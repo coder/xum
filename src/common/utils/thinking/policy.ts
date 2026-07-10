@@ -89,8 +89,7 @@ export function getThinkingPolicyForModel(
   modelString: string,
   providersConfig?: ProvidersConfigMap | null
 ): ThinkingPolicy {
-  const capabilityModel = resolveModelForMetadata(modelString, providersConfig ?? null);
-  return getExplicitThinkingPolicy(capabilityModel) ?? DEFAULT_THINKING_POLICY;
+  return getExplicitThinkingPolicyForModel(modelString, providersConfig) ?? DEFAULT_THINKING_POLICY;
 }
 
 /**
@@ -204,6 +203,20 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
   return null;
 }
 
+/**
+ * Resolve a model to its capability model (following `mappedToModel` aliases via
+ * {@link resolveModelForMetadata}) and return its explicit reasoning policy, or
+ * `null` when none matches. Shared by {@link getThinkingPolicyForModel} and
+ * {@link hasExplicitThinkingPolicy}, which must resolve aliases identically
+ * before rule matching so a mapped alias inherits its target's policy.
+ */
+function getExplicitThinkingPolicyForModel(
+  modelString: string,
+  providersConfig?: ProvidersConfigMap | null
+): ThinkingPolicy | null {
+  return getExplicitThinkingPolicy(resolveModelForMetadata(modelString, providersConfig ?? null));
+}
+
 /** Canonical ordering index for a level (off=0 … max=5). */
 function thinkingLevelIndex(level: ThinkingLevel): number {
   return THINKING_LEVELS.indexOf(level);
@@ -245,10 +258,7 @@ export function hasExplicitThinkingPolicy(
   modelString: string,
   providersConfig?: ProvidersConfigMap | null
 ): boolean {
-  return (
-    getExplicitThinkingPolicy(resolveModelForMetadata(modelString, providersConfig ?? null)) !==
-    null
-  );
+  return getExplicitThinkingPolicyForModel(modelString, providersConfig) !== null;
 }
 
 /**
