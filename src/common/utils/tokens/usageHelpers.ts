@@ -105,6 +105,17 @@ export function addUsage(
 }
 
 /**
+ * Read Anthropic cache-creation input tokens from a provider-metadata record.
+ * Returns 0 when the field is absent so callers can sum without null checks.
+ */
+function getAnthropicCacheCreateTokens(metadata: Record<string, unknown> | undefined): number {
+  return (
+    (metadata?.anthropic as { cacheCreationInputTokens?: number } | undefined)
+      ?.cacheCreationInputTokens ?? 0
+  );
+}
+
+/**
  * Accumulate provider metadata across steps for additive billing metadata.
  *
  * Anthropic cache creation tokens and xAI exact-cost ticks are reported per request/step
@@ -118,12 +129,8 @@ export function accumulateProviderMetadata(
   if (!existing) return step;
 
   // Extract cache creation tokens from both
-  const existingCacheCreate =
-    (existing.anthropic as { cacheCreationInputTokens?: number } | undefined)
-      ?.cacheCreationInputTokens ?? 0;
-  const stepCacheCreate =
-    (step.anthropic as { cacheCreationInputTokens?: number } | undefined)
-      ?.cacheCreationInputTokens ?? 0;
+  const existingCacheCreate = getAnthropicCacheCreateTokens(existing);
+  const stepCacheCreate = getAnthropicCacheCreateTokens(step);
 
   const totalCacheCreate = existingCacheCreate + stepCacheCreate;
   const existingXaiCostTicks =
