@@ -726,18 +726,27 @@ export class MessageQueue {
   }
 
   /**
+   * Project a single entry's cancellation callbacks into the clear-callback shape.
+   * Shared by full-queue clears and targeted workspace-turn removal so both notify
+   * the same callback set.
+   */
+  private entryClearCallbacks(entry: QueueEntry): QueueClearCallbacks {
+    return {
+      ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
+      ...(entry.onAcceptedPreStreamFailure != null
+        ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }
+        : {}),
+    };
+  }
+
+  /**
    * Cancellation callbacks for every pending entry, in queue order.
    * Callers must notify each one when clearing the queue.
    */
   getClearCallbacks(): QueueClearCallbacks[] {
     return this.entries
       .filter((entry) => entry.onCanceled != null || entry.onAcceptedPreStreamFailure != null)
-      .map((entry) => ({
-        ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
-        ...(entry.onAcceptedPreStreamFailure != null
-          ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }
-          : {}),
-      }));
+      .map((entry) => this.entryClearCallbacks(entry));
   }
 
   /**
@@ -757,12 +766,7 @@ export class MessageQueue {
       return null;
     }
     const [entry] = this.entries.splice(index, 1);
-    return {
-      ...(entry.onCanceled != null ? { onCanceled: entry.onCanceled } : {}),
-      ...(entry.onAcceptedPreStreamFailure != null
-        ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }
-        : {}),
-    };
+    return this.entryClearCallbacks(entry);
   }
 
   /** Remove queued entries carrying a dedupe key with the given prefix. */
