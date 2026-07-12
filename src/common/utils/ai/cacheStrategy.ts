@@ -236,6 +236,16 @@ function isOfficialOpenAIBaseUrl(baseUrl: string): boolean {
 }
 
 /**
+ * Whether a canonical `provider:model` string has an `openai` origin with a
+ * non-empty model name. Used to gate both the request model and its resolved
+ * capability target in openaiExplicitPromptCachingAvailable.
+ */
+function isOpenAIOriginModel(canonical: string): boolean {
+  const [origin, modelName] = canonical.split(":", 2);
+  return origin === "openai" && !!modelName;
+}
+
+/**
  * Route-aware eligibility for GPT-5.6 explicit prompt cache breakpoints.
  *
  * Explicit breakpoints (and the Chat Completions promptCacheKey extension) are
@@ -270,16 +280,14 @@ export function openaiExplicitPromptCachingAvailable(
   }
 
   const normalized = normalizeToCanonical(modelString);
-  const [origin, modelName] = normalized.split(":", 2);
-  if (origin !== "openai" || !modelName) {
+  if (!isOpenAIOriginModel(normalized)) {
     return false;
   }
 
   // Mapped aliases inherit eligibility only when the resolved capability
   // target is also an OpenAI GPT-5.6-family model.
   const capabilityModel = resolveModelForMetadata(normalized, providersConfig);
-  const [capabilityOrigin, capabilityModelName] = capabilityModel.split(":", 2);
-  if (capabilityOrigin !== "openai" || !capabilityModelName) {
+  if (!isOpenAIOriginModel(capabilityModel)) {
     return false;
   }
   if (!isGpt56FamilyModel(capabilityModel)) {
