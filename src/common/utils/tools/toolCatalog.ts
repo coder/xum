@@ -12,13 +12,7 @@
  * aiService or streamText.
  */
 
-import type {
-  AssistantModelMessage,
-  Tool,
-  ToolCallPart,
-  ToolModelMessage,
-  ToolResultPart,
-} from "ai";
+import type { AssistantModelMessage, Tool, ToolModelMessage } from "ai";
 import type { ModelMessage, MuxMessage } from "@/common/types/message";
 import { buildRequiredToolPatterns, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 
@@ -577,13 +571,10 @@ function isMuxToolSearchOutput(output: unknown): boolean {
   );
 }
 
-function renameLegacyToolSearchCallPart(part: ToolCallPart): ToolCallPart {
-  return part.toolName === LEGACY_TOOL_SEARCH_TOOL_NAME
-    ? { ...part, toolName: TOOL_SEARCH_TOOL_NAME }
-    : part;
-}
-
-function renameLegacyToolSearchResultPart(part: ToolResultPart): ToolResultPart {
+// Generic over the part shape so the assistant tool-call and tool-result paths
+// share one implementation: both parts carry a `toolName`, and the rename is
+// identical regardless of which kind of part is being rewritten.
+function renameLegacyToolSearchPart<T extends { toolName: string }>(part: T): T {
   return part.toolName === LEGACY_TOOL_SEARCH_TOOL_NAME
     ? { ...part, toolName: TOOL_SEARCH_TOOL_NAME }
     : part;
@@ -663,10 +654,10 @@ export function normalizeLegacyToolSearchMessages(messages: ModelMessage[]): Mod
             return part;
           }
           if (part.type === "tool-call") {
-            return renameLegacyToolSearchCallPart(part);
+            return renameLegacyToolSearchPart(part);
           }
           if (part.type === "tool-result") {
-            return renameLegacyToolSearchResultPart(part);
+            return renameLegacyToolSearchPart(part);
           }
           return part;
         }
@@ -678,7 +669,7 @@ export function normalizeLegacyToolSearchMessages(messages: ModelMessage[]): Mod
     if (message.role === "tool") {
       const content: ToolModelMessage["content"] = message.content.map((part) => {
         if (part.type === "tool-result" && legacyCallIds.has(part.toolCallId)) {
-          return renameLegacyToolSearchResultPart(part);
+          return renameLegacyToolSearchPart(part);
         }
         return part;
       });
