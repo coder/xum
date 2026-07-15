@@ -26,6 +26,15 @@ function isRecordValue(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Tool outputs may be wrapped in a { type: "json", value } container (UI parts and SDK
+ * ToolResultPart outputs share this shape). Both the terminal-status probe and the
+ * record-stripping pass unwrap this the same way before inspecting the inner value.
+ */
+function isJsonWrappedOutput(output: Record<string, unknown>): boolean {
+  return output.type === "json" && "value" in output;
+}
+
+/**
  * workflow_run / workflow_resume outputs embed the full run record (script source, event
  * log, step snapshots) solely for the UI run card. The model only needs status/runId/result —
  * in-progress events may never materialize in the final outcome — so drop the record from
@@ -41,7 +50,7 @@ export function isTerminalWorkflowRunToolOutput(
   if (!isWorkflowRunEmittingToolName(toolName) || !isRecordValue(output)) {
     return false;
   }
-  if (output.type === "json" && "value" in output) {
+  if (isJsonWrappedOutput(output)) {
     return isTerminalWorkflowRunToolOutput(toolName, output.value, runId);
   }
   const status = output.status;
@@ -55,9 +64,7 @@ export function stripWorkflowRunRecordForModel(toolName: string, output: unknown
   if (!isWorkflowRunEmittingToolName(toolName) || !isRecordValue(output)) {
     return output;
   }
-  // Tool outputs may be wrapped in a { type: "json", value } container (UI parts and
-  // SDK ToolResultPart outputs share this shape).
-  if (output.type === "json" && "value" in output) {
+  if (isJsonWrappedOutput(output)) {
     const strippedValue = stripWorkflowRunRecordForModel(toolName, output.value);
     return strippedValue === output.value ? output : { ...output, value: strippedValue };
   }
