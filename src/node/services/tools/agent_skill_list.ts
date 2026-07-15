@@ -7,9 +7,7 @@ import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
 import {
   AgentSkillDescriptorSchema,
   SkillNameSchema,
-  resolveSkillAdvertise,
-  resolveSkillUserInvocable,
-  resolveSkillWhenToUse,
+  buildSkillDescriptor,
 } from "@/common/orpc/schemas";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import type { AgentSkillListToolResult } from "@/common/types/tools";
@@ -128,15 +126,9 @@ async function readSkillDescriptor(
       directoryName,
     });
 
-    const descriptorResult = AgentSkillDescriptorSchema.safeParse({
-      name: parsed.frontmatter.name,
-      description: parsed.frontmatter.description,
-      scope,
-      advertise: resolveSkillAdvertise(parsed.frontmatter),
-      userInvocable: resolveSkillUserInvocable(parsed.frontmatter),
-      argumentHint: parsed.frontmatter["argument-hint"],
-      whenToUse: resolveSkillWhenToUse(parsed.frontmatter),
-    });
+    const descriptorResult = AgentSkillDescriptorSchema.safeParse(
+      buildSkillDescriptor(parsed.frontmatter, scope)
+    );
 
     if (!descriptorResult.success) {
       log.warn(
