@@ -15787,11 +15787,12 @@ export class TaskService implements AgentTaskIntegration {
     // Explicit in-session recovery cases (aborted, context_exceeded) may
     // continue through queued/preparing turns; auto-retryable errors require a
     // pending auto-retry of the same turn.
+    const errorType = event.errorType;
     const explicitRecovery =
-      event.errorType != null && WORKSPACE_TURN_RECOVERABLE_STREAM_ERRORS.has(event.errorType);
+      errorType != null && WORKSPACE_TURN_RECOVERABLE_STREAM_ERRORS.has(errorType);
     if (
-      event.errorType != null &&
-      isWorkspaceTurnRecoverableStreamError(event.errorType) &&
+      errorType != null &&
+      isWorkspaceTurnRecoverableStreamError(errorType) &&
       (await this.hasRecoverableWorkspaceTurnRetryInFlight(record.workspaceId, event.messageId, {
         requireAutoRetry: !explicitRecovery,
       }))
