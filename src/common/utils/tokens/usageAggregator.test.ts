@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { getTotalCost, sumUsageHistory } from "./usageAggregator";
+import { getTotalCost, getTotalTokens, sumUsageHistory } from "./usageAggregator";
 
 describe("sumUsageHistory", () => {
   test("preserves hasUnknownCosts when an entry is approximate but still has numeric costs", () => {
@@ -25,5 +25,23 @@ describe("sumUsageHistory", () => {
     expect(result).toBeDefined();
     expect(result?.hasUnknownCosts).toBe(true);
     expect(getTotalCost(result)).toBeCloseTo(0.544);
+  });
+});
+
+describe("getTotalTokens", () => {
+  test("sums tokens across all five components", () => {
+    expect(
+      getTotalTokens({
+        input: { tokens: 100 },
+        cached: { tokens: 20 },
+        cacheCreate: { tokens: 5 },
+        output: { tokens: 10 },
+        reasoning: { tokens: 3 },
+      })
+    ).toBe(138);
+  });
+
+  test("returns 0 for undefined usage", () => {
+    expect(getTotalTokens(undefined)).toBe(0);
   });
 });

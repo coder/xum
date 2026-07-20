@@ -117,6 +117,21 @@ export function getTotalCost(usage: ChatUsageDisplay | undefined): number | unde
 }
 
 /**
+ * Sum the token counts across every usage component (input, cached,
+ * cacheCreate, output, reasoning) into a single total. Mirrors the component
+ * iteration used by getTotalCost so token totals stay consistent everywhere.
+ */
+export function getTotalTokens(usage: ChatUsageDisplay | undefined): number {
+  if (!usage) return 0;
+  const components = ["input", "cached", "cacheCreate", "output", "reasoning"] as const;
+  let total = 0;
+  for (const key of components) {
+    total += usage[key].tokens;
+  }
+  return total;
+}
+
+/**
  * Format cost for display with dollar sign.
  * Returns "~$0.00" for very small values, "$X.XX" otherwise.
  */

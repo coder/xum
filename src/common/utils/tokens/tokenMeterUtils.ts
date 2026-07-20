@@ -1,6 +1,6 @@
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
-import type { ChatUsageDisplay } from "./usageAggregator";
+import { getTotalTokens, type ChatUsageDisplay } from "./usageAggregator";
 
 // NOTE: Provide theme-matching fallbacks so token meters render consistently
 // even if a host environment doesn't define the CSS variables (e.g., an embedded UI).
@@ -69,12 +69,7 @@ export function calculateTokenMeterData(
   // Total tokens used in the request.
   // For Anthropic prompt caching, cacheCreate tokens are reported separately but still
   // count toward total input tokens for the request.
-  const totalUsed =
-    usage.input.tokens +
-    usage.cached.tokens +
-    usage.cacheCreate.tokens +
-    usage.output.tokens +
-    usage.reasoning.tokens;
+  const totalUsed = getTotalTokens(usage);
 
   const toPercentage = (tokens: number) => {
     if (verticalProportions) {

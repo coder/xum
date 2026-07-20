@@ -4,6 +4,7 @@ import {
   sumUsageHistory,
   formatCostWithDollar,
   getTotalCost,
+  getTotalTokens,
   type ChatUsageDisplay,
 } from "@/common/utils/tokens/usageAggregator";
 import { formatModelStringForDisplay } from "@/common/utils/ai/models";
@@ -66,12 +67,7 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
     return Array.from(merged.entries())
       .map(([model, entry]) => ({
         model,
-        tokens:
-          entry.input.tokens +
-          entry.cached.tokens +
-          entry.cacheCreate.tokens +
-          entry.output.tokens +
-          entry.reasoning.tokens,
+        tokens: getTotalTokens(entry),
         cost: getTotalCost(entry),
       }))
       .sort((a, b) => (b.cost ?? 0) - (a.cost ?? 0) || b.tokens - a.tokens);
