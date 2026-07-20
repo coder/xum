@@ -780,9 +780,11 @@ export class MessageQueue {
     let removedCount = 0;
     const removedCallbacks: QueueClearCallbacks[] = [];
     this.entries = this.entries.flatMap((entry) => {
-      const matchingKeys = [...entry.dedupeKeys].filter((dedupeKey) =>
-        dedupeKey.startsWith(prefix)
-      );
+      // Snapshot the dedupe keys once: the message-index lookup below would otherwise
+      // re-spread the Set on every message iteration. The Set is not mutated until after
+      // keptMessages is computed, so both reads observe the same ordered snapshot.
+      const dedupeKeyList = [...entry.dedupeKeys];
+      const matchingKeys = dedupeKeyList.filter((dedupeKey) => dedupeKey.startsWith(prefix));
       if (matchingKeys.length === 0) {
         return [entry];
       }
@@ -792,7 +794,7 @@ export class MessageQueue {
       // preserve unrelated keys/messages that share the same entry.
       const matchingKeySet = new Set(matchingKeys);
       const keptMessages = entry.messages.filter((_message, index) => {
-        const key = [...entry.dedupeKeys][index];
+        const key = dedupeKeyList[index];
         return key == null || !matchingKeySet.has(key);
       });
       if (keptMessages.length > 0) {
