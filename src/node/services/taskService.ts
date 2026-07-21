@@ -1062,6 +1062,23 @@ function isSelfHealEligibleSettledWorkspaceTurn(
 }
 
 /**
+ * Under the settlement lock, confirm a reloaded handle is still the exact record a read-time
+ * reconciliation resolved against before mutating it. Comparing updatedAt as well as status
+ * matters: a concurrent settlement can produce a NEWER record with the same status, and a
+ * stale read must not clobber it. Callers pass a `null` / non-matching `current` straight
+ * through so the concurrent winner is reported. Typed as a guard so the matched branch narrows
+ * `current` to a non-null record.
+ */
+function isReconciledWorkspaceTurnUnchanged(
+  current: WorkspaceTurnTaskHandleRecord | null,
+  record: WorkspaceTurnTaskHandleRecord
+): current is WorkspaceTurnTaskHandleRecord {
+  return (
+    current != null && current.status === record.status && current.updatedAt === record.updatedAt
+  );
+}
+
+/**
  * A workspace-turn stream error may resolve without parent intervention when
  * the child can still make progress on its own. The caller must still confirm
  * a retry/continuation is actually in flight
@@ -11720,13 +11737,7 @@ export class TaskService implements AgentTaskIntegration {
         record.handleId
       );
       // A concurrent settlement/repair wins; only replace the exact record we reconciled.
-      // Comparing updatedAt (not just status) matters: a concurrent settlement can produce
-      // a NEWER record with the same status that must not be clobbered by our stale read.
-      if (
-        current == null ||
-        current.status !== record.status ||
-        current.updatedAt !== record.updatedAt
-      ) {
+      if (!isReconciledWorkspaceTurnUnchanged(current, record)) {
         // If this direct parent's task_await will return that concurrent terminal winner,
         // consume it here so its post-lock delivery cannot append the same outcome too.
         return await this.markDirectParentWorkspaceTurnResultConsumedUnlocked(
@@ -11791,15 +11802,10 @@ export class TaskService implements AgentTaskIntegration {
         record.ownerWorkspaceId,
         record.handleId
       );
-      // A concurrent transition wins; only revive the exact record we reconciled against.
-      // Comparing updatedAt (not just status) matters: the live retry itself can fail and
-      // settle a NEWER record with the same status (e.g. error → error) between our read
-      // and this lock — reviving that fresh terminal failure would strand task_await.
-      if (
-        current == null ||
-        current.status !== record.status ||
-        current.updatedAt !== record.updatedAt
-      ) {
+      // A concurrent transition wins; only revive the exact record we reconciled against — the
+      // live retry can itself fail into a NEWER error record between our read and this lock, and
+      // reviving that fresh terminal failure would strand task_await.
+      if (!isReconciledWorkspaceTurnUnchanged(current, record)) {
         return current;
       }
       // Another turn already owns the child workspace; the activity is not this turn's retry.
