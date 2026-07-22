@@ -377,6 +377,8 @@ function formatSubagentReportUserMessage(params: {
     ...(params.executionId != null ? { executionId: params.executionId } : {}),
     ...(params.model != null ? { model: params.model } : {}),
     ...(params.thinkingLevel != null ? { thinkingLevel: params.thinkingLevel } : {}),
+    // Omit structuredOutput entirely when absent so callers can forward the value directly
+    // without re-implementing the undefined guard at each call site.
     ...(params.structuredOutput !== undefined ? { structuredOutput: params.structuredOutput } : {}),
   });
 }
@@ -10352,9 +10354,7 @@ export class TaskService implements AgentTaskIntegration {
         ...(childEntry.workspace.taskThinkingLevel != null
           ? { thinkingLevel: childEntry.workspace.taskThinkingLevel }
           : {}),
-        ...(report.structuredOutput !== undefined
-          ? { structuredOutput: report.structuredOutput }
-          : {}),
+        structuredOutput: report.structuredOutput,
       });
       // A progress report is itself the wake-up message. Unlike terminal attention, it must be
       // allowed through while this child is still active so review findings and other incremental
@@ -17811,9 +17811,7 @@ export class TaskService implements AgentTaskIntegration {
       status: "completed",
       ...(childModelString != null ? { model: childModelString } : {}),
       ...(childThinkingLevel != null ? { thinkingLevel: childThinkingLevel } : {}),
-      ...(report.structuredOutput !== undefined
-        ? { structuredOutput: report.structuredOutput }
-        : {}),
+      structuredOutput: report.structuredOutput,
     });
 
     const workspaceTurnMuxMetadata =
