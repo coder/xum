@@ -1860,13 +1860,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
     const combinedMcpPromptRefs = mcpPromptRefsResult.refs;
 
+    // The initial /goal path sets a goal without sending a user message, so
+    // attachments would be silently dropped. With attachments present, skip
+    // command processing and send the raw text as a normal message instead.
+    // Shared by the creation route below and the workspace path (transferred
+    // creation drafts retried in the composer), which resolve `parsed` and
+    // `attachments` identically.
+    const goalCommandBypassedForAttachments = parsed?.type === "goal-set" && attachments.length > 0;
+
     // Route to creation handler for creation variant
     if (variant === "creation") {
-      // The initial /goal path sets a goal without sending a user message, so
-      // attachments would be silently dropped. With attachments present, skip
-      // command processing and send the raw text as a normal message instead.
-      const goalCommandBypassedForAttachments =
-        parsed?.type === "goal-set" && attachments.length > 0;
       const initialSlashCommand =
         parsed?.type === "goal-set" && !goalCommandBypassedForAttachments ? parsed : undefined;
       if (
@@ -1971,12 +1974,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
     try {
       const modelOneShot = parsed?.type === "model-oneshot" ? parsed : null;
-      // Mirror the creation-composer /goal bypass: with attachments present,
-      // send the raw text as a normal message instead of processing the
-      // command, which would drop the files. Transferred staging-failure
-      // drafts (raw /goal text + staged/pending chips) retry through here.
-      const goalCommandBypassedForAttachments =
-        parsed?.type === "goal-set" && attachments.length > 0;
       const commandHandled =
         modelOneShot || goalCommandBypassedForAttachments
           ? false
