@@ -216,6 +216,11 @@ def get_model_from_config(config_path: Path) -> str | None:
         return None
 
 
+def _child_dirs(path: Path) -> list[Path]:
+    """List the immediate subdirectories of a directory, skipping plain files."""
+    return [child for child in path.iterdir() if child.is_dir()]
+
+
 def _is_job_folder(path: Path) -> bool:
     """Check if a directory looks like a job folder (contains trial dirs with config.json)."""
     if not path.is_dir():
@@ -249,20 +254,14 @@ def find_job_folders(artifacts_dir: Path) -> list[Path]:
     # Check for direct jobs/ folder
     direct_jobs = artifacts_dir / "jobs"
     if direct_jobs.exists():
-        for item in direct_jobs.iterdir():
-            if item.is_dir():
-                job_folders.append(item)
+        job_folders.extend(_child_dirs(direct_jobs))
         return job_folders
 
     # Check for per-artifact structure
-    for artifact_dir in artifacts_dir.iterdir():
-        if not artifact_dir.is_dir():
-            continue
+    for artifact_dir in _child_dirs(artifacts_dir):
         jobs_dir = artifact_dir / "jobs"
         if jobs_dir.exists():
-            for item in jobs_dir.iterdir():
-                if item.is_dir():
-                    job_folders.append(item)
+            job_folders.extend(_child_dirs(jobs_dir))
 
     return job_folders
 
