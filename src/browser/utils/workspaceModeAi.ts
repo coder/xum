@@ -6,7 +6,7 @@ import {
   type OpenAIReasoningMode,
   type ThinkingLevel,
 } from "@/common/types/thinking";
-import { normalizeAgentId as normalizeWorkspaceAgentId } from "@/common/utils/agentIds";
+import { normalizeAgentId } from "@/common/utils/agentIds";
 import { collectDeclaredAncestorLayers } from "@/common/utils/ai/agentAncestorLayers";
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
 
@@ -16,10 +16,6 @@ export type WorkspaceAISettingsCache = Partial<
     { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
   >
 >;
-
-function normalizeAgentId(agentId: string): string {
-  return normalizeWorkspaceAgentId(agentId, "exec");
-}
 
 /**
  * Field-wise configured defaults for an agent through its declared base chain,
