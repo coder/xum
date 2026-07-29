@@ -55,6 +55,7 @@ import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/const
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import {
+  MOBILE_TOUCH_MEDIA_QUERY,
   NARROW_VIEWPORT_MAX_WIDTH_PX,
   WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
 } from "@/constants/layout";
@@ -184,7 +185,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
 
   const handleOpenTerminal = useCallback(() => {
     // On mobile touch devices, always use popout since the right sidebar is hidden
-    const isMobileTouch = window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
+    const isMobileTouch = window.matchMedia(MOBILE_TOUCH_MEDIA_QUERY).matches;
     if (onOpenTerminal && !isMobileTouch) {
       onOpenTerminal();
     } else {
@@ -194,8 +195,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   }, [workspaceId, openTerminalPopout, runtimeConfig, onOpenTerminal]);
 
   const isTouchMobileScreen =
-    typeof window !== "undefined" &&
-    window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
+    typeof window !== "undefined" && window.matchMedia(MOBILE_TOUCH_MEDIA_QUERY).matches;
 
   // The right sidebar (home of the Timeline tab) is CSS-hidden by two independent
   // rules: a viewport media query (<=768px, any pointer) and the workspace-shell

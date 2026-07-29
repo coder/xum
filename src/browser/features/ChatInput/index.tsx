@@ -202,6 +202,7 @@ import {
   COMPOSER_WORKSPACE_ICON_ONLY_HIDE_CLASS,
   CHAT_DOCK_GUTTER_CLASS,
   CREATION_COLUMN_MAX_WIDTH_CLASS,
+  MOBILE_TOUCH_MEDIA_QUERY,
 } from "@/constants/layout";
 import { useChatDockColumnWidthClass } from "@/browser/components/ChatPane/chatDockColumn";
 import { prepareMessagePayload } from "./prepareMessagePayload";
@@ -294,14 +295,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const isStreamStarting = variant === "workspace" ? (props.isStreamStarting ?? false) : false;
   const isCompacting = variant === "workspace" ? (props.isCompacting ?? false) : false;
   const [isMobileTouch, setIsMobileTouch] = useState(
-    () =>
-      typeof window !== "undefined" &&
-      window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches
+    () => typeof window !== "undefined" && window.matchMedia(MOBILE_TOUCH_MEDIA_QUERY).matches
   );
   useEffect(() => {
     if (typeof window === "undefined") return;
 
-    const mobileTouchMediaQuery = window.matchMedia("(max-width: 768px) and (pointer: coarse)");
+    const mobileTouchMediaQuery = window.matchMedia(MOBILE_TOUCH_MEDIA_QUERY);
     const handleMobileTouchChange = () => {
       setIsMobileTouch(mobileTouchMediaQuery.matches);
     };
