@@ -201,6 +201,7 @@ import {
   COMPOSER_ICON_ONLY_HIDE_CLASS,
   COMPOSER_WORKSPACE_ICON_ONLY_HIDE_CLASS,
   CHAT_DOCK_GUTTER_CLASS,
+  CHAT_DOCK_TOAST_OVERLAY_CLASS,
   CREATION_COLUMN_MAX_WIDTH_CLASS,
   MOBILE_TOUCH_MEDIA_QUERY,
 } from "@/constants/layout";
@@ -2520,7 +2521,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       >
         <div className={cn(variant === "creation" ? "w-full" : chatDockColumnWidthClass)}>
           {/* Toasts (overlay) */}
-          <div className="pointer-events-none absolute right-[15px] bottom-full left-[15px] z-[1000] mb-2 flex flex-col gap-2 [&>*]:pointer-events-auto">
+          <div className={cn(CHAT_DOCK_TOAST_OVERLAY_CLASS, "flex flex-col gap-2")}>
             <ConnectionStatusToast wrap={false} />
             <ChatInputToast
               toast={activeToast}

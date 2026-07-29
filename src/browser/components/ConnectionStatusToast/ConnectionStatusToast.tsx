@@ -1,8 +1,6 @@
 import React from "react";
 import { useAPI } from "@/browser/contexts/API";
-
-const wrapperClassName =
-  "pointer-events-none absolute right-[15px] bottom-full left-[15px] z-[1000] mb-2 [&>*]:pointer-events-auto";
+import { CHAT_DOCK_TOAST_OVERLAY_CLASS } from "@/constants/layout";
 
 /**
  * Connection status banner that uses the same *overlay placement* as ChatInputToast.
@@ -55,7 +53,7 @@ export const ConnectionStatusToast: React.FC<ConnectionStatusToastProps> = ({ wr
 
     if (!wrap) return content;
 
-    return <div className={wrapperClassName}>{content}</div>;
+    return <div className={CHAT_DOCK_TOAST_OVERLAY_CLASS}>{content}</div>;
   }
 
   if (apiState.status === "error") {
@@ -75,7 +73,7 @@ export const ConnectionStatusToast: React.FC<ConnectionStatusToastProps> = ({ wr
 
     if (!wrap) return content;
 
-    return <div className={wrapperClassName}>{content}</div>;
+    return <div className={CHAT_DOCK_TOAST_OVERLAY_CLASS}>{content}</div>;
   }
 
   return null;

@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { AlertTriangle, Check } from "lucide-react";
 import React, { useEffect, useCallback } from "react";
 import { cn } from "@/common/lib/utils";
+import { CHAT_DOCK_TOAST_OVERLAY_CLASS } from "@/constants/layout";
 
 const toastTypeStyles: Record<"success" | "error", string> = {
   success: "bg-toast-success-bg border border-accent-dark text-toast-success-text",
@@ -30,9 +31,6 @@ interface ChatInputToastProps {
 export const SolutionLabel: React.FC<{ children: ReactNode }> = ({ children }) => (
   <div className="text-muted-light mb-1 text-[10px] uppercase">{children}</div>
 );
-
-const wrapperClassName =
-  "pointer-events-none absolute right-[15px] bottom-full left-[15px] z-[1000] mb-2 [&>*]:pointer-events-auto";
 
 export const ChatInputToast: React.FC<ChatInputToastProps> = ({
   toast,
@@ -149,5 +147,5 @@ export const ChatInputToast: React.FC<ChatInputToastProps> = ({
 
   if (!wrap) return content;
 
-  return <div className={wrapperClassName}>{content}</div>;
+  return <div className={CHAT_DOCK_TOAST_OVERLAY_CLASS}>{content}</div>;
 };

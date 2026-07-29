@@ -13,6 +13,13 @@ export const CREATION_COLUMN_MAX_WIDTH_CLASS = "max-w-[67rem]";
 // text, so this has to stay a literal class string.
 export const CHAT_DOCK_GUTTER_CLASS = "px-[15px]";
 
+// Toasts float above the composer instead of displacing it, so every toast host has to agree on the
+// same overlay box or a stacked toast would jump when its host changes. Inset matches
+// CHAT_DOCK_GUTTER_CLASS, but Tailwind scans source text, so the placement cannot be composed from
+// it and has to stay a literal class string.
+export const CHAT_DOCK_TOAST_OVERLAY_CLASS =
+  "pointer-events-none absolute right-[15px] bottom-full left-[15px] z-[1000] mb-2 [&>*]:pointer-events-auto";
+
 // The viewport/pointer combination that gates Mux's mobile affordances. Must stay in sync with the
 // matching `@media` block in globals.css: the renderer branches on this same environment through
 // `window.matchMedia`, so a per-callsite copy of the literal can silently desync JS from CSS.
