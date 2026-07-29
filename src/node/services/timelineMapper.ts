@@ -85,16 +85,20 @@ const MACHINE_AUTHORED_TURN_TYPES = new Set([
   WORKFLOW_RESULT_METADATA_TYPE,
 ]);
 
+// Only a non-null object has fields to read, so every other shape yields undefined rather than
+// throwing. Callers narrow the returned `unknown` to the type they expect.
+function readObjectField(value: unknown, field: string): unknown {
+  return typeof value === "object" && value !== null
+    ? (value as Record<string, unknown>)[field]
+    : undefined;
+}
+
 // muxMetadata crosses the oRPC boundary as `any`, so read its string fields defensively.
 function readMuxMetadataField(
   metadata: Extract<WorkspaceChatMessage, { type: "message" }>["metadata"],
   field: "type" | "source" | "runId"
 ): string | undefined {
-  const muxMetadata: unknown = metadata?.muxMetadata;
-  if (typeof muxMetadata !== "object" || muxMetadata === null) {
-    return undefined;
-  }
-  const value = (muxMetadata as Record<string, unknown>)[field];
+  const value = readObjectField(metadata?.muxMetadata, field);
   return typeof value === "string" ? value : undefined;
 }
 
@@ -136,20 +140,13 @@ function isUnloggedMachineTurn(
 function readMonitorWakeProcesses(
   metadata: Extract<WorkspaceChatMessage, { type: "message" }>["metadata"]
 ): string | undefined {
-  const muxMetadata: unknown = metadata?.muxMetadata;
-  const records: unknown =
-    typeof muxMetadata === "object" && muxMetadata !== null
-      ? (muxMetadata as Record<string, unknown>).records
-      : undefined;
+  const records = readObjectField(metadata?.muxMetadata, "records");
   if (!Array.isArray(records)) {
     return undefined;
   }
   const names = new Set<string>();
   for (const record of records) {
-    const displayName: unknown =
-      typeof record === "object" && record !== null
-        ? (record as Record<string, unknown>).displayName
-        : undefined;
+    const displayName = readObjectField(record, "displayName");
     if (typeof displayName === "string" && displayName !== "") {
       names.add(displayName);
     }
