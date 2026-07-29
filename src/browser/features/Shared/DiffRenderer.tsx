@@ -6,7 +6,7 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
-import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { isPrimaryMouseButton, stopKeyboardPropagation } from "@/browser/utils/events";
 import { cn } from "@/common/lib/utils";
 import { getLanguageFromPath } from "@/common/utils/git/languageDetector";
 import { useOverflowDetection } from "@/browser/hooks/useOverflowDetection";
@@ -1643,7 +1643,7 @@ export const SelectableDiffRenderer = React.memo<SelectableDiffRendererProps>(
                     isInteractive={Boolean(onReviewNote ?? onLineIndexSelect)}
                     onMouseDown={(e) => {
                       if (!onReviewNote) return;
-                      if (e.button !== 0) return;
+                      if (!isPrimaryMouseButton(e)) return;
                       e.preventDefault();
                       e.stopPropagation();
                       startDragSelection(displayIndex, e.shiftKey);
