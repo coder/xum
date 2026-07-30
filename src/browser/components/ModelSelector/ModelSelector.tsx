@@ -433,33 +433,34 @@ export const ModelSelector = forwardRef<ModelSelectorRef, ModelSelectorProps>(
                   const modelProvider = getModelProvider(model);
                   const showProviderLabel =
                     modelProvider.length > 0 && duplicateModelNames.has(modelName);
+                  // Name the row's selection/highlight state once so the option class, ARIA state,
+                  // and accent styling below can't drift apart (mirrors AgentModePicker).
+                  const isHighlighted = index === highlightedIndex;
+                  const isSelected = value === model;
 
                   return (
                     <div
                       key={model}
-                      data-highlighted={index === highlightedIndex}
+                      data-highlighted={isHighlighted}
                       onMouseEnter={() => setHighlightedIndex(index)}
                       className={composerPickerOptionClass(
-                        {
-                          isHighlighted: index === highlightedIndex,
-                          isSelected: value === model,
-                        },
+                        { isHighlighted, isSelected },
                         "py-1",
                         hiddenSet.has(model) && "opacity-50"
                       )}
                       onClick={() => handleSelectModel(model)}
                       role="option"
-                      aria-selected={value === model}
+                      aria-selected={isSelected}
                     >
                       <ProviderIcon
                         provider={modelProvider}
                         className={cn(
                           "h-3 w-3 shrink-0",
-                          value === model ? "text-accent" : "text-muted"
+                          isSelected ? "text-accent" : "text-muted"
                         )}
                       />
                       <span className="flex min-w-0 flex-1 items-baseline gap-1">
-                        <span className={cn("min-w-0 truncate", value === model && "text-accent")}>
+                        <span className={cn("min-w-0 truncate", isSelected && "text-accent")}>
                           {formatModelDisplayName(modelName)}
                         </span>
                         {showProviderLabel && (
