@@ -5,7 +5,7 @@
  * Each window connects to a terminal session via WebSocket.
  */
 
-import { installInactiveAnimationPause } from "@/browser/utils/inactiveAnimations";
+import { installInactiveAnimationPauseSafely } from "@/browser/utils/inactiveAnimations";
 import ReactDOM from "react-dom/client";
 import { TerminalView } from "@/browser/components/TerminalView/TerminalView";
 import { APIProvider, useAPI } from "@/browser/contexts/API";
@@ -35,11 +35,7 @@ function TerminalWindowContent(props: {
   );
 }
 
-try {
-  installInactiveAnimationPause();
-} catch {
-  // Animation throttling is an optimization and must never block renderer startup.
-}
+installInactiveAnimationPauseSafely();
 
 installWindowOpenLocalhostProxyNormalization();
 

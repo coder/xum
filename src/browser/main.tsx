@@ -2,7 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { installBrowserLogCapture } from "@/browser/utils/browserLog";
 import { installWindowOpenLocalhostProxyNormalization } from "@/browser/utils/windowOpenLocalhostProxy";
-import { installInactiveAnimationPause } from "@/browser/utils/inactiveAnimations";
+import { installInactiveAnimationPauseSafely } from "@/browser/utils/inactiveAnimations";
 import { AppLoader } from "@/browser/components/AppLoader/AppLoader";
 import { initTelemetry, trackAppStarted } from "@/common/telemetry";
 import { initTitlebarInsets } from "@/browser/hooks/useDesktopTitlebar";
@@ -15,11 +15,7 @@ try {
   // Silent failure — never crash the app for logging capture
 }
 
-try {
-  installInactiveAnimationPause();
-} catch {
-  // Animation throttling is an optimization and must never block renderer startup.
-}
+installInactiveAnimationPauseSafely();
 
 installWindowOpenLocalhostProxyNormalization();
 
