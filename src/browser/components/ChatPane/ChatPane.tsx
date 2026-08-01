@@ -41,6 +41,7 @@ import {
   mergeConsecutiveStreamErrors,
   computeBashOutputGroupInfos,
   shouldBypassDeferredMessages,
+  isBashMonitorWakeMessage,
 } from "@/browser/utils/messages/messageUtils";
 import { computeTaskReportLinking } from "@/browser/utils/messages/taskReportLinking";
 import { BashCollapsedSummaryModeProvider } from "@/browser/features/Tools/BashCollapsedSummaryModeContext";
@@ -767,7 +768,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       // interrupt navigation between human prompts (payloads themselves are assistant rows).
       if (
         message.type === "user" &&
-        message.bashMonitorWake == null &&
+        !isBashMonitorWakeMessage(message) &&
         message.agentPeerMessageTrigger == null
       ) {
         userHistoryIds.push(message.historyId);
