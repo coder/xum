@@ -37,6 +37,7 @@ import {
   SUBAGENT_FAILURE_ENVELOPE_TAG,
   formatSubagentReportEnvelope,
   parseSubagentReportEnvelope,
+  parseSubagentReportFromMessage,
   subagentReportFallbackTitle,
   subagentUpdateFallbackTitle,
 } from "@/common/utils/subagentReportEnvelope";
@@ -16725,11 +16726,7 @@ export class TaskService implements AgentTaskIntegration {
           if (message.role !== "user" || message.metadata?.synthetic !== true) {
             continue;
           }
-          const text = message.parts
-            .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
-            .map((part) => part.text)
-            .join("\n");
-          const reportEnvelope = parseSubagentReportEnvelope(text);
+          const reportEnvelope = parseSubagentReportFromMessage(message);
           if (reportEnvelope == null || reportEnvelope.status === "in_progress") {
             continue;
           }
