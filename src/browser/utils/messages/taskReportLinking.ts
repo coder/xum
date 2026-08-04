@@ -52,21 +52,37 @@ export interface TaskReportLinking {
   bashSpawnByTaskId: Map<string, BashTaskSpawnInfo>;
 }
 
+/**
+ * Every field this module reads comes from persisted tool args/results typed as `unknown`, so each
+ * read repeated the same "is a string, is not blank, use the trimmed form" coercion. Centralizing it
+ * keeps the call sites from drifting on whether they trim before or after the blank check.
+ *
+ * Deliberately NOT used by the `task_await` result reader below: those sites validate that a field is
+ * non-blank but go on to store the raw, untrimmed value, so routing them through here would change
+ * what gets persisted.
+ */
+function coerceNonBlankString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
 function getTaskIdsFromToolResult(result: unknown): string[] {
   if (typeof result !== "object" || result === null) return [];
 
   const taskIds = new Set<string>();
 
-  const taskId = (result as { taskId?: unknown }).taskId;
-  if (typeof taskId === "string" && taskId.trim().length > 0) {
-    taskIds.add(taskId.trim());
+  const taskId = coerceNonBlankString((result as { taskId?: unknown }).taskId);
+  if (taskId !== undefined) {
+    taskIds.add(taskId);
   }
 
   const pluralTaskIds = (result as { taskIds?: unknown }).taskIds;
   if (Array.isArray(pluralTaskIds)) {
-    for (const candidate of pluralTaskIds) {
-      if (typeof candidate === "string" && candidate.trim().length > 0) {
-        taskIds.add(candidate.trim());
+    for (const rawCandidate of pluralTaskIds) {
+      const candidate = coerceNonBlankString(rawCandidate);
+      if (candidate !== undefined) {
+        taskIds.add(candidate);
       }
     }
   }
@@ -75,9 +91,9 @@ function getTaskIdsFromToolResult(result: unknown): string[] {
   if (Array.isArray(tasks)) {
     for (const task of tasks) {
       if (typeof task !== "object" || task === null) continue;
-      const candidate = (task as { taskId?: unknown }).taskId;
-      if (typeof candidate === "string" && candidate.trim().length > 0) {
-        taskIds.add(candidate.trim());
+      const candidate = coerceNonBlankString((task as { taskId?: unknown }).taskId);
+      if (candidate !== undefined) {
+        taskIds.add(candidate);
       }
     }
   }
@@ -89,8 +105,7 @@ function getTitleFromTaskToolArgs(args: unknown): string | null {
   if (typeof args !== "object" || args === null) return null;
   if (!("title" in args)) return null;
 
-  const title = (args as { title?: unknown }).title;
-  return typeof title === "string" && title.trim().length > 0 ? title.trim() : null;
+  return coerceNonBlankString((args as { title?: unknown }).title) ?? null;
 }
 
 function getAgentTypeFromTaskToolArgs(args: unknown): string | null {
@@ -101,8 +116,9 @@ function getAgentTypeFromTaskToolArgs(args: unknown): string | null {
     (args as { subagent_type?: unknown }).subagent_type,
   ];
   for (const candidate of candidates) {
-    if (typeof candidate === "string" && candidate.trim().length > 0) {
-      return candidate.trim();
+    const agentType = coerceNonBlankString(candidate);
+    if (agentType !== undefined) {
+      return agentType;
     }
   }
   return null;
@@ -112,8 +128,7 @@ function getAgentTypeFromTaskToolArgs(args: unknown): string | null {
 function getBashSpawnTaskId(result: unknown): string | null {
   if (typeof result !== "object" || result === null) return null;
 
-  const taskId = (result as { taskId?: unknown }).taskId;
-  return typeof taskId === "string" && taskId.trim().length > 0 ? taskId.trim() : null;
+  return coerceNonBlankString((result as { taskId?: unknown }).taskId) ?? null;
 }
 
 function getBashSpawnInfoFromArgs(args: unknown): BashTaskSpawnInfo | null {
@@ -123,10 +138,7 @@ function getBashSpawnInfoFromArgs(args: unknown): BashTaskSpawnInfo | null {
     script?: unknown;
     model_intent?: unknown;
   };
-  const modelIntent =
-    typeof model_intent === "string" && model_intent.trim().length > 0
-      ? model_intent.trim()
-      : undefined;
+  const modelIntent = coerceNonBlankString(model_intent);
   if (modelIntent === undefined) return null;
 
   return {
