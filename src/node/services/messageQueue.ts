@@ -77,6 +77,20 @@ function isAgentPeerMessageMetadata(meta: unknown): boolean {
   return obj.type === "agent-peer-message" && typeof obj.fromWorkspaceId === "string";
 }
 
+// Bash-monitor wake metadata. Only `type` is declared/validated because callers
+// just need to recognize a wake, not read its records. Shared with AgentSession
+// so the queue-head check and the mid-dispatch check cannot drift on how a wake
+// is identified (see AgentSession.hasPendingBashMonitorWakeContinuation).
+export interface BashMonitorWakeMetadata {
+  type: "bash-monitor-wake";
+}
+
+export function isBashMonitorWakeMetadata(meta: unknown): meta is BashMonitorWakeMetadata {
+  if (typeof meta !== "object" || meta === null) return false;
+  const obj = meta as Record<string, unknown>;
+  return obj.type === "bash-monitor-wake";
+}
+
 // Type guard for metadata with reviews
 interface MetadataWithReviews {
   reviews?: ReviewNoteData[];
@@ -332,9 +346,7 @@ export class MessageQueue {
    * supersedes the turn when it dispatches.
    */
   isNextEntryBashMonitorWake(): boolean {
-    const muxMetadata = this.entries[0]?.muxMetadata;
-    if (typeof muxMetadata !== "object" || muxMetadata === null) return false;
-    return (muxMetadata as Record<string, unknown>).type === "bash-monitor-wake";
+    return isBashMonitorWakeMetadata(this.entries[0]?.muxMetadata);
   }
 
   /**

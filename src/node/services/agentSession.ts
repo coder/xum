@@ -113,7 +113,7 @@ import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
-import { MessageQueue } from "./messageQueue";
+import { isBashMonitorWakeMetadata, MessageQueue } from "./messageQueue";
 import type { QueueCutCutter } from "./messageQueue";
 import {
   copyStreamLifecycleSnapshot,
@@ -6675,8 +6675,7 @@ export class AgentSession {
     if (this.messageQueue.isNextEntryBashMonitorWake()) {
       return true;
     }
-    const dispatching = this.dispatchingQueuedEntryMuxMetadata as MuxMessageMetadata | undefined;
-    return dispatching?.type === "bash-monitor-wake";
+    return isBashMonitorWakeMetadata(this.dispatchingQueuedEntryMuxMetadata);
   }
 
   /**
