@@ -1802,14 +1802,13 @@ export class ProviderModelFactory {
         // that capability; older custom model strings stay on Chat Completions for
         // legacy search_parameters compatibility.
         const capabilityModel = resolveModelForMetadata(`xai:${modelId}`, providersConfig);
-        const model = isGrokFrontierModel(capabilityModel)
-          ? provider.responses(modelId)
-          : provider.chat(modelId);
+        const isGrokFrontier = isGrokFrontierModel(capabilityModel);
+        const model = isGrokFrontier ? provider.responses(modelId) : provider.chat(modelId);
 
         // Frontier Grok Responses: force store=false by default so ZDR and non-ZDR share
         // one path. buildProviderOptions already defaults this; inject here too so
         // callers that omit providerOptions still get ZDR-safe requests.
-        if (isGrokFrontierModel(capabilityModel)) {
+        if (isGrokFrontier) {
           injectGrokStoreDefault(model, muxProviderOptions?.xai?.store);
         }
 
