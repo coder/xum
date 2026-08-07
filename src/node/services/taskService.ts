@@ -398,6 +398,17 @@ function parseTerminalSubagentExecutionVersion(content: string): string | null {
   return /<execution_version>([^\n<]+)<\/execution_version>/.exec(content)?.[1] ?? null;
 }
 
+// Flattens a history message to the text payload that the sub-agent report/failure envelope
+// parsers expect. Both terminal-attention history scans below classify rows this way, so keeping
+// the part filter and separator in one place stops them from drifting apart and silently
+// disagreeing about which messages already carry a terminal report.
+function joinMessageText(message: MuxMessage): string {
+  return message.parts
+    .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
+    .map((part) => part.text)
+    .join("\n");
+}
+
 // Failure twin of formatSubagentReportUserMessage: terminal child failures are
 // delivered into the parent context as an explicit failure block (never as a
 // report) so a later wake-up — by ANY sibling's settlement — cannot present the
@@ -8572,12 +8583,7 @@ export class TaskService implements AgentTaskIntegration {
     const existingTaskIds = new Set<string>();
     for (const message of historyResult.data) {
       if (message.role !== "user" || message.metadata?.synthetic !== true) continue;
-      const taskId = parseTerminalSubagentTaskId(
-        message.parts
-          .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
-          .map((part) => part.text)
-          .join("\n")
-      );
+      const taskId = parseTerminalSubagentTaskId(joinMessageText(message));
       if (taskId == null) continue;
       existingTaskIds.add(taskId);
       existingReportMessages.set(taskId, message);
@@ -8729,11 +8735,7 @@ export class TaskService implements AgentTaskIntegration {
 
     for (const message of historyResult.data) {
       if (message.role === "user" && message.metadata?.synthetic === true) {
-        const text = message.parts
-          .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
-          .map((part) => part.text)
-          .join("\n");
-        const taskId = parseTerminalSubagentTaskId(text);
+        const taskId = parseTerminalSubagentTaskId(joinMessageText(message));
         const historySequence = message.metadata?.historySequence;
         if (taskId != null && pendingIds.has(taskId) && typeof historySequence === "number") {
           terminalSequenceByTaskId.set(taskId, historySequence);
