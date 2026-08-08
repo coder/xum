@@ -84,12 +84,9 @@ import {
   convertSymbolCommandAtCursor,
   convertTerminatedSymbolCommand,
 } from "@/browser/features/ChatInput/symbolShortcuts";
-import {
-  formatProjectHierarchyLabel,
-  resolveWorkspaceCreationScope,
-} from "@/common/utils/subProjects";
+import { resolveWorkspaceCreationScope } from "@/common/utils/subProjects";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
-import { CreationProjectSelect } from "./CreationProjectSelect";
+import { CreationProjectSelect, projectSelectOptions } from "./CreationProjectSelect";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { AgentModePicker } from "@/browser/components/AgentModePicker/AgentModePicker";
 import { ContextUsageIndicatorButton } from "@/browser/components/ContextUsageIndicatorButton/ContextUsageIndicatorButton";
@@ -2568,10 +2565,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                 tooltip={SCRATCH_PROJECT_NAME}
                 options={[
                   { value: SCRATCH_PROJECT_CONFIG_KEY, label: SCRATCH_PROJECT_NAME },
-                  ...Array.from(userProjects.keys()).map((path) => ({
-                    value: path,
-                    label: formatProjectHierarchyLabel(path, userProjects),
-                  })),
+                  ...projectSelectOptions(userProjects),
                 ]}
                 onChange={(path) => {
                   if (path !== SCRATCH_PROJECT_CONFIG_KEY) {
