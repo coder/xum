@@ -45,11 +45,16 @@ export function getThinkingDisplayLabel(level: ThinkingLevel, modelString?: stri
       return "XHIGH";
     }
 
-    // Anthropic Opus 4.7+: xhigh is a distinct effort level from max
-    if (level === "xhigh" && anthropicSupportsNativeXhigh(modelString)) return "XHIGH";
-
-    // Grok 4.6: xhigh is a distinct native reasoning effort (its policy has no max).
-    if (level === "xhigh" && isGrok46Model(modelString)) return "XHIGH";
+    // Non-OpenAI models where xhigh is a distinct native effort rather than an
+    // alias for max: Anthropic Opus 4.7+ / Sonnet 5+ (max is a separate level)
+    // and Grok 4.6 (its thinking policy has no max at all). Everywhere else
+    // xhigh falls through to the shared "MAX" label below.
+    if (
+      level === "xhigh" &&
+      (anthropicSupportsNativeXhigh(modelString) || isGrok46Model(modelString))
+    ) {
+      return "XHIGH";
+    }
   }
   return THINKING_DISPLAY_LABELS[level];
 }
