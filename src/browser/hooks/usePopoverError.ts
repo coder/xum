@@ -1,15 +1,41 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+export interface PopoverErrorAnchor {
+  top: number;
+  left: number;
+}
+
 export interface PopoverErrorState {
   id: string;
   error: string;
-  position: { top: number; left: number };
+  position: PopoverErrorAnchor;
 }
 
 export interface UsePopoverErrorResult {
   error: PopoverErrorState | null;
-  showError: (id: string, error: string, anchor?: { top: number; left: number }) => void;
+  showError: (id: string, error: string, anchor?: PopoverErrorAnchor) => void;
   clearError: () => void;
+}
+
+/** Gutter between the triggering control's right edge and the error popover. */
+const POPOVER_ERROR_ANCHOR_GAP_PX = 10;
+
+/**
+ * Places an error popover just outside the right edge of the control that triggered it.
+ * Every trigger has to apply the same two conversions — getBoundingClientRect is
+ * viewport-relative while the popover is positioned in document space, hence the scrollY
+ * offset — so keep them here rather than re-deriving the arithmetic at each call site.
+ * A missing element yields `undefined`, which lets showError fall back to its default
+ * corner placement (callers whose trigger unmounts on click pass it through the same way).
+ */
+export function resolvePopoverErrorAnchor(
+  element: HTMLElement | null | undefined
+): PopoverErrorAnchor | undefined {
+  if (element == null) {
+    return undefined;
+  }
+  const rect = element.getBoundingClientRect();
+  return { top: rect.top + window.scrollY, left: rect.right + POPOVER_ERROR_ANCHOR_GAP_PX };
 }
 
 /**

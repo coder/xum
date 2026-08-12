@@ -8,7 +8,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { usePopoverError } from "@/browser/hooks/usePopoverError";
+import { resolvePopoverErrorAnchor, usePopoverError } from "@/browser/hooks/usePopoverError";
 import { ChevronDown, ChevronRight, FolderX, Loader2, Search, Trash2 } from "lucide-react";
 import { ArchiveIcon, ArchiveRestoreIcon } from "../icons/ArchiveIcon/ArchiveIcon";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
@@ -584,15 +584,11 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
         return;
       }
 
-      if (anchorEl) {
-        const rect = anchorEl.getBoundingClientRect();
-        unarchiveError.showError(workspaceId, result.error ?? "Failed to restore workspace", {
-          top: rect.top + window.scrollY,
-          left: rect.right + 10,
-        });
-      } else {
-        unarchiveError.showError(workspaceId, result.error ?? "Failed to restore workspace");
-      }
+      unarchiveError.showError(
+        workspaceId,
+        result.error ?? "Failed to restore workspace",
+        resolvePopoverErrorAnchor(anchorEl)
+      );
     } finally {
       setProcessingIds((prev) => {
         const next = new Set(prev);
@@ -675,8 +671,7 @@ export const ArchivedWorkspaces: React.FC<ArchivedWorkspacesProps> = ({
   };
 
   const handleDeleteWorktree = async (workspaceId: string, anchorEl?: HTMLElement) => {
-    const rect = anchorEl?.getBoundingClientRect();
-    const anchor = rect ? { top: rect.top + window.scrollY, left: rect.right + 10 } : undefined;
+    const anchor = resolvePopoverErrorAnchor(anchorEl);
 
     if (!api) {
       deleteWorktreeError.showError(workspaceId, "Not connected to server", anchor);

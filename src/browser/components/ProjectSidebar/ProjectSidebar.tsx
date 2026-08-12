@@ -126,7 +126,7 @@ import {
 } from "lucide-react";
 import { useWorkspaceActions } from "@/browser/contexts/WorkspaceContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
-import { usePopoverError } from "@/browser/hooks/usePopoverError";
+import { resolvePopoverErrorAnchor, usePopoverError } from "@/browser/hooks/usePopoverError";
 import { forkWorkspace } from "@/browser/utils/chatCommands";
 import { PopoverError } from "../PopoverError/PopoverError";
 import { SectionHeader } from "../SectionHeader/SectionHeader";
@@ -1017,14 +1017,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         return;
       }
 
-      let anchor: { top: number; left: number } | undefined;
-      if (buttonElement) {
-        const rect = buttonElement.getBoundingClientRect();
-        anchor = {
-          top: rect.top + window.scrollY,
-          left: rect.right + 10,
-        };
-      }
+      const anchor = resolvePopoverErrorAnchor(buttonElement);
 
       try {
         const result = await forkWorkspace({
@@ -1046,14 +1039,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
   const handleStopRuntime = useCallback(
     async (workspaceId: string, buttonElement?: HTMLElement) => {
-      let anchor: { top: number; left: number } | undefined;
-      if (buttonElement) {
-        const rect = buttonElement.getBoundingClientRect();
-        anchor = {
-          top: rect.top + window.scrollY,
-          left: rect.right + 10,
-        };
-      }
+      const anchor = resolvePopoverErrorAnchor(buttonElement);
 
       if (!api) {
         workspaceStopRuntimeError.showError(workspaceId, "Not connected to server", anchor);
@@ -1375,16 +1361,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   ) => {
     // Capture the anchor location up front because the sub-project action menu unmounts its
     // button immediately after click; failures still need stable error placement.
-    const anchor =
-      buttonElement != null
-        ? (() => {
-            const buttonRect = buttonElement.getBoundingClientRect();
-            return {
-              top: buttonRect.top + window.scrollY,
-              left: buttonRect.right + 10,
-            };
-          })()
-        : undefined;
+    const anchor = resolvePopoverErrorAnchor(buttonElement);
 
     // Removing a sub-project unregisters it and clears the cwd pointer from its workspaces.
     // projects.list excludes archived workspaces, so this count covers live ones only;
