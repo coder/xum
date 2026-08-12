@@ -561,6 +561,46 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   // those controls and the MCP/editor/terminal buttons become unclickable.
   const isDesktop = isDesktopMode();
 
+  // The notification settings panel is reachable two ways: the hover tooltip and the
+  // click popover. Both render the identical control set, so build the tree once and
+  // render it in both slots to stop the two copies from drifting apart.
+  const notificationSettingsContent = (
+    <div className="flex flex-col gap-2">
+      <label className="flex cursor-pointer items-center gap-2">
+        <Checkbox
+          checked={notifyOnResponse}
+          onCheckedChange={(checked) => setNotifyOnResponse(checked === true)}
+        />
+        <span className="text-foreground">
+          Notify on all responses{" "}
+          <span className="text-muted-foreground">
+            ({formatKeybind(KEYBINDS.TOGGLE_NOTIFICATIONS)})
+          </span>
+        </span>
+      </label>
+      <label className="flex cursor-pointer items-start gap-2">
+        <Checkbox
+          checked={autoEnableNotifications}
+          onCheckedChange={(checked) => setAutoEnableNotifications(checked === true)}
+        />
+        <span className="text-muted-foreground">
+          Auto-enable for new workspaces in this project
+        </span>
+      </label>
+      <p className="text-muted-foreground border-separator-light border-t pt-2">
+        Agents can also notify on specific events.{" "}
+        <a
+          href="https://mux.coder.com/config/notifications"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-accent hover:underline"
+        >
+          Learn more
+        </a>
+      </p>
+    </div>
+  );
+
   return (
     <div
       ref={menuBarRef}
@@ -664,40 +704,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
               </PopoverTrigger>
             </TooltipTrigger>
             <TooltipContent side="bottom" align="end">
-              <div className="flex flex-col gap-2">
-                <label className="flex cursor-pointer items-center gap-2">
-                  <Checkbox
-                    checked={notifyOnResponse}
-                    onCheckedChange={(checked) => setNotifyOnResponse(checked === true)}
-                  />
-                  <span className="text-foreground">
-                    Notify on all responses{" "}
-                    <span className="text-muted-foreground">
-                      ({formatKeybind(KEYBINDS.TOGGLE_NOTIFICATIONS)})
-                    </span>
-                  </span>
-                </label>
-                <label className="flex cursor-pointer items-start gap-2">
-                  <Checkbox
-                    checked={autoEnableNotifications}
-                    onCheckedChange={(checked) => setAutoEnableNotifications(checked === true)}
-                  />
-                  <span className="text-muted-foreground">
-                    Auto-enable for new workspaces in this project
-                  </span>
-                </label>
-                <p className="text-muted-foreground border-separator-light border-t pt-2">
-                  Agents can also notify on specific events.{" "}
-                  <a
-                    href="https://mux.coder.com/config/notifications"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-accent hover:underline"
-                  >
-                    Learn more
-                  </a>
-                </p>
-              </div>
+              {notificationSettingsContent}
             </TooltipContent>
           </Tooltip>
 
@@ -706,40 +713,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
             align="end"
             className="bg-modal-bg border-separator-light w-64 overflow-visible rounded px-[10px] py-[6px] text-[11px] font-normal shadow-[0_2px_8px_rgba(0,0,0,0.4)]"
           >
-            <div className="flex flex-col gap-2">
-              <label className="flex cursor-pointer items-center gap-2">
-                <Checkbox
-                  checked={notifyOnResponse}
-                  onCheckedChange={(checked) => setNotifyOnResponse(checked === true)}
-                />
-                <span className="text-foreground">
-                  Notify on all responses{" "}
-                  <span className="text-muted-foreground">
-                    ({formatKeybind(KEYBINDS.TOGGLE_NOTIFICATIONS)})
-                  </span>
-                </span>
-              </label>
-              <label className="flex cursor-pointer items-start gap-2">
-                <Checkbox
-                  checked={autoEnableNotifications}
-                  onCheckedChange={(checked) => setAutoEnableNotifications(checked === true)}
-                />
-                <span className="text-muted-foreground">
-                  Auto-enable for new workspaces in this project
-                </span>
-              </label>
-              <p className="text-muted-foreground border-separator-light border-t pt-2">
-                Agents can also notify on specific events.{" "}
-                <a
-                  href="https://mux.coder.com/config/notifications"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-accent hover:underline"
-                >
-                  Learn more
-                </a>
-              </p>
-            </div>
+            {notificationSettingsContent}
           </PopoverContent>
         </Popover>
         <SkillIndicator
