@@ -44,22 +44,27 @@ type TimeZoneMode = "local" | "utc";
 
 const VALID_TIME_RANGES = new Set<string>(["7d", "30d", "90d", "all"]);
 const VALID_TIMING_METRICS = new Set<string>(["ttft", "duration", "tps"]);
-
 const VALID_TIME_ZONE_MODES = new Set<string>(["local", "utc"]);
+
 const ANALYTICS_TIME_RANGE_STORAGE_KEY = "analytics:timeRange";
 const ANALYTICS_TIMING_METRIC_STORAGE_KEY = "analytics:timingMetric";
 const ANALYTICS_TIME_ZONE_MODE_STORAGE_KEY = "analytics:timeZoneMode";
 
-/** Coerce a persisted value to a known TimeRange, falling back to "30d" if stale/corrupted. */
-function normalizeTimeRange(value: unknown): TimeRange {
-  return typeof value === "string" && VALID_TIME_RANGES.has(value) ? (value as TimeRange) : "30d";
-}
-
-/** Coerce a persisted value to a known TimingMetric, falling back to "duration" if stale/corrupted. */
-function normalizeTimingMetric(value: unknown): TimingMetric {
-  return typeof value === "string" && VALID_TIMING_METRICS.has(value)
-    ? (value as TimingMetric)
-    : "duration";
+/**
+ * Coerce a persisted value to a member of `validValues`, falling back to
+ * `fallback` if stale/corrupted. Persisted dashboard selections come from
+ * localStorage, so every read has to tolerate arbitrary JSON.
+ *
+ * Pass the union explicitly (e.g. `normalizePersistedChoice<TimeRange>(...)`);
+ * inferring `T` from `fallback` alone would narrow the result to that single
+ * literal instead of the full union.
+ */
+function normalizePersistedChoice<T extends string>(
+  value: unknown,
+  validValues: ReadonlySet<string>,
+  fallback: T
+): T {
+  return typeof value === "string" && validValues.has(value) ? (value as T) : fallback;
 }
 
 /** Build a calendar-date boundary for the selected timezone. */
@@ -116,13 +121,6 @@ function computeDateRange(
   }
 }
 
-/** Coerce a persisted value to a supported timezone mode. */
-function normalizeTimeZoneMode(value: unknown): TimeZoneMode {
-  return typeof value === "string" && VALID_TIME_ZONE_MODES.has(value)
-    ? (value as TimeZoneMode)
-    : "local";
-}
-
 function getBrowserTimeZone(): string {
   return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 }
@@ -147,9 +145,17 @@ export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
 
   // Coerce persisted values to known enums — stale/corrupted localStorage
   // entries self-heal to defaults instead of crashing the dashboard.
-  const timeRange = normalizeTimeRange(rawTimeRange);
-  const timingMetric = normalizeTimingMetric(rawTimingMetric);
-  const timeZoneMode = normalizeTimeZoneMode(rawTimeZoneMode);
+  const timeRange = normalizePersistedChoice<TimeRange>(rawTimeRange, VALID_TIME_RANGES, "30d");
+  const timingMetric = normalizePersistedChoice<TimingMetric>(
+    rawTimingMetric,
+    VALID_TIMING_METRICS,
+    "duration"
+  );
+  const timeZoneMode = normalizePersistedChoice<TimeZoneMode>(
+    rawTimeZoneMode,
+    VALID_TIME_ZONE_MODES,
+    "local"
+  );
   const timeZone = timeZoneMode === "utc" ? "UTC" : getBrowserTimeZone();
 
   const dateRange = computeDateRange(timeRange, "UTC");
