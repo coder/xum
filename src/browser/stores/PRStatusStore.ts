@@ -91,6 +91,25 @@ const prStatusLRU = createLRUCache<PersistedPRStatus>({
   // No TTL - we refresh on mount anyway, just want instant display
 });
 
+/**
+ * Narrows an untrusted `gh` JSON value to an indexable record.
+ *
+ * Every parser in this module walks raw CLI/GraphQL output field by field, so they all need the
+ * same "is this an object I can index into?" gate before reading properties. Arrays intentionally
+ * pass (they are `typeof "object"`); callers reject them via the field checks that follow.
+ */
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : null;
+}
+
+/**
+ * Descends into the `data.repository` envelope that wraps every `gh api graphql` response,
+ * returning the repository's selected fields, or null if either level is missing/not an object.
+ */
+function graphqlRepositoryFields(raw: unknown): Record<string, unknown> | null {
+  return asRecord(asRecord(asRecord(raw)?.data)?.repository);
+}
+
 function summarizeStatusCheckRollup(raw: unknown): {
   hasPendingChecks: boolean;
   hasFailedChecks: boolean;
@@ -103,11 +122,11 @@ function summarizeStatusCheckRollup(raw: unknown): {
   let hasFailedChecks = false;
 
   for (const item of raw) {
-    if (typeof item !== "object" || item === null) {
+    const record = asRecord(item);
+    if (!record) {
       continue;
     }
 
-    const record = item as Record<string, unknown>;
     const status = record.status;
     const conclusion = record.conclusion;
 
@@ -143,11 +162,11 @@ function summarizeStatusCheckRollup(raw: unknown): {
  * Parse merge queue entry data from GitHub GraphQL response payloads.
  */
 export function parseMergeQueueEntry(raw: unknown): MergeQueueEntry | null {
-  if (typeof raw !== "object" || raw === null) {
+  const record = asRecord(raw);
+  if (!record) {
     return null;
   }
 
-  const record = raw as Record<string, unknown>;
   const state = typeof record.state === "string" ? record.state : "QUEUED";
   const positionRaw = record.position;
   const position =
@@ -164,13 +183,8 @@ function isStackPRState(value: unknown): value is NonNullable<WorkspaceStackBran
 
 export function parseStackViewOutput(output: string): WorkspaceStackInfo | null {
   try {
-    const parsed = JSON.parse(output) as unknown;
-    if (typeof parsed !== "object" || parsed === null) {
-      return null;
-    }
-
-    const record = parsed as Record<string, unknown>;
-    if (record.no_stack === true || typeof record.trunk !== "string") {
+    const record = asRecord(JSON.parse(output) as unknown);
+    if (!record || record.no_stack === true || typeof record.trunk !== "string") {
       return null;
     }
     if (!Array.isArray(record.branches) || record.branches.length < 2) {
@@ -179,12 +193,9 @@ export function parseStackViewOutput(output: string): WorkspaceStackInfo | null 
 
     const branches: WorkspaceStackBranch[] = [];
     for (const rawBranch of record.branches) {
-      if (typeof rawBranch !== "object" || rawBranch === null) {
-        return null;
-      }
-
-      const branchRecord = rawBranch as Record<string, unknown>;
+      const branchRecord = asRecord(rawBranch);
       if (
+        !branchRecord ||
         typeof branchRecord.name !== "string" ||
         typeof branchRecord.isCurrent !== "boolean" ||
         typeof branchRecord.isMerged !== "boolean" ||
@@ -196,12 +207,9 @@ export function parseStackViewOutput(output: string): WorkspaceStackInfo | null 
 
       let pr: WorkspaceStackBranch["pr"];
       if (branchRecord.pr != null) {
-        if (typeof branchRecord.pr !== "object") {
-          return null;
-        }
-
-        const prRecord = branchRecord.pr as Record<string, unknown>;
+        const prRecord = asRecord(branchRecord.pr);
         if (
+          !prRecord ||
           typeof prRecord.number !== "number" ||
           !Number.isInteger(prRecord.number) ||
           prRecord.number <= 0 ||
@@ -241,21 +249,11 @@ export function mergeStackPullRequestMetadata(
   stack: WorkspaceStackInfo,
   raw: unknown
 ): WorkspaceStackInfo {
-  if (typeof raw !== "object" || raw === null) {
+  const pullRequests = graphqlRepositoryFields(raw);
+  if (!pullRequests) {
     return stack;
   }
 
-  const data = (raw as Record<string, unknown>).data;
-  if (typeof data !== "object" || data === null) {
-    return stack;
-  }
-
-  const repository = (data as Record<string, unknown>).repository;
-  if (typeof repository !== "object" || repository === null) {
-    return stack;
-  }
-
-  const pullRequests = repository as Record<string, unknown>;
   return {
     ...stack,
     branches: stack.branches.map((branch) => {
@@ -263,13 +261,8 @@ export function mergeStackPullRequestMetadata(
         return branch;
       }
 
-      const rawPullRequest = pullRequests[`p${branch.pr.number}`];
-      if (typeof rawPullRequest !== "object" || rawPullRequest === null) {
-        return branch;
-      }
-
-      const pullRequest = rawPullRequest as Record<string, unknown>;
-      if (pullRequest.number !== branch.pr.number) {
+      const pullRequest = asRecord(pullRequests[`p${branch.pr.number}`]);
+      if (!pullRequest || pullRequest.number !== branch.pr.number) {
         return branch;
       }
 
@@ -856,23 +849,13 @@ export class PRStatusStore {
         return null;
       }
 
-      const parsed = JSON.parse(result.data.output) as Record<string, unknown>;
-      const data = parsed.data;
-      if (typeof data !== "object" || data === null) {
+      const repository = graphqlRepositoryFields(JSON.parse(result.data.output) as unknown);
+      const pullRequest = asRecord(repository?.pullRequest);
+      if (!pullRequest) {
         return null;
       }
 
-      const repository = (data as Record<string, unknown>).repository;
-      if (typeof repository !== "object" || repository === null) {
-        return null;
-      }
-
-      const pullRequest = (repository as Record<string, unknown>).pullRequest;
-      if (typeof pullRequest !== "object" || pullRequest === null) {
-        return null;
-      }
-
-      return parseMergeQueueEntry((pullRequest as Record<string, unknown>).mergeQueueEntry);
+      return parseMergeQueueEntry(pullRequest.mergeQueueEntry);
     } catch {
       return null;
     }
