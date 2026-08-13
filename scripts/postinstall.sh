@@ -81,40 +81,39 @@ else
   exit 0
 fi
 
-# 6) Rebuild node-pty (once per version/platform)
-if [ "$HAS_NODE_PTY" = "1" ]; then
-  if [ -f "$NODE_PTY_STAMP_FILE" ]; then
-    echo "✅ node-pty already rebuilt for Electron ${ELECTRON_VERSION} on ${PLATFORM}/${ARCH} – skipping"
-  else
-    echo "🔧 Rebuilding node-pty for Electron ${ELECTRON_VERSION} on ${PLATFORM}/${ARCH}..."
-    $REBUILD_CMD @electron/rebuild -f -m node_modules/node-pty || {
-      echo "⚠️  Failed to rebuild native modules"
-      echo "   Terminal functionality may not work in desktop mode."
-      echo "   Run 'make rebuild-native' manually to fix."
-      exit 0
-    }
-    touch "$NODE_PTY_STAMP_FILE"
-    echo "✅ node-pty rebuilt successfully (cached at $NODE_PTY_STAMP_FILE)"
+# 6) Rebuild one native module for Electron's ABI, skipping when its stamp exists.
+# A rebuild failure is non-fatal (desktop terminal/DB features degrade, install succeeds),
+# so the failure path exits the whole script with 0 rather than returning to the caller.
+rebuild_native_module() {
+  label="$1"
+  module_path="$2"
+  stamp_file="$3"
+
+  if [ -f "$stamp_file" ]; then
+    echo "✅ ${label} already rebuilt for Electron ${ELECTRON_VERSION} on ${PLATFORM}/${ARCH} – skipping"
+    return 0
   fi
+
+  echo "🔧 Rebuilding ${label} for Electron ${ELECTRON_VERSION} on ${PLATFORM}/${ARCH}..."
+  $REBUILD_CMD @electron/rebuild -f -m "$module_path" || {
+    echo "⚠️  Failed to rebuild native modules"
+    echo "   Terminal functionality may not work in desktop mode."
+    echo "   Run 'make rebuild-native' manually to fix."
+    exit 0
+  }
+  touch "$stamp_file"
+  echo "✅ ${label} rebuilt successfully (cached at $stamp_file)"
+}
+
+# 7) Rebuild native modules (once per version/platform)
+if [ "$HAS_NODE_PTY" = "1" ]; then
+  rebuild_native_module "node-pty" "node_modules/node-pty" "$NODE_PTY_STAMP_FILE"
 else
   echo "ℹ️  node-pty package missing – skipping node-pty rebuild"
 fi
 
-# 7) Rebuild DuckDB (once per version/platform)
 if [ "$HAS_DUCKDB" = "1" ]; then
-  if [ -f "$DUCKDB_STAMP_FILE" ]; then
-    echo "✅ DuckDB already rebuilt for Electron ${ELECTRON_VERSION} on ${PLATFORM}/${ARCH} – skipping"
-  else
-    echo "🔧 Rebuilding DuckDB for Electron ${ELECTRON_VERSION} on ${PLATFORM}/${ARCH}..."
-    $REBUILD_CMD @electron/rebuild -f -m node_modules/@duckdb/node-bindings || {
-      echo "⚠️  Failed to rebuild native modules"
-      echo "   Terminal functionality may not work in desktop mode."
-      echo "   Run 'make rebuild-native' manually to fix."
-      exit 0
-    }
-    touch "$DUCKDB_STAMP_FILE"
-    echo "✅ DuckDB rebuilt successfully (cached at $DUCKDB_STAMP_FILE)"
-  fi
+  rebuild_native_module "DuckDB" "node_modules/@duckdb/node-bindings" "$DUCKDB_STAMP_FILE"
 else
   echo "ℹ️  DuckDB packages missing – skipping DuckDB rebuild"
 fi
