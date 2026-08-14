@@ -29,13 +29,22 @@ interface TaskGroupListItemProps {
 }
 
 /**
+ * A group is "working" when the workflow run itself is active or any member is
+ * still running. Both the aggregate status dot and the running-state icon/title
+ * treatment key off this predicate, so they cannot drift apart.
+ */
+function groupHasRunningWork(props: TaskGroupListItemProps): boolean {
+  return props.isRunActive === true || props.runningCount > 0;
+}
+
+/**
  * Aggregate member state in the same visual language as agent rows. Running
  * wins over interrupted: while any member still works the group is making
  * progress, so the error-ish interrupted state only surfaces once nothing is
  * running anymore.
  */
 function getAggregateVisualState(props: TaskGroupListItemProps): VisualState {
-  if (props.isRunActive === true || props.runningCount > 0) {
+  if (groupHasRunningWork(props)) {
     return "active";
   }
   if (props.interruptedCount > 0) {
@@ -45,7 +54,7 @@ function getAggregateVisualState(props: TaskGroupListItemProps): VisualState {
 }
 
 export function TaskGroupListItem(props: TaskGroupListItemProps) {
-  const hasRunningWork = props.isRunActive === true || props.runningCount > 0;
+  const hasRunningWork = groupHasRunningWork(props);
   const aggregateState = getAggregateVisualState(props);
   const statusDescriptionId = `task-group-status-${props.groupId}`;
   const paddingLeft = getSidebarItemPaddingLeft(props.depth);
