@@ -218,8 +218,13 @@ function HeartbeatFallbackIcon() {
   );
 }
 
+/** Plural "s" for the sidebar activity counts, which are all regular nouns. */
+function pluralSuffix(count: number): string {
+  return count === 1 ? "" : "s";
+}
+
 function formatSubAgentCount(count: number, label: "active" | "queued"): string {
-  return `${count} sub-agent${count === 1 ? "" : "s"} ${label}`;
+  return `${count} sub-agent${pluralSuffix(count)} ${label}`;
 }
 
 function formatDelegatedActivityText(activity: WorkspaceDelegatedActivity): string | null {
@@ -295,8 +300,7 @@ function formatHiddenSubAgentsPresentation(
         ? summary.runningWorkflowAgentCount
         : summary.queuedWorkflowAgentCount;
       // Gap-only runs have no countable workers; skip the "(0 agents)" noise.
-      const agentSuffix =
-        agentCount > 0 ? ` (${agentCount} agent${agentCount === 1 ? "" : "s"})` : "";
+      const agentSuffix = agentCount > 0 ? ` (${agentCount} agent${pluralSuffix(agentCount)})` : "";
       const queuedSuffix =
         hasRunningRun && summary.queuedWorkflowAgentCount > 0
           ? ` · ${summary.queuedWorkflowAgentCount} queued`
