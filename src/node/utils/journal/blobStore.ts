@@ -20,6 +20,16 @@ import type { BlobRef } from "@/common/types/durableEvent";
 import { BlobRefSchema } from "@/common/types/durableEvent";
 import { log } from "@/node/services/log";
 
+/**
+ * The content address (BlobRef) naming a buffer's bytes. put() uses it to name
+ * new content and get() uses it to verify bytes read back, and the two MUST
+ * derive it identically or a freshly written blob would fail its own hash
+ * check — so the digest and the `sha256:` prefix live in one place.
+ */
+function blobRefFor(content: Buffer): BlobRef {
+  return `sha256:${crypto.createHash("sha256").update(content).digest("hex")}`;
+}
+
 export class BlobStore {
   constructor(private readonly dir: string) {
     assert(dir.length > 0, "BlobStore requires a directory");
@@ -37,8 +47,7 @@ export class BlobStore {
   ): Promise<{ ref: BlobRef; size: number; created: boolean }> {
     const buffer =
       typeof content === "string" ? Buffer.from(content, "utf-8") : Buffer.from(content);
-    const hash = crypto.createHash("sha256").update(buffer).digest("hex");
-    const ref: BlobRef = `sha256:${hash}`;
+    const ref = blobRefFor(buffer);
     const blobPath = this.pathFor(ref);
 
     let existed = false;
@@ -80,8 +89,7 @@ export class BlobStore {
       }
       throw error;
     }
-    const hash = crypto.createHash("sha256").update(buffer).digest("hex");
-    if (`sha256:${hash}` !== ref) {
+    if (blobRefFor(buffer) !== ref) {
       log.warn(`BlobStore: hash mismatch for ${ref} (corrupted blob); treating as missing`);
       return null;
     }
