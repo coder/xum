@@ -872,25 +872,35 @@ export async function clearWorkspaceAnalyticsState(
  * once in the wild: a 17KB "model" string spanning ~670 events, which then
  * wallpapered the Analytics dashboard as one giant legend entry). The donor
  * rows are written correctly, so deleting rows with impossible string lengths
- * loses no real data. Thresholds are generous: legitimate values are all far
- * shorter (workspace IDs are short hex; model IDs are < 100 chars).
+ * loses no real data.
+ *
+ * Thresholds sit above the longest legitimately constructible value for each
+ * column so no legal row can match:
+ * - Workspace IDs: new IDs are short hex, but migrated legacy IDs are
+ *   `${projectBasename}-${workspaceBasename}` (config.generateLegacyId) with
+ *   no explicit limit; each basename is bounded by the filesystem's NAME_MAX
+ *   (255 bytes), so 511 is the legal ceiling. Cap at 1024.
+ * - Agent IDs/types also derive from file basenames: same 1024 cap.
+ * - Model strings are `provider:modelId` config values (longest observed in a
+ *   large production DB: 41 chars); 512 is far beyond any real model ID.
+ * The observed phantom row exceeded every one of these by an order of
+ * magnitude (6,720-char workspace_id, 17,229-char model).
  */
 export async function deleteCorruptAnalyticsRows(conn: DuckDBConnection): Promise<number> {
   const eventsResult = await conn.run(`
     DELETE FROM events
-    WHERE LENGTH(workspace_id) > 64
-       OR LENGTH(parent_workspace_id) > 64
-       OR LENGTH(model) > 256
-       OR LENGTH(agent_id) > 64
-       OR LENGTH(thinking_level) > 64
+    WHERE LENGTH(workspace_id) > 1024
+       OR LENGTH(parent_workspace_id) > 1024
+       OR LENGTH(model) > 512
+       OR LENGTH(agent_id) > 1024
   `);
 
   const rollupsResult = await conn.run(`
     DELETE FROM delegation_rollups
-    WHERE LENGTH(parent_workspace_id) > 64
-       OR LENGTH(child_workspace_id) > 64
-       OR LENGTH(model) > 256
-       OR LENGTH(agent_type) > 64
+    WHERE LENGTH(parent_workspace_id) > 1024
+       OR LENGTH(child_workspace_id) > 1024
+       OR LENGTH(model) > 512
+       OR LENGTH(agent_type) > 1024
   `);
 
   return eventsResult.rowsChanged + rollupsResult.rowsChanged;

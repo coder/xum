@@ -1645,9 +1645,17 @@ describe("deleteCorruptAnalyticsRows", () => {
       "anthropic:claude-haiku-4-5",
       1.0,
     ]);
+    // Migrated legacy IDs are `${projectBasename}-${workspaceBasename}` with
+    // no length limit (up to 2x NAME_MAX + 1 = 511 chars) and must survive.
+    const legacyId = `${"p".repeat(255)}-${"w".repeat(255)}`;
+    await conn.run("INSERT INTO events (workspace_id, model, total_cost_usd) VALUES (?, ?, ?)", [
+      legacyId,
+      "anthropic:claude-haiku-4-5",
+      2.0,
+    ]);
     // Phantom corruption row: varchar columns hold cross-row concatenations.
     await conn.run("INSERT INTO events (workspace_id, model, total_cost_usd) VALUES (?, ?, ?)", [
-      "x".repeat(500),
+      "x".repeat(2000),
       "anthropic:claude-haiku-4-5".repeat(100),
       0.05,
     ]);
@@ -1659,13 +1667,16 @@ describe("deleteCorruptAnalyticsRows", () => {
     await conn.run(
       `INSERT INTO delegation_rollups (parent_workspace_id, child_workspace_id, model)
        VALUES (?, ?, ?)`,
-      ["p".repeat(500), "child-corrupt", "openai:gpt-5.6-sol"]
+      ["p".repeat(2000), "child-corrupt", "openai:gpt-5.6-sol"]
     );
 
     expect(await deleteCorruptAnalyticsRows(conn)).toBe(2);
 
-    const eventRows = await queryRows(conn, "SELECT workspace_id FROM events");
-    expect(eventRows).toEqual([{ workspace_id: "ws-healthy" }]);
+    const eventRows = await queryRows(
+      conn,
+      "SELECT workspace_id FROM events ORDER BY LENGTH(workspace_id)"
+    );
+    expect(eventRows).toEqual([{ workspace_id: "ws-healthy" }, { workspace_id: legacyId }]);
     const rollupRows = await queryRows(conn, "SELECT parent_workspace_id FROM delegation_rollups");
     expect(rollupRows).toEqual([{ parent_workspace_id: "parent-healthy" }]);
 

@@ -152,12 +152,23 @@ async function handleInit(data: InitData): Promise<void> {
   await sweepCorruptRows("init");
 }
 
-/** Delete corruption-class rows and log when anything was actually removed. */
+/**
+ * Delete corruption-class rows and log when anything was actually removed.
+ * Best-effort: a failed sweep must never reject init (which would cache a
+ * worker error and disable analytics until restart) or fail an
+ * otherwise-successful ingest, so errors are logged and swallowed.
+ */
 async function sweepCorruptRows(context: string): Promise<void> {
-  const deleted = await deleteCorruptAnalyticsRows(getConn());
-  if (deleted > 0) {
+  try {
+    const deleted = await deleteCorruptAnalyticsRows(getConn());
+    if (deleted > 0) {
+      process.stderr.write(
+        `[analytics-worker] Deleted ${deleted} corrupt analytics row(s) (${context})\n`
+      );
+    }
+  } catch (error) {
     process.stderr.write(
-      `[analytics-worker] Deleted ${deleted} corrupt analytics row(s) (${context})\n`
+      `[analytics-worker] Corrupt-row sweep failed (${context}): ${getErrorMessage(error)}\n`
     );
   }
 }
