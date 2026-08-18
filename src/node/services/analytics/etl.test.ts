@@ -1637,48 +1637,61 @@ describe("pricing fingerprint", () => {
 });
 
 describe("deleteCorruptAnalyticsRows", () => {
-  test("deletes rows with impossible string lengths while keeping healthy rows", async () => {
+  async function seedWatermark(conn: DuckDBConnection, workspaceId: string): Promise<void> {
+    await conn.run(
+      "INSERT INTO ingest_watermarks (workspace_id, last_sequence, last_modified) VALUES (?, ?, ?)",
+      [workspaceId, 1, 1]
+    );
+  }
+
+  test("deletes corrupt rows while keeping healthy rows", async () => {
     const conn = await createTestConn();
 
-    await conn.run("INSERT INTO events (workspace_id, model, total_cost_usd) VALUES (?, ?, ?)", [
-      "ws-healthy",
-      "anthropic:claude-haiku-4-5",
-      1.0,
-    ]);
     // Migrated legacy IDs are `${projectBasename}-${workspaceBasename}` with
     // no length limit (up to 2x NAME_MAX + 1 = 511 chars) and must survive.
     const legacyId = `${"p".repeat(255)}-${"w".repeat(255)}`;
-    await conn.run("INSERT INTO events (workspace_id, model, total_cost_usd) VALUES (?, ?, ?)", [
-      legacyId,
-      "anthropic:claude-haiku-4-5",
-      2.0,
-    ]);
     // Custom-provider model IDs have no schema max length; an extremely long
     // model on an otherwise-healthy row must never be deletion evidence.
     const longModel = `custom:${"m".repeat(2000)}`;
-    await conn.run("INSERT INTO events (workspace_id, model, total_cost_usd) VALUES (?, ?, ?)", [
-      "ws-long-model",
-      longModel,
-      3.0,
-    ]);
-    // Phantom corruption row: varchar columns hold cross-row concatenations.
-    await conn.run("INSERT INTO events (workspace_id, model, total_cost_usd) VALUES (?, ?, ?)", [
-      "x".repeat(2000),
-      "anthropic:claude-haiku-4-5".repeat(100),
-      0.05,
-    ]);
-    await conn.run(
-      `INSERT INTO delegation_rollups (parent_workspace_id, child_workspace_id, model)
-       VALUES (?, ?, ?)`,
-      ["parent-healthy", "child-healthy", "openai:gpt-5.6-sol"]
-    );
-    await conn.run(
-      `INSERT INTO delegation_rollups (parent_workspace_id, child_workspace_id, model)
-       VALUES (?, ?, ?)`,
-      ["p".repeat(2000), "child-corrupt", "openai:gpt-5.6-sol"]
-    );
 
-    expect(await deleteCorruptAnalyticsRows(conn)).toBe(2);
+    for (const workspaceId of ["ws-healthy", legacyId, "ws-long-model", "parent-healthy"]) {
+      await seedWatermark(conn, workspaceId);
+    }
+
+    for (const [workspaceId, model, cost] of [
+      ["ws-healthy", "anthropic:claude-haiku-4-5", 1.0],
+      [legacyId, "anthropic:claude-haiku-4-5", 2.0],
+      ["ws-long-model", longModel, 3.0],
+      // Large-batch phantom: concatenated identifiers exceed the length caps.
+      ["x".repeat(2000), "anthropic:claude-haiku-4-5".repeat(100), 0.05],
+      // Small-batch phantom: two concatenated 10-char workspace IDs stay far
+      // under the length caps but can never match a real watermark.
+      ["aaaaabbbbbcccccddddd", "openai:gpt-5.6-solopenai:gpt-5.6-sol", 0.05],
+    ] as const) {
+      await conn.run("INSERT INTO events (workspace_id, model, total_cost_usd) VALUES (?, ?, ?)", [
+        workspaceId,
+        model,
+        cost,
+      ]);
+    }
+
+    for (const [parent, child] of [
+      ["parent-healthy", "child-healthy"],
+      // A rollup may outlive its removed child workspace; only the parent
+      // must be a known workspace.
+      ["parent-healthy", "child-removed"],
+      ["p".repeat(2000), "child-corrupt"],
+      // Small-batch phantom parent: unknown to watermarks.
+      ["par-aaaaapar-bbbbb", "child-x"],
+    ] as const) {
+      await conn.run(
+        `INSERT INTO delegation_rollups (parent_workspace_id, child_workspace_id, model)
+         VALUES (?, ?, ?)`,
+        [parent, child, "openai:gpt-5.6-sol"]
+      );
+    }
+
+    expect(await deleteCorruptAnalyticsRows(conn)).toBe(4);
 
     const eventRows = await queryRows(
       conn,
@@ -1689,8 +1702,14 @@ describe("deleteCorruptAnalyticsRows", () => {
       { workspace_id: "ws-long-model" },
       { workspace_id: legacyId },
     ]);
-    const rollupRows = await queryRows(conn, "SELECT parent_workspace_id FROM delegation_rollups");
-    expect(rollupRows).toEqual([{ parent_workspace_id: "parent-healthy" }]);
+    const rollupRows = await queryRows(
+      conn,
+      "SELECT child_workspace_id FROM delegation_rollups ORDER BY child_workspace_id"
+    );
+    expect(rollupRows).toEqual([
+      { child_workspace_id: "child-healthy" },
+      { child_workspace_id: "child-removed" },
+    ]);
 
     // Idempotent: nothing left to delete.
     expect(await deleteCorruptAnalyticsRows(conn)).toBe(0);

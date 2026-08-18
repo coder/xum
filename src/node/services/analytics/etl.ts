@@ -874,18 +874,25 @@ export async function clearWorkspaceAnalyticsState(
  * rows are written correctly, so deleting rows with impossible string lengths
  * loses no real data.
  *
- * Detection anchors ONLY on identifier columns with a provable legal maximum,
- * because the corruption concatenates every VARCHAR column at once and
- * workspace identifiers are present on every row:
- * - Workspace IDs: new IDs are short hex, but migrated legacy IDs are
- *   `${projectBasename}-${workspaceBasename}` (config.generateLegacyId) with
- *   no explicit limit; each basename is bounded by the filesystem's NAME_MAX
- *   (255 bytes), so 511 is the legal ceiling. Cap at 1024.
- * - Agent IDs/types also derive from file basenames: same 1024 cap.
- * Unbounded columns (model: custom-provider model IDs have no schema max, see
- * ProviderModelEntrySchema; paths; workspace names) must NOT be deletion
- * evidence on their own, or a legitimately long value would wipe real spend.
- * The observed phantom row's workspace_id was 6,720 chars.
+ * Two evidence classes, both structural (unbounded columns like model,
+ * paths, and workspace names are never deletion evidence on their own, since
+ * custom-provider model IDs etc. have no schema max length):
+ *
+ * 1. Identifier length beyond the legal construction maximum. New workspace
+ *    IDs are short hex; migrated legacy IDs are
+ *    `${projectBasename}-${workspaceBasename}` (config.generateLegacyId),
+ *    each basename bounded by the filesystem's NAME_MAX (255 bytes), so 511
+ *    is the ceiling. Agent IDs/types also derive from basenames. Cap at 1024.
+ *
+ * 2. Workspace identity unknown to ingest_watermarks. A concatenation of two
+ *    or more workspace IDs can never equal a real workspace ID, no matter how
+ *    small the corrupted batch, while every legitimate row's workspace gets a
+ *    watermark by the end of the ingest/rebuild pass that wrote it (sweeps
+ *    run after those passes complete). If a crash lands between the event
+ *    write and the watermark write, deleting the orphans is still safe: the
+ *    missing watermark makes the next syncCheck re-ingest that workspace from
+ *    disk in full. delegation_rollups joins on parent_workspace_id only;
+ *    child_workspace_id may legitimately reference a removed child workspace.
  */
 export async function deleteCorruptAnalyticsRows(conn: DuckDBConnection): Promise<number> {
   const eventsResult = await conn.run(`
@@ -893,6 +900,9 @@ export async function deleteCorruptAnalyticsRows(conn: DuckDBConnection): Promis
     WHERE LENGTH(workspace_id) > 1024
        OR LENGTH(parent_workspace_id) > 1024
        OR LENGTH(agent_id) > 1024
+       OR NOT EXISTS (
+         SELECT 1 FROM ingest_watermarks w WHERE w.workspace_id = events.workspace_id
+       )
   `);
 
   const rollupsResult = await conn.run(`
@@ -900,6 +910,10 @@ export async function deleteCorruptAnalyticsRows(conn: DuckDBConnection): Promis
     WHERE LENGTH(parent_workspace_id) > 1024
        OR LENGTH(child_workspace_id) > 1024
        OR LENGTH(agent_type) > 1024
+       OR NOT EXISTS (
+         SELECT 1 FROM ingest_watermarks w
+         WHERE w.workspace_id = delegation_rollups.parent_workspace_id
+       )
   `);
 
   return eventsResult.rowsChanged + rollupsResult.rowsChanged;
