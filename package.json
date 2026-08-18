@@ -61,7 +61,7 @@
     "@dnd-kit/core": "^6.3.1",
     "@dnd-kit/sortable": "^10.0.0",
     "@dnd-kit/utilities": "^3.2.2",
-    "@duckdb/node-api": "^1.4.4-r.1",
+    "@duckdb/node-api": "^1.5.5-r.4",
     "@homebridge/ciao": "^1.3.4",
     "@jitl/quickjs-wasmfile-release-asyncify": "^0.31.0",
     "@lydell/node-pty": "1.1.0",
