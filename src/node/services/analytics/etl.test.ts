@@ -9,6 +9,7 @@ import {
   appendEvents,
   CHAT_FILE_NAME,
   clearWorkspaceAnalyticsState,
+  deleteCorruptAnalyticsRows,
   getCurrentPricingFingerprint,
   ingestWorkspace,
   parseWorkspaceFromDisk,
@@ -1632,5 +1633,43 @@ describe("pricing fingerprint", () => {
     // Idempotent upsert: storing again keeps a single row with the same value.
     await storePricingFingerprint(conn);
     expect(await readStoredPricingFingerprint(conn)).toBe(getCurrentPricingFingerprint());
+  });
+});
+
+describe("deleteCorruptAnalyticsRows", () => {
+  test("deletes rows with impossible string lengths while keeping healthy rows", async () => {
+    const conn = await createTestConn();
+
+    await conn.run("INSERT INTO events (workspace_id, model, total_cost_usd) VALUES (?, ?, ?)", [
+      "ws-healthy",
+      "anthropic:claude-haiku-4-5",
+      1.0,
+    ]);
+    // Phantom corruption row: varchar columns hold cross-row concatenations.
+    await conn.run("INSERT INTO events (workspace_id, model, total_cost_usd) VALUES (?, ?, ?)", [
+      "x".repeat(500),
+      "anthropic:claude-haiku-4-5".repeat(100),
+      0.05,
+    ]);
+    await conn.run(
+      `INSERT INTO delegation_rollups (parent_workspace_id, child_workspace_id, model)
+       VALUES (?, ?, ?)`,
+      ["parent-healthy", "child-healthy", "openai:gpt-5.6-sol"]
+    );
+    await conn.run(
+      `INSERT INTO delegation_rollups (parent_workspace_id, child_workspace_id, model)
+       VALUES (?, ?, ?)`,
+      ["p".repeat(500), "child-corrupt", "openai:gpt-5.6-sol"]
+    );
+
+    expect(await deleteCorruptAnalyticsRows(conn)).toBe(2);
+
+    const eventRows = await queryRows(conn, "SELECT workspace_id FROM events");
+    expect(eventRows).toEqual([{ workspace_id: "ws-healthy" }]);
+    const rollupRows = await queryRows(conn, "SELECT parent_workspace_id FROM delegation_rollups");
+    expect(rollupRows).toEqual([{ parent_workspace_id: "parent-healthy" }]);
+
+    // Idempotent: nothing left to delete.
+    expect(await deleteCorruptAnalyticsRows(conn)).toBe(0);
   });
 });

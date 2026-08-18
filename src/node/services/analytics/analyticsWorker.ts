@@ -6,6 +6,7 @@ import { decideSyncPlan, type SyncAction } from "./backfillDecision";
 import { shouldCheckpointAfterSync } from "./checkpointDecision";
 import {
   clearWorkspaceAnalyticsState,
+  deleteCorruptAnalyticsRows,
   getCurrentPricingFingerprint,
   ingestWorkspace,
   readStoredPricingFingerprint,
@@ -147,6 +148,18 @@ async function handleInit(data: InitData): Promise<void> {
   for (const migrationSql of DELEGATION_ROLLUPS_COLUMN_MIGRATIONS_SQL) {
     await activeConn.run(migrationSql);
   }
+
+  await sweepCorruptRows("init");
+}
+
+/** Delete corruption-class rows and log when anything was actually removed. */
+async function sweepCorruptRows(context: string): Promise<void> {
+  const deleted = await deleteCorruptAnalyticsRows(getConn());
+  if (deleted > 0) {
+    process.stderr.write(
+      `[analytics-worker] Deleted ${deleted} corrupt analytics row(s) (${context})\n`
+    );
+  }
 }
 
 async function handleIngest(data: IngestData): Promise<void> {
@@ -154,6 +167,7 @@ async function handleIngest(data: IngestData): Promise<void> {
   assert(data.sessionDir.trim().length > 0, "ingest requires sessionDir");
 
   await ingestWorkspace(getConn(), data.workspaceId, data.sessionDir, data.meta ?? {});
+  await sweepCorruptRows("ingest");
 }
 
 async function handleRebuildAll(data: RebuildAllData): Promise<{ workspacesIngested: number }> {
@@ -169,6 +183,7 @@ async function handleRebuildAll(data: RebuildAllData): Promise<{ workspacesInges
   // A completed rebuild priced everything with the current tables; refresh the
   // fingerprint so the next sync check does not schedule a redundant rebuild.
   await storePricingFingerprint(getConn());
+  await sweepCorruptRows("rebuildAll");
   return result;
 }
 
@@ -390,6 +405,7 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
     if (pricingFingerprintChanged) {
       await storePricingFingerprint(getConn());
     }
+    await sweepCorruptRows("syncCheck full_rebuild");
     await checkpointIfNeeded(plan.action, workspacesIngested, 0);
 
     const elapsedMs = Math.round(performance.now() - syncStartMs);
@@ -448,6 +464,7 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
     }
   }
 
+  await sweepCorruptRows("syncCheck incremental");
   await checkpointIfNeeded(plan.action, workspacesIngested, workspacesPurged);
 
   const elapsedMs = Math.round(performance.now() - syncStartMs);

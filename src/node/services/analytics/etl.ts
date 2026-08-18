@@ -865,6 +865,37 @@ export async function clearWorkspaceAnalyticsState(
   }
 }
 
+/**
+ * Self-healing sweep for a rare native-layer corruption class: a phantom row
+ * can materialize whose every VARCHAR column is the concatenation of that
+ * column's non-null values across an entire batch of inserted rows (observed
+ * once in the wild: a 17KB "model" string spanning ~670 events, which then
+ * wallpapered the Analytics dashboard as one giant legend entry). The donor
+ * rows are written correctly, so deleting rows with impossible string lengths
+ * loses no real data. Thresholds are generous: legitimate values are all far
+ * shorter (workspace IDs are short hex; model IDs are < 100 chars).
+ */
+export async function deleteCorruptAnalyticsRows(conn: DuckDBConnection): Promise<number> {
+  const eventsResult = await conn.run(`
+    DELETE FROM events
+    WHERE LENGTH(workspace_id) > 64
+       OR LENGTH(parent_workspace_id) > 64
+       OR LENGTH(model) > 256
+       OR LENGTH(agent_id) > 64
+       OR LENGTH(thinking_level) > 64
+  `);
+
+  const rollupsResult = await conn.run(`
+    DELETE FROM delegation_rollups
+    WHERE LENGTH(parent_workspace_id) > 64
+       OR LENGTH(child_workspace_id) > 64
+       OR LENGTH(model) > 256
+       OR LENGTH(agent_type) > 64
+  `);
+
+  return eventsResult.rowsChanged + rollupsResult.rowsChanged;
+}
+
 function serializeHeadSignatureValue(value: string | number | null): string {
   if (value === null) {
     return "null";
