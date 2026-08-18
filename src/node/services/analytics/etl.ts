@@ -874,24 +874,24 @@ export async function clearWorkspaceAnalyticsState(
  * rows are written correctly, so deleting rows with impossible string lengths
  * loses no real data.
  *
- * Thresholds sit above the longest legitimately constructible value for each
- * column so no legal row can match:
+ * Detection anchors ONLY on identifier columns with a provable legal maximum,
+ * because the corruption concatenates every VARCHAR column at once and
+ * workspace identifiers are present on every row:
  * - Workspace IDs: new IDs are short hex, but migrated legacy IDs are
  *   `${projectBasename}-${workspaceBasename}` (config.generateLegacyId) with
  *   no explicit limit; each basename is bounded by the filesystem's NAME_MAX
  *   (255 bytes), so 511 is the legal ceiling. Cap at 1024.
  * - Agent IDs/types also derive from file basenames: same 1024 cap.
- * - Model strings are `provider:modelId` config values (longest observed in a
- *   large production DB: 41 chars); 512 is far beyond any real model ID.
- * The observed phantom row exceeded every one of these by an order of
- * magnitude (6,720-char workspace_id, 17,229-char model).
+ * Unbounded columns (model: custom-provider model IDs have no schema max, see
+ * ProviderModelEntrySchema; paths; workspace names) must NOT be deletion
+ * evidence on their own, or a legitimately long value would wipe real spend.
+ * The observed phantom row's workspace_id was 6,720 chars.
  */
 export async function deleteCorruptAnalyticsRows(conn: DuckDBConnection): Promise<number> {
   const eventsResult = await conn.run(`
     DELETE FROM events
     WHERE LENGTH(workspace_id) > 1024
        OR LENGTH(parent_workspace_id) > 1024
-       OR LENGTH(model) > 512
        OR LENGTH(agent_id) > 1024
   `);
 
@@ -899,7 +899,6 @@ export async function deleteCorruptAnalyticsRows(conn: DuckDBConnection): Promis
     DELETE FROM delegation_rollups
     WHERE LENGTH(parent_workspace_id) > 1024
        OR LENGTH(child_workspace_id) > 1024
-       OR LENGTH(model) > 512
        OR LENGTH(agent_type) > 1024
   `);
 

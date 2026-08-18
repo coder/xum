@@ -1653,6 +1653,14 @@ describe("deleteCorruptAnalyticsRows", () => {
       "anthropic:claude-haiku-4-5",
       2.0,
     ]);
+    // Custom-provider model IDs have no schema max length; an extremely long
+    // model on an otherwise-healthy row must never be deletion evidence.
+    const longModel = `custom:${"m".repeat(2000)}`;
+    await conn.run("INSERT INTO events (workspace_id, model, total_cost_usd) VALUES (?, ?, ?)", [
+      "ws-long-model",
+      longModel,
+      3.0,
+    ]);
     // Phantom corruption row: varchar columns hold cross-row concatenations.
     await conn.run("INSERT INTO events (workspace_id, model, total_cost_usd) VALUES (?, ?, ?)", [
       "x".repeat(2000),
@@ -1676,7 +1684,11 @@ describe("deleteCorruptAnalyticsRows", () => {
       conn,
       "SELECT workspace_id FROM events ORDER BY LENGTH(workspace_id)"
     );
-    expect(eventRows).toEqual([{ workspace_id: "ws-healthy" }, { workspace_id: legacyId }]);
+    expect(eventRows).toEqual([
+      { workspace_id: "ws-healthy" },
+      { workspace_id: "ws-long-model" },
+      { workspace_id: legacyId },
+    ]);
     const rollupRows = await queryRows(conn, "SELECT parent_workspace_id FROM delegation_rollups");
     expect(rollupRows).toEqual([{ parent_workspace_id: "parent-healthy" }]);
 
