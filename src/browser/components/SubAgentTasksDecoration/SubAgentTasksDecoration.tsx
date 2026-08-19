@@ -221,46 +221,63 @@ export function mergeActiveWorkflowGroups(
   return merged;
 }
 
-export function getSubAgentStatusPresentation(workspace: FrontendWorkspaceMetadata): {
+interface SubAgentStatusPresentation {
   label: string;
   icon: typeof Clock3;
   iconClassName: string;
-} {
+}
+
+/**
+ * Presentations are keyed by outcome rather than by status because the two status sources below
+ * (taskExecutionStatus for a reawakened run, taskStatus for the retained base report) map several
+ * distinct statuses onto the same outcome. Keeping one table avoids the duplicated object literals
+ * the two switches used to carry, where a label or class could silently drift between them.
+ */
+const SUB_AGENT_STATUS_PRESENTATIONS = {
+  queued: { label: "Queued", icon: Clock3, iconClassName: "text-muted" },
+  starting: { label: "Starting", icon: LoaderCircle, iconClassName: "text-warning animate-spin" },
+  running: { label: "Running", icon: LoaderCircle, iconClassName: "text-success animate-spin" },
+  finishing: { label: "Finishing", icon: LoaderCircle, iconClassName: "text-warning animate-spin" },
+  completed: { label: "Completed", icon: CheckCircle2, iconClassName: "text-success" },
+  interrupted: { label: "Interrupted", icon: CircleSlash2, iconClassName: "text-muted" },
+  failed: { label: "Failed", icon: CircleX, iconClassName: "text-danger" },
+  inactive: { label: "Inactive", icon: CheckCircle2, iconClassName: "text-muted" },
+} satisfies Record<string, SubAgentStatusPresentation>;
+
+export function getSubAgentStatusPresentation(
+  workspace: FrontendWorkspaceMetadata
+): SubAgentStatusPresentation {
   // No execution status (never-reawakened sub-agent) falls through to taskStatus.
   if (workspace.taskExecutionStatus !== undefined) {
     switch (workspace.taskExecutionStatus) {
       case "queued":
-        return { label: "Queued", icon: Clock3, iconClassName: "text-muted" };
+        return SUB_AGENT_STATUS_PRESENTATIONS.queued;
       case "starting":
       case "running":
-        return {
-          label: "Running",
-          icon: LoaderCircle,
-          iconClassName: "text-success animate-spin",
-        };
+        return SUB_AGENT_STATUS_PRESENTATIONS.running;
       case "completed":
-        return { label: "Completed", icon: CheckCircle2, iconClassName: "text-success" };
+        return SUB_AGENT_STATUS_PRESENTATIONS.completed;
       case "interrupted":
-        return { label: "Interrupted", icon: CircleSlash2, iconClassName: "text-muted" };
+        return SUB_AGENT_STATUS_PRESENTATIONS.interrupted;
       case "error":
-        return { label: "Failed", icon: CircleX, iconClassName: "text-danger" };
+        return SUB_AGENT_STATUS_PRESENTATIONS.failed;
     }
   }
   switch (workspace.taskStatus) {
     case "queued":
-      return { label: "Queued", icon: Clock3, iconClassName: "text-muted" };
+      return SUB_AGENT_STATUS_PRESENTATIONS.queued;
     case "starting":
-      return { label: "Starting", icon: LoaderCircle, iconClassName: "text-warning animate-spin" };
+      return SUB_AGENT_STATUS_PRESENTATIONS.starting;
     case "running":
-      return { label: "Running", icon: LoaderCircle, iconClassName: "text-success animate-spin" };
+      return SUB_AGENT_STATUS_PRESENTATIONS.running;
     case "awaiting_report":
-      return { label: "Finishing", icon: LoaderCircle, iconClassName: "text-warning animate-spin" };
+      return SUB_AGENT_STATUS_PRESENTATIONS.finishing;
     case "reported":
-      return { label: "Completed", icon: CheckCircle2, iconClassName: "text-success" };
+      return SUB_AGENT_STATUS_PRESENTATIONS.completed;
     case "interrupted":
-      return { label: "Interrupted", icon: CircleSlash2, iconClassName: "text-muted" };
+      return SUB_AGENT_STATUS_PRESENTATIONS.interrupted;
     default:
-      return { label: "Inactive", icon: CheckCircle2, iconClassName: "text-muted" };
+      return SUB_AGENT_STATUS_PRESENTATIONS.inactive;
   }
 }
 
