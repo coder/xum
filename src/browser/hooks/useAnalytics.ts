@@ -41,6 +41,19 @@ interface DateFilterParams {
   to?: Date | null;
 }
 
+// Every analytics hook takes `Date` filters but reads them inside an effect. A `Date` is a
+// fresh reference on each render, so depending on it directly would re-fire the effect
+// constantly. Each hook therefore narrows the filters to epoch milliseconds (a stable
+// primitive) for its dependency array and rebuilds the `Date` inside the effect. These two
+// helpers keep both halves of that round-trip in one place.
+function toEpochMs(date: Date | null | undefined): number | null {
+  return date?.getTime() ?? null;
+}
+
+function fromEpochMs(epochMs: number | null): Date | null {
+  return epochMs == null ? null : new Date(epochMs);
+}
+
 interface AnalyticsNamespace {
   getSummary: (input: SummaryInput) => Promise<Summary>;
   getSpendOverTime: (input: SpendOverTimeInput) => Promise<SpendOverTimeItem[]>;
@@ -154,8 +167,8 @@ export function useAnalyticsSummary(
   projectPath?: string | null,
   dateFilters?: DateFilterParams
 ): AsyncState<Summary> {
-  const fromMs = dateFilters?.from?.getTime() ?? null;
-  const toMs = dateFilters?.to?.getTime() ?? null;
+  const fromMs = toEpochMs(dateFilters?.from);
+  const toMs = toEpochMs(dateFilters?.to);
 
   const { api } = useAPI();
   const [state, setState] = useState<AsyncState<Summary>>({
@@ -165,8 +178,8 @@ export function useAnalyticsSummary(
   });
 
   useEffect(() => {
-    const fromDate = fromMs == null ? null : new Date(fromMs);
-    const toDate = toMs == null ? null : new Date(toMs);
+    const fromDate = fromEpochMs(fromMs);
+    const toDate = fromEpochMs(toMs);
     return runAnalyticsEffect(api, setState, (analyticsApi) =>
       analyticsApi.getSummary({ projectPath: projectPath ?? null, from: fromDate, to: toDate })
     );
@@ -187,8 +200,8 @@ export function useAnalyticsSpendOverTime(params: {
     "useAnalyticsSpendOverTime requires a valid granularity"
   );
 
-  const fromMs = params.from?.getTime() ?? null;
-  const toMs = params.to?.getTime() ?? null;
+  const fromMs = toEpochMs(params.from);
+  const toMs = toEpochMs(params.to);
 
   const { api } = useAPI();
   const [state, setState] = useState<AsyncState<SpendOverTimeItem[]>>({
@@ -198,8 +211,8 @@ export function useAnalyticsSpendOverTime(params: {
   });
 
   useEffect(() => {
-    const fromDate = fromMs == null ? null : new Date(fromMs);
-    const toDate = toMs == null ? null : new Date(toMs);
+    const fromDate = fromEpochMs(fromMs);
+    const toDate = fromEpochMs(toMs);
     return runAnalyticsEffect(api, setState, (analyticsApi) =>
       analyticsApi.getSpendOverTime({
         projectPath: params.projectPath ?? null,
@@ -217,8 +230,8 @@ export function useAnalyticsSpendOverTime(params: {
 export function useAnalyticsSpendByProject(
   dateFilters?: DateFilterParams
 ): AsyncState<SpendByProjectItem[]> {
-  const fromMs = dateFilters?.from?.getTime() ?? null;
-  const toMs = dateFilters?.to?.getTime() ?? null;
+  const fromMs = toEpochMs(dateFilters?.from);
+  const toMs = toEpochMs(dateFilters?.to);
 
   const { api } = useAPI();
   const [state, setState] = useState<AsyncState<SpendByProjectItem[]>>({
@@ -228,8 +241,8 @@ export function useAnalyticsSpendByProject(
   });
 
   useEffect(() => {
-    const fromDate = fromMs == null ? null : new Date(fromMs);
-    const toDate = toMs == null ? null : new Date(toMs);
+    const fromDate = fromEpochMs(fromMs);
+    const toDate = fromEpochMs(toMs);
     return runAnalyticsEffect(api, setState, (analyticsApi) =>
       analyticsApi.getSpendByProject({ from: fromDate, to: toDate })
     );
@@ -242,8 +255,8 @@ export function useAnalyticsSpendByModel(
   projectPath?: string | null,
   dateFilters?: DateFilterParams
 ): AsyncState<SpendByModelItem[]> {
-  const fromMs = dateFilters?.from?.getTime() ?? null;
-  const toMs = dateFilters?.to?.getTime() ?? null;
+  const fromMs = toEpochMs(dateFilters?.from);
+  const toMs = toEpochMs(dateFilters?.to);
 
   const { api } = useAPI();
   const [state, setState] = useState<AsyncState<SpendByModelItem[]>>({
@@ -253,8 +266,8 @@ export function useAnalyticsSpendByModel(
   });
 
   useEffect(() => {
-    const fromDate = fromMs == null ? null : new Date(fromMs);
-    const toDate = toMs == null ? null : new Date(toMs);
+    const fromDate = fromEpochMs(fromMs);
+    const toDate = fromEpochMs(toMs);
     return runAnalyticsEffect(api, setState, (analyticsApi) =>
       analyticsApi.getSpendByModel({ projectPath: projectPath ?? null, from: fromDate, to: toDate })
     );
@@ -267,8 +280,8 @@ export function useAnalyticsTokensByModel(
   projectPath?: string | null,
   dateFilters?: DateFilterParams
 ): AsyncState<TokensByModelItem[]> {
-  const fromMs = dateFilters?.from?.getTime() ?? null;
-  const toMs = dateFilters?.to?.getTime() ?? null;
+  const fromMs = toEpochMs(dateFilters?.from);
+  const toMs = toEpochMs(dateFilters?.to);
 
   const { api } = useAPI();
   const [state, setState] = useState<AsyncState<TokensByModelItem[]>>({
@@ -278,8 +291,8 @@ export function useAnalyticsTokensByModel(
   });
 
   useEffect(() => {
-    const fromDate = fromMs == null ? null : new Date(fromMs);
-    const toDate = toMs == null ? null : new Date(toMs);
+    const fromDate = fromEpochMs(fromMs);
+    const toDate = fromEpochMs(toMs);
     return runAnalyticsEffect(api, setState, (analyticsApi) =>
       analyticsApi.getTokensByModel({
         projectPath: projectPath ?? null,
@@ -302,8 +315,8 @@ export function useAnalyticsTimingDistribution(
     "useAnalyticsTimingDistribution requires a valid metric"
   );
 
-  const fromMs = dateFilters?.from?.getTime() ?? null;
-  const toMs = dateFilters?.to?.getTime() ?? null;
+  const fromMs = toEpochMs(dateFilters?.from);
+  const toMs = toEpochMs(dateFilters?.to);
 
   const { api } = useAPI();
   const [state, setState] = useState<AsyncState<TimingDistribution>>({
@@ -313,8 +326,8 @@ export function useAnalyticsTimingDistribution(
   });
 
   useEffect(() => {
-    const fromDate = fromMs == null ? null : new Date(fromMs);
-    const toDate = toMs == null ? null : new Date(toMs);
+    const fromDate = fromEpochMs(fromMs);
+    const toDate = fromEpochMs(toMs);
     return runAnalyticsEffect(api, setState, (analyticsApi) =>
       analyticsApi.getTimingDistribution({
         metric,
@@ -332,8 +345,8 @@ export function useAnalyticsProviderCacheHitRatio(
   projectPath?: string | null,
   dateFilters?: DateFilterParams
 ): AsyncState<ProviderCacheHitRatioItem[]> {
-  const fromMs = dateFilters?.from?.getTime() ?? null;
-  const toMs = dateFilters?.to?.getTime() ?? null;
+  const fromMs = toEpochMs(dateFilters?.from);
+  const toMs = toEpochMs(dateFilters?.to);
 
   const { api } = useAPI();
   const [state, setState] = useState<AsyncState<ProviderCacheHitRatioItem[]>>({
@@ -343,8 +356,8 @@ export function useAnalyticsProviderCacheHitRatio(
   });
 
   useEffect(() => {
-    const fromDate = fromMs == null ? null : new Date(fromMs);
-    const toDate = toMs == null ? null : new Date(toMs);
+    const fromDate = fromEpochMs(fromMs);
+    const toDate = fromEpochMs(toMs);
     return runAnalyticsEffect(api, setState, (analyticsApi) =>
       analyticsApi.getCacheHitRatioByProvider({
         projectPath: projectPath ?? null,
@@ -361,8 +374,8 @@ export function useAnalyticsAgentCostBreakdown(
   projectPath?: string | null,
   dateFilters?: DateFilterParams
 ): AsyncState<AgentCostItem[]> {
-  const fromMs = dateFilters?.from?.getTime() ?? null;
-  const toMs = dateFilters?.to?.getTime() ?? null;
+  const fromMs = toEpochMs(dateFilters?.from);
+  const toMs = toEpochMs(dateFilters?.to);
 
   const { api } = useAPI();
   const [state, setState] = useState<AsyncState<AgentCostItem[]>>({
@@ -372,8 +385,8 @@ export function useAnalyticsAgentCostBreakdown(
   });
 
   useEffect(() => {
-    const fromDate = fromMs == null ? null : new Date(fromMs);
-    const toDate = toMs == null ? null : new Date(toMs);
+    const fromDate = fromEpochMs(fromMs);
+    const toDate = fromEpochMs(toMs);
     return runAnalyticsEffect(api, setState, (analyticsApi) =>
       analyticsApi.getAgentCostBreakdown({
         projectPath: projectPath ?? null,
@@ -390,8 +403,8 @@ export function useAnalyticsDelegationSummary(
   projectPath?: string | null,
   dateFilters?: DateFilterParams
 ): AsyncState<DelegationSummary> {
-  const fromMs = dateFilters?.from?.getTime() ?? null;
-  const toMs = dateFilters?.to?.getTime() ?? null;
+  const fromMs = toEpochMs(dateFilters?.from);
+  const toMs = toEpochMs(dateFilters?.to);
 
   const { api } = useAPI();
   const [state, setState] = useState<AsyncState<DelegationSummary>>({
@@ -401,8 +414,8 @@ export function useAnalyticsDelegationSummary(
   });
 
   useEffect(() => {
-    const fromDate = fromMs == null ? null : new Date(fromMs);
-    const toDate = toMs == null ? null : new Date(toMs);
+    const fromDate = fromEpochMs(fromMs);
+    const toDate = fromEpochMs(toMs);
     return runAnalyticsEffect(api, setState, (analyticsApi) =>
       analyticsApi.getDelegationSummary({
         projectPath: projectPath ?? null,
