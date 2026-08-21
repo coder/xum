@@ -188,6 +188,7 @@ import {
 } from "@/node/services/branchSummary";
 import type { Runtime } from "@/node/runtime/Runtime";
 import type { XumToolScope } from "@/common/types/toolScope";
+import { isErrnoWithCode } from "@/node/utils/fs";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { renderAgentSkillSnapshotText } from "@/common/utils/agentSkills/skillSnapshot";
 import type { MemorySessionContext } from "@/node/services/memoryService";
@@ -459,11 +460,7 @@ export async function clearProviderConfigFixableAbandonMarkers(
   try {
     entries = await readdir(sessionsDir, { withFileTypes: true });
   } catch (error) {
-    const errno =
-      typeof error === "object" && error !== null && "code" in error
-        ? (error as { code?: unknown }).code
-        : undefined;
-    if (errno === "ENOENT") {
+    if (isErrnoWithCode(error, "ENOENT")) {
       return;
     }
     throw error;
@@ -1412,23 +1409,20 @@ export class AgentSession {
     } catch (error) {
       // Missing preference file is the default path. Use any legacy frontend hint
       // (captured at onChat subscribe time) before falling back to enabled.
-      const errno =
-        typeof error === "object" && error !== null && "code" in error
-          ? (error as { code?: unknown }).code
-          : undefined;
+      const isMissingPreferenceFile = isErrnoWithCode(error, "ENOENT");
       const defaultEnabled =
-        errno === "ENOENT" && this.legacyAutoRetryEnabledHint === false ? false : true;
+        isMissingPreferenceFile && this.legacyAutoRetryEnabledHint === false ? false : true;
 
       this.autoRetryEnabledPreference = defaultEnabled;
       this.legacyAutoRetryEnabledHint = null;
       this.startupAutoRetryAbandon = null;
       this.retryManager.setEnabled(defaultEnabled);
 
-      if (errno === "ENOENT" && defaultEnabled === false) {
+      if (isMissingPreferenceFile && defaultEnabled === false) {
         // Persist migrated legacy opt-out so restart behavior no longer depends
         // on renderer localStorage keys.
         await this.persistAutoRetryState();
-      } else if (errno !== "ENOENT") {
+      } else if (!isMissingPreferenceFile) {
         log.warn("Failed to load auto-retry preference; defaulting to enabled", {
           workspaceId: this.workspaceId,
           error: getErrorMessage(error),
@@ -1448,11 +1442,7 @@ export class AgentSession {
       try {
         await unlink(preferencePath);
       } catch (error) {
-        const errno =
-          typeof error === "object" && error !== null && "code" in error
-            ? (error as { code?: unknown }).code
-            : undefined;
-        if (errno !== "ENOENT") {
+        if (!isErrnoWithCode(error, "ENOENT")) {
           log.debug("Failed to clear auto-retry preference file", {
             workspaceId: this.workspaceId,
             error: getErrorMessage(error),
