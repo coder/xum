@@ -340,6 +340,21 @@ function friendlyFsError(error: unknown, action: string, targetPath: string): st
   }
 }
 
+/**
+ * Best-effort rollback of a `.git` directory this process just created. Every
+ * git-init failure path must restore the directory to its prior state (so a retry
+ * is not rejected as non-empty, and a concurrent winner does not inherit a
+ * repository it never asked for), but the caller is already returning the real
+ * error, so a cleanup failure is only logged.
+ */
+async function rollBackInitializedGitDir(normalizedPath: string): Promise<void> {
+  await fsPromises
+    .rm(path.join(normalizedPath, ".git"), { recursive: true, force: true })
+    .catch((cleanupError: unknown) => {
+      log.error(`Failed to roll back git init in ${normalizedPath}:`, cleanupError);
+    });
+}
+
 async function resolveRealProjectPath(projectPath: string): Promise<string> {
   return stripTrailingSlashes(await fsPromises.realpath(projectPath));
 }
@@ -727,11 +742,7 @@ export class ProjectService {
         // .git this losing request created would silently turn the winner's project
         // into a repository it never asked for, or wrap its checkout in an
         // unregistered outer repository that changes git discovery.
-        await fsPromises
-          .rm(path.join(normalizedPath, ".git"), { recursive: true, force: true })
-          .catch((cleanupError: unknown) => {
-            log.error(`Failed to roll back git init in ${normalizedPath}:`, cleanupError);
-          });
+        await rollBackInitializedGitDir(normalizedPath);
       }
       if (createResult.success && !this.config.loadConfigOrDefault().projects.has(normalizedPath)) {
         // Config persistence (editConfig → private saveConfig) logs-and-continues on
@@ -1598,11 +1609,7 @@ export class ProjectService {
       // the directory returns to its prior state and a retry is not rejected as
       // non-empty (e.g. when the initial commit fails).
       if (initializedGitDir) {
-        await fsPromises
-          .rm(path.join(normalizedPath, ".git"), { recursive: true, force: true })
-          .catch((cleanupError: unknown) => {
-            log.error(`Failed to roll back git init in ${normalizedPath}:`, cleanupError);
-          });
+        await rollBackInitializedGitDir(normalizedPath);
       }
       const message = getErrorMessage(error);
       log.error("Failed to initialize git repository:", error);
