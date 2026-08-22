@@ -368,6 +368,41 @@ describe("SandboxHostService", () => {
     expect(await journal2.blobs.has(latest)).toBe(true);
   });
 
+  test("foreign snapshot appends invalidate the incremental reclamation cache (r43)", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const publishSnapshot = async (journal: DurableEventJournal, content: string) => {
+      const { ref } = await journal.publishWithBlob(content, (blobHash, size) => ({
+        workspaceId: "ws-foreign",
+        kind: "sandbox-vars-snapshot",
+        data: { scopeKey: "ws-foreign", blobHash, size },
+      }));
+      return ref;
+    };
+    // Two backends (XUM_ALLOW_MULTIPLE_INSTANCES=1) alternate kernel calls
+    // against one workspace. Each journal instance caches only the snapshot
+    // ref IT published; without the mention-index epoch check, each pass
+    // would consider only its own stale cached ref and the other process's
+    // superseded snapshots would leak until a restart's recovery sweep.
+    const journalA = new DurableEventJournal(tmp.path);
+    const journalB = new DurableEventJournal(tmp.path);
+
+    const v1 = await publishSnapshot(journalA, '{"v":1}');
+    await reclaimSupersededSnapshotBlobs(journalA, "ws-foreign", v1);
+
+    // B's first pass is a recovery sweep: v1 (now superseded) is reclaimed.
+    const v2 = await publishSnapshot(journalB, '{"v":2}');
+    await reclaimSupersededSnapshotBlobs(journalB, "ws-foreign", v2);
+    expect(await journalB.blobs.has(v1)).toBe(false);
+
+    // A's next pass: its cached "previous latest" is v1 (already deleted).
+    // The foreign append (v2) moved A's mention-index epoch, so A must
+    // rebuild candidates and reclaim B's superseded v2 instead of leaking it.
+    const v3 = await publishSnapshot(journalA, '{"v":3}');
+    await reclaimSupersededSnapshotBlobs(journalA, "ws-foreign", v3);
+    expect(await journalA.blobs.has(v2)).toBe(false);
+    expect(await journalA.blobs.has(v3)).toBe(true);
+  });
+
   test("host→guest events: queue + drain via drainHostEvents()", async () => {
     using tmp = new DisposableTempDir("sandbox-host-test");
     const host = new SandboxHostService();

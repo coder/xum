@@ -956,16 +956,18 @@ export class RefineService {
       using _turnExclusion = turnExclusionResult.data;
 
       // TOCTOU guard: the history snapshot above was taken before the model
-      // streamed. A context reset, full clear, or compaction during
-      // generation discards/replaces the distilled rows; publishing now
+      // streamed. A context reset, full clear, compaction, or tail rewrite
+      // during generation discards/replaces distilled rows; publishing now
       // would land a proposal derived from that discarded context where the
       // approval-hash scan accepts it. Verify under the staging lock — which
-      // the reset/clear paths also hold across their mutation — that both
-      // the latest context-boundary identity AND the active segment's first
-      // row (anchor) are unchanged. The anchor catches boundary-less
-      // mutations: a full /clear leaves the boundary identity null on both
-      // sides but changes (or empties) the segment's first row, while
-      // ordinary mid-pass appends extend the tail without touching it.
+      // the reset/clear paths also hold across their mutation — that the
+      // latest context-boundary identity is unchanged AND that the distilled
+      // snapshot is still an unchanged PREFIX of the active segment (r43).
+      // Ordinary mid-pass appends extend the tail and keep the prefix; a
+      // boundary-less full /clear empties it; and an edit-resend or partial
+      // truncation that keeps the first row but rewrites the tail — invisible
+      // to the previous first-row anchor check — removes distilled rows and
+      // breaks the prefix.
       const recheckResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
       if (!recheckResult.success) {
         return Err(`could not re-verify workspace history before staging: ${recheckResult.error}`);
@@ -973,16 +975,15 @@ export class RefineService {
       const recheckBoundaryIndex = findLatestContextBoundaryIndex(recheckResult.data);
       const recheckBoundaryId =
         recheckBoundaryIndex >= 0 ? recheckResult.data[recheckBoundaryIndex].id : null;
-      const recheckAnchorId =
-        sliceMessagesForProviderFromLatestContextBoundary(recheckResult.data)[0]?.id ?? null;
-      if (
-        recheckBoundaryId !== (boundaryRow?.id ?? null) ||
-        recheckAnchorId !== (activeSegment[0]?.id ?? null)
-      ) {
+      const recheckSegment = sliceMessagesForProviderFromLatestContextBoundary(recheckResult.data);
+      const snapshotIsUnchangedPrefix =
+        activeSegment.length <= recheckSegment.length &&
+        activeSegment.every((row, index) => recheckSegment[index]?.id === row.id);
+      if (recheckBoundaryId !== (boundaryRow?.id ?? null) || !snapshotIsUnchangedPrefix) {
         return Err(
-          "the workspace context was reset, cleared, or compacted while the refine pass was " +
-            "running; the distilled proposal no longer describes the active context — run " +
-            "/refine again"
+          "the workspace context was reset, cleared, compacted, or rewritten while the refine " +
+            "pass was running; the distilled proposal no longer describes the active context — " +
+            "run /refine again"
         );
       }
 

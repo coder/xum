@@ -75,10 +75,14 @@ export class VarsSnapshotBudgetError extends Error {
  * heals leftovers from crashes or failed best-effort deletions.
  */
 interface JournalReclamationState {
-  /** Latest published snapshot ref per scope. A present key means this
-   * process already swept the scope, so each later persist reclaims exactly
-   * the one ref that just ceased being latest. */
-  latestSnapshotRef: Map<string, BlobRef>;
+  /** Latest published snapshot ref per scope, with the journal.blobIndexEpoch
+   * it was recorded at. A present key with a CURRENT epoch means this process
+   * already swept the scope, so each later persist reclaims exactly the one
+   * ref that just ceased being latest. A stale epoch means a foreign process
+   * appended since (r43): its snapshots may have been superseded without this
+   * process ever caching them, so the scope must re-derive candidates from
+   * the mention index before the incremental fast path may resume. */
+  latestSnapshotRef: Map<string, { ref: BlobRef; epoch: number }>;
   /** Handle payloads currently retained under the quota, newest first
    * (bounded by quota/offload-threshold); null until the recovery sweep. */
   retainedHandles: BlobQuotaEntry[] | null;
@@ -117,23 +121,32 @@ export async function reclaimSupersededSnapshotBlobs(
   assert(scopeKey.length > 0, "reclaimSupersededSnapshotBlobs requires a scopeKey");
   await journal.withBlobLock(async () => {
     const state = reclamationStateFor(journal);
-    const previousRef = state.latestSnapshotRef.get(scopeKey);
+    const previous = state.latestSnapshotRef.get(scopeKey);
+    const index = await journal.blobMentionIndex();
+    // Epoch check AFTER blobMentionIndex(): that call detects foreign
+    // appends. The incremental fast path is only sound while no other
+    // process appended since our cache was recorded — a foreign backend
+    // (XUM_ALLOW_MULTIPLE_INSTANCES=1) may have published and superseded
+    // snapshots this process never cached, and alternating kernel calls
+    // across two backends would otherwise leak an unbounded run of foreign
+    // snapshot blobs until a restart's recovery sweep (r43).
+    const epoch = journal.blobIndexEpoch;
+    const incremental = previous?.epoch === epoch;
     // Record the new latest BEFORE deleting: a failed best-effort deletion
     // must not be retried on every later persist (the next process's
     // recovery sweep heals it instead).
-    state.latestSnapshotRef.set(scopeKey, latestRef);
-    if (previousRef === latestRef) return;
+    state.latestSnapshotRef.set(scopeKey, { ref: latestRef, epoch });
+    if (incremental && previous.ref === latestRef) return;
 
-    const index = await journal.blobMentionIndex();
-    const candidates =
-      previousRef !== undefined
-        ? [previousRef]
-        : // Recovery sweep: first persist for this scope since process start.
-          // A ref mentioned by a snapshot row of this scope IS some
-          // snapshot's blobHash — that is the kind's only ref-valued field.
-          [...index.entries()]
-            .filter(([ref, mentions]) => mentions.snapshotScopes.has(scopeKey) && ref !== latestRef)
-            .map(([ref]) => ref);
+    const candidates = incremental
+      ? [previous.ref]
+      : // Recovery sweep: first persist for this scope since process start,
+        // or a foreign append invalidated the cache. A ref mentioned by a
+        // snapshot row of this scope IS some snapshot's blobHash — that is
+        // the kind's only ref-valued field.
+        [...index.entries()]
+          .filter(([ref, mentions]) => mentions.snapshotScopes.has(scopeKey) && ref !== latestRef)
+          .map(([ref]) => ref);
     // Seed our own scope's latest (just published) so the common
     // single-scope case never needs a journal read.
     const resolveLatestSnapshot = makeSnapshotLatestResolver(journal, { scopeKey, ref: latestRef });

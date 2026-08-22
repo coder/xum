@@ -5774,6 +5774,19 @@ export class AgentSession {
   }
 
   /**
+   * r43: true while any turn is active OR mid-stream compaction is between
+   * stopping the original stream and dispatching its compaction request.
+   * During that window the session looks idle (turnPhase IDLE, no stream,
+   * the original send's preflight already settled), but interruptForCompaction
+   * will imminently call sendMessage directly — bypassing WorkspaceService
+   * entry accounting — so context-discarding mutations and refine publication
+   * must treat it as turn work and refuse.
+   */
+  hasActiveOrPendingTurnWork(): boolean {
+    return this.isBusy() || this.midStreamCompactionPending;
+  }
+
+  /**
    * r41: discard pending auto-retry state and the persisted partial as part
    * of a context-discarding history mutation. A retry scheduled before the
    * mutation (session idle during backoff) would otherwise fire after the

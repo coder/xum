@@ -2116,6 +2116,67 @@ describe("RefineService", () => {
     expect(fixture.emittedMessages).toHaveLength(0);
   });
 
+  it("refuses to publish a proposal when the tail was rewritten mid-pass (r43)", async () => {
+    // SECURITY: an edit-resend truncates AFTER an earlier message and appends
+    // a new branch — the boundary identity stays null and the segment's
+    // FIRST row is untouched, so the previous boundary+anchor recheck
+    // accepted a proposal distilled from the now-abandoned tail. The prefix
+    // verification must catch the removed distilled row instead.
+    let rewriteTailOnce: (() => Promise<void>) | null = null;
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: async () => {
+            if (rewriteTailOnce !== null) {
+              const rewrite = rewriteTailOnce;
+              rewriteTailOnce = null;
+              await rewrite();
+            }
+            return {
+              stream: simulateReadableStream({
+                chunks: [
+                  {
+                    type: "tool-call",
+                    toolCallId: "refine-rewrite-toctou-1",
+                    toolName: "memory",
+                    input: JSON.stringify({
+                      command: "create",
+                      path: LESSON_PATH,
+                      file_text: "A lesson distilled from an abandoned branch.\n",
+                    }),
+                  } satisfies LanguageModelV3StreamPart,
+                  finishChunk("tool-calls"),
+                ],
+              }),
+            };
+          },
+        }),
+    });
+    await fixture.seedTrajectory();
+    rewriteTailOnce = async () => {
+      // Edit-resend shape: drop the distilled tail row (user-1), keep the
+      // anchor row (user-0), and grow a replacement branch past the original
+      // length so a length-only check could not catch it either.
+      const truncated = await fixture.historyService.truncateAfterMessage(WORKSPACE_ID, "user-0");
+      if (!truncated.success) throw new Error(truncated.error);
+      for (const id of ["user-1-rewrite", "user-2-rewrite"]) {
+        const appended = await fixture.historyService.appendToHistory(
+          WORKSPACE_ID,
+          createMuxMessage(id, "user", `rewritten branch ${id}`, { timestamp: Date.now() })
+        );
+        if (!appended.success) throw new Error(appended.error);
+      }
+    };
+
+    const result = await fixture.service.run(WORKSPACE_ID);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("while the refine pass was running");
+    }
+    expect(await loadStagedRefineSet(fixture.sessionDir)).toBeNull();
+    expect(fixture.emittedMessages).toHaveLength(0);
+  });
+
   it("fails closed on ambiguous timeline boundaries (r38)", async () => {
     const prompts: string[] = [];
     const now = Date.now();

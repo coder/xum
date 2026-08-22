@@ -2899,8 +2899,10 @@ export class WorkspaceService extends EventEmitter {
       },
     };
     // Busy check AFTER arming the block: a turn admitted first is observed
-    // here; a turn admitted later observes the block and refuses.
-    if (session.isBusy() || this.aiService.isStreaming(workspaceId)) {
+    // here; a turn admitted later observes the block and refuses. Pending
+    // mid-stream compaction counts as turn work (r43): its direct session
+    // send bypasses this service's entry accounting.
+    if (session.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId)) {
       guard[Symbol.dispose]();
       return Err(`Cannot ${operation} while a turn is active. Press Esc to stop the stream first.`);
     }
@@ -2929,7 +2931,11 @@ export class WorkspaceService extends EventEmitter {
   acquireIdleTurnExclusion(workspaceId: string): Result<Disposable> {
     const session = this.getOrCreateSession(workspaceId);
     const hold = session.holdTurnAdmission();
-    if (session.isBusy() || this.aiService.isStreaming(workspaceId)) {
+    // Pending mid-stream compaction counts as turn work (r43): its direct
+    // session send bypasses this service's entry accounting, so publishing
+    // between the stopped stream and the compaction request would interleave
+    // exactly like publishing mid-turn.
+    if (session.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId)) {
       hold[Symbol.dispose]();
       return Err("a turn is preparing or streaming");
     }
@@ -10122,7 +10128,10 @@ export class WorkspaceService extends EventEmitter {
     // Recheck under the guard + lock: the admission block refuses ordinary
     // turn starts during the awaits above, but in-turn compaction retries
     // bypass admission gating when they cross a transient idle gap.
-    if (isFullClear && (session?.isBusy() || this.aiService.isStreaming(workspaceId))) {
+    if (
+      isFullClear &&
+      (session?.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId))
+    ) {
       return Err(
         "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
       );
@@ -10137,6 +10146,14 @@ export class WorkspaceService extends EventEmitter {
           `Cannot clear history: pending retry state could not be discarded (${retryDiscard.error})`
         );
       }
+    }
+    // r43: a fork's settled branch-summary registration stays consumable
+    // until the first send; its row is about to be deleted, so drop the
+    // registration too or the next send would re-emit the discarded summary
+    // into the live transcript (resurfacing pre-clear content that is absent
+    // from history after reload).
+    if (isFullClear) {
+      await clearPendingBranchSummary(workspaceId);
     }
     if (effectivePercentage > 0) {
       session?.clearUsageState();
@@ -10270,7 +10287,7 @@ export class WorkspaceService extends EventEmitter {
       // Recheck under the guard + lock: the admission block refuses ordinary
       // turn starts during the awaits above, but in-turn compaction retries
       // bypass admission gating when they cross a transient idle gap.
-      if (session?.isBusy() || this.aiService.isStreaming(workspaceId)) {
+      if (session?.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId)) {
         return Err(
           "Cannot reset context while a turn is active. Press Esc to stop the stream first."
         );
@@ -10286,6 +10303,10 @@ export class WorkspaceService extends EventEmitter {
           );
         }
       }
+      // r43: drop any settled-but-unconsumed branch-summary registration —
+      // its row lands behind the new boundary, and the next send would
+      // otherwise re-emit that pre-reset summary into the live transcript.
+      await clearPendingBranchSummary(workspaceId);
 
       const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
       if (!historyResult.success) {
@@ -10532,7 +10553,8 @@ export class WorkspaceService extends EventEmitter {
         // transient idle gap.
         if (
           !isCompaction &&
-          (this.sessions.get(workspaceId)?.isBusy() || this.aiService.isStreaming(workspaceId))
+          (this.sessions.get(workspaceId)?.hasActiveOrPendingTurnWork() ||
+            this.aiService.isStreaming(workspaceId))
         ) {
           return Err(
             "Cannot replace history while a turn is active. Press Esc to stop the stream first."
@@ -10548,6 +10570,10 @@ export class WorkspaceService extends EventEmitter {
               `Cannot replace history: pending retry state could not be discarded (${retryDiscard.error})`
             );
           }
+        }
+        // r43: same branch-summary hygiene as full clear (see truncateHistory).
+        if (!isCompaction) {
+          await clearPendingBranchSummary(workspaceId);
         }
         this.sessions.get(workspaceId)?.clearUsageState();
         const clearResult = await this.clearHistoryWithRetiredBashMonitorWakes(

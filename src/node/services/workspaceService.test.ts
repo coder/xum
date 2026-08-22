@@ -26,7 +26,11 @@ import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { ExperimentsService } from "./experimentsService";
-import { awaitPendingBranchSummary } from "./branchSummary";
+import {
+  awaitPendingBranchSummary,
+  startAbandonedBranchSummaryInBackground,
+  type BranchSummaryAiService,
+} from "./branchSummary";
 import type { InitStateManager, InitStatus } from "./initStateManager";
 import {
   ExtensionMetadataService,
@@ -4947,6 +4951,151 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       } finally {
         appendSpy.mockRestore();
       }
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("context mutations and refine exclusion refuse while mid-stream compaction is pending (r43)", async () => {
+    // interruptForCompaction stops the original stream, waits for idle, then
+    // calls AgentSession.sendMessage directly — bypassing WorkspaceService
+    // entry accounting. During that window the session looks idle, so
+    // mutations and refine publication must treat pending mid-stream
+    // compaction as turn work and refuse.
+    const { config, workspaceService, cleanup } = await createServices();
+    const workspaceId = "midstream-compaction-guard";
+    try {
+      await config.addWorkspace("/tmp/midstream-compaction-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "midstream-compaction-project",
+        projectPath: "/tmp/midstream-compaction-project",
+        runtimeConfig: { type: "local" },
+      });
+      const session = workspaceService.getOrCreateSession(workspaceId);
+      const pendingSpy = spyOn(session, "hasActiveOrPendingTurnWork").mockReturnValue(true);
+      try {
+        expect(await workspaceService.truncateHistory(workspaceId)).toEqual({
+          success: false,
+          error:
+            "Cannot truncate history while a turn is active. Press Esc to stop the stream first.",
+        });
+        expect(await workspaceService.resetContext(workspaceId)).toEqual({
+          success: false,
+          error: "Cannot reset context while a turn is active. Press Esc to stop the stream first.",
+        });
+        expect(workspaceService.acquireIdleTurnExclusion(workspaceId)).toEqual({
+          success: false,
+          error: "a turn is preparing or streaming",
+        });
+      } finally {
+        pendingSpy.mockRestore();
+      }
+      // Window closed: mutations are admitted again.
+      expect(await workspaceService.resetContext(workspaceId)).toEqual({
+        success: true,
+        data: "noop",
+      });
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a full clear drops a settled-but-unconsumed branch-summary registration (r43)", async () => {
+    // A fork's summary can append and settle before the fork's first send;
+    // the registration stays consumable so that send can emit the row. A
+    // full clear deletes the row — the registration must be dropped with it,
+    // or the next send re-emits the discarded summary into the live
+    // transcript (absent from history after reload).
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "clear-drops-summary-registration";
+    try {
+      await config.addWorkspace("/tmp/clear-drops-summary-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "clear-drops-summary-project",
+        projectPath: "/tmp/clear-drops-summary-project",
+        runtimeConfig: { type: "local" },
+      });
+      // Fork shape: kept rows end at the guard tail; the abandoned branch is
+      // meaty enough to clear the summarization threshold.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("m1", "user", "original question", { timestamp: 1 })
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("m2", "assistant", "branch point answer", { timestamp: 2 })
+      );
+      const filler = "investigated the flaky test and traced the race ".repeat(200);
+      const abandonedMessages = [
+        createMuxMessage("abandoned-user", "user", `Please fix this: ${filler}`, { timestamp: 3 }),
+        createMuxMessage("abandoned-assistant", "assistant", `Findings: ${filler}`, {
+          timestamp: 4,
+        }),
+      ];
+      const summaryAiService: BranchSummaryAiService = {
+        createModelWithPinnedMetadata: (modelString: string) =>
+          Promise.resolve(
+            Ok({
+              model: new MockLanguageModelV3({
+                doStream: () =>
+                  Promise.resolve({
+                    stream: simulateReadableStream({
+                      chunks: [
+                        { type: "text-start", id: "t1" },
+                        { type: "text-delta", id: "t1", delta: "Abandoned: explored a race." },
+                        { type: "text-end", id: "t1" },
+                        {
+                          type: "finish",
+                          finishReason: { unified: "stop", raw: "stop" },
+                          usage: {
+                            inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
+                            outputTokens: { total: 5, text: 5, reasoning: 0 },
+                          },
+                        } satisfies LanguageModelV3StreamPart,
+                      ] satisfies LanguageModelV3StreamPart[],
+                    }),
+                  }),
+              }),
+              metadataModel: modelString,
+            })
+          ) as ReturnType<BranchSummaryAiService["createModelWithPinnedMetadata"]>,
+        getWorkspaceMetadata: () =>
+          Promise.resolve(
+            Ok({ aiSettings: { model: "anthropic:claude-haiku-4-5" } })
+          ) as ReturnType<BranchSummaryAiService["getWorkspaceMetadata"]>,
+      };
+      startAbandonedBranchSummaryInBackground({
+        historyService,
+        aiService: summaryAiService,
+        workspaceId,
+        abandonedMessages,
+        experiments: { rlm: true, programmaticToolCalling: true },
+        guardTailMessageId: "m2",
+      });
+      // Wait for the background generation to append + settle WITHOUT
+      // consuming the registration (the r43 scenario: settled before the
+      // first send).
+      const deadline = Date.now() + 10_000;
+      for (;;) {
+        const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        if (history.success && history.data.length === 3) break;
+        if (Date.now() > deadline) {
+          throw new Error("branch summary row never appended");
+        }
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+
+      expect(await workspaceService.truncateHistory(workspaceId)).toEqual({
+        success: true,
+        data: undefined,
+      });
+
+      // The registration went with the row: nothing left to re-emit.
+      expect(await awaitPendingBranchSummary(workspaceId)).toBeNull();
+      const cleared = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(cleared.success ? cleared.data : ["unexpected"]).toHaveLength(0);
     } finally {
       await cleanup();
     }
