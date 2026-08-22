@@ -4878,22 +4878,22 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     }
   });
 
-  test("a send predated by a COMPLETED clear is refused admission and notified (r41)", async () => {
-    // Complete-before-resume: the send passes the entry check, parks in
-    // pre-admission work, and the full clear starts AND FINISHES before it
-    // resumes. The level-triggered admission block is released by then, so
-    // only the mutation-epoch probe can refuse the turn — and because the
-    // send was already accepted (rows durable, onAccepted ran), the accepted
-    // pre-stream failure callback must fire so internal callers can revert
-    // delivered-state bookkeeping.
+  test("context mutations are refused while a send is in its pre-admission window (r42)", async () => {
+    // SECURITY: a send past the entry check may have passed its pre-persist
+    // gate but not yet appended its rows (family payload + user row). A
+    // mutation committing in that window would leave those rows — composed
+    // against, and possibly influenced by, the discarded context — durably in
+    // the fresh transcript: the epoch gate blocks the send's stream but
+    // cannot un-append. The mutation must refuse while the send is in
+    // preflight, and succeed again once it settles.
     const { config, historyService, workspaceService, cleanup } = await createServices();
-    const workspaceId = "clear-completes-before-resume";
+    const workspaceId = "mutation-refuses-preflight";
     try {
-      await config.addWorkspace("/tmp/clear-before-resume-project", {
+      await config.addWorkspace("/tmp/mutation-refuses-preflight-project", {
         id: workspaceId,
         name: workspaceId,
-        projectName: "clear-before-resume-project",
-        projectPath: "/tmp/clear-before-resume-project",
+        projectName: "mutation-refuses-preflight-project",
+        projectPath: "/tmp/mutation-refuses-preflight-project",
         runtimeConfig: { type: "local" },
       });
       await historyService.appendToHistory(
@@ -4901,6 +4901,8 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         createMuxMessage("pre-clear-user", "user", "before clear", {})
       );
 
+      // Park the send at its user-row append: past every entry check and the
+      // pre-persist gate, strictly before its rows land.
       const appendReached = createDeferred<void>();
       const releaseAppend = createDeferred<void>();
       const originalAppend = historyService.appendToHistory.bind(historyService);
@@ -4912,58 +4914,36 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         }
       );
       try {
-        let acceptedCalls = 0;
-        const failureErrors: SendMessageError[] = [];
-        const sendPromise = workspaceService.sendMessage(
-          workspaceId,
-          "hello",
-          {
-            model: "anthropic:claude-sonnet-4-6",
-            thinkingLevel: "off",
-            toolPolicy: [],
-            agentId: "exec",
-          },
-          {
-            synthetic: true,
-            onAccepted: () => {
-              acceptedCalls += 1;
-            },
-            onAcceptedPreStreamFailure: (error) => {
-              failureErrors.push(error);
-            },
-          }
-        );
+        const sendPromise = workspaceService.sendMessage(workspaceId, "hello", {
+          model: "anthropic:claude-sonnet-4-6",
+          thinkingLevel: "off",
+          toolPolicy: [],
+          agentId: "exec",
+        });
         await appendReached.promise;
 
-        // The clear starts and COMPLETES while the send is parked.
+        expect(await workspaceService.truncateHistory(workspaceId)).toEqual({
+          success: false,
+          error: "Cannot truncate history while a message is being sent. Try again in a moment.",
+        });
+        expect(await workspaceService.resetContext(workspaceId)).toEqual({
+          success: false,
+          error: "Cannot reset context while a message is being sent. Try again in a moment.",
+        });
+
+        releaseAppend.resolve();
+        // The send fails at stream startup (no provider in this fixture) —
+        // only its settled outcome matters here.
+        await sendPromise;
+
+        // Preflight settled: the clear is admitted and discards everything,
+        // including the send's rows — nothing straddles the mutation.
         expect(await workspaceService.truncateHistory(workspaceId)).toEqual({
           success: true,
           data: undefined,
         });
-
-        releaseAppend.resolve();
-        const sendResult = await sendPromise;
-        expect(sendResult).toEqual({
-          success: false,
-          error: {
-            type: "unknown",
-            raw: "Workspace history is being cleared or reset. Please wait and try again.",
-          },
-        });
-        // Accepted, then notified of the pre-stream refusal (r41).
-        expect(acceptedCalls).toBe(1);
-        expect(failureErrors).toHaveLength(1);
-        expect(failureErrors[0]).toEqual({
-          type: "unknown",
-          raw: "Workspace history is being cleared or reset. Please wait and try again.",
-        });
-        // The refused turn never streamed: no assistant output followed the
-        // clear (the accepted user row may remain, per acceptance semantics).
         const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
-        expect(history.success).toBe(true);
-        if (history.success) {
-          expect(history.data.filter((row) => row.role === "assistant")).toHaveLength(0);
-        }
+        expect(history.success ? history.data : ["unexpected"]).toHaveLength(0);
       } finally {
         appendSpy.mockRestore();
       }
@@ -5034,89 +5014,6 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         expect(history.success ? history.data : []).toHaveLength(1);
       } finally {
         deleteSpy.mockRestore();
-      }
-    } finally {
-      await cleanup();
-    }
-  });
-
-  test("a send already past the entry check is refused turn admission mid-clear (r40)", async () => {
-    // SECURITY (the exact r40 race): the send passed the workspace-level
-    // entry check BEFORE the clear started and is still persisting its rows
-    // when the clear arms the guard — the clear's busy checks see an idle
-    // session. The session-level admission block must refuse the turn in the
-    // same synchronous step that would set PREPARING, so the send can never
-    // snapshot the pre-clear transcript and stream across the truncation.
-    const { config, historyService, workspaceService, cleanup } = await createServices();
-    const workspaceId = "clear-blocks-inflight-send";
-    try {
-      await config.addWorkspace("/tmp/clear-blocks-inflight-project", {
-        id: workspaceId,
-        name: workspaceId,
-        projectName: "clear-blocks-inflight-project",
-        projectPath: "/tmp/clear-blocks-inflight-project",
-        runtimeConfig: { type: "local" },
-      });
-      await historyService.appendToHistory(
-        workspaceId,
-        createMuxMessage("pre-clear-user", "user", "before clear", {})
-      );
-
-      // Park the send at its user-row append: past every entry check,
-      // strictly before turn admission.
-      const appendReached = createDeferred<void>();
-      const releaseAppend = createDeferred<void>();
-      const originalAppend = historyService.appendToHistory.bind(historyService);
-      const appendSpy = spyOn(historyService, "appendToHistory").mockImplementationOnce(
-        async (...args: Parameters<HistoryService["appendToHistory"]>) => {
-          appendReached.resolve();
-          await releaseAppend.promise;
-          return originalAppend(...args);
-        }
-      );
-      const drainStarted = createDeferred<void>();
-      const releaseDrain = createDeferred<void>();
-      try {
-        const sendPromise = workspaceService.sendMessage(workspaceId, "hello", {
-          model: "anthropic:claude-sonnet-4-6",
-          thinkingLevel: "off",
-          toolPolicy: [],
-          agentId: "exec",
-        });
-        await appendReached.promise;
-
-        // The clear starts while the send is invisible (idle session) and
-        // parks inside its await window with the guard armed.
-        workspaceService.setRefinePassCanceller({
-          cancelInFlightRefinePass: async () => {
-            drainStarted.resolve();
-            await releaseDrain.promise;
-          },
-        });
-        const clearPromise = workspaceService.truncateHistory(workspaceId);
-        await drainStarted.promise;
-
-        // The send resumes: its user row lands (pre-clear), but turn
-        // admission is refused at the PREPARING gate.
-        releaseAppend.resolve();
-        const sendResult = await sendPromise;
-        expect(sendResult).toEqual({
-          success: false,
-          error: {
-            type: "unknown",
-            raw: "Workspace history is being cleared or reset. Please wait and try again.",
-          },
-        });
-
-        releaseDrain.resolve();
-        expect(await clearPromise).toEqual({ success: true, data: undefined });
-        // The refused send's user row landed pre-truncation and was wiped
-        // with the rest of the transcript — nothing repopulates the cleared
-        // context.
-        const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
-        expect(history.success ? history.data : ["unexpected"]).toHaveLength(0);
-      } finally {
-        appendSpy.mockRestore();
       }
     } finally {
       await cleanup();

@@ -1,0 +1,136 @@
+import { describe, expect, it, mock, afterEach, spyOn } from "bun:test";
+import { EventEmitter } from "events";
+import type { AIService } from "@/node/services/aiService";
+import type { InitStateManager } from "@/node/services/initStateManager";
+import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
+import type { Config } from "@/node/config";
+import type { SendMessageError } from "@/common/types/errors";
+import { createMuxMessage } from "@/common/types/message";
+import { Ok } from "@/common/types/result";
+import { AgentSession, CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE } from "./agentSession";
+import { createTestHistoryService } from "./testHistoryService";
+
+const TEST_MODEL = "anthropic:claude-3-5-sonnet-latest";
+const config = {
+  srcDir: "/tmp",
+  getSessionDir: (_workspaceId: string) => "/tmp",
+} as unknown as Config;
+
+// r41/r42: the admissionEpochStale probe is a session-level backstop for
+// context-discarding mutations that complete while a send is between its
+// entry check and admission. WorkspaceService normally makes that scenario
+// impossible (mutations refuse while sends are in preflight, r42), so these
+// tests drive the probe directly to pin the backstop contracts: no stream
+// over a stale snapshot, and accepted sends are notified so internal callers
+// can revert delivered-state bookkeeping.
+describe("AgentSession.sendMessage (admission gates)", () => {
+  let historyCleanup: (() => Promise<void>) | undefined;
+
+  async function createSessionHarness(workspaceId: string) {
+    const { historyService, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+
+    const streamMessage = mock(() => Promise.resolve(Ok(undefined)));
+    const aiService = Object.assign(new EventEmitter(), {
+      isStreaming: mock((_workspaceId: string) => false),
+      stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
+      streamMessage: streamMessage as unknown as AIService["streamMessage"],
+    }) as unknown as AIService;
+
+    return {
+      historyService,
+      streamMessage,
+      session: new AgentSession({
+        workspaceId,
+        config,
+        historyService,
+        aiService,
+        initStateManager: new EventEmitter() as unknown as InitStateManager,
+        backgroundProcessManager: {
+          cleanup: mock((_workspaceId: string) => Promise.resolve()),
+          setMessageQueued: mock((_workspaceId: string, _queued: boolean) => {
+            void _queued;
+          }),
+        } as unknown as BackgroundProcessManager,
+      }),
+    };
+  }
+
+  afterEach(async () => {
+    await historyCleanup?.();
+  });
+
+  it("refuses at the pre-persist gate before any row lands when the epoch is stale", async () => {
+    const workspaceId = "ws-epoch-prepersist";
+    const { session, historyService, streamMessage } = await createSessionHarness(workspaceId);
+    const appendMany = spyOn(historyService, "appendManyToHistory");
+    let acceptedCalls = 0;
+
+    const result = await session.sendMessage(
+      "family trigger",
+      { model: TEST_MODEL, agentId: "exec" },
+      {
+        synthetic: true,
+        preTurnMessages: [
+          createMuxMessage("family-payload-stale", "assistant", "untrusted payload", {
+            timestamp: 1,
+            synthetic: true,
+          }),
+        ],
+        onAccepted: () => {
+          acceptedCalls += 1;
+        },
+        admissionEpochStale: () => true,
+      }
+    );
+
+    expect(result).toEqual({
+      success: false,
+      error: { type: "unknown", raw: CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE },
+    });
+    // Pre-acceptance refusal: nothing persisted, nothing accepted, no stream.
+    expect(acceptedCalls).toBe(0);
+    expect(appendMany).not.toHaveBeenCalled();
+    expect(streamMessage).not.toHaveBeenCalled();
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success ? history.data : ["unexpected"]).toHaveLength(0);
+  });
+
+  it("notifies accepted sends refused at the PREPARING gate and never streams", async () => {
+    const workspaceId = "ws-epoch-preparing";
+    const { session, streamMessage } = await createSessionHarness(workspaceId);
+    // The epoch goes stale only after acceptance — models a mutation
+    // committing between row persistence and PREPARING (reachable only via
+    // entry-accounting bypasses; see r42 in WorkspaceService).
+    let stale = false;
+    let acceptedCalls = 0;
+    const failures: SendMessageError[] = [];
+
+    const result = await session.sendMessage(
+      "hello",
+      { model: TEST_MODEL, agentId: "exec" },
+      {
+        synthetic: true,
+        onAccepted: () => {
+          acceptedCalls += 1;
+          stale = true;
+        },
+        onAcceptedPreStreamFailure: (error) => {
+          failures.push(error);
+        },
+        admissionEpochStale: () => stale,
+      }
+    );
+
+    expect(result).toEqual({
+      success: false,
+      error: { type: "unknown", raw: CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE },
+    });
+    // Accepted, then notified so delivered-state bookkeeping can revert
+    // (terminal-attention outbox contract, r41) — and the stale snapshot
+    // never streams.
+    expect(acceptedCalls).toBe(1);
+    expect(failures).toEqual([{ type: "unknown", raw: CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE }]);
+    expect(streamMessage).not.toHaveBeenCalled();
+  });
+});

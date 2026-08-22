@@ -2904,6 +2904,17 @@ export class WorkspaceService extends EventEmitter {
       guard[Symbol.dispose]();
       return Err(`Cannot ${operation} while a turn is active. Press Esc to stop the stream first.`);
     }
+    // r42: a send between its entry check and admission may have passed its
+    // pre-persist gate but not yet appended its rows. If this mutation
+    // committed first, those rows — including attacker-influenced family
+    // payload rows — would land durably in the fresh context: the epoch gate
+    // blocks the send's stream but cannot un-append. Refuse instead; sends
+    // settle in bounded time and the user retries. Counted synchronously at
+    // the send's entry, so one side always observes the other.
+    if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
+      guard[Symbol.dispose]();
+      return Err(`Cannot ${operation} while a message is being sent. Try again in a moment.`);
+    }
     return Ok(guard);
   }
 

@@ -3368,9 +3368,10 @@ export class AgentSession {
     // rows composed against the discarded context (snapshots, family
     // payloads, the user row) land in the fresh transcript even though the
     // PREPARING gate below refuses the turn. Still pre-acceptance here, so a
-    // plain Err keeps cancellation/rollback contracts clean. The gate below
-    // remains the airtight backstop for a mutation completing between this
-    // check and acceptance.
+    // plain Err keeps cancellation/rollback contracts clean. Mutations also
+    // refuse while sends are in preflight (r42), so rows can no longer land
+    // after a mutation commits; this check and the PREPARING gate remain
+    // backstops for entry-accounting bypasses.
     if (this.turnAdmissionBlocks > 0 || internal?.admissionEpochStale?.() === true) {
       return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
     }
@@ -3613,9 +3614,11 @@ export class AgentSession {
     // same synchronous block that would set PREPARING: streaming would
     // snapshot the transcript the mutation is about to discard and repopulate
     // the cleared context. The turn rows persisted above land pre-mutation,
-    // so the mutation itself discards them. The epoch probe (r41) also
-    // refuses when such a mutation COMPLETED during the awaits above — the
-    // level check alone misses start-and-finish-before-resume.
+    // so the mutation itself discards them. The epoch probe (r41) is a
+    // backstop for a mutation that COMPLETED during the awaits above —
+    // normally impossible since mutations refuse while sends are in
+    // preflight (r42), but kept for paths that bypass WorkspaceService
+    // entry accounting.
     if (this.turnAdmissionBlocks > 0 || internal?.admissionEpochStale?.() === true) {
       const error = createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE);
       // The turn was already accepted (rows durable, onAccepted ran):
