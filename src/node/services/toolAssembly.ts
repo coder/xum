@@ -11,6 +11,7 @@
 
 import type { Tool } from "ai";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
+import { getErrorMessage } from "@/common/utils/errors";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import type { SendMessageOptions } from "@/common/orpc/types";
 
@@ -345,7 +346,19 @@ export async function applyToolPolicyAndExperiments(
         toolsForModel = { ...toolsForModel, ...rollback };
       }
     } catch (error) {
-      // Fall back to policy-filtered tools if PTC creation fails
+      // RLM fails CLOSED (r49): silently degrading to the complete flat
+      // toolset would drop the exclusive persistent kernel and its
+      // nested-result context isolation while the run is still recorded as
+      // RLM — bulk tool results would leak into model context and corrupt
+      // RLM evaluations. Surfacing the failure lets the send fail visibly
+      // and the user retry once the cause (e.g. QuickJS WASM load) clears.
+      if (rlmActive) {
+        throw new Error(
+          `RLM kernel assembly failed and RLM must not silently fall back to flat tools: ${getErrorMessage(error)}`
+        );
+      }
+      // Non-RLM PTC keeps the legacy behavior: fall back to policy-filtered
+      // tools if code_execution creation fails.
       log.error("Failed to create code_execution tool, falling back to base tools", { error });
     }
   }

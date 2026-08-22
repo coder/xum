@@ -160,6 +160,44 @@ export function validateSkillWriteProposal(args: {
   return { ok: true };
 }
 
+/**
+ * Lexically resolve the host-local project-scope path a skill write would
+ * land on. Used by refine staging/apply to fingerprint the CURRENT target
+ * content so apply can refuse staged writes whose target changed after
+ * staging (r49). Built from the same primitives the execute path uses
+ * (SkillNameSchema, resolveSkillFilePath, isSkillMarkdownRootFile,
+ * SKILL_FILENAME) so it cannot drift lexically; deliberately excludes
+ * symlink/containment checks — the real tool re-validates those
+ * authoritatively when the write executes, and a fingerprint read through a
+ * divergent path only fails the apply closed.
+ */
+export function resolveProjectSkillWriteTargetPath(args: {
+  projectRoot: string;
+  name: string;
+  filePath?: string | null;
+}): { ok: true; path: string } | { ok: false; error: string } {
+  const parsedName = SkillNameSchema.safeParse(args.name);
+  if (!parsedName.success) {
+    return { ok: false, error: parsedName.error.message };
+  }
+  const skillDir = path.join(
+    args.projectRoot,
+    getCanonicalProjectMetadataRelativePath("skills"),
+    parsedName.data
+  );
+  try {
+    const resolved = resolveSkillFilePath(skillDir, args.filePath ?? SKILL_FILENAME);
+    // Same casing canonicalization as the execute path: any SKILL.md casing
+    // variant writes the canonical filename.
+    const normalizedRelativePath = isSkillMarkdownRootFile(resolved.normalizedRelativePath)
+      ? SKILL_FILENAME
+      : resolved.normalizedRelativePath;
+    return { ok: true, path: path.join(skillDir, normalizedRelativePath) };
+  } catch (error) {
+    return { ok: false, error: getErrorMessage(error) };
+  }
+}
+
 /** Create or update files in the contextual skills directory. */
 export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration) => {
   return tool({

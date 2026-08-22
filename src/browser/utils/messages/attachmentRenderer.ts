@@ -125,52 +125,24 @@ function renderCompletedReportsIndexWithBudget(
 }
 
 /**
- * Conservative allowlist for rendering a repo-controlled path verbatim.
- * Deliberately excludes whitespace: multi-word prose (the shape instructions
- * take) cannot be spelled without it, while real repo paths almost never
- * need it. Also excludes quotes/angle brackets and every control character,
- * and caps length so a single path cannot dominate the block. Backslash is
- * allowed for Windows paths — JSON quoting escapes it, and without
- * whitespace it cannot help spell prose.
- */
-const SAFE_RENDERABLE_PATH_RE = /^[A-Za-z0-9._/@#%+=,:~^()[\]\\-]{1,256}$/;
-
-/** djb2 (xor) — stable, dependency-free label hash; NOT a security boundary. */
-function hashPathLabel(path: string): string {
-  let hash = 5381;
-  for (let i = 0; i < path.length; i++) {
-    hash = ((hash << 5) + hash) ^ path.charCodeAt(i);
-  }
-  return (hash >>> 0).toString(16).padStart(8, "0");
-}
-
-/**
- * SECURITY AUDIT: repo-controlled paths are embedded in a synthetic
- * <system-update> block inside a USER-role post-compaction message — a
- * high-trust channel that recurs on every turn after compaction summarized
- * the original tool result away. Escaping tag syntax alone is insufficient
- * there: a filename spelling out instructions would survive as readable
- * prose with user-message priority (persistent prompt injection, Codex
- * r48). Paths are therefore rendered verbatim ONLY when they match a
- * conservative no-whitespace allowlist; anything else is replaced by an
- * opaque, stable handle (the attacker's bytes never enter model context —
- * only a hex label useful for correlating repeat mentions). The JSON quoting
- * on allowlisted paths is kept as defense in depth.
- */
-function serializeUntrustedPath(path: string): string {
-  if (SAFE_RENDERABLE_PATH_RE.test(path)) {
-    return JSON.stringify(path);
-  }
-  return `[unrenderable path #${hashPathLabel(path)}]`;
-}
-
-/**
- * Render the RLM read-files list compactly: paths only (newest-first), so the
- * model knows which files it has already seen without re-reading them.
+ * SECURITY AUDIT: this attachment lands in a synthetic <system-update> block
+ * inside a USER-role post-compaction message — a high-trust channel that
+ * recurs on every turn after compaction summarized the original tool results
+ * away. File paths are repo-controlled bytes: tag-syntax escaping preserved
+ * instruction prose (Codex r48), and any charset allowlist still lets
+ * separator characters encode readable instructions
+ * (IGNORE_ALL_PREVIOUS_INSTRUCTIONS, r49). No filter renders attacker text
+ * safe in this channel, so NO path bytes are rendered at all — only the
+ * count, which is derived from list length, not attacker content. The model
+ * loses the per-path dedup hint and may re-read a file; that is the accepted
+ * cost of closing a persistent prompt-injection channel.
  */
 function renderReadFilesReference(attachment: ReadFilesReferenceAttachment): string {
-  const serialized = attachment.paths.map(serializeUntrustedPath);
-  return `Files previously read (contents summarized away; re-read only if needed): ${serialized.join(", ")}`;
+  const count = attachment.paths.length;
+  return (
+    `${count} previously read file${count === 1 ? "" : "s"} had their contents ` +
+    `summarized away by compaction; re-read files when their contents are needed again.`
+  );
 }
 
 /**

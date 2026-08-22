@@ -87,7 +87,11 @@ import {
 import { runRefinePass } from "@/node/services/refinement/refineRunner";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { TimelineService } from "@/node/services/timelineService";
-import { createAgentSkillWriteTool } from "@/node/services/tools/agent_skill_write";
+import * as fsPromises from "node:fs/promises";
+import {
+  createAgentSkillWriteTool,
+  resolveProjectSkillWriteTargetPath,
+} from "@/node/services/tools/agent_skill_write";
 import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { createRefineSummaryMessageId } from "@/node/services/utils/messageIds";
 
@@ -553,6 +557,14 @@ export class RefineService {
     // cause is fixed. Executed edits are marked attempted and never replay.
     // Re-examined fresh each pass, hence in-pass only (never persisted).
     const skipFailures = new Map<string, string>();
+    // r49: staged skill-write target verification needs the same confined
+    // project root the tool writes under. Resolved once; per-edit hashes are
+    // recomputed inside the loop right before execution.
+    const skillTargetProjectRoot = staged.edits.some(
+      (edit) => edit.tool === "agent_skill_write" && edit.targetContentHash !== undefined
+    )
+      ? await this.resolveSkillWriteProjectRoot(workspaceId)
+      : undefined;
     for (const edit of staged.edits) {
       // Applied (or at least attempted) before a crash: never replay.
       if (attempted.has(edit.toolCallId)) continue;
@@ -585,6 +597,29 @@ export class RefineService {
           `input failed schema validation: ${parsedInput.error.message.slice(0, 200)}`
         );
         continue;
+      }
+      // r49: agent_skill_write is a full-file overwrite — refuse when the
+      // target changed after staging (manual edit or another agent): the
+      // proposal was generated against the OLD contents, so applying now
+      // would silently clobber the newer file. Never-executed skip: no side
+      // effects, and a retry of this same staged set can never succeed —
+      // the reason tells the user to restage.
+      if (edit.tool === "agent_skill_write" && edit.targetContentHash !== undefined) {
+        const currentHash =
+          skillTargetProjectRoot === undefined
+            ? undefined
+            : await this.fingerprintSkillWriteTarget(skillTargetProjectRoot, edit.input);
+        if (currentHash !== edit.targetContentHash) {
+          log.warn("[Refine] staged edit skipped: target changed since staging", {
+            workspaceId,
+            tool: edit.tool,
+          });
+          skipFailures.set(
+            edit.toolCallId,
+            "target file changed since this proposal was staged; run /refine again to restage"
+          );
+          continue;
+        }
       }
       try {
         const result: unknown = await tool.execute(parsedInput.data, {
@@ -1016,16 +1051,23 @@ export class RefineService {
         );
       }
 
+      // r49: fingerprint each staged skill write's CURRENT target before the
+      // set is saved and hash-bound to the proposal row, so apply can refuse
+      // full-file writes whose target changed after staging. Enriched BEFORE
+      // both the save and hashStagedRefineSet below — the approval hash must
+      // cover the exact persisted set.
+      const stagedEdits = await this.fingerprintSkillWriteTargets(workspaceId, result.stagedEdits);
+
       // Every completed pass REPLACES the staged set (one per workspace):
       // stale proposals from an older trajectory must not linger behind a
       // newer no-op result.
-      if (result.stagedEdits.length > 0) {
+      if (stagedEdits.length > 0) {
         await saveStagedRefineSet(sessionDir, {
           version: 1,
           workspaceId,
           createdAt: Date.now(),
           summary,
-          edits: result.stagedEdits,
+          edits: stagedEdits,
         });
       } else {
         await clearStagedRefineSet(sessionDir);
@@ -1038,8 +1080,8 @@ export class RefineService {
       if (!record.noOp) {
         const proposalDurable = await this.appendSummaryMessage(workspaceId, record, {
           mode: "staged",
-          edits: result.stagedEdits,
-          stagedSetHash: hashStagedRefineSet(result.stagedEdits),
+          edits: stagedEdits,
+          stagedSetHash: hashStagedRefineSet(stagedEdits),
         });
         // Approval is hash-bound to this rendered row; without it apply fails
         // closed ("no staged refine proposal found"). Reporting staged
@@ -1095,6 +1137,83 @@ export class RefineService {
   }
 
   /**
+   * sha256 fingerprint of a staged agent_skill_write edit's CURRENT target
+   * file, "absent" when it does not exist, or undefined when the target
+   * cannot be resolved or read (invalid input is rejected by apply's schema
+   * check regardless).
+   */
+  private async fingerprintSkillWriteTarget(
+    projectRoot: string,
+    input: unknown
+  ): Promise<string | undefined> {
+    const parsed = TOOL_DEFINITIONS.agent_skill_write.schema.safeParse(input);
+    if (!parsed.success) return undefined;
+    const resolved = resolveProjectSkillWriteTargetPath({
+      projectRoot,
+      name: parsed.data.name,
+      filePath: parsed.data.filePath,
+    });
+    if (!resolved.ok) return undefined;
+    try {
+      const content = await fsPromises.readFile(resolved.path);
+      return createHash("sha256").update(content).digest("hex");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return "absent";
+      return undefined;
+    }
+  }
+
+  /**
+   * Enrich staged skill writes with target fingerprints (r49):
+   * agent_skill_write is a full-file overwrite, so apply must be able to
+   * detect a target edited after staging and refuse to clobber it. Memory
+   * edits are excluded — their command semantics carry their own conflict
+   * behavior (create fails on existing files, str_replace verifies its
+   * anchor text).
+   */
+  private async fingerprintSkillWriteTargets(
+    workspaceId: string,
+    edits: StagedRefineEdit[]
+  ): Promise<StagedRefineEdit[]> {
+    if (!edits.some((edit) => edit.tool === "agent_skill_write")) return edits;
+    const projectRoot = await this.resolveSkillWriteProjectRoot(workspaceId);
+    if (projectRoot === undefined) return edits;
+    return Promise.all(
+      edits.map(async (edit) => {
+        if (edit.tool !== "agent_skill_write") return edit;
+        const targetContentHash = await this.fingerprintSkillWriteTarget(projectRoot, edit.input);
+        return targetContentHash === undefined ? edit : { ...edit, targetContentHash };
+      })
+    );
+  }
+
+  /**
+   * The checkout root skill writes are confined to, under the same guards
+   * buildSkillWriteTool applies (host-local, single project) — shared by the
+   * r49 target fingerprinting so its path resolution cannot drift from the
+   * tool the apply executes. Undefined disables both.
+   */
+  private async resolveSkillWriteProjectRoot(workspaceId: string): Promise<string | undefined> {
+    try {
+      const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
+      if (!metadataResult.success) return undefined;
+      const metadata = metadataResult.data;
+      const runtimeType = metadata.runtimeConfig.type;
+      if (runtimeType === "ssh" || runtimeType === "docker") return undefined;
+      if ((metadata.projects?.length ?? 0) > 1) return undefined;
+      const workspace = this.config.findWorkspace(workspaceId);
+      if (!workspace) return undefined;
+      return workspace.workspacePath;
+    } catch (error) {
+      log.debug("[Refine] skill project root unresolved", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      return undefined;
+    }
+  }
+
+  /**
    * Standard agent_skill_write tool confined to the workspace checkout's
    * .xum/skills (project scope). Only for host-local single-project
    * workspaces: remote runtimes would need a live runtime connection and
@@ -1107,15 +1226,8 @@ export class RefineService {
     sessionDir: string
   ): Promise<Tool | undefined> {
     try {
-      const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
-      if (!metadataResult.success) return undefined;
-      const metadata = metadataResult.data;
-      const runtimeType = metadata.runtimeConfig.type;
-      if (runtimeType === "ssh" || runtimeType === "docker") return undefined;
-      if ((metadata.projects?.length ?? 0) > 1) return undefined;
-      const workspace = this.config.findWorkspace(workspaceId);
-      if (!workspace) return undefined;
-      const projectRoot = workspace.workspacePath;
+      const projectRoot = await this.resolveSkillWriteProjectRoot(workspaceId);
+      if (projectRoot === undefined) return undefined;
 
       // Minimal host-local ToolConfiguration: the project-local skill path
       // only touches fs/promises under xumScope roots; workspaceSessionDir +

@@ -641,14 +641,42 @@ export class QuickJSRuntime implements IJSRuntime {
     fnHandle.dispose();
   }
 
+  /**
+   * Array.isArray over a guest handle. Named properties DO store on a guest
+   * array (the read-back verify passes) but JSON.stringify(vars) ignores
+   * them, so a load landing on `vars = []` would report success while the
+   * next snapshot durably commits `[]` — after a restart the loaded key is
+   * gone (r49, same normalization as storeResultHandle's guest code).
+   */
+  private isGuestArray(handle: QuickJSHandle): boolean {
+    const arrayCtor = this.ctx.getProp(this.ctx.global, "Array");
+    const isArrayFn = this.ctx.getProp(arrayCtor, "isArray");
+    try {
+      const call = this.ctx.callFunction(isArrayFn, this.ctx.undefined, handle);
+      if (call.error) {
+        call.error.dispose();
+        return false;
+      }
+      const result: unknown = this.ctx.dump(call.value);
+      call.value.dispose();
+      return result === true;
+    } finally {
+      isArrayFn.dispose();
+      arrayCtor.dispose();
+    }
+  }
+
   setVarsProperty(key: string, value: string): void {
     this.assertNotDisposed("setVarsProperty");
     const valueHandle = this.ctx.newString(value);
     let varsHandle = this.ctx.getProp(this.ctx.global, "vars");
-    // vars is guest-writable: if the guest deleted or clobbered it (non-object
-    // or null), recreate the namespace instead of crashing the write mid-eval.
+    // vars is guest-writable: if the guest deleted or clobbered it (non-object,
+    // null, or an array whose named properties JSON.stringify would drop),
+    // recreate the namespace instead of crashing the write mid-eval.
     const clobbered =
-      this.ctx.typeof(varsHandle) !== "object" || this.ctx.eq(varsHandle, this.ctx.null);
+      this.ctx.typeof(varsHandle) !== "object" ||
+      this.ctx.eq(varsHandle, this.ctx.null) ||
+      this.isGuestArray(varsHandle);
     if (clobbered) {
       varsHandle.dispose();
       varsHandle = this.ctx.newObject();

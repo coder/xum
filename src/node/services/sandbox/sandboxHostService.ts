@@ -554,8 +554,11 @@ export class SandboxMount {
       // primitive/null namespace is already unusable state (every read
       // yields undefined or throws), so resetting it to a plain object is
       // strictly an improvement — the same recovery setVarsProperty applies
-      // for loads.
-      if (typeof vars !== "object" || vars === null) vars = {};
+      // for loads. Arrays too (r49): named properties DO store on an array
+      // (the read-back check passes) but JSON.stringify(vars) ignores them,
+      // so the snapshot would durably commit [] while the handle event was
+      // published — after a restart the advertised handle is gone.
+      if (typeof vars !== "object" || vars === null || Array.isArray(vars)) vars = {};
       const seq = nextHandleSeq();
       vars.__handleSeq = seq;
       const key = "__h" + seq;

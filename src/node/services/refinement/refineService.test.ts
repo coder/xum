@@ -1816,6 +1816,74 @@ describe("RefineService", () => {
     expect(await pathExists(skillFile)).toBe(false);
   });
 
+  it("refuses to apply a staged skill write whose target changed after staging (r49)", async () => {
+    // agent_skill_write is a full-file overwrite: a target edited manually
+    // (or by another agent) between staging and apply would be silently
+    // clobbered by a proposal generated against the OLD contents. The staged
+    // set records the target's fingerprint; apply recomputes and refuses on
+    // mismatch, retaining the newer file.
+    const skillMarkdown = [
+      "---",
+      "name: distilled-lesson",
+      "description: Run bun install before make test in this repo.",
+      "---",
+      "",
+      "Run `bun install` before `make test`.",
+      "",
+    ].join("\n");
+    using fixture = await createFixture({
+      withSkillTool: true,
+      modelFactory: () =>
+        toolCallModel(
+          [
+            {
+              toolCallId: "refine-skill-race-1",
+              toolName: "agent_skill_write",
+              input: { name: "distilled-lesson", content: skillMarkdown },
+            },
+          ],
+          "distilled-lesson: repo test setup procedure."
+        ),
+    });
+    await fixture.seedTrajectory();
+
+    const stagedResult = await fixture.service.run(WORKSPACE_ID);
+    expect(stagedResult.success).toBe(true);
+    if (!stagedResult.success) return;
+    expect(stagedResult.data.staged).toHaveLength(1);
+
+    // Target edited between staging and apply.
+    const skillFile = path.join(
+      fixture.workspacePath,
+      ".xum",
+      "skills",
+      "distilled-lesson",
+      "SKILL.md"
+    );
+    const newerContent = [
+      "---",
+      "name: distilled-lesson",
+      "description: Newer manual edit that must survive.",
+      "---",
+      "",
+      "keep me",
+      "",
+    ].join("\n");
+    await fsPromises.mkdir(path.dirname(skillFile), { recursive: true });
+    await fsPromises.writeFile(skillFile, newerContent, "utf-8");
+
+    const result = await fixture.service.apply(WORKSPACE_ID);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.applied).toHaveLength(0);
+    expect(result.data.failed).toHaveLength(1);
+    // The newer file was not clobbered and no journal row was written.
+    expect(await fsPromises.readFile(skillFile, "utf-8")).toBe(newerContent);
+    expect(await listRefinements(fixture.sessionDir)).toHaveLength(0);
+    // Never-executed skip: the staged set is retained (a restage replaces it).
+    expect(await loadStagedRefineSet(fixture.sessionDir)).not.toBeNull();
+  });
+
   it("refuses to stage a skill write the real tool would reject", async () => {
     // Codex round 19: the staging wrapper recorded agent_skill_write
     // proposals without the real tool's validation — an invalid-frontmatter
