@@ -472,6 +472,15 @@ export async function clearProviderConfigFixableAbandonMarkers(
   );
 }
 
+/**
+ * Rejection surfaced to sends refused because a context-discarding history
+ * mutation (reset, full clear, destructive replace) is in flight (r40).
+ * Shared with WorkspaceService's entry-point rejection so the user sees one
+ * message regardless of where the send was refused.
+ */
+export const CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE =
+  "Workspace history is being cleared or reset. Please wait and try again.";
+
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_BASE_DELAY_MS = 1_000;
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_MAX_DELAY_MS = 30_000;
 const MAX_STARTUP_RECOVERY_DEFERRED_ATTEMPTS = 4;
@@ -553,6 +562,12 @@ export class AgentSession {
   private turnPhase: TurnPhase = TurnPhase.IDLE;
   /** Edit-flow admission reservations currently holding busy-ness (see isBusy, r32). */
   private editAdmissionDepth = 0;
+  /**
+   * Context-discarding history mutations currently blocking turn admission
+   * (see holdTurnAdmission, r40). Deliberately NOT part of isBusy(): the
+   * holder itself requires an idle session.
+   */
+  private turnAdmissionBlocks = 0;
   private activePreparedTurnAbortController: AbortController | null = null;
   /**
    * Per-turn holder for mid-turn thinking-level overrides. Created when a turn
@@ -3023,6 +3038,16 @@ export class AgentSession {
         }
       }
 
+      // r40: same admission gate as the acceptance path below — the edit is
+      // about to truncate and rewrite history while a context-discarding
+      // mutation may sit between its busy check and its mutation. Checked in
+      // the same synchronous block that arms the edit reservation (which
+      // claims busy-ness), so whichever side runs first is observed by the
+      // other.
+      if (this.turnAdmissionBlocks > 0) {
+        return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+      }
+
       // Idle (or preempted to idle) now: hold busy-ness from here until the
       // turn phase takes over, so concurrent sends queue instead of racing the
       // truncate + summary + append sequence below.
@@ -3559,6 +3584,17 @@ export class AgentSession {
       acceptedPreStreamFailureNotified = true;
     };
 
+    // r40: a context-discarding mutation (reset, full clear, destructive
+    // replace) may have started while this send was validating and persisting
+    // rows — its busy checks saw an idle session. Refuse admission in the
+    // same synchronous block that would set PREPARING: streaming would
+    // snapshot the transcript the mutation is about to discard and repopulate
+    // the cleared context. The turn rows persisted above land pre-mutation,
+    // so the mutation itself discards them.
+    if (this.turnAdmissionBlocks > 0) {
+      return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+    }
+
     const preparedTurnAbortController = new AbortController();
     this.activePreparedTurnAbortController = preparedTurnAbortController;
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata);
@@ -3698,6 +3734,14 @@ export class AgentSession {
       if (!pricingGate.success) {
         return Err(pricingGate.error);
       }
+    }
+
+    // r40: refuse resume admission while a context-discarding mutation is
+    // mid-flight (see holdTurnAdmission) — checked in the same synchronous
+    // block that sets PREPARING. The auto-retry contract treats a non-started
+    // resume as retriable later.
+    if (this.turnAdmissionBlocks > 0) {
+      return Ok({ started: false });
     }
 
     // A resumed attempt becomes the latest live resume request as soon as we
@@ -4831,6 +4875,19 @@ export class AgentSession {
     };
 
     await this.finalizeCompactionRetry(data.messageId);
+
+    // r40: the completion path passes through a transient idle gap here — a
+    // context-discarding mutation admitted during that gap must not race the
+    // retry stream (it would snapshot the transcript the mutation discards).
+    // Skipping leaves the recovery decision to the terminal path, exactly
+    // like a retry that failed to start.
+    if (this.turnAdmissionBlocks > 0) {
+      log.info("Skipping compaction retry: a context-discarding history mutation is in progress", {
+        workspaceId: this.workspaceId,
+      });
+      return false;
+    }
+
     this.setAutoRetryResumeState(retryOptionsForResume, retryAgentInitiated, retryGoalKind);
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
       retryOptionsForResume.muxMetadata
@@ -4928,6 +4985,16 @@ export class AgentSession {
       messageId: data.messageId,
     });
     await this.clearFailedAssistantMessage(data.messageId, "post-compaction-retry");
+
+    // r40: same admission gate as the compaction retry above — this path also
+    // crosses a transient idle gap before re-entering PREPARING.
+    if (this.turnAdmissionBlocks > 0) {
+      log.info(
+        "Skipping post-compaction retry: a context-discarding history mutation is in progress",
+        { workspaceId: this.workspaceId }
+      );
+      return false;
+    }
 
     // Retry the same request, but without post-compaction injection.
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(context.options?.muxMetadata);
@@ -5669,6 +5736,49 @@ export class AgentSession {
   }
 
   /**
+   * Block new turn admission while a context-discarding history mutation
+   * (reset, full clear, destructive replace) runs (r40). Unlike
+   * editAdmissionDepth this does NOT claim busy-ness — the holder requires an
+   * idle session — it refuses turn starts during the mutation's awaits
+   * (refine drain + cross-process lock, up to seconds) that would otherwise
+   * snapshot the about-to-be-discarded transcript and stream across the
+   * mutation, repopulating the cleared context with derived output.
+   *
+   * Every idle→PREPARING entry point checks the counter in the same
+   * synchronous block that sets PREPARING (or arms busy-ness); the mutation
+   * arms this block and only then (re)checks busy-ness. On a single thread
+   * one side always observes the other: a turn admitted first fails the
+   * mutation's busy check, a mutation armed first fails the turn's admission
+   * check.
+   */
+  holdTurnAdmission(): Disposable {
+    this.turnAdmissionBlocks += 1;
+    let released = false;
+    return {
+      [Symbol.dispose]: () => {
+        if (released) {
+          return;
+        }
+        released = true;
+        this.turnAdmissionBlocks -= 1;
+        assert(this.turnAdmissionBlocks >= 0, "turnAdmissionBlocks must not go negative");
+        // Entries left queued while the block was held have no stream-end
+        // drain to dispatch them (the session stayed idle throughout) —
+        // drain now, mirroring the edit-admission release. Only when entries
+        // exist: releases from a session that never queued must stay
+        // side-effect free.
+        if (
+          this.turnAdmissionBlocks === 0 &&
+          this.turnPhase === TurnPhase.IDLE &&
+          !this.messageQueue.isEmpty()
+        ) {
+          this.sendQueuedMessages();
+        }
+      },
+    };
+  }
+
+  /**
    * Mid-turn thinking change: request that the active turn's next model step
    * uses `level`. Returns accepted:false when no turn is active — the caller
    * already persisted the setting, which covers the next turn. Last write wins
@@ -6157,6 +6267,13 @@ export class AgentSession {
     // trigger it off stream/tool events and disposal does not await stopStream().
     // If the session is already disposed, do nothing.
     if (this.disposed) {
+      return;
+    }
+
+    // r40: leave entries queued while a context-discarding mutation blocks
+    // turn admission — dispatching would set PREPARING and stream across the
+    // mutation. The block's release drains the queue (holdTurnAdmission).
+    if (this.turnAdmissionBlocks > 0) {
       return;
     }
 

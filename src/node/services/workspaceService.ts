@@ -29,6 +29,7 @@ import { isPathInsideDir } from "@/node/utils/pathUtils";
 import {
   AgentSession,
   clearProviderConfigFixableAbandonMarkers,
+  CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE,
   type StreamErrorRecoveryOutcome,
 } from "@/node/services/agentSession";
 import type { HistoryService } from "@/node/services/historyService";
@@ -1987,8 +1988,11 @@ export class WorkspaceService extends EventEmitter {
     | ((workspaceId: string, outcome: IdleCompactionOutcome) => void)
     | undefined;
 
-  // Blocks new sends while a context reset is committing its durable boundary and cleanup.
-  private readonly resettingContextWorkspaces = new Set<string>();
+  // Blocks new sends while a context-discarding history mutation (reset, full
+  // clear, destructive replace) is in flight, and enforces one such mutation
+  // at a time (r40). Sends already past this entry check are refused by the
+  // session-level turn-admission block (AgentSession.holdTurnAdmission).
+  private readonly contextMutationWorkspaces = new Set<string>();
 
   // Tracks in-flight fork auto-title generations so only the first accepted continue
   // message can claim the workspace title.
@@ -2832,6 +2836,42 @@ export class WorkspaceService extends EventEmitter {
         `Cannot ${operation} while a refine operation is in progress: ${getErrorMessage(error)}`
       );
     }
+  }
+
+  /**
+   * Admission guard for context-discarding history mutations (r40): reject
+   * new sends at the door (contextMutationWorkspaces), block turn admission
+   * inside the session, and only then verify idleness — all in one
+   * synchronous block, so no turn can slip between the check and the guard
+   * (see AgentSession.holdTurnAdmission for the pairing argument). Callers
+   * hold the guard across the whole mutation — including the refine
+   * drain/lock awaits — and must recheck busy-ness after those awaits for
+   * the turn starts that bypass admission gating (in-turn compaction
+   * retries observing a transient idle gap).
+   */
+  private acquireContextMutationAdmissionGuard(
+    workspaceId: string,
+    operation: "truncate history" | "reset context" | "replace history"
+  ): Result<Disposable> {
+    if (this.contextMutationWorkspaces.has(workspaceId)) {
+      return Err("A context reset or clear is already in progress for this workspace.");
+    }
+    const session = this.getOrCreateSession(workspaceId);
+    this.contextMutationWorkspaces.add(workspaceId);
+    const admissionHold = session.holdTurnAdmission();
+    const guard: Disposable = {
+      [Symbol.dispose]: () => {
+        this.contextMutationWorkspaces.delete(workspaceId);
+        admissionHold[Symbol.dispose]();
+      },
+    };
+    // Busy check AFTER arming the block: a turn admitted first is observed
+    // here; a turn admitted later observes the block and refuses.
+    if (session.isBusy() || this.aiService.isStreaming(workspaceId)) {
+      guard[Symbol.dispose]();
+      return Err(`Cannot ${operation} while a turn is active. Press Esc to stop the stream first.`);
+    }
+    return Ok(guard);
   }
 
   private getWorktreeArchiveBehavior(): "keep" | "delete" | "snapshot" {
@@ -8751,11 +8791,13 @@ export class WorkspaceService extends EventEmitter {
         });
       }
 
-      if (this.resettingContextWorkspaces.has(workspaceId)) {
-        log.debug("sendMessage blocked: context reset is in progress", { workspaceId });
+      if (this.contextMutationWorkspaces.has(workspaceId)) {
+        log.debug("sendMessage blocked: a context-discarding history mutation is in progress", {
+          workspaceId,
+        });
         return Err({
           type: "unknown",
-          raw: "Workspace context is resetting. Please wait and try again.",
+          raw: CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE,
         });
       }
 
@@ -9929,15 +9971,34 @@ export class WorkspaceService extends EventEmitter {
   }
 
   async truncateHistory(workspaceId: string, percentage?: number): Promise<Result<void>> {
-    const session = this.sessions.get(workspaceId);
-    if (session?.isBusy() || this.aiService.isStreaming(workspaceId)) {
+    const effectivePercentage = percentage ?? 1.0;
+    const isFullClear = effectivePercentage >= 1.0;
+    // A full clear holds the admission guard across the refine drain/lock
+    // awaits below: without it, a send admitted during those awaits could
+    // snapshot the pre-clear transcript and stream across the truncation,
+    // repopulating the cleared context. Partial truncation keeps the plain
+    // pre-check — no awaits sit between it and the truncation.
+    let admissionGuard: Disposable | null = null;
+    if (isFullClear) {
+      const guardResult = this.acquireContextMutationAdmissionGuard(
+        workspaceId,
+        "truncate history"
+      );
+      if (!guardResult.success) {
+        return Err(guardResult.error);
+      }
+      admissionGuard = guardResult.data;
+    } else if (
+      this.sessions.get(workspaceId)?.isBusy() ||
+      this.aiService.isStreaming(workspaceId)
+    ) {
       return Err(
         "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
       );
     }
+    using _admissionGuard = admissionGuard;
+    const session = this.sessions.get(workspaceId);
 
-    const effectivePercentage = percentage ?? 1.0;
-    const isFullClear = effectivePercentage >= 1.0;
     // A full clear discards the transcript a streaming refine pass may be
     // distilling — and unlike a reset it appends NO boundary marker, so the
     // pass's boundary identity stays null-to-null; only its segment-anchor
@@ -9957,6 +10018,14 @@ export class WorkspaceService extends EventEmitter {
       refineLock = refineLockResult.data;
     }
     await using _refineLock = refineLock;
+    // Recheck under the guard + lock: the admission block refuses ordinary
+    // turn starts during the awaits above, but in-turn compaction retries
+    // bypass admission gating when they cross a transient idle gap.
+    if (isFullClear && (session?.isBusy() || this.aiService.isStreaming(workspaceId))) {
+      return Err(
+        "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
+      );
+    }
     if (effectivePercentage > 0) {
       session?.clearUsageState();
     }
@@ -10038,18 +10107,18 @@ export class WorkspaceService extends EventEmitter {
   }
 
   async resetContext(workspaceId: string): Promise<Result<"reset" | "noop">> {
-    if (this.resettingContextWorkspaces.has(workspaceId)) {
-      return Err("Context reset is already in progress for this workspace.");
+    // Admission guard (r40): rejects duplicate mutations and new sends at the
+    // door, blocks turn admission inside the session, and verifies idleness —
+    // held across the refine drain/lock awaits below so a send admitted
+    // mid-reset cannot snapshot the pre-reset transcript and stream across
+    // the boundary.
+    const guardResult = this.acquireContextMutationAdmissionGuard(workspaceId, "reset context");
+    if (!guardResult.success) {
+      return Err(guardResult.error);
     }
-
-    this.resettingContextWorkspaces.add(workspaceId);
+    const admissionGuard = guardResult.data;
     try {
       const session = this.sessions.get(workspaceId);
-      if (session?.isBusy() || this.aiService.isStreaming(workspaceId)) {
-        return Err(
-          "Cannot reset context while a turn is active. Press Esc to stop the stream first."
-        );
-      }
 
       if (this.hasPendingQueuedOrPreparingTurn(workspaceId)) {
         return Err(
@@ -10079,6 +10148,15 @@ export class WorkspaceService extends EventEmitter {
         return Err(refineLockResult.error);
       }
       await using _refineLock = refineLockResult.data;
+
+      // Recheck under the guard + lock: the admission block refuses ordinary
+      // turn starts during the awaits above, but in-turn compaction retries
+      // bypass admission gating when they cross a transient idle gap.
+      if (session?.isBusy() || this.aiService.isStreaming(workspaceId)) {
+        return Err(
+          "Cannot reset context while a turn is active. Press Esc to stop the stream first."
+        );
+      }
 
       const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
       if (!historyResult.success) {
@@ -10206,7 +10284,7 @@ export class WorkspaceService extends EventEmitter {
 
       return Ok("reset");
     } finally {
-      this.resettingContextWorkspaces.delete(workspaceId);
+      admissionGuard[Symbol.dispose]();
     }
   }
 
@@ -10220,14 +10298,20 @@ export class WorkspaceService extends EventEmitter {
   ): Promise<Result<void>> {
     // Support both new enum ("user"|"idle") and legacy boolean (true)
     const isCompaction = !!summaryMessage.metadata?.compacted;
+    // Non-compaction replaces hold the admission guard (r40): the destructive
+    // path awaits the refine drain/lock below, and a send admitted during
+    // those awaits could snapshot the pre-replace transcript and stream
+    // across the mutation. Compaction replaces preserve context and run
+    // inside an active turn, so they stay unguarded.
+    let admissionGuard: Disposable | null = null;
     if (!isCompaction) {
-      const session = this.sessions.get(workspaceId);
-      if (session?.isBusy() || this.aiService.isStreaming(workspaceId)) {
-        return Err(
-          "Cannot replace history while a turn is active. Press Esc to stop the stream first."
-        );
+      const guardResult = this.acquireContextMutationAdmissionGuard(workspaceId, "replace history");
+      if (!guardResult.success) {
+        return Err(guardResult.error);
       }
+      admissionGuard = guardResult.data;
     }
+    using _admissionGuard = admissionGuard;
 
     const replaceMode = options?.mode ?? "destructive";
 
@@ -10309,6 +10393,18 @@ export class WorkspaceService extends EventEmitter {
           refineLock = refineLockResult.data;
         }
         await using _refineLock = refineLock;
+        // Recheck under the guard + lock: the admission block refuses
+        // ordinary turn starts during the awaits above, but in-turn
+        // compaction retries bypass admission gating when they cross a
+        // transient idle gap.
+        if (
+          !isCompaction &&
+          (this.sessions.get(workspaceId)?.isBusy() || this.aiService.isStreaming(workspaceId))
+        ) {
+          return Err(
+            "Cannot replace history while a turn is active. Press Esc to stop the stream first."
+          );
+        }
         this.sessions.get(workspaceId)?.clearUsageState();
         const clearResult = await this.clearHistoryWithRetiredBashMonitorWakes(
           workspaceId,

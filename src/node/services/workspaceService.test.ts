@@ -4647,6 +4647,209 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     }
   });
 
+  test("context-discarding mutations block send admission across their awaits (r40)", async () => {
+    // SECURITY: a full clear awaits the refine drain + cross-process lock
+    // BETWEEN its busy check and the truncation. A send admitted during that
+    // window would snapshot the pre-clear transcript and stream across the
+    // clear, repopulating the cleared context — so the mutation publishes an
+    // admission guard BEFORE its first await: new sends reject at the door
+    // and concurrent mutations are refused.
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "clear-blocks-sends";
+    try {
+      await config.addWorkspace("/tmp/clear-blocks-sends-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "clear-blocks-sends-project",
+        projectPath: "/tmp/clear-blocks-sends-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("pre-clear-user", "user", "before clear", {})
+      );
+      const drainStarted = createDeferred<void>();
+      const releaseDrain = createDeferred<void>();
+      workspaceService.setRefinePassCanceller({
+        cancelInFlightRefinePass: async () => {
+          drainStarted.resolve();
+          await releaseDrain.promise;
+        },
+      });
+
+      const clearPromise = workspaceService.truncateHistory(workspaceId);
+      await drainStarted.promise;
+
+      // Mid-await: the guard is already published.
+      const sendResult = await workspaceService.sendMessage(workspaceId, "hello", {
+        model: "anthropic:claude-sonnet-4-6",
+        thinkingLevel: "off",
+        toolPolicy: [],
+        agentId: "exec",
+      });
+      expect(sendResult).toEqual({
+        success: false,
+        error: {
+          type: "unknown",
+          raw: "Workspace history is being cleared or reset. Please wait and try again.",
+        },
+      });
+      expect(await workspaceService.resetContext(workspaceId)).toEqual({
+        success: false,
+        error: "A context reset or clear is already in progress for this workspace.",
+      });
+
+      releaseDrain.resolve();
+      expect(await clearPromise).toEqual({ success: true, data: undefined });
+      // Guard released: a follow-up mutation is admitted again.
+      expect(await workspaceService.resetContext(workspaceId)).toEqual({
+        success: true,
+        data: "noop",
+      });
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("full clear fails closed when a turn starts during its awaits (r40)", async () => {
+    // A turn start that bypasses send admission (in-turn compaction retries
+    // crossing a transient idle gap) can begin streaming while the clear sits
+    // in its refine drain/lock awaits. The busy recheck under the guard +
+    // lock must fail the mutation instead of truncating under a live stream.
+    let streaming = false;
+    const aiService = {
+      on: mock(() => undefined),
+      isStreaming: mock(() => streaming),
+    } as unknown as AIService;
+    const { config, historyService, workspaceService, cleanup } = await createServices(aiService);
+    const workspaceId = "clear-recheck-busy";
+    try {
+      await config.addWorkspace("/tmp/clear-recheck-busy-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "clear-recheck-busy-project",
+        projectPath: "/tmp/clear-recheck-busy-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("pre-clear-user", "user", "before clear", {})
+      );
+      workspaceService.setRefinePassCanceller({
+        cancelInFlightRefinePass: () => {
+          // A stream starts exactly inside the mutation's await window.
+          streaming = true;
+          return Promise.resolve();
+        },
+      });
+
+      const result = await workspaceService.truncateHistory(workspaceId);
+      expect(result).toEqual({
+        success: false,
+        error:
+          "Cannot truncate history while a turn is active. Press Esc to stop the stream first.",
+      });
+      // Failed closed: nothing was truncated under the live stream.
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success ? history.data : []).toHaveLength(1);
+
+      // Once the stream ends, the clear (and its admission guard) work again.
+      streaming = false;
+      workspaceService.setRefinePassCanceller({
+        cancelInFlightRefinePass: () => Promise.resolve(),
+      });
+      expect(await workspaceService.truncateHistory(workspaceId)).toEqual({
+        success: true,
+        data: undefined,
+      });
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a send already past the entry check is refused turn admission mid-clear (r40)", async () => {
+    // SECURITY (the exact r40 race): the send passed the workspace-level
+    // entry check BEFORE the clear started and is still persisting its rows
+    // when the clear arms the guard — the clear's busy checks see an idle
+    // session. The session-level admission block must refuse the turn in the
+    // same synchronous step that would set PREPARING, so the send can never
+    // snapshot the pre-clear transcript and stream across the truncation.
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "clear-blocks-inflight-send";
+    try {
+      await config.addWorkspace("/tmp/clear-blocks-inflight-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "clear-blocks-inflight-project",
+        projectPath: "/tmp/clear-blocks-inflight-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("pre-clear-user", "user", "before clear", {})
+      );
+
+      // Park the send at its user-row append: past every entry check,
+      // strictly before turn admission.
+      const appendReached = createDeferred<void>();
+      const releaseAppend = createDeferred<void>();
+      const originalAppend = historyService.appendToHistory.bind(historyService);
+      const appendSpy = spyOn(historyService, "appendToHistory").mockImplementationOnce(
+        async (...args: Parameters<HistoryService["appendToHistory"]>) => {
+          appendReached.resolve();
+          await releaseAppend.promise;
+          return originalAppend(...args);
+        }
+      );
+      const drainStarted = createDeferred<void>();
+      const releaseDrain = createDeferred<void>();
+      try {
+        const sendPromise = workspaceService.sendMessage(workspaceId, "hello", {
+          model: "anthropic:claude-sonnet-4-6",
+          thinkingLevel: "off",
+          toolPolicy: [],
+          agentId: "exec",
+        });
+        await appendReached.promise;
+
+        // The clear starts while the send is invisible (idle session) and
+        // parks inside its await window with the guard armed.
+        workspaceService.setRefinePassCanceller({
+          cancelInFlightRefinePass: async () => {
+            drainStarted.resolve();
+            await releaseDrain.promise;
+          },
+        });
+        const clearPromise = workspaceService.truncateHistory(workspaceId);
+        await drainStarted.promise;
+
+        // The send resumes: its user row lands (pre-clear), but turn
+        // admission is refused at the PREPARING gate.
+        releaseAppend.resolve();
+        const sendResult = await sendPromise;
+        expect(sendResult).toEqual({
+          success: false,
+          error: {
+            type: "unknown",
+            raw: "Workspace history is being cleared or reset. Please wait and try again.",
+          },
+        });
+
+        releaseDrain.resolve();
+        expect(await clearPromise).toEqual({ success: true, data: undefined });
+        // The refused send's user row landed pre-truncation and was wiped
+        // with the rest of the transcript — nothing repopulates the cleared
+        // context.
+        const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(history.success ? history.data : ["unexpected"]).toHaveLength(0);
+      } finally {
+        appendSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("context reset surfaces active-context history read failures", async () => {
     const { config, historyService, workspaceService, cleanup } = await createServices();
     const workspaceId = "context-reset-history-read-fails";
@@ -4861,7 +5064,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         const duplicateReset = await workspaceService.resetContext(workspaceId);
         expect(duplicateReset).toEqual({
           success: false,
-          error: "Context reset is already in progress for this workspace.",
+          error: "A context reset or clear is already in progress for this workspace.",
         });
 
         const sendResult = await workspaceService.sendMessage(workspaceId, "hello", {
@@ -4874,7 +5077,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
           success: false,
           error: {
             type: "unknown",
-            raw: "Workspace context is resetting. Please wait and try again.",
+            raw: "Workspace history is being cleared or reset. Please wait and try again.",
           },
         });
 
