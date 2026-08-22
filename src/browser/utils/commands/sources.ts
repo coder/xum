@@ -1139,22 +1139,29 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           });
         },
       });
+      // Truncation failures — including partial ones where history was
+      // deleted but durable cleanup (e.g. sandbox kernel invalidation)
+      // failed — must surface instead of silently resolving as success
+      // (mirrors the Reset Context action above).
+      const runTruncate = async (percentage: number) => {
+        const result = await p.api?.workspace.truncateHistory({ workspaceId: id, percentage });
+        if (result && !result.success) {
+          showCommandFeedbackToast({ type: "error", message: result.error });
+          throw new Error(result.error);
+        }
+      };
       list.push({
         id: CommandIds.chatClear(),
         title: "Clear History",
         section: section.chat,
-        run: async () => {
-          await p.api?.workspace.truncateHistory({ workspaceId: id, percentage: 1.0 });
-        },
+        run: () => runTruncate(1.0),
       });
       for (const pct of [0.75, 0.5, 0.25]) {
         list.push({
           id: CommandIds.chatTruncate(pct),
           title: `Truncate History to ${Math.round((1 - pct) * 100)}%`,
           section: section.chat,
-          run: async () => {
-            await p.api?.workspace.truncateHistory({ workspaceId: id, percentage: pct });
-          },
+          run: () => runTruncate(pct),
         });
       }
       list.push({

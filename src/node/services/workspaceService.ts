@@ -2874,6 +2874,24 @@ export class WorkspaceService extends EventEmitter {
     return Ok(guard);
   }
 
+  /**
+   * Block turn admission while a background service (/refine) publishes rows
+   * into an idle workspace's history or applies refinements (r40). Fails
+   * when a turn is active: foreign rows must not land inside a PREPARING
+   * snapshot window or between a streaming turn's user row and its response.
+   * Same Dekker pairing as acquireContextMutationAdmissionGuard, without the
+   * send entry-set — sends admitted after release see the completed append.
+   */
+  acquireIdleTurnExclusion(workspaceId: string): Result<Disposable> {
+    const session = this.getOrCreateSession(workspaceId);
+    const hold = session.holdTurnAdmission();
+    if (session.isBusy() || this.aiService.isStreaming(workspaceId)) {
+      hold[Symbol.dispose]();
+      return Err("a turn is preparing or streaming");
+    }
+    return Ok(hold);
+  }
+
   private getWorktreeArchiveBehavior(): "keep" | "delete" | "snapshot" {
     return (
       this.config.loadConfigOrDefault().worktreeArchiveBehavior ?? DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR

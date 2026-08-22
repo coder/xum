@@ -288,6 +288,12 @@ export class ServiceContainer {
         sessionUsageService: this.sessionUsageService,
         emitChatMessage: (workspaceId, message) =>
           this.workspaceService.emitChatEvent(workspaceId, { ...message, type: "message" }),
+        // r40: refine row publication and apply mutations must not interleave
+        // with a concurrent turn's PREPARING snapshot or split its
+        // user/assistant pair — hold the session's turn-admission block while
+        // they land, failing closed when a turn is active.
+        acquireTurnExclusion: (workspaceId) =>
+          this.workspaceService.acquireIdleTurnExclusion(workspaceId),
       }
     );
     // Removal must be able to abort + drain a running /refine pass before it

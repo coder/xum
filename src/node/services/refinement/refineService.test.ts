@@ -10,7 +10,7 @@ import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import { Err, Ok } from "@/common/types/result";
+import { Err, Ok, type Result } from "@/common/types/result";
 import { REFINE_SUMMARY_LABEL } from "@/constants/refine";
 import { Config } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
@@ -144,6 +144,8 @@ async function createFixture(options?: {
   onStagedEditAttempted?: (toolCallId: string) => void;
   /** Shortens the cross-process apply-lock acquisition timeout. */
   applyLockTimeoutMs?: number;
+  /** r40 turn-exclusion hook (busy-workspace refusal tests). */
+  acquireTurnExclusion?: (workspaceId: string) => Result<Disposable, string>;
 }): Promise<Fixture> {
   const tempDir = new TestTempDir("test-refine-service");
   const muxHome = path.join(tempDir.path, "mux-home");
@@ -203,6 +205,9 @@ async function createFixture(options?: {
       ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
       ...(options?.applyLockTimeoutMs !== undefined
         ? { applyLockTimeoutMs: options.applyLockTimeoutMs }
+        : {}),
+      ...(options?.acquireTurnExclusion !== undefined
+        ? { acquireTurnExclusion: options.acquireTurnExclusion }
         : {}),
       ...(options?.onStagedEditAttempted !== undefined
         ? { onStagedEditAttempted: options.onStagedEditAttempted }
@@ -406,6 +411,100 @@ describe("RefineService", () => {
     } finally {
       await foreignLock[Symbol.asyncDispose]();
     }
+  });
+
+  it("refuses to publish a proposal while a turn is active (r40)", async () => {
+    // A fire-and-forget /refine settling during a concurrent turn must not
+    // append its synthetic assistant proposal row into that turn's PREPARING
+    // snapshot window (or between the turn's user row and its response). The
+    // pass fails closed instead of staging/publishing.
+    using fixture = await createFixture({
+      modelFactory: () =>
+        toolCallModel(
+          [
+            {
+              toolCallId: "refine-edit-1",
+              toolName: "memory",
+              input: { command: "create", path: LESSON_PATH, file_text: "lesson\n" },
+            },
+          ],
+          `${LESSON_PATH}: lesson staged.`
+        ),
+      acquireTurnExclusion: () => Err("a turn is preparing or streaming"),
+    });
+    await fixture.seedTrajectory();
+
+    const result = await fixture.service.run(WORKSPACE_ID);
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error).toContain("run /refine again once the workspace is idle");
+    // Nothing was staged or published into the busy conversation.
+    expect(await loadStagedRefineSet(fixture.sessionDir)).toBeNull();
+    expect(fixture.emittedMessages).toHaveLength(0);
+  });
+
+  it("refuses to apply while a turn is active, retaining the staged set (r40)", async () => {
+    // Apply refuses BEFORE its first mutation: prompt/memory/skill edits and
+    // the audit row must not land mid-request. The staged set is retained so
+    // the user can re-approve once the workspace is idle.
+    let busy = false;
+    let holds = 0;
+    let disposals = 0;
+    using fixture = await createFixture({
+      modelFactory: () =>
+        toolCallModel(
+          [
+            {
+              toolCallId: "refine-edit-1",
+              toolName: "memory",
+              input: { command: "create", path: LESSON_PATH, file_text: "lesson\n" },
+            },
+          ],
+          `${LESSON_PATH}: lesson staged.`
+        ),
+      acquireTurnExclusion: () => {
+        if (busy) return Err("a turn is preparing or streaming");
+        holds += 1;
+        return Ok({
+          [Symbol.dispose]: () => {
+            disposals += 1;
+          },
+        });
+      },
+    });
+    await fixture.seedTrajectory();
+
+    const stagedResult = await fixture.service.run(WORKSPACE_ID);
+    expect(stagedResult.success).toBe(true);
+    // The run held the exclusion around its write section and released it.
+    expect(holds).toBe(1);
+    expect(disposals).toBe(1);
+
+    busy = true;
+    const applyResult = await fixture.service.apply(WORKSPACE_ID);
+    expect(applyResult.success).toBe(false);
+    if (applyResult.success) return;
+    expect(applyResult.error).toContain("run /refine apply again once the workspace is idle");
+    // No mutation, no journal row; the staged set survives for retry.
+    const lessonFile = path.join(
+      fixture.muxHome,
+      "sessions",
+      WORKSPACE_ID,
+      "memory",
+      "refine-lessons.md"
+    );
+    expect(await pathExists(lessonFile)).toBe(false);
+    expect(await listRefinements(fixture.sessionDir)).toHaveLength(0);
+    expect(await loadStagedRefineSet(fixture.sessionDir)).not.toBeNull();
+
+    // Idle again: the retained set applies cleanly and releases its hold.
+    busy = false;
+    const retryResult = await fixture.service.apply(WORKSPACE_ID);
+    expect(retryResult.success).toBe(true);
+    if (!retryResult.success) return;
+    expect(retryResult.data.applied).toHaveLength(1);
+    expect(holds).toBe(2);
+    expect(disposals).toBe(2);
   });
 
   it("rejects a concurrent invocation while a pass is in flight", async () => {

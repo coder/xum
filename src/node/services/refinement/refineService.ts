@@ -117,6 +117,17 @@ interface RefineServiceOptions {
   sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
   /** Live-session emission hook so the appended summary row renders immediately. */
   emitChatMessage?: (workspaceId: string, message: MuxMessage) => void;
+  /**
+   * Serialize refine row publication (and apply mutations) with the
+   * workspace's turn lifecycle (r40): returns a disposable holding the
+   * session's turn-admission block, or Err when a turn is already
+   * active/preparing. Without it, a fire-and-forget /refine settling during
+   * a concurrent turn could append its synthetic assistant row inside that
+   * turn's PREPARING window (entering the in-flight request snapshot) or
+   * between the turn's user row and its response. Absent in lightweight
+   * test fakes — appends then run unserialized, as before.
+   */
+  acquireTurnExclusion?: (workspaceId: string) => Result<Disposable, string>;
   /** Test seam: overrides REFINE_TIMEOUT_MS as the pass deadline. */
   timeoutMs?: number;
   /** Test seam: overrides the cross-process apply-lock acquisition timeout. */
@@ -457,6 +468,22 @@ export class RefineService {
     if (cancellationSignal.aborted) {
       return Err("refine apply cancelled (workspace removed)");
     }
+
+    // r40: block turn admission for the rest of the apply — mutations plus
+    // the audit-row append — failing closed BEFORE the first mutation when a
+    // turn is already active. Without this, a concurrent turn's PREPARING
+    // snapshot could ingest the audit row (or the row could split the turn's
+    // user/assistant pair), and prompt/memory/skill mutations would land
+    // mid-request.
+    const turnExclusionResult = this.acquireTurnExclusionIfWired(workspaceId);
+    if (!turnExclusionResult.success) {
+      return Err(
+        `a turn is active in this workspace (${turnExclusionResult.error}); refinements cannot ` +
+          `be applied into a running conversation — run /refine apply again once the workspace ` +
+          `is idle (nothing was applied)`
+      );
+    }
+    using _turnExclusion = turnExclusionResult.data;
 
     // CRASH SAFETY (consume-before-mutate): transition the staged file into
     // its applying state — persisted baseline + attempted list — BEFORE the
@@ -912,6 +939,22 @@ export class RefineService {
       }
       await using _stagingLock = stagingLock;
 
+      // r40: block turn admission across the recheck + staged-set
+      // replacement + proposal append, failing closed when a turn is already
+      // active. The boundary/anchor recheck below deliberately tolerates
+      // ordinary tail appends, so without this gate the proposal row could
+      // land inside a concurrent turn's PREPARING snapshot window or between
+      // its user row and its response.
+      const turnExclusionResult = this.acquireTurnExclusionIfWired(workspaceId);
+      if (!turnExclusionResult.success) {
+        return Err(
+          `a turn is active in this workspace (${turnExclusionResult.error}); the distilled ` +
+            `proposal cannot be published into a running conversation — run /refine again once ` +
+            `the workspace is idle`
+        );
+      }
+      using _turnExclusion = turnExclusionResult.data;
+
       // TOCTOU guard: the history snapshot above was taken before the model
       // streamed. A context reset, full clear, or compaction during
       // generation discards/replaces the distilled rows; publishing now
@@ -1107,6 +1150,18 @@ export class RefineService {
       });
       return undefined;
     }
+  }
+
+  /**
+   * r40: acquire the workspace's turn-admission block when the hook is
+   * wired; Ok(null) otherwise (lightweight test fakes). `using` accepts the
+   * null, so call sites stay uniform.
+   */
+  private acquireTurnExclusionIfWired(workspaceId: string): Result<Disposable | null, string> {
+    if (!this.options.acquireTurnExclusion) {
+      return Ok(null);
+    }
+    return this.options.acquireTurnExclusion(workspaceId);
   }
 
   /**

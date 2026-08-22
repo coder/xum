@@ -4767,6 +4767,57 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     }
   });
 
+  test("acquireIdleTurnExclusion refuses busy workspaces and blocks turn admission while held (r40)", async () => {
+    // /refine publication rides this exclusion: it must fail closed when a
+    // turn is active and, while held, refuse new turn admission so the
+    // published row cannot land inside a PREPARING snapshot window.
+    let streaming = true;
+    const aiService = {
+      on: mock(() => undefined),
+      isStreaming: mock(() => streaming),
+    } as unknown as AIService;
+    const { config, workspaceService, cleanup } = await createServices(aiService);
+    const workspaceId = "refine-turn-exclusion";
+    try {
+      await config.addWorkspace("/tmp/refine-turn-exclusion-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "refine-turn-exclusion-project",
+        projectPath: "/tmp/refine-turn-exclusion-project",
+        runtimeConfig: { type: "local" },
+      });
+
+      expect(workspaceService.acquireIdleTurnExclusion(workspaceId)).toEqual({
+        success: false,
+        error: "a turn is preparing or streaming",
+      });
+
+      streaming = false;
+      const exclusion = workspaceService.acquireIdleTurnExclusion(workspaceId);
+      expect(exclusion.success).toBe(true);
+      if (!exclusion.success) return;
+      try {
+        const sendResult = await workspaceService.sendMessage(workspaceId, "hello", {
+          model: "anthropic:claude-sonnet-4-6",
+          thinkingLevel: "off",
+          toolPolicy: [],
+          agentId: "exec",
+        });
+        expect(sendResult).toEqual({
+          success: false,
+          error: {
+            type: "unknown",
+            raw: "Workspace history is being cleared or reset. Please wait and try again.",
+          },
+        });
+      } finally {
+        exclusion.data[Symbol.dispose]();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("a send already past the entry check is refused turn admission mid-clear (r40)", async () => {
     // SECURITY (the exact r40 race): the send passed the workspace-level
     // entry check BEFORE the clear started and is still persisting its rows
