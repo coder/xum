@@ -143,13 +143,25 @@ export async function reclaimSupersededSnapshotBlobs(
       : // Recovery sweep: first persist for this scope since process start,
         // or a foreign append invalidated the cache. A ref mentioned by a
         // snapshot row of this scope IS some snapshot's blobHash — that is
-        // the kind's only ref-valued field.
+        // the kind's only ref-valued field. latestRef is deliberately NOT
+        // excluded (r44): a foreign backend may have published a NEWER
+        // snapshot for this scope between our publishWithBlob() releasing
+        // the blob lock and this pass acquiring it, making our just-published
+        // ref the superseded one — the journal-truth resolver below retains
+        // whichever ref is actually latest and reclaims the rest.
         [...index.entries()]
-          .filter(([ref, mentions]) => mentions.snapshotScopes.has(scopeKey) && ref !== latestRef)
+          .filter(([, mentions]) => mentions.snapshotScopes.has(scopeKey))
           .map(([ref]) => ref);
-    // Seed our own scope's latest (just published) so the common
-    // single-scope case never needs a journal read.
-    const resolveLatestSnapshot = makeSnapshotLatestResolver(journal, { scopeKey, ref: latestRef });
+    // Seed our own scope's latest ONLY on the incremental fast path: epoch
+    // equality proves no foreign append exists since our cache was recorded,
+    // so the ref we just published IS the journal's latest for this scope and
+    // the common single-scope case needs no journal read. Seeding the sweep
+    // would misreport a stale ref as latest and authorize deleting the
+    // scope's actual latest restore payload (r44) — the sweep resolver must
+    // read journal truth under the lock instead.
+    const resolveLatestSnapshot = incremental
+      ? makeSnapshotLatestResolver(journal, { scopeKey, ref: latestRef })
+      : makeSnapshotLatestResolver(journal);
     for (const ref of candidates) {
       const deletable = await canDeleteEvictedBlob({
         journal,

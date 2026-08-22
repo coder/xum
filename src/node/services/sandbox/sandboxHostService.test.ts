@@ -403,6 +403,33 @@ describe("SandboxHostService", () => {
     expect(await journalA.blobs.has(v3)).toBe(true);
   });
 
+  test("a foreign snapshot published between our publish and reclamation survives the sweep (r44)", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const publishSnapshot = async (journal: DurableEventJournal, content: string) => {
+      const { ref } = await journal.publishWithBlob(content, (blobHash, size) => ({
+        workspaceId: "ws-latest-race",
+        kind: "sandbox-vars-snapshot",
+        data: { scopeKey: "ws-latest-race", blobHash, size },
+      }));
+      return ref;
+    };
+    const journalA = new DurableEventJournal(tmp.path);
+    const journalB = new DurableEventJournal(tmp.path);
+
+    // Backend B publishes a NEWER snapshot for the same scope after A's
+    // publishWithBlob() released the blob lock but before A's reclamation
+    // pass acquired it: B's ref — not the one A is about to pass as
+    // "latest" — is the journal's latest. A resolver seeded with A's stale
+    // ref would consider vB superseded and delete the scope's actual restore
+    // payload, leaving the newest journal row unrestorable.
+    const vA = await publishSnapshot(journalA, '{"v":"A"}');
+    const vB = await publishSnapshot(journalB, '{"v":"B"}');
+    await reclaimSupersededSnapshotBlobs(journalA, "ws-latest-race", vA);
+    expect(await journalA.blobs.has(vB)).toBe(true);
+    // A's own ref is the superseded one — the same sweep reclaims it.
+    expect(await journalA.blobs.has(vA)).toBe(false);
+  });
+
   test("host→guest events: queue + drain via drainHostEvents()", async () => {
     using tmp = new DisposableTempDir("sandbox-host-test");
     const host = new SandboxHostService();

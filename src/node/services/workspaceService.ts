@@ -10147,14 +10147,6 @@ export class WorkspaceService extends EventEmitter {
         );
       }
     }
-    // r43: a fork's settled branch-summary registration stays consumable
-    // until the first send; its row is about to be deleted, so drop the
-    // registration too or the next send would re-emit the discarded summary
-    // into the live transcript (resurfacing pre-clear content that is absent
-    // from history after reload).
-    if (isFullClear) {
-      await clearPendingBranchSummary(workspaceId);
-    }
     if (effectivePercentage > 0) {
       session?.clearUsageState();
     }
@@ -10173,6 +10165,20 @@ export class WorkspaceService extends EventEmitter {
     // admitted afterwards (their content references the discarded context).
     if (isFullClear) {
       this.advanceContextMutationEpoch(workspaceId);
+    }
+    // r43: a fork's settled branch-summary registration stays consumable
+    // until the first send; its row was just deleted, so drop the
+    // registration too or the next send would re-emit the discarded summary
+    // into the live transcript (resurfacing pre-clear content that is absent
+    // from history after reload). Only AFTER the truncation commits (r44): a
+    // failed clear keeps the row in history, and dropping the registration
+    // first would leave that never-emitted row with nothing to emit it —
+    // hidden assistant context the user cannot see until a reload. Late
+    // in-flight writer appends stay safe either way via the compare-and-
+    // append tail guard, and the admission guard blocks consuming sends for
+    // this whole window.
+    if (isFullClear) {
+      await clearPendingBranchSummary(workspaceId);
     }
 
     const deletedSequences = truncateResult.data;
@@ -10303,11 +10309,6 @@ export class WorkspaceService extends EventEmitter {
           );
         }
       }
-      // r43: drop any settled-but-unconsumed branch-summary registration —
-      // its row lands behind the new boundary, and the next send would
-      // otherwise re-emit that pre-reset summary into the live transcript.
-      await clearPendingBranchSummary(workspaceId);
-
       const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
       if (!historyResult.success) {
         return Err(`Failed to read active context before reset: ${historyResult.error}`);
@@ -10369,6 +10370,16 @@ export class WorkspaceService extends EventEmitter {
       // be admitted afterwards (their content references the discarded
       // context).
       this.advanceContextMutationEpoch(workspaceId);
+      // r43: drop any settled-but-unconsumed branch-summary registration —
+      // its row now sits behind the new boundary, and the next send would
+      // otherwise re-emit that pre-reset summary into the live transcript.
+      // Only AFTER the boundary append commits (r44): a reset failing before
+      // the boundary lands keeps the row in the active context, and dropping
+      // the registration first would leave that never-emitted row invisible
+      // to the user until a reload while the provider still sees it. The
+      // later cleanup steps may still Err, but the discard itself is durable
+      // by this point, so the registration goes regardless.
+      await clearPendingBranchSummary(workspaceId);
 
       session?.clearUsageState();
 
@@ -10571,10 +10582,6 @@ export class WorkspaceService extends EventEmitter {
             );
           }
         }
-        // r43: same branch-summary hygiene as full clear (see truncateHistory).
-        if (!isCompaction) {
-          await clearPendingBranchSummary(workspaceId);
-        }
         this.sessions.get(workspaceId)?.clearUsageState();
         const clearResult = await this.clearHistoryWithRetiredBashMonitorWakes(
           workspaceId,
@@ -10588,6 +10595,10 @@ export class WorkspaceService extends EventEmitter {
           // r41: the destructive replacement is durable — refuse sends that
           // entered before it (see contextMutationEpochs).
           this.advanceContextMutationEpoch(workspaceId);
+          // r43: same branch-summary hygiene as full clear, and same r44
+          // ordering — drop the registration only after the clear commits
+          // (see truncateHistory).
+          await clearPendingBranchSummary(workspaceId);
           // A destructive non-compaction replace (e.g. "start here") begins a
           // new context segment: discard pre-boundary post-compaction
           // carryover like resetContext does, durable-or-fail for the same

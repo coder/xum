@@ -5001,6 +5001,86 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     }
   });
 
+  /**
+   * Seed a fork-shaped history and drive a background abandoned-branch
+   * summary until its row is durably appended, leaving the registration
+   * settled but unconsumed (the r43/r44 scenario: settled before the fork's
+   * first send). History ends up with 3 rows: m1, m2, summary.
+   */
+  async function seedSettledBranchSummaryRegistration(
+    historyService: HistoryService,
+    workspaceId: string
+  ): Promise<void> {
+    // Fork shape: kept rows end at the guard tail; the abandoned branch is
+    // meaty enough to clear the summarization threshold.
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("m1", "user", "original question", { timestamp: 1 })
+    );
+    await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("m2", "assistant", "branch point answer", { timestamp: 2 })
+    );
+    const filler = "investigated the flaky test and traced the race ".repeat(200);
+    const abandonedMessages = [
+      createMuxMessage("abandoned-user", "user", `Please fix this: ${filler}`, { timestamp: 3 }),
+      createMuxMessage("abandoned-assistant", "assistant", `Findings: ${filler}`, {
+        timestamp: 4,
+      }),
+    ];
+    const summaryAiService: BranchSummaryAiService = {
+      createModelWithPinnedMetadata: (modelString: string) =>
+        Promise.resolve(
+          Ok({
+            model: new MockLanguageModelV3({
+              doStream: () =>
+                Promise.resolve({
+                  stream: simulateReadableStream({
+                    chunks: [
+                      { type: "text-start", id: "t1" },
+                      { type: "text-delta", id: "t1", delta: "Abandoned: explored a race." },
+                      { type: "text-end", id: "t1" },
+                      {
+                        type: "finish",
+                        finishReason: { unified: "stop", raw: "stop" },
+                        usage: {
+                          inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
+                          outputTokens: { total: 5, text: 5, reasoning: 0 },
+                        },
+                      } satisfies LanguageModelV3StreamPart,
+                    ] satisfies LanguageModelV3StreamPart[],
+                  }),
+                }),
+            }),
+            metadataModel: modelString,
+          })
+        ) as ReturnType<BranchSummaryAiService["createModelWithPinnedMetadata"]>,
+      getWorkspaceMetadata: () =>
+        Promise.resolve(Ok({ aiSettings: { model: "anthropic:claude-haiku-4-5" } })) as ReturnType<
+          BranchSummaryAiService["getWorkspaceMetadata"]
+        >,
+    };
+    startAbandonedBranchSummaryInBackground({
+      historyService,
+      aiService: summaryAiService,
+      workspaceId,
+      abandonedMessages,
+      experiments: { rlm: true, programmaticToolCalling: true },
+      guardTailMessageId: "m2",
+    });
+    // Wait for the background generation to append + settle WITHOUT
+    // consuming the registration.
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (history.success && history.data.length === 3) return;
+      if (Date.now() > deadline) {
+        throw new Error("branch summary row never appended");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+
   test("a full clear drops a settled-but-unconsumed branch-summary registration (r43)", async () => {
     // A fork's summary can append and settle before the fork's first send;
     // the registration stays consumable so that send can emit the row. A
@@ -5017,75 +5097,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         projectPath: "/tmp/clear-drops-summary-project",
         runtimeConfig: { type: "local" },
       });
-      // Fork shape: kept rows end at the guard tail; the abandoned branch is
-      // meaty enough to clear the summarization threshold.
-      await historyService.appendToHistory(
-        workspaceId,
-        createMuxMessage("m1", "user", "original question", { timestamp: 1 })
-      );
-      await historyService.appendToHistory(
-        workspaceId,
-        createMuxMessage("m2", "assistant", "branch point answer", { timestamp: 2 })
-      );
-      const filler = "investigated the flaky test and traced the race ".repeat(200);
-      const abandonedMessages = [
-        createMuxMessage("abandoned-user", "user", `Please fix this: ${filler}`, { timestamp: 3 }),
-        createMuxMessage("abandoned-assistant", "assistant", `Findings: ${filler}`, {
-          timestamp: 4,
-        }),
-      ];
-      const summaryAiService: BranchSummaryAiService = {
-        createModelWithPinnedMetadata: (modelString: string) =>
-          Promise.resolve(
-            Ok({
-              model: new MockLanguageModelV3({
-                doStream: () =>
-                  Promise.resolve({
-                    stream: simulateReadableStream({
-                      chunks: [
-                        { type: "text-start", id: "t1" },
-                        { type: "text-delta", id: "t1", delta: "Abandoned: explored a race." },
-                        { type: "text-end", id: "t1" },
-                        {
-                          type: "finish",
-                          finishReason: { unified: "stop", raw: "stop" },
-                          usage: {
-                            inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
-                            outputTokens: { total: 5, text: 5, reasoning: 0 },
-                          },
-                        } satisfies LanguageModelV3StreamPart,
-                      ] satisfies LanguageModelV3StreamPart[],
-                    }),
-                  }),
-              }),
-              metadataModel: modelString,
-            })
-          ) as ReturnType<BranchSummaryAiService["createModelWithPinnedMetadata"]>,
-        getWorkspaceMetadata: () =>
-          Promise.resolve(
-            Ok({ aiSettings: { model: "anthropic:claude-haiku-4-5" } })
-          ) as ReturnType<BranchSummaryAiService["getWorkspaceMetadata"]>,
-      };
-      startAbandonedBranchSummaryInBackground({
-        historyService,
-        aiService: summaryAiService,
-        workspaceId,
-        abandonedMessages,
-        experiments: { rlm: true, programmaticToolCalling: true },
-        guardTailMessageId: "m2",
-      });
-      // Wait for the background generation to append + settle WITHOUT
-      // consuming the registration (the r43 scenario: settled before the
-      // first send).
-      const deadline = Date.now() + 10_000;
-      for (;;) {
-        const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
-        if (history.success && history.data.length === 3) break;
-        if (Date.now() > deadline) {
-          throw new Error("branch summary row never appended");
-        }
-        await new Promise((resolve) => setTimeout(resolve, 20));
-      }
+      await seedSettledBranchSummaryRegistration(historyService, workspaceId);
 
       expect(await workspaceService.truncateHistory(workspaceId)).toEqual({
         success: true,
@@ -5096,6 +5108,49 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
       expect(await awaitPendingBranchSummary(workspaceId)).toBeNull();
       const cleared = await historyService.getHistoryFromLatestBoundary(workspaceId);
       expect(cleared.success ? cleared.data : ["unexpected"]).toHaveLength(0);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a failed full clear retains the settled branch-summary registration (r44)", async () => {
+    // The registration is dropped only AFTER the truncation commits: dropping
+    // it first and then failing the write would leave the durable summary row
+    // in history with nothing left to emit it — the provider would see
+    // assistant context the user cannot see until a reload.
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "failed-clear-retains-registration";
+    try {
+      await config.addWorkspace("/tmp/failed-clear-retains-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "failed-clear-retains-project",
+        projectPath: "/tmp/failed-clear-retains-project",
+        runtimeConfig: { type: "local" },
+      });
+      await seedSettledBranchSummaryRegistration(historyService, workspaceId);
+
+      const truncateSpy = spyOn(historyService, "truncateHistory").mockImplementationOnce(() =>
+        Promise.resolve(Err("disk full"))
+      );
+      try {
+        expect(await workspaceService.truncateHistory(workspaceId)).toEqual({
+          success: false,
+          error: "disk full",
+        });
+      } finally {
+        truncateSpy.mockRestore();
+      }
+
+      // The registration survived the failed clear: the next send still
+      // consumes and emits the row, which remains in history.
+      const summary = await awaitPendingBranchSummary(workspaceId);
+      expect(summary).not.toBeNull();
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        expect(history.data.some((row) => row.id === summary?.id)).toBe(true);
+      }
     } finally {
       await cleanup();
     }
