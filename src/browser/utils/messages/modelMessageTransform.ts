@@ -1039,15 +1039,17 @@ function mergeConsecutiveAssistantTextMessages(messages: ModelMessage[]): ModelM
       // into one string: rebuilding parts as plain {type,text} would discard
       // part-level providerOptions (e.g. cacheControl) carried by the folded
       // row. Only the message envelope of the merged-away row is dropped.
-      // Empty text parts are filtered from BOTH sides — the previous row can
-      // itself carry one (extended thinking preserves signed-reasoning rows
-      // whose text part is empty) and Anthropic rejects empty text blocks;
-      // non-text parts (reasoning) pass through with their providerOptions.
+      // Empty and whitespace-only text parts are filtered from BOTH sides —
+      // the previous row can itself carry one (extended thinking preserves
+      // signed-reasoning rows whose text part is empty, and an interrupted
+      // stream can persist a whitespace-only delta) and Anthropic rejects
+      // text blocks without non-whitespace content; non-text parts
+      // (reasoning) pass through with their providerOptions.
       const dropEmptyText = <T extends { type: string; text?: unknown }>(part: T) =>
-        part.type !== "text" || (typeof part.text === "string" && part.text.length > 0);
+        part.type !== "text" || (typeof part.text === "string" && part.text.trim().length > 0);
       const currentParts: AssistantContentArray =
         typeof msg.content === "string"
-          ? msg.content.length > 0
+          ? msg.content.trim().length > 0
             ? [{ type: "text", text: msg.content }]
             : []
           : msg.content.filter(dropEmptyText);

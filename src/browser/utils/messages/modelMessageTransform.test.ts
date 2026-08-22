@@ -744,6 +744,40 @@ describe("modelMessageTransform", () => {
       ]);
     });
 
+    it("filters whitespace-only text from both sides of the merge (r46)", () => {
+      // An interrupted stream can persist a whitespace-only text delta on the
+      // signed-reasoning row; Anthropic rejects text blocks without
+      // non-whitespace content, so a nonzero-length whitespace part must be
+      // dropped like an empty one — from the previous row's parts and from
+      // incoming string content alike.
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "question" }] },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "reasoning",
+              text: "thinking...",
+              providerOptions: { anthropic: { signature: "sig" } },
+            },
+            { type: "text", text: "  \n" },
+          ],
+        },
+        { role: "assistant", content: "Summary of the abandoned branch: explored a race." },
+        { role: "assistant", content: " \t" },
+      ];
+      const result = transformModelMessages(messages, "anthropic");
+      expect(result).toHaveLength(2);
+      expect(result[1].content).toEqual([
+        {
+          type: "reasoning",
+          text: "thinking...",
+          providerOptions: { anthropic: { signature: "sig" } },
+        },
+        { type: "text", text: "Summary of the abandoned branch: explored a race." },
+      ]);
+    });
+
     it("keeps a summary row standalone after a tool-call/tool-result pair", () => {
       // Tool-call/tool-result adjacency must stay intact: when the branch
       // point turn ended in tool calls, the summary follows the TOOL message
