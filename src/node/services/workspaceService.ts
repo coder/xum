@@ -2001,6 +2001,15 @@ export class WorkspaceService extends EventEmitter {
   // pre-admission awaits (e.g. branch-summary generation).
   private readonly contextMutationEpochs = new Map<string, number>();
 
+  // r41: sends currently between the entry check and their settled outcome
+  // (queued, refused, or admitted — PREPARING is set before any early
+  // background-start return). Refine publication must not interleave with a
+  // send's pre-admission window: a proposal row published and RELEASED while
+  // a send with an already-persisted user row awaits admission would land
+  // after that user row and enter the send's request as a trailing foreign
+  // assistant row (see acquireIdleTurnExclusion).
+  private readonly preflightSendCounts = new Map<string, number>();
+
   // Tracks in-flight fork auto-title generations so only the first accepted continue
   // message can claim the workspace title.
   private readonly autoTitlingWorkspaces = new Set<string>();
@@ -2912,6 +2921,16 @@ export class WorkspaceService extends EventEmitter {
     if (session.isBusy() || this.aiService.isStreaming(workspaceId)) {
       hold[Symbol.dispose]();
       return Err("a turn is preparing or streaming");
+    }
+    // r41: a send between its entry check and admission looks idle here, but
+    // may have already persisted its user row — publishing and releasing
+    // before it resumes would slip the published row into its request as a
+    // trailing foreign assistant row. Refuse instead; the caller reports a
+    // retryable failure. Counted synchronously at the send's entry, so on a
+    // single thread one side always observes the other.
+    if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
+      hold[Symbol.dispose]();
+      return Err("a send is being admitted");
     }
     return Ok(hold);
   }
@@ -8850,6 +8869,25 @@ export class WorkspaceService extends EventEmitter {
       const admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
       const admissionEpochStale = () =>
         (this.contextMutationEpochs.get(workspaceId) ?? 0) !== admissionEpoch;
+      // r41: count this send as in-preflight until it settles so refine
+      // publication refuses to interleave with its pre-admission window
+      // (context mutations instead refuse the send itself via the epoch
+      // probe above). Released on every exit path; admitted sends have set
+      // PREPARING (busy) by the time sendMessage returns.
+      this.preflightSendCounts.set(
+        workspaceId,
+        (this.preflightSendCounts.get(workspaceId) ?? 0) + 1
+      );
+      using _preflightSend = {
+        [Symbol.dispose]: () => {
+          const remaining = (this.preflightSendCounts.get(workspaceId) ?? 1) - 1;
+          if (remaining <= 0) {
+            this.preflightSendCounts.delete(workspaceId);
+          } else {
+            this.preflightSendCounts.set(workspaceId, remaining);
+          }
+        },
+      };
 
       // Guard: avoid creating sessions for workspaces that don't exist anymore.
       const workspaceConfig = this.config.findWorkspace(workspaceId);

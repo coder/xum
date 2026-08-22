@@ -4818,6 +4818,66 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     }
   });
 
+  test("acquireIdleTurnExclusion refuses while a send is in its pre-admission window (r41)", async () => {
+    // Release-before-resume: a send past the entry check may have already
+    // persisted its user row while the session still looks idle. If refine
+    // published and released here, the proposal row would land after that
+    // user row and enter the send's request as a trailing foreign assistant
+    // row — the exclusion must refuse instead.
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "refine-preflight-send";
+    try {
+      await config.addWorkspace("/tmp/refine-preflight-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "refine-preflight-project",
+        projectPath: "/tmp/refine-preflight-project",
+        runtimeConfig: { type: "local" },
+      });
+
+      const appendReached = createDeferred<void>();
+      const releaseAppend = createDeferred<void>();
+      const originalAppend = historyService.appendToHistory.bind(historyService);
+      const appendSpy = spyOn(historyService, "appendToHistory").mockImplementationOnce(
+        async (...args: Parameters<HistoryService["appendToHistory"]>) => {
+          appendReached.resolve();
+          await releaseAppend.promise;
+          return originalAppend(...args);
+        }
+      );
+      try {
+        const sendPromise = workspaceService.sendMessage(workspaceId, "hello", {
+          model: "anthropic:claude-sonnet-4-6",
+          thinkingLevel: "off",
+          toolPolicy: [],
+          agentId: "exec",
+        });
+        await appendReached.promise;
+
+        expect(workspaceService.acquireIdleTurnExclusion(workspaceId)).toEqual({
+          success: false,
+          error: "a send is being admitted",
+        });
+
+        releaseAppend.resolve();
+        // The send fails at stream startup (no provider in this fixture) —
+        // only its settled outcome matters here.
+        await sendPromise;
+
+        // Preflight released: the exclusion is available again.
+        const exclusion = workspaceService.acquireIdleTurnExclusion(workspaceId);
+        expect(exclusion.success).toBe(true);
+        if (exclusion.success) {
+          exclusion.data[Symbol.dispose]();
+        }
+      } finally {
+        appendSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("a send predated by a COMPLETED clear is refused admission and notified (r41)", async () => {
     // Complete-before-resume: the send passes the entry check, parks in
     // pre-admission work, and the full clear starts AND FINISHES before it
