@@ -22,9 +22,12 @@ import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiment
 import { buildCompactionPrompt } from "@/common/constants/ui";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import {
   BRANCH_SUMMARY_MAX_ACCUMULATED_CHARS,
   BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
@@ -820,6 +823,22 @@ interface PendingBranchSummary {
 const pendingBranchSummaries = new Map<string, PendingBranchSummary>();
 
 /**
+ * Cross-process pending marker (r48): held in the fork target's session dir
+ * for the whole background generation + guarded append, so a first send
+ * served by another backend (XUM_ALLOW_MULTIPLE_INSTANCES=1) can wait for
+ * the row to land instead of advancing the guarded tail mid-generation.
+ */
+const BRANCH_SUMMARY_LOCK_FILENAME = "branch-summary.lock";
+/** Registration-side acquire: a fresh fork session dir is effectively
+ * uncontended, so failure here means something is wrong — degrade to
+ * process-local coordination rather than delaying the writer. */
+const BRANCH_SUMMARY_LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
+/** Foreign-send wait: generation is deadline-bounded; the margin covers the
+ * guarded append and scheduling. On timeout the send proceeds (best-effort,
+ * same posture as the summary itself). */
+const BRANCH_SUMMARY_LOCK_WAIT_TIMEOUT_MS = BRANCH_SUMMARY_TIMEOUT_MS + 15_000;
+
+/**
  * Start abandoned-branch summarization WITHOUT blocking the caller. Used by
  * fork: awaiting generation synchronously stalls the user-facing fork for
  * seconds even when it ultimately produces nothing. Instead the promise is
@@ -830,13 +849,46 @@ const pendingBranchSummaries = new Map<string, PendingBranchSummary>();
  * rejection behind.
  */
 export function startAbandonedBranchSummaryInBackground(
-  input: AbandonedBranchSummaryInput & { guardTailMessageId: string }
+  input: AbandonedBranchSummaryInput & { guardTailMessageId: string; sessionDir?: string }
 ): void {
   const controller = new AbortController();
-  const promise = maybeAppendAbandonedBranchSummary({
-    ...input,
-    cancellationSignal: controller.signal,
-  });
+  const promise = (async (): Promise<MuxMessage | null> => {
+    // Cross-process pending marker (r48): this registration map is
+    // process-local, so with XUM_ALLOW_MULTIPLE_INSTANCES=1 a first send
+    // served by ANOTHER backend would find no entry, append its user row
+    // immediately, and the guarded append below would drop the summary as a
+    // tail mismatch — permanently losing the abandoned-branch context the
+    // first-send wait exists to preserve. Hold a session-dir lockfile across
+    // generation + the guarded append so a foreign send can wait on it (see
+    // awaitPendingBranchSummary). Acquired inside the background promise:
+    // the registration itself stays synchronous, leaving a ~ms window before
+    // the marker lands that only a send racing the fork IPC return could
+    // hit. Best-effort like the summary itself — acquisition failure
+    // degrades to process-local coordination.
+    let lock: AsyncDisposable | null = null;
+    if (input.sessionDir !== undefined) {
+      try {
+        lock = await acquireProcessFileLock({
+          lockPath: path.join(input.sessionDir, BRANCH_SUMMARY_LOCK_FILENAME),
+          timeoutMs: BRANCH_SUMMARY_LOCK_ACQUIRE_TIMEOUT_MS,
+          label: "branch summary pending marker",
+        });
+      } catch (error) {
+        log.debug("Branch summary: pending marker acquisition failed", {
+          workspaceId: input.workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
+    }
+    try {
+      return await maybeAppendAbandonedBranchSummary({
+        ...input,
+        cancellationSignal: controller.signal,
+      });
+    } finally {
+      await lock?.[Symbol.asyncDispose]();
+    }
+  })();
   const entry: PendingBranchSummary = { promise, controller, consumed: false };
   pendingBranchSummaries.set(input.workspaceId, entry);
   void promise.then((appended) => {
@@ -860,9 +912,47 @@ export function startAbandonedBranchSummaryInBackground(
  * append user messages / build requests must call this first so the summary
  * row keeps its before-the-next-request ordering.
  */
-export async function awaitPendingBranchSummary(workspaceId: string): Promise<MuxMessage | null> {
+export async function awaitPendingBranchSummary(
+  workspaceId: string,
+  sessionDir?: string
+): Promise<MuxMessage | null> {
   const entry = pendingBranchSummaries.get(workspaceId);
   if (!entry) {
+    // Cross-process fork (r48): the registration map is process-local, so an
+    // absent entry proves nothing when another backend may have created the
+    // fork (XUM_ALLOW_MULTIPLE_INSTANCES=1). The writer holds the session-dir
+    // pending marker across generation + guarded append; when it exists,
+    // wait for it so this send's user row cannot advance the guarded tail
+    // mid-generation (the summary would drop as a tail mismatch and this
+    // request would lose the abandoned-branch context). The row — if one was
+    // produced — is durable before the marker releases, so this send's
+    // request assembly reads it from history; only the foreign process can
+    // emit it to its renderer. The ENOENT fast path keeps ordinary sends at
+    // one stat of a nonexistent file.
+    if (sessionDir !== undefined) {
+      const lockPath = path.join(sessionDir, BRANCH_SUMMARY_LOCK_FILENAME);
+      const markerExists = await fs.stat(lockPath).then(
+        () => true,
+        () => false
+      );
+      if (markerExists) {
+        try {
+          const lock = await acquireProcessFileLock({
+            lockPath,
+            timeoutMs: BRANCH_SUMMARY_LOCK_WAIT_TIMEOUT_MS,
+            label: "branch summary pending marker",
+          });
+          await lock[Symbol.asyncDispose]();
+        } catch (error) {
+          // Timeout or contention weirdness: proceed without the summary
+          // (best-effort) rather than blocking the send indefinitely.
+          log.debug("Branch summary: foreign pending-marker wait failed", {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        }
+      }
+    }
     return null;
   }
   if (entry.consumed) {

@@ -1906,7 +1906,21 @@ export class HistoryService {
             message.metadata = { ...message.metadata, historySequence: nextSeqNum };
             this.sequenceCounters.set(workspaceId, nextSeqNum + 1);
           }
-          await fs.appendFile(historyPath, this.serializeHistoryEntries(messages, workspaceId));
+          // Atomic all-or-nothing commit (r48): fs.appendFile is not
+          // transactional — an ENOSPC or crash mid-write could persist the
+          // payload line without the trigger line, and the caller registers
+          // rollback IDs only after this returns, so the torn prefix would
+          // survive as an undelivered assistant row in future provider
+          // requests. Rewrite the whole file through the same
+          // temp-and-rename helper the other history mutations use.
+          const existing = await fs.readFile(historyPath, "utf-8").catch((error: unknown) => {
+            if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return "";
+            throw error;
+          });
+          await writeFileAtomic(
+            historyPath,
+            existing + this.serializeHistoryEntries(messages, workspaceId)
+          );
           return Ok(undefined);
         } catch (error) {
           return Err(`Failed to append to history: ${getErrorMessage(error)}`);

@@ -1,5 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 
@@ -1099,6 +1101,104 @@ describe("branch summary placement on fork/truncate flows", () => {
       // The source workspace keeps its full history untouched.
       const sourceHistory = await historyService.getHistoryFromLatestBoundary(source);
       expect(sourceHistory.success && sourceHistory.data.length).toBe(4);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a send in another process waits on the pending marker before proceeding (r48)", async () => {
+    // The registration map is process-local: with XUM_ALLOW_MULTIPLE_INSTANCES=1
+    // a fork created by backend A is invisible to backend B, whose first send
+    // would append its user row immediately and advance the guarded tail —
+    // permanently dropping the summary. The writer therefore holds a
+    // session-dir marker lockfile across generation + guarded append, and a
+    // send that finds NO local registration must wait on that marker.
+    // Simulated here with a foreign workspace id (no local map entry)
+    // sharing the session dir.
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    try {
+      const ws = "ws-cross-process-marker";
+      const branchPoint = createMuxMessage("xp-1", "assistant", "branch point", { timestamp: 1 });
+      expect((await historyService.appendToHistory(ws, branchPoint)).success).toBe(true);
+      const sessionDir = config.getSessionDir(ws);
+
+      // Gate the model so generation is provably in flight while the foreign
+      // send checks the marker.
+      let releaseGate!: () => void;
+      const gate = new Promise<void>((resolve) => (releaseGate = resolve));
+      const filler = "explored a deep race condition in the scheduler ".repeat(120);
+      const gatedModel = new MockLanguageModelV3({
+        doStream: async () => {
+          await gate;
+          return {
+            stream: simulateReadableStream({
+              chunks: [
+                { type: "text-start", id: "t1" },
+                { type: "text-delta", id: "t1", delta: "Abandoned: explored a race." },
+                { type: "text-end", id: "t1" },
+                finishChunk("stop"),
+              ] satisfies LanguageModelV3StreamPart[],
+            }),
+          };
+        },
+      });
+
+      startAbandonedBranchSummaryInBackground({
+        historyService,
+        aiService: fakeAiService(gatedModel),
+        workspaceId: ws,
+        sessionDir,
+        abandonedMessages: [
+          createMuxMessage("xp-abandoned-user", "user", `Fix this: ${filler}`, { timestamp: 2 }),
+          createMuxMessage("xp-abandoned-assistant", "assistant", `Findings: ${filler}`, {
+            timestamp: 3,
+          }),
+        ],
+        experiments: RLM_ON,
+        guardTailMessageId: "xp-1",
+      });
+
+      // The marker is acquired inside the background promise; wait for it to
+      // land before simulating the foreign send.
+      const lockPath = path.join(sessionDir, "branch-summary.lock");
+      const markerDeadline = Date.now() + 5_000;
+      for (;;) {
+        if (
+          await fs.stat(lockPath).then(
+            () => true,
+            () => false
+          )
+        ) {
+          break;
+        }
+        if (Date.now() > markerDeadline) throw new Error("pending marker never appeared");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      // Foreign send: no local registration under this id, marker exists —
+      // it must BLOCK until the writer settles, not return immediately.
+      const foreignWait = awaitPendingBranchSummary("ws-foreign-process", sessionDir);
+      const sentinel = Symbol("still-pending");
+      expect(
+        await Promise.race([
+          foreignWait,
+          new Promise((resolve) => setTimeout(() => resolve(sentinel), 250)),
+        ])
+      ).toBe(sentinel);
+
+      releaseGate();
+      expect(await foreignWait).toBeNull();
+      // By the time the wait releases, the row is durable — the foreign
+      // send's request assembly reads it straight from history.
+      const history = await historyService.getHistoryFromLatestBoundary(ws);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        expect(history.data.some((m) => m.metadata?.muxMetadata?.type === "branch-summary")).toBe(
+          true
+        );
+      }
+      // The owning process's registration stays consumable for emission.
+      expect(await awaitPendingBranchSummary(ws)).not.toBeNull();
     } finally {
       await cleanup();
     }

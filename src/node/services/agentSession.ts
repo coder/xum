@@ -2953,7 +2953,12 @@ export class AgentSession {
     // it keeps its position BEFORE this turn's user message and request build
     // (the "summary lands before the next request" contract). Bounded by the
     // generation deadline; resolves immediately when nothing is pending.
-    const pendingBranchSummary = await awaitPendingBranchSummary(this.workspaceId);
+    const pendingBranchSummary = await awaitPendingBranchSummary(
+      this.workspaceId,
+      // Session dir enables the cross-process pending-marker wait (r48): a
+      // fork registered in another backend has no entry in this process.
+      this.config.getSessionDir(this.workspaceId)
+    );
     // Workspace removal disposes the session and cancels the summary writer
     // while this send is parked on the await above; every append between here
     // and the late pre-stream disposed check would recreate the session

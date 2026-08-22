@@ -81,6 +81,21 @@ function contextTokensFromUsage(usage: Record<string, unknown>): number {
   return typeof usage.inputTokens === "number" ? usage.inputTokens : 0;
 }
 
+/**
+ * Usage snapshot for the peak-context metric. metadata.usage is CUMULATIVE
+ * across all provider steps of a turn, so a tool-looping code_execution turn
+ * would report the sum of every step as one request's context window —
+ * inflating configurations that take more tool loops. StreamManager persists
+ * the LAST step separately as metadata.contextUsage for exactly this
+ * measurement; usage remains only as a compatibility fallback for rows
+ * recorded before contextUsage existed.
+ */
+function peakContextUsage(meta: Record<string, unknown>): Record<string, unknown> | null {
+  if (isRecord(meta.contextUsage)) return meta.contextUsage;
+  if (isRecord(meta.usage)) return meta.usage;
+  return null;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -169,18 +184,21 @@ export function extractMetrics(sessionDir: string): CellMetrics {
       // Internal assistant rows (compaction summaries etc.) are real provider
       // requests, so their usage still counts toward peak context pressure —
       // only their text/tool parts are excluded from scenario turns.
-      if (isRecord(meta) && isRecord(meta.usage)) {
-        metrics.peakContextTokens = Math.max(
-          metrics.peakContextTokens,
-          contextTokensFromUsage(meta.usage)
-        );
+      if (isRecord(meta)) {
+        const usage = peakContextUsage(meta);
+        if (usage !== null) {
+          metrics.peakContextTokens = Math.max(
+            metrics.peakContextTokens,
+            contextTokensFromUsage(usage)
+          );
+        }
       }
       continue;
     }
     if (isRecord(meta)) {
       // Peak per-request context pressure from the per-row usage snapshot.
-      const usage = meta.usage;
-      if (isRecord(usage)) {
+      const usage = peakContextUsage(meta);
+      if (usage !== null) {
         metrics.peakContextTokens = Math.max(
           metrics.peakContextTokens,
           contextTokensFromUsage(usage)

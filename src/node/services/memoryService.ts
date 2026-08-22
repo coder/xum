@@ -186,17 +186,31 @@ async function assertRenameDestinationOutsideDirSource(args: {
     refuse();
   }
   const sourceStat = await fsPromises.stat(args.store.physicalPath(args.sourceRelPath));
+  // Containment, not just identity (r48): an in-root symlink can point at a
+  // DESCENDANT of the source ('alias -> notes/sub'), so no destination
+  // ancestor shares the source root's inode, yet the move still lands inside
+  // the source tree ('notes' -> 'alias/new/notes' resolves under
+  // 'notes/sub'). Resolve the source once and refuse any EXISTING ancestor
+  // whose real path is the source or sits underneath it. The inode identity
+  // check stays as well: bind-mount style aliases can share dev+ino while
+  // resolving to different real paths.
+  const sourceReal = await fsPromises.realpath(args.store.physicalPath(args.sourceRelPath));
   const segments = args.destRelPath.split("/");
   for (let depth = 1; depth <= segments.length; depth++) {
     const ancestorRel = segments.slice(0, depth).join("/");
+    const ancestorPhysical = args.store.physicalPath(ancestorRel);
     let ancestorStat;
     try {
-      ancestorStat = await fsPromises.stat(args.store.physicalPath(ancestorRel));
+      ancestorStat = await fsPromises.stat(ancestorPhysical);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
       throw error;
     }
     if (ancestorStat.dev === sourceStat.dev && ancestorStat.ino === sourceStat.ino) {
+      refuse();
+    }
+    const ancestorReal = await fsPromises.realpath(ancestorPhysical);
+    if (ancestorReal === sourceReal || ancestorReal.startsWith(sourceReal + path.sep)) {
       refuse();
     }
   }
@@ -770,6 +784,18 @@ export class MemoryService extends EventEmitter {
     kind: MemoryEntryKind
   ): Promise<RefinementInverseDraft | null> {
     try {
+      // Top-level symlink guard (r48): the caller's kind came from
+      // store.kind(), which FOLLOWS symlinks — a requested path that is
+      // itself an in-root symlink classifies as its referent, and this
+      // capture would journal the referent's contents as a restore-files
+      // inverse. fs.rm then removes only the LINK, so rollback would create
+      // a regular file (or copied tree) where a symlink used to be,
+      // violating the lossless-inverse contract. The child walker already
+      // rejects symlinks; apply the same rule to the top-level entry.
+      const topStat = await fsPromises.lstat(store.physicalPath(relPath));
+      if (!topStat.isFile() && !topStat.isDirectory()) {
+        throw new MemoryCaptureSkippedError(`'${relPath}' is not a regular file or directory`);
+      }
       const capture = async (fileRelPath: string): Promise<RefinementFileCapture> => {
         const content = await this.readBoundedTextFile(store, fileRelPath, fileRelPath);
         // Lossy utf-8 decode (externally created binary file): restoring the

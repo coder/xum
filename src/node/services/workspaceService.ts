@@ -8561,6 +8561,9 @@ export class WorkspaceService extends EventEmitter {
           historyService: this.historyService,
           aiService: this.aiService,
           workspaceId: newWorkspaceId,
+          // Cross-process pending marker home (r48): lets a first send served
+          // by another backend wait for the in-flight summary.
+          sessionDir: this.config.getSessionDir(newWorkspaceId),
           abandonedMessages: abandonedBranchMessages,
           isExperimentEnabled: (experimentId) => this.isExperimentEnabled(experimentId),
           guardTailMessageId: sourceMessageId,
