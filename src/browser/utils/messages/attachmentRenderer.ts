@@ -125,17 +125,43 @@ function renderCompletedReportsIndexWithBudget(
 }
 
 /**
- * SECURITY AUDIT: serialize a repo-controlled path as explicitly untrusted
- * data before it is embedded in a synthetic <system-update> block. Legal Unix
- * paths can contain newlines and the characters needed to spell a closing
- * </system-update> tag, so a crafted filename read by the agent could
- * otherwise break out of the block and inject attacker text as instructions.
- * JSON.stringify escapes control characters (no raw newlines survive) and the
- * additional \u003c escape removes every literal "<", making tag injection
- * impossible while keeping ordinary paths readable (just quoted).
+ * Conservative allowlist for rendering a repo-controlled path verbatim.
+ * Deliberately excludes whitespace: multi-word prose (the shape instructions
+ * take) cannot be spelled without it, while real repo paths almost never
+ * need it. Also excludes quotes/angle brackets and every control character,
+ * and caps length so a single path cannot dominate the block. Backslash is
+ * allowed for Windows paths — JSON quoting escapes it, and without
+ * whitespace it cannot help spell prose.
+ */
+const SAFE_RENDERABLE_PATH_RE = /^[A-Za-z0-9._/@#%+=,:~^()[\]\\-]{1,256}$/;
+
+/** djb2 (xor) — stable, dependency-free label hash; NOT a security boundary. */
+function hashPathLabel(path: string): string {
+  let hash = 5381;
+  for (let i = 0; i < path.length; i++) {
+    hash = ((hash << 5) + hash) ^ path.charCodeAt(i);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+/**
+ * SECURITY AUDIT: repo-controlled paths are embedded in a synthetic
+ * <system-update> block inside a USER-role post-compaction message — a
+ * high-trust channel that recurs on every turn after compaction summarized
+ * the original tool result away. Escaping tag syntax alone is insufficient
+ * there: a filename spelling out instructions would survive as readable
+ * prose with user-message priority (persistent prompt injection, Codex
+ * r48). Paths are therefore rendered verbatim ONLY when they match a
+ * conservative no-whitespace allowlist; anything else is replaced by an
+ * opaque, stable handle (the attacker's bytes never enter model context —
+ * only a hex label useful for correlating repeat mentions). The JSON quoting
+ * on allowlisted paths is kept as defense in depth.
  */
 function serializeUntrustedPath(path: string): string {
-  return JSON.stringify(path).replace(/</g, "\\u003c");
+  if (SAFE_RENDERABLE_PATH_RE.test(path)) {
+    return JSON.stringify(path);
+  }
+  return `[unrenderable path #${hashPathLabel(path)}]`;
 }
 
 /**
