@@ -2698,6 +2698,16 @@ export class AgentSession {
        * in-flight request without their trigger (r30).
        */
       preTurnMessages?: MuxMessage[];
+      /**
+       * r41: staleness probe for this send's admission epoch, captured
+       * synchronously with WorkspaceService's entry checks. Returns true when
+       * a context-discarding mutation COMPLETED after the send entered — the
+       * level-triggered turnAdmissionBlocks check cannot catch a mutation
+       * that started and finished while the send sat in pre-admission
+       * awaits. Not threaded through queued entries: those dispatch into the
+       * post-mutation context by design.
+       */
+      admissionEpochStale?: () => boolean;
     }
   ): Promise<Result<void, SendMessageError>> {
     this.assertNotDisposed("sendMessage");
@@ -3043,8 +3053,9 @@ export class AgentSession {
       // mutation may sit between its busy check and its mutation. Checked in
       // the same synchronous block that arms the edit reservation (which
       // claims busy-ness), so whichever side runs first is observed by the
-      // other.
-      if (this.turnAdmissionBlocks > 0) {
+      // other. The epoch probe (r41) also refuses edits whose target rows a
+      // completed mutation already discarded.
+      if (this.turnAdmissionBlocks > 0 || internal?.admissionEpochStale?.() === true) {
         return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
       }
 
@@ -3352,6 +3363,18 @@ export class AgentSession {
       }
     }
 
+    // r41: reject before persisting the turn's rows when a context-discarding
+    // mutation is in flight or completed after this send entered — otherwise
+    // rows composed against the discarded context (snapshots, family
+    // payloads, the user row) land in the fresh transcript even though the
+    // PREPARING gate below refuses the turn. Still pre-acceptance here, so a
+    // plain Err keeps cancellation/rollback contracts clean. The gate below
+    // remains the airtight backstop for a mutation completing between this
+    // check and acceptance.
+    if (this.turnAdmissionBlocks > 0 || internal?.admissionEpochStale?.() === true) {
+      return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+    }
+
     // Persist snapshots only when this turn will be sent immediately.
     // On on-send compaction paths, snapshots are deferred with the follow-up turn.
     const shouldPersistTurnSnapshots = autoCompactionMessage === null;
@@ -3590,9 +3613,18 @@ export class AgentSession {
     // same synchronous block that would set PREPARING: streaming would
     // snapshot the transcript the mutation is about to discard and repopulate
     // the cleared context. The turn rows persisted above land pre-mutation,
-    // so the mutation itself discards them.
-    if (this.turnAdmissionBlocks > 0) {
-      return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+    // so the mutation itself discards them. The epoch probe (r41) also
+    // refuses when such a mutation COMPLETED during the awaits above — the
+    // level check alone misses start-and-finish-before-resume.
+    if (this.turnAdmissionBlocks > 0 || internal?.admissionEpochStale?.() === true) {
+      const error = createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE);
+      // The turn was already accepted (rows durable, onAccepted ran):
+      // internal callers like the terminal-attention outbox mark state
+      // delivered in onAccepted and rely on the accepted pre-stream failure
+      // callback to revert it — returning without notifying would strand
+      // that bookkeeping (r41).
+      await notifyAcceptedPreStreamFailure(error);
+      return Err(error);
     }
 
     const preparedTurnAbortController = new AbortController();
@@ -3738,8 +3770,11 @@ export class AgentSession {
 
     // r40: refuse resume admission while a context-discarding mutation is
     // mid-flight (see holdTurnAdmission) — checked in the same synchronous
-    // block that sets PREPARING. The auto-retry contract treats a non-started
-    // resume as retriable later.
+    // block that sets PREPARING. A non-started resume reads as retriable to
+    // retryActiveStream, but the mutation itself cancels pending retries and
+    // clears the resume request (discardAutoRetryForContextMutation, r41),
+    // so a straggler reschedule self-abandons instead of replaying the
+    // discarded context.
     if (this.turnAdmissionBlocks > 0) {
       return Ok({ started: false });
     }
@@ -5733,6 +5768,25 @@ export class AgentSession {
     // idle session would interleave its rows with the edit's against moved
     // history.
     return this.turnPhase !== TurnPhase.IDLE || this.editAdmissionDepth > 0;
+  }
+
+  /**
+   * r41: discard pending auto-retry state and the persisted partial as part
+   * of a context-discarding history mutation. A retry scheduled before the
+   * mutation (session idle during backoff) would otherwise fire after the
+   * admission guard releases, commit the pre-mutation partial, and stream a
+   * request derived from the discarded context. Clearing the resume request
+   * makes any straggler reschedule self-abandon (missing_retry_options), and
+   * deleting the partial removes the discarded transcript's tail durably.
+   */
+  async discardAutoRetryForContextMutation(): Promise<Result<void>> {
+    this.retryManager.cancel();
+    this.setAutoRetryResumeState(undefined);
+    const deleteResult = await this.historyService.deletePartial(this.workspaceId);
+    if (!deleteResult.success) {
+      return Err(deleteResult.error);
+    }
+    return Ok(undefined);
   }
 
   /**

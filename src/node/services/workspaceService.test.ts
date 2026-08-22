@@ -4818,6 +4818,168 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     }
   });
 
+  test("a send predated by a COMPLETED clear is refused admission and notified (r41)", async () => {
+    // Complete-before-resume: the send passes the entry check, parks in
+    // pre-admission work, and the full clear starts AND FINISHES before it
+    // resumes. The level-triggered admission block is released by then, so
+    // only the mutation-epoch probe can refuse the turn — and because the
+    // send was already accepted (rows durable, onAccepted ran), the accepted
+    // pre-stream failure callback must fire so internal callers can revert
+    // delivered-state bookkeeping.
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "clear-completes-before-resume";
+    try {
+      await config.addWorkspace("/tmp/clear-before-resume-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "clear-before-resume-project",
+        projectPath: "/tmp/clear-before-resume-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("pre-clear-user", "user", "before clear", {})
+      );
+
+      const appendReached = createDeferred<void>();
+      const releaseAppend = createDeferred<void>();
+      const originalAppend = historyService.appendToHistory.bind(historyService);
+      const appendSpy = spyOn(historyService, "appendToHistory").mockImplementationOnce(
+        async (...args: Parameters<HistoryService["appendToHistory"]>) => {
+          appendReached.resolve();
+          await releaseAppend.promise;
+          return originalAppend(...args);
+        }
+      );
+      try {
+        let acceptedCalls = 0;
+        const failureErrors: SendMessageError[] = [];
+        const sendPromise = workspaceService.sendMessage(
+          workspaceId,
+          "hello",
+          {
+            model: "anthropic:claude-sonnet-4-6",
+            thinkingLevel: "off",
+            toolPolicy: [],
+            agentId: "exec",
+          },
+          {
+            synthetic: true,
+            onAccepted: () => {
+              acceptedCalls += 1;
+            },
+            onAcceptedPreStreamFailure: (error) => {
+              failureErrors.push(error);
+            },
+          }
+        );
+        await appendReached.promise;
+
+        // The clear starts and COMPLETES while the send is parked.
+        expect(await workspaceService.truncateHistory(workspaceId)).toEqual({
+          success: true,
+          data: undefined,
+        });
+
+        releaseAppend.resolve();
+        const sendResult = await sendPromise;
+        expect(sendResult).toEqual({
+          success: false,
+          error: {
+            type: "unknown",
+            raw: "Workspace history is being cleared or reset. Please wait and try again.",
+          },
+        });
+        // Accepted, then notified of the pre-stream refusal (r41).
+        expect(acceptedCalls).toBe(1);
+        expect(failureErrors).toHaveLength(1);
+        expect(failureErrors[0]).toEqual({
+          type: "unknown",
+          raw: "Workspace history is being cleared or reset. Please wait and try again.",
+        });
+        // The refused turn never streamed: no assistant output followed the
+        // clear (the accepted user row may remain, per acceptance semantics).
+        const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(history.success).toBe(true);
+        if (history.success) {
+          expect(history.data.filter((row) => row.role === "assistant")).toHaveLength(0);
+        }
+      } finally {
+        appendSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("context-discarding mutations drop pending partials so retries cannot replay them (r41)", async () => {
+    // A retry scheduled during backoff would fire after the guard releases,
+    // commit the pre-mutation partial, and stream a request derived from the
+    // discarded context — mutations must durably drop that state first, and
+    // fail closed when they cannot.
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "clear-discards-partial";
+    try {
+      await config.addWorkspace("/tmp/clear-discards-partial-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "clear-discards-partial-project",
+        projectPath: "/tmp/clear-discards-partial-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("pre-clear-user", "user", "before clear", {})
+      );
+      const seedPartial = () =>
+        historyService.writePartial(
+          workspaceId,
+          createMuxMessage("partial-1", "assistant", "pre-mutation partial", {})
+        );
+
+      // getOrCreateSession must exist for the discard hook to run.
+      await seedPartial();
+      expect(await workspaceService.truncateHistory(workspaceId)).toEqual({
+        success: true,
+        data: undefined,
+      });
+      expect(await historyService.readPartial(workspaceId)).toBeNull();
+
+      // Reset drops the partial too — even on its no-op branch the discard
+      // runs before the history read, so stale retry state cannot survive.
+      await seedPartial();
+      expect(await workspaceService.resetContext(workspaceId)).toEqual({
+        success: true,
+        data: "noop",
+      });
+      expect(await historyService.readPartial(workspaceId)).toBeNull();
+
+      // Fail closed: an undeletable partial blocks the clear.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("post-clear-user", "user", "again", {})
+      );
+      await seedPartial();
+      const deleteSpy = spyOn(historyService, "deletePartial").mockImplementationOnce(() =>
+        Promise.resolve(Err("disk full"))
+      );
+      try {
+        const blocked = await workspaceService.truncateHistory(workspaceId);
+        expect(blocked).toEqual({
+          success: false,
+          error: "Cannot clear history: pending retry state could not be discarded (disk full)",
+        });
+        // Nothing was truncated.
+        const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(history.success ? history.data : []).toHaveLength(1);
+      } finally {
+        deleteSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("a send already past the entry check is refused turn admission mid-clear (r40)", async () => {
     // SECURITY (the exact r40 race): the send passed the workspace-level
     // entry check BEFORE the clear started and is still persisting its rows

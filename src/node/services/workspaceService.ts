@@ -1994,6 +1994,13 @@ export class WorkspaceService extends EventEmitter {
   // session-level turn-admission block (AgentSession.holdTurnAdmission).
   private readonly contextMutationWorkspaces = new Set<string>();
 
+  // r41: monotonic count of COMPLETED context-discarding mutations per
+  // workspace. Sends capture it synchronously with the entry check above and
+  // re-verify at their admission gates: the level-triggered admission block
+  // cannot catch a mutation that started and finished while a send sat in
+  // pre-admission awaits (e.g. branch-summary generation).
+  private readonly contextMutationEpochs = new Map<string, number>();
+
   // Tracks in-flight fork auto-title generations so only the first accepted continue
   // message can claim the workspace title.
   private readonly autoTitlingWorkspaces = new Set<string>();
@@ -2838,6 +2845,14 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
+  /** r41: mark a context-discarding mutation as durably committed (see contextMutationEpochs). */
+  private advanceContextMutationEpoch(workspaceId: string): void {
+    this.contextMutationEpochs.set(
+      workspaceId,
+      (this.contextMutationEpochs.get(workspaceId) ?? 0) + 1
+    );
+  }
+
   /**
    * Admission guard for context-discarding history mutations (r40): reject
    * new sends at the door (contextMutationWorkspaces), block turn admission
@@ -2848,6 +2863,15 @@ export class WorkspaceService extends EventEmitter {
    * drain/lock awaits — and must recheck busy-ness after those awaits for
    * the turn starts that bypass admission gating (in-turn compaction
    * retries observing a transient idle gap).
+   *
+   * Scope: process-local, like every send/rename/remove/busy guard in this
+   * service. Under XUM_ALLOW_MULTIPLE_INSTANCES=1 a second backend sharing
+   * the workspace can admit a send this guard never sees; sends do not
+   * participate in a cross-process admission protocol (only refine's
+   * durable staging/apply state does, via refine-apply.lock). Multi-instance
+   * mode is a development escape hatch — concurrent turn traffic against one
+   * workspace from two backends is unsupported beyond those durable-state
+   * locks.
    */
   private acquireContextMutationAdmissionGuard(
     workspaceId: string,
@@ -8818,6 +8842,14 @@ export class WorkspaceService extends EventEmitter {
           raw: CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE,
         });
       }
+      // r41: capture the mutation epoch in the same synchronous block as the
+      // entry check; the session's admission gates re-verify it so a
+      // reset/clear/replace that completes while this send is still doing
+      // pre-admission work refuses the send instead of letting it append and
+      // stream stale content into the fresh context.
+      const admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
+      const admissionEpochStale = () =>
+        (this.contextMutationEpochs.get(workspaceId) ?? 0) !== admissionEpoch;
 
       // Guard: avoid creating sessions for workspaces that don't exist anymore.
       const workspaceConfig = this.config.findWorkspace(workspaceId);
@@ -8920,6 +8952,7 @@ export class WorkspaceService extends EventEmitter {
             onAcceptedPreStreamFailure: internal?.onAcceptedPreStreamFailure,
             startStreamInBackground: internal?.startStreamInBackground,
             goalContinuation: internal?.goalContinuation,
+            admissionEpochStale,
           });
         }
         return Err(pricingGate.error);
@@ -9096,6 +9129,7 @@ export class WorkspaceService extends EventEmitter {
         onAccepted: internal?.onAccepted,
         onAcceptedPreStreamFailure,
         preTurnMessages: internal?.preTurnMessages,
+        admissionEpochStale,
       });
       if (!result.success) {
         log.error("sendMessage handler: session returned error", {
@@ -10044,6 +10078,17 @@ export class WorkspaceService extends EventEmitter {
         "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
       );
     }
+    // r41: a retry scheduled before this clear would replay the discarded
+    // context after the guard releases — cancel it and drop the partial
+    // durably before the transcript goes away.
+    if (isFullClear && session) {
+      const retryDiscard = await session.discardAutoRetryForContextMutation();
+      if (!retryDiscard.success) {
+        return Err(
+          `Cannot clear history: pending retry state could not be discarded (${retryDiscard.error})`
+        );
+      }
+    }
     if (effectivePercentage > 0) {
       session?.clearUsageState();
     }
@@ -10056,6 +10101,12 @@ export class WorkspaceService extends EventEmitter {
         : await truncate();
     if (!truncateResult.success) {
       return Err(truncateResult.error);
+    }
+
+    // r41: the discard is durable — sends that entered before it must not be
+    // admitted afterwards (their content references the discarded context).
+    if (isFullClear) {
+      this.advanceContextMutationEpoch(workspaceId);
     }
 
     const deletedSequences = truncateResult.data;
@@ -10175,6 +10226,17 @@ export class WorkspaceService extends EventEmitter {
           "Cannot reset context while a turn is active. Press Esc to stop the stream first."
         );
       }
+      // r41: a retry scheduled before this reset would commit the pre-reset
+      // partial past the boundary and replay the discarded context after the
+      // guard releases — cancel it and drop the partial durably first.
+      if (session) {
+        const retryDiscard = await session.discardAutoRetryForContextMutation();
+        if (!retryDiscard.success) {
+          return Err(
+            `Cannot reset context: pending retry state could not be discarded (${retryDiscard.error})`
+          );
+        }
+      }
 
       const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
       if (!historyResult.success) {
@@ -10233,6 +10295,10 @@ export class WorkspaceService extends EventEmitter {
       if (!appendResult.success) {
         return Err(`Failed to append context reset boundary: ${appendResult.error}`);
       }
+      // r41: the boundary is durable — sends that entered before it must not
+      // be admitted afterwards (their content references the discarded
+      // context).
+      this.advanceContextMutationEpoch(workspaceId);
 
       session?.clearUsageState();
 
@@ -10423,6 +10489,17 @@ export class WorkspaceService extends EventEmitter {
             "Cannot replace history while a turn is active. Press Esc to stop the stream first."
           );
         }
+        // r41: same retry hygiene as full clear — a pending retry would
+        // replay the replaced context after the guard releases.
+        const replaceSession = this.sessions.get(workspaceId);
+        if (!isCompaction && replaceSession) {
+          const retryDiscard = await replaceSession.discardAutoRetryForContextMutation();
+          if (!retryDiscard.success) {
+            return Err(
+              `Cannot replace history: pending retry state could not be discarded (${retryDiscard.error})`
+            );
+          }
+        }
         this.sessions.get(workspaceId)?.clearUsageState();
         const clearResult = await this.clearHistoryWithRetiredBashMonitorWakes(
           workspaceId,
@@ -10433,6 +10510,9 @@ export class WorkspaceService extends EventEmitter {
           return Err(`Failed to clear history: ${clearResult.error}`);
         }
         if (!isCompaction) {
+          // r41: the destructive replacement is durable — refuse sends that
+          // entered before it (see contextMutationEpochs).
+          this.advanceContextMutationEpoch(workspaceId);
           // A destructive non-compaction replace (e.g. "start here") begins a
           // new context segment: discard pre-boundary post-compaction
           // carryover like resetContext does, durable-or-fail for the same
