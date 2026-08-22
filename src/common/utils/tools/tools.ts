@@ -470,6 +470,37 @@ function wrapToolsWithModelOnlyNotifications(
 }
 
 /**
+ * Derive the hook config every hook-wrapped tool runs with, or null when
+ * hooks must not run. Shared with the kernel file loader (mux.load) so the
+ * bulk-ingestion path can never drift from the tool trust gate: hooks are
+ * repo-controlled scripts, so they run only for trusted projects, and mux.load
+ * must be hook-gated exactly when file_read is.
+ */
+export function deriveToolHookConfig(config: ToolConfiguration): HookConfig | null {
+  // Skip hooks for untrusted projects — repo-controlled scripts must not run
+  if (config.trusted !== true) {
+    return null;
+  }
+
+  // Hooks require workspaceId, cwd, and runtime
+  if (!config.workspaceId || !config.cwd || !config.runtime) {
+    return null;
+  }
+
+  return {
+    runtime: config.runtime,
+    cwd: config.cwd,
+    runtimeTempDir: config.runtimeTempDir,
+    workspaceId: config.workspaceId,
+    // Match bash tool behavior: xumEnv is present and secrets override it.
+    env: {
+      ...(config.xumEnv ?? {}),
+      ...(config.secrets ?? {}),
+    },
+  };
+}
+
+/**
  * Wrap tools with hook support.
  *
  * If any of these exist, each tool execution is wrapped:
@@ -481,27 +512,10 @@ function wrapToolsWithHooks(
   tools: Record<string, Tool>,
   config: ToolConfiguration
 ): Record<string, Tool> {
-  // Skip hooks for untrusted projects — repo-controlled scripts must not run
-  if (config.trusted !== true) {
+  const hookConfig = deriveToolHookConfig(config);
+  if (hookConfig === null) {
     return tools;
   }
-
-  // Hooks require workspaceId, cwd, and runtime
-  if (!config.workspaceId || !config.cwd || !config.runtime) {
-    return tools;
-  }
-
-  const hookConfig: HookConfig = {
-    runtime: config.runtime,
-    cwd: config.cwd,
-    runtimeTempDir: config.runtimeTempDir,
-    workspaceId: config.workspaceId,
-    // Match bash tool behavior: xumEnv is present and secrets override it.
-    env: {
-      ...(config.xumEnv ?? {}),
-      ...(config.secrets ?? {}),
-    },
-  };
 
   const wrappedTools: Record<string, Tool> = {};
   for (const [toolName, tool] of Object.entries(tools)) {

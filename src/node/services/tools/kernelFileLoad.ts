@@ -8,6 +8,7 @@
  * model-visible record only ever carry {key, bytes, lines, preview}.
  */
 
+import assert from "node:assert";
 import type { Runtime } from "@/node/runtime/Runtime";
 import {
   StreamByteCeilingExceededError,
@@ -15,6 +16,7 @@ import {
 } from "@/node/runtime/streamUtils";
 import { MAX_FILE_SIZE, resolvePathWithinCwd, validateFileSize } from "./fileCommon";
 import { KERNEL_LOAD_PREVIEW_CHARS } from "@/constants/kernelOutput";
+import { runThroughToolHookPipeline, type HookConfig } from "./withHooks";
 
 /** Full content + bounded model-visible summary of one loaded file. */
 export interface KernelLoadedFile {
@@ -43,12 +45,26 @@ export type KernelFileLoader = (args: {
  * absolute/relative path resolution is consistent with mux.file_read.
  * Errors are thrown (not returned) so the tool bridge surfaces them as
  * catchable guest errors recorded by the compact call record.
+ *
+ * SECURITY: when `hooks` is provided (trusted projects — the same gate that
+ * hook-wraps every ordinary tool), the read runs through the `tool.execute`
+ * waterfall AS a `file_read` execution. mux.load rides file_read's capability
+ * grant, so it must also ride file_read's hook gate: a trusted tool_pre that
+ * denies sensitive paths (.env) for file_read would otherwise be bypassed by
+ * prompt-injected kernel code bulk-loading the same file into vars (Codex
+ * P1). Hooks and middleware observe the raw guest-provided path exactly like
+ * a paginated xum.file_read call; a pre-hook block throws a catchable guest
+ * error before any content is read.
  */
 export function createKernelFileLoader(config: {
   cwd: string;
   runtime: Runtime;
+  hooks?: HookConfig;
 }): KernelFileLoader {
-  return async ({ path, abortSignal }) => {
+  const readWholeFile = async (
+    path: string,
+    abortSignal?: AbortSignal
+  ): Promise<KernelLoadedFile> => {
     const { resolvedPath } = resolvePathWithinCwd(path, config.cwd, config.runtime);
     // stat throws a RuntimeError with a clear message for missing paths.
     const stat = await config.runtime.stat(resolvedPath, abortSignal);
@@ -95,5 +111,48 @@ export function createKernelFileLoader(config: {
     const lines = content === "" ? 0 : segments.length;
     const preview = content.slice(0, KERNEL_LOAD_PREVIEW_CHARS);
     return { content, bytes, lines, preview };
+  };
+
+  const hooks = config.hooks;
+  if (hooks === undefined) {
+    // Untrusted projects: hooks never run for ANY tool (repo-controlled
+    // scripts), so the raw read matches file_read's own behavior there.
+    return ({ path, abortSignal }) => readWholeFile(path, abortSignal);
+  }
+  return async ({ path, abortSignal }) => {
+    // Full content stays in this closure: middleware and post-hooks observe
+    // the bounded model-visible summary, mirroring what the model sees (and
+    // keeping hook env payloads small); the pre-hook path gate is what this
+    // pipeline exists to enforce.
+    let loaded: KernelLoadedFile | null = null;
+    const outcome = await runThroughToolHookPipeline({
+      toolName: "file_read",
+      args: { path },
+      config: hooks,
+      abortSignal,
+      execute: async (currentArgs) => {
+        // Middleware may rewrite args; honor the rewritten path, but never
+        // read from a shape a middleware corrupted.
+        assert(
+          typeof currentArgs.path === "string" && currentArgs.path.length > 0,
+          "mux.load: tool.execute middleware rewrote file_read args to a non-path"
+        );
+        loaded = await readWholeFile(currentArgs.path, abortSignal);
+        const { bytes, lines, preview } = loaded;
+        return { bytes, lines, preview };
+      },
+    });
+    if (outcome.blocked) {
+      const blockedError =
+        typeof outcome.result === "object" &&
+        outcome.result !== null &&
+        "error" in outcome.result &&
+        typeof outcome.result.error === "string"
+          ? outcome.result.error
+          : "blocked by tool hook";
+      throw new Error(`mux.load blocked by file_read hook: ${blockedError}`);
+    }
+    assert(loaded !== null, "mux.load: hook pipeline completed without executing the read");
+    return loaded;
   };
 }

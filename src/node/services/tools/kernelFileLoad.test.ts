@@ -28,6 +28,43 @@ describe("createKernelFileLoader line counting", () => {
   });
 });
 
+describe("createKernelFileLoader hook gating", () => {
+  it("routes loads through the file_read tool_pre gate; blocked paths never reach vars", async () => {
+    // Security regression (Codex P1): mux.load rides file_read's capability
+    // grant, so it must also ride file_read's hook gate — a trusted tool_pre
+    // denying sensitive paths for file_read must deny the bulk load too, or
+    // prompt-injected kernel code could exfiltrate a denied .env via vars.
+    using tmp = new DisposableTempDir("kernel-load-hooks");
+    await fs.writeFile(nodePath.join(tmp.path, ".env"), "SECRET=1\n", "utf8");
+    await fs.writeFile(nodePath.join(tmp.path, "notes.txt"), "hello\n", "utf8");
+    const hookDir = nodePath.join(tmp.path, ".xum");
+    await fs.mkdir(hookDir, { recursive: true });
+    const hookPath = nodePath.join(hookDir, "tool_pre");
+    await fs.writeFile(
+      hookPath,
+      `#!/bin/bash
+case "$XUM_TOOL_INPUT" in
+  *".env"*) echo "denied: sensitive path"; exit 1;;
+esac
+exit 0
+`
+    );
+    await fs.chmod(hookPath, 0o755);
+
+    const runtime = new LocalRuntime(tmp.path);
+    const load = createKernelFileLoader({
+      cwd: tmp.path,
+      runtime,
+      hooks: { runtime, cwd: tmp.path, runtimeTempDir: tmp.path, workspaceId: "test-ws" },
+    });
+
+    // Denied path: a catchable guest error, no content escapes the read.
+    expect(load({ path: ".env" })).rejects.toThrow(/denied: sensitive path/);
+    // Allowed path: loads normally through the same pipeline.
+    expect((await load({ path: "notes.txt" })).content).toBe("hello\n");
+  });
+});
+
 describe("createKernelFileLoader byte ceiling", () => {
   it("fails and cancels when the stream exceeds the size the stat reported", async () => {
     // Models /dev/zero (stat size 0, infinite stream) and stat→read growth

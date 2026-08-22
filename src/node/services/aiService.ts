@@ -33,6 +33,7 @@ import { runLanguageModelCleanup } from "./languageModelCleanup";
 import type { InitStateManager } from "./initStateManager";
 import type { SendMessageError } from "@/common/types/errors";
 import {
+  deriveToolHookConfig,
   getForcedXaiSearchToolNames,
   getToolsForModel,
   type AdvisorStepCaptureRef,
@@ -2843,9 +2844,14 @@ export class AIService extends EventEmitter {
       // Host file loader backing mux.load (r12 bulk kernel ingestion). Built
       // from the same cwd/runtime pair the file tools use so path resolution
       // matches mux.file_read. Only honored by kernel-mode code_execution.
+      // SECURITY: the loader shares the tool hook trust gate — its bulk read
+      // runs through the same tool.execute pipeline as a hook-wrapped
+      // file_read call, so a trusted tool_pre denying sensitive paths gates
+      // mux.load too (it must not be a hook bypass for file_read).
       const kernelFileLoader = createKernelFileLoader({
         cwd: toolsForModelConfig.cwd,
         runtime: toolsForModelConfig.runtime,
+        hooks: deriveToolHookConfig(toolsForModelConfig) ?? undefined,
       });
 
       // Apply tool policy and PTC experiments (lazy-loads PTC dependencies only when needed).
