@@ -20,6 +20,7 @@
  * append or emission failures log and continue (self-healing doctrine); a
  * stream failure returns an error so the user knows the pass did not finish.
  */
+import { createHash } from "node:crypto";
 import * as os from "node:os";
 import type { LanguageModel, Tool } from "ai";
 
@@ -139,6 +140,20 @@ interface RefineServiceOptions {
    * after runs).
    */
   onStagedEditAttempted?: (toolCallId: string) => void;
+}
+
+/**
+ * Content fingerprint of one history row for the pre-publication prefix
+ * recheck (r47). Serialized-bytes hash: both the snapshot and the recheck
+ * parse rows from the same JSONL, so unchanged on-disk rows stringify
+ * identically, while ANY in-place rewrite (StreamManager finalizing a
+ * mid-flight row via updateHistory, edit-resends) changes the hash even
+ * though the row ID and historySequence are preserved. A semantically-equal
+ * rewrite with different key order fails closed (re-run /refine).
+ */
+function fingerprintHistoryRow(row: MuxMessage | undefined): string {
+  if (row === undefined) return "<missing>";
+  return createHash("sha256").update(JSON.stringify(row)).digest("hex");
 }
 
 /** Human-readable action line for a refinement journal row. */
@@ -792,6 +807,15 @@ export class RefineService {
       return Err(`could not read workspace history: ${messagesResult.error}`);
     }
     const activeSegment = sliceMessagesForProviderFromLatestContextBoundary(messagesResult.data);
+    // r47: fingerprint the snapshot rows for the pre-publication recheck.
+    // Row IDs alone cannot detect same-ID rewrites: StreamManager finalizes
+    // a streaming assistant row through updateHistory() PRESERVING its ID
+    // and historySequence, so a pass distilled from the in-flight
+    // placeholder would pass an ID-only prefix test after the stream
+    // settles. Hash the serialized row instead — any in-place rewrite
+    // changes the bytes. Captured before any consumer touches the rows so
+    // the fingerprints reflect the disk state the transcript was built from.
+    const snapshotRowFingerprints = activeSegment.map(fingerprintHistoryRow);
     // Reuse the branch-summary transcript builder: role-labeled,
     // thinking-stripped, char-bounded — exactly the evidence shape a
     // distillation pass needs. The tail cap preserves the prior bound on
@@ -962,12 +986,15 @@ export class RefineService {
       // approval-hash scan accepts it. Verify under the staging lock — which
       // the reset/clear paths also hold across their mutation — that the
       // latest context-boundary identity is unchanged AND that the distilled
-      // snapshot is still an unchanged PREFIX of the active segment (r43).
-      // Ordinary mid-pass appends extend the tail and keep the prefix; a
-      // boundary-less full /clear empties it; and an edit-resend or partial
-      // truncation that keeps the first row but rewrites the tail — invisible
-      // to the previous first-row anchor check — removes distilled rows and
-      // breaks the prefix.
+      // snapshot is still an unchanged PREFIX of the active segment (r43),
+      // compared by per-row content fingerprint, not row ID (r47): a stream
+      // that was mid-flight at snapshot time settles by finalizing its
+      // placeholder row IN PLACE (same ID, new parts), which an ID-only
+      // prefix test cannot see. Ordinary mid-pass appends extend the tail
+      // and keep the prefix; a boundary-less full /clear empties it; an
+      // edit-resend or partial truncation that keeps the first row but
+      // rewrites the tail breaks the prefix; and a same-ID finalization
+      // changes the row's fingerprint.
       const recheckResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
       if (!recheckResult.success) {
         return Err(`could not re-verify workspace history before staging: ${recheckResult.error}`);
@@ -978,7 +1005,9 @@ export class RefineService {
       const recheckSegment = sliceMessagesForProviderFromLatestContextBoundary(recheckResult.data);
       const snapshotIsUnchangedPrefix =
         activeSegment.length <= recheckSegment.length &&
-        activeSegment.every((row, index) => recheckSegment[index]?.id === row.id);
+        snapshotRowFingerprints.every(
+          (fingerprint, index) => fingerprintHistoryRow(recheckSegment[index]) === fingerprint
+        );
       if (recheckBoundaryId !== (boundaryRow?.id ?? null) || !snapshotIsUnchangedPrefix) {
         return Err(
           "the workspace context was reset, cleared, compacted, or rewritten while the refine " +

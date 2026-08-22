@@ -2177,6 +2177,72 @@ describe("RefineService", () => {
     expect(fixture.emittedMessages).toHaveLength(0);
   });
 
+  it("refuses to publish a proposal when a snapshot row was rewritten in place (r47)", async () => {
+    // SECURITY: a stream that was mid-flight at snapshot time settles by
+    // finalizing its placeholder row through updateHistory() with the SAME
+    // id and historySequence — only the parts change. An ID-only prefix
+    // recheck accepts that rewrite (the r43 gap's fresh evidence); the
+    // per-row content fingerprint must refuse it.
+    let rewriteRowOnce: (() => Promise<void>) | null = null;
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: async () => {
+            if (rewriteRowOnce !== null) {
+              const rewrite = rewriteRowOnce;
+              rewriteRowOnce = null;
+              await rewrite();
+            }
+            return {
+              stream: simulateReadableStream({
+                chunks: [
+                  {
+                    type: "tool-call",
+                    toolCallId: "refine-inplace-toctou-1",
+                    toolName: "memory",
+                    input: JSON.stringify({
+                      command: "create",
+                      path: LESSON_PATH,
+                      file_text: "A lesson distilled from a stale placeholder row.\n",
+                    }),
+                  } satisfies LanguageModelV3StreamPart,
+                  finishChunk("tool-calls"),
+                ],
+              }),
+            };
+          },
+        }),
+    });
+    await fixture.seedTrajectory();
+    rewriteRowOnce = async () => {
+      // Stream-finalization shape: same row id, same historySequence, same
+      // position, new content — row count, ordering, and every id are
+      // unchanged, exactly what updateHistory preserves when StreamManager
+      // finalizes a placeholder.
+      const rows = await fixture.readChat();
+      const placeholder = rows.find((row) => row.id === "user-1");
+      if (placeholder === undefined) throw new Error("seeded row user-1 missing");
+      const updated = await fixture.historyService.updateHistory(
+        WORKSPACE_ID,
+        createMuxMessage(
+          placeholder.id,
+          "user",
+          "finalized content replacing the placeholder",
+          placeholder.metadata
+        )
+      );
+      if (!updated.success) throw new Error(updated.error);
+    };
+
+    const result = await fixture.service.run(WORKSPACE_ID);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("while the refine pass was running");
+    }
+    expect(await loadStagedRefineSet(fixture.sessionDir)).toBeNull();
+    expect(fixture.emittedMessages).toHaveLength(0);
+  });
+
   it("fails closed on ambiguous timeline boundaries (r38)", async () => {
     const prompts: string[] = [];
     const now = Date.now();
