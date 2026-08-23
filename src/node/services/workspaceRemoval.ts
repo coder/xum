@@ -117,6 +117,13 @@ export async function removeSessionDirUnderMemoryLocks(args: {
   workspaceId: string;
 }): Promise<void> {
   assert(args.sessionDir.length > 0, "removeSessionDirUnderMemoryLocks requires a session dir");
+  // Crash clearly on a malformed config (test stubs, future refactors): an
+  // undefined rootDir would otherwise surface as an obscure path.resolve
+  // TypeError from deep inside the lock-key derivation.
+  assert(
+    typeof args.rootDir === "string" && args.rootDir.length > 0,
+    "removeSessionDirUnderMemoryLocks requires a rootDir"
+  );
   // Same key derivations as MemoryService.storeLockKey: the workspace store
   // root lives inside the session directory; global/project mutations hold
   // the coarse `<rootDir>/memory` key while journaling into this session dir.

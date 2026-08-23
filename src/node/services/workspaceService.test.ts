@@ -10073,6 +10073,9 @@ describe("WorkspaceService remove desktop session cleanup", () => {
 
     const mockConfig: Partial<Config> = {
       srcDir: "/tmp/src",
+      // r63: removal serializes session-dir deletion with the memory target
+      // locks and removal tombstones under `<rootDir>/locks`.
+      rootDir: tempRoot,
       getSessionDir: mock((id: string) => path.join(tempRoot, "sessions", id)),
       removeWorkspace: removeWorkspaceMock,
       findWorkspace: mock(() => null),
