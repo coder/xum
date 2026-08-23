@@ -1,5 +1,5 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import {
@@ -30,6 +30,16 @@ const BadgeStory = (props: BadgeStoryProps) => {
       ...props.config,
     })
   );
+  // Storybook reuses one browser origin across stories; restore the disabled
+  // default on unmount so later stories with terminals don't inherit the badge.
+  useEffect(() => {
+    return () => {
+      updatePersistedState<TerminalBadgeConfig>(
+        TERMINAL_BADGE_CONFIG_KEY,
+        DEFAULT_TERMINAL_BADGE_CONFIG
+      );
+    };
+  }, []);
 
   return (
     <div className="p-4" style={{ width: props.width, maxWidth: "100%" }}>

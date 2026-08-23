@@ -15,6 +15,7 @@ import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import {
   SELECTED_WORKSPACE_KEY,
   SIDEBAR_AGE_GROUPING_KEY,
+  TERMINAL_BADGE_CONFIG_KEY,
   UI_THEME_KEY,
 } from "@/common/constants/storage";
 
@@ -88,6 +89,9 @@ function resetStorybookPersistedStateForStory(): void {
     // Stories that disable sidebar age grouping must not leak the setting
     // into later stories via the shared localStorage origin.
     localStorage.removeItem(SIDEBAR_AGE_GROUPING_KEY);
+    // Terminal badge stories seed an enabled badge config; clear it so other
+    // stories with terminals don't render order-dependent badge overlays.
+    localStorage.removeItem(TERMINAL_BADGE_CONFIG_KEY);
   }
 }
 function getStorybookRenderKey(): string | null {
