@@ -424,6 +424,25 @@ describe("ProviderModelFactory.createModel", () => {
     }
   });
 
+  it("merges backend disableBetaFeatures for custom anthropic-messages providers", async () => {
+    await withTempConfig(async (config, factory) => {
+      // The providerType, not the provider name, classifies the request as
+      // Anthropic-wire: without it providers.anthropic.disableBetaFeatures
+      // never merges and cache_control is injected despite the user
+      // disabling beta features.
+      saveLocalVllmConfig(config, { providerType: "anthropic-messages" });
+      config.saveProvidersConfig({
+        ...config.loadProvidersConfig(),
+        anthropic: { disableBetaFeatures: true },
+      } as Parameters<Config["saveProvidersConfig"]>[0]);
+
+      const muxOptions: MuxProviderOptions = {};
+      const result = await factory.createModel(`local-vllm:${LOCAL_VLLM_MODEL}`, muxOptions);
+      expect(result.success).toBe(true);
+      expect(muxOptions.anthropic?.disableBetaFeatures).toBe(true);
+    });
+  });
+
   it("allows policy-allowed custom OpenAI-compatible providers when policy is enforced", async () => {
     await withTempPolicyProviderFactory(
       {

@@ -121,7 +121,10 @@ import {
   resolveCoderWireCanonicalModel,
 } from "@/common/constants/coderOAuth";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
-import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
+import {
+  customProviderWireOrigin,
+  isCustomProviderConfig,
+} from "@/common/utils/providers/customProviders";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
@@ -1561,8 +1564,33 @@ export class AIService extends EventEmitter {
         // no snapshot, and their canonical form is the raw string.
         coderWire:
           | { origin: "anthropic" | "openai"; modelId: string; providerType: string }
-          | undefined
+          | undefined,
+        // Snapshot the identity is resolved against; the refusal-fallback
+        // path passes ITS pinned snapshot, not the primary request's.
+        providersConfigSnapshot: ProvidersConfigMap
       ): { modelString: string; openaiWireFormat?: "chatCompletions" | "responses" } => {
+        // Custom providers own their raw prefix (including shadowed built-in
+        // ids) and speak the wire their providerType selects: tool assembly
+        // must key on that wire so Responses-bound MCP schemas are sanitized
+        // and provider-native tools are offered. Chat-completions custom
+        // providers keep their generic identity.
+        const rawSeparator = raw.indexOf(":");
+        const rawPrefix = rawSeparator > 0 ? raw.slice(0, rawSeparator) : "";
+        const rawCustomEntry = rawPrefix ? providersConfigSnapshot[rawPrefix] : undefined;
+        if (isCustomProviderConfig(rawCustomEntry)) {
+          const wireOrigin = customProviderWireOrigin(rawCustomEntry.providerType);
+          if (wireOrigin === "openai") {
+            // The factory always creates provider.responses() for this type.
+            return {
+              modelString: `openai:${raw.slice(rawSeparator + 1)}`,
+              openaiWireFormat: "responses",
+            };
+          }
+          if (wireOrigin === "anthropic") {
+            return { modelString: `anthropic:${raw.slice(rawSeparator + 1)}` };
+          }
+          return { modelString: raw };
+        }
         if (!raw.startsWith("coder:")) {
           return { modelString: raw };
         }
@@ -1610,7 +1638,8 @@ export class AIService extends EventEmitter {
         modelString,
         effectiveModelString,
         canonicalModelString,
-        modelResult.data.coderWire
+        modelResult.data.coderWire,
+        requestProvidersConfig
       );
       const toolsModelString = toolsIdentity.modelString;
       // Option/header builder identity: raw selections resolve via the
@@ -3484,7 +3513,8 @@ export class AIService extends EventEmitter {
                   nextModelString,
                   next.effectiveModelString,
                   next.canonicalModelString,
-                  next.coderWire
+                  next.coderWire,
+                  nextProvidersConfig
                 );
                 // Same effective-route rule as the main path's
                 // optionsModelString: a Coder fallback selection that itself

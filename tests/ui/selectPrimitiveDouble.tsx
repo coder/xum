@@ -43,7 +43,7 @@ export function createSelectPrimitiveDouble() {
     children: React.ReactNode;
   }) {
     const [open, setOpen] = React.useState(false);
-    const options = React.useMemo(() => collectOptions(props.children), [props.children]);
+    const options = collectOptions(props.children);
     return (
       <SelectContext.Provider
         value={{

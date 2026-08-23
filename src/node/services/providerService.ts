@@ -25,7 +25,6 @@ import {
   isCustomProviderConfig,
   isCustomProviderType,
   validateCustomProviderId,
-  type CustomProviderType,
   type ProvidersConfigWithProviderType,
 } from "@/common/utils/providers/customProviders";
 import {
@@ -1421,26 +1420,8 @@ export class ProviderService {
 
     try {
       const isProviderTypeEdit = keyPath.length === 1 && keyPath[0] === "providerType";
-      if (isProviderTypeEdit) {
-        if (!isCustomProviderType(value)) {
-          return { success: false, error: `Invalid custom provider type: ${String(value)}` };
-        }
-
-        // The add-time id collision rule applies only when this write would
-        // CONVERT a non-custom entry into a custom provider. An entry that is
-        // already custom stays editable even when its id shadows a built-in
-        // (upgraded installs deliberately preserve such entries).
-        const existingEntry = this.config.loadProvidersConfig()?.[provider];
-        if (!isCustomProviderConfig(existingEntry)) {
-          const providerType: CustomProviderType = value;
-          const validation = validateCustomProviderId(provider);
-          if (!validation.ok) {
-            return {
-              success: false,
-              error: `Invalid custom provider id for ${providerType}: ${validation.reason}`,
-            };
-          }
-        }
+      if (isProviderTypeEdit && !isCustomProviderType(value)) {
+        return { success: false, error: `Invalid custom provider type: ${String(value)}` };
       }
 
       // Read-modify-write under the cross-process lock (see setConfigValue).
@@ -1452,6 +1433,19 @@ export class ProviderService {
         }
 
         const providersConfig = this.config.loadProvidersConfig() ?? {};
+
+        // The add-time id collision rule applies only when this write would
+        // CONVERT a non-custom entry into a custom provider. An entry that is
+        // already custom stays editable even when its id shadows a built-in
+        // (upgraded installs deliberately preserve such entries). Checked
+        // against the config read INSIDE the lock: a pre-lock read could race
+        // another process removing the entry and recreate it as custom.
+        if (isProviderTypeEdit && !isCustomProviderConfig(providersConfig[provider])) {
+          const validation = validateCustomProviderId(provider);
+          if (!validation.ok) {
+            return `Invalid custom provider id for ${String(value)}: ${validation.reason}`;
+          }
+        }
 
         // Track if this is first time setting couponCode for mux-gateway
         const isFirstMuxGatewayCoupon =

@@ -1203,7 +1203,9 @@ export class ProviderModelFactory {
         : null;
       const isAnthropicRoutedModel = isCoderGatewayModel
         ? coderWire?.origin === "anthropic"
-        : providerName === "anthropic" || modelId.startsWith("anthropic/");
+        : customProviderType === "anthropic-messages" ||
+          providerName === "anthropic" ||
+          modelId.startsWith("anthropic/");
 
       // Anthropic-specific: merge global disableBetaFeatures into muxProviderOptions.
       const configDisableBeta = providersConfig.anthropic?.disableBetaFeatures;
@@ -1308,11 +1310,16 @@ export class ProviderModelFactory {
           }
           case "anthropic-messages": {
             const { createAnthropic } = await PROVIDER_REGISTRY.anthropic();
+            // Honor beta disablement like the built-in Anthropic path: strict
+            // ZDR proxies reject cache_control when beta features are off.
+            const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
             const provider = createAnthropic({
               baseURL: normalizeAnthropicBaseURL(credentials.baseURL),
               apiKey: isolatedApiKey,
               headers: { ...muxAttributionHeaders },
-              fetch: wrapFetchWithAnthropicCacheControl(providerFetch, effectiveAnthropicCacheTtl),
+              fetch: wrapFetchWithAnthropicCacheControl(providerFetch, effectiveAnthropicCacheTtl, {
+                injectCacheControl: !disableBeta,
+              }),
             });
             return Ok(provider(modelId));
           }
