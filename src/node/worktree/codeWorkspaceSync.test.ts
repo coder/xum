@@ -244,6 +244,41 @@ describe("updateCodeWorkspaceFile", () => {
     expect(parseFolders(await readWorkspaceFile())).toEqual([{ path: theirs }]);
   });
 
+  test("refuses to write through a symlink whose target is not a .code-workspace file", async () => {
+    const worktree = path.join(managedRootDir, "feature-a");
+    const externalJson = path.join(tempDir, "external.json");
+    const externalContent = JSON.stringify({ folders: [{ path: "/user/data" }] });
+    await fsPromises.writeFile(externalJson, externalContent);
+    const linkPath = path.join(tempDir, "proj.code-workspace");
+    await fsPromises.symlink(externalJson, linkPath);
+
+    const result = await updateCodeWorkspaceFile({
+      codeWorkspacePath: linkPath,
+      managedRootDirs: [managedRootDir],
+      desiredPaths: [worktree],
+      seedFolders: [worktree],
+    });
+
+    expect(result.ok).toBe(false);
+    expect(await fsPromises.readFile(externalJson, "utf-8")).toBe(externalContent);
+
+    // The dangling variant must not create the non-extension target either.
+    const danglingLink = path.join(tempDir, "dangling-bad.code-workspace");
+    await fsPromises.symlink(path.join(tempDir, "planted.json"), danglingLink);
+    const danglingResult = await updateCodeWorkspaceFile({
+      codeWorkspacePath: danglingLink,
+      managedRootDirs: [managedRootDir],
+      desiredPaths: [worktree],
+      seedFolders: [worktree],
+    });
+    expect(danglingResult.ok).toBe(false);
+    const plantedExists = await fsPromises.stat(path.join(tempDir, "planted.json")).then(
+      () => true,
+      () => false
+    );
+    expect(plantedExists).toBe(false);
+  });
+
   test("creates a dangling symlink's target instead of replacing the link", async () => {
     const worktree = path.join(managedRootDir, "feature-a");
     const target = path.join(tempDir, "real-target.code-workspace");

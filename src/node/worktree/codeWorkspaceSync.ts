@@ -162,6 +162,16 @@ async function updateCodeWorkspaceFileLocked(
   update: CodeWorkspaceFileUpdate
 ): Promise<CodeWorkspaceSyncResult> {
   const { codeWorkspacePath, managedRootDirs, desiredPaths } = update;
+  // SECURITY: the configured path was extension-validated, but a symlink at
+  // that path can live inside the checkout (repo-controlled) and point
+  // anywhere. Re-validate the RESOLVED target so a planted link cannot
+  // redirect the write into an arbitrary JSON file (or create one).
+  if (!targetPath.endsWith(CODE_WORKSPACE_EXTENSION)) {
+    log.warn("Skipping .code-workspace sync: resolved target is not a .code-workspace file", {
+      codeWorkspacePath,
+    });
+    return { ok: false, error: "Workspace file symlink does not target a .code-workspace file" };
+  }
   // Relative folder entries resolve against the configured file location,
   // matching how VS Code resolves them for the file the user opens.
   const fileDir = path.dirname(codeWorkspacePath);
