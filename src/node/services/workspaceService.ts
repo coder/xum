@@ -2744,6 +2744,7 @@ export class WorkspaceService extends EventEmitter {
   private memoryConsolidationService?: {
     triggerInBackground(workspaceId: string, trigger: "compaction" | "archive"): void;
     triggerHarvestThenSweepInBackground(metadata: CompactionCompletionMetadata): void;
+    cancelInFlightConsolidation(workspaceId: string): Promise<void>;
   };
   private worktreeArchiveSnapshotService?: WorktreeArchiveSnapshotLifecycleService;
   private taskService?: TaskService;
@@ -2797,6 +2798,7 @@ export class WorkspaceService extends EventEmitter {
   setMemoryConsolidationService(service: {
     triggerInBackground(workspaceId: string, trigger: "compaction" | "archive"): void;
     triggerHarvestThenSweepInBackground(metadata: CompactionCompletionMetadata): void;
+    cancelInFlightConsolidation(workspaceId: string): Promise<void>;
   }): void {
     this.memoryConsolidationService = service;
   }
@@ -5135,6 +5137,13 @@ export class WorkspaceService extends EventEmitter {
         // recoverable (rerun /refine, refork); a checkout write racing
         // deletion is not. Both calls are idempotent; they run again later
         // for the phantom-metadata path.
+        // Dream/harvest consolidation is a third producer (r60): its runs
+        // ride only a hard timeout, so removal must abort them explicitly or
+        // a detached run could mutate memory and journal into the deleted
+        // session directory. Cancel BEFORE clearPendingBranchSummary so
+        // residual wedged runs it hands to the usage-write registry get that
+        // drain's bounded second chance.
+        await this.memoryConsolidationService?.cancelInFlightConsolidation(workspaceId);
         await clearPendingBranchSummary(workspaceId);
         await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
 
@@ -5439,6 +5448,11 @@ export class WorkspaceService extends EventEmitter {
       // the resulting stream-abort event would otherwise be recorded on the timeline after the
       // delete, recreating the session directory for a workspace the user removed.
       this.disposeSession(workspaceId);
+
+      // Same for in-flight dream/harvest consolidation (r60): abort + drain
+      // before the session directory disappears (idempotent; normally
+      // already cancelled before the usage rollup above).
+      await this.memoryConsolidationService?.cancelInFlightConsolidation(workspaceId);
 
       // Cancel and drain any background branch-summary writer BEFORE deleting
       // the session directory: a mid-flight append could otherwise recreate

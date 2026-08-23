@@ -341,6 +341,45 @@ async function seedCompactionEpoch(
 }
 
 describe("MemoryConsolidationService", () => {
+  it("workspace removal aborts and drains an in-flight consolidation run (r60)", async () => {
+    // Removal only ever raced the run's hard timeout before: the drain must
+    // abort the stream itself, settle the run, and return promptly so
+    // removal is never wedged behind an open provider stream.
+    let streamStarted!: () => void;
+    const started = new Promise<void>((resolve) => (streamStarted = resolve));
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: (options) => {
+            streamStarted();
+            // Emits nothing and never closes; like a real provider stream it
+            // errors only when the request's abort signal fires.
+            return Promise.resolve({
+              stream: new ReadableStream<LanguageModelV3StreamPart>({
+                start(controller) {
+                  options.abortSignal?.addEventListener("abort", () => {
+                    controller.error(new Error("request aborted"));
+                  });
+                },
+              }),
+            });
+          },
+        }),
+    });
+    const run = fixture.service.maybeRun("ws-dream", "manual");
+    await started;
+    await fixture.service.cancelInFlightConsolidation("ws-dream");
+    // The run settled (abort surfaced as a stream failure) instead of
+    // holding the in-flight lock until its multi-minute timeout.
+    const result = await run;
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("stream failed");
+    }
+    // Idempotent with nothing in flight (the phantom-metadata removal path).
+    await fixture.service.cancelInFlightConsolidation("ws-dream");
+  });
+
   it("runs, persists the journal record, and reports it via getRecord", async () => {
     using fixture = await createFixture();
     const result = await fixture.service.maybeRun("ws-dream", "compaction");

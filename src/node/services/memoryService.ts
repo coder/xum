@@ -1421,7 +1421,8 @@ export class MemoryService extends EventEmitter {
     virtualPath: string,
     content: string,
     expectedSha256: string | null,
-    actor: MemoryActor
+    actor: MemoryActor,
+    abortSignal?: AbortSignal
   ): Promise<MemorySaveFileResult> {
     const conflict = (message: string): MemorySaveFileResult => ({
       success: false,
@@ -1462,6 +1463,7 @@ export class MemoryService extends EventEmitter {
               );
             }
           }
+          throwIfMutationCancelled(abortSignal, virtualPath);
           await store.writeFile(parsed.relPath, content);
           await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
           this.emitChange(ctx, scope, parsed.relPath, actor);

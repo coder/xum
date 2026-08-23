@@ -41,7 +41,11 @@ import {
 } from "@/common/orpc/schemas/memory";
 import { defaultModel } from "@/common/utils/ai/models";
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
-import { deriveSideChannelModelCandidates } from "@/node/services/branchSummary";
+import {
+  deriveSideChannelModelCandidates,
+  trackPendingUsageWrite,
+} from "@/node/services/branchSummary";
+import { USAGE_WRITE_DRAIN_WINDOW_MS } from "@/constants/streamDrain";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { getErrorMessage } from "@/common/utils/errors";
 import { Err, Ok } from "@/common/types/result";
@@ -285,6 +289,18 @@ export class MemoryConsolidationService extends EventEmitter {
    */
   private readonly inFlight = new Map<string, Promise<Result<MemoryConsolidationRecord, string>>>();
 
+  /**
+   * Per-run removal controllers (r60): workspace removal must abort and
+   * drain in-flight dream/harvest runs BEFORE deleting the session
+   * directory — their timeout signal alone never fires during removal, so a
+   * detached run could still mutate global/project memory and append its
+   * refinement journal row into the deleted session directory, recreating
+   * it. Each run combines its hard timeout with one of these controllers
+   * (AbortSignal.any); cancelInFlightConsolidation aborts them and awaits
+   * the runs bounded.
+   */
+  private readonly runControllers = new Map<string, Set<AbortController>>();
+
   /** Coalesces duplicate completion signals for one physical compaction boundary. */
   private readonly harvestInFlight = new Map<
     string,
@@ -426,6 +442,87 @@ export class MemoryConsolidationService extends EventEmitter {
     }
   }
 
+  /** Register one run's removal controller; disposed when the run settles. */
+  private trackRunController(workspaceId: string): {
+    controller: AbortController;
+    dispose: () => void;
+  } {
+    const controller = new AbortController();
+    const set = this.runControllers.get(workspaceId) ?? new Set<AbortController>();
+    set.add(controller);
+    this.runControllers.set(workspaceId, set);
+    return {
+      controller,
+      dispose: () => {
+        set.delete(controller);
+        if (set.size === 0 && this.runControllers.get(workspaceId) === set) {
+          this.runControllers.delete(workspaceId);
+        }
+      },
+    };
+  }
+
+  /**
+   * Workspace-removal drain (r60): abort every in-flight dream/harvest run
+   * for this workspace and await them BOUNDED. The stream abort settles a
+   * run promptly, but one wedged in pre-stream awaits or tool filesystem
+   * I/O must not hang removal — after the window, residual runs are handed
+   * to the shared usage-write registry (clearPendingBranchSummary drains it
+   * right after this in the removal flow) for one more bounded chance, and
+   * anything that outlives even that cannot commit durable memory: its
+   * combined signal is aborted, so MemoryService refuses pre-commit inside
+   * the target mutation lock. Idempotent; no-runs is a fast no-op.
+   */
+  async cancelInFlightConsolidation(workspaceId: string): Promise<void> {
+    for (const controller of this.runControllers.get(workspaceId) ?? []) {
+      try {
+        controller.abort();
+      } catch (error) {
+        // Stream internals attach abort listeners that can rethrow the abort
+        // reason synchronously out of abort() (observed under Bun); the
+        // removal drain must keep going — the signal IS aborted regardless.
+        log.debug("[MemoryConsolidation] abort listener threw during removal drain", { error });
+      }
+    }
+    const waits: Array<Promise<void>> = [];
+    const active = this.inFlight.get(workspaceId);
+    if (active !== undefined) {
+      waits.push(
+        active.then(
+          () => undefined,
+          () => undefined
+        )
+      );
+    }
+    for (const [key, run] of this.harvestInFlight) {
+      if (key.startsWith(`${workspaceId}:`)) {
+        waits.push(
+          run.then(
+            () => undefined,
+            () => undefined
+          )
+        );
+      }
+    }
+    if (waits.length === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const settled = await Promise.race([
+        Promise.allSettled(waits).then(() => true as const),
+        new Promise<false>((resolve) => {
+          timer = setTimeout(() => resolve(false), USAGE_WRITE_DRAIN_WINDOW_MS);
+        }),
+      ]);
+      if (!settled) {
+        for (const wait of waits) {
+          void trackPendingUsageWrite(workspaceId, wait);
+        }
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   /**
    * Funnel for every trigger. Checks experiment + debounce, then runs and
    * journals. Returns the record on a completed run, or a skip reason.
@@ -452,13 +549,15 @@ export class MemoryConsolidationService extends EventEmitter {
     // check and start a second concurrent run over the same directories.
     // runLocked executes synchronously up to its first await, so the map is
     // populated before any other caller can observe it.
-    const run = this.runLocked(workspaceId, trigger, options);
+    const removal = this.trackRunController(workspaceId);
+    const run = this.runLocked(workspaceId, trigger, options, removal.controller.signal);
     this.inFlight.set(workspaceId, run);
     let result: Result<MemoryConsolidationRecord, string>;
     try {
       result = await run;
     } finally {
       this.inFlight.delete(workspaceId);
+      removal.dispose();
     }
     if (options.skipHarvestRecovery !== true) {
       await this.recoverRetryableHarvests(workspaceId);
@@ -470,7 +569,8 @@ export class MemoryConsolidationService extends EventEmitter {
   private async runLocked(
     workspaceId: string,
     trigger: MemoryConsolidationTrigger,
-    options: MemoryConsolidationRunOptions
+    options: MemoryConsolidationRunOptions,
+    removalSignal: AbortSignal
   ): Promise<Result<MemoryConsolidationRecord, string>> {
     // Manual runs bypass debounce (an explicit /dream is explicit intent).
     // Archive too: it is the workspace's one-shot final pass — the only
@@ -516,7 +616,13 @@ export class MemoryConsolidationService extends EventEmitter {
       finalPass: trigger === "archive",
       // Hard timeout: a wedged provider stream must not hold the in-flight
       // lock forever (and stall the sequential launch sweep behind it).
-      abortSignal: AbortSignal.timeout(MEMORY_CONSOLIDATION_TIMEOUT_MS),
+      // Combined with the removal controller (r60): workspace removal must
+      // abort the stream AND flip the tool-level pre-commit checks so a
+      // detached mutation cannot land after the session directory is gone.
+      abortSignal: AbortSignal.any([
+        AbortSignal.timeout(MEMORY_CONSOLIDATION_TIMEOUT_MS),
+        removalSignal,
+      ]),
       recordUsage: async (usage, providerMetadata) => {
         const recorded = await this.sessionUsageService?.recordHeadlessUsage(
           workspaceId,
@@ -575,17 +681,20 @@ export class MemoryConsolidationService extends EventEmitter {
     const active = this.harvestInFlight.get(boundaryRunKey);
     if (active !== undefined) return active;
 
-    const run = this.harvestThenSweepLocked(metadata);
+    const removal = this.trackRunController(metadata.workspaceId);
+    const run = this.harvestThenSweepLocked(metadata, removal.controller.signal);
     this.harvestInFlight.set(boundaryRunKey, run);
     try {
       return await run;
     } finally {
       this.harvestInFlight.delete(boundaryRunKey);
+      removal.dispose();
     }
   }
 
   private async harvestThenSweepLocked(
-    metadata: CompactionCompletionMetadata
+    metadata: CompactionCompletionMetadata,
+    removalSignal: AbortSignal
   ): Promise<Result<MemoryConsolidationRecord, string>> {
     const workspace = this.config.findWorkspace(metadata.workspaceId);
     if (!workspace) return Err(`workspace not found: ${metadata.workspaceId}`);
@@ -663,7 +772,11 @@ export class MemoryConsolidationService extends EventEmitter {
           completionMetadata: metadata,
           messages: epoch.data.messages,
           summary: epoch.data.summary,
-          abortSignal: AbortSignal.timeout(MEMORY_CONSOLIDATION_TIMEOUT_MS),
+          // Timeout + removal (r60); see the runLocked signal for rationale.
+          abortSignal: AbortSignal.any([
+            AbortSignal.timeout(MEMORY_CONSOLIDATION_TIMEOUT_MS),
+            removalSignal,
+          ]),
           recordUsage: async (usage, providerMetadata) => {
             const recorded = await this.sessionUsageService?.recordHeadlessUsage(
               metadata.workspaceId,
