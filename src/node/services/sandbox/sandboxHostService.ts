@@ -875,12 +875,16 @@ export class SandboxHostService {
         );
       }
     }
+    const runtime = await options.runtimeFactory.create();
     // One journal read feeds both the reset generation this mount is created
     // against (r52) and the latest-snapshot restore below. Read AFTER the
-    // pending-discard retry so a just-published tombstone is counted.
-    const creationEvents = await journal.read();
-    const mountResetGeneration = countScopeResets(creationEvents, scopeKey);
-    const runtime = await options.runtimeFactory.create();
+    // pending-discard retry so a just-published tombstone is counted, and
+    // AFTER the (slow, asynchronous) runtime creation (r53) so a foreign
+    // reset landing during that window is already visible here. Mutable: the
+    // post-restore stabilization loop below re-reads, and the persist
+    // precondition compares against the binding's CURRENT value.
+    let creationEvents = await journal.read();
+    let mountResetGeneration = countScopeResets(creationEvents, scopeKey);
     const mount = new SandboxMount(
       runtime,
       "persistent",
@@ -950,7 +954,24 @@ export class SandboxHostService {
     );
 
     if (grants.vars) {
-      await this.initializeVars(mount, journal, scopeKey, creationEvents);
+      // Post-restore stabilization (r53): vars restoration is itself
+      // asynchronous, so a foreign reset can land between the events read
+      // above and the restore completing — the mount would then expose
+      // pre-reset vars to guest code even though the persist precondition
+      // blocks saving them. Restore, then re-read: only a pass whose
+      // post-restore read observes the same generation the restore used can
+      // return the mount. Terminates because each extra iteration requires
+      // ANOTHER foreign reset (a rare explicit user action) landing inside
+      // the restore window; initializeVars is idempotent (vars = {} then
+      // restore-latest).
+      for (;;) {
+        await this.initializeVars(mount, journal, scopeKey, creationEvents);
+        const recheckEvents = await journal.read();
+        const recheckGeneration = countScopeResets(recheckEvents, scopeKey);
+        if (recheckGeneration === mountResetGeneration) break;
+        creationEvents = recheckEvents;
+        mountResetGeneration = recheckGeneration;
+      }
     }
     this.mountResetGenerations.set(mount, mountResetGeneration);
     if (grants.hostEvents) {

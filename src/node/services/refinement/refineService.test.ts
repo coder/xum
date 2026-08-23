@@ -1884,6 +1884,73 @@ describe("RefineService", () => {
     expect(await loadStagedRefineSet(fixture.sessionDir)).not.toBeNull();
   });
 
+  it("collapses same-target staged skill writes to the last one (r53)", async () => {
+    // Two full-file writes to the same target in one proposal: fingerprinting
+    // both against the same pre-apply file would make the in-lock guard
+    // reject the second as an external change the moment the first applied —
+    // an approved proposal that can never fully apply. Staging keeps only the
+    // final write (identical end state for full-file overwrites).
+    const draft = [
+      "---",
+      "name: distilled-lesson",
+      "description: Draft lesson.",
+      "---",
+      "",
+      "Draft body.",
+      "",
+    ].join("\n");
+    const final = [
+      "---",
+      "name: distilled-lesson",
+      "description: Final lesson.",
+      "---",
+      "",
+      "Final body.",
+      "",
+    ].join("\n");
+    using fixture = await createFixture({
+      withSkillTool: true,
+      modelFactory: () =>
+        toolCallModel(
+          [
+            {
+              toolCallId: "refine-skill-dup-1",
+              toolName: "agent_skill_write",
+              input: { name: "distilled-lesson", content: draft },
+            },
+            {
+              toolCallId: "refine-skill-dup-2",
+              toolName: "agent_skill_write",
+              input: { name: "distilled-lesson", content: final },
+            },
+          ],
+          "distilled-lesson: repo lesson."
+        ),
+    });
+    await fixture.seedTrajectory();
+
+    const stagedResult = await fixture.service.run(WORKSPACE_ID);
+    expect(stagedResult.success).toBe(true);
+    if (!stagedResult.success) return;
+    expect(stagedResult.data.staged).toHaveLength(1);
+    const staged = await loadStagedRefineSet(fixture.sessionDir);
+    expect(staged?.edits.map((edit) => edit.toolCallId)).toEqual(["refine-skill-dup-2"]);
+
+    const result = await fixture.service.apply(WORKSPACE_ID);
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.applied).toHaveLength(1);
+    expect(result.data.failed).toBeUndefined();
+    const skillFile = path.join(
+      fixture.workspacePath,
+      ".xum",
+      "skills",
+      "distilled-lesson",
+      "SKILL.md"
+    );
+    expect(await fsPromises.readFile(skillFile, "utf-8")).toContain("Final body.");
+  });
+
   it("refuses to stage a skill write the real tool would reject", async () => {
     // Codex round 19: the staging wrapper recorded agent_skill_write
     // proposals without the real tool's validation — an invalid-frontmatter

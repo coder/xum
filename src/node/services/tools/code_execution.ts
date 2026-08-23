@@ -673,8 +673,21 @@ ${xumTypes}
             }
           }
 
-          // Execute the code
-          const result = await runtime.eval(code);
+          // Execute the code. Detach the abort listener the moment eval
+          // settles (r53): its only job is interrupting THIS eval, and the
+          // post-eval persistence below (vars snapshot + handle publication)
+          // takes real time. eval()'s finally has already cleared the
+          // runtime's sticky abort flag, so an Esc landing in that window
+          // would re-set it via onAbort — and the NEXT call on this reused
+          // persistent runtime would then abort immediately at its own
+          // eval() start. The outer finally's removal stays as the safety
+          // net for pre-eval throws (removeEventListener is idempotent).
+          let result: PTCExecutionResult;
+          try {
+            result = await runtime.eval(code);
+          } finally {
+            abortSignal?.removeEventListener("abort", onAbort);
+          }
 
           // Kernel-mode context isolation (r12): nested records become compact
           // summaries and console output is bounded, regardless of grants —

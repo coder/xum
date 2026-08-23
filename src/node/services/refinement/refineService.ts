@@ -969,15 +969,6 @@ export class RefineService {
       }
 
       const summary = result.summary.length > 0 ? result.summary : "Nothing worth distilling.";
-      const record: RefineRecord = {
-        applied: [],
-        summary,
-        noOp: result.stagedEdits.length === 0,
-        ...(result.stagedEdits.length > 0
-          ? { staged: result.stagedEdits.map((edit) => ({ description: edit.description })) }
-          : {}),
-        usage: result.usage,
-      };
 
       log.debug("[Refine] staging pass complete", {
         workspaceId,
@@ -1077,6 +1068,18 @@ export class RefineService {
       // both the save and hashStagedRefineSet below — the approval hash must
       // cover the exact persisted set.
       const stagedEdits = await this.fingerprintSkillWriteTargets(workspaceId, result.stagedEdits);
+      // Built from the COLLAPSED set (r53): same-target skill writes were
+      // deduplicated above, and the record's staged descriptions must match
+      // the persisted set the user approves.
+      const record: RefineRecord = {
+        applied: [],
+        summary,
+        noOp: stagedEdits.length === 0,
+        ...(stagedEdits.length > 0
+          ? { staged: stagedEdits.map((edit) => ({ description: edit.description })) }
+          : {}),
+        usage: result.usage,
+      };
 
       // Every completed pass REPLACES the staged set (one per workspace):
       // stale proposals from an older trajectory must not linger behind a
@@ -1156,6 +1159,19 @@ export class RefineService {
     return matched;
   }
 
+  /** Resolved target path for a staged skill write, or undefined when the
+   * input cannot be parsed/resolved (such edits also get no fingerprint). */
+  private resolveStagedSkillWriteTarget(projectRoot: string, input: unknown): string | undefined {
+    const parsed = TOOL_DEFINITIONS.agent_skill_write.schema.safeParse(input);
+    if (!parsed.success) return undefined;
+    const resolved = resolveProjectSkillWriteTargetPath({
+      projectRoot,
+      name: parsed.data.name,
+      filePath: parsed.data.filePath,
+    });
+    return resolved.ok ? resolved.path : undefined;
+  }
+
   /**
    * sha256 fingerprint of a staged agent_skill_write edit's CURRENT target
    * file, "absent" when it does not exist, or undefined when the target
@@ -1166,18 +1182,12 @@ export class RefineService {
     projectRoot: string,
     input: unknown
   ): Promise<string | undefined> {
-    const parsed = TOOL_DEFINITIONS.agent_skill_write.schema.safeParse(input);
-    if (!parsed.success) return undefined;
-    const resolved = resolveProjectSkillWriteTargetPath({
-      projectRoot,
-      name: parsed.data.name,
-      filePath: parsed.data.filePath,
-    });
-    if (!resolved.ok) return undefined;
+    const targetPath = this.resolveStagedSkillWriteTarget(projectRoot, input);
+    if (targetPath === undefined) return undefined;
     try {
       // Shared hash helper (r50): the tool recomputes this fingerprint under
       // its mutation lock at apply, so encoding and sentinel must match.
-      const content = await fsPromises.readFile(resolved.path, "utf-8");
+      const content = await fsPromises.readFile(targetPath, "utf-8");
       return hashSkillWriteTargetContent(content);
     } catch (error) {
       if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
@@ -1202,8 +1212,28 @@ export class RefineService {
     if (!edits.some((edit) => edit.tool === "agent_skill_write")) return edits;
     const projectRoot = await this.resolveSkillWriteProjectRoot(workspaceId);
     if (projectRoot === undefined) return edits;
+    // r53: collapse multiple staged writes to the SAME resolved target down
+    // to the LAST one (in apply order). Staged skill writes are full-file
+    // overwrites, so the final write alone yields the identical end state —
+    // whereas fingerprinting every duplicate against the same pre-apply file
+    // would make the in-lock guard reject each later duplicate as an
+    // external change the moment the first one applied, leaving an approved
+    // proposal that can never fully apply. Collapsed BEFORE fingerprinting,
+    // saving, and hashStagedRefineSet so the user approves exactly the set
+    // apply executes.
+    const lastWriteIndexByTarget = new Map<string, number>();
+    edits.forEach((edit, index) => {
+      if (edit.tool !== "agent_skill_write") return;
+      const targetPath = this.resolveStagedSkillWriteTarget(projectRoot, edit.input);
+      if (targetPath !== undefined) lastWriteIndexByTarget.set(targetPath, index);
+    });
+    const collapsed = edits.filter((edit, index) => {
+      if (edit.tool !== "agent_skill_write") return true;
+      const targetPath = this.resolveStagedSkillWriteTarget(projectRoot, edit.input);
+      return targetPath === undefined || lastWriteIndexByTarget.get(targetPath) === index;
+    });
     return Promise.all(
-      edits.map(async (edit) => {
+      collapsed.map(async (edit) => {
         if (edit.tool !== "agent_skill_write") return edit;
         const targetContentHash = await this.fingerprintSkillWriteTarget(projectRoot, edit.input);
         return targetContentHash === undefined ? edit : { ...edit, targetContentHash };

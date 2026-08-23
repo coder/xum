@@ -872,6 +872,42 @@ describe("SandboxHostService", () => {
     await hostA.disposeScope("ws-foreign-reset");
   });
 
+  test("a reset landing during runtime creation cannot leak pre-reset vars (r53)", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const hostA = new SandboxHostService();
+    const hostB = new SandboxHostService();
+    const seeded = await hostA.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-create-race",
+      sessionDir: tmp.path,
+    });
+    await seeded.runtime.eval('vars.secret = "discarded"; return true;');
+    await seeded.persistVars();
+    await hostA.disposeScope("ws-create-race");
+
+    // Runtime creation is slow and asynchronous (WASM init): a foreign reset
+    // landing inside that window must not let the new mount restore the
+    // pre-reset snapshot. The factory seam lands the reset deterministically
+    // mid-creation.
+    const racingFactory = {
+      create: async () => {
+        await hostB.discardScope("ws-create-race", tmp.path);
+        return runtimeFactory.create();
+      },
+    };
+    const mount = await hostA.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory: racingFactory,
+      scopeKey: "ws-create-race",
+      sessionDir: tmp.path,
+    });
+    const probe = await mount.runtime.eval("return Object.keys(vars).length;");
+    expect(probe.success).toBe(true);
+    expect(probe.result).toBe(0);
+    await hostA.disposeScope("ws-create-race");
+  });
+
   test("a stale mount's persist cannot supersede a foreign reset tombstone (r52)", async () => {
     using tmp = new DisposableTempDir("sandbox-host-test");
     const hostA = new SandboxHostService();
