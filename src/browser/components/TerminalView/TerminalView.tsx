@@ -141,6 +141,11 @@ interface TerminalViewProps {
   tabName?: string;
   /** 0-based tab position for the badge's {index} token; unknown in pop-out windows. */
   tabIndex?: number;
+  /**
+   * OSC title carried over from before a pop-out handoff, so the badge doesn't
+   * reset to "Terminal" until the shell emits another title.
+   */
+  initialTitle?: string;
 }
 
 export function TerminalView({
@@ -156,6 +161,7 @@ export function TerminalView({
   projectName,
   tabName,
   tabIndex,
+  initialTitle,
 }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -195,7 +201,7 @@ export function TerminalView({
   } | null>(null);
   // Latest OSC 0/1/2 title; badge fallback for pop-out windows where the
   // sidebar's per-tab title map is unavailable.
-  const [oscTitle, setOscTitle] = useState<string | null>(null);
+  const [oscTitle, setOscTitle] = useState<string | null>(initialTitle ?? null);
 
   // Set window title (dedicated terminal window only)
   useEffect(() => {

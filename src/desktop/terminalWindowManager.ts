@@ -32,7 +32,11 @@ export class TerminalWindowManager {
    * Multiple windows can be open for the same workspace
    * @param sessionId Optional session ID to reattach to (for pop-out handoff from embedded terminal)
    */
-  async openTerminalWindow(workspaceId: string, sessionId?: string): Promise<void> {
+  async openTerminalWindow(
+    workspaceId: string,
+    sessionId?: string,
+    initialTitle?: string
+  ): Promise<void> {
     this.windowCount++;
     const windowId = this.windowCount;
 
@@ -116,6 +120,9 @@ export class TerminalWindowManager {
     const queryParams: Record<string, string> = { workspaceId };
     if (sessionId) {
       queryParams.sessionId = sessionId;
+    }
+    if (initialTitle) {
+      queryParams.title = initialTitle;
     }
 
     if (useDevServer) {

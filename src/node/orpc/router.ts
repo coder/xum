@@ -6195,7 +6195,11 @@ export const router = (authToken?: string) => {
         .input(schemas.terminal.openWindow.input)
         .output(schemas.terminal.openWindow.output)
         .handler(async ({ context, input }) => {
-          return context.terminalService.openWindow(input.workspaceId, input.sessionId);
+          return context.terminalService.openWindow(
+            input.workspaceId,
+            input.sessionId,
+            input.initialTitle
+          );
         }),
       closeWindow: t
         .input(schemas.terminal.closeWindow.input)

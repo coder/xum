@@ -2194,6 +2194,8 @@ export const terminal = {
       workspaceId: z.string(),
       /** Optional session ID to reattach to an existing terminal session (for pop-out handoff) */
       sessionId: z.string().optional(),
+      /** Last known OSC title, so the pop-out badge doesn't reset to "Terminal" */
+      initialTitle: z.string().optional(),
     }),
     output: z.void(),
   },

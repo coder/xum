@@ -1540,10 +1540,14 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       // an unhandled promise rejection. We surface it via the same PopoverError used by
       // handleAddTerminal — the user already paid the cost of removing the tab below, so
       // they need to know if the pop-out itself failed.
-      void openTerminalPopout(api, workspaceId, sessionId).catch((err: unknown) => {
-        console.error("[RightSidebar] Failed to open terminal pop-out:", err);
-        terminalCreateError.showError("terminal-popout", getErrorMessage(err));
-      });
+      // Carry the known OSC title into the pop-out; it is deleted from the
+      // sidebar map below and the new window only sees future title changes.
+      void openTerminalPopout(api, workspaceId, sessionId, terminalTitles.get(tab)).catch(
+        (err: unknown) => {
+          console.error("[RightSidebar] Failed to open terminal pop-out:", err);
+          terminalCreateError.showError("terminal-popout", getErrorMessage(err));
+        }
+      );
 
       // Remove the tab from the sidebar (terminal now lives in its own window)
       // Don't close the session - the pop-out window takes over
@@ -1557,7 +1561,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         return next;
       });
     },
-    [workspaceId, api, setLayout, terminalTitlesKey, terminalCreateError]
+    [workspaceId, api, setLayout, terminalTitlesKey, terminalCreateError, terminalTitles]
   );
 
   // Configure sensors with distance threshold for click vs drag disambiguation

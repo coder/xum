@@ -200,9 +200,12 @@ export function GeneralSection() {
     String.fromCodePoint(0xf135), // fa-rocket
   ].join(" ");
 
+  // The command palette also toggles this key, so stay subscribed to
+  // external updates while Settings is mounted.
   const [rawTerminalBadgeConfig, setTerminalBadgeConfig] = usePersistedState<TerminalBadgeConfig>(
     TERMINAL_BADGE_CONFIG_KEY,
-    DEFAULT_TERMINAL_BADGE_CONFIG
+    DEFAULT_TERMINAL_BADGE_CONFIG,
+    { listener: true }
   );
   const terminalBadgeConfig = normalizeTerminalBadgeConfig(rawTerminalBadgeConfig);
 
