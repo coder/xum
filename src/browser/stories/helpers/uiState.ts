@@ -53,3 +53,12 @@ export function collapseLeftSidebar(): void {
 export function expandRightSidebar(): void {
   localStorage.setItem(RIGHT_SIDEBAR_COLLAPSED_KEY, JSON.stringify(false));
 }
+
+/**
+ * Expand the left sidebar (project tree). The app defaults to collapsed when
+ * window.innerWidth <= 768, so stories whose play functions click sidebar
+ * controls must force it open to pass under Pixel's phone viewport.
+ */
+export function expandLeftSidebar(): void {
+  localStorage.setItem(LEFT_SIDEBAR_COLLAPSED_KEY, JSON.stringify(false));
+}
