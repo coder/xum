@@ -189,6 +189,57 @@ describe("acquireProcessFileLock", () => {
     await fs.writeFile(lockPath, original, "utf-8");
   });
 
+  test("a live holder renews its lease while held, and stops at release (r59)", async () => {
+    // On birth-less platforms the lease is the ONLY reclaim guard: without
+    // renewal, a live holder stalled past the lease (target mutation wedged
+    // in filesystem I/O) was judged stale and displaced — double entry.
+    using tmp = new DisposableTempDir("file-lock-test");
+    const lockPath = path.join(tmp.path, "x.lock");
+    const lock = await acquireProcessFileLock({
+      lockPath,
+      timeoutMs: 500,
+      label: "test",
+      renewIntervalMs: 20,
+    });
+    // Age the lockfile far past any lease; a renewal tick must refresh it.
+    const past = new Date(Date.now() - 10 * 60_000);
+    await fs.utimes(lockPath, past, past);
+    const refreshDeadline = Date.now() + 5_000;
+    for (;;) {
+      const { mtimeMs } = await fs.stat(lockPath);
+      if (Date.now() - mtimeMs < 60_000) break; // renewed to "now"
+      if (Date.now() > refreshDeadline) {
+        throw new Error("lease was never renewed while the lock was held");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await lock[Symbol.asyncDispose]();
+    expect(await lockExists(lockPath)).toBe(false);
+  });
+
+  test("a displaced holder never refreshes the successor's lease (r59)", async () => {
+    using tmp = new DisposableTempDir("file-lock-test");
+    const lockPath = path.join(tmp.path, "x.lock");
+    const lock = await acquireProcessFileLock({
+      lockPath,
+      timeoutMs: 500,
+      label: "test",
+      renewIntervalMs: 20,
+    });
+    // Simulate a (wrongful) reclaim + new owner, then age the successor's
+    // lockfile: the displaced holder's renewal re-verifies the token and
+    // must leave the foreign mtime alone.
+    await fs.writeFile(lockPath, liveToken("successor"), "utf-8");
+    const past = new Date(Date.now() - 10 * 60_000);
+    await fs.utimes(lockPath, past, past);
+    await new Promise((resolve) => setTimeout(resolve, 120)); // several ticks
+    const { mtimeMs } = await fs.stat(lockPath);
+    expect(Math.abs(mtimeMs - past.getTime())).toBeLessThan(1_000);
+    // Disposal leaves the successor's lock in place (ownership-verified).
+    await lock[Symbol.asyncDispose]();
+    expect(await lockExists(lockPath)).toBe(true);
+  });
+
   test("never lease-breaks a verified-live holder, no matter how old the lock is", async () => {
     using tmp = new DisposableTempDir("file-lock-test");
     const lockPath = path.join(tmp.path, "x.lock");

@@ -141,6 +141,14 @@ export async function executeMemoryCommand(
      * position with no content anchor. Ignored by every other command.
      */
     expectedTargetFingerprint?: string;
+    /**
+     * Caller-teardown guard (r59): re-checked by MemoryService INSIDE its
+     * target mutation lock immediately before the first durable write, so a
+     * mutation detached by a cancelled consolidation pass cannot commit (or
+     * journal into a deleted session directory) once its wedged pre-commit
+     * I/O unblocks. Ignored by reads.
+     */
+    abortSignal?: AbortSignal;
   }
 ): Promise<MemoryToolResult> {
   try {
@@ -160,7 +168,14 @@ export async function executeMemoryCommand(
         }
         return (
           checkWriteAccess(input.path) ??
-          (await memoryService.create(ctx, input.path, input.file_text, "agent", toolCallId))
+          (await memoryService.create(
+            ctx,
+            input.path,
+            input.file_text,
+            "agent",
+            toolCallId,
+            options?.abortSignal
+          ))
         );
       }
       case "str_replace": {
@@ -175,7 +190,8 @@ export async function executeMemoryCommand(
             input.old_str,
             input.new_str ?? "",
             "agent",
-            toolCallId
+            toolCallId,
+            options?.abortSignal
           ))
         );
       }
@@ -195,7 +211,8 @@ export async function executeMemoryCommand(
             input.insert_text,
             "agent",
             toolCallId,
-            options?.expectedTargetFingerprint
+            options?.expectedTargetFingerprint,
+            options?.abortSignal
           ))
         );
       }
@@ -210,7 +227,8 @@ export async function executeMemoryCommand(
             input.path,
             "agent",
             toolCallId,
-            options?.expectedTargetFingerprint
+            options?.expectedTargetFingerprint,
+            options?.abortSignal
           ))
         );
       }
@@ -223,7 +241,14 @@ export async function executeMemoryCommand(
         return (
           checkWriteAccess(oldPath) ??
           checkWriteAccess(input.new_path) ??
-          (await memoryService.rename(ctx, oldPath, input.new_path, "agent", toolCallId))
+          (await memoryService.rename(
+            ctx,
+            oldPath,
+            input.new_path,
+            "agent",
+            toolCallId,
+            options?.abortSignal
+          ))
         );
       }
     }

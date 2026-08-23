@@ -222,7 +222,14 @@ async function runCell(
   const config = CONFIGS.find((c) => c.id === configId);
   if (!scenario || !config) throw new Error(`unknown scenario/config: ${scenarioId}/${configId}`);
 
-  const fixtureDir = `/tmp/rlm-eval-fixtures/${scenario.id}`;
+  // r59: one fixture dir PER CELL, wiped before setup. Configs and seeds of
+  // a scenario used to share one directory, and setup only overwrites its
+  // known files — a model writing an intermediate file (e.g. a generated
+  // .jsonl under shard-pipeline/shards) would leak into every later cell
+  // that enumerates the advertised directory, making pass rates depend on
+  // execution order instead of the selected configuration.
+  const fixtureDir = `/tmp/rlm-eval-fixtures/${scenario.id}-${config.id}-s${seed}`;
+  fs.rmSync(fixtureDir, { recursive: true, force: true });
   const truth = scenario.setup(fixtureDir);
   const turns = scenario.turns(truth, fixtureDir);
 

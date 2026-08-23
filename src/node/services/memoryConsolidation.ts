@@ -216,6 +216,16 @@ export function createConsolidationMemoryTool(args: {
    * silently lands in the wrong place on contents edited after staging.
    */
   expectedTargetFingerprints?: ReadonlyMap<string, string>;
+  /**
+   * Caller-teardown guard (r59): tool executions receive no hard
+   * cancellation, so a run wedged in filesystem I/O is eventually detached
+   * by the caller's bounded drain — and would otherwise commit durable
+   * memory (and journal into a deleted session directory, recreating it)
+   * once the I/O unblocks after workspace teardown. Checked at execute
+   * entry AND re-verified by MemoryService inside its target mutation lock
+   * immediately before the first durable write.
+   */
+  abortSignal?: AbortSignal;
 }): { tool: Tool; getMutationCount: () => number } {
   const { memoryService, metaService, ctx, dryRun, journal } = args;
   const budget = args.budget ?? createMutationBudget(MEMORY_CONSOLIDATION_OP_BUDGET);
@@ -264,6 +274,12 @@ export function createConsolidationMemoryTool(args: {
     // toolCallId is threaded into the r2 refinement journal rows so callers
     // (refine, r11) can correlate this run's edits to their journaled ids.
     execute: async (input, { toolCallId }): Promise<MemoryToolResult> => {
+      // r59: a cancelled pass must not start new work — the in-service
+      // pre-commit recheck (below) is what stops executions that were
+      // already in flight when the caller was torn down.
+      if (args.abortSignal?.aborted === true) {
+        return { success: false, error: "Consolidation pass was cancelled" };
+      }
       const target = classifyMutation(input);
       if (target === null) {
         // Reads (and malformed inputs, which fail validation inside) pass through.
@@ -310,6 +326,7 @@ export function createConsolidationMemoryTool(args: {
 
       const result = await executeMemoryCommand(memoryService, ctx, input, () => null, toolCallId, {
         expectedTargetFingerprint: args.expectedTargetFingerprints?.get(toolCallId),
+        abortSignal: args.abortSignal,
       });
       journal.push({
         ...target,
@@ -363,6 +380,10 @@ export async function runMemoryConsolidation(args: {
     ctx: args.ctx,
     dryRun: args.dryRun,
     journal,
+    // r59: workspace removal aborts this signal — a tool execution wedged in
+    // filesystem I/O must not commit durable memory (or recreate the deleted
+    // session directory via its journal row) once the I/O unblocks.
+    abortSignal: args.abortSignal,
   });
 
   const finalPassPrompt =

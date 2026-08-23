@@ -30,12 +30,14 @@
  * Invariant: at most one process can believe it owns the lock. On
  * birth-capable platforms (Linux/macOS) this holds outright: a live holder
  * is never judged stale, and any canonical-token change between judgment
- * and displacement aborts the reclaim. On birth-less platforms the
- * lease-judged residual window (owner releasing exactly between the guarded
- * re-read and the rename after a >5min hold) remains theoretically possible;
- * holders therefore expose `assertStillOwned` so critical sections re-verify
- * ownership immediately before irreversible mutations (mirrors the rollback
- * lock's commit-point doctrine in refinementRollback.ts).
+ * and displacement aborts the reclaim. On birth-less platforms live holders
+ * renew the lease while held (r59), so lease expiry implies a crashed or
+ * frozen owner rather than a slow one; the lease-judged residual window
+ * (owner releasing exactly between the guarded re-read and the rename after
+ * an event-loop freeze outlasting the lease) remains theoretically possible,
+ * so holders also expose `assertStillOwned` for critical sections to
+ * re-verify ownership immediately before irreversible mutations (mirrors the
+ * rollback lock's commit-point doctrine in refinementRollback.ts).
  */
 
 import assert from "node:assert";
@@ -51,14 +53,28 @@ const FILE_LOCK_RETRY_MS = 10;
 
 /**
  * Lease for locks whose staleness cannot be proven via pid + birth identity
- * (platforms without a birth probe, or pre-birth-format tokens). Every
- * legitimate hold is ms (appends) to seconds (blob-lock recovery sweeps), so
- * minutes-old means the owner crashed — while a lease this generous can
- * never displace a merely slow live holder. Recovery from PID reuse on
- * birth-less platforms is thus bounded by this lease instead of requiring
- * manual lockfile cleanup.
+ * (platforms without a birth probe, or pre-birth-format tokens). Most
+ * legitimate holds are ms (appends) to seconds (blob-lock recovery sweeps),
+ * and holds that CAN stall longer (target mutation locks wedged in slow
+ * filesystem I/O) stay safe because live holders renew the lease below —
+ * so an expired lease means the owner crashed or froze, never that it is
+ * merely slow (r59). Recovery from PID reuse on birth-less platforms is
+ * thus bounded by this lease instead of requiring manual lockfile cleanup.
  */
 const FILE_LOCK_LEASE_MS = 5 * 60_000;
+
+/**
+ * How often a live holder refreshes the lockfile mtime while holding the
+ * lock (r59). Lease-based staleness is the ONLY reclaim guard on birth-less
+ * platforms (e.g. Windows without a usable `ps`), so without renewal a live
+ * holder whose critical section stalls past the lease — a target mutation
+ * wedged in filesystem I/O — was judged stale and displaced, letting a
+ * competing backend double-enter the same protected section. Renewal is
+ * event-loop driven: async-I/O stalls keep renewing (the holder is alive and
+ * will commit), while a crashed or frozen process stops and its lease
+ * expires as before.
+ */
+const FILE_LOCK_RENEW_INTERVAL_MS = FILE_LOCK_LEASE_MS / 4;
 
 /** Interleaving points inside reclamation, exposed only for tests. */
 export type ReclaimSeamPhase = "post-guard" | "pre-restore";
@@ -79,6 +95,12 @@ export interface ProcessFileLockOptions {
    * displacement is detected, before the restoration link.
    */
   testOnlyReclaimSeam?: (phase: ReclaimSeamPhase) => Promise<void>;
+  /**
+   * Lease-renewal cadence override (default FILE_LOCK_RENEW_INTERVAL_MS).
+   * Exists so tests can observe renewal without a multi-minute wait; real
+   * callers should not need to tune it.
+   */
+  renewIntervalMs?: number;
 }
 
 export interface ProcessFileLock extends AsyncDisposable {
@@ -203,9 +225,32 @@ export async function acquireProcessFileLock(
     for (;;) {
       try {
         await fs.link(tempPath, lockPath);
+        // Lease renewal (r59, see FILE_LOCK_RENEW_INTERVAL_MS): keep a live
+        // holder's mtime fresh so birth-less-platform reclaim can never
+        // displace it mid-critical-section. unref'd — a held lock must not
+        // keep the process alive; renewal only matters while real work
+        // (which itself keeps the loop alive) is still running.
+        const renewIntervalMs = options.renewIntervalMs ?? FILE_LOCK_RENEW_INTERVAL_MS;
+        assert(renewIntervalMs > 0, "renewIntervalMs must be positive");
+        let renewInFlight: Promise<void> | null = null;
+        const renewTimer = setInterval(() => {
+          if (renewInFlight !== null) return; // never overlap renewals
+          renewInFlight = renewLeaseOnce(lockPath, token, label).finally(() => {
+            renewInFlight = null;
+          });
+        }, renewIntervalMs);
+        renewTimer.unref();
         return {
           assertStillOwned: () => assertLockOwned(lockPath, token, label),
-          [Symbol.asyncDispose]: () => releaseFileLock(lockPath, token, label),
+          [Symbol.asyncDispose]: async () => {
+            // Stop-and-JOIN renewal before releasing: a renewal still in
+            // flight after release could otherwise refresh a successor's
+            // lockfile it no longer owns (renewLeaseOnce re-verifies the
+            // token, but only joining makes the ordering deterministic).
+            clearInterval(renewTimer);
+            if (renewInFlight !== null) await renewInFlight;
+            await releaseFileLock(lockPath, token, label);
+          },
         };
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
@@ -222,6 +267,27 @@ export async function acquireProcessFileLock(
     }
   } finally {
     await fs.unlink(tempPath).catch(() => undefined);
+  }
+}
+
+/**
+ * One lease-renewal tick (r59): refresh the held lock's mtime so the lease —
+ * the only staleness guard on birth-less platforms — never expires under a
+ * live holder. Only the current owner renews (token re-verified first); the
+ * residual read→utimes race can only refresh a successor's fresh lease,
+ * never displace anyone. Never throws: a failed renewal degrades to the
+ * pre-renewal exposure, still bounded by commit-point assertStillOwned.
+ */
+async function renewLeaseOnce(lockPath: string, token: string, label: string): Promise<void> {
+  try {
+    const current = await fs.readFile(lockPath, "utf-8");
+    if (current !== token) {
+      return; // Displaced or reclaimed: nothing of ours to renew.
+    }
+    const now = new Date();
+    await fs.utimes(lockPath, now, now);
+  } catch (error) {
+    log.debug(`FileLock: failed to renew ${label} ${lockPath}`, { error });
   }
 }
 

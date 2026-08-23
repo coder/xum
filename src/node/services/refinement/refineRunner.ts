@@ -242,6 +242,10 @@ export async function runRefinePass(args: {
     dryRun: true,
     journal,
     budget,
+    // r59 defense in depth: dry-run stages in memory only (nothing durable),
+    // but a cancelled pass must not start new validation work either, and
+    // the shared signal keeps this posture if dry-run semantics ever change.
+    abortSignal: args.abortSignal,
     onStagedMutation: (input, toolCallId) => {
       const pathLabel = input.command === "rename" ? (input.old_path ?? input.path) : input.path;
       stagedEdits.push({
@@ -490,20 +494,23 @@ export async function runRefinePass(args: {
     }
   }
 
-  // Drain in-flight tool executions before resolving: a memory/skill write
-  // launched by a step keeps running after reader cancellation, and the
-  // caller's removal flow deletes the session directory as soon as this pass
-  // settles — a write (and its journal append) still in flight would recreate
-  // it. allSettled because a failed write must not fail the pass here (its
-  // tool result already reported the error to the model). BOUNDED after
-  // cancellation (r58): the memory tools receive no abort signal, so an
-  // execution wedged in filesystem I/O (e.g. a named pipe placed under a
-  // memory root) would otherwise keep the pass in flight forever and hang
-  // workspace removal in cancelInFlightRefinePass. While the signal is live
-  // we wait; once it aborts, remaining runs get the bounded window and are
-  // then handed to the shared usage-write registry so removal's
-  // clearPendingBranchSummary drain gives them one more bounded chance to
-  // settle before the session directory is deleted.
+  // Drain in-flight tool executions before resolving: a tool run launched by
+  // a step keeps running after reader cancellation, and the caller's removal
+  // flow deletes the session directory as soon as this pass settles.
+  // allSettled because a failed run must not fail the pass here (its tool
+  // result already reported the error to the model). BOUNDED after
+  // cancellation (r58): an execution wedged in filesystem I/O (e.g. a named
+  // pipe placed under a memory root) would otherwise keep the pass in flight
+  // forever and hang workspace removal in cancelInFlightRefinePass. While
+  // the signal is live we wait; once it aborts, remaining runs get the
+  // bounded window and are then handed to the shared usage-write registry so
+  // removal's clearPendingBranchSummary drain gives them one more bounded
+  // chance to settle before the session directory is deleted. A run detached
+  // past that drain cannot persist anything when it later unblocks (r59):
+  // this pass's tools are dry-run (in-memory staging only), and the shared
+  // abort signal makes real memory mutations refuse pre-commit INSIDE the
+  // target mutation lock (see throwIfMutationCancelled in memoryService.ts),
+  // so no durable write or journal append can land after teardown.
   if (pendingToolRuns.size > 0) {
     await Promise.race([
       Promise.allSettled([...pendingToolRuns]),

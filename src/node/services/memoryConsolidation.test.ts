@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
@@ -95,6 +95,84 @@ async function execute(tool: Tool, input: Record<string, unknown>): Promise<Memo
 }
 
 describe("consolidation memory tool rails", () => {
+  it("a mutation wedged before commit refuses once the pass is cancelled (r59)", async () => {
+    // Tool executions receive no hard cancellation: a live run wedged in
+    // pre-commit I/O is detached by the caller's bounded drain, and once
+    // the wedge unblocked it used to commit durable memory AND append its
+    // refinement journal row into the (by then deleted) session directory,
+    // recreating it. The abort signal must make the mutation refuse INSIDE
+    // the target lock instead.
+    using fixture = await createFixture();
+    // Seed the target directly on disk: going through the service would
+    // journal the create and pre-create the session directory this test
+    // asserts is never materialized.
+    const targetPath = path.join(fixture.globalMemoryDir, "wedged.md");
+    await fsPromises.writeFile(targetPath, "contents that must survive\n");
+
+    const controller = new AbortController();
+    const { tool } = createConsolidationMemoryTool({
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+      journal: [],
+      abortSignal: controller.signal,
+    });
+    // Wedge the guard's pin lookup (the delete path's pre-commit I/O).
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => (releaseGate = resolve));
+    const entriesSpy = spyOn(fixture.metaService, "getEntries").mockImplementation(async () => {
+      await gate;
+      return new Map();
+    });
+    try {
+      const pending = execute(tool, { command: "delete", path: "/memories/global/wedged.md" });
+      // Teardown races in while the execution is wedged.
+      controller.abort();
+      releaseGate();
+      const result = await pending;
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("cancelled before commit");
+    } finally {
+      entriesSpy.mockRestore();
+    }
+    // Nothing durable landed: the target survived and no refinement journal
+    // row recreated the workspace's session directory.
+    expect(await fsPromises.readFile(targetPath, "utf-8")).toContain("must survive");
+    const sessionDir = path.join(fixture.xumHome, "sessions", fixture.ctx.workspaceId);
+    expect(
+      await fsPromises.access(sessionDir).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
+  });
+
+  it("a cancelled pass refuses new executions at entry (r59)", async () => {
+    using fixture = await createFixture();
+    const targetPath = path.join(fixture.globalMemoryDir, "entry.md");
+    await fsPromises.writeFile(targetPath, "original\n");
+    const controller = new AbortController();
+    controller.abort();
+    const { tool } = createConsolidationMemoryTool({
+      memoryService: fixture.memoryService,
+      metaService: fixture.metaService,
+      ctx: fixture.ctx,
+      dryRun: false,
+      journal: [],
+      abortSignal: controller.signal,
+    });
+    const result = await execute(tool, {
+      command: "str_replace",
+      path: "/memories/global/entry.md",
+      old_str: "original",
+      new_str: "clobbered",
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("cancelled");
+    expect(await fsPromises.readFile(targetPath, "utf-8")).toContain("original");
+  });
+
   it("applies in-scope mutations and journals them", async () => {
     using fixture = await createFixture();
     const result = await execute(fixture.tool, {

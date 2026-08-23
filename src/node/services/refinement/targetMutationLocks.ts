@@ -50,7 +50,11 @@
  * proceed-with-warning — proceeding would reopen the exact silent-overwrite
  * race this lock closes. Legitimate holds are ms-range disk I/O, crash
  * remnants are bounded by the file lock's birth/lease reclaim, so a
- * 2-second wait only ever fails against a genuinely wedged holder.
+ * 2-second wait only ever fails against a genuinely wedged holder. A LIVE
+ * holder wedged past the stale-lock lease stays safe even on hosts where
+ * process birth is undeterminable: the file lock renews its lease while
+ * held (r59), so lease-based reclaim can never displace a live holder
+ * mid-mutation and let two processes commit to the same target.
  *
  * Callers that cannot resolve muxRoot (`null`) fall back to in-process-only
  * locking — the pre-round-18 behavior — rather than inventing a divergent
