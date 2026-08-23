@@ -573,6 +573,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
                 tabType={terminalTab}
                 visible={isActive}
                 tabName={tabName}
+                tabIndex={terminalIndex}
                 onTitleChange={(title) => props.onTerminalTitleChange(terminalTab, title)}
                 autoFocus={shouldAutoFocus}
                 onAutoFocusConsumed={shouldAutoFocus ? props.onAutoFocusConsumed : undefined}

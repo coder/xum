@@ -139,6 +139,8 @@ interface TerminalViewProps {
   workspaceName?: string;
   projectName?: string;
   tabName?: string;
+  /** 0-based tab position for the badge's {index} token; unknown in pop-out windows. */
+  tabIndex?: number;
 }
 
 export function TerminalView({
@@ -153,6 +155,7 @@ export function TerminalView({
   workspaceName,
   projectName,
   tabName,
+  tabIndex,
 }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -918,6 +921,7 @@ export function TerminalView({
           workspaceName={workspaceName ?? resolvedNames?.workspaceName ?? ""}
           projectName={projectName ?? resolvedNames?.projectName ?? ""}
           tabName={tabName ?? oscTitle ?? getTerminalTabFallbackName(0)}
+          tabIndex={tabIndex}
         />
       )}
     </div>

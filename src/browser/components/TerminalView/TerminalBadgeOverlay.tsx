@@ -20,6 +20,8 @@ interface TerminalBadgeOverlayProps {
   workspaceName: string;
   projectName: string;
   tabName: string;
+  /** 0-based tab position; undefined when unknown (pop-out windows). */
+  tabIndex?: number;
 }
 
 /**
@@ -45,6 +47,7 @@ export const TerminalBadgeOverlay: React.FC<TerminalBadgeOverlayProps> = (props)
     workspace: props.workspaceName,
     project: props.projectName,
     tab: props.tabName,
+    index: props.tabIndex != null ? String(props.tabIndex + 1) : "",
   });
   if (!text) {
     return null;

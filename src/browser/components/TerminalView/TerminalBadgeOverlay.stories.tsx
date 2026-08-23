@@ -44,6 +44,7 @@ const BadgeStory = (props: BadgeStoryProps) => {
           workspaceName={props.workspaceName ?? "fix-3607-terminal-badge"}
           projectName="xum"
           tabName={props.tabName ?? "Terminal"}
+          tabIndex={0}
         />
       </div>
     </div>

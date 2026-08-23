@@ -1,12 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import { formatTerminalBadge } from "./terminalBadgeTemplate";
 
-const vars = { workspace: "fix-badge", project: "xum", tab: "Terminal 2" };
+const vars = { workspace: "fix-badge", project: "xum", tab: "Terminal 2", index: "2" };
 
 describe("formatTerminalBadge", () => {
-  test("substitutes workspace, project, and tab tokens", () => {
+  test("substitutes workspace, project, tab, and index tokens", () => {
     expect(formatTerminalBadge("{workspace} · {tab}", vars)).toBe("fix-badge · Terminal 2");
     expect(formatTerminalBadge("{project}/{workspace}", vars)).toBe("xum/fix-badge");
+    expect(formatTerminalBadge("{workspace} #{index}", vars)).toBe("fix-badge #2");
+  });
+
+  test("unknown index expands to empty and trims away", () => {
+    expect(formatTerminalBadge("{workspace} {index}", { ...vars, index: "" })).toBe("fix-badge");
   });
 
   test("substitutes repeated tokens", () => {

@@ -751,7 +751,11 @@ export function GeneralSection() {
                 <div className="flex-1">
                   <div className="text-foreground text-sm">Terminal Badge Template</div>
                   <div className="text-muted text-xs">
-                    Tokens: {"{workspace}"}, {"{tab}"}, {"{project}"}
+                    Tokens: {"{workspace}"}, {"{tab}"}, {"{project}"}, {"{index}"}
+                  </div>
+                  <div className="text-muted text-xs">
+                    {"{tab}"} follows the tab label (shell titles); {"{index}"} is the stable tab
+                    number
                   </div>
                 </div>
                 <Input

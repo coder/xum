@@ -11,6 +11,8 @@ interface TerminalTabProps {
   visible: boolean;
   /** Display name for this tab (OSC title or "Terminal N" fallback), shown by the badge overlay. */
   tabName: string;
+  /** 0-based position among the tabset's terminal tabs, for the badge's {index} token. */
+  tabIndex: number;
   /** Called when terminal title changes (from shell OSC sequences) */
   onTitleChange?: (title: string) => void;
   /** Whether to auto-focus the terminal when it becomes visible (e.g., when opened via keybind) */
@@ -55,6 +57,7 @@ export const TerminalTab: React.FC<TerminalTabProps> = (props) => {
       workspaceName={metadata?.name ?? ""}
       projectName={metadata?.projectName ?? ""}
       tabName={props.tabName}
+      tabIndex={props.tabIndex}
     />
   );
 };
