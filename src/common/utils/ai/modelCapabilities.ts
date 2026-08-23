@@ -62,7 +62,9 @@ function generateLookupKeys(modelString: string): string[] {
   return keys;
 }
 
-function extractModelCapabilities(data: RawModelCapabilitiesData): ModelCapabilities {
+// Exported for tests: upstream LiteLLM no longer ships max_pdf_size_mb, so the
+// inference branches can only be exercised with injected metadata.
+export function extractModelCapabilities(data: RawModelCapabilitiesData): ModelCapabilities {
   const maxPdfSizeMb = typeof data.max_pdf_size_mb === "number" ? data.max_pdf_size_mb : undefined;
   const provider = typeof data.litellm_provider === "string" ? data.litellm_provider : undefined;
 
