@@ -83,8 +83,8 @@ import { EnvHttpProxyAgent, type Dispatcher } from "undici";
 import packageJson from "../../../package.json";
 
 // ---------------------------------------------------------------------------
-// Undici agent with unlimited timeouts for AI streaming requests.
-// Safe because users control cancellation via AbortSignal from the UI.
+// Undici agent with unlimited transport timeouts for AI streaming requests.
+// StreamManager applies a semantic progress deadline and users can also cancel.
 // Uses EnvHttpProxyAgent to automatically respect HTTP_PROXY, HTTPS_PROXY,
 // and NO_PROXY environment variables for debugging/corporate network support.
 // ---------------------------------------------------------------------------

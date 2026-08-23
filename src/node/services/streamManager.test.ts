@@ -214,6 +214,7 @@ function createStreamInfoForTests(
     toolCompletionTimestamps: new Map<string, number>(),
     pendingWorkflowRunAttachments: new Map<string, unknown>(),
     pendingToolExecutionStarts: new Map<string, number>(),
+    activeLocalToolExecutions: new Set<string>(),
     model,
     metadataModel: overrides.metadataModel ?? model,
     historySequence: 1,
@@ -406,6 +407,13 @@ describe("StreamManager - tool execution start timing", () => {
     expect(events[0].timestamp).toBeGreaterThan(timestamp);
 
     const parts = streamInfo.parts as Array<Record<string, unknown>>;
+    expect((streamInfo.activeLocalToolExecutions as Set<string>).has("tool-call-1")).toBe(true);
+
+    const handleToolExecutionEnd = getPrivateMethodForTests<
+      (workspaceId: string, messageId: string, toolCallId: string) => void
+    >(streamManager, "handleToolExecutionEnd");
+    handleToolExecutionEnd.call(streamManager, workspaceId, messageId, "tool-call-1");
+    expect((streamInfo.activeLocalToolExecutions as Set<string>).size).toBe(0);
     expect(parts[0].executionStartedAt).toBe(events[0].timestamp);
   });
 
@@ -2326,6 +2334,83 @@ describe("StreamManager - empty stream completions", () => {
     );
     expect(partial?.metadata?.metadataModel).toBe(KNOWN_MODELS.SONNET.id);
     expect(partial?.parts).toMatchObject([{ type: "text", text: "partial answer" }]);
+  });
+
+  test("aborts and persists a retryable error when a provider stream stops making progress", async () => {
+    const streamManager = new StreamManager(historyService);
+    expect(Reflect.set(streamManager, "providerStreamIdleTimeoutMs", 20)).toBe(true);
+
+    const errorEvents: Array<{ messageId: string; error: string; errorType?: string }> = [];
+    const streamEndEvents: unknown[] = [];
+    streamManager.on("error", (data) => {
+      errorEvents.push(data as { messageId: string; error: string; errorType?: string });
+    });
+    streamManager.on("stream-end", (data) => {
+      streamEndEvents.push(data);
+    });
+    expect(
+      Reflect.set(streamManager, "tokenTracker", {
+        setModel: () => Promise.resolve(undefined),
+        countTokens: () => Promise.resolve(0),
+      })
+    ).toBe(true);
+
+    const workspaceId = "idle-timeout-workspace";
+    const messageId = "idle-timeout-message";
+    const historySequence = 1;
+    const abortController = new AbortController();
+    let abortObserved = false;
+    abortController.signal.addEventListener(
+      "abort",
+      () => {
+        abortObserved = true;
+      },
+      { once: true }
+    );
+
+    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
+    const processStreamWithCleanup = getProcessStreamWithCleanupForTests(streamManager);
+    const startTime = Date.now() - 250;
+    const streamInfo = createStreamInfoForTests({
+      abortController,
+      streamResult: createStreamResultForTests(
+        (async function* () {
+          yield { type: "text-delta", text: "Ratified — spawning the implementation child now." };
+          await new Promise<void>((resolve) => {
+            abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        })(),
+        { inputTokens: 3, outputTokens: 2, totalTokens: 5 }
+      ),
+      messageId,
+      startTime,
+      lastPartTimestamp: startTime,
+      model: KNOWN_MODELS.SONNET.id,
+      metadataModel: KNOWN_MODELS.SONNET.id,
+      historySequence,
+      initialMetadata: { agentId: "exec" },
+      runtime,
+    });
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+
+    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
+
+    expect(abortObserved).toBe(true);
+    expect(streamEndEvents).toHaveLength(0);
+    expect(errorEvents).toHaveLength(1);
+    expect(errorEvents[0]).toMatchObject({
+      messageId,
+      errorType: "stream_truncated",
+    });
+    expect(errorEvents[0]?.error).toContain("produced no stream progress for 20ms");
+    expect(getWorkspaceStreamsForTests(streamManager).has(workspaceId)).toBe(false);
+
+    const partial = await historyService.readPartial(workspaceId);
+    expect(partial?.metadata?.errorType).toBe("stream_truncated");
+    expect(partial?.metadata?.error).toContain("produced no stream progress for 20ms");
+    expect(partial?.parts).toMatchObject([
+      { type: "text", text: "Ratified — spawning the implementation child now." },
+    ]);
   });
 
   test("treats streamText's synthesized (other, undefined) finish part as a truncated stream", async () => {
@@ -5731,6 +5816,7 @@ describe("StreamManager - mid-turn thinking override", () => {
       undefined,
       undefined,
       undefined, // onToolExecutionStart
+      undefined, // onToolExecutionEnd
       state,
       rebuild
     );

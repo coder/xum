@@ -209,13 +209,13 @@ class SharedExecutionLock {
  * tasks share the read side so they can overlap with each other, while every
  * other tool call stays exclusive.
  *
- * `onExecutionStart` fires right after the execution lock is acquired (i.e.
- * when the tool actually starts running, not when the model emitted the call),
- * so queued siblings don't count wait time as execution time.
+ * `onExecutionStart` fires after the execution lock is acquired. `onExecutionEnd`
+ * fires after execute() settles. These callbacks exclude queued lock wait time.
  */
 export function withSequentialExecution(
   tools: Record<string, Tool> | undefined,
-  onExecutionStart?: (toolCallId: string) => void
+  onExecutionStart?: (toolCallId: string) => void,
+  onExecutionEnd?: (toolCallId: string) => void
 ): Record<string, Tool> | undefined {
   if (!tools) {
     return tools;
@@ -250,7 +250,13 @@ export function withSequentialExecution(
       if (onExecutionStart && toolCallId !== undefined) {
         onExecutionStart(toolCallId);
       }
-      return await executeFn.call(baseTool, args, options);
+      try {
+        return await executeFn.call(baseTool, args, options);
+      } finally {
+        if (onExecutionEnd && toolCallId !== undefined) {
+          onExecutionEnd(toolCallId);
+        }
+      }
     };
 
     wrappedTools[toolName] = wrappedTool;
