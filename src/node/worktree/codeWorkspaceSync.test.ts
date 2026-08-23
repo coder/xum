@@ -7,7 +7,9 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { Config } from "@/node/config";
 import {
   MAX_CODE_WORKSPACE_FILE_BYTES,
+  MAX_CODE_WORKSPACE_FOLDERS,
   computeManagedWorktreePaths,
+  managedRootsByProject,
   syncProjectCodeWorkspace,
   updateCodeWorkspaceFile,
 } from "./codeWorkspaceSync";
@@ -242,6 +244,25 @@ describe("updateCodeWorkspaceFile", () => {
     });
 
     expect(parseFolders(await readWorkspaceFile())).toEqual([{ path: theirs }]);
+  });
+
+  test("skips files with more folder entries than the sync cap", async () => {
+    const worktree = path.join(managedRootDir, "feature-a");
+    const filePath = path.join(tempDir, "huge.code-workspace");
+    const content = JSON.stringify({
+      folders: Array.from({ length: MAX_CODE_WORKSPACE_FOLDERS + 1 }, () => ({})),
+    });
+    await fsPromises.writeFile(filePath, content);
+
+    const result = await updateCodeWorkspaceFile({
+      codeWorkspacePath: filePath,
+      managedRootDirs: [managedRootDir],
+      desiredPaths: [worktree],
+      seedFolders: [worktree],
+    });
+
+    expect(result.ok).toBe(false);
+    expect(await fsPromises.readFile(filePath, "utf-8")).toBe(content);
   });
 
   test("refuses to write through a symlink whose target is not a .code-workspace file", async () => {
@@ -606,6 +627,19 @@ describe("computeManagedWorktreePaths", () => {
       ...computeParams,
     });
     expect(desiredPaths).toEqual([`${managedRoot}/feature-a`]);
+  });
+
+  test("managedRootsByProject derives devcontainer cleanup roots from the checkout", () => {
+    const subProjectPath = `${projectPath}/packages/api`;
+    const metadata = makeMetadata({
+      subProjectPath,
+      runtimeConfig: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
+    });
+    const roots = managedRootsByProject(metadata);
+    // Cleanup after removal/reassignment must retain the parent checkout root,
+    // matching what computeManagedWorktreePaths derives while the metadata exists.
+    expect(roots.get(subProjectPath)).toEqual([managedRoot]);
+    expect(roots.get(projectPath)).toEqual([managedRoot]);
   });
 
   test("keeps a devcontainer workspace assigned to a sub-project under the parent root", () => {

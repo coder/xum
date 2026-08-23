@@ -32,6 +32,7 @@ export const CODE_WORKSPACE_EXTENSION = ".code-workspace";
 // synchronous (no timeout can preempt it), so cap the bytes we are willing to
 // read and parse. Real .code-workspace files are a few KiB.
 export const MAX_CODE_WORKSPACE_FILE_BYTES = 1024 * 1024;
+export const MAX_CODE_WORKSPACE_FOLDERS = 2_000;
 
 // Bound each sync: a configured file on an unavailable network mount can hang
 // fs calls indefinitely, and workspace lifecycle operations await syncs.
@@ -263,6 +264,17 @@ async function updateCodeWorkspaceFileLocked(
     log.warn("Skipping .code-workspace sync: 'folders' is not an array", { codeWorkspacePath });
     return { ok: false, error: "Workspace file 'folders' is not an array" };
   }
+  // SECURITY: jsonc.modify serialization is synchronous and superlinear in
+  // entry count, so a repo-controlled file within the byte cap can still hold
+  // tens of thousands of entries and freeze the main thread for >10s. Real
+  // multi-root workspaces have well under this many folders.
+  if (Array.isArray(existingFolders) && existingFolders.length > MAX_CODE_WORKSPACE_FOLDERS) {
+    log.warn("Skipping .code-workspace sync: too many folder entries", {
+      codeWorkspacePath,
+      folderCount: existingFolders.length,
+    });
+    return { ok: false, error: "Workspace file has too many folder entries to sync" };
+  }
 
   const desired = new Set(desiredPaths.map((desiredPath) => path.resolve(desiredPath)));
 
@@ -437,10 +449,10 @@ export function computeManagedWorktreePaths(params: {
  */
 export function managedRootsByProject(metadata: FrontendWorkspaceMetadata): Map<string, string[]> {
   const rootsByProject = new Map<string, string[]>();
-  if (!isWorktreeRuntime(metadata.runtimeConfig)) {
+  const runtimeConfig = metadata.runtimeConfig;
+  if (!hasManagedHostWorktree(runtimeConfig)) {
     return rootsByProject;
   }
-  const srcBaseDir = expandTilde(metadata.runtimeConfig.srcBaseDir);
   const involved = new Set<string>([
     metadata.projectPath,
     ...(metadata.subProjectPath != null ? [metadata.subProjectPath] : []),
@@ -448,9 +460,17 @@ export function managedRootsByProject(metadata: FrontendWorkspaceMetadata): Map<
   ]);
   for (const involvedPath of involved) {
     const normalized = stripTrailingSlashes(involvedPath);
-    rootsByProject.set(normalized, [
-      path.resolve(path.join(srcBaseDir, participantCheckoutDirName(metadata, normalized))),
-    ]);
+    const root = isWorktreeRuntime(runtimeConfig)
+      ? path.resolve(
+          path.join(
+            expandTilde(runtimeConfig.srcBaseDir),
+            participantCheckoutDirName(metadata, normalized)
+          )
+        )
+      : // Devcontainer host worktrees live under the parent project's
+        // directory, mirroring computeManagedWorktreePaths.
+        path.dirname(path.resolve(metadata.namedWorkspacePath));
+    rootsByProject.set(normalized, [root]);
   }
   return rootsByProject;
 }
