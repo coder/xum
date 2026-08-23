@@ -4,6 +4,7 @@ import writeFileAtomic from "write-file-atomic";
 import assert from "@/common/utils/assert";
 import type { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
+import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
 import { sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
@@ -237,6 +238,17 @@ export class SessionUsageService {
     }
   ): Promise<{ model: string; usage: ChatUsageDisplay } | undefined> {
     if (!usage) return undefined;
+    // r62: headless writers (dream/harvest consolidation, status generation)
+    // can settle AFTER workspace removal — a foreign backend's run survives
+    // the remover's process-local cancellation entirely. The sidecar mkdir +
+    // append and the ledger write below would recreate the deleted session
+    // directory, so the durable removal tombstone gates these usage commit
+    // points too. Dropping the spend row is correct: the workspace whose
+    // dashboards it would feed no longer exists.
+    if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+      log.debug("Skipping headless usage write for removed workspace", { workspaceId });
+      return undefined;
+    }
     try {
       // Headless callers pass live AI SDK usage. Normalize to mux's persisted
       // flat shape and re-inject cache-write tokens (moved off providerMetadata

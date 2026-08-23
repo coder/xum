@@ -699,37 +699,21 @@ export class MemoryService extends EventEmitter {
   }
 
   /**
-   * Resolve a parsed path to its store with containment verified.
-   * createRoot is reserved for commands that can create files (create, UI
-   * save): everything else must not materialize scope roots. Missing roots
-   * simply make targets report "not found".
+   * Resolve a parsed path to its store with containment verified. Never
+   * materializes scope roots: commands that can create files (create, UI
+   * save) call store.ensureRoot() INSIDE their target mutation lock, after
+   * the removal/cancellation commit check (r62) — an out-of-lock mkdir could
+   * otherwise recreate a removed workspace's session directory as an empty
+   * orphan after removal's serialized deletion. Missing roots simply make
+   * targets report "not found".
    */
   private async resolveStore(
     ctx: MemoryScopeContext,
     scope: MemoryScope,
-    relPath: string,
-    opts?: { createRoot?: boolean }
+    relPath: string
   ): Promise<MemoryStore> {
     const store = this.getStore(ctx, scope);
-    if (opts?.createRoot) {
-      // r61: refuse to MATERIALIZE roots for a removed workspace before the
-      // mkdir — the workspace store root lives inside the session directory,
-      // so ensureRoot would recreate it even though the in-lock commit check
-      // later refuses the write. Advisory here (the mkdir races removal's rm
-      // at worst into an empty dir); the in-lock assertMutationCommittable
-      // remains the authoritative data/journal gate.
-      if (
-        ctx.workspaceId !== "" &&
-        (await isWorkspaceRemovalTombstoned(this.config.rootDir, ctx.workspaceId))
-      ) {
-        throw new MemoryCommandError(
-          `Workspace ${ctx.workspaceId} was removed; refusing to create memory scope roots`
-        );
-      }
-      await store.ensureRoot();
-    } else {
-      await store.assertRootSafe();
-    }
+    await store.assertRootSafe();
     await store.assertContained(relPath);
     return store;
   }
@@ -976,9 +960,14 @@ export class MemoryService extends EventEmitter {
       const parsed = parseMemoryPath(virtualPath);
       const scope = this.requireFilePath(parsed, virtualPath);
       assertWithinFileSizeCap(fileText);
-      // create is a write: materialize the scope root on first use.
-      const store = await this.resolveStore(ctx, scope, parsed.relPath, { createRoot: true });
+      const store = await this.resolveStore(ctx, scope, parsed.relPath);
       return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
+        // create is a write: materialize the scope root on first use — but
+        // only INSIDE the lock and after the removal check (r62), so the
+        // mkdir serializes with removal's locked deletion and cannot
+        // recreate a removed session directory.
+        await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+        await store.ensureRoot();
         const existing = await store.kind(parsed.relPath);
         if (existing !== null) {
           throw new MemoryCommandError(
@@ -1447,12 +1436,15 @@ export class MemoryService extends EventEmitter {
       const parsed = parseMemoryPath(virtualPath);
       const scope = this.requireFilePath(parsed, virtualPath);
       assertWithinFileSizeCap(content);
-      // UI save can create new files: materialize the scope root on first use.
-      const store = await this.resolveStore(ctx, scope, parsed.relPath, { createRoot: true });
+      const store = await this.resolveStore(ctx, scope, parsed.relPath);
       return await withTargetMutationLock(
         this.config.rootDir,
         this.storeLockKey(store),
         async () => {
+          // UI save can create new files: materialize the scope root on
+          // first use — in-lock, after the removal check (r62; see create).
+          await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
+          await store.ensureRoot();
           const kind = await store.kind(parsed.relPath);
           if (kind === "dir") {
             throw new MemoryCommandError(`${virtualPath} is a directory, not a file`);

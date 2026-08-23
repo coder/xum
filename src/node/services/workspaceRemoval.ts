@@ -37,6 +37,7 @@ import {
   memoryMutationLockKey,
   withTargetMutationLocks,
 } from "@/node/services/refinement/targetMutationLocks";
+import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 /** Durable tombstone path for one removed workspace (hashed: IDs are user-influenced). */
 export function workspaceRemovalTombstonePath(rootDir: string, workspaceId: string): string {
@@ -45,7 +46,14 @@ export function workspaceRemovalTombstonePath(rootDir: string, workspaceId: stri
   return path.join(rootDir, "locks", `workspace-removed-${digest}.json`);
 }
 
-/** True when a durable removal tombstone exists for this workspace. */
+/**
+ * True when a durable removal tombstone exists for this workspace. This is
+ * the authoritative pre-commit gate for memory/usage writers, so it FAILS
+ * CLOSED (r62): only a provable ENOENT means "not removed" — any other
+ * access failure (transient I/O error, broken locks dir) reports removal so
+ * a writer never commits into a possibly-deleted session directory it
+ * cannot verify. Callers surface the refusal as a retryable error.
+ */
 export async function isWorkspaceRemovalTombstoned(
   rootDir: string,
   workspaceId: string
@@ -53,8 +61,8 @@ export async function isWorkspaceRemovalTombstoned(
   try {
     await fsPromises.access(workspaceRemovalTombstonePath(rootDir, workspaceId));
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    return !hasErrorCode(error, "ENOENT");
   }
 }
 
@@ -79,17 +87,32 @@ export async function removeSessionDirUnderMemoryLocks(args: {
     path.join(args.sessionDir, "memory")
   );
   const sharedMemoryKey = memoryMutationLockKey(args.rootDir, path.join(args.rootDir, "memory"));
-  await withTargetMutationLocks(args.rootDir, [workspaceMemoryKey, sharedMemoryKey], async () => {
+  const publishTombstone = async (): Promise<void> => {
     const tombstonePath = workspaceRemovalTombstonePath(args.rootDir, args.workspaceId);
     await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
-    // Tombstone BEFORE rm: once the locks release, any waiting writer
-    // re-checks it pre-commit (inside its own lock) and refuses, so the
-    // deleted directory cannot be recreated by a late mutation or journal
-    // append.
     await writeFileAtomic(
       tombstonePath,
       JSON.stringify({ workspaceId: args.workspaceId, removedAt: Date.now() })
     );
-    await fsPromises.rm(args.sessionDir, { recursive: true, force: true });
-  });
+  };
+  try {
+    await withTargetMutationLocks(args.rootDir, [workspaceMemoryKey, sharedMemoryKey], async () => {
+      // Tombstone BEFORE rm: once the locks release, any waiting writer
+      // re-checks it pre-commit (inside its own lock) and refuses, so the
+      // deleted directory cannot be recreated by a late mutation or journal
+      // append.
+      await publishTombstone();
+      await fsPromises.rm(args.sessionDir, { recursive: true, force: true });
+    });
+  } catch (error) {
+    // Fail-closed orphan path (r62): a wedged writer blocks the deletion,
+    // but the caller proceeds to deregister the workspace regardless — so
+    // the terminal marker must still become durable or a foreign backend
+    // would keep mutating memory and journaling into the retained orphan
+    // forever. Publishing outside the locks is safe on THIS path precisely
+    // because the directory is not deleted: a writer mid-commit lands in
+    // the orphan, and every later mutation observes the tombstone.
+    await publishTombstone().catch(() => undefined);
+    throw error;
+  }
 }

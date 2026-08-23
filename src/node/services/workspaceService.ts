@@ -99,7 +99,10 @@ import {
   deriveSideChannelModelCandidates,
   startAbandonedBranchSummaryInBackground,
 } from "@/node/services/branchSummary";
-import { removeSessionDirUnderMemoryLocks } from "@/node/services/workspaceRemoval";
+import {
+  removeSessionDirUnderMemoryLocks,
+  workspaceRemovalTombstonePath,
+} from "@/node/services/workspaceRemoval";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
   ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME,
@@ -5549,7 +5552,22 @@ export class WorkspaceService extends EventEmitter {
       await this.closeDesktopSessionBestEffort(workspaceId, "remove");
 
       // Remove from config
-      await this.config.removeWorkspace(workspaceId);
+      try {
+        await this.config.removeWorkspace(workspaceId);
+      } catch (error) {
+        // r62: the session directory and its durable removal tombstone are
+        // already committed above. If deregistration fails here (e.g. the
+        // config lock timed out), the workspace would survive REGISTERED but
+        // permanently tombstoned — every memory mutation refused forever.
+        // Un-tombstone so the surviving workspace stays usable (its missing
+        // session state self-heals on demand) and removal can be retried.
+        // In-process consolidation stays cancelled until restart, matching
+        // the drained-producers tradeoff documented above.
+        await fsPromises
+          .rm(workspaceRemovalTombstonePath(this.config.rootDir, workspaceId), { force: true })
+          .catch(() => undefined);
+        throw error;
+      }
       removedFromConfig = true;
       this.autoTitlingWorkspaces.delete(workspaceId);
 
