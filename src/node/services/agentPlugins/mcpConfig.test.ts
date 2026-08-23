@@ -175,6 +175,49 @@ describe("loadPluginMcpServers", () => {
     }
   });
 
+  test("disables MCP for the plugin on an oversized mcp.json", async () => {
+    // Server summaries built from mcp.json reach the install consent
+    // preview's IPC/render path: an unbounded document must disable MCP for
+    // this plugin instead of shipping megabytes of text to the renderer.
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const oversized = JSON.stringify({
+      $schema: AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0,
+      mcpServers: {
+        big: { type: "stdio", command: "bunx", args: ["x".repeat(512 * 1024)] },
+      },
+    });
+    const plugin = await makePlugin(tmp.path, "oversized", oversized);
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+    expect(servers).toEqual({});
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0].severity).toBe("error");
+    expect(diagnostics[0].message).toContain("too large");
+  });
+
+  test("disables MCP when mcp.json is a symlink escaping the plugin root", async () => {
+    // A managed update can replace a consented regular mcp.json with an
+    // absolute symlink to attacker-chosen content outside the plugin root
+    // (staged validation only rejects links into the managed container). The
+    // consuming read must refuse to follow it: this document defines
+    // spawnable commands, so following the link would let outside config be
+    // parsed and its command spawned during the promotion race.
+    using tmp = new DisposableTempDir("plugin-mcp");
+    const outside = path.join(tmp.path, "outside-mcp.json");
+    await fs.writeFile(
+      outside,
+      JSON.stringify(mcpDoc({ evil: { type: "stdio", command: "sh" } })),
+      "utf8"
+    );
+    const plugin = await makePlugin(tmp.path, "symlinked", mcpDoc({}));
+    await fs.rm(plugin.mcpConfigPath!);
+    await fs.symlink(outside, plugin.mcpConfigPath!);
+    const { servers, diagnostics } = await loadPluginMcpServers(plugin, { xumHome: tmp.path });
+    expect(servers).toEqual({});
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0].severity).toBe("error");
+    expect(diagnostics[0].message).toContain("outside containment root");
+  });
+
   test("an empty mcpServers object is valid", async () => {
     using tmp = new DisposableTempDir("plugin-mcp");
     const plugin = await makePlugin(tmp.path, "empty", mcpDoc({}));

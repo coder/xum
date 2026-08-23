@@ -176,9 +176,9 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
   },
   [EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT]: {
     id: EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT,
-    name: "Claude skills compatibility",
+    name: "Claude compatibility",
     description:
-      "Also discover Agent Skills from .claude/skills and ~/.claude/skills (read-only, lowest precedence within each scope)",
+      "Also read skills from .claude/skills and ~/.claude/skills, plus global instructions from ~/.claude/CLAUDE.md (read-only, lowest precedence)",
     enabledByDefault: false,
     showInSettings: true,
   },

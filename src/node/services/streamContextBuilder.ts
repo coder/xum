@@ -269,7 +269,7 @@ export interface BuildStreamSystemContextOptions {
    * tokenizer, so repeated turns stay byte-identical (prompt-cache-stable).
    */
   hotMemoriesBlock?: string;
-  /** claude-skills-compat experiment: discover skills from .claude/skills roots (read-only). */
+  /** claude-skills-compat experiment: read Claude skills and global instructions (read-only). */
   claudeSkillsCompatEnabled?: boolean;
   /** agent-plugins experiment: discover skills from Agent Plugins containers (read-only). */
   agentPluginsEnabled?: boolean;
@@ -643,6 +643,7 @@ export async function buildStreamSystemContext(
       agentSystemPromptSections,
       modes: [effectiveMode, agentDefinition.id],
       projectConfigs: cfg.projects,
+      claudeSkillsCompatEnabled: opts.claudeSkillsCompatEnabled,
     }
   );
 

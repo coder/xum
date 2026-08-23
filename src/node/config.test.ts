@@ -1,6 +1,8 @@
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { log } from "@/node/services/log";
 import { Config } from "./config";
 import {
   CODER_ARCHIVE_BEHAVIORS,
@@ -37,6 +39,554 @@ describe("Config", () => {
   async function flushConfigEdits(): Promise<void> {
     await config.editConfig((cfg) => cfg);
   }
+
+  describe("loadConfigOrDefault corrupt config recovery", () => {
+    function configFilePath(): string {
+      return path.join(tempDir, "config.json");
+    }
+
+    function corruptBackups(): string[] {
+      return fs
+        .readdirSync(tempDir)
+        .filter((name) => name.startsWith("config.json.corrupt-"))
+        .map((name) => path.join(tempDir, name));
+    }
+
+    it("preserves malformed JSON and falls back to defaults", () => {
+      const configFile = configFilePath();
+      const corruptData = '{ "projects": ';
+      fs.writeFileSync(configFile, corruptData);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+
+      const loaded = config.loadConfigOrDefault();
+
+      expect(loaded.projects.size).toBe(0);
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(corruptData);
+      const backups = corruptBackups();
+      expect(backups).toHaveLength(1);
+      expect(fs.readFileSync(backups[0])).toEqual(Buffer.from(corruptData));
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(String(errorSpy.mock.calls[0]?.[0])).toContain(configFile);
+      errorSpy.mockRestore();
+    });
+
+    it("does not create duplicate backups for identical corrupt bytes", () => {
+      const corruptData = '{ "projects": ';
+      fs.writeFileSync(configFilePath(), corruptData);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+
+      config.loadConfigOrDefault();
+      config.loadConfigOrDefault();
+      new Config(tempDir).loadConfigOrDefault();
+
+      const backups = corruptBackups();
+      expect(backups).toHaveLength(1);
+      expect(fs.readFileSync(backups[0])).toEqual(Buffer.from(corruptData));
+      errorSpy.mockRestore();
+    });
+
+    it.each(["null", '"just a string"', "[1,2]"])(
+      "recovers from a non-object JSON root: %s",
+      (corruptData) => {
+        const configFile = configFilePath();
+        fs.writeFileSync(configFile, corruptData);
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+
+        const loaded = config.loadConfigOrDefault();
+
+        expect(loaded.projects.size).toBe(0);
+        expect(fs.readFileSync(configFile, "utf-8")).toBe(corruptData);
+        const backups = corruptBackups();
+        expect(backups).toHaveLength(1);
+        expect(fs.readFileSync(backups[0])).toEqual(Buffer.from(corruptData));
+        errorSpy.mockRestore();
+      }
+    );
+
+    it("heals invalid fields in an object without creating a backup", () => {
+      fs.writeFileSync(
+        configFilePath(),
+        JSON.stringify({
+          projects: [],
+          apiServerPort: "abc",
+          defaultModel: "openai:gpt-4o",
+          taskSettings: { preserveSubagentsUntilArchive: true },
+          migrations: {
+            defaultModelFallbacksSeeded: true,
+            persistentSubagentsDefaulted: true,
+          },
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+
+      expect(loaded.apiServerPort).toBeUndefined();
+      expect(loaded.defaultModel).toBe("openai:gpt-4o");
+      expect(corruptBackups()).toHaveLength(0);
+    });
+
+    it("treats a missing config as a silent fresh install", () => {
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+
+      const loaded = config.loadConfigOrDefault();
+
+      expect(loaded.projects.size).toBe(0);
+      expect(corruptBackups()).toHaveLength(0);
+      expect(errorSpy).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+
+    it("keeps the corrupt bytes after a settings edit rewrites config.json", async () => {
+      const configFile = configFilePath();
+      const corruptData = '{ "projects": ';
+      fs.writeFileSync(configFile, corruptData);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+
+      config.loadConfigOrDefault();
+      const [backupPath] = corruptBackups();
+      await config.setUpdateChannel("nightly");
+
+      const rewritten = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+        updateChannel?: unknown;
+      };
+      expect(rewritten.updateChannel).toBe("nightly");
+      expect(fs.readFileSync(backupPath)).toEqual(Buffer.from(corruptData));
+      errorSpy.mockRestore();
+    });
+
+    it("backs up malformed JSON before rethrowing for cleanup guards", () => {
+      const corruptData = '{ "projects": ';
+      fs.writeFileSync(configFilePath(), corruptData);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+
+      expect(() => config.loadConfigOrDefault({ throwOnError: true })).toThrow();
+
+      const backups = corruptBackups();
+      expect(backups).toHaveLength(1);
+      expect(fs.readFileSync(backups[0])).toEqual(Buffer.from(corruptData));
+      errorSpy.mockRestore();
+    });
+
+    it("retries the backup on the next load after a transient failure", () => {
+      const corruptData = '{ "projects": ';
+      fs.writeFileSync(configFilePath(), corruptData);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      const writeSpy = spyOn(fs, "writeFileSync").mockImplementationOnce(() => {
+        throw new Error("disk full");
+      });
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.projects.size).toBe(0);
+      expect(corruptBackups()).toHaveLength(0);
+
+      const retried = config.loadConfigOrDefault();
+      expect(retried.projects.size).toBe(0);
+      const backups = corruptBackups();
+      expect(backups).toHaveLength(1);
+      expect(fs.readFileSync(backups[0])).toEqual(Buffer.from(corruptData));
+
+      writeSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it("never overwrites an existing sidecar on a timestamp collision", () => {
+      const configFile = configFilePath();
+      const corruptData = '{ "projects": ';
+      fs.writeFileSync(configFile, corruptData);
+      const olderSnapshot = "older corrupt snapshot";
+      const nowSpy = spyOn(Date, "now").mockReturnValue(1234567890);
+      const collidingPath = `${configFile}.corrupt-1234567890`;
+      fs.writeFileSync(collidingPath, olderSnapshot);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+
+      config.loadConfigOrDefault();
+
+      expect(fs.readFileSync(collidingPath, "utf-8")).toBe(olderSnapshot);
+      expect(fs.readFileSync(`${collidingPath}-1`)).toEqual(Buffer.from(corruptData));
+      nowSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it("does not overwrite the corrupt config through edits until a backup is confirmed", async () => {
+      const configFile = configFilePath();
+      const corruptData = '{ "projects": ';
+      fs.writeFileSync(configFile, corruptData);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      const origWrite = fs.writeFileSync.bind(fs);
+      const writeSpy = spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+        if (typeof file === "string" && file.includes(".corrupt-")) {
+          throw new Error("disk full");
+        }
+        origWrite(file, data, options);
+      });
+
+      // Callers must see the blocked write as a failure, not a silent success.
+      const blockedError = await config.setUpdateChannel("nightly").then(
+        () => null,
+        (e: unknown) => e
+      );
+      expect(String(blockedError)).toContain("no confirmed backup yet");
+
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(corruptData);
+      expect(corruptBackups()).toHaveLength(0);
+
+      writeSpy.mockRestore();
+
+      await config.setUpdateChannel("nightly");
+
+      const backups = corruptBackups();
+      expect(backups).toHaveLength(1);
+      expect(fs.readFileSync(backups[0])).toEqual(Buffer.from(corruptData));
+      const rewritten = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+        updateChannel?: unknown;
+      };
+      expect(rewritten.updateChannel).toBe("nightly");
+      errorSpy.mockRestore();
+    });
+
+    it("re-blocks edits when new corrupt bytes appear after a confirmed backup", async () => {
+      const configFile = configFilePath();
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      fs.writeFileSync(configFile, '{ "projects": ');
+      config.loadConfigOrDefault();
+      expect(corruptBackups()).toHaveLength(1);
+
+      // Different corrupt bytes whose own backup fails must not inherit the
+      // earlier confirmation, or an edit would overwrite the only copy.
+      const newCorrupt = '{ "taskSettings": ';
+      fs.writeFileSync(configFile, newCorrupt);
+      const origWrite = fs.writeFileSync.bind(fs);
+      const writeSpy = spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+        if (typeof file === "string" && file.includes(".corrupt-")) {
+          throw new Error("disk full");
+        }
+        origWrite(file, data, options);
+      });
+
+      const blockedError = await config.setUpdateChannel("nightly").then(
+        () => null,
+        (e: unknown) => e
+      );
+      expect(String(blockedError)).toContain("no confirmed backup yet");
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(newCorrupt);
+      expect(corruptBackups()).toHaveLength(1);
+
+      writeSpy.mockRestore();
+
+      await config.setUpdateChannel("nightly");
+      expect(corruptBackups()).toHaveLength(2);
+      const rewritten = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+        updateChannel?: unknown;
+      };
+      expect(rewritten.updateChannel).toBe("nightly");
+      errorSpy.mockRestore();
+    });
+
+    it("re-creates a deleted sidecar before an edit may overwrite the corrupt config", async () => {
+      const configFile = configFilePath();
+      const corruptData = '{ "projects": ';
+      fs.writeFileSync(configFile, corruptData);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+
+      config.loadConfigOrDefault();
+      const [firstBackup] = corruptBackups();
+      fs.rmSync(firstBackup);
+
+      await config.setUpdateChannel("nightly");
+
+      // The edit-time load must have re-verified against disk and restored preservation.
+      const backups = corruptBackups();
+      expect(backups).toHaveLength(1);
+      expect(fs.readFileSync(backups[0])).toEqual(Buffer.from(corruptData));
+      const rewritten = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+        updateChannel?: unknown;
+      };
+      expect(rewritten.updateChannel).toBe("nightly");
+      errorSpy.mockRestore();
+    });
+
+    it("skips an unreadable stale sidecar and still creates a fresh backup", () => {
+      const configFile = configFilePath();
+      const corruptData = '{ "projects": ';
+      fs.writeFileSync(configFile, corruptData);
+      const stalePath = `${configFile}.corrupt-1`;
+      fs.writeFileSync(stalePath, "older unrelated snapshot");
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      const origRead = fs.readFileSync.bind(fs);
+      const readSpy = spyOn(fs, "readFileSync").mockImplementation(((
+        file: fs.PathOrFileDescriptor,
+        options?: Parameters<typeof fs.readFileSync>[1]
+      ) => {
+        if (file === stalePath) {
+          throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+        }
+        return origRead(file, options);
+      }) as typeof fs.readFileSync);
+
+      const loaded = config.loadConfigOrDefault();
+
+      expect(loaded.projects.size).toBe(0);
+      const fresh = corruptBackups().filter((p) => p !== stalePath);
+      expect(fresh).toHaveLength(1);
+      expect(origRead(fresh[0])).toEqual(Buffer.from(corruptData));
+      readSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it("logs again when a previously confirmed backup can no longer be restored", () => {
+      const configFile = configFilePath();
+      const corruptData = '{ "projects": ';
+      fs.writeFileSync(configFile, corruptData);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+
+      config.loadConfigOrDefault();
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+
+      const [backupPath] = corruptBackups();
+      fs.rmSync(backupPath);
+      const origWrite = fs.writeFileSync.bind(fs);
+      const writeSpy = spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+        if (typeof file === "string" && file.includes(".corrupt-")) {
+          throw new Error("disk full");
+        }
+        origWrite(file, data, options);
+      });
+
+      // Losing the backup must surface the new failure, not stay deduped.
+      config.loadConfigOrDefault();
+      expect(errorSpy).toHaveBeenCalledTimes(2);
+      expect(String(errorSpy.mock.calls[1]?.[0])).toContain("Backup failed");
+
+      // The still-failing state stays deduped afterwards.
+      config.loadConfigOrDefault();
+      expect(errorSpy).toHaveBeenCalledTimes(2);
+
+      writeSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it("logs again when the backup is re-verified at a different path", () => {
+      const configFile = configFilePath();
+      const corruptData = '{ "projects": ';
+      fs.writeFileSync(configFile, corruptData);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      const nowSpy = spyOn(Date, "now").mockReturnValue(1000);
+
+      config.loadConfigOrDefault();
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+
+      // Delete the confirmed sidecar; recreation at a new path must replace the stale
+      // guidance that points at the deleted file.
+      fs.rmSync(`${configFile}.corrupt-1000`);
+      nowSpy.mockReturnValue(2000);
+      config.loadConfigOrDefault();
+
+      expect(errorSpy).toHaveBeenCalledTimes(2);
+      expect(String(errorSpy.mock.calls[1]?.[0])).toContain("corrupt-2000");
+
+      config.loadConfigOrDefault();
+      expect(errorSpy).toHaveBeenCalledTimes(2);
+      nowSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it("creates sidecars with owner-only permissions", () => {
+      if (process.platform === "win32") {
+        return;
+      }
+      const configFile = configFilePath();
+      // Pin a permissive umask: under a 0077 umask this assertion would pass vacuously.
+      const prevUmask = process.umask(0o022);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        fs.writeFileSync(configFile, '{ "projects": ');
+        config.loadConfigOrDefault();
+
+        const [backup] = corruptBackups();
+        // Sidecars can hold credentials; peer file proves the narrowing is not ambient.
+        expect(fs.statSync(backup).mode & 0o777).toBe(0o600);
+        expect(fs.statSync(configFile).mode & 0o777).toBe(0o644);
+      } finally {
+        process.umask(prevUmask);
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("creates readable owner-only sidecars even under a restrictive umask", () => {
+      if (process.platform === "win32") {
+        return;
+      }
+      const configFile = configFilePath();
+      const corruptData = '{ "projects": ';
+      // Write the corrupt config while file creation still works normally; only the
+      // sidecar creation should run under the restrictive umask.
+      fs.writeFileSync(configFile, corruptData);
+      // A 0777 umask strips the requested creation mode to 0000; the backup must still
+      // end up readable or recovery guidance points at an unusable file.
+      const prevUmask = process.umask(0o777);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        config.loadConfigOrDefault();
+
+        const [backup] = corruptBackups();
+        expect(fs.statSync(backup).mode & 0o777).toBe(0o600);
+        expect(fs.readFileSync(backup)).toEqual(Buffer.from(corruptData));
+      } finally {
+        process.umask(prevUmask);
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("tightens permissions on a reused permissive sidecar", () => {
+      if (process.platform === "win32") {
+        return;
+      }
+      const configFile = configFilePath();
+      const corruptData = '{ "projects": ';
+      const prevUmask = process.umask(0o022);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        fs.writeFileSync(configFile, corruptData);
+        // A byte-identical sidecar left by an older build without the 0600 fix.
+        const stale = `${configFile}.corrupt-1`;
+        fs.writeFileSync(stale, corruptData);
+        fs.chmodSync(stale, 0o644);
+
+        config.loadConfigOrDefault();
+
+        expect(corruptBackups()).toHaveLength(1);
+        expect(fs.statSync(stale).mode & 0o777).toBe(0o600);
+      } finally {
+        process.umask(prevUmask);
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("reuses a later usable duplicate when the first cannot be secured", () => {
+      const configFile = configFilePath();
+      const corruptData = '{ "projects": ';
+      fs.writeFileSync(configFile, corruptData);
+      const untightenable = `${configFile}.corrupt-1`;
+      const usable = `${configFile}.corrupt-2`;
+      fs.writeFileSync(untightenable, corruptData);
+      fs.writeFileSync(usable, corruptData);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      const origChmod = fs.chmodSync.bind(fs);
+      const chmodSpy = spyOn(fs, "chmodSync").mockImplementation((file, mode) => {
+        if (file === untightenable) {
+          throw Object.assign(new Error("EPERM: operation not permitted"), { code: "EPERM" });
+        }
+        origChmod(file, mode);
+      });
+      // Creating a fresh sidecar must not be needed: the usable duplicate is reused.
+      const origWrite = fs.writeFileSync.bind(fs);
+      const writeSpy = spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+        if (typeof file === "string" && file.includes(".corrupt-") && file !== untightenable) {
+          throw new Error("unexpected sidecar creation");
+        }
+        origWrite(file, data, options);
+      });
+
+      config.loadConfigOrDefault();
+
+      expect(corruptBackups().sort()).toEqual([untightenable, usable].sort());
+      expect(String(errorSpy.mock.calls[0]?.[0])).toContain(usable);
+      writeSpy.mockRestore();
+      chmodSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it("aborts an edit write when the corrupt file changed after the edit loaded it", async () => {
+      const configFile = configFilePath();
+      const corruptA = '{ "projects": ';
+      const corruptB = '{ "taskSettings": ';
+      fs.writeFileSync(configFile, corruptA);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+
+      // Simulate a concurrent writer replacing the file between this edit's load and write.
+      const raceError = await config
+        .editConfig((cfg) => {
+          fs.writeFileSync(configFile, corruptB);
+          return cfg;
+        })
+        .then(
+          () => null,
+          (e: unknown) => e
+        );
+      expect(String(raceError)).toContain("changed after this edit loaded it");
+
+      // The write was skipped: B is still on disk instead of a defaults rewrite.
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(corruptB);
+
+      // The next edit's own load backs up B, so it may proceed.
+      await config.setUpdateChannel("nightly");
+      const contents = corruptBackups().map((p) => fs.readFileSync(p, "utf-8"));
+      expect(contents).toContain(corruptA);
+      expect(contents).toContain(corruptB);
+      const rewritten = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+        updateChannel?: unknown;
+      };
+      expect(rewritten.updateChannel).toBe("nightly");
+      errorSpy.mockRestore();
+    });
+
+    it("dedupes repeated backup failures whose messages embed the generated path", () => {
+      const configFile = configFilePath();
+      fs.writeFileSync(configFile, '{ "projects": ');
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      const nowSpy = spyOn(Date, "now");
+      const origWrite = fs.writeFileSync.bind(fs);
+      const writeSpy = spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+        if (typeof file === "string" && file.includes(".corrupt-")) {
+          throw Object.assign(new Error(`ENOSPC: no space left on device, open '${file}'`), {
+            code: "ENOSPC",
+          });
+        }
+        origWrite(file, data, options);
+      });
+
+      nowSpy.mockReturnValue(1000);
+      config.loadConfigOrDefault();
+      nowSpy.mockReturnValue(2000);
+      config.loadConfigOrDefault();
+
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      writeSpy.mockRestore();
+      nowSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it("logs a corrupt config once across Config instances on the same path", () => {
+      const corruptData = '{ "projects": ';
+      fs.writeFileSync(configFilePath(), corruptData);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+
+      config.loadConfigOrDefault();
+      new Config(tempDir).loadConfigOrDefault();
+
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      errorSpy.mockRestore();
+    });
+
+    it("recovers from an unreadable config without creating a backup", () => {
+      const configFile = configFilePath();
+      // A directory at the config path makes readFileSync fail before any bytes exist.
+      fs.mkdirSync(configFile);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+
+      const loaded = config.loadConfigOrDefault();
+
+      expect(loaded.projects.size).toBe(0);
+      expect(corruptBackups()).toHaveLength(0);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(String(errorSpy.mock.calls[0]?.[0])).toContain(configFile);
+
+      // Repeated loads of the same unreadable state stay deduped.
+      config.loadConfigOrDefault();
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      errorSpy.mockRestore();
+    });
+  });
 
   describe("loadConfigOrDefault settingsBackup sanitizing", () => {
     it("degrades a malformed settingsBackup instead of returning it", () => {
@@ -1493,8 +2043,8 @@ describe("Config", () => {
       });
 
       const raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
-        agentAiDefaults?: Record<string, { modelString?: string }>;
-        subagentAiDefaults?: Record<string, { modelString?: string }>;
+        agentAiDefaults?: Record<string, { modelString?: string; thinkingLevel?: string }>;
+        subagentAiDefaults?: Record<string, { modelString?: string; thinkingLevel?: string }>;
       };
 
       expect(raw.agentAiDefaults).toEqual({

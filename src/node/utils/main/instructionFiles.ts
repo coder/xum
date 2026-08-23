@@ -10,6 +10,9 @@ import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { readFileString } from "@/node/utils/runtime/helpers";
 
+export const CLAUDE_COMPAT_INSTRUCTIONS_DIRECTORY = ".claude";
+const CLAUDE_COMPAT_GLOBAL_INSTRUCTION_FILENAME = "CLAUDE.md";
+
 const MARKDOWN_COMMENT_REGEX = /<!--[\s\S]*?-->/g;
 
 function stripMarkdownComments(content: string): string {
@@ -235,6 +238,35 @@ export async function readInstructionSet(
     scope,
     projectName
   );
+}
+
+/**
+ * Read Claude Code's host-global instruction file as a lowest-precedence,
+ * read-only compatibility source. Only CLAUDE.md is supported here so native
+ * Xum candidate and local-file semantics never leak into ~/.claude.
+ */
+export async function readClaudeCompatGlobalInstructionSet(
+  directory: string
+): Promise<InstructionSet | null> {
+  const resolvedDirectory = path.resolve(directory);
+  const result = await readSingleFile(
+    createLocalFileReader(),
+    resolvedDirectory,
+    CLAUDE_COMPAT_GLOBAL_INSTRUCTION_FILENAME,
+    INSTRUCTION_SCOPE.GLOBAL,
+    false,
+    undefined,
+    false
+  );
+  if (!result.exists || !result.file) return null;
+
+  return {
+    scope: INSTRUCTION_SCOPE.GLOBAL,
+    projectName: null,
+    directory: resolvedDirectory,
+    files: [result.file],
+    combinedContent: result.file.content,
+  };
 }
 
 /**

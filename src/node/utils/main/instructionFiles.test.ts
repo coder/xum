@@ -2,7 +2,11 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
 import { INSTRUCTION_SCOPE } from "@/common/types/instructions";
-import { readInstructionSet, gatherInstructionSets } from "./instructionFiles";
+import {
+  gatherInstructionSets,
+  readClaudeCompatGlobalInstructionSet,
+  readInstructionSet,
+} from "./instructionFiles";
 
 describe("instructionFiles", () => {
   let tempDir: string;
@@ -179,6 +183,41 @@ describe("instructionFiles", () => {
       expect(result?.combinedContent).toBe("global instructions");
       expect(result?.files).toHaveLength(1);
       expect(result?.files[0]?.xumOnly).toBe(true);
+    });
+  });
+
+  describe("readClaudeCompatGlobalInstructionSet", () => {
+    it("returns null when CLAUDE.md is missing", async () => {
+      expect(await readClaudeCompatGlobalInstructionSet(tempDir)).toBeNull();
+    });
+
+    it("reads only CLAUDE.md as a shared global instruction file", async () => {
+      await fs.writeFile(path.join(tempDir, "AGENTS.md"), "native candidate");
+      await fs.writeFile(path.join(tempDir, "AGENT.md"), "secondary candidate");
+      await fs.writeFile(path.join(tempDir, "CLAUDE.md"), "claude instructions");
+
+      const result = await readClaudeCompatGlobalInstructionSet(tempDir);
+
+      expect(result?.combinedContent).toBe("claude instructions");
+      expect(result?.scope).toBe(INSTRUCTION_SCOPE.GLOBAL);
+      expect(result?.files).toHaveLength(1);
+      expect(result?.files[0]).toMatchObject({
+        filename: "CLAUDE.md",
+        isLocal: false,
+        xumOnly: false,
+        scope: INSTRUCTION_SCOPE.GLOBAL,
+      });
+    });
+
+    it("does not append local or nested Xum instruction files", async () => {
+      await fs.writeFile(path.join(tempDir, "CLAUDE.md"), "claude instructions");
+      await fs.writeFile(path.join(tempDir, "AGENTS.local.md"), "local instructions");
+      await fs.mkdir(path.join(tempDir, ".mux"));
+      await fs.writeFile(path.join(tempDir, ".mux", "AGENTS.md"), "nested instructions");
+
+      const result = await readClaudeCompatGlobalInstructionSet(tempDir);
+
+      expect(result?.files.map((file) => file.content)).toEqual(["claude instructions"]);
     });
   });
 

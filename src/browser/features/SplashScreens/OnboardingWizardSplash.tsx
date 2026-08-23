@@ -823,8 +823,8 @@ export function OnboardingWizardSplash(props: { onDismiss: () => void }) {
       body: (
         <>
           <p>
-            Projects are the folders or repos you want Xum to work in. Add a local folder or clone
-            from GitHub, then click Next.
+            Projects are the folders or repos you want Xum to work in. Add a local folder, clone
+            from GitHub, or create a new project, then click Next.
           </p>
 
           {userProjects.size > 0 ? (

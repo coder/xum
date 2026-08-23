@@ -196,6 +196,44 @@ describe("MCP server disable filtering", () => {
     });
   });
 
+  test("canonical plugin keys are reserved: ignored in user config layers, rejected by addServer", async () => {
+    // A user server occupying a canonical `plugin:<16-hex>:<name>` key would
+    // shadow the plugin server (user layers win on collision) yet lose its
+    // workspace overrides to that plugin's uninstall, which prunes such keys
+    // by shape. Hand-edited config entries are ignored (not started, not
+    // shadowing); the add flow rejects the name outright.
+    const reservedKey = "plugin:0123456789abcdef:srv";
+    const withProvider = new MCPConfigService(config, {
+      agentPluginsMcpProvider: () => Promise.resolve({ [reservedKey]: PLUGIN_SERVER }),
+    });
+
+    const added = await withProvider.addServer(reservedKey, { transport: "stdio", command: "x" });
+    expect(added.success).toBe(false);
+    if (!added.success) {
+      expect(added.error).toContain("reserved");
+    }
+
+    // Hand-edited global + project entries on the reserved key.
+    await fs.writeFile(
+      path.join(config.rootDir, "mcp.jsonc"),
+      JSON.stringify({ servers: { [reservedKey]: "user-global", ordinary: "user-ordinary" } }),
+      "utf-8"
+    );
+    const projectPath = path.join(tempDir, "repo-reserved");
+    await fs.mkdir(path.join(projectPath, ".xum"), { recursive: true });
+    await fs.writeFile(
+      path.join(projectPath, ".xum", "mcp.jsonc"),
+      JSON.stringify({ servers: { [reservedKey]: "user-project" } }),
+      "utf-8"
+    );
+
+    const servers = await withProvider.listServers(projectPath, true);
+    // The plugin server keeps its reserved key; the user entries neither
+    // shadow it nor appear under their own name. Ordinary names still load.
+    expect(servers[reservedKey]).toEqual(PLUGIN_SERVER);
+    expect(servers.ordinary).toMatchObject({ command: "user-ordinary" });
+  });
+
   test("listServers resolves the Agent Plugins context: default, explicit, and null", async () => {
     const seenArgs: Array<{ projectRoot?: string; projectKey?: string; trusted: boolean }> = [];
     const withProvider = new MCPConfigService(config, {

@@ -49,6 +49,8 @@ import {
 } from "@/node/services/analytics/analyticsService";
 import { ExperimentsService } from "@/node/services/experimentsService";
 import { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
+import { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { McpOauthService } from "@/node/services/mcpOauthService";
 import { HeartbeatService } from "@/node/services/heartbeatService";
 import { AgentStatusService } from "@/node/services/agentStatusService";
@@ -122,6 +124,7 @@ export class ServiceContainer {
   public readonly voiceService: VoiceService;
   public readonly mcpOauthService: McpOauthService;
   public readonly workspaceMcpOverridesService: WorkspaceMcpOverridesService;
+  public readonly agentPluginInstallService: AgentPluginInstallService;
   public readonly telemetryService: TelemetryService;
   public readonly sessionTimingService: SessionTimingService;
   public readonly timelineService: TimelineService;
@@ -228,6 +231,16 @@ export class ServiceContainer {
     this.memoryConsolidationService = core.memoryConsolidationService;
     this.extensionMetadata = core.extensionMetadata;
     this.backgroundProcessManager = core.backgroundProcessManager;
+
+    // Managed Agent Plugin installer (agent-plugins experiment). Gated on the
+    // backend ExperimentsService exactly like the plugin MCP provider; the
+    // MCP manager dependency lets update/uninstall recycle running plugin
+    // servers whose content changed behind an unchanged command line.
+    this.agentPluginInstallService = new AgentPluginInstallService(config, {
+      isEnabled: () => this.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS),
+      mcpServerManager: this.mcpServerManager,
+      workspaceMcpOverridesService: this.workspaceMcpOverridesService,
+    });
 
     this.projectService = new ProjectService(config, this.sshPromptService);
     this.projectService.setWorkspaceService(this.workspaceService);
@@ -346,6 +359,8 @@ export class ServiceContainer {
     // Wire terminal service to workspace service for cleanup on removal
     this.workspaceService.setTerminalService(this.terminalService);
     this.workspaceService.setDesktopSessionManager(this.desktopSessionManager);
+    // Plugin-override pruning is wired inside createCoreServices (shared with
+    // headless CLI registration), using this.workspaceMcpOverridesService.
     // Editor service for opening workspaces in code editors
     this.editorService = new EditorService(config);
     this.updateService = new UpdateService(this.config);
@@ -619,6 +634,7 @@ export class ServiceContainer {
       mcpOauthService: this.mcpOauthService,
       workspaceMcpOverridesService: this.workspaceMcpOverridesService,
       mcpServerManager: this.mcpServerManager,
+      agentPluginInstallService: this.agentPluginInstallService,
       sessionTimingService: this.sessionTimingService,
       timelineService: this.timelineService,
       telemetryService: this.telemetryService,

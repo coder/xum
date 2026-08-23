@@ -50,21 +50,28 @@ export async function runFullInit(
 /**
  * Fire-and-forget init with standardized error handling.
  * Use this for background init after workspace creation (workspaceService, taskService).
+ *
+ * Returns a promise that SETTLES (never rejects) when init terminates, so
+ * error paths that must tear down the checkout can await termination first —
+ * deleting a worktree while init still runs against it races its writes and
+ * open handles. Callers that never tear down may ignore it with `void`.
  */
-
 export function runBackgroundInit(
   runtime: Runtime,
   params: WorkspaceInitParams,
   workspaceId: string,
   // eslint-disable-next-line local/no-object-parameters -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
   logger?: { error: (msg: string, ctx: object) => void }
-): void {
-  void runFullInit(runtime, params).catch((error: unknown) => {
-    const errorMsg = getErrorMessage(error);
-    logger?.error(`Workspace init failed for ${workspaceId}:`, { error });
-    params.initLogger.logStderr(`Initialization failed: ${errorMsg}`);
-    params.initLogger.logComplete(-1);
-  });
+): Promise<void> {
+  return runFullInit(runtime, params).then(
+    () => undefined,
+    (error: unknown) => {
+      const errorMsg = getErrorMessage(error);
+      logger?.error(`Workspace init failed for ${workspaceId}:`, { error });
+      params.initLogger.logStderr(`Initialization failed: ${errorMsg}`);
+      params.initLogger.logComplete(-1);
+    }
+  );
 }
 
 function shouldUseSSH2Runtime(): boolean {

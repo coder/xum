@@ -9,6 +9,7 @@ import {
   MCP_PROMPT_MAX_TEXT_BYTES,
   MCP_PROMPT_TRUNCATION_MARKER,
 } from "@/common/constants/toolLimits";
+import { MUTATION_EPOCH_UNREADABLE_TOKEN } from "@/node/services/agentPlugins/journals";
 import * as mcpSdk from "@/node/services/mcpClient";
 import {
   MCPServerManager,
@@ -150,6 +151,787 @@ describe("MCPServerManager", () => {
 
   afterEach(() => {
     manager.dispose();
+  });
+
+  test("cross-process plugin mutation token retires cached plugin instances before serving", async () => {
+    // A sibling process's update/uninstall recycles only its OWN manager;
+    // this manager must notice the bumped on-disk mutation token and retire
+    // matching cached instances instead of serving stale-tree servers forever.
+    manager.dispose();
+    let token = "epoch-1";
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
+    });
+    access = manager as unknown as MCPServerManagerTestAccess;
+
+    const workspaceId = "ws-cross-process";
+    const pluginKey = "plugin:abc123:echo";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({ [pluginKey]: stdioConfig("node server.js") })
+    );
+    const close = mock(() => Promise.resolve(undefined));
+    access.startServers = () =>
+      Promise.resolve(startResult([[pluginKey, { tools: { echo: testTool() }, close }]]));
+
+    const first = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(Object.keys(first.tools)).toHaveLength(1);
+
+    // Unchanged token: the cached instance is served untouched.
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(close).toHaveBeenCalledTimes(0);
+
+    // The sibling's mutation bumps the token: retire and restart.
+    token = "epoch-2";
+    const close2 = mock(() => Promise.resolve(undefined));
+    access.startServers = () =>
+      Promise.resolve(startResult([[pluginKey, { tools: { echo: testTool() }, close: close2 }]]));
+    const third = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(Object.keys(third.tools)).toHaveLength(1);
+    expect(close2).toHaveBeenCalledTimes(0);
+  });
+
+  test("a mutation landing during startup is caught by the post-publication token recheck", async () => {
+    // A sibling mutation beginning AFTER the preflight token read is
+    // invisible to the in-process epoch and to the installer's discovery
+    // bracket; the serve must re-read the token after publication, retire the
+    // just-published stale instance, and rebuild from the new tree. The
+    // sweep also clears the cross-process-stale override cache.
+    manager.dispose();
+    let token = "epoch-1";
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
+    });
+    access = manager as unknown as MCPServerManagerTestAccess;
+
+    const workspaceId = "ws-startup-race";
+    const pluginKey = "plugin:abc123:echo";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({ [pluginKey]: stdioConfig("node server.js") })
+    );
+    // Seed the token on a DIFFERENT workspace (first serve only records it),
+    // so the raced serve below takes the full startup path.
+    access.startServers = () => Promise.resolve(startResult([]));
+    await manager.getToolsForWorkspace(workspaceRequest("ws-token-seed"));
+
+    // Seed a stale cached override entry a sibling's prune cannot reach.
+    await manager.applyWorkspaceOverrides(workspaceId, { enabledServers: [pluginKey] });
+
+    // Serve the raced workspace: the mutation lands DURING startup —
+    // startServers flips the token as a side effect, after the preflight
+    // already read the old value.
+    const close = mock(() => Promise.resolve(undefined));
+    const close2 = mock(() => Promise.resolve(undefined));
+    let starts = 0;
+    access.startServers = () => {
+      starts += 1;
+      if (starts === 1) {
+        token = "epoch-2"; // Sibling mutation mid-startup.
+        return Promise.resolve(startResult([[pluginKey, { tools: { echo: testTool() }, close }]]));
+      }
+      return Promise.resolve(
+        startResult([[pluginKey, { tools: { echo: testTool() }, close: close2 }]])
+      );
+    };
+    const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    // The stale-tree instance was retired post-publication; the rebuild's
+    // instance (new tree) is served.
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(close2).toHaveBeenCalledTimes(0);
+    expect(starts).toBe(2);
+    expect(Object.keys(result.tools)).toHaveLength(1);
+    // With no disk reader wired, the sweep scrubs plugin keys from the
+    // cross-process-stale cache while preserving unrelated override state.
+    expect(
+      (
+        access as unknown as { latestWorkspaceOverrides: Map<string, unknown> }
+      ).latestWorkspaceOverrides.get(workspaceId)
+    ).toEqual({ enabledServers: [] });
+  });
+
+  test("concurrent serves await an in-flight cross-process sweep before returning", async () => {
+    // The observed token must publish only AFTER the sweep completes: a
+    // concurrent serve that merely compared the token could otherwise return
+    // an instance the sweep has not yet retired.
+    manager.dispose();
+    let token = "epoch-1";
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
+    });
+    access = manager as unknown as MCPServerManagerTestAccess;
+
+    const workspaceId = "ws-sweep-order";
+    const pluginKey = "plugin:abc123:echo";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({ [pluginKey]: stdioConfig("node server.js") })
+    );
+    // First serve: cache an instance whose close is GATED, so the sweep
+    // triggered by the token bump blocks mid-retire.
+    let releaseClose!: () => void;
+    const closeGate = new Promise<void>((resolve) => {
+      releaseClose = resolve;
+    });
+    const close = mock(() => closeGate);
+    access.startServers = () =>
+      Promise.resolve(startResult([[pluginKey, { tools: { echo: testTool() }, close }]]));
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    token = "epoch-2";
+    const restarted = mock(() => Promise.resolve(undefined));
+    access.startServers = () =>
+      Promise.resolve(
+        startResult([[pluginKey, { tools: { echo: testTool() }, close: restarted }]])
+      );
+    let firstDone = false;
+    let secondDone = false;
+    const first = manager.getToolsForWorkspace(workspaceRequest(workspaceId)).then((result) => {
+      firstDone = true;
+      return result;
+    });
+    const second = manager.getToolsForWorkspace(workspaceRequest(workspaceId)).then((result) => {
+      secondDone = true;
+      return result;
+    });
+    // Both serves are queued behind the gated sweep: neither may resolve.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(firstDone).toBe(false);
+    expect(secondDone).toBe(false);
+
+    releaseClose();
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    // Neither serve returned the stale instance; both see the restarted tree.
+    expect(Object.keys(firstResult.tools)).toHaveLength(1);
+    expect(Object.keys(secondResult.tools)).toHaveLength(1);
+    expect(restarted).toHaveBeenCalledTimes(0);
+  });
+
+  test("serves loop until a startup is bracketed by an unchanged mutation token", async () => {
+    // A single post-publication rebuild is not enough: a second sibling
+    // mutation starting after the rebuild's preflight would let the rebuild
+    // publish an instance from ITS replaced tree and serve it indefinitely.
+    // The serve must repeat until one startup sees the same token on both
+    // sides.
+    manager.dispose();
+    let token = "epoch-1";
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
+    });
+    access = manager as unknown as MCPServerManagerTestAccess;
+
+    const workspaceId = "ws-token-loop";
+    const pluginKey = "plugin:abc123:echo";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({ [pluginKey]: stdioConfig("node server.js") })
+    );
+    // Seed the token on a different workspace (first serve only records it).
+    access.startServers = () => Promise.resolve(startResult([]));
+    await manager.getToolsForWorkspace(workspaceRequest("ws-token-seed"));
+
+    // Two consecutive startups each race a fresh sibling mutation; the third
+    // runs clean.
+    const closes = [
+      mock(() => Promise.resolve(undefined)),
+      mock(() => Promise.resolve(undefined)),
+      mock(() => Promise.resolve(undefined)),
+    ];
+    let starts = 0;
+    access.startServers = () => {
+      starts += 1;
+      if (starts <= 2) {
+        token = `epoch-${starts + 1}`; // Sibling mutation mid-startup.
+      }
+      return Promise.resolve(
+        startResult([[pluginKey, { tools: { echo: testTool() }, close: closes[starts - 1] }]])
+      );
+    };
+    const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    // Both raced instances were retired; only the bracketed third serve's
+    // instance survives.
+    expect(starts).toBe(3);
+    expect(closes[0]).toHaveBeenCalledTimes(1);
+    expect(closes[1]).toHaveBeenCalledTimes(1);
+    expect(closes[2]).toHaveBeenCalledTimes(0);
+    expect(Object.keys(result.tools)).toHaveLength(1);
+  });
+
+  test("prompt listing retries when a plugin mutation lands during startup", async () => {
+    manager.dispose();
+    let token = "epoch-1";
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
+    });
+    access = manager as unknown as MCPServerManagerTestAccess;
+
+    const workspaceId = "ws-prompt-list-token-race";
+    const pluginKey = "plugin:abc123:echo";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({ [pluginKey]: stdioConfig("node server.js") })
+    );
+    access.startServers = () => Promise.resolve(startResult([]));
+    await manager.getToolsForWorkspace(workspaceRequest("ws-prompt-token-seed"));
+
+    const staleClose = mock(() => Promise.resolve(undefined));
+    const freshClose = mock(() => Promise.resolve(undefined));
+    let starts = 0;
+    access.startServers = () => {
+      starts += 1;
+      if (starts === 1) {
+        token = "epoch-2";
+      }
+      return Promise.resolve(
+        startResult([
+          [
+            pluginKey,
+            {
+              prompts: [{ name: "review", description: starts === 1 ? "stale" : "fresh" }],
+              close: starts === 1 ? staleClose : freshClose,
+            },
+          ],
+        ])
+      );
+    };
+
+    const prompts = await manager.getPromptsForWorkspace(workspaceRequest(workspaceId));
+    expect(starts).toBe(2);
+    expect(staleClose).toHaveBeenCalledTimes(1);
+    expect(freshClose).toHaveBeenCalledTimes(0);
+    const review = prompts.find((prompt) => prompt.promptName === "review");
+    expect(review?.description).toBe("fresh");
+  });
+
+  test("prompt invocation retries when a plugin mutation lands during prompts/get", async () => {
+    manager.dispose();
+    let token = "epoch-1";
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: { keyPrefix: "plugin:", readToken: () => Promise.resolve(token) },
+    });
+    access = manager as unknown as MCPServerManagerTestAccess;
+
+    const workspaceId = "ws-prompt-get-token-race";
+    const pluginKey = "plugin:abc123:echo";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({ [pluginKey]: stdioConfig("node server.js") })
+    );
+    const staleClose = mock(() => Promise.resolve(undefined));
+    const freshClose = mock(() => Promise.resolve(undefined));
+    const staleGetPrompt = mock(() => {
+      token = "epoch-2";
+      return Promise.resolve({
+        messages: [{ role: "user" as const, content: { type: "text" as const, text: "stale" } }],
+      });
+    });
+    const freshGetPrompt = mock(() =>
+      Promise.resolve({
+        messages: [{ role: "user" as const, content: { type: "text" as const, text: "fresh" } }],
+      })
+    );
+    let starts = 0;
+    access.startServers = () => {
+      starts += 1;
+      return Promise.resolve(
+        startResult([
+          [
+            pluginKey,
+            {
+              getPrompt: starts === 1 ? staleGetPrompt : freshGetPrompt,
+              close: starts === 1 ? staleClose : freshClose,
+            },
+          ],
+        ])
+      );
+    };
+
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    const prompt = await manager.getPrompt(workspaceId, pluginKey, "review", {});
+    expect(prompt.text).toBe("fresh");
+    expect(staleGetPrompt).toHaveBeenCalledTimes(1);
+    expect(staleClose).toHaveBeenCalledTimes(1);
+    expect(freshGetPrompt).toHaveBeenCalledTimes(1);
+    expect(freshClose).toHaveBeenCalledTimes(0);
+  });
+
+  test("an unreadable mutation epoch fails closed only for plugin servers", async () => {
+    // Unreadability is a STABLE state: transition into it sweeps once and
+    // suppresses plugin configs, while unrelated MCP servers remain usable.
+    // Repeated serves cannot exhaust the mutation bracket, and transition
+    // back to a readable epoch enables plugins again.
+    manager.dispose();
+    let token = "epoch-1";
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: {
+        keyPrefix: "plugin:",
+        readToken: () => Promise.resolve(token),
+      },
+    });
+    access = manager as unknown as MCPServerManagerTestAccess;
+
+    const workspaceId = "ws-unreadable-epoch";
+    const pluginKey = "plugin:abc123:echo";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({
+        [pluginKey]: {
+          ...stdioConfig("node plugin.js"),
+          plugin: {
+            pluginName: "demo",
+            serverName: "echo",
+            sourceScope: "global" as const,
+            sourceLocation: ".xum/plugins/demo",
+          },
+        },
+        regular: stdioConfig("node regular.js"),
+      })
+    );
+    const pluginClose = mock(() => Promise.resolve(undefined));
+    access.startServers = (...args: unknown[]) => {
+      const servers = args[0] as Record<string, unknown>;
+      return Promise.resolve(
+        startResult(
+          Object.keys(servers).map((name) => [
+            name,
+            {
+              tools: { echo: testTool() },
+              close: name === pluginKey ? pluginClose : mock(() => Promise.resolve(undefined)),
+            },
+          ])
+        )
+      );
+    };
+
+    const first = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(Object.keys(first.tools)).toHaveLength(2);
+
+    token = MUTATION_EPOCH_UNREADABLE_TOKEN;
+    const second = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(pluginClose).toHaveBeenCalledTimes(1);
+    expect(Object.keys(second.tools)).toHaveLength(1);
+
+    // Stable unreadability: no repeated sweep or retry exhaustion.
+    const third = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(pluginClose).toHaveBeenCalledTimes(1);
+    expect(Object.keys(third.tools)).toHaveLength(1);
+
+    token = "epoch-2";
+    const recovered = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(Object.keys(recovered.tools)).toHaveLength(2);
+  });
+
+  test("cross-process sweep refreshes cached override snapshots from disk", async () => {
+    // A sibling's uninstall prunes plugin keys from workspace override FILES.
+    // Cached copies — the per-call overlay cache AND recorded request options
+    // (which getPrompt()'s refresh reuses) — must converge to disk, or a
+    // pre-prune enable would restart a same-name reinstall's server without
+    // new consent.
+    manager.dispose();
+    let token = "epoch-1";
+    let diskOverrides: Record<string, unknown> = { enabledServers: ["plugin:abc123:echo"] };
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: {
+        keyPrefix: "plugin:",
+        readToken: () => Promise.resolve(token),
+        readWorkspaceOverrides: () => Promise.resolve(diskOverrides),
+      },
+    });
+    access = manager as unknown as MCPServerManagerTestAccess;
+
+    const workspaceId = "ws-disk-refresh";
+    const pluginKey = "plugin:abc123:echo";
+    // Project-level disabled: only the workspace override enables the server.
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({ [pluginKey]: stdioConfig("node server.js", true) })
+    );
+    const close = mock(() => Promise.resolve(undefined));
+    // Start only what enablement actually requested: the pruned second serve
+    // must derive an EMPTY start set, not merely discard a started instance.
+    access.startServers = (...args: unknown[]) => {
+      const servers = args[0] as Record<string, unknown>;
+      return Promise.resolve(
+        pluginKey in servers
+          ? startResult([[pluginKey, { tools: { echo: testTool() }, close }]])
+          : startResult([])
+      );
+    };
+
+    // First serve: the caller's snapshot enables the plugin server.
+    const staleCallerOptions = workspaceRequest(workspaceId, {
+      overrides: { enabledServers: [pluginKey] },
+    });
+    const first = await manager.getToolsForWorkspace(staleCallerOptions);
+    expect(Object.keys(first.tools)).toHaveLength(1);
+
+    // Sibling uninstall: the override file is pruned on disk, then the epoch
+    // bumps.
+    diskOverrides = {};
+    token = "epoch-2";
+
+    // Same STALE caller snapshot: the preflight sweep must reload disk state
+    // before the overlay captures this call's overrides, so the pruned
+    // (empty) overrides win and no replacement server starts.
+    const second = await manager.getToolsForWorkspace(staleCallerOptions);
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(Object.keys(second.tools)).toHaveLength(0);
+
+    // Both caches converged to disk: getPrompt()'s refresh (recorded
+    // options) can no longer resurrect the pre-prune enable.
+    const internals = access as unknown as {
+      latestWorkspaceOverrides: Map<string, unknown>;
+      lastWorkspaceRequestOptions: Map<string, { overrides?: unknown }>;
+    };
+    expect(internals.latestWorkspaceOverrides.get(workspaceId)).toEqual({});
+    expect(internals.lastWorkspaceRequestOptions.get(workspaceId)?.overrides).toEqual({});
+  });
+
+  test("a cold workspace's first serve loads disk overrides instead of trusting the caller snapshot", async () => {
+    // Two processes, one home: the caller read its snapshot BEFORE a sibling
+    // uninstall + same-name reinstall pruned the enable from the override
+    // file. This manager never served the workspace (no cached snapshot for
+    // the sweep to refresh) and its first token observation records the
+    // already-advanced epoch, so the bracket sees nothing to retire — disk
+    // must win on the first serve, or the stale enable overrides the
+    // replacement server's default-disabled state.
+    manager.dispose();
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: {
+        keyPrefix: "plugin:",
+        readToken: () => Promise.resolve("epoch-post-mutation"),
+        readWorkspaceOverrides: () => Promise.resolve({}), // pruned on disk
+      },
+    });
+    access = manager as unknown as MCPServerManagerTestAccess;
+
+    const pluginKey = "plugin:abc123:echo";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({ [pluginKey]: stdioConfig("node server.js", true) })
+    );
+    let startedPluginServer = false;
+    access.startServers = (...args: unknown[]) => {
+      const servers = args[0] as Record<string, unknown>;
+      if (pluginKey in servers) {
+        startedPluginServer = true;
+      }
+      return Promise.resolve(startResult([]));
+    };
+
+    const staleCallerOptions = workspaceRequest("ws-cold-first-serve", {
+      overrides: { enabledServers: [pluginKey] },
+    });
+    const result = await manager.getToolsForWorkspace(staleCallerOptions);
+    expect(startedPluginServer).toBe(false);
+    expect(Object.keys(result.tools)).toHaveLength(0);
+  });
+
+  test("a settings save landing during the first-serve disk read wins over the read result", async () => {
+    // The first serve's disk read races a successful MCP settings save: the
+    // save persists to disk, then publishes into the override cache — but a
+    // read started BEFORE the save can resolve with the older state
+    // afterwards. The continuation must recheck the cache: recording the
+    // stale read would expose a just-disabled server for this send, and the
+    // save's repair path only patches recorded options, which do not exist
+    // yet on a first serve.
+    manager.dispose();
+    let readStarted: () => void = () => undefined;
+    const readStartedPromise = new Promise<void>((resolve) => {
+      readStarted = resolve;
+    });
+    let resolveRead: (value: Record<string, unknown>) => void = () => undefined;
+    const pendingRead = new Promise<Record<string, unknown>>((resolve) => {
+      resolveRead = resolve;
+    });
+    manager = new MCPServerManager(configService as unknown as MCPConfigService, {
+      pluginInvalidation: {
+        keyPrefix: "plugin:",
+        readToken: () => Promise.resolve("epoch-1"),
+        readWorkspaceOverrides: () => {
+          readStarted();
+          return pendingRead;
+        },
+      },
+    });
+    access = manager as unknown as MCPServerManagerTestAccess;
+
+    const workspaceId = "ws-first-serve-race";
+    const pluginKey = "plugin:abc123:echo";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({ [pluginKey]: stdioConfig("node server.js", true) })
+    );
+    let startedPluginServer = false;
+    access.startServers = (...args: unknown[]) => {
+      const servers = args[0] as Record<string, unknown>;
+      if (pluginKey in servers) {
+        startedPluginServer = true;
+      }
+      return Promise.resolve(startResult([]));
+    };
+
+    const serve = manager.getToolsForWorkspace(
+      workspaceRequest(workspaceId, { overrides: { enabledServers: [pluginKey] } })
+    );
+    // Deterministic interleaving: the serve is parked on the disk read when
+    // the save publishes, then the read resolves with the pre-save state.
+    await readStartedPromise;
+    await manager.applyWorkspaceOverrides(workspaceId, {});
+    resolveRead({ enabledServers: [pluginKey] });
+
+    const result = await serve;
+    expect(startedPluginServer).toBe(false);
+    expect(Object.keys(result.tools)).toHaveLength(0);
+    const internals = access as unknown as {
+      lastWorkspaceRequestOptions: Map<string, { overrides?: unknown }>;
+    };
+    expect(internals.lastWorkspaceRequestOptions.get(workspaceId)?.overrides).toEqual({});
+  });
+
+  test("stopServersWithKeyPrefix invalidates instances published by an in-flight startup, then retries them", async () => {
+    const workspaceId = "ws-swap-race";
+    const pluginKey = "plugin:abc123:echo";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({ [pluginKey]: stdioConfig("node server.js") })
+    );
+
+    // Block startServers mid-flight so a plugin swap can land while the
+    // instance exists but is not yet published in workspaceServers.
+    let releaseStartup!: () => void;
+    const startupGate = new Promise<void>((resolve) => {
+      releaseStartup = resolve;
+    });
+    const close = mock(() => Promise.resolve(undefined));
+    access.startServers = async () => {
+      await startupGate;
+      return startResult([[pluginKey, { close }]]);
+    };
+
+    const toolsPromise = manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    // Give getToolsForWorkspace time to enter the (gated) startServers call.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // The updater's recycle runs while startup is in flight: the scan sees
+    // nothing (not yet published), so the epoch record must catch it.
+    await manager.stopServersWithKeyPrefix("plugin:abc123:");
+
+    releaseStartup();
+    const result = await toolsPromise;
+
+    // The stale instance was closed instead of published.
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(Object.keys(result.tools)).toEqual([]);
+    const entry = access.workspaceServers.get(workspaceId) as {
+      instances: Map<string, unknown>;
+      timedOutServerNames: string[];
+    };
+    expect(entry.instances.size).toBe(0);
+
+    // The entry was published under the UNCHANGED config signature, so the
+    // next call hits the cached path — the removed server must carry a retry
+    // marker there, or the updated plugin's tools stay unavailable forever.
+    expect(entry.timedOutServerNames).toContain(pluginKey);
+    const echoTool = testTool();
+    const close2 = mock(() => Promise.resolve(undefined));
+    access.startServers = () =>
+      Promise.resolve(startResult([[pluginKey, { tools: { echo: echoTool }, close: close2 }]]));
+
+    const second = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+
+    // Restarted from the (new) tree via the retry path — not served from the
+    // reduced cached map, and not torn down again.
+    expect(close2).toHaveBeenCalledTimes(0);
+    expect(Object.keys(second.tools)).toHaveLength(1);
+    const secondEntry = access.workspaceServers.get(workspaceId) as {
+      instances: Map<string, unknown>;
+      timedOutServerNames: string[];
+    };
+    expect(secondEntry.instances.size).toBe(1);
+    expect(secondEntry.timedOutServerNames).toEqual([]);
+  });
+
+  test("invalidation landing between the final epoch scan and cache publication never publishes the stale instance", async () => {
+    const workspaceId = "ws-publish-race";
+    const pluginKey = "plugin:abc123:echo";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({ [pluginKey]: stdioConfig("node server.js") })
+    );
+
+    // The invalidation scan iterates the instances map ([...instances]), so a
+    // one-shot iterator hook that QUEUES a microtask runs stopServersWithKeyPrefix
+    // strictly after that scan's checks but before the awaiting continuation
+    // publishes: the stop's epoch record lands after the scan read it, and its
+    // own published-map scan runs before workspaceServers.set — the exact
+    // window where both mechanisms used to miss.
+    const close = mock(() => Promise.resolve(undefined));
+    let stopPromise: Promise<void> | undefined;
+    const instances = new Map<string, unknown>([[pluginKey, testInstance(pluginKey, { close })]]);
+    let armed = true;
+    const originalIterator = instances[Symbol.iterator].bind(instances);
+    instances[Symbol.iterator] = () => {
+      if (armed) {
+        armed = false;
+        queueMicrotask(() => {
+          stopPromise = manager.stopServersWithKeyPrefix("plugin:abc123:");
+        });
+      }
+      return originalIterator();
+    };
+
+    access.startServers = () =>
+      Promise.resolve({ instances, failedServerNames: [], timedOutServerNames: [] });
+
+    const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(stopPromise).toBeDefined();
+    await stopPromise;
+
+    // The stale-tree instance was closed, never published, and carries a
+    // retry marker so the next call restarts it from the new tree.
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(Object.keys(result.tools)).toEqual([]);
+    const entry = access.workspaceServers.get(workspaceId) as {
+      instances: Map<string, unknown>;
+      timedOutServerNames: string[];
+    };
+    expect(entry.instances.size).toBe(0);
+    expect(entry.timedOutServerNames).toContain(pluginKey);
+
+    const echoTool = testTool();
+    access.startServers = () =>
+      Promise.resolve(startResult([[pluginKey, { tools: { echo: echoTool } }]]));
+    const second = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(Object.keys(second.tools)).toHaveLength(1);
+  });
+
+  test("workspace removal landing during the invalidation scan never publishes the started servers", async () => {
+    const workspaceId = "ws-removal-race";
+    const pluginKey = "plugin:abc123:echo";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({ [pluginKey]: stdioConfig("node server.js") })
+    );
+
+    // Same one-shot iterator hook as the invalidation race above, but the
+    // queued call is a removal-style stopServers(workspaceId): it bumps the
+    // stop epoch AFTER the pre-publication epoch check ran and finds no cache
+    // entry to close (publication hasn't happened) — publishing anyway would
+    // resurrect MCP processes for a removed workspace until idle cleanup.
+    const close = mock(() => Promise.resolve(undefined));
+    let stopPromise: Promise<void> | undefined;
+    const instances = new Map<string, unknown>([[pluginKey, testInstance(pluginKey, { close })]]);
+    let armed = true;
+    const originalIterator = instances[Symbol.iterator].bind(instances);
+    instances[Symbol.iterator] = () => {
+      if (armed) {
+        armed = false;
+        queueMicrotask(() => {
+          stopPromise = manager.stopServers(workspaceId);
+        });
+      }
+      return originalIterator();
+    };
+
+    access.startServers = () =>
+      Promise.resolve({ instances, failedServerNames: [], timedOutServerNames: [] });
+
+    const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(stopPromise).toBeDefined();
+    await stopPromise;
+
+    // Publication was skipped and the late clients were closed.
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(Object.keys(result.tools)).toEqual([]);
+    expect(access.workspaceServers.has(workspaceId)).toBe(false);
+  });
+
+  test("workspace removal landing during a timed-out retry never merges into the detached entry", async () => {
+    const workspaceId = "ws-retry-removal-race";
+    const pluginKey = "plugin:abc123:echo";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({ [pluginKey]: stdioConfig("node server.js") })
+    );
+
+    // First call: the server times out, so the cached entry carries a retry
+    // marker and no live instance.
+    access.startServers = () =>
+      Promise.resolve({
+        instances: new Map(),
+        failedServerNames: [],
+        timedOutServerNames: [pluginKey],
+      });
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(access.workspaceServers.has(workspaceId)).toBe(true);
+
+    // Second call retries the timed-out server. The one-shot iterator hook
+    // queues a removal-style stopServers(workspaceId) during the retry's
+    // invalidation scan: it deletes the cache entry, so the merge callback
+    // must NOT attach these clients to the detached entry (they would have
+    // no owner to ever clean them up).
+    const close = mock(() => Promise.resolve(undefined));
+    let stopPromise: Promise<void> | undefined;
+    const retried = new Map<string, unknown>([[pluginKey, testInstance(pluginKey, { close })]]);
+    let armed = true;
+    const originalIterator = retried[Symbol.iterator].bind(retried);
+    retried[Symbol.iterator] = () => {
+      if (armed) {
+        armed = false;
+        queueMicrotask(() => {
+          stopPromise = manager.stopServers(workspaceId);
+        });
+      }
+      return originalIterator();
+    };
+    access.startServers = () =>
+      Promise.resolve({ instances: retried, failedServerNames: [], timedOutServerNames: [] });
+
+    const result = await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    expect(stopPromise).toBeDefined();
+    await stopPromise;
+
+    // The retried client was closed, nothing was merged into the detached
+    // entry, and the removed workspace stays uncached.
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(Object.keys(result.tools)).toEqual([]);
+    expect(access.workspaceServers.has(workspaceId)).toBe(false);
+  });
+
+  test("stopServersWithKeyPrefix closes only matching instances and retries them on next use", async () => {
+    const workspaceId = "ws-selective-stop";
+    const pluginKey = "plugin:abc123:echo";
+    const userServer = "user-server";
+    configService.listServers.mockImplementation(() =>
+      Promise.resolve({
+        [pluginKey]: stdioConfig("node server.js"),
+        [userServer]: stdioConfig("npx user-server"),
+      })
+    );
+
+    const pluginClose = mock(() => Promise.resolve(undefined));
+    const userClose = mock(() => Promise.resolve(undefined));
+    const userTool = testTool();
+    access.startServers = () =>
+      Promise.resolve(
+        startResult([
+          [pluginKey, { close: pluginClose }],
+          [userServer, { tools: { toolu: userTool }, close: userClose }],
+        ])
+      );
+
+    await manager.getToolsForWorkspace(workspaceRequest(workspaceId));
+    // Simulate a live agent stream holding the workspace's servers.
+    manager.acquireLease(workspaceId);
+    try {
+      await manager.stopServersWithKeyPrefix("plugin:abc123:");
+
+      // Only the plugin instance was closed; the unrelated healthy client
+      // survives underneath the live lease.
+      expect(pluginClose).toHaveBeenCalledTimes(1);
+      expect(userClose).toHaveBeenCalledTimes(0);
+      const entry = access.workspaceServers.get(workspaceId) as {
+        instances: Map<string, unknown>;
+        timedOutServerNames: string[];
+      };
+      expect(entry.instances.has(userServer)).toBe(true);
+      expect(entry.instances.has(pluginKey)).toBe(false);
+      // The stopped plugin server is queued for restart on next use.
+      expect(entry.timedOutServerNames).toContain(pluginKey);
+    } finally {
+      manager.releaseLease(workspaceId);
+    }
   });
 
   test("cleanupIdleServers stops idle servers when workspace is not leased", () => {

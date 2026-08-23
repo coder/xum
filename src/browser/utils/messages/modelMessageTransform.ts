@@ -921,23 +921,26 @@ function coalesceConsecutiveParts(messages: ModelMessage[]): ModelMessage[] {
       // Merge consecutive reasoning parts (extended thinking)
       if (part.type === "reasoning" && lastPart?.type === "reasoning") {
         lastPart.text += part.text;
-        // Preserve signature from later parts - during streaming, the signature
-        // arrives at the end and is attached to the last reasoning part.
-        // Cast needed because AI SDK's ReasoningPart doesn't have signature,
-        // but our XumReasoningPart (which flows through convertToModelMessages) does.
-        const partWithSig = part as typeof part & {
-          signature?: string;
-          providerOptions?: { anthropic?: { signature?: string } };
-        };
-        const lastWithSig = lastPart as typeof lastPart & {
-          signature?: string;
-          providerOptions?: { anthropic?: { signature?: string } };
-        };
+        // Streaming splits one reasoning block across many parts and replay
+        // metadata can land on any of them: Anthropic signatures arrive on the
+        // LAST part of a run, while OpenAI/xAI itemId/encrypted content attach
+        // to the FIRST (and itemId may repeat on later deltas). Merge per
+        // provider namespace so a later partial object cannot clobber fields
+        // accumulated earlier (e.g. reasoningEncryptedContent under ZDR).
+        if (part.providerOptions) {
+          const existing = lastPart.providerOptions ?? {};
+          const merged: NonNullable<typeof lastPart.providerOptions> = { ...existing };
+          for (const [provider, fields] of Object.entries(part.providerOptions)) {
+            merged[provider] = { ...existing[provider], ...fields };
+          }
+          lastPart.providerOptions = merged;
+        }
+        // The legacy top-level `signature` field predates providerOptions and
+        // survives here only for defensiveness (conversion strips it upstream).
+        const partWithSig = part as typeof part & { signature?: string };
+        const lastWithSig = lastPart as typeof lastPart & { signature?: string };
         if (partWithSig.signature) {
           lastWithSig.signature = partWithSig.signature;
-        }
-        if (partWithSig.providerOptions) {
-          lastWithSig.providerOptions = partWithSig.providerOptions;
         }
         continue;
       }

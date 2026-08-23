@@ -25,7 +25,7 @@ import type {
   SkillName,
 } from "@/common/types/agentSkill";
 import { log } from "@/node/services/log";
-import { validateFileSize } from "@/node/services/tools/fileCommon";
+import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 import { ensureRuntimePathWithinWorkspace } from "@/node/services/tools/runtimeSkillPathUtils";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { AgentSkillParseError, parseSkillMarkdown } from "./parseSkillMarkdown";
@@ -33,6 +33,7 @@ import { getBuiltInSkillByName, getBuiltInSkillDescriptors } from "./builtInSkil
 import type { ProjectSkillContainment } from "./skillStorageContext";
 import {
   discoverAgentPlugins,
+  readPluginFileWithinRootCapped,
   UNIVERSAL_AGENT_PLUGINS_CONTAINER,
 } from "@/node/services/agentPlugins/discovery";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
@@ -434,7 +435,7 @@ async function readSkillDescriptorFromDir(
   skillDir: string,
   directoryName: SkillName,
   scope: AgentSkillScope,
-  options?: { invalidSkills?: AgentSkillIssue[]; pluginName?: string }
+  options?: { invalidSkills?: AgentSkillIssue[]; pluginName?: string; pluginRoot?: string }
 ): Promise<AgentSkillDescriptor | null> {
   const skillFilePath = runtime.normalizePath("SKILL.md", skillDir);
 
@@ -450,50 +451,78 @@ async function readSkillDescriptorFromDir(
     });
   };
 
-  let stat;
-  try {
-    stat = await runtime.stat(skillFilePath);
-  } catch {
-    pushInvalidSkill(
-      "SKILL.md is missing or unreadable.",
-      "Create a SKILL.md file with YAML frontmatter (--- ... ---)."
-    );
-    return null;
-  }
-
-  if (stat.isDirectory) {
-    pushInvalidSkill(
-      "SKILL.md is a directory (expected a file).",
-      "Replace SKILL.md with a regular file."
-    );
-    return null;
-  }
-
-  // Avoid reading very large files into memory (parseSkillMarkdown enforces the same limit).
-  const sizeValidation = validateFileSize(stat);
-  if (sizeValidation) {
-    log.warn(`Skipping skill '${directoryName}' (${scope}): ${sizeValidation.error}`);
-    pushInvalidSkill(sizeValidation.error, "Reduce SKILL.md size below 1MB.");
-    return null;
-  }
-
   let content: string;
-  try {
-    content = await readFileString(runtime, skillFilePath);
-  } catch (err) {
-    const message = getErrorMessage(err);
-    log.warn(`Failed to read SKILL.md for ${directoryName}: ${message}`);
-    pushInvalidSkill(
-      `Failed to read SKILL.md: ${message}`,
-      "Check file permissions and ensure the file is UTF-8 text."
-    );
-    return null;
+  let byteSize: number;
+  if (options?.pluginRoot != null) {
+    // Plugin skills (host-local by construction): bounded post-open
+    // revalidation of containment + file identity — see the pluginRoot doc
+    // on ResolvedAgentSkill. isPluginSkillContained ran before this call,
+    // and a managed update promoted in between could otherwise have the
+    // stale canonical path read an outside SKILL.md.
+    try {
+      const result = await readPluginFileWithinRootCapped({
+        filePath: skillFilePath,
+        pluginRoot: options.pluginRoot,
+        maxBytes: MAX_FILE_SIZE,
+        label: `plugin skill '${directoryName}' SKILL.md`,
+      });
+      content = result.content;
+      byteSize = result.byteSize;
+    } catch (err) {
+      const message = getErrorMessage(err);
+      log.warn(`Failed to read plugin SKILL.md for ${directoryName}: ${message}`);
+      pushInvalidSkill(
+        `Failed to read SKILL.md: ${message}`,
+        "Ensure SKILL.md is a regular file inside the plugin (no escaping symlinks)."
+      );
+      return null;
+    }
+  } else {
+    let stat;
+    try {
+      stat = await runtime.stat(skillFilePath);
+    } catch {
+      pushInvalidSkill(
+        "SKILL.md is missing or unreadable.",
+        "Create a SKILL.md file with YAML frontmatter (--- ... ---)."
+      );
+      return null;
+    }
+
+    if (stat.isDirectory) {
+      pushInvalidSkill(
+        "SKILL.md is a directory (expected a file).",
+        "Replace SKILL.md with a regular file."
+      );
+      return null;
+    }
+
+    // Avoid reading very large files into memory (parseSkillMarkdown enforces the same limit).
+    const sizeValidation = validateFileSize(stat);
+    if (sizeValidation) {
+      log.warn(`Skipping skill '${directoryName}' (${scope}): ${sizeValidation.error}`);
+      pushInvalidSkill(sizeValidation.error, "Reduce SKILL.md size below 1MB.");
+      return null;
+    }
+
+    try {
+      content = await readFileString(runtime, skillFilePath);
+    } catch (err) {
+      const message = getErrorMessage(err);
+      log.warn(`Failed to read SKILL.md for ${directoryName}: ${message}`);
+      pushInvalidSkill(
+        `Failed to read SKILL.md: ${message}`,
+        "Check file permissions and ensure the file is UTF-8 text."
+      );
+      return null;
+    }
+    byteSize = stat.size;
   }
 
   try {
     const parsed = parseSkillMarkdown({
       content,
-      byteSize: stat.size,
+      byteSize,
       directoryName,
     });
 
@@ -632,7 +661,10 @@ export async function discoverAgentSkills(
         skillDir,
         directoryName,
         scan.scope,
-        scan.pluginName !== undefined ? { pluginName: scan.pluginName } : undefined
+        {
+          ...(scan.pluginName !== undefined ? { pluginName: scan.pluginName } : {}),
+          ...(scan.pluginRoot !== undefined ? { pluginRoot: scan.pluginRoot } : {}),
+        }
       );
       if (!descriptor) continue;
 
@@ -789,6 +821,7 @@ export async function discoverAgentSkillsDiagnostics(
         {
           invalidSkills,
           ...(scan.pluginName !== undefined ? { pluginName: scan.pluginName } : {}),
+          ...(scan.pluginRoot !== undefined ? { pluginRoot: scan.pluginRoot } : {}),
         }
       );
       if (!descriptor) continue;
@@ -829,30 +862,59 @@ export interface ResolvedAgentSkill {
   package: AgentSkillPackage;
   skillDir: string;
   sourceRuntime: Runtime | null;
+  /**
+   * Plugin provenance: set for Agent Plugin skills so consuming reads
+   * (SKILL.md above, and every referenced file via agent_skill_read_file)
+   * can revalidate post-open containment against the PLUGIN root. A managed
+   * update can replace skills/<name> (or an ancestor) with an absolute
+   * symlink to an outside directory after isPluginSkillContained passed —
+   * staged validation reads that as a capability removal — so skill-dir
+   * containment alone would canonicalize through the same link and accept
+   * outside content.
+   */
+  pluginRoot?: string;
 }
 
 async function readAgentSkillFromDir(
   runtime: Runtime,
   skillDir: string,
   directoryName: SkillName,
-  scope: AgentSkillScope
+  scope: AgentSkillScope,
+  pluginRoot?: string
 ): Promise<ResolvedAgentSkill> {
   const skillFilePath = runtime.normalizePath("SKILL.md", skillDir);
 
-  const stat = await runtime.stat(skillFilePath);
-  if (stat.isDirectory) {
-    throw new Error(`SKILL.md is not a file: ${skillFilePath}`);
-  }
+  let content: string;
+  let byteSize: number;
+  if (pluginRoot != null) {
+    // Plugin skills are host-local by construction (plugin scan candidates
+    // pin a LocalRuntime): bounded post-open revalidation — see the
+    // pluginRoot doc on ResolvedAgentSkill.
+    const result = await readPluginFileWithinRootCapped({
+      filePath: skillFilePath,
+      pluginRoot,
+      maxBytes: MAX_FILE_SIZE,
+      label: `plugin skill '${directoryName}' SKILL.md`,
+    });
+    content = result.content;
+    byteSize = result.byteSize;
+  } else {
+    const stat = await runtime.stat(skillFilePath);
+    if (stat.isDirectory) {
+      throw new Error(`SKILL.md is not a file: ${skillFilePath}`);
+    }
 
-  const sizeValidation = validateFileSize(stat);
-  if (sizeValidation) {
-    throw new Error(sizeValidation.error);
-  }
+    const sizeValidation = validateFileSize(stat);
+    if (sizeValidation) {
+      throw new Error(sizeValidation.error);
+    }
 
-  const content = await readFileString(runtime, skillFilePath);
+    content = await readFileString(runtime, skillFilePath);
+    byteSize = stat.size;
+  }
   const parsed = parseSkillMarkdown({
     content,
-    byteSize: stat.size,
+    byteSize,
     directoryName,
   });
 
@@ -874,6 +936,7 @@ async function readAgentSkillFromDir(
     package: validated.data,
     skillDir,
     sourceRuntime: runtime,
+    ...(pluginRoot != null ? { pluginRoot } : {}),
   };
 }
 
@@ -955,7 +1018,13 @@ export async function readAgentSkill(
       const stat = await candidate.runtime.stat(skillDir);
       if (!stat.isDirectory) continue;
 
-      return await readAgentSkillFromDir(candidate.runtime, skillDir, name, candidate.scope);
+      return await readAgentSkillFromDir(
+        candidate.runtime,
+        skillDir,
+        name,
+        candidate.scope,
+        candidate.pluginRoot
+      );
     } catch {
       continue;
     }

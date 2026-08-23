@@ -16,11 +16,6 @@ on:
         required: false
         type: string
         default: ""
-      allow_unsigned_windows:
-        description: "Build Windows unsigned when GCP signing auth fails (nightly only; stable releases stay fail-closed)"
-        required: false
-        type: boolean
-        default: false
 
 jobs:
   build-macos:
@@ -237,7 +232,6 @@ jobs:
         id: signing
         uses: ./.github/actions/setup-windows-signing
         with:
-          allow_unsigned_fallback: "${{ inputs.allow_unsigned_windows }}"
           ev_signing_cert: ${{ secrets.EV_SIGNING_CERT }}
           gcp_workload_id_provider: ${{ vars.GCP_WORKLOAD_ID_PROVIDER }}
           gcp_service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}

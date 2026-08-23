@@ -590,9 +590,6 @@ jobs:
           ev_signing_cert: ${{ secrets.EV_SIGNING_CERT }}
           gcp_workload_id_provider: ${{ vars.GCP_WORKLOAD_ID_PROVIDER }}
           gcp_service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
-          # CI artifact only - keep main green while the repo rename breaks
-          # GCP WIF auth (see setup-windows-signing action for details).
-          allow_unsigned_fallback: "true"
       - name: Package for Windows
         run: make dist-win
         env:

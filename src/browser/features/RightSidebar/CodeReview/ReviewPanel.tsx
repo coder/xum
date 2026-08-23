@@ -2659,6 +2659,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
               assistedOnly={filters.assistedOnly}
               assistedCount={assistedHunks.length}
               assistedUnreadCount={unreadAssistedInDiff}
+              isMultiProjectWorkspace={(workspaceReviewMetadata?.projects?.length ?? 0) > 1}
             />,
             root
           );

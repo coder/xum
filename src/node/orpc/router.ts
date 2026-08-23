@@ -50,6 +50,7 @@ import {
   resolveWorkspaceRootPath,
 } from "@/node/runtime/runtimeHelpers";
 import {
+  buildAddedPluginKeyValidator,
   resolveAgentPluginsMcpContext,
   type AgentPluginsMcpContext,
 } from "@/node/services/agentPlugins/mcpConfig";
@@ -3187,6 +3188,85 @@ export const router = (authToken?: string) => {
           return result;
         }),
     },
+    // Managed Agent Plugin installs (agent-plugins experiment). The service
+    // gates every method on the experiment flag and throws user-facing
+    // errors; handlers translate them into Result values.
+    agentPlugins: {
+      preview: t
+        .input(schemas.agentPlugins.preview.input)
+        .output(schemas.agentPlugins.preview.output)
+        .handler(async ({ context, input }) => {
+          try {
+            const data = await context.agentPluginInstallService.preview({
+              input: input.input,
+              ref: input.ref ?? undefined,
+              subpath: input.subpath ?? undefined,
+            });
+            return { success: true, data };
+          } catch (error) {
+            return { success: false, error: getErrorMessage(error) };
+          }
+        }),
+      install: t
+        .input(schemas.agentPlugins.install.input)
+        .output(schemas.agentPlugins.install.output)
+        .handler(async ({ context, input }) => {
+          try {
+            const data = await context.agentPluginInstallService.install(input);
+            return { success: true, data };
+          } catch (error) {
+            return { success: false, error: getErrorMessage(error) };
+          }
+        }),
+      list: t
+        .input(schemas.agentPlugins.list.input)
+        .output(schemas.agentPlugins.list.output)
+        .handler(async ({ context }) => {
+          try {
+            const data = await context.agentPluginInstallService.list();
+            return { success: true, data };
+          } catch (error) {
+            return { success: false, error: getErrorMessage(error) };
+          }
+        }),
+      containerLocation: t
+        .input(schemas.agentPlugins.containerLocation.input)
+        .output(schemas.agentPlugins.containerLocation.output)
+        .handler(({ context }) => context.agentPluginInstallService.containerLocation()),
+      uninstall: t
+        .input(schemas.agentPlugins.uninstall.input)
+        .output(schemas.agentPlugins.uninstall.output)
+        .handler(async ({ context, input }) => {
+          try {
+            await context.agentPluginInstallService.uninstall(input);
+            return { success: true, data: undefined };
+          } catch (error) {
+            return { success: false, error: getErrorMessage(error) };
+          }
+        }),
+      checkUpdates: t
+        .input(schemas.agentPlugins.checkUpdates.input)
+        .output(schemas.agentPlugins.checkUpdates.output)
+        .handler(async ({ context }) => {
+          try {
+            const data = await context.agentPluginInstallService.checkUpdates();
+            return { success: true, data };
+          } catch (error) {
+            return { success: false, error: getErrorMessage(error) };
+          }
+        }),
+      update: t
+        .input(schemas.agentPlugins.update.input)
+        .output(schemas.agentPlugins.update.output)
+        .handler(async ({ context, input }) => {
+          try {
+            const data = await context.agentPluginInstallService.update(input);
+            return { success: true, data };
+          } catch (error) {
+            return { success: false, error: getErrorMessage(error) };
+          }
+        }),
+    },
     mcpOauth: {
       startDesktopFlow: t
         .input(schemas.mcpOauth.startDesktopFlow.input)
@@ -3293,7 +3373,7 @@ export const router = (authToken?: string) => {
         .input(schemas.projects.create.input)
         .output(schemas.projects.create.output)
         .handler(async ({ context, input }) => {
-          return context.projectService.create(input.projectPath);
+          return context.projectService.create(input.projectPath, { initGit: input.initGit });
         }),
       getDefaultProjectDir: t
         .input(schemas.projects.getDefaultProjectDir.input)
@@ -5653,7 +5733,7 @@ export const router = (authToken?: string) => {
               policy.mcp.allowUserDefined.remote === false;
 
             if (mcpDisabledByPolicy) {
-              return {};
+              return { overrides: {}, revision: "mcp-disabled-by-policy" };
             }
 
             try {
@@ -5661,8 +5741,10 @@ export const router = (authToken?: string) => {
                 input.workspaceId
               );
             } catch {
-              // Defensive: overrides must never brick workspace UI.
-              return {};
+              // Defensive: overrides must never brick workspace UI. The
+              // sentinel revision never matches a real one, so a save from
+              // this unknown state is rejected instead of clobbering data.
+              return { overrides: {}, revision: "unavailable" };
             }
           }),
         prompts: {
@@ -5698,9 +5780,10 @@ export const router = (authToken?: string) => {
               if (!readyResult.ready) {
                 throw new Error(readyResult.error);
               }
-              const overrides = await context.workspaceMcpOverridesService.getOverridesForWorkspace(
-                input.workspaceId
-              );
+              const { overrides } =
+                await context.workspaceMcpOverridesService.getOverridesForWorkspace(
+                  input.workspaceId
+                );
               // Match streamMessage and the prompt-invocation resolver: multi-project
               // workspaces need every project's secrets, not just the primary's.
               const projectSecrets = await secretsToRecord(
@@ -5734,13 +5817,45 @@ export const router = (authToken?: string) => {
             try {
               await context.workspaceMcpOverridesService.setOverridesForWorkspace(
                 input.workspaceId,
-                input.overrides
-              );
-              // Prompt invocation can hit cached servers before the next stream
-              // recomputes enablement, so sync the manager's view immediately.
-              await context.mcpServerManager.applyWorkspaceOverrides(
-                input.workspaceId,
-                input.overrides
+                input.overrides,
+                {
+                  expectedRevision: input.expectedRevision,
+                  // Content-derived revisions cannot detect an uninstall that
+                  // left overrides byte-identical ({} before and after), so a
+                  // stale dialog could persist a plugin: key for a plugin
+                  // that is gone. Validate additions against the DISCOVERED
+                  // plugin server keys for this workspace (managed installs,
+                  // project containers, ~/.agents/plugins, unmanaged dirs) —
+                  // the same set the modal lists from.
+                  validateAgainstCurrent: buildAddedPluginKeyValidator(async () => {
+                    const metadataResult = await context.aiService.getWorkspaceMetadata(
+                      input.workspaceId
+                    );
+                    if (!metadataResult.success) {
+                      throw new Error(metadataResult.error);
+                    }
+                    const projectPath = metadataResult.data.projectPath;
+                    const servers = await context.mcpConfigService.listServers(
+                      projectPath,
+                      isTrustedProjectPath(context, projectPath),
+                      {
+                        agentPlugins: await resolveWorkspaceAgentPluginsMcpContext(
+                          context,
+                          input.workspaceId,
+                          projectPath
+                        ),
+                      }
+                    );
+                    return new Set(Object.keys(servers).filter((key) => key.startsWith("plugin:")));
+                  }),
+                  // Prompt invocation can hit cached servers before the next
+                  // stream recomputes enablement, so sync the manager's view —
+                  // INSIDE the write queue, so a concurrent plugin-uninstall
+                  // prune cannot interleave its own publication and leave the
+                  // cache holding the older snapshot (in either direction).
+                  publish: (persisted) =>
+                    context.mcpServerManager.applyWorkspaceOverrides(input.workspaceId, persisted),
+                }
               );
               return { success: true, data: undefined };
             } catch (error) {

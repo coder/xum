@@ -320,6 +320,7 @@ export {
   desktop,
   general,
   menu,
+  agentPlugins,
   agentSkills,
   agents,
   workflows,

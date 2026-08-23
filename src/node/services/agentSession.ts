@@ -509,6 +509,19 @@ interface AgentSessionOptions {
   sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
   /** When true, skip terminating background processes on dispose/compaction (for bench/CI) */
   keepBackgroundProcesses?: boolean;
+  /**
+   * Registration-time Agent Plugin override sanitization for workspaces this
+   * session registers itself (ensureMetadata: CLI `xum run`/`xum workflow` in
+   * a directory with no existing metadata). Wired to
+   * WorkspaceService.sanitizeCliRegisteredWorkspace, which rolls the config
+   * write back on failure; ensureMetadata must then abort without announcing
+   * the workspace. Returns an error string or undefined on success.
+   */
+  sanitizeCliWorkspaceRegistration?: (args: {
+    workspaceId: string;
+    workspacePath: string;
+    runtimeConfig: RuntimeConfig | undefined;
+  }) => Promise<string | undefined>;
   /** Called when compaction completes (e.g., to clear idle compaction pending state) */
   onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
   /** Called with the terminal outcome of an idle compaction (persisted success / post-stream failure) */
@@ -552,6 +565,7 @@ export class AgentSession {
   private readonly workspaceGoalService?: WorkspaceGoalService;
   private readonly sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
   private readonly keepBackgroundProcesses: boolean;
+  private readonly sanitizeCliWorkspaceRegistration?: AgentSessionOptions["sanitizeCliWorkspaceRegistration"];
   private readonly onPostCompactionStateChange?: () => void;
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
@@ -796,6 +810,7 @@ export class AgentSession {
       workspaceGoalService,
       sessionUsageService,
       keepBackgroundProcesses,
+      sanitizeCliWorkspaceRegistration,
       onCompactionComplete,
       onIdleCompactionOutcome,
       onPostCompactionStateChange,
@@ -815,6 +830,7 @@ export class AgentSession {
     this.workspaceGoalService = workspaceGoalService;
     this.sessionUsageService = sessionUsageService;
     this.keepBackgroundProcesses = keepBackgroundProcesses ?? false;
+    this.sanitizeCliWorkspaceRegistration = sanitizeCliWorkspaceRegistration;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
 
     this.compactionHandler = new CompactionHandler({
@@ -2671,6 +2687,20 @@ export class AgentSession {
 
     // Write metadata directly to config.json (single source of truth)
     await this.config.addWorkspace(derivedProjectPath, metadata);
+    // This registration path bypasses WorkspaceService.create/fork and the
+    // task-materialization flows, so it must run the same pre-announcement
+    // Agent Plugin override sanitization: a preserved checkout can carry a
+    // stale canonical `plugin:` enable from a since-removed workspace, which
+    // would start a same-name reinstall's default-disabled server on the
+    // first CLI send. The callback rolls back the config write on failure.
+    const sanitizeError = await this.sanitizeCliWorkspaceRegistration?.({
+      workspaceId: this.workspaceId,
+      workspacePath: normalizedWorkspacePath,
+      runtimeConfig: metadata.runtimeConfig,
+    });
+    if (sanitizeError !== undefined) {
+      throw new Error(`Failed to register workspace: ${sanitizeError}`);
+    }
     this.emitMetadata(metadata);
   }
 

@@ -11,10 +11,6 @@ inputs:
   gcp_service_account:
     description: "GCP Service Account"
     required: false
-  allow_unsigned_fallback:
-    description: "Continue with an unsigned build when GCP signing auth fails (CI/nightly only; keep stable releases fail-closed)"
-    required: false
-    default: "false"
 
 outputs:
   gcloud_access_token:
@@ -33,13 +29,6 @@ runs:
     - name: Authenticate to Google Cloud
       id: gcloud_auth
       if: inputs.gcp_workload_id_provider != ''
-      # The coder/shux -> coder/xum repo rename broke the GCP Workload Identity
-      # trust policy (matches owner/repo as a string), so this auth step fails
-      # with iam.serviceAccounts.getAccessToken PERMISSION_DENIED. Callers that
-      # opt in via allow_unsigned_fallback build unsigned until the GCP-side
-      # binding is updated for the new repo name; signing resumes automatically
-      # then. Stable releases keep the default and fail closed.
-      continue-on-error: ${{ inputs.allow_unsigned_fallback == 'true' }}
       uses: google-github-actions/auth@71f986410dfbc7added4569d411d040a91dc6935 # v2.1.8
       with:
         workload_identity_provider: ${{ inputs.gcp_workload_id_provider }}
@@ -54,15 +43,11 @@ runs:
           exit 0
         }
 
-        # Signing requires a GCP access token for Cloud KMS. When auth failed
-        # or was skipped, only the opt-in fallback may continue (leaving
-        # JSIGN_PATH unset so sign-windows.js skips signing); otherwise fail
-        # closed so a certificate-bearing release can never ship unsigned.
+        # Signing requires a GCP access token for Cloud KMS. Fail closed when
+        # auth produced no token (e.g. skipped because no workload identity
+        # provider was configured) so a certificate-bearing release can never
+        # ship unsigned.
         if (-not $env:GCLOUD_ACCESS_TOKEN) {
-          if ($env:ALLOW_UNSIGNED_FALLBACK -eq 'true') {
-            Write-Host "::warning title=Windows build unsigned::GCP signing auth unavailable (rename broke WIF trust policy) - building unsigned"
-            exit 0
-          }
           Write-Host "::error::EV certificate provided but GCP signing auth produced no access token - failing closed"
           exit 1
         }
@@ -81,4 +66,3 @@ runs:
       env:
         EV_SIGNING_CERT: ${{ inputs.ev_signing_cert }}
         GCLOUD_ACCESS_TOKEN: ${{ steps.gcloud_auth.outputs.access_token }}
-        ALLOW_UNSIGNED_FALLBACK: ${{ inputs.allow_unsigned_fallback }}

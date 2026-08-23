@@ -15,6 +15,7 @@ import { inlineSvgAsTextForProvider } from "@/node/utils/messages/inlineSvgAsTex
 import { extractToolMediaAsUserMessages } from "@/node/utils/messages/extractToolMediaAsUserMessages";
 import { sanitizeAnthropicPdfFilenames } from "@/node/utils/messages/sanitizeAnthropicDocumentFilename";
 import { convertDataUriFilePartsForSdk } from "@/node/utils/messages/convertDataUriFilePartsForSdk";
+import { attachReasoningReplayMetadata } from "@/node/utils/messages/reasoningProviderOptions";
 import type { MuxMessage } from "@/common/types/message";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -156,11 +157,15 @@ export async function prepareMessagesForProvider(
     messagesWithToolMediaExtracted
   );
 
+  // Mirror persisted reasoning replay data (signatures, encrypted reasoning) into
+  // providerMetadata, the only field convertToModelMessages forwards to the request.
+  const messagesWithReasoningReplay = attachReasoningReplayMetadata(messagesWithSdkSafeFileParts);
+
   // --- Convert to ModelMessage format ---
 
   // Type assertion needed because XumMessage has custom tool parts for interrupted tools
   // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument
-  const rawModelMessages = await convertToModelMessages(messagesWithSdkSafeFileParts as any, {
+  const rawModelMessages = await convertToModelMessages(messagesWithReasoningReplay as any, {
     // Drop unfinished tool calls (input-streaming/input-available) so downstream
     // transforms only see tool calls that actually produced outputs.
     ignoreIncompleteToolCalls: true,

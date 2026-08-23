@@ -882,12 +882,13 @@ export interface MuxReasoningPart {
    */
   signature?: string;
   /**
-   * Provider options for SDK compatibility.
-   * When converting to ModelMessages via the SDK's convertToModelMessages,
-   * this is passed through so reasoning can be replayed:
+   * Persisted replay data for reasoning parts. The SDK's convertToModelMessages
+   * only reads `providerMetadata` from UI parts, so attachReasoningReplayMetadata
+   * mirrors this field there at request time so reasoning can be replayed:
    * - Anthropic: { anthropic: { signature } }
    * - OpenAI/xAI Responses (esp. store=false/ZDR): itemId + reasoningEncryptedContent
    *   so the next turn can restore encrypted reasoning without server-side storage.
+   * - Google: { google: { thoughtSignature } }
    */
   providerOptions?: {
     anthropic?: {
@@ -900,6 +901,9 @@ export interface MuxReasoningPart {
     xai?: {
       itemId?: string;
       reasoningEncryptedContent?: string | null;
+    };
+    google?: {
+      thoughtSignature?: string;
     };
   };
 }

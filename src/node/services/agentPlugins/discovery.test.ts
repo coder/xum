@@ -4,7 +4,13 @@ import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
 
 import { DisposableTempDir } from "@/node/services/tempDir";
-import { computeAgentPluginContainers, discoverAgentPlugins } from "./discovery";
+import {
+  computeAgentPluginContainers,
+  discoverAgentPlugins,
+  journalDerivedDiscoveryGate,
+  setAgentPluginDiscoveryGate,
+} from "./discovery";
+import { bumpContainerMutationEpoch, MUTATION_EPOCH_FILE, STAGING_DIR_NAME } from "./journals";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 
 async function writePlugin(
@@ -298,6 +304,29 @@ describe("discoverAgentPlugins", () => {
     expect(result.diagnostics[0].message).toContain("hooks.js");
   });
 
+  test("an oversized hooks.js invalidates only the hooks component", async () => {
+    // The hook source is read and hashed every send and evaluated in the
+    // main process: a repo pouring its checkout quota into hooks.js must not
+    // gain a post-install stall primitive. The same discovery cap governs
+    // the consent preview, so preview and runtime exclude identically.
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const pluginDir = await writePlugin(container, "big-hooks", { mcpJson: "{}" });
+    await fs.writeFile(
+      path.join(pluginDir, "hooks.js"),
+      `// ${"x".repeat(2 * 1024 * 1024)}\n({})`,
+      "utf8"
+    );
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins).toHaveLength(1);
+    expect(result.plugins[0].hooksPath).toBeUndefined();
+    expect(result.plugins[0].mcpConfigPath).toBeDefined();
+    expect(result.diagnostics).toHaveLength(1);
+    expect(result.diagnostics[0].message).toContain("too large");
+  });
+
   test("a symlinked plugin directory anchors containment at its realpath", async () => {
     using tmp = new DisposableTempDir("agent-plugins");
     const container = path.join(tmp.path, "plugins");
@@ -363,6 +392,87 @@ describe("discoverAgentPlugins", () => {
     ]);
 
     expect(result.plugins.map((p) => p.name)).toEqual(["alpha", "zeta"]);
+  });
+
+  test("discards a container's results when the gate's post-scan confirm flags it", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    await writePlugin(container, "transient-plugin");
+
+    // A mutation that overlaps the scan is only visible AFTER the scan read
+    // the container: pre-scan suppression stays empty and confirm flags it.
+    setAgentPluginDiscoveryGate((containerPaths) =>
+      Promise.resolve({
+        suppressed: [],
+        confirm: () => Promise.resolve(containerPaths),
+      })
+    );
+    try {
+      const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+      expect(result.plugins).toEqual([]);
+      expect(result.diagnostics.some((d) => d.message.includes("overlapped this scan"))).toBe(true);
+    } finally {
+      setAgentPluginDiscoveryGate(journalDerivedDiscoveryGate);
+    }
+  });
+});
+
+describe("journalDerivedDiscoveryGate", () => {
+  test("suppresses a container whose staging root holds a journal at session creation", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const stagingRoot = path.join(tmp.path, STAGING_DIR_NAME);
+    await fs.mkdir(container, { recursive: true });
+    await fs.mkdir(stagingRoot, { recursive: true });
+    await fs.writeFile(path.join(stagingRoot, "promotion-demo.json"), "{}", "utf8");
+
+    const session = await journalDerivedDiscoveryGate([container]);
+    expect(session.suppressed).toEqual([container]);
+  });
+
+  test("suppresses a container while its mutation epoch is unreadable", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const stagingRoot = path.join(tmp.path, STAGING_DIR_NAME);
+    await fs.mkdir(container, { recursive: true });
+    await fs.mkdir(stagingRoot, { recursive: true });
+    // A directory at the epoch path is a deterministic non-ENOENT read
+    // failure without relying on permission behavior of the test user.
+    await fs.mkdir(path.join(stagingRoot, MUTATION_EPOCH_FILE));
+
+    const session = await journalDerivedDiscoveryGate([container]);
+    expect(session.suppressed).toEqual([container]);
+    expect(await session.confirm()).toEqual([container]);
+  });
+
+  test("confirm flags a mutation whose whole journal lifetime fit inside the scan window", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const stagingRoot = path.join(tmp.path, STAGING_DIR_NAME);
+    await fs.mkdir(container, { recursive: true });
+    await fs.mkdir(stagingRoot, { recursive: true });
+
+    const session = await journalDerivedDiscoveryGate([container]);
+    expect(session.suppressed).toEqual([]);
+
+    // Nothing changed: a quiet container stays accepted (also covers the
+    // stable "epoch file never written" state on both reads).
+    expect(await session.confirm()).toEqual([]);
+
+    // Full transaction between the session's two reads: journal written,
+    // container mutated, epoch bumped (the install service bumps BEFORE
+    // deleting any journal), journal consumed. The journal file alone can no
+    // longer betray the mutation — only the epoch can.
+    const journalPath = path.join(stagingRoot, "promotion-demo.json");
+    await fs.writeFile(journalPath, "{}", "utf8");
+    await bumpContainerMutationEpoch(stagingRoot);
+    await fs.rm(journalPath);
+    expect(await session.confirm()).toEqual([container]);
+
+    // A journal still in flight at confirm time is flagged as well.
+    const session2 = await journalDerivedDiscoveryGate([container]);
+    await fs.writeFile(journalPath, "{}", "utf8");
+    expect(await session2.confirm()).toEqual([container]);
   });
 });
 

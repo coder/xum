@@ -4,7 +4,7 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
 import { normalizeProjectMetadataIdentityPath } from "@/common/compat/legacyMux";
-import type { MCPServerInfo, MCPStdioServerInfo } from "@/common/types/mcp";
+import type { MCPServerInfo, MCPStdioServerInfo, WorkspaceMCPOverrides } from "@/common/types/mcp";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -12,7 +12,12 @@ import { isMultiProject } from "@/common/utils/multiProject";
 import { log } from "@/node/services/log";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import type { AgentPluginContainer, AgentPluginDiagnostic, AgentPluginInfo } from "./discovery";
-import { computeAgentPluginContainers, discoverAgentPlugins } from "./discovery";
+import {
+  computeAgentPluginContainers,
+  discoverAgentPlugins,
+  MAX_PLUGIN_MANIFEST_BYTES,
+  readPluginFileWithinRootCapped,
+} from "./discovery";
 import { expandPluginPlaceholders, type PluginPlaceholderValues } from "./expansion";
 
 /**
@@ -25,7 +30,7 @@ import { expandPluginPlaceholders, type PluginPlaceholderValues } from "./expans
 export const AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0 =
   "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json";
 
-const PLUGIN_SERVER_KEY_PREFIX = "plugin:";
+export const PLUGIN_SERVER_KEY_PREFIX = "plugin:";
 
 /**
  * Stable plugin-instance identity. Global plugins hash their LEXICAL
@@ -49,6 +54,105 @@ export function getPluginDataPath(xumHome: string, instanceId: string): string {
 
 export function buildPluginServerKey(instanceId: string, serverName: string): string {
   return `${PLUGIN_SERVER_KEY_PREFIX}${instanceId}:${serverName}`;
+}
+
+/**
+ * Canonical uninstall-tombstone prefix shape: `plugin:<instanceId>:` where
+ * the instance ID is the 16-hex-char computePluginInstanceId output. Persisted
+ * tombstones are validated against this before being executed so a corrupted
+ * `plugins.json` prefix (e.g. `"g"`) can never destructively prune arbitrary
+ * workspace override keys.
+ */
+const CANONICAL_PLUGIN_KEY_PREFIX_PATTERN = /^plugin:[0-9a-f]{16}:$/;
+
+export function isCanonicalPluginServerKeyPrefix(prefix: string): boolean {
+  return CANONICAL_PLUGIN_KEY_PREFIX_PATTERN.test(prefix);
+}
+
+/**
+ * Whether a FULL override key has the canonical managed-plugin shape
+ * `plugin:<16-hex instanceId>:<server>`. MCP server names are otherwise
+ * arbitrary user strings (a user-defined server may legitimately be named
+ * "plugin:custom"), so plugin-key pruning must match only this shape.
+ */
+const CANONICAL_PLUGIN_KEY_PATTERN = /^plugin:[0-9a-f]{16}:/;
+
+export function isCanonicalPluginServerKey(key: string): boolean {
+  return CANONICAL_PLUGIN_KEY_PATTERN.test(key);
+}
+
+/**
+ * Plugin keys PER FIELD, not collapsed into one set: a stale key that only
+ * survives in toolAllowlist (e.g. a removed unmanaged dir's old tool
+ * selection) must not make that key's NEW appearance in enabledServers look
+ * like a no-op — enabling is the consent-relevant action.
+ */
+function collectPluginOverrideKeysByField(
+  overrides: WorkspaceMCPOverrides
+): Record<"enabledServers" | "disabledServers" | "toolAllowlist", Set<string>> {
+  // Canonical shape only (mirrors the pruning path): a user-defined global or
+  // project server may legitimately be NAMED "plugin:custom", and validating
+  // it against discovered plugin-server keys would reject the whole save.
+  const pluginKeys = (keys: readonly string[]): Set<string> =>
+    new Set(keys.filter(isCanonicalPluginServerKey));
+  return {
+    enabledServers: pluginKeys(overrides.enabledServers ?? []),
+    disabledServers: pluginKeys(overrides.disabledServers ?? []),
+    toolAllowlist: pluginKeys(Object.keys(overrides.toolAllowlist ?? {})),
+  };
+}
+
+/**
+ * Save-time validator for workspace MCP override writes: rejects NEWLY ADDED
+ * `plugin:` keys that do not name a currently-discoverable plugin server.
+ *
+ * Why additions-only, at write time: the overrides revision is content-derived,
+ * so a dialog opened while a default-disabled plugin had no override key sees
+ * the same revision ({} hash) before and after that plugin's uninstall — the
+ * CAS check alone cannot tell the snapshot is stale. Without this, the stale
+ * dialog could enable the ghost row, persist its key, and a later reinstall of
+ * the same instance ID would silently re-enable the server without consent.
+ *
+ * Validation source is the workspace's DISCOVERED plugin server keys — the
+ * same set the Workspace MCP modal lists from — so servers contributed by
+ * project containers, ~/.agents/plugins, and unmanaged global dirs stay
+ * enableable; the managed-install registry alone would reject them. Existing
+ * keys round-trip untouched so unrelated saves never break.
+ */
+export function buildAddedPluginKeyValidator(
+  listDiscoveredPluginServerKeys: () => Promise<Set<string>>
+): (current: WorkspaceMCPOverrides, incoming: WorkspaceMCPOverrides) => Promise<void> {
+  return async (current, incoming) => {
+    // Additions are computed PER FIELD so a key already present in one field
+    // (say a stale toolAllowlist entry) still validates when it newly enters
+    // another (enabledServers — the consent-relevant one).
+    const currentByField = collectPluginOverrideKeysByField(current);
+    const incomingByField = collectPluginOverrideKeysByField(incoming);
+    const addedKeys = [
+      ...new Set(
+        (Object.keys(incomingByField) as Array<keyof typeof incomingByField>).flatMap((field) =>
+          [...incomingByField[field]].filter((key) => !currentByField[field].has(key))
+        )
+      ),
+    ];
+    if (addedKeys.length === 0) {
+      return;
+    }
+    let discoveredKeys: Set<string>;
+    try {
+      discoveredKeys = await listDiscoveredPluginServerKeys();
+    } catch {
+      // Cannot confirm → reject the additions (never accept unverifiable keys).
+      discoveredKeys = new Set();
+    }
+    const staleKeys = addedKeys.filter((key) => !discoveredKeys.has(key));
+    if (staleKeys.length > 0) {
+      throw new Error(
+        `Cannot save: ${staleKeys.join(", ")} does not match any available plugin server. ` +
+          "Close and reopen this dialog to load the current server list."
+      );
+    }
+  };
 }
 
 export interface LoadPluginMcpServersResult {
@@ -453,9 +557,32 @@ export async function loadPluginMcpServers(
     return { servers: {}, diagnostics };
   };
 
+  // Size-cap before parsing: server summaries built from this document
+  // (command lines, env assignments, URLs) reach the install consent
+  // preview's IPC/render path, so one unbounded string must not be able to
+  // freeze the app before consent (same ceiling as plugin.json). The bounded
+  // handle read also revalidates containment + file identity AFTER the open:
+  // this document defines spawnable commands, so a replacement symlink
+  // promoted between discovery and this read (see
+  // readPluginFileWithinRootCapped) would otherwise let an outside file be
+  // parsed as server config and its command spawned before the mutation-epoch
+  // post-check can retire the stale result.
+  let text: string;
+  try {
+    text = (
+      await readPluginFileWithinRootCapped({
+        filePath: plugin.mcpConfigPath,
+        pluginRoot: plugin.rootPath,
+        maxBytes: MAX_PLUGIN_MANIFEST_BYTES,
+        label: "mcp.json",
+      })
+    ).content;
+  } catch (error) {
+    return disableMcp(getErrorMessage(error));
+  }
   let raw: unknown;
   try {
-    raw = JSON.parse(await fsPromises.readFile(plugin.mcpConfigPath, "utf8")) as unknown;
+    raw = JSON.parse(text) as unknown;
   } catch (error) {
     // §7.2.2 rule 2: invalid JSON disables MCP for this plugin only.
     return disableMcp(`mcp.json is not valid JSON: ${getErrorMessage(error)}`);

@@ -36,7 +36,7 @@ export type WorkspaceInstructions = z.infer<typeof WorkspaceInstructionsSchema>;
  */
 export function flattenInstructionFiles(sources: InstructionSources): InstructionFile[] {
   const out: InstructionFile[] = [];
-  if (sources.global) out.push(...sources.global.files);
+  for (const set of sources.global) out.push(...set.files);
   for (const set of sources.context) out.push(...set.files);
   return out;
 }

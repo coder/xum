@@ -445,5 +445,28 @@ describe("resolveWorkflowScript", () => {
         resolveWorkflowScript({ ...input, scriptPath: "plugin://my-plugin/release.ts" })
       ).rejects.toThrow(".js");
     });
+
+    test("rejects nested plugin workflow paths the consent surface never names", async () => {
+      // The install preview and update capability comparison fingerprint
+      // TOP-LEVEL workflows/*.js only: a resolvable nested file would be an
+      // executable an upstream can add without re-consent.
+      using tempDir = new TestTempDir("workflow-script-plugin-nested");
+      const container = path.join(tempDir.path, ".mux", "plugins");
+      await writePluginWithWorkflow(container, "my-plugin", "release.js");
+      const nestedDir = path.join(container, "my-plugin", "workflows", "private");
+      await fs.mkdir(nestedDir, { recursive: true });
+      await fs.writeFile(path.join(nestedDir, "hidden.js"), "({})", "utf8");
+      const input = {
+        runtime: new LocalRuntime(tempDir.path),
+        workspacePath: tempDir.path,
+        projectTrusted: true,
+        includeAgentPlugins: true,
+        roots: pluginRoots(tempDir, container),
+      };
+
+      await expect(
+        resolveWorkflowScript({ ...input, scriptPath: "plugin://my-plugin/private/hidden.js" })
+      ).rejects.toThrow("top-level");
+    });
   });
 });

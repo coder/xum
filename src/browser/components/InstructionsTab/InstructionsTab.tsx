@@ -130,8 +130,8 @@ function Header({ totalTokens, fileCount, loading, onRefresh }: HeaderProps) {
 function InstructionsBody({ data }: { data: WorkspaceInstructions }) {
   // Render structured groups so the panel layout reflects the prompt structure.
   const groups: Array<{ title: string; sets: InstructionSet[] }> = [];
-  if (data.sources.global) {
-    groups.push({ title: "Global (~/.xum)", sets: [data.sources.global] });
+  if (data.sources.global.length > 0) {
+    groups.push({ title: "Global", sets: data.sources.global });
   }
   const workspaceSets = data.sources.context.filter((s) => s.scope === INSTRUCTION_SCOPE.WORKSPACE);
   if (workspaceSets.length > 0) {

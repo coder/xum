@@ -19,7 +19,11 @@ import {
   type WorkspaceGoalServiceOptions,
 } from "@/node/services/workspaceGoalService";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { createAgentPluginsMcpProvider } from "@/node/services/agentPlugins/mcpConfig";
+import { STAGING_DIR_NAME, readMutationEpochToken } from "@/node/services/agentPlugins/journals";
+import {
+  PLUGIN_SERVER_KEY_PREFIX,
+  createAgentPluginsMcpProvider,
+} from "@/node/services/agentPlugins/mcpConfig";
 import { MCPConfigService } from "@/node/services/mcpConfigService";
 import { MCPServerManager, type MCPServerManagerOptions } from "@/node/services/mcpServerManager";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
@@ -28,7 +32,7 @@ import { secretsToRecord } from "@/common/types/secrets";
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import { WorkspaceService } from "@/node/services/workspaceService";
 import { TaskService } from "@/node/services/taskService";
-import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
+import { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { PolicyService } from "@/node/services/policyService";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
@@ -102,6 +106,12 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     opts.goalServiceOptions
   );
 
+  // Default-construct when the caller (CLI) does not pass one: workspace MCP
+  // override reads AND registration-time plugin-override sanitization must
+  // work in every process that can register workspaces, not just desktop.
+  const workspaceMcpOverridesService =
+    opts.workspaceMcpOverridesService ?? new WorkspaceMcpOverridesService(config);
+
   const aiService = new AIService(
     config,
     historyService,
@@ -109,7 +119,7 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     providerService,
     backgroundProcessManager,
     sessionUsageService,
-    opts.workspaceMcpOverridesService,
+    workspaceMcpOverridesService,
     opts.policyService,
     opts.telemetryService,
     opts.devToolsService,
@@ -148,7 +158,20 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
   });
   const mcpServerManager = new MCPServerManager(
     mcpConfigService,
-    opts.mcpServerManagerOptions,
+    {
+      // A plugin update/uninstall in a sibling process (desktop app alongside
+      // `xum server`) bumps the installer's mutation epoch; managers retire
+      // cached plugin instances before serving them again. The sibling's
+      // uninstall also pruned plugin keys from workspace override files, so
+      // the sweep refreshes cached override snapshots from disk.
+      pluginInvalidation: {
+        keyPrefix: PLUGIN_SERVER_KEY_PREFIX,
+        readToken: () => readMutationEpochToken(path.join(mcpConfig.rootDir, STAGING_DIR_NAME)),
+        readWorkspaceOverrides: async (workspaceId: string) =>
+          (await workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId)).overrides,
+      },
+      ...opts.mcpServerManagerOptions,
+    },
     opts.policyService
   );
   aiService.setMCPServerManager(mcpServerManager);
@@ -190,6 +213,12 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     workspaceService.setDevToolsService(opts.devToolsService);
   }
   workspaceService.setMCPServerManager(mcpServerManager);
+  // Plugin override keys must be pruned from a workspace's override files when
+  // registering a preserved checkout (desktop create/fork, task
+  // materialization, and headless `xum run`/`xum workflow` registration) and
+  // during removal: a stale enable in a kept .xum/mcp.local.jsonc could
+  // otherwise re-activate a same-name reinstall's server.
+  workspaceService.setWorkspaceMcpOverridesService(workspaceMcpOverridesService);
   workspaceService.setWorkspaceGoalService(workspaceGoalService);
   workspaceGoalService.setOnActivityChange((workspaceId, snapshot) => {
     workspaceService.emitWorkspaceActivity(workspaceId, snapshot);

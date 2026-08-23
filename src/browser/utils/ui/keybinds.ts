@@ -585,6 +585,9 @@ export const KEYBINDS = {
   /** Toggle focus between diff and notes sidebar in immersive review */
   REVIEW_FOCUS_NOTES: { key: "Tab" },
 
+  /** Copy the active file's full contents to the clipboard in immersive review */
+  REVIEW_COPY_FILE: { key: "y" },
+
   /** Toggle plan annotation mode in propose_plan */
   TOGGLE_PLAN_ANNOTATE: { key: "a", shift: true },
 

@@ -17,7 +17,7 @@ import { z } from "zod";
 
 /** Where in the instruction hierarchy a file lives. */
 export const INSTRUCTION_SCOPE = {
-  /** Global ~/.xum/AGENTS.md (+ optional AGENTS.local.md). */
+  /** Host-global instruction sources, including native ~/.xum and optional compat files. */
   GLOBAL: "global",
   /** Workspace-root AGENTS.md (the workspace's own checkout). */
   WORKSPACE: "workspace",
@@ -83,8 +83,8 @@ export const InstructionSetSchema = z.object({
 
 /** All instruction sets resolved for a workspace. */
 export const InstructionSourcesSchema = z.object({
-  /** ~/.xum/AGENTS.md set, if any. */
-  global: InstructionSetSchema.nullable(),
+  /** Host-global sets in prompt order, with compatibility sources before native ~/.xum files. */
+  global: z.array(InstructionSetSchema),
   /**
    * Workspace-level context sets in prompt order:
    * - single-project: [workspace, optional sub-project]

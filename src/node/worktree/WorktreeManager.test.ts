@@ -162,10 +162,10 @@ describe("WorktreeManager.createWorkspace", () => {
       20_000
     );
   }
-  it("uses directoryName for the workspace path while checking out the requested branch", async () => {
+  it("uses a sanitized directory for slash branch names and persists the mapping", async () => {
     const fixture = await createWorktreeManagerFixture();
-    const branchName = "feature-branch";
-    const directoryName = "review-slot";
+    const branchName = "feature/foo";
+    const directoryName = "feature-foo";
 
     try {
       const result = await fixture.manager.createWorkspace({
@@ -185,6 +185,14 @@ describe("WorktreeManager.createWorkspace", () => {
       expect(result.workspacePath).toBe(
         fixture.manager.getWorkspacePath(fixture.projectPath, directoryName)
       );
+      const nestedBranchDirectoryExists = await fsPromises
+        .access(fixture.manager.getWorkspacePath(fixture.projectPath, "feature"))
+        .then(
+          () => true,
+          () => false
+        );
+      expect(nestedBranchDirectoryExists).toBe(false);
+
       const checkedOutBranch = execSync("git branch --show-current", {
         cwd: result.workspacePath,
         stdio: ["ignore", "pipe", "ignore"],
@@ -192,6 +200,13 @@ describe("WorktreeManager.createWorkspace", () => {
         .toString()
         .trim();
       expect(checkedOutBranch).toBe(branchName);
+
+      const branchMapPath = path.join(fixture.projectPath, ".git", "mux-workspace-branches.json");
+      const branchMap = JSON.parse(await fsPromises.readFile(branchMapPath, "utf8")) as Record<
+        string,
+        string
+      >;
+      expect(branchMap[directoryName]).toBe(branchName);
     } finally {
       await fixture.cleanup();
     }

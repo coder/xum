@@ -35,9 +35,12 @@ fallback. A directory may have only `.xum/AGENTS.md` and no shared file.
 
 Instructions are collected from (most general to most specific):
 
-1. `~/.xum/AGENTS.md` — global defaults (Xum-dedicated by construction)
-2. Workspace root — shared file + `<workspace>/.xum/AGENTS.md`
-3. Sub-project and each repo directory in multi-project workspaces — shared file + `.xum/AGENTS.md`
+1. `~/.claude/CLAUDE.md` when the **Claude compatibility** experiment is enabled
+2. `~/.xum/AGENTS.md` as native global defaults (Xum-dedicated by construction)
+3. Workspace root with its shared file and `<workspace>/.xum/AGENTS.md`
+4. Sub-project and each repo directory in multi-project workspaces with their shared file and `.xum/AGENTS.md`
+
+The Claude compatibility source has the lowest global precedence, so native `~/.xum` instructions always layer on top. Xum reads only the exact `~/.claude/CLAUDE.md` file: it does not probe `AGENTS.md`, `AGENT.md`, local variants, or a `.xum` subdirectory there, and it never writes to `~/.claude`. This file uses shared-file semantics, so `Model:` and `Mode:` headings remain ordinary markdown while `Tool:` sections still work.
 
 <Info>
   Xum strips HTML-style markdown comments (`<!-- ... -->`) from instruction files before sending them
@@ -178,8 +181,11 @@ Customize how the AI uses specific tools by appending instructions to their desc
 ## Practical layout
 
 ```
+~/.claude/
+  CLAUDE.md          # Optional read-only compatibility source
+
 ~/.xum/
-  AGENTS.md          # Global instructions (Xum-dedicated)
+  AGENTS.md          # Native global instructions (Xum-dedicated)
   AGENTS.local.md    # Personal tweaks (gitignored)
 
 my-project/

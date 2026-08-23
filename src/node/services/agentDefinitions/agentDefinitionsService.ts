@@ -21,11 +21,12 @@ import type {
   AgentId,
 } from "@/common/types/agentDefinition";
 import { log } from "@/node/services/log";
-import { validateFileSize } from "@/node/services/tools/fileCommon";
+import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import {
   discoverAgentPlugins,
+  readPluginFileWithinRootCapped,
   UNIVERSAL_AGENT_PLUGINS_CONTAINER,
   type AgentPluginContainer,
 } from "@/node/services/agentPlugins/discovery";
@@ -318,35 +319,63 @@ async function readAgentDescriptorFromFile(
   filePath: string,
   agentId: AgentId,
   scope: Exclude<AgentDefinitionScope, "built-in">,
-  pluginName?: string
+  pluginName?: string,
+  /**
+   * Plugin agents (host-local by construction): the consuming read must
+   * revalidate containment + file identity through a bounded post-open
+   * handle. isPluginAgentContained ran BEFORE this call, and a managed
+   * update promoted in between can replace agents/<id>.md (or an ancestor)
+   * with an absolute symlink to an outside definition — staged validation
+   * reads that as a capability removal, and the outside frontmatter would
+   * otherwise control agent policy (runnable/base/tools).
+   */
+  pluginRoot?: string
 ): Promise<AgentDefinitionDescriptor | null> {
-  let stat;
-  try {
-    stat = await runtime.stat(filePath);
-  } catch {
-    return null;
-  }
-
-  if (stat.isDirectory) {
-    return null;
-  }
-
-  const sizeValidation = validateFileSize(stat);
-  if (sizeValidation) {
-    log.warn(`Skipping agent '${agentId}' (${scope}): ${sizeValidation.error}`);
-    return null;
-  }
-
   let content: string;
-  try {
-    content = await readFileString(runtime, filePath);
-  } catch (err) {
-    log.warn(`Failed to read agent definition ${filePath}: ${getErrorMessage(err)}`);
-    return null;
+  let byteSize: number;
+  if (pluginRoot != null) {
+    try {
+      const result = await readPluginFileWithinRootCapped({
+        filePath,
+        pluginRoot,
+        maxBytes: MAX_FILE_SIZE,
+        label: `plugin agent '${agentId}'`,
+      });
+      content = result.content;
+      byteSize = result.byteSize;
+    } catch (err) {
+      log.warn(`Failed to read plugin agent definition ${filePath}: ${getErrorMessage(err)}`);
+      return null;
+    }
+  } else {
+    let stat;
+    try {
+      stat = await runtime.stat(filePath);
+    } catch {
+      return null;
+    }
+
+    if (stat.isDirectory) {
+      return null;
+    }
+
+    const sizeValidation = validateFileSize(stat);
+    if (sizeValidation) {
+      log.warn(`Skipping agent '${agentId}' (${scope}): ${sizeValidation.error}`);
+      return null;
+    }
+
+    try {
+      content = await readFileString(runtime, filePath);
+    } catch (err) {
+      log.warn(`Failed to read agent definition ${filePath}: ${getErrorMessage(err)}`);
+      return null;
+    }
+    byteSize = stat.size;
   }
 
   try {
-    const parsed = parseAgentDefinitionMarkdown({ content, byteSize: stat.size });
+    const parsed = parseAgentDefinitionMarkdown({ content, byteSize });
 
     const { selectable } = resolveAgentVisibility(parsed.frontmatter.ui);
 
@@ -470,7 +499,8 @@ export async function discoverAgentDefinitions(
         filePath,
         agentId,
         scan.scope,
-        scan.pluginName
+        scan.pluginName,
+        scan.pluginRoot
       );
       if (!descriptor) continue;
 
@@ -592,18 +622,37 @@ export async function readAgentDefinition(
     }
 
     try {
-      const stat = await candidate.runtime.stat(filePath);
-      if (stat.isDirectory) {
-        continue;
-      }
+      let content: string;
+      let byteSize: number;
+      if (candidate.pluginRoot != null) {
+        // Plugin agents: bounded post-open revalidation (containment + file
+        // identity) — see the pluginRoot doc on readAgentDescriptorFromFile.
+        // This frontmatter controls agent policy (runnable/base/tools), so a
+        // replacement symlink promoted after isPluginAgentContained must not
+        // have its outside target read here.
+        const result = await readPluginFileWithinRootCapped({
+          filePath,
+          pluginRoot: candidate.pluginRoot,
+          maxBytes: MAX_FILE_SIZE,
+          label: `plugin agent '${agentId}'`,
+        });
+        content = result.content;
+        byteSize = result.byteSize;
+      } else {
+        const stat = await candidate.runtime.stat(filePath);
+        if (stat.isDirectory) {
+          continue;
+        }
 
-      const sizeValidation = validateFileSize(stat);
-      if (sizeValidation) {
-        throw new Error(sizeValidation.error);
-      }
+        const sizeValidation = validateFileSize(stat);
+        if (sizeValidation) {
+          throw new Error(sizeValidation.error);
+        }
 
-      const content = await readFileString(candidate.runtime, filePath);
-      const parsed = parseAgentDefinitionMarkdown({ content, byteSize: stat.size });
+        content = await readFileString(candidate.runtime, filePath);
+        byteSize = stat.size;
+      }
+      const parsed = parseAgentDefinitionMarkdown({ content, byteSize });
 
       const pkg: AgentDefinitionPackage = {
         id: agentId,

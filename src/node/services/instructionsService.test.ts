@@ -1,7 +1,7 @@
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { InstructionsService } from "./instructionsService";
 import { Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
@@ -28,9 +28,14 @@ describe("InstructionsService model resolution", () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
-  function createService(metadata: WorkspaceMetadata, countedModels: string[]) {
+  function createService(
+    metadata: WorkspaceMetadata,
+    countedModels: string[],
+    claudeSkillsCompatEnabled = false
+  ) {
     const aiService = {
       getWorkspaceMetadata: () => Promise.resolve({ success: true, data: metadata }),
+      isClaudeSkillsCompatEnabled: () => claudeSkillsCompatEnabled,
     } as unknown as AIService;
     const tokenizerService = {
       countTokens: (model: string, content: string) => {
@@ -105,6 +110,46 @@ describe("InstructionsService model resolution", () => {
     );
     const legacyResult = await legacyOnly.getWorkspaceInstructions("ws-1");
     expect(legacyResult.model).toBe("anthropic:legacy-model");
+  });
+
+  test("includes Claude compatibility instructions in the panel payload with token counts", async () => {
+    const originalMuxRoot = process.env.MUX_ROOT;
+    const mockHomedir = spyOn(os, "homedir").mockReturnValue(tempDir);
+    const claudeDir = path.join(tempDir, ".claude");
+    const nativeGlobalDir = path.join(tempDir, ".xum");
+    await fs.mkdir(claudeDir);
+    await fs.mkdir(nativeGlobalDir);
+    await fs.writeFile(path.join(claudeDir, "CLAUDE.md"), "Claude panel guidance.");
+    process.env.MUX_ROOT = nativeGlobalDir;
+
+    try {
+      const counted: string[] = [];
+      const service = createService(
+        {
+          ...baseMetadata(),
+          aiSettings: { model: "anthropic:test-model", thinkingLevel: "off" },
+        },
+        counted,
+        true
+      );
+
+      const result = await service.getWorkspaceInstructions("ws-1");
+      const claudeFile = result.sources.global[0]?.files[0];
+
+      expect(claudeFile?.path).toBe(path.join(claudeDir, "CLAUDE.md"));
+      expect(claudeFile?.xumOnly).toBe(false);
+      expect(claudeFile?.tokens).toBe("Claude panel guidance.".length);
+      expect(result.files[0]?.path).toBe(claudeFile?.path);
+      expect(result.totalTokens).not.toBeNull();
+      expect(new Set(counted)).toEqual(new Set(["anthropic:test-model"]));
+    } finally {
+      mockHomedir.mockRestore();
+      if (originalMuxRoot === undefined) {
+        delete process.env.MUX_ROOT;
+      } else {
+        process.env.MUX_ROOT = originalMuxRoot;
+      }
+    }
   });
 
   test("explicit model override wins over persisted settings", async () => {

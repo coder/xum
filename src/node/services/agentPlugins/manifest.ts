@@ -25,14 +25,10 @@
 export const AGENT_PLUGIN_SCHEMA_ID_1_0_0 =
   "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 
-// Canonical name pattern from plugin.schema.json (JS supports the lookahead).
-const PLUGIN_NAME_PATTERN = /^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/;
-const PLUGIN_NAME_MAX_LENGTH = 64;
+// Name grammar shared with the install registry schema (see the module's doc comment).
+import { isValidAgentPluginName } from "@/common/utils/agentPluginName";
 
-/** True when `name` satisfies the §5 plugin-name grammar. */
-export function isValidAgentPluginName(name: string): boolean {
-  return name.length <= PLUGIN_NAME_MAX_LENGTH && PLUGIN_NAME_PATTERN.test(name);
-}
+export { isValidAgentPluginName };
 
 export interface AgentPluginAuthor {
   name?: string;

@@ -3511,6 +3511,34 @@ export class TaskService {
       return;
     }
 
+    if (!sharesParentCheckout) {
+      // SECURITY: task worktrees materialize AFTER their workspace entry is
+      // registered, so creation-time plugin-override sanitization never saw
+      // this checkout — a tracked stale `plugin:` enable would re-activate a
+      // same-name reinstall's default-disabled MCP server on the first send.
+      // Same contract as WorkspaceService.create/fork: sanitize or fail.
+      const sanitizeError = await this.workspaceService.sanitizeMaterializedTaskWorkspace(
+        plan.taskId,
+        workspacePath,
+        forkedRuntimeConfig
+      );
+      if (sanitizeError !== undefined) {
+        initLogger.logComplete(-1);
+        // Reclaim the just-materialized worktree/session before failing the
+        // launch: the throw reaches scheduleReservedTaskLaunch, which only
+        // marks the task interrupted — without this cleanup the physical
+        // checkout would accumulate and collide with later same-name forks.
+        await this.cleanupMaterializedTaskWorkspace(
+          runtimeForTaskWorkspace,
+          plan.parentMeta.projectPath,
+          plan.workspaceName,
+          plan.taskId,
+          { preservePhysicalWorkspace: false }
+        );
+        throw new Error(sanitizeError);
+      }
+    }
+
     if (sharesParentCheckout) {
       // The parent's checkout is already initialized and live; re-running init would redundantly
       // (and possibly disruptively) mutate it. Skip init entirely.
@@ -3520,7 +3548,7 @@ export class TaskService {
       const secrets = await secretsToRecord(
         this.config.getEffectiveSecrets(plan.parentMeta.projectPath)
       );
-      runBackgroundInit(
+      void runBackgroundInit(
         runtimeForTaskWorkspace,
         {
           projectPath: plan.parentMeta.projectPath,
@@ -4471,6 +4499,32 @@ export class TaskService {
       return config;
     });
 
+    if (!useSharedWorkspace) {
+      // SECURITY: this checkout materialized outside WorkspaceService.create/
+      // fork, so registration-time plugin-override sanitization never saw it —
+      // a tracked stale `plugin:` enable would re-activate a same-name
+      // reinstall's default-disabled MCP server on the send below. Runs
+      // BEFORE emitWorkspaceMetadata (the pre-announcement invariant of
+      // normal workspace creation): once metadata is emitted, the UI or any
+      // subscriber can send to this running-status task workspace while
+      // sanitization is still waiting on the override lock.
+      const sanitizeError = await this.workspaceService.sanitizeMaterializedTaskWorkspace(
+        taskId,
+        workspacePath,
+        forkedRuntimeConfig
+      );
+      if (sanitizeError !== undefined) {
+        await this.rollbackFailedTaskCreate(
+          runtimeForTaskWorkspace,
+          parentMeta.projectPath,
+          workspaceName,
+          taskId
+        );
+        initLogger.logComplete(-1);
+        return Err(sanitizeError);
+      }
+    }
+
     // Emit metadata update so the UI sees the workspace immediately.
     await this.emitWorkspaceMetadata(taskId);
 
@@ -4481,7 +4535,7 @@ export class TaskService {
       const secrets = await secretsToRecord(
         this.config.getEffectiveSecrets(parentMeta.projectPath)
       );
-      runBackgroundInit(
+      void runBackgroundInit(
         runtimeForTaskWorkspace,
         {
           projectPath: parentMeta.projectPath,

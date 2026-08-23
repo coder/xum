@@ -2,6 +2,7 @@ import { TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS } from "@/constants/termination
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { EventEmitter } from "events";
 import * as path from "path";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import * as fsPromises from "fs/promises";
 import assert from "@/common/utils/assert";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
@@ -67,7 +68,13 @@ import { targetWorkspaceBucketToLayer } from "@/common/types/agentAiSettings";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
 import { getWorkspacePathHintForProject } from "@/node/services/workspaceProjectRepos";
-import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
+import {
+  formatBranchWorkspaceNameConflict,
+  getBranchWorkspaceNameConflict,
+  sanitizeBranchNameForWorkspace,
+  validateWorkspaceBranchName,
+  validateWorkspaceName,
+} from "@/common/utils/validation/workspaceValidation";
 import { ensurePrivateDir, isErrnoWithCode } from "@/node/utils/fs";
 import {
   CHAT_FILE_NAME,
@@ -2767,6 +2774,10 @@ export class WorkspaceService extends EventEmitter {
   private devToolsService?: { removeWorkspaceData(workspaceId: string): Promise<void> };
   /** Cancels running /refine passes before removal deletes the session dir; wired post-construction (RefineService is built later). */
   private refinePassCanceller?: { cancelInFlightRefinePass(workspaceId: string): Promise<void> };
+  /** Narrow overrides-cleanup surface; wired by ServiceContainer for stale plugin-key sanitization. */
+  private workspaceMcpOverridesService?: {
+    prunePluginOverrideKeys(workspaceId: string, keyPrefix: string): Promise<void>;
+  };
 
   setTimelineRecorder(recorder: TimelineRecorder): void {
     this.timelineRecorder = recorder;
@@ -2778,6 +2789,272 @@ export class WorkspaceService extends EventEmitter {
    */
   setMCPServerManager(manager: MCPServerManager): void {
     this.mcpServerManager = manager;
+  }
+
+  setWorkspaceMcpOverridesService(service: {
+    prunePluginOverrideKeys(workspaceId: string, keyPrefix: string): Promise<void>;
+  }): void {
+    this.workspaceMcpOverridesService = service;
+  }
+
+  /**
+   * Workspace IDs whose creation persisted a config entry but has not yet
+   * finished registration-time plugin-override sanitization. Two overlapping
+   * creations for the same checkout would otherwise each see the other's
+   * just-persisted entry as a live sibling and BOTH skip sanitizing; entries
+   * in this set never qualify as siblings, so the first sanitize to run
+   * prunes (a concurrent double-prune is idempotent) and later ones see a
+   * completed registration.
+   */
+  private readonly pendingPluginSanitizations = new Set<string>();
+
+  /**
+   * Serializes persist + sanitize of a new host-local registration across
+   * PROCESSES sharing this config root. pendingPluginSanitizations only
+   * covers this process: two processes registering the same preserved
+   * checkout could otherwise each persist an entry and then each read the
+   * other's unsanitized entry as a live sibling — both skipping the prune,
+   * letting a stale canonical enable activate a same-name reinstall's
+   * default-disabled server. Under the lock the second registrant scans only
+   * after the first's prune committed, so it correctly sees a completed live
+   * sibling.
+   */
+  private acquireRegistrationSanitizeLock(): Promise<() => Promise<void>> {
+    return acquireCrossProcessLock({
+      lockPath: path.join(this.config.rootDir, "workspace-registration.lock"),
+      // Persist + sibling scan + one override-file prune; canonicalization is
+      // bounded per entry, so a minute outlasts any legitimate holder.
+      acquireTimeoutMs: 60_000,
+      staleMs: 5 * 60_000,
+      timeoutMessage:
+        "Another Mux process is currently registering a workspace. Wait for it to finish and try again.",
+    });
+  }
+
+  /**
+   * TaskService entry point: task worktrees are REGISTERED before their
+   * checkout exists (queued/reserved launches persist the entry with a future
+   * path), so creation-time sanitization cannot cover them and an uninstall's
+   * override pruning enumerates a path with nothing to prune — the later
+   * materialization then restores a committed stale `plugin:` enable. Call
+   * this after the checkout materializes and BEFORE the first send. Off-host
+   * runtimes are skipped (plugin servers never spawn there in v1); shared
+   * parent checkouts are skipped by the live-sibling scan inside.
+   * Returns an error string (the launch must fail) or undefined on success.
+   */
+  async sanitizeMaterializedTaskWorkspace(
+    workspaceId: string,
+    workspacePath: string,
+    runtimeConfig: RuntimeConfig | undefined,
+    persistentSiblingConfig?: Pick<Config, "loadConfigOrDefault">
+  ): Promise<string | undefined> {
+    const hostLocal =
+      runtimeConfig === undefined ||
+      runtimeConfig.type === "local" ||
+      runtimeConfig.type === "worktree";
+    if (!hostLocal) {
+      return undefined;
+    }
+    return this.sanitizeStalePluginOverridesForNewWorkspace(
+      workspaceId,
+      workspacePath,
+      persistentSiblingConfig
+    );
+  }
+
+  /**
+   * Registration-time sanitization for workspaces that AgentSession registers
+   * directly (CLI `xum run` / `xum workflow` in a directory without existing
+   * metadata) — a path that bypasses WorkspaceService.create/fork and the
+   * task-materialization flows. Called between the config write and the
+   * metadata announcement; on failure the registration is rolled back so a
+   * preserved checkout's stale `plugin:` enables can never activate a
+   * same-name reinstall's default-disabled server on the first CLI send.
+   * Returns an error string (the caller must abort) or undefined on success.
+   */
+  async sanitizeCliRegisteredWorkspace(
+    workspaceId: string,
+    workspacePath: string,
+    runtimeConfig: RuntimeConfig | undefined,
+    /**
+     * CLI sessions run on an EPHEMERAL config whose project entries carry no
+     * workspace records, so the live-sibling scan below would never see a
+     * desktop workspace registered for the same checkout — and would prune
+     * plugin enables that live consent context still owns from the shared
+     * .xum/mcp.local.jsonc. Callers on a temp config must pass the persistent
+     * config so those siblings are visible.
+     */
+    persistentSiblingConfig?: Pick<Config, "loadConfigOrDefault">
+  ): Promise<string | undefined> {
+    this.pendingPluginSanitizations.add(workspaceId);
+    try {
+      const sanitizeError = await this.sanitizeMaterializedTaskWorkspace(
+        workspaceId,
+        workspacePath,
+        runtimeConfig,
+        persistentSiblingConfig
+      );
+      if (sanitizeError !== undefined) {
+        await this.rollbackUnsanitizedWorkspaceRegistration(workspaceId);
+      }
+      return sanitizeError;
+    } finally {
+      this.pendingPluginSanitizations.delete(workspaceId);
+    }
+  }
+
+  /**
+   * Registration-time sanitization of stale Agent Plugin override keys.
+   *
+   * A host-local workspace's `.mux/mcp.local.jsonc` lives in the checkout,
+   * which removal PRESERVES — while a removed workspace is invisible to the
+   * plugin uninstaller's pruning/tombstones. Plugin-server consent must die
+   * with the workspace that granted it: when a directory is REGISTERED as a
+   * new local workspace and no other live workspace resolves to the same
+   * path, canonical `plugin:<16-hex>:` keys are pruned before the workspace
+   * is announced, so a stale enable can never silently re-activate a
+   * same-name reinstall's default-disabled server.
+   *
+   * Deliberately NOT done at removal time: a removal-time prune edits a file
+   * that sibling workspaces (conversation forks share the local checkout) may
+   * still be using, has no durable retry if it fails (the workspace becomes
+   * unresolvable), and races Workspace MCP dialog saves that land between the
+   * prune and the metadata drop. Sanitizing at the moment the NEW workspace
+   * identity is created has none of those windows: siblings force a skip,
+   * a failure aborts creation (nothing announced, no silent activation), and
+   * no dialog can target a workspace that has not been announced yet.
+   *
+   * Returns an error string (creation must abort) or undefined on success.
+   */
+  private async sanitizeStalePluginOverridesForNewWorkspace(
+    workspaceId: string,
+    workspacePath: string,
+    persistentSiblingConfig?: Pick<Config, "loadConfigOrDefault">
+  ): Promise<string | undefined> {
+    if (!this.workspaceMcpOverridesService) {
+      return undefined;
+    }
+    // A sibling workspace resolving to the same checkout (local-runtime
+    // conversation forks) means the consent context is still ALIVE — its
+    // enables must survive, and the uninstaller can still reach the file
+    // through that sibling. Qualification is deliberately strict on runtime
+    // KIND and loose on path SPELLING:
+    // - Only host-local workspaces (project-dir local / worktree, including
+    //   legacy entries without a runtimeConfig) qualify: an SSH or container
+    //   workspace whose persisted remote path merely equals this local path
+    //   string lives in a different filesystem namespace and preserves no
+    //   consent context for the local file.
+    // - Paths compare by canonical filesystem identity (realpath) IN ADDITION
+    //   to normalized spelling: a sibling registered through a symlinked or
+    //   differently-cased spelling of the same checkout must still be
+    //   recognized, or pruning would strip a live workspace's enables.
+    //   Failures fall back to spelling so an unresolvable path errs toward
+    //   skipping (leaving keys) rather than pruning live consent.
+    // Bounded canonicalization: realpath against a stalled filesystem (e.g. a
+    // dead NFS mount backing an UNRELATED persistent workspace record) must
+    // not hang CLI registration indefinitely. Timeouts join ordinary realpath
+    // failures in the spelling fallback below.
+    const CANONICALIZE_TIMEOUT_MS = 2_000;
+    const canonicalize = async (candidate: string): Promise<string> => {
+      const stripped = stripTrailingSlashes(candidate);
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        return await Promise.race([
+          fsPromises.realpath(stripped),
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(
+              () => reject(new Error("realpath timed out")),
+              CANONICALIZE_TIMEOUT_MS
+            );
+          }),
+        ]);
+      } catch {
+        return stripped;
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    const isHostLocalConfig = (runtimeConfig: RuntimeConfig | undefined): boolean =>
+      runtimeConfig === undefined ||
+      runtimeConfig.type === "local" ||
+      runtimeConfig.type === "worktree";
+    const normalizedPath = stripTrailingSlashes(workspacePath);
+    const canonicalPath = await canonicalize(workspacePath);
+    // Scan the service's own config AND (when provided) the persistent one:
+    // ephemeral CLI configs carry no workspace records, so a desktop
+    // workspace live on the same checkout is only visible in the latter.
+    // The persistent source reads in THROWING mode: the lenient read swallows
+    // a malformed/unreadable config into an empty project map, which reads as
+    // "no live sibling" and would prune enables a live desktop workspace
+    // still owns. A missing file still yields the default (genuinely no
+    // siblings). this.config keeps the lenient read — it is the service's own
+    // store, whose desktop/task registration paths already depend on it.
+    let configSnapshots: ProjectsConfig[];
+    try {
+      configSnapshots = [
+        this.config.loadConfigOrDefault(),
+        ...(persistentSiblingConfig
+          ? [persistentSiblingConfig.loadConfigOrDefault({ throwOnError: true })]
+          : []),
+      ];
+    } catch (error) {
+      return `Cannot verify live sibling workspaces for plugin override sanitization (the persistent config is unreadable: ${getErrorMessage(error)}). Refusing to prune; fix the config and retry.`;
+    }
+    for (const config of configSnapshots) {
+      for (const project of config.projects.values()) {
+        for (const workspace of project.workspaces) {
+          if (
+            workspace.id === workspaceId ||
+            // Registered-but-unsanitized entries from an overlapping creation
+            // are not live consent contexts (see pendingPluginSanitizations).
+            (workspace.id !== undefined && this.pendingPluginSanitizations.has(workspace.id)) ||
+            !isHostLocalConfig(workspace.runtimeConfig)
+          ) {
+            continue;
+          }
+          if (
+            stripTrailingSlashes(workspace.path) === normalizedPath ||
+            (await canonicalize(workspace.path)) === canonicalPath
+          ) {
+            return undefined;
+          }
+        }
+      }
+    }
+    try {
+      await this.workspaceMcpOverridesService.prunePluginOverrideKeys(workspaceId, "plugin:");
+      return undefined;
+    } catch (error) {
+      // Abort creation instead of proceeding with the stale file: continuing
+      // would re-create the silent-activation path this sanitization exists
+      // to close, with no durable record left to retry it.
+      return `The directory's existing MCP overrides file could not be sanitized: ${getErrorMessage(error)}. Fix or remove the workspace MCP overrides file (.xum/mcp.local.jsonc, or legacy .mux/mcp.local.jsonc) in ${workspacePath} and try again.`;
+    }
+  }
+
+  /**
+   * Roll back a just-persisted workspace registration and VERIFY it left the
+   * on-disk config. Config.saveConfig logs and swallows write failures, so
+   * removeWorkspace can resolve while the entry is still persisted — after a
+   * restart that entry would resurrect with the unsanitized overrides file
+   * this rollback exists to keep unreachable. Returns whether the entry is
+   * provably gone from disk.
+   */
+  private async rollbackUnsanitizedWorkspaceRegistration(workspaceId: string): Promise<boolean> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await this.config.removeWorkspace(workspaceId).catch(() => undefined);
+      const persisted = this.config.loadConfigOrDefault();
+      const stillPresent = Array.from(persisted.projects.values()).some((project) =>
+        project.workspaces.some((workspace) => workspace.id === workspaceId)
+      );
+      if (!stillPresent) {
+        return true;
+      }
+    }
+    log.error(
+      `Failed to roll back workspace ${workspaceId} after plugin-override sanitization aborted creation`
+    );
+    return false;
   }
 
   setWorkspaceGoalService(service: WorkspaceGoalService): void {
@@ -3726,6 +4003,12 @@ export class WorkspaceService extends EventEmitter {
       backgroundProcessManager: this.backgroundProcessManager,
       // Branch-summary side-channel spend recording (edit-resend path).
       sessionUsageService: this.sessionUsageService,
+      sanitizeCliWorkspaceRegistration: (args) =>
+        this.sanitizeCliRegisteredWorkspace(
+          args.workspaceId,
+          args.workspacePath,
+          args.runtimeConfig
+        ),
       onCompactionComplete: (metadata) => {
         this.schedulePostCompactionMetadataRefresh(workspaceId);
         // Compaction marks a long session with accumulated learnings: harvest
@@ -4343,10 +4626,19 @@ export class WorkspaceService extends EventEmitter {
       resolvedBranchName = branchName;
     }
 
-    // Validate workspace name (covers both caller-provided and auto-generated names)
-    const validation = validateWorkspaceName(resolvedBranchName);
+    const validation = validateWorkspaceBranchName(resolvedBranchName);
     if (!validation.valid) {
-      return Err(validation.error ?? "Invalid workspace name");
+      return Err(validation.error ?? "Invalid branch name");
+    }
+
+    const initialWorkspaceName = sanitizeBranchNameForWorkspace(resolvedBranchName);
+    // Sanitized collisions must fail so distinct Git branches cannot share one workspace identity.
+    const initialConflict = getBranchWorkspaceNameConflict(
+      resolvedBranchName,
+      (projectConfig.workspaces ?? []).map((workspace) => workspace.name)
+    );
+    if (initialConflict) {
+      return Err(initialConflict);
     }
 
     // Generate stable workspace ID
@@ -4405,8 +4697,9 @@ export class WorkspaceService extends EventEmitter {
     const initLogger = this.createInitLogger(workspaceId);
 
     try {
-      // Create workspace with automatic collision retry
       let finalBranchName = resolvedBranchName;
+      let finalWorkspaceName = initialWorkspaceName;
+      const hasSanitizedWorkspaceName = finalBranchName !== finalWorkspaceName;
       let createResult: { success: boolean; workspacePath?: string; error?: string };
 
       // If runtime uses config-level collision detection (e.g., Coder - can't reach host),
@@ -4417,24 +4710,34 @@ export class WorkspaceService extends EventEmitter {
             (w) => w.name
           )
         );
+        const configConflict = getBranchWorkspaceNameConflict(finalBranchName, existingNames);
+        if (configConflict) {
+          initLogger.logComplete(-1);
+          return Err(configConflict);
+        }
+
         for (
           let i = 0;
-          i < MAX_WORKSPACE_NAME_COLLISION_RETRIES && existingNames.has(finalBranchName);
+          i < MAX_WORKSPACE_NAME_COLLISION_RETRIES && existingNames.has(finalWorkspaceName);
           i++
         ) {
-          log.debug(`Workspace name collision for "${finalBranchName}", adding suffix`);
+          log.debug(`Workspace name collision for "${finalWorkspaceName}", adding suffix`);
           finalBranchName = appendCollisionSuffix(resolvedBranchName);
+          finalWorkspaceName = sanitizeBranchNameForWorkspace(finalBranchName);
         }
       }
 
       const createEnv = await secretsToRecord(this.config.getEffectiveSecrets(owningProjectPath));
+      const maxCollisionRetries = hasSanitizedWorkspaceName
+        ? 0
+        : MAX_WORKSPACE_NAME_COLLISION_RETRIES;
 
-      for (let attempt = 0; attempt <= MAX_WORKSPACE_NAME_COLLISION_RETRIES; attempt++) {
+      for (let attempt = 0; attempt <= maxCollisionRetries; attempt++) {
         createResult = await runtime.createWorkspace({
           projectPath: owningProjectPath,
           branchName: finalBranchName,
           trunkBranch: normalizedTrunkBranch,
-          directoryName: finalBranchName,
+          directoryName: finalWorkspaceName,
           initLogger,
           abortSignal: initAbortController.signal,
           env: createEnv,
@@ -4443,13 +4746,18 @@ export class WorkspaceService extends EventEmitter {
 
         if (createResult.success) break;
 
-        // If collision and not last attempt, retry with suffix
+        if (hasSanitizedWorkspaceName && isWorkspaceNameCollision(createResult.error)) {
+          initLogger.logComplete(-1);
+          return Err(formatBranchWorkspaceNameConflict(finalBranchName));
+        }
+
         if (
           isWorkspaceNameCollision(createResult.error) &&
           attempt < MAX_WORKSPACE_NAME_COLLISION_RETRIES
         ) {
-          log.debug(`Workspace name collision for "${finalBranchName}", retrying with suffix`);
+          log.debug(`Workspace name collision for "${finalWorkspaceName}", retrying with suffix`);
           finalBranchName = appendCollisionSuffix(resolvedBranchName);
+          finalWorkspaceName = sanitizeBranchNameForWorkspace(finalBranchName);
           continue;
         }
         break;
@@ -4462,7 +4770,7 @@ export class WorkspaceService extends EventEmitter {
 
       // Let runtime finalize config (e.g., derive names, compute host) after collision handling
       if (runtime.finalizeConfig) {
-        const finalizeResult = await runtime.finalizeConfig(finalBranchName, finalRuntimeConfig);
+        const finalizeResult = await runtime.finalizeConfig(finalWorkspaceName, finalRuntimeConfig);
         if (!finalizeResult.success) {
           initLogger.logComplete(-1);
           return Err(finalizeResult.error);
@@ -4474,7 +4782,7 @@ export class WorkspaceService extends EventEmitter {
       // Let runtime validate before persisting (e.g., external collision checks)
       if (runtime.validateBeforePersist) {
         const validateResult = await runtime.validateBeforePersist(
-          finalBranchName,
+          finalWorkspaceName,
           finalRuntimeConfig
         );
         if (!validateResult.success) {
@@ -4488,7 +4796,7 @@ export class WorkspaceService extends EventEmitter {
 
       const metadata = {
         id: workspaceId,
-        name: finalBranchName,
+        name: finalWorkspaceName,
         title,
         projectName,
         projectPath: owningProjectPath,
@@ -4496,37 +4804,129 @@ export class WorkspaceService extends EventEmitter {
         createdAt: new Date().toISOString(),
       };
 
-      await this.config.editConfig((config) => {
-        let projectConfig = config.projects.get(owningProjectPath);
-        if (!projectConfig) {
-          projectConfig = { workspaces: [] };
-          config.projects.set(owningProjectPath, projectConfig);
-        }
-        projectConfig.workspaces.push({
-          path: createResult!.workspacePath!,
-          id: workspaceId,
-          name: finalBranchName,
-          title,
-          createdAt: metadata.createdAt,
-          runtimeConfig: finalRuntimeConfig,
-          subProjectPath: effectiveSubProjectPath,
-          // Persist tags atomically with creation so orchestration loops that
-          // look workspaces up by tag (e.g. workspace.ensure) never observe a
-          // created-but-untagged window after a crash.
-          ...(tags != null && Object.keys(tags).length > 0 ? { tags } : {}),
-          // Mirror /fork: when /new is invoked with a start message, defer title
-          // selection until the first message can drive LLM-based generation.
-          ...(pendingAutoTitle === true ? { pendingAutoTitle: true } : {}),
-        });
-        return config;
-      });
-
-      const allMetadata = await this.config.getAllWorkspaceMetadata();
-      const completeMetadata = allMetadata.find((m) => m.id === workspaceId);
-      if (!completeMetadata) {
-        initLogger.logComplete(-1);
-        return Err("Failed to retrieve workspace metadata");
+      // Host-local checkouts (project-dir local and worktree) get their
+      // preserved/tracked .mux/mcp.local.jsonc sanitized below. Mark this
+      // registration pending BEFORE the entry persists so an overlapping
+      // creation for the same checkout cannot mistake the not-yet-sanitized
+      // entry for a live sibling and skip its own sanitization.
+      const isHostLocalCheckout =
+        finalRuntimeConfig.type === "local" || finalRuntimeConfig.type === "worktree";
+      let completeMetadata: FrontendWorkspaceMetadata | undefined;
+      if (isHostLocalCheckout) {
+        this.pendingPluginSanitizations.add(workspaceId);
       }
+      let releaseRegistrationLock: (() => Promise<void>) | undefined;
+      try {
+        if (isHostLocalCheckout) {
+          // Cross-process: persist + sanitize must not interleave with a
+          // sibling process registering the same checkout (see
+          // acquireRegistrationSanitizeLock).
+          releaseRegistrationLock = await this.acquireRegistrationSanitizeLock();
+        }
+        await this.config.editConfig((config) => {
+          let projectConfig = config.projects.get(owningProjectPath);
+          if (!projectConfig) {
+            projectConfig = { workspaces: [] };
+            config.projects.set(owningProjectPath, projectConfig);
+          }
+          projectConfig.workspaces.push({
+            path: createResult!.workspacePath!,
+            id: workspaceId,
+            name: finalWorkspaceName,
+            title,
+            createdAt: metadata.createdAt,
+            runtimeConfig: finalRuntimeConfig,
+            subProjectPath: effectiveSubProjectPath,
+            // Persist tags atomically with creation so orchestration loops that
+            // look workspaces up by tag (e.g. workspace.ensure) never observe a
+            // created-but-untagged window after a crash.
+            ...(tags != null && Object.keys(tags).length > 0 ? { tags } : {}),
+            // Mirror /fork: when /new is invoked with a start message, defer title
+            // selection until the first message can drive LLM-based generation.
+            ...(pendingAutoTitle === true ? { pendingAutoTitle: true } : {}),
+          });
+          return config;
+        });
+
+        const allMetadata = await this.config.getAllWorkspaceMetadata();
+        completeMetadata = allMetadata.find((m) => m.id === workspaceId);
+        if (!completeMetadata) {
+          initLogger.logComplete(-1);
+          return Err("Failed to retrieve workspace metadata");
+        }
+
+        // The checkout being registered may already hold plugin enables no
+        // live workspace consented to: LocalRuntime registers an EXISTING
+        // directory whose preserved .mux/mcp.local.jsonc can carry enables
+        // from a since-removed workspace, and a fresh WORKTREE checkout
+        // materializes the file when the repository tracks it (project plugin
+        // instance IDs are stable across a project's worktrees, so committed
+        // enables would silently activate here). Sanitize before announcing;
+        // a failure aborts the creation so nothing stale ever activates.
+        // SSH/container runtimes exec off-host, where plugin servers never
+        // spawn (host-path containers only in v1).
+        if (isHostLocalCheckout) {
+          const sanitizeError = await this.sanitizeStalePluginOverridesForNewWorkspace(
+            workspaceId,
+            createResult!.workspacePath
+          );
+          if (sanitizeError !== undefined) {
+            const rolledBack = await this.rollbackUnsanitizedWorkspaceRegistration(workspaceId);
+            // WORKTREE runtimes created a fresh checkout above; without
+            // deleting it, retrying the same branch collides with the
+            // orphaned worktree and leaks a suffixed checkout per attempt.
+            // LocalRuntime registered an EXISTING user directory, which must
+            // be preserved (its deleteWorkspace is a no-op by design, but we
+            // never call it here to keep that contract explicit). Only after
+            // a successful config rollback: while the entry persists, the
+            // checkout is still referenced.
+            if (rolledBack && isWorktreeRuntime(finalRuntimeConfig)) {
+              const deleteResult = await runtime
+                .deleteWorkspace(
+                  owningProjectPath,
+                  // Worktree directories are named after the sanitized
+                  // workspace name (branch names may contain "/").
+                  finalWorkspaceName,
+                  false,
+                  undefined,
+                  projectConfig.trusted ?? false
+                )
+                .catch((error: unknown) => ({
+                  success: false as const,
+                  error: getErrorMessage(error),
+                }));
+              if (!deleteResult.success) {
+                log.warn("Failed to remove created worktree after sanitization aborted creation", {
+                  workspaceId,
+                  error: deleteResult.error,
+                });
+              }
+            }
+            // Tear down the in-memory state registered earlier in this
+            // creation (session, init record, abort controller) exactly like
+            // workspace removal would; without this every aborted retry
+            // against the same bad file leaks another unreachable session
+            // for the process lifetime.
+            initAbortController.abort();
+            this.initAbortControllers.delete(workspaceId);
+            this.initStateManager.clearInMemoryState(workspaceId);
+            this.disposeSession(workspaceId);
+            initLogger.logComplete(-1);
+            return Err(
+              rolledBack
+                ? sanitizeError
+                : `${sanitizeError} Additionally, the half-created workspace registration could not be rolled back; remove workspace ${workspaceId} manually before retrying.`
+            );
+          }
+        }
+      } finally {
+        await releaseRegistrationLock?.();
+        this.pendingPluginSanitizations.delete(workspaceId);
+      }
+      assert(
+        completeMetadata !== undefined,
+        "create: registration must have produced workspace metadata"
+      );
 
       session.emitMetadata(this.enrichFrontendMetadata(completeMetadata));
 
@@ -4537,7 +4937,7 @@ export class WorkspaceService extends EventEmitter {
       // If the user cancelled creation while create() was still in flight, avoid spawning
       // additional background work for a workspace that's already being removed.
       if (!this.removingWorkspaces.has(workspaceId) && !initAbortController.signal.aborted) {
-        runBackgroundInit(
+        void runBackgroundInit(
           runtime,
           {
             projectPath: owningProjectPath,
@@ -4593,10 +4993,11 @@ export class WorkspaceService extends EventEmitter {
     let initLogger: ReturnType<WorkspaceService["createInitLogger"]> | null = null;
 
     try {
-      const validation = validateWorkspaceName(branchName);
+      const validation = validateWorkspaceBranchName(branchName);
       if (!validation.valid) {
-        return Err(validation.error ?? "Invalid workspace name");
+        return Err(validation.error ?? "Invalid branch name");
       }
+      const workspaceName = sanitizeBranchNameForWorkspace(branchName);
 
       const normalizedProjects = projects.map((project) => ({
         projectPath: stripTrailingSlashes(project.projectPath),
@@ -4626,6 +5027,24 @@ export class WorkspaceService extends EventEmitter {
             `Project ${project.projectName} must be trusted before creating workspaces. Trust the project in Settings → Security, or create a workspace from the project page.`
           );
         }
+      }
+
+      const existingWorkspaceNames = [
+        ...(configSnapshot.projects.get(MULTI_PROJECT_CONFIG_KEY)?.workspaces ?? []).map(
+          (workspace) => workspace.name
+        ),
+        ...normalizedProjects.flatMap((project) =>
+          (
+            configSnapshot.projects.get(stripTrailingSlashes(project.projectPath))?.workspaces ?? []
+          ).map((workspace) => workspace.name)
+        ),
+      ];
+      const workspaceNameConflict = getBranchWorkspaceNameConflict(
+        branchName,
+        existingWorkspaceNames
+      );
+      if (workspaceNameConflict) {
+        return Err(workspaceNameConflict);
       }
 
       const workspaceId = this.config.generateStableId();
@@ -4716,7 +5135,7 @@ export class WorkspaceService extends EventEmitter {
         project,
         runtime: createRuntime(finalRuntimeConfig, {
           projectPath: project.projectPath,
-          workspaceName: branchName,
+          workspaceName,
         }),
       }));
 
@@ -4737,7 +5156,7 @@ export class WorkspaceService extends EventEmitter {
             // also drop an older same-named branch in worktree runtimes.
             await createdWorkspace.runtime.deleteWorkspace(
               createdWorkspace.project.projectPath,
-              branchName,
+              workspaceName,
               false,
               initAbortController.signal,
               trusted
@@ -4783,7 +5202,7 @@ export class WorkspaceService extends EventEmitter {
           projectPath: projectRuntimeEntry.project.projectPath,
           branchName,
           trunkBranch: projectTrunkBranch,
-          directoryName: branchName,
+          directoryName: workspaceName,
           initLogger,
           abortSignal: initAbortController.signal,
           env: createEnv,
@@ -4793,6 +5212,9 @@ export class WorkspaceService extends EventEmitter {
         if (!createResult.success || !createResult.workspacePath) {
           await rollbackCreatedWorkspaces();
           initLogger.logComplete(-1);
+          if (branchName !== workspaceName && isWorkspaceNameCollision(createResult.error)) {
+            return Err(formatBranchWorkspaceNameConflict(branchName));
+          }
           return Err(
             createResult.error ??
               `Failed to create workspace for project ${projectRuntimeEntry.project.projectName}`
@@ -4811,7 +5233,7 @@ export class WorkspaceService extends EventEmitter {
       let containerPath: string;
       try {
         containerPath = await containerManager.createContainer(
-          branchName,
+          workspaceName,
           createdWorkspaces.map((workspace) => ({
             projectName: workspace.project.projectName,
             workspacePath: workspace.workspacePath,
@@ -4822,7 +5244,7 @@ export class WorkspaceService extends EventEmitter {
         const containerAlreadyExists = isErrnoWithCode(error, "EEXIST");
         if (!containerAlreadyExists) {
           try {
-            await containerManager.removeContainer(branchName);
+            await containerManager.removeContainer(workspaceName);
           } catch (cleanupError: unknown) {
             log.error("Failed to clean up multi-project container after create failure", {
               workspaceId,
@@ -4833,7 +5255,10 @@ export class WorkspaceService extends EventEmitter {
         }
         initLogger.logComplete(-1);
         if (containerAlreadyExists) {
-          return Err(`Failed to create multi-project container: ${branchName} already exists`);
+          if (branchName !== workspaceName) {
+            return Err(formatBranchWorkspaceNameConflict(branchName));
+          }
+          return Err(`Failed to create multi-project container: ${workspaceName} already exists`);
         }
         return Err(`Failed to create multi-project container: ${getErrorMessage(error)}`);
       }
@@ -4849,7 +5274,7 @@ export class WorkspaceService extends EventEmitter {
         multiProjectConfig.workspaces.push({
           path: containerPath,
           id: workspaceId,
-          name: branchName,
+          name: workspaceName,
           title,
           createdAt,
           runtimeConfig: finalRuntimeConfig,
@@ -8411,7 +8836,12 @@ export class WorkspaceService extends EventEmitter {
       }
 
       const secrets = await resolveProjectEnv(foundProjectPath);
-      runBackgroundInit(
+      // Fire-and-forget on the happy path, but keep the termination handle:
+      // the sanitization-abort cleanup below deletes the fresh worktree, and
+      // doing that while init still runs against the checkout races its
+      // writes/open handles (a failed delete leaves an orphaned worktree that
+      // collides with the next fork of the same branch).
+      const initSettled = runBackgroundInit(
         targetRuntime,
         {
           projectPath: foundProjectPath,
@@ -8616,7 +9046,76 @@ export class WorkspaceService extends EventEmitter {
           : {}),
       };
 
-      await this.config.addWorkspace(foundProjectPath, metadata);
+      // Same pre-announcement sanitization as create(): a worktree fork of a
+      // trusted repo materializes tracked files, so a committed
+      // .mux/mcp.local.jsonc can carry a stale canonical plugin: enable that
+      // no live workspace consented to — announced unpruned, the first agent
+      // request would spawn that plugin's default-disabled MCP server. Local
+      // (project-dir) forks share the source checkout, which the sibling scan
+      // detects and skips (the source's consent context is alive).
+      const forkIsHostLocalCheckout =
+        forkedRuntimeConfig.type === "local" || forkedRuntimeConfig.type === "worktree";
+      if (forkIsHostLocalCheckout) {
+        this.pendingPluginSanitizations.add(newWorkspaceId);
+      }
+      let releaseRegistrationLock: (() => Promise<void>) | undefined;
+      try {
+        if (forkIsHostLocalCheckout) {
+          // Cross-process: persist + sanitize must not interleave with a
+          // sibling process registering the same checkout (see
+          // acquireRegistrationSanitizeLock).
+          releaseRegistrationLock = await this.acquireRegistrationSanitizeLock();
+        }
+        await this.config.addWorkspace(foundProjectPath, metadata);
+        if (forkIsHostLocalCheckout) {
+          const sanitizeError = await this.sanitizeStalePluginOverridesForNewWorkspace(
+            newWorkspaceId,
+            workspacePath
+          );
+          if (sanitizeError !== undefined) {
+            // Background init is still running against this checkout: abort
+            // it and AWAIT termination before deleting the worktree, or the
+            // delete races init's writes/open handles and can fail, leaving
+            // an orphaned worktree that collides with the next fork attempt.
+            initAbortController.abort();
+            await initSettled;
+            const rolledBack = await this.rollbackUnsanitizedWorkspaceRegistration(newWorkspaceId);
+            if (rolledBack && isWorktreeRuntime(forkedRuntimeConfig)) {
+              // Matches the copy-failure cleanup above: the fork's checkout
+              // is known fresh, so force-delete is safe here.
+              await targetRuntime
+                .deleteWorkspace(
+                  foundProjectPath,
+                  resolvedName,
+                  true,
+                  undefined,
+                  projectConfig.trusted ?? false
+                )
+                .catch((error: unknown) => {
+                  log.warn("Failed to remove forked worktree after sanitization abort", {
+                    newWorkspaceId,
+                    error: getErrorMessage(error),
+                  });
+                });
+            }
+            await fsPromises
+              .rm(newSessionDir, { recursive: true, force: true })
+              .catch(() => undefined);
+            this.initAbortControllers.delete(newWorkspaceId);
+            this.initStateManager.clearInMemoryState(newWorkspaceId);
+            this.disposeSession(newWorkspaceId);
+            initLogger.logComplete(-1);
+            return Err(
+              rolledBack
+                ? sanitizeError
+                : `${sanitizeError} Additionally, the half-created workspace registration could not be rolled back; remove workspace ${newWorkspaceId} manually before retrying.`
+            );
+          }
+        }
+      } finally {
+        await releaseRegistrationLock?.();
+        this.pendingPluginSanitizations.delete(newWorkspaceId);
+      }
       await this.workspaceGoalService?.inheritFromFork(sourceWorkspaceId, newWorkspaceId);
 
       if (sourceMessageId && abandonedBranchMessages !== null) {

@@ -120,6 +120,13 @@ import {
   MCPTestResultSchema,
   WorkspaceMCPOverridesSchema,
 } from "./mcp";
+import {
+  AgentPluginGitSourceSchema,
+  AgentPluginInstallEntrySchema,
+  AgentPluginInstallPreviewSchema,
+  AgentPluginListItemSchema,
+  AgentPluginUpdateCheckSchema,
+} from "./agentPlugins";
 import { PolicyGetResponseSchema } from "./policy";
 import {
   AgentAiDefaultsSchema,
@@ -691,7 +698,7 @@ export const mcpOauth = {
 // Projects
 export const projects = {
   create: {
-    input: z.object({ projectPath: z.string() }),
+    input: z.object({ projectPath: z.string(), initGit: z.boolean().optional() }),
     output: ResultSchema(
       z.object({
         projectConfig: ProjectConfigSchema,
@@ -983,6 +990,60 @@ export const mcp = {
   setToolAllowlist: {
     input: MCPSetToolAllowlistGlobalParamsSchema,
     output: ResultSchema(z.void(), z.string()),
+  },
+};
+
+/**
+ * Managed Agent Plugin installs (agent-plugins experiment; global scope only).
+ *
+ * Human-driven surfaces only (Settings + palette) — there is deliberately no
+ * agent-facing installer tool in v1. All endpoints return Result values; the
+ * backend service gates on the experiment flag.
+ */
+export const agentPlugins = {
+  /** Temp shallow clone + validation of the staged tree; writes nothing permanent. */
+  preview: {
+    input: z.object({
+      input: z.string(),
+      ref: z.string().nullish(),
+      subpath: z.string().nullish(),
+    }),
+    output: ResultSchema(AgentPluginInstallPreviewSchema, z.string()),
+  },
+  /** Fetch the consented SHA, promote into ~/.mux/plugins, write the registry entry. */
+  install: {
+    input: z.object({
+      source: AgentPluginGitSourceSchema,
+      /** SHA from the preview the user consented to. */
+      expectedSha: z.string(),
+    }),
+    output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
+  },
+  list: {
+    input: z.void(),
+    output: ResultSchema(z.array(AgentPluginListItemSchema), z.string()),
+  },
+  /** Display path of the ACTIVE managed plugin container (config-derived root; never hardcode it in UI). */
+  containerLocation: {
+    input: z.void(),
+    output: z.string(),
+  },
+  uninstall: {
+    input: z.object({
+      name: z.string(),
+      /** Also delete ~/.mux/plugin-data/<instanceId> (default off — preserve data). */
+      deletePluginData: z.boolean(),
+    }),
+    output: ResultSchema(z.void(), z.string()),
+  },
+  /** git ls-remote per managed entry vs lockedSha; no fetch, no timers. */
+  checkUpdates: {
+    input: z.void(),
+    output: ResultSchema(z.array(AgentPluginUpdateCheckSchema), z.string()),
+  },
+  update: {
+    input: z.object({ name: z.string() }),
+    output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
   },
 };
 
@@ -1911,7 +1972,11 @@ export const workspace = {
   mcp: {
     get: {
       input: z.object({ workspaceId: z.string() }),
-      output: WorkspaceMCPOverridesSchema,
+      output: z.object({
+        overrides: WorkspaceMCPOverridesSchema,
+        /** Opaque token for optimistic-concurrency saves (set.expectedRevision). */
+        revision: z.string(),
+      }),
     },
     prompts: {
       list: {
@@ -1923,6 +1988,13 @@ export const workspace = {
       input: z.object({
         workspaceId: z.string(),
         overrides: WorkspaceMCPOverridesSchema,
+        /**
+         * Revision returned by get. The save is rejected if the stored
+         * overrides changed since then, so a stale dialog snapshot cannot
+         * silently restore entries removed by a concurrent writer (e.g. an
+         * Agent Plugin uninstall pruning its `plugin:` keys).
+         */
+        expectedRevision: z.string(),
       }),
       output: ResultSchema(z.void(), z.string()),
     },

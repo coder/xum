@@ -820,6 +820,30 @@ function removeLegacyMuxChatEntries(projects: Map<string, ProjectConfig>): boole
   return modified;
 }
 
+interface ConfigLoadFailureState {
+  /** Signature (content + error + backup detail) of the last logged load failure, for log dedupe. */
+  failureSignature: string | null;
+  /**
+   * Content hash of corrupt config bytes whose sidecar backup was verified on disk during
+   * the most recent failed load (re-checked every failed load, never trusted across loads).
+   */
+  backupSignature: string | null;
+}
+
+// Process-scoped, keyed by config file path: production creates short-lived Config
+// instances (e.g. runtimeFactory per runtime check), so instance-local dedupe would
+// re-log the same corrupt-config error once per instance.
+const configLoadFailureStates = new Map<string, ConfigLoadFailureState>();
+
+function configLoadFailureState(configFile: string): ConfigLoadFailureState {
+  let state = configLoadFailureStates.get(configFile);
+  if (!state) {
+    state = { failureSignature: null, backupSignature: null };
+    configLoadFailureStates.set(configFile, state);
+  }
+  return state;
+}
+
 /**
  * Config - Centralized configuration management
  *
@@ -940,11 +964,130 @@ export class Config {
     return priority.length > 1 ? priority : undefined;
   }
 
+  private handleConfigLoadFailure(rawBytes: Buffer | undefined, error: unknown): void {
+    const state = configLoadFailureState(this.configFile);
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    // Backup confirmation is keyed on content alone: the same corrupt bytes need only one
+    // sidecar regardless of which error message they produced.
+    const contentSignature =
+      rawBytes !== undefined ? crypto.createHash("sha256").update(rawBytes).digest("hex") : null;
+
+    // Re-verify preservation against the disk on every failed load rather than trusting a
+    // cached confirmation: a sidecar deleted or truncated since the last load must re-block
+    // the edit gate (and be re-created) or a defaults write would destroy the only copy.
+    let backupStatus = "No backup was created because the file contents could not be read.";
+    // The actionable part of backupStatus (verified sidecar path, or the failure error);
+    // folded into the log-dedupe signature so any change in remediation logs again.
+    let backupDetail = "<unreadable>";
+    let backupConfirmed = false;
+    if (rawBytes !== undefined) {
+      try {
+        const configDir = path.dirname(this.configFile);
+        const corruptPrefix = `${path.basename(this.configFile)}.corrupt-`;
+        // Reuse a byte-identical sidecar only if it can also be secured: one from an older
+        // build may be world-readable, so tighten it to 0600 before trusting it as the
+        // backup. Skip candidates that are unreadable or untightenable (e.g. owned by
+        // another user) and keep scanning; a later usable duplicate must still be found
+        // even when creating a fresh sidecar would fail (read-only dir, full disk).
+        let reusedPath: string | null = null;
+        for (const entry of fs.readdirSync(configDir, { withFileTypes: true })) {
+          if (!entry.isFile() || !entry.name.startsWith(corruptPrefix)) {
+            continue;
+          }
+          const candidatePath = path.join(configDir, entry.name);
+          try {
+            if (fs.readFileSync(candidatePath).equals(rawBytes)) {
+              fs.chmodSync(candidatePath, 0o600);
+              reusedPath = candidatePath;
+              break;
+            }
+          } catch {
+            // Unusable candidate; keep scanning.
+          }
+        }
+        if (reusedPath) {
+          backupStatus = `Backup skipped because identical bytes already exist at ${reusedPath}.`;
+          backupDetail = reusedPath;
+        } else {
+          // Write the bytes that actually failed parsing (not a re-read of the file, which
+          // another process may have replaced), leaving the corrupt source in place so
+          // throwOnError cleanup guards continue to reject it. "wx" creates exclusively;
+          // on a same-millisecond collision retry with a suffix instead of overwriting an
+          // earlier snapshot. Mode 0600 because config.json can hold credentials (e.g.
+          // muxGovernorToken) that the source file's permissions may protect.
+          const basePath = `${this.configFile}.corrupt-${Date.now()}`;
+          let backupPath = basePath;
+          for (let suffix = 1; ; suffix++) {
+            try {
+              fs.writeFileSync(backupPath, rawBytes, { flag: "wx", mode: 0o600 });
+              break;
+            } catch (writeError) {
+              if ((writeError as NodeJS.ErrnoException).code !== "EEXIST") {
+                throw writeError;
+              }
+              backupPath = `${basePath}-${suffix}`;
+            }
+          }
+          // The creation mode is reduced by the process umask (a 0777 umask yields an
+          // owner-unreadable file); chmod is not, so pin the final mode explicitly.
+          fs.chmodSync(backupPath, 0o600);
+          backupStatus = `The original bytes were backed up to ${backupPath}.`;
+          backupDetail = backupPath;
+        }
+        backupConfirmed = true;
+      } catch (backupError) {
+        const backupErrorMessage =
+          backupError instanceof Error ? backupError.message : String(backupError);
+        backupStatus = `Backup failed (${backupErrorMessage}); it will be retried on the next load, and settings changes will not overwrite config.json until a backup succeeds.`;
+        // Node fs errors embed the attempted (timestamped) sidecar path in the message, so
+        // dedupe on the stable errno code where present or repeated ENOSPC/EACCES failures
+        // would log on every load.
+        const backupErrorCode = (backupError as NodeJS.ErrnoException).code;
+        backupDetail = `failed: ${backupErrorCode ?? backupErrorMessage}`;
+      }
+    }
+    // Until a sidecar is confirmed for these exact bytes, enqueueConfigEdit refuses to
+    // overwrite the corrupt source.
+    state.backupSignature = backupConfirmed ? contentSignature : null;
+
+    // Dedupe on content + error + actionable backup detail: repeated loads of the same
+    // state stay silent, while any change in remediation (backup gained or lost, sidecar
+    // verified at a different path, a different backup error) replaces stale guidance.
+    const logSignature = crypto
+      .createHash("sha256")
+      .update(rawBytes ?? "<config unreadable>")
+      .update("\0")
+      .update(errorMessage)
+      .update("\0")
+      .update(backupDetail)
+      .digest("hex");
+    if (logSignature === state.failureSignature) {
+      return;
+    }
+    state.failureSignature = logSignature;
+
+    const guidance =
+      rawBytes === undefined
+        ? `Check that ${this.configFile} is a regular file readable by this user.`
+        : `Fix the reported problem in ${this.configFile} or restore it from the backup.`;
+    log.error(
+      `Failed to load config file ${this.configFile}: ${errorMessage}. ${backupStatus} ${guidance} Xum will continue with default settings and may rewrite config.json with defaults at any time, including at startup, so use the backup to recover your original settings.`
+    );
+  }
+
   loadConfigOrDefault(options?: { throwOnError?: boolean }): ProjectsConfig {
+    // Read as a Buffer and hand the same snapshot to the failure handler: backing up via a
+    // second read could preserve a concurrent writer's replacement instead of the bytes that
+    // actually failed parsing.
+    let rawBytes: Buffer | undefined;
     try {
       if (fs.existsSync(this.configFile)) {
-        const data = fs.readFileSync(this.configFile, "utf-8");
-        const parsed = JSON.parse(data) as Partial<AppConfigOnDisk> & Record<string, unknown>;
+        rawBytes = fs.readFileSync(this.configFile);
+        const parsedValue: unknown = JSON.parse(rawBytes.toString("utf-8"));
+        if (!parsedValue || typeof parsedValue !== "object" || Array.isArray(parsedValue)) {
+          throw new Error("Config root must be a JSON object");
+        }
+        const parsed = parsedValue as Partial<AppConfigOnDisk> & Record<string, unknown>;
         let configModified = false;
         let shouldInvalidateSessionUsageCaches = false;
 
@@ -1317,6 +1460,9 @@ export class Config {
           ? undefined
           : layoutPresetsRaw;
 
+        // Also forget the confirmed backup: after a healthy load the user may prune sidecars,
+        // so a later re-corruption must re-verify the backup on disk.
+        configLoadFailureStates.delete(this.configFile);
         return {
           projects: projectsMap,
           apiServerBindHost: parseOptionalNonEmptyString(parsed.apiServerBindHost),
@@ -1371,9 +1517,11 @@ export class Config {
             .parse(parsed.settingsBackup),
           legacyOnePasswordAccountName: parseOptionalNonEmptyString(parsed.onePasswordAccountName),
         };
+      } else {
+        configLoadFailureStates.delete(this.configFile);
       }
     } catch (error) {
-      log.error("Error loading config:", error);
+      this.handleConfigLoadFailure(rawBytes, error);
       if (options?.throwOnError) {
         throw error;
       }
@@ -1727,6 +1875,43 @@ export class Config {
     const run = this.editConfigQueue.then(async () => {
       const config = this.loadConfigOrDefault();
       const newConfig = fn(config);
+      // If that load failed, writing would replace the corrupt file with defaults. Only
+      // proceed when the bytes on disk right now are the ones with a confirmed sidecar:
+      // no confirmed backup, a concurrent replacement since the load, or an unreadable
+      // file all reject the edit so callers do not treat the mutation as durable (unlike
+      // saveConfig's log-and-swallow of unexpected I/O errors, this skip is deliberate).
+      // A missing file is safe to overwrite. This cannot fully close the cross-process
+      // race (that needs file locking, which editConfig has never had); it binds the
+      // approval to the current bytes and shrinks the window to the atomic write itself.
+      const failureState = configLoadFailureStates.get(this.configFile);
+      if (failureState) {
+        const rejectEdit = (reason: string): never => {
+          const message = `Skipping config write to ${this.configFile}: ${reason}`;
+          log.error(message);
+          throw new Error(message);
+        };
+        if (failureState.backupSignature === null) {
+          rejectEdit(
+            "the existing corrupt config has no confirmed backup yet. Fix the reported backup failure or move the corrupt file aside, then retry."
+          );
+        }
+        let currentSignature: string | null = null;
+        try {
+          const currentBytes = fs.readFileSync(this.configFile);
+          currentSignature = crypto.createHash("sha256").update(currentBytes).digest("hex");
+        } catch (readError) {
+          if ((readError as NodeJS.ErrnoException).code !== "ENOENT") {
+            rejectEdit(
+              `the file could not be re-read before writing (${readError instanceof Error ? readError.message : String(readError)}). Retry the settings change.`
+            );
+          }
+        }
+        if (currentSignature !== null && currentSignature !== failureState.backupSignature) {
+          rejectEdit(
+            "the file changed after this edit loaded it and the new content has no confirmed backup. Retry the settings change."
+          );
+        }
+      }
       await this.saveConfig(newConfig);
       // Backend-initiated config edits (for example gateway auth changes) use this signal
       // so frontend subscribers can refresh derived state without polling.

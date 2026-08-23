@@ -122,10 +122,6 @@ jobs:
       ref: ${{ needs.compute-version.outputs.build_sha }}
       release_tag: ${{ needs.compute-version.outputs.release_tag }}
       version_override: ${{ needs.compute-version.outputs.nightly_version }}
-      # Nightly ships unsigned Windows builds while the repo rename breaks GCP
-      # WIF signing auth (see setup-windows-signing action). Stable releases
-      # keep the fail-closed default.
-      allow_unsigned_windows: true
     secrets: inherit # zizmor: ignore[secrets-inherit] -- reusable workflow needs platform signing secrets
 
   docker-publish:

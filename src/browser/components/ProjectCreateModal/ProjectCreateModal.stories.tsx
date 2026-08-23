@@ -64,6 +64,27 @@ export const LocalFolder: AppStory = {
   },
 };
 
+/**
+ * Three labeled modes must fit narrow dialogs without overflowing the right edge;
+ * the pinned phone viewport guards the wrap layout (dialogs portal to body, so a
+ * fixed-width decorator cannot constrain them).
+ */
+export const PhoneViewport: AppStory = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    ...appMeta.parameters,
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+  },
+  render: () => <AppWithMocks setup={setupProjectCreateStory} />,
+  play: async ({ canvasElement }) => {
+    await openNewProjectModal(canvasElement);
+  },
+};
+
 /** "Clone repo" tab of the Add Project modal. */
 export const CloneRepo: AppStory = {
   // Integration: stories navigate via sidebar → "Add project" button to open the modal portal.

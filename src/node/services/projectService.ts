@@ -16,6 +16,8 @@ import type { Secret } from "@/common/types/secrets";
 import type { Stats } from "fs";
 import * as fsPromises from "fs/promises";
 import { execFileAsync, killProcessTree } from "@/node/utils/disposableExec";
+import { normalizeRepoUrlForClone } from "@/node/utils/gitUrls";
+import { GIT_SCOPE_ENV_UNSET } from "@/node/services/backup/credentials";
 import {
   buildFileCompletionsIndex,
   EMPTY_FILE_COMPLETIONS_INDEX,
@@ -228,58 +230,6 @@ function deriveRepoFolderName(repoUrl: string): string {
   return safeFolderName;
 }
 
-const GITHUB_SHORTHAND_PATTERN = /^[a-zA-Z0-9][\w-]*\/[a-zA-Z0-9][\w.-]*$/;
-
-function hasLikelySshCredentials(): boolean {
-  const sshAgentSocket = process.env.SSH_AUTH_SOCK;
-  // Be conservative: only prefer git@github.com shorthand when the session has an active
-  // SSH agent. The mere presence of local key files does not imply GitHub SSH access.
-  return typeof sshAgentSocket === "string" && sshAgentSocket.trim().length > 0;
-}
-
-/**
- * Normalize a repo URL so git clone receives a valid remote.
- * Expands "owner/repo" shorthand to either SSH or HTTPS based on likely local credentials.
- * All other inputs (HTTPS URLs, SSH URLs, SCP-style, etc.) pass through unchanged.
- */
-function normalizeRepoUrlForClone(repoUrl: string): {
-  cloneUrl: string;
-  fallbackCloneUrl?: string;
-} {
-  const trimmedRepoUrl = repoUrl.trim();
-  const shorthandCandidate = trimmedRepoUrl.replace(/[\\/]+$/, "");
-
-  // owner/repo shorthand: exactly two non-empty segments separated by a single slash,
-  // where the first segment looks like a GitHub username (letters, digits, hyphens).
-  // Excludes local paths like ../repo, ./foo, foo/bar/baz, and absolute paths.
-  // Note: bare `foo/bar` style local relative paths are intentionally treated as GitHub
-  // shorthand here because this function is only called from the Clone dialog, which is
-  // specifically for remote repos. Users cloning local repos should use the "Local folder" tab.
-  if (GITHUB_SHORTHAND_PATTERN.test(shorthandCandidate)) {
-    // Strip existing .git suffix before appending to avoid double .git (e.g. owner/repo.git → owner/repo.git.git)
-    const withoutGitSuffix = shorthandCandidate.replace(/\.git$/i, "");
-    const httpsUrl = `https://github.com/${withoutGitSuffix}.git`;
-
-    // Prefer SSH for shorthand only when the current session has an active SSH agent.
-    // This avoids assuming GitHub access from unrelated key files on disk.
-    if (hasLikelySshCredentials()) {
-      // GitHub SSH requires a recognized key even for public repositories, and an agent
-      // socket does not prove one is available. Keep HTTPS as a fallback for readable repos.
-      return { cloneUrl: `git@github.com:${withoutGitSuffix}.git`, fallbackCloneUrl: httpsUrl };
-    }
-
-    return { cloneUrl: httpsUrl };
-  }
-
-  // Strip query strings and fragments only from URL-like inputs (protocol:// or git@),
-  // not from local paths where # and ? may be valid filename characters.
-  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmedRepoUrl) || trimmedRepoUrl.startsWith("git@")) {
-    return { cloneUrl: trimmedRepoUrl.replace(/[?#].*$/, "") };
-  }
-
-  return { cloneUrl: trimmedRepoUrl };
-}
-
 function parseScpStyleSshUrl(url: string): { host: string } | undefined {
   const trimmedUrl = url.trim();
 
@@ -424,6 +374,8 @@ function hasRegisteredSubProjectAncestor(
 
 export class ProjectService {
   private readonly fileCompletionsCache = new Map<string, FileCompletionsCacheEntry>();
+  /** Canonical paths with git initialization in flight; see create() claim below. */
+  private readonly activeGitInits = new Set<string>();
   private directoryPicker?: (initialPath?: string | null) => Promise<string | null>;
   private readonly sshPromptService: SshPromptService | undefined;
   private workspaceService?: WorkspaceRemover;
@@ -449,8 +401,10 @@ export class ProjectService {
   }
 
   async create(
-    projectPath: string
+    projectPath: string,
+    options?: { initGit?: boolean }
   ): Promise<Result<{ projectConfig: ProjectConfig; normalizedPath: string }>> {
+    let gitInitClaimKey: string | null = null;
     try {
       // Validate input
       if (!projectPath || projectPath.trim().length === 0) {
@@ -502,31 +456,84 @@ export class ProjectService {
         return Err("Project path is not a directory");
       }
 
+      if (options?.initGit && existingStat) {
+        const entries = await fsPromises.readdir(normalizedPath);
+        if (entries.length > 0) {
+          return Err("Directory already exists and is not empty");
+        }
+      }
+
       if (config.projects.has(normalizedPath)) {
         return Err("Project already exists");
       }
 
-      const createdDirectory = existingStat == null;
-      const cleanupCreatedDirectory = async () => {
-        if (!createdDirectory) return;
+      // Create the directory if it doesn't exist. The non-recursive mkdir on the leaf is
+      // an exclusive ownership claim: only the call that actually created the directory
+      // may remove it later, so concurrent creates of the same absent path cannot delete
+      // each other's work. Keep the user-facing path stable in config; Windows realpath
+      // may expand 8.3 short names and surprise callers.
+      let createdDirectory = false;
+      if (existingStat == null) {
         try {
-          await fsPromises.rm(normalizedPath, { recursive: true, force: true });
+          await fsPromises.mkdir(path.dirname(normalizedPath), { recursive: true });
+        } catch (error) {
+          const err = error as NodeJS.ErrnoException;
+          // Recursive mkdir never rejects an existing directory, so EEXIST here means a
+          // path component exists as a file: report it like ENOTDIR ("not a folder").
+          const friendly = friendlyFsError(
+            err.code === "EEXIST" ? { ...err, code: "ENOTDIR" } : error,
+            "create folder",
+            normalizedPath
+          );
+          if (friendly) {
+            return Err(friendly);
+          }
+          throw error;
+        }
+        try {
+          await fsPromises.mkdir(normalizedPath);
+          createdDirectory = true;
+        } catch (error) {
+          const err = error as NodeJS.ErrnoException;
+          if (err.code !== "EEXIST") {
+            const friendly = friendlyFsError(error, "create folder", normalizedPath);
+            if (friendly) {
+              return Err(friendly);
+            }
+            throw error;
+          }
+          // Lost a creation race: the path now belongs to the concurrent winner, so
+          // re-validate it as a pre-existing entry instead of claiming ownership.
+          const raceStat = await fsPromises.stat(normalizedPath).catch(() => null);
+          if (!raceStat?.isDirectory()) {
+            return Err("Project path is not a directory");
+          }
+          // Never git-init a directory that appeared mid-call: the winner may still be
+          // initializing it, and interleaved git operations could corrupt or delete its
+          // work. A retry sees the directory as pre-existing and validates it normally.
+          if (options?.initGit) {
+            return Err("Directory already exists");
+          }
+        }
+      }
+
+      let initializedGitDir = false;
+      const cleanupCreatedDirectory = async () => {
+        try {
+          if (createdDirectory) {
+            await fsPromises.rm(normalizedPath, { recursive: true, force: true });
+          } else if (initializedGitDir) {
+            // We only initialized git inside a pre-existing directory: remove the .git
+            // we created so a retry does not hit the non-empty-directory rejection.
+            await fsPromises.rm(path.join(normalizedPath, ".git"), {
+              recursive: true,
+              force: true,
+            });
+          }
         } catch (error) {
           log.error(`Failed to clean up rejected project directory ${normalizedPath}:`, error);
         }
       };
-
-      // Create the directory if it doesn't exist (like mkdir -p). Keep the user-facing
-      // path stable in config; Windows realpath may expand 8.3 short names and surprise callers.
-      try {
-        await fsPromises.mkdir(normalizedPath, { recursive: true });
-      } catch (error) {
-        const friendly = friendlyFsError(error, "create folder", normalizedPath);
-        if (friendly) {
-          return Err(friendly);
-        }
-        throw error;
-      }
       const canonicalPath = await resolveRealProjectPath(normalizedPath);
 
       if (config.projects.has(canonicalPath)) {
@@ -541,6 +548,17 @@ export class ProjectService {
       }
 
       const parentProjectPath = findDeepestTopLevelParentProject(normalizedPath, config.projects);
+      // Initializing a nested repository would flip the new directory's git root after
+      // the same-repository validation below, persisting a sub-project from a different
+      // repository (mirrors the clone-into-project-tree rejection). Check the canonical
+      // path too so a symlinked alias into a registered checkout cannot bypass this.
+      if (
+        options?.initGit &&
+        (parentProjectPath ?? findDeepestTopLevelParentProject(canonicalPath, config.projects))
+      ) {
+        await cleanupCreatedDirectory();
+        return Err("Cannot create a new git repository inside an existing project");
+      }
       if (parentProjectPath) {
         const [parentGitRoot, subProjectGitRoot] = await Promise.all([
           readGitTopLevel(parentProjectPath),
@@ -566,6 +584,24 @@ export class ProjectService {
             );
           }
         }
+      }
+
+      if (options?.initGit) {
+        // Exclusive per-canonical-path claim: two initGit creates targeting the same
+        // pre-existing empty directory would otherwise interleave git init and failure
+        // rollback, letting one call delete the .git the other just initialized.
+        if (this.activeGitInits.has(canonicalPath)) {
+          return Err("Another project creation is already initializing this directory");
+        }
+        this.activeGitInits.add(canonicalPath);
+        gitInitClaimKey = canonicalPath;
+
+        const gitInitResult = await this.initializeGitRepository(normalizedPath);
+        if (!gitInitResult.success) {
+          await cleanupCreatedDirectory();
+          return gitInitResult;
+        }
+        initializedGitDir = gitInitResult.data.initializedGitDir;
       }
 
       // Register the project inside the serialized editConfig transform, re-checking for
@@ -615,6 +651,17 @@ export class ProjectService {
         const hasNewDescendantProject = freshDescendantProjectPaths.some(
           (candidatePath) => !descendantProjectPaths.includes(candidatePath)
         );
+        // Re-check the canonical parent for initGit: the snapshot-time rejection above
+        // can miss a parent registered concurrently, and the lexical freshParent check
+        // below cannot see it when this path reaches the checkout through a symlink.
+        if (
+          options?.initGit &&
+          findDeepestTopLevelParentProject(canonicalPath, freshConfig.projects)
+        ) {
+          transformFailure = "hierarchy-changed";
+          createResult = Err("Project hierarchy changed concurrently; please retry");
+          return freshConfig;
+        }
         if (freshParentProjectPath !== parentProjectPath || hasNewDescendantProject) {
           // A new descendant registered under this path claims the directory tree we
           // created: recursive cleanup would delete that project's checkout, so treat
@@ -642,11 +689,36 @@ export class ProjectService {
       // depth and parent-only hierarchy rejections leave the directory ours to remove.
       if (transformFailure === "depth" || transformFailure === "hierarchy-changed") {
         await cleanupCreatedDirectory();
+      } else if (
+        (transformFailure === "hierarchy-changed-descendant" || transformFailure === "duplicate") &&
+        initializedGitDir
+      ) {
+        // The winning registration owns the files (a duplicate winner registered this
+        // exact pre-existing directory; a descendant winner lives inside it), but the
+        // .git this losing request created would silently turn the winner's project
+        // into a repository it never asked for, or wrap its checkout in an
+        // unregistered outer repository that changes git discovery.
+        await fsPromises
+          .rm(path.join(normalizedPath, ".git"), { recursive: true, force: true })
+          .catch((cleanupError: unknown) => {
+            log.error(`Failed to roll back git init in ${normalizedPath}:`, cleanupError);
+          });
+      }
+      if (createResult.success && !this.config.loadConfigOrDefault().projects.has(normalizedPath)) {
+        // Config persistence (editConfig → private saveConfig) logs-and-continues on
+        // write failures. Without this check a git-initialized project would report
+        // success, vanish after restart, and block retries on the leftover .git.
+        await cleanupCreatedDirectory();
+        return Err("Failed to save project configuration");
       }
       return createResult;
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to create project: ${message}`);
+    } finally {
+      if (gitInitClaimKey) {
+        this.activeGitInits.delete(gitInitClaimKey);
+      }
     }
   }
 
@@ -1382,6 +1454,70 @@ export class ProjectService {
     }
   }
 
+  /** Reports whether it created the `.git` directory so callers can roll that back. */
+  private async initializeGitRepository(
+    normalizedPath: string
+  ): Promise<Result<{ initializedGitDir: boolean }>> {
+    // Set before running `git init`: even a failing init can leave a partial .git
+    // behind (e.g. a broken init template), which must be rolled back too.
+    let initializedGitDir = false;
+    try {
+      const isGitRepo = await isGitRepository(normalizedPath);
+
+      if (isGitRepo) {
+        const branches = await listLocalBranches(normalizedPath);
+        if (branches.length > 0) {
+          return Err("Directory is already a git repository with commits");
+        }
+      } else {
+        initializedGitDir = true;
+        using initProc = execFileAsync("git", ["-C", normalizedPath, "init", "-b", "main"], {
+          // Inherited repository selectors (GIT_DIR/GIT_WORK_TREE) win over -C and
+          // would redirect init/commit into an unrelated external repository.
+          env: GIT_SCOPE_ENV_UNSET,
+        });
+        await initProc.result;
+      }
+
+      // A born branch is required by worktree and SSH runtimes. Keep the fallback
+      // identity scoped to this initial commit instead of changing repository config.
+      using commitProc = execFileAsync(
+        "git",
+        [
+          "-C",
+          normalizedPath,
+          "-c",
+          "user.name=mux",
+          "-c",
+          "user.email=mux@localhost",
+          "commit",
+          "--allow-empty",
+          "-m",
+          "Initial commit",
+        ],
+        { env: GIT_SCOPE_ENV_UNSET }
+      );
+      await commitProc.result;
+
+      this.fileCompletionsCache.delete(normalizedPath);
+      return Ok({ initializedGitDir });
+    } catch (error) {
+      // Roll back a .git we created (or that a failed init left partially behind) so
+      // the directory returns to its prior state and a retry is not rejected as
+      // non-empty (e.g. when the initial commit fails).
+      if (initializedGitDir) {
+        await fsPromises
+          .rm(path.join(normalizedPath, ".git"), { recursive: true, force: true })
+          .catch((cleanupError: unknown) => {
+            log.error(`Failed to roll back git init in ${normalizedPath}:`, cleanupError);
+          });
+      }
+      const message = getErrorMessage(error);
+      log.error("Failed to initialize git repository:", error);
+      return Err(`Failed to initialize git repository: ${message}`);
+    }
+  }
+
   /**
    * Initialize a git repository in the project directory.
    * Runs `git init` and creates an initial commit so branches exist.
@@ -1391,53 +1527,33 @@ export class ProjectService {
     if (typeof projectPath !== "string" || projectPath.trim().length === 0) {
       return Err("Project path is required");
     }
+    let claimKey: string | null = null;
     try {
       const validation = await validateProjectPath(projectPath);
       if (!validation.valid) {
         return Err(validation.error ?? "Invalid project path");
       }
       const normalizedPath = validation.expandedPath!;
-
-      const isGitRepo = await isGitRepository(normalizedPath);
-
-      if (isGitRepo) {
-        // Check if repo is "unborn" (git init but no commits yet)
-        const branches = await listLocalBranches(normalizedPath);
-        if (branches.length > 0) {
-          return Err("Directory is already a git repository with commits");
-        }
-        // Repo exists but is unborn - just create the initial commit
-      } else {
-        // Initialize git repository with main as default branch
-        using initProc = execFileAsync("git", ["-C", normalizedPath, "init", "-b", "main"]);
-        await initProc.result;
+      // Same exclusive claim as create(): concurrent initializations of one directory
+      // could double-commit or let one call's failure rollback delete the other's .git.
+      const canonicalPath = await resolveRealProjectPath(normalizedPath).catch(
+        () => normalizedPath
+      );
+      if (this.activeGitInits.has(canonicalPath)) {
+        return Err("Another project creation is already initializing this directory");
       }
-
-      // Create an initial empty commit so the branch exists and worktree/SSH can work
-      // Without a commit, the repo is "unborn" and has no branches
-      // Use -c flags to set identity only for this commit (don't persist to repo config)
-      using commitProc = execFileAsync("git", [
-        "-C",
-        normalizedPath,
-        "-c",
-        "user.name=mux",
-        "-c",
-        "user.email=mux@localhost",
-        "commit",
-        "--allow-empty",
-        "-m",
-        "Initial commit",
-      ]);
-      await commitProc.result;
-
-      // Invalidate file completions cache since the repo state changed
-      this.fileCompletionsCache.delete(normalizedPath);
-
-      return Ok(undefined);
+      this.activeGitInits.add(canonicalPath);
+      claimKey = canonicalPath;
+      const result = await this.initializeGitRepository(normalizedPath);
+      return result.success ? Ok(undefined) : result;
     } catch (error) {
       const message = getErrorMessage(error);
       log.error("Failed to initialize git repository:", error);
       return Err(`Failed to initialize git repository: ${message}`);
+    } finally {
+      if (claimKey) {
+        this.activeGitInits.delete(claimKey);
+      }
     }
   }
 

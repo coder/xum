@@ -9480,6 +9480,256 @@ describe("WorkspaceService remove lifecycle coordination", () => {
   });
 });
 
+describe("WorkspaceService registration-time plugin override sanitization", () => {
+  // A LocalRuntime checkout preserves .mux/mcp.local.jsonc across workspace
+  // removal, and a removed workspace is invisible to the Agent Plugin
+  // uninstaller's pruning/tombstones. Consent dies with the workspace:
+  // registering the directory as a NEW workspace sanitizes canonical plugin
+  // keys — unless a live sibling still resolves to the same path (its consent
+  // context is alive), and a failed sanitize aborts creation instead of
+  // silently activating stale enables.
+  interface SanitizeAccess {
+    sanitizeStalePluginOverridesForNewWorkspace(
+      workspaceId: string,
+      workspacePath: string,
+      persistentSiblingConfig?: Pick<Config, "loadConfigOrDefault">
+    ): Promise<string | undefined>;
+    pendingPluginSanitizations: Set<string>;
+    rollbackUnsanitizedWorkspaceRegistration(workspaceId: string): Promise<boolean>;
+  }
+
+  function makeService(
+    existingWorkspaces: Array<{ id: string; path: string; runtimeConfig?: unknown }>
+  ): WorkspaceService {
+    return createWorkspaceServiceForTest({
+      config: {
+        srcDir: "/tmp/src",
+        loadConfigOrDefault: mock(() => ({
+          projects: new Map([["/tmp/proj", { workspaces: existingWorkspaces }]]),
+        })),
+      } as unknown as Config,
+    });
+  }
+
+  test("sanitizes canonical plugin keys when no sibling shares the path", async () => {
+    const service = makeService([{ id: "ws-new", path: "/tmp/proj" }]);
+    const pruned: string[] = [];
+    service.setWorkspaceMcpOverridesService({
+      prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
+        pruned.push(`${workspaceId}:${keyPrefix}`);
+        return Promise.resolve();
+      },
+    });
+    const error = await (
+      service as unknown as SanitizeAccess
+    ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", "/tmp/proj");
+    expect(error).toBeUndefined();
+    expect(pruned).toEqual(["ws-new:plugin:"]);
+  });
+
+  test("skips sanitization when the live sibling is only visible in the persistent config", async () => {
+    // xum run / xum workflow register on an EPHEMERAL temp config whose
+    // project entries carry no workspace records; a desktop workspace live on
+    // the same checkout exists only in the persistent config. Pruning would
+    // strip enables that live consent context still owns from the shared
+    // .xum/mcp.local.jsonc — the persistent sibling must force a skip, while
+    // a persistent record for a DIFFERENT checkout must not.
+    const service = makeService([{ id: "ws-new", path: "/tmp/proj" }]);
+    const pruned: string[] = [];
+    service.setWorkspaceMcpOverridesService({
+      prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
+        pruned.push(`${workspaceId}:${keyPrefix}`);
+        return Promise.resolve();
+      },
+    });
+    const persistentWith = (workspacePath: string): Pick<Config, "loadConfigOrDefault"> =>
+      ({
+        loadConfigOrDefault: () => ({
+          projects: new Map([
+            ["/tmp/proj", { workspaces: [{ id: "ws-desktop", path: workspacePath }] }],
+          ]),
+        }),
+      }) as unknown as Pick<Config, "loadConfigOrDefault">;
+
+    const skip = await (
+      service as unknown as SanitizeAccess
+    ).sanitizeStalePluginOverridesForNewWorkspace(
+      "ws-new",
+      "/tmp/proj",
+      persistentWith("/tmp/proj")
+    );
+    expect(skip).toBeUndefined();
+    expect(pruned).toEqual([]);
+
+    const prune = await (
+      service as unknown as SanitizeAccess
+    ).sanitizeStalePluginOverridesForNewWorkspace(
+      "ws-new",
+      "/tmp/proj",
+      persistentWith("/tmp/other")
+    );
+    expect(prune).toBeUndefined();
+    expect(pruned).toEqual(["ws-new:plugin:"]);
+  });
+
+  test("refuses to prune when the persistent sibling config is unreadable", async () => {
+    // The lenient loadConfigOrDefault swallows a malformed ~/.xum/config.json
+    // into an EMPTY project map — which reads as "no live sibling" and would
+    // prune enables a live desktop workspace still owns. The persistent
+    // source must be read in throwing mode and sanitization must fail closed
+    // (abort the registration, leave the override file untouched).
+    const service = makeService([{ id: "ws-new", path: "/tmp/proj" }]);
+    const pruned: string[] = [];
+    service.setWorkspaceMcpOverridesService({
+      prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
+        pruned.push(`${workspaceId}:${keyPrefix}`);
+        return Promise.resolve();
+      },
+    });
+    const broken = {
+      loadConfigOrDefault: (options?: { throwOnError?: boolean }) => {
+        if (options?.throwOnError) {
+          throw new Error("config.json is malformed");
+        }
+        // A lenient read would hide the corruption behind an empty map.
+        return { projects: new Map() };
+      },
+    } as unknown as Pick<Config, "loadConfigOrDefault">;
+    const error = await (
+      service as unknown as SanitizeAccess
+    ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", "/tmp/proj", broken);
+    expect(error).toContain("unreadable");
+    expect(pruned).toEqual([]);
+  });
+
+  test("skips sanitization while a live sibling resolves to the same path", async () => {
+    // Conversation forks of a local workspace share the checkout: the
+    // sibling's consent context is alive, so its enables must survive.
+    const service = makeService([
+      { id: "ws-sibling", path: "/tmp/proj" },
+      { id: "ws-new", path: "/tmp/proj/" },
+    ]);
+    const pruned: string[] = [];
+    service.setWorkspaceMcpOverridesService({
+      prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
+        pruned.push(`${workspaceId}:${keyPrefix}`);
+        return Promise.resolve();
+      },
+    });
+    const error = await (
+      service as unknown as SanitizeAccess
+    ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", "/tmp/proj");
+    expect(error).toBeUndefined();
+    expect(pruned).toEqual([]);
+  });
+
+  test("a failed sanitize surfaces an error so creation aborts", async () => {
+    const service = makeService([{ id: "ws-new", path: "/tmp/proj" }]);
+    service.setWorkspaceMcpOverridesService({
+      prunePluginOverrideKeys: () =>
+        Promise.reject(new Error('duplicate "enabledServers" properties')),
+    });
+    const error = await (
+      service as unknown as SanitizeAccess
+    ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", "/tmp/proj");
+    expect(error).toContain("could not be sanitized");
+    expect(error).toContain("mcp.local.jsonc");
+  });
+
+  test("an off-host workspace with an equal path string is not a sibling", async () => {
+    // SSH/container paths occupy a different filesystem namespace: an equal
+    // STRING proves nothing about the local overrides file, and skipping
+    // would leave a stale enable to activate on the next local request.
+    const service = makeService([
+      { id: "ws-ssh", path: "/tmp/proj", runtimeConfig: { type: "ssh", host: "box" } },
+      { id: "ws-new", path: "/tmp/proj" },
+    ]);
+    const pruned: string[] = [];
+    service.setWorkspaceMcpOverridesService({
+      prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
+        pruned.push(`${workspaceId}:${keyPrefix}`);
+        return Promise.resolve();
+      },
+    });
+    const error = await (
+      service as unknown as SanitizeAccess
+    ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", "/tmp/proj");
+    expect(error).toBeUndefined();
+    expect(pruned).toEqual(["ws-new:plugin:"]);
+  });
+
+  test("a sibling registered through a symlinked spelling still forces a skip", async () => {
+    // Canonical (realpath) identity, not just spelling: pruning here would
+    // strip the live symlink-spelled sibling's enables from the shared file.
+    const realDir = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-sanitize-real-"));
+    const linkPath = `${realDir}-link`;
+    await fsPromises.symlink(realDir, linkPath);
+    try {
+      const service = makeService([
+        { id: "ws-symlink-sibling", path: linkPath },
+        { id: "ws-new", path: realDir },
+      ]);
+      const pruned: string[] = [];
+      service.setWorkspaceMcpOverridesService({
+        prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
+          pruned.push(`${workspaceId}:${keyPrefix}`);
+          return Promise.resolve();
+        },
+      });
+      const error = await (
+        service as unknown as SanitizeAccess
+      ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", realDir);
+      expect(error).toBeUndefined();
+      expect(pruned).toEqual([]);
+    } finally {
+      await fsPromises.rm(linkPath, { force: true });
+      await fsPromises.rm(realDir, { recursive: true, force: true });
+    }
+  });
+
+  test("an overlapping registration pending its own sanitization is not a sibling", async () => {
+    // Two creations for the same checkout can both persist config entries
+    // before either sanitizes; a not-yet-sanitized entry is no proof of live
+    // consent, so the scan must ignore it or BOTH creations skip pruning.
+    const service = makeService([
+      { id: "ws-concurrent", path: "/tmp/proj" },
+      { id: "ws-new", path: "/tmp/proj" },
+    ]);
+    (service as unknown as SanitizeAccess).pendingPluginSanitizations.add("ws-concurrent");
+    const pruned: string[] = [];
+    service.setWorkspaceMcpOverridesService({
+      prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
+        pruned.push(`${workspaceId}:${keyPrefix}`);
+        return Promise.resolve();
+      },
+    });
+    const error = await (
+      service as unknown as SanitizeAccess
+    ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", "/tmp/proj");
+    expect(error).toBeUndefined();
+    expect(pruned).toEqual(["ws-new:plugin:"]);
+  });
+
+  test("rollback verification detects a swallowed config write failure", async () => {
+    // Config.saveConfig logs and swallows write errors, so removeWorkspace
+    // can resolve while the entry survives on disk; the rollback must verify
+    // absence rather than trust the resolved promise.
+    const stuckWorkspaces = [{ id: "ws-stuck", path: "/tmp/proj" }];
+    const service = createWorkspaceServiceForTest({
+      config: {
+        removeWorkspace: mock(() => Promise.resolve()),
+        loadConfigOrDefault: mock(() => ({
+          projects: new Map([["/tmp/proj", { workspaces: stuckWorkspaces }]]),
+        })),
+      } as unknown as Config,
+    });
+    const access = service as unknown as SanitizeAccess;
+    expect(await access.rollbackUnsanitizedWorkspaceRegistration("ws-stuck")).toBe(false);
+    // A rollback that actually lands verifies clean.
+    expect(await access.rollbackUnsanitizedWorkspaceRegistration("ws-gone")).toBe(true);
+  });
+});
+
 describe("WorkspaceService remove timing rollup", () => {
   let historyService: HistoryService;
   let cleanupHistory: () => Promise<void>;
@@ -12373,6 +12623,44 @@ describe("WorkspaceService init cancellation", () => {
     expect(generateStableIdMock).not.toHaveBeenCalled();
   });
 
+  test("create() rejects slash branches whose sanitized workspace name already exists", async () => {
+    const projectPath = "/tmp/proj";
+    const generateStableIdMock = mock(() => "ws-conflict");
+    const mockConfig: Partial<Config> = {
+      rootDir: "/tmp/mux-root",
+      srcDir: "/tmp/src",
+      getSessionDir: mock(() => "/tmp/test/sessions"),
+      generateStableId: generateStableIdMock,
+      findWorkspace: mock(() => null),
+      loadConfigOrDefault: mock(() => ({
+        projects: new Map([
+          [
+            projectPath,
+            {
+              workspaces: [{ id: "existing", name: "feature-foo", path: "/tmp/proj/feature-foo" }],
+              trusted: true,
+            },
+          ],
+        ]),
+      })),
+    };
+    const workspaceService = createWorkspaceServiceForTest({
+      config: mockConfig,
+      historyService,
+    });
+
+    const result = await workspaceService.create(projectPath, "feature/foo", undefined, "title", {
+      type: "local",
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain('Branch "feature/foo"');
+      expect(result.error).toContain('workspace name "feature-foo"');
+    }
+    expect(generateStableIdMock).not.toHaveBeenCalled();
+  });
+
   test("archive() aborts init and still archives when init is running", async () => {
     const workspaceId = "ws-init-running";
 
@@ -13383,8 +13671,8 @@ describe("WorkspaceService fork", () => {
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
-    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
-      () => undefined
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+      Promise.resolve(undefined)
     );
     const copyPlanSpy = spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(
       undefined
@@ -13512,8 +13800,8 @@ describe("WorkspaceService fork", () => {
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
-    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
-      () => undefined
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+      Promise.resolve(undefined)
     );
     const copyPlanSpy = spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(
       undefined
@@ -13629,8 +13917,8 @@ describe("WorkspaceService fork", () => {
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
-    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
-      () => undefined
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+      Promise.resolve(undefined)
     );
     const copyPlanSpy = spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(
       undefined
@@ -13741,8 +14029,8 @@ describe("WorkspaceService fork", () => {
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
-    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
-      () => undefined
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+      Promise.resolve(undefined)
     );
     const copyPlanSpy = spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(
       undefined
@@ -13851,8 +14139,8 @@ describe("WorkspaceService fork", () => {
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
-    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
-      () => undefined
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+      Promise.resolve(undefined)
     );
     const copyPlanSpy = spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(
       undefined
@@ -13960,8 +14248,8 @@ describe("WorkspaceService fork", () => {
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
-    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
-      () => undefined
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+      Promise.resolve(undefined)
     );
     const copyPlanSpy = spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(
       undefined

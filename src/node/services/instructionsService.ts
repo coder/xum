@@ -88,7 +88,8 @@ export class InstructionsService {
       metadata,
       runtime,
       workspaceRootPath,
-      this.config.loadConfigOrDefault().projects
+      this.config.loadConfigOrDefault().projects,
+      this.aiService.isClaudeSkillsCompatEnabled()
     );
 
     const trimmedOverride = modelOverride?.trim();
@@ -131,7 +132,7 @@ export class InstructionsService {
     });
 
     const annotatedSources: InstructionSources = {
-      global: sources.global ? annotateSet(sources.global) : null,
+      global: sources.global.map(annotateSet),
       context: sources.context.map(annotateSet),
     };
     const annotatedFiles = flattenInstructionFiles(annotatedSources);

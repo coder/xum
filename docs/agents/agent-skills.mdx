@@ -49,7 +49,7 @@ After project skills, the remaining precedence order is **global (`~/.xum/skills
 
 ### Claude Code compatibility (experiment)
 
-Many repositories already ship skills in Claude Code's directories. Enable the **Claude skills compatibility** experiment (Settings → Experiments) to also discover skills from:
+Many repositories already ship skills in Claude Code's directories. Enable the **Claude compatibility** experiment (Settings → Experiments) to also discover skills from:
 
 - **Workspace-local**: `.claude/skills/<skill-name>/SKILL.md`
 - **Global**: `~/.claude/skills/<skill-name>/SKILL.md`
@@ -64,6 +64,8 @@ Enable the **Agent Plugins** experiment (Settings → Experiments) to also disco
 - **Global**: `~/.xum/plugins/<plugin>/` and `~/.agents/plugins/<plugin>/`
 
 Plugin skills have the lowest precedence within their scope and are read-only. A broken plugin (or a broken skill inside one) never affects other plugins or skills. Plugins can also ship MCP servers; see [MCP servers](/config/mcp-servers#agent-plugins-servers-experiment).
+
+Global plugins can be installed from git via **Settings → Plugins** (paste a git URL or `owner/repo[@ref]`); the install preview lists every skill the plugin would contribute before anything is written.
 
 ## Skill layout
 

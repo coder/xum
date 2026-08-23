@@ -1,3 +1,4 @@
+import * as os from "node:os";
 import path from "node:path";
 
 import {
@@ -17,6 +18,8 @@ import {
   type InstructionSources,
 } from "@/common/types/instructions";
 import {
+  CLAUDE_COMPAT_INSTRUCTIONS_DIRECTORY,
+  readClaudeCompatGlobalInstructionSet,
   readInstructionSet,
   readInstructionSetFromRuntime,
 } from "@/node/utils/main/instructionFiles";
@@ -308,7 +311,8 @@ export async function readToolInstructions(
   workspacePath: string,
   modelString: string,
   agentInstructions?: readonly string[],
-  projectConfigs?: Map<string, ProjectConfig>
+  projectConfigs?: Map<string, ProjectConfig>,
+  claudeSkillsCompatEnabled = false
 ): Promise<Record<string, string>> {
   // Tool instructions read the same `AGENTS.md` files as the system prompt;
   // anchor at the workspace root so sub-project workspaces still see parent
@@ -318,9 +322,14 @@ export async function readToolInstructions(
     metadata,
     runtime,
     workspaceRootPath,
-    projectConfigs
+    projectConfigs,
+    claudeSkillsCompatEnabled
   );
-  const globalContents = collectInstructionContents([sources.global]);
+  // Tool extraction joins sources highest-precedence first (agent → context →
+  // global), the opposite of prompt order. `sources.global` is compat-first
+  // for the prompt, so reverse it here to keep native guidance ahead of the
+  // ~/.claude/CLAUDE.md compatibility source.
+  const globalContents = collectInstructionContents([...sources.global].reverse());
   const contextContents = collectInstructionContents(sources.context);
 
   return extractToolInstructions(globalContents, contextContents, modelString, {
@@ -469,20 +478,32 @@ function deriveSubProjectRelativePath(projectPath: string, subProjectPath: strin
  * @param runtime - Runtime for reading workspace files (supports SSH)
  * @param workspacePath - Workspace directory path
  * @param projectConfigs - Project configs from ~/.mux/config.json for per-project customInstructions
- * @returns Structured instruction sources (global + ordered context entries)
+ * @param claudeSkillsCompatEnabled - Whether to include ~/.claude/CLAUDE.md before native globals
+ * @returns Structured instruction sources (ordered global and context entries)
  */
 export async function loadInstructionSources(
   metadata: WorkspaceMetadata,
   runtime: Runtime,
   workspaceRootPath: string,
-  projectConfigs?: Map<string, ProjectConfig>
+  projectConfigs?: Map<string, ProjectConfig>,
+  claudeSkillsCompatEnabled = false
 ): Promise<InstructionSources> {
   // `workspaceRootPath` is the parent project's checkout root — *without* the
   // optional sub-project segment. Callers that hand us the execution path
   // (root + subProject) for a sub-project workspace would silently lose the
   // parent project's AGENTS.md, so we require root explicitly. See
   // `resolveWorkspaceRootPath` in `@/node/runtime/runtimeHelpers`.
-  const global = await readInstructionSet(getSystemDirectory(), INSTRUCTION_SCOPE.GLOBAL);
+  const [claudeCompatGlobal, nativeGlobal] = await Promise.all([
+    claudeSkillsCompatEnabled
+      ? readClaudeCompatGlobalInstructionSet(
+          path.join(os.homedir(), CLAUDE_COMPAT_INSTRUCTIONS_DIRECTORY)
+        )
+      : Promise.resolve(null),
+    readInstructionSet(getSystemDirectory(), INSTRUCTION_SCOPE.GLOBAL),
+  ]);
+  const global = [claudeCompatGlobal, nativeGlobal].filter(
+    (set): set is InstructionSet => set != null
+  );
   const context = isMultiProject(metadata)
     ? await readMultiProjectContextInstructions(metadata, runtime, workspaceRootPath)
     : await readSingleProjectContextInstructions(metadata, runtime, workspaceRootPath);
@@ -545,7 +566,7 @@ function buildProjectSettingsInstructionSets(
  * Builds a system message for the AI model by combining instruction sources.
  *
  * Instruction layers:
- * 1. Global: ~/.xum/AGENTS.md (always included; Xum-dedicated)
+ * 1. Global: optional ~/.claude/CLAUDE.md compatibility source, then native ~/.xum/AGENTS.md
  * 2. Context: workspace/AGENTS.md (+ workspace/.xum/AGENTS.md) plus project repo instructions
  *    for multi-project workspaces, or workspace/AGENTS.md OR project/AGENTS.md for
  *    single-project workspaces, plus per-project `customInstructions` from
@@ -595,6 +616,8 @@ export async function buildSystemMessage(
      * `customInstructions` (Settings → Instructions) to the prompt.
      */
     projectConfigs?: Map<string, ProjectConfig>;
+    /** Read ~/.claude/CLAUDE.md as a lowest-precedence global compatibility source. */
+    claudeSkillsCompatEnabled?: boolean;
   }
 ): Promise<string> {
   if (!metadata) throw new Error("Invalid workspace metadata: metadata is required");
@@ -634,16 +657,17 @@ export async function buildSystemMessage(
     metadata,
     runtime,
     workspaceRootPath,
-    options?.projectConfigs
+    options?.projectConfigs,
+    options?.claudeSkillsCompatEnabled
   );
   // Xum-dedicated per-file contents (<dir>/.xum/AGENTS.md context files, then
-  // the global ~/.xum/AGENTS.md set, which is Xum-dedicated by construction).
+  // native ~/.xum global files). Claude compatibility instructions are shared.
   // Scoped Model:/Mode: directives are honored ONLY in Xum-dedicated sources
   // so a "Model: …" heading in a shared AGENTS.md (read by non-Xum agents too)
   // stays ordinary markdown. Extraction runs per file: a scoped section at the
   // end of one file must not swallow the next file's unscoped content.
   const muxContextContents = collectMuxOnlyInstructionContents(instructionSources.context);
-  const muxGlobalContents = collectMuxOnlyInstructionContents([instructionSources.global]);
+  const muxGlobalContents = collectMuxOnlyInstructionContents(instructionSources.global);
 
   const agentPromptSections = (options?.agentSystemPromptSections ?? [])
     .map((section) => section.trim())
@@ -680,7 +704,7 @@ export async function buildSystemMessage(
     return parts.length > 0 ? parts.join("\n\n") : undefined;
   };
 
-  const customInstructionSources = [instructionSources.global, ...instructionSources.context]
+  const customInstructionSources = [...instructionSources.global, ...instructionSources.context]
     .map(sanitizeSet)
     .filter((value): value is string => Boolean(value));
   const customInstructions = customInstructionSources.join("\n\n");
