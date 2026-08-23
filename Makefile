@@ -472,6 +472,9 @@ dist: build ## Build distributable packages
 ensure-mac-sharp-runtime-deps: node_modules/.installed
 	@bun install --frozen-lockfile --os=darwin --cpu=x64
 	@bun install --frozen-lockfile --os=darwin --cpu=arm64
+	@# Cross-arch installs repoint node_modules/.bin at the last-installed platform; a
+	@# host-native install restores them and keeps the darwin packages added above.
+	@bun install --frozen-lockfile
 	@for dir in \
 		node_modules/@img/sharp-darwin-x64 \
 		node_modules/@img/sharp-libvips-darwin-x64 \
