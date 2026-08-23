@@ -50,3 +50,8 @@ export function getTerminalSessionId(tab: TabType): string | undefined {
 export function makeTerminalTabType(sessionId?: string): TabType {
   return sessionId ? `terminal:${sessionId}` : "terminal";
 }
+
+/** Default terminal tab name when no OSC title has been set (0-based index). */
+export function getTerminalTabFallbackName(terminalIndex: number): string {
+  return terminalIndex === 0 ? "Terminal" : `Terminal ${terminalIndex + 1}`;
+}

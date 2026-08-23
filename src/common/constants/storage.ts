@@ -525,6 +525,77 @@ export function normalizeTerminalFontConfig(value: unknown): TerminalFontConfig 
 }
 
 /**
+ * Terminal badge overlay configuration (global)
+ * Scroll-fixed workspace/tab watermark rendered above the terminal canvas,
+ * similar to iTerm2 badges. Stores: { enabled, template, position, opacity, fontSize }
+ */
+export const TERMINAL_BADGE_CONFIG_KEY = "terminalBadgeConfig";
+
+export const TERMINAL_BADGE_POSITIONS = [
+  "top-left",
+  "top-right",
+  "bottom-left",
+  "bottom-right",
+] as const;
+export type TerminalBadgePosition = (typeof TERMINAL_BADGE_POSITIONS)[number];
+
+export interface TerminalBadgeConfig {
+  enabled: boolean;
+  /** Supports {workspace}, {tab}, and {project} tokens. */
+  template: string;
+  position: TerminalBadgePosition;
+  /** 0-1 */
+  opacity: number;
+  fontSize: number;
+}
+
+export const DEFAULT_TERMINAL_BADGE_CONFIG: TerminalBadgeConfig = {
+  enabled: false,
+  template: "{workspace} · {tab}",
+  position: "top-right",
+  opacity: 0.4,
+  fontSize: 16,
+};
+
+function isTerminalBadgePosition(value: unknown): value is TerminalBadgePosition {
+  return (
+    typeof value === "string" && TERMINAL_BADGE_POSITIONS.includes(value as TerminalBadgePosition)
+  );
+}
+
+export function normalizeTerminalBadgeConfig(value: unknown): TerminalBadgeConfig {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return DEFAULT_TERMINAL_BADGE_CONFIG;
+  }
+
+  const record = value as {
+    enabled?: unknown;
+    template?: unknown;
+    position?: unknown;
+    opacity?: unknown;
+    fontSize?: unknown;
+  };
+  const enabled = record.enabled === true;
+  const template =
+    typeof record.template === "string" ? record.template : DEFAULT_TERMINAL_BADGE_CONFIG.template;
+  const position = isTerminalBadgePosition(record.position)
+    ? record.position
+    : DEFAULT_TERMINAL_BADGE_CONFIG.position;
+  const opacityNumber = Number(record.opacity);
+  const opacity =
+    Number.isFinite(opacityNumber) && opacityNumber > 0 && opacityNumber <= 1
+      ? opacityNumber
+      : DEFAULT_TERMINAL_BADGE_CONFIG.opacity;
+  const fontSizeNumber = Number(record.fontSize);
+  const fontSize =
+    Number.isFinite(fontSizeNumber) && fontSizeNumber > 0
+      ? fontSizeNumber
+      : DEFAULT_TERMINAL_BADGE_CONFIG.fontSize;
+
+  return { enabled, template, position, opacity, fontSize };
+}
+
+/**
  * Tutorial state storage key (global)
  * Stores: { disabled: boolean, completed: { creation?: true, workspace?: true, review?: true } }
  */

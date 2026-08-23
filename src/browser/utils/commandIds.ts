@@ -41,6 +41,7 @@ export const CommandIds = {
   navPrev: () => "nav:prev" as const,
   navToggleSidebar: () => "nav:toggleSidebar" as const,
   navToggleHideSubAgents: () => "nav:toggle-hide-subagents" as const,
+  navToggleTerminalBadge: () => "nav:toggle-terminal-badge" as const,
   navRightSidebarFocusTerminal: () => "nav:rightSidebar:focusTerminal" as const,
   navRightSidebarSplitHorizontal: () => "nav:rightSidebar:splitHorizontal" as const,
   navRightSidebarSplitVertical: () => "nav:rightSidebar:splitVertical" as const,

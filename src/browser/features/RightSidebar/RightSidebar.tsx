@@ -58,6 +58,7 @@ import {
   isTabType,
   isTerminalTab,
   getTerminalSessionId,
+  getTerminalTabFallbackName,
   makeTerminalTabType,
   type TabType,
 } from "@/browser/types/rightSidebar";
@@ -548,13 +549,15 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
         )}
 
         {/* Render all terminal tabs (keep-alive: hidden but mounted) */}
-        {terminalTabs.map((terminalTab) => {
+        {terminalTabs.map((terminalTab, terminalIndex) => {
           const terminalTabId = `${tabsetBaseId}-tab-${terminalTab}`;
           const terminalPanelId = `${tabsetBaseId}-panel-${terminalTab}`;
           const isActive = props.node.activeTab === terminalTab;
           // Check if this terminal should be auto-focused (was just opened via keybind)
           const terminalSessionId = getTerminalSessionId(terminalTab);
           const shouldAutoFocus = isActive && terminalSessionId === props.autoFocusTerminalSession;
+          const tabName =
+            props.terminalTitles.get(terminalTab) ?? getTerminalTabFallbackName(terminalIndex);
 
           return (
             <div
@@ -569,6 +572,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
                 workspaceId={props.workspaceId}
                 tabType={terminalTab}
                 visible={isActive}
+                tabName={tabName}
                 onTitleChange={(title) => props.onTerminalTitleChange(terminalTab, title)}
                 autoFocus={shouldAutoFocus}
                 onAutoFocusConsumed={shouldAutoFocus ? props.onAutoFocusConsumed : undefined}

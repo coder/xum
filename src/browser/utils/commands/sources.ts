@@ -24,8 +24,12 @@ import assert from "@/common/utils/assert";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import {
+  DEFAULT_TERMINAL_BADGE_CONFIG,
   RIGHT_SIDEBAR_COLLAPSED_KEY,
   SIDEBAR_HIDE_SUBAGENTS_KEY,
+  TERMINAL_BADGE_CONFIG_KEY,
+  normalizeTerminalBadgeConfig,
+  type TerminalBadgeConfig,
 } from "@/common/constants/storage";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { CommandIds } from "@/browser/utils/commandIds";
@@ -715,6 +719,29 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
         keywords: ["sub-agents", "subagents", "hide", "show", "sidebar"],
         run: () => {
           updatePersistedState<boolean>(SIDEBAR_HIDE_SUBAGENTS_KEY, (prev) => !prev, false);
+        },
+      },
+      {
+        id: CommandIds.navToggleTerminalBadge(),
+        title: "Toggle Terminal Badge",
+        subtitle: `Current: ${
+          normalizeTerminalBadgeConfig(
+            readPersistedState(TERMINAL_BADGE_CONFIG_KEY, DEFAULT_TERMINAL_BADGE_CONFIG)
+          ).enabled
+            ? "Shown"
+            : "Hidden"
+        }`,
+        section: section.navigation,
+        keywords: ["terminal", "badge", "watermark", "overlay", "workspace", "tab"],
+        run: () => {
+          updatePersistedState<TerminalBadgeConfig>(
+            TERMINAL_BADGE_CONFIG_KEY,
+            (prev) => {
+              const config = normalizeTerminalBadgeConfig(prev);
+              return { ...config, enabled: !config.enabled };
+            },
+            DEFAULT_TERMINAL_BADGE_CONFIG
+          );
         },
       },
     ];
