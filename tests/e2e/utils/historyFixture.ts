@@ -210,6 +210,7 @@ export async function seedWorkspaceHistoryProfile(args: {
 
   const historyService = new HistoryService({
     getSessionDir: (workspaceId: string) => path.join(demoProject.sessionsDir, workspaceId),
+    rootDir: path.dirname(demoProject.sessionsDir),
   });
 
   await fsPromises.writeFile(demoProject.historyPath, "", "utf-8");

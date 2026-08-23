@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import { defaultConfig } from "@/node/config";
 import { HistoryService } from "@/node/services/historyService";
 import { ProviderService } from "@/node/services/providerService";
@@ -19,7 +20,11 @@ export function resolveReplaySessionDir(workspaceId: string): {
   if (workspaceId === REPLAY_FIXTURE_WORKSPACE_ID) {
     return {
       sessionDir: REPLAY_FIXTURE_DIR,
-      historyService: new HistoryService({ getSessionDir: () => REPLAY_FIXTURE_DIR }),
+      historyService: new HistoryService({
+        getSessionDir: () => REPLAY_FIXTURE_DIR,
+        // Read-only verification: rootDir only locates write locks/tombstones.
+        rootDir: path.dirname(REPLAY_FIXTURE_DIR),
+      }),
     };
   }
   return {

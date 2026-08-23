@@ -9,6 +9,10 @@ import { createHash } from "node:crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import {
+  historyWriteLockPath,
+  workspaceRemovalTombstonePath,
+} from "@/node/services/workspaceRemoval";
 
 /** Collect all messages via iterateFullHistory (replaces removed getFullHistory). */
 async function collectFullHistory(service: HistoryService, workspaceId: string) {
@@ -384,7 +388,9 @@ describe("HistoryService", () => {
       // replacement — built from contents read before the foreign append —
       // would silently delete the foreign row.
       const foreign = await acquireProcessFileLock({
-        lockPath: path.join(config.getSessionDir(workspaceId), "history.lock"),
+        // r63: the history write lock lives outside the session directory so
+        // removal can hold it across its tombstone+delete critical section.
+        lockPath: historyWriteLockPath(config.rootDir, workspaceId),
         timeoutMs: 5_000,
         label: "test foreign backend",
       });
@@ -405,6 +411,30 @@ describe("HistoryService", () => {
       expect(result.success).toBe(true);
       const messages = await collectFullHistory(service, workspaceId);
       expect(messages.map((m) => m.id)).toEqual(["msg1", "payload-1", "trigger-1"]);
+    });
+
+    it("refuses history mutations for a removed workspace without recreating its session dir (r63)", async () => {
+      // A foreign backend's in-flight stream survives the remover's
+      // process-local cancellation; once removal's tombstone is durable, a
+      // late append must fail instead of recreating the deleted session
+      // directory via ensurePrivateDir.
+      const workspaceId = "removed-history-workspace";
+      const tombstonePath = workspaceRemovalTombstonePath(config.rootDir, workspaceId);
+      await fs.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await fs.writeFile(tombstonePath, JSON.stringify({ workspaceId, removedAt: Date.now() }));
+
+      const result = await service.appendToHistory(
+        workspaceId,
+        createMuxMessage("late-append", "assistant", "must not land")
+      );
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("removed");
+      expect(
+        await fs.access(config.getSessionDir(workspaceId)).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
     });
 
     it("advances the sequence counter past foreign rows under the write lock (r51)", async () => {

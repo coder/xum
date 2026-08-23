@@ -33,13 +33,17 @@ import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReas
 import { getErrorMessage } from "@/common/utils/errors";
 import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import {
+  historyWriteLockPath,
+  isWorkspaceRemovalTombstoned,
+} from "@/node/services/workspaceRemoval";
 
-/** Cross-process history write lock (r50/r51); lives in the session directory. */
-const HISTORY_WRITE_LOCK_FILENAME = "history.lock";
 /**
  * Generous bound on waiting for a foreign backend's write: legitimate holds
  * are one append or one read+replace of the active file (ms). A timeout
- * fails the mutation visibly instead of corrupting history.
+ * fails the mutation visibly instead of corrupting history. The lockfile
+ * itself lives OUTSIDE the session directory (r63, historyWriteLockPath) so
+ * workspace removal can hold it across its tombstone+delete critical section.
  */
 const HISTORY_WRITE_LOCK_TIMEOUT_MS = 10_000;
 
@@ -199,9 +203,9 @@ export class HistoryService {
   // Shared file operation lock across all workspace file services
   // This prevents deadlocks when operations compose while touching the same workspace files.
   private readonly fileLocks = workspaceFileLocks;
-  private readonly config: Pick<Config, "getSessionDir">;
+  private readonly config: Pick<Config, "getSessionDir" | "rootDir">;
 
-  constructor(config: Pick<Config, "getSessionDir">) {
+  constructor(config: Pick<Config, "getSessionDir" | "rootDir">) {
     this.config = config;
   }
 
@@ -1888,14 +1892,26 @@ export class HistoryService {
     operation: () => Promise<T>
   ): Promise<T> {
     const sessionDir = this.config.getSessionDir(workspaceId);
-    // The lock helper creates missing parent directories with default
-    // permissions; create the session dir with private permissions first.
-    await ensurePrivateDir(sessionDir);
+    // Lock BEFORE any directory creation (r63): the lockfile lives outside
+    // the session dir, and removal holds this same lock while it tombstones
+    // and deletes — so a mutation serializes with removal instead of racing
+    // its own ensurePrivateDir against the deletion.
     await using _lock = await acquireProcessFileLock({
-      lockPath: path.join(sessionDir, HISTORY_WRITE_LOCK_FILENAME),
+      lockPath: historyWriteLockPath(this.config.rootDir, workspaceId),
       timeoutMs: HISTORY_WRITE_LOCK_TIMEOUT_MS,
       label: "history write lock",
     });
+    // Removal gate (r63), checked IN-LOCK: a foreign backend's in-flight
+    // stream survives the remover's process-local cancellation entirely; its
+    // late append would otherwise recreate the deleted session directory via
+    // ensurePrivateDir below. Throwing here surfaces as a normal Err through
+    // withRecoveredHistoryResultLock.
+    if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+      throw new Error(`workspace ${workspaceId} was removed; refusing history mutation`);
+    }
+    // Create the session dir with private permissions only for a live
+    // workspace (writeFileAtomic and appends assume the parent exists).
+    await ensurePrivateDir(sessionDir);
     return await operation();
   }
 

@@ -10,8 +10,11 @@ import {
 } from "@/node/services/refinement/targetMutationLocks";
 import { getProcessBirth } from "@/node/utils/concurrency/fileLock";
 import {
+  healRemovalTombstonesForRegisteredWorkspaces,
   isWorkspaceRemovalTombstoned,
+  REMOVAL_TOMBSTONE_HEAL_MIN_AGE_MS,
   removeSessionDirUnderMemoryLocks,
+  TombstoneNotDurableError,
   workspaceRemovalTombstonePath,
 } from "./workspaceRemoval";
 
@@ -109,4 +112,55 @@ describe("workspaceRemoval", () => {
     ).toBe(true);
     expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(true);
   }, 15_000);
+
+  test("aborts with TombstoneNotDurableError when no marker can be written (r63)", async () => {
+    // Without a durable marker, deregistering would leave the orphan
+    // writable by foreign backends once the transient failure clears — the
+    // caller must keep the workspace registered and retry.
+    using tmp = new DisposableTempDir("workspace-removal-test");
+    const rootDir = path.join(tmp.path, "xum-home");
+    const workspaceId = "ws-enospc";
+    const sessionDir = path.join(rootDir, "sessions", workspaceId);
+    await fsPromises.mkdir(path.join(sessionDir, "memory"), { recursive: true });
+    // Blocking `<rootDir>/locks` with a FILE makes both the lock acquisition
+    // and every tombstone publication attempt fail.
+    await fsPromises.writeFile(path.join(rootDir, "locks"), "not a directory");
+
+    try {
+      await removeSessionDirUnderMemoryLocks({ rootDir, sessionDir, workspaceId });
+      expect.unreachable("removal must abort when the tombstone cannot be published");
+    } catch (error) {
+      expect(error).toBeInstanceOf(TombstoneNotDurableError);
+    }
+    expect(
+      await fsPromises.access(sessionDir).then(
+        () => true,
+        () => false
+      )
+    ).toBe(true);
+  }, 15_000);
+
+  test("startup heal reclaims old tombstones only for still-registered workspaces (r63)", async () => {
+    using tmp = new DisposableTempDir("workspace-removal-test");
+    const rootDir = path.join(tmp.path, "xum-home");
+    const write = async (workspaceId: string, removedAt: number) => {
+      const p = workspaceRemovalTombstonePath(rootDir, workspaceId);
+      await fsPromises.mkdir(path.dirname(p), { recursive: true });
+      await fsPromises.writeFile(p, JSON.stringify({ workspaceId, removedAt }));
+    };
+    const old = Date.now() - REMOVAL_TOMBSTONE_HEAL_MIN_AGE_MS - 1_000;
+    await write("ws-bricked-registered", old); // failure residue → heal
+    await write("ws-mid-removal", Date.now()); // fresh: may be a removal in flight → keep
+    await write("ws-gone", old); // deregistered long ago (normal terminal state) → keep
+
+    const registered = new Set(["ws-bricked-registered", "ws-mid-removal"]);
+    await healRemovalTombstonesForRegisteredWorkspaces({
+      rootDir,
+      findWorkspace: (id) => (registered.has(id) ? { id } : undefined),
+    });
+
+    expect(await isWorkspaceRemovalTombstoned(rootDir, "ws-bricked-registered")).toBe(false);
+    expect(await isWorkspaceRemovalTombstoned(rootDir, "ws-mid-removal")).toBe(true);
+    expect(await isWorkspaceRemovalTombstoned(rootDir, "ws-gone")).toBe(true);
+  });
 });

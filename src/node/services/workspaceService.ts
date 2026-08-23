@@ -100,7 +100,9 @@ import {
   startAbandonedBranchSummaryInBackground,
 } from "@/node/services/branchSummary";
 import {
+  healRemovalTombstonesForRegisteredWorkspaces,
   removeSessionDirUnderMemoryLocks,
+  TombstoneNotDurableError,
   workspaceRemovalTombstonePath,
 } from "@/node/services/workspaceRemoval";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
@@ -2076,6 +2078,14 @@ export class WorkspaceService extends EventEmitter {
     this.aiService.on("providers-config-changed", this.providerConfigChangedListener);
     this.setupMetadataListeners();
     this.setupInitMetadataListeners();
+    // r63 startup self-heal: reclaim removal tombstones left behind by a
+    // removal whose config deregistration AND tombstone rollback both failed
+    // — otherwise that workspace stays registered but refused every mutation
+    // across restarts. Fire-and-forget with an explicit catch (startup
+    // initialization must never crash the app).
+    healRemovalTombstonesForRegisteredWorkspaces(this.config).catch((error: unknown) => {
+      log.debug("Removal tombstone self-heal failed at startup", { error });
+    });
   }
 
   /**
@@ -5528,6 +5538,13 @@ export class WorkspaceService extends EventEmitter {
           workspaceId,
         });
       } catch (error) {
+        // r63: without a durable tombstone the retained orphan stays
+        // writable by foreign backends forever — abort the removal (the
+        // workspace stays registered and retryable) instead of proceeding
+        // to deregistration below.
+        if (error instanceof TombstoneNotDurableError) {
+          throw error;
+        }
         log.error(`Failed to remove session directory for ${workspaceId}:`, error);
       }
 
@@ -5565,7 +5582,18 @@ export class WorkspaceService extends EventEmitter {
         // the drained-producers tradeoff documented above.
         await fsPromises
           .rm(workspaceRemovalTombstonePath(this.config.rootDir, workspaceId), { force: true })
-          .catch(() => undefined);
+          .catch((rollbackError: unknown) => {
+            // r63: a failed rollback must not be silent — the workspace
+            // would stay registered but refused every mutation across
+            // restarts. The startup self-heal
+            // (healRemovalTombstonesForRegisteredWorkspaces) reclaims this
+            // exact residue once the tombstone ages past its guard window.
+            log.error(
+              "Failed to roll back the removal tombstone after config deregistration failed; " +
+                "the startup self-heal will reclaim it",
+              { workspaceId, rollbackError }
+            );
+          });
         throw error;
       }
       removedFromConfig = true;

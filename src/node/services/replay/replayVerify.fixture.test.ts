@@ -12,6 +12,7 @@
  */
 
 import { beforeAll, describe, expect, test } from "bun:test";
+import * as path from "node:path";
 import type { MuxMessage } from "@/common/types/message";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { HistoryService } from "@/node/services/historyService";
@@ -31,7 +32,10 @@ import {
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 
 async function readFixtureHistory(): Promise<MuxMessage[]> {
-  const historyService = new HistoryService({ getSessionDir: () => REPLAY_FIXTURE_DIR });
+  const historyService = new HistoryService({
+    getSessionDir: () => REPLAY_FIXTURE_DIR,
+    rootDir: path.dirname(REPLAY_FIXTURE_DIR),
+  });
   const result = await collectFullHistory(historyService, REPLAY_FIXTURE_WORKSPACE_ID);
   if (!result.success) {
     throw new Error(`fixture history read failed: ${result.error}`);

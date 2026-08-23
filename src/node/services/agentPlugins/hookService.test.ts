@@ -554,7 +554,10 @@ describe("replay determinism with hooks active", () => {
     expect(hookRows[0].data.text).toBe("House rule: never commit secrets.");
 
     // ...and byte-level replay verification passes with the hook active.
-    const historyService = new HistoryService({ getSessionDir: () => harness.sessionDir });
+    const historyService = new HistoryService({
+      getSessionDir: () => harness.sessionDir,
+      rootDir: path.dirname(harness.sessionDir),
+    });
     const history = await collectFullHistory(historyService, REPLAY_FIXTURE_WORKSPACE_ID);
     expect(history.success).toBe(true);
     if (!history.success) throw new Error("history read failed");

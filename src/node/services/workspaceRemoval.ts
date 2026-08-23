@@ -33,11 +33,49 @@ import * as path from "node:path";
 import writeFileAtomic from "write-file-atomic";
 
 import assert from "@/common/utils/assert";
+import { log } from "@/node/services/log";
 import {
   memoryMutationLockKey,
   withTargetMutationLocks,
 } from "@/node/services/refinement/targetMutationLocks";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+
+/**
+ * Removal failed WITHOUT a durable tombstone (r63). Callers must abort
+ * workspace deregistration in this case: without the marker, a foreign
+ * backend's consolidation would keep mutating and journaling into the
+ * retained session directory forever once the transient failure (e.g.
+ * ENOSPC) clears — while the workspace no longer exists anywhere else.
+ * Keeping the workspace registered keeps removal retryable instead.
+ */
+export class TombstoneNotDurableError extends Error {
+  constructor(workspaceId: string, options?: ErrorOptions) {
+    super(
+      `Removal tombstone for workspace ${workspaceId} could not be made durable; aborting removal`,
+      options
+    );
+    this.name = "TombstoneNotDurableError";
+  }
+}
+
+/**
+ * Cross-process history write lock path (r63) — OUTSIDE the session
+ * directory. The lock used to live at `<sessionDir>/history.lock`, which
+ * removal deletes with the directory: a foreign backend's in-flight append
+ * would resume against a vanished lock and recreate the session directory
+ * via its own ensurePrivateDir. External placement lets removal acquire the
+ * SAME lock before deleting, and lets the post-acquisition tombstone gate in
+ * HistoryService refuse late appends. (Mixed-version fleets briefly lose
+ * cross-process append serialization during a rolling upgrade; multi-instance
+ * mode is an experimental env flag, and single-instance safety is unaffected
+ * because the in-process history mutex still serializes.)
+ */
+export function historyWriteLockPath(rootDir: string, workspaceId: string): string {
+  assert(workspaceId.length > 0, "historyWriteLockPath requires a workspace id");
+  const digest = crypto.createHash("sha256").update(workspaceId).digest("hex").slice(0, 32);
+  return path.join(rootDir, "locks", `history-${digest}.lock`);
+}
 
 /** Durable tombstone path for one removed workspace (hashed: IDs are user-influenced). */
 export function workspaceRemovalTombstonePath(rootDir: string, workspaceId: string): string {
@@ -87,6 +125,10 @@ export async function removeSessionDirUnderMemoryLocks(args: {
     path.join(args.sessionDir, "memory")
   );
   const sharedMemoryKey = memoryMutationLockKey(args.rootDir, path.join(args.rootDir, "memory"));
+  // The session dir itself is a third target key (r63): session-scoped
+  // sidecar writers (headless usage) serialize their tombstone check +
+  // commit against this same key, closing their check→write window.
+  const sessionDirKey = path.resolve(args.sessionDir);
   const publishTombstone = async (): Promise<void> => {
     const tombstonePath = workspaceRemovalTombstonePath(args.rootDir, args.workspaceId);
     await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
@@ -96,14 +138,28 @@ export async function removeSessionDirUnderMemoryLocks(args: {
     );
   };
   try {
-    await withTargetMutationLocks(args.rootDir, [workspaceMemoryKey, sharedMemoryKey], async () => {
-      // Tombstone BEFORE rm: once the locks release, any waiting writer
-      // re-checks it pre-commit (inside its own lock) and refuses, so the
-      // deleted directory cannot be recreated by a late mutation or journal
-      // append.
-      await publishTombstone();
-      await fsPromises.rm(args.sessionDir, { recursive: true, force: true });
-    });
+    await withTargetMutationLocks(
+      args.rootDir,
+      [sessionDirKey, workspaceMemoryKey, sharedMemoryKey],
+      async () => {
+        // History append serialization (r63): a foreign backend's in-flight
+        // stream can be mid-append under the history write lock; acquiring
+        // that same (session-dir-external) lock here means the append either
+        // commits before the deletion below or starts afterwards and hits
+        // HistoryService's in-lock tombstone gate.
+        await using _historyLock = await acquireProcessFileLock({
+          lockPath: historyWriteLockPath(args.rootDir, args.workspaceId),
+          timeoutMs: 10_000,
+          label: "history write lock (removal)",
+        });
+        // Tombstone BEFORE rm: once the locks release, any waiting writer
+        // re-checks it pre-commit (inside its own lock) and refuses, so the
+        // deleted directory cannot be recreated by a late mutation or
+        // journal append.
+        await publishTombstone();
+        await fsPromises.rm(args.sessionDir, { recursive: true, force: true });
+      }
+    );
   } catch (error) {
     // Fail-closed orphan path (r62): a wedged writer blocks the deletion,
     // but the caller proceeds to deregister the workspace regardless — so
@@ -112,7 +168,68 @@ export async function removeSessionDirUnderMemoryLocks(args: {
     // forever. Publishing outside the locks is safe on THIS path precisely
     // because the directory is not deleted: a writer mid-commit lands in
     // the orphan, and every later mutation observes the tombstone.
-    await publishTombstone().catch(() => undefined);
+    try {
+      await publishTombstone();
+    } catch (publishError) {
+      // No durable marker could be written at all (r63, e.g. ENOSPC):
+      // deregistering now would leave the orphan writable again the moment
+      // the transient failure clears. Signal the caller to ABORT the
+      // removal so the workspace stays registered and retryable.
+      throw new TombstoneNotDurableError(args.workspaceId, { cause: publishError });
+    }
     throw error;
+  }
+}
+
+/**
+ * Minimum tombstone age before the startup self-heal below may reclaim it.
+ * A FRESH tombstone for a still-registered workspace is normal: removal
+ * publishes the marker before config deregistration lands, so another
+ * backend's in-flight removal looks exactly like the failure residue for a
+ * few seconds. Only markers old enough that no healthy removal could still
+ * be between those two steps are healed.
+ */
+export const REMOVAL_TOMBSTONE_HEAL_MIN_AGE_MS = 10 * 60_000;
+
+/**
+ * Startup self-heal (r63): a REGISTERED workspace with an old removal
+ * tombstone is the residue of a removal whose config deregistration failed
+ * AND whose compensating tombstone rollback also failed — without healing,
+ * every memory/history/usage mutation for that workspace stays refused
+ * across restarts (permanently bricked). Deleting the marker restores the
+ * workspace; the user can retry removal. Tombstones for workspaces absent
+ * from config (the normal terminal state) are retained forever. Never
+ * throws: startup initialization must not crash the app.
+ */
+export async function healRemovalTombstonesForRegisteredWorkspaces(config: {
+  rootDir: string;
+  findWorkspace(workspaceId: string): unknown;
+}): Promise<void> {
+  let entries: string[];
+  try {
+    entries = await fsPromises.readdir(path.join(config.rootDir, "locks"));
+  } catch {
+    return; // No locks dir: nothing to heal.
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith("workspace-removed-") || !entry.endsWith(".json")) continue;
+    const filePath = path.join(config.rootDir, "locks", entry);
+    try {
+      const parsed = JSON.parse(await fsPromises.readFile(filePath, "utf-8")) as {
+        workspaceId?: unknown;
+        removedAt?: unknown;
+      };
+      if (typeof parsed.workspaceId !== "string" || typeof parsed.removedAt !== "number") continue;
+      if (Date.now() - parsed.removedAt < REMOVAL_TOMBSTONE_HEAL_MIN_AGE_MS) continue;
+      if (config.findWorkspace(parsed.workspaceId) == null) continue;
+      await fsPromises.rm(filePath, { force: true });
+      log.warn(
+        "Healed a removal tombstone for a still-registered workspace (previous removal failed mid-flight)",
+        { workspaceId: parsed.workspaceId }
+      );
+    } catch (error) {
+      // Per-entry isolation: one unreadable marker must not stop the sweep.
+      log.debug("Skipping unreadable removal tombstone during self-heal", { entry, error });
+    }
   }
 }
