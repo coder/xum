@@ -3,6 +3,7 @@ import { AlertTriangle, Loader2 } from "lucide-react";
 
 import { Button } from "@/browser/components/Button/Button";
 import { Input } from "@/browser/components/Input/Input";
+import { getErrorMessage } from "@/common/utils/errors";
 
 import {
   CoderWorkspaceForm,
@@ -153,6 +154,16 @@ function CodeWorkspaceSyncField(props: { projectPath: string }) {
   const draftValue = draft ?? savedPath;
   const isDirty = draftValue.trim() !== savedPath;
 
+  // DOM attributes must not receive promise-returning handlers
+  // (@typescript-eslint/no-misused-promises), so instead of awaiting inline,
+  // unexpected rejections are explicitly routed into the visible error state.
+  const saveDraft = () => {
+    void handleSave().catch((saveError: unknown) => {
+      setError(getErrorMessage(saveError));
+      setSaving(false);
+    });
+  };
+
   const handleSave = async () => {
     setSaving(true);
     setError(null);
@@ -185,7 +196,7 @@ function CodeWorkspaceSyncField(props: { projectPath: string }) {
           onKeyDown={(event) => {
             if (event.key === "Enter" && isDirty && !saving) {
               event.preventDefault();
-              void handleSave();
+              saveDraft();
             }
           }}
           disabled={saving}
@@ -193,13 +204,7 @@ function CodeWorkspaceSyncField(props: { projectPath: string }) {
           aria-label="VS Code workspace file path"
           className="max-w-[360px] min-w-0"
         />
-        <Button
-          onClick={() => {
-            void handleSave();
-          }}
-          disabled={!isDirty || saving}
-          className="shrink-0"
-        >
+        <Button onClick={saveDraft} disabled={!isDirty || saving} className="shrink-0">
           {saving ? "Saving..." : "Save"}
         </Button>
       </div>

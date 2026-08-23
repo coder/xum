@@ -15,6 +15,7 @@ import { isErrnoWithCode } from "@/node/utils/fs";
 import { isPathInsideDir, stripTrailingSlashes } from "@/node/utils/pathUtils";
 import {
   CODE_WORKSPACE_EXTENSION,
+  managedRootsByProject,
   syncProjectCodeWorkspace,
 } from "@/node/worktree/codeWorkspaceSync";
 import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
@@ -3992,6 +3993,14 @@ export const router = (authToken?: string) => {
           .input(schemas.projects.subProjects.assignWorkspace.input)
           .output(schemas.projects.subProjects.assignWorkspace.output)
           .handler(async ({ context, input }) => {
+            // Reassignment moves the workspace between sub-project workspace
+            // files. Capture the previous assignment (and the managed roots
+            // the workspace contributed to it) before it changes: afterwards
+            // the old file could no longer remove the entry, for the same
+            // reason workspace removal captures managedRootsByProject.
+            const previousMetadata = (await context.config.getAllWorkspaceMetadata()).find(
+              (m) => m.id === input.workspaceId
+            );
             const result = await context.projectService.assignWorkspaceToSubProject(
               input.projectPath,
               input.workspaceId,
@@ -3999,6 +4008,28 @@ export const router = (authToken?: string) => {
             );
             if (result.success) {
               await context.workspaceService.refreshAndEmitMetadata(input.workspaceId);
+              // Best-effort (results logged inside): reconcile both sides of
+              // the reassignment so the old file drops the entry and the new
+              // one gains it without waiting for the next lifecycle event.
+              if (input.subProjectPath !== null) {
+                await syncProjectCodeWorkspace(context.config, input.subProjectPath);
+              }
+              const previousSubProjectPath =
+                previousMetadata?.subProjectPath != null
+                  ? stripTrailingSlashes(previousMetadata.subProjectPath)
+                  : null;
+              const newSubProjectPath =
+                input.subProjectPath !== null ? stripTrailingSlashes(input.subProjectPath) : null;
+              if (
+                previousMetadata &&
+                previousSubProjectPath !== null &&
+                previousSubProjectPath !== newSubProjectPath
+              ) {
+                await syncProjectCodeWorkspace(context.config, previousSubProjectPath, {
+                  extraManagedRootDirs:
+                    managedRootsByProject(previousMetadata).get(previousSubProjectPath),
+                });
+              }
             }
             return result;
           }),

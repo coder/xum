@@ -244,6 +244,23 @@ describe("updateCodeWorkspaceFile", () => {
     expect(parseFolders(await readWorkspaceFile())).toEqual([{ path: theirs }]);
   });
 
+  test("creates a dangling symlink's target instead of replacing the link", async () => {
+    const worktree = path.join(managedRootDir, "feature-a");
+    const target = path.join(tempDir, "real-target.code-workspace");
+    const linkPath = path.join(tempDir, "dangling.code-workspace");
+    await fsPromises.symlink(target, linkPath);
+
+    await updateCodeWorkspaceFile({
+      codeWorkspacePath: linkPath,
+      managedRootDirs: [managedRootDir],
+      desiredPaths: [worktree],
+      seedFolders: [worktree],
+    });
+
+    expect((await fsPromises.lstat(linkPath)).isSymbolicLink()).toBe(true);
+    expect(parseFolders(await fsPromises.readFile(target, "utf-8"))).toEqual([{ path: worktree }]);
+  });
+
   test("writes through a symlinked workspace file without replacing the link", async () => {
     const worktree = path.join(managedRootDir, "feature-a");
     const realFile = path.join(tempDir, "shared-config", "real.code-workspace");
@@ -554,6 +571,24 @@ describe("computeManagedWorktreePaths", () => {
       ...computeParams,
     });
     expect(desiredPaths).toEqual([`${managedRoot}/feature-a`]);
+  });
+
+  test("keeps a devcontainer workspace assigned to a sub-project under the parent root", () => {
+    const subProjectPath = `${projectPath}/packages/api`;
+    // Devcontainer host worktrees live under the PARENT project's directory;
+    // the sub-project's default root (/base/src/api) does not contain them.
+    const { desiredPaths, managedRootDirs } = computeManagedWorktreePaths({
+      allMetadata: [
+        makeMetadata({
+          subProjectPath,
+          runtimeConfig: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
+        }),
+      ],
+      projectPath: subProjectPath,
+      defaultManagedRootDir: "/base/src/api",
+    });
+    expect(desiredPaths).toEqual([`${managedRoot}/feature-a`]);
+    expect(managedRootDirs).toContain(managedRoot);
   });
 
   test("includes workspaces assigned to a registered sub-project", () => {

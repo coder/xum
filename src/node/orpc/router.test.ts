@@ -6,6 +6,7 @@ import * as os from "os";
 import * as path from "path";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import { Config } from "@/node/config";
+import { ProjectService } from "@/node/services/projectService";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
@@ -1243,5 +1244,60 @@ describe("projects.setCodeWorkspaceSyncPath", () => {
       config.loadConfigOrDefault().projects.get(projectPath)?.codeWorkspaceSyncPath
     ).toBeUndefined();
     expect(fs.existsSync(path.join(projectPath, "proj.code-workspace"))).toBe(true);
+  });
+
+  test("reassigning a workspace between sub-projects syncs both workspace files", async () => {
+    const subProjectA = path.join(projectPath, "packages", "a");
+    const subProjectB = path.join(projectPath, "packages", "b");
+    fs.mkdirSync(subProjectA, { recursive: true });
+    fs.mkdirSync(subProjectB, { recursive: true });
+    const worktreePath = path.join(config.srcDir, "project", "feat-1");
+    await config.editConfig((current) => {
+      current.projects.set(projectPath, {
+        workspaces: [
+          {
+            path: worktreePath,
+            id: "aaaaaaaaaa",
+            name: "feat-1",
+            runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+            subProjectPath: subProjectA,
+          },
+        ],
+      });
+      current.projects.set(subProjectA, {
+        workspaces: [],
+        parentProjectPath: projectPath,
+        codeWorkspaceSyncPath: "a.code-workspace",
+      });
+      current.projects.set(subProjectB, {
+        workspaces: [],
+        parentProjectPath: projectPath,
+        codeWorkspaceSyncPath: "b.code-workspace",
+      });
+      return current;
+    });
+    const fileA = path.join(subProjectA, "a.code-workspace");
+    const fileB = path.join(subProjectB, "b.code-workspace");
+    // File A already lists the workspace, as a prior sync would have left it.
+    fs.writeFileSync(fileA, JSON.stringify({ folders: [{ path: worktreePath }] }));
+
+    const client = createRouterClient(router(), {
+      context: {
+        config,
+        projectService: new ProjectService(config),
+        workspaceService: { refreshAndEmitMetadata: async () => undefined },
+      } as unknown as ORPCContext,
+    });
+    const result = await client.projects.subProjects.assignWorkspace({
+      projectPath,
+      workspaceId: "aaaaaaaaaa",
+      subProjectPath: subProjectB,
+    });
+
+    expect(result.success).toBe(true);
+    const foldersOf = (file: string) =>
+      (JSON.parse(fs.readFileSync(file, "utf-8")) as { folders: Array<{ path: string }> }).folders;
+    expect(foldersOf(fileA).map((f) => f.path)).not.toContain(worktreePath);
+    expect(foldersOf(fileB).map((f) => f.path)).toContain(worktreePath);
   });
 });

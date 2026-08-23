@@ -80,9 +80,31 @@ async function boundedRealPath(filePath: string): Promise<string | null> {
 // symlink rather than write through it; resolve the real target first so user
 // symlinks to shared editor config survive syncs.
 async function resolveRealPath(filePath: string): Promise<string> {
+  return resolveRealPathFollowingDanglingLinks(filePath, 10);
+}
+
+async function resolveRealPathFollowingDanglingLinks(
+  filePath: string,
+  hopsLeft: number
+): Promise<string> {
   try {
     return await fsPromises.realpath(filePath);
   } catch {
+    // realpath fails on a DANGLING symlink too; follow it manually so the
+    // creation path writes the link's intended target instead of atomically
+    // renaming over (and destroying) the link itself. Hops are bounded so
+    // cyclic links cannot loop forever.
+    if (hopsLeft > 0) {
+      try {
+        const linkTarget = await fsPromises.readlink(filePath);
+        return await resolveRealPathFollowingDanglingLinks(
+          path.resolve(path.dirname(filePath), linkTarget),
+          hopsLeft - 1
+        );
+      } catch {
+        // Not a symlink: a plain missing file, resolved via its parent below.
+      }
+    }
     // File may not exist yet; resolve the parent so directory symlinks are
     // still honored, keeping the configured basename.
     try {
@@ -173,14 +195,29 @@ async function updateCodeWorkspaceFileLocked(
         return { ok: false, error: "Workspace file is not a regular file" };
       }
       const buffer = Buffer.alloc(MAX_CODE_WORKSPACE_FILE_BYTES + 1);
-      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-      if (bytesRead > MAX_CODE_WORKSPACE_FILE_BYTES) {
+      // read() may legally return short counts before EOF (notably on network
+      // filesystems), so loop until EOF or the cap is exceeded; a single read
+      // could silently truncate a valid file and rewrite it without its tail.
+      let totalRead = 0;
+      while (totalRead < buffer.length) {
+        const { bytesRead } = await handle.read(
+          buffer,
+          totalRead,
+          buffer.length - totalRead,
+          totalRead
+        );
+        if (bytesRead === 0) {
+          break;
+        }
+        totalRead += bytesRead;
+      }
+      if (totalRead > MAX_CODE_WORKSPACE_FILE_BYTES) {
         log.warn("Skipping .code-workspace sync: file exceeds size limit", {
           codeWorkspacePath,
         });
         return { ok: false, error: "Workspace file exceeds the 1 MiB sync limit" };
       }
-      original = buffer.subarray(0, bytesRead).toString("utf-8");
+      original = buffer.subarray(0, totalRead).toString("utf-8");
     } finally {
       await handle.close();
     }
@@ -309,17 +346,27 @@ export function computeManagedWorktreePaths(params: {
   // pass the removed workspace's roots explicitly (managedRootsByProject).
   const roots = new Set<string>([path.resolve(defaultManagedRootDir)]);
   for (const metadata of allMetadata) {
-    if (!belongsToProject(metadata, projectPath) || !isWorktreeRuntime(metadata.runtimeConfig)) {
+    if (
+      !belongsToProject(metadata, projectPath) ||
+      !hasManagedHostWorktree(metadata.runtimeConfig)
+    ) {
       continue;
     }
-    roots.add(
-      path.resolve(
-        path.join(
-          expandTilde(metadata.runtimeConfig.srcBaseDir),
-          participantCheckoutDirName(metadata, projectPath)
+    if (isWorktreeRuntime(metadata.runtimeConfig)) {
+      roots.add(
+        path.resolve(
+          path.join(
+            expandTilde(metadata.runtimeConfig.srcBaseDir),
+            participantCheckoutDirName(metadata, projectPath)
+          )
         )
-      )
-    );
+      );
+    } else {
+      // Devcontainer host worktrees live under <srcDir>/<parent-project-name>;
+      // for a sub-project participant that differs from defaultManagedRootDir,
+      // so derive the root from the checkout itself.
+      roots.add(path.dirname(path.resolve(metadata.namedWorkspacePath)));
+    }
   }
   const managedRootDirs = [...roots].sort();
 
@@ -475,22 +522,33 @@ export async function syncProjectCodeWorkspace(
           const roots = new Set<string>(
             (options?.extraManagedRootDirs ?? []).map((rootDir) => path.resolve(rootDir))
           );
-          const participantPaths: string[] = [];
+          const candidates: Array<{ participantPath: string; participantFile: string }> = [];
           for (const [participantPath, participantConfig] of currentProjects) {
             const participantFile = resolveConfiguredCodeWorkspacePath(
               participantPath,
               participantConfig.codeWorkspaceSyncPath
             );
-            if (participantFile === null) {
-              continue;
+            if (participantFile !== null) {
+              candidates.push({ participantPath, participantFile });
             }
-            // A stalled canonicalization of an unrelated project's path only
-            // drops that project from this round; it cannot block the sync.
-            if (participantFile !== targetFile) {
-              const participantCanonical = await boundedRealPath(participantFile);
-              if (participantCanonical !== canonicalTarget) {
-                continue;
+          }
+          // Canonicalize candidates concurrently: several stalled mounts under
+          // unrelated projects' paths cost one shared REALPATH_TIMEOUT_MS in
+          // total instead of one each, and a stalled path only drops that
+          // project from this round; it cannot block the sync.
+          const matchedPaths = await Promise.all(
+            candidates.map(async ({ participantPath, participantFile }) => {
+              if (participantFile === targetFile) {
+                return participantPath;
               }
+              const participantCanonical = await boundedRealPath(participantFile);
+              return participantCanonical === canonicalTarget ? participantPath : null;
+            })
+          );
+          const participantPaths: string[] = [];
+          for (const participantPath of matchedPaths) {
+            if (participantPath === null) {
+              continue;
             }
             const computed = computeManagedWorktreePaths({
               allMetadata,
