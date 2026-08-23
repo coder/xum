@@ -43,7 +43,7 @@ import {
   supports1MContext,
 } from "./models";
 import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
-import { isCustomOpenAICompatibleProviderConfig } from "@/common/utils/providers/customProviders";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 
 // Re-export for existing consumers (aiService, providerModelFactory, tests):
 // the implementations moved to browser-safe modules because this module
@@ -69,7 +69,7 @@ export { openaiProModeAvailable } from "./proMode";
  * emitting OpenAI options for an Anthropic-wire request. Metadata-aware wire
  * resolution must win over the name convention (which it still falls back to
  * for unknown instances). Mirrors resolveAndCreateModel's raw-prefix shadow
- * check: a custom OpenAI-compatible provider named "coder" owns the prefix,
+ * check: a custom provider named "coder" owns the prefix,
  * and its model IDs must not get gateway wire treatment.
  */
 function resolveOptionsCanonicalModel(
@@ -80,7 +80,7 @@ function resolveOptionsCanonicalModel(
   if (colonIndex === -1 || modelString.slice(0, colonIndex) !== "coder") {
     return normalizeToCanonical(modelString);
   }
-  if (isCustomOpenAICompatibleProviderConfig(providersConfig?.coder)) {
+  if (isCustomProviderConfig(providersConfig?.coder)) {
     return modelString; // custom-provider shadowing wins; already canonical
   }
   const wire = resolveCoderWireCanonicalModel(

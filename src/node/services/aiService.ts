@@ -121,7 +121,7 @@ import {
   resolveCoderWireCanonicalModel,
 } from "@/common/constants/coderOAuth";
 import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
-import { isCustomOpenAICompatibleProviderConfig } from "@/common/utils/providers/customProviders";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { sliceMessagesForProviderFromLatestContextBoundary } from "@/common/utils/messages/compactionBoundary";
 import { getProjects, isMultiProject } from "@/common/utils/multiProject";
@@ -2597,7 +2597,7 @@ export class AIService extends EventEmitter {
                       return advisorModelString;
                     }
                     const coderSection = advisorProvidersConfig.coder;
-                    if (isCustomOpenAICompatibleProviderConfig(coderSection)) {
+                    if (isCustomProviderConfig(coderSection)) {
                       return advisorModelString;
                     }
                     if (!advisorOnCoderRoute) {
@@ -3135,7 +3135,7 @@ export class AIService extends EventEmitter {
             };
           }
           const coderSection = currentProvidersConfig?.coder;
-          if (!isCustomOpenAICompatibleProviderConfig(coderSection)) {
+          if (!isCustomProviderConfig(coderSection)) {
             const wire = resolveCoderWireCanonicalModel(
               rawModelString.slice("coder:".length),
               coderSection as

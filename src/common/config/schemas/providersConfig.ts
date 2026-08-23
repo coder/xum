@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
+
 import { ModelParametersByModelSchema } from "./modelParameters";
 import { ProviderModelEntrySchema } from "./providerModelEntry";
 
@@ -21,7 +23,7 @@ export const BaseProviderConfigSchema = z
     baseURL: z.string().optional(),
     headers: z.record(z.string(), z.string()).optional(),
     enabled: z.boolean().optional(),
-    providerType: z.literal("openai-compatible").optional(),
+    providerType: z.enum(CUSTOM_PROVIDER_TYPES).optional(),
     displayName: z.string().min(1).optional(),
     models: z.array(ProviderModelEntrySchema).optional(),
     modelParameters: ModelParametersByModelSchema.optional(),

@@ -3,9 +3,16 @@ import {
   SUPPORTED_PROVIDERS,
   type ProviderName,
 } from "@/common/constants/providers";
+export const CUSTOM_PROVIDER_TYPES = [
+  "openai-compatible",
+  "openai-responses",
+  "anthropic-messages",
+] as const;
+export type CustomProviderType = (typeof CUSTOM_PROVIDER_TYPES)[number];
+
 export type ProvidersConfigWithProviderType = Record<
   string,
-  (object & { providerType?: "openai-compatible" }) | undefined
+  (object & { providerType?: CustomProviderType }) | undefined
 >;
 
 export const CUSTOM_PROVIDER_ID_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
@@ -20,6 +27,7 @@ const RESERVED_CUSTOM_PROVIDER_IDS = new Set<string>([
 ]);
 
 const SUPPORTED_PROVIDER_NAMES: ReadonlySet<string> = new Set(SUPPORTED_PROVIDERS);
+const CUSTOM_PROVIDER_TYPE_SET: ReadonlySet<string> = new Set(CUSTOM_PROVIDER_TYPES);
 const FORBIDDEN_CUSTOM_PROVIDER_ID_CHARS = /[.:/\s]/;
 
 export function isBuiltInProvider(provider: string): provider is ProviderName {
@@ -61,22 +69,30 @@ export function isValidCustomProviderId(id: string): boolean {
   return validateCustomProviderId(id).ok;
 }
 
-export function isCustomOpenAICompatibleProviderConfig(config: unknown): boolean {
+export function isCustomProviderType(value: unknown): value is CustomProviderType {
+  return typeof value === "string" && CUSTOM_PROVIDER_TYPE_SET.has(value);
+}
+
+export function isCustomProviderConfig(config: unknown): config is Record<string, unknown> & {
+  providerType: CustomProviderType;
+  enabled?: unknown;
+  baseUrl?: unknown;
+  baseURL?: unknown;
+  displayName?: unknown;
+} {
   return (
     typeof config === "object" &&
     config !== null &&
     !Array.isArray(config) &&
-    (config as { providerType?: unknown }).providerType === "openai-compatible"
+    isCustomProviderType((config as { providerType?: unknown }).providerType)
   );
 }
 
-export function getCustomOpenAICompatibleProviderIds(
-  providersConfig: ProvidersConfigWithProviderType
-): string[] {
+export function getCustomProviderIds(providersConfig: ProvidersConfigWithProviderType): string[] {
   const providerIds: string[] = [];
 
   for (const [provider, config] of Object.entries(providersConfig)) {
-    if (!isCustomOpenAICompatibleProviderConfig(config)) {
+    if (!isCustomProviderConfig(config)) {
       continue;
     }
 
@@ -86,19 +102,23 @@ export function getCustomOpenAICompatibleProviderIds(
   return providerIds;
 }
 
-export function getShadowedCustomOpenAICompatibleProviderIds(
+export function getShadowedCustomProviderIds(
   providersConfig: ProvidersConfigWithProviderType
 ): string[] {
-  return getCustomOpenAICompatibleProviderIds(providersConfig).filter(isBuiltInProvider);
+  return getCustomProviderIds(providersConfig).filter(isBuiltInProvider);
 }
 
 export function formatProviderDisplayName(
   provider: string,
-  config?: { displayName?: string; providerType?: "openai-compatible" }
+  config?: { displayName?: string; providerType?: CustomProviderType }
 ): string {
   // Manual providers.jsonc edits can shadow a built-in provider id, so prefer
-  // the custom OpenAI-compatible display name before consulting built-in names.
-  if (config?.providerType === "openai-compatible" && config.displayName) {
+  // the custom display name before consulting built-in names.
+  if (
+    isCustomProviderConfig(config) &&
+    typeof config.displayName === "string" &&
+    config.displayName
+  ) {
     return config.displayName;
   }
 

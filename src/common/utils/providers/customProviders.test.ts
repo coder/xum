@@ -2,11 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { SUPPORTED_PROVIDERS } from "@/common/constants/providers";
 import type { ProvidersConfig } from "@/common/config/schemas/providersConfig";
 import {
+  CUSTOM_PROVIDER_TYPES,
   formatProviderDisplayName,
-  getCustomOpenAICompatibleProviderIds,
-  getShadowedCustomOpenAICompatibleProviderIds,
+  getCustomProviderIds,
+  getShadowedCustomProviderIds,
   isBuiltInProvider,
-  isCustomOpenAICompatibleProviderConfig,
+  isCustomProviderConfig,
   isValidCustomProviderId,
   validateCustomProviderId,
 } from "./customProviders";
@@ -54,54 +55,55 @@ describe("custom provider id validation", () => {
   });
 });
 
-describe("isCustomOpenAICompatibleProviderConfig", () => {
-  test("returns true for OpenAI-compatible custom provider config", () => {
-    expect(
-      isCustomOpenAICompatibleProviderConfig({
-        providerType: "openai-compatible",
-        baseUrl: "http://localhost:8000/v1",
-      })
-    ).toBe(true);
+describe("isCustomProviderConfig", () => {
+  test("returns true for every custom provider API format", () => {
+    for (const providerType of CUSTOM_PROVIDER_TYPES) {
+      expect(
+        isCustomProviderConfig({
+          providerType,
+          baseUrl: "http://localhost:8000/v1",
+        })
+      ).toBe(true);
+    }
   });
 
   test("returns false for non-custom provider config", () => {
-    expect(isCustomOpenAICompatibleProviderConfig({ apiKey: "key" })).toBe(false);
-    expect(isCustomOpenAICompatibleProviderConfig(null)).toBe(false);
+    expect(isCustomProviderConfig({ apiKey: "key" })).toBe(false);
+    expect(isCustomProviderConfig({ providerType: "unknown-format" })).toBe(false);
+    expect(isCustomProviderConfig(null)).toBe(false);
   });
 });
 
-describe("getCustomOpenAICompatibleProviderIds", () => {
-  test("returns custom OpenAI-compatible providers in config key order", () => {
+describe("getCustomProviderIds", () => {
+  test("returns custom providers in config key order", () => {
     const providersConfig: ProvidersConfig = {
       openai: { providerType: "openai-compatible", apiKey: "key" },
       "legacy-custom": { apiKey: "legacy-key" },
       "local-vllm": {
-        providerType: "openai-compatible",
+        providerType: "openai-responses",
         baseUrl: "http://localhost:8000/v1",
       },
       "llama-cpp": {
-        providerType: "openai-compatible",
+        providerType: "anthropic-messages",
         baseUrl: "http://localhost:8080/v1",
       },
     };
 
-    expect(getCustomOpenAICompatibleProviderIds(providersConfig)).toEqual([
-      "openai",
-      "local-vllm",
-      "llama-cpp",
-    ]);
-    expect(getShadowedCustomOpenAICompatibleProviderIds(providersConfig)).toEqual(["openai"]);
+    expect(getCustomProviderIds(providersConfig)).toEqual(["openai", "local-vllm", "llama-cpp"]);
+    expect(getShadowedCustomProviderIds(providersConfig)).toEqual(["openai"]);
   });
 });
 
 describe("formatProviderDisplayName", () => {
-  test("prefers shadowed custom display name over built-in display name", () => {
-    expect(
-      formatProviderDisplayName("openai", {
-        providerType: "openai-compatible",
-        displayName: "Shadowed OpenAI",
-      })
-    ).toBe("Shadowed OpenAI");
+  test("prefers shadowed custom display name over built-in display name for every format", () => {
+    for (const providerType of CUSTOM_PROVIDER_TYPES) {
+      expect(
+        formatProviderDisplayName("openai", {
+          providerType,
+          displayName: "Shadowed OpenAI",
+        })
+      ).toBe("Shadowed OpenAI");
+    }
   });
 
   test("uses built-in provider display names", () => {

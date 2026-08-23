@@ -10,6 +10,7 @@ import {
   MAX_STAGED_ATTACHMENT_BASE64_CHARS,
   MAX_STAGED_ATTACHMENT_SIZE_BYTES,
 } from "@/common/constants/stagedAttachments";
+import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
 import { ChatStatsSchema, SessionUsageFileSchema } from "./chatStats";
 import { AdditionalSystemContextSchema, WorkspaceInstructionsSchema } from "./instructions";
 import {
@@ -246,7 +247,7 @@ export const ProviderConfigInfoSchema = z.object({
   baseUrlSource: z.enum(["config", "env"]).nullish(),
   /** Active base URL for display only. Env values must not be persisted from this field. */
   baseUrlResolved: z.string().nullish(),
-  providerType: z.literal("openai-compatible").optional(),
+  providerType: z.enum(CUSTOM_PROVIDER_TYPES).optional(),
   displayName: z.string().optional(),
   isCustom: z.boolean().optional(),
   models: z.array(ProviderModelEntrySchema).optional(),
@@ -355,9 +356,10 @@ export const CustomProviderMutationErrorSchema = z.discriminatedUnion("code", [
 ]);
 
 export const providers = {
-  addCustomOpenAICompatibleProvider: {
+  addCustomProvider: {
     input: z.object({
       provider: z.string(),
+      providerType: z.enum(CUSTOM_PROVIDER_TYPES).optional(),
       displayName: z.string().optional(),
       baseUrl: z.string(),
       apiKey: z.string().optional(),

@@ -2270,12 +2270,10 @@ export const router = (authToken?: string) => {
         .input(schemas.providers.getConfig.input)
         .output(schemas.providers.getConfig.output)
         .handler(({ context }) => context.providerService.getConfig()),
-      addCustomOpenAICompatibleProvider: t
-        .input(schemas.providers.addCustomOpenAICompatibleProvider.input)
-        .output(schemas.providers.addCustomOpenAICompatibleProvider.output)
-        .handler(({ context, input }) =>
-          context.providerService.addCustomOpenAICompatibleProvider(input)
-        ),
+      addCustomProvider: t
+        .input(schemas.providers.addCustomProvider.input)
+        .output(schemas.providers.addCustomProvider.output)
+        .handler(({ context, input }) => context.providerService.addCustomProvider(input)),
       removeCustomProvider: t
         .input(schemas.providers.removeCustomProvider.input)
         .output(schemas.providers.removeCustomProvider.output)

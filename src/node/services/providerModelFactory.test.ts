@@ -10,6 +10,7 @@ import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { CODEX_ENDPOINT, CODEX_OAUTH_ROUTED_HEADER } from "@/common/constants/codexOAuth";
 import { PROVIDER_REGISTRY } from "@/common/constants/providers";
+import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
 import { resolveProviderOptionsNamespaceKey } from "@/common/utils/ai/providerOptions";
 import { Ok } from "@/common/types/result";
 import {
@@ -377,6 +378,28 @@ describe("ProviderModelFactory.createModel", () => {
 
       expect((unlistedModel.data as { provider?: unknown }).provider).toBe("local-vllm.chat");
     });
+  });
+
+  it("creates a model with the selected custom provider adapter", async () => {
+    const expectedProviders = {
+      "openai-compatible": "local-vllm.chat",
+      "openai-responses": "openai.responses",
+      "anthropic-messages": "anthropic.messages",
+    } as const;
+
+    for (const providerType of CUSTOM_PROVIDER_TYPES) {
+      await withTempConfig(async (config, factory) => {
+        saveLocalVllmConfig(config, { providerType });
+
+        const result = await factory.createModel(`local-vllm:${LOCAL_VLLM_MODEL}`);
+        expect(result.success).toBe(true);
+        if (result.success) {
+          expect((result.data as { provider?: unknown }).provider).toBe(
+            expectedProviders[providerType]
+          );
+        }
+      });
+    }
   });
 
   it("allows policy-allowed custom OpenAI-compatible providers when policy is enforced", async () => {

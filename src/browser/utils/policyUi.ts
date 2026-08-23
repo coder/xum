@@ -2,7 +2,7 @@ import { SUPPORTED_PROVIDERS, type ProviderName } from "@/common/constants/provi
 import { RUNTIME_MODE, type ParsedRuntime, type RuntimeMode } from "@/common/types/runtime";
 import type { EffectivePolicy, PolicyRuntimeId } from "@/common/orpc/types";
 import {
-  getCustomOpenAICompatibleProviderIds,
+  getCustomProviderIds,
   type ProvidersConfigWithProviderType,
 } from "@/common/utils/providers/customProviders";
 
@@ -65,9 +65,7 @@ export function getAllowedProvidersForUi(
   policy: EffectivePolicy | null,
   providersConfig?: ProvidersConfigWithProviderType | null
 ): string[] {
-  const customProviders = providersConfig
-    ? getCustomOpenAICompatibleProviderIds(providersConfig)
-    : [];
+  const customProviders = providersConfig ? getCustomProviderIds(providersConfig) : [];
   const access = policy?.providerAccess;
   if (access == null) {
     return Array.from(new Set([...SUPPORTED_PROVIDERS, ...customProviders]));

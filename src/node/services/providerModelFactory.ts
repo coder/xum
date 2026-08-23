@@ -26,7 +26,7 @@ import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import {
   isBuiltInProvider,
-  isCustomOpenAICompatibleProviderConfig,
+  isCustomProviderConfig,
 } from "@/common/utils/providers/customProviders";
 import { isGatewayModelAccessibleFromAuthoritativeCatalog } from "@/common/utils/providers/gatewayModelCatalog";
 import {
@@ -1143,19 +1143,21 @@ export class ProviderModelFactory {
       const providersConfig = opts?.providersConfig ?? this.config.loadProvidersConfig() ?? {};
       const providerConfigEntry = providersConfig[providerName];
       const providerIsBuiltIn = isBuiltInProvider(providerName);
-      const providerIsCustomOpenAICompatible =
-        providerConfigEntry != null && isCustomOpenAICompatibleProviderConfig(providerConfigEntry);
+      const customProviderType = isCustomProviderConfig(providerConfigEntry)
+        ? providerConfigEntry.providerType
+        : null;
+      const providerIsCustom = customProviderType !== null;
 
-      // Check if provider is supported. Explicit custom OpenAI-compatible config wins
+      // Check if provider is supported. Explicit custom provider config wins
       // even if a future release adds a built-in provider with the same id.
-      if (!providerIsCustomOpenAICompatible && providerIsBuiltIn) {
+      if (!providerIsCustom && providerIsBuiltIn) {
         if (!Object.hasOwn(PROVIDER_REGISTRY, providerName)) {
           return Err({
             type: "provider_not_supported",
             provider: providerName,
           });
         }
-      } else if (!providerIsCustomOpenAICompatible) {
+      } else if (!providerIsCustom) {
         return Err({
           type: "provider_not_supported",
           provider: providerName,
@@ -1189,7 +1191,7 @@ export class ProviderModelFactory {
       // disableBetaFeatures/cacheTtl, while a cross-typed canonical name
       // (coder:anthropic/x fronting an OpenAI-compatible upstream) must not.
       const isCoderGatewayModel =
-        providerName === "coder" && !isCustomOpenAICompatibleProviderConfig(providersConfig.coder);
+        providerName === "coder" && !isCustomProviderConfig(providersConfig.coder);
       const coderWire = isCoderGatewayModel
         ? resolveCoderWireCanonicalModel(
             modelId,
@@ -1269,7 +1271,7 @@ export class ProviderModelFactory {
         headers: buildAppAttributionHeaders(providerConfig.headers),
       };
 
-      if (providerIsCustomOpenAICompatible) {
+      if (customProviderType) {
         const credentials = resolveCustomProviderCredentials(providerName, providerConfig);
         if (!credentials.ok) {
           return Err(formatCustomProviderRequirementError(providerName, credentials.error));
@@ -1277,17 +1279,43 @@ export class ProviderModelFactory {
 
         const providerFetch = getProviderFetch(providerConfig);
         const muxAttributionHeaders = buildAppAttributionHeaders(providerConfig.headers);
+        // Custom adapters must not fall back to official-provider environment keys.
+        const isolatedApiKey = credentials.apiKey ?? "";
 
-        // Pass only explicit OpenAI-compatible SDK settings so Xum-only config
-        // fields such as models, enabled, and providerType never reach the SDK.
-        const provider = createOpenAICompatible({
-          name: providerName,
-          baseURL: normalizeOpenAICompatibleBaseURL(credentials.baseURL),
-          ...(credentials.apiKey != null ? { apiKey: credentials.apiKey } : {}),
-          headers: { ...muxAttributionHeaders },
-          fetch: providerFetch,
-        });
-        return Ok(provider(modelId));
+        switch (customProviderType) {
+          case "openai-compatible": {
+            // Pass only explicit OpenAI-compatible SDK settings so Xum-only config
+            // fields such as models, enabled, and providerType never reach the SDK.
+            const provider = createOpenAICompatible({
+              name: providerName,
+              baseURL: normalizeOpenAICompatibleBaseURL(credentials.baseURL),
+              ...(credentials.apiKey != null ? { apiKey: credentials.apiKey } : {}),
+              headers: { ...muxAttributionHeaders },
+              fetch: providerFetch,
+            });
+            return Ok(provider(modelId));
+          }
+          case "openai-responses": {
+            const { createOpenAI } = await PROVIDER_REGISTRY.openai();
+            const provider = createOpenAI({
+              baseURL: normalizeOpenAICompatibleBaseURL(credentials.baseURL),
+              apiKey: isolatedApiKey,
+              headers: { ...muxAttributionHeaders },
+              fetch: providerFetch,
+            });
+            return Ok(provider.responses(modelId));
+          }
+          case "anthropic-messages": {
+            const { createAnthropic } = await PROVIDER_REGISTRY.anthropic();
+            const provider = createAnthropic({
+              baseURL: normalizeAnthropicBaseURL(credentials.baseURL),
+              apiKey: isolatedApiKey,
+              headers: { ...muxAttributionHeaders },
+              fetch: wrapFetchWithAnthropicCacheControl(providerFetch, effectiveAnthropicCacheTtl),
+            });
+            return Ok(provider(modelId));
+          }
+        }
       }
 
       // Handle Anthropic provider
@@ -2344,7 +2372,7 @@ export class ProviderModelFactory {
     const [rawProviderName] = parseModelString(modelString);
     const rawPrefixShadowedByCustomProvider =
       rawProviderName.length > 0 &&
-      isCustomOpenAICompatibleProviderConfig(providersConfigForShadowCheck[rawProviderName]);
+      isCustomProviderConfig(providersConfigForShadowCheck[rawProviderName]);
 
     const explicitGateway = rawPrefixShadowedByCustomProvider
       ? undefined
@@ -2507,7 +2535,7 @@ export class ProviderModelFactory {
       | undefined;
     if (
       effectiveRouteProvider === "coder" &&
-      !isCustomOpenAICompatibleProviderConfig(providersConfigForShadowCheck.coder)
+      !isCustomProviderConfig(providersConfigForShadowCheck.coder)
     ) {
       const wire = resolveCoderWireCanonicalModel(
         effectiveModelString.slice(effectiveModelString.indexOf(":") + 1),
@@ -2666,16 +2694,13 @@ export class ProviderModelFactory {
     const providersConfig = providersConfigSnapshot ?? this.config.loadProvidersConfig() ?? {};
 
     // Shadow check on the RAW prefix, BEFORE gateway canonicalization: a
-    // custom OpenAI-compatible provider can shadow a built-in gateway id
+    // custom provider can shadow a built-in gateway id
     // (an upgraded install may already have one named "coder"). Left to the
     // canonical check below, fromGatewayModelId would rewrite
     // coder:openai/foo to openai:foo first and silently route it through
     // the built-in machinery instead of the user's custom endpoint.
     const [rawProviderName] = parseModelString(modelString);
-    if (
-      rawProviderName &&
-      isCustomOpenAICompatibleProviderConfig(providersConfig[rawProviderName])
-    ) {
+    if (rawProviderName && isCustomProviderConfig(providersConfig[rawProviderName])) {
       return modelString;
     }
 
@@ -2691,7 +2716,7 @@ export class ProviderModelFactory {
       return canonicalModelString;
     }
 
-    if (isCustomOpenAICompatibleProviderConfig(providersConfig[originProviderName])) {
+    if (isCustomProviderConfig(providersConfig[originProviderName])) {
       // Manual providers.jsonc edits can shadow a built-in provider id. Custom providers
       // are direct-only, so keep the user's model pointed at the custom endpoint.
       return canonicalModelString;

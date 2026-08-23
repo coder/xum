@@ -5,7 +5,7 @@ import assert from "@/common/utils/assert";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { wouldRouteOpenAIThroughCodexOauth } from "@/common/utils/providers/codexOauthRouting";
 import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
-import { isCustomOpenAICompatibleProviderConfig } from "@/common/utils/providers/customProviders";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { getExplicitGatewayPrefix, normalizeToCanonical } from "./models";
 
@@ -39,10 +39,7 @@ export function supportsAnthropicCache(
   if (providersConfig?.anthropic?.disableBetaFeatures === true) {
     return false;
   }
-  if (
-    modelString.startsWith("coder:") &&
-    !isCustomOpenAICompatibleProviderConfig(providersConfig?.coder)
-  ) {
+  if (modelString.startsWith("coder:") && !isCustomProviderConfig(providersConfig?.coder)) {
     const wire = resolveCoderWireCanonicalModel(
       modelString.slice("coder:".length),
       providersConfig?.coder
