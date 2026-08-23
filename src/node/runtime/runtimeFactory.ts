@@ -12,7 +12,7 @@ import { XUM_PRODUCT_NAME } from "@/common/constants/product";
 import type { RuntimeConfig, RuntimeMode, RuntimeAvailabilityStatus } from "@/common/types/runtime";
 import { hasSrcBaseDir } from "@/common/types/runtime";
 import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility";
-import { detectContainerEngine } from "./containerCli";
+import { detectContainerEngine, isEngineResponsive } from "./containerCli";
 import type { CoderService } from "@/node/services/coderService";
 import { Config } from "@/node/config";
 import { checkDevcontainerCliVersion } from "./devcontainerCli";
@@ -257,22 +257,19 @@ type RuntimeAvailabilityMap = Record<RuntimeMode, RuntimeAvailabilityStatus>;
 export async function checkRuntimeAvailability(
   projectPath: string
 ): Promise<RuntimeAvailabilityMap> {
-  const [isGit, containerEngine, devcontainerCliInfo, devcontainerConfigs] = await Promise.all([
-    isGitRepository(projectPath),
-    detectContainerEngine(),
-    checkDevcontainerCliVersion(),
-    scanDevcontainerConfigs(projectPath),
-  ]);
+  const [isGit, containerEngine, dockerResponsive, devcontainerCliInfo, devcontainerConfigs] =
+    await Promise.all([
+      isGitRepository(projectPath),
+      detectContainerEngine(),
+      // The devcontainer CLI shells out to the literal `docker` binary regardless
+      // of which engine the Docker runtime resolved (e.g. an XUM_CONTAINER_CLI
+      // override), so Dev Container availability needs its own docker probe.
+      isEngineResponsive("docker"),
+      checkDevcontainerCliVersion(),
+      scanDevcontainerConfigs(projectPath),
+    ]);
 
   const devcontainerConfigInfo = buildDevcontainerConfigInfo(devcontainerConfigs);
-  // The devcontainer CLI shells out to the literal `docker` binary, so Dev
-  // Containers work only when the detected engine actually is docker.
-  const engineIsDocker =
-    containerEngine.available &&
-    path
-      .basename(containerEngine.cli)
-      .replace(/\.exe$/i, "")
-      .toLowerCase() === "docker";
 
   const gitRequiredReason = "Requires git repository";
 
@@ -285,14 +282,10 @@ export async function checkRuntimeAvailability(
       available: false,
       reason: "Dev Container CLI not installed. Run: npm install -g @devcontainers/cli",
     };
-  } else if (!engineIsDocker) {
+  } else if (!dockerResponsive) {
     devcontainerAvailability = {
       available: false,
-      // Distinguish "another engine is in use" from "docker is down" so users
-      // running podman are not told a running daemon is stopped.
-      reason: containerEngine.available
-        ? `Dev Containers require Docker (current container engine: ${path.basename(containerEngine.cli)})`
-        : "Dev Containers require Docker; Docker daemon not running",
+      reason: "Dev Containers require Docker; Docker daemon not running",
     };
   } else if (devcontainerConfigInfo.length === 0) {
     devcontainerAvailability = { available: false, reason: "No devcontainer.json found" };
