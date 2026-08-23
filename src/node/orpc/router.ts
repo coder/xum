@@ -3525,11 +3525,13 @@ export const router = (authToken?: string) => {
               message: `Path must end with ${CODE_WORKSPACE_EXTENSION}`,
             });
           }
+          let previousValue: string | undefined;
           await context.config.editConfig((config) => {
             const project = config.projects.get(normalizedPath);
             if (!project) {
               throw new Error(`Project not found: ${normalizedPath}`);
             }
+            previousValue = project.codeWorkspaceSyncPath;
             // Store undefined for blank input to keep config.json minimal.
             project.codeWorkspaceSyncPath = trimmed ? trimmed : undefined;
             return config;
@@ -3538,7 +3540,19 @@ export const router = (authToken?: string) => {
           // next workspace lifecycle event. Clearing or changing the path never
           // deletes previously written files (they belong to the user).
           if (trimmed) {
-            await syncProjectCodeWorkspace(context.config, normalizedPath);
+            const result = await syncProjectCodeWorkspace(context.config, normalizedPath);
+            if (!result.ok) {
+              // Roll back so a broken integration is not retried on every
+              // later lifecycle event, and surface the reason to the user.
+              await context.config.editConfig((config) => {
+                const project = config.projects.get(normalizedPath);
+                if (project) {
+                  project.codeWorkspaceSyncPath = previousValue;
+                }
+                return config;
+              });
+              throw new ORPCError("BAD_REQUEST", { message: result.error });
+            }
           }
         }),
       remove: t

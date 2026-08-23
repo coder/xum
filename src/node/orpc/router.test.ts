@@ -1205,6 +1205,29 @@ describe("projects.setCodeWorkspaceSyncPath", () => {
     expect(written.folders).toEqual([{ path: projectPath }]);
   });
 
+  test("surfaces sync failures on explicit save and rolls the setting back", async () => {
+    // A malformed target must fail the save visibly instead of persisting a
+    // broken integration that silently retries on every lifecycle event.
+    fs.writeFileSync(path.join(projectPath, "broken.code-workspace"), "{ not valid jsonc");
+    const client = createClient();
+
+    let thrown: unknown;
+    try {
+      await client.projects.setCodeWorkspaceSyncPath({
+        projectPath,
+        codeWorkspaceSyncPath: "broken.code-workspace",
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(ORPCError);
+    expect((thrown as ORPCError<string, unknown>).message).toContain("not valid JSONC");
+    expect(
+      config.loadConfigOrDefault().projects.get(projectPath)?.codeWorkspaceSyncPath
+    ).toBeUndefined();
+  });
+
   test("clearing the setting removes it without deleting the existing file", async () => {
     const client = createClient();
     await client.projects.setCodeWorkspaceSyncPath({

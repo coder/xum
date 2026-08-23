@@ -3,6 +3,7 @@ import * as path from "path";
 import * as jsonc from "jsonc-parser";
 import writeFileAtomic from "write-file-atomic";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { getErrorMessage } from "@/common/utils/errors";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { isWorktreeRuntime } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -122,15 +123,17 @@ function isUnderAnyRoot(managedRootDirs: string[], candidate: string): boolean {
  * managed-entry invariant. Creates the file (with `seedFolders`) when missing.
  * Uses jsonc-parser edits so user comments and unknown keys survive.
  */
-export async function updateCodeWorkspaceFile(update: CodeWorkspaceFileUpdate): Promise<void> {
+export async function updateCodeWorkspaceFile(
+  update: CodeWorkspaceFileUpdate
+): Promise<CodeWorkspaceSyncResult> {
   const targetPath = await resolveRealPath(update.codeWorkspacePath);
-  await withFileWriteLock(targetPath, () => updateCodeWorkspaceFileLocked(targetPath, update));
+  return withFileWriteLock(targetPath, () => updateCodeWorkspaceFileLocked(targetPath, update));
 }
 
 async function updateCodeWorkspaceFileLocked(
   targetPath: string,
   update: CodeWorkspaceFileUpdate
-): Promise<void> {
+): Promise<CodeWorkspaceSyncResult> {
   const { codeWorkspacePath, managedRootDirs, desiredPaths } = update;
   // Relative folder entries resolve against the configured file location,
   // matching how VS Code resolves them for the file the user opens.
@@ -144,7 +147,7 @@ async function updateCodeWorkspaceFileLocked(
         codeWorkspacePath,
         sizeBytes: stats.size,
       });
-      return;
+      return { ok: false, error: "Workspace file exceeds the 1 MiB sync limit" };
     }
     original = await fsPromises.readFile(targetPath, "utf-8");
   } catch (error) {
@@ -158,7 +161,7 @@ async function updateCodeWorkspaceFileLocked(
     const fresh = { folders: update.seedFolders.map((folderPath) => ({ path: folderPath })) };
     await fsPromises.mkdir(path.dirname(targetPath), { recursive: true });
     await writeFileAtomic(targetPath, JSON.stringify(fresh, null, "\t") + "\n");
-    return;
+    return { ok: true };
   }
 
   // Never clobber a file we cannot faithfully edit (self-healing over failing).
@@ -171,13 +174,13 @@ async function updateCodeWorkspaceFileLocked(
     Array.isArray(parsed)
   ) {
     log.warn("Skipping .code-workspace sync: file is not valid JSONC", { codeWorkspacePath });
-    return;
+    return { ok: false, error: "Workspace file is not valid JSONC" };
   }
 
   const existingFolders = (parsed as { folders?: unknown }).folders;
   if (existingFolders !== undefined && !Array.isArray(existingFolders)) {
     log.warn("Skipping .code-workspace sync: 'folders' is not an array", { codeWorkspacePath });
-    return;
+    return { ok: false, error: "Workspace file 'folders' is not an array" };
   }
 
   const desired = new Set(desiredPaths.map((desiredPath) => path.resolve(desiredPath)));
@@ -232,14 +235,37 @@ async function updateCodeWorkspaceFileLocked(
   if (text !== original) {
     await writeFileAtomic(targetPath, text);
   }
+  return { ok: true };
 }
 
 function belongsToProject(metadata: FrontendWorkspaceMetadata, projectPath: string): boolean {
   return (
     stripTrailingSlashes(metadata.projectPath) === projectPath ||
+    // Workspaces assigned to a registered sub-project live in the parent's
+    // bucket; the sub-project's own file must still list them.
+    (metadata.subProjectPath != null &&
+      stripTrailingSlashes(metadata.subProjectPath) === projectPath) ||
     (metadata.projects?.some((ref) => stripTrailingSlashes(ref.projectPath) === projectPath) ??
       false)
   );
+}
+
+// The directory that holds this workspace's checkout for the given
+// participant project. Sub-project workspaces share the parent repo's
+// worktree directory; multi-project participants each have a directory named
+// after themselves.
+function participantCheckoutDirName(
+  metadata: FrontendWorkspaceMetadata,
+  participantPath: string
+): string {
+  const isPrimary = stripTrailingSlashes(metadata.projectPath) === participantPath;
+  const isRef =
+    metadata.projects?.some((ref) => stripTrailingSlashes(ref.projectPath) === participantPath) ??
+    false;
+  if (isPrimary || isRef) {
+    return getProjectName(participantPath);
+  }
+  return getProjectName(stripTrailingSlashes(metadata.projectPath));
 }
 
 /**
@@ -251,23 +277,28 @@ export function computeManagedWorktreePaths(params: {
   allMetadata: FrontendWorkspaceMetadata[];
   /** Normalized (no trailing slash) project path. */
   projectPath: string;
-  projectName: string;
   defaultManagedRootDir: string;
 }): { desiredPaths: string[]; managedRootDirs: string[] } {
-  const { allMetadata, projectPath, projectName, defaultManagedRootDir } = params;
+  const { allMetadata, projectPath, defaultManagedRootDir } = params;
 
   // Managed roots come from every persisted worktree workspace of the project
   // (any lifecycle state), not just the current global srcDir: worktrees
   // created under a custom or legacy srcBaseDir (e.g. pre-rename ~/.mux/src)
-  // must stay managed after upgrades. Residual: an entry under a custom root
-  // whose last workspace was deleted is no longer classified as managed and
-  // can linger until removed by hand.
+  // must stay managed after upgrades. Callers cleaning up after a deletion
+  // pass the removed workspace's roots explicitly (managedRootsByProject).
   const roots = new Set<string>([path.resolve(defaultManagedRootDir)]);
   for (const metadata of allMetadata) {
     if (!belongsToProject(metadata, projectPath) || !isWorktreeRuntime(metadata.runtimeConfig)) {
       continue;
     }
-    roots.add(path.resolve(path.join(expandTilde(metadata.runtimeConfig.srcBaseDir), projectName)));
+    roots.add(
+      path.resolve(
+        path.join(
+          expandTilde(metadata.runtimeConfig.srcBaseDir),
+          participantCheckoutDirName(metadata, projectPath)
+        )
+      )
+    );
   }
   const managedRootDirs = [...roots].sort();
 
@@ -296,12 +327,12 @@ export function computeManagedWorktreePaths(params: {
     if (isMultiProject(metadata)) {
       // Multi-project workspaces persist the _workspaces/<name> symlink
       // container as namedWorkspacePath; the real per-project checkout lives
-      // at <srcBaseDir>/<projectName>/<workspaceName> for the primary and
+      // at <srcBaseDir>/<checkoutDirName>/<workspaceName> for the primary and
       // secondary projects alike (createMultiProject passes
       // directoryName: workspaceName).
       worktreePath = path.join(
         expandTilde(metadata.runtimeConfig.srcBaseDir),
-        projectName,
+        participantCheckoutDirName(metadata, projectPath),
         metadata.name
       );
     } else {
@@ -318,25 +349,31 @@ export function computeManagedWorktreePaths(params: {
 }
 
 /**
- * Managed roots contributed by one workspace, computed from its own runtime
- * config. Callers capture this BEFORE deleting a workspace: once its config
- * entry is gone, a custom/legacy srcBaseDir root can no longer be
+ * Managed roots contributed by one workspace, keyed by each involved project
+ * path (normalized). Callers capture this BEFORE deleting a workspace: once
+ * its config entry is gone, a custom/legacy srcBaseDir root can no longer be
  * reconstructed and the deleted checkout's folder entry would linger forever.
+ * Roots are per-project so one project's file is never granted removal rights
+ * under another project's root.
  */
-export function managedRootsForWorkspace(
-  metadata: Pick<FrontendWorkspaceMetadata, "runtimeConfig" | "projectPath" | "projects">
-): string[] {
+export function managedRootsByProject(metadata: FrontendWorkspaceMetadata): Map<string, string[]> {
+  const rootsByProject = new Map<string, string[]>();
   if (!isWorktreeRuntime(metadata.runtimeConfig)) {
-    return [];
+    return rootsByProject;
   }
   const srcBaseDir = expandTilde(metadata.runtimeConfig.srcBaseDir);
   const involved = new Set<string>([
     metadata.projectPath,
+    ...(metadata.subProjectPath != null ? [metadata.subProjectPath] : []),
     ...(metadata.projects ?? []).map((ref) => ref.projectPath),
   ]);
-  return [...involved].map((involvedPath) =>
-    path.resolve(path.join(srcBaseDir, getProjectName(stripTrailingSlashes(involvedPath))))
-  );
+  for (const involvedPath of involved) {
+    const normalized = stripTrailingSlashes(involvedPath);
+    rootsByProject.set(normalized, [
+      path.resolve(path.join(srcBaseDir, participantCheckoutDirName(metadata, normalized))),
+    ]);
+  }
+  return rootsByProject;
 }
 
 // Resolve a project's configured setting to an absolute target path, or null
@@ -361,18 +398,21 @@ function resolveConfiguredCodeWorkspacePath(
   return codeWorkspacePath;
 }
 
+export type CodeWorkspaceSyncResult = { ok: true } | { ok: false; error: string };
+
 /**
  * Best-effort sync entry point used by workspace lifecycle operations and
  * startup reconciliation. Fast no-op when the project has no
  * `codeWorkspaceSyncPath` configured. Never throws and is bounded by
  * SYNC_TIMEOUT_MS: sync failures or stalled filesystems must never fail or
- * block a workspace operation.
+ * block a workspace operation. Background callers ignore the returned result;
+ * the explicit settings save path surfaces it to the user.
  */
 export async function syncProjectCodeWorkspace(
   config: Config,
   projectPath: string,
   options?: { extraManagedRootDirs?: string[] }
-): Promise<void> {
+): Promise<CodeWorkspaceSyncResult> {
   try {
     const normalizedProjectPath = stripTrailingSlashes(projectPath);
     const projects = config.loadConfigOrDefault().projects;
@@ -381,16 +421,19 @@ export async function syncProjectCodeWorkspace(
       projects.get(normalizedProjectPath)?.codeWorkspaceSyncPath
     );
     if (!targetFile) {
-      return;
+      return { ok: true };
     }
 
-    // The work never rejects (errors are logged inside), so a timeout that
+    // The work never rejects (errors become results), so a timeout that
     // orphans it cannot leave an unhandled rejection behind.
-    const work = (async () => {
+    const work: Promise<CodeWorkspaceSyncResult> = (async () => {
       try {
         // Reconcile every project targeting this file together. Projects can
         // share a file, and same-basename projects even share a managed root;
         // independent per-project removals would erase each other's entries.
+        // Group by canonical (symlink-resolved) target so aliases of one file
+        // reconcile together too.
+        const canonicalTarget = await resolveRealPath(targetFile);
         const allMetadata = await config.getAllWorkspaceMetadata();
         const desired = new Set<string>();
         const roots = new Set<string>(
@@ -398,27 +441,30 @@ export async function syncProjectCodeWorkspace(
         );
         const participantPaths: string[] = [];
         for (const [participantPath, participantConfig] of projects) {
+          const participantFile = resolveConfiguredCodeWorkspacePath(
+            participantPath,
+            participantConfig.codeWorkspaceSyncPath
+          );
           if (
-            resolveConfiguredCodeWorkspacePath(
-              participantPath,
-              participantConfig.codeWorkspaceSyncPath
-            ) !== targetFile
+            participantFile === null ||
+            (await resolveRealPath(participantFile)) !== canonicalTarget
           ) {
             continue;
           }
-          const projectName = getProjectName(participantPath);
           const computed = computeManagedWorktreePaths({
             allMetadata,
             projectPath: participantPath,
-            projectName,
-            defaultManagedRootDir: path.join(expandTilde(config.srcDir), projectName),
+            defaultManagedRootDir: path.join(
+              expandTilde(config.srcDir),
+              getProjectName(participantPath)
+            ),
           });
           participantPaths.push(participantPath);
           computed.desiredPaths.forEach((desiredPath) => desired.add(desiredPath));
           computed.managedRootDirs.forEach((rootDir) => roots.add(rootDir));
         }
         const desiredPaths = [...desired].sort();
-        await updateCodeWorkspaceFile({
+        return await updateCodeWorkspaceFile({
           codeWorkspacePath: targetFile,
           managedRootDirs: [...roots].sort(),
           desiredPaths,
@@ -426,16 +472,20 @@ export async function syncProjectCodeWorkspace(
         });
       } catch (error) {
         log.warn("Failed to sync .code-workspace file", { projectPath, error });
+        return { ok: false, error: getErrorMessage(error) };
       }
     })();
 
     const outcome = await raceWithAbortAndTimeout(work, { timeoutMs: SYNC_TIMEOUT_MS });
-    if (outcome.kind === "timeout") {
+    if (outcome.kind !== "ok") {
       log.warn("Timed out syncing .code-workspace file; continuing in background", {
         projectPath,
       });
+      return { ok: false, error: "Timed out accessing the workspace file" };
     }
+    return outcome.value;
   } catch (error) {
     log.warn("Failed to sync .code-workspace file", { projectPath, error });
+    return { ok: false, error: getErrorMessage(error) };
   }
 }

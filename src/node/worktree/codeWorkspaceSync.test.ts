@@ -343,6 +343,49 @@ describe("syncProjectCodeWorkspace", () => {
     expect((await fsPromises.readdir(projectPath)).length).toBe(0);
   });
 
+  test("groups symlink aliases of the same file into one reconcile", async () => {
+    // One project configures the symlink path, another the real path; lexical
+    // comparison would treat them as different files and let their overlapping
+    // managed root erase each other's entries.
+    const config = new Config(tempDir);
+    const projectA = path.join(tempDir, "a", "repo");
+    const projectB = path.join(tempDir, "b", "repo");
+    await fsPromises.mkdir(projectA, { recursive: true });
+    await fsPromises.mkdir(projectB, { recursive: true });
+    const realFile = path.join(tempDir, "real.code-workspace");
+    await fsPromises.writeFile(realFile, JSON.stringify({ folders: [] }));
+    const linkFile = path.join(tempDir, "alias.code-workspace");
+    await fsPromises.symlink(realFile, linkFile);
+    const worktreeA = path.join(config.srcDir, "repo", "feat-a");
+    const worktreeB = path.join(config.srcDir, "repo", "feat-b");
+    const workspaceEntry = (worktree: string, id: string) => ({
+      path: worktree,
+      id,
+      name: path.basename(worktree),
+      runtimeConfig: { type: "worktree" as const, srcBaseDir: config.srcDir },
+    });
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectA, {
+        workspaces: [workspaceEntry(worktreeA, "aaaaaaaaaa")],
+        codeWorkspaceSyncPath: linkFile,
+      });
+      cfg.projects.set(projectB, {
+        workspaces: [workspaceEntry(worktreeB, "bbbbbbbbbb")],
+        codeWorkspaceSyncPath: realFile,
+      });
+      return cfg;
+    });
+
+    await syncProjectCodeWorkspace(config, projectA);
+    await syncProjectCodeWorkspace(config, projectB);
+
+    const folderPaths = parseFolders(await fsPromises.readFile(realFile, "utf-8")).map(
+      (entry) => entry.path
+    );
+    expect(folderPaths).toContain(worktreeA);
+    expect(folderPaths).toContain(worktreeB);
+  });
+
   test("unions projects that target the same file so they cannot erase each other", async () => {
     // Same-basename projects share one managed root (<srcDir>/repo); a sync
     // scoped to only one project would remove the other's entries.
@@ -441,7 +484,6 @@ describe("computeManagedWorktreePaths", () => {
   const managedRoot = "/base/src/my-project";
   const computeParams = {
     projectPath,
-    projectName: "my-project",
     defaultManagedRootDir: managedRoot,
   };
 
@@ -483,6 +525,19 @@ describe("computeManagedWorktreePaths", () => {
       ...computeParams,
     });
     expect(desiredPaths).toEqual([`${managedRoot}/feature-a`]);
+  });
+
+  test("includes workspaces assigned to a registered sub-project", () => {
+    const subProjectPath = `${projectPath}/packages/api`;
+    // The workspace lives in the parent's bucket and shares the parent repo's
+    // worktree directory; the sub-project's own file must still list it.
+    const { desiredPaths, managedRootDirs } = computeManagedWorktreePaths({
+      allMetadata: [makeMetadata({ subProjectPath })],
+      projectPath: subProjectPath,
+      defaultManagedRootDir: "/base/src/api",
+    });
+    expect(desiredPaths).toEqual([`${managedRoot}/feature-a`]);
+    expect(managedRootDirs).toContain(managedRoot);
   });
 
   test("keeps worktrees under a custom or legacy srcBaseDir managed", () => {

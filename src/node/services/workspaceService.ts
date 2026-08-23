@@ -117,10 +117,7 @@ import {
 import { isWorktreeRuntime } from "@/node/runtime/worktreeLifecycleHooks";
 import { expandTilde, expandTildeForSSH } from "@/node/runtime/tildeExpansion";
 import { removeManagedGitWorktree } from "@/node/worktree/removeManagedGitWorktree";
-import {
-  managedRootsForWorkspace,
-  syncProjectCodeWorkspace,
-} from "@/node/worktree/codeWorkspaceSync";
+import { managedRootsByProject, syncProjectCodeWorkspace } from "@/node/worktree/codeWorkspaceSync";
 
 import {
   copyStagedWorkspaceAttachments,
@@ -4803,7 +4800,7 @@ export class WorkspaceService extends EventEmitter {
         session.emitMetadata(this.enrichFrontendMetadata(completeMetadata));
       }
 
-      await this.syncCodeWorkspaceFiles(owningProjectPath);
+      await this.syncCodeWorkspaceFiles(completeMetadata);
       eventSpine.emit("workspace.created", { workspaceId });
       return Ok({ metadata: this.enrichFrontendMetadata(completeMetadata) });
     } catch (error) {
@@ -5221,7 +5218,7 @@ export class WorkspaceService extends EventEmitter {
         session.emitMetadata(this.enrichFrontendMetadata(completeMetadata));
       }
 
-      await this.syncCodeWorkspaceFiles(completeMetadata.projectPath, completeMetadata.projects);
+      await this.syncCodeWorkspaceFiles(completeMetadata);
       eventSpine.emit("workspace.created", { workspaceId });
       return Ok(enrichedMetadata);
     } catch (error) {
@@ -5775,18 +5772,20 @@ export class WorkspaceService extends EventEmitter {
         (m) => m.id === workspaceId
       );
       const removedWorkspaceRoots = removedMetadata
-        ? managedRootsForWorkspace(removedMetadata)
-        : [];
+        ? managedRootsByProject(removedMetadata)
+        : undefined;
 
       // Remove from config
       await this.config.removeWorkspace(workspaceId);
       removedFromConfig = true;
       this.autoTitlingWorkspaces.delete(workspaceId);
 
-      if (persistedWorkspace) {
+      if (removedMetadata || persistedWorkspace) {
         await this.syncCodeWorkspaceFiles(
-          persistedWorkspace.projectPath,
-          persistedWorkspace.projects,
+          removedMetadata ?? {
+            projectPath: persistedWorkspace!.projectPath,
+            projects: persistedWorkspace!.projects,
+          },
           removedWorkspaceRoots
         );
       }
@@ -5817,13 +5816,28 @@ export class WorkspaceService extends EventEmitter {
    * syncProjectCodeWorkspace never throws, so lifecycle ops cannot fail here.
    */
   private async syncCodeWorkspaceFiles(
-    projectPath: string,
-    projects?: ReadonlyArray<{ projectPath: string }>,
-    extraManagedRootDirs?: string[]
+    workspace: {
+      projectPath: string;
+      projects?: ReadonlyArray<{ projectPath: string }>;
+      subProjectPath?: string;
+    },
+    extraManagedRootDirsByProject?: ReadonlyMap<string, string[]>
   ): Promise<void> {
-    const involvedPaths = new Set([projectPath, ...(projects ?? []).map((ref) => ref.projectPath)]);
+    const involvedPaths = new Set([
+      workspace.projectPath,
+      // A registered sub-project's file lists workspaces assigned to it even
+      // though they live in the parent's bucket.
+      ...(workspace.subProjectPath != null ? [workspace.subProjectPath] : []),
+      ...(workspace.projects ?? []).map((ref) => ref.projectPath),
+    ]);
     for (const involvedPath of involvedPaths) {
-      await syncProjectCodeWorkspace(this.config, involvedPath, { extraManagedRootDirs });
+      await syncProjectCodeWorkspace(this.config, involvedPath, {
+        // Extras are scoped per project so one project's file never gains
+        // removal rights under another project's root.
+        extraManagedRootDirs: extraManagedRootDirsByProject?.get(
+          stripTrailingSlashes(involvedPath)
+        ),
+      });
     }
   }
 
@@ -6737,7 +6751,7 @@ export class WorkspaceService extends EventEmitter {
         this.emit("metadata", { workspaceId, metadata: enrichedMetadata });
       }
 
-      await this.syncCodeWorkspaceFiles(configProjectPath, updatedMetadata.projects);
+      await this.syncCodeWorkspaceFiles(updatedMetadata);
 
       return Ok({ newWorkspaceId: workspaceId });
     } catch (error) {
@@ -7560,7 +7574,11 @@ export class WorkspaceService extends EventEmitter {
       // disposal here only frees runtimes and spine middleware. Never throws.
       await agentPluginHookService.disposeWorkspace(workspaceId);
 
-      await this.syncCodeWorkspaceFiles(projectPath, beforeArchiveMetadata?.projects);
+      await this.syncCodeWorkspaceFiles({
+        projectPath,
+        projects: beforeArchiveMetadata?.projects,
+        subProjectPath: beforeArchiveMetadata?.subProjectPath,
+      });
       eventSpine.emit("workspace.archived", { workspaceId });
       return Ok({ kind: "archived" as const });
     } catch (error) {
@@ -7688,7 +7706,11 @@ export class WorkspaceService extends EventEmitter {
         await this.emitCurrentWorkspaceMetadata(workspaceId);
       }
 
-      await this.syncCodeWorkspaceFiles(projectPath, hookMetadata?.projects);
+      await this.syncCodeWorkspaceFiles({
+        projectPath,
+        projects: hookMetadata?.projects,
+        subProjectPath: hookMetadata?.subProjectPath,
+      });
 
       return Ok(undefined);
     } catch (error) {
@@ -8896,7 +8918,7 @@ export class WorkspaceService extends EventEmitter {
       const enrichedMetadata = this.enrichFrontendMetadata(metadata);
       session.emitMetadata(enrichedMetadata);
 
-      await this.syncCodeWorkspaceFiles(foundProjectPath, metadata.projects);
+      await this.syncCodeWorkspaceFiles(metadata);
       eventSpine.emit("workspace.created", { workspaceId: newWorkspaceId });
       return Ok({ metadata: enrichedMetadata, projectPath: foundProjectPath });
     } catch (error) {
