@@ -918,7 +918,7 @@ export function TerminalView({
       )}
       {!showLoading && (
         <TerminalBadgeOverlay
-          workspaceName={workspaceName ?? resolvedNames?.workspaceName ?? ""}
+          workspaceName={workspaceName ?? resolvedNames?.workspaceName ?? workspaceId}
           projectName={projectName ?? resolvedNames?.projectName ?? ""}
           tabName={tabName ?? oscTitle ?? getTerminalTabFallbackName(0)}
           tabIndex={tabIndex}

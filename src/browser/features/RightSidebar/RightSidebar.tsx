@@ -287,6 +287,8 @@ interface RightSidebarTabsetNodeProps {
   onTerminalExit: (tab: TabType) => void;
   /** Map of terminal tab types to their current titles (from OSC sequences) */
   terminalTitles: Map<TabType, string>;
+  /** Workspace-wide 0-based ordering of terminal tabs across all splits */
+  terminalTabOrder: Map<TabType, number>;
   /** Handler to update a terminal's title */
   onTerminalTitleChange: (tab: TabType, title: string) => void;
   /** Map of tab → global position index (0-based) for keybind tooltips */
@@ -412,7 +414,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
       const Label = TAB_REGISTRY[tab].Label;
       label = <Label workspaceId={props.workspaceId} reviewStats={props.reviewStats} />;
     } else if (isTerminal) {
-      const terminalIndex = terminalTabs.indexOf(tab);
+      const terminalIndex = props.terminalTabOrder.get(tab) ?? 0;
       label = (
         <TerminalTabLabel
           dynamicTitle={props.terminalTitles.get(tab)}
@@ -549,13 +551,14 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
         )}
 
         {/* Render all terminal tabs (keep-alive: hidden but mounted) */}
-        {terminalTabs.map((terminalTab, terminalIndex) => {
+        {terminalTabs.map((terminalTab) => {
           const terminalTabId = `${tabsetBaseId}-tab-${terminalTab}`;
           const terminalPanelId = `${tabsetBaseId}-panel-${terminalTab}`;
           const isActive = props.node.activeTab === terminalTab;
           // Check if this terminal should be auto-focused (was just opened via keybind)
           const terminalSessionId = getTerminalSessionId(terminalTab);
           const shouldAutoFocus = isActive && terminalSessionId === props.autoFocusTerminalSession;
+          const terminalIndex = props.terminalTabOrder.get(terminalTab) ?? 0;
           const tabName =
             props.terminalTitles.get(terminalTab) ?? getTerminalTabFallbackName(terminalIndex);
 
@@ -1323,6 +1326,13 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return positions;
   }, [layout.root]);
 
+  // Workspace-wide terminal ordering. Numbering per tabset would restart at
+  // "Terminal"/#1 in every split, defeating the badge's per-tab identity.
+  const terminalTabOrder = new Map<TabType, number>();
+  collectAllTabs(layout.root)
+    .filter(isTerminalTab)
+    .forEach((tab, index) => terminalTabOrder.set(tab, index));
+
   // @dnd-kit state for tracking active drag
   const [activeDragData, setActiveDragData] = React.useState<TabDragData | null>(null);
 
@@ -1700,6 +1710,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         onCloseTerminal={handleCloseTerminal}
         onTerminalExit={removeTerminalTab}
         terminalTitles={terminalTitles}
+        terminalTabOrder={terminalTabOrder}
         onTerminalTitleChange={handleTerminalTitleChange}
         tabPositions={tabPositions}
         onRequestTerminalFocus={setAutoFocusTerminalSession}

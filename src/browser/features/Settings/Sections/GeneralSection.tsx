@@ -747,7 +747,7 @@ export function GeneralSection() {
 
           {terminalBadgeConfig.enabled && (
             <>
-              <div className="flex items-center justify-between gap-4">
+              <div className="flex flex-wrap items-center justify-between gap-4">
                 <div className="flex-1">
                   <div className="text-foreground text-sm">Terminal Badge Template</div>
                   <div className="text-muted text-xs">
@@ -765,7 +765,7 @@ export function GeneralSection() {
                   }
                   placeholder={DEFAULT_TERMINAL_BADGE_CONFIG.template}
                   aria-label="Terminal Badge Template"
-                  className="border-border-medium bg-background-secondary h-9 w-80"
+                  className="border-border-medium bg-background-secondary h-9 w-80 max-w-full"
                 />
               </div>
 
