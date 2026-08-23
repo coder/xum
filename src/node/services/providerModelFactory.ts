@@ -597,11 +597,22 @@ function getProviderFetch(providerConfig: ProviderConfig): typeof fetch {
  * @returns The base URL with /v1 suffix
  */
 export function normalizeAnthropicBaseURL(baseURL: string): string {
-  const trimmed = baseURL.replace(/\/+$/, ""); // Remove trailing slashes
-  if (trimmed.endsWith("/v1")) {
-    return trimmed;
+  // Append /v1 to the URL PATH: raw-string suffixing would push the version
+  // segment into a query or fragment (proxy.example/a?token=x -> ...?token=x/v1).
+  try {
+    const url = new URL(baseURL.trim());
+    // Compute on a local: the pathname setter normalizes "" back to "/".
+    const strippedPath = url.pathname.replace(/\/+$/, "");
+    url.pathname = strippedPath.endsWith("/v1") ? strippedPath : `${strippedPath}/v1`;
+    return url.toString();
+  } catch {
+    // Not an absolute URL; keep the legacy raw-string behavior.
+    const trimmed = baseURL.replace(/\/+$/, ""); // Remove trailing slashes
+    if (trimmed.endsWith("/v1")) {
+      return trimmed;
+    }
+    return `${trimmed}/v1`;
   }
-  return `${trimmed}/v1`;
 }
 
 export function normalizeOpenAICompatibleBaseURL(baseURL: string): string {

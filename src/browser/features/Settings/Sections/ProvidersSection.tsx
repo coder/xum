@@ -1451,7 +1451,11 @@ export function ProvidersSection() {
   }, [api, editingField, editValue, updateOptimistically]);
 
   // Plain function: React Compiler handles memoization.
-  const handleCustomProviderTypeChange = (provider: string, next: CustomProviderType) => {
+  const handleCustomProviderTypeChange = (
+    provider: string,
+    next: CustomProviderType,
+    previous: CustomProviderType | undefined
+  ) => {
     if (!api) return;
 
     updateOptimistically(provider, { providerType: next });
@@ -1469,6 +1473,9 @@ export function ProvidersSection() {
         // The format decides the request wire protocol, so an optimistic
         // value that failed to persist (policy denial, lock/write failure)
         // must not keep advertising an adapter the backend never adopted.
+        // Restore the previous value first: refresh() is best-effort and
+        // keeps the optimistic state when the refetch itself fails.
+        updateOptimistically(provider, { providerType: previous });
         void refresh();
       }
     })();
@@ -3064,7 +3071,11 @@ export function ProvidersSection() {
                               value={providerInfo.providerType}
                               onValueChange={(next) => {
                                 if (isCustomProviderType(next)) {
-                                  handleCustomProviderTypeChange(provider, next);
+                                  handleCustomProviderTypeChange(
+                                    provider,
+                                    next,
+                                    providerInfo.providerType
+                                  );
                                 }
                               }}
                             >

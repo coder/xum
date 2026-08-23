@@ -310,9 +310,12 @@ describe("ProvidersSection", () => {
     fireEvent.click(await within(customCard).findByRole("button", { name: "Anthropic Messages" }));
 
     // The optimistic format must not survive a failed persistence: the UI
-    // refetches backend truth instead of advertising an adapter that was
-    // never adopted.
+    // restores the previous value (refresh alone is best-effort and keeps
+    // optimistic state when the refetch fails) and refetches backend truth.
     await waitFor(() => {
+      expect(updateOptimisticallyMock).toHaveBeenCalledWith(CUSTOM_PROVIDER_ID, {
+        providerType: "openai-compatible",
+      });
       expect(providersRefreshMock).toHaveBeenCalled();
     });
   });

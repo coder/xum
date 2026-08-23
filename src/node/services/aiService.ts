@@ -2622,6 +2622,22 @@ export class AIService extends EventEmitter {
                   // namespace for custom-named/cross-typed instances. Mirrors
                   // resolveOptionsCanonicalModel's shadow + wire rules.
                   const advisorOptionsModelString = (() => {
+                    // Custom providers speak the wire their providerType
+                    // selects; mirrors resolveOptionsCanonicalModel's remap so
+                    // advisor reasoning options land in the SDK namespace.
+                    const advisorColonIndex = advisorModelString.indexOf(":");
+                    const advisorPrefixEntry =
+                      advisorColonIndex > 0
+                        ? advisorProvidersConfig[advisorModelString.slice(0, advisorColonIndex)]
+                        : undefined;
+                    if (isCustomProviderConfig(advisorPrefixEntry)) {
+                      const advisorWireOrigin = customProviderWireOrigin(
+                        advisorPrefixEntry.providerType
+                      );
+                      return advisorWireOrigin
+                        ? `${advisorWireOrigin}:${advisorModelString.slice(advisorColonIndex + 1)}`
+                        : advisorModelString;
+                    }
                     if (!advisorModelString.startsWith("coder:")) {
                       return advisorModelString;
                     }
