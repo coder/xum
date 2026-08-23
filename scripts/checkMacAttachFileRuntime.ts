@@ -64,15 +64,9 @@ async function findAppBundles(rootDir: string): Promise<{ matches: string[]; see
   return { matches, seen };
 }
 
-async function chooseDefaultAppBundle(): Promise<string> {
-  const { matches: appBundles, seen } = await findAppBundles(RELEASE_DIR);
-  assert(
-    appBundles.length > 0,
-    `No ${APP_NAME} found under ${RELEASE_DIR}. Run make dist-mac first. Stored .app names: ${
-      seen.length > 0 ? seen.join(", ") : "(none)"
-    }`
-  );
-
+// Takes the already-discovered bundles so callers do not re-walk the release
+// tree (and re-run the identical "no bundle found" assert) just to pick one.
+function chooseDefaultAppBundle(appBundles: readonly string[]): string {
   const preferredSuffixes =
     process.arch === "arm64"
       ? [
@@ -94,7 +88,7 @@ async function chooseDefaultAppBundle(): Promise<string> {
     }
   }
 
-  return appBundles.sort()[0]!;
+  return [...appBundles].sort()[0]!;
 }
 
 async function findFileMatching(rootDir: string, pattern: RegExp): Promise<string | null> {
@@ -304,7 +298,7 @@ async function main(): Promise<void> {
       }`
     );
     appBundles = matches;
-    smokeAppBundle = await chooseDefaultAppBundle();
+    smokeAppBundle = chooseDefaultAppBundle(matches);
   }
 
   const verifiedArchitectures = new Set<MacAppArchitecture>();
