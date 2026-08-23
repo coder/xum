@@ -53,11 +53,12 @@ const MAX_BASELINE_SHRINK_FRACTION = 0.1;
 // must not block refreshes forever).
 const MIN_BASELINE_FOR_SHRINK_CHECK = 20;
 const MAX_INVALID_PRICING_FRACTION = 0.05;
-// A poisoned upstream could keep every field present but scale prices toward
-// zero (or absurdly high), silently corrupting cost accounting. Legitimate
-// repricing moves few models or small factors, so a catalog-wide median shift
-// beyond this factor is treated as corruption.
-const MAX_MEDIAN_COST_SHIFT_FACTOR = 100;
+// A poisoned upstream could keep every field present but rescale values
+// (prices toward zero, token limits toward 1), silently corrupting cost
+// accounting or context handling. Legitimate repricing moves few models or
+// small factors, so a catalog-wide median shift beyond this factor is treated
+// as corruption.
+const MAX_MEDIAN_SHIFT_FACTOR = 100;
 
 /** Modes whose metadata applies to chat-style usage; mirrored by the Treat-as catalog. */
 export const MAPPABLE_MODES = new Set(["chat", "responses"]);
@@ -153,21 +154,33 @@ export function findMissingKnownModels(
 }
 
 export interface ModeCoverage {
+  /** Entries in this mode. */
+  entries: number;
   /** Entries passing getModelStats' usability bar (usable token limits). */
   usable: number;
-  /** Entries carrying a numeric input cost. */
-  inputPriced: number;
-  /** Entries carrying a numeric output cost. */
-  outputPriced: number;
+  /**
+   * Per retained field, entries carrying a consumed value. Every retained
+   * field is read somewhere at runtime (stats, pricing, capabilities) and most
+   * are optional per entry, so coverage is tracked per field and per mode:
+   * an upstream removal or rename of any one field registers as shrinkage
+   * instead of hiding behind counts of the surviving fields.
+   */
+  fields: Record<string, number>;
+}
+
+export interface NumericFieldStats {
+  /** Mappable-mode entries carrying a positive value for the field. */
+  samples: number;
+  /** Median of those positive values (0 when none). */
+  median: number;
 }
 
 export interface CatalogSummary {
   totalEntries: number;
   /** Coverage per mode string, spanning every mode (not just mappable ones). */
   modes: Record<string, ModeCoverage>;
-  /** Median positive per-token costs across mappable entries (0 when none). */
-  medianInputCost: number;
-  medianOutputCost: number;
+  /** Magnitude stats per numeric retained field across mappable entries. */
+  numericFields: Record<string, NumericFieldStats>;
 }
 
 function median(values: number[]): number {
@@ -178,51 +191,56 @@ function median(values: number[]): number {
   return sorted[Math.floor(sorted.length / 2)];
 }
 
+// Booleans count only when true: capability flags are consumed as "absent ==
+// unsupported", so a catalog-wide flip to false is equivalent to removal.
+function hasConsumedValue(value: unknown): boolean {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value);
+  }
+  return typeof value === "string" && value.length > 0;
+}
+
 export function summarizeCatalog(catalog: ModelCatalogData): CatalogSummary {
-  const summary: CatalogSummary = {
-    totalEntries: 0,
-    modes: {},
-    medianInputCost: 0,
-    medianOutputCost: 0,
-  };
-  const inputCosts: number[] = [];
-  const outputCosts: number[] = [];
+  const summary: CatalogSummary = { totalEntries: 0, modes: {}, numericFields: {} };
+  const numericSamples = new Map<string, number[]>();
   for (const metadata of Object.values(catalog)) {
     summary.totalEntries++;
     const mode = typeof metadata.mode === "string" ? metadata.mode : "unknown";
-    const coverage = (summary.modes[mode] ??= { usable: 0, inputPriced: 0, outputPriced: 0 });
+    const coverage = (summary.modes[mode] ??= { entries: 0, usable: 0, fields: {} });
+    coverage.entries++;
     // Usability applies getModelStats' bar: entries without usable token limits
     // never resolve, so losing max_input_tokens must register as shrinkage.
     if (hasUsableTokenLimits(metadata)) {
       coverage.usable++;
     }
-    // Input and output pricing are tracked separately per mode so renaming one
-    // cost field, or stripping pricing from a smaller mode like `responses`,
-    // cannot hide behind another field's or a larger mode's coverage.
-    if (typeof metadata.input_cost_per_token === "number") {
-      coverage.inputPriced++;
-      if (MAPPABLE_MODES.has(mode) && metadata.input_cost_per_token > 0) {
-        inputCosts.push(metadata.input_cost_per_token);
+    for (const field of RETAINED_FIELDS) {
+      if (field === "mode") {
+        continue; // the bucket key itself; `entries` already counts it
       }
-    }
-    if (typeof metadata.output_cost_per_token === "number") {
-      coverage.outputPriced++;
-      if (MAPPABLE_MODES.has(mode) && metadata.output_cost_per_token > 0) {
-        outputCosts.push(metadata.output_cost_per_token);
+      const value = metadata[field];
+      if (hasConsumedValue(value)) {
+        coverage.fields[field] = (coverage.fields[field] ?? 0) + 1;
+      }
+      if (MAPPABLE_MODES.has(mode) && typeof value === "number" && value > 0) {
+        let samples = numericSamples.get(field);
+        if (samples === undefined) {
+          samples = [];
+          numericSamples.set(field, samples);
+        }
+        samples.push(value);
       }
     }
   }
-  summary.medianInputCost = median(inputCosts);
-  summary.medianOutputCost = median(outputCosts);
+  for (const [field, samples] of numericSamples) {
+    summary.numericFields[field] = { samples: samples.length, median: median(samples) };
+  }
   return summary;
 }
 
-const EMPTY_BASELINE: CatalogSummary = {
-  totalEntries: 0,
-  modes: {},
-  medianInputCost: 0,
-  medianOutputCost: 0,
-};
+const EMPTY_BASELINE: CatalogSummary = { totalEntries: 0, modes: {}, numericFields: {} };
 
 function belowBaseline(count: number, baseline: number): boolean {
   return (
@@ -255,23 +273,45 @@ export function validateModelData(
     );
   }
 
-  // Costs are optional per entry (subscription providers), so an upstream
-  // pricing-field rename or a wholesale mode omission would sail through the
-  // per-entry checks; comparing every mode's usable and priced coverage against
-  // the vendored baseline (plus the total entry count for modes without usable
-  // limits, like image_generation pricing rows) keeps getModelStats from
-  // silently zero-pricing or dropping whole slices of the catalog.
+  // Fields are optional per entry (e.g. subscription providers omit costs), so
+  // an upstream rename or wholesale omission of any retained field, or of a
+  // whole mode, would sail through the per-entry checks; comparing every mode's
+  // entry/usable counts and every retained field's per-mode coverage against
+  // the vendored baseline keeps a refresh from silently dropping, zero-pricing,
+  // or de-capability-ing whole slices of the catalog.
   const shrinkChecks: Array<[label: string, count: number, baselineCount: number]> = [
     ["total entry count", summary.totalEntries, baseline.totalEntries],
   ];
-  const emptyCoverage: ModeCoverage = { usable: 0, inputPriced: 0, outputPriced: 0 };
+  const emptyCoverage: ModeCoverage = { entries: 0, usable: 0, fields: {} };
   for (const [mode, baselineCoverage] of Object.entries(baseline.modes)) {
     const coverage = summary.modes[mode] ?? emptyCoverage;
     shrinkChecks.push(
-      [`${mode} usable model count`, coverage.usable, baselineCoverage.usable],
-      [`${mode} input-priced model count`, coverage.inputPriced, baselineCoverage.inputPriced],
-      [`${mode} output-priced model count`, coverage.outputPriced, baselineCoverage.outputPriced]
+      [`${mode} entry count`, coverage.entries, baselineCoverage.entries],
+      [`${mode} usable model count`, coverage.usable, baselineCoverage.usable]
     );
+    for (const [field, baselineCount] of Object.entries(baselineCoverage.fields)) {
+      shrinkChecks.push([`${mode} ${field} coverage`, coverage.fields[field] ?? 0, baselineCount]);
+    }
+  }
+  // Numeric magnitudes are guarded too, not just field presence: a poisoned
+  // catalog could retain every field while rescaling values (prices toward
+  // zero or absurdly high, token limits toward 1). A collapsed sample count
+  // (e.g. every price zeroed) fails both the sample shrink and the median
+  // check, since a zero median is more than MAX_MEDIAN_SHIFT_FACTOR below any
+  // positive baseline.
+  for (const [field, baselineStats] of Object.entries(baseline.numericFields)) {
+    if (baselineStats.samples < MIN_BASELINE_FOR_SHRINK_CHECK || baselineStats.median <= 0) {
+      continue;
+    }
+    const candidate = summary.numericFields[field] ?? { samples: 0, median: 0 };
+    shrinkChecks.push([`${field} positive-value count`, candidate.samples, baselineStats.samples]);
+    const ratio = candidate.median / baselineStats.median;
+    if (ratio > MAX_MEDIAN_SHIFT_FACTOR || ratio < 1 / MAX_MEDIAN_SHIFT_FACTOR) {
+      errors.push(
+        `${field} median shifted from ${baselineStats.median} to ${candidate.median} ` +
+          `(more than ${MAX_MEDIAN_SHIFT_FACTOR}x from the vendored baseline; possible corruption)`
+      );
+    }
   }
   for (const [label, count, baselineCount] of shrinkChecks) {
     if (belowBaseline(count, baselineCount)) {
@@ -279,24 +319,6 @@ export function validateModelData(
         `${label} shrank from ${baselineCount} to ${count} ` +
           `(more than ${MAX_BASELINE_SHRINK_FRACTION * 100}% below the vendored baseline)`
       );
-    }
-  }
-
-  // Guard price magnitudes, not just field presence: a poisoned catalog could
-  // retain every field while scaling all rates toward zero.
-  const medianChecks: Array<[label: string, value: number, baselineValue: number]> = [
-    ["median input cost", summary.medianInputCost, baseline.medianInputCost],
-    ["median output cost", summary.medianOutputCost, baseline.medianOutputCost],
-  ];
-  for (const [label, value, baselineValue] of medianChecks) {
-    if (value > 0 && baselineValue > 0) {
-      const ratio = value / baselineValue;
-      if (ratio > MAX_MEDIAN_COST_SHIFT_FACTOR || ratio < 1 / MAX_MEDIAN_COST_SHIFT_FACTOR) {
-        errors.push(
-          `${label} shifted from ${baselineValue} to ${value} (more than ` +
-            `${MAX_MEDIAN_COST_SHIFT_FACTOR}x from the vendored baseline; possible price corruption)`
-        );
-      }
     }
   }
 
