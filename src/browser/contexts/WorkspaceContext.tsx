@@ -65,7 +65,10 @@ import {
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { reassignPinnedTimestamps } from "@/common/utils/pin";
-import { shouldApplyWorkspaceAiSettingsFromBackend } from "@/browser/utils/workspaceAiSettingsSync";
+import {
+  shouldApplyWorkspaceAgentIdFromBackend,
+  shouldApplyWorkspaceAiSettingsFromBackend,
+} from "@/browser/utils/workspaceAiSettingsSync";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import { findAdjacentWorkspaceId } from "@/browser/utils/ui/workspaceDomNav";
 import { useRouter } from "@/browser/contexts/RouterContext";
@@ -161,12 +164,6 @@ function migrateLocalGatewayPrefsToBackend(
   }
 }
 
-function shouldSeedWorkspaceAgentIdFromBackend(metadata: FrontendWorkspaceMetadata): boolean {
-  // Main workspaces own their live agent selection in localStorage. Child/task
-  // workspaces are backend-defined and locked, so they must re-seed from metadata.
-  return metadata.parentWorkspaceId != null;
-}
-
 /**
  * Seed per-workspace localStorage from backend workspace metadata.
  *
@@ -183,13 +180,21 @@ function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadat
 
   const workspaceId = metadata.id;
 
+  // Seed the active agent from backend metadata so the last used mode follows
+  // the workspace across clients. Child/task workspaces are backend-defined and
+  // locked, so they always re-seed; main workspaces persist local mode changes
+  // to the backend and are protected from stale broadcasts by the pending-echo
+  // guard (shouldApplyWorkspaceAgentIdFromBackend).
   const metadataAgentId = resolvePersistedAgentId(metadata, "");
-  if (shouldSeedWorkspaceAgentIdFromBackend(metadata) && metadataAgentId.length > 0) {
-    const key = getAgentIdKey(workspaceId);
+  if (metadataAgentId.length > 0) {
     const normalized = normalizeAgentId(metadataAgentId);
-    const existing = readPersistedState<string | undefined>(key, undefined);
-    if (existing !== normalized) {
-      updatePersistedState(key, normalized);
+    const isLockedChildWorkspace = metadata.parentWorkspaceId != null;
+    if (isLockedChildWorkspace || shouldApplyWorkspaceAgentIdFromBackend(workspaceId, normalized)) {
+      const key = getAgentIdKey(workspaceId);
+      const existing = readPersistedState<string | undefined>(key, undefined);
+      if (existing !== normalized) {
+        updatePersistedState(key, normalized);
+      }
     }
   }
 

@@ -88,3 +88,38 @@ export function shouldApplyWorkspaceAiSettingsFromBackend(
 
   return false;
 }
+
+// Same pending-echo protection as AI settings, but for the workspace's active
+// agent selection: a local mode switch must not be reverted by a stale
+// metadata broadcast that raced the persistence write.
+const pendingAgentIdByWorkspace = new Map<string, string>();
+
+export function markPendingWorkspaceAgentId(workspaceId: string, agentId: string): void {
+  if (!workspaceId || !agentId) {
+    return;
+  }
+  pendingAgentIdByWorkspace.set(workspaceId, agentId);
+}
+
+export function clearPendingWorkspaceAgentId(workspaceId: string, agentId: string): void {
+  // Clear only the matching entry so a failed write cannot wipe a newer
+  // pending selection from a rapid follow-up switch.
+  if (pendingAgentIdByWorkspace.get(workspaceId) === agentId) {
+    pendingAgentIdByWorkspace.delete(workspaceId);
+  }
+}
+
+export function shouldApplyWorkspaceAgentIdFromBackend(
+  workspaceId: string,
+  incomingAgentId: string
+): boolean {
+  const pending = pendingAgentIdByWorkspace.get(workspaceId);
+  if (!pending) {
+    return true;
+  }
+  if (pending === incomingAgentId) {
+    pendingAgentIdByWorkspace.delete(workspaceId);
+    return true;
+  }
+  return false;
+}

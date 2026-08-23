@@ -22,6 +22,12 @@ import type * as WorkspaceContextModule from "./WorkspaceContext";
 
 let mockAgentDefinitions: AgentDefinitionDescriptor[] = [];
 let mockWorkspaceMetadata = new Map<string, { parentWorkspaceId?: string; agentId?: string }>();
+let updateAgentAISettingsCalls: Array<{
+  workspaceId: string;
+  agentId: string;
+  aiSettings: { model: string } | null;
+  persistSelectedAgentId?: boolean | null;
+}> = [];
 
 let APIProvider!: typeof APIModule.APIProvider;
 let RouterProvider!: typeof RouterContextModule.RouterProvider;
@@ -200,6 +206,10 @@ function createApiClient(): APIClient {
       },
       truncateHistory: () => Promise.resolve({ success: true as const, data: undefined }),
       interruptStream: () => Promise.resolve({ success: true as const, data: undefined }),
+      updateAgentAISettings: (input: (typeof updateAgentAISettingsCalls)[number]) => {
+        updateAgentAISettingsCalls.push(input);
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
     },
     projects: {
       list: () => Promise.resolve([]),
@@ -246,6 +256,7 @@ describe("AgentContext", () => {
     isolatedModuleDir = await importIsolatedAgentModules();
     mockAgentDefinitions = [];
     mockWorkspaceMetadata = new Map();
+    updateAgentAISettingsCalls = [];
 
     originalWindow = globalThis.window;
     originalDocument = globalThis.document;
@@ -360,6 +371,39 @@ describe("AgentContext", () => {
     await waitFor(() => {
       expect(contextValue?.agentId).toBe("review");
     });
+  });
+
+  test("workspace agent selection persists to the backend", async () => {
+    const projectPath = "/tmp/project";
+    const workspaceId = "main-workspace";
+    mockAgentDefinitions = [EXEC_AGENT, PLAN_AGENT];
+    mockWorkspaceMetadata.set(workspaceId, {});
+    window.localStorage.setItem(getAgentIdKey(workspaceId), JSON.stringify("exec"));
+
+    let contextValue: AgentContextValue | undefined;
+
+    renderAgentHarness({
+      workspaceId,
+      projectPath,
+      onChange: (value) => (contextValue = value),
+    });
+
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("exec");
+    });
+
+    contextValue?.setAgentId("plan");
+
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("plan");
+    });
+    expect(updateAgentAISettingsCalls).toEqual([
+      { workspaceId, agentId: "plan", aiSettings: null, persistSelectedAgentId: true },
+    ]);
+
+    // Re-selecting the current agent is a no-op and must not hit the backend.
+    contextValue?.setAgentId("plan");
+    expect(updateAgentAISettingsCalls).toHaveLength(1);
   });
 
   test("shortcut actions do not override a locked workspace agent", async () => {

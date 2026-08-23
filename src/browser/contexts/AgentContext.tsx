@@ -25,6 +25,10 @@ import {
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { sortAgentsStable } from "@/browser/utils/agents";
 import { normalizeAgentId, resolveRemovedBuiltinAgentId } from "@/common/utils/agentIds";
+import {
+  clearPendingWorkspaceAgentId,
+  markPendingWorkspaceAgentId,
+} from "@/browser/utils/workspaceAiSettingsSync";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
 export interface AgentContextValue {
@@ -120,17 +124,52 @@ function AgentProviderWithState(props: {
     }
   }, [disableWorkspaceAgents, setDisableWorkspaceAgents]);
 
+  // Child/subagent workspaces keep the backend-assigned agent; their selection
+  // is locked, so local changes must never be written back.
+  const isCurrentAgentLocked = currentMeta?.parentWorkspaceId != null;
+
+  const workspaceId = props.workspaceId;
   const setAgentId: Dispatch<SetStateAction<string>> = useCallback(
     (value) => {
+      // usePersistedState runs the updater synchronously, so `next` is
+      // available right after the call.
+      let next: string | null = null;
+      let changed = false;
       setAgentIdRaw((prev) => {
         const explicitPrevAgentId =
           typeof prev === "string" && prev.trim().length > 0 ? prev : globalDefaultAgentId;
         const previousAgentId = coerceAgentId(isProjectScope ? explicitPrevAgentId : prev);
-        const next = typeof value === "function" ? value(previousAgentId) : value;
-        return coerceAgentId(next);
+        next = coerceAgentId(typeof value === "function" ? value(previousAgentId) : value);
+        changed = next !== previousAgentId;
+        return next;
       });
+
+      // Persist workspace mode changes so the selection is remembered
+      // per-workspace across clients, not just in this client's localStorage.
+      if (!api || !workspaceId || isCurrentAgentLocked || next == null || !changed) {
+        return;
+      }
+      const nextAgentId: string = next;
+
+      markPendingWorkspaceAgentId(workspaceId, nextAgentId);
+      api.workspace
+        .updateAgentAISettings({
+          workspaceId,
+          agentId: nextAgentId,
+          aiSettings: null,
+          persistSelectedAgentId: true,
+        })
+        .then((result) => {
+          if (!result.success) {
+            clearPendingWorkspaceAgentId(workspaceId, nextAgentId);
+          }
+        })
+        .catch(() => {
+          // Best-effort only: the next sendMessage persists the same selection.
+          clearPendingWorkspaceAgentId(workspaceId, nextAgentId);
+        });
     },
-    [globalDefaultAgentId, isProjectScope, setAgentIdRaw]
+    [api, globalDefaultAgentId, isCurrentAgentLocked, isProjectScope, setAgentIdRaw, workspaceId]
   );
 
   const [agents, setAgents] = useState<AgentDefinitionDescriptor[]>([]);
@@ -230,11 +269,8 @@ function AgentProviderWithState(props: {
     }
   }, [fetchAgents, props.projectPath, props.workspaceId, disableWorkspaceAgents]);
 
-  // Project-scoped providers should inherit the global default agent until a
-  // project-scoped preference is explicitly set. Child/subagent workspaces keep
-  // the backend-assigned agent so local persisted overrides cannot drift.
-  const isCurrentAgentLocked = currentMeta?.parentWorkspaceId != null;
-
+  // Project-scoped providers inherit the global default agent until a
+  // project-scoped preference is explicitly set.
   // For locked workspaces, use the backend-assigned agent — persisted localStorage
   // may contain a stale selection from before locking, and the picker is disabled
   // so there's no in-UI recovery path.

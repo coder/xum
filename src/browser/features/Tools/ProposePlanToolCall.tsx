@@ -53,6 +53,7 @@ import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
+import { markPendingWorkspaceAgentId } from "@/browser/utils/workspaceAiSettingsSync";
 import {
   resolveWorkspaceAiSettingsForAgent,
   type WorkspaceAISettingsCache,
@@ -505,6 +506,9 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
       });
 
+    // The follow-up send persists this switch to the backend; guard the interim
+    // against stale metadata broadcasts re-seeding the previous agent.
+    markPendingWorkspaceAgentId(args.workspaceId, args.targetAgentId);
     updatePersistedState(getAgentIdKey(args.workspaceId), args.targetAgentId);
 
     if (existingModel !== resolvedModel) {

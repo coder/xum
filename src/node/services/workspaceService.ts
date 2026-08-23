@@ -9676,39 +9676,45 @@ export class WorkspaceService extends EventEmitter {
   async updateAgentAISettings(
     workspaceId: string,
     agentId: string,
-    aiSettings: WorkspaceAISettings,
+    // Null persists only the selected agent (with persistSelectedAgentId),
+    // leaving the agent's stored settings untouched.
+    aiSettings: WorkspaceAISettings | null,
     options?: { persistSelectedAgentId?: boolean }
   ): Promise<Result<void, string>> {
     try {
-      const normalized = this.normalizeWorkspaceAISettings(aiSettings);
-      if (!normalized.success) {
-        return Err(normalized.error);
-      }
+      let normalizedSettings: WorkspaceAISettings | null = null;
+      if (aiSettings != null) {
+        const normalized = this.normalizeWorkspaceAISettings(aiSettings);
+        if (!normalized.success) {
+          return Err(normalized.error);
+        }
+        normalizedSettings = normalized.data;
 
-      if (this.workspaceGoalService) {
-        const goal = await this.workspaceGoalService.getGoal(workspaceId);
-        // Use the resumable check rather than active-only: a paused or
-        // budget-limited budgeted goal will resume accounting when the user
-        // un-pauses or raises the budget. Letting them switch to an unpriced
-        // model in the meantime silently records 0 cost on the next stream
-        // and budget enforcement quietly stops working.
-        if (
-          hasBudgetedResumableGoal(goal) &&
-          !modelHasPricingData(
-            normalized.data.model,
-            typeof this.config.loadProvidersConfig === "function"
-              ? this.config.loadProvidersConfig()
-              : null
-          )
-        ) {
-          return Err(UNPRICED_TARGET_MODEL_GOAL_MESSAGE);
+        if (this.workspaceGoalService) {
+          const goal = await this.workspaceGoalService.getGoal(workspaceId);
+          // Use the resumable check rather than active-only: a paused or
+          // budget-limited budgeted goal will resume accounting when the user
+          // un-pauses or raises the budget. Letting them switch to an unpriced
+          // model in the meantime silently records 0 cost on the next stream
+          // and budget enforcement quietly stops working.
+          if (
+            hasBudgetedResumableGoal(goal) &&
+            !modelHasPricingData(
+              normalizedSettings.model,
+              typeof this.config.loadProvidersConfig === "function"
+                ? this.config.loadProvidersConfig()
+                : null
+            )
+          ) {
+            return Err(UNPRICED_TARGET_MODEL_GOAL_MESSAGE);
+          }
         }
       }
 
       const persistResult = await this.persistWorkspaceAISettingsForAgent(
         workspaceId,
         agentId,
-        normalized.data,
+        normalizedSettings,
         {
           emitMetadata: true,
           ...(options?.persistSelectedAgentId === true ? { persistSelectedAgentId: true } : {}),
@@ -9726,7 +9732,7 @@ export class WorkspaceService extends EventEmitter {
           status: "completed",
           data: {
             agentId,
-            model: normalized.data.model,
+            model: normalizedSettings?.model,
             mode: parsedMode.success ? parsedMode.data : undefined,
           },
         });

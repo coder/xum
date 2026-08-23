@@ -21,6 +21,7 @@ import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { RecursivePartial } from "@/browser/testUtils";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { markPendingWorkspaceAgentId } from "@/browser/utils/workspaceAiSettingsSync";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 
@@ -520,8 +521,30 @@ describe("WorkspaceContext", () => {
       "xhigh"
     );
   });
-  test("stale metadata does not override a main workspace agent selection", async () => {
+  test("backend agentId seeds a main workspace agent selection", async () => {
     const workspaceId = "ws-agent-main";
+
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([createWorkspaceMetadata({ id: workspaceId, agentId: "plan" })]),
+      },
+      localStorage: {
+        // Backend value wins over a stale local selection from another client.
+        [getAgentIdKey(workspaceId)]: JSON.stringify("exec"),
+      },
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
+    expect(readPersistedState<string | undefined>(getAgentIdKey(workspaceId), undefined)).toBe(
+      "plan"
+    );
+  });
+
+  test("stale metadata does not clobber a pending local agent switch", async () => {
+    const workspaceId = "ws-agent-pending";
     let emitMetadata:
       | ((event: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }) => void)
       | null = null;
@@ -532,13 +555,16 @@ describe("WorkspaceContext", () => {
         onMetadata: () =>
           Promise.resolve(
             (async function* () {
-              const event = await new Promise<{
-                workspaceId: string;
-                metadata: FrontendWorkspaceMetadata | null;
-              }>((resolve) => {
-                emitMetadata = resolve;
-              });
-              yield event;
+              while (true) {
+                const event = await new Promise<{
+                  workspaceId: string;
+                  metadata: FrontendWorkspaceMetadata | null;
+                }>((resolve) => {
+                  emitMetadata = resolve;
+                });
+                emitMetadata = null;
+                yield event;
+              }
             })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
           ),
       },
@@ -547,22 +573,48 @@ describe("WorkspaceContext", () => {
       },
     });
 
+    // Simulate a local mode switch whose backend write hasn't echoed yet.
+    markPendingWorkspaceAgentId(workspaceId, "exec");
+
     const ctx = await setup();
 
     await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
     await waitFor(() => expect(emitMetadata).toBeTruthy());
-    expect(ctx().workspaceMetadata.get(workspaceId)?.agentId).toBeUndefined();
 
+    // A stale broadcast carrying the previous agent must not revert the switch.
     act(() => {
       emitMetadata?.({
         workspaceId,
         metadata: createWorkspaceMetadata({ id: workspaceId, agentId: "plan" }),
       });
     });
-
     await waitFor(() => expect(ctx().workspaceMetadata.get(workspaceId)?.agentId).toBe("plan"));
     expect(readPersistedState<string | undefined>(getAgentIdKey(workspaceId), undefined)).toBe(
       "exec"
+    );
+
+    // The backend echo of the pending value clears the guard...
+    await waitFor(() => expect(emitMetadata).toBeTruthy());
+    act(() => {
+      emitMetadata?.({
+        workspaceId,
+        metadata: createWorkspaceMetadata({ id: workspaceId, agentId: "exec" }),
+      });
+    });
+    await waitFor(() => expect(ctx().workspaceMetadata.get(workspaceId)?.agentId).toBe("exec"));
+
+    // ...so later backend updates apply again.
+    await waitFor(() => expect(emitMetadata).toBeTruthy());
+    act(() => {
+      emitMetadata?.({
+        workspaceId,
+        metadata: createWorkspaceMetadata({ id: workspaceId, agentId: "plan" }),
+      });
+    });
+    await waitFor(() =>
+      expect(readPersistedState<string | undefined>(getAgentIdKey(workspaceId), undefined)).toBe(
+        "plan"
+      )
     );
   });
 

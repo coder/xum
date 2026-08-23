@@ -56,6 +56,51 @@ describe("workspace.updateAgentAISettings", () => {
     }
   }, 60000);
 
+  test("persists only the selected agent when aiSettings is null", async () => {
+    const env: TestEnvironment = await createTestEnvironment();
+    const tempGitRepo = await createTempGitRepo();
+
+    try {
+      const branchName = generateBranchName("agent-only");
+      const createResult = await createWorkspace(env, tempGitRepo, branchName);
+      if (!createResult.success) {
+        throw new Error(`Workspace creation failed: ${createResult.error}`);
+      }
+
+      const workspaceId = createResult.metadata.id;
+      expect(workspaceId).toBeTruthy();
+
+      const client = resolveOrpcClient(env);
+      const seedResult = await client.workspace.updateAgentAISettings({
+        workspaceId: workspaceId!,
+        agentId: "exec",
+        aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "xhigh" },
+        persistSelectedAgentId: true,
+      });
+      expect(seedResult.success).toBe(true);
+
+      // Mode switch without settings: remembers the agent, leaves settings alone.
+      const switchResult = await client.workspace.updateAgentAISettings({
+        workspaceId: workspaceId!,
+        agentId: "plan",
+        aiSettings: null,
+        persistSelectedAgentId: true,
+      });
+      expect(switchResult.success).toBe(true);
+
+      const info = await client.workspace.getInfo({ workspaceId: workspaceId! });
+      expect(info?.agentId).toBe("plan");
+      expect(info?.aiSettingsByAgent?.plan).toBeUndefined();
+      expect(info?.aiSettingsByAgent?.exec).toEqual({
+        model: "openai:gpt-5.2",
+        thinkingLevel: "xhigh",
+      });
+    } finally {
+      await cleanupTestEnvironment(env);
+      await cleanupTempGitRepo(tempGitRepo);
+    }
+  }, 60000);
+
   test("keeps ask-scoped settings separate from exec when persisting agent settings", async () => {
     const env: TestEnvironment = await createTestEnvironment();
     const tempGitRepo = await createTempGitRepo();
