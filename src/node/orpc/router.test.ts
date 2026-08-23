@@ -1142,3 +1142,83 @@ describe("router config.saveConfig", () => {
     expect(savedTaskSettings.proposePlanImplementReplacesChatHistory).toBe(true);
   });
 });
+
+describe("projects.setCodeWorkspaceSyncPath", () => {
+  let tempDir: string;
+  let config: Config;
+  let projectPath: string;
+
+  beforeEach(async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-router-codews-test-"));
+    config = new Config(tempDir);
+    projectPath = path.join(tempDir, "project");
+    fs.mkdirSync(projectPath, { recursive: true });
+    await config.editConfig((current) => {
+      current.projects.set(projectPath, { workspaces: [] });
+      return current;
+    });
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function createClient() {
+    return createRouterClient(router(), {
+      context: { config } as unknown as ORPCContext,
+    });
+  }
+
+  test("rejects paths without the .code-workspace extension with a client-visible error", async () => {
+    const client = createClient();
+    let thrown: unknown;
+    try {
+      await client.projects.setCodeWorkspaceSyncPath({
+        projectPath,
+        codeWorkspaceSyncPath: "/tmp/notes.txt",
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    // Must be an ORPCError so the extension hint reaches the UI instead of
+    // a generic "Internal server error".
+    expect(thrown).toBeInstanceOf(ORPCError);
+    expect((thrown as ORPCError<string, unknown>).message).toContain(".code-workspace");
+    expect(
+      config.loadConfigOrDefault().projects.get(projectPath)?.codeWorkspaceSyncPath
+    ).toBeUndefined();
+  });
+
+  test("stores the path and writes the workspace file immediately", async () => {
+    const client = createClient();
+    await client.projects.setCodeWorkspaceSyncPath({
+      projectPath,
+      codeWorkspaceSyncPath: "  proj.code-workspace  ",
+    });
+
+    expect(config.loadConfigOrDefault().projects.get(projectPath)?.codeWorkspaceSyncPath).toBe(
+      "proj.code-workspace"
+    );
+    const written = JSON.parse(
+      fs.readFileSync(path.join(projectPath, "proj.code-workspace"), "utf-8")
+    ) as { folders: Array<{ path: string }> };
+    expect(written.folders).toEqual([{ path: projectPath }]);
+  });
+
+  test("clearing the setting removes it without deleting the existing file", async () => {
+    const client = createClient();
+    await client.projects.setCodeWorkspaceSyncPath({
+      projectPath,
+      codeWorkspaceSyncPath: "proj.code-workspace",
+    });
+    await client.projects.setCodeWorkspaceSyncPath({
+      projectPath,
+      codeWorkspaceSyncPath: null,
+    });
+
+    expect(
+      config.loadConfigOrDefault().projects.get(projectPath)?.codeWorkspaceSyncPath
+    ).toBeUndefined();
+    expect(fs.existsSync(path.join(projectPath, "proj.code-workspace"))).toBe(true);
+  });
+});

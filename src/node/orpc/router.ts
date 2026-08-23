@@ -3520,7 +3520,10 @@ export const router = (authToken?: string) => {
           const trimmed = input.codeWorkspaceSyncPath?.trim() ?? "";
           if (trimmed && !trimmed.endsWith(CODE_WORKSPACE_EXTENSION)) {
             // The sync read-modify-writes this file, so refuse arbitrary targets.
-            throw new Error(`Path must end with ${CODE_WORKSPACE_EXTENSION}`);
+            // ORPCError so the message reaches the UI instead of "Internal server error".
+            throw new ORPCError("BAD_REQUEST", {
+              message: `Path must end with ${CODE_WORKSPACE_EXTENSION}`,
+            });
           }
           await context.config.editConfig((config) => {
             const project = config.projects.get(normalizedPath);
