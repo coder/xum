@@ -44,11 +44,14 @@ const COST_FIELDS = [
 ] as const;
 
 // Abort thresholds guarding against truncated or structurally reshaped upstream data.
-// The absolute floor catches degenerate payloads; the relative bound catches partial
-// responses that would silently drop metadata for thousands of currently known models.
-const MIN_CHAT_MODELS = 500;
-const MAX_CHAT_MODEL_SHRINK_FRACTION = 0.1;
+// The absolute floor catches degenerate payloads; the relative bounds catch partial
+// responses or field renames that would silently degrade thousands of known models.
+const MIN_USABLE_MAPPABLE_MODELS = 500;
+const MAX_BASELINE_SHRINK_FRACTION = 0.1;
 const MAX_INVALID_PRICING_FRACTION = 0.05;
+
+/** Modes whose metadata applies to chat-style usage; mirrored by the Treat-as catalog. */
+export const MAPPABLE_MODES = new Set(["chat", "responses"]);
 
 export type ModelCatalogData = Record<string, Record<string, unknown>>;
 
@@ -148,33 +151,51 @@ export function findMissingKnownModels(
 }
 
 export interface CatalogSummary {
-  chatModels: number;
-  /** Chat models carrying a numeric input or output cost. */
-  pricedChatModels: number;
+  /** Chat/responses entries with usable token limits (what the Treat-as catalog can expose). */
+  usableMappableModels: number;
+  /** Chat entries carrying a numeric input cost. */
+  inputPricedChatModels: number;
+  /** Chat entries carrying a numeric output cost. */
+  outputPricedChatModels: number;
 }
 
 export function summarizeCatalog(catalog: ModelCatalogData): CatalogSummary {
-  let chatModels = 0;
-  let pricedChatModels = 0;
+  const summary: CatalogSummary = {
+    usableMappableModels: 0,
+    inputPricedChatModels: 0,
+    outputPricedChatModels: 0,
+  };
   for (const metadata of Object.values(catalog)) {
-    if (metadata.mode !== "chat") {
+    if (typeof metadata.mode !== "string" || !MAPPABLE_MODES.has(metadata.mode)) {
       continue;
     }
-    chatModels++;
-    if (
-      typeof metadata.input_cost_per_token === "number" ||
-      typeof metadata.output_cost_per_token === "number"
-    ) {
-      pricedChatModels++;
+    // Usability applies getModelStats' bar: entries without usable token limits
+    // never resolve, so losing max_input_tokens must register as shrinkage.
+    if (hasUsableTokenLimits(metadata)) {
+      summary.usableMappableModels++;
+    }
+    if (metadata.mode === "chat") {
+      // Input and output pricing are tracked separately so renaming just one
+      // cost field cannot hide behind the other's coverage.
+      if (typeof metadata.input_cost_per_token === "number") {
+        summary.inputPricedChatModels++;
+      }
+      if (typeof metadata.output_cost_per_token === "number") {
+        summary.outputPricedChatModels++;
+      }
     }
   }
-  return { chatModels, pricedChatModels };
+  return summary;
 }
 
-const EMPTY_BASELINE: CatalogSummary = { chatModels: 0, pricedChatModels: 0 };
+const EMPTY_BASELINE: CatalogSummary = {
+  usableMappableModels: 0,
+  inputPricedChatModels: 0,
+  outputPricedChatModels: 0,
+};
 
 function belowBaseline(count: number, baseline: number): boolean {
-  return count < Math.ceil(baseline * (1 - MAX_CHAT_MODEL_SHRINK_FRACTION));
+  return count < Math.ceil(baseline * (1 - MAX_BASELINE_SHRINK_FRACTION));
 }
 
 /**
@@ -190,26 +211,40 @@ export function validateModelData(
   const errors: string[] = [];
 
   const summary = summarizeCatalog(catalog);
-  if (summary.chatModels < MIN_CHAT_MODELS) {
+  if (summary.usableMappableModels < MIN_USABLE_MAPPABLE_MODELS) {
     errors.push(
-      `only ${summary.chatModels} chat models found (expected at least ${MIN_CHAT_MODELS})`
+      `only ${summary.usableMappableModels} usable chat/responses models found ` +
+        `(expected at least ${MIN_USABLE_MAPPABLE_MODELS})`
     );
   }
-  if (belowBaseline(summary.chatModels, baseline.chatModels)) {
-    errors.push(
-      `chat model count shrank from ${baseline.chatModels} to ${summary.chatModels} ` +
-        `(more than ${MAX_CHAT_MODEL_SHRINK_FRACTION * 100}% below the vendored baseline)`
-    );
-  }
-  // Costs are optional per entry (subscription providers), so an upstream
-  // pricing-field rename would sail through the per-entry checks; catching a
-  // collapse in priced coverage keeps getModelStats from silently zero-pricing
-  // the whole catalog.
-  if (belowBaseline(summary.pricedChatModels, baseline.pricedChatModels)) {
-    errors.push(
-      `priced chat model count shrank from ${baseline.pricedChatModels} to ` +
-        `${summary.pricedChatModels} (upstream pricing fields may have been renamed)`
-    );
+  const shrinkChecks: Array<[label: string, count: number, baselineCount: number]> = [
+    [
+      "usable chat/responses model count",
+      summary.usableMappableModels,
+      baseline.usableMappableModels,
+    ],
+    // Costs are optional per entry (subscription providers), so an upstream
+    // pricing-field rename would sail through the per-entry checks; catching a
+    // collapse in priced coverage keeps getModelStats from silently zero-pricing
+    // the whole catalog.
+    [
+      "input-priced chat model count",
+      summary.inputPricedChatModels,
+      baseline.inputPricedChatModels,
+    ],
+    [
+      "output-priced chat model count",
+      summary.outputPricedChatModels,
+      baseline.outputPricedChatModels,
+    ],
+  ];
+  for (const [label, count, baselineCount] of shrinkChecks) {
+    if (belowBaseline(count, baselineCount)) {
+      errors.push(
+        `${label} shrank from ${baselineCount} to ${count} ` +
+          `(more than ${MAX_BASELINE_SHRINK_FRACTION * 100}% below the vendored baseline)`
+      );
+    }
   }
 
   const total = Object.keys(catalog).length + droppedModelIds.length;

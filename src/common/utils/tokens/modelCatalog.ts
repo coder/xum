@@ -8,9 +8,7 @@ import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import modelsData from "./models.json";
 import { resolveRawModelEntry } from "./modelStats";
-
-// Only modes whose metadata (pricing, context window) applies to chat-style usage.
-const MAPPABLE_MODES = new Set(["chat", "responses"]);
+import { MAPPABLE_MODES } from "./updateModelsData";
 
 function toCanonicalModelId(catalogKey: string, metadata: Record<string, unknown>): string | null {
   // LiteLLM keys are either "provider/model" or a bare model id whose provider

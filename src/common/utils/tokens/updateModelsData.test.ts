@@ -120,7 +120,7 @@ describe("validateModelData", () => {
 
   test("rejects truncated upstream data", () => {
     expect(() => validateModelData({ catalog: chatEntries(10), droppedModelIds: [] })).toThrow(
-      /only 10 chat models found/
+      /only 10 usable chat\/responses models found/
     );
   });
 
@@ -136,23 +136,25 @@ describe("validateModelData", () => {
       catalog: { ...chatEntries(600), ...curatedCoverage },
       droppedModelIds: [],
     };
-    expect(() => validateModelData(sanitized, { chatModels: 2000, pricedChatModels: 600 })).toThrow(
-      /chat model count shrank from 2000/
+    const baseline = (usableMappableModels: number) => ({
+      usableMappableModels,
+      inputPricedChatModels: 600,
+      outputPricedChatModels: 600,
+    });
+    expect(() => validateModelData(sanitized, baseline(2000))).toThrow(
+      /usable chat\/responses model count shrank from 2000/
     );
     // A small decrease within the bound is acceptable (e.g. upstream pruning).
-    expect(() =>
-      validateModelData(sanitized, { chatModels: 650, pricedChatModels: 600 })
-    ).not.toThrow();
+    expect(() => validateModelData(sanitized, baseline(650))).not.toThrow();
   });
 
-  test("rejects a catalog-wide loss of pricing fields", () => {
-    // Entries keep modes and token limits but lose every cost field, as an
-    // upstream pricing-field rename would produce: nothing is dropped per-entry,
-    // yet priced coverage collapses.
-    const unpriced = Object.fromEntries(
+  test("rejects the loss of one pricing field even when the other survives", () => {
+    // An upstream rename of just output_cost_per_token keeps every entry
+    // input-priced, so aggregated priced coverage would hide the regression.
+    const outputless = Object.fromEntries(
       Array.from({ length: 700 }, (_, i) => [
-        `provider/unpriced-${i}`,
-        { mode: "chat", max_input_tokens: 128000 },
+        `provider/outputless-${i}`,
+        { mode: "chat", max_input_tokens: 128000, input_cost_per_token: 0.000001 },
       ])
     );
     const curatedCoverage = Object.fromEntries(
@@ -161,10 +163,58 @@ describe("validateModelData", () => {
         { mode: "chat", max_input_tokens: 200000 },
       ])
     );
-    const sanitized = { catalog: { ...unpriced, ...curatedCoverage }, droppedModelIds: [] };
-    expect(() => validateModelData(sanitized, { chatModels: 700, pricedChatModels: 680 })).toThrow(
-      /priced chat model count shrank from 680/
+    const sanitized = { catalog: { ...outputless, ...curatedCoverage }, droppedModelIds: [] };
+    expect(() =>
+      validateModelData(sanitized, {
+        usableMappableModels: 700,
+        inputPricedChatModels: 680,
+        outputPricedChatModels: 680,
+      })
+    ).toThrow(/output-priced chat model count shrank from 680/);
+  });
+
+  test("rejects a catalog-wide loss of token limits even when pricing survives", () => {
+    // Entries keep mode + pricing but lose max_input_tokens: getModelStats
+    // rejects them, so usable coverage must register the collapse.
+    const limitless = Object.fromEntries(
+      Array.from({ length: 700 }, (_, i) => [
+        `provider/limitless-${i}`,
+        { mode: "chat", input_cost_per_token: 0.000001, output_cost_per_token: 0.000002 },
+      ])
     );
+    const curatedCoverage = Object.fromEntries(
+      Object.values(KNOWN_MODELS).map((model) => [
+        model.providerModelId,
+        { mode: "chat", max_input_tokens: 200000 },
+      ])
+    );
+    const sanitized = { catalog: { ...limitless, ...curatedCoverage }, droppedModelIds: [] };
+    expect(() =>
+      validateModelData(sanitized, {
+        usableMappableModels: 700,
+        inputPricedChatModels: 680,
+        outputPricedChatModels: 680,
+      })
+    ).toThrow(/usable chat\/responses model count shrank from 700/);
+  });
+
+  test("counts responses-mode entries and applies the usability bar", () => {
+    expect(
+      summarizeCatalog({
+        usableChat: {
+          mode: "chat",
+          max_input_tokens: 128000,
+          input_cost_per_token: 0.000001,
+        },
+        usableResponses: { mode: "responses", max_input_tokens: 128000 },
+        limitlessChat: { mode: "chat", input_cost_per_token: 0.000001 },
+        embedding: { mode: "embedding", max_input_tokens: 8192 },
+      })
+    ).toEqual({
+      usableMappableModels: 2,
+      inputPricedChatModels: 2,
+      outputPricedChatModels: 0,
+    });
   });
 
   test("rejects data where too many entries had invalid pricing", () => {
