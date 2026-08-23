@@ -9,6 +9,7 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { Config } from "@/node/config";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { log } from "@/node/services/log";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { isPathInsideDir, stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { getProjectName } from "@/node/utils/runtime/helpers";
 
@@ -25,6 +26,15 @@ import { getProjectName } from "@/node/utils/runtime/helpers";
  */
 
 export const CODE_WORKSPACE_EXTENSION = ".code-workspace";
+
+// The target file can be repository- or user-controlled, and jsonc.parse is
+// synchronous (no timeout can preempt it), so cap the bytes we are willing to
+// read and parse. Real .code-workspace files are a few KiB.
+export const MAX_CODE_WORKSPACE_FILE_BYTES = 1024 * 1024;
+
+// Bound each sync: a configured file on an unavailable network mount can hang
+// fs calls indefinitely, and workspace lifecycle operations await syncs.
+const SYNC_TIMEOUT_MS = 10_000;
 
 // VS Code generates .code-workspace files with tab indentation; match it.
 const MODIFY_OPTIONS: jsonc.ModificationOptions = {
@@ -128,6 +138,14 @@ async function updateCodeWorkspaceFileLocked(
 
   let original: string | null;
   try {
+    const stats = await fsPromises.stat(targetPath);
+    if (stats.size > MAX_CODE_WORKSPACE_FILE_BYTES) {
+      log.warn("Skipping .code-workspace sync: file exceeds size limit", {
+        codeWorkspacePath,
+        sizeBytes: stats.size,
+      });
+      return;
+    }
     original = await fsPromises.readFile(targetPath, "utf-8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -300,43 +318,123 @@ export function computeManagedWorktreePaths(params: {
 }
 
 /**
+ * Managed roots contributed by one workspace, computed from its own runtime
+ * config. Callers capture this BEFORE deleting a workspace: once its config
+ * entry is gone, a custom/legacy srcBaseDir root can no longer be
+ * reconstructed and the deleted checkout's folder entry would linger forever.
+ */
+export function managedRootsForWorkspace(
+  metadata: Pick<FrontendWorkspaceMetadata, "runtimeConfig" | "projectPath" | "projects">
+): string[] {
+  if (!isWorktreeRuntime(metadata.runtimeConfig)) {
+    return [];
+  }
+  const srcBaseDir = expandTilde(metadata.runtimeConfig.srcBaseDir);
+  const involved = new Set<string>([
+    metadata.projectPath,
+    ...(metadata.projects ?? []).map((ref) => ref.projectPath),
+  ]);
+  return [...involved].map((involvedPath) =>
+    path.resolve(path.join(srcBaseDir, getProjectName(stripTrailingSlashes(involvedPath))))
+  );
+}
+
+// Resolve a project's configured setting to an absolute target path, or null
+// when unset or invalid. Relative settings resolve against the project root;
+// `~` is expanded.
+function resolveConfiguredCodeWorkspacePath(
+  projectPath: string,
+  setting: string | undefined
+): string | null {
+  const raw = setting?.trim();
+  if (!raw) {
+    return null;
+  }
+  const codeWorkspacePath = path.resolve(projectPath, expandTilde(raw));
+  if (!codeWorkspacePath.endsWith(CODE_WORKSPACE_EXTENSION)) {
+    // We read-modify-write this file, so never target arbitrary files.
+    log.warn("Skipping .code-workspace sync: path must end with .code-workspace", {
+      codeWorkspacePath,
+    });
+    return null;
+  }
+  return codeWorkspacePath;
+}
+
+/**
  * Best-effort sync entry point used by workspace lifecycle operations and
  * startup reconciliation. Fast no-op when the project has no
- * `codeWorkspaceSyncPath` configured. Never throws: sync failures must never
- * fail or block a workspace operation.
+ * `codeWorkspaceSyncPath` configured. Never throws and is bounded by
+ * SYNC_TIMEOUT_MS: sync failures or stalled filesystems must never fail or
+ * block a workspace operation.
  */
-export async function syncProjectCodeWorkspace(config: Config, projectPath: string): Promise<void> {
+export async function syncProjectCodeWorkspace(
+  config: Config,
+  projectPath: string,
+  options?: { extraManagedRootDirs?: string[] }
+): Promise<void> {
   try {
     const normalizedProjectPath = stripTrailingSlashes(projectPath);
-    const projectConfig = config.loadConfigOrDefault().projects.get(normalizedProjectPath);
-    const rawSetting = projectConfig?.codeWorkspaceSyncPath?.trim();
-    if (!rawSetting) {
+    const projects = config.loadConfigOrDefault().projects;
+    const targetFile = resolveConfiguredCodeWorkspacePath(
+      normalizedProjectPath,
+      projects.get(normalizedProjectPath)?.codeWorkspaceSyncPath
+    );
+    if (!targetFile) {
       return;
     }
 
-    // Relative settings resolve against the project root; `~` is expanded.
-    const codeWorkspacePath = path.resolve(normalizedProjectPath, expandTilde(rawSetting));
-    if (!codeWorkspacePath.endsWith(CODE_WORKSPACE_EXTENSION)) {
-      // We read-modify-write this file, so never target arbitrary files.
-      log.warn("Skipping .code-workspace sync: path must end with .code-workspace", {
-        codeWorkspacePath,
+    // The work never rejects (errors are logged inside), so a timeout that
+    // orphans it cannot leave an unhandled rejection behind.
+    const work = (async () => {
+      try {
+        // Reconcile every project targeting this file together. Projects can
+        // share a file, and same-basename projects even share a managed root;
+        // independent per-project removals would erase each other's entries.
+        const allMetadata = await config.getAllWorkspaceMetadata();
+        const desired = new Set<string>();
+        const roots = new Set<string>(
+          (options?.extraManagedRootDirs ?? []).map((rootDir) => path.resolve(rootDir))
+        );
+        const participantPaths: string[] = [];
+        for (const [participantPath, participantConfig] of projects) {
+          if (
+            resolveConfiguredCodeWorkspacePath(
+              participantPath,
+              participantConfig.codeWorkspaceSyncPath
+            ) !== targetFile
+          ) {
+            continue;
+          }
+          const projectName = getProjectName(participantPath);
+          const computed = computeManagedWorktreePaths({
+            allMetadata,
+            projectPath: participantPath,
+            projectName,
+            defaultManagedRootDir: path.join(expandTilde(config.srcDir), projectName),
+          });
+          participantPaths.push(participantPath);
+          computed.desiredPaths.forEach((desiredPath) => desired.add(desiredPath));
+          computed.managedRootDirs.forEach((rootDir) => roots.add(rootDir));
+        }
+        const desiredPaths = [...desired].sort();
+        await updateCodeWorkspaceFile({
+          codeWorkspacePath: targetFile,
+          managedRootDirs: [...roots].sort(),
+          desiredPaths,
+          seedFolders: [...participantPaths, ...desiredPaths],
+        });
+      } catch (error) {
+        log.warn("Failed to sync .code-workspace file", { projectPath, error });
+      }
+    })();
+
+    const outcome = await raceWithAbortAndTimeout(work, { timeoutMs: SYNC_TIMEOUT_MS });
+    if (outcome.kind === "timeout") {
+      log.warn("Timed out syncing .code-workspace file; continuing in background", {
+        projectPath,
       });
-      return;
     }
-
-    const projectName = getProjectName(normalizedProjectPath);
-    const { desiredPaths, managedRootDirs } = computeManagedWorktreePaths({
-      allMetadata: await config.getAllWorkspaceMetadata(),
-      projectPath: normalizedProjectPath,
-      projectName,
-      defaultManagedRootDir: path.join(expandTilde(config.srcDir), projectName),
-    });
-    await updateCodeWorkspaceFile({
-      codeWorkspacePath,
-      managedRootDirs,
-      desiredPaths,
-      seedFolders: [normalizedProjectPath, ...desiredPaths],
-    });
   } catch (error) {
     log.warn("Failed to sync .code-workspace file", { projectPath, error });
   }

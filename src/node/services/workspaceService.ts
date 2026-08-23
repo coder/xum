@@ -117,7 +117,10 @@ import {
 import { isWorktreeRuntime } from "@/node/runtime/worktreeLifecycleHooks";
 import { expandTilde, expandTildeForSSH } from "@/node/runtime/tildeExpansion";
 import { removeManagedGitWorktree } from "@/node/worktree/removeManagedGitWorktree";
-import { syncProjectCodeWorkspace } from "@/node/worktree/codeWorkspaceSync";
+import {
+  managedRootsForWorkspace,
+  syncProjectCodeWorkspace,
+} from "@/node/worktree/codeWorkspaceSync";
 
 import {
   copyStagedWorkspaceAttachments,
@@ -3183,11 +3186,11 @@ export class WorkspaceService extends EventEmitter {
       }
 
       // Repair .code-workspace drift from lifecycle changes that happened while
-      // the app was not running. Bounded: a stalled filesystem (e.g. an
-      // unreachable network mount holding a configured file) must never block
-      // startup. Past the deadline the loop keeps running in the background;
-      // syncProjectCodeWorkspace never throws, so the orphaned promise cannot
-      // reject unhandled.
+      // the app was not running. Each sync is internally bounded, but startup
+      // additionally caps the whole loop: many enabled projects on a stalled
+      // filesystem must never delay launch. Past the deadline the loop keeps
+      // running in the background; syncProjectCodeWorkspace never throws, so
+      // the orphaned promise cannot reject unhandled.
       const codeWorkspaceSyncAll = (async () => {
         for (const [projectPath, projectConfig] of this.config.loadConfigOrDefault().projects) {
           if (projectConfig.codeWorkspaceSyncPath?.trim()) {
@@ -5765,6 +5768,16 @@ export class WorkspaceService extends EventEmitter {
       this.terminalService?.closeWorkspaceSessions(workspaceId);
       await this.closeDesktopSessionBestEffort(workspaceId, "remove");
 
+      // Capture managed roots before the config entry disappears: a worktree
+      // under a custom/legacy srcBaseDir cannot be reconstructed afterwards,
+      // which would leave its folder entry in the .code-workspace file forever.
+      const removedMetadata = (await this.config.getAllWorkspaceMetadata()).find(
+        (m) => m.id === workspaceId
+      );
+      const removedWorkspaceRoots = removedMetadata
+        ? managedRootsForWorkspace(removedMetadata)
+        : [];
+
       // Remove from config
       await this.config.removeWorkspace(workspaceId);
       removedFromConfig = true;
@@ -5773,7 +5786,8 @@ export class WorkspaceService extends EventEmitter {
       if (persistedWorkspace) {
         await this.syncCodeWorkspaceFiles(
           persistedWorkspace.projectPath,
-          persistedWorkspace.projects
+          persistedWorkspace.projects,
+          removedWorkspaceRoots
         );
       }
 
@@ -5804,11 +5818,12 @@ export class WorkspaceService extends EventEmitter {
    */
   private async syncCodeWorkspaceFiles(
     projectPath: string,
-    projects?: ReadonlyArray<{ projectPath: string }>
+    projects?: ReadonlyArray<{ projectPath: string }>,
+    extraManagedRootDirs?: string[]
   ): Promise<void> {
     const involvedPaths = new Set([projectPath, ...(projects ?? []).map((ref) => ref.projectPath)]);
     for (const involvedPath of involvedPaths) {
-      await syncProjectCodeWorkspace(this.config, involvedPath);
+      await syncProjectCodeWorkspace(this.config, involvedPath, { extraManagedRootDirs });
     }
   }
 

@@ -6,6 +6,7 @@ import * as jsonc from "jsonc-parser";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { Config } from "@/node/config";
 import {
+  MAX_CODE_WORKSPACE_FILE_BYTES,
   computeManagedWorktreePaths,
   syncProjectCodeWorkspace,
   updateCodeWorkspaceFile,
@@ -155,6 +156,22 @@ describe("updateCodeWorkspaceFile", () => {
     });
 
     expect(parseFolders(await readWorkspaceFile())).toEqual([{ path: worktree }]);
+  });
+
+  test("skips files exceeding the size cap without rewriting them", async () => {
+    // jsonc.parse is synchronous, so oversized (potentially repo-controlled)
+    // files must be rejected before parsing.
+    const oversized = `{"folders": [], "pad": "${"x".repeat(MAX_CODE_WORKSPACE_FILE_BYTES + 1)}"}`;
+    await fsPromises.writeFile(workspaceFilePath, oversized);
+
+    await updateCodeWorkspaceFile({
+      codeWorkspacePath: workspaceFilePath,
+      managedRootDirs: [managedRootDir],
+      desiredPaths: [path.join(managedRootDir, "feature-a")],
+      seedFolders: [],
+    });
+
+    expect(await readWorkspaceFile()).toBe(oversized);
   });
 
   test("leaves a malformed file untouched without throwing", async () => {
@@ -324,6 +341,71 @@ describe("syncProjectCodeWorkspace", () => {
     await syncProjectCodeWorkspace(config, projectPath);
 
     expect((await fsPromises.readdir(projectPath)).length).toBe(0);
+  });
+
+  test("unions projects that target the same file so they cannot erase each other", async () => {
+    // Same-basename projects share one managed root (<srcDir>/repo); a sync
+    // scoped to only one project would remove the other's entries.
+    const config = new Config(tempDir);
+    const projectA = path.join(tempDir, "a", "repo");
+    const projectB = path.join(tempDir, "b", "repo");
+    await fsPromises.mkdir(projectA, { recursive: true });
+    await fsPromises.mkdir(projectB, { recursive: true });
+    const sharedFile = path.join(tempDir, "shared.code-workspace");
+    const worktreeA = path.join(config.srcDir, "repo", "feat-a");
+    const worktreeB = path.join(config.srcDir, "repo", "feat-b");
+    const workspaceEntry = (worktree: string, id: string) => ({
+      path: worktree,
+      id,
+      name: path.basename(worktree),
+      runtimeConfig: { type: "worktree" as const, srcBaseDir: config.srcDir },
+    });
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectA, {
+        workspaces: [workspaceEntry(worktreeA, "aaaaaaaaaa")],
+        codeWorkspaceSyncPath: sharedFile,
+      });
+      cfg.projects.set(projectB, {
+        workspaces: [workspaceEntry(worktreeB, "bbbbbbbbbb")],
+        codeWorkspaceSyncPath: sharedFile,
+      });
+      return cfg;
+    });
+
+    await syncProjectCodeWorkspace(config, projectA);
+    await syncProjectCodeWorkspace(config, projectB);
+
+    const folders = parseFolders(await fsPromises.readFile(sharedFile, "utf-8"));
+    const folderPaths = folders.map((entry) => entry.path);
+    expect(folderPaths).toContain(worktreeA);
+    expect(folderPaths).toContain(worktreeB);
+  });
+
+  test("removes stale entries under extra managed roots after their workspace is gone", async () => {
+    // Deleting the last workspace under a custom/legacy srcBaseDir removes the
+    // metadata that reconstructed its root; callers pass the captured root so
+    // the deleted checkout's entry still gets cleaned up.
+    const config = new Config(tempDir);
+    const projectPath = path.join(tempDir, "repo");
+    await fsPromises.mkdir(projectPath, { recursive: true });
+    const legacyRoot = path.join(tempDir, "legacy-src", "repo");
+    const staleEntry = path.join(legacyRoot, "deleted-feature");
+    const file = path.join(projectPath, "repo.code-workspace");
+    await fsPromises.writeFile(
+      file,
+      JSON.stringify({ folders: [{ path: projectPath }, { path: staleEntry }] })
+    );
+    await config.editConfig((cfg) => {
+      cfg.projects.set(projectPath, {
+        workspaces: [],
+        codeWorkspaceSyncPath: "repo.code-workspace",
+      });
+      return cfg;
+    });
+
+    await syncProjectCodeWorkspace(config, projectPath, { extraManagedRootDirs: [legacyRoot] });
+
+    expect(parseFolders(await fsPromises.readFile(file, "utf-8"))).toEqual([{ path: projectPath }]);
   });
 
   test("refuses paths without the .code-workspace extension", async () => {

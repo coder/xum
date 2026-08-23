@@ -681,6 +681,7 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
     runtimeOverridesEnabled?: unknown;
     projectKind?: unknown;
     customInstructions?: unknown;
+    codeWorkspaceSyncPath?: unknown;
   };
   const runtimeEnablement = normalizeRuntimeEnablementOverrides(record.runtimeEnablement);
   const defaultRuntime = normalizeRuntimeEnablementId(record.defaultRuntime);
@@ -723,6 +724,13 @@ function normalizeProjectRuntimeSettings(projectConfig: ProjectConfig): ProjectC
     next.customInstructions = record.customInstructions;
   } else {
     delete next.customInstructions;
+  }
+
+  // Same hand-edit hazard as customInstructions above.
+  if (typeof record.codeWorkspaceSyncPath === "string" && record.codeWorkspaceSyncPath.trim()) {
+    next.codeWorkspaceSyncPath = record.codeWorkspaceSyncPath;
+  } else {
+    delete next.codeWorkspaceSyncPath;
   }
 
   // Legacy named workflow schedules are intentionally dropped while workflow
