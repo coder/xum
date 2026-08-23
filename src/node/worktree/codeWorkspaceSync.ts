@@ -240,6 +240,13 @@ async function updateCodeWorkspaceFileLocked(
   }
 
   if (original === null) {
+    if (update.seedFolders.length > MAX_CODE_WORKSPACE_FOLDERS) {
+      log.warn("Skipping .code-workspace sync: too many folder entries", {
+        codeWorkspacePath,
+        folderCount: update.seedFolders.length,
+      });
+      return { ok: false, error: "Workspace file has too many folder entries to sync" };
+    }
     const fresh = { folders: update.seedFolders.map((folderPath) => ({ path: folderPath })) };
     await fsPromises.mkdir(path.dirname(targetPath), { recursive: true });
     await writeFileAtomic(targetPath, JSON.stringify(fresh, null, "\t") + "\n");
@@ -264,16 +271,19 @@ async function updateCodeWorkspaceFileLocked(
     log.warn("Skipping .code-workspace sync: 'folders' is not an array", { codeWorkspacePath });
     return { ok: false, error: "Workspace file 'folders' is not an array" };
   }
-  // SECURITY: jsonc.modify serialization is synchronous and superlinear in
-  // entry count, so a repo-controlled file within the byte cap can still hold
-  // tens of thousands of entries and freeze the main thread for >10s. Real
-  // multi-root workspaces have well under this many folders.
-  if (Array.isArray(existingFolders) && existingFolders.length > MAX_CODE_WORKSPACE_FOLDERS) {
-    log.warn("Skipping .code-workspace sync: too many folder entries", {
+  // jsonc.parse reads the LAST duplicate property while jsonc.modify edits the
+  // FIRST, so a hand-edited file with duplicate `folders` keys would silently
+  // stop syncing while reporting success; reject it instead.
+  const rootNode = jsonc.parseTree(original, undefined, { allowTrailingComma: true });
+  const foldersPropCount =
+    rootNode?.children?.filter(
+      (prop) => prop.type === "property" && prop.children?.[0]?.value === "folders"
+    ).length ?? 0;
+  if (foldersPropCount > 1) {
+    log.warn("Skipping .code-workspace sync: duplicate 'folders' properties", {
       codeWorkspacePath,
-      folderCount: existingFolders.length,
     });
-    return { ok: false, error: "Workspace file has too many folder entries to sync" };
+    return { ok: false, error: "Workspace file has duplicate 'folders' properties" };
   }
 
   const desired = new Set(desiredPaths.map((desiredPath) => path.resolve(desiredPath)));
@@ -303,6 +313,18 @@ async function updateCodeWorkspaceFileLocked(
     return { ok: true };
   }
   const newFolders = [...kept, ...additions.map((folderPath) => ({ path: folderPath }))];
+  // SECURITY: jsonc.modify serialization is synchronous and superlinear in
+  // entry count, so a file within the byte cap can still hold tens of
+  // thousands of entries and freeze the main thread for >10s. Checked on the
+  // FINAL count (not the input) so a write can never push a file over the cap
+  // and brick later syncs. Real multi-root workspaces stay far below it.
+  if (newFolders.length > MAX_CODE_WORKSPACE_FOLDERS) {
+    log.warn("Skipping .code-workspace sync: too many folder entries", {
+      codeWorkspacePath,
+      folderCount: newFolders.length,
+    });
+    return { ok: false, error: "Workspace file has too many folder entries to sync" };
+  }
   const text = jsonc.applyEdits(
     original,
     jsonc.modify(original, ["folders"], newFolders, MODIFY_OPTIONS)

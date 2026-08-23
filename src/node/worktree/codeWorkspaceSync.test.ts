@@ -246,12 +246,53 @@ describe("updateCodeWorkspaceFile", () => {
     expect(parseFolders(await readWorkspaceFile())).toEqual([{ path: theirs }]);
   });
 
-  test("skips files with more folder entries than the sync cap", async () => {
+  test("refuses reconciles whose final folder count exceeds the sync cap", async () => {
     const worktree = path.join(managedRootDir, "feature-a");
     const filePath = path.join(tempDir, "huge.code-workspace");
+    // Exactly at the cap: the single addition would push the FINAL count over.
     const content = JSON.stringify({
-      folders: Array.from({ length: MAX_CODE_WORKSPACE_FOLDERS + 1 }, () => ({})),
+      folders: Array.from({ length: MAX_CODE_WORKSPACE_FOLDERS }, () => ({})),
     });
+    await fsPromises.writeFile(filePath, content);
+
+    const result = await updateCodeWorkspaceFile({
+      codeWorkspacePath: filePath,
+      managedRootDirs: [managedRootDir],
+      desiredPaths: [worktree],
+      seedFolders: [worktree],
+    });
+
+    expect(result.ok).toBe(false);
+    expect(await fsPromises.readFile(filePath, "utf-8")).toBe(content);
+  });
+
+  test("refuses to create a file with more seed folders than the sync cap", async () => {
+    const filePath = path.join(tempDir, "seeded.code-workspace");
+    const seedFolders = Array.from({ length: MAX_CODE_WORKSPACE_FOLDERS + 1 }, (_, i) =>
+      path.join(managedRootDir, `feature-${i}`)
+    );
+
+    const result = await updateCodeWorkspaceFile({
+      codeWorkspacePath: filePath,
+      managedRootDirs: [managedRootDir],
+      desiredPaths: seedFolders,
+      seedFolders,
+    });
+
+    expect(result.ok).toBe(false);
+    const exists = await fsPromises.stat(filePath).then(
+      () => true,
+      () => false
+    );
+    expect(exists).toBe(false);
+  });
+
+  test("rejects files with duplicate top-level folders properties", async () => {
+    const worktree = path.join(managedRootDir, "feature-a");
+    const filePath = path.join(tempDir, "dupe.code-workspace");
+    // jsonc.parse reads the last property but jsonc.modify edits the first, so
+    // a reconcile would silently no-op while reporting success.
+    const content = `{"folders": [], "folders": [{"path": "/user/data"}]}`;
     await fsPromises.writeFile(filePath, content);
 
     const result = await updateCodeWorkspaceFile({
