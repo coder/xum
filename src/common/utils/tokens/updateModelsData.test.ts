@@ -142,6 +142,8 @@ describe("validateModelData", () => {
     };
     const baseline = (usableChat: number) => ({
       totalEntries: usableChat,
+      medianInputCost: 0.000001,
+      medianOutputCost: 0.000002,
       modes: { chat: { usable: usableChat, inputPriced: 600, outputPriced: 600 } },
     });
     expect(() => validateModelData(sanitized, baseline(2000))).toThrow(
@@ -170,6 +172,8 @@ describe("validateModelData", () => {
     expect(() =>
       validateModelData(sanitized, {
         totalEntries: 700,
+        medianInputCost: 0.000001,
+        medianOutputCost: 0.000002,
         modes: { chat: { usable: 700, inputPriced: 680, outputPriced: 680 } },
       })
     ).toThrow(/chat output-priced model count shrank from 680/);
@@ -208,6 +212,8 @@ describe("validateModelData", () => {
     expect(() =>
       validateModelData(sanitized, {
         totalEntries: 760,
+        medianInputCost: 0.000001,
+        medianOutputCost: 0.000002,
         modes: {
           chat: { usable: 700, inputPriced: 700, outputPriced: 700 },
           responses: { usable: 60, inputPriced: 59, outputPriced: 59 },
@@ -232,6 +238,8 @@ describe("validateModelData", () => {
     expect(() =>
       validateModelData(sanitized, {
         totalEntries: 760,
+        medianInputCost: 0.000001,
+        medianOutputCost: 0.000002,
         modes: {
           chat: { usable: 700, inputPriced: 700, outputPriced: 700 },
           image_generation: { usable: 300, inputPriced: 250, outputPriced: 0 },
@@ -259,6 +267,8 @@ describe("validateModelData", () => {
     expect(() =>
       validateModelData(sanitized, {
         totalEntries: 700,
+        medianInputCost: 0.000001,
+        medianOutputCost: 0.000002,
         modes: { chat: { usable: 700, inputPriced: 680, outputPriced: 680 } },
       })
     ).toThrow(/chat usable model count shrank from 700/);
@@ -288,7 +298,41 @@ describe("validateModelData", () => {
         responses: { usable: 1, inputPriced: 1, outputPriced: 1 },
         embedding: { usable: 1, inputPriced: 1, outputPriced: 0 },
       },
+      // Medians span mappable entries only, so the embedding cost is excluded.
+      medianInputCost: 0.000001,
+      medianOutputCost: 0.000008,
     });
+  });
+
+  test("rejects a catalog-wide price magnitude collapse", () => {
+    // Every field survives and all counters match, but rates are scaled by
+    // 1e-9; only the median magnitude guard can catch this.
+    const scaled = Object.fromEntries(
+      Array.from({ length: 700 }, (_, i) => [
+        `provider/scaled-${i}`,
+        {
+          mode: "chat",
+          max_input_tokens: 128000,
+          input_cost_per_token: 0.000001e-9,
+          output_cost_per_token: 0.000002e-9,
+        },
+      ])
+    );
+    const curatedCoverage = Object.fromEntries(
+      Object.values(KNOWN_MODELS).map((model) => [
+        model.providerModelId,
+        { mode: "chat", max_input_tokens: 200000 },
+      ])
+    );
+    const sanitized = { catalog: { ...scaled, ...curatedCoverage }, droppedModelIds: [] };
+    expect(() =>
+      validateModelData(sanitized, {
+        totalEntries: 721,
+        medianInputCost: 0.000001,
+        medianOutputCost: 0.000002,
+        modes: { chat: { usable: 721, inputPriced: 700, outputPriced: 700 } },
+      })
+    ).toThrow(/median input cost shifted/);
   });
 
   test("rejects data where too many entries had invalid pricing", () => {

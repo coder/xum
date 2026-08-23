@@ -53,6 +53,11 @@ const MAX_BASELINE_SHRINK_FRACTION = 0.1;
 // must not block refreshes forever).
 const MIN_BASELINE_FOR_SHRINK_CHECK = 20;
 const MAX_INVALID_PRICING_FRACTION = 0.05;
+// A poisoned upstream could keep every field present but scale prices toward
+// zero (or absurdly high), silently corrupting cost accounting. Legitimate
+// repricing moves few models or small factors, so a catalog-wide median shift
+// beyond this factor is treated as corruption.
+const MAX_MEDIAN_COST_SHIFT_FACTOR = 100;
 
 /** Modes whose metadata applies to chat-style usage; mirrored by the Treat-as catalog. */
 export const MAPPABLE_MODES = new Set(["chat", "responses"]);
@@ -160,10 +165,28 @@ export interface CatalogSummary {
   totalEntries: number;
   /** Coverage per mode string, spanning every mode (not just mappable ones). */
   modes: Record<string, ModeCoverage>;
+  /** Median positive per-token costs across mappable entries (0 when none). */
+  medianInputCost: number;
+  medianOutputCost: number;
+}
+
+function median(values: number[]): number {
+  if (values.length === 0) {
+    return 0;
+  }
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
 }
 
 export function summarizeCatalog(catalog: ModelCatalogData): CatalogSummary {
-  const summary: CatalogSummary = { totalEntries: 0, modes: {} };
+  const summary: CatalogSummary = {
+    totalEntries: 0,
+    modes: {},
+    medianInputCost: 0,
+    medianOutputCost: 0,
+  };
+  const inputCosts: number[] = [];
+  const outputCosts: number[] = [];
   for (const metadata of Object.values(catalog)) {
     summary.totalEntries++;
     const mode = typeof metadata.mode === "string" ? metadata.mode : "unknown";
@@ -178,15 +201,28 @@ export function summarizeCatalog(catalog: ModelCatalogData): CatalogSummary {
     // cannot hide behind another field's or a larger mode's coverage.
     if (typeof metadata.input_cost_per_token === "number") {
       coverage.inputPriced++;
+      if (MAPPABLE_MODES.has(mode) && metadata.input_cost_per_token > 0) {
+        inputCosts.push(metadata.input_cost_per_token);
+      }
     }
     if (typeof metadata.output_cost_per_token === "number") {
       coverage.outputPriced++;
+      if (MAPPABLE_MODES.has(mode) && metadata.output_cost_per_token > 0) {
+        outputCosts.push(metadata.output_cost_per_token);
+      }
     }
   }
+  summary.medianInputCost = median(inputCosts);
+  summary.medianOutputCost = median(outputCosts);
   return summary;
 }
 
-const EMPTY_BASELINE: CatalogSummary = { totalEntries: 0, modes: {} };
+const EMPTY_BASELINE: CatalogSummary = {
+  totalEntries: 0,
+  modes: {},
+  medianInputCost: 0,
+  medianOutputCost: 0,
+};
 
 function belowBaseline(count: number, baseline: number): boolean {
   return (
@@ -243,6 +279,24 @@ export function validateModelData(
         `${label} shrank from ${baselineCount} to ${count} ` +
           `(more than ${MAX_BASELINE_SHRINK_FRACTION * 100}% below the vendored baseline)`
       );
+    }
+  }
+
+  // Guard price magnitudes, not just field presence: a poisoned catalog could
+  // retain every field while scaling all rates toward zero.
+  const medianChecks: Array<[label: string, value: number, baselineValue: number]> = [
+    ["median input cost", summary.medianInputCost, baseline.medianInputCost],
+    ["median output cost", summary.medianOutputCost, baseline.medianOutputCost],
+  ];
+  for (const [label, value, baselineValue] of medianChecks) {
+    if (value > 0 && baselineValue > 0) {
+      const ratio = value / baselineValue;
+      if (ratio > MAX_MEDIAN_COST_SHIFT_FACTOR || ratio < 1 / MAX_MEDIAN_COST_SHIFT_FACTOR) {
+        errors.push(
+          `${label} shifted from ${baselineValue} to ${value} (more than ` +
+            `${MAX_MEDIAN_COST_SHIFT_FACTOR}x from the vendored baseline; possible price corruption)`
+        );
+      }
     }
   }
 
