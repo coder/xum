@@ -343,7 +343,8 @@ describeOpenAICompatible("custom OpenAI-compatible providers", () => {
       assertStreamSuccess(collector);
       expect(extractTextFromEvents(collector.getDeltas())).toContain("Hello from responses");
       expect(mock.requests[0]?.path).toBe("/v1/responses");
-      expect(mock.requests[0]?.headers.authorization).not.toContain("must-not-leak");
+      // Keyless provider: no env-key fallback AND no empty auth header.
+      expect(mock.requests[0]?.headers.authorization).toBeUndefined();
       expect(mock.errors).toEqual([]);
     } finally {
       if (previousApiKey === undefined) {
@@ -387,7 +388,8 @@ describeOpenAICompatible("custom OpenAI-compatible providers", () => {
       assertStreamSuccess(collector);
       expect(extractTextFromEvents(collector.getDeltas())).toContain("Hello from Anthropic");
       expect(mock.requests[0]?.path).toBe("/v1/messages");
-      expect(mock.requests[0]?.headers["x-api-key"]).not.toContain("must-not-leak");
+      // Keyless provider: no env-key fallback AND no empty auth header.
+      expect(mock.requests[0]?.headers["x-api-key"]).toBeUndefined();
       expect(mock.errors).toEqual([]);
     } finally {
       if (previousApiKey === undefined) {

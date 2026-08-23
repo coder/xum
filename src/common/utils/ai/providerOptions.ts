@@ -331,7 +331,14 @@ export function buildProviderOptions(
 
   // Resolve aliases to their base model for capability detection while keeping
   // the original modelString for provider routing and metadata lookups.
-  const capabilityModel = resolveModelForMetadata(normalizedModel, providersConfig ?? null);
+  // Custom-provider model entries (mappedToModel aliases) live under the raw
+  // custom prefix; the wire-remapped identity above is only for namespace and
+  // payload-format selection, so metadata must resolve from the raw identity.
+  const rawPrefixForMetadata = modelString.slice(0, Math.max(modelString.indexOf(":"), 0));
+  const metadataModel = isCustomProviderConfig(providersConfig?.[rawPrefixForMetadata])
+    ? modelString
+    : normalizedModel;
+  const capabilityModel = resolveModelForMetadata(metadataModel, providersConfig ?? null);
   const [, resolvedCapabilityModelName] = capabilityModel.split(":", 2);
   const capModelName = resolvedCapabilityModelName || modelName;
 

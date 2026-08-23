@@ -519,6 +519,38 @@ function wrapFetchWithMuxGatewayAutoLogout(
 }
 
 /**
+ * Custom adapters pass an explicit empty apiKey so the official SDKs cannot
+ * fall back to OPENAI_API_KEY/ANTHROPIC_API_KEY env credentials, but the SDKs
+ * then emit an empty auth header ("Authorization: Bearer" / "x-api-key: ").
+ * Keyless endpoints and auth proxies can reject a present malformed
+ * credential, so strip the empty header before the request leaves.
+ */
+function wrapFetchStrippingEmptyAuthHeaders(baseFetch: typeof fetch): typeof fetch {
+  const wrappedFetch = async (
+    input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1]
+  ): Promise<Response> => {
+    const headers = new Headers(init?.headers);
+    const authorization = headers.get("authorization");
+    if (
+      authorization != null &&
+      authorization
+        .trim()
+        .toLowerCase()
+        .replace(/^bearer$/, "") === ""
+    ) {
+      headers.delete("authorization");
+    }
+    const apiKeyHeader = headers.get("x-api-key");
+    if (apiKeyHeader != null && apiKeyHeader.trim() === "") {
+      headers.delete("x-api-key");
+    }
+    return baseFetch(input, { ...init, headers });
+  };
+  return Object.assign(wrappedFetch, baseFetch) as typeof fetch;
+}
+
+/**
  * Get fetch function for provider - use custom if provided, otherwise unlimited timeout default
  */
 function getProviderFetch(providerConfig: ProviderConfig): typeof fetch {
@@ -1233,7 +1265,9 @@ export class ProviderModelFactory {
       // while a cross-typed openai-named instance must not.
       const isOpenAIRoutedModel = isCoderGatewayModel
         ? coderWire?.providerType === "openai"
-        : providerName === "openai" || modelId.startsWith("openai/");
+        : customProviderType === "openai-responses" ||
+          providerName === "openai" ||
+          modelId.startsWith("openai/");
       const configOpenAIStore = providersConfig.openai?.store;
       if (isOpenAIRoutedModel && typeof configOpenAIStore === "boolean") {
         muxProviderOptions ??= {};
@@ -1284,6 +1318,10 @@ export class ProviderModelFactory {
         const muxAttributionHeaders = buildAppAttributionHeaders(providerConfig.headers);
         // Custom adapters must not fall back to official-provider environment keys.
         const isolatedApiKey = credentials.apiKey ?? "";
+        const customAdapterFetch =
+          credentials.apiKey == null
+            ? wrapFetchStrippingEmptyAuthHeaders(providerFetch)
+            : providerFetch;
 
         switch (customProviderType) {
           case "openai-compatible": {
@@ -1304,7 +1342,7 @@ export class ProviderModelFactory {
               baseURL: normalizeOpenAICompatibleBaseURL(credentials.baseURL),
               apiKey: isolatedApiKey,
               headers: { ...muxAttributionHeaders },
-              fetch: providerFetch,
+              fetch: customAdapterFetch,
             });
             return Ok(provider.responses(modelId));
           }
@@ -1317,9 +1355,11 @@ export class ProviderModelFactory {
               baseURL: normalizeAnthropicBaseURL(credentials.baseURL),
               apiKey: isolatedApiKey,
               headers: { ...muxAttributionHeaders },
-              fetch: wrapFetchWithAnthropicCacheControl(providerFetch, effectiveAnthropicCacheTtl, {
-                injectCacheControl: !disableBeta,
-              }),
+              fetch: wrapFetchWithAnthropicCacheControl(
+                customAdapterFetch,
+                effectiveAnthropicCacheTtl,
+                { injectCacheControl: !disableBeta }
+              ),
             });
             return Ok(provider(modelId));
           }
@@ -2586,7 +2626,8 @@ export class ProviderModelFactory {
     // Must mirror resolveOptionsCanonicalModel so the extras-merge namespace
     // key matches what buildProviderOptions computes internally.
     const canonicalCustomEntry = providersConfigForShadowCheck[canonicalProviderName];
-    if (isCustomProviderConfig(canonicalCustomEntry)) {
+    const canonicalIsCustomProvider = isCustomProviderConfig(canonicalCustomEntry);
+    if (canonicalIsCustomProvider) {
       const customWireOrigin = customProviderWireOrigin(canonicalCustomEntry.providerType);
       if (customWireOrigin) {
         wireProviderName = customWireOrigin;
@@ -2639,7 +2680,11 @@ export class ProviderModelFactory {
       coderWire,
       coderSelectedInstance,
       routedThroughGateway,
-      routeProvider,
+      // Custom adapters are direct routes: the raw custom id is not a
+      // ProviderName, and leaking it as routeProvider makes downstream
+      // namespace/format selection treat the request as a transforming
+      // gateway (empty provider options, suppressed Anthropic headers).
+      routeProvider: canonicalIsCustomProvider ? undefined : routeProvider,
     });
   }
 

@@ -419,9 +419,30 @@ describe("ProviderModelFactory.createModel", () => {
           // Message preparation and options namespaces key on the wire the
           // request speaks, not the custom prefix.
           expect(result.data.wireProviderName).toBe(expectedWire[providerType]);
+          // Custom adapters are direct routes: leaking the raw custom id as
+          // routeProvider would make namespace selection treat the request
+          // as a transforming gateway and drop provider options entirely.
+          expect(result.data.routeProvider).toBeUndefined();
         }
       });
     }
+  });
+
+  it("merges backend OpenAI store policy for custom openai-responses providers", async () => {
+    await withTempConfig(async (config, factory) => {
+      // ZDR: providers.openai.store applies to every Responses-wire route,
+      // including custom Responses adapters.
+      saveLocalVllmConfig(config, { providerType: "openai-responses" });
+      config.saveProvidersConfig({
+        ...config.loadProvidersConfig(),
+        openai: { store: false },
+      } as Parameters<Config["saveProvidersConfig"]>[0]);
+
+      const muxOptions: MuxProviderOptions = {};
+      const result = await factory.createModel(`local-vllm:${LOCAL_VLLM_MODEL}`, muxOptions);
+      expect(result.success).toBe(true);
+      expect(muxOptions.openai?.store).toBe(false);
+    });
   });
 
   it("merges backend disableBetaFeatures for custom anthropic-messages providers", async () => {
