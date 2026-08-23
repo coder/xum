@@ -8,6 +8,7 @@ import assert from "node:assert";
 import { createHash } from "node:crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 
 /** Collect all messages via iterateFullHistory (replaces removed getFullHistory). */
 async function collectFullHistory(service: HistoryService, workspaceId: string) {
@@ -338,6 +339,72 @@ describe("HistoryService", () => {
 
       expect(result.success).toBe(true);
       expect(result.success && result.data).toBe("tail-mismatch");
+    });
+  });
+
+  describe("appendManyToHistory", () => {
+    it("terminates a torn crash tail so every batch row survives intact (r50)", async () => {
+      const workspaceId = "workspace1";
+      const workspaceDir = config.getSessionDir(workspaceId);
+      await fs.mkdir(workspaceDir, { recursive: true });
+      // A crash mid-write can leave chat.jsonl ending in an unterminated JSON
+      // fragment. Without healing, the first batch row glues onto those bytes
+      // and the self-healing reader drops payload+corruption as ONE malformed
+      // line while KEEPING the trigger — a durable trigger referencing an
+      // absent payload.
+      const intact = messageLine(
+        workspaceId,
+        createMuxMessage("msg1", "user", "Hello", { historySequence: 0 })
+      );
+      await fs.writeFile(
+        path.join(workspaceDir, "chat.jsonl"),
+        intact + "\n" + '{"id":"torn-row","role":"assis'
+      );
+
+      const result = await service.appendManyToHistory(workspaceId, [
+        createMuxMessage("payload-1", "assistant", "family payload"),
+        createMuxMessage("trigger-1", "user", "family trigger"),
+      ]);
+      expect(result.success).toBe(true);
+
+      const messages = await collectFullHistory(service, workspaceId);
+      expect(messages.map((m) => m.id)).toEqual(["msg1", "payload-1", "trigger-1"]);
+    });
+
+    it("waits on the cross-process append lock before replacing the file (r50)", async () => {
+      const workspaceId = "workspace1";
+      const seeded = await service.appendToHistory(
+        workspaceId,
+        createMuxMessage("msg1", "user", "Hello")
+      );
+      expect(seeded.success).toBe(true);
+
+      // A foreign backend (XUM_ALLOW_MULTIPLE_INSTANCES=1) holds the
+      // session-dir append lock: the batch's read+replace must wait, or its
+      // replacement — built from contents read before the foreign append —
+      // would silently delete the foreign row.
+      const foreign = await acquireProcessFileLock({
+        lockPath: path.join(config.getSessionDir(workspaceId), "history-append.lock"),
+        timeoutMs: 5_000,
+        label: "test foreign backend",
+      });
+      const batch = service.appendManyToHistory(workspaceId, [
+        createMuxMessage("payload-1", "assistant", "family payload"),
+        createMuxMessage("trigger-1", "user", "family trigger"),
+      ]);
+      const sentinel = Symbol("still-pending");
+      expect(
+        await Promise.race([
+          batch,
+          new Promise((resolve) => setTimeout(() => resolve(sentinel), 250)),
+        ])
+      ).toBe(sentinel);
+
+      await foreign[Symbol.asyncDispose]();
+      const result = await batch;
+      expect(result.success).toBe(true);
+      const messages = await collectFullHistory(service, workspaceId);
+      expect(messages.map((m) => m.id)).toEqual(["msg1", "payload-1", "trigger-1"]);
     });
   });
 

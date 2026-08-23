@@ -800,6 +800,35 @@ describe("maybeAppendAbandonedBranchSummary", () => {
     }
   });
 
+  test("wedged model creation is cut off by the shared deadline (r50)", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    try {
+      // Provider CONSTRUCTION that never settles (lazy module load, wedged
+      // token refresh): it must ride the same deadline as generation, or the
+      // synchronous edit-resend path blocks past BRANCH_SUMMARY_TIMEOUT_MS
+      // and workspace removal waits forever on the background drain.
+      const base = fakeAiService(null);
+      const wedgedCreation: BranchSummaryAiService = {
+        createModelWithPinnedMetadata: () => new Promise<never>(() => undefined),
+        getWorkspaceMetadata: base.getWorkspaceMetadata,
+      };
+      const startedAt = Date.now();
+      const appended = await maybeAppendAbandonedBranchSummary({
+        historyService,
+        aiService: wedgedCreation,
+        workspaceId: "ws-wedged-create",
+        abandonedMessages: meatyExchange("wedged-create"),
+        experiments: RLM_ON,
+        timeoutMs: 100,
+      });
+      expect(appended).toBeNull();
+      // Bounded wait: well under a second even though creation never answers.
+      expect(Date.now() - startedAt).toBeLessThan(5_000);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("deadline salvages complete sentences already streamed", async () => {
     const { historyService, cleanup } = await createTestHistoryService();
     try {

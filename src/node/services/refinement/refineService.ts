@@ -90,6 +90,8 @@ import type { TimelineService } from "@/node/services/timelineService";
 import * as fsPromises from "node:fs/promises";
 import {
   createAgentSkillWriteTool,
+  createStagedAgentSkillWriteTool,
+  hashSkillWriteTargetContent,
   resolveProjectSkillWriteTargetPath,
 } from "@/node/services/tools/agent_skill_write";
 import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
@@ -474,7 +476,21 @@ export class RefineService {
       journal: [],
       budget: createMutationBudget(REFINE_OP_BUDGET),
     });
-    const skillWriteTool = await this.buildSkillWriteTool(workspaceId, sessionDir);
+    // r50: hand the staged target fingerprints to the writer so it re-verifies
+    // them INSIDE its per-root mutation lock immediately before writing — the
+    // apply loop's pre-check below is unlocked and cannot exclude a writer
+    // landing between the check and the tool's lock acquisition.
+    const stagedSkillTargetHashes = new Map<string, string>();
+    for (const edit of staged.edits) {
+      if (edit.tool === "agent_skill_write" && edit.targetContentHash !== undefined) {
+        stagedSkillTargetHashes.set(edit.toolCallId, edit.targetContentHash);
+      }
+    }
+    const skillWriteTool = await this.buildSkillWriteTool(
+      workspaceId,
+      sessionDir,
+      stagedSkillTargetHashes
+    );
 
     // Cancellation is honored ONLY before the first mutation. Once admitted,
     // the apply runs to completion: aborting between edits left a partially
@@ -603,7 +619,11 @@ export class RefineService {
       // proposal was generated against the OLD contents, so applying now
       // would silently clobber the newer file. Never-executed skip: no side
       // effects, and a retry of this same staged set can never succeed —
-      // the reason tells the user to restage.
+      // the reason tells the user to restage. Advisory fast path only (r50):
+      // this check is unlocked, so the AUTHORITATIVE comparison runs again
+      // inside the tool's per-root mutation lock immediately before the
+      // write (createStagedAgentSkillWriteTool) — a writer landing between
+      // here and that lock is refused there as an executed failure.
       if (edit.tool === "agent_skill_write" && edit.targetContentHash !== undefined) {
         const currentHash =
           skillTargetProjectRoot === undefined
@@ -1155,10 +1175,14 @@ export class RefineService {
     });
     if (!resolved.ok) return undefined;
     try {
-      const content = await fsPromises.readFile(resolved.path);
-      return createHash("sha256").update(content).digest("hex");
+      // Shared hash helper (r50): the tool recomputes this fingerprint under
+      // its mutation lock at apply, so encoding and sentinel must match.
+      const content = await fsPromises.readFile(resolved.path, "utf-8");
+      return hashSkillWriteTargetContent(content);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return "absent";
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+        return hashSkillWriteTargetContent(null);
+      }
       return undefined;
     }
   }
@@ -1223,7 +1247,10 @@ export class RefineService {
    */
   private async buildSkillWriteTool(
     workspaceId: string,
-    sessionDir: string
+    sessionDir: string,
+    // r50 (apply only): staged target fingerprints, verified by the tool
+    // INSIDE its per-root mutation lock immediately before writing.
+    expectedTargetHashes?: ReadonlyMap<string, string>
   ): Promise<Tool | undefined> {
     try {
       const projectRoot = await this.resolveSkillWriteProjectRoot(workspaceId);
@@ -1246,7 +1273,9 @@ export class RefineService {
           projectStorageAuthority: "host-local",
         },
       };
-      return createAgentSkillWriteTool(toolConfig);
+      return expectedTargetHashes !== undefined
+        ? createStagedAgentSkillWriteTool(toolConfig, expectedTargetHashes)
+        : createAgentSkillWriteTool(toolConfig);
     } catch (error) {
       log.debug("[Refine] skill tool unavailable; running memory-only", {
         workspaceId,

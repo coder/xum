@@ -372,10 +372,28 @@ async function generateAbandonedBranchSummaryText(input: {
   for (let i = 0; i < maxAttempts; i++) {
     if (abortSignal.aborted) break;
     const modelString = input.candidates[i];
-    const modelResult = await input.aiService.createModelWithPinnedMetadata(modelString, {
+    // Model creation rides the same shared deadline as generation (r50): a
+    // provider whose construction wedges (lazy module load, slow token
+    // refresh) would otherwise block OUTSIDE every deadline race — the
+    // synchronous edit-resend path past BRANCH_SUMMARY_TIMEOUT_MS, and
+    // workspace removal indefinitely on the background drain.
+    const modelPromise = input.aiService.createModelWithPinnedMetadata(modelString, {
       agentInitiated: true,
       workspaceId: input.workspaceId,
     });
+    const modelResult = await Promise.race([modelPromise, deadline]);
+    if (modelResult === null) {
+      // Deadline won while the provider was still constructing. The late
+      // model may still resolve holding real resources; clean it up when it
+      // does so it cannot outlive workspace removal.
+      void modelPromise.then(
+        (late) => {
+          if (late.success) runLanguageModelCleanup(late.data.model);
+        },
+        () => undefined
+      );
+      break;
+    }
     if (!modelResult.success) {
       log.debug("Branch summary: skipping model candidate", {
         modelString,
@@ -441,8 +459,10 @@ async function generateAbandonedBranchSummaryText(input: {
           // Cancel (not just release) on ANY exit: an early break above must
           // stop the underlying stream, not leave it producing into a locked
           // reader. No-op when the stream already closed; rejects when it
-          // errored, hence the swallow.
-          void reader.cancel().catch(() => undefined);
+          // errored, hence the swallow. Awaited so the consume task's
+          // settlement includes the cancellation itself (r50) — the deadline
+          // path drains this task before cleaning up the model.
+          await reader.cancel().catch(() => undefined);
         }
       })();
       await Promise.race([consume, deadline]);
@@ -451,8 +471,14 @@ async function generateAbandonedBranchSummaryText(input: {
         // Actively cancel the losing consumer: a wedged provider leaves it
         // pinned in read() (the loop's aborted check only runs when a delta
         // arrives), and cancel resolves that pending read so the reader is
-        // released promptly instead of leaking with the raced-away task.
-        void reader.cancel().catch(() => undefined);
+        // released promptly. AWAITED, then the consume task drained (r50,
+        // mirroring the refine runner's deadline path): returning while
+        // cancellation is still in flight would run the finally's
+        // runLanguageModelCleanup underneath a provider whose asynchronous
+        // stream teardown had not settled, keeping network/runtime resources
+        // alive past workspace removal.
+        await reader.cancel().catch(() => undefined);
+        await consume;
         // Deadline hit. Salvage whole sentences already streamed — a missed
         // deadline should still buy a (shorter) summary when tokens flowed.
         const salvaged = trimSummaryToBoundary(accumulated);

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
 import { tool } from "ai";
@@ -198,8 +199,42 @@ export function resolveProjectSkillWriteTargetPath(args: {
   }
 }
 
+/**
+ * Fingerprint of a skill write target's content for staged-edit verification
+ * (r49/r50): sha256 hex of the utf-8 content, or the "absent" sentinel when
+ * the file does not exist. Shared by refine staging (which records it) and
+ * the in-lock verification below (which recomputes it) so the two sides can
+ * never diverge in encoding or sentinel.
+ */
+export function hashSkillWriteTargetContent(content: string | null): string {
+  return content === null ? "absent" : createHash("sha256").update(content, "utf8").digest("hex");
+}
+
 /** Create or update files in the contextual skills directory. */
-export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration) => {
+export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration) =>
+  makeAgentSkillWriteTool(config, undefined);
+
+/**
+ * Refine-apply variant (r50): verifies each staged edit's recorded target
+ * fingerprint INSIDE the per-root mutation lock immediately before writing.
+ * The apply loop's own pre-check is unlocked — a concurrent writer landing
+ * between that check and this tool's lock acquisition would still be
+ * silently clobbered by the stale full-file overwrite; comparing under the
+ * same lock every ordinary skill writer and the rollback engine hold closes
+ * that window (the prior content read in-lock IS the content the write
+ * replaces). Keyed by toolCallId; calls without an entry verify nothing.
+ */
+export function createStagedAgentSkillWriteTool(
+  config: ToolConfiguration,
+  expectedTargetHashes: ReadonlyMap<string, string>
+): ReturnType<ToolFactory> {
+  return makeAgentSkillWriteTool(config, expectedTargetHashes);
+}
+
+function makeAgentSkillWriteTool(
+  config: ToolConfiguration,
+  expectedTargetHashes: ReadonlyMap<string, string> | undefined
+): ReturnType<ToolFactory> {
   return tool({
     description: TOOL_DEFINITIONS.agent_skill_write.description,
     inputSchema: TOOL_DEFINITIONS.agent_skill_write.schema,
@@ -245,6 +280,16 @@ export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration
         }
 
         if (skillCtx.kind === "project-runtime") {
+          // Staged-target verification is host-local only (refine never
+          // constructs runtime-backed writers, and runtime writes hold no
+          // target lock). Fail closed rather than silently skipping the
+          // guard if that assumption ever breaks.
+          if (expectedTargetHashes?.get(toolCallId) !== undefined) {
+            return {
+              success: false,
+              error: "staged-target verification requires a host-local skill write",
+            };
+          }
           const skillsRoot = config.runtime.normalizePath(
             getCanonicalProjectMetadataRelativePath("skills"),
             skillCtx.workspacePath
@@ -491,6 +536,23 @@ export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration
               }
             }
 
+            // Staged-target verification (r50), authoritative because it runs
+            // under the same mutation lock as the write: refuse the full-file
+            // overwrite when the target no longer matches the fingerprint the
+            // refine proposal was staged against. The prior content read
+            // above IS the content this write would destroy.
+            const expectedTargetHash = expectedTargetHashes?.get(toolCallId);
+            if (expectedTargetHash !== undefined) {
+              const currentHash = hashSkillWriteTargetContent(fileExisted ? originalContent : null);
+              if (currentHash !== expectedTargetHash) {
+                return {
+                  success: false,
+                  error:
+                    "target file changed since this proposal was staged; run /refine again to restage",
+                };
+              }
+            }
+
             await fsPromises.mkdir(path.dirname(resolvedTarget.resolvedPath), { recursive: true });
             await fsPromises.writeFile(resolvedTarget.resolvedPath, contentToWrite, "utf-8");
 
@@ -546,4 +608,4 @@ export const createAgentSkillWriteTool: ToolFactory = (config: ToolConfiguration
       }
     },
   });
-};
+}

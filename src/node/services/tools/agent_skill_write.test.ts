@@ -17,7 +17,11 @@ import {
   seedForeignTargetLock,
 } from "@/node/services/refinement/refinementTestHelpers";
 import { createAgentSkillReadTool } from "./agent_skill_read";
-import { createAgentSkillWriteTool } from "./agent_skill_write";
+import {
+  createAgentSkillWriteTool,
+  createStagedAgentSkillWriteTool,
+  hashSkillWriteTargetContent,
+} from "./agent_skill_write";
 import { SKILL_FILENAME } from "./skillFileUtils";
 import {
   createTestToolConfig,
@@ -1240,6 +1244,57 @@ describe("refinement journal", () => {
   function sessionDirOf(muxHome: string): string {
     return path.join(muxHome, "sessions", GLOBAL_WORKSPACE_ID);
   }
+
+  it("refuses a staged write whose target changed after staging, in-lock (r50)", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-staged-guard");
+
+    // The refine apply loop's own pre-check is UNLOCKED: a concurrent writer
+    // can land between that check and this tool's mutation lock. The tool
+    // itself must therefore re-verify the staged fingerprint under the lock,
+    // immediately before the full-file overwrite.
+    const workspaceSessionDir = await createWorkspaceSessionDir(tempDir.path, GLOBAL_WORKSPACE_ID);
+    const config = createTestToolConfig(tempDir.path, {
+      workspaceId: GLOBAL_WORKSPACE_ID,
+      sessionsDir: workspaceSessionDir,
+    });
+    const skillFile = path.join(tempDir.path, "skills", "demo-skill", SKILL_FILENAME);
+    const original = skillMarkdown("demo-skill", { body: "Original body" });
+    await fs.mkdir(path.dirname(skillFile), { recursive: true });
+    await fs.writeFile(skillFile, original, "utf-8");
+
+    // Proposal staged against `original`; target then edited by someone else.
+    const staleTool = createStagedAgentSkillWriteTool(
+      config,
+      new Map([[mockToolCallOptions.toolCallId, hashSkillWriteTargetContent(original)]])
+    );
+    const newer = skillMarkdown("demo-skill", { body: "Newer manual edit that must survive" });
+    await fs.writeFile(skillFile, newer, "utf-8");
+
+    const refused = (await staleTool.execute!(
+      { name: "demo-skill", content: skillMarkdown("demo-skill", { body: "Stale proposal" }) },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+
+    expect(refused.success).toBe(false);
+    if (!refused.success) {
+      expect(refused.error).toContain("restage");
+    }
+    // The newer content survives and no refinement row was journaled.
+    expect(await fs.readFile(skillFile, "utf-8")).toBe(newer);
+    expect(await readRefinementEvents(sessionDirOf(tempDir.path))).toHaveLength(0);
+
+    // A fingerprint matching the current content writes normally.
+    const freshTool = createStagedAgentSkillWriteTool(
+      config,
+      new Map([[mockToolCallOptions.toolCallId, hashSkillWriteTargetContent(newer)]])
+    );
+    const applied = (await freshTool.execute!(
+      { name: "demo-skill", content: skillMarkdown("demo-skill", { body: "Applied" }) },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+    expect(applied.success).toBe(true);
+    expect(await fs.readFile(skillFile, "utf-8")).toContain("Applied");
+  });
 
   it("journals a new-file write with a delete inverse that round-trips", async () => {
     using tempDir = new TestTempDir("test-agent-skill-write-refinement-create");
