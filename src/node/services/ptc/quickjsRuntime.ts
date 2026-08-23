@@ -695,13 +695,48 @@ export class QuickJSRuntime implements IJSRuntime {
       const readBack = this.ctx.getProp(varsHandle, key);
       stored = this.ctx.eq(readBack, valueHandle);
       readBack.dispose();
+      if (stored) {
+        // r54: the identity read-back above goes through the SAME [[Get]] a
+        // lying Proxy controls — a get trap that echoes the just-assigned
+        // value passes it while [[OwnPropertyKeys]] omits the key, so
+        // JSON.stringify(vars) (exactly what the durable snapshot persists)
+        // would drop the load and it would vanish after a restart. Verify
+        // through the serialization itself: stash the expected value in a
+        // temp global (string identity survives) and compare against the
+        // parse(stringify(vars)) round trip.
+        this.ctx.setProp(this.ctx.global, "__xumVarsWriteVerify", valueHandle);
+        const verify = this.ctx.evalCode(
+          `(function () {
+            try {
+              const round = JSON.parse(JSON.stringify(globalThis.vars));
+              return (
+                round !== null &&
+                typeof round === "object" &&
+                round[${JSON.stringify(key)}] === globalThis.__xumVarsWriteVerify
+              );
+            } catch {
+              return false;
+            } finally {
+              delete globalThis.__xumVarsWriteVerify;
+            }
+          })()`
+        );
+        if (verify.error) {
+          verify.error.dispose();
+          stored = false;
+        } else {
+          const survived: unknown = this.ctx.dump(verify.value);
+          verify.value.dispose();
+          stored = survived === true;
+        }
+      }
     } finally {
       varsHandle.dispose();
       valueHandle.dispose();
     }
     if (!stored) {
       throw new Error(
-        `vars assignment did not store ${JSON.stringify(key)} — the guest vars namespace swallows writes; restore vars to a plain object and retry`
+        `vars assignment did not store ${JSON.stringify(key)} — the guest vars namespace swallows or hides writes from serialization; restore vars to a plain object and retry`
       );
     }
   }

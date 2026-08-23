@@ -327,7 +327,9 @@ function compactKernelToolCallRecords(result: PTCExecutionResult, loadActive: bo
   result.toolCalls = result.toolCalls.map((record) => {
     // Load records keep their result ({key, bytes, lines, preview} — bounded
     // by construction: parseLoadArgs caps the key, the preview is capped
-    // host-side), but their ARGS and ERROR are still guest-influenced: a
+    // host-side; an optional hookResult annotation is repo-controlled hook
+    // output, the same trust class ordinary file_read exposes), but their
+    // ARGS and ERROR are still guest-influenced: a
     // rejected call's record can carry an unbounded key/path, and host error
     // messages echo guest paths verbatim (ENAMETOOLONG), so bound both like
     // every other record.

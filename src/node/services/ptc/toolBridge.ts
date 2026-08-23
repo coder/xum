@@ -345,7 +345,14 @@ export class ToolBridge {
           // vars[key] without passing through the return value below (which
           // is all the record, the events, and the model ever see).
           runtime.setVarsProperty(key, loaded.content);
-          return { key, bytes: loaded.bytes, lines: loaded.lines, preview: loaded.preview };
+          return {
+            key,
+            bytes: loaded.bytes,
+            lines: loaded.lines,
+            preview: loaded.preview,
+            // r54: bounded model-visible hook annotations (never full content).
+            ...(loaded.hookResult !== undefined ? { hookResult: loaded.hookResult } : {}),
+          };
         };
       } else if (this.deniedToolNames.has("file_read")) {
         xumObj.load = () =>

@@ -253,6 +253,33 @@ describe("QuickJSRuntime", () => {
       expect(result.success).toBe(true);
       expect(String(result.result)).toContain("did not store");
     });
+
+    it("throws when a guest Proxy vars hides the write from serialization (r54)", async () => {
+      // A default set trap stores into the target, so the identity read-back
+      // passes — but ownKeys omits the key, so JSON.stringify(vars) (exactly
+      // what the durable snapshot persists) drops the load: after a restart
+      // the advertised key is gone. The write must fail loudly instead.
+      runtime.registerFunction("hostWrite", (...args: unknown[]) => {
+        runtime.setVarsProperty(String(args[0]), String(args[1]));
+        return Promise.resolve(true);
+      });
+      const result = await runtime.eval(`
+        vars = new Proxy({}, {
+          ownKeys: function () { return []; },
+        });
+        try {
+          hostWrite("a", "hello");
+          return "stored";
+        } catch (e) {
+          return String(e);
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(String(result.result)).toContain("did not store");
+      // The verification temp global must not linger in the guest realm.
+      const leak = await runtime.eval(`return typeof globalThis.__xumVarsWriteVerify;`);
+      expect(leak.result).toBe("undefined");
+    });
   });
 
   describe("console capture", () => {

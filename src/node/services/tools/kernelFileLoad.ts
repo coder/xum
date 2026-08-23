@@ -26,6 +26,14 @@ export interface KernelLoadedFile {
   lines: number;
   /** Bounded head of the content. */
   preview: string;
+  /**
+   * r54: transformed model-visible output of the file_read hook pipeline,
+   * present only when a post-hook or tool.execute.after middleware
+   * annotated the bounded summary (warnings, notices) — exactly the
+   * feedback ordinary file_read exposes to the model. Never contains the
+   * full content: hooks only ever observe the bounded summary.
+   */
+  hookResult?: unknown;
 }
 
 /** Host closure resolving + reading a file with the workspace's cwd/runtime. */
@@ -153,6 +161,28 @@ export function createKernelFileLoader(config: {
       throw new Error(`mux.load blocked by file_read hook: ${blockedError}`);
     }
     assert(loaded !== null, "mux.load: hook pipeline completed without executing the read");
-    return loaded;
+    // Explicitly typed local: TS control-flow cannot see the closure
+    // assignment above, so `loaded` narrows to never after the assert.
+    const loadedFile: KernelLoadedFile = loaded;
+    // r54: post-hooks and tool.execute.after middleware may annotate the
+    // bounded summary exactly as they do for ordinary file_read results.
+    // Returning the pre-hook object would silently drop those warnings even
+    // though the hooks ran — propagate the transformed output when it
+    // differs. Compared/attached via JSON so a non-serializable hook value
+    // degrades to no annotation instead of failing a successful load.
+    try {
+      const rawSummary = JSON.stringify({
+        bytes: loadedFile.bytes,
+        lines: loadedFile.lines,
+        preview: loadedFile.preview,
+      });
+      const transformed = JSON.stringify(outcome.result);
+      if (transformed !== undefined && transformed !== rawSummary) {
+        return { ...loadedFile, hookResult: JSON.parse(transformed) as unknown };
+      }
+    } catch {
+      // Unserializable hook output: keep the load result unannotated.
+    }
+    return loadedFile;
   };
 }

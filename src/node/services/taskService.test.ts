@@ -13795,12 +13795,16 @@ describe("TaskService", () => {
         internal?: {
           preTurnMessages?: MuxMessage[];
           onAccepted?: () => Promise<void> | void;
+          onPreTurnRowsPersisted?: () => void;
         }
       ): Promise<Result<void, { type: string; raw: string }>> => {
         for (const row of internal?.preTurnMessages ?? []) {
           const appended = await historyService.appendToHistory(workspaceId, row);
           if (!appended.success) throw new Error(appended.error);
         }
+        // r54: the real path signals persistence at the rollback horizon
+        // (rows durable), before acceptance.
+        internal?.onPreTurnRowsPersisted?.();
         await internal?.onAccepted?.();
         return Err({ type: "unknown", raw: "stream path down after acceptance" });
       }
@@ -13836,6 +13840,90 @@ describe("TaskService", () => {
       (m) => m.metadata?.muxMetadata?.type === "family-message"
     );
     // Rendered-length charging (round 20) refuses before the raw quotient.
+    expect(payloadRows.length).toBeGreaterThan(0);
+    expect(payloadRows.length).toBeLessThan(maxSizeSends);
+  });
+
+  test("post-persistence pre-acceptance failures retain the budget charge (r54)", async () => {
+    // Codex round 54: the charge was keyed to turn ACCEPTANCE — but a send
+    // can fail between the pre-turn batch committing (rollback horizon:
+    // rows irrevocably durable in parent history) and acceptance (e.g. goal
+    // sync throwing). Refunding there let a child that catches the tool
+    // error retry unlimited max-size payload rows, each durably appended,
+    // without ever consuming budget.
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-postpersist-budget";
+    const childTaskId = "child-postpersist-budget";
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId, {
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+        projectWorkspace(projectPath, "child", childTaskId, {
+          parentWorkspaceId,
+          taskStatus: "running",
+          taskExperiments: { rlm: true },
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    // Rows persist and cross the rollback horizon, then the send fails
+    // BEFORE acceptance: onAccepted never fires.
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService, historyService } = createTaskServiceHarness(config, {
+      workspaceService,
+    });
+    sendMessage.mockImplementation(
+      async (
+        workspaceId: string,
+        _message: string,
+        _options: unknown,
+        internal?: {
+          preTurnMessages?: MuxMessage[];
+          onPreTurnRowsPersisted?: () => void;
+        }
+      ): Promise<Result<void, { type: string; raw: string }>> => {
+        for (const row of internal?.preTurnMessages ?? []) {
+          const appended = await historyService.appendToHistory(workspaceId, row);
+          if (!appended.success) throw new Error(appended.error);
+        }
+        internal?.onPreTurnRowsPersisted?.();
+        return Err({ type: "unknown", raw: "goal sync down after persistence" });
+      }
+    );
+
+    const maxSizeSends = TASK_FAMILY_MESSAGE_MAX_TOTAL_CHARS / TASK_FAMILY_MESSAGE_MAX_CHARS;
+    for (let i = 0; i < maxSizeSends; i++) {
+      const sent = await taskService.sendMessageToParentFromAgentTask(
+        childTaskId,
+        "x".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS),
+        "tool-end"
+      );
+      expect(sent.success).toBe(false);
+    }
+
+    // Budget exhausted: the next retry is refused WITHOUT appending another
+    // payload row, even though acceptance never fired.
+    const exhausted = await taskService.sendMessageToParentFromAgentTask(
+      childTaskId,
+      "x".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS),
+      "tool-end"
+    );
+    expect(exhausted.success).toBe(false);
+    if (!exhausted.success) {
+      expect("message" in exhausted.error && exhausted.error.message).toContain("budget");
+    }
+    const history = await historyService.getHistoryFromLatestBoundary(parentWorkspaceId);
+    expect(history.success).toBe(true);
+    if (!history.success) return;
+    const payloadRows = history.data.filter(
+      (m) => m.metadata?.muxMetadata?.type === "family-message"
+    );
     expect(payloadRows.length).toBeGreaterThan(0);
     expect(payloadRows.length).toBeLessThan(maxSizeSends);
   });

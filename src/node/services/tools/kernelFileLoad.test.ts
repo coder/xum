@@ -65,6 +65,52 @@ exit 0
   });
 });
 
+describe("createKernelFileLoader hook annotations", () => {
+  it("propagates post-hook annotations without leaking full content (r54)", async () => {
+    // Codex r54: mux.load returned the pre-hook object, silently dropping
+    // tool_post / tool.execute.after annotations (formatter notices,
+    // warnings) even though the hooks ran — feedback ordinary file_read
+    // exposes to the model. The annotation must ride the load record while
+    // the full content stays host-side.
+    using tmp = new DisposableTempDir("kernel-load-post-hook");
+    await fs.writeFile(nodePath.join(tmp.path, "notes.txt"), "hello\nworld\n", "utf8");
+    const hookDir = nodePath.join(tmp.path, ".xum");
+    await fs.mkdir(hookDir, { recursive: true });
+    const prePath = nodePath.join(hookDir, "tool_pre");
+    await fs.writeFile(prePath, "#!/bin/bash\nexit 0\n");
+    await fs.chmod(prePath, 0o755);
+    const postPath = nodePath.join(hookDir, "tool_post");
+    await fs.writeFile(postPath, '#!/bin/bash\necho "formatter notice"\nexit 0\n');
+    await fs.chmod(postPath, 0o755);
+
+    const runtime = new LocalRuntime(tmp.path);
+    const load = createKernelFileLoader({
+      cwd: tmp.path,
+      runtime,
+      hooks: { runtime, cwd: tmp.path, runtimeTempDir: tmp.path, workspaceId: "test-ws" },
+    });
+
+    const annotated = await load({ path: "notes.txt" });
+    // Full content still rides the host closure into vars.
+    expect(annotated.content).toBe("hello\nworld\n");
+    // The transformed model-visible summary carries the hook's annotation...
+    const hookResult = annotated.hookResult as {
+      bytes?: number;
+      hook_output?: string;
+    } | null;
+    expect(hookResult?.hook_output).toContain("formatter notice");
+    expect(hookResult?.bytes).toBe(annotated.bytes);
+    // ...but never the full-content field (hooks only observe the summary).
+    expect(hookResult).not.toHaveProperty("content");
+
+    // Hooks are rediscovered per call: with the post-hook gone the summary
+    // is untransformed and no annotation is attached.
+    await fs.rm(postPath);
+    const plain = await load({ path: "notes.txt" });
+    expect(plain.hookResult).toBeUndefined();
+  });
+});
+
 describe("createKernelFileLoader byte ceiling", () => {
   it("fails and cancels when the stream exceeds the size the stat reported", async () => {
     // Models /dev/zero (stat size 0, infinite stream) and stat→read growth

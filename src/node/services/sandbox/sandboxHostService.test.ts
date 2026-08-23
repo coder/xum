@@ -1410,6 +1410,95 @@ describe("SandboxHostService", () => {
     await host.disposeScope("ws-primitive-vars");
   });
 
+  test("storeResultHandle rejects a Proxy vars that hides keys from serialization (r54)", async () => {
+    // Codex r54: the identity read-back (vars[key] !== value) goes through
+    // the same [[Get]] a lying Proxy controls — a default set trap stores
+    // into the target so the read-back passes, but ownKeys omits the key and
+    // JSON.stringify(vars) (what the durable snapshot persists) drops the
+    // handle: after a restart the advertised handle is gone. The write must
+    // fail loudly instead of publishing a phantom handle event.
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    const mount = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-lying-proxy-vars",
+      sessionDir: tmp.path,
+    });
+
+    const seeded = await mount.runtime.eval(`
+      vars = new Proxy({}, {
+        ownKeys: function () { return []; },
+      });
+      return true;
+    `);
+    expect(seeded.success).toBe(true);
+
+    try {
+      await mount.storeResultHandle(JSON.stringify({ n: 1 }), 10_000);
+      expect.unreachable("storeResultHandle should have thrown");
+    } catch (e) {
+      expect(String(e)).toContain("did not survive serialization");
+    }
+    await host.disposeScope("ws-lying-proxy-vars");
+  });
+
+  test("mount setup failure after runtime creation disposes the runtime (r54)", async () => {
+    // Codex r54: acquirePersistentMountLocked created the runtime, then ran
+    // journal reads / vars restoration / bridge registration with no guard —
+    // any failure leaked one live QuickJS sandbox per retry attempt.
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    let disposed = false;
+    const failingFactory = {
+      create: async () => {
+        const real = await runtimeFactory.create();
+        // Forwarding proxy: vars restoration (initializeVars) is the first
+        // eval after runtime creation — fail it and record disposal.
+        return new Proxy(real, {
+          get(target, prop, receiver) {
+            if (prop === "eval") {
+              return () => Promise.reject(new Error("simulated setup failure"));
+            }
+            if (prop === "dispose") {
+              return () => {
+                disposed = true;
+                target.dispose();
+              };
+            }
+            return Reflect.get(target, prop, receiver) as unknown;
+          },
+        });
+      },
+    };
+
+    try {
+      await host.acquireMount({
+        lifetime: "persistent",
+        runtimeFactory: failingFactory,
+        scopeKey: "ws-setup-failure",
+        sessionDir: tmp.path,
+      });
+      expect.unreachable("acquireMount should have thrown");
+    } catch (e) {
+      expect(String(e)).toContain("simulated setup failure");
+    }
+    expect(disposed).toBe(true);
+
+    // The failed scope must not be registered: a later acquire with a
+    // working factory starts fresh instead of returning a broken mount.
+    const recovered = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-setup-failure",
+      sessionDir: tmp.path,
+    });
+    const ok = await recovered.runtime.eval("return 1 + 1;");
+    expect(ok.success).toBe(true);
+    expect(ok.result).toBe(2);
+    await host.disposeScope("ws-setup-failure");
+  });
+
   test("retention measures UTF-8 bytes, not UTF-16 code units (multibyte payloads)", async () => {
     // Codex r24: sizes were measured as JSON.stringify().length — UTF-16
     // code units — under-counting multibyte payloads by up to 4x. Handles

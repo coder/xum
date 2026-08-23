@@ -4861,7 +4861,11 @@ export class TaskService {
             onAccepted: async () => {
               await clearGuidanceReservation(false);
               accepted = true;
-              // Acceptance is when pre-turn rows became durable on this path.
+            },
+            // r54: persistence is signaled at the rollback horizon, not at
+            // acceptance — acceptance can fail after the pre-turn batch is
+            // already irrevocable, and the budget charge must stick then.
+            onPreTurnRowsPersisted: () => {
               options?.onPreTurnPersisted?.();
             },
           }
@@ -7452,8 +7456,15 @@ export class TaskService {
     queueDispatchMode?: TaskMessageQueueDispatchMode;
     /** Synthetic assistant rows persisted just before the wake's user row (family payloads). */
     preTurnMessages?: MuxMessage[];
-    /** Invoked once the wake turn is durably accepted (rows persisted). */
+    /** Invoked once the wake turn is durably accepted. */
     onAccepted?: () => void;
+    /**
+     * r54: invoked once the pre-turn rows cross the rollback horizon —
+     * acceptance can still fail AFTER that point (e.g. goal sync throwing)
+     * with the rows durable, so budget accounting must key off this, not
+     * onAccepted.
+     */
+    onPreTurnRowsPersisted?: () => void;
   }): Promise<Result<void, string>> {
     assert(params.parentWorkspaceId.length > 0, "wakeParentWorkspace: parent ID required");
     assert(params.content.length > 0, "wakeParentWorkspace: content required");
@@ -7487,6 +7498,9 @@ export class TaskService {
         workspaceTurnContinuation: workspaceTurnMuxMetadata != null,
         ...(params.preTurnMessages != null ? { preTurnMessages: params.preTurnMessages } : {}),
         ...(params.onAccepted != null ? { onAccepted: params.onAccepted } : {}),
+        ...(params.onPreTurnRowsPersisted != null
+          ? { onPreTurnRowsPersisted: params.onPreTurnRowsPersisted }
+          : {}),
         ...(params.queueDedupeKey != null
           ? { queueDedupeKey: params.queueDedupeKey, removableQueueDedupeKey: true }
           : {}),
@@ -7727,29 +7741,33 @@ export class TaskService {
       // sendMessage refuses removed/removing workspaces, and no direct
       // historyService write remains that could recreate a removed session
       // directory.
-      let accepted = false;
+      let payloadPersisted = false;
       const wakeResult = await this.wakeParentWorkspaceWithSyntheticMessage({
         parentWorkspaceId,
         parentEntry,
         content: triggerContent,
         queueDispatchMode,
         preTurnMessages: [payloadRow],
-        onAccepted: () => {
-          accepted = true;
+        // r54: keyed to the rollback horizon, NOT turn acceptance — a send
+        // can fail after the batch committed but before acceptance (e.g.
+        // goal sync throwing), leaving both rows durable while acceptance
+        // never fires.
+        onPreTurnRowsPersisted: () => {
+          payloadPersisted = true;
         },
       });
       if (!wakeResult.success) {
-        // Refund only when the turn was never accepted: pre-acceptance
-        // failures roll back every persisted pre-turn row, so nothing landed
-        // in the parent transcript. Post-acceptance failures keep the charge —
-        // payload + trigger are durable, and refunding would let a child that
-        // catches the tool error retry unlimited max-size payload rows while
-        // the stream path is down (r21). A delivery queued behind a busy
-        // parent returns success here; if its entry is later cleared before
+        // Refund only when nothing landed in the parent transcript:
+        // pre-horizon failures roll back every persisted pre-turn row.
+        // Post-persistence failures keep the charge — payload + trigger are
+        // durable, and refunding would let a child that catches the tool
+        // error retry unlimited max-size payload rows while the acceptance
+        // path is failing (r21/r54). A delivery queued behind a busy parent
+        // returns success here; if its entry is later cleared before
         // dispatch, the charge is also kept: the budget is a conservative
         // safety ceiling, and refunding unexecuted queue entries would let a
         // child cycle max-size sends through a busy parent's queue for free.
-        if (!accepted) {
+        if (!payloadPersisted) {
           refundBudget();
         }
         return Err({ code: "send_failed" as const, message: wakeResult.error });

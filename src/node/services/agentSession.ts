@@ -2699,6 +2699,15 @@ export class AgentSession {
        */
       preTurnMessages?: MuxMessage[];
       /**
+       * r54: fired once the pre-turn batch has crossed the rollback horizon —
+       * durably committed AND past the last cancellation/rollback gate. From
+       * that point every failure (goal sync, acceptance, stream start) keeps
+       * the rows in the transcript, so budget-style accounting must treat the
+       * delivery as persisted. Turn ACCEPTANCE is the wrong signal: it can
+       * fail after the rows are already irrevocable.
+       */
+      onPreTurnRowsPersisted?: () => void;
+      /**
        * r41: staleness probe for this send's admission epoch, captured
        * synchronously with WorkspaceService's entry checks. Returns true when
        * a context-discarding mutation COMPLETED after the send entered — the
@@ -3506,6 +3515,12 @@ export class AgentSession {
     // wake finish acceptance rather than delete the row after goal state has already observed it.
     if (cancelSignal != null) {
       cancellationDisabled = true;
+    }
+    // r54: the pre-turn batch is now irrevocable — rollbackPersistedTurnRows
+    // is never invoked past this point, so even a failure in goal sync or
+    // acceptance leaves the payload + trigger rows durable in the transcript.
+    if (internal?.preTurnMessages != null && internal.preTurnMessages.length > 0) {
+      internal.onPreTurnRowsPersisted?.();
     }
     try {
       await this.workspaceGoalService?.syncGoalModeWithChatTail(this.workspaceId);
@@ -5966,6 +5981,8 @@ export class AgentSession {
       cancelSignal?: AbortSignal;
       /** Synthetic assistant rows persisted just before the dispatched turn's user row. */
       preTurnMessages?: MuxMessage[];
+      /** r54: fired once pre-turn rows cross the rollback horizon at dispatch. */
+      onPreTurnRowsPersisted?: () => void;
     }
   ): "tool-end" | "turn-end" | null {
     this.assertNotDisposed("queueMessage");

@@ -567,6 +567,22 @@ export class SandboxMount {
       // swallow it): fail the eval so the caller degrades to a bounded
       // truncated record instead of advertising a missing handle.
       if (vars[key] !== value) throw new Error("vars handle assignment did not store");
+      // r54: the identity check above goes through the same [[Get]] a lying
+      // Proxy controls — a get trap can echo the assigned value while
+      // [[OwnPropertyKeys]] omits the key, and JSON.stringify(vars) (what
+      // the durable snapshot persists) would drop the handle: after a
+      // restart the advertised handle is gone. Verify through the
+      // serialization itself.
+      {
+        const round = JSON.parse(JSON.stringify(vars));
+        if (
+          round === null ||
+          typeof round !== "object" ||
+          JSON.stringify(round[key]) !== JSON.stringify(value)
+        ) {
+          throw new Error("vars handle assignment did not survive serialization");
+        }
+      }
       const others = [];
       for (const k of Object.keys(vars)) {
         if (k === key) continue;
@@ -830,7 +846,6 @@ export class SandboxHostService {
     const sessionDir = options.sessionDir;
     assert(scopeKey, "persistent mounts require a scopeKey");
     assert(sessionDir, "persistent mounts require a sessionDir");
-    const lock = this.lockFor(scopeKey);
     const journal = this.journalFor(sessionDir);
 
     const existing = this.persistentMounts.get(scopeKey);
@@ -876,6 +891,38 @@ export class SandboxHostService {
       }
     }
     const runtime = await options.runtimeFactory.create();
+    // Setup guard (r54): until ownership transfers to persistentMounts, any
+    // failure below (journal read, vars restoration, bridge registration)
+    // must dispose the freshly created runtime — retries would otherwise
+    // leak one live sandbox runtime per attempt.
+    let setupMount: SandboxMount | undefined;
+    try {
+      return await this.finishPersistentMountSetupLocked(options, grants, runtime, (mount) => {
+        setupMount = mount;
+      });
+    } catch (error) {
+      if (setupMount !== undefined) {
+        setupMount.dispose();
+      } else {
+        runtime.dispose();
+      }
+      throw error;
+    }
+  }
+
+  /** Setup steps after runtime creation; caller disposes on throw (r54). */
+  private async finishPersistentMountSetupLocked(
+    options: AcquireMountOptions,
+    grants: CapabilityGrants,
+    runtime: IJSRuntime,
+    onMountConstructed: (mount: SandboxMount) => void
+  ): Promise<SandboxMount> {
+    const scopeKey = options.scopeKey;
+    const sessionDir = options.sessionDir;
+    assert(scopeKey, "persistent mounts require a scopeKey");
+    assert(sessionDir, "persistent mounts require a sessionDir");
+    const lock = this.lockFor(scopeKey);
+    const journal = this.journalFor(sessionDir);
     // One journal read feeds both the reset generation this mount is created
     // against (r52) and the latest-snapshot restore below. Read AFTER the
     // pending-discard retry so a just-published tombstone is counted, and
@@ -952,6 +999,10 @@ export class SandboxHostService {
         }
       }
     );
+
+    // From here on, failure cleanup must dispose the MOUNT (which owns the
+    // runtime), not the bare runtime (r54).
+    onMountConstructed(mount);
 
     if (grants.vars) {
       // Post-restore stabilization (r53): vars restoration is itself

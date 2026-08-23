@@ -104,6 +104,8 @@ interface QueuedMessageInternalOptions {
    * append could land between that turn's user row and its assistant response.
    */
   preTurnMessages?: MuxMessage[];
+  /** r54: fired once pre-turn rows cross the rollback horizon at dispatch. */
+  onPreTurnRowsPersisted?: () => void;
 }
 
 type QueueClearCallbacks = Pick<
@@ -148,6 +150,8 @@ interface QueueEntry {
   cancelSignal?: AbortSignal;
   /** Pre-turn rows delivered with this entry (entries carrying them are sealed). */
   preTurnMessages?: MuxMessage[];
+  /** r54: fired once this entry's pre-turn rows cross the rollback horizon. */
+  onPreTurnRowsPersisted?: () => void;
 }
 
 /**
@@ -496,6 +500,20 @@ export class MessageQueue {
     if (internal?.onAcceptedPreStreamFailure != null) {
       entry.onAcceptedPreStreamFailure = internal.onAcceptedPreStreamFailure;
     }
+    if (internal?.onPreTurnRowsPersisted != null) {
+      // Callback-carrying sends seal their entries, but pre-turn batches can
+      // in principle concatenate — chain instead of overwrite so no
+      // producer's persistence signal is dropped (r54).
+      const previous = entry.onPreTurnRowsPersisted;
+      const next = internal.onPreTurnRowsPersisted;
+      entry.onPreTurnRowsPersisted =
+        previous == null
+          ? next
+          : () => {
+              previous();
+              next();
+            };
+    }
 
     if (internal?.cancelState != null) {
       entry.cancelState = internal.cancelState;
@@ -766,6 +784,9 @@ export class MessageQueue {
             : {}),
           ...(entry.preTurnMessages != null && entry.preTurnMessages.length > 0
             ? { preTurnMessages: entry.preTurnMessages }
+            : {}),
+          ...(entry.onPreTurnRowsPersisted != null
+            ? { onPreTurnRowsPersisted: entry.onPreTurnRowsPersisted }
             : {}),
         }
       : undefined;
