@@ -208,6 +208,14 @@ export function createConsolidationMemoryTool(args: {
    * dry-run ignores it.
    */
   onStagedMutation?: (input: MemoryCommandInput, toolCallId: string) => void;
+  /**
+   * r55 (refine apply only): staging-time delete-target fingerprints keyed
+   * by toolCallId, re-verified by MemoryService INSIDE its target mutation
+   * lock immediately before removal — a memory delete is destructive with no
+   * command-level conflict semantics, so a target edited between staging and
+   * apply must refuse instead of destroying the newer contents.
+   */
+  expectedDeleteFingerprints?: ReadonlyMap<string, string>;
 }): { tool: Tool; getMutationCount: () => number } {
   const { memoryService, metaService, ctx, dryRun, journal } = args;
   const budget = args.budget ?? createMutationBudget(MEMORY_CONSOLIDATION_OP_BUDGET);
@@ -300,7 +308,9 @@ export function createConsolidationMemoryTool(args: {
         return { success: true, output: `[dry-run] recorded ${target.command} ${target.path}` };
       }
 
-      const result = await executeMemoryCommand(memoryService, ctx, input, () => null, toolCallId);
+      const result = await executeMemoryCommand(memoryService, ctx, input, () => null, toolCallId, {
+        expectedDeleteFingerprint: args.expectedDeleteFingerprints?.get(toolCallId),
+      });
       journal.push({
         ...target,
         applied: result.success,

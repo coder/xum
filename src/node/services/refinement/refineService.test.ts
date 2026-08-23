@@ -1469,6 +1469,90 @@ describe("RefineService", () => {
     }
   });
 
+  it("removal cancels a run parked on wedged model creation (r55)", async () => {
+    // Provider construction can wedge (lazy module load, slow token refresh)
+    // and used to run OUTSIDE every deadline race: cancelInFlightRefinePass
+    // aborts its controller but awaits the in-flight promise, so without
+    // racing construction against the shared signal, workspace removal hung
+    // indefinitely.
+    let releaseModel: () => void = () => undefined;
+    const modelGate = new Promise<void>((resolve) => {
+      releaseModel = resolve;
+    });
+    using fixture = await createFixture({ modelGate });
+    await fixture.seedTrajectory();
+    try {
+      const runPromise = fixture.service.run(WORKSPACE_ID);
+      // Wait until the run is parked inside model creation.
+      const spinDeadline = Date.now() + 5_000;
+      while (fixture.modelCalls.length === 0 && Date.now() < spinDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(fixture.modelCalls.length).toBe(1);
+      // Removal: must settle WITHOUT the gate ever opening.
+      await fixture.service.cancelInFlightRefinePass(WORKSPACE_ID);
+      const result = await runPromise;
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("cancelled while creating model");
+    } finally {
+      // Late model resolution after the lost race must be absorbed cleanly.
+      releaseModel();
+    }
+  });
+
+  it("refuses a staged memory delete whose target changed after staging (r55)", async () => {
+    // A memory delete carries no command-level conflict semantics: apply
+    // would only revalidate existence and then remove the CURRENT contents,
+    // so approving a proposal staged against the old state could destroy
+    // newer manual or agent changes.
+    using fixture = await createFixture({
+      modelFactory: () =>
+        toolCallModel(
+          [
+            {
+              toolCallId: "stale-delete-1",
+              toolName: "memory",
+              input: { command: "delete", path: LESSON_PATH },
+            },
+          ],
+          `${LESSON_PATH}: deletion proposed.`
+        ),
+    });
+    await fixture.seedTrajectory();
+    const ctx = { runtime: null, checkoutCwd: "", workspaceId: WORKSPACE_ID, projectPath: "" };
+    expect(
+      (await fixture.memoryService.create(ctx, LESSON_PATH, "original lesson\n", "user")).success
+    ).toBe(true);
+
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+
+    // The target changes between staging and apply (manual edit).
+    expect(
+      (await fixture.memoryService.strReplace(ctx, LESSON_PATH, "original", "amended", "user"))
+        .success
+    ).toBe(true);
+
+    const staleApply = await fixture.service.apply(WORKSPACE_ID);
+    expect(staleApply.success).toBe(true);
+    if (!staleApply.success) return;
+    // The delete was refused as an executed failure, not applied.
+    expect(staleApply.data.applied).toHaveLength(0);
+    expect(staleApply.data.failed).toHaveLength(1);
+    expect(staleApply.data.failed?.[0]?.reason).toContain("changed since this proposal was staged");
+    // The newer contents survived.
+    const survived = await fixture.memoryService.view(ctx, LESSON_PATH, {});
+    expect(survived.success).toBe(true);
+    if (survived.success) expect(survived.output).toContain("amended");
+
+    // Restaged against the CURRENT state, the same delete applies cleanly:
+    // the fingerprint refuses stale proposals, not deletes as such.
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+    const freshApply = await fixture.service.apply(WORKSPACE_ID);
+    expect(freshApply.success).toBe(true);
+    if (freshApply.success) expect(freshApply.data.applied).toHaveLength(1);
+    expect((await fixture.memoryService.view(ctx, LESSON_PATH, {})).success).toBe(false);
+  });
+
   it("cancelInFlightRefinePass aborts a running pass so no writes or summary land", async () => {
     // Removal races a pass that WOULD apply a memory edit and post a summary
     // row. Gate model creation to hold the race window open deterministically;

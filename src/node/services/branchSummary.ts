@@ -877,19 +877,31 @@ const BRANCH_SUMMARY_LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
 const BRANCH_SUMMARY_LOCK_WAIT_TIMEOUT_MS = BRANCH_SUMMARY_TIMEOUT_MS + 15_000;
 
 /**
- * Start abandoned-branch summarization WITHOUT blocking the caller. Used by
- * fork: awaiting generation synchronously stalls the user-facing fork for
- * seconds even when it ultimately produces nothing. Instead the promise is
- * registered so the fork's first send awaits it (see
+ * Start abandoned-branch summarization without blocking the caller on
+ * GENERATION. Used by fork: awaiting generation synchronously stalls the
+ * user-facing fork for seconds even when it ultimately produces nothing.
+ * Instead the promise is registered so the fork's first send awaits it (see
  * awaitPendingBranchSummary), and the tail guard guarantees a late append can
- * never land after unrelated rows. maybeAppendAbandonedBranchSummary never
- * rejects, so this deliberate not-awaited call cannot leave an unhandled
- * rejection behind.
+ * never land after unrelated rows. The returned promise (which never rejects)
+ * resolves once the cross-process pending marker is published — callers must
+ * await it before returning the fork so a foreign backend's first send can
+ * observe the marker (r55).
  */
-export function startAbandonedBranchSummaryInBackground(
+export async function startAbandonedBranchSummaryInBackground(
   input: AbandonedBranchSummaryInput & { guardTailMessageId: string; sessionDir?: string }
-): void {
+): Promise<void> {
   const controller = new AbortController();
+  // r55: the returned promise resolves only after the cross-process pending
+  // marker is published (markerReady below), so the fork IPC does not return
+  // until the marker is stat-visible — with XUM_ALLOW_MULTIPLE_INSTANCES=1 an
+  // immediate first send handled by ANOTHER backend could otherwise stat the
+  // session dir before a detached acquisition linked the lockfile, append its
+  // user row, and the guarded summary append would drop as a tail mismatch.
+  // Only generation + the guarded append stay in the background.
+  let markerPublished!: () => void;
+  const markerReady = new Promise<void>((resolve) => {
+    markerPublished = resolve;
+  });
   const promise = (async (): Promise<MuxMessage | null> => {
     // Cross-process pending marker (r48): this registration map is
     // process-local, so with XUM_ALLOW_MULTIPLE_INSTANCES=1 a first send
@@ -898,11 +910,8 @@ export function startAbandonedBranchSummaryInBackground(
     // tail mismatch — permanently losing the abandoned-branch context the
     // first-send wait exists to preserve. Hold a session-dir lockfile across
     // generation + the guarded append so a foreign send can wait on it (see
-    // awaitPendingBranchSummary). Acquired inside the background promise:
-    // the registration itself stays synchronous, leaving a ~ms window before
-    // the marker lands that only a send racing the fork IPC return could
-    // hit. Best-effort like the summary itself — acquisition failure
-    // degrades to process-local coordination.
+    // awaitPendingBranchSummary). Best-effort like the summary itself —
+    // acquisition failure degrades to process-local coordination.
     let lock: AsyncDisposable | null = null;
     if (input.sessionDir !== undefined) {
       try {
@@ -918,6 +927,7 @@ export function startAbandonedBranchSummaryInBackground(
         });
       }
     }
+    markerPublished();
     try {
       return await maybeAppendAbandonedBranchSummary({
         ...input,
@@ -927,6 +937,9 @@ export function startAbandonedBranchSummaryInBackground(
       await lock?.[Symbol.asyncDispose]();
     }
   })();
+  // Registration stays SYNCHRONOUS (before any await): removal of a
+  // just-created fork must always find the entry to cancel + drain — an
+  // await-then-register window would let clearPendingBranchSummary miss it.
   const entry: PendingBranchSummary = { promise, controller, consumed: false };
   pendingBranchSummaries.set(input.workspaceId, entry);
   void promise.then((appended) => {
@@ -941,6 +954,9 @@ export function startAbandonedBranchSummaryInBackground(
       pendingBranchSummaries.delete(input.workspaceId);
     }
   });
+  // Block the caller ONLY until the marker is stat-visible (bounded by the
+  // acquire timeout; normally ~ms on a fresh uncontended session dir).
+  await markerReady;
 }
 
 /**

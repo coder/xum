@@ -1131,7 +1131,7 @@ describe("branch summary placement on fork/truncate flows", () => {
         "abandoned-assistant",
       ]);
 
-      startAbandonedBranchSummaryInBackground({
+      await startAbandonedBranchSummaryInBackground({
         historyService,
         aiService: fakeAiService(summaryModel("The abandoned attempt explored a race condition.")),
         workspaceId: fork,
@@ -1205,7 +1205,7 @@ describe("branch summary placement on fork/truncate flows", () => {
         },
       });
 
-      startAbandonedBranchSummaryInBackground({
+      await startAbandonedBranchSummaryInBackground({
         historyService,
         aiService: fakeAiService(gatedModel),
         workspaceId: ws,
@@ -1220,22 +1220,17 @@ describe("branch summary placement on fork/truncate flows", () => {
         guardTailMessageId: "xp-1",
       });
 
-      // The marker is acquired inside the background promise; wait for it to
-      // land before simulating the foreign send.
+      // r55: the starter resolves only after the marker is stat-visible —
+      // the fork IPC must not return before a foreign backend's immediate
+      // first send could observe it. No polling: a regression to detached
+      // acquisition fails this assertion outright.
       const lockPath = path.join(sessionDir, "branch-summary.lock");
-      const markerDeadline = Date.now() + 5_000;
-      for (;;) {
-        if (
-          await fs.stat(lockPath).then(
-            () => true,
-            () => false
-          )
-        ) {
-          break;
-        }
-        if (Date.now() > markerDeadline) throw new Error("pending marker never appeared");
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
+      expect(
+        await fs.stat(lockPath).then(
+          () => true,
+          () => false
+        )
+      ).toBe(true);
 
       // Foreign send: no local registration under this id, marker exists —
       // it must BLOCK until the writer settles, not return immediately.
@@ -1273,7 +1268,7 @@ describe("branch summary placement on fork/truncate flows", () => {
       const branchPoint = createMuxMessage("sb-1", "assistant", "branch point", { timestamp: 1 });
       expect((await historyService.appendToHistory(ws, branchPoint)).success).toBe(true);
 
-      startAbandonedBranchSummaryInBackground({
+      await startAbandonedBranchSummaryInBackground({
         historyService,
         aiService: fakeAiService(summaryModel("The abandoned attempt found the root cause.")),
         workspaceId: ws,
@@ -1329,7 +1324,7 @@ describe("branch summary placement on fork/truncate flows", () => {
         }) as BranchSummaryAiService["createModelWithPinnedMetadata"],
         getWorkspaceMetadata: fakeAiService(model).getWorkspaceMetadata,
       };
-      startAbandonedBranchSummaryInBackground({
+      await startAbandonedBranchSummaryInBackground({
         historyService,
         aiService: gatedAiService,
         workspaceId: ws,
@@ -1387,7 +1382,7 @@ describe("branch summary placement on fork/truncate flows", () => {
       const branchPoint = createMuxMessage("cl-1", "assistant", "branch point", { timestamp: 1 });
       expect((await historyService.appendToHistory(ws, branchPoint)).success).toBe(true);
 
-      startAbandonedBranchSummaryInBackground({
+      await startAbandonedBranchSummaryInBackground({
         historyService,
         aiService: fakeAiService(summaryModel("A summary nobody ever consumes.")),
         workspaceId: ws,
@@ -1430,7 +1425,7 @@ describe("branch summary placement on fork/truncate flows", () => {
             }),
           }),
       });
-      startAbandonedBranchSummaryInBackground({
+      await startAbandonedBranchSummaryInBackground({
         historyService,
         aiService: fakeAiService(slowModel),
         workspaceId: ws,
@@ -1478,7 +1473,7 @@ describe("branch summary placement on fork/truncate flows", () => {
         getWorkspaceMetadata: fakeAiService(model).getWorkspaceMetadata,
       };
 
-      startAbandonedBranchSummaryInBackground({
+      await startAbandonedBranchSummaryInBackground({
         historyService,
         aiService: gatedAiService,
         workspaceId: ws,
@@ -1534,7 +1529,7 @@ describe("branch summary placement on fork/truncate flows", () => {
       const branchPoint = createMuxMessage("ser-1", "assistant", "branch point", { timestamp: 1 });
       expect((await historyService.appendToHistory(ws, branchPoint)).success).toBe(true);
 
-      startAbandonedBranchSummaryInBackground({
+      await startAbandonedBranchSummaryInBackground({
         historyService,
         aiService: fakeAiService(summaryModel("Summary appended mid-removal.")),
         workspaceId: ws,

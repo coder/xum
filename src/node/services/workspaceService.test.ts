@@ -5060,7 +5060,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
           BranchSummaryAiService["getWorkspaceMetadata"]
         >,
     };
-    startAbandonedBranchSummaryInBackground({
+    await startAbandonedBranchSummaryInBackground({
       historyService,
       aiService: summaryAiService,
       workspaceId,

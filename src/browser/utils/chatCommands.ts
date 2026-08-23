@@ -847,24 +847,34 @@ export async function processSlashCommand(
               })
         )
           .then((result) => {
+            // untrackedApplied: edits that succeeded but could not be
+            // journaled (no rollback id) — still real, so counted.
+            const appliedCount = result.success
+              ? result.data.applied.length + (result.data.untrackedApplied ?? 0)
+              : 0;
+            const failedCount = result.success ? (result.data.failed?.length ?? 0) : 0;
+            // r55: an apply where every edit failed (e.g. all staged targets
+            // changed) returns success:true with zero applied edits — a green
+            // "0 edit(s) applied, N failed" toast would read like the
+            // approved changes landed. Surface it as an error instead.
+            const allFailed =
+              result.success &&
+              refineApply &&
+              !result.data.noOp &&
+              appliedCount === 0 &&
+              failedCount > 0;
             context.setToast(
               result.success
                 ? {
                     id: Date.now().toString(),
-                    type: "success",
+                    type: allFailed ? "error" : "success",
                     message: result.data.noOp
                       ? refineApply
                         ? "Refine: nothing was applied"
                         : "Refine: nothing worth distilling"
                       : refineApply
-                        ? // untrackedApplied: edits that succeeded but could not
-                          // be journaled (no rollback id) — still real, so counted.
-                          // Failed edits are surfaced too: an all-failed apply
-                          // must not read like a success.
-                          `Refine: ${result.data.applied.length + (result.data.untrackedApplied ?? 0)} edit(s) applied${
-                            result.data.failed !== undefined && result.data.failed.length > 0
-                              ? `, ${result.data.failed.length} failed`
-                              : ""
+                        ? `Refine: ${appliedCount} edit(s) applied${
+                            failedCount > 0 ? `, ${failedCount} failed` : ""
                           } (see chat summary)`
                         : `Refine: ${result.data.staged?.length ?? 0} edit(s) staged — approve with /refine apply`,
                   }

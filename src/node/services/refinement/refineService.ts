@@ -162,6 +162,18 @@ function fingerprintHistoryRow(row: MuxMessage | undefined): string {
   return createHash("sha256").update(JSON.stringify(row)).digest("hex");
 }
 
+/**
+ * Virtual path of a staged memory DELETE edit, or undefined for any other
+ * (or malformed) memory command input. Staged inputs are untrusted on-disk
+ * state, so fields are read defensively rather than schema-cast (r55).
+ */
+function stagedMemoryDeletePath(input: unknown): string | undefined {
+  if (typeof input !== "object" || input === null) return undefined;
+  const { command, path: virtualPath } = input as { command?: unknown; path?: unknown };
+  if (command !== "delete" || typeof virtualPath !== "string") return undefined;
+  return virtualPath;
+}
+
 /** Human-readable action line for a refinement journal row. */
 export function describeRefinementRow(row: RefinementEvent): string {
   if (row.data.kind === "memory") {
@@ -468,6 +480,21 @@ export class RefineService {
       workspaceId,
       projectPath,
     };
+    // r55: staging-time fingerprints of memory DELETE targets, re-verified by
+    // MemoryService INSIDE its target mutation lock immediately before the
+    // removal — a delete has no command-level conflict semantics, so a target
+    // edited between staging and apply must refuse instead of destroying the
+    // newer contents (same posture as the skill-write hashes below).
+    const stagedMemoryDeleteFingerprints = new Map<string, string>();
+    for (const edit of staged.edits) {
+      if (
+        edit.tool === "memory" &&
+        edit.targetContentHash !== undefined &&
+        stagedMemoryDeletePath(edit.input) !== undefined
+      ) {
+        stagedMemoryDeleteFingerprints.set(edit.toolCallId, edit.targetContentHash);
+      }
+    }
     const { tool: memoryTool } = createConsolidationMemoryTool({
       memoryService: this.memoryService,
       metaService: this.metaService,
@@ -475,6 +502,7 @@ export class RefineService {
       dryRun: false,
       journal: [],
       budget: createMutationBudget(REFINE_OP_BUDGET),
+      expectedDeleteFingerprints: stagedMemoryDeleteFingerprints,
     });
     // r50: hand the staged target fingerprints to the writer so it re-verifies
     // them INSIDE its per-root mutation lock immediately before writing — the
@@ -907,10 +935,41 @@ export class RefineService {
     // of background self-maintenance agent, so a per-workspace dream override
     // intentionally covers both.
     const modelString = resolveDreamModelString(this.config, workspaceId);
-    const modelResult = await this.aiService.createModelWithPinnedMetadata(modelString, {
+    // Hard timeout + removal cancellation, created BEFORE model construction
+    // (r55): a provider whose construction wedges (lazy module load, slow
+    // token refresh) would otherwise block OUTSIDE every deadline race — the
+    // per-workspace refine entry stays in flight indefinitely and workspace
+    // removal hangs in cancelInFlightRefinePass, which aborts its controller
+    // but awaits this promise while construction never observes the signal.
+    // Same treatment as branch summary's model-creation race (r50).
+    const abortSignal = AbortSignal.any([
+      AbortSignal.timeout(this.options.timeoutMs ?? REFINE_TIMEOUT_MS),
+      cancellationSignal,
+    ]);
+    const abortPromise = new Promise<null>((resolve) => {
+      if (abortSignal.aborted) {
+        resolve(null);
+        return;
+      }
+      abortSignal.addEventListener("abort", () => resolve(null), { once: true });
+    });
+    const modelPromise = this.aiService.createModelWithPinnedMetadata(modelString, {
       agentInitiated: true,
       workspaceId,
     });
+    const modelResult = await Promise.race([modelPromise, abortPromise]);
+    if (modelResult === null) {
+      // The deadline/removal won while the provider was still constructing.
+      // The late model may still resolve holding real resources; clean it up
+      // when it does so it cannot outlive workspace removal.
+      void modelPromise.then(
+        (late) => {
+          if (late.success) runLanguageModelCleanup(late.data.model);
+        },
+        () => undefined
+      );
+      return Err(`refine cancelled while creating model ${modelString}`);
+    }
     if (!modelResult.success) {
       return Err(`could not create model ${modelString}: ${modelResult.error.type}`);
     }
@@ -944,10 +1003,9 @@ export class RefineService {
         // Hard timeout: a wedged provider stream must not hold the run lock
         // forever. Workspace-removal cancellation is folded into the same
         // signal so it stops the stream (and its tool-driven writes) promptly.
-        abortSignal: AbortSignal.any([
-          AbortSignal.timeout(this.options.timeoutMs ?? REFINE_TIMEOUT_MS),
-          cancellationSignal,
-        ]),
+        // The shared signal's timeout spans model creation + the pass (r55),
+        // so construction time counts against the same deadline.
+        abortSignal,
         recordUsage: async (usage, providerMetadata) => {
           await this.options.sessionUsageService?.recordHeadlessUsage(
             workspaceId,
@@ -1067,7 +1125,10 @@ export class RefineService {
       // full-file writes whose target changed after staging. Enriched BEFORE
       // both the save and hashStagedRefineSet below — the approval hash must
       // cover the exact persisted set.
-      const stagedEdits = await this.fingerprintSkillWriteTargets(workspaceId, result.stagedEdits);
+      const stagedEdits = await this.fingerprintMemoryDeleteTargets(
+        ctx,
+        await this.fingerprintSkillWriteTargets(workspaceId, result.stagedEdits)
+      );
       // Built from the COLLAPSED set (r53): same-target skill writes were
       // deduplicated above, and the record's staged descriptions must match
       // the persisted set the user approves.
@@ -1201,9 +1262,10 @@ export class RefineService {
    * Enrich staged skill writes with target fingerprints (r49):
    * agent_skill_write is a full-file overwrite, so apply must be able to
    * detect a target edited after staging and refuse to clobber it. Memory
-   * edits are excluded — their command semantics carry their own conflict
-   * behavior (create fails on existing files, str_replace verifies its
-   * anchor text).
+   * WRITE edits are excluded — their command semantics carry their own
+   * conflict behavior (create fails on existing files, str_replace verifies
+   * its anchor text) — but destructive memory deletes are fingerprinted by
+   * fingerprintMemoryDeleteTargets (r55).
    */
   private async fingerprintSkillWriteTargets(
     workspaceId: string,
@@ -1237,6 +1299,42 @@ export class RefineService {
         if (edit.tool !== "agent_skill_write") return edit;
         const targetContentHash = await this.fingerprintSkillWriteTarget(projectRoot, edit.input);
         return targetContentHash === undefined ? edit : { ...edit, targetContentHash };
+      })
+    );
+  }
+
+  /**
+   * Enrich staged memory DELETE edits with target fingerprints (r55): unlike
+   * memory writes, a delete carries no command-level conflict semantics —
+   * apply would only revalidate that the target exists and then remove its
+   * CURRENT contents, so approving a proposal generated against the old
+   * state could destroy newer manual or agent changes. deletePath re-verifies
+   * the fingerprint INSIDE its target mutation lock at apply. Best-effort:
+   * a fingerprinting failure leaves the edit unfingerprinted (previous
+   * behavior) rather than failing the staging pass.
+   */
+  private async fingerprintMemoryDeleteTargets(
+    ctx: MemoryScopeContext,
+    edits: StagedRefineEdit[]
+  ): Promise<StagedRefineEdit[]> {
+    return Promise.all(
+      edits.map(async (edit) => {
+        if (edit.tool !== "memory") return edit;
+        const deleteTargetPath = stagedMemoryDeletePath(edit.input);
+        if (deleteTargetPath === undefined) return edit;
+        try {
+          const targetContentHash = await this.memoryService.fingerprintDeleteTarget(
+            ctx,
+            deleteTargetPath
+          );
+          return { ...edit, targetContentHash };
+        } catch (error) {
+          log.debug("[Refine] memory delete target fingerprinting failed", {
+            path: deleteTargetPath,
+            error: getErrorMessage(error),
+          });
+          return edit;
+        }
       })
     );
   }

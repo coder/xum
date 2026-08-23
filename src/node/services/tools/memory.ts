@@ -131,7 +131,15 @@ export async function executeMemoryCommand(
   ctx: MemoryScopeContext,
   input: MemoryCommandInput,
   checkWriteAccess: (virtualPath: string) => MemoryToolResult | null,
-  toolCallId?: string
+  toolCallId?: string,
+  options?: {
+    /**
+     * r55 (staged refine deletes only): staging-time fingerprint of the
+     * delete target, re-verified by MemoryService INSIDE its target mutation
+     * lock immediately before removal. Ignored by every other command.
+     */
+    expectedDeleteFingerprint?: string;
+  }
 ): Promise<MemoryToolResult> {
   try {
     switch (input.command) {
@@ -194,7 +202,13 @@ export async function executeMemoryCommand(
         }
         return (
           checkWriteAccess(input.path) ??
-          (await memoryService.deletePath(ctx, input.path, "agent", toolCallId))
+          (await memoryService.deletePath(
+            ctx,
+            input.path,
+            "agent",
+            toolCallId,
+            options?.expectedDeleteFingerprint
+          ))
         );
       }
       case "rename": {

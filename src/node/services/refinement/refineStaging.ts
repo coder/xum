@@ -42,13 +42,15 @@ export const StagedRefineEditSchema = z.object({
    */
   input: z.unknown(),
   /**
-   * Fingerprint of the edit's TARGET file at staging time (r49): sha256 hex
-   * of its bytes, or "absent" when it did not exist. agent_skill_write is a
-   * full-file overwrite, so a target edited between staging and apply would
-   * be silently clobbered by a proposal generated against the old state —
-   * apply recomputes this and refuses on mismatch. Optional: memory edits
-   * carry their own conflict semantics, and staged sets written by older
-   * builds lack the field (those applies keep the previous behavior).
+   * Fingerprint of the edit's TARGET at staging time. For agent_skill_write
+   * (r49): sha256 hex of the file's bytes, or "absent" when it did not exist
+   * — a full-file overwrite of a target edited between staging and apply
+   * would silently clobber the newer state, so apply recomputes and refuses
+   * on mismatch. For memory DELETE edits (r55): a subtree fingerprint
+   * (MemoryService.fingerprintDeleteTarget), re-verified inside the target
+   * mutation lock before removal. Optional: memory WRITE edits carry their
+   * own conflict semantics, and staged sets written by older builds lack the
+   * field (those applies keep the previous behavior).
    */
   targetContentHash: z.string().optional(),
 });

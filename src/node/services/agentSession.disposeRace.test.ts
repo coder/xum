@@ -1,7 +1,11 @@
 import { describe, expect, test, mock } from "bun:test";
+import { existsSync } from "node:fs";
+import * as fs from "node:fs/promises";
+import * as nodePath from "node:path";
 import { AgentSession } from "./agentSession";
 import type { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
+import { createTestHistoryService } from "./testHistoryService";
 import type { AIService } from "./aiService";
 import type { InitStateManager } from "./initStateManager";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
@@ -140,11 +144,11 @@ describe("AgentSession disposal race conditions", () => {
       streamMessage,
     } as unknown as AIService;
 
-    const appendToHistory = mock(() => Promise.resolve(Ok(undefined)));
-    const historyService: HistoryService = {
-      appendToHistory,
-      getLastMessages: mock(() => Promise.resolve(Ok([]))),
-    } as unknown as HistoryService;
+    // Real HistoryService on a real temp session dir (r55): the assertion
+    // below is about actual disk state — a late append would recreate the
+    // just-deleted session directory — so mock call counts prove nothing.
+    // The race seam stays at the gated MODEL creation, not at history I/O.
+    const { historyService, config, cleanup } = await createTestHistoryService();
 
     const initStateManager: InitStateManager = {
       on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
@@ -160,83 +164,87 @@ describe("AgentSession disposal race conditions", () => {
       setMessageQueued: mock(() => undefined),
     } as unknown as BackgroundProcessManager;
 
-    const config: Config = {
-      srcDir: "/tmp",
-      getSessionDir: mock(() => "/tmp"),
-    } as unknown as Config;
-
     const workspaceId = "ws-branch-summary-dispose";
-    const session = new AgentSession({
-      workspaceId,
-      config,
-      historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
-    });
+    const sessionDir = config.getSessionDir(workspaceId);
+    try {
+      const session = new AgentSession({
+        workspaceId,
+        config,
+        historyService,
+        aiService,
+        initStateManager,
+        backgroundProcessManager,
+      });
 
-    // Register a gated background summary (generation held open at model
-    // creation) so sendMessage parks on awaitPendingBranchSummary — the exact
-    // window workspace removal races into.
-    let releaseModel: () => void = () => undefined;
-    const modelGate = new Promise<void>((resolve) => {
-      releaseModel = resolve;
-    });
-    const writerGuardedAppend = mock(() => Promise.resolve(Ok("appended" as const)));
-    const writerHistoryService = {
-      appendToHistory: mock(() => Promise.resolve(Ok(undefined))),
-      appendToHistoryIfTailMatches: writerGuardedAppend,
-    } as unknown as HistoryService;
-    const gatedAiService = {
-      createModelWithPinnedMetadata: async () => {
-        await modelGate;
-        return Err({ type: "api_key_not_found" as const, provider: "anthropic" });
-      },
-      // Side-channel candidates are confined to workspace-configured
-      // providers; metadata must resolve with a model or the writer settles
-      // null before createModelWithPinnedMetadata — the gate above would
-      // never park the send.
-      getWorkspaceMetadata: () =>
-        Promise.resolve(Ok({ aiSettings: { model: "anthropic:claude-sonnet-4-5" } })),
-    } as unknown as BranchSummaryAiService;
-    // Large enough to clear the tiny-segment threshold (chars/4 heuristic).
-    const filler = "investigated the dispose race and traced the write path ".repeat(200);
-    startAbandonedBranchSummaryInBackground({
-      historyService: writerHistoryService,
-      aiService: gatedAiService,
-      workspaceId,
-      abandonedMessages: [
-        createMuxMessage("bs-u", "user", filler, { timestamp: 1 }),
-        createMuxMessage("bs-a", "assistant", filler, { timestamp: 2 }),
-      ],
-      experiments: { rlm: true, programmaticToolCalling: true },
-      guardTailMessageId: "bs-a",
-    });
+      // Register a gated background summary (generation held open at model
+      // creation) so sendMessage parks on awaitPendingBranchSummary — the exact
+      // window workspace removal races into. Same real HistoryService as the
+      // session, mirroring production.
+      let releaseModel: () => void = () => undefined;
+      const modelGate = new Promise<void>((resolve) => {
+        releaseModel = resolve;
+      });
+      const gatedAiService = {
+        createModelWithPinnedMetadata: async () => {
+          await modelGate;
+          return Err({ type: "api_key_not_found" as const, provider: "anthropic" });
+        },
+        // Side-channel candidates are confined to workspace-configured
+        // providers; metadata must resolve with a model or the writer settles
+        // null before createModelWithPinnedMetadata — the gate above would
+        // never park the send.
+        getWorkspaceMetadata: () =>
+          Promise.resolve(Ok({ aiSettings: { model: "anthropic:claude-sonnet-4-5" } })),
+      } as unknown as BranchSummaryAiService;
+      // Large enough to clear the tiny-segment threshold (chars/4 heuristic).
+      const filler = "investigated the dispose race and traced the write path ".repeat(200);
+      await startAbandonedBranchSummaryInBackground({
+        historyService,
+        aiService: gatedAiService,
+        workspaceId,
+        abandonedMessages: [
+          createMuxMessage("bs-u", "user", filler, { timestamp: 1 }),
+          createMuxMessage("bs-a", "assistant", filler, { timestamp: 2 }),
+        ],
+        experiments: { rlm: true, programmaticToolCalling: true },
+        guardTailMessageId: "bs-a",
+      });
 
-    const sendPromise = session.sendMessage("first send on the fork", {
-      model: "anthropic:claude-sonnet-4-5",
-      agentId: "exec",
-    });
-    // Let the send reach the pending-summary await: while the gate is closed
-    // it is the only unresolved promise in the send's path, and nothing may
-    // have been appended yet.
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(appendToHistory).toHaveBeenCalledTimes(0);
+      const sendPromise = session.sendMessage("first send on the fork", {
+        model: "anthropic:claude-sonnet-4-5",
+        agentId: "exec",
+      });
+      // Let the send reach the pending-summary await: while the gate is closed
+      // it is the only unresolved promise in the send's path, and nothing may
+      // have been appended yet — on disk, not in a mock ledger.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(existsSync(nodePath.join(sessionDir, "chat.jsonl"))).toBe(false);
 
-    // Mirror removeWorkspace: dispose the session, then cancel + drain the
-    // writer (the session directory would be deleted right after).
-    session.dispose();
-    const clearPromise = clearPendingBranchSummary(workspaceId);
-    releaseModel();
-    await clearPromise;
+      // Mirror removeWorkspace: dispose the session, cancel + drain the
+      // writer, then delete the session directory.
+      session.dispose();
+      const clearPromise = clearPendingBranchSummary(workspaceId);
+      releaseModel();
+      await clearPromise;
+      await fs.rm(sessionDir, { recursive: true, force: true });
 
-    const result = await sendPromise;
-    expect(result.success).toBe(true);
-    // Neither the resumed send nor the cancelled writer appended anything —
-    // a late append would recreate the just-deleted session directory.
-    expect(appendToHistory).toHaveBeenCalledTimes(0);
-    expect(writerGuardedAppend).toHaveBeenCalledTimes(0);
-    expect(streamMessage).toHaveBeenCalledTimes(0);
+      const result = await sendPromise;
+      expect(result.success).toBe(true);
+      expect(streamMessage).toHaveBeenCalledTimes(0);
+      // Give any stray late write a macrotask to land before inspecting disk.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      // Neither the resumed send nor the cancelled writer wrote anything: the
+      // just-deleted session directory must not have been recreated.
+      expect(existsSync(sessionDir)).toBe(false);
+      // Read-back through the real service agrees: no history rows survived.
+      const readBack = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(readBack.success).toBe(true);
+      if (readBack.success) {
+        expect(readBack.data).toHaveLength(0);
+      }
+    } finally {
+      await cleanup();
+    }
   });
 
   test("forwards task-created events to onChatEvent subscribers for the matching workspace", () => {

@@ -8556,8 +8556,12 @@ export class WorkspaceService extends EventEmitter {
         // the registration. Also keeps the summary's recorded usage from
         // being wiped by resetForkedSessionUsage above. Fork IPC carries no
         // send-option experiments, so gating falls back to the persisted
-        // machine overrides. Best-effort — never fails the fork.
-        startAbandonedBranchSummaryInBackground({
+        // machine overrides. Best-effort — never fails the fork (the promise
+        // never rejects). Awaited so the cross-process pending marker is
+        // stat-visible before the fork IPC returns (r55): an immediate first
+        // send handled by another backend must find it; generation itself
+        // still runs in the background.
+        await startAbandonedBranchSummaryInBackground({
           historyService: this.historyService,
           aiService: this.aiService,
           workspaceId: newWorkspaceId,

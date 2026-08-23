@@ -1180,11 +1180,29 @@ export class MemoryService extends EventEmitter {
     return result.success ? { ok: true } : { ok: false, error: result.error };
   }
 
+  /**
+   * Deterministic fingerprint of a delete target's CURRENT physical state
+   * (r55): sha256 over the sorted subtree listing (path + entry kind +
+   * per-file content hash). Unlike captureDeleteInverse this walk is lenient
+   * — symlinks, dotfiles, and binary files hash as opaque markers instead of
+   * failing — because the fingerprint only needs to DETECT change between
+   * /refine staging and apply, not represent the subtree losslessly. Staging
+   * computes it unlocked; deletePath recomputes it INSIDE the target
+   * mutation lock and refuses the removal on mismatch.
+   */
+  async fingerprintDeleteTarget(ctx: MemoryScopeContext, virtualPath: string): Promise<string> {
+    const parsed = parseMemoryPath(virtualPath);
+    const scope = this.requireFilePath(parsed, virtualPath);
+    const store = await this.resolveStore(ctx, scope, parsed.relPath);
+    return fingerprintPhysicalSubtree(store, parsed.relPath);
+  }
+
   async deletePath(
     ctx: MemoryScopeContext,
     virtualPath: string,
     actor: MemoryActor,
-    toolCallId?: string
+    toolCallId?: string,
+    expectedFingerprint?: string
   ): Promise<MemoryCommandResult> {
     return this.runCommand(async () => {
       const parsed = parseMemoryPath(virtualPath);
@@ -1194,6 +1212,19 @@ export class MemoryService extends EventEmitter {
         const kind = await store.kind(parsed.relPath);
         if (kind === null) {
           throw new MemoryCommandError(`No memory file or directory at ${virtualPath}`);
+        }
+        // r55: staged refine deletes were approved against the target's
+        // staging-time state — a target edited between staging and apply
+        // must refuse rather than silently destroying the newer contents.
+        // Verified INSIDE the mutation lock so no writer can land between
+        // the check and the removal below.
+        if (expectedFingerprint !== undefined) {
+          const currentFingerprint = await fingerprintPhysicalSubtree(store, parsed.relPath);
+          if (currentFingerprint !== expectedFingerprint) {
+            throw new MemoryCommandError(
+              `${virtualPath} changed since this proposal was staged; run /refine again to restage`
+            );
+          }
         }
         // Prior contents must be captured before removal; the row itself is
         // written after the mutation succeeds and before it is acknowledged.
@@ -1574,6 +1605,40 @@ export function formatMemoryIndexForToolDescription(
 
 function sha256Hex(content: string): string {
   return createHash("sha256").update(content, "utf-8").digest("hex");
+}
+
+/**
+ * Deterministic, lenient hash of a physical subtree for delete-target change
+ * detection (r55, see MemoryService.fingerprintDeleteTarget). Sorted walk;
+ * each entry contributes its rel path + kind (+ content hash for regular
+ * files); an absent target hashes as a distinct sentinel. Never throws on
+ * unrepresentable entries — symlinks/sockets hash as opaque "other" markers.
+ */
+async function fingerprintPhysicalSubtree(store: MemoryStore, relPath: string): Promise<string> {
+  const entries: string[] = [];
+  const visit = async (rel: string): Promise<void> => {
+    let stat;
+    try {
+      stat = await fsPromises.lstat(store.physicalPath(rel));
+    } catch {
+      entries.push(`${rel}\u0000absent`);
+      return;
+    }
+    if (stat.isFile()) {
+      const content = await fsPromises.readFile(store.physicalPath(rel));
+      entries.push(`${rel}\u0000file\u0000${createHash("sha256").update(content).digest("hex")}`);
+    } else if (stat.isDirectory()) {
+      entries.push(`${rel}\u0000dir`);
+      const names = (await fsPromises.readdir(store.physicalPath(rel))).sort();
+      for (const name of names) {
+        await visit(`${rel}/${name}`);
+      }
+    } else {
+      entries.push(`${rel}\u0000other`);
+    }
+  };
+  await visit(relPath);
+  return sha256Hex(entries.join("\n"));
 }
 
 /**

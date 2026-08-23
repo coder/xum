@@ -173,64 +173,102 @@ export async function emitTurnEnvelope(params: {
     // snapshot/handle payloads, and a concurrent reclamation pass must never
     // observe the put→append window (see DurableEventJournal.withBlobLock).
     await params.journal.withBlobLock(async () => {
-      // Content-addressed: unchanged prompts across turns dedupe to one blob.
-      const { ref } = await params.journal.blobs.put(params.systemMessage);
+      // r55: blobs whose envelope row never lands would leak forever —
+      // reclamation derives candidates from journal references, so it never
+      // even considers an unreferenced file, and repeated append failures
+      // with changing plans/attachments/continuations would grow the blob
+      // store without bound. Track which puts CREATED a file and remove
+      // exactly those when the append fails (mirroring publishWithBlob's
+      // failure cleanup): a pre-existing blob (created=false) may be
+      // referenced by earlier rows and must never be deleted here.
+      const createdRefs: BlobRef[] = [];
+      const putTracked = async (content: string): Promise<BlobRef> => {
+        const { ref, created } = await params.journal.blobs.put(content);
+        if (created) createdRefs.push(ref);
+        return ref;
+      };
+      try {
+        // Content-addressed: unchanged prompts across turns dedupe to one blob.
+        const ref = await putTracked(params.systemMessage);
 
-      // Request-time inputs that reach the provider request must be logged too
-      // ("model-visible ⟹ logged"): blob-store the injected plan content and
-      // post-compaction attachments so replay can rebuild those turns.
-      let planTransitionContentHash: BlobRef | undefined;
-      if (params.planContentForTransition != null && params.planContentForTransition.length > 0) {
-        planTransitionContentHash = (
-          await params.journal.blobs.put(params.planContentForTransition)
-        ).ref;
-      }
-      let postCompactionAttachmentsHash: BlobRef | undefined;
-      if (params.postCompactionAttachments != null && params.postCompactionAttachments.length > 0) {
-        postCompactionAttachmentsHash = (
-          await params.journal.blobs.put(JSON.stringify(params.postCompactionAttachments))
-        ).ref;
-      }
-      let partialContinuationHash: BlobRef | undefined;
-      if (params.partialContinuationMessage != null) {
-        partialContinuationHash = (
-          await params.journal.blobs.put(JSON.stringify(params.partialContinuationMessage))
-        ).ref;
-      }
+        // Request-time inputs that reach the provider request must be logged too
+        // ("model-visible ⟹ logged"): blob-store the injected plan content and
+        // post-compaction attachments so replay can rebuild those turns.
+        let planTransitionContentHash: BlobRef | undefined;
+        if (params.planContentForTransition != null && params.planContentForTransition.length > 0) {
+          planTransitionContentHash = await putTracked(params.planContentForTransition);
+        }
+        let postCompactionAttachmentsHash: BlobRef | undefined;
+        if (
+          params.postCompactionAttachments != null &&
+          params.postCompactionAttachments.length > 0
+        ) {
+          postCompactionAttachmentsHash = await putTracked(
+            JSON.stringify(params.postCompactionAttachments)
+          );
+        }
+        let partialContinuationHash: BlobRef | undefined;
+        if (params.partialContinuationMessage != null) {
+          partialContinuationHash = await putTracked(
+            JSON.stringify(params.partialContinuationMessage)
+          );
+        }
 
-      await params.journal.append({
-        kind: "turn-envelope",
-        workspaceId: params.workspaceId,
-        data: {
-          systemPromptHash: ref,
-          toolsetManifest: buildToolsetManifest(params.tools),
-          modelString: params.modelString,
-          // Hash only — resolved providerOptions may embed auth-adjacent config
-          // (headers, cache keys), so the raw object is never persisted.
-          providerOptionsHash: sha256Hex(stableStringify(params.providerOptions)),
-          thinkingLevel: params.thinkingLevel,
-          ...(params.requestHistorySequence != null && params.requestHistorySequence >= 0
-            ? { requestHistorySequence: params.requestHistorySequence }
-            : {}),
-          ...(params.sentinelToolNames != null
-            ? { sentinelToolNames: params.sentinelToolNames }
-            : {}),
-          ...(params.wireProviderName != null ? { wireProviderName: params.wireProviderName } : {}),
-          ...(params.anthropicCacheTtl != null
-            ? { anthropicCacheTtl: params.anthropicCacheTtl }
-            : {}),
-          ...(planTransitionContentHash !== undefined
-            ? {
-                planTransitionContentHash,
-                ...(params.planFilePath != null
-                  ? { planTransitionFilePath: params.planFilePath }
-                  : {}),
-              }
-            : {}),
-          ...(postCompactionAttachmentsHash !== undefined ? { postCompactionAttachmentsHash } : {}),
-          ...(partialContinuationHash !== undefined ? { partialContinuationHash } : {}),
-        },
-      });
+        // Ownership re-check between put and append (publishWithBlob parity):
+        // if this holder was wrongfully displaced, a reclaimer may have
+        // deleted the just-put blobs — appending would then create a row
+        // permanently referencing a missing payload. Abort instead.
+        await params.journal.assertBlobLockOwned();
+        await params.journal.append({
+          kind: "turn-envelope",
+          workspaceId: params.workspaceId,
+          data: {
+            systemPromptHash: ref,
+            toolsetManifest: buildToolsetManifest(params.tools),
+            modelString: params.modelString,
+            // Hash only — resolved providerOptions may embed auth-adjacent config
+            // (headers, cache keys), so the raw object is never persisted.
+            providerOptionsHash: sha256Hex(stableStringify(params.providerOptions)),
+            thinkingLevel: params.thinkingLevel,
+            ...(params.requestHistorySequence != null && params.requestHistorySequence >= 0
+              ? { requestHistorySequence: params.requestHistorySequence }
+              : {}),
+            ...(params.sentinelToolNames != null
+              ? { sentinelToolNames: params.sentinelToolNames }
+              : {}),
+            ...(params.wireProviderName != null
+              ? { wireProviderName: params.wireProviderName }
+              : {}),
+            ...(params.anthropicCacheTtl != null
+              ? { anthropicCacheTtl: params.anthropicCacheTtl }
+              : {}),
+            ...(planTransitionContentHash !== undefined
+              ? {
+                  planTransitionContentHash,
+                  ...(params.planFilePath != null
+                    ? { planTransitionFilePath: params.planFilePath }
+                    : {}),
+                }
+              : {}),
+            ...(postCompactionAttachmentsHash !== undefined
+              ? { postCompactionAttachmentsHash }
+              : {}),
+            ...(partialContinuationHash !== undefined ? { partialContinuationHash } : {}),
+          },
+        });
+      } catch (error) {
+        for (const createdRef of createdRefs) {
+          try {
+            // Ownership-verified delete (same as publishWithBlob's cleanup):
+            // a displaced holder skips the delete instead of racing a new
+            // owner who may already reference the hash.
+            await params.journal.deleteBlobUnderLock(createdRef);
+          } catch {
+            // Best-effort: never mask the original append failure.
+          }
+        }
+        throw error;
+      }
     });
   } catch (error) {
     log.warn("Failed to write turn-envelope durable event", {
