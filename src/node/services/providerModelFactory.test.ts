@@ -402,6 +402,28 @@ describe("ProviderModelFactory.createModel", () => {
     }
   });
 
+  it("keys the wire identity on the custom provider's API format", async () => {
+    const expectedWire = {
+      "openai-compatible": "local-vllm",
+      "openai-responses": "openai",
+      "anthropic-messages": "anthropic",
+    } as const;
+
+    for (const providerType of CUSTOM_PROVIDER_TYPES) {
+      await withTempConfig(async (config, factory) => {
+        saveLocalVllmConfig(config, { providerType });
+
+        const result = await factory.resolveAndCreateModel(`local-vllm:${LOCAL_VLLM_MODEL}`, "off");
+        expect(result.success).toBe(true);
+        if (result.success) {
+          // Message preparation and options namespaces key on the wire the
+          // request speaks, not the custom prefix.
+          expect(result.data.wireProviderName).toBe(expectedWire[providerType]);
+        }
+      });
+    }
+  });
+
   it("allows policy-allowed custom OpenAI-compatible providers when policy is enforced", async () => {
     await withTempPolicyProviderFactory(
       {

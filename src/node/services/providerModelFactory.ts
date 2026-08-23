@@ -25,6 +25,7 @@ import type { ServiceTier, XAIServiceTier } from "@/common/config/schemas/provid
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import {
+  customProviderWireOrigin,
   isBuiltInProvider,
   isCustomProviderConfig,
 } from "@/common/utils/providers/customProviders";
@@ -2568,6 +2569,20 @@ export class ProviderModelFactory {
       const [seedOrigin] = parseModelString(normalizeToCanonical(routeSeedModelString));
       if (seedOrigin) {
         wireProviderName = seedOrigin;
+      }
+    }
+
+    // Custom providers speak the wire their providerType selects: an
+    // anthropic-messages provider sends Anthropic-shaped bytes, so Anthropic
+    // reasoning transforms and options namespaces must key on the wire, not
+    // the custom prefix (same rationale as the Coder-gateway remap above).
+    // Must mirror resolveOptionsCanonicalModel so the extras-merge namespace
+    // key matches what buildProviderOptions computes internally.
+    const canonicalCustomEntry = providersConfigForShadowCheck[canonicalProviderName];
+    if (isCustomProviderConfig(canonicalCustomEntry)) {
+      const customWireOrigin = customProviderWireOrigin(canonicalCustomEntry.providerType);
+      if (customWireOrigin) {
+        wireProviderName = customWireOrigin;
       }
     }
 

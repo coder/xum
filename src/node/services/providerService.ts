@@ -1426,13 +1426,20 @@ export class ProviderService {
           return { success: false, error: `Invalid custom provider type: ${String(value)}` };
         }
 
-        const providerType: CustomProviderType = value;
-        const validation = validateCustomProviderId(provider);
-        if (!validation.ok) {
-          return {
-            success: false,
-            error: `Invalid custom provider id for ${providerType}: ${validation.reason}`,
-          };
+        // The add-time id collision rule applies only when this write would
+        // CONVERT a non-custom entry into a custom provider. An entry that is
+        // already custom stays editable even when its id shadows a built-in
+        // (upgraded installs deliberately preserve such entries).
+        const existingEntry = this.config.loadProvidersConfig()?.[provider];
+        if (!isCustomProviderConfig(existingEntry)) {
+          const providerType: CustomProviderType = value;
+          const validation = validateCustomProviderId(provider);
+          if (!validation.ok) {
+            return {
+              success: false,
+              error: `Invalid custom provider id for ${providerType}: ${validation.reason}`,
+            };
+          }
         }
       }
 

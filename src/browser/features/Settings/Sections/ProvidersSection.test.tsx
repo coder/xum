@@ -296,6 +296,27 @@ describe("ProvidersSection", () => {
     });
   });
 
+  test("resyncs from the backend when API format persistence fails", async () => {
+    const view = renderProvidersSection();
+    view.setProviderConfig.mockImplementationOnce(() =>
+      Promise.resolve({ success: false as const, error: "policy denied" })
+    );
+
+    const customButton = await view.findByRole("button", { name: /Acme OpenAI/ });
+    fireEvent.click(customButton);
+
+    const customCard = getProviderCard(customButton);
+    fireEvent.pointerDown(within(customCard).getByRole("combobox", { name: "API format" }));
+    fireEvent.click(await within(customCard).findByRole("button", { name: "Anthropic Messages" }));
+
+    // The optimistic format must not survive a failed persistence: the UI
+    // refetches backend truth instead of advertising an adapter that was
+    // never adopted.
+    await waitFor(() => {
+      expect(providersRefreshMock).toHaveBeenCalled();
+    });
+  });
+
   test("validates custom provider IDs in the add form", async () => {
     const view = renderProvidersSection();
 

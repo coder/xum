@@ -73,6 +73,25 @@ export function isCustomProviderType(value: unknown): value is CustomProviderTyp
   return typeof value === "string" && CUSTOM_PROVIDER_TYPE_SET.has(value);
 }
 
+/**
+ * Wire origin whose provider-specific request transforms (reasoning/PDF
+ * message preparation) and provider-options namespace a custom provider
+ * speaks. Chat Completions is the generic OpenAI-compatible dialect, so
+ * `openai-compatible` providers keep their own identity (null).
+ */
+export function customProviderWireOrigin(
+  providerType: CustomProviderType
+): "openai" | "anthropic" | null {
+  switch (providerType) {
+    case "openai-responses":
+      return "openai";
+    case "anthropic-messages":
+      return "anthropic";
+    case "openai-compatible":
+      return null;
+  }
+}
+
 export function isCustomProviderConfig(config: unknown): config is Record<string, unknown> & {
   providerType: CustomProviderType;
   enabled?: unknown;

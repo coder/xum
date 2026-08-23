@@ -43,7 +43,10 @@ import {
   supports1MContext,
 } from "./models";
 import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
-import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
+import {
+  customProviderWireOrigin,
+  isCustomProviderConfig,
+} from "@/common/utils/providers/customProviders";
 
 // Re-export for existing consumers (aiService, providerModelFactory, tests):
 // the implementations moved to browser-safe modules because this module
@@ -77,11 +80,21 @@ function resolveOptionsCanonicalModel(
   providersConfig?: ProvidersConfigMap | null
 ): string {
   const colonIndex = modelString.indexOf(":");
-  if (colonIndex === -1 || modelString.slice(0, colonIndex) !== "coder") {
+  if (colonIndex === -1) {
     return normalizeToCanonical(modelString);
   }
-  if (isCustomProviderConfig(providersConfig?.coder)) {
-    return modelString; // custom-provider shadowing wins; already canonical
+  const prefix = modelString.slice(0, colonIndex);
+  const prefixEntry = providersConfig?.[prefix];
+  if (isCustomProviderConfig(prefixEntry)) {
+    // Custom providers (including ones shadowing built-in ids) speak the wire
+    // their providerType selects, so thinking/cache/header decisions must key
+    // on that origin. Generic chat-completions providers keep their own
+    // identity. Must mirror resolveAndCreateModel's wireProviderName remap.
+    const wireOrigin = customProviderWireOrigin(prefixEntry.providerType);
+    return wireOrigin ? `${wireOrigin}:${modelString.slice(colonIndex + 1)}` : modelString;
+  }
+  if (prefix !== "coder") {
+    return normalizeToCanonical(modelString);
   }
   const wire = resolveCoderWireCanonicalModel(
     modelString.slice(colonIndex + 1),

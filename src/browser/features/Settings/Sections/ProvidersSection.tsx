@@ -1450,6 +1450,32 @@ export function ProvidersSection() {
     void api.providers.setProviderConfig({ provider, keyPath: [field], value: editValue });
   }, [api, editingField, editValue, updateOptimistically]);
 
+  const handleCustomProviderTypeChange = useCallback(
+    (provider: string, next: CustomProviderType) => {
+      if (!api) return;
+
+      updateOptimistically(provider, { providerType: next });
+      void (async () => {
+        try {
+          const result = await api.providers.setProviderConfig({
+            provider,
+            keyPath: ["providerType"],
+            value: next,
+          });
+          if (!result.success) {
+            throw new Error(result.error);
+          }
+        } catch {
+          // The format decides the request wire protocol, so an optimistic
+          // value that failed to persist (policy denial, lock/write failure)
+          // must not keep advertising an adapter the backend never adopted.
+          void refresh();
+        }
+      })();
+    },
+    [api, refresh, updateOptimistically]
+  );
+
   const handleClearField = useCallback(
     (provider: string, field: string) => {
       if (!api) return;
@@ -3039,14 +3065,9 @@ export function ProvidersSection() {
                             <Select
                               value={providerInfo.providerType}
                               onValueChange={(next) => {
-                                if (!api || !isCustomProviderType(next)) return;
-
-                                updateOptimistically(provider, { providerType: next });
-                                void api.providers.setProviderConfig({
-                                  provider,
-                                  keyPath: ["providerType"],
-                                  value: next,
-                                });
+                                if (isCustomProviderType(next)) {
+                                  handleCustomProviderTypeChange(provider, next);
+                                }
                               }}
                             >
                               <SelectTrigger className="w-56 max-w-full" aria-label="API format">

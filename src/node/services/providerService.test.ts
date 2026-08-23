@@ -1110,6 +1110,37 @@ describe("ProviderService custom provider mutations", () => {
     });
   }
 
+  it("permits providerType edits on custom entries that shadow built-in ids", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      // Upgraded installs can carry a custom provider whose id shadows a
+      // built-in; the add-time id collision rule must not block format edits.
+      config.saveProvidersConfig({
+        coder: {
+          providerType: "openai-compatible",
+          baseUrl: LOCAL_VLLM_BASE_URL,
+        },
+      });
+
+      const result = await service.setConfig("coder", ["providerType"], "anthropic-messages");
+
+      expect(result.success).toBe(true);
+      expect(config.loadProvidersConfig()?.coder?.providerType).toBe("anthropic-messages");
+    });
+  });
+
+  it("still rejects providerType writes that would convert a built-in entry", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      config.saveProvidersConfig({
+        openai: { apiKey: "sk-real" },
+      });
+
+      const result = await service.setConfig("openai", ["providerType"], "openai-compatible");
+
+      expect(result.success).toBe(false);
+      expect(config.loadProvidersConfig()?.openai?.providerType).toBeUndefined();
+    });
+  });
+
   it("rejects provider ids denied by enforced policy", async () => {
     await withTempPolicyProviderService(
       {
