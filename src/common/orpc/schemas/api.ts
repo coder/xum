@@ -809,6 +809,15 @@ export const projects = {
       .passthrough(),
     output: z.void(),
   },
+  setCodeWorkspaceSyncPath: {
+    input: z
+      .object({
+        projectPath: z.string(),
+        codeWorkspaceSyncPath: z.string().nullish(),
+      })
+      .passthrough(),
+    output: z.void(),
+  },
   mcp: {
     list: {
       input: z.object({ projectPath: z.string() }),

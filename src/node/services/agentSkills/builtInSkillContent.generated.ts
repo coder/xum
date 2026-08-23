@@ -7897,6 +7897,12 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "    fix-ci-flakes/",
       "```",
       "",
+      "## VS Code workspace file sync",
+      "",
+      "To browse all of a project's worktrees from one VS Code or code-server window, set a `.code-workspace` file path per project in Settings → Runtimes (select the project scope). Xum keeps that file's folder list in sync as worktree workspaces are created, renamed, archived, and deleted.",
+      "",
+      "Xum only manages folder entries under the project's worktree directory; folders you add yourself, comments, and `settings`/`extensions` blocks are left untouched.",
+      "",
     ].join("\n"),
     "references/docs/workspaces/compaction/automatic.mdx": [
       "---",

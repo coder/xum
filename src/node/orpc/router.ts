@@ -13,6 +13,10 @@ import { Err, Ok } from "@/common/types/result";
 import { resolveProviderCredentials } from "@/node/utils/providerRequirements";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { isPathInsideDir, stripTrailingSlashes } from "@/node/utils/pathUtils";
+import {
+  CODE_WORKSPACE_EXTENSION,
+  syncProjectCodeWorkspace,
+} from "@/node/worktree/codeWorkspaceSync";
 import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
 import {
   WorkspaceGoalChildWorkspaceError,
@@ -3507,6 +3511,32 @@ export const router = (authToken?: string) => {
               : undefined;
             return config;
           });
+        }),
+      setCodeWorkspaceSyncPath: t
+        .input(schemas.projects.setCodeWorkspaceSyncPath.input)
+        .output(schemas.projects.setCodeWorkspaceSyncPath.output)
+        .handler(async ({ context, input }) => {
+          const normalizedPath = stripTrailingSlashes(input.projectPath);
+          const trimmed = input.codeWorkspaceSyncPath?.trim() ?? "";
+          if (trimmed && !trimmed.endsWith(CODE_WORKSPACE_EXTENSION)) {
+            // The sync read-modify-writes this file, so refuse arbitrary targets.
+            throw new Error(`Path must end with ${CODE_WORKSPACE_EXTENSION}`);
+          }
+          await context.config.editConfig((config) => {
+            const project = config.projects.get(normalizedPath);
+            if (!project) {
+              throw new Error(`Project not found: ${normalizedPath}`);
+            }
+            // Store undefined for blank input to keep config.json minimal.
+            project.codeWorkspaceSyncPath = trimmed ? trimmed : undefined;
+            return config;
+          });
+          // Sync immediately so enabling takes effect without waiting for the
+          // next workspace lifecycle event. Clearing or changing the path never
+          // deletes previously written files (they belong to the user).
+          if (trimmed) {
+            await syncProjectCodeWorkspace(context.config, normalizedPath);
+          }
         }),
       remove: t
         .input(schemas.projects.remove.input)
