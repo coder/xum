@@ -11,6 +11,8 @@ import type {
 } from "@/common/types/devtools";
 import type { Config } from "@/node/config";
 import { log } from "@/node/services/log";
+import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
+import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 
 interface WorkspaceData {
   runs: Map<string, DevToolsRun>;
@@ -360,11 +362,11 @@ export class DevToolsService extends EventEmitter {
     this.pendingRunMetadata.delete(workspaceId);
 
     // Enqueue truncation so clear() cannot race with pending appends.
-    await this.enqueueWrite(workspaceId, async () => {
-      const filePath = this.getSessionFilePath(workspaceId);
-      await fs.mkdir(path.dirname(filePath), { recursive: true });
-      await fs.writeFile(filePath, "", "utf-8");
-    });
+    await this.enqueueWrite(workspaceId, () =>
+      this.commitToSessionFileUnlessRemoved(workspaceId, (filePath) =>
+        fs.writeFile(filePath, "", "utf-8")
+      )
+    );
 
     this.emitWorkspaceEvent(workspaceId, { type: "cleared" });
   }
@@ -624,9 +626,41 @@ export class DevToolsService extends EventEmitter {
         return;
       }
 
-      const filePath = this.getSessionFilePath(workspaceId);
-      await fs.mkdir(path.dirname(filePath), { recursive: true });
-      await fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8");
+      await this.commitToSessionFileUnlessRemoved(workspaceId, (filePath) =>
+        fs.appendFile(filePath, `${JSON.stringify(entry)}\n`, "utf-8")
+      );
     });
+  }
+
+  /**
+   * r64: devtools.jsonl commits recreate the session directory via mkdir,
+   * and with XUM_ALLOW_MULTIPLE_INSTANCES=1 a foreign backend's in-flight
+   * stream survives the remover's process-local cancellation entirely — its
+   * step finalization would resurrect the directory the remover just
+   * deleted. Run every directory-creating disk commit inside the same
+   * sessionDir target mutation lock removal's tombstone+delete critical
+   * section holds, and recheck the durable removal tombstone in-lock (same
+   * posture as SessionUsageService.recordHeadlessUsage). Dropping the entry
+   * is correct: debug logs for a removed workspace have no reader. Callers
+   * never hold other target locks here, so this single-key acquisition
+   * cannot ABBA with removal's sorted multi-key acquisition.
+   */
+  private async commitToSessionFileUnlessRemoved(
+    workspaceId: string,
+    write: (filePath: string) => Promise<void>
+  ): Promise<void> {
+    await withTargetMutationLock(
+      this.config.rootDir,
+      this.config.getSessionDir(workspaceId),
+      async () => {
+        if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+          log.debug("Skipping DevTools write for removed workspace", { workspaceId });
+          return;
+        }
+        const filePath = this.getSessionFilePath(workspaceId);
+        await fs.mkdir(path.dirname(filePath), { recursive: true });
+        await write(filePath);
+      }
+    );
   }
 }

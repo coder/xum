@@ -84,7 +84,10 @@ import {
   createInvalidCompactModelToast,
 } from "@/browser/features/ChatInput/ChatInputToasts";
 import { trackCommandUsed } from "@/common/telemetry";
-import { addEphemeralMessage } from "@/browser/stores/WorkspaceStore";
+import {
+  addEphemeralMessage,
+  getDisplayedRefineProposalHash,
+} from "@/browser/stores/WorkspaceStore";
 import { setGoalWithConflictRetry } from "@/browser/utils/goals/setGoalWithConflictRetry";
 import { loadGoalDefaults, resolveGoalSetIntent } from "@/browser/utils/goals/resolveGoalSetIntent";
 import {
@@ -835,10 +838,28 @@ export async function processSlashCommand(
         // backend-only gate could refuse /refine while this client already
         // offers the command and runs with the RLM kernel.
         const refineExperiments = context.sendMessageOptions.experiments;
+        // r64: bind approval to the proposal THIS window rendered. The shared
+        // transcript can hold a newer foreign proposal (second app instance
+        // over the same root) that this renderer never displayed; the backend
+        // refuses to apply when the staged set no longer hashes to the
+        // proposal we send here.
+        const displayedProposalHash = refineApply
+          ? getDisplayedRefineProposalHash(refineWorkspaceId)
+          : null;
+        if (refineApply && displayedProposalHash === null) {
+          context.setToast({
+            id: Date.now().toString(),
+            type: "error",
+            message:
+              "Refine failed: no staged /refine proposal is visible in this chat; run /refine first",
+          });
+          return { clearInput: true, toastShown: true };
+        }
         void (
-          refineApply
+          refineApply && displayedProposalHash !== null
             ? refineClient.refinements.apply({
                 workspaceId: refineWorkspaceId,
+                approvedProposalHash: displayedProposalHash,
                 experiments: refineExperiments,
               })
             : refineClient.refinements.run({

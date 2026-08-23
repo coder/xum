@@ -1234,7 +1234,18 @@ export const refinements = {
   },
   /** Apply the staged edits from the last run (explicit user approval step). */
   apply: {
-    input: z.object({ workspaceId: z.string(), experiments: ExperimentsSchema.optional() }),
+    input: z.object({
+      workspaceId: z.string(),
+      /**
+       * Hash of the newest staged proposal this renderer DISPLAYED (r64).
+       * Required: with XUM_ALLOW_MULTIPLE_INSTANCES=1 the shared transcript
+       * can hold a newer foreign proposal this window never rendered, so the
+       * backend cannot infer the displayed proposal from the transcript
+       * alone; apply refuses when this hash no longer matches the staged set.
+       */
+      approvedProposalHash: z.string().min(1),
+      experiments: ExperimentsSchema.optional(),
+    }),
     output: ResultSchema(RefineRecordSchema, z.string()),
   },
 };

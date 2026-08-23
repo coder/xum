@@ -413,6 +413,64 @@ describe("HistoryService", () => {
       expect(messages.map((m) => m.id)).toEqual(["msg1", "payload-1", "trigger-1"]);
     });
 
+    it("read-path truncation recovery waits on the cross-process lock (r64)", async () => {
+      const workspaceId = "workspace1";
+      const seeded = await service.appendToHistory(
+        workspaceId,
+        createMuxMessage("msg1", "user", "Hello")
+      );
+      expect(seeded.success).toBe(true);
+
+      // Simulate another backend's IN-FLIGHT truncation: the marker and the
+      // archive tombstone exist while it holds the write lock. An unlocked
+      // read-path recovery cannot tell this from a crash and would roll the
+      // live transaction back mid-flight — restoring the old archive between
+      // the foreign writer's archive and chat writes, so discarded history
+      // reappears with mismatched archive/chat state.
+      const sessionDir = config.getSessionDir(workspaceId);
+      const archivePath = path.join(sessionDir, "chat-archive.jsonl");
+      const tombstonePath = `${archivePath}.truncate`;
+      const markerPath = `${archivePath}.truncate.json`;
+      const oldArchiveRow = `${JSON.stringify({ id: "old-archive-row" })}\n`;
+      await fs.writeFile(tombstonePath, oldArchiveRow);
+      await fs.writeFile(
+        markerPath,
+        JSON.stringify({ finalArchiveHash: "in-flight", finalChatHash: "in-flight" })
+      );
+
+      const foreign = await acquireProcessFileLock({
+        lockPath: historyWriteLockPath(config.rootDir, workspaceId),
+        timeoutMs: 5_000,
+        label: "test foreign truncation",
+      });
+      const read = service.iterateFullHistory(workspaceId, "forward", () => undefined);
+      const sentinel = Symbol("still-pending");
+      expect(
+        await Promise.race([
+          read,
+          new Promise((resolve) => setTimeout(() => resolve(sentinel), 250)),
+        ])
+      ).toBe(sentinel);
+      // The live transaction's artifacts were not rolled back while the
+      // foreign lock was held.
+      const exists = (p: string) =>
+        fs.stat(p).then(
+          () => true,
+          () => false
+        );
+      expect(await exists(markerPath)).toBe(true);
+      expect(await exists(tombstonePath)).toBe(true);
+
+      await foreign[Symbol.asyncDispose]();
+      const result = await read;
+      expect(result.success).toBe(true);
+      // Once the lock was released, recovery ran under it: rollback restored
+      // the archive from the tombstone and consumed the marker.
+      expect(await exists(markerPath)).toBe(false);
+      expect(await exists(tombstonePath)).toBe(false);
+      expect(await fs.readFile(archivePath, "utf8")).toBe(oldArchiveRow);
+    });
+
     it("refuses history mutations for a removed workspace without recreating its session dir (r63)", async () => {
       // A foreign backend's in-flight stream survives the remover's
       // process-local cancellation; once removal's tombstone is durable, a

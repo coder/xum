@@ -326,12 +326,62 @@ export class HistoryService {
     return false;
   }
 
+  /**
+   * Cheap unlocked probe for truncation-recovery artifacts. Recovery only
+   * MUTATES files when the marker or the archive tombstone exists, so a
+   * clean probe lets read paths stay lock-free (r64).
+   */
+  private async truncateRecoveryArtifactsPresent(workspaceId: string): Promise<boolean> {
+    const exists = (p: string) =>
+      fs.stat(p).then(
+        () => true,
+        (error: unknown) => {
+          if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+            return false;
+          }
+          throw error;
+        }
+      );
+    const [tombstone, marker] = await Promise.all([
+      exists(`${this.getChatArchivePath(workspaceId)}.truncate`),
+      exists(this.getTruncateTransactionPath(workspaceId)),
+    ]);
+    return tombstone || marker;
+  }
+
+  /**
+   * Read-path truncation recovery (r64). Recovery mutates the archive, chat
+   * file, and marker — and an UNLOCKED recovery cannot distinguish a crashed
+   * truncation from a LIVE rewriteHistoryFilesUnlocked() in another backend
+   * (XUM_ALLOW_MULTIPLE_INSTANCES=1): rolling back a live transaction can
+   * restore the old archive between the foreign writer's archive and chat
+   * writes, letting discarded history reappear with mismatched archive/chat
+   * state. Probe without the lock (no artifacts ⇒ nothing to mutate ⇒ reads
+   * stay lock-free); when artifacts exist, take the cross-process write lock
+   * and re-run recovery inside it — recovery re-stats its inputs, so a live
+   * foreign transaction that commits while we wait leaves nothing to do.
+   * Skips recovery for removal-tombstoned workspaces: recovery must never
+   * resurrect files inside a session directory removal is deleting; the read
+   * proceeds against whatever remains.
+   */
+  private async recoverTruncateTransactionForReads(workspaceId: string): Promise<void> {
+    if (!(await this.truncateRecoveryArtifactsPresent(workspaceId))) {
+      return;
+    }
+    await this.withHistoryWriteFileLock(workspaceId, async () => {
+      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+        return;
+      }
+      await this.recoverTruncateTransactionUnlocked(workspaceId);
+    });
+  }
+
   private async withRecoveredHistoryLock<T>(
     workspaceId: string,
     operation: () => Promise<T>
   ): Promise<T> {
     return this.fileLocks.withLock(workspaceId, async () => {
-      await this.recoverTruncateTransactionUnlocked(workspaceId);
+      await this.recoverTruncateTransactionForReads(workspaceId);
       return operation();
     });
   }
@@ -958,14 +1008,17 @@ export class HistoryService {
     );
   }
 
-  /** Call only while holding workspaceFileLocks for this workspace. */
+  /**
+   * Call only while holding workspaceFileLocks for this workspace (and NOT
+   * the cross-process history write lock — recovery acquires it on demand).
+   */
   async iterateFullHistoryUnderLock(
     workspaceId: string,
     direction: "forward" | "backward",
     visitor: (messages: MuxMessage[]) => boolean | void | Promise<boolean | void>
   ): Promise<Result<void>> {
     try {
-      await this.recoverTruncateTransactionUnlocked(workspaceId);
+      await this.recoverTruncateTransactionForReads(workspaceId);
       return await this.iterateFullHistoryUnlocked(workspaceId, direction, visitor);
     } catch (error) {
       return Err(`Failed to iterate history: ${getErrorMessage(error)}`);
@@ -1896,22 +1949,38 @@ export class HistoryService {
     // the session dir, and removal holds this same lock while it tombstones
     // and deletes — so a mutation serializes with removal instead of racing
     // its own ensurePrivateDir against the deletion.
+    return this.withHistoryWriteFileLock(workspaceId, async () => {
+      // Removal gate (r63), checked IN-LOCK: a foreign backend's in-flight
+      // stream survives the remover's process-local cancellation entirely; its
+      // late append would otherwise recreate the deleted session directory via
+      // ensurePrivateDir below. Throwing here surfaces as a normal Err through
+      // withRecoveredHistoryWriteResultLock.
+      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+        throw new Error(`workspace ${workspaceId} was removed; refusing history mutation`);
+      }
+      // Create the session dir with private permissions only for a live
+      // workspace (writeFileAtomic and appends assume the parent exists).
+      await ensurePrivateDir(sessionDir);
+      // Truncation recovery runs IN-LOCK (r64): recovery mutates the
+      // archive/chat/marker files, and outside the lock it cannot tell a
+      // crashed transaction from another backend's live rewrite — rolling
+      // back a live transaction mid-flight resurrects discarded history with
+      // mismatched archive/chat state.
+      await this.recoverTruncateTransactionUnlocked(workspaceId);
+      return operation();
+    });
+  }
+
+  /** Bare cross-process history file lock; see withCrossProcessWriteLock. */
+  private async withHistoryWriteFileLock<T>(
+    workspaceId: string,
+    operation: () => Promise<T>
+  ): Promise<T> {
     await using _lock = await acquireProcessFileLock({
       lockPath: historyWriteLockPath(this.config.rootDir, workspaceId),
       timeoutMs: HISTORY_WRITE_LOCK_TIMEOUT_MS,
       label: "history write lock",
     });
-    // Removal gate (r63), checked IN-LOCK: a foreign backend's in-flight
-    // stream survives the remover's process-local cancellation entirely; its
-    // late append would otherwise recreate the deleted session directory via
-    // ensurePrivateDir below. Throwing here surfaces as a normal Err through
-    // withRecoveredHistoryResultLock.
-    if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
-      throw new Error(`workspace ${workspaceId} was removed; refusing history mutation`);
-    }
-    // Create the session dir with private permissions only for a live
-    // workspace (writeFileAtomic and appends assume the parent exists).
-    await ensurePrivateDir(sessionDir);
     return await operation();
   }
 
@@ -1948,9 +2017,16 @@ export class HistoryService {
     errorPrefix: string,
     operation: () => Promise<Result<T>>
   ): Promise<Result<T>> {
-    return this.withRecoveredHistoryResultLock(workspaceId, errorPrefix, () =>
-      this.withCrossProcessWriteLock(workspaceId, operation)
-    );
+    // Not composed from withRecoveredHistoryLock: recovery for write paths
+    // runs INSIDE withCrossProcessWriteLock (r64); the read-side conditional
+    // recovery would redundantly acquire and release the same file lock.
+    try {
+      return await this.fileLocks.withLock(workspaceId, () =>
+        this.withCrossProcessWriteLock(workspaceId, operation)
+      );
+    } catch (error) {
+      return Err(`${errorPrefix}: ${getErrorMessage(error)}`);
+    }
   }
 
   async appendToHistory(workspaceId: string, message: MuxMessage): Promise<Result<void>> {

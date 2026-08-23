@@ -5217,6 +5217,34 @@ export function showAllMessages(workspaceId: string): void {
 }
 
 /**
+ * Newest staged /refine proposal hash RENDERED in this window (r64).
+ * /refine apply must bind approval to the proposal THIS user saw: with
+ * XUM_ALLOW_MULTIPLE_INSTANCES=1 the shared chat transcript can contain a
+ * newer proposal from another backend that this renderer never displayed,
+ * so the backend cannot infer the displayed proposal from the transcript
+ * alone. Scans the live aggregator — exactly what the transcript view
+ * renders — newest-first for a refine-summary row carrying a stagedSetHash.
+ */
+export function getDisplayedRefineProposalHash(workspaceId: string): string | null {
+  const aggregator = getStoreInstance().getAggregator(workspaceId);
+  if (!aggregator) {
+    return null;
+  }
+  const messages = aggregator.getAllMessages();
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const muxMetadata = messages[i].metadata?.muxMetadata;
+    if (
+      muxMetadata?.type === "refine-summary" &&
+      typeof muxMetadata.stagedSetHash === "string" &&
+      muxMetadata.stagedSetHash.length > 0
+    ) {
+      return muxMetadata.stagedSetHash;
+    }
+  }
+  return null;
+}
+
+/**
  * Add an ephemeral message to a workspace and trigger a re-render.
  * Used for displaying frontend-only messages like /plan output.
  */

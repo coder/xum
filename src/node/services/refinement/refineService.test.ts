@@ -126,6 +126,10 @@ interface Fixture extends Disposable {
   emittedMessages: MuxMessage[];
   seedTrajectory: (lines?: string[]) => Promise<void>;
   readChat: () => Promise<MuxMessage[]>;
+  /** Newest transcript proposal hash — what a single-window renderer displayed (r64). */
+  shownProposalHash: () => Promise<string>;
+  /** apply() bound to the proposal a single-window renderer displayed (r64). */
+  applyShown: () => ReturnType<RefineService["apply"]>;
 }
 
 async function createFixture(options?: {
@@ -277,10 +281,32 @@ async function createFixture(options?: {
       if (!result.success) throw new Error(result.error);
       return result.data;
     },
+    shownProposalHash,
+    applyShown: async () => service.apply(WORKSPACE_ID, await shownProposalHash()),
     [Symbol.dispose]() {
       tempDir[Symbol.dispose]();
     },
   };
+
+  // r64: mirrors getDisplayedRefineProposalHash in the renderer — a
+  // single-window renderer's view equals the shared transcript. Falls back to
+  // a sentinel so pre-approval failure paths (no staged file, no proposal
+  // row) still exercise their own errors rather than a missing-argument path.
+  async function shownProposalHash(): Promise<string> {
+    const result = await historyService.getHistoryFromLatestBoundary(WORKSPACE_ID);
+    if (!result.success) throw new Error(result.error);
+    for (let i = result.data.length - 1; i >= 0; i--) {
+      const muxMetadata = result.data[i].metadata?.muxMetadata;
+      if (
+        muxMetadata?.type === "refine-summary" &&
+        typeof muxMetadata.stagedSetHash === "string" &&
+        muxMetadata.stagedSetHash.length > 0
+      ) {
+        return muxMetadata.stagedSetHash;
+      }
+    }
+    return "no-proposal-rendered";
+  }
 }
 
 describe("RefineService", () => {
@@ -360,7 +386,7 @@ describe("RefineService", () => {
       label: "test foreign apply lock",
     });
     try {
-      const result = await fixture.service.apply(WORKSPACE_ID);
+      const result = await fixture.applyShown();
       expect(result.success).toBe(false);
       if (!result.success) {
         expect(result.error).toContain("another process");
@@ -483,7 +509,7 @@ describe("RefineService", () => {
     expect(disposals).toBe(1);
 
     busy = true;
-    const applyResult = await fixture.service.apply(WORKSPACE_ID);
+    const applyResult = await fixture.applyShown();
     expect(applyResult.success).toBe(false);
     if (applyResult.success) return;
     expect(applyResult.error).toContain("run /refine apply again once the workspace is idle");
@@ -501,7 +527,7 @@ describe("RefineService", () => {
 
     // Idle again: the retained set applies cleanly and releases its hold.
     busy = false;
-    const retryResult = await fixture.service.apply(WORKSPACE_ID);
+    const retryResult = await fixture.applyShown();
     expect(retryResult.success).toBe(true);
     if (!retryResult.success) return;
     expect(retryResult.data.applied).toHaveLength(1);
@@ -566,7 +592,7 @@ describe("RefineService", () => {
       Promise.reject(new Error("journal unavailable"))
     );
     try {
-      const result = await fixture.service.apply(WORKSPACE_ID);
+      const result = await fixture.applyShown();
       expect(result.success).toBe(true);
       if (!result.success) return;
       // No journal row landed...
@@ -619,7 +645,7 @@ describe("RefineService", () => {
       recursive: true,
     });
 
-    const result = await fixture.service.apply(WORKSPACE_ID);
+    const result = await fixture.applyShown();
     expect(result.success).toBe(true);
     if (!result.success) return;
     expect(result.data.noOp).toBe(false);
@@ -631,7 +657,7 @@ describe("RefineService", () => {
     expect(auditText?.type === "text" && auditText.text).toContain("FAILED:");
     // Executed edits are attempted and never replay (side effects may be
     // partially observable), so the staged set was consumed — not retained.
-    const second = await fixture.service.apply(WORKSPACE_ID);
+    const second = await fixture.applyShown();
     expect(second.success).toBe(false);
     if (!second.success) expect(second.error).toContain("no staged refine edits");
   });
@@ -668,7 +694,7 @@ describe("RefineService", () => {
       Promise.resolve(Err("history unavailable"))
     );
     try {
-      const failedApply = await fixture.service.apply(WORKSPACE_ID);
+      const failedApply = await fixture.applyShown();
       expect(failedApply.success).toBe(false);
       if (!failedApply.success) expect(failedApply.error).toContain("audit summary row");
       // Retained: the retry below is only possible while the staged set (with
@@ -678,7 +704,7 @@ describe("RefineService", () => {
       appendSpy.mockRestore();
     }
 
-    const retry = await fixture.service.apply(WORKSPACE_ID);
+    const retry = await fixture.applyShown();
     expect(retry.success).toBe(true);
     if (!retry.success) return;
     // Zero re-mutation: the edit was attempted, so the retry only reproduces
@@ -731,7 +757,7 @@ describe("RefineService", () => {
       // "Crash" before the audit row: the failed append retains the staged
       // set, leaving exactly the post-crash on-disk state (attempted +
       // succeeded persisted, no journal row, no audit row).
-      const crashed = await fixture.service.apply(WORKSPACE_ID);
+      const crashed = await fixture.applyShown();
       expect(crashed.success).toBe(false);
     } finally {
       journalSpy.mockRestore();
@@ -739,7 +765,7 @@ describe("RefineService", () => {
     }
     expect(await pathExists(stagedPath)).toBe(true);
 
-    const resumed = await fixture.service.apply(WORKSPACE_ID);
+    const resumed = await fixture.applyShown();
     expect(resumed.success).toBe(true);
     if (!resumed.success) return;
     // No journal row ever landed (nothing addressable for rollback), but the
@@ -791,14 +817,14 @@ describe("RefineService", () => {
       // "Crash" before the audit row: the failed append retains the staged
       // set, leaving exactly the post-crash on-disk state (attempted +
       // failure outcome persisted, no audit row).
-      const crashed = await fixture.service.apply(WORKSPACE_ID);
+      const crashed = await fixture.applyShown();
       expect(crashed.success).toBe(false);
     } finally {
       appendSpy.mockRestore();
     }
     expect(await pathExists(stagedPath)).toBe(true);
 
-    const resumed = await fixture.service.apply(WORKSPACE_ID);
+    const resumed = await fixture.applyShown();
     expect(resumed.success).toBe(true);
     if (!resumed.success) return;
     // The approved edit's failure is reported from the persisted outcome —
@@ -1031,7 +1057,7 @@ describe("RefineService", () => {
     await fsPromises.writeFile(stagedPath, JSON.stringify(stagedRaw, null, 2));
 
     // Apply must refuse with a descriptive error and write NOTHING.
-    const result = await fixture.service.apply(WORKSPACE_ID);
+    const result = await fixture.applyShown();
     expect(result.success).toBe(false);
     if (!result.success) expect(result.error).toContain("no longer match the proposal");
     expect(await listRefinements(fixture.sessionDir)).toHaveLength(0);
@@ -1095,7 +1121,7 @@ describe("RefineService", () => {
     try {
       // First apply "crashes" after edit 1.
       try {
-        await fixture.service.apply(WORKSPACE_ID);
+        await fixture.applyShown();
         expect.unreachable("apply should have crashed");
       } catch (error) {
         expect(String(error)).toContain("simulated crash");
@@ -1104,7 +1130,7 @@ describe("RefineService", () => {
       expect(await listRefinements(fixture.sessionDir)).toHaveLength(1);
 
       // Restart + re-apply: edit 1 is NOT replayed, edit 2 applies.
-      const result = await fixture.service.apply(WORKSPACE_ID);
+      const result = await fixture.applyShown();
       expect(result.success).toBe(true);
       if (!result.success) return;
       expect(createSpy).toHaveBeenCalledTimes(2);
@@ -1122,7 +1148,7 @@ describe("RefineService", () => {
         expect(auditText).toContain(row.id);
       }
       // Consumed: nothing left to apply.
-      const reapply = await fixture.service.apply(WORKSPACE_ID);
+      const reapply = await fixture.applyShown();
       expect(reapply.success).toBe(false);
     } finally {
       createSpy.mockRestore();
@@ -1163,7 +1189,7 @@ describe("RefineService", () => {
     const createSpy = spyOn(fixture.memoryService, "create").mockImplementation(realCreate);
     try {
       try {
-        await fixture.service.apply(WORKSPACE_ID);
+        await fixture.applyShown();
         expect.unreachable("apply should have crashed");
       } catch (error) {
         expect(String(error)).toContain("simulated crash");
@@ -1172,7 +1198,7 @@ describe("RefineService", () => {
 
       // Re-apply replays NOTHING and reports the already-applied edit with a
       // correct audit row (crash also lost the original audit append).
-      const result = await fixture.service.apply(WORKSPACE_ID);
+      const result = await fixture.applyShown();
       expect(result.success).toBe(true);
       if (!result.success) return;
       expect(createSpy).toHaveBeenCalledTimes(1);
@@ -1228,7 +1254,7 @@ describe("RefineService", () => {
     const realCreate = fixture.memoryService.create.bind(fixture.memoryService);
     const createSpy = spyOn(fixture.memoryService, "create").mockImplementation(realCreate);
     try {
-      const result = await fixture.service.apply(WORKSPACE_ID);
+      const result = await fixture.applyShown();
       expect(result.success).toBe(true);
       // The audit append observed the staged file still on disk
       // (crash-resumable) and the set was consumed only afterwards.
@@ -1239,7 +1265,7 @@ describe("RefineService", () => {
       // the audit append, before the clear): restore the fully-attempted
       // staged file and re-apply.
       await fsPromises.writeFile(stagedPath, stagedBytesAtAppend ?? "");
-      const resumed = await fixture.service.apply(WORKSPACE_ID);
+      const resumed = await fixture.applyShown();
       expect(resumed.success).toBe(true);
       if (!resumed.success) return;
       // Zero re-mutation and no new journal row; the resume reports the
@@ -1308,7 +1334,7 @@ describe("RefineService", () => {
     const createSpy = spyOn(fixture.memoryService, "create").mockImplementation(realCreate);
     try {
       try {
-        await fixture.service.apply(WORKSPACE_ID);
+        await fixture.applyShown();
         expect.unreachable("apply should have crashed");
       } catch (error) {
         expect(String(error)).toContain("simulated crash");
@@ -1325,7 +1351,7 @@ describe("RefineService", () => {
 
       // Re-apply: edit 1 is recovered from its journal row (never replayed),
       // edit 2 applies normally.
-      const result = await fixture.service.apply(WORKSPACE_ID);
+      const result = await fixture.applyShown();
       expect(result.success).toBe(true);
       if (!result.success) return;
       expect(createSpy).toHaveBeenCalledTimes(2);
@@ -1389,7 +1415,7 @@ describe("RefineService", () => {
       }
     );
     try {
-      const applyPromise = fixture.service.apply(WORKSPACE_ID);
+      const applyPromise = fixture.applyShown();
       const spinDeadline = Date.now() + 5_000;
       while (!gated && Date.now() < spinDeadline) {
         await new Promise((resolve) => setTimeout(resolve, 5));
@@ -1454,7 +1480,11 @@ describe("RefineService", () => {
       return -1;
     });
     try {
-      const applyPromise = fixture.service.apply(WORKSPACE_ID);
+      // Pre-resolve the displayed-proposal hash: apply() must be REGISTERED
+      // in flight before cancelInFlightRefinePass runs, and applyShown()'s
+      // internal history read would defer that registration past the cancel.
+      const shownHash = await fixture.shownProposalHash();
+      const applyPromise = fixture.service.apply(WORKSPACE_ID, shownHash);
       const cancelPromise = fixture.service.cancelInFlightRefinePass(WORKSPACE_ID);
       releaseLoad();
       await cancelPromise;
@@ -1616,7 +1646,7 @@ describe("RefineService", () => {
         .success
     ).toBe(true);
 
-    const staleApply = await fixture.service.apply(WORKSPACE_ID);
+    const staleApply = await fixture.applyShown();
     expect(staleApply.success).toBe(true);
     if (!staleApply.success) return;
     // The delete was refused as an executed failure, not applied.
@@ -1631,7 +1661,7 @@ describe("RefineService", () => {
     // Restaged against the CURRENT state, the same delete applies cleanly:
     // the fingerprint refuses stale proposals, not deletes as such.
     expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
-    const freshApply = await fixture.service.apply(WORKSPACE_ID);
+    const freshApply = await fixture.applyShown();
     expect(freshApply.success).toBe(true);
     if (freshApply.success) expect(freshApply.data.applied).toHaveLength(1);
     expect((await fixture.memoryService.view(ctx, LESSON_PATH, {})).success).toBe(false);
@@ -1673,7 +1703,7 @@ describe("RefineService", () => {
         .success
     ).toBe(true);
 
-    const staleApply = await fixture.service.apply(WORKSPACE_ID);
+    const staleApply = await fixture.applyShown();
     expect(staleApply.success).toBe(true);
     if (!staleApply.success) return;
     expect(staleApply.data.applied).toHaveLength(0);
@@ -1690,7 +1720,7 @@ describe("RefineService", () => {
     // Restaged against the CURRENT state, the same insert applies cleanly:
     // the fingerprint refuses stale proposals, not inserts as such.
     expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
-    const freshApply = await fixture.service.apply(WORKSPACE_ID);
+    const freshApply = await fixture.applyShown();
     expect(freshApply.success).toBe(true);
     if (freshApply.success) expect(freshApply.data.applied).toHaveLength(1);
     const inserted = await fixture.memoryService.view(ctx, LESSON_PATH, {});
@@ -1698,6 +1728,66 @@ describe("RefineService", () => {
     if (inserted.success) expect(inserted.output).toContain("inserted after line one");
   });
 
+  it("refuses to apply a proposal this window never displayed (r64)", async () => {
+    // Two backends over the same root (XUM_ALLOW_MULTIPLE_INSTANCES=1): a
+    // foreign /refine can replace refine-staged.json and append a NEWER
+    // proposal row that only its own renderer displayed. The staged file and
+    // the newest transcript row then agree with each other — approval must
+    // additionally bind to the hash of the proposal THIS caller rendered.
+    let runIndex = 0;
+    using fixture = await createFixture({
+      modelFactory: () => {
+        runIndex += 1;
+        return toolCallModel(
+          [
+            {
+              toolCallId: `restage-${runIndex}`,
+              toolName: "memory",
+              input: {
+                command: "create",
+                path: LESSON_PATH,
+                file_text:
+                  runIndex === 1
+                    ? "lesson displayed in this window\n"
+                    : "foreign lesson this window never saw\n",
+              },
+            },
+          ],
+          runIndex === 1 ? "proposal shown in this window" : "foreign proposal"
+        );
+      },
+    });
+    await fixture.seedTrajectory();
+    const ctx = { runtime: null, checkoutCwd: "", workspaceId: WORKSPACE_ID, projectPath: "" };
+
+    // This window stages and displays proposal A.
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+    const displayedHash = await fixture.shownProposalHash();
+
+    // A foreign backend restages: staged file replaced, newer proposal row
+    // appended to the shared transcript.
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+    const foreignHash = await fixture.shownProposalHash();
+    expect(foreignHash).not.toBe(displayedHash);
+
+    // Approval bound to what THIS window displayed refuses, even though the
+    // staged file and the newest transcript row are mutually consistent.
+    const staleWindowApply = await fixture.service.apply(WORKSPACE_ID, displayedHash);
+    expect(staleWindowApply.success).toBe(false);
+    if (!staleWindowApply.success) {
+      expect(staleWindowApply.error).toContain("not the one displayed in this window");
+    }
+    // Nothing was applied.
+    expect((await fixture.memoryService.view(ctx, LESSON_PATH, {})).success).toBe(false);
+
+    // A window that rendered the newest proposal can still approve it.
+    const freshWindowApply = await fixture.service.apply(WORKSPACE_ID, foreignHash);
+    expect(freshWindowApply.success).toBe(true);
+    if (freshWindowApply.success) expect(freshWindowApply.data.applied).toHaveLength(1);
+    const applied = await fixture.memoryService.view(ctx, LESSON_PATH, {});
+    expect(applied.success).toBe(true);
+    if (applied.success) expect(applied.output).toContain("foreign lesson");
+  });
   it("a wedged tool execution does not keep a cancelled pass in flight past the bounded drain (r58)", async () => {
     // The memory tools receive no abort signal; an execution wedged in
     // filesystem I/O previously held the pass in flight forever after the
@@ -1790,7 +1880,7 @@ describe("RefineService", () => {
     expect(await listRefinements(fixture.sessionDir)).toHaveLength(0);
     expect(await fixture.readChat()).toHaveLength(chatBefore.length);
     expect(fixture.emittedMessages).toHaveLength(0);
-    const applyAfterCancel = await fixture.service.apply(WORKSPACE_ID);
+    const applyAfterCancel = await fixture.applyShown();
     expect(applyAfterCancel.success).toBe(false);
     if (!applyAfterCancel.success) {
       expect(applyAfterCancel.error).toContain("no staged refine edits");
@@ -1945,7 +2035,7 @@ describe("RefineService", () => {
     expect(stagedText).toContain("/refine apply");
 
     // Explicit approval applies through the journaled tool path.
-    const result = await fixture.service.apply(WORKSPACE_ID);
+    const result = await fixture.applyShown();
     expect(result.success).toBe(true);
     if (!result.success) return;
     expect(result.data.noOp).toBe(false);
@@ -1976,7 +2066,7 @@ describe("RefineService", () => {
     expect(fixture.emittedMessages).toHaveLength(2);
 
     // The staged set is consumed: a second apply has nothing to do.
-    const reapply = await fixture.service.apply(WORKSPACE_ID);
+    const reapply = await fixture.applyShown();
     expect(reapply.success).toBe(false);
     if (!reapply.success) expect(reapply.error).toContain("no staged refine edits");
 
@@ -2064,7 +2154,7 @@ describe("RefineService", () => {
     expect(stagedResult.data.staged).toHaveLength(1);
     expect(await listRefinements(fixture.sessionDir)).toHaveLength(0);
 
-    const result = await fixture.service.apply(WORKSPACE_ID);
+    const result = await fixture.applyShown();
     expect(result.success).toBe(true);
     if (!result.success) return;
     expect(result.data.applied).toHaveLength(1);
@@ -2149,7 +2239,7 @@ describe("RefineService", () => {
     await fsPromises.mkdir(path.dirname(skillFile), { recursive: true });
     await fsPromises.writeFile(skillFile, newerContent, "utf-8");
 
-    const result = await fixture.service.apply(WORKSPACE_ID);
+    const result = await fixture.applyShown();
     expect(result.success).toBe(true);
     if (!result.success) return;
     expect(result.data.applied).toHaveLength(0);
@@ -2213,7 +2303,7 @@ describe("RefineService", () => {
     const staged = await loadStagedRefineSet(fixture.sessionDir);
     expect(staged?.edits.map((edit) => edit.toolCallId)).toEqual(["refine-skill-dup-2"]);
 
-    const result = await fixture.service.apply(WORKSPACE_ID);
+    const result = await fixture.applyShown();
     expect(result.success).toBe(true);
     if (!result.success) return;
     expect(result.data.applied).toHaveLength(1);
@@ -2260,7 +2350,7 @@ describe("RefineService", () => {
     // Nothing staged: the proposal failed validation with the real error.
     expect(result.data.noOp).toBe(true);
     expect(result.data.staged).toBeUndefined();
-    const applyAfter = await fixture.service.apply(WORKSPACE_ID);
+    const applyAfter = await fixture.applyShown();
     expect(applyAfter.success).toBe(false);
     if (!applyAfter.success) expect(applyAfter.error).toContain("no staged refine edits");
   });
@@ -2413,7 +2503,7 @@ describe("RefineService", () => {
       })
     );
 
-    const result = await fixture.service.apply(WORKSPACE_ID);
+    const result = await fixture.applyShown();
     expect(result.success).toBe(false);
     if (!result.success) {
       expect(result.error).toContain("no staged refine proposal");

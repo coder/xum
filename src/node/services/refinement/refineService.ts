@@ -399,6 +399,15 @@ export class RefineService {
    */
   async apply(
     workspaceId: string,
+    /**
+     * Hash of the newest staged proposal the CALLER'S renderer displayed
+     * (r64). Required: the shared transcript alone cannot prove what this
+     * user saw — with XUM_ALLOW_MULTIPLE_INSTANCES=1 a foreign backend's
+     * /refine can replace refine-staged.json and append a newer proposal row
+     * that only its own renderer displayed, so binding approval to the
+     * newest transcript row would apply edits this user never audited.
+     */
+    approvedProposalHash: string,
     experiments?: RlmExperimentFlags
   ): Promise<Result<RefineRecord, string>> {
     if (!this.enabled(experiments)) {
@@ -408,7 +417,7 @@ export class RefineService {
       return Err("a refine pass is already running for this workspace");
     }
     const controller = new AbortController();
-    const run = this.applyLocked(workspaceId, controller.signal);
+    const run = this.applyLocked(workspaceId, controller.signal, approvedProposalHash);
     const entry: InFlightRefinePass = { promise: run, controller };
     this.inFlight.set(workspaceId, entry);
     try {
@@ -422,7 +431,8 @@ export class RefineService {
 
   private async applyLocked(
     workspaceId: string,
-    cancellationSignal: AbortSignal
+    cancellationSignal: AbortSignal,
+    approvedProposalHash: string
   ): Promise<Result<RefineRecord, string>> {
     const workspace = this.config.findWorkspace(workspaceId);
     if (!workspace) return Err(`workspace not found: ${workspaceId}`);
@@ -469,6 +479,20 @@ export class RefineService {
     if (actualHash !== approvedHash) {
       return Err(
         "staged refine edits no longer match the proposal shown in chat (the staged file changed after it was displayed); run /refine again and re-approve"
+      );
+    }
+    // r64: additionally bind approval to the proposal THIS caller rendered.
+    // The transcript check above binds to the NEWEST row in the SHARED
+    // chat.jsonl — but with XUM_ALLOW_MULTIPLE_INSTANCES=1 a foreign
+    // backend's /refine (serialized before this apply, or after this
+    // renderer last refreshed) can replace refine-staged.json and append a
+    // newer proposal row emitted only to ITS OWN renderer; both checks above
+    // then pass against bytes this approving user never saw. The renderer
+    // sends the hash of the newest proposal it actually displayed, and apply
+    // refuses on mismatch.
+    if (approvedProposalHash !== actualHash) {
+      return Err(
+        "the staged refine proposal is not the one displayed in this window (another window restaged after this chat was rendered); review the newest /refine proposal or run /refine again, then re-approve"
       );
     }
 
