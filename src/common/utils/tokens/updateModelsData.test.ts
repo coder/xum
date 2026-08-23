@@ -2,11 +2,11 @@ import { describe, test, expect } from "@jest/globals";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import modelsJson from "./models.json";
 import {
-  countChatModels,
   findMissingKnownModels,
   pruneModelData,
   sanitizePricing,
   serializeModelData,
+  summarizeCatalog,
   validateModelData,
 } from "./updateModelsData";
 
@@ -115,7 +115,7 @@ describe("validateModelData", () => {
     const vendored = modelsJson as Record<string, Record<string, unknown>>;
     const sanitized = sanitizePricing(vendored);
     expect(sanitized.droppedModelIds).toEqual([]);
-    expect(() => validateModelData(sanitized, countChatModels(vendored))).not.toThrow();
+    expect(() => validateModelData(sanitized, summarizeCatalog(vendored))).not.toThrow();
   });
 
   test("rejects truncated upstream data", () => {
@@ -136,9 +136,35 @@ describe("validateModelData", () => {
       catalog: { ...chatEntries(600), ...curatedCoverage },
       droppedModelIds: [],
     };
-    expect(() => validateModelData(sanitized, 2000)).toThrow(/chat model count shrank from 2000/);
+    expect(() => validateModelData(sanitized, { chatModels: 2000, pricedChatModels: 600 })).toThrow(
+      /chat model count shrank from 2000/
+    );
     // A small decrease within the bound is acceptable (e.g. upstream pruning).
-    expect(() => validateModelData(sanitized, 650)).not.toThrow();
+    expect(() =>
+      validateModelData(sanitized, { chatModels: 650, pricedChatModels: 600 })
+    ).not.toThrow();
+  });
+
+  test("rejects a catalog-wide loss of pricing fields", () => {
+    // Entries keep modes and token limits but lose every cost field, as an
+    // upstream pricing-field rename would produce: nothing is dropped per-entry,
+    // yet priced coverage collapses.
+    const unpriced = Object.fromEntries(
+      Array.from({ length: 700 }, (_, i) => [
+        `provider/unpriced-${i}`,
+        { mode: "chat", max_input_tokens: 128000 },
+      ])
+    );
+    const curatedCoverage = Object.fromEntries(
+      Object.values(KNOWN_MODELS).map((model) => [
+        model.providerModelId,
+        { mode: "chat", max_input_tokens: 200000 },
+      ])
+    );
+    const sanitized = { catalog: { ...unpriced, ...curatedCoverage }, droppedModelIds: [] };
+    expect(() => validateModelData(sanitized, { chatModels: 700, pricedChatModels: 680 })).toThrow(
+      /priced chat model count shrank from 680/
+    );
   });
 
   test("rejects data where too many entries had invalid pricing", () => {

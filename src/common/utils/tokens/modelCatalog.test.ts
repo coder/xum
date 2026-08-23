@@ -1,5 +1,6 @@
 import { describe, test, expect } from "@jest/globals";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import modelsJson from "./models.json";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { listModelCatalogIds } from "./modelCatalog";
 import { getModelStats } from "./modelStats";
@@ -34,6 +35,14 @@ describe("listModelCatalogIds", () => {
 
   test("excludes models without chat-style metadata", () => {
     expect(ids).not.toContain("openai:text-embedding-3-small");
+  });
+
+  test("excludes provider-scoped duplicates whose stats resolve to another entry", () => {
+    // snowflake/claude-sonnet-4-6 exists upstream, but stats resolution prefers
+    // the bare models-extra override, so exposing the scoped row would inherit
+    // metadata from a different entry than the row represents.
+    expect(Object.keys(modelsJson)).toContain("snowflake/claude-sonnet-4-6");
+    expect(ids).not.toContain("snowflake:claude-sonnet-4-6");
   });
 
   test("every id is self-canonical so selection metadata matches the visible row", () => {

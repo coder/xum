@@ -7,7 +7,7 @@
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import modelsData from "./models.json";
-import { getModelStats } from "./modelStats";
+import { resolveRawModelEntry } from "./modelStats";
 
 // Only modes whose metadata (pricing, context window) applies to chat-style usage.
 const MAPPABLE_MODES = new Set(["chat", "responses"]);
@@ -53,9 +53,14 @@ export function listModelCatalogIds(): string[] {
       // gateway duplicates; otherwise a gateway row would silently inherit the
       // direct entry's metadata while looking like a distinct option.
       const normalized = normalizeToCanonical(id);
-      // getModelStats enforces the validity bar (usable token limits), so every
-      // listed id inherits real metadata when selected as a mapping target.
-      if (getModelStats(normalized) === null) {
+      // Only expose rows whose stats resolve from this very entry (same validity
+      // bar as getModelStats). A provider-scoped duplicate like
+      // snowflake/claude-sonnet-4-6 loses stats resolution to the bare
+      // models-extra override, so selecting it would inherit metadata from a
+      // different entry than the row represents; the id stays selectable through
+      // whichever entry actually backs it.
+      const resolved = resolveRawModelEntry(normalized);
+      if (resolved?.key !== key) {
         continue;
       }
       ids.add(normalized);

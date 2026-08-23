@@ -9,11 +9,12 @@
  */
 
 import {
-  countChatModels,
   pruneModelData,
   sanitizePricing,
   serializeModelData,
+  summarizeCatalog,
   validateModelData,
+  type CatalogSummary,
   type ModelCatalogData,
 } from "../src/common/utils/tokens/updateModelsData";
 
@@ -42,16 +43,16 @@ async function updateModels() {
     .text()
     .catch(() => null);
   // Validate shrinkage against the vendored catalog so a truncated upstream
-  // response cannot silently drop metadata for thousands of known models.
-  let baselineChatCount = 0;
+  // response or a pricing-field rename cannot silently degrade known models.
+  let baseline: CatalogSummary | undefined;
   if (existing !== null) {
     try {
-      baselineChatCount = countChatModels(JSON.parse(existing) as ModelCatalogData);
+      baseline = summarizeCatalog(JSON.parse(existing) as ModelCatalogData);
     } catch {
       console.warn(`Could not parse existing ${OUTPUT_PATH}; skipping baseline size check`);
     }
   }
-  validateModelData(sanitized, baselineChatCount);
+  validateModelData(sanitized, baseline);
 
   const serialized = serializeModelData(sanitized.catalog);
   if (existing === serialized) {

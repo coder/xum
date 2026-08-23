@@ -226,12 +226,19 @@ export function generateModelLookupKeys(modelString: string): string[] {
   return keys;
 }
 
+export interface ResolvedRawModelEntry {
+  /** The models-extra/models.json key the stats actually come from. */
+  key: string;
+  data: RawModelData;
+}
+
 /**
- * Gets model statistics for a given Vercel AI SDK model string
- * @param modelString - Format: "provider:model-name" (e.g., "anthropic:claude-opus-4-1", "ollama:gpt-oss:20b")
- * @returns ModelStats or null if model not found
+ * Resolves the raw override/catalog entry backing a model string, preserving
+ * getModelStats' precedence: models-extra across every lookup key first, then
+ * models.json. Exported so the Treat-as catalog can exclude ids whose stats
+ * would resolve from a different entry than the row represents.
  */
-export function getModelStats(modelString: string): ModelStats | null {
+export function resolveRawModelEntry(modelString: string): ResolvedRawModelEntry | null {
   const normalized = normalizeToCanonical(modelString);
   const lookupKeys = generateModelLookupKeys(normalized);
 
@@ -239,7 +246,7 @@ export function getModelStats(modelString: string): ModelStats | null {
   for (const key of lookupKeys) {
     const data = (modelsExtra as Record<string, RawModelData>)[key];
     if (data && hasUsableTokenLimits(data)) {
-      return extractModelStats(data);
+      return { key, data };
     }
   }
 
@@ -247,11 +254,21 @@ export function getModelStats(modelString: string): ModelStats | null {
   for (const key of lookupKeys) {
     const data = (modelsData as Record<string, RawModelData>)[key];
     if (data && hasUsableTokenLimits(data)) {
-      return extractModelStats(data);
+      return { key, data };
     }
   }
 
   return null;
+}
+
+/**
+ * Gets model statistics for a given Vercel AI SDK model string
+ * @param modelString - Format: "provider:model-name" (e.g., "anthropic:claude-opus-4-1", "ollama:gpt-oss:20b")
+ * @returns ModelStats or null if model not found
+ */
+export function getModelStats(modelString: string): ModelStats | null {
+  const entry = resolveRawModelEntry(modelString);
+  return entry === null ? null : extractModelStats(entry.data);
 }
 
 export function getModelStatsResolved(

@@ -147,28 +147,68 @@ export function findMissingKnownModels(
   return missing;
 }
 
-export function countChatModels(catalog: ModelCatalogData): number {
-  return Object.values(catalog).filter((metadata) => metadata.mode === "chat").length;
+export interface CatalogSummary {
+  chatModels: number;
+  /** Chat models carrying a numeric input or output cost. */
+  pricedChatModels: number;
+}
+
+export function summarizeCatalog(catalog: ModelCatalogData): CatalogSummary {
+  let chatModels = 0;
+  let pricedChatModels = 0;
+  for (const metadata of Object.values(catalog)) {
+    if (metadata.mode !== "chat") {
+      continue;
+    }
+    chatModels++;
+    if (
+      typeof metadata.input_cost_per_token === "number" ||
+      typeof metadata.output_cost_per_token === "number"
+    ) {
+      pricedChatModels++;
+    }
+  }
+  return { chatModels, pricedChatModels };
+}
+
+const EMPTY_BASELINE: CatalogSummary = { chatModels: 0, pricedChatModels: 0 };
+
+function belowBaseline(count: number, baseline: number): boolean {
+  return count < Math.ceil(baseline * (1 - MAX_CHAT_MODEL_SHRINK_FRACTION));
 }
 
 /**
  * Throws when the sanitized upstream data is unfit to replace the vendored
- * models.json. `baselineChatCount` is the chat-model count of the currently
- * vendored catalog (0 when unavailable).
+ * models.json. `baseline` summarizes the currently vendored catalog (defaults
+ * to empty when unavailable, disabling the relative checks).
  */
-export function validateModelData(sanitized: SanitizedModelData, baselineChatCount = 0): void {
+export function validateModelData(
+  sanitized: SanitizedModelData,
+  baseline: CatalogSummary = EMPTY_BASELINE
+): void {
   const { catalog, droppedModelIds } = sanitized;
   const errors: string[] = [];
 
-  const chatCount = countChatModels(catalog);
-  if (chatCount < MIN_CHAT_MODELS) {
-    errors.push(`only ${chatCount} chat models found (expected at least ${MIN_CHAT_MODELS})`);
-  }
-  const minRelativeChatCount = Math.ceil(baselineChatCount * (1 - MAX_CHAT_MODEL_SHRINK_FRACTION));
-  if (chatCount < minRelativeChatCount) {
+  const summary = summarizeCatalog(catalog);
+  if (summary.chatModels < MIN_CHAT_MODELS) {
     errors.push(
-      `chat model count shrank from ${baselineChatCount} to ${chatCount} ` +
+      `only ${summary.chatModels} chat models found (expected at least ${MIN_CHAT_MODELS})`
+    );
+  }
+  if (belowBaseline(summary.chatModels, baseline.chatModels)) {
+    errors.push(
+      `chat model count shrank from ${baseline.chatModels} to ${summary.chatModels} ` +
         `(more than ${MAX_CHAT_MODEL_SHRINK_FRACTION * 100}% below the vendored baseline)`
+    );
+  }
+  // Costs are optional per entry (subscription providers), so an upstream
+  // pricing-field rename would sail through the per-entry checks; catching a
+  // collapse in priced coverage keeps getModelStats from silently zero-pricing
+  // the whole catalog.
+  if (belowBaseline(summary.pricedChatModels, baseline.pricedChatModels)) {
+    errors.push(
+      `priced chat model count shrank from ${baseline.pricedChatModels} to ` +
+        `${summary.pricedChatModels} (upstream pricing fields may have been renamed)`
     );
   }
 
