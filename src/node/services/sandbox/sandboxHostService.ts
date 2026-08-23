@@ -1231,18 +1231,16 @@ export class SandboxHostService {
     journal: DurableEventJournal,
     scopeKey: string
   ): Promise<void> {
-    // Skip only when the journal is truly empty (no files to create for a
-    // sandbox-less workspace). Widened from a has-snapshot guard (r52): a
-    // foreign backend's live mount may hold vars it has not persisted yet,
-    // so the tombstone must land — bumping the reset generation that
-    // invalidates that mount — even when no snapshot row exists. The
-    // residual window (both instances racing the scope's very first run on
-    // an empty journal) is accepted.
-    const events = await journal.read();
-    if (events.length === 0) {
-      this.pendingDiscards.delete(scopeKey);
-      return;
-    }
+    // Published UNCONDITIONALLY — even on an empty journal (r57, widened
+    // twice: r52 dropped the has-snapshot guard, r57 dropped the empty-
+    // journal skip). A foreign backend's live mount can hold unpersisted
+    // pre-reset vars while this scope's journal is still empty (the scope's
+    // very first kernel call racing a reset in another instance); skipping
+    // here recorded no generation bump, so that mount's persist precondition
+    // still saw generation zero and could publish the discarded vars after
+    // the reset. The cost — creating a small journal for a workspace that
+    // never used the sandbox — is bounded and one-time per reset.
+    //
     // `reset: true` marks this row as a generation bump (r52): foreign
     // mounts recount reset rows before every lease and persist.
     const { ref } = await journal.publishWithBlob("{}", (blobHash, size) => ({

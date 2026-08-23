@@ -38,6 +38,7 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import {
   REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS,
+  REFINE_APPLY_LOCK_FILENAME,
   REFINE_MAX_MESSAGES,
   REFINE_OP_BUDGET,
   REFINE_SUMMARY_LABEL,
@@ -61,6 +62,7 @@ import {
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import type { HistoryService } from "@/node/services/historyService";
 import { runLanguageModelCleanup } from "@/node/services/languageModelCleanup";
+import { trackPendingUsageWrite } from "@/node/services/branchSummary";
 import { log } from "@/node/services/log";
 import {
   createConsolidationMemoryTool,
@@ -430,7 +432,7 @@ export class RefineService {
     let applyLock: Awaited<ReturnType<typeof acquireProcessFileLock>>;
     try {
       applyLock = await acquireProcessFileLock({
-        lockPath: path.join(sessionDir, "refine-apply.lock"),
+        lockPath: path.join(sessionDir, REFINE_APPLY_LOCK_FILENAME),
         timeoutMs: this.options.applyLockTimeoutMs ?? REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS,
         label: "refine apply lock",
       });
@@ -1007,7 +1009,9 @@ export class RefineService {
         // so construction time counts against the same deadline.
         abortSignal,
         recordUsage: async (usage, providerMetadata) => {
-          await this.options.sessionUsageService?.recordHeadlessUsage(
+          const sessionUsageService = this.options.sessionUsageService;
+          if (sessionUsageService === undefined) return;
+          const write = sessionUsageService.recordHeadlessUsage(
             workspaceId,
             modelString,
             usage,
@@ -1018,6 +1022,16 @@ export class RefineService {
               metadataModel: modelResult.data.metadataModel,
             }
           );
+          // r57: the runner races this write against the pass deadline and
+          // may detach it — register it in the shared usage-write registry
+          // so removal's bounded clearPendingBranchSummary drain gives a
+          // detached write one more chance to land before the session
+          // directory is deleted.
+          void trackPendingUsageWrite(
+            workspaceId,
+            write.then(() => undefined)
+          );
+          await write;
         },
       });
       if (result.streamError !== undefined) {
@@ -1055,7 +1069,7 @@ export class RefineService {
       let stagingLock: Awaited<ReturnType<typeof acquireProcessFileLock>>;
       try {
         stagingLock = await acquireProcessFileLock({
-          lockPath: path.join(sessionDir, "refine-apply.lock"),
+          lockPath: path.join(sessionDir, REFINE_APPLY_LOCK_FILENAME),
           timeoutMs: this.options.applyLockTimeoutMs ?? REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS,
           label: "refine staging lock",
         });
@@ -1329,14 +1343,19 @@ export class RefineService {
           );
           return { ...edit, targetContentHash };
         } catch (error) {
-          log.debug("[Refine] memory delete target fingerprinting failed", {
+          // FAIL CLOSED (r57): keeping the delete without a fingerprint
+          // would let apply remove contents edited after staging — exactly
+          // the clobber the fingerprint exists to refuse. Drop the edit from
+          // the staged set instead; the destructive operation is simply not
+          // proposed this pass.
+          log.warn("[Refine] dropping staged memory delete: target fingerprinting failed", {
             path: deleteTargetPath,
             error: getErrorMessage(error),
           });
-          return edit;
+          return undefined;
         }
       })
-    );
+    ).then((results) => results.filter((edit): edit is StagedRefineEdit => edit !== undefined));
   }
 
   /**

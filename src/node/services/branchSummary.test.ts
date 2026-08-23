@@ -17,6 +17,7 @@ import {
   BRANCH_SUMMARY_TARGET_WORDS,
   BRANCH_SUMMARY_TIMEOUT_MS,
 } from "@/constants/branchSummary";
+import { USAGE_WRITE_DRAIN_WINDOW_MS } from "@/constants/streamDrain";
 
 import {
   BRANCH_SUMMARY_LABEL,
@@ -28,7 +29,9 @@ import {
   getSideChannelModelCandidates,
   isRlmModeEnabled,
   maybeAppendAbandonedBranchSummary,
+  runInlineAbandonedBranchSummary,
   startAbandonedBranchSummaryInBackground,
+  trackPendingUsageWrite,
   trimSummaryToBoundary,
   type BranchSummaryAiService,
   type SideChannelMetadata,
@@ -253,10 +256,13 @@ describe("getSideChannelModelCandidates (r23: provider confinement)", () => {
     expect(candidates).toEqual(["anthropic:claude-opus-5"]);
   });
 
-  test("the selected agent's per-agent model wins over stale legacy aiSettings", () => {
+  test("stale legacy aiSettings is EXCLUDED once per-agent settings exist (r57 P1)", () => {
     // updateAgentAISettings persists aiSettingsByAgent[agentId] + agentId and
     // never rewrites legacy aiSettings, so the legacy field goes stale the
-    // moment a per-agent model is picked.
+    // moment a per-agent model is picked. It must not ride along even as a
+    // last fallback: if the current private/gateway routes fail creation,
+    // falling back to the stale direct-provider model would send abandoned
+    // history through a provider the user no longer selected.
     const candidates = deriveSideChannelModelCandidates({
       agentId: "exec",
       aiSettings: { model: "anthropic:stale-legacy", thinkingLevel: "off" },
@@ -265,26 +271,31 @@ describe("getSideChannelModelCandidates (r23: provider confinement)", () => {
         exec: { model: "ollama:current-exec", thinkingLevel: "off" },
       },
     });
-    // Selected agent first; the other configured (user-consented) models
-    // remain fallbacks, legacy last since it is the most likely stale.
-    expect(candidates).toEqual([
-      "ollama:current-exec",
-      "openai:plan-model",
-      "anthropic:stale-legacy",
-    ]);
+    // Selected agent first; the other configured (user-consented) per-agent
+    // models remain fallbacks. No legacy entry.
+    expect(candidates).toEqual(["ollama:current-exec", "openai:plan-model"]);
   });
 
-  test("legacy aiSettings resolves the current model when no per-agent entry matches", () => {
-    // agentId without a per-agent entry falls back to legacy — not to an
-    // arbitrary Object.values() pick from other agents' settings.
+  test("per-agent settings without a selected-agent entry still exclude legacy (r57 P1)", () => {
+    // The moment ANY per-agent settings exist the workspace has migrated;
+    // legacy is stale and must not be a failover route even when the
+    // selected agent has no entry of its own.
     const candidates = deriveSideChannelModelCandidates({
       agentId: "exec",
-      aiSettings: { model: "anthropic:legacy-current", thinkingLevel: "off" },
+      aiSettings: { model: "anthropic:stale-legacy", thinkingLevel: "off" },
       aiSettingsByAgent: {
         plan: { model: "openai:plan-model", thinkingLevel: "off" },
       },
     });
-    expect(candidates[0]).toBe("anthropic:legacy-current");
+    expect(candidates).toEqual(["openai:plan-model"]);
+  });
+
+  test("legacy aiSettings is used only when no per-agent settings exist", () => {
+    const candidates = deriveSideChannelModelCandidates({
+      agentId: "exec",
+      aiSettings: { model: "anthropic:legacy-only", thinkingLevel: "off" },
+    });
+    expect(candidates).toEqual(["anthropic:legacy-only"]);
   });
 
   test("no workspace metadata means no candidates (degrades to no summary)", async () => {
@@ -1259,6 +1270,73 @@ describe("branch summary placement on fork/truncate flows", () => {
     } finally {
       await cleanup();
     }
+  });
+
+  test("removal cancels an inline edit-resend summary through clearPendingBranchSummary (r57 P1)", async () => {
+    // The edit-resend path awaits its summary synchronously — no first-send
+    // consumer — but the writer must still be registered: an unregistered
+    // inline writer gave removal no cancellation handle, so its late append
+    // could land after the session directory was deleted, recreating it.
+    const { historyService, cleanup } = await createTestHistoryService();
+    try {
+      const ws = "ws-inline-cancel";
+      // Gate generation INSIDE the stream so the writer is provably in
+      // flight when removal races in; a working model proves the abort (not
+      // a generation failure) suppressed the row.
+      let releaseGate!: () => void;
+      const gate = new Promise<void>((resolve) => (releaseGate = resolve));
+      const gatedModel = new MockLanguageModelV3({
+        doStream: async () => {
+          await gate;
+          return {
+            stream: simulateReadableStream({
+              chunks: [
+                { type: "text-start", id: "t1" },
+                { type: "text-delta", id: "t1", delta: "Abandoned: must never land." },
+                { type: "text-end", id: "t1" },
+                finishChunk("stop"),
+              ] satisfies LanguageModelV3StreamPart[],
+            }),
+          };
+        },
+      });
+
+      const inlinePromise = runInlineAbandonedBranchSummary({
+        historyService,
+        aiService: fakeAiService(gatedModel),
+        workspaceId: ws,
+        abandonedMessages: meatyExchange("inline-cancel"),
+        experiments: RLM_ON,
+      });
+      // Let the writer reach the gated stream.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      // Removal: must find the inline registration, abort it, and drain.
+      const clearPromise = clearPendingBranchSummary(ws);
+      releaseGate();
+      await clearPromise;
+
+      // The cancelled writer produced nothing and appended nothing.
+      expect(await inlinePromise).toBeNull();
+      const history = await historyService.getHistoryFromLatestBoundary(ws);
+      expect(history.success).toBe(true);
+      if (history.success) expect(history.data).toHaveLength(0);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("clearPendingBranchSummary abandons a wedged usage write after the bounded window (r57)", async () => {
+    // A recordUsage write wedged in the filesystem must not hold workspace
+    // removal hostage: the drain detaches after the shared bounded window.
+    const ws = "ws-wedged-usage-write";
+    void trackPendingUsageWrite(ws, new Promise<void>(() => undefined));
+    const started = Date.now();
+    await clearPendingBranchSummary(ws);
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeGreaterThanOrEqual(USAGE_WRITE_DRAIN_WINDOW_MS - 100);
+    // Well under an unbounded hang; generous ceiling for CI scheduling.
+    expect(elapsed).toBeLessThan(USAGE_WRITE_DRAIN_WINDOW_MS + 2_000);
   });
 
   test("summary that settles before the first send stays consumable", async () => {

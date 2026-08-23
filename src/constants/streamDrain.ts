@@ -9,3 +9,15 @@
  * already-abandoned stream, and nothing observable depends on it afterward.
  */
 export const STREAM_CANCEL_DRAIN_WINDOW_MS = 2_000;
+
+/**
+ * Bounded drain window for usage-telemetry writes that outlived their
+ * producer's deadline (r57). Removal flows (clearPendingBranchSummary before
+ * session-directory deletion, cancelInFlightRefinePass) give a wedged
+ * recordUsage/recordHeadlessUsage write this long to land, then detach: a
+ * write wedged in the filesystem must not hold workspace removal hostage.
+ * Residual risk — a detached write completing after directory deletion — is
+ * bounded to one file and accepted over an unbounded hang; write STARTS are
+ * additionally gated on the producer's abort signal where available.
+ */
+export const USAGE_WRITE_DRAIN_WINDOW_MS = 2_000;

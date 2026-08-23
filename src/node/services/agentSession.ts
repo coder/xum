@@ -169,7 +169,7 @@ import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiment
 import {
   awaitPendingBranchSummary,
   isRlmModeEnabled,
-  maybeAppendAbandonedBranchSummary,
+  runInlineAbandonedBranchSummary,
 } from "@/node/services/branchSummary";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
@@ -3114,8 +3114,11 @@ export class AgentSession {
         // RLM mode: summarize the truncated tail into a durable labeled row
         // BEFORE the edited user message is appended and this turn's request is
         // built (log purity by construction). Best-effort with a hard deadline —
-        // never blocks or fails the edit beyond that bound.
-        const branchSummaryMessage = await maybeAppendAbandonedBranchSummary({
+        // never blocks or fails the edit beyond that bound. Registered (r57
+        // P1): workspace removal racing this await must find a cancellation
+        // handle in clearPendingBranchSummary, or the writer's late append
+        // could recreate the just-deleted session directory.
+        const branchSummaryMessage = await runInlineAbandonedBranchSummary({
           historyService: this.historyService,
           aiService: this.aiService,
           workspaceId: this.workspaceId,

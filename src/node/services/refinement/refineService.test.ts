@@ -140,6 +140,8 @@ async function createFixture(options?: {
   timeoutMs?: number;
   /** Captures recordHeadlessUsage calls (usage accounting tests). */
   onHeadlessUsage?: (usage: { inputTokens?: number; outputTokens?: number }) => void;
+  /** Overrides the usage write's settlement (wedged-telemetry tests, r57). */
+  headlessUsageWrite?: () => Promise<void>;
   /** Crash-injection seam for apply-recovery tests (throw to simulate death). */
   onStagedEditAttempted?: (toolCallId: string) => void;
   /** Shortens the cross-process apply-lock acquisition timeout. */
@@ -212,7 +214,7 @@ async function createFixture(options?: {
       ...(options?.onStagedEditAttempted !== undefined
         ? { onStagedEditAttempted: options.onStagedEditAttempted }
         : {}),
-      ...(options?.onHeadlessUsage !== undefined
+      ...(options?.onHeadlessUsage !== undefined || options?.headlessUsageWrite !== undefined
         ? {
             sessionUsageService: {
               recordHeadlessUsage: (
@@ -220,8 +222,8 @@ async function createFixture(options?: {
                 _modelString: string,
                 usage: { inputTokens?: number; outputTokens?: number } | undefined
               ) => {
-                if (usage) options.onHeadlessUsage!(usage);
-                return Promise.resolve(undefined);
+                if (usage) options?.onHeadlessUsage?.(usage);
+                return (options?.headlessUsageWrite?.() ?? Promise.resolve()).then(() => undefined);
               },
             },
           }
@@ -1498,6 +1500,88 @@ describe("RefineService", () => {
       // Late model resolution after the lost race must be absorbed cleanly.
       releaseModel();
     }
+  });
+
+  it("a wedged usage write does not keep the pass in flight past the deadline (r57)", async () => {
+    // recordHeadlessUsage runs AFTER the bounded stream race; unbounded, a
+    // wedged write kept the pass in `inFlight` forever and workspace removal
+    // hung in cancelInFlightRefinePass. The pass must settle once the
+    // deadline aborts the shared signal plus the bounded drain window.
+    let releaseWrite: () => void = () => undefined;
+    const writeGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    using fixture = await createFixture({
+      timeoutMs: 300,
+      headlessUsageWrite: () => writeGate,
+      modelFactory: () =>
+        toolCallModel(
+          [
+            {
+              toolCallId: "wedged-usage-1",
+              toolName: "memory",
+              input: {
+                command: "create",
+                path: LESSON_PATH,
+                file_text: "Lesson staged while telemetry wedges.\n",
+              },
+            },
+          ],
+          "one lesson staged"
+        ),
+    });
+    await fixture.seedTrajectory();
+    try {
+      const outcome = await Promise.race([
+        fixture.service.run(WORKSPACE_ID),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 4_000)),
+      ]);
+      // Settled (either way) well before the test deadline — never wedged.
+      expect(outcome).not.toBeNull();
+    } finally {
+      releaseWrite();
+    }
+  });
+
+  it("drops a staged memory delete when target fingerprinting fails (r57)", async () => {
+    // FAIL CLOSED: keeping the delete without a fingerprint would let apply
+    // remove contents edited after staging — the unguarded destructive edit
+    // must not be staged at all.
+    using fixture = await createFixture({
+      modelFactory: () =>
+        toolCallModel(
+          [
+            {
+              toolCallId: "drop-delete-1",
+              toolName: "memory",
+              input: { command: "delete", path: LESSON_PATH },
+            },
+          ],
+          `${LESSON_PATH}: deletion proposed.`
+        ),
+    });
+    await fixture.seedTrajectory();
+    const ctx = { runtime: null, checkoutCwd: "", workspaceId: WORKSPACE_ID, projectPath: "" };
+    expect(
+      (await fixture.memoryService.create(ctx, LESSON_PATH, "original lesson\n", "user")).success
+    ).toBe(true);
+
+    const fingerprintSpy = spyOn(
+      fixture.memoryService,
+      "fingerprintDeleteTarget"
+    ).mockImplementation(() => Promise.reject(new Error("temporarily unreadable")));
+    try {
+      const run = await fixture.service.run(WORKSPACE_ID);
+      expect(run.success).toBe(true);
+      if (run.success) {
+        expect(run.data.noOp).toBe(true);
+        expect(run.data.staged ?? []).toHaveLength(0);
+      }
+    } finally {
+      fingerprintSpy.mockRestore();
+    }
+    // The target was never touched.
+    expect((await fixture.memoryService.view(ctx, LESSON_PATH, {})).success).toBe(true);
   });
 
   it("refuses a staged memory delete whose target changed after staging (r55)", async () => {

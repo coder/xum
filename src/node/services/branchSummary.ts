@@ -36,7 +36,10 @@ import {
   BRANCH_SUMMARY_TARGET_WORDS,
   BRANCH_SUMMARY_TIMEOUT_MS,
 } from "@/constants/branchSummary";
-import { STREAM_CANCEL_DRAIN_WINDOW_MS } from "@/constants/streamDrain";
+import {
+  STREAM_CANCEL_DRAIN_WINDOW_MS,
+  USAGE_WRITE_DRAIN_WINDOW_MS,
+} from "@/constants/streamDrain";
 
 import type { AIService } from "./aiService";
 import type { HistoryService } from "./historyService";
@@ -229,18 +232,23 @@ export function deriveSideChannelModelCandidates(metadata: SideChannelMetadata):
   // The selected agent's entry is the workspace's CURRENT model:
   // updateAgentAISettings persists per-agent settings plus the selected
   // agentId and never rewrites legacy aiSettings, so the legacy field can be
-  // stale. It survives only as a compatibility fallback (pre-per-agent
-  // workspaces, and test/legacy fakes that stub metadata with aiSettings).
+  // stale. It survives only as a compatibility fallback for workspaces with
+  // NO per-agent settings at all (pre-per-agent workspaces, and test/legacy
+  // fakes that stub metadata with aiSettings). It must NOT ride along as a
+  // failover route once per-agent settings exist (r57 P1): if the current
+  // private/gateway routes fail model creation, falling back to the stale
+  // direct-provider model would send abandoned user and repository-derived
+  // history through a provider the user no longer selected.
+  const perAgentModels = Object.values(byAgent)
+    .map((settings) => settings.model)
+    .filter((model): model is string => typeof model === "string" && model.length > 0);
   const selectedModel =
-    (metadata.agentId !== undefined ? byAgent[metadata.agentId]?.model : undefined) ??
-    metadata.aiSettings?.model;
-  const models = [
-    selectedModel,
-    ...Object.values(byAgent).map((settings) => settings.model),
-    metadata.aiSettings?.model,
-  ].filter((model): model is string => typeof model === "string" && model.length > 0);
+    metadata.agentId !== undefined ? byAgent[metadata.agentId]?.model : undefined;
+  const models =
+    perAgentModels.length > 0 ? [selectedModel, ...perAgentModels] : [metadata.aiSettings?.model];
   const candidates: string[] = [];
   for (const model of models) {
+    if (typeof model !== "string" || model.length === 0) continue;
     if (!candidates.includes(model)) candidates.push(model);
   }
   return candidates;
@@ -296,8 +304,12 @@ export function trimSummaryToBoundary(text: string): string {
  */
 const pendingUsageWrites = new Map<string, Set<Promise<void>>>();
 
-/** Register a usage write for drain; the returned promise never rejects. */
-function trackPendingUsageWrite(workspaceId: string, write: Promise<void>): Promise<void> {
+/**
+ * Register a usage write for drain; the returned promise never rejects.
+ * Exported (r57) so the refine pass's deadline-detached recordHeadlessUsage
+ * write is drained by the same removal protocol.
+ */
+export function trackPendingUsageWrite(workspaceId: string, write: Promise<void>): Promise<void> {
   let writes = pendingUsageWrites.get(workspaceId);
   if (writes === undefined) {
     writes = new Set();
@@ -877,6 +889,49 @@ const BRANCH_SUMMARY_LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
 const BRANCH_SUMMARY_LOCK_WAIT_TIMEOUT_MS = BRANCH_SUMMARY_TIMEOUT_MS + 15_000;
 
 /**
+ * Run an abandoned-branch summary synchronously for the edit-resend path
+ * (r57 P1). Unlike the fork path there is no first-send consumer — the
+ * caller awaits the row inline — but the writer must STILL be registered in
+ * pendingBranchSummaries so workspace removal can abort and drain it through
+ * clearPendingBranchSummary: an unregistered inline writer had no
+ * cancellation handle, so a removal racing this await deleted the session
+ * directory while the summary was still generating, and its late append
+ * recreated the directory as an orphan. Registered pre-consumed so a
+ * concurrent awaitPendingBranchSummary waits without emitting the row (only
+ * this caller does). The send path's own awaitPendingBranchSummary runs —
+ * and deletes its entry — before the edit-resend truncation, so the
+ * registration slot is free here; a leftover entry would mean overlapping
+ * writers, so it is logged and replaced (the abort in
+ * clearPendingBranchSummary remains the only consumer of the handle).
+ */
+export async function runInlineAbandonedBranchSummary(
+  input: AbandonedBranchSummaryInput
+): Promise<MuxMessage | null> {
+  const existing = pendingBranchSummaries.get(input.workspaceId);
+  if (existing !== undefined) {
+    log.warn("Branch summary: inline writer found an unexpected pending registration", {
+      workspaceId: input.workspaceId,
+    });
+  }
+  const controller = new AbortController();
+  const promise = maybeAppendAbandonedBranchSummary({
+    ...input,
+    cancellationSignal: controller.signal,
+  });
+  const entry: PendingBranchSummary = { promise, controller, consumed: true };
+  pendingBranchSummaries.set(input.workspaceId, entry);
+  try {
+    return await promise;
+  } finally {
+    // Identity-guarded: clearPendingBranchSummary may have already deleted
+    // (and a re-registration under the same id must not be swept).
+    if (pendingBranchSummaries.get(input.workspaceId) === entry) {
+      pendingBranchSummaries.delete(input.workspaceId);
+    }
+  }
+}
+
+/**
  * Start abandoned-branch summarization without blocking the caller on
  * GENERATION. Used by fork: awaiting generation synchronously stalls the
  * user-facing fork for seconds even when it ultimately produces nothing.
@@ -1063,12 +1118,27 @@ export async function clearPendingBranchSummary(workspaceId: string): Promise<vo
   // (no pending entry) but its usage write may still be in flight. Looped:
   // a write registered while an earlier one settles must not escape; the
   // abort above stops generation, so the producer is finite. Tracked
-  // promises never reject.
+  // promises never reject. BOUNDED (r57): a write wedged in the filesystem
+  // must not hold workspace removal indefinitely — after the shared drain
+  // window the write is detached (the residual recreate risk is bounded to
+  // one file and accepted over an unbounded hang).
+  const drainDeadline = Date.now() + USAGE_WRITE_DRAIN_WINDOW_MS;
   for (;;) {
     const writes = pendingUsageWrites.get(workspaceId);
     if (writes === undefined || writes.size === 0) {
       return;
     }
-    await Promise.all([...writes]);
+    const remainingMs = drainDeadline - Date.now();
+    if (remainingMs <= 0) {
+      log.warn("Branch summary: abandoning wedged usage write(s) at removal drain deadline", {
+        workspaceId,
+        pending: writes.size,
+      });
+      return;
+    }
+    await Promise.race([
+      Promise.all([...writes]),
+      new Promise<void>((resolve) => setTimeout(resolve, remainingMs)),
+    ]);
   }
 }

@@ -28,7 +28,10 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelpers";
 import { REFINE_MAX_STEPS, REFINE_OP_BUDGET } from "@/constants/refine";
-import { STREAM_CANCEL_DRAIN_WINDOW_MS } from "@/constants/streamDrain";
+import {
+  STREAM_CANCEL_DRAIN_WINDOW_MS,
+  USAGE_WRITE_DRAIN_WINDOW_MS,
+} from "@/constants/streamDrain";
 import {
   createConsolidationMemoryTool,
   createMutationBudget,
@@ -126,6 +129,26 @@ function trackToolExecutions(inner: Tool, pending: Set<Promise<unknown>>): Tool 
       return run;
     },
   };
+}
+
+/**
+ * Resolves `windowMs` after `signal` aborts (immediately-armed when already
+ * aborted); never resolves without a signal, so a caller racing a write
+ * against it waits for the write whenever no deadline governs the pass (r57).
+ */
+function abortedSignalDrainWindow(
+  signal: AbortSignal | undefined,
+  windowMs: number
+): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal === undefined) return;
+    const arm = () => setTimeout(resolve, windowMs);
+    if (signal.aborted) {
+      arm();
+      return;
+    }
+    signal.addEventListener("abort", arm, { once: true });
+  });
 }
 
 /**
@@ -436,7 +459,29 @@ export async function runRefinePass(args: {
         // Skip recording when nothing was measured (e.g. an error before any
         // step completed) so zero rows do not pollute the ledger.
         if (effectiveUsage.inputTokens !== undefined || effectiveUsage.outputTokens !== undefined) {
-          await args.recordUsage?.(effectiveUsage, accumulateStepsProviderMetadata(steps));
+          const recordPromise = args.recordUsage?.(
+            effectiveUsage,
+            accumulateStepsProviderMetadata(steps)
+          );
+          if (recordPromise !== undefined) {
+            // Detachment safety: if the race below abandons the write, a
+            // late rejection must not surface as an unhandled rejection.
+            void recordPromise.catch(() => undefined);
+            // r57: post-stream telemetry rides the same pass deadline as the
+            // stream — a wedged recordHeadlessUsage would otherwise keep the
+            // pass in flight forever and hang workspace removal in
+            // cancelInFlightRefinePass. While the signal is live we wait
+            // (the deadline aborts it); once aborted, the write gets the
+            // bounded drain window and is then detached. The service-side
+            // write is registered in the shared usage-write registry, so
+            // removal's clearPendingBranchSummary drain gives a detached
+            // write one more bounded chance to land before the session
+            // directory is deleted.
+            await Promise.race([
+              recordPromise,
+              abortedSignalDrainWindow(args.abortSignal, USAGE_WRITE_DRAIN_WINDOW_MS),
+            ]);
+          }
         }
       }
     } catch {

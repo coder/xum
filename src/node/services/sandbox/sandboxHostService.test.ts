@@ -1443,6 +1443,25 @@ describe("SandboxHostService", () => {
     await host.disposeScope("ws-lying-proxy-vars");
   });
 
+  test("discardScope publishes a reset tombstone even on an empty journal (r57)", async () => {
+    // A foreign backend's live mount can hold unpersisted pre-reset vars
+    // while this scope's journal is still empty (its very first kernel call
+    // racing a reset in another instance). The tombstone must bump the reset
+    // generation even then, or that mount's persist precondition still sees
+    // generation zero and can publish the discarded vars after the reset.
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    await host.discardScope("ws-empty-journal-reset", tmp.path);
+    const events = await sharedDurableEventJournal(tmp.path).read();
+    const resets = events.filter(
+      (event) =>
+        event.kind === "sandbox-vars-snapshot" &&
+        event.data.scopeKey === "ws-empty-journal-reset" &&
+        event.data.reset === true
+    );
+    expect(resets).toHaveLength(1);
+  });
+
   test("mount setup failure after runtime creation disposes the runtime (r54)", async () => {
     // Codex r54: acquirePersistentMountLocked created the runtime, then ran
     // journal reads / vars restoration / bridge registration with no guard —

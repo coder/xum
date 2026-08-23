@@ -263,7 +263,10 @@ import type {
 import { BashMonitorRegistryStore } from "@/node/services/bashMonitorRegistryStore";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
-import { REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS } from "@/constants/refine";
+import {
+  REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS,
+  REFINE_APPLY_LOCK_FILENAME,
+} from "@/constants/refine";
 import {
   BashMonitorWakeStore,
   buildBashMonitorWakeMetadata,
@@ -2842,7 +2845,7 @@ export class WorkspaceService extends EventEmitter {
     try {
       return Ok(
         await acquireProcessFileLock({
-          lockPath: path.join(this.config.getSessionDir(workspaceId), "refine-apply.lock"),
+          lockPath: path.join(this.config.getSessionDir(workspaceId), REFINE_APPLY_LOCK_FILENAME),
           timeoutMs: REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS,
           label: `refine serialization lock (${operation})`,
         })
