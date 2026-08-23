@@ -219,6 +219,16 @@ start: node_modules/.installed build-main build-preload build-static ## Build an
 ## Build targets (can run in parallel)
 build: node_modules/.installed src/version.ts build-renderer build-main build-preload build-icons build-static ## Build all targets
 
+.PHONY: update-models
+update-models: node_modules/.installed ## Fetch latest LiteLLM model data, validate it, update models.json if changed
+	@bun scripts/update_models.ts
+
+# #3727: `make build UPDATE_MODELS=1` refreshes the vendored models.json before
+# building; plain `make build` stays network-free and reproducible.
+ifeq ($(UPDATE_MODELS),1)
+build: update-models
+endif
+
 build-main: node_modules/.installed dist/cli/index.js dist/cli/api.mjs ## Build main process
 
 BUILTIN_AGENTS_GENERATED := src/node/services/agentDefinitions/builtInAgentContent.generated.ts
