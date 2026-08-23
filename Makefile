@@ -60,7 +60,10 @@ endif
 
 # Issue #3831: macOS may SIGKILL the copied esbuild inode while the platform binary still execs.
 # ESBUILD_BINARY_PATH is not used because only esbuild's JS API honors it, not the Go CLI.
-ESBUILD_BIN = $(firstword $(wildcard node_modules/@esbuild/*/bin/esbuild) node_modules/esbuild/bin/esbuild)
+# Prefer the host platform package: ensure-mac-sharp-runtime-deps adds darwin packages on any
+# host, and a bare wildcard would sort @esbuild/darwin-arm64 first (issue #3338).
+ESBUILD_HOST_PLATFORM := $(subst Linux,linux,$(subst Darwin,darwin,$(shell uname -s)))-$(subst x86_64,x64,$(subst aarch64,arm64,$(shell uname -m)))
+ESBUILD_BIN = $(firstword $(wildcard node_modules/@esbuild/$(ESBUILD_HOST_PLATFORM)/bin/esbuild) $(wildcard node_modules/@esbuild/*/bin/esbuild) node_modules/esbuild/bin/esbuild)
 
 # Common esbuild flags for CLI API bundle (ESM format for trpc-cli)
 ESBUILD_CLI_FLAGS := --bundle --format=esm --platform=node --target=node20 --outfile=dist/cli/api.mjs --external:zod --external:commander --external:jsonc-parser --external:@trpc/server --external:ssh2 --external:cpu-features --banner:js="import{createRequire}from'module';globalThis.require=createRequire(import.meta.url);"
