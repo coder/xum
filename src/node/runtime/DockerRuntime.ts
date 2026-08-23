@@ -131,6 +131,21 @@ function runCommand(
 }
 
 /**
+ * Quote the container CLI for the host shell used by `shell: true`.
+ * On Windows that shell is cmd.exe, where POSIX single quotes are literal
+ * characters, so bare tokens (the common docker/podman case) pass through
+ * unquoted and anything else is quoted per platform.
+ */
+function quoteCliForHostShell(cli: string): string {
+  if (/^[A-Za-z0-9_.:/-]+$/.test(cli)) return cli;
+  if (process.platform === "win32") {
+    // cmd.exe expands %VAR% even in double quotes, so escape literal % as %%.
+    return `"${cli.replace(/%/g, "%%").replace(/"/g, '""')}"`;
+  }
+  return shescape.quote(cli);
+}
+
+/**
  * Run a Docker-compatible CLI command and return result.
  * The command contains CLI arguments without the binary. Unlike execAsync, this always resolves
  * (never rejects) and returns the exit code.
@@ -141,7 +156,7 @@ async function runDockerCommand(
   abortSignal?: AbortSignal
 ): Promise<DockerCommandResult> {
   const cli = await resolveContainerCli();
-  return runCommand(`${shescape.quote(cli)} ${command}`, [], {
+  return runCommand(`${quoteCliForHostShell(cli)} ${command}`, [], {
     timeoutMs,
     shell: true,
     abortSignal,
