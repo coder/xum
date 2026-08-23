@@ -538,6 +538,8 @@ jobs:
       - name: Build macOS distributables
         # Retry for transient Apple timestamp-server failures during code signing.
         run: ./scripts/retry.sh 3 30 make dist-mac
+      - name: Smoke test packaged macOS attach_file runtime
+        run: make check-mac-attach-file-runtime
       - name: Upload x64 artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
