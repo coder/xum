@@ -1568,7 +1568,7 @@ describe("RefineService", () => {
 
     const fingerprintSpy = spyOn(
       fixture.memoryService,
-      "fingerprintDeleteTarget"
+      "fingerprintMutationTarget"
     ).mockImplementation(() => Promise.reject(new Error("temporarily unreadable")));
     try {
       const run = await fixture.service.run(WORKSPACE_ID);
@@ -1635,6 +1635,115 @@ describe("RefineService", () => {
     expect(freshApply.success).toBe(true);
     if (freshApply.success) expect(freshApply.data.applied).toHaveLength(1);
     expect((await fixture.memoryService.view(ctx, LESSON_PATH, {})).success).toBe(false);
+  });
+
+  it("refuses a staged memory insert whose target changed after staging (r58)", async () => {
+    // An insert's numeric line position carries no content anchor: applied
+    // to contents edited after staging it lands at a now-different location
+    // and reports success — silently modifying the wrong section.
+    using fixture = await createFixture({
+      modelFactory: () =>
+        toolCallModel(
+          [
+            {
+              toolCallId: "stale-insert-1",
+              toolName: "memory",
+              input: {
+                command: "insert",
+                path: LESSON_PATH,
+                insert_line: 1,
+                insert_text: "inserted after line one\n",
+              },
+            },
+          ],
+          `${LESSON_PATH}: insert proposed.`
+        ),
+    });
+    await fixture.seedTrajectory();
+    const ctx = { runtime: null, checkoutCwd: "", workspaceId: WORKSPACE_ID, projectPath: "" };
+    expect(
+      (await fixture.memoryService.create(ctx, LESSON_PATH, "line one\nline two\n", "user")).success
+    ).toBe(true);
+
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+
+    // The target changes between staging and apply (manual edit).
+    expect(
+      (await fixture.memoryService.strReplace(ctx, LESSON_PATH, "line one", "line ONE", "user"))
+        .success
+    ).toBe(true);
+
+    const staleApply = await fixture.service.apply(WORKSPACE_ID);
+    expect(staleApply.success).toBe(true);
+    if (!staleApply.success) return;
+    expect(staleApply.data.applied).toHaveLength(0);
+    expect(staleApply.data.failed).toHaveLength(1);
+    expect(staleApply.data.failed?.[0]?.reason).toContain("changed since this proposal was staged");
+    // The edited contents were not modified.
+    const survived = await fixture.memoryService.view(ctx, LESSON_PATH, {});
+    expect(survived.success).toBe(true);
+    if (survived.success) {
+      expect(survived.output).toContain("line ONE");
+      expect(survived.output).not.toContain("inserted after line one");
+    }
+
+    // Restaged against the CURRENT state, the same insert applies cleanly:
+    // the fingerprint refuses stale proposals, not inserts as such.
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+    const freshApply = await fixture.service.apply(WORKSPACE_ID);
+    expect(freshApply.success).toBe(true);
+    if (freshApply.success) expect(freshApply.data.applied).toHaveLength(1);
+    const inserted = await fixture.memoryService.view(ctx, LESSON_PATH, {});
+    expect(inserted.success).toBe(true);
+    if (inserted.success) expect(inserted.output).toContain("inserted after line one");
+  });
+
+  it("a wedged tool execution does not keep a cancelled pass in flight past the bounded drain (r58)", async () => {
+    // The memory tools receive no abort signal; an execution wedged in
+    // filesystem I/O previously held the pass in flight forever after the
+    // deadline, hanging workspace removal in cancelInFlightRefinePass. Once
+    // the signal aborts, the drain detaches after the bounded window (the
+    // wedged run is handed to the shared usage-write registry for removal's
+    // bounded second chance).
+    let releaseGuard: () => void = () => undefined;
+    const guardGate = new Promise<void>((resolve) => {
+      releaseGuard = resolve;
+    });
+    using fixture = await createFixture({
+      timeoutMs: 150,
+      modelFactory: () =>
+        toolCallModel(
+          [
+            {
+              toolCallId: "refine-wedged-guard-1",
+              toolName: "memory",
+              input: { command: "delete", path: LESSON_PATH },
+            },
+          ],
+          `${LESSON_PATH}: deletion proposed slowly.`
+        ),
+    });
+    await fixture.seedTrajectory();
+    const metaService = (
+      fixture.service as unknown as {
+        metaService: { getEntries: () => Promise<Map<string, never>> };
+      }
+    ).metaService;
+    const entriesSpy = spyOn(metaService, "getEntries").mockImplementation(async () => {
+      await guardGate;
+      return new Map<string, never>();
+    });
+    try {
+      const outcome = await Promise.race([
+        fixture.service.run(WORKSPACE_ID),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 4_000)),
+      ]);
+      // Settled while the tool execution is STILL wedged.
+      expect(outcome).not.toBeNull();
+    } finally {
+      releaseGuard();
+      entriesSpy.mockRestore();
+    }
   });
 
   it("cancelInFlightRefinePass aborts a running pass so no writes or summary land", async () => {

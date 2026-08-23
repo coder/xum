@@ -46,8 +46,8 @@ export const StagedRefineEditSchema = z.object({
    * (r49): sha256 hex of the file's bytes, or "absent" when it did not exist
    * — a full-file overwrite of a target edited between staging and apply
    * would silently clobber the newer state, so apply recomputes and refuses
-   * on mismatch. For memory DELETE edits (r55): a subtree fingerprint
-   * (MemoryService.fingerprintDeleteTarget), re-verified inside the target
+   * on mismatch. For memory DELETE (r55) and INSERT (r58) edits: a subtree fingerprint
+   * (MemoryService.fingerprintMutationTarget), re-verified inside the target
    * mutation lock before removal. Optional: memory WRITE edits carry their
    * own conflict semantics, and staged sets written by older builds lack the
    * field (those applies keep the previous behavior).

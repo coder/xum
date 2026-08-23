@@ -1040,13 +1040,28 @@ export class MemoryService extends EventEmitter {
     insertLine: number,
     insertText: string,
     actor: MemoryActor,
-    toolCallId?: string
+    toolCallId?: string,
+    expectedFingerprint?: string
   ): Promise<MemoryCommandResult> {
     return this.runCommand(async () => {
       const parsed = parseMemoryPath(virtualPath);
       const scope = this.requireFilePath(parsed, virtualPath);
       const store = await this.resolveStore(ctx, scope, parsed.relPath);
       return withTargetMutationLock(this.config.rootDir, this.storeLockKey(store), async () => {
+        // r58: staged refine inserts were approved against the target's
+        // staging-time contents — the numeric line position carries no
+        // content anchor, so a file edited between staging and apply would
+        // accept the insert at a now-different location and silently modify
+        // the wrong section. Verified INSIDE the mutation lock (mirrors
+        // deletePath's r55 guard).
+        if (expectedFingerprint !== undefined) {
+          const currentFingerprint = await fingerprintPhysicalSubtree(store, parsed.relPath);
+          if (currentFingerprint !== expectedFingerprint) {
+            throw new MemoryCommandError(
+              `${virtualPath} changed since this proposal was staged; run /refine again to restage`
+            );
+          }
+        }
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
         const { updated, insertedLineCount } = computeInsertUpdate(content, insertLine, insertText);
         assertWithinFileSizeCap(updated);
@@ -1181,16 +1196,18 @@ export class MemoryService extends EventEmitter {
   }
 
   /**
-   * Deterministic fingerprint of a delete target's CURRENT physical state
-   * (r55): sha256 over the sorted subtree listing (path + entry kind +
-   * per-file content hash). Unlike captureDeleteInverse this walk is lenient
-   * — symlinks, dotfiles, and binary files hash as opaque markers instead of
-   * failing — because the fingerprint only needs to DETECT change between
-   * /refine staging and apply, not represent the subtree losslessly. Staging
-   * computes it unlocked; deletePath recomputes it INSIDE the target
-   * mutation lock and refuses the removal on mismatch.
+   * Deterministic fingerprint of a mutation target's CURRENT physical state
+   * (r55 deletes, r58 inserts): sha256 over the sorted subtree listing
+   * (path + entry kind + per-file content hash). Unlike captureDeleteInverse
+   * this walk is lenient — symlinks, dotfiles, and binary files hash as
+   * opaque markers instead of failing — because the fingerprint only needs
+   * to DETECT change between /refine staging and apply, not represent the
+   * subtree losslessly. Staging computes it unlocked; deletePath/insert
+   * recompute it INSIDE the target mutation lock and refuse on mismatch
+   * (a delete has no command-level conflict semantics; an insert's numeric
+   * line position silently lands in the wrong place on edited contents).
    */
-  async fingerprintDeleteTarget(ctx: MemoryScopeContext, virtualPath: string): Promise<string> {
+  async fingerprintMutationTarget(ctx: MemoryScopeContext, virtualPath: string): Promise<string> {
     const parsed = parseMemoryPath(virtualPath);
     const scope = this.requireFilePath(parsed, virtualPath);
     const store = await this.resolveStore(ctx, scope, parsed.relPath);
@@ -1609,7 +1626,7 @@ function sha256Hex(content: string): string {
 
 /**
  * Deterministic, lenient hash of a physical subtree for delete-target change
- * detection (r55, see MemoryService.fingerprintDeleteTarget). Sorted walk;
+ * detection (r55/r58, see MemoryService.fingerprintMutationTarget). Sorted walk;
  * each entry contributes its rel path + kind (+ content hash for regular
  * files); an absent target hashes as a distinct sentinel. Never throws on
  * unrepresentable entries — symlinks/sockets hash as opaque "other" markers.

@@ -341,10 +341,13 @@ export async function generateXumTypes(
     // ToolBridge.addKernelMethods and createKernelFileLoader.
     if (options.load === true) {
       lines.push(
-        "  /** Bulk file ingestion: reads the WHOLE file host-side into vars[key] as a string (no 16KB/1000-line pagination cap) and returns only this bounded summary — the content itself never enters your context. Same path resolution and capability grant as file_read. */"
+        "  /** Bulk file ingestion: reads the WHOLE file host-side into vars[key] as a string (no 16KB/1000-line pagination cap) and returns only this bounded summary — the content itself never enters your context. Same path resolution and capability grant as file_read. hookResult is present only when a repo tool hook or plugin middleware annotated the read (warnings, notices). */"
       );
+      // r58: hookResult must be declared — kernel programs are TypeScript-
+      // analyzed before execution, so an undeclared runtime property is
+      // unreachable to guest code (keep in sync with ToolBridge's load record).
       lines.push(
-        "  type LoadResult = { key: string; bytes: number; lines: number; preview: string };"
+        "  type LoadResult = { key: string; bytes: number; lines: number; preview: string; hookResult?: unknown };"
       );
       lines.push("  function load(args: { path: string; key: string }): LoadResult;");
       lines.push("");

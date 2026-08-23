@@ -32,6 +32,7 @@ import {
   STREAM_CANCEL_DRAIN_WINDOW_MS,
   USAGE_WRITE_DRAIN_WINDOW_MS,
 } from "@/constants/streamDrain";
+import { trackPendingUsageWrite } from "@/node/services/branchSummary";
 import {
   createConsolidationMemoryTool,
   createMutationBudget,
@@ -493,11 +494,33 @@ export async function runRefinePass(args: {
   // launched by a step keeps running after reader cancellation, and the
   // caller's removal flow deletes the session directory as soon as this pass
   // settles — a write (and its journal append) still in flight would recreate
-  // it. Local FS operations, so this wait is bounded; allSettled because a
-  // failed write must not fail the pass here (its tool result already
-  // reported the error to the model).
+  // it. allSettled because a failed write must not fail the pass here (its
+  // tool result already reported the error to the model). BOUNDED after
+  // cancellation (r58): the memory tools receive no abort signal, so an
+  // execution wedged in filesystem I/O (e.g. a named pipe placed under a
+  // memory root) would otherwise keep the pass in flight forever and hang
+  // workspace removal in cancelInFlightRefinePass. While the signal is live
+  // we wait; once it aborts, remaining runs get the bounded window and are
+  // then handed to the shared usage-write registry so removal's
+  // clearPendingBranchSummary drain gives them one more bounded chance to
+  // settle before the session directory is deleted.
   if (pendingToolRuns.size > 0) {
-    await Promise.allSettled([...pendingToolRuns]);
+    await Promise.race([
+      Promise.allSettled([...pendingToolRuns]),
+      abortedSignalDrainWindow(args.abortSignal, USAGE_WRITE_DRAIN_WINDOW_MS),
+    ]);
+    if (args.ctx.workspaceId) {
+      // trackToolExecutions prunes settled runs, so only wedged ones remain.
+      for (const run of pendingToolRuns) {
+        void trackPendingUsageWrite(
+          args.ctx.workspaceId,
+          run.then(
+            () => undefined,
+            () => undefined
+          )
+        );
+      }
+    }
   }
 
   // Stable sort: edits without a recorded emission index (defensive; every

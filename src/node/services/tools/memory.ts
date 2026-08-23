@@ -134,11 +134,13 @@ export async function executeMemoryCommand(
   toolCallId?: string,
   options?: {
     /**
-     * r55 (staged refine deletes only): staging-time fingerprint of the
-     * delete target, re-verified by MemoryService INSIDE its target mutation
-     * lock immediately before removal. Ignored by every other command.
+     * Staged refine mutations only (r55 deletes, r58 inserts): staging-time
+     * fingerprint of the mutation target, re-verified by MemoryService
+     * INSIDE its target mutation lock immediately before the write. Deletes
+     * have no command-level conflict semantics; inserts carry a numeric line
+     * position with no content anchor. Ignored by every other command.
      */
-    expectedDeleteFingerprint?: string;
+    expectedTargetFingerprint?: string;
   }
 ): Promise<MemoryToolResult> {
   try {
@@ -192,7 +194,8 @@ export async function executeMemoryCommand(
             input.insert_line,
             input.insert_text,
             "agent",
-            toolCallId
+            toolCallId,
+            options?.expectedTargetFingerprint
           ))
         );
       }
@@ -207,7 +210,7 @@ export async function executeMemoryCommand(
             input.path,
             "agent",
             toolCallId,
-            options?.expectedDeleteFingerprint
+            options?.expectedTargetFingerprint
           ))
         );
       }

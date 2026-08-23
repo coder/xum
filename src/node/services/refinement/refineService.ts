@@ -165,14 +165,19 @@ function fingerprintHistoryRow(row: MuxMessage | undefined): string {
 }
 
 /**
- * Virtual path of a staged memory DELETE edit, or undefined for any other
- * (or malformed) memory command input. Staged inputs are untrusted on-disk
- * state, so fields are read defensively rather than schema-cast (r55).
+ * Virtual path of a staged memory edit that needs a target fingerprint —
+ * deletes (r55: no command-level conflict semantics) and inserts (r58: a
+ * numeric line position silently lands in the wrong place on contents edited
+ * after staging) — or undefined for any other (or malformed) memory command.
+ * Staged inputs are untrusted on-disk state, so fields are read defensively
+ * rather than schema-cast (r55).
  */
-function stagedMemoryDeletePath(input: unknown): string | undefined {
+function stagedMemoryGuardedTargetPath(input: unknown): string | undefined {
   if (typeof input !== "object" || input === null) return undefined;
   const { command, path: virtualPath } = input as { command?: unknown; path?: unknown };
-  if (command !== "delete" || typeof virtualPath !== "string") return undefined;
+  if ((command !== "delete" && command !== "insert") || typeof virtualPath !== "string") {
+    return undefined;
+  }
   return virtualPath;
 }
 
@@ -482,19 +487,19 @@ export class RefineService {
       workspaceId,
       projectPath,
     };
-    // r55: staging-time fingerprints of memory DELETE targets, re-verified by
-    // MemoryService INSIDE its target mutation lock immediately before the
-    // removal — a delete has no command-level conflict semantics, so a target
-    // edited between staging and apply must refuse instead of destroying the
-    // newer contents (same posture as the skill-write hashes below).
-    const stagedMemoryDeleteFingerprints = new Map<string, string>();
+    // Staging-time fingerprints of memory delete/insert targets (r55/r58),
+    // re-verified by MemoryService INSIDE its target mutation lock
+    // immediately before the write — a target edited between staging and
+    // apply must refuse instead of destroying or misplacing content (same
+    // posture as the skill-write hashes below).
+    const stagedMemoryTargetFingerprints = new Map<string, string>();
     for (const edit of staged.edits) {
       if (
         edit.tool === "memory" &&
         edit.targetContentHash !== undefined &&
-        stagedMemoryDeletePath(edit.input) !== undefined
+        stagedMemoryGuardedTargetPath(edit.input) !== undefined
       ) {
-        stagedMemoryDeleteFingerprints.set(edit.toolCallId, edit.targetContentHash);
+        stagedMemoryTargetFingerprints.set(edit.toolCallId, edit.targetContentHash);
       }
     }
     const { tool: memoryTool } = createConsolidationMemoryTool({
@@ -504,7 +509,7 @@ export class RefineService {
       dryRun: false,
       journal: [],
       budget: createMutationBudget(REFINE_OP_BUDGET),
-      expectedDeleteFingerprints: stagedMemoryDeleteFingerprints,
+      expectedTargetFingerprints: stagedMemoryTargetFingerprints,
     });
     // r50: hand the staged target fingerprints to the writer so it re-verifies
     // them INSIDE its per-root mutation lock immediately before writing — the
@@ -1139,7 +1144,7 @@ export class RefineService {
       // full-file writes whose target changed after staging. Enriched BEFORE
       // both the save and hashStagedRefineSet below — the approval hash must
       // cover the exact persisted set.
-      const stagedEdits = await this.fingerprintMemoryDeleteTargets(
+      const stagedEdits = await this.fingerprintMemoryTargets(
         ctx,
         await this.fingerprintSkillWriteTargets(workspaceId, result.stagedEdits)
       );
@@ -1279,7 +1284,7 @@ export class RefineService {
    * WRITE edits are excluded — their command semantics carry their own
    * conflict behavior (create fails on existing files, str_replace verifies
    * its anchor text) — but destructive memory deletes are fingerprinted by
-   * fingerprintMemoryDeleteTargets (r55).
+   * fingerprintMemoryTargets (r55 deletes, r58 inserts).
    */
   private async fingerprintSkillWriteTargets(
     workspaceId: string,
@@ -1318,38 +1323,33 @@ export class RefineService {
   }
 
   /**
-   * Enrich staged memory DELETE edits with target fingerprints (r55): unlike
-   * memory writes, a delete carries no command-level conflict semantics —
-   * apply would only revalidate that the target exists and then remove its
-   * CURRENT contents, so approving a proposal generated against the old
-   * state could destroy newer manual or agent changes. deletePath re-verifies
-   * the fingerprint INSIDE its target mutation lock at apply. Best-effort:
-   * a fingerprinting failure leaves the edit unfingerprinted (previous
-   * behavior) rather than failing the staging pass.
+   * Enrich staged memory DELETE (r55) and INSERT (r58) edits with target
+   * fingerprints: unlike create/str_replace, neither carries usable
+   * command-level conflict semantics — a delete would remove the target's
+   * CURRENT contents, and an insert's numeric line position would silently
+   * land in the wrong place when the file was edited after staging.
+   * MemoryService re-verifies the fingerprint INSIDE its target mutation
+   * lock at apply. FAIL CLOSED (r57): a fingerprinting failure drops the
+   * edit from the staged set — an unguarded mutation must not be proposed.
    */
-  private async fingerprintMemoryDeleteTargets(
+  private async fingerprintMemoryTargets(
     ctx: MemoryScopeContext,
     edits: StagedRefineEdit[]
   ): Promise<StagedRefineEdit[]> {
     return Promise.all(
       edits.map(async (edit) => {
         if (edit.tool !== "memory") return edit;
-        const deleteTargetPath = stagedMemoryDeletePath(edit.input);
-        if (deleteTargetPath === undefined) return edit;
+        const guardedTargetPath = stagedMemoryGuardedTargetPath(edit.input);
+        if (guardedTargetPath === undefined) return edit;
         try {
-          const targetContentHash = await this.memoryService.fingerprintDeleteTarget(
+          const targetContentHash = await this.memoryService.fingerprintMutationTarget(
             ctx,
-            deleteTargetPath
+            guardedTargetPath
           );
           return { ...edit, targetContentHash };
         } catch (error) {
-          // FAIL CLOSED (r57): keeping the delete without a fingerprint
-          // would let apply remove contents edited after staging — exactly
-          // the clobber the fingerprint exists to refuse. Drop the edit from
-          // the staged set instead; the destructive operation is simply not
-          // proposed this pass.
-          log.warn("[Refine] dropping staged memory delete: target fingerprinting failed", {
-            path: deleteTargetPath,
+          log.warn("[Refine] dropping staged memory edit: target fingerprinting failed", {
+            path: guardedTargetPath,
             error: getErrorMessage(error),
           });
           return undefined;
