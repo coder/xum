@@ -7,7 +7,7 @@
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { modelsExtra } from "./models-extra";
-import { hasUsableTokenLimits } from "./modelStats";
+import { generateModelLookupKeys, hasUsableTokenLimits } from "./modelStats";
 
 const RETAINED_FIELDS = [
   "max_input_tokens",
@@ -48,6 +48,10 @@ const COST_FIELDS = [
 // responses or field renames that would silently degrade thousands of known models.
 const MIN_USABLE_MAPPABLE_MODELS = 500;
 const MAX_BASELINE_SHRINK_FRACTION = 0.1;
+// Relative checks only apply to baselines with enough entries for the fraction
+// to be signal rather than noise (a 3-entry mode legitimately losing 1 entry
+// must not block refreshes forever).
+const MIN_BASELINE_FOR_SHRINK_CHECK = 20;
 const MAX_INVALID_PRICING_FRACTION = 0.05;
 
 /** Modes whose metadata applies to chat-style usage; mirrored by the Treat-as catalog. */
@@ -123,9 +127,9 @@ function providesUsableMetadata(entry: unknown): boolean {
 
 /**
  * Curated models that would lose token/pricing metadata under the given catalog.
- * The models-extra overrides are consulted the same way getModelStats does, and
- * coverage requires usable metadata (not mere key presence), so an upstream entry
- * that loses its token limits still counts as missing.
+ * Coverage uses getModelStats' own lookup keys and usability bar, so any key
+ * form the runtime can resolve (bare, provider-scoped, models-extra override)
+ * counts, and an entry that loses its token limits still counts as missing.
  */
 export function findMissingKnownModels(
   catalog: ModelCatalogData,
@@ -133,68 +137,62 @@ export function findMissingKnownModels(
 ): string[] {
   const missing: string[] = [];
   for (const model of Object.values(KNOWN_MODELS)) {
-    const modelId = model.providerModelId;
-    // xAI and Moonshot models are provider-prefixed in token metadata.
-    const lookupKey =
-      model.provider === "xai" || model.provider === "moonshotai"
-        ? `${model.provider}/${modelId}`
-        : modelId;
-    if (
-      !providesUsableMetadata(catalog[lookupKey]) &&
-      !providesUsableMetadata(extra[lookupKey]) &&
-      !providesUsableMetadata(extra[modelId])
-    ) {
+    const covered = generateModelLookupKeys(model.id).some(
+      (key) => providesUsableMetadata(catalog[key]) || providesUsableMetadata(extra[key])
+    );
+    if (!covered) {
       missing.push(model.id);
     }
   }
   return missing;
 }
 
+export interface ModeCoverage {
+  /** Entries passing getModelStats' usability bar (usable token limits). */
+  usable: number;
+  /** Entries carrying a numeric input cost. */
+  inputPriced: number;
+  /** Entries carrying a numeric output cost. */
+  outputPriced: number;
+}
+
 export interface CatalogSummary {
-  /** Chat/responses entries with usable token limits (what the Treat-as catalog can expose). */
-  usableMappableModels: number;
-  /** Mappable (chat/responses) entries carrying a numeric input cost. */
-  inputPricedModels: number;
-  /** Mappable (chat/responses) entries carrying a numeric output cost. */
-  outputPricedModels: number;
+  totalEntries: number;
+  /** Coverage per mode string, spanning every mode (not just mappable ones). */
+  modes: Record<string, ModeCoverage>;
 }
 
 export function summarizeCatalog(catalog: ModelCatalogData): CatalogSummary {
-  const summary: CatalogSummary = {
-    usableMappableModels: 0,
-    inputPricedModels: 0,
-    outputPricedModels: 0,
-  };
+  const summary: CatalogSummary = { totalEntries: 0, modes: {} };
   for (const metadata of Object.values(catalog)) {
-    if (typeof metadata.mode !== "string" || !MAPPABLE_MODES.has(metadata.mode)) {
-      continue;
-    }
+    summary.totalEntries++;
+    const mode = typeof metadata.mode === "string" ? metadata.mode : "unknown";
+    const coverage = (summary.modes[mode] ??= { usable: 0, inputPriced: 0, outputPriced: 0 });
     // Usability applies getModelStats' bar: entries without usable token limits
     // never resolve, so losing max_input_tokens must register as shrinkage.
     if (hasUsableTokenLimits(metadata)) {
-      summary.usableMappableModels++;
+      coverage.usable++;
     }
-    // Priced coverage spans every mappable mode (getModelStats prices responses
-    // entries identically), and input/output are tracked separately so renaming
-    // just one cost field cannot hide behind the other's coverage.
+    // Input and output pricing are tracked separately per mode so renaming one
+    // cost field, or stripping pricing from a smaller mode like `responses`,
+    // cannot hide behind another field's or a larger mode's coverage.
     if (typeof metadata.input_cost_per_token === "number") {
-      summary.inputPricedModels++;
+      coverage.inputPriced++;
     }
     if (typeof metadata.output_cost_per_token === "number") {
-      summary.outputPricedModels++;
+      coverage.outputPriced++;
     }
   }
   return summary;
 }
 
-const EMPTY_BASELINE: CatalogSummary = {
-  usableMappableModels: 0,
-  inputPricedModels: 0,
-  outputPricedModels: 0,
-};
+const EMPTY_BASELINE: CatalogSummary = { totalEntries: 0, modes: {} };
 
 function belowBaseline(count: number, baseline: number): boolean {
-  return count < Math.ceil(baseline * (1 - MAX_BASELINE_SHRINK_FRACTION));
+  return (
+    baseline >= MIN_BASELINE_FOR_SHRINK_CHECK &&
+    count < Math.ceil(baseline * (1 - MAX_BASELINE_SHRINK_FRACTION))
+  );
 }
 
 /**
@@ -210,25 +208,35 @@ export function validateModelData(
   const errors: string[] = [];
 
   const summary = summarizeCatalog(catalog);
-  if (summary.usableMappableModels < MIN_USABLE_MAPPABLE_MODELS) {
+  const usableMappableModels = [...MAPPABLE_MODES].reduce(
+    (count, mode) => count + (summary.modes[mode]?.usable ?? 0),
+    0
+  );
+  if (usableMappableModels < MIN_USABLE_MAPPABLE_MODELS) {
     errors.push(
-      `only ${summary.usableMappableModels} usable chat/responses models found ` +
+      `only ${usableMappableModels} usable chat/responses models found ` +
         `(expected at least ${MIN_USABLE_MAPPABLE_MODELS})`
     );
   }
+
+  // Costs are optional per entry (subscription providers), so an upstream
+  // pricing-field rename or a wholesale mode omission would sail through the
+  // per-entry checks; comparing every mode's usable and priced coverage against
+  // the vendored baseline (plus the total entry count for modes without usable
+  // limits, like image_generation pricing rows) keeps getModelStats from
+  // silently zero-pricing or dropping whole slices of the catalog.
   const shrinkChecks: Array<[label: string, count: number, baselineCount: number]> = [
-    [
-      "usable chat/responses model count",
-      summary.usableMappableModels,
-      baseline.usableMappableModels,
-    ],
-    // Costs are optional per entry (subscription providers), so an upstream
-    // pricing-field rename would sail through the per-entry checks; catching a
-    // collapse in priced coverage keeps getModelStats from silently zero-pricing
-    // the whole catalog.
-    ["input-priced model count", summary.inputPricedModels, baseline.inputPricedModels],
-    ["output-priced model count", summary.outputPricedModels, baseline.outputPricedModels],
+    ["total entry count", summary.totalEntries, baseline.totalEntries],
   ];
+  const emptyCoverage: ModeCoverage = { usable: 0, inputPriced: 0, outputPriced: 0 };
+  for (const [mode, baselineCoverage] of Object.entries(baseline.modes)) {
+    const coverage = summary.modes[mode] ?? emptyCoverage;
+    shrinkChecks.push(
+      [`${mode} usable model count`, coverage.usable, baselineCoverage.usable],
+      [`${mode} input-priced model count`, coverage.inputPriced, baselineCoverage.inputPriced],
+      [`${mode} output-priced model count`, coverage.outputPriced, baselineCoverage.outputPriced]
+    );
+  }
   for (const [label, count, baselineCount] of shrinkChecks) {
     if (belowBaseline(count, baselineCount)) {
       errors.push(

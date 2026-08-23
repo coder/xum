@@ -78,15 +78,19 @@ describe("findMissingKnownModels", () => {
     );
   });
 
-  test("provider-prefixed lookups satisfy xai models while bare keys do not", () => {
+  test("any runtime-resolvable key form satisfies coverage, unrelated keys do not", () => {
     const grok = Object.values(KNOWN_MODELS).find((model) => model.provider === "xai");
     if (!grok) throw new Error("expected a curated xai model");
 
-    const bareKey = { [grok.providerModelId]: usable };
-    expect(findMissingKnownModels(bareKey, {})).toContain(grok.id);
-
-    const prefixedKey = { [`xai/${grok.providerModelId}`]: usable };
-    expect(findMissingKnownModels(prefixedKey, {})).not.toContain(grok.id);
+    // Coverage mirrors getModelStats' lookup keys: both the provider-prefixed
+    // form LiteLLM uses for xAI and the bare fallback resolve at runtime.
+    expect(findMissingKnownModels({ [`xai/${grok.providerModelId}`]: usable }, {})).not.toContain(
+      grok.id
+    );
+    expect(findMissingKnownModels({ [grok.providerModelId]: usable }, {})).not.toContain(grok.id);
+    expect(
+      findMissingKnownModels({ [`unrelated/${grok.providerModelId}x`]: usable }, {})
+    ).toContain(grok.id);
   });
 
   test("a retained key with unusable token limits still counts as missing", () => {
@@ -136,13 +140,12 @@ describe("validateModelData", () => {
       catalog: { ...chatEntries(600), ...curatedCoverage },
       droppedModelIds: [],
     };
-    const baseline = (usableMappableModels: number) => ({
-      usableMappableModels,
-      inputPricedModels: 600,
-      outputPricedModels: 600,
+    const baseline = (usableChat: number) => ({
+      totalEntries: usableChat,
+      modes: { chat: { usable: usableChat, inputPriced: 600, outputPriced: 600 } },
     });
     expect(() => validateModelData(sanitized, baseline(2000))).toThrow(
-      /usable chat\/responses model count shrank from 2000/
+      /chat usable model count shrank from 2000/
     );
     // A small decrease within the bound is acceptable (e.g. upstream pruning).
     expect(() => validateModelData(sanitized, baseline(650))).not.toThrow();
@@ -166,11 +169,75 @@ describe("validateModelData", () => {
     const sanitized = { catalog: { ...outputless, ...curatedCoverage }, droppedModelIds: [] };
     expect(() =>
       validateModelData(sanitized, {
-        usableMappableModels: 700,
-        inputPricedModels: 680,
-        outputPricedModels: 680,
+        totalEntries: 700,
+        modes: { chat: { usable: 700, inputPriced: 680, outputPriced: 680 } },
       })
-    ).toThrow(/output-priced model count shrank from 680/);
+    ).toThrow(/chat output-priced model count shrank from 680/);
+  });
+
+  test("rejects pricing loss confined to a smaller mode", () => {
+    // Stripping costs from every responses row barely moves aggregate priced
+    // counts, so each mode compares against its own baseline.
+    const pricedChat = Object.fromEntries(
+      Array.from({ length: 700 }, (_, i) => [
+        `provider/chat-${i}`,
+        {
+          mode: "chat",
+          max_input_tokens: 128000,
+          input_cost_per_token: 0.000001,
+          output_cost_per_token: 0.000002,
+        },
+      ])
+    );
+    const unpricedResponses = Object.fromEntries(
+      Array.from({ length: 60 }, (_, i) => [
+        `provider/responses-${i}`,
+        { mode: "responses", max_input_tokens: 128000 },
+      ])
+    );
+    const curatedCoverage = Object.fromEntries(
+      Object.values(KNOWN_MODELS).map((model) => [
+        model.providerModelId,
+        { mode: "chat", max_input_tokens: 200000 },
+      ])
+    );
+    const sanitized = {
+      catalog: { ...pricedChat, ...unpricedResponses, ...curatedCoverage },
+      droppedModelIds: [],
+    };
+    expect(() =>
+      validateModelData(sanitized, {
+        totalEntries: 760,
+        modes: {
+          chat: { usable: 700, inputPriced: 700, outputPriced: 700 },
+          responses: { usable: 60, inputPriced: 59, outputPriced: 59 },
+        },
+      })
+    ).toThrow(/responses input-priced model count shrank from 59 to 0/);
+  });
+
+  test("rejects wholesale omission of a non-mappable mode", () => {
+    // A partial payload that keeps chat/responses but drops image_generation
+    // rows must trip that mode's own usable baseline.
+    const curatedCoverage = Object.fromEntries(
+      Object.values(KNOWN_MODELS).map((model) => [
+        model.providerModelId,
+        { mode: "chat", max_input_tokens: 200000 },
+      ])
+    );
+    const sanitized = {
+      catalog: { ...chatEntries(700), ...curatedCoverage },
+      droppedModelIds: [],
+    };
+    expect(() =>
+      validateModelData(sanitized, {
+        totalEntries: 760,
+        modes: {
+          chat: { usable: 700, inputPriced: 700, outputPriced: 700 },
+          image_generation: { usable: 300, inputPriced: 250, outputPriced: 0 },
+        },
+      })
+    ).toThrow(/image_generation usable model count shrank from 300 to 0/);
   });
 
   test("rejects a catalog-wide loss of token limits even when pricing survives", () => {
@@ -191,14 +258,13 @@ describe("validateModelData", () => {
     const sanitized = { catalog: { ...limitless, ...curatedCoverage }, droppedModelIds: [] };
     expect(() =>
       validateModelData(sanitized, {
-        usableMappableModels: 700,
-        inputPricedModels: 680,
-        outputPricedModels: 680,
+        totalEntries: 700,
+        modes: { chat: { usable: 700, inputPriced: 680, outputPriced: 680 } },
       })
-    ).toThrow(/usable chat\/responses model count shrank from 700/);
+    ).toThrow(/chat usable model count shrank from 700/);
   });
 
-  test("counts responses-mode entries and applies the usability bar", () => {
+  test("summarizes coverage per mode with the usability bar applied", () => {
     expect(
       summarizeCatalog({
         usableChat: {
@@ -216,9 +282,12 @@ describe("validateModelData", () => {
         embedding: { mode: "embedding", max_input_tokens: 8192, input_cost_per_token: 0.0000001 },
       })
     ).toEqual({
-      usableMappableModels: 2,
-      inputPricedModels: 3,
-      outputPricedModels: 1,
+      totalEntries: 4,
+      modes: {
+        chat: { usable: 1, inputPriced: 2, outputPriced: 0 },
+        responses: { usable: 1, inputPriced: 1, outputPriced: 1 },
+        embedding: { usable: 1, inputPriced: 1, outputPriced: 0 },
+      },
     });
   });
 
