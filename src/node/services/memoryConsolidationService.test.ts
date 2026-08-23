@@ -26,6 +26,7 @@ import { HistoryService } from "./historyService";
 import { MemoryService } from "./memoryService";
 import { SessionUsageService } from "./sessionUsageService";
 import { TestTempDir } from "./tools/testHelpers";
+import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
 
 /**
  * Behavior under test: the orchestration rails around the runner —
@@ -341,6 +342,30 @@ async function seedCompactionEpoch(
 }
 
 describe("MemoryConsolidationService", () => {
+  it("teardown blocks follow-on consolidation runs (r61)", async () => {
+    // The one-shot abort loop cannot reach runs registered after it (the
+    // post-harvest sweep, retryable-harvest recovery): entry must refuse
+    // once teardown began, locally or via a foreign backend's durable
+    // removal tombstone.
+    using fixture = await createFixture();
+    await fixture.service.cancelInFlightConsolidation("ws-dream");
+    const followOn = await fixture.service.maybeRun("ws-dream", "manual");
+    expect(followOn.success).toBe(false);
+    if (!followOn.success) expect(followOn.error).toContain("being removed");
+
+    // Durable tombstone alone (removal performed by another backend).
+    await fixture.addWorkspace("ws-foreign");
+    const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-foreign");
+    await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+    await fsPromises.writeFile(
+      tombstonePath,
+      JSON.stringify({ workspaceId: "ws-foreign", removedAt: Date.now() })
+    );
+    const foreign = await fixture.service.maybeRun("ws-foreign", "manual");
+    expect(foreign.success).toBe(false);
+    if (!foreign.success) expect(foreign.error).toContain("being removed");
+  });
+
   it("workspace removal aborts and drains an in-flight consolidation run (r60)", async () => {
     // Removal only ever raced the run's hard timeout before: the drain must
     // abort the stream itself, settle the run, and return promptly so

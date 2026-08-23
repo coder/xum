@@ -15,6 +15,7 @@ import { createConsolidationMemoryTool, type MemoryConsolidationOp } from "./mem
 import { memoryLogicalKey, MemoryMetaService } from "./memoryMeta";
 import { MemoryService, projectMemoryDirName, type MemoryScopeContext } from "./memoryService";
 import { TestTempDir, mockToolCallOptions } from "./tools/testHelpers";
+import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
 
 /**
  * Behavior under test: the consolidation rails (scope restriction, pin
@@ -139,6 +140,53 @@ describe("consolidation memory tool rails", () => {
     // Nothing durable landed: the target survived and no refinement journal
     // row recreated the workspace's session directory.
     expect(await fsPromises.readFile(targetPath, "utf-8")).toContain("must survive");
+    const sessionDir = path.join(fixture.xumHome, "sessions", fixture.ctx.workspaceId);
+    expect(
+      await fsPromises.access(sessionDir).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
+  });
+
+  it("a durable removal tombstone refuses memory mutations at commit (r61)", async () => {
+    // Cross-process teardown: with multiple backends over one Xum root, the
+    // remover cannot abort a foreign backend's dream run — its mutations
+    // must observe the durable tombstone at commit time and refuse, without
+    // any abort signal, so they cannot recreate the deleted session dir.
+    using fixture = await createFixture();
+    const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, fixture.ctx.workspaceId);
+    await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+    await fsPromises.writeFile(
+      tombstonePath,
+      JSON.stringify({ workspaceId: fixture.ctx.workspaceId, removedAt: Date.now() })
+    );
+
+    const created = await fixture.memoryService.create(
+      fixture.ctx,
+      "/memories/global/after-removal.md",
+      "must not land\n",
+      "agent"
+    );
+    expect(created.success).toBe(false);
+    if (!created.success) expect(created.error).toContain("was removed");
+    expect(
+      await fsPromises.access(path.join(fixture.globalMemoryDir, "after-removal.md")).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
+
+    // The harvest inbox path (saveFile) refuses through the same check.
+    const saved = await fixture.memoryService.saveFile(
+      fixture.ctx,
+      "/memories/workspace/harvest/inbox.md",
+      "late inbox\n",
+      null,
+      "agent"
+    );
+    expect(saved.success).toBe(false);
+    // No session directory materialized by either refusal.
     const sessionDir = path.join(fixture.xumHome, "sessions", fixture.ctx.workspaceId);
     expect(
       await fsPromises.access(sessionDir).then(

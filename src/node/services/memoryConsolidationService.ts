@@ -46,6 +46,7 @@ import {
   trackPendingUsageWrite,
 } from "@/node/services/branchSummary";
 import { USAGE_WRITE_DRAIN_WINDOW_MS } from "@/constants/streamDrain";
+import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { getErrorMessage } from "@/common/utils/errors";
 import { Err, Ok } from "@/common/types/result";
@@ -301,6 +302,22 @@ export class MemoryConsolidationService extends EventEmitter {
    */
   private readonly runControllers = new Map<string, Set<AbortController>>();
 
+  /**
+   * Workspaces whose teardown has begun in THIS process (r61). The one-shot
+   * abort loop in cancelInFlightConsolidation cannot reach follow-on runs
+   * registered after it finishes — a cancelled harvest still starts the
+   * post-harvest sweep, and a cancelled run still starts retryable-harvest
+   * recovery, each with a fresh un-aborted signal. Entry points refuse and
+   * new controllers start pre-aborted while a workspace is in this set.
+   * Entries are never cleared: removal is terminal, and if a force=false
+   * removal fails after the drain, losing background consolidation for the
+   * surviving workspace (until restart) matches the documented drained-
+   * producers tradeoff in WorkspaceService.removeWorkspace. Cross-PROCESS
+   * teardown is covered by the durable removal tombstone instead (see
+   * workspaceRemoval.ts), checked at memory mutation commit points.
+   */
+  private readonly removalCancelled = new Set<string>();
+
   /** Coalesces duplicate completion signals for one physical compaction boundary. */
   private readonly harvestInFlight = new Map<
     string,
@@ -442,12 +459,29 @@ export class MemoryConsolidationService extends EventEmitter {
     }
   }
 
+  /**
+   * True once teardown began for this workspace — in this process (local
+   * cancel set) or any other backend over the same Xum root (durable
+   * removal tombstone, r61). Gates every run entry point, including the
+   * follow-on post-harvest sweep and retryable-harvest recovery, which
+   * funnel through maybeRun/maybeHarvestThenSweep.
+   */
+  private async isWorkspaceBeingRemoved(workspaceId: string): Promise<boolean> {
+    if (this.removalCancelled.has(workspaceId)) return true;
+    return isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId);
+  }
+
   /** Register one run's removal controller; disposed when the run settles. */
   private trackRunController(workspaceId: string): {
     controller: AbortController;
     dispose: () => void;
   } {
     const controller = new AbortController();
+    // r61: a run registered after teardown began (follow-on sweep/recovery
+    // racing the entry checks) must start already aborted.
+    if (this.removalCancelled.has(workspaceId)) {
+      controller.abort();
+    }
     const set = this.runControllers.get(workspaceId) ?? new Set<AbortController>();
     set.add(controller);
     this.runControllers.set(workspaceId, set);
@@ -474,6 +508,10 @@ export class MemoryConsolidationService extends EventEmitter {
    * the target mutation lock. Idempotent; no-runs is a fast no-op.
    */
   async cancelInFlightConsolidation(workspaceId: string): Promise<void> {
+    // Mark BEFORE aborting (r61): follow-on runs launched by the aborted
+    // runs' own completion paths (post-harvest sweep, retryable-harvest
+    // recovery) must find the workspace already tearing down.
+    this.removalCancelled.add(workspaceId);
     for (const controller of this.runControllers.get(workspaceId) ?? []) {
       try {
         controller.abort();
@@ -533,6 +571,9 @@ export class MemoryConsolidationService extends EventEmitter {
     options: MemoryConsolidationRunOptions = {}
   ): Promise<Result<MemoryConsolidationRecord, string>> {
     if (!this.enabled()) return Err("memory-consolidation experiment is disabled");
+    if (await this.isWorkspaceBeingRemoved(workspaceId)) {
+      return Err("workspace is being removed; consolidation refused");
+    }
     const active = this.inFlight.get(workspaceId);
     if (active !== undefined) {
       // Archive is the workspace's one-shot final pass (workspace→global
@@ -676,6 +717,9 @@ export class MemoryConsolidationService extends EventEmitter {
     metadata: CompactionCompletionMetadata
   ): Promise<Result<MemoryConsolidationRecord, string>> {
     if (!this.enabled()) return Err("memory-consolidation experiment is disabled");
+    if (await this.isWorkspaceBeingRemoved(metadata.workspaceId)) {
+      return Err("workspace is being removed; harvest refused");
+    }
 
     const boundaryRunKey = `${metadata.workspaceId}:${metadata.summaryMessageId}`;
     const active = this.harvestInFlight.get(boundaryRunKey);

@@ -99,6 +99,7 @@ import {
   deriveSideChannelModelCandidates,
   startAbandonedBranchSummaryInBackground,
 } from "@/node/services/branchSummary";
+import { removeSessionDirUnderMemoryLocks } from "@/node/services/workspaceRemoval";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
   ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME,
@@ -5510,7 +5511,19 @@ export class WorkspaceService extends EventEmitter {
           }
         }
 
-        await fsPromises.rm(sessionDir, { recursive: true, force: true });
+        // r61: serialized with the memory target mutation locks and preceded
+        // by a durable removal tombstone (see workspaceRemoval.ts) — a memory
+        // write stalled inside its commit either lands before this deletion
+        // (and is deleted with the directory) or observes the tombstone under
+        // its own lock and refuses, so a late write can never recreate the
+        // directory. Fail-closed on a wedged writer: the catch below keeps
+        // the directory as a recoverable orphan instead of deleting it out
+        // from under a live commit.
+        await removeSessionDirUnderMemoryLocks({
+          rootDir: this.config.rootDir,
+          sessionDir,
+          workspaceId,
+        });
       } catch (error) {
         log.error(`Failed to remove session directory for ${workspaceId}:`, error);
       }

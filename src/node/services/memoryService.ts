@@ -56,6 +56,7 @@ import {
   type RefinementFileCapture,
   type RefinementInverseDraft,
 } from "@/node/services/refinement/refinementJournal";
+import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
 import {
   escapeXmlAttribute,
   selectHotMemories,
@@ -711,6 +712,20 @@ export class MemoryService extends EventEmitter {
   ): Promise<MemoryStore> {
     const store = this.getStore(ctx, scope);
     if (opts?.createRoot) {
+      // r61: refuse to MATERIALIZE roots for a removed workspace before the
+      // mkdir — the workspace store root lives inside the session directory,
+      // so ensureRoot would recreate it even though the in-lock commit check
+      // later refuses the write. Advisory here (the mkdir races removal's rm
+      // at worst into an empty dir); the in-lock assertMutationCommittable
+      // remains the authoritative data/journal gate.
+      if (
+        ctx.workspaceId !== "" &&
+        (await isWorkspaceRemovalTombstoned(this.config.rootDir, ctx.workspaceId))
+      ) {
+        throw new MemoryCommandError(
+          `Workspace ${ctx.workspaceId} was removed; refusing to create memory scope roots`
+        );
+      }
       await store.ensureRoot();
     } else {
       await store.assertRootSafe();
@@ -976,7 +991,7 @@ export class MemoryService extends EventEmitter {
             `The ${scope} memory scope is full (${MEMORY_MAX_FILES_PER_SCOPE} files); delete unused files first`
           );
         }
-        throwIfMutationCancelled(abortSignal, virtualPath);
+        await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, fileText);
         // Row is written before the create is acknowledged (mutation → row → ack).
         await this.journalRefinement(
@@ -1017,7 +1032,7 @@ export class MemoryService extends EventEmitter {
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
         const updated = computeStrReplaceUpdate(content, oldStr, newStr, virtualPath);
         assertWithinFileSizeCap(updated);
-        throwIfMutationCancelled(abortSignal, virtualPath);
+        await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
         await this.journalRefinement(
@@ -1070,7 +1085,7 @@ export class MemoryService extends EventEmitter {
         const content = await this.readTextFileForEdit(store, parsed.relPath, virtualPath);
         const { updated, insertedLineCount } = computeInsertUpdate(content, insertLine, insertText);
         assertWithinFileSizeCap(updated);
-        throwIfMutationCancelled(abortSignal, virtualPath);
+        await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
         await store.writeFile(parsed.relPath, updated);
         // Row is written before the edit is acknowledged (mutation → row → ack).
         await this.journalRefinement(
@@ -1253,7 +1268,7 @@ export class MemoryService extends EventEmitter {
         // Prior contents must be captured before removal; the row itself is
         // written after the mutation succeeds and before it is acknowledged.
         const inverse = await this.captureDeleteInverse(store, parsed.relPath, kind);
-        throwIfMutationCancelled(abortSignal, virtualPath);
+        await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
         await store.remove(parsed.relPath);
         if (inverse !== null) {
           await this.journalRefinement(
@@ -1315,7 +1330,7 @@ export class MemoryService extends EventEmitter {
         if (newKind !== null) {
           throw new MemoryCommandError(`Destination ${newVirtualPath} already exists`);
         }
-        throwIfMutationCancelled(abortSignal, oldVirtualPath);
+        await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, oldVirtualPath);
         await store.rename(oldParsed.relPath, newParsed.relPath);
         // Row is written before the rename is acknowledged (mutation → row → ack).
         await this.journalRefinement(
@@ -1463,7 +1478,7 @@ export class MemoryService extends EventEmitter {
               );
             }
           }
-          throwIfMutationCancelled(abortSignal, virtualPath);
+          await assertMutationCommittable(this.config.rootDir, ctx, abortSignal, virtualPath);
           await store.writeFile(parsed.relPath, content);
           await this.recordUsage(ctx, scope, parsed.relPath, { write: true });
           this.emitChange(ctx, scope, parsed.relPath, actor);
@@ -1637,20 +1652,39 @@ function sha256Hex(content: string): string {
 }
 
 /**
- * Refuse to COMMIT a mutation whose caller was cancelled mid-flight (r59).
- * Consolidation/refine passes receive no hard tool cancellation — an
- * execution wedged in pre-commit I/O (e.g. a named pipe under a memory root)
- * is detached by the caller's bounded drain, and once the I/O unblocks after
- * workspace teardown it would still write durable memory AND append its
- * refinement journal row into the deleted session directory, recreating it.
- * Checked INSIDE the target mutation lock immediately before the first
- * durable write; a mutation that already committed always journals
- * (mutation → row → ack) so rollback lineage stays intact.
+ * Refuse to COMMIT a mutation whose caller was torn down (r59/r61). Checked
+ * INSIDE the target mutation lock immediately before the first durable
+ * write; a mutation that already committed always journals (mutation → row
+ * → ack) so rollback lineage stays intact. Two teardown signals:
+ *
+ * - The caller's abort signal (r59): consolidation/refine passes receive no
+ *   hard tool cancellation — an execution wedged in pre-commit I/O (e.g. a
+ *   named pipe under a memory root) is detached by the caller's bounded
+ *   drain, and once the I/O unblocks after workspace teardown it would
+ *   still write durable memory AND append its refinement journal row into
+ *   the deleted session directory, recreating it.
+ * - The durable removal tombstone (r61): with multiple backends over one
+ *   Xum root, the remover cannot abort a dream/harvest run in ANOTHER
+ *   process — that run's signal stays live after removal. The tombstone is
+ *   published under the same memory target locks this check runs inside
+ *   (see workspaceRemoval.ts), so a foreign backend's mutation observes
+ *   removal here at commit time and refuses instead of recreating the
+ *   deleted session directory via its write or journal append.
  */
-function throwIfMutationCancelled(signal: AbortSignal | undefined, virtualPath: string): void {
+async function assertMutationCommittable(
+  rootDir: string,
+  ctx: MemoryScopeContext,
+  signal: AbortSignal | undefined,
+  virtualPath: string
+): Promise<void> {
   if (signal?.aborted === true) {
     throw new MemoryCommandError(
       `Mutation of ${virtualPath} was cancelled before commit (caller torn down)`
+    );
+  }
+  if (ctx.workspaceId !== "" && (await isWorkspaceRemovalTombstoned(rootDir, ctx.workspaceId))) {
+    throw new MemoryCommandError(
+      `Workspace ${ctx.workspaceId} was removed; refusing to commit the mutation of ${virtualPath}`
     );
   }
 }
