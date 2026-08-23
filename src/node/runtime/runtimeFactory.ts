@@ -265,7 +265,9 @@ export async function checkRuntimeAvailability(
   ]);
 
   const devcontainerConfigInfo = buildDevcontainerConfigInfo(devcontainerConfigs);
-  const dockerAvailable =
+  // The devcontainer CLI shells out to the literal `docker` binary, so Dev
+  // Containers work only when the detected engine actually is docker.
+  const engineIsDocker =
     containerEngine.available &&
     path
       .basename(containerEngine.cli)
@@ -283,10 +285,14 @@ export async function checkRuntimeAvailability(
       available: false,
       reason: "Dev Container CLI not installed. Run: npm install -g @devcontainers/cli",
     };
-  } else if (!dockerAvailable) {
+  } else if (!engineIsDocker) {
     devcontainerAvailability = {
       available: false,
-      reason: "Dev Containers require Docker; Docker daemon not running",
+      // Distinguish "another engine is in use" from "docker is down" so users
+      // running podman are not told a running daemon is stopped.
+      reason: containerEngine.available
+        ? `Dev Containers require Docker (current container engine: ${path.basename(containerEngine.cli)})`
+        : "Dev Containers require Docker; Docker daemon not running",
     };
   } else if (devcontainerConfigInfo.length === 0) {
     devcontainerAvailability = { available: false, reason: "No devcontainer.json found" };

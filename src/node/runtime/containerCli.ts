@@ -65,6 +65,8 @@ export async function resolveContainerCli(
   probe: ContainerEngineProbe = isEngineResponsive
 ): Promise<string> {
   const override = getContainerCliOverride();
+  // Deliberately unprobed: the override is an explicit user choice, so failures
+  // should surface from the real commands instead of being masked by a probe.
   if (override) return override;
   if (cachedContainerCli) return cachedContainerCli;
 
