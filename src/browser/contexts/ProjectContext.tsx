@@ -572,20 +572,6 @@ export function ProjectProvider(props: { children: ReactNode }) {
     [api, refreshProjects]
   );
 
-  const updateCodeWorkspaceSyncPath = useCallback(
-    async (projectPath: string, codeWorkspaceSyncPath: string | null): Promise<Result<void>> => {
-      if (!api) return { success: false, error: "API not connected" };
-      try {
-        await api.projects.setCodeWorkspaceSyncPath({ projectPath, codeWorkspaceSyncPath });
-        await refreshProjects();
-        return { success: true, data: undefined };
-      } catch (error) {
-        return { success: false, error: getErrorMessage(error) };
-      }
-    },
-    [api, refreshProjects]
-  );
-
   const assignWorkspaceToSubProject = useCallback(
     async (
       projectPath: string,
@@ -639,7 +625,21 @@ export function ProjectProvider(props: { children: ReactNode }) {
       updateDisplayName,
       updateColor,
       updateCustomInstructions,
-      updateCodeWorkspaceSyncPath,
+      // Defined inline (not useCallback): the repo bans new manual useCallback
+      // memoization, and inlining keeps exhaustive-deps satisfied via `api`.
+      updateCodeWorkspaceSyncPath: async (
+        projectPath: string,
+        codeWorkspaceSyncPath: string | null
+      ): Promise<Result<void>> => {
+        if (!api) return { success: false, error: "API not connected" };
+        try {
+          await api.projects.setCodeWorkspaceSyncPath({ projectPath, codeWorkspaceSyncPath });
+          await refreshProjects();
+          return { success: true, data: undefined };
+        } catch (error) {
+          return { success: false, error: getErrorMessage(error) };
+        }
+      },
       assignWorkspaceToSubProject,
     }),
     [
@@ -666,7 +666,7 @@ export function ProjectProvider(props: { children: ReactNode }) {
       updateDisplayName,
       updateColor,
       updateCustomInstructions,
-      updateCodeWorkspaceSyncPath,
+      api,
       assignWorkspaceToSubProject,
     ]
   );

@@ -39,7 +39,7 @@ describe("updateCodeWorkspaceFile", () => {
     const worktree = path.join(managedRootDir, "feature-a");
     await updateCodeWorkspaceFile({
       codeWorkspacePath: workspaceFilePath,
-      managedRootDir,
+      managedRootDirs: [managedRootDir],
       desiredPaths: [worktree],
       seedFolders: [path.join(tempDir, "project"), worktree],
     });
@@ -58,7 +58,7 @@ describe("updateCodeWorkspaceFile", () => {
 
     await updateCodeWorkspaceFile({
       codeWorkspacePath: workspaceFilePath,
-      managedRootDir,
+      managedRootDirs: [managedRootDir],
       desiredPaths: [existing, added],
       seedFolders: [],
     });
@@ -77,7 +77,7 @@ describe("updateCodeWorkspaceFile", () => {
 
     await updateCodeWorkspaceFile({
       codeWorkspacePath: workspaceFilePath,
-      managedRootDir,
+      managedRootDirs: [managedRootDir],
       desiredPaths: [kept],
       seedFolders: [],
     });
@@ -98,7 +98,7 @@ describe("updateCodeWorkspaceFile", () => {
 
     await updateCodeWorkspaceFile({
       codeWorkspacePath: workspaceFilePath,
-      managedRootDir,
+      managedRootDirs: [managedRootDir],
       desiredPaths: [],
       seedFolders: [],
     });
@@ -128,7 +128,7 @@ describe("updateCodeWorkspaceFile", () => {
 
     await updateCodeWorkspaceFile({
       codeWorkspacePath: workspaceFilePath,
-      managedRootDir,
+      managedRootDirs: [managedRootDir],
       desiredPaths: [kept, added],
       seedFolders: [],
     });
@@ -149,7 +149,7 @@ describe("updateCodeWorkspaceFile", () => {
 
     await updateCodeWorkspaceFile({
       codeWorkspacePath: workspaceFilePath,
-      managedRootDir,
+      managedRootDirs: [managedRootDir],
       desiredPaths: [worktree],
       seedFolders: [],
     });
@@ -163,7 +163,7 @@ describe("updateCodeWorkspaceFile", () => {
 
     await updateCodeWorkspaceFile({
       codeWorkspacePath: workspaceFilePath,
-      managedRootDir,
+      managedRootDirs: [managedRootDir],
       desiredPaths: [path.join(managedRootDir, "feature-a")],
       seedFolders: [],
     });
@@ -175,7 +175,7 @@ describe("updateCodeWorkspaceFile", () => {
     const worktree = path.join(managedRootDir, "feature-a");
     const update = {
       codeWorkspacePath: workspaceFilePath,
-      managedRootDir,
+      managedRootDirs: [managedRootDir],
       desiredPaths: [worktree],
       seedFolders: [worktree],
     };
@@ -202,12 +202,60 @@ describe("updateCodeWorkspaceFile", () => {
     // other project's entry.
     await updateCodeWorkspaceFile({
       codeWorkspacePath: workspaceFilePath,
-      managedRootDir,
+      managedRootDirs: [managedRootDir],
       desiredPaths: [],
       seedFolders: [],
     });
 
     expect(parseFolders(await readWorkspaceFile())).toEqual([{ path: theirs }]);
+  });
+
+  test("writes through a symlinked workspace file without replacing the link", async () => {
+    const worktree = path.join(managedRootDir, "feature-a");
+    const realFile = path.join(tempDir, "shared-config", "real.code-workspace");
+    await fsPromises.mkdir(path.dirname(realFile), { recursive: true });
+    await fsPromises.writeFile(realFile, JSON.stringify({ folders: [] }));
+    const linkPath = path.join(tempDir, "linked.code-workspace");
+    await fsPromises.symlink(realFile, linkPath);
+
+    await updateCodeWorkspaceFile({
+      codeWorkspacePath: linkPath,
+      managedRootDirs: [managedRootDir],
+      desiredPaths: [worktree],
+      seedFolders: [],
+    });
+
+    expect((await fsPromises.lstat(linkPath)).isSymbolicLink()).toBe(true);
+    expect(parseFolders(await fsPromises.readFile(realFile, "utf-8"))).toEqual([
+      { path: worktree },
+    ]);
+  });
+
+  test("serializes concurrent updates to the same file", async () => {
+    await fsPromises.writeFile(workspaceFilePath, JSON.stringify({ folders: [] }));
+    const otherRoot = path.join(tempDir, "src", "other-project");
+    const mine = path.join(managedRootDir, "feature-a");
+    const theirs = path.join(otherRoot, "feature-x");
+
+    // Two projects sharing one file sync concurrently; without per-file
+    // serialization one write clobbers the other's addition.
+    await Promise.all([
+      updateCodeWorkspaceFile({
+        codeWorkspacePath: workspaceFilePath,
+        managedRootDirs: [managedRootDir],
+        desiredPaths: [mine],
+        seedFolders: [],
+      }),
+      updateCodeWorkspaceFile({
+        codeWorkspacePath: workspaceFilePath,
+        managedRootDirs: [otherRoot],
+        desiredPaths: [theirs],
+        seedFolders: [],
+      }),
+    ]);
+
+    const folders = parseFolders(await readWorkspaceFile());
+    expect(folders.map((entry) => entry.path).sort()).toEqual([mine, theirs].sort());
   });
 
   test("resolves relative folder entries against the file's directory", async () => {
@@ -221,7 +269,7 @@ describe("updateCodeWorkspaceFile", () => {
 
     await updateCodeWorkspaceFile({
       codeWorkspacePath: workspaceFilePath,
-      managedRootDir,
+      managedRootDirs: [managedRootDir],
       desiredPaths: [path.join(managedRootDir, "feature-a")],
       seedFolders: [],
     });
@@ -229,7 +277,7 @@ describe("updateCodeWorkspaceFile", () => {
 
     await updateCodeWorkspaceFile({
       codeWorkspacePath: workspaceFilePath,
-      managedRootDir,
+      managedRootDirs: [managedRootDir],
       desiredPaths: [],
       seedFolders: [],
     });
@@ -309,22 +357,26 @@ describe("computeManagedWorktreePaths", () => {
   }
 
   const managedRoot = "/base/src/my-project";
+  const computeParams = {
+    projectPath,
+    projectName: "my-project",
+    defaultManagedRootDir: managedRoot,
+  };
 
   test("includes active worktree workspaces and sorts deduped paths", () => {
-    const paths = computeManagedWorktreePaths({
+    const { desiredPaths } = computeManagedWorktreePaths({
       allMetadata: [
         makeMetadata({ name: "b", namedWorkspacePath: `${managedRoot}/b` }),
         makeMetadata({ name: "a", namedWorkspacePath: `${managedRoot}/a` }),
         makeMetadata({ name: "a-dup", namedWorkspacePath: `${managedRoot}/a` }),
       ],
-      projectPath,
-      managedRootDir: managedRoot,
+      ...computeParams,
     });
-    expect(paths).toEqual([`${managedRoot}/a`, `${managedRoot}/b`]);
+    expect(desiredPaths).toEqual([`${managedRoot}/a`, `${managedRoot}/b`]);
   });
 
   test("excludes archived, sub-agent, isolation-none, other-project, and out-of-root workspaces", () => {
-    const paths = computeManagedWorktreePaths({
+    const { desiredPaths } = computeManagedWorktreePaths({
       allMetadata: [
         makeMetadata({ archivedAt: "2026-01-02T00:00:00Z" }),
         makeMetadata({ parentWorkspaceId: "parent1234" }),
@@ -333,41 +385,68 @@ describe("computeManagedWorktreePaths", () => {
         makeMetadata({ namedWorkspacePath: "/elsewhere/feature-a" }),
         makeMetadata({ runtimeConfig: { type: "local" } }),
       ],
-      projectPath,
-      managedRootDir: managedRoot,
+      ...computeParams,
     });
-    expect(paths).toEqual([]);
+    expect(desiredPaths).toEqual([]);
   });
 
   test("re-includes unarchived workspaces", () => {
-    const paths = computeManagedWorktreePaths({
+    const { desiredPaths } = computeManagedWorktreePaths({
       allMetadata: [
         makeMetadata({
           archivedAt: "2026-01-01T00:00:00Z",
           unarchivedAt: "2026-01-02T00:00:00Z",
         }),
       ],
-      projectPath,
-      managedRootDir: managedRoot,
+      ...computeParams,
     });
-    expect(paths).toEqual([`${managedRoot}/feature-a`]);
+    expect(desiredPaths).toEqual([`${managedRoot}/feature-a`]);
   });
 
-  test("derives secondary checkout paths for multi-project workspaces", () => {
-    const paths = computeManagedWorktreePaths({
+  test("keeps worktrees under a custom or legacy srcBaseDir managed", () => {
+    // Legacy "local"-with-srcBaseDir runtime rooted somewhere other than the
+    // current global srcDir (e.g. a pre-rename ~/.mux/src) must still sync.
+    const { desiredPaths, managedRootDirs } = computeManagedWorktreePaths({
+      allMetadata: [
+        makeMetadata({
+          namedWorkspacePath: "/legacy/src/my-project/feature-a",
+          runtimeConfig: { type: "local", srcBaseDir: "/legacy/src" },
+        }),
+      ],
+      ...computeParams,
+    });
+    expect(desiredPaths).toEqual(["/legacy/src/my-project/feature-a"]);
+    expect(managedRootDirs).toEqual(["/base/src/my-project", "/legacy/src/my-project"]);
+  });
+
+  test("derives per-project checkout paths for multi-project workspaces", () => {
+    const multiProjects = [
+      { projectPath: "/home/user/projects/primary", projectName: "primary" },
+      { projectPath, projectName: "my-project" },
+    ];
+    // namedWorkspacePath for multi-project workspaces is the _workspaces/<name>
+    // symlink container, never a real checkout, for primary and secondary alike.
+    const asSecondary = computeManagedWorktreePaths({
       allMetadata: [
         makeMetadata({
           projectPath: "/home/user/projects/primary",
-          namedWorkspacePath: "/base/src/primary/feature-a",
-          projects: [
-            { projectPath: "/home/user/projects/primary", projectName: "primary" },
-            { projectPath, projectName: "my-project" },
-          ],
+          namedWorkspacePath: "/base/src/_workspaces/feature-a",
+          projects: multiProjects,
         }),
       ],
-      projectPath,
-      managedRootDir: managedRoot,
+      ...computeParams,
     });
-    expect(paths).toEqual([`${managedRoot}/feature-a`]);
+    expect(asSecondary.desiredPaths).toEqual([`${managedRoot}/feature-a`]);
+
+    const asPrimary = computeManagedWorktreePaths({
+      allMetadata: [
+        makeMetadata({
+          namedWorkspacePath: "/base/src/_workspaces/feature-a",
+          projects: multiProjects,
+        }),
+      ],
+      ...computeParams,
+    });
+    expect(asPrimary.desiredPaths).toEqual([`${managedRoot}/feature-a`]);
   });
 });

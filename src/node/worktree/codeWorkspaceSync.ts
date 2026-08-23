@@ -3,6 +3,7 @@ import * as path from "path";
 import * as jsonc from "jsonc-parser";
 import writeFileAtomic from "write-file-atomic";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { isMultiProject } from "@/common/utils/multiProject";
 import { isWorktreeRuntime } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { Config } from "@/node/config";
@@ -30,6 +31,46 @@ const MODIFY_OPTIONS: jsonc.ModificationOptions = {
   formattingOptions: { insertSpaces: false, tabSize: 4, eol: "\n" },
 };
 
+// Serialize read-modify-write per canonical file path: two projects may share
+// one .code-workspace file, and concurrent lifecycle syncs would otherwise
+// lose updates (the later write wins over a stale read).
+const fileWriteQueues = new Map<string, Promise<void>>();
+
+async function withFileWriteLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = fileWriteQueues.get(key) ?? Promise.resolve();
+  const run = prev.then(fn);
+  const tail: Promise<void> = run
+    .then(
+      () => undefined,
+      () => undefined
+    )
+    .then(() => {
+      if (fileWriteQueues.get(key) === tail) {
+        fileWriteQueues.delete(key);
+      }
+    });
+  fileWriteQueues.set(key, tail);
+  return run;
+}
+
+// write-file-atomic renames a temp file over the target, which would replace a
+// symlink rather than write through it; resolve the real target first so user
+// symlinks to shared editor config survive syncs.
+async function resolveRealPath(filePath: string): Promise<string> {
+  try {
+    return await fsPromises.realpath(filePath);
+  } catch {
+    // File may not exist yet; resolve the parent so directory symlinks are
+    // still honored, keeping the configured basename.
+    try {
+      const realDir = await fsPromises.realpath(path.dirname(filePath));
+      return path.join(realDir, path.basename(filePath));
+    } catch {
+      return filePath;
+    }
+  }
+}
+
 function readFolders(text: string): unknown[] | undefined {
   const parsed = jsonc.parse(text, undefined, { allowTrailingComma: true }) as
     | { folders?: unknown }
@@ -54,12 +95,16 @@ function getEntryPath(entry: unknown, workspaceFileDir: string): string | null {
 export interface CodeWorkspaceFileUpdate {
   /** Absolute path of the .code-workspace file. */
   codeWorkspacePath: string;
-  /** Absolute directory; only folder entries under it are managed by xum. */
-  managedRootDir: string;
+  /** Absolute directories; only folder entries under one of them are managed by xum. */
+  managedRootDirs: string[];
   /** Absolute worktree paths that should be present as folder entries. */
   desiredPaths: string[];
   /** Folder paths written when the file does not exist yet. */
   seedFolders: string[];
+}
+
+function isUnderAnyRoot(managedRootDirs: string[], candidate: string): boolean {
+  return managedRootDirs.some((rootDir) => isPathInsideDir(rootDir, candidate));
 }
 
 /**
@@ -68,12 +113,22 @@ export interface CodeWorkspaceFileUpdate {
  * Uses jsonc-parser edits so user comments and unknown keys survive.
  */
 export async function updateCodeWorkspaceFile(update: CodeWorkspaceFileUpdate): Promise<void> {
-  const { codeWorkspacePath, managedRootDir, desiredPaths } = update;
+  const targetPath = await resolveRealPath(update.codeWorkspacePath);
+  await withFileWriteLock(targetPath, () => updateCodeWorkspaceFileLocked(targetPath, update));
+}
+
+async function updateCodeWorkspaceFileLocked(
+  targetPath: string,
+  update: CodeWorkspaceFileUpdate
+): Promise<void> {
+  const { codeWorkspacePath, managedRootDirs, desiredPaths } = update;
+  // Relative folder entries resolve against the configured file location,
+  // matching how VS Code resolves them for the file the user opens.
   const fileDir = path.dirname(codeWorkspacePath);
 
   let original: string | null;
   try {
-    original = await fsPromises.readFile(codeWorkspacePath, "utf-8");
+    original = await fsPromises.readFile(targetPath, "utf-8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
       throw error;
@@ -83,8 +138,8 @@ export async function updateCodeWorkspaceFile(update: CodeWorkspaceFileUpdate): 
 
   if (original === null) {
     const fresh = { folders: update.seedFolders.map((folderPath) => ({ path: folderPath })) };
-    await fsPromises.mkdir(fileDir, { recursive: true });
-    await writeFileAtomic(codeWorkspacePath, JSON.stringify(fresh, null, "\t") + "\n");
+    await fsPromises.mkdir(path.dirname(targetPath), { recursive: true });
+    await writeFileAtomic(targetPath, JSON.stringify(fresh, null, "\t") + "\n");
     return;
   }
 
@@ -100,6 +155,7 @@ export async function updateCodeWorkspaceFile(update: CodeWorkspaceFileUpdate): 
     log.warn("Skipping .code-workspace sync: file is not valid JSONC", { codeWorkspacePath });
     return;
   }
+
   const existingFolders = (parsed as { folders?: unknown }).folders;
   if (existingFolders !== undefined && !Array.isArray(existingFolders)) {
     log.warn("Skipping .code-workspace sync: 'folders' is not an array", { codeWorkspacePath });
@@ -120,7 +176,7 @@ export async function updateCodeWorkspaceFile(update: CodeWorkspaceFileUpdate): 
     const removeIndex = folders.findIndex((entry) => {
       const entryPath = getEntryPath(entry, fileDir);
       return (
-        entryPath !== null && isPathInsideDir(managedRootDir, entryPath) && !desired.has(entryPath)
+        entryPath !== null && isUnderAnyRoot(managedRootDirs, entryPath) && !desired.has(entryPath)
       );
     });
     if (removeIndex < 0) {
@@ -156,21 +212,47 @@ export async function updateCodeWorkspaceFile(update: CodeWorkspaceFileUpdate): 
   }
 
   if (text !== original) {
-    await writeFileAtomic(codeWorkspacePath, text);
+    await writeFileAtomic(targetPath, text);
   }
 }
 
+function belongsToProject(metadata: FrontendWorkspaceMetadata, projectPath: string): boolean {
+  return (
+    stripTrailingSlashes(metadata.projectPath) === projectPath ||
+    (metadata.projects?.some((ref) => stripTrailingSlashes(ref.projectPath) === projectPath) ??
+      false)
+  );
+}
+
 /**
- * Compute the worktree paths that belong in a project's .code-workspace file:
- * active (non-archived) top-level worktree workspaces under the managed root.
+ * Compute the worktree paths that belong in a project's .code-workspace file
+ * (active, top-level worktree workspaces) plus the managed root directories
+ * that scope which existing entries xum may remove.
  */
 export function computeManagedWorktreePaths(params: {
   allMetadata: FrontendWorkspaceMetadata[];
   /** Normalized (no trailing slash) project path. */
   projectPath: string;
-  managedRootDir: string;
-}): string[] {
-  const { allMetadata, projectPath, managedRootDir } = params;
+  projectName: string;
+  defaultManagedRootDir: string;
+}): { desiredPaths: string[]; managedRootDirs: string[] } {
+  const { allMetadata, projectPath, projectName, defaultManagedRootDir } = params;
+
+  // Managed roots come from every persisted worktree workspace of the project
+  // (any lifecycle state), not just the current global srcDir: worktrees
+  // created under a custom or legacy srcBaseDir (e.g. pre-rename ~/.mux/src)
+  // must stay managed after upgrades. Residual: an entry under a custom root
+  // whose last workspace was deleted is no longer classified as managed and
+  // can linger until removed by hand.
+  const roots = new Set<string>([path.resolve(defaultManagedRootDir)]);
+  for (const metadata of allMetadata) {
+    if (!belongsToProject(metadata, projectPath) || !isWorktreeRuntime(metadata.runtimeConfig)) {
+      continue;
+    }
+    roots.add(path.resolve(path.join(expandTilde(metadata.runtimeConfig.srcBaseDir), projectName)));
+  }
+  const managedRootDirs = [...roots].sort();
+
   const desired = new Set<string>();
   for (const metadata of allMetadata) {
     if (!isWorktreeRuntime(metadata.runtimeConfig)) {
@@ -188,29 +270,33 @@ export function computeManagedWorktreePaths(params: {
     if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) {
       continue;
     }
-
-    let worktreePath: string | null = null;
-    if (stripTrailingSlashes(metadata.projectPath) === projectPath) {
-      worktreePath = metadata.namedWorkspacePath;
-    } else if (
-      metadata.projects?.some((ref) => stripTrailingSlashes(ref.projectPath) === projectPath)
-    ) {
-      // Multi-project workspaces persist only the primary checkout path; each
-      // secondary checkout lives at <srcBaseDir>/<projectName>/<workspaceName>
-      // (createMultiProject passes directoryName: workspaceName).
-      worktreePath = path.join(managedRootDir, metadata.name);
-    }
-    if (!worktreePath) {
+    if (!belongsToProject(metadata, projectPath)) {
       continue;
     }
+
+    let worktreePath: string;
+    if (isMultiProject(metadata)) {
+      // Multi-project workspaces persist the _workspaces/<name> symlink
+      // container as namedWorkspacePath; the real per-project checkout lives
+      // at <srcBaseDir>/<projectName>/<workspaceName> for the primary and
+      // secondary projects alike (createMultiProject passes
+      // directoryName: workspaceName).
+      worktreePath = path.join(
+        expandTilde(metadata.runtimeConfig.srcBaseDir),
+        projectName,
+        metadata.name
+      );
+    } else {
+      worktreePath = metadata.namedWorkspacePath;
+    }
     const resolved = path.resolve(worktreePath);
-    // Only paths under the managed root are synced; anything else is user-owned.
-    if (!isPathInsideDir(managedRootDir, resolved)) {
+    // Only paths under a managed root are synced; anything else is user-owned.
+    if (!isUnderAnyRoot(managedRootDirs, resolved)) {
       continue;
     }
     desired.add(resolved);
   }
-  return [...desired].sort();
+  return { desiredPaths: [...desired].sort(), managedRootDirs };
 }
 
 /**
@@ -238,18 +324,16 @@ export async function syncProjectCodeWorkspace(config: Config, projectPath: stri
       return;
     }
 
-    const managedRootDir = path.join(
-      expandTilde(config.srcDir),
-      getProjectName(normalizedProjectPath)
-    );
-    const desiredPaths = computeManagedWorktreePaths({
+    const projectName = getProjectName(normalizedProjectPath);
+    const { desiredPaths, managedRootDirs } = computeManagedWorktreePaths({
       allMetadata: await config.getAllWorkspaceMetadata(),
       projectPath: normalizedProjectPath,
-      managedRootDir,
+      projectName,
+      defaultManagedRootDir: path.join(expandTilde(config.srcDir), projectName),
     });
     await updateCodeWorkspaceFile({
       codeWorkspacePath,
-      managedRootDir,
+      managedRootDirs,
       desiredPaths,
       seedFolders: [normalizedProjectPath, ...desiredPaths],
     });

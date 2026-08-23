@@ -322,6 +322,9 @@ const MAX_WORKSPACE_NAME_COLLISION_RETRIES = 3;
  */
 const ORPHAN_SESSION_DIR_GRACE_MS = 24 * 60 * 60 * 1000;
 
+// Upper bound on startup .code-workspace reconciliation (see initialize()).
+const STARTUP_CODE_WORKSPACE_SYNC_TIMEOUT_MS = 10_000;
+
 /**
  * Base name used when /new auto-generates a branch name. Numbered suffixes
  * (`workspace-1`, `workspace-2`, ...) come from {@link generateForkBranchName}
@@ -3180,12 +3183,21 @@ export class WorkspaceService extends EventEmitter {
       }
 
       // Repair .code-workspace drift from lifecycle changes that happened while
-      // the app was not running (best-effort; syncProjectCodeWorkspace never throws).
-      for (const [projectPath, projectConfig] of this.config.loadConfigOrDefault().projects) {
-        if (projectConfig.codeWorkspaceSyncPath?.trim()) {
-          await syncProjectCodeWorkspace(this.config, projectPath);
+      // the app was not running. Bounded: a stalled filesystem (e.g. an
+      // unreachable network mount holding a configured file) must never block
+      // startup. Past the deadline the loop keeps running in the background;
+      // syncProjectCodeWorkspace never throws, so the orphaned promise cannot
+      // reject unhandled.
+      const codeWorkspaceSyncAll = (async () => {
+        for (const [projectPath, projectConfig] of this.config.loadConfigOrDefault().projects) {
+          if (projectConfig.codeWorkspaceSyncPath?.trim()) {
+            await syncProjectCodeWorkspace(this.config, projectPath);
+          }
         }
-      }
+      })();
+      await raceWithAbortAndTimeout(codeWorkspaceSyncAll, {
+        timeoutMs: STARTUP_CODE_WORKSPACE_SYNC_TIMEOUT_MS,
+      });
 
       log.info("[startup] WorkspaceService.initialize completed", {
         totalMs: Date.now() - startupStartedAt,
