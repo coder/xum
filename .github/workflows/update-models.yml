@@ -79,14 +79,23 @@ jobs:
           git config user.email "264182336+mux-bot[bot]@users.noreply.github.com"
           git checkout -B bot/update-models
           git add src/common/utils/tokens/models.json
-          git commit -m "🤖 chore: refresh models.json from LiteLLM"
+          # Attribution footer per .xum/skills/pull-requests: automation
+          # commits use the workflow marker instead of model/thinking/cost.
+          footer="---
+
+          _Automated by the \`update-models\` workflow (GitHub Actions)._
+
+          <!-- xum-attribution: workflow=update-models -->"
+          git commit -m "🤖 chore: refresh models.json from LiteLLM" -m "$footer"
           git push --force origin bot/update-models
 
           open_prs=$(gh pr list --head bot/update-models --state open --json number --jq length)
           if [ "$open_prs" = "0" ]; then
             gh pr create \
               --title "🤖 chore: refresh models.json from LiteLLM" \
-              --body "Automated weekly refresh of the vendored LiteLLM model catalog via \`make update-models\` (#3727)." \
+              --body "Automated weekly refresh of the vendored LiteLLM model catalog via \`make update-models\` (#3727).
+
+          $footer" \
               --base main \
               --head bot/update-models
           else

@@ -41,7 +41,12 @@ const PROVIDER_KEY_ALIASES: Record<string, string> = {
   "github-copilot": "github_copilot",
 };
 
-function parseNum(value: unknown): number | null {
+/**
+ * Runtime numeric semantics for raw catalog values (accepts numeric strings
+ * with comma separators). Exported so update-models validation compares
+ * magnitudes exactly as getModelStats would parse them.
+ */
+export function parseNum(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
   }

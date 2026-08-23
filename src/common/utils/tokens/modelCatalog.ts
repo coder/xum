@@ -8,20 +8,7 @@ import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import modelsData from "./models.json";
 import { resolveRawModelEntry } from "./modelStats";
-import { MAPPABLE_MODES } from "./updateModelsData";
-
-function toCanonicalModelId(catalogKey: string, metadata: Record<string, unknown>): string | null {
-  // LiteLLM keys are either "provider/model" or a bare model id whose provider
-  // lives in litellm_provider. Both canonical forms round-trip through
-  // getModelStats: generateLookupKeys tries "provider/model" first and the bare
-  // model name as a fallback.
-  const slashIndex = catalogKey.indexOf("/");
-  if (slashIndex > 0) {
-    return `${catalogKey.slice(0, slashIndex)}:${catalogKey.slice(slashIndex + 1)}`;
-  }
-  const provider = metadata.litellm_provider;
-  return typeof provider === "string" && provider.length > 0 ? `${provider}:${catalogKey}` : null;
-}
+import { MAPPABLE_MODES, toCanonicalModelId } from "./updateModelsData";
 
 let cachedIds: string[] | undefined;
 

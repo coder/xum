@@ -6,8 +6,9 @@
  */
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { normalizeToCanonical } from "../ai/models";
 import { modelsExtra } from "./models-extra";
-import { generateModelLookupKeys, hasUsableTokenLimits } from "./modelStats";
+import { generateModelLookupKeys, hasUsableTokenLimits, parseNum } from "./modelStats";
 
 const RETAINED_FIELDS = [
   "max_input_tokens",
@@ -62,6 +63,24 @@ const MAX_MAGNITUDE_SHIFT_FACTOR = 100;
 
 /** Modes whose metadata applies to chat-style usage; mirrored by the Treat-as catalog. */
 export const MAPPABLE_MODES = new Set(["chat", "responses"]);
+
+/**
+ * Canonical `provider:model` id for a catalog key. LiteLLM keys are either
+ * "provider/model" or a bare model id whose provider lives in litellm_provider;
+ * both forms round-trip through getModelStats' lookup keys. Shared with the
+ * Treat-as catalog so validation and the UI derive identities identically.
+ */
+export function toCanonicalModelId(
+  catalogKey: string,
+  metadata: Record<string, unknown>
+): string | null {
+  const slashIndex = catalogKey.indexOf("/");
+  if (slashIndex > 0) {
+    return `${catalogKey.slice(0, slashIndex)}:${catalogKey.slice(slashIndex + 1)}`;
+  }
+  const provider = metadata.litellm_provider;
+  return typeof provider === "string" && provider.length > 0 ? `${provider}:${catalogKey}` : null;
+}
 
 export type ModelCatalogData = Record<string, Record<string, unknown>>;
 
@@ -224,13 +243,16 @@ export function summarizeCatalog(catalog: ModelCatalogData): CatalogSummary {
       if (hasConsumedValue(value)) {
         coverage.fields[field] = (coverage.fields[field] ?? 0) + 1;
       }
-      if (MAPPABLE_MODES.has(mode) && typeof value === "number" && value > 0) {
+      // parseNum mirrors runtime parsing, so a numeric string like "128000"
+      // contributes its real magnitude instead of reading as a collapse.
+      const numeric = parseNum(value);
+      if (MAPPABLE_MODES.has(mode) && numeric !== null && numeric > 0) {
         let samples = numericSamples.get(field);
         if (samples === undefined) {
           samples = [];
           numericSamples.set(field, samples);
         }
-        samples.push(value);
+        samples.push(numeric);
       }
     }
   }
@@ -238,6 +260,24 @@ export function summarizeCatalog(catalog: ModelCatalogData): CatalogSummary {
     summary.numericFields[field] = { samples: samples.length, median: median(samples) };
   }
   return summary;
+}
+
+/**
+ * The entry a catalog would serve for a model id, using getModelStats' own
+ * lookup preference and usability bar. Alias-shadowing corruption is only
+ * visible through this resolution, never through raw key comparison.
+ */
+function resolveCatalogEntry(
+  catalog: ModelCatalogData,
+  modelId: string
+): Record<string, unknown> | undefined {
+  for (const key of generateModelLookupKeys(modelId)) {
+    const entry = catalog[key];
+    if (entry !== undefined && hasUsableTokenLimits(entry)) {
+      return entry;
+    }
+  }
+  return undefined;
 }
 
 function belowBaseline(count: number, baseline: number): boolean {
@@ -321,37 +361,58 @@ export function validateModelData(
     }
   }
 
-  // Catalog-wide counts and medians cannot see a targeted repricing of a
-  // single row, so each surviving entry's numeric fields are also bounded
-  // against their own baseline values (a positive value must stay a number
-  // within the factor; vanishing is the same attack as scaling toward zero).
-  // A legitimate per-row correction beyond the factor fails closed: delete
-  // models.json and rerun to deliberately accept a full refresh.
+  // Catalog-wide counts and medians cannot see targeted single-row corruption,
+  // and raw-key comparison cannot see alias shadowing: a poisoned catalog can
+  // add a higher-precedence key (openai/gpt-4o-mini over a baseline
+  // gpt-4o-mini) or move a row to such an alias, leaving every count and
+  // median intact while runtime lookups resolve the poisoned entry. Entries
+  // are therefore compared by runtime identity: for every model id either
+  // catalog can serve, the entry each catalog resolves through getModelStats'
+  // own lookup preference must keep positive numeric fields present and
+  // within the magnitude factor (runtime parseNum semantics, so numeric
+  // strings compare by value) and keep baseline-true capability flags (runtime
+  // treats absent/false as unsupported). Legitimate changes beyond these
+  // bounds fail closed: delete models.json and rerun to deliberately accept a
+  // full refresh.
   const entryShifts: string[] = [];
-  for (const [key, baselineEntry] of Object.entries(baselineCatalog)) {
-    const entry = catalog[key];
+  const identities = new Set<string>();
+  for (const source of [baselineCatalog, catalog]) {
+    for (const [key, metadata] of Object.entries(source)) {
+      identities.add(normalizeToCanonical(toCanonicalModelId(key, metadata) ?? key));
+    }
+  }
+  for (const id of identities) {
+    const baselineEntry = resolveCatalogEntry(baselineCatalog, id);
+    if (baselineEntry === undefined) {
+      continue; // genuinely new identity; nothing vendored to compare against
+    }
+    const entry = resolveCatalogEntry(catalog, id);
     if (entry === undefined) {
-      continue; // removed keys are governed by the coverage baselines above
+      continue; // fully removed identities are governed by the coverage baselines
     }
     for (const field of RETAINED_FIELDS) {
       const baselineValue = baselineEntry[field];
-      if (typeof baselineValue !== "number" || baselineValue <= 0) {
+      if (baselineValue === true) {
+        if (entry[field] !== true) {
+          entryShifts.push(`${id} ${field}: true -> ${JSON.stringify(entry[field]) ?? "absent"}`);
+        }
         continue;
       }
-      const value = entry[field];
-      const ratio = typeof value === "number" ? value / baselineValue : 0;
+      const baselineNum = typeof baselineValue === "boolean" ? null : parseNum(baselineValue);
+      if (baselineNum === null || baselineNum <= 0) {
+        continue;
+      }
+      const candidateNum = parseNum(entry[field]);
+      const ratio = candidateNum === null ? 0 : candidateNum / baselineNum;
       if (ratio > MAX_MAGNITUDE_SHIFT_FACTOR || ratio < 1 / MAX_MAGNITUDE_SHIFT_FACTOR) {
-        entryShifts.push(
-          `${key} ${field}: ${baselineValue} -> ${typeof value === "number" ? value : "absent"}`
-        );
+        entryShifts.push(`${id} ${field}: ${baselineNum} -> ${candidateNum ?? "absent"}`);
       }
     }
   }
   if (entryShifts.length > 0) {
     errors.push(
-      `${entryShifts.length} surviving entries shifted a numeric field more than ` +
-        `${MAX_MAGNITUDE_SHIFT_FACTOR}x from the vendored baseline ` +
-        `(e.g. ${entryShifts.slice(0, 5).join("; ")})`
+      `${entryShifts.length} resolved model identities regressed a retained field beyond the ` +
+        `vendored baseline (e.g. ${entryShifts.slice(0, 5).join("; ")})`
     );
   }
 

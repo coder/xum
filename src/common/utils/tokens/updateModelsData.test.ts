@@ -338,16 +338,63 @@ describe("validateModelData", () => {
       return { catalog, droppedModelIds: [] };
     };
     // Scaling (or deleting) one row's price moves no count and no median; only
-    // the per-entry magnitude bound can catch it.
+    // the per-identity magnitude bound can catch it.
     expect(() =>
       validateModelData(poison({ input_cost_per_token: 0.000001e-9 }), chatEntries(700))
-    ).toThrow(/provider\/model-3 input_cost_per_token: 0.000001 -> 1e-15/);
+    ).toThrow(/provider:model-3 input_cost_per_token: 0.000001 -> 1e-15/);
     expect(() =>
       validateModelData(poison({ input_cost_per_token: undefined }), chatEntries(700))
-    ).toThrow(/provider\/model-3 input_cost_per_token: 0.000001 -> absent/);
+    ).toThrow(/provider:model-3 input_cost_per_token: 0.000001 -> absent/);
     // Ordinary per-row repricing within the factor is accepted.
     expect(() =>
       validateModelData(poison({ input_cost_per_token: 0.00001 }), chatEntries(700))
+    ).not.toThrow();
+  });
+
+  test("rejects a poisoned higher-precedence alias shadowing a baseline row", () => {
+    // Adding openai/x on top of a baseline bare x (or moving the row there)
+    // leaves every count and median intact, but runtime lookup prefers the
+    // scoped key; comparison must follow resolved identities, not raw keys.
+    const bare = {
+      mode: "chat",
+      max_input_tokens: 128000,
+      input_cost_per_token: 0.000001,
+      output_cost_per_token: 0.000002,
+      litellm_provider: "acme",
+    };
+    const poisonedAlias = { ...bare, input_cost_per_token: 0.000001e-9 };
+    const baseline = { ...chatEntries(700), "acme-chat-1": bare };
+    for (const catalog of [
+      // Attack 1: new alias added while the original row survives.
+      { ...baseline, "acme/acme-chat-1": poisonedAlias },
+      // Attack 2: original key removed, row substituted under the alias.
+      { ...chatEntries(700), "acme/acme-chat-1": poisonedAlias },
+    ]) {
+      const sanitized = { catalog: { ...catalog, ...curatedCoverage }, droppedModelIds: [] };
+      expect(() => validateModelData(sanitized, baseline)).toThrow(
+        /acme:acme-chat-1 input_cost_per_token: 0.000001 -> 1e-15/
+      );
+    }
+  });
+
+  test("rejects a targeted capability-flag flip on a single row", () => {
+    // One true -> false flip is far inside the aggregate 10% allowance, but
+    // runtime would start rejecting valid attachments for that model.
+    const baseline = chatEntries(700, { supports_pdf_input: true });
+    const catalog = { ...baseline, ...curatedCoverage };
+    catalog["provider/model-3"] = { ...catalog["provider/model-3"], supports_pdf_input: false };
+    expect(() => validateModelData({ catalog, droppedModelIds: [] }, baseline)).toThrow(
+      /provider:model-3 supports_pdf_input: true -> false/
+    );
+  });
+
+  test("accepts runtime-parseable numeric strings as equal magnitudes", () => {
+    // getModelStats parses "128000" like 128000, so a representation change
+    // must not read as a >100x collapse and block the refresh.
+    const catalog = { ...chatEntries(700), ...curatedCoverage };
+    catalog["provider/model-3"] = { ...catalog["provider/model-3"], max_input_tokens: "128000" };
+    expect(() =>
+      validateModelData({ catalog, droppedModelIds: [] }, chatEntries(700))
     ).not.toThrow();
   });
 
