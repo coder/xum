@@ -130,6 +130,16 @@ export const SandboxVarsSnapshotDataSchema = z.object({
   scopeKey: z.string(),
   blobHash: BlobRefSchema,
   size: z.number().int().nonnegative(),
+  /**
+   * Marks a context-reset tombstone (r52): an empty snapshot superseding all
+   * prior ones. The count of reset-marked rows per scope is its "reset
+   * generation" — persistent mounts capture it at creation and re-verify it
+   * before every lease and persist, so a mount still alive in ANOTHER
+   * backend (XUM_ALLOW_MULTIPLE_INSTANCES=1) cannot expose or re-persist
+   * vars the user discarded. Absent on ordinary snapshots and on pre-r52
+   * rows (both count as generation contributions of zero).
+   */
+  reset: z.boolean().optional(),
 });
 
 /** Envelope shared by all durable agent events (one JSONL row each). */

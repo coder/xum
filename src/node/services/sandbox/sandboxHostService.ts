@@ -22,7 +22,7 @@
  */
 
 import assert from "node:assert";
-import type { BlobRef } from "@/common/types/durableEvent";
+import type { BlobRef, DurableEvent } from "@/common/types/durableEvent";
 import type { IJSRuntime, IJSRuntimeFactory } from "@/node/services/ptc/runtime";
 import { resolveCapabilityGrants, type CapabilityGrants } from "@/common/types/capabilityGrants";
 import {
@@ -739,6 +739,17 @@ function grantsKey(grants: CapabilityGrants): string {
 
 export class SandboxHostService {
   private readonly persistentMounts = new Map<string, SandboxMount>();
+
+  /**
+   * Journal reset generation each persistent mount was created against
+   * (r52): the count of reset-marked snapshot rows for its scope at mount
+   * time. Process-local scope locks cannot invalidate a mount alive in
+   * ANOTHER backend (XUM_ALLOW_MULTIPLE_INSTANCES=1), so every lease and
+   * every persist re-verifies this against the shared journal; a mismatch
+   * means a foreign context reset landed and the mount's vars are discarded
+   * state that must be neither exposed to guest code nor re-persisted.
+   */
+  private readonly mountResetGenerations = new WeakMap<SandboxMount, number>();
   /** Per-scope mutex serializing acquisition, exclusive runs, and disposal.
    * Kept for the process lifetime (bounded by workspace count). */
   private readonly scopeLocks = new Map<string, AsyncMutex>();
@@ -820,24 +831,35 @@ export class SandboxHostService {
     assert(scopeKey, "persistent mounts require a scopeKey");
     assert(sessionDir, "persistent mounts require a sessionDir");
     const lock = this.lockFor(scopeKey);
+    const journal = this.journalFor(sessionDir);
 
     const existing = this.persistentMounts.get(scopeKey);
     if (existing && !existing.isDisposed) {
-      if (
+      // Cross-process staleness check before every lease (r52): a foreign
+      // backend (XUM_ALLOW_MULTIPLE_INSTANCES=1) may have reset this scope
+      // after our mount was created — the process-local scope lock and mount
+      // map cannot invalidate a mount alive in another instance. A stale
+      // mount would expose pre-reset vars to guest code, so it is disposed
+      // WITHOUT persisting (disposeScopeLocked's snapshot would resurrect
+      // exactly the vars the reset discarded) and rebuilt fresh below.
+      const currentGeneration = countScopeResets(await journal.read(), scopeKey);
+      if (this.mountResetGenerations.get(existing) !== currentGeneration) {
+        this.persistentMounts.delete(scopeKey);
+        existing.dispose();
+      } else if (
         grantsKey(existing.grants) === grantsKey(grants) &&
         existing.bridgeKey === options.bridgeKey
       ) {
         return existing;
+      } else {
+        // Effective grants OR bridge configuration changed between requests
+        // (e.g. policy narrowed): a mount must never outlive its capability
+        // boundary, and rebuilding the runtime is the only way to revoke bridge
+        // function references the guest saved in globals. Snapshot under the
+        // OLD grants, dispose, and rebuild below.
+        await this.disposeScopeLocked(scopeKey);
       }
-      // Effective grants OR bridge configuration changed between requests
-      // (e.g. policy narrowed): a mount must never outlive its capability
-      // boundary, and rebuilding the runtime is the only way to revoke bridge
-      // function references the guest saved in globals. Snapshot under the
-      // OLD grants, dispose, and rebuild below.
-      await this.disposeScopeLocked(scopeKey);
     }
-
-    const journal = this.journalFor(sessionDir);
     if (this.pendingDiscards.has(scopeKey)) {
       // A context reset disposed this scope but its durable invalidation
       // never landed: retry it now and refuse the mount while it keeps
@@ -853,6 +875,11 @@ export class SandboxHostService {
         );
       }
     }
+    // One journal read feeds both the reset generation this mount is created
+    // against (r52) and the latest-snapshot restore below. Read AFTER the
+    // pending-discard retry so a just-published tombstone is counted.
+    const creationEvents = await journal.read();
+    const mountResetGeneration = countScopeResets(creationEvents, scopeKey);
     const runtime = await options.runtimeFactory.create();
     const mount = new SandboxMount(
       runtime,
@@ -862,11 +889,32 @@ export class SandboxHostService {
       async (varsJson) => {
         // Blob + event publish as one unit under the journal blob lock, so a
         // concurrent reclamation pass can never observe the put→append window.
-        const { ref } = await journal.publishWithBlob(varsJson, (blobHash, size) => ({
-          workspaceId: scopeKey,
-          kind: "sandbox-vars-snapshot",
-          data: { scopeKey, blobHash, size },
-        }));
+        const { ref } = await journal.publishWithBlob(
+          varsJson,
+          (blobHash, size) => ({
+            workspaceId: scopeKey,
+            kind: "sandbox-vars-snapshot",
+            data: { scopeKey, blobHash, size },
+          }),
+          {
+            // Reset-generation verification INSIDE the blob lock (r52): the
+            // tombstone publisher serializes on the same cross-process lock,
+            // so this recount cannot miss a concurrent foreign reset — there
+            // is no check→append window. Without it, a mount still alive in
+            // another backend could publish its pre-reset vars as the newest
+            // snapshot, superseding the tombstone and resurrecting context
+            // the user discarded.
+            precondition: async () => {
+              const current = countScopeResets(await journal.read(), scopeKey);
+              if (current !== mountResetGeneration) {
+                throw new Error(
+                  `sandbox scope '${scopeKey}' was reset by another instance; ` +
+                    `refusing to persist this mount's stale vars`
+                );
+              }
+            },
+          }
+        );
         // Reclaim superseded snapshot blobs: only the LATEST snapshot per
         // scope is ever restored, so older versions are pure disk growth
         // (per-call persistence would otherwise retain every unique vars
@@ -902,8 +950,9 @@ export class SandboxHostService {
     );
 
     if (grants.vars) {
-      await this.initializeVars(mount, journal, scopeKey);
+      await this.initializeVars(mount, journal, scopeKey, creationEvents);
     }
+    this.mountResetGenerations.set(mount, mountResetGeneration);
     if (grants.hostEvents) {
       // Queue + drain: the guest polls for host events (task completions,
       // lifecycle notifications). Must be a SYNC bridge function: guests call
@@ -1110,21 +1159,24 @@ export class SandboxHostService {
     journal: DurableEventJournal,
     scopeKey: string
   ): Promise<void> {
-    // Only write the empty snapshot when there is prior state to supersede;
-    // otherwise a reset in a sandbox-less workspace would create journal
-    // files for nothing.
+    // Skip only when the journal is truly empty (no files to create for a
+    // sandbox-less workspace). Widened from a has-snapshot guard (r52): a
+    // foreign backend's live mount may hold vars it has not persisted yet,
+    // so the tombstone must land — bumping the reset generation that
+    // invalidates that mount — even when no snapshot row exists. The
+    // residual window (both instances racing the scope's very first run on
+    // an empty journal) is accepted.
     const events = await journal.read();
-    const hasSnapshot = events.some(
-      (event) => event.kind === "sandbox-vars-snapshot" && event.data.scopeKey === scopeKey
-    );
-    if (!hasSnapshot) {
+    if (events.length === 0) {
       this.pendingDiscards.delete(scopeKey);
       return;
     }
+    // `reset: true` marks this row as a generation bump (r52): foreign
+    // mounts recount reset rows before every lease and persist.
     const { ref } = await journal.publishWithBlob("{}", (blobHash, size) => ({
       workspaceId: scopeKey,
       kind: "sandbox-vars-snapshot",
-      data: { scopeKey, blobHash, size },
+      data: { scopeKey, blobHash, size, reset: true },
     }));
     this.pendingDiscards.delete(scopeKey);
     try {
@@ -1160,16 +1212,18 @@ export class SandboxHostService {
   }
 
   /** Set up `vars` and restore the latest snapshot if one exists (self-heal:
-   * a missing/corrupt snapshot starts empty instead of failing the mount). */
+   * a missing/corrupt snapshot starts empty instead of failing the mount).
+   * `events` is the caller's journal read (shared with the reset-generation
+   * capture so both observe the same journal state). */
   private async initializeVars(
     mount: SandboxMount,
     journal: DurableEventJournal,
-    scopeKey: string
+    scopeKey: string,
+    events: DurableEvent[]
   ): Promise<void> {
     const init = await mount.runtime.eval("globalThis.vars = {}; return true;");
     assert(init.success, `vars init failed: ${init.error ?? "unknown error"}`);
 
-    const events = await journal.read();
     for (let i = events.length - 1; i >= 0; i--) {
       const event = events[i];
       if (event.kind !== "sandbox-vars-snapshot" || event.data.scopeKey !== scopeKey) {
@@ -1192,6 +1246,26 @@ export class SandboxHostService {
       return;
     }
   }
+}
+
+/**
+ * A scope's journal reset generation (r52): the count of reset-marked
+ * snapshot rows. Pre-r52 tombstones carry no marker and count as zero —
+ * safe, because a generation only needs to CHANGE when a reset lands while
+ * a mount is alive, and every reset since the marker shipped bumps it.
+ */
+function countScopeResets(events: DurableEvent[], scopeKey: string): number {
+  let count = 0;
+  for (const event of events) {
+    if (
+      event.kind === "sandbox-vars-snapshot" &&
+      event.data.scopeKey === scopeKey &&
+      event.data.reset === true
+    ) {
+      count++;
+    }
+  }
+  return count;
 }
 
 /**

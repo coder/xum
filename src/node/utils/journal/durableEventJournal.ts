@@ -253,12 +253,21 @@ export class DurableEventJournal {
   /**
    * Store a blob and append the event referencing it as one atomic unit with
    * respect to blob reclamation (see withBlobLock).
+   *
+   * `options.precondition` (r52) runs INSIDE the blob lock before anything
+   * is stored; a throw aborts the publish with no blob and no row. Because
+   * every publisher serializes on the same cross-process blob lock, this
+   * lets a producer verify journal state that a concurrent foreign
+   * publication could invalidate (e.g. a stale vars snapshot racing a
+   * context-reset tombstone) with no check→append window.
    */
   async publishWithBlob(
     content: string | Uint8Array,
-    buildDraft: (ref: BlobRef, size: number) => DurableEventDraft
+    buildDraft: (ref: BlobRef, size: number) => DurableEventDraft,
+    options?: { precondition?: () => Promise<void> }
   ): Promise<{ event: DurableEvent; ref: BlobRef; size: number }> {
     return await this.withBlobLock(async () => {
+      await options?.precondition?.();
       const { ref, size, created } = await this.blobs.put(content);
       try {
         // Ownership re-check between put and append (round 11 defense in

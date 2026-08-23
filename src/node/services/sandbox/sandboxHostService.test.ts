@@ -839,6 +839,79 @@ describe("SandboxHostService", () => {
     await host.disposeScope("ws-reset");
   });
 
+  test("a foreign backend's reset invalidates a live mount at the next lease (r52)", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const hostA = new SandboxHostService();
+    const hostB = new SandboxHostService();
+    const mountA = await hostA.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-foreign-reset",
+      sessionDir: tmp.path,
+    });
+    await mountA.runtime.eval('vars.secret = "discarded"; return true;');
+    await mountA.persistVars();
+
+    // Foreign backend resets the scope: hostA's process-local mount map and
+    // scope lock are untouched, so only the journal's reset generation can
+    // invalidate mountA.
+    await hostB.discardScope("ws-foreign-reset", tmp.path);
+    expect(mountA.isDisposed).toBe(false);
+
+    const released = await hostA.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-foreign-reset",
+      sessionDir: tmp.path,
+    });
+    expect(released).not.toBe(mountA);
+    expect(mountA.isDisposed).toBe(true);
+    const probe = await released.runtime.eval("return Object.keys(vars).length;");
+    expect(probe.success).toBe(true);
+    expect(probe.result).toBe(0);
+    await hostA.disposeScope("ws-foreign-reset");
+  });
+
+  test("a stale mount's persist cannot supersede a foreign reset tombstone (r52)", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const hostA = new SandboxHostService();
+    const hostB = new SandboxHostService();
+    const mountA = await hostA.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-stale-persist",
+      sessionDir: tmp.path,
+    });
+    await mountA.runtime.eval('vars.secret = "discarded"; return true;');
+    await mountA.persistVars();
+
+    await hostB.discardScope("ws-stale-persist", tmp.path);
+
+    // The stale mount's persist must be refused atomically (verified inside
+    // the same blob lock the tombstone publisher held); letting it land
+    // would supersede the tombstone and resurrect discarded vars.
+    try {
+      await mountA.persistVars();
+      expect.unreachable("stale persist must be refused");
+    } catch (error) {
+      expect(String(error)).toContain("reset by another instance");
+    }
+
+    // The journal's newest snapshot is still the tombstone: a fresh mount
+    // starts empty.
+    const fresh = await hostB.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-stale-persist",
+      sessionDir: tmp.path,
+    });
+    const probe = await fresh.runtime.eval("return Object.keys(vars).length;");
+    expect(probe.success).toBe(true);
+    expect(probe.result).toBe(0);
+    await hostB.disposeScope("ws-stale-persist");
+    await hostA.disposeScope("ws-stale-persist");
+  });
+
   test("context reset never resurrects pre-reset vars when the tombstone publish fails once", async () => {
     using tmp = new DisposableTempDir("sandbox-host-test");
     const host = new SandboxHostService();

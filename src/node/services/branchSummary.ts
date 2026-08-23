@@ -29,7 +29,6 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import {
-  BRANCH_SUMMARY_CANCEL_DRAIN_MS,
   BRANCH_SUMMARY_MAX_ACCUMULATED_CHARS,
   BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
   BRANCH_SUMMARY_MAX_TRANSCRIPT_CHARS,
@@ -37,6 +36,7 @@ import {
   BRANCH_SUMMARY_TARGET_WORDS,
   BRANCH_SUMMARY_TIMEOUT_MS,
 } from "@/constants/branchSummary";
+import { STREAM_CANCEL_DRAIN_WINDOW_MS } from "@/constants/streamDrain";
 
 import type { AIService } from "./aiService";
 import type { HistoryService } from "./historyService";
@@ -489,7 +489,7 @@ async function generateAbandonedBranchSummaryText(input: {
         })();
         await Promise.race([
           drained,
-          new Promise<void>((resolve) => setTimeout(resolve, BRANCH_SUMMARY_CANCEL_DRAIN_MS)),
+          new Promise<void>((resolve) => setTimeout(resolve, STREAM_CANCEL_DRAIN_WINDOW_MS)),
         ]);
         // Deadline hit. Salvage whole sentences already streamed — a missed
         // deadline should still buy a (shorter) summary when tokens flowed.

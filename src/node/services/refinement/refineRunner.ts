@@ -28,6 +28,7 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelpers";
 import { REFINE_MAX_STEPS, REFINE_OP_BUDGET } from "@/constants/refine";
+import { STREAM_CANCEL_DRAIN_WINDOW_MS } from "@/constants/streamDrain";
 import {
   createConsolidationMemoryTool,
   createMutationBudget,
@@ -376,15 +377,24 @@ export async function runRefinePass(args: {
     // consumer — a wedged provider leaves it pinned in read() — and record
     // the timeout as a stream error so the result awaits below (which would
     // drain a wedged stream indefinitely) are skipped and the caller reports
-    // the failure instead of hanging. Both awaited: the pass must not resolve
+    // the failure instead of hanging. Drained before the pass resolves
     // (releasing the run lock and unblocking cancelInFlightRefinePass /
-    // session-dir deletion) while cancellation or the consumer is still
-    // settling. Safe to await: cancel settles promptly even on wedged
-    // streams (a pending pull does not block it), and it resolves the pinned
-    // read so the consumer exits.
+    // session-dir deletion) so cancellation and the consumer settle first —
+    // but BOUNDED (r52): reader.cancel() itself waits on the provider's
+    // underlying cancellation, and a provider wedged in that path would
+    // otherwise hold the per-workspace refine lock and workspace removal
+    // indefinitely. After the window the stuck consumer is detached; the
+    // deadline stream error below already makes the pass skip every result
+    // await, so nothing observable depends on it.
     externallyCancelled = true;
-    await reader.cancel().catch(() => undefined);
-    await consume;
+    const drained = (async () => {
+      await reader.cancel().catch(() => undefined);
+      await consume;
+    })();
+    await Promise.race([
+      drained,
+      new Promise<void>((resolve) => setTimeout(resolve, STREAM_CANCEL_DRAIN_WINDOW_MS)),
+    ]);
     if (streamErrors.length === 0) {
       streamErrors.push("refine pass deadline exceeded before the stream finished");
     }

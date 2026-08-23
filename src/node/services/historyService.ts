@@ -2177,6 +2177,12 @@ export class HistoryService {
       "Failed to persist compaction boundary with tail copies",
       async () => {
         try {
+          // r52: this path assigns fresh sequences (appended summary + every
+          // preserved tail copy) from the cached counter, so it needs the
+          // same in-lock refresh as the append family — a stale cache would
+          // duplicate a foreign backend's sequences and let a later
+          // updateHistory() replace an unrelated row.
+          await this.refreshSequenceCounterUnderWriteLock(workspaceId);
           await ensurePrivateDir(this.config.getSessionDir(workspaceId));
           const historyPath = this.getChatHistoryPath(workspaceId);
           const messages = await this.readChatHistory(workspaceId);

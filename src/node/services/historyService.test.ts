@@ -441,6 +441,41 @@ describe("HistoryService", () => {
     });
   });
 
+  describe("persistBoundaryWithTailCopies", () => {
+    it("advances the sequence counter past foreign rows before assigning tail copies (r52)", async () => {
+      const workspaceId = "workspace1";
+      const seeded = await service.appendToHistory(
+        workspaceId,
+        createMuxMessage("msg1", "user", "Hello")
+      );
+      expect(seeded.success).toBe(true);
+      // A foreign backend appended a higher-sequence row after this process
+      // cached its counter; the boundary path assigns fresh sequences to the
+      // summary and every tail copy, so it needs the same in-lock refresh as
+      // the append family.
+      const foreignLine = messageLine(
+        workspaceId,
+        createMuxMessage("foreign-1", "assistant", "foreign row", { historySequence: 7 })
+      );
+      await fs.appendFile(
+        path.join(config.getSessionDir(workspaceId), "chat.jsonl"),
+        foreignLine + "\n"
+      );
+
+      const summary = createMuxMessage("summary-1", "assistant", "compaction summary");
+      const tailCopy = createMuxMessage("tail-1", "user", "preserved tail");
+      const result = await service.persistBoundaryWithTailCopies(
+        workspaceId,
+        summary,
+        [tailCopy],
+        false
+      );
+      expect(result.success).toBe(true);
+      expect(summary.metadata?.historySequence).toBe(8);
+      expect(tailCopy.metadata?.historySequence).toBe(9);
+    });
+  });
+
   describe("updateHistory", () => {
     it("should update message by historySequence", async () => {
       const workspaceId = "workspace1";
