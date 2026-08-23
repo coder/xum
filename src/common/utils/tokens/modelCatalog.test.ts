@@ -1,5 +1,6 @@
 import { describe, test, expect } from "@jest/globals";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { listModelCatalogIds } from "./modelCatalog";
 import { getModelStats } from "./modelStats";
 
@@ -33,6 +34,14 @@ describe("listModelCatalogIds", () => {
 
   test("excludes models without chat-style metadata", () => {
     expect(ids).not.toContain("openai:text-embedding-3-small");
+  });
+
+  test("every id is self-canonical so selection metadata matches the visible row", () => {
+    // Gateway keys like openrouter/deepseek/x normalize to the direct provider id
+    // during stats resolution; exposing non-canonical ids would create rows that
+    // look distinct but inherit another entry's metadata.
+    const nonCanonical = ids.filter((id) => normalizeToCanonical(id) !== id);
+    expect(nonCanonical).toEqual([]);
   });
 
   test("is sorted, deduplicated, and stable across calls", () => {

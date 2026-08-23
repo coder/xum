@@ -2,9 +2,11 @@ import { describe, test, expect } from "@jest/globals";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import modelsJson from "./models.json";
 import {
+  countChatModels,
   findMissingKnownModels,
   pruneModelData,
   sanitizePricing,
+  serializeModelData,
   validateModelData,
 } from "./updateModelsData";
 
@@ -65,6 +67,8 @@ describe("sanitizePricing", () => {
 });
 
 describe("findMissingKnownModels", () => {
+  const usable = { max_input_tokens: 256000 };
+
   test("reports all curated models against an empty catalog and no overrides", () => {
     const missing = findMissingKnownModels({}, {});
     expect(missing.sort()).toEqual(
@@ -78,34 +82,63 @@ describe("findMissingKnownModels", () => {
     const grok = Object.values(KNOWN_MODELS).find((model) => model.provider === "xai");
     if (!grok) throw new Error("expected a curated xai model");
 
-    const bareKey = { [grok.providerModelId]: {} };
+    const bareKey = { [grok.providerModelId]: usable };
     expect(findMissingKnownModels(bareKey, {})).toContain(grok.id);
 
-    const prefixedKey = { [`xai/${grok.providerModelId}`]: {} };
+    const prefixedKey = { [`xai/${grok.providerModelId}`]: usable };
     expect(findMissingKnownModels(prefixedKey, {})).not.toContain(grok.id);
+  });
+
+  test("a retained key with unusable token limits still counts as missing", () => {
+    const anthropic = Object.values(KNOWN_MODELS).find((model) => model.provider === "anthropic");
+    if (!anthropic) throw new Error("expected a curated anthropic model");
+
+    // Key presence is not coverage: getModelStats would reject these entries.
+    expect(findMissingKnownModels({ [anthropic.providerModelId]: {} }, {})).toContain(anthropic.id);
+    expect(
+      findMissingKnownModels({ [anthropic.providerModelId]: { max_input_tokens: 0 } }, {})
+    ).toContain(anthropic.id);
   });
 
   test("models-extra overrides satisfy models absent upstream", () => {
     const anthropic = Object.values(KNOWN_MODELS).find((model) => model.provider === "anthropic");
     if (!anthropic) throw new Error("expected a curated anthropic model");
 
-    expect(findMissingKnownModels({}, { [anthropic.providerModelId]: {} })).not.toContain(
+    expect(findMissingKnownModels({}, { [anthropic.providerModelId]: usable })).not.toContain(
       anthropic.id
     );
   });
 });
 
 describe("validateModelData", () => {
-  test("accepts the current vendored models.json", () => {
-    const sanitized = sanitizePricing(modelsJson as Record<string, Record<string, unknown>>);
+  test("accepts the current vendored models.json against its own baseline", () => {
+    const vendored = modelsJson as Record<string, Record<string, unknown>>;
+    const sanitized = sanitizePricing(vendored);
     expect(sanitized.droppedModelIds).toEqual([]);
-    expect(() => validateModelData(sanitized)).not.toThrow();
+    expect(() => validateModelData(sanitized, countChatModels(vendored))).not.toThrow();
   });
 
   test("rejects truncated upstream data", () => {
     expect(() => validateModelData({ catalog: chatEntries(10), droppedModelIds: [] })).toThrow(
       /only 10 chat models found/
     );
+  });
+
+  test("rejects a large shrink below the vendored baseline even above the floor", () => {
+    // Cover every curated model so only the shrink rule is under test.
+    const curatedCoverage = Object.fromEntries(
+      Object.values(KNOWN_MODELS).map((model) => [
+        model.providerModelId,
+        { mode: "chat", max_input_tokens: 200000 },
+      ])
+    );
+    const sanitized = {
+      catalog: { ...chatEntries(600), ...curatedCoverage },
+      droppedModelIds: [],
+    };
+    expect(() => validateModelData(sanitized, 2000)).toThrow(/chat model count shrank from 2000/);
+    // A small decrease within the bound is acceptable (e.g. upstream pruning).
+    expect(() => validateModelData(sanitized, 650)).not.toThrow();
   });
 
   test("rejects data where too many entries had invalid pricing", () => {
@@ -122,5 +155,14 @@ describe("validateModelData", () => {
     expect(() => validateModelData({ catalog: chatEntries(600), droppedModelIds: [] })).toThrow(
       /curated known models missing from upstream/
     );
+  });
+});
+
+describe("serializeModelData", () => {
+  test("sorts keys so upstream reordering produces no diff", () => {
+    const forward = serializeModelData({ b: { mode: "chat" }, a: { mode: "chat" } });
+    const reversed = serializeModelData({ a: { mode: "chat" }, b: { mode: "chat" } });
+    expect(forward).toBe(reversed);
+    expect(forward.indexOf('"a"')).toBeLessThan(forward.indexOf('"b"'));
   });
 });

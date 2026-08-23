@@ -224,9 +224,13 @@ update-models: node_modules/.installed ## Fetch latest LiteLLM model data, valid
 	@bun scripts/update_models.ts
 
 # #3727: `make build UPDATE_MODELS=1` refreshes the vendored models.json before
-# building; plain `make build` stays network-free and reproducible.
+# building; plain `make build` stays network-free and reproducible. The refresh
+# must be a prerequisite of every catalog-consuming bundle (not just `build`) so
+# parallel make cannot bundle the old catalog, and the phony prerequisite forces
+# those bundles stale because models.json is not part of $(TS_SOURCES).
 ifeq ($(UPDATE_MODELS),1)
 build: update-models
+build-renderer dist/cli/index.js dist/cli/api.mjs: update-models
 endif
 
 build-main: node_modules/.installed dist/cli/index.js dist/cli/api.mjs ## Build main process

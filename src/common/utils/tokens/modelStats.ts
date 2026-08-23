@@ -70,9 +70,10 @@ function hasTieredPricing(data: RawModelData): boolean {
 }
 
 /**
- * Validates raw model data has required fields
+ * Whether raw model metadata is usable for stats resolution. Exported so the
+ * update-models validation applies the same bar as getModelStats.
  */
-function isValidModelData(data: RawModelData): boolean {
+export function hasUsableTokenLimits(data: RawModelData): boolean {
   const maxInputTokens = parseNum(data.max_input_tokens);
   return maxInputTokens != null && maxInputTokens > 0;
 }
@@ -234,7 +235,7 @@ export function getModelStats(modelString: string): ModelStats | null {
   // Check models-extra.ts first (overrides for models with incorrect upstream data)
   for (const key of lookupKeys) {
     const data = (modelsExtra as Record<string, RawModelData>)[key];
-    if (data && isValidModelData(data)) {
+    if (data && hasUsableTokenLimits(data)) {
       return extractModelStats(data);
     }
   }
@@ -242,7 +243,7 @@ export function getModelStats(modelString: string): ModelStats | null {
   // Fall back to main models.json
   for (const key of lookupKeys) {
     const data = (modelsData as Record<string, RawModelData>)[key];
-    if (data && isValidModelData(data)) {
+    if (data && hasUsableTokenLimits(data)) {
       return extractModelStats(data);
     }
   }

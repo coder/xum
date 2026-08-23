@@ -7,6 +7,7 @@
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { modelsExtra } from "./models-extra";
+import { hasUsableTokenLimits } from "./modelStats";
 
 const RETAINED_FIELDS = [
   "max_input_tokens",
@@ -43,7 +44,10 @@ const COST_FIELDS = [
 ] as const;
 
 // Abort thresholds guarding against truncated or structurally reshaped upstream data.
+// The absolute floor catches degenerate payloads; the relative bound catches partial
+// responses that would silently drop metadata for thousands of currently known models.
 const MIN_CHAT_MODELS = 500;
+const MAX_CHAT_MODEL_SHRINK_FRACTION = 0.1;
 const MAX_INVALID_PRICING_FRACTION = 0.05;
 
 export type ModelCatalogData = Record<string, Record<string, unknown>>;
@@ -106,9 +110,19 @@ export function sanitizePricing(pruned: ModelCatalogData): SanitizedModelData {
   return { catalog, droppedModelIds };
 }
 
+function providesUsableMetadata(entry: unknown): boolean {
+  return (
+    typeof entry === "object" &&
+    entry !== null &&
+    hasUsableTokenLimits(entry as Record<string, unknown>)
+  );
+}
+
 /**
  * Curated models that would lose token/pricing metadata under the given catalog.
- * The models-extra overrides are consulted the same way getModelStats does.
+ * The models-extra overrides are consulted the same way getModelStats does, and
+ * coverage requires usable metadata (not mere key presence), so an upstream entry
+ * that loses its token limits still counts as missing.
  */
 export function findMissingKnownModels(
   catalog: ModelCatalogData,
@@ -122,21 +136,40 @@ export function findMissingKnownModels(
       model.provider === "xai" || model.provider === "moonshotai"
         ? `${model.provider}/${modelId}`
         : modelId;
-    if (!(lookupKey in catalog) && !(lookupKey in extra) && !(modelId in extra)) {
+    if (
+      !providesUsableMetadata(catalog[lookupKey]) &&
+      !providesUsableMetadata(extra[lookupKey]) &&
+      !providesUsableMetadata(extra[modelId])
+    ) {
       missing.push(model.id);
     }
   }
   return missing;
 }
 
-/** Throws when the sanitized upstream data is unfit to replace the vendored models.json. */
-export function validateModelData(sanitized: SanitizedModelData): void {
+export function countChatModels(catalog: ModelCatalogData): number {
+  return Object.values(catalog).filter((metadata) => metadata.mode === "chat").length;
+}
+
+/**
+ * Throws when the sanitized upstream data is unfit to replace the vendored
+ * models.json. `baselineChatCount` is the chat-model count of the currently
+ * vendored catalog (0 when unavailable).
+ */
+export function validateModelData(sanitized: SanitizedModelData, baselineChatCount = 0): void {
   const { catalog, droppedModelIds } = sanitized;
   const errors: string[] = [];
 
-  const chatCount = Object.values(catalog).filter((metadata) => metadata.mode === "chat").length;
+  const chatCount = countChatModels(catalog);
   if (chatCount < MIN_CHAT_MODELS) {
     errors.push(`only ${chatCount} chat models found (expected at least ${MIN_CHAT_MODELS})`);
+  }
+  const minRelativeChatCount = Math.ceil(baselineChatCount * (1 - MAX_CHAT_MODEL_SHRINK_FRACTION));
+  if (chatCount < minRelativeChatCount) {
+    errors.push(
+      `chat model count shrank from ${baselineChatCount} to ${chatCount} ` +
+        `(more than ${MAX_CHAT_MODEL_SHRINK_FRACTION * 100}% below the vendored baseline)`
+    );
   }
 
   const total = Object.keys(catalog).length + droppedModelIds.length;
@@ -158,5 +191,10 @@ export function validateModelData(sanitized: SanitizedModelData): void {
 }
 
 export function serializeModelData(catalog: ModelCatalogData): string {
-  return `${JSON.stringify(catalog, null, 2)}\n`;
+  // Sort keys so upstream object reordering never shows up as a diff (the CLI
+  // and the scheduled workflow treat byte-identical output as "no update").
+  const sorted = Object.fromEntries(
+    Object.entries(catalog).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  );
+  return `${JSON.stringify(sorted, null, 2)}\n`;
 }

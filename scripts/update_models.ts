@@ -9,10 +9,12 @@
  */
 
 import {
+  countChatModels,
   pruneModelData,
   sanitizePricing,
   serializeModelData,
   validateModelData,
+  type ModelCatalogData,
 } from "../src/common/utils/tokens/updateModelsData";
 
 const LITELLM_URL =
@@ -35,12 +37,23 @@ async function updateModels() {
         sanitized.droppedModelIds.slice(0, 10).join(", ")
     );
   }
-  validateModelData(sanitized);
 
-  const serialized = serializeModelData(sanitized.catalog);
   const existing = await Bun.file(OUTPUT_PATH)
     .text()
     .catch(() => null);
+  // Validate shrinkage against the vendored catalog so a truncated upstream
+  // response cannot silently drop metadata for thousands of known models.
+  let baselineChatCount = 0;
+  if (existing !== null) {
+    try {
+      baselineChatCount = countChatModels(JSON.parse(existing) as ModelCatalogData);
+    } catch {
+      console.warn(`Could not parse existing ${OUTPUT_PATH}; skipping baseline size check`);
+    }
+  }
+  validateModelData(sanitized, baselineChatCount);
+
+  const serialized = serializeModelData(sanitized.catalog);
   if (existing === serialized) {
     console.log("✓ models.json already up to date");
     return;

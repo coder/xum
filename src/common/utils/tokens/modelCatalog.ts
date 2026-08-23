@@ -5,6 +5,7 @@
  */
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { normalizeToCanonical } from "@/common/utils/ai/models";
 import modelsData from "./models.json";
 import { getModelStats } from "./modelStats";
 
@@ -44,12 +45,20 @@ export function listModelCatalogIds(): string[] {
         continue;
       }
       const id = toCanonicalModelId(key, metadata);
-      // getModelStats enforces the validity bar (usable token limits), so every
-      // listed id inherits real metadata when selected as a mapping target.
-      if (id === null || getModelStats(id) === null) {
+      if (id === null) {
         continue;
       }
-      ids.add(id);
+      // Stats resolution normalizes gateway ids (openrouter:deepseek/x resolves as
+      // deepseek:x), so expose the normalized identity and let the Set collapse
+      // gateway duplicates; otherwise a gateway row would silently inherit the
+      // direct entry's metadata while looking like a distinct option.
+      const normalized = normalizeToCanonical(id);
+      // getModelStats enforces the validity bar (usable token limits), so every
+      // listed id inherits real metadata when selected as a mapping target.
+      if (getModelStats(normalized) === null) {
+        continue;
+      }
+      ids.add(normalized);
     }
     cachedIds = [...ids].sort();
   }
