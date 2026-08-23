@@ -43,6 +43,15 @@ export const BRANCH_SUMMARY_MAX_OUTPUT_TOKENS = 512;
 export const BRANCH_SUMMARY_TIMEOUT_MS = 6_000;
 
 /**
+ * Bounded cleanup window for draining a deadline-cancelled summary stream
+ * (reader.cancel + consumer settlement). Cancellation normally settles in
+ * milliseconds; a provider wedged in its own cancel path must not hold the
+ * synchronous edit-resend wait or workspace removal past the deadline the
+ * drain exists to serve — after this window the consumer is detached.
+ */
+export const BRANCH_SUMMARY_CANCEL_DRAIN_MS = 2_000;
+
+/**
  * Hard cap on characters accumulated from the summary stream. Purely
  * defensive: BRANCH_SUMMARY_MAX_OUTPUT_TOKENS already bounds well-behaved
  * providers (~4 chars/token ≈ 2k chars), but a pathological provider that

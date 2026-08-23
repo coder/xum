@@ -34,14 +34,14 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 
-/** Cross-process history append lock (r50); lives in the session directory. */
-const HISTORY_APPEND_LOCK_FILENAME = "history-append.lock";
+/** Cross-process history write lock (r50/r51); lives in the session directory. */
+const HISTORY_WRITE_LOCK_FILENAME = "history.lock";
 /**
- * Generous bound on waiting for a foreign backend's append: legitimate holds
- * are one append or one batch read+replace (ms). A timeout fails the append
- * visibly instead of corrupting history.
+ * Generous bound on waiting for a foreign backend's write: legitimate holds
+ * are one append or one read+replace of the active file (ms). A timeout
+ * fails the mutation visibly instead of corrupting history.
  */
-const HISTORY_APPEND_LOCK_TIMEOUT_MS = 10_000;
+const HISTORY_WRITE_LOCK_TIMEOUT_MS = 10_000;
 
 function hasDurableCompactionBoundary(metadata: MuxMetadata | undefined): boolean {
   if (metadata?.compactionBoundary !== true) {
@@ -1869,22 +1869,21 @@ export class HistoryService {
   }
 
   /**
-   * Serialize history APPENDS across backend processes (r50). The in-process
-   * history mutex cannot exclude a second backend
+   * Serialize history WRITES across backend processes (r50/r51). The
+   * in-process history mutex cannot exclude a second backend
    * (XUM_ALLOW_MULTIPLE_INSTANCES=1) writing the same chat.jsonl: plain
-   * appends are O_APPEND and never delete foreign rows, but the batch append
-   * (appendManyToHistory) is a read-modify-write — a foreign row landing
-   * between its read and its atomic replace would be silently deleted, and
-   * two concurrent batches could overwrite each other. Every appender
-   * therefore holds this session-dir lock across its write, and the batch
-   * holds it across its whole read+replace. Scoped to the append paths a
-   * foreign backend actually exercises concurrently (family-message delivery
-   * into a workspace another backend is appending to); full-rewrite
-   * mutations (updateHistory/truncation/rotation) keep their pre-existing
-   * single-writer assumptions. Always nested INSIDE the in-process history
+   * appends are O_APPEND and never delete foreign rows, but every
+   * read-modify-write that atomically replaces the file — the family-message
+   * batch, updateHistory's row finalization, deletes, truncations, boundary
+   * persistence — would silently revert or delete a foreign row landing
+   * between its read and its replace. ALL mutation paths therefore hold this
+   * session-dir lock for their whole read+replace (via
+   * withRecoveredHistoryWriteResultLock); reads stay lock-free because
+   * writeFileAtomic's rename means a reader observes either the old or the
+   * new file, never a torn one. Always nested INSIDE the in-process history
    * mutex, so lock order is fixed and re-entry is impossible.
    */
-  private async withCrossProcessAppendLock<T>(
+  private async withCrossProcessWriteLock<T>(
     workspaceId: string,
     operation: () => Promise<T>
   ): Promise<T> {
@@ -1893,16 +1892,57 @@ export class HistoryService {
     // permissions; create the session dir with private permissions first.
     await ensurePrivateDir(sessionDir);
     await using _lock = await acquireProcessFileLock({
-      lockPath: path.join(sessionDir, HISTORY_APPEND_LOCK_FILENAME),
-      timeoutMs: HISTORY_APPEND_LOCK_TIMEOUT_MS,
-      label: "history append lock",
+      lockPath: path.join(sessionDir, HISTORY_WRITE_LOCK_FILENAME),
+      timeoutMs: HISTORY_WRITE_LOCK_TIMEOUT_MS,
+      label: "history write lock",
     });
     return await operation();
   }
 
+  /**
+   * Advance the cached sequence counter from durable history (r51). Call
+   * FIRST inside the write lock from every path that ASSIGNS new sequences
+   * from the cached counter (the append family): the cache can be stale once
+   * the lock lands — a foreign backend may have appended rows with higher
+   * sequences since this process last looked — and a stale assignment would
+   * duplicate a foreign row's sequence (updateHistory() replaces the first
+   * row matching a sequence, so a duplicate lets a later stream finalization
+   * overwrite an unrelated foreign row). Advance-only: delete/truncate flows
+   * recompute their own counters from the post-mutation file under this same
+   * lock and may deliberately allow removed sequences to be reused, so they
+   * must not be pre-seeded here. Same cost class as the recovery scan that
+   * precedes every operation (active file is bounded by rotation).
+   */
+  private async refreshSequenceCounterUnderWriteLock(workspaceId: string): Promise<void> {
+    const persistedNext = (await this.getMaxHistorySequence(workspaceId)) + 1;
+    const cached = this.sequenceCounters.get(workspaceId);
+    if (cached === undefined || persistedNext > cached) {
+      this.sequenceCounters.set(workspaceId, persistedNext);
+    }
+  }
+
+  /**
+   * Write-path variant of withRecoveredHistoryResultLock: additionally holds
+   * the cross-process write lock (and refreshes the sequence counter under
+   * it). Every method that appends to or atomically replaces chat.jsonl must
+   * use this wrapper; read-only methods stay on the mutex-only variant.
+   */
+  private async withRecoveredHistoryWriteResultLock<T>(
+    workspaceId: string,
+    errorPrefix: string,
+    operation: () => Promise<Result<T>>
+  ): Promise<Result<T>> {
+    return this.withRecoveredHistoryResultLock(workspaceId, errorPrefix, () =>
+      this.withCrossProcessWriteLock(workspaceId, operation)
+    );
+  }
+
   async appendToHistory(workspaceId: string, message: MuxMessage): Promise<Result<void>> {
-    return this.withRecoveredHistoryResultLock(workspaceId, "Failed to append history", () =>
-      this.withCrossProcessAppendLock(workspaceId, async () => {
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to append history",
+      async () => {
+        await this.refreshSequenceCounterUnderWriteLock(workspaceId);
         const result = await this._appendToHistoryUnlocked(workspaceId, message);
         if (result.success) {
           // A new durable boundary seals the previous epoch — rotate it out of
@@ -1910,7 +1950,7 @@ export class HistoryService {
           await this.rotateAfterBoundaryWriteUnlocked(workspaceId, message);
         }
         return result;
-      })
+      }
     );
   }
 
@@ -1925,9 +1965,12 @@ export class HistoryService {
    */
   async appendManyToHistory(workspaceId: string, messages: MuxMessage[]): Promise<Result<void>> {
     assert(messages.length > 0, "appendManyToHistory requires at least one message");
-    return this.withRecoveredHistoryResultLock(workspaceId, "Failed to append history", () =>
-      this.withCrossProcessAppendLock(workspaceId, async () => {
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to append history",
+      async () => {
         try {
+          await this.refreshSequenceCounterUnderWriteLock(workspaceId);
           const workspaceDir = this.config.getSessionDir(workspaceId);
           await ensurePrivateDir(workspaceDir);
           const historyPath = this.getChatHistoryPath(workspaceId);
@@ -1975,7 +2018,7 @@ export class HistoryService {
         } catch (error) {
           return Err(`Failed to append to history: ${getErrorMessage(error)}`);
         }
-      })
+      }
     );
   }
 
@@ -1998,24 +2041,24 @@ export class HistoryService {
       expectedTailMessageId.length > 0,
       "appendToHistoryIfTailMatches requires a non-empty expected tail id"
     );
-    return this.withRecoveredHistoryResultLock<"appended" | "tail-mismatch">(
+    return this.withRecoveredHistoryWriteResultLock<"appended" | "tail-mismatch">(
       workspaceId,
       "Failed to append history",
-      () =>
+      async () => {
+        await this.refreshSequenceCounterUnderWriteLock(workspaceId);
         // Tail check + append under the cross-process lock (r50) so a foreign
         // backend's append cannot land between the check and this write.
-        this.withCrossProcessAppendLock(workspaceId, async () => {
-          const tail = await this.readLastMessagesFromFile(this.getChatHistoryPath(workspaceId), 1);
-          if (tail.length === 0 || tail[0].id !== expectedTailMessageId) {
-            return Ok("tail-mismatch");
-          }
-          const result = await this._appendToHistoryUnlocked(workspaceId, message);
-          if (!result.success) {
-            return Err(result.error);
-          }
-          await this.rotateAfterBoundaryWriteUnlocked(workspaceId, message);
-          return Ok("appended");
-        })
+        const tail = await this.readLastMessagesFromFile(this.getChatHistoryPath(workspaceId), 1);
+        if (tail.length === 0 || tail[0].id !== expectedTailMessageId) {
+          return Ok("tail-mismatch");
+        }
+        const result = await this._appendToHistoryUnlocked(workspaceId, message);
+        if (!result.success) {
+          return Err(result.error);
+        }
+        await this.rotateAfterBoundaryWriteUnlocked(workspaceId, message);
+        return Ok("appended");
+      }
     );
   }
 
@@ -2028,7 +2071,7 @@ export class HistoryService {
    * never in the sealed archive.
    */
   async updateHistory(workspaceId: string, message: MuxMessage): Promise<Result<void>> {
-    return this.withRecoveredHistoryResultLock(
+    return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to update history",
       async () => {
@@ -2129,7 +2172,7 @@ export class HistoryService {
     updateExisting: boolean
   ): Promise<Result<void>> {
     assert(tailCopies.length > 0, "persistBoundaryWithTailCopies requires at least one tail copy");
-    return this.withRecoveredHistoryResultLock(
+    return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to persist compaction boundary with tail copies",
       async () => {
@@ -2222,7 +2265,7 @@ export class HistoryService {
     const ids = new Set(messageIds);
     assert(ids.size === messageIds.length, "deleteMessages requires unique message IDs");
 
-    return this.withRecoveredHistoryResultLock(
+    return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to delete messages",
       async () => {
@@ -2284,7 +2327,7 @@ export class HistoryService {
    * messages may already have been appended.
    */
   async deleteMessage(workspaceId: string, messageId: string): Promise<Result<void>> {
-    return this.withRecoveredHistoryResultLock(
+    return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to delete message",
       async () => {
@@ -2378,7 +2421,7 @@ export class HistoryService {
     messageId: string,
     options?: { keepTargetMessage?: boolean }
   ): Promise<Result<{ removedMessages: MuxMessage[] }>> {
-    return this.withRecoveredHistoryResultLock(
+    return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to truncate history",
       async () => {
@@ -2539,7 +2582,7 @@ export class HistoryService {
     workspaceId: string,
     percentage: number
   ): Promise<Result<number[], string>> {
-    return this.withRecoveredHistoryResultLock(
+    return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to truncate history",
       async () => {
@@ -2679,7 +2722,10 @@ export class HistoryService {
    * IMPORTANT: Should be called AFTER the session directory has been renamed
    */
   async migrateWorkspaceId(oldWorkspaceId: string, newWorkspaceId: string): Promise<Result<void>> {
-    return this.withRecoveredHistoryResultLock(
+    // Safe to hold the cross-process write lock: the session directory was
+    // already renamed, so the lockfile lives (and is released) at the new
+    // path.
+    return this.withRecoveredHistoryWriteResultLock(
       newWorkspaceId,
       "Failed to migrate workspace history",
       async () => {

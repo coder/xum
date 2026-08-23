@@ -800,6 +800,39 @@ describe("maybeAppendAbandonedBranchSummary", () => {
     }
   });
 
+  test("a provider wedged in its cancel path cannot hold the deadline drain (r51)", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    try {
+      // Never produces chunks AND never settles its cancel: the deadline
+      // drain (reader.cancel + consume) must be bounded, or the synchronous
+      // edit-resend wait blocks indefinitely on exactly the wedged provider
+      // the deadline exists to cap.
+      const wedgedCancel = new MockLanguageModelV3({
+        doStream: () =>
+          Promise.resolve({
+            stream: new ReadableStream<LanguageModelV3StreamPart>({
+              pull: () => new Promise<never>(() => undefined),
+              cancel: () => new Promise<never>(() => undefined),
+            }),
+          }),
+      });
+      const startedAt = Date.now();
+      const appended = await maybeAppendAbandonedBranchSummary({
+        historyService,
+        aiService: fakeAiService(wedgedCancel),
+        workspaceId: "ws-wedged-cancel",
+        abandonedMessages: meatyExchange("wedged-cancel"),
+        experiments: RLM_ON,
+        timeoutMs: 100,
+      });
+      expect(appended).toBeNull();
+      // Bounded: deadline + drain window, well under the suite cap.
+      expect(Date.now() - startedAt).toBeLessThan(5_000);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("wedged model creation is cut off by the shared deadline (r50)", async () => {
     const { historyService, cleanup } = await createTestHistoryService();
     try {

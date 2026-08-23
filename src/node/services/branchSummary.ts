@@ -29,6 +29,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import {
+  BRANCH_SUMMARY_CANCEL_DRAIN_MS,
   BRANCH_SUMMARY_MAX_ACCUMULATED_CHARS,
   BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
   BRANCH_SUMMARY_MAX_TRANSCRIPT_CHARS,
@@ -471,14 +472,25 @@ async function generateAbandonedBranchSummaryText(input: {
         // Actively cancel the losing consumer: a wedged provider leaves it
         // pinned in read() (the loop's aborted check only runs when a delta
         // arrives), and cancel resolves that pending read so the reader is
-        // released promptly. AWAITED, then the consume task drained (r50,
-        // mirroring the refine runner's deadline path): returning while
+        // released promptly. Drained before cleanup (r50): returning while
         // cancellation is still in flight would run the finally's
         // runLanguageModelCleanup underneath a provider whose asynchronous
         // stream teardown had not settled, keeping network/runtime resources
-        // alive past workspace removal.
-        await reader.cancel().catch(() => undefined);
-        await consume;
+        // alive past workspace removal. The drain itself is BOUNDED (r51):
+        // a provider wedged in its own cancel path would otherwise hold the
+        // synchronous edit-resend wait or workspace removal indefinitely —
+        // exactly the wedged-provider case the deadline exists to cap. After
+        // the window the consumer is detached; nothing observable depends on
+        // it (the salvage snapshot below is taken from `accumulated`, and
+        // the raced-away task can only settle into an abandoned stream).
+        const drained = (async () => {
+          await reader.cancel().catch(() => undefined);
+          await consume;
+        })();
+        await Promise.race([
+          drained,
+          new Promise<void>((resolve) => setTimeout(resolve, BRANCH_SUMMARY_CANCEL_DRAIN_MS)),
+        ]);
         // Deadline hit. Salvage whole sentences already streamed — a missed
         // deadline should still buy a (shorter) summary when tokens flowed.
         const salvaged = trimSummaryToBoundary(accumulated);

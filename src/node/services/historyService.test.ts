@@ -384,7 +384,7 @@ describe("HistoryService", () => {
       // replacement — built from contents read before the foreign append —
       // would silently delete the foreign row.
       const foreign = await acquireProcessFileLock({
-        lockPath: path.join(config.getSessionDir(workspaceId), "history-append.lock"),
+        lockPath: path.join(config.getSessionDir(workspaceId), "history.lock"),
         timeoutMs: 5_000,
         label: "test foreign backend",
       });
@@ -405,6 +405,39 @@ describe("HistoryService", () => {
       expect(result.success).toBe(true);
       const messages = await collectFullHistory(service, workspaceId);
       expect(messages.map((m) => m.id)).toEqual(["msg1", "payload-1", "trigger-1"]);
+    });
+
+    it("advances the sequence counter past foreign rows under the write lock (r51)", async () => {
+      const workspaceId = "workspace1";
+      // Cache a counter in this instance (msg1 takes sequence 0, counter -> 1).
+      const seeded = await service.appendToHistory(
+        workspaceId,
+        createMuxMessage("msg1", "user", "Hello")
+      );
+      expect(seeded.success).toBe(true);
+      // A foreign backend (XUM_ALLOW_MULTIPLE_INSTANCES=1) appends a row with
+      // a higher sequence from its own counter.
+      const foreignLine = messageLine(
+        workspaceId,
+        createMuxMessage("foreign-1", "assistant", "foreign row", { historySequence: 7 })
+      );
+      await fs.appendFile(
+        path.join(config.getSessionDir(workspaceId), "chat.jsonl"),
+        foreignLine + "\n"
+      );
+      // Without the in-lock counter refresh this batch would assign stale
+      // sequences from the cached counter; updateHistory replaces the FIRST
+      // row matching a sequence, so a duplicate would let a later stream
+      // finalization overwrite an unrelated foreign row.
+      const result = await service.appendManyToHistory(workspaceId, [
+        createMuxMessage("payload-1", "assistant", "family payload"),
+        createMuxMessage("trigger-1", "user", "family trigger"),
+      ]);
+      expect(result.success).toBe(true);
+      const messages = await collectFullHistory(service, workspaceId);
+      const seqById = new Map(messages.map((m) => [m.id, m.metadata?.historySequence]));
+      expect(seqById.get("payload-1")).toBe(8);
+      expect(seqById.get("trigger-1")).toBe(9);
     });
   });
 
