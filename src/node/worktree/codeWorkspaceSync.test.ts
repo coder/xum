@@ -398,6 +398,8 @@ describe("syncProjectCodeWorkspace", () => {
     const projectPath = path.join(tempDir, "repo");
     await fsPromises.mkdir(projectPath, { recursive: true });
     const worktreePath = path.join(config.srcDir, "repo", "feat-1");
+    // Checkout must exist on disk or metadata is marked transcript-only.
+    await fsPromises.mkdir(worktreePath, { recursive: true });
     await config.editConfig((cfg) => {
       cfg.projects.set(projectPath, {
         workspaces: [
@@ -448,6 +450,8 @@ describe("syncProjectCodeWorkspace", () => {
     await fsPromises.symlink(realFile, linkFile);
     const worktreeA = path.join(config.srcDir, "repo", "feat-a");
     const worktreeB = path.join(config.srcDir, "repo", "feat-b");
+    await fsPromises.mkdir(worktreeA, { recursive: true });
+    await fsPromises.mkdir(worktreeB, { recursive: true });
     const workspaceEntry = (worktree: string, id: string) => ({
       path: worktree,
       id,
@@ -487,6 +491,8 @@ describe("syncProjectCodeWorkspace", () => {
     const sharedFile = path.join(tempDir, "shared.code-workspace");
     const worktreeA = path.join(config.srcDir, "repo", "feat-a");
     const worktreeB = path.join(config.srcDir, "repo", "feat-b");
+    await fsPromises.mkdir(worktreeA, { recursive: true });
+    await fsPromises.mkdir(worktreeB, { recursive: true });
     const workspaceEntry = (worktree: string, id: string) => ({
       path: worktree,
       id,
@@ -627,6 +633,14 @@ describe("computeManagedWorktreePaths", () => {
       ...computeParams,
     });
     expect(desiredPaths).toEqual([`${managedRoot}/feature-a`]);
+  });
+
+  test("excludes transcript-only workspaces whose checkout was deleted", () => {
+    const { desiredPaths } = computeManagedWorktreePaths({
+      allMetadata: [makeMetadata({ transcriptOnly: true })],
+      ...computeParams,
+    });
+    expect(desiredPaths).toEqual([]);
   });
 
   test("managedRootsByProject derives devcontainer cleanup roots from the checkout", () => {

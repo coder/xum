@@ -7901,7 +7901,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "To browse all of a project's worktrees from one VS Code or code-server window, set a `.code-workspace` file path per project in Settings → Runtimes (select the project scope). Xum keeps that file's folder list in sync as worktree workspaces are created, renamed, archived, and deleted.",
       "",
-      "Xum only manages folder entries under the project's worktree directory; folders you add yourself, comments, and `settings`/`extensions` blocks are left untouched.",
+      "Xum only manages folder entries under the project's worktree directory; folders you add yourself and everything outside the `folders` array (comments, `settings`/`extensions` blocks) are left untouched. When Xum adds or removes an entry it rewrites the `folders` array itself, so comments placed inside that array are not preserved.",
       "",
     ].join("\n"),
     "references/docs/workspaces/compaction/automatic.mdx": [

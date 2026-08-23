@@ -1252,6 +1252,8 @@ describe("projects.setCodeWorkspaceSyncPath", () => {
     fs.mkdirSync(subProjectA, { recursive: true });
     fs.mkdirSync(subProjectB, { recursive: true });
     const worktreePath = path.join(config.srcDir, "project", "feat-1");
+    // Checkout must exist on disk or metadata is marked transcript-only.
+    fs.mkdirSync(worktreePath, { recursive: true });
     await config.editConfig((current) => {
       current.projects.set(projectPath, {
         workspaces: [

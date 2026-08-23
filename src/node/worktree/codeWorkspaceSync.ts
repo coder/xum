@@ -407,6 +407,11 @@ export function computeManagedWorktreePaths(params: {
     if (metadata.taskIsolation === "none") {
       continue;
     }
+    // Transcript-only workspaces (checkout deleted, e.g. archive ->
+    // delete-worktree -> unarchive) have no directory to open in the editor.
+    if (metadata.transcriptOnly) {
+      continue;
+    }
     if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) {
       continue;
     }
