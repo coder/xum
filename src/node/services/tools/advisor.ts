@@ -252,7 +252,8 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
         handoffMessage != null ? [...transcript, handoffMessage] : transcript;
 
       try {
-        const { model, optionsModelString } = await runtime.createModel(advisorModelString);
+        const { model, optionsModelString, optionsProvidersConfig } =
+          await runtime.createModel(advisorModelString);
         // Provider options from the wire-resolved identity captured at model
         // creation (same snapshot): a raw coder: string would resolve to the
         // wrong (or no) provider namespace for custom-named or cross-typed
@@ -262,7 +263,13 @@ export function createAdvisorTool(config: ToolConfiguration): Tool {
         // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
         const providerOptions = buildProviderOptions(
           optionsModelString,
-          effectiveReasoningLevel
+          effectiveReasoningLevel,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          optionsProvidersConfig
         ) as unknown as StreamTextProviderOptions;
 
         emitAdvisorPhase("waiting_for_response");

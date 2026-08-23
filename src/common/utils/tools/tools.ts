@@ -2,6 +2,7 @@ import { xai } from "@ai-sdk/xai";
 import { type LanguageModel, type Tool } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { isGrokFrontierModel } from "@/common/types/thinking";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
@@ -322,9 +323,17 @@ export interface ToolConfiguration {
      * the wrong (or no) provider namespace for custom-named or cross-typed
      * instances.
      */
-    createModel: (
-      modelString: string
-    ) => Promise<{ model: LanguageModel; optionsModelString: string }>;
+    createModel: (modelString: string) => Promise<{
+      model: LanguageModel;
+      optionsModelString: string;
+      /**
+       * Providers snapshot captured at model-creation time for option
+       * construction. Required so buildProviderOptions can remap
+       * custom-provider wire namespaces while still resolving mappedToModel
+       * alias metadata from the raw custom identity.
+       */
+      optionsProvidersConfig: ProvidersConfigMap | null;
+    }>;
     /** The abort signal from the parent stream */
     abortSignal: AbortSignal;
   };

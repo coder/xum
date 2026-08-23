@@ -2580,6 +2580,10 @@ export class AIService extends EventEmitter {
                   // a catalog refresh land between them, running the request
                   // on one wire while recording usage under another type.
                   const advisorProvidersConfig = this.config.loadProvidersConfig() ?? {};
+                  // View snapshot captured at creation time for option
+                  // building (buildProviderOptions takes the oRPC view, not
+                  // the raw config shape).
+                  const advisorOptionsProvidersConfig = this.providerService.getConfig();
                   const advisorModel = await this.createModel(advisorModelString, undefined, {
                     workspaceId,
                     providersConfig: advisorProvidersConfig,
@@ -2622,22 +2626,10 @@ export class AIService extends EventEmitter {
                   // namespace for custom-named/cross-typed instances. Mirrors
                   // resolveOptionsCanonicalModel's shadow + wire rules.
                   const advisorOptionsModelString = (() => {
-                    // Custom providers speak the wire their providerType
-                    // selects; mirrors resolveOptionsCanonicalModel's remap so
-                    // advisor reasoning options land in the SDK namespace.
-                    const advisorColonIndex = advisorModelString.indexOf(":");
-                    const advisorPrefixEntry =
-                      advisorColonIndex > 0
-                        ? advisorProvidersConfig[advisorModelString.slice(0, advisorColonIndex)]
-                        : undefined;
-                    if (isCustomProviderConfig(advisorPrefixEntry)) {
-                      const advisorWireOrigin = customProviderWireOrigin(
-                        advisorPrefixEntry.providerType
-                      );
-                      return advisorWireOrigin
-                        ? `${advisorWireOrigin}:${advisorModelString.slice(advisorColonIndex + 1)}`
-                        : advisorModelString;
-                    }
+                    // Custom providers keep their RAW identity: with the
+                    // pinned snapshot below, buildProviderOptions remaps the
+                    // wire namespace itself while still resolving
+                    // mappedToModel alias metadata from the custom entry.
                     if (!advisorModelString.startsWith("coder:")) {
                       return advisorModelString;
                     }
@@ -2661,6 +2653,7 @@ export class AIService extends EventEmitter {
                   return {
                     model: advisorModel.data,
                     optionsModelString: advisorOptionsModelString,
+                    optionsProvidersConfig: advisorOptionsProvidersConfig,
                   };
                 },
                 abortSignal: combinedAbortSignal,
