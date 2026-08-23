@@ -153,17 +153,17 @@ export function findMissingKnownModels(
 export interface CatalogSummary {
   /** Chat/responses entries with usable token limits (what the Treat-as catalog can expose). */
   usableMappableModels: number;
-  /** Chat entries carrying a numeric input cost. */
-  inputPricedChatModels: number;
-  /** Chat entries carrying a numeric output cost. */
-  outputPricedChatModels: number;
+  /** Mappable (chat/responses) entries carrying a numeric input cost. */
+  inputPricedModels: number;
+  /** Mappable (chat/responses) entries carrying a numeric output cost. */
+  outputPricedModels: number;
 }
 
 export function summarizeCatalog(catalog: ModelCatalogData): CatalogSummary {
   const summary: CatalogSummary = {
     usableMappableModels: 0,
-    inputPricedChatModels: 0,
-    outputPricedChatModels: 0,
+    inputPricedModels: 0,
+    outputPricedModels: 0,
   };
   for (const metadata of Object.values(catalog)) {
     if (typeof metadata.mode !== "string" || !MAPPABLE_MODES.has(metadata.mode)) {
@@ -174,15 +174,14 @@ export function summarizeCatalog(catalog: ModelCatalogData): CatalogSummary {
     if (hasUsableTokenLimits(metadata)) {
       summary.usableMappableModels++;
     }
-    if (metadata.mode === "chat") {
-      // Input and output pricing are tracked separately so renaming just one
-      // cost field cannot hide behind the other's coverage.
-      if (typeof metadata.input_cost_per_token === "number") {
-        summary.inputPricedChatModels++;
-      }
-      if (typeof metadata.output_cost_per_token === "number") {
-        summary.outputPricedChatModels++;
-      }
+    // Priced coverage spans every mappable mode (getModelStats prices responses
+    // entries identically), and input/output are tracked separately so renaming
+    // just one cost field cannot hide behind the other's coverage.
+    if (typeof metadata.input_cost_per_token === "number") {
+      summary.inputPricedModels++;
+    }
+    if (typeof metadata.output_cost_per_token === "number") {
+      summary.outputPricedModels++;
     }
   }
   return summary;
@@ -190,8 +189,8 @@ export function summarizeCatalog(catalog: ModelCatalogData): CatalogSummary {
 
 const EMPTY_BASELINE: CatalogSummary = {
   usableMappableModels: 0,
-  inputPricedChatModels: 0,
-  outputPricedChatModels: 0,
+  inputPricedModels: 0,
+  outputPricedModels: 0,
 };
 
 function belowBaseline(count: number, baseline: number): boolean {
@@ -227,16 +226,8 @@ export function validateModelData(
     // pricing-field rename would sail through the per-entry checks; catching a
     // collapse in priced coverage keeps getModelStats from silently zero-pricing
     // the whole catalog.
-    [
-      "input-priced chat model count",
-      summary.inputPricedChatModels,
-      baseline.inputPricedChatModels,
-    ],
-    [
-      "output-priced chat model count",
-      summary.outputPricedChatModels,
-      baseline.outputPricedChatModels,
-    ],
+    ["input-priced model count", summary.inputPricedModels, baseline.inputPricedModels],
+    ["output-priced model count", summary.outputPricedModels, baseline.outputPricedModels],
   ];
   for (const [label, count, baselineCount] of shrinkChecks) {
     if (belowBaseline(count, baselineCount)) {

@@ -138,8 +138,8 @@ describe("validateModelData", () => {
     };
     const baseline = (usableMappableModels: number) => ({
       usableMappableModels,
-      inputPricedChatModels: 600,
-      outputPricedChatModels: 600,
+      inputPricedModels: 600,
+      outputPricedModels: 600,
     });
     expect(() => validateModelData(sanitized, baseline(2000))).toThrow(
       /usable chat\/responses model count shrank from 2000/
@@ -167,10 +167,10 @@ describe("validateModelData", () => {
     expect(() =>
       validateModelData(sanitized, {
         usableMappableModels: 700,
-        inputPricedChatModels: 680,
-        outputPricedChatModels: 680,
+        inputPricedModels: 680,
+        outputPricedModels: 680,
       })
-    ).toThrow(/output-priced chat model count shrank from 680/);
+    ).toThrow(/output-priced model count shrank from 680/);
   });
 
   test("rejects a catalog-wide loss of token limits even when pricing survives", () => {
@@ -192,8 +192,8 @@ describe("validateModelData", () => {
     expect(() =>
       validateModelData(sanitized, {
         usableMappableModels: 700,
-        inputPricedChatModels: 680,
-        outputPricedChatModels: 680,
+        inputPricedModels: 680,
+        outputPricedModels: 680,
       })
     ).toThrow(/usable chat\/responses model count shrank from 700/);
   });
@@ -206,14 +206,19 @@ describe("validateModelData", () => {
           max_input_tokens: 128000,
           input_cost_per_token: 0.000001,
         },
-        usableResponses: { mode: "responses", max_input_tokens: 128000 },
+        usableResponses: {
+          mode: "responses",
+          max_input_tokens: 128000,
+          input_cost_per_token: 0.000002,
+          output_cost_per_token: 0.000008,
+        },
         limitlessChat: { mode: "chat", input_cost_per_token: 0.000001 },
-        embedding: { mode: "embedding", max_input_tokens: 8192 },
+        embedding: { mode: "embedding", max_input_tokens: 8192, input_cost_per_token: 0.0000001 },
       })
     ).toEqual({
       usableMappableModels: 2,
-      inputPricedChatModels: 2,
-      outputPricedChatModels: 0,
+      inputPricedModels: 3,
+      outputPricedModels: 1,
     });
   });
 
