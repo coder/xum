@@ -12,7 +12,7 @@ import { XUM_PRODUCT_NAME } from "@/common/constants/product";
 import type { RuntimeConfig, RuntimeMode, RuntimeAvailabilityStatus } from "@/common/types/runtime";
 import { hasSrcBaseDir } from "@/common/types/runtime";
 import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility";
-import { execFileAsync } from "@/node/utils/disposableExec";
+import { detectContainerEngine } from "./containerCli";
 import type { CoderService } from "@/node/services/coderService";
 import { Config } from "@/node/config";
 import { checkDevcontainerCliVersion } from "./devcontainerCli";
@@ -248,25 +248,6 @@ async function isGitRepository(projectPath: string): Promise<boolean> {
   }
 }
 
-/**
- * Check if Docker daemon is running and accessible.
- */
-async function isDockerAvailable(): Promise<boolean> {
-  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-  try {
-    using proc = execFileAsync("docker", ["info"]);
-    const timeout = new Promise<never>((_, reject) => {
-      timeoutHandle = setTimeout(() => reject(new Error("timeout")), 5000);
-    });
-    await Promise.race([proc.result, timeout]);
-    return true;
-  } catch {
-    return false;
-  } finally {
-    if (timeoutHandle) clearTimeout(timeoutHandle);
-  }
-}
-
 type RuntimeAvailabilityMap = Record<RuntimeMode, RuntimeAvailabilityStatus>;
 
 /**
@@ -276,14 +257,20 @@ type RuntimeAvailabilityMap = Record<RuntimeMode, RuntimeAvailabilityStatus>;
 export async function checkRuntimeAvailability(
   projectPath: string
 ): Promise<RuntimeAvailabilityMap> {
-  const [isGit, dockerAvailable, devcontainerCliInfo, devcontainerConfigs] = await Promise.all([
+  const [isGit, containerEngine, devcontainerCliInfo, devcontainerConfigs] = await Promise.all([
     isGitRepository(projectPath),
-    isDockerAvailable(),
+    detectContainerEngine(),
     checkDevcontainerCliVersion(),
     scanDevcontainerConfigs(projectPath),
   ]);
 
   const devcontainerConfigInfo = buildDevcontainerConfigInfo(devcontainerConfigs);
+  const dockerAvailable =
+    containerEngine.available &&
+    path
+      .basename(containerEngine.cli)
+      .replace(/\.exe$/i, "")
+      .toLowerCase() === "docker";
 
   const gitRequiredReason = "Requires git repository";
 
@@ -297,7 +284,10 @@ export async function checkRuntimeAvailability(
       reason: "Dev Container CLI not installed. Run: npm install -g @devcontainers/cli",
     };
   } else if (!dockerAvailable) {
-    devcontainerAvailability = { available: false, reason: "Docker daemon not running" };
+    devcontainerAvailability = {
+      available: false,
+      reason: "Dev Containers require Docker; Docker daemon not running",
+    };
   } else if (devcontainerConfigInfo.length === 0) {
     devcontainerAvailability = { available: false, reason: "No devcontainer.json found" };
   } else {
@@ -314,8 +304,8 @@ export async function checkRuntimeAvailability(
     ssh: isGit ? { available: true } : { available: false, reason: gitRequiredReason },
     docker: !isGit
       ? { available: false, reason: gitRequiredReason }
-      : !dockerAvailable
-        ? { available: false, reason: "Docker daemon not running" }
+      : !containerEngine.available
+        ? { available: false, reason: containerEngine.reason }
         : { available: true },
     devcontainer: devcontainerAvailability,
   };
