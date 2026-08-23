@@ -249,7 +249,9 @@ $(BUILTIN_SKILLS_GENERATED): $(BUILTIN_SKILL_SOURCES) $(DOCS_SOURCES) scripts/ge
 $(WORKFLOW_RUNTIME_SOURCES_GENERATED): $(WORKFLOW_RUNTIME_SOURCES) scripts/gen_workflow_runtime_sources.ts
 	@bun scripts/gen_workflow_runtime_sources.ts
 
-dist/cli/index.js: src/cli/index.ts src/desktop/main.ts src/cli/server.ts src/version.ts tsconfig.main.json tsconfig.json $(TS_SOURCES) $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
+# models.json is bundled but not in $(TS_SOURCES); without this prerequisite a
+# catalog-only refresh would leave a stale main bundle (#3727).
+dist/cli/index.js: src/cli/index.ts src/desktop/main.ts src/cli/server.ts src/version.ts tsconfig.main.json tsconfig.json $(TS_SOURCES) src/common/utils/tokens/models.json $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
 	@echo "Building main process..."
 	@NODE_ENV=production $(TSGO) -p tsconfig.main.json
 	@NODE_ENV=production bun x tsc-alias -p tsconfig.main.json

@@ -27,8 +27,8 @@ jobs:
       - name: Check required secrets
         id: precheck
         env:
-          XUM_APP_ID: ${{ secrets.XUM_APP_ID || secrets.MUX_APP_ID }}
-          XUM_APP_PRIVATE_KEY: ${{ secrets.XUM_APP_PRIVATE_KEY || secrets.MUX_APP_PRIVATE_KEY }}
+          XUM_APP_ID: ${{ secrets.XUM_APP_ID }}
+          XUM_APP_PRIVATE_KEY: ${{ secrets.XUM_APP_PRIVATE_KEY }}
         run: |
           if [ -z "$XUM_APP_ID" ] || [ -z "$XUM_APP_PRIVATE_KEY" ]; then
             echo "Skipping (missing XUM_APP_ID / XUM_APP_PRIVATE_KEY)."
@@ -43,8 +43,8 @@ jobs:
         with:
           # Use a GitHub App token so PR events trigger CI. PRs opened via
           # GITHUB_TOKEN intentionally do not trigger other workflows.
-          app-id: ${{ secrets.XUM_APP_ID || secrets.MUX_APP_ID }}
-          private-key: ${{ secrets.XUM_APP_PRIVATE_KEY || secrets.MUX_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.XUM_APP_ID }}
+          private-key: ${{ secrets.XUM_APP_PRIVATE_KEY }}
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         if: ${{ steps.precheck.outputs.enabled == 'true' }}

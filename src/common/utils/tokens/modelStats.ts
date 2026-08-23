@@ -136,10 +136,13 @@ function stripLatestSuffix(modelName: string): string {
 }
 
 /**
- * Generates lookup keys for a model string with multiple naming patterns
- * Handles LiteLLM conventions like "ollama/model-cloud" and "provider/model"
+ * Generates lookup keys for a model string with multiple naming patterns.
+ * Handles LiteLLM conventions like "ollama/model-cloud" and "provider/model".
+ * Exported so capability resolution shares the exact same key preference:
+ * provider-scoped entries must win over bare-name entries in both lookups,
+ * otherwise a model can inherit stats and capabilities from different entries.
  */
-function generateLookupKeys(modelString: string): string[] {
+export function generateModelLookupKeys(modelString: string): string[] {
   const colonIndex = modelString.indexOf(":");
   const provider = colonIndex !== -1 ? modelString.slice(0, colonIndex) : "";
   const modelName = colonIndex !== -1 ? modelString.slice(colonIndex + 1) : modelString;
@@ -230,7 +233,7 @@ function generateLookupKeys(modelString: string): string[] {
  */
 export function getModelStats(modelString: string): ModelStats | null {
   const normalized = normalizeToCanonical(modelString);
-  const lookupKeys = generateLookupKeys(normalized);
+  const lookupKeys = generateModelLookupKeys(normalized);
 
   // Check models-extra.ts first (overrides for models with incorrect upstream data)
   for (const key of lookupKeys) {
