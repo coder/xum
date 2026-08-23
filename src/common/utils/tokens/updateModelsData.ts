@@ -55,10 +55,10 @@ const MIN_BASELINE_FOR_SHRINK_CHECK = 20;
 const MAX_INVALID_PRICING_FRACTION = 0.05;
 // A poisoned upstream could keep every field present but rescale values
 // (prices toward zero, token limits toward 1), silently corrupting cost
-// accounting or context handling. Legitimate repricing moves few models or
-// small factors, so a catalog-wide median shift beyond this factor is treated
-// as corruption.
-const MAX_MEDIAN_SHIFT_FACTOR = 100;
+// accounting or context handling. Legitimate repricing rarely approaches this
+// factor, so both a catalog-wide median shift and a per-entry value shift
+// beyond it are treated as corruption.
+const MAX_MAGNITUDE_SHIFT_FACTOR = 100;
 
 /** Modes whose metadata applies to chat-style usage; mirrored by the Treat-as catalog. */
 export const MAPPABLE_MODES = new Set(["chat", "responses"]);
@@ -240,8 +240,6 @@ export function summarizeCatalog(catalog: ModelCatalogData): CatalogSummary {
   return summary;
 }
 
-const EMPTY_BASELINE: CatalogSummary = { totalEntries: 0, modes: {}, numericFields: {} };
-
 function belowBaseline(count: number, baseline: number): boolean {
   return (
     baseline >= MIN_BASELINE_FOR_SHRINK_CHECK &&
@@ -251,17 +249,18 @@ function belowBaseline(count: number, baseline: number): boolean {
 
 /**
  * Throws when the sanitized upstream data is unfit to replace the vendored
- * models.json. `baseline` summarizes the currently vendored catalog (defaults
+ * models.json. `baselineCatalog` is the currently vendored catalog (defaults
  * to empty when unavailable, disabling the relative checks).
  */
 export function validateModelData(
   sanitized: SanitizedModelData,
-  baseline: CatalogSummary = EMPTY_BASELINE
+  baselineCatalog: ModelCatalogData = {}
 ): void {
   const { catalog, droppedModelIds } = sanitized;
   const errors: string[] = [];
 
   const summary = summarizeCatalog(catalog);
+  const baseline = summarizeCatalog(baselineCatalog);
   const usableMappableModels = [...MAPPABLE_MODES].reduce(
     (count, mode) => count + (summary.modes[mode]?.usable ?? 0),
     0
@@ -306,10 +305,10 @@ export function validateModelData(
     const candidate = summary.numericFields[field] ?? { samples: 0, median: 0 };
     shrinkChecks.push([`${field} positive-value count`, candidate.samples, baselineStats.samples]);
     const ratio = candidate.median / baselineStats.median;
-    if (ratio > MAX_MEDIAN_SHIFT_FACTOR || ratio < 1 / MAX_MEDIAN_SHIFT_FACTOR) {
+    if (ratio > MAX_MAGNITUDE_SHIFT_FACTOR || ratio < 1 / MAX_MAGNITUDE_SHIFT_FACTOR) {
       errors.push(
         `${field} median shifted from ${baselineStats.median} to ${candidate.median} ` +
-          `(more than ${MAX_MEDIAN_SHIFT_FACTOR}x from the vendored baseline; possible corruption)`
+          `(more than ${MAX_MAGNITUDE_SHIFT_FACTOR}x from the vendored baseline; possible corruption)`
       );
     }
   }
@@ -320,6 +319,40 @@ export function validateModelData(
           `(more than ${MAX_BASELINE_SHRINK_FRACTION * 100}% below the vendored baseline)`
       );
     }
+  }
+
+  // Catalog-wide counts and medians cannot see a targeted repricing of a
+  // single row, so each surviving entry's numeric fields are also bounded
+  // against their own baseline values (a positive value must stay a number
+  // within the factor; vanishing is the same attack as scaling toward zero).
+  // A legitimate per-row correction beyond the factor fails closed: delete
+  // models.json and rerun to deliberately accept a full refresh.
+  const entryShifts: string[] = [];
+  for (const [key, baselineEntry] of Object.entries(baselineCatalog)) {
+    const entry = catalog[key];
+    if (entry === undefined) {
+      continue; // removed keys are governed by the coverage baselines above
+    }
+    for (const field of RETAINED_FIELDS) {
+      const baselineValue = baselineEntry[field];
+      if (typeof baselineValue !== "number" || baselineValue <= 0) {
+        continue;
+      }
+      const value = entry[field];
+      const ratio = typeof value === "number" ? value / baselineValue : 0;
+      if (ratio > MAX_MAGNITUDE_SHIFT_FACTOR || ratio < 1 / MAX_MAGNITUDE_SHIFT_FACTOR) {
+        entryShifts.push(
+          `${key} ${field}: ${baselineValue} -> ${typeof value === "number" ? value : "absent"}`
+        );
+      }
+    }
+  }
+  if (entryShifts.length > 0) {
+    errors.push(
+      `${entryShifts.length} surviving entries shifted a numeric field more than ` +
+        `${MAX_MAGNITUDE_SHIFT_FACTOR}x from the vendored baseline ` +
+        `(e.g. ${entryShifts.slice(0, 5).join("; ")})`
+    );
   }
 
   const total = Object.keys(catalog).length + droppedModelIds.length;

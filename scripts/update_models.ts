@@ -12,9 +12,7 @@ import {
   pruneModelData,
   sanitizePricing,
   serializeModelData,
-  summarizeCatalog,
   validateModelData,
-  type CatalogSummary,
   type ModelCatalogData,
 } from "../src/common/utils/tokens/updateModelsData";
 
@@ -42,14 +40,14 @@ async function updateModels() {
   const existing = await Bun.file(OUTPUT_PATH)
     .text()
     .catch(() => null);
-  // Validate shrinkage against the vendored catalog so a truncated upstream
-  // response or a pricing-field rename cannot silently degrade known models.
-  let baseline: CatalogSummary | undefined;
+  // Validate against the vendored catalog so a truncated upstream response, a
+  // field rename, or a targeted repricing cannot silently degrade known models.
+  let baseline: ModelCatalogData | undefined;
   if (existing !== null) {
     try {
-      baseline = summarizeCatalog(JSON.parse(existing) as ModelCatalogData);
+      baseline = JSON.parse(existing) as ModelCatalogData;
     } catch {
-      console.warn(`Could not parse existing ${OUTPUT_PATH}; skipping baseline size check`);
+      console.warn(`Could not parse existing ${OUTPUT_PATH}; skipping baseline checks`);
     }
   }
   validateModelData(sanitized, baseline);

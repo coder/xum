@@ -132,7 +132,7 @@ describe("validateModelData", () => {
     const vendored = modelsJson as Record<string, Record<string, unknown>>;
     const sanitized = sanitizePricing(vendored);
     expect(sanitized.droppedModelIds).toEqual([]);
-    expect(() => validateModelData(sanitized, summarizeCatalog(vendored))).not.toThrow();
+    expect(() => validateModelData(sanitized, vendored)).not.toThrow();
   });
 
   test("rejects truncated upstream data", () => {
@@ -146,11 +146,11 @@ describe("validateModelData", () => {
       catalog: { ...chatEntries(600), ...curatedCoverage },
       droppedModelIds: [],
     };
-    expect(() => validateModelData(sanitized, summarizeCatalog(chatEntries(2000)))).toThrow(
+    expect(() => validateModelData(sanitized, chatEntries(2000))).toThrow(
       /chat usable model count shrank from 2000/
     );
     // A small decrease within the bound is acceptable (e.g. upstream pruning).
-    expect(() => validateModelData(sanitized, summarizeCatalog(chatEntries(650)))).not.toThrow();
+    expect(() => validateModelData(sanitized, chatEntries(650))).not.toThrow();
   });
 
   test("rejects the loss of one pricing field even when the other survives", () => {
@@ -158,7 +158,7 @@ describe("validateModelData", () => {
     // input-priced, so aggregated priced coverage would hide the regression.
     const outputless = chatEntries(700, { output_cost_per_token: undefined }, "prov/outputless");
     const sanitized = { catalog: { ...outputless, ...curatedCoverage }, droppedModelIds: [] };
-    expect(() => validateModelData(sanitized, summarizeCatalog(chatEntries(700)))).toThrow(
+    expect(() => validateModelData(sanitized, chatEntries(700))).toThrow(
       /chat output_cost_per_token coverage shrank from 700 to 0/
     );
   });
@@ -168,7 +168,7 @@ describe("validateModelData", () => {
     // counts, so each mode compares against its own baseline.
     const responses = (overrides: Record<string, unknown>) =>
       chatEntries(60, { mode: "responses", ...overrides }, "prov/responses");
-    const baseline = summarizeCatalog({ ...chatEntries(700), ...responses({}) });
+    const baseline = { ...chatEntries(700), ...responses({}) };
     const sanitized = {
       catalog: {
         ...chatEntries(700),
@@ -185,10 +185,10 @@ describe("validateModelData", () => {
   test("rejects wholesale omission of a non-mappable mode", () => {
     // A partial payload that keeps chat/responses but drops image_generation
     // rows must trip that mode's own entry-count baseline.
-    const baseline = summarizeCatalog({
+    const baseline = {
       ...chatEntries(700),
       ...chatEntries(300, { mode: "image_generation", max_input_tokens: undefined }, "prov/image"),
-    });
+    };
     const sanitized = {
       catalog: { ...chatEntries(700), ...curatedCoverage },
       droppedModelIds: [],
@@ -203,10 +203,10 @@ describe("validateModelData", () => {
     // runtime would silently fall back to (much lower) generic output rates.
     const image = (overrides: Record<string, unknown>) =>
       chatEntries(300, { mode: "image_generation", ...overrides }, "prov/image");
-    const baseline = summarizeCatalog({
+    const baseline = {
       ...chatEntries(700),
       ...image({ output_cost_per_image_token: 0.00002 }),
-    });
+    };
     const sanitized = {
       catalog: { ...chatEntries(700), ...image({}), ...curatedCoverage },
       droppedModelIds: [],
@@ -219,7 +219,7 @@ describe("validateModelData", () => {
   test("rejects a catalog-wide loss of capability flags", () => {
     // Runtime treats missing/false capability flags as unsupported, so both a
     // field removal and a mass flip to false must register as coverage loss.
-    const baseline = summarizeCatalog(chatEntries(700, { supports_pdf_input: true }));
+    const baseline = chatEntries(700, { supports_pdf_input: true });
     const flipped = {
       catalog: { ...chatEntries(700, { supports_pdf_input: false }), ...curatedCoverage },
       droppedModelIds: [],
@@ -240,7 +240,7 @@ describe("validateModelData", () => {
     // rejects them, so usable coverage must register the collapse.
     const limitless = chatEntries(700, { max_input_tokens: undefined }, "prov/limitless");
     const sanitized = { catalog: { ...limitless, ...curatedCoverage }, droppedModelIds: [] };
-    expect(() => validateModelData(sanitized, summarizeCatalog(chatEntries(700)))).toThrow(
+    expect(() => validateModelData(sanitized, chatEntries(700))).toThrow(
       /chat usable model count shrank from 700/
     );
   });
@@ -250,7 +250,7 @@ describe("validateModelData", () => {
     // count, so only the magnitude median can catch mass-shrunk context sizes.
     const tiny = chatEntries(700, { max_input_tokens: 1 }, "prov/tiny");
     const sanitized = { catalog: { ...tiny, ...curatedCoverage }, droppedModelIds: [] };
-    expect(() => validateModelData(sanitized, summarizeCatalog(chatEntries(700)))).toThrow(
+    expect(() => validateModelData(sanitized, chatEntries(700))).toThrow(
       /max_input_tokens median shifted/
     );
   });
@@ -311,7 +311,7 @@ describe("validateModelData", () => {
       "prov/scaled"
     );
     const sanitized = { catalog: { ...scaled, ...curatedCoverage }, droppedModelIds: [] };
-    expect(() => validateModelData(sanitized, summarizeCatalog(chatEntries(700)))).toThrow(
+    expect(() => validateModelData(sanitized, chatEntries(700))).toThrow(
       /input_cost_per_token median shifted/
     );
   });
@@ -326,9 +326,29 @@ describe("validateModelData", () => {
       "prov/free"
     );
     const sanitized = { catalog: { ...free, ...curatedCoverage }, droppedModelIds: [] };
-    expect(() => validateModelData(sanitized, summarizeCatalog(chatEntries(700)))).toThrow(
+    expect(() => validateModelData(sanitized, chatEntries(700))).toThrow(
       /input_cost_per_token median shifted from 0.000001 to 0/
     );
+  });
+
+  test("rejects a targeted single-row price shift that no catalog-wide guard sees", () => {
+    const poison = (overrides: Record<string, unknown>) => {
+      const catalog = { ...chatEntries(700), ...curatedCoverage };
+      catalog["provider/model-3"] = { ...catalog["provider/model-3"], ...overrides };
+      return { catalog, droppedModelIds: [] };
+    };
+    // Scaling (or deleting) one row's price moves no count and no median; only
+    // the per-entry magnitude bound can catch it.
+    expect(() =>
+      validateModelData(poison({ input_cost_per_token: 0.000001e-9 }), chatEntries(700))
+    ).toThrow(/provider\/model-3 input_cost_per_token: 0.000001 -> 1e-15/);
+    expect(() =>
+      validateModelData(poison({ input_cost_per_token: undefined }), chatEntries(700))
+    ).toThrow(/provider\/model-3 input_cost_per_token: 0.000001 -> absent/);
+    // Ordinary per-row repricing within the factor is accepted.
+    expect(() =>
+      validateModelData(poison({ input_cost_per_token: 0.00001 }), chatEntries(700))
+    ).not.toThrow();
   });
 
   test("rejects data where too many entries had invalid pricing", () => {
