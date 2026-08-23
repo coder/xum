@@ -3544,9 +3544,11 @@ export const router = (authToken?: string) => {
             if (!result.ok) {
               // Roll back so a broken integration is not retried on every
               // later lifecycle event, and surface the reason to the user.
+              // Guarded: a concurrent save may have stored a newer value that
+              // this failing request must not discard.
               await context.config.editConfig((config) => {
                 const project = config.projects.get(normalizedPath);
-                if (project) {
+                if (project?.codeWorkspaceSyncPath === trimmed) {
                   project.codeWorkspaceSyncPath = previousValue;
                 }
                 return config;

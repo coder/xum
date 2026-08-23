@@ -5,7 +5,7 @@ import writeFileAtomic from "write-file-atomic";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isMultiProject } from "@/common/utils/multiProject";
-import { isWorktreeRuntime } from "@/common/types/runtime";
+import { isWorktreeRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { Config } from "@/node/config";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
@@ -64,6 +64,18 @@ async function withFileWriteLock<T>(key: string, fn: () => Promise<T>): Promise<
   return run;
 }
 
+// Canonicalization of another project's configured path must never stall the
+// current sync (its file may sit on a dead network mount), so realpath calls
+// used for grouping are individually bounded.
+const REALPATH_TIMEOUT_MS = 1_000;
+
+async function boundedRealPath(filePath: string): Promise<string | null> {
+  const outcome = await raceWithAbortAndTimeout(resolveRealPath(filePath), {
+    timeoutMs: REALPATH_TIMEOUT_MS,
+  });
+  return outcome.kind === "ok" ? outcome.value : null;
+}
+
 // write-file-atomic renames a temp file over the target, which would replace a
 // symlink rather than write through it; resolve the real target first so user
 // symlinks to shared editor config survive syncs.
@@ -80,13 +92,6 @@ async function resolveRealPath(filePath: string): Promise<string> {
       return filePath;
     }
   }
-}
-
-function readFolders(text: string): unknown[] | undefined {
-  const parsed = jsonc.parse(text, undefined, { allowTrailingComma: true }) as
-    | { folders?: unknown }
-    | undefined;
-  return Array.isArray(parsed?.folders) ? parsed.folders : undefined;
 }
 
 // VS Code resolves relative folder paths against the .code-workspace file's
@@ -141,7 +146,15 @@ async function updateCodeWorkspaceFileLocked(
 
   let original: string | null;
   try {
+    // Reject non-regular targets before opening: a symlink can point at e.g.
+    // /dev/zero, where the reported size is 0 but reads never reach EOF.
     const stats = await fsPromises.stat(targetPath);
+    if (!stats.isFile()) {
+      log.warn("Skipping .code-workspace sync: target is not a regular file", {
+        codeWorkspacePath,
+      });
+      return { ok: false, error: "Workspace file is not a regular file" };
+    }
     if (stats.size > MAX_CODE_WORKSPACE_FILE_BYTES) {
       log.warn("Skipping .code-workspace sync: file exceeds size limit", {
         codeWorkspacePath,
@@ -149,7 +162,28 @@ async function updateCodeWorkspaceFileLocked(
       });
       return { ok: false, error: "Workspace file exceeds the 1 MiB sync limit" };
     }
-    original = await fsPromises.readFile(targetPath, "utf-8");
+    // Byte-limited read through one descriptor: never trust the stat size.
+    const handle = await fsPromises.open(targetPath, "r");
+    try {
+      const handleStats = await handle.stat();
+      if (!handleStats.isFile()) {
+        log.warn("Skipping .code-workspace sync: target is not a regular file", {
+          codeWorkspacePath,
+        });
+        return { ok: false, error: "Workspace file is not a regular file" };
+      }
+      const buffer = Buffer.alloc(MAX_CODE_WORKSPACE_FILE_BYTES + 1);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      if (bytesRead > MAX_CODE_WORKSPACE_FILE_BYTES) {
+        log.warn("Skipping .code-workspace sync: file exceeds size limit", {
+          codeWorkspacePath,
+        });
+        return { ok: false, error: "Workspace file exceeds the 1 MiB sync limit" };
+      }
+      original = buffer.subarray(0, bytesRead).toString("utf-8");
+    } finally {
+      await handle.close();
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
       throw error;
@@ -184,58 +218,45 @@ async function updateCodeWorkspaceFileLocked(
   }
 
   const desired = new Set(desiredPaths.map((desiredPath) => path.resolve(desiredPath)));
-  let text = original;
 
-  if (existingFolders === undefined) {
-    text = jsonc.applyEdits(text, jsonc.modify(text, ["folders"], [], MODIFY_OPTIONS));
-  }
-
-  // Remove managed entries that are no longer desired, one edit at a time
-  // (indices shift after every removal, so re-parse between edits).
-  for (;;) {
-    const folders = readFolders(text) ?? [];
-    const removeIndex = folders.findIndex((entry) => {
-      const entryPath = getEntryPath(entry, fileDir);
-      return (
-        entryPath !== null && isUnderAnyRoot(managedRootDirs, entryPath) && !desired.has(entryPath)
-      );
-    });
-    if (removeIndex < 0) {
-      break;
+  // One-pass reconcile: a repository-controlled file can hold thousands of
+  // entries and per-entry jsonc edits reparse the whole document each time
+  // (quadratic, synchronous, and untouchable by timeouts). Build the new
+  // folders value once and apply a single edit. Comments inside the folders
+  // array are not preserved when a change is needed; everything outside it is.
+  const currentFolders: unknown[] = existingFolders ?? [];
+  const presentPaths = new Set<string>();
+  const kept = currentFolders.filter((entry) => {
+    const entryPath = getEntryPath(entry, fileDir);
+    if (entryPath === null) {
+      return true;
     }
-    text = jsonc.applyEdits(
-      text,
-      jsonc.modify(text, ["folders", removeIndex], undefined, MODIFY_OPTIONS)
-    );
-  }
-
+    if (isUnderAnyRoot(managedRootDirs, entryPath) && !desired.has(entryPath)) {
+      return false;
+    }
+    presentPaths.add(entryPath);
+    return true;
+  });
   // Append missing desired entries after the existing ones (user order is preserved).
-  const presentPaths = new Set(
-    (readFolders(text) ?? [])
-      .map((entry) => getEntryPath(entry, fileDir))
-      .filter((entryPath): entryPath is string => entryPath !== null)
-  );
   const additions = [...desired].filter((desiredPath) => !presentPaths.has(desiredPath)).sort();
-  for (const folderPath of additions) {
-    const length = (readFolders(text) ?? []).length;
-    text = jsonc.applyEdits(
-      text,
-      jsonc.modify(
-        text,
-        ["folders", length],
-        { path: folderPath },
-        {
-          ...MODIFY_OPTIONS,
-          isArrayInsertion: true,
-        }
-      )
-    );
-  }
 
-  if (text !== original) {
-    await writeFileAtomic(targetPath, text);
+  if (kept.length === currentFolders.length && additions.length === 0) {
+    return { ok: true };
   }
+  const newFolders = [...kept, ...additions.map((folderPath) => ({ path: folderPath }))];
+  const text = jsonc.applyEdits(
+    original,
+    jsonc.modify(original, ["folders"], newFolders, MODIFY_OPTIONS)
+  );
+  await writeFileAtomic(targetPath, text);
   return { ok: true };
+}
+
+// DevcontainerRuntime also creates a normal host git worktree via
+// WorktreeManager under the default srcDir, so its workspaces belong in the
+// file too (rooted at the default managed root).
+function hasManagedHostWorktree(runtimeConfig: RuntimeConfig | undefined): boolean {
+  return isWorktreeRuntime(runtimeConfig) || runtimeConfig?.type === "devcontainer";
 }
 
 function belongsToProject(metadata: FrontendWorkspaceMetadata, projectPath: string): boolean {
@@ -304,7 +325,8 @@ export function computeManagedWorktreePaths(params: {
 
   const desired = new Set<string>();
   for (const metadata of allMetadata) {
-    if (!isWorktreeRuntime(metadata.runtimeConfig)) {
+    const runtimeConfig = metadata.runtimeConfig;
+    if (!hasManagedHostWorktree(runtimeConfig)) {
       continue;
     }
     // Sub-agent child workspaces are transient implementation detail; listing
@@ -324,14 +346,14 @@ export function computeManagedWorktreePaths(params: {
     }
 
     let worktreePath: string;
-    if (isMultiProject(metadata)) {
+    if (isMultiProject(metadata) && isWorktreeRuntime(runtimeConfig)) {
       // Multi-project workspaces persist the _workspaces/<name> symlink
       // container as namedWorkspacePath; the real per-project checkout lives
       // at <srcBaseDir>/<checkoutDirName>/<workspaceName> for the primary and
       // secondary projects alike (createMultiProject passes
       // directoryName: workspaceName).
       worktreePath = path.join(
-        expandTilde(metadata.runtimeConfig.srcBaseDir),
+        expandTilde(runtimeConfig.srcBaseDir),
         participantCheckoutDirName(metadata, projectPath),
         metadata.name
       );
@@ -424,57 +446,77 @@ export async function syncProjectCodeWorkspace(
       return { ok: true };
     }
 
+    // Group by canonical (symlink-resolved) target so aliases of one file
+    // reconcile together. The realpath is bounded so a dead mount holding this
+    // project's file fails fast instead of hanging until the outer timeout.
+    const canonicalTarget = await boundedRealPath(targetFile);
+    if (canonicalTarget === null) {
+      log.warn("Timed out canonicalizing .code-workspace path", { projectPath });
+      return { ok: false, error: "Timed out accessing the workspace file" };
+    }
+
     // The work never rejects (errors become results), so a timeout that
     // orphans it cannot leave an unhandled rejection behind.
-    const work: Promise<CodeWorkspaceSyncResult> = (async () => {
-      try {
-        // Reconcile every project targeting this file together. Projects can
-        // share a file, and same-basename projects even share a managed root;
-        // independent per-project removals would erase each other's entries.
-        // Group by canonical (symlink-resolved) target so aliases of one file
-        // reconcile together too.
-        const canonicalTarget = await resolveRealPath(targetFile);
-        const allMetadata = await config.getAllWorkspaceMetadata();
-        const desired = new Set<string>();
-        const roots = new Set<string>(
-          (options?.extraManagedRootDirs ?? []).map((rootDir) => path.resolve(rootDir))
-        );
-        const participantPaths: string[] = [];
-        for (const [participantPath, participantConfig] of projects) {
-          const participantFile = resolveConfiguredCodeWorkspacePath(
-            participantPath,
-            participantConfig.codeWorkspaceSyncPath
+    const work: Promise<CodeWorkspaceSyncResult> = withFileWriteLock(
+      canonicalTarget,
+      async (): Promise<CodeWorkspaceSyncResult> => {
+        try {
+          // Desired state is derived INSIDE the per-file critical section:
+          // with derivation outside it, an older lifecycle snapshot could be
+          // written after a newer one and resurrect stale entries.
+          //
+          // Reconcile every project targeting this file together. Projects can
+          // share a file, and same-basename projects even share a managed
+          // root; independent per-project removals would erase each other's
+          // entries.
+          const currentProjects = config.loadConfigOrDefault().projects;
+          const allMetadata = await config.getAllWorkspaceMetadata();
+          const desired = new Set<string>();
+          const roots = new Set<string>(
+            (options?.extraManagedRootDirs ?? []).map((rootDir) => path.resolve(rootDir))
           );
-          if (
-            participantFile === null ||
-            (await resolveRealPath(participantFile)) !== canonicalTarget
-          ) {
-            continue;
+          const participantPaths: string[] = [];
+          for (const [participantPath, participantConfig] of currentProjects) {
+            const participantFile = resolveConfiguredCodeWorkspacePath(
+              participantPath,
+              participantConfig.codeWorkspaceSyncPath
+            );
+            if (participantFile === null) {
+              continue;
+            }
+            // A stalled canonicalization of an unrelated project's path only
+            // drops that project from this round; it cannot block the sync.
+            if (participantFile !== targetFile) {
+              const participantCanonical = await boundedRealPath(participantFile);
+              if (participantCanonical !== canonicalTarget) {
+                continue;
+              }
+            }
+            const computed = computeManagedWorktreePaths({
+              allMetadata,
+              projectPath: participantPath,
+              defaultManagedRootDir: path.join(
+                expandTilde(config.srcDir),
+                getProjectName(participantPath)
+              ),
+            });
+            participantPaths.push(participantPath);
+            computed.desiredPaths.forEach((desiredPath) => desired.add(desiredPath));
+            computed.managedRootDirs.forEach((rootDir) => roots.add(rootDir));
           }
-          const computed = computeManagedWorktreePaths({
-            allMetadata,
-            projectPath: participantPath,
-            defaultManagedRootDir: path.join(
-              expandTilde(config.srcDir),
-              getProjectName(participantPath)
-            ),
+          const desiredPaths = [...desired].sort();
+          return await updateCodeWorkspaceFileLocked(canonicalTarget, {
+            codeWorkspacePath: targetFile,
+            managedRootDirs: [...roots].sort(),
+            desiredPaths,
+            seedFolders: [...participantPaths, ...desiredPaths],
           });
-          participantPaths.push(participantPath);
-          computed.desiredPaths.forEach((desiredPath) => desired.add(desiredPath));
-          computed.managedRootDirs.forEach((rootDir) => roots.add(rootDir));
+        } catch (error) {
+          log.warn("Failed to sync .code-workspace file", { projectPath, error });
+          return { ok: false, error: getErrorMessage(error) };
         }
-        const desiredPaths = [...desired].sort();
-        return await updateCodeWorkspaceFile({
-          codeWorkspacePath: targetFile,
-          managedRootDirs: [...roots].sort(),
-          desiredPaths,
-          seedFolders: [...participantPaths, ...desiredPaths],
-        });
-      } catch (error) {
-        log.warn("Failed to sync .code-workspace file", { projectPath, error });
-        return { ok: false, error: getErrorMessage(error) };
       }
-    })();
+    );
 
     const outcome = await raceWithAbortAndTimeout(work, { timeoutMs: SYNC_TIMEOUT_MS });
     if (outcome.kind !== "ok") {

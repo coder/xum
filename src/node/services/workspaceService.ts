@@ -5768,12 +5768,22 @@ export class WorkspaceService extends EventEmitter {
       // Capture managed roots before the config entry disappears: a worktree
       // under a custom/legacy srcBaseDir cannot be reconstructed afterwards,
       // which would leave its folder entry in the .code-workspace file forever.
-      const removedMetadata = (await this.config.getAllWorkspaceMetadata()).find(
-        (m) => m.id === workspaceId
-      );
-      const removedWorkspaceRoots = removedMetadata
-        ? managedRootsByProject(removedMetadata)
-        : undefined;
+      // Best-effort: removal must proceed even when the capture fails.
+      let removedMetadata: FrontendWorkspaceMetadata | undefined;
+      let removedWorkspaceRoots: Map<string, string[]> | undefined;
+      try {
+        removedMetadata = (await this.config.getAllWorkspaceMetadata()).find(
+          (m) => m.id === workspaceId
+        );
+        removedWorkspaceRoots = removedMetadata
+          ? managedRootsByProject(removedMetadata)
+          : undefined;
+      } catch (error) {
+        log.debug("Failed to capture removed workspace roots for .code-workspace sync", {
+          workspaceId,
+          error,
+        });
+      }
 
       // Remove from config
       await this.config.removeWorkspace(workspaceId);

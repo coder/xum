@@ -158,6 +158,23 @@ describe("updateCodeWorkspaceFile", () => {
     expect(parseFolders(await readWorkspaceFile())).toEqual([{ path: worktree }]);
   });
 
+  test("rejects non-regular targets like device files behind a symlink", async () => {
+    // A checkout-supplied symlink can point at e.g. /dev/zero, where stat
+    // reports size 0 but reads never reach EOF.
+    const linkPath = path.join(tempDir, "device.code-workspace");
+    await fsPromises.symlink("/dev/null", linkPath);
+
+    const result = await updateCodeWorkspaceFile({
+      codeWorkspacePath: linkPath,
+      managedRootDirs: [managedRootDir],
+      desiredPaths: [path.join(managedRootDir, "feature-a")],
+      seedFolders: [],
+    });
+
+    expect(result.ok).toBe(false);
+    expect((await fsPromises.lstat(linkPath)).isSymbolicLink()).toBe(true);
+  });
+
   test("skips files exceeding the size cap without rewriting them", async () => {
     // jsonc.parse is synchronous, so oversized (potentially repo-controlled)
     // files must be rejected before parsing.
@@ -520,6 +537,18 @@ describe("computeManagedWorktreePaths", () => {
         makeMetadata({
           archivedAt: "2026-01-01T00:00:00Z",
           unarchivedAt: "2026-01-02T00:00:00Z",
+        }),
+      ],
+      ...computeParams,
+    });
+    expect(desiredPaths).toEqual([`${managedRoot}/feature-a`]);
+  });
+
+  test("includes devcontainer workspaces (host worktrees under the default root)", () => {
+    const { desiredPaths } = computeManagedWorktreePaths({
+      allMetadata: [
+        makeMetadata({
+          runtimeConfig: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
         }),
       ],
       ...computeParams,
