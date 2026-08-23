@@ -76,7 +76,10 @@ async function getProjectOrGlobalConfigPath(
 ): Promise<string | null> {
   for (const relativePath of listProjectMetadataRelativePaths(filename)) {
     const projectPath = joinPathLike(projectDir, relativePath);
-    if (await isFile(runtime, projectPath)) return projectPath;
+    if (await isFile(runtime, projectPath)) {
+      // Hook and tool_env paths are embedded in exec scripts, so return them in that namespace.
+      return runtime.mapPathForExec?.(projectPath) ?? projectPath;
+    }
   }
   return getUserGlobalConfigPath(runtime, filename);
 }

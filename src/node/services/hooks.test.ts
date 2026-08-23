@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
@@ -13,6 +13,22 @@ import {
 } from "./hooks";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 
+class ExecPathMappingRuntime extends LocalRuntime {
+  constructor(
+    projectPath: string,
+    private readonly hostPrefix: string,
+    private readonly execPrefix: string
+  ) {
+    super(projectPath);
+  }
+
+  mapPathForExec(filePath: string): string {
+    return filePath.startsWith(this.hostPrefix)
+      ? this.execPrefix + filePath.slice(this.hostPrefix.length)
+      : filePath;
+  }
+}
+
 describe("hooks", () => {
   let tempDir: string;
   let runtime: LocalRuntime;
@@ -24,6 +40,31 @@ describe("hooks", () => {
 
   afterEach(async () => {
     await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  describe("exec path mapping", () => {
+    test("returns mapped project hook and tool_env paths after host discovery", async () => {
+      const configDir = path.join(tempDir, ".xum");
+      const hookPath = path.join(configDir, "tool_hook");
+      const toolEnvPath = path.join(configDir, "tool_env");
+      const execPrefix = "/workspaces/project";
+      await fs.mkdir(configDir, { recursive: true });
+      await fs.writeFile(hookPath, "#!/bin/bash\necho test");
+      await fs.writeFile(toolEnvPath, "export FOO=bar");
+
+      const mappingRuntime = new ExecPathMappingRuntime(tempDir, tempDir, execPrefix);
+      const statSpy = spyOn(mappingRuntime, "stat");
+
+      expect(await getHookPath(mappingRuntime, tempDir)).toBe(
+        path.posix.join(execPrefix, ".xum/tool_hook")
+      );
+      expect(await getToolEnvPath(mappingRuntime, tempDir)).toBe(
+        path.posix.join(execPrefix, ".xum/tool_env")
+      );
+      const statPaths = statSpy.mock.calls.map(([filePath]) => filePath);
+      expect(statPaths).toContain(hookPath);
+      expect(statPaths).toContain(toolEnvPath);
+    });
   });
 
   describe("getHookPath", () => {
