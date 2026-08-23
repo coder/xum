@@ -65,6 +65,41 @@ describe("hooks", () => {
       expect(statPaths).toContain(hookPath);
       expect(statPaths).toContain(toolEnvPath);
     });
+
+    test("hook runners export the mapped project dir as XUM_PROJECT_DIR", async () => {
+      const execPrefix = "/workspaces/project";
+      const mappingRuntime = new ExecPathMappingRuntime(tempDir, tempDir, execPrefix);
+      const hookDir = path.join(tempDir, ".xum");
+      await fs.mkdir(hookDir, { recursive: true });
+      const writeHook = async (name: string) => {
+        const hookPath = path.join(hookDir, name);
+        await fs.writeFile(hookPath, '#!/bin/bash\necho "project_dir=$XUM_PROJECT_DIR"');
+        await fs.chmod(hookPath, 0o755);
+        return hookPath;
+      };
+      const context = {
+        tool: "test_tool",
+        toolInput: "{}",
+        workspaceId: "test-workspace",
+        projectDir: tempDir,
+      };
+
+      const preResult = await runPreHook(mappingRuntime, await writeHook("tool_pre"), context);
+      expect(preResult.output).toContain(`project_dir=${execPrefix}`);
+
+      const postResult = await runPostHook(mappingRuntime, await writeHook("tool_post"), context, {
+        success: true,
+      });
+      expect(postResult.output).toContain(`project_dir=${execPrefix}`);
+
+      const { hook } = await runWithHook(
+        mappingRuntime,
+        await writeHook("tool_hook"),
+        context,
+        () => Promise.resolve({ success: true })
+      );
+      expect(hook.stdoutBeforeExec).toContain(`project_dir=${execPrefix}`);
+    });
   });
 
   describe("getHookPath", () => {
