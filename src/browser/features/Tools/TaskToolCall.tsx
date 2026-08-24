@@ -307,6 +307,8 @@ interface TaskRowProps {
   agentType?: string;
   title?: string;
   depth?: number;
+  /** Tree relationship to the calling workspace (task_list scope:"tree" rows). */
+  relationship?: string;
   startedAtMs?: number;
   openWorkspaceId?: string;
   className?: string;
@@ -371,6 +373,9 @@ const TaskRow: React.FC<TaskRowProps> = (props) => {
                 openWorkspaceId={props.openWorkspaceId}
               />
             )}
+            {props.relationship && (
+              <span className="text-muted text-[10px]">{props.relationship}</span>
+            )}
             {typeof props.depth === "number" && props.depth > 0 && (
               <span className="text-muted text-[10px]">depth {props.depth}</span>
             )}
@@ -398,6 +403,7 @@ const TaskRow: React.FC<TaskRowProps> = (props) => {
       {props.title && (
         <span className="text-foreground max-w-[200px] truncate text-[11px]">{props.title}</span>
       )}
+      {props.relationship && <span className="text-muted text-[10px]">{props.relationship}</span>}
       {typeof props.depth === "number" && props.depth > 0 && (
         <span className="text-muted text-[10px]">depth: {props.depth}</span>
       )}
@@ -1687,6 +1693,9 @@ const TaskListItem: React.FC<{
     agentType={task.handleKind === "workspace_turn" ? "workspace" : task.agentType}
     title={task.title}
     depth={task.depth}
+    // Tree-scope rows carry the sender-relative relationship (ancestor/sibling/descendant/
+    // self) — the key context for interpreting the tree view and addressing peer messages.
+    relationship={task.relationship}
     openWorkspaceId={task.workspaceId}
   />
 );

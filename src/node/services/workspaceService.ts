@@ -9778,14 +9778,22 @@ export class WorkspaceService extends EventEmitter {
       // Non-destructive interrupt cascades preserve descendant task workspaces with
       // taskStatus=interrupted. Transition before starting a new stream so TaskService
       // stream-end handling does not early-return on interrupted status.
-      try {
-        resumedInterruptedTask =
-          (await this.taskService?.markInterruptedTaskRunning?.(workspaceId)) ?? false;
-      } catch (error: unknown) {
-        log.error("Failed to restore interrupted task status before sendMessage", {
-          workspaceId,
-          error,
-        });
+      //
+      // Guarded sends (peer messages) skip this rescue entirely: it exists for user-driven
+      // resumes, and a task_stop persisting `interrupted` between the probe pass above and the
+      // config read inside markInterruptedTaskRunning would otherwise be flipped straight back
+      // to running — after which every later probe sees an active status and admits the very
+      // turn the stop was meant to prevent.
+      if (internal?.admissionStale == null) {
+        try {
+          resumedInterruptedTask =
+            (await this.taskService?.markInterruptedTaskRunning?.(workspaceId)) ?? false;
+        } catch (error: unknown) {
+          log.error("Failed to restore interrupted task status before sendMessage", {
+            workspaceId,
+            error,
+          });
+        }
       }
 
       const continuationSendState = getContinuationSendState();

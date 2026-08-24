@@ -3555,6 +3555,21 @@ export class AgentSession {
       }
     }
 
+    // Caller-probe staleness (peer sends racing a Stop) must resolve BEFORE the pre-turn batch
+    // becomes irrevocable below: the rows persisted by the appends above are still inside the
+    // rollback horizon here, so a Stop that landed during that history IO refuses the send and
+    // leaves no trace for a later human resume to replay into provider context. Past this point
+    // rollback is forbidden by design (goal sync observes the durable row), so a Stop landing in
+    // the remaining pre-stream awaits refuses the turn at the PREPARING gate with rows retained.
+    if (internal?.admissionStale?.() === true) {
+      await rollbackPersistedTurnRows();
+      return Err(
+        createUnknownSendMessageError(
+          "Send refused: the caller's admission became stale before the turn was accepted."
+        )
+      );
+    }
+
     // Goal synchronization can mutate goal.json based on this durable user row. Once it begins, the
     // turn has crossed the cancellation point-of-no-return: a concurrent monitor stop must let this
     // wake finish acceptance rather than delete the row after goal state has already observed it.

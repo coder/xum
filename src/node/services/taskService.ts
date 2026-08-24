@@ -1451,6 +1451,15 @@ export class TaskService {
    * This closes races where descendants could report between parent interrupt and cascade cleanup.
    */
   private interruptedParentWorkspaceIds = new Set<string>();
+  /**
+   * Monotonic per-workspace stop generation, bumped synchronously at every explicit stop
+   * boundary (user Stop suppression, task_stop interruption, workspace-turn interruption).
+   * Peer-send admission captures its endpoints' generations and refuses when any changed:
+   * unlike the level-triggered suppression set and persisted statuses — which a quick user
+   * resume clears between probe evaluations — a bump latches, so an intervening stop keeps
+   * the in-flight send stale forever.
+   */
+  private readonly workspaceStopEpochs = new Map<string, number>();
   /** Tracks consecutive auto-resumes per workspace. Reset when a user message is sent. */
   private consecutiveAutoResumes = new Map<string, number>();
   // Peer-messaging loop protection (in-memory, like consecutiveAutoResumes; restart clears it).
@@ -1751,7 +1760,17 @@ export class TaskService {
     return null;
   }
 
+  private bumpWorkspaceStopEpoch(workspaceId: string): void {
+    this.workspaceStopEpochs.set(workspaceId, (this.workspaceStopEpochs.get(workspaceId) ?? 0) + 1);
+  }
+
+  private getWorkspaceStopEpoch(workspaceId: string): number {
+    return this.workspaceStopEpochs.get(workspaceId) ?? 0;
+  }
+
   private recordTaskInterrupted(taskId: string, parentWorkspaceId: string | undefined): void {
+    // Latch the stop for in-flight peer-send admission even when there is no parent to notify.
+    this.bumpWorkspaceStopEpoch(taskId);
     if (!parentWorkspaceId) {
       return;
     }
@@ -5125,9 +5144,11 @@ export class TaskService {
       // while the new execution runs under a workspace-turn handle; the mirrored
       // taskExecutionStatus is the effective execution state (the same overlay
       // isActiveAgentTaskEntry and task_list use), so an actively executing reawakened agent
-      // may send even though its stable status is terminal. interruptWorkspaceTurn marks that
-      // mirror terminal WITH the handle transition, so the admission probe below can also
-      // trust it as the authoritative stop signal.
+      // may send even though its stable status is terminal. Only a RUNNING mirror counts:
+      // queued/starting executions have not been admitted, so tool calls cannot originate from
+      // them — a send arriving then belongs to the previous terminal execution. The mirror is
+      // marked terminal inside interruptWorkspaceTurn's settlement boundary, so the admission
+      // probe below can also trust it as the authoritative stop signal.
       const senderInactiveRefusal = {
         code: "refused" as const,
         reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
@@ -5140,7 +5161,7 @@ export class TaskService {
         const status = workspace.taskStatus ?? "running";
         return (
           isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) ||
-          (!isActiveWorkspaceTurnTaskStatus(workspace.taskExecutionStatus) &&
+          (workspace.taskExecutionStatus !== "running" &&
             status !== "running" &&
             status !== "awaiting_report")
         );
@@ -5196,13 +5217,15 @@ export class TaskService {
       if (targetIsAgentTask) {
         const targetStatus = targetEntry.workspace.taskStatus ?? "running";
         // A reawakened persistent child is effectively executing when its mirrored
-        // workspace-turn execution state is active, even though its stable taskStatus stays
+        // workspace-turn execution state is RUNNING, even though its stable taskStatus stays
         // terminal (`reported`) — the same overlay task_list advertises, so an addressable
-        // "running" row must also accept messages. The persisted mirror flips terminal
-        // synchronously with the handle transition, so this is NOT a transient-stream rescue.
-        const targetExecutionActive = isActiveWorkspaceTurnTaskStatus(
-          targetEntry.workspace.taskExecutionStatus
-        );
+        // "running" row must also accept messages. Queued/starting executions do NOT count:
+        // the reawakening turn has not been admitted, its handle is not registered for
+        // correlation, and an uncorrelated peer entry could cut or trail the delegated replay
+        // as a generic turn — effectively a peer reactivation of the terminal child. The
+        // mirror flips terminal inside interruptWorkspaceTurn's settlement boundary, so this
+        // is NOT a transient-stream rescue.
+        const targetExecutionActive = targetEntry.workspace.taskExecutionStatus === "running";
         if (!targetExecutionActive) {
           if (targetStatus === "queued" || targetStatus === "starting") {
             return Err({
@@ -5232,11 +5255,12 @@ export class TaskService {
       // undo the stop by queueing or starting another turn on the interrupted workspace. The
       // suppression set holds the ANCESTOR the user interrupted, so check the target's whole
       // ancestor chain — the termination cascade may not have reached a lower target yet.
+      const targetChainIds = [
+        targetId,
+        ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, targetId),
+      ];
       const targetChainInterrupted = (): boolean =>
-        [
-          targetId,
-          ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, targetId),
-        ].some((id) => this.interruptedParentWorkspaceIds.has(id));
+        targetChainIds.some((id) => this.interruptedParentWorkspaceIds.has(id));
       const interruptedRefusal = {
         code: "refused" as const,
         reason:
@@ -5245,6 +5269,16 @@ export class TaskService {
       if (targetChainInterrupted()) {
         return Err(interruptedRefusal);
       }
+
+      // Latch stop generations for the admission probe below: the suppression set and persisted
+      // statuses are level-triggered, so a Stop followed by a quick user resume BETWEEN probe
+      // evaluations (e.g. while a queued entry sits in PREPARING) would read as clean again. Any
+      // bump after this capture keeps the send stale forever — the resumed workspace belongs to
+      // the user, not to a wake admitted before the stop.
+      const stopEpochIds = [senderWorkspaceId, ...targetChainIds];
+      const capturedStopEpochs = stopEpochIds.map((id) => this.getWorkspaceStopEpoch(id));
+      const stopEpochsChanged = (): boolean =>
+        stopEpochIds.some((id, i) => this.getWorkspaceStopEpoch(id) !== capturedStopEpochs[i]);
 
       const throttleError = this.checkPeerMessageThrottles(
         senderWorkspaceId,
@@ -5381,6 +5415,13 @@ export class TaskService {
       // resurrecting the stopped task via markInterruptedTaskRunning.
       let admissionRefusal: SendAgentTreeMessageError | null = null;
       const admissionStale = (): boolean => {
+        // Latched stop check first: unlike the level-triggered probes below, a generation bump
+        // stays observable even when a user resume already cleared suppression and restored
+        // running statuses between probe evaluations.
+        if (stopEpochsChanged()) {
+          admissionRefusal = interruptedRefusal;
+          return true;
+        }
         if (targetChainInterrupted()) {
           admissionRefusal = interruptedRefusal;
           return true;
@@ -5406,7 +5447,7 @@ export class TaskService {
           // always wins the race.
           const freshStatus = freshEntry.workspace.taskStatus ?? "running";
           if (
-            !isActiveWorkspaceTurnTaskStatus(freshEntry.workspace.taskExecutionStatus) &&
+            freshEntry.workspace.taskExecutionStatus !== "running" &&
             freshStatus !== "running" &&
             freshStatus !== "awaiting_report"
           ) {
@@ -9761,6 +9802,14 @@ export class TaskService {
       };
       await this.taskHandleStore.upsertWorkspaceTurn(next);
       interruptedRecord = next;
+      // Latch the stop synchronously inside the settlement boundary: in-flight peer-send
+      // admission observes this generation immediately, without waiting for the async config
+      // mirror below to persist.
+      this.bumpWorkspaceStopEpoch(record.workspaceId);
+      // Persist the execution mirror terminal within the same settlement boundary as the
+      // handle transition, so config readers (peer admission, task_list) never observe an
+      // interrupted handle with a still-running mirror.
+      await this.updateAgentTaskExecutionState(record.workspaceId, record.handleId, "interrupted");
 
       const active = this.activeWorkspaceTurnHandleByWorkspaceId.get(record.workspaceId);
       if (
@@ -9781,13 +9830,6 @@ export class TaskService {
       return result;
     }
 
-    if (workspaceId != null) {
-      // Mark the persisted execution mirror terminal WITH the handle transition, before the
-      // stopStream await below: peer-message admission trusts taskExecutionStatus as the
-      // effective execution state, so a mirror that lags until after stopStream would let the
-      // stopped child's in-flight sends pass lifecycle checks during that gap.
-      await this.updateAgentTaskExecutionState(workspaceId, handleId, "interrupted");
-    }
     if (shouldClearQueuedPrompt && workspaceId != null) {
       // Targeted removal: the queue can hold unrelated user messages before/behind
       // this turn's entry, so clearing the whole queue would drop real input.
@@ -11287,6 +11329,9 @@ export class TaskService {
     assert(workspaceId.length > 0, "markParentWorkspaceInterrupted: workspaceId must be non-empty");
     this.consecutiveAutoResumes.delete(workspaceId);
     this.interruptedParentWorkspaceIds.add(workspaceId);
+    // Latch the stop: the suppression entry above is level-triggered and cleared by resume, so
+    // in-flight peer-send admission also needs the monotonic generation to observe the stop.
+    this.bumpWorkspaceStopEpoch(workspaceId);
   }
 
   /**

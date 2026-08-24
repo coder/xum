@@ -3,7 +3,7 @@ title: "Research: Claude Code cross-session messaging vs. Mux"
 description: Feature-by-feature comparison of Claude Code's cross-session messaging against Mux's existing inter-agent messaging, with code-level evidence and gap analysis
 ---
 
-> Research document (2026-08-09, re-verified against `main` @ `bc1b4a5a2` on 2026-08-24), based on the live [Claude Code cross-session messaging docs](https://code.claude.com/docs/en/cross-session-messaging) and a read-only audit of this repository. No product changes are proposed here; this is input for a build/skip decision.
+> **Historical pre-implementation design document.** This research (2026-08-09, verified against `main` @ `bc1b4a5a2`) informed the build decision, and its Draft 1 sketch has since **shipped**: `task_send_message` now delivers to any node in the same task tree (siblings, cousins, ancestors, and the root workspace) with server-computed relationships, an untrusted `<mux_agent_message>` envelope, messaging-specific rate limits/dedupe/wake budgets, and `task_list scope:"tree"` discovery. Statements below about missing peer messaging, discovery, or throttling describe the codebase **before** that implementation — the current tool descriptions and system prompt are the authoritative behavior reference. Cross-machine federation and inbound consent controls remain unimplemented.
 
 ## Verdict
 
