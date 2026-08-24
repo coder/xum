@@ -112,6 +112,7 @@ const TaskStatusBadge: React.FC<{
       case "backgrounded":
         return "bg-pending/20 text-pending";
       case "awaiting_report":
+      case "rate_limited":
         return "bg-warning/20 text-warning";
       case "queued":
         return "bg-muted/20 text-muted";
@@ -122,6 +123,7 @@ const TaskStatusBadge: React.FC<{
         return "bg-interrupted/20 text-interrupted";
       case "not_found":
       case "invalid_scope":
+      case "refused":
       case "error":
       case "failed":
         // Workflow-run terminal failure status (task_list rows).
@@ -131,7 +133,12 @@ const TaskStatusBadge: React.FC<{
     }
   };
 
-  const label = status === "awaiting_report" ? "awaiting report" : status;
+  const label =
+    status === "awaiting_report"
+      ? "awaiting report"
+      : status === "rate_limited"
+        ? "rate limited"
+        : status;
 
   return (
     <span
@@ -1715,12 +1722,23 @@ export const TaskSendMessageToolCall: React.FC<TaskSendMessageToolCallProps> = (
             <div className="flex items-center gap-2">
               <TaskId id={props.args.task_id} />
               {props.result && <TaskStatusBadge status={props.result.status} />}
+              {props.result && "targetRelation" in props.result && props.result.targetRelation && (
+                <span className="text-muted text-[10px]">to {props.result.targetRelation}</span>
+              )}
             </div>
             <div className="text-foreground bg-code-bg max-h-[140px] overflow-y-auto rounded-sm p-2 text-[11px] break-words whitespace-pre-wrap">
               {props.args.message}
             </div>
             {props.result && "error" in props.result && props.result.error && (
               <div className="text-danger text-[11px]">{props.result.error}</div>
+            )}
+            {props.result?.status === "refused" && (
+              <div className="text-danger text-[11px]">{props.result.reason}</div>
+            )}
+            {props.result?.status === "rate_limited" && props.result.retryAfterMs != null && (
+              <div className="text-warning text-[11px]">
+                Retry in {Math.ceil(props.result.retryAfterMs / 1000)}s
+              </div>
             )}
           </div>
         </ToolDetails>

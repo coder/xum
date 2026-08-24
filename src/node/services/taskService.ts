@@ -26,6 +26,19 @@ import {
   subagentUpdateFallbackTitle,
 } from "@/common/utils/subagentReportEnvelope";
 import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
+import {
+  type AgentMessageRelationship,
+  formatAgentMessageEnvelope,
+} from "@/common/utils/agentMessageEnvelope";
+import type { SendMessageOptions } from "@/common/orpc/types";
+import {
+  MAX_CONSECUTIVE_PEER_WAKES,
+  MAX_QUEUED_PEER_MESSAGES_PER_TARGET,
+  PEER_MESSAGE_DEDUPE_WINDOW_MS,
+  PEER_MESSAGE_RATE_LIMIT_MAX,
+  PEER_MESSAGE_RATE_WINDOW_MS,
+  PEER_MESSAGE_TARGET_RATE_LIMIT_MAX,
+} from "@/constants/agentMessaging";
 import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
 import {
   TASK_FAMILY_MESSAGE_MAX_CHARS,
@@ -657,6 +670,34 @@ export interface SendParentAgentMessageResult {
 export type SendParentAgentMessageError =
   | { code: "invalid_scope"; message: string }
   | { code: "send_failed"; message: string };
+
+/**
+ * How the target relates to the sender within one task tree (parentWorkspaceId chains only).
+ * "target_descendant" routes to the trusted parent→child guidance path; "peer" (sibling/cousin)
+ * and "target_ancestor" take the untrusted <mux_agent_message> envelope path.
+ */
+export type AgentTreeTargetRelation = "target_descendant" | "target_ancestor" | "peer";
+
+export type SendAgentTreeMessageError =
+  | SendAgentTaskMessageError
+  | { code: "refused"; reason: string }
+  | { code: "rate_limited"; retryAfterMs?: number };
+
+/** The caller-relative relationship tag on task_list scope:"tree" rows. */
+export type TreeAgentRelationship = "self" | "ancestor" | "sibling" | "descendant";
+
+export interface TreeAgentTaskInfo extends DescendantAgentTaskInfo {
+  relationship: TreeAgentRelationship;
+}
+
+export interface TaskTreeAgentsResult {
+  /** Root of the caller's task tree (a plain workspace, not an agent task). */
+  rootWorkspaceId: string;
+  rootTitle?: string;
+  /** "self" when the caller is the root; "ancestor" otherwise. */
+  rootRelationship: "self" | "ancestor";
+  tasks: TreeAgentTaskInfo[];
+}
 
 export interface TerminateAgentTaskResult {
   /** Task IDs terminated (includes descendants). */
@@ -1411,6 +1452,15 @@ export class TaskService {
   private interruptedParentWorkspaceIds = new Set<string>();
   /** Tracks consecutive auto-resumes per workspace. Reset when a user message is sent. */
   private consecutiveAutoResumes = new Map<string, number>();
+  // Peer-messaging loop protection (in-memory, like consecutiveAutoResumes; restart clears it).
+  /** Key: sender\u0000target → send timestamps within the sliding rate window. */
+  private readonly peerMessageSendTimesByPair = new Map<string, number[]>();
+  /** Key: target → send timestamps across all senders within the sliding rate window. */
+  private readonly peerMessageSendTimesByTarget = new Map<string, number[]>();
+  /** Key: sender\u0000target\u0000trimmedText → last send timestamp (duplicate suppression). */
+  private readonly peerMessageDedupeTimes = new Map<string, number>();
+  /** Consecutive turns a target started from peer messages since its last user/parent attention. */
+  private readonly consecutivePeerWakes = new Map<string, number>();
 
   private async findLatestWorkflowSupersession(workspaceId: string): Promise<{
     found: boolean;
@@ -4967,6 +5017,364 @@ export class TaskService {
       this.workspaceService.emitChatEvent(targetWorkspaceId, { ...row, type: "message" });
     }
     return Ok(undefined);
+  }
+
+  /**
+   * Routes a task_send_message send by the target's relation to the sender within one task tree.
+   * Descendant targets take the unchanged trusted guidance path (framing, reactivation, durable
+   * pending guidance); siblings/cousins and ancestors (including the root workspace) receive an
+   * untrusted <mux_agent_message> envelope. The relation is computed server-side so a sender can
+   * never claim parent authority it does not have.
+   */
+  async sendAgentTreeMessage(
+    senderWorkspaceId: string,
+    targetId: string,
+    message: string,
+    queueDispatchMode?: TaskMessageQueueDispatchMode
+  ): Promise<
+    Result<
+      SendAgentTaskMessageResult & { relation: AgentTreeTargetRelation },
+      SendAgentTreeMessageError
+    >
+  > {
+    assert(
+      senderWorkspaceId.length > 0,
+      "sendAgentTreeMessage: senderWorkspaceId must be non-empty"
+    );
+    assert(targetId.length > 0, "sendAgentTreeMessage: targetId must be non-empty");
+    const trimmedMessage = message.trim();
+    assert(trimmedMessage.length > 0, "sendAgentTreeMessage: message must be non-empty");
+
+    const cfg = this.config.loadConfigOrDefault();
+    const relation = this.resolveAgentTreeTargetRelation(
+      this.buildAgentTaskIndex(cfg).parentById,
+      senderWorkspaceId,
+      targetId
+    );
+    if (relation == null) {
+      // Cross-tree targets and self-sends are out of scope for tree messaging.
+      return Err({ code: "invalid_scope" as const });
+    }
+
+    if (relation === "target_descendant") {
+      // Descendant sends keep their historical tool-end default and trusted behavior unchanged.
+      const result = await this.sendMessageToDescendantAgentTask(
+        senderWorkspaceId,
+        targetId,
+        message,
+        queueDispatchMode ?? "tool-end"
+      );
+      return result.success ? Ok({ ...result.data, relation }) : result;
+    }
+
+    return this.sendAgentPeerMessage({
+      senderWorkspaceId,
+      targetId,
+      message: trimmedMessage,
+      relation,
+      queueDispatchMode,
+    });
+  }
+
+  /** Peer/ancestor delivery: untrusted envelope, no reactivation, throttled. */
+  private async sendAgentPeerMessage(params: {
+    senderWorkspaceId: string;
+    targetId: string;
+    message: string;
+    relation: "peer" | "target_ancestor";
+    queueDispatchMode?: TaskMessageQueueDispatchMode;
+  }): Promise<
+    Result<
+      SendAgentTaskMessageResult & { relation: AgentTreeTargetRelation },
+      SendAgentTreeMessageError
+    >
+  > {
+    const { senderWorkspaceId, targetId, relation } = params;
+    return this.workspaceEventLocks.withLock(targetId, async () => {
+      const cfg = this.config.loadConfigOrDefault();
+      const targetEntry = findWorkspaceEntry(cfg, targetId);
+      const senderEntry = findWorkspaceEntry(cfg, senderWorkspaceId);
+      if (!targetEntry || !senderEntry) {
+        return Err({ code: "not_found" as const });
+      }
+      const index = this.buildAgentTaskIndex(cfg);
+
+      // Re-verify under the target's event lock: tree membership may have changed since routing.
+      if (
+        this.resolveAgentTreeTargetRelation(index.parentById, senderWorkspaceId, targetId) !==
+        relation
+      ) {
+        return Err({ code: "invalid_scope" as const });
+      }
+
+      // Workflow-owned endpoints exchange I/O through WorkflowRunner's journal; peer messages
+      // would break durable replay (same rationale as reportAgentProgress's early return).
+      if (
+        this.isWorkflowOwnedTaskUsingIndex(index, senderWorkspaceId) ||
+        this.isWorkflowOwnedTaskUsingIndex(index, targetId)
+      ) {
+        return Err({
+          code: "refused" as const,
+          reason: "Workflow-owned tasks cannot send or receive peer messages.",
+        });
+      }
+
+      // Best-of candidates (and their subtrees) must stay independent: sibling↔candidate would
+      // break candidate independence and candidate→ancestor would lobby the selecting parent
+      // mid-run. Only the existing ancestor→candidate guidance path is allowed.
+      if (
+        this.isBestOfChainUsingIndex(index, senderWorkspaceId) ||
+        this.isBestOfChainUsingIndex(index, targetId)
+      ) {
+        return Err({
+          code: "refused" as const,
+          reason: "Best-of candidates cannot send or receive peer messages.",
+        });
+      }
+
+      const legacyArchived = isWorkspaceArchived(
+        targetEntry.workspace.archivedAt,
+        targetEntry.workspace.unarchivedAt
+      );
+      if (legacyArchived) {
+        return Err({
+          code: "not_active" as const,
+          taskStatus: targetEntry.workspace.taskStatus ?? "unknown",
+          message: "Target workspace is archived; only its parent can restore and reawaken it.",
+        });
+      }
+
+      // The root workspace has no task lifecycle: an idle root simply starts a turn on delivery.
+      // Agent-task targets must have a live session/turn — peers can neither mutate a queued
+      // task's durable launch prompt (ancestor-only ownership) nor reactivate a terminal task
+      // (a peer-triggered reactivation would make the sender the continuation owner and reroute
+      // the target's agent_report stream away from its real parent).
+      const targetIsAgentTask =
+        coerceNonEmptyString(targetEntry.workspace.parentWorkspaceId) != null;
+      if (targetIsAgentTask) {
+        const targetStatus = targetEntry.workspace.taskStatus ?? "running";
+        if (targetStatus === "queued" || targetStatus === "starting") {
+          return Err({
+            code: "not_active" as const,
+            taskStatus: targetStatus,
+            message:
+              "Target has not started yet; only its parent may update a queued task's prompt.",
+          });
+        }
+        const executionId = targetEntry.workspace.taskExecutionId;
+        const activeTurn = this.activeWorkspaceTurnHandleByWorkspaceId.get(targetId);
+        const continuationActive = executionId != null && activeTurn?.handleId === executionId;
+        if (
+          targetStatus !== "running" &&
+          targetStatus !== "awaiting_report" &&
+          !this.aiService.isStreaming(targetId) &&
+          !continuationActive
+        ) {
+          return Err({
+            code: "not_active" as const,
+            taskStatus: targetStatus,
+            message: "Target is inactive; peer messages cannot reactivate it — ask its parent.",
+          });
+        }
+      }
+
+      const throttleError = this.checkPeerMessageThrottles(
+        senderWorkspaceId,
+        targetId,
+        params.message,
+        Date.now()
+      );
+      if (throttleError != null) {
+        return Err(throttleError);
+      }
+
+      const senderTitle =
+        coerceNonEmptyString(senderEntry.workspace.title) ??
+        coerceNonEmptyString(senderEntry.workspace.name);
+      // The envelope carries the SENDER's relationship to the recipient (what the target reads).
+      const relationship: AgentMessageRelationship =
+        relation === "target_ancestor" ? "descendant" : "sibling";
+      const envelope = formatAgentMessageEnvelope({
+        from: senderWorkspaceId,
+        ...(senderTitle != null ? { fromTitle: senderTitle } : {}),
+        relationship,
+        message: params.message,
+      });
+      const muxMetadata: MuxMessageMetadata = {
+        type: "agent-peer-message",
+        fromWorkspaceId: senderWorkspaceId,
+        ...(senderTitle != null ? { fromTitle: senderTitle } : {}),
+        relationship,
+      };
+
+      // Ancestor targets are often human-driven: default to turn-end so a peer message does not
+      // cut into an active turn unless the sender explicitly asks. Sibling sends keep tool-end.
+      const effectiveDispatchMode =
+        params.queueDispatchMode ?? (relation === "target_ancestor" ? "turn-end" : "tool-end");
+
+      let sendOptions: SendMessageOptions;
+      if (relation === "target_ancestor") {
+        const resumeOptions = await this.resolveParentAutoResumeOptions(
+          targetId,
+          targetEntry,
+          defaultModel
+        );
+        sendOptions = {
+          model: resumeOptions.model,
+          agentId: resumeOptions.agentId,
+          thinkingLevel: resumeOptions.thinkingLevel,
+          reasoningMode: resumeOptions.reasoningMode,
+          muxMetadata,
+          queueDispatchMode: effectiveDispatchMode,
+        };
+      } else {
+        const activeAgentId = resolveTaskAgentIdForResume(targetEntry.workspace);
+        const activeAiSettings = this.resolveWorkspaceAISettings(
+          targetEntry.workspace,
+          activeAgentId
+        );
+        sendOptions = {
+          model:
+            coerceNonEmptyString(activeAiSettings?.model) ??
+            targetEntry.workspace.taskModelString ??
+            defaultModel,
+          agentId: activeAgentId,
+          thinkingLevel: activeAiSettings?.thinkingLevel ?? targetEntry.workspace.taskThinkingLevel,
+          reasoningMode: coerceOpenAIReasoningMode(activeAiSettings?.reasoningMode),
+          experiments: targetEntry.workspace.taskExperiments,
+          muxMetadata,
+          queueDispatchMode: effectiveDispatchMode,
+        };
+      }
+
+      let accepted = false;
+      const sendResult = await this.workspaceService.sendMessage(targetId, envelope, sendOptions, {
+        synthetic: true,
+        agentInitiated: true,
+        startStreamInBackground: true,
+        // Peer sends must not count as fresh user attention: resetAutoResumeCount also clears
+        // consecutivePeerWakes, so letting a peer message trigger it would let peers extend each
+        // other's wake budget indefinitely.
+        skipAutoResumeReset: true,
+        // Unique key ⇒ never coalesces (removable dedupe keys force a sealed queue entry), so
+        // sender attribution, queue caps, and previews survive later queued messages.
+        queueDedupeKey: `agent-msg:${senderWorkspaceId}:${randomUUID()}`,
+        removableQueueDedupeKey: true,
+        onAccepted: () => {
+          accepted = true;
+          this.consecutivePeerWakes.set(
+            targetId,
+            (this.consecutivePeerWakes.get(targetId) ?? 0) + 1
+          );
+        },
+      });
+      if (!sendResult.success) {
+        return Err({
+          code: "send_failed" as const,
+          message: formatSendMessageError(sendResult.error).message,
+        });
+      }
+
+      this.recordPeerMessageSend(senderWorkspaceId, targetId, params.message, Date.now());
+      return Ok(
+        accepted
+          ? { delivery: "accepted" as const, relation }
+          : { delivery: "queued" as const, relation, queueDispatchMode: effectiveDispatchMode }
+      );
+    });
+  }
+
+  /** Pure read-side throttle checks; call recordPeerMessageSend only after a successful send. */
+  private checkPeerMessageThrottles(
+    senderWorkspaceId: string,
+    targetId: string,
+    message: string,
+    now: number
+  ): SendAgentTreeMessageError | null {
+    this.sweepPeerMessageThrottleState(now);
+
+    const rateCutoff = now - PEER_MESSAGE_RATE_WINDOW_MS;
+    const pairKey = `${senderWorkspaceId}\u0000${targetId}`;
+    const pairTimes = (this.peerMessageSendTimesByPair.get(pairKey) ?? []).filter(
+      (time) => time > rateCutoff
+    );
+    if (pairTimes.length >= PEER_MESSAGE_RATE_LIMIT_MAX) {
+      return {
+        code: "rate_limited",
+        retryAfterMs: Math.max(0, pairTimes[0] + PEER_MESSAGE_RATE_WINDOW_MS - now),
+      };
+    }
+    const targetTimes = (this.peerMessageSendTimesByTarget.get(targetId) ?? []).filter(
+      (time) => time > rateCutoff
+    );
+    if (targetTimes.length >= PEER_MESSAGE_TARGET_RATE_LIMIT_MAX) {
+      return {
+        code: "rate_limited",
+        retryAfterMs: Math.max(0, targetTimes[0] + PEER_MESSAGE_RATE_WINDOW_MS - now),
+      };
+    }
+
+    const lastDuplicate = this.peerMessageDedupeTimes.get(`${pairKey}\u0000${message}`);
+    if (lastDuplicate != null && now - lastDuplicate < PEER_MESSAGE_DEDUPE_WINDOW_MS) {
+      return {
+        code: "refused",
+        reason: "Duplicate of an identical message recently sent to this target.",
+      };
+    }
+
+    if ((this.consecutivePeerWakes.get(targetId) ?? 0) >= MAX_CONSECUTIVE_PEER_WAKES) {
+      return {
+        code: "refused",
+        reason:
+          "Target reached its consecutive peer-wake limit and needs user or parent attention.",
+      };
+    }
+
+    // Optional chaining: test harnesses mock WorkspaceService with a narrow method surface.
+    const queuedCount = this.workspaceService.countQueuedAgentPeerMessages?.(targetId) ?? 0;
+    if (queuedCount >= MAX_QUEUED_PEER_MESSAGES_PER_TARGET) {
+      return {
+        code: "refused",
+        reason: "Target already has the maximum number of queued peer messages.",
+      };
+    }
+
+    return null;
+  }
+
+  private recordPeerMessageSend(
+    senderWorkspaceId: string,
+    targetId: string,
+    message: string,
+    now: number
+  ): void {
+    const pairKey = `${senderWorkspaceId}\u0000${targetId}`;
+    const pairTimes = this.peerMessageSendTimesByPair.get(pairKey) ?? [];
+    pairTimes.push(now);
+    this.peerMessageSendTimesByPair.set(pairKey, pairTimes);
+    const targetTimes = this.peerMessageSendTimesByTarget.get(targetId) ?? [];
+    targetTimes.push(now);
+    this.peerMessageSendTimesByTarget.set(targetId, targetTimes);
+    this.peerMessageDedupeTimes.set(`${pairKey}\u0000${message}`, now);
+  }
+
+  /** Evict throttle entries older than their windows so sender/target maps stay bounded. */
+  private sweepPeerMessageThrottleState(now: number): void {
+    const rateCutoff = now - PEER_MESSAGE_RATE_WINDOW_MS;
+    for (const [key, times] of this.peerMessageSendTimesByPair) {
+      const kept = times.filter((time) => time > rateCutoff);
+      if (kept.length === 0) this.peerMessageSendTimesByPair.delete(key);
+      else this.peerMessageSendTimesByPair.set(key, kept);
+    }
+    for (const [key, times] of this.peerMessageSendTimesByTarget) {
+      const kept = times.filter((time) => time > rateCutoff);
+      if (kept.length === 0) this.peerMessageSendTimesByTarget.delete(key);
+      else this.peerMessageSendTimesByTarget.set(key, kept);
+    }
+    const dedupeCutoff = now - PEER_MESSAGE_DEDUPE_WINDOW_MS;
+    for (const [key, time] of this.peerMessageDedupeTimes) {
+      if (time <= dedupeCutoff) this.peerMessageDedupeTimes.delete(key);
+    }
   }
 
   async stopDescendantAgentTask(
@@ -9689,6 +10097,106 @@ export class TaskService {
     );
   }
 
+  /** Walks parentWorkspaceId chains up to the tree root (a workspace with no agent-task parent). */
+  private resolveRootWorkspaceIdUsingParentById(
+    parentById: Map<string, string>,
+    workspaceId: string
+  ): string {
+    let current = workspaceId;
+    for (let i = 0; i < 32; i++) {
+      const parent = parentById.get(current);
+      if (!parent) return current;
+      current = parent;
+    }
+
+    throw new Error(
+      `resolveRootWorkspaceIdUsingParentById: possible parentWorkspaceId cycle starting at ${workspaceId}`
+    );
+  }
+
+  /**
+   * Relation of `targetId` to `senderWorkspaceId` within one task tree, or null when the endpoints
+   * are the same workspace (self-sends are out of scope) or live in different trees. Only
+   * parentWorkspaceId chains define the tree; workspace-turn ownership tags are a separate graph.
+   */
+  private resolveAgentTreeTargetRelation(
+    parentById: Map<string, string>,
+    senderWorkspaceId: string,
+    targetId: string
+  ): AgentTreeTargetRelation | null {
+    if (senderWorkspaceId === targetId) return null;
+    if (this.isDescendantAgentTaskUsingParentById(parentById, senderWorkspaceId, targetId)) {
+      return "target_descendant";
+    }
+    if (this.isDescendantAgentTaskUsingParentById(parentById, targetId, senderWorkspaceId)) {
+      return "target_ancestor";
+    }
+    // Ancestor/descendant is already ruled out, so a shared root means sibling/cousin. Distinct
+    // roots (including two unrelated plain workspaces, each its own root) are cross-tree.
+    const senderRoot = this.resolveRootWorkspaceIdUsingParentById(parentById, senderWorkspaceId);
+    const targetRoot = this.resolveRootWorkspaceIdUsingParentById(parentById, targetId);
+    return senderRoot === targetRoot ? "peer" : null;
+  }
+
+  /** True when the workspace or any agent-task ancestor carries best-of candidate metadata. */
+  private isBestOfChainUsingIndex(index: AgentTaskIndex, workspaceId: string): boolean {
+    let current = workspaceId;
+    for (let i = 0; i < 32; i++) {
+      const entry = index.byId.get(current);
+      if (entry != null && this.getEffectiveTaskGroup(current, entry) != null) return true;
+      const parent = index.parentById.get(current);
+      if (!parent) return false;
+      current = parent;
+    }
+
+    throw new Error(
+      `isBestOfChainUsingIndex: possible parentWorkspaceId cycle starting at ${workspaceId}`
+    );
+  }
+
+  /**
+   * All addressable agent tasks in the caller's task tree (the root's full descendant
+   * enumeration, workflow-owned subtrees excluded), tagged with each row's relationship to the
+   * caller. The root is returned separately because it is a plain workspace, not an agent task.
+   */
+  listTaskTreeAgents(workspaceId: string): TaskTreeAgentsResult {
+    assert(workspaceId.length > 0, "listTaskTreeAgents: workspaceId must be non-empty");
+
+    const cfg = this.config.loadConfigOrDefault();
+    const index = this.buildAgentTaskIndex(cfg);
+    const rootWorkspaceId = this.resolveRootWorkspaceIdUsingParentById(
+      index.parentById,
+      workspaceId
+    );
+    const rootEntry = findWorkspaceEntry(cfg, rootWorkspaceId);
+    const rootTitle =
+      rootEntry != null
+        ? (coerceNonEmptyString(rootEntry.workspace.title) ??
+          coerceNonEmptyString(rootEntry.workspace.name))
+        : undefined;
+
+    const tasks = this.listDescendantAgentTasks(rootWorkspaceId, {
+      excludeWorkflowTasks: true,
+    }).map((task): TreeAgentTaskInfo => {
+      const relationship: TreeAgentRelationship =
+        task.taskId === workspaceId
+          ? "self"
+          : this.isDescendantAgentTaskUsingParentById(index.parentById, workspaceId, task.taskId)
+            ? "descendant"
+            : this.isDescendantAgentTaskUsingParentById(index.parentById, task.taskId, workspaceId)
+              ? "ancestor"
+              : "sibling";
+      return { ...task, relationship };
+    });
+
+    return {
+      rootWorkspaceId,
+      ...(rootTitle != null ? { rootTitle } : {}),
+      rootRelationship: rootWorkspaceId === workspaceId ? "self" : "ancestor",
+      tasks,
+    };
+  }
+
   // --- Internal orchestration ---
 
   private listAncestorWorkspaceIdsUsingParentById(
@@ -10534,6 +11042,9 @@ export class TaskService {
     assert(workspaceId.length > 0, "resetAutoResumeCount: workspaceId must be non-empty");
     this.consecutiveAutoResumes.delete(workspaceId);
     this.interruptedParentWorkspaceIds.delete(workspaceId);
+    // User-authored sends (and parent guidance, which does not skip this reset) count as fresh
+    // attention: peer messages may wake this workspace again.
+    this.consecutivePeerWakes.delete(workspaceId);
   }
 
   /** Mark a parent workspace as hard-interrupted by the user. */

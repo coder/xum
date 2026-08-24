@@ -65,6 +65,7 @@ import { Ok, Err, type Result } from "@/common/types/result";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
+import { parseAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
 import { defaultModel } from "@/common/utils/ai/models";
 import { enforceThinkingPolicy } from "@/common/utils/thinking/policy";
 import type { AgentAiDefaults, AgentAiSubagentProfile } from "@/common/types/agentAiDefaults";
@@ -486,6 +487,7 @@ function createWorkspaceServiceMocks(
     emitChatEvent: ReturnType<typeof mock>;
     isWorkflowInvocationCurrent: ReturnType<typeof mock>;
     create: ReturnType<typeof mock>;
+    countQueuedAgentPeerMessages: ReturnType<typeof mock>;
   }>
 ): {
   workspaceService: WorkspaceService;
@@ -569,6 +571,7 @@ function createWorkspaceServiceMocks(
     mock((_workspaceId: string, _message: WorkspaceChatMessage) => undefined);
   const isWorkflowInvocationCurrent =
     overrides?.isWorkflowInvocationCurrent ?? mock(() => Promise.resolve(true));
+  const countQueuedAgentPeerMessages = overrides?.countQueuedAgentPeerMessages ?? mock(() => 0);
 
   const create =
     overrides?.create ??
@@ -613,6 +616,7 @@ function createWorkspaceServiceMocks(
       isExperimentEnabled,
       emitChatEvent,
       isWorkflowInvocationCurrent,
+      countQueuedAgentPeerMessages,
     } as unknown as WorkspaceService,
     create,
     sendMessage,
@@ -13039,6 +13043,508 @@ describe("TaskService", () => {
     expect(findWorkspaceInConfig(config, childTaskId)?.taskPrompt).toBe(
       "Original brief\n\nUpdated guidance from parent:\n\nDo not edit generated files."
     );
+  });
+
+  test("sendAgentTreeMessage delivers sibling messages with the target's settings and an untrusted envelope", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "sib-a", "sib-a", {
+          parentWorkspaceId: "tree-root",
+          title: "Watcher A",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          agentId: "explore",
+          agentType: "explore",
+          taskStatus: "running",
+          taskModelString: "openai:gpt-5.2",
+          taskExperiments: { advisorTool: true },
+          aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      sendMessage: mock(
+        async (
+          _workspaceId: string,
+          _message: string,
+          _options: unknown,
+          internal?: { onAccepted?: () => Promise<void> | void }
+        ): Promise<Result<void>> => {
+          await internal?.onAccepted?.();
+          return Ok(undefined);
+        }
+      ),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const result = await taskService.sendAgentTreeMessage(
+      "sib-a",
+      "sib-b",
+      "Schema renamed; update your queries."
+    );
+
+    expect(result).toEqual(Ok({ delivery: "accepted", relation: "peer" }));
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const [targetId, message, options, internal] = sendMessage.mock.calls[0] as [
+      string,
+      string,
+      {
+        model: string;
+        agentId: string;
+        queueDispatchMode?: string;
+        muxMetadata?: {
+          type?: string;
+          fromWorkspaceId?: string;
+          fromTitle?: string;
+          relationship?: string;
+        };
+      },
+      { skipAutoResumeReset?: boolean; removableQueueDedupeKey?: boolean; queueDedupeKey?: string },
+    ];
+    expect(targetId).toBe("sib-b");
+    // Raw sender text never appears unencoded: the delivery is the escaped envelope.
+    expect(parseAgentMessageEnvelope(message)).toEqual({
+      from: "sib-a",
+      fromTitle: "Watcher A",
+      relationship: "sibling",
+      message: "Schema renamed; update your queries.",
+    });
+    // Sibling targets keep their own persisted settings and the tool-end default.
+    expect(options.model).toBe("openai:gpt-5.2");
+    expect(options.agentId).toBe("explore");
+    expect(options.queueDispatchMode).toBe("tool-end");
+    expect(options.muxMetadata).toEqual({
+      type: "agent-peer-message",
+      fromWorkspaceId: "sib-a",
+      fromTitle: "Watcher A",
+      relationship: "sibling",
+    });
+    // Peer sends must not reset the wake budget, and must never coalesce in the queue.
+    expect(internal.skipAutoResumeReset).toBe(true);
+    expect(internal.removableQueueDedupeKey).toBe(true);
+    expect(internal.queueDedupeKey).toStartWith("agent-msg:sib-a:");
+  });
+
+  test("sendAgentTreeMessage delivers ancestor messages with a turn-end default and descendant relationship", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "child", "child-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const result = await taskService.sendAgentTreeMessage("child-a", "tree-root", "Blocked on CI.");
+
+    // No onAccepted call from the default mock ⇒ the send queued behind the (busy) ancestor.
+    expect(result).toEqual(
+      Ok({ delivery: "queued", relation: "target_ancestor", queueDispatchMode: "turn-end" })
+    );
+    const [targetId, message, options, internal] = sendMessage.mock.calls[0] as [
+      string,
+      string,
+      { queueDispatchMode?: string; muxMetadata?: { relationship?: string } },
+      { skipAutoResumeReset?: boolean },
+    ];
+    expect(targetId).toBe("tree-root");
+    // The envelope carries the SENDER's relationship to the recipient: a descendant.
+    expect(parseAgentMessageEnvelope(message)?.relationship).toBe("descendant");
+    expect(options.queueDispatchMode).toBe("turn-end");
+    expect(options.muxMetadata?.relationship).toBe("descendant");
+    expect(internal.skipAutoResumeReset).toBe(true);
+  });
+
+  test("sendAgentTreeMessage routes descendant targets to the unchanged trusted guidance path", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "child", "child-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      sendMessage: mock(
+        async (
+          _workspaceId: string,
+          _message: string,
+          _options: unknown,
+          internal?: { onAccepted?: () => Promise<void> | void }
+        ): Promise<Result<void>> => {
+          await internal?.onAccepted?.();
+          return Ok(undefined);
+        }
+      ),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const result = await taskService.sendAgentTreeMessage(
+      "tree-root",
+      "child-a",
+      "Focus on the parser."
+    );
+
+    expect(result).toEqual(Ok({ delivery: "accepted", relation: "target_descendant" }));
+    const [, message] = sendMessage.mock.calls[0] as [string, string];
+    // Guidance framing, not the peer envelope.
+    expect(message).toBe("Updated guidance from parent:\n\nFocus on the parser.");
+  });
+
+  test("sendAgentTreeMessage rejects self-sends and cross-tree targets", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "child", "child-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "other-root", "other-root"),
+        projectWorkspace(projectPath, "other-child", "other-child", {
+          parentWorkspaceId: "other-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    expect(await taskService.sendAgentTreeMessage("child-a", "child-a", "hi")).toEqual(
+      Err({ code: "invalid_scope" })
+    );
+    expect(await taskService.sendAgentTreeMessage("child-a", "other-child", "hi")).toEqual(
+      Err({ code: "invalid_scope" })
+    );
+    expect(await taskService.sendAgentTreeMessage("child-a", "other-root", "hi")).toEqual(
+      Err({ code: "invalid_scope" })
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("sendAgentTreeMessage refuses workflow-owned and best-of endpoints for peer sends", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "sib-a", "sib-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "wf-child", "wf-child", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+          workflowTask: { runId: "wfr_peer", stepId: "step" },
+        }),
+        projectWorkspace(projectPath, "cand", "cand-1", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+          bestOf: { groupId: "grp", index: 0, total: 2 },
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    // Workflow-owned target and workflow-owned sender are both refused.
+    expect(await taskService.sendAgentTreeMessage("sib-a", "wf-child", "hi")).toEqual(
+      Err({ code: "refused", reason: "Workflow-owned tasks cannot send or receive peer messages." })
+    );
+    expect(await taskService.sendAgentTreeMessage("wf-child", "sib-a", "hi")).toEqual(
+      Err({ code: "refused", reason: "Workflow-owned tasks cannot send or receive peer messages." })
+    );
+
+    // Best-of candidates: sibling↔candidate and candidate→ancestor alike.
+    expect(await taskService.sendAgentTreeMessage("sib-a", "cand-1", "hi")).toEqual(
+      Err({ code: "refused", reason: "Best-of candidates cannot send or receive peer messages." })
+    );
+    expect(await taskService.sendAgentTreeMessage("cand-1", "tree-root", "hi")).toEqual(
+      Err({ code: "refused", reason: "Best-of candidates cannot send or receive peer messages." })
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    // Ancestor→candidate guidance stays allowed (trusted descendant path).
+    const guidance = await taskService.sendAgentTreeMessage("tree-root", "cand-1", "guidance");
+    expect(guidance.success).toBe(true);
+  });
+
+  test("sendAgentTreeMessage returns not_active for queued and terminal peer targets without side effects", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "sib-a", "sib-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sib-q", "sib-q", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "queued",
+          taskPrompt: "original launch prompt",
+        }),
+        projectWorkspace(projectPath, "sib-r", "sib-r", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "reported",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage, create } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    // Queued target: only an ancestor may mutate the durable launch prompt.
+    const queuedResult = await taskService.sendAgentTreeMessage("sib-a", "sib-q", "hi");
+    expect(queuedResult.success).toBe(false);
+    if (!queuedResult.success) {
+      expect(queuedResult.error.code).toBe("not_active");
+    }
+    expect(findWorkspaceInConfig(config, "sib-q")?.taskPrompt).toBe("original launch prompt");
+
+    // Terminal target: peers cannot reactivate (that would reroute agent_report ownership).
+    const terminalResult = await taskService.sendAgentTreeMessage("sib-a", "sib-r", "hi");
+    expect(terminalResult.success).toBe(false);
+    if (!terminalResult.success) {
+      expect(terminalResult.error.code).toBe("not_active");
+    }
+    expect(create).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("sendAgentTreeMessage enforces the per-pair rate limit and duplicate suppression", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "sib-a", "sib-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    // The default mock never calls onAccepted (queued deliveries), keeping the
+    // consecutive-wake counter out of this test's way.
+    const { workspaceService } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    // Duplicate text within the window is refused (and does not consume rate budget).
+    expect((await taskService.sendAgentTreeMessage("sib-a", "sib-b", "same text")).success).toBe(
+      true
+    );
+    const duplicate = await taskService.sendAgentTreeMessage("sib-a", "sib-b", "same text");
+    expect(duplicate).toEqual(
+      Err({
+        code: "refused",
+        reason: "Duplicate of an identical message recently sent to this target.",
+      })
+    );
+
+    for (let i = 2; i <= 5; i++) {
+      const result = await taskService.sendAgentTreeMessage("sib-a", "sib-b", `message ${i}`);
+      expect(result.success).toBe(true);
+    }
+
+    const limited = await taskService.sendAgentTreeMessage("sib-a", "sib-b", "message 6");
+    expect(limited.success).toBe(false);
+    if (!limited.success) {
+      expect(limited.error.code).toBe("rate_limited");
+      if (limited.error.code === "rate_limited") {
+        expect(limited.error.retryAfterMs).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  test("sendAgentTreeMessage caps consecutive peer wakes until user attention resets them", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "sib-a", "sib-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService } = createWorkspaceServiceMocks({
+      sendMessage: mock(
+        async (
+          _workspaceId: string,
+          _message: string,
+          _options: unknown,
+          internal?: { onAccepted?: () => Promise<void> | void }
+        ): Promise<Result<void>> => {
+          await internal?.onAccepted?.();
+          return Ok(undefined);
+        }
+      ),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    for (let i = 1; i <= 3; i++) {
+      const result = await taskService.sendAgentTreeMessage("sib-a", "sib-b", `wake ${i}`);
+      expect(result.success).toBe(true);
+    }
+
+    const capped = await taskService.sendAgentTreeMessage("sib-a", "sib-b", "wake 4");
+    expect(capped).toEqual(
+      Err({
+        code: "refused",
+        reason:
+          "Target reached its consecutive peer-wake limit and needs user or parent attention.",
+      })
+    );
+
+    // User-authored input (or parent guidance) resets the wake budget.
+    taskService.resetAutoResumeCount("sib-b");
+    expect((await taskService.sendAgentTreeMessage("sib-a", "sib-b", "wake 5")).success).toBe(true);
+  });
+
+  test("sendAgentTreeMessage refuses when the target's peer-message queue is at capacity", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "sib-a", "sib-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      countQueuedAgentPeerMessages: mock(() => 10),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "hi")).toEqual(
+      Err({
+        code: "refused",
+        reason: "Target already has the maximum number of queued peer messages.",
+      })
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("listTaskTreeAgents tags relationships relative to the caller and excludes workflow subtrees", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root", { title: "Root workspace" }),
+        projectWorkspace(projectPath, "a", "task-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "b", "task-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "a1", "task-a1", {
+          parentWorkspaceId: "task-a",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "wf", "task-wf", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+          workflowTask: { runId: "wfr_tree", stepId: "step" },
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { taskService } = createTaskServiceHarness(config);
+
+    const fromA = taskService.listTaskTreeAgents("task-a");
+    expect(fromA.rootWorkspaceId).toBe("tree-root");
+    expect(fromA.rootTitle).toBe("Root workspace");
+    expect(fromA.rootRelationship).toBe("ancestor");
+    expect(Object.fromEntries(fromA.tasks.map((task) => [task.taskId, task.relationship]))).toEqual(
+      {
+        "task-a": "self",
+        "task-b": "sibling",
+        "task-a1": "descendant",
+      }
+    );
+
+    const fromRoot = taskService.listTaskTreeAgents("tree-root");
+    expect(fromRoot.rootRelationship).toBe("self");
+    expect(fromRoot.tasks.every((task) => task.relationship === "descendant")).toBe(true);
   });
 
   test("pending parent guidance blocks stale report settlement at stream end", async () => {

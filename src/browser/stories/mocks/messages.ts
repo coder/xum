@@ -8,6 +8,10 @@ import type {
   MuxToolPart,
 } from "@/common/types/message";
 import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvelope";
+import {
+  type AgentMessageRelationship,
+  formatAgentMessageEnvelope,
+} from "@/common/utils/agentMessageEnvelope";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import {
@@ -119,6 +123,47 @@ export function createBashMonitorWakeMessage(
       muxMetadata: {
         type: "bash-monitor-wake",
         records: opts.records,
+      },
+    },
+  };
+}
+
+/** Create the synthetic envelope used for intra-tree agent peer messages. */
+export function createAgentPeerMessage(
+  id: string,
+  opts: {
+    historySequence: number;
+    timestamp?: number;
+    fromWorkspaceId: string;
+    fromTitle?: string;
+    relationship: AgentMessageRelationship;
+    message: string;
+  }
+): ChatMuxMessage {
+  return {
+    type: "message",
+    id,
+    role: "user",
+    parts: [
+      {
+        type: "text",
+        text: formatAgentMessageEnvelope({
+          from: opts.fromWorkspaceId,
+          ...(opts.fromTitle != null ? { fromTitle: opts.fromTitle } : {}),
+          relationship: opts.relationship,
+          message: opts.message,
+        }),
+      },
+    ],
+    metadata: {
+      historySequence: opts.historySequence,
+      timestamp: opts.timestamp ?? STABLE_TIMESTAMP,
+      synthetic: true,
+      muxMetadata: {
+        type: "agent-peer-message",
+        fromWorkspaceId: opts.fromWorkspaceId,
+        ...(opts.fromTitle != null ? { fromTitle: opts.fromTitle } : {}),
+        relationship: opts.relationship,
       },
     },
   };

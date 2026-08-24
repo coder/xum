@@ -4134,6 +4134,13 @@ export class WorkspaceService extends EventEmitter {
     this.sessions.get(trimmed)?.emitChatEvent(message);
   }
 
+  /** Queued agent peer messages behind a busy workspace; sessions are lazy, so no session ⇒ 0. */
+  public countQueuedAgentPeerMessages(workspaceId: string): number {
+    const trimmed = workspaceId.trim();
+    assert(trimmed.length > 0, "countQueuedAgentPeerMessages requires workspaceId");
+    return this.sessions.get(trimmed)?.countQueuedAgentPeerMessages() ?? 0;
+  }
+
   public disposeSession(workspaceId: string): void {
     const trimmed = workspaceId.trim();
     const transientSession = this.transientStartupRecoverySessions.get(trimmed);

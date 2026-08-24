@@ -327,6 +327,16 @@ function buildUserDisplayedMessages(options: {
       compactionRequest,
       reviews: muxMeta?.reviews,
       bashMonitorWake: bashMonitorWakeRecords ? { records: bashMonitorWakeRecords } : undefined,
+      // Backend-attached metadata (never typed by a user) gates the peer-message presentation,
+      // so a user-typed lookalike envelope still renders as an ordinary escaped user message.
+      agentPeerMessage:
+        muxMeta?.type === "agent-peer-message"
+          ? {
+              fromWorkspaceId: muxMeta.fromWorkspaceId,
+              ...(muxMeta.fromTitle != null ? { fromTitle: muxMeta.fromTitle } : {}),
+              relationship: muxMeta.relationship,
+            }
+          : undefined,
     },
   ];
 }

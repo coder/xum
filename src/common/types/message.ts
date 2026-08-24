@@ -12,6 +12,7 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import type { z } from "zod";
 import type { AgentMode } from "./mode";
 import type { AgentSkillScope } from "./agentSkill";
+import type { AgentMessageRelationship } from "@/common/utils/agentMessageEnvelope";
 import type { ThinkingLevel } from "./thinking";
 import { type ReviewNoteData, formatReviewForModel } from "./review";
 import { isMcpPromptCommandKey } from "@/common/utils/tools/mcpPromptCommandKey";
@@ -673,6 +674,17 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         ownerWorkspaceId: string;
         turnId: string;
       }
+    | {
+        // Intra-tree agent peer message (sibling/cousin or descendant→ancestor task_send_message).
+        // The <mux_agent_message> envelope stays in the message text for the model; this metadata
+        // drives the compact transcript card and queue-entry counting without re-parsing it.
+        type: "agent-peer-message";
+        /** Sender's tree target id — the reply address for task_send_message. */
+        fromWorkspaceId: string;
+        fromTitle?: string;
+        /** The sender's relationship to the recipient (mirrors the envelope enum). */
+        relationship: AgentMessageRelationship;
+      }
   );
 
 export function getCompactionFollowUpContent(
@@ -980,6 +992,12 @@ export type DisplayedMessage =
       /** Present when this synthetic turn is a background bash monitor wake-up. */
       bashMonitorWake?: {
         records: BashMonitorWakeDisplayRecord[];
+      };
+      /** Present when this synthetic turn is an intra-tree agent peer message. */
+      agentPeerMessage?: {
+        fromWorkspaceId: string;
+        fromTitle?: string;
+        relationship: AgentMessageRelationship;
       };
     }
   | {

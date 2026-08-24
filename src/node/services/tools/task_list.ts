@@ -14,7 +14,7 @@ import { TaskListToolResultSchema, TOOL_DEFINITIONS } from "@/common/utils/tools
 import { isWorkspaceArchived } from "@/common/utils/archive";
 
 import { isNestedWorkflowRun } from "@/common/types/workflow";
-import type { AgentTaskStatus } from "@/node/services/taskService";
+import type { AgentTaskStatus, TaskService } from "@/node/services/taskService";
 import type { Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Config } from "@/node/config";
 import { log } from "@/node/services/log";
@@ -71,6 +71,10 @@ function taskListStatusFromExecution(status: WorkspaceTurnTaskStatus): TaskListS
 // Discovery should keep a useful reusable bench without letting inactive children accumulate
 // indefinitely or turning every task boundary into a blanket cleanup.
 const INACTIVE_CHILD_RETENTION_NOTE = `Inactive persistent children remain available under stable task IDs. Rows with bestOf metadata are temporary grouped candidates rather than standalone bench members; after their results and artifacts are consumed and no same-candidate follow-up is expected, remove them with task_remove. Keep each parent's direct standalone bench role-based: aim for at most ${SUBAGENT_REUSABLE_BENCH_TARGET} and keep it below ${SUBAGENT_REUSABLE_BENCH_EXCLUSIVE_LIMIT}. Prefer reawakening relevant context and use task_retitle when responsibility changes; prune substantially overlapping, obsolete, or least-useful inactive roles with task_remove when the bench exceeds those bounds. Do not sweep a small bench merely because a turn, task, or PR ended. A reawakened child keeps its checkout, so for repository-dependent work verify the retained snapshot or tell it to synchronize. Interrupted children were stopped before a terminal report; reawaken and ask them to finalize if their work should count as completed.`;
+
+const TREE_SCOPE_NOTE =
+  'Every row (including the root "workspace" row) is addressable via task_send_message; ' +
+  "the relationship field is computed relative to this workspace.";
 
 const MAX_ARCHIVE_ANCESTOR_DEPTH = 32;
 
@@ -206,6 +210,66 @@ function shouldHideArchivedWorkspaceTurn(
   );
 }
 
+/**
+ * scope:"tree" — peer-discovery view: every agent workspace in the caller's task tree plus the
+ * root workspace row. Workflow runs, workspace turns, and bash processes stay descendants-only.
+ */
+async function executeTreeScope(
+  taskService: TaskService,
+  workspaceId: string,
+  requestedStatuses: readonly TaskListStatus[] | null
+): Promise<unknown> {
+  const tree = taskService.listTaskTreeAgents(workspaceId);
+  const explicit = requestedStatuses != null && requestedStatuses.length > 0;
+  const statusFilter = new Set<TaskListStatus>(
+    explicit ? requestedStatuses : [...DEFAULT_STATUSES, "workspace"]
+  );
+
+  const tasks: TaskListToolSuccessResult["tasks"] = [];
+  // The root is a plain workspace with no task lifecycle: included by default, filtered like any
+  // other row (status "workspace") when explicit statuses were passed.
+  if (statusFilter.has("workspace")) {
+    tasks.push({
+      taskId: tree.rootWorkspaceId,
+      status: "workspace",
+      ...(tree.rootTitle != null ? { title: tree.rootTitle } : {}),
+      relationship: tree.rootRelationship,
+      depth: 0,
+    });
+  }
+
+  const resolveAgentExecution =
+    taskService.getDescendantAgentTaskExecutionSnapshot?.bind(taskService);
+  for (const task of tree.tasks) {
+    let status: TaskListStatus = task.status;
+    let executionStatus = task.executionStatus;
+    // The live execution overlay is ancestor-scoped; non-descendant rows fall back to the
+    // persisted execution status, which is close enough for peer discovery.
+    if (
+      task.executionTaskId != null &&
+      task.relationship === "descendant" &&
+      resolveAgentExecution != null
+    ) {
+      const resolvedExecution = await resolveAgentExecution(workspaceId, task.taskId);
+      executionStatus = resolvedExecution?.record?.status ?? executionStatus;
+    }
+    if (executionStatus != null) {
+      status = taskListStatusFromExecution(executionStatus);
+    }
+    if (!statusFilter.has(status)) {
+      continue;
+    }
+    const {
+      executionTaskId: _executionTaskId,
+      executionStatus: _executionStatus,
+      ...publicTask
+    } = task;
+    tasks.push({ ...publicTask, status });
+  }
+
+  return parseToolResult(TaskListToolResultSchema, { tasks, note: TREE_SCOPE_NOTE }, "task_list");
+}
+
 export const createTaskListTool: ToolFactory = (config: ToolConfiguration) => {
   return tool({
     description: TOOL_DEFINITIONS.task_list.description,
@@ -213,6 +277,10 @@ export const createTaskListTool: ToolFactory = (config: ToolConfiguration) => {
     execute: async (args): Promise<unknown> => {
       const workspaceId = requireWorkspaceId(config, "task_list");
       const taskService = requireTaskService(config, "task_list");
+
+      if ((args.scope ?? "descendants") === "tree") {
+        return executeTreeScope(taskService, workspaceId, args.statuses ?? null);
+      }
 
       const statuses =
         args.statuses && args.statuses.length > 0 ? args.statuses : [...DEFAULT_STATUSES];

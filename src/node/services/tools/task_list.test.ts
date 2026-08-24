@@ -896,4 +896,81 @@ describe("task_list tool", () => {
       ],
     });
   });
+
+  function buildTreeTaskService() {
+    const listTaskTreeAgents = mock(() => ({
+      rootWorkspaceId: "tree-root",
+      rootTitle: "Root workspace",
+      rootRelationship: "ancestor" as const,
+      tasks: [
+        { ...buildAgentTask("task-self", "running", "tree-root"), relationship: "self" as const },
+        {
+          ...buildAgentTask("task-sib", "running", "tree-root"),
+          relationship: "sibling" as const,
+        },
+        {
+          ...buildAgentTask("task-done", "reported", "tree-root"),
+          relationship: "sibling" as const,
+        },
+      ],
+    }));
+    return {
+      listTaskTreeAgents,
+      taskService: { listTaskTreeAgents } as unknown as TaskService,
+    };
+  }
+
+  it("tree scope includes the root row by default and filters inactive rows", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-default");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+    const { listTaskTreeAgents, taskService } = buildTreeTaskService();
+
+    const tool = createTaskListTool({ ...baseConfig, taskService });
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ scope: "tree" }, mockToolCallOptions)
+    );
+
+    expect(listTaskTreeAgents).toHaveBeenCalledWith("task-self");
+    // Default statuses: the root "workspace" row plus active rows; reported rows stay hidden.
+    expect(taskIds(result)).toEqual(["tree-root", "task-self", "task-sib"]);
+    const parsed = result as {
+      tasks: Array<{
+        taskId: string;
+        status: string;
+        title?: string;
+        relationship?: string;
+        depth: number;
+      }>;
+      note?: string;
+    };
+    expect(parsed.tasks[0]).toEqual({
+      taskId: "tree-root",
+      status: "workspace",
+      title: "Root workspace",
+      relationship: "ancestor",
+      depth: 0,
+    });
+    expect(parsed.tasks[1].relationship).toBe("self");
+    expect(parsed.note).toContain("task_send_message");
+  });
+
+  it("tree scope filters the root row like any other row when explicit statuses are passed", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-explicit");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+
+    const tool = createTaskListTool({
+      ...baseConfig,
+      taskService: buildTreeTaskService().taskService,
+    });
+
+    const withoutWorkspaceStatus: unknown = await Promise.resolve(
+      tool.execute!({ scope: "tree", statuses: ["running"] }, mockToolCallOptions)
+    );
+    expect(taskIds(withoutWorkspaceStatus)).toEqual(["task-self", "task-sib"]);
+
+    const withWorkspaceStatus: unknown = await Promise.resolve(
+      tool.execute!({ scope: "tree", statuses: ["workspace", "reported"] }, mockToolCallOptions)
+    );
+    expect(taskIds(withWorkspaceStatus)).toEqual(["tree-root", "task-done"]);
+  });
 });

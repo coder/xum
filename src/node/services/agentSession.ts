@@ -6138,6 +6138,11 @@ export class AgentSession {
     );
   }
 
+  /** Queued intra-tree agent peer messages awaiting dispatch (peer-message queue cap input). */
+  countQueuedAgentPeerMessages(): number {
+    return this.messageQueue.countAgentPeerMessageEntries();
+  }
+
   /**
    * Whether an earlier queued, dequeued, or direct send supersedes a continuation.
    *

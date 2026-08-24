@@ -65,6 +65,14 @@ function isWorkspaceTurnMetadata(meta: unknown): meta is WorkspaceTurnMetadata {
   );
 }
 
+// Peer messages are sealed single-message entries (their sends use removable dedupe keys), so
+// counting entries by this metadata type is an exact count of queued peer messages.
+function isAgentPeerMessageMetadata(meta: unknown): boolean {
+  if (typeof meta !== "object" || meta === null) return false;
+  const obj = meta as Record<string, unknown>;
+  return obj.type === "agent-peer-message" && typeof obj.fromWorkspaceId === "string";
+}
+
 // Type guard for metadata with reviews
 interface MetadataWithReviews {
   reviews?: ReviewNoteData[];
@@ -192,6 +200,11 @@ export class MessageQueue {
           isWorkspaceTurnMetadata(entry.muxMetadata) && entry.muxMetadata.taskHandleId === handleId
       )
     );
+  }
+
+  /** Queued intra-tree agent peer messages (sealed entries, one message each). */
+  countAgentPeerMessageEntries(): number {
+    return this.entries.filter((entry) => isAgentPeerMessageMetadata(entry.muxMetadata)).length;
   }
 
   private getDispatchMode(entries: readonly QueueEntry[]): QueueDispatchMode {

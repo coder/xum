@@ -43,6 +43,33 @@ describe("MessageQueue", () => {
       expect(queue.dequeueNext().message).toBe("User follow-up");
     });
 
+    it("keeps agent peer messages sealed so later messages never coalesce with them", () => {
+      const peerMetadata: MuxMessageMetadata = {
+        type: "agent-peer-message",
+        fromWorkspaceId: "task-sibling",
+        fromTitle: "Watcher",
+        relationship: "sibling",
+      };
+      queue.add(
+        "<mux_agent_message>...</mux_agent_message>",
+        { model: "gpt-4", agentId: "exec", muxMetadata: peerMetadata },
+        // Matches the peer-send path: a removable dedupe key forces a sealed entry.
+        { synthetic: true, agentInitiated: true, removableDedupeKey: true }
+      );
+      queue.add("User follow-up");
+
+      // The follow-up starts a new entry: sender attribution stays on the peer entry alone,
+      // and the count reflects exactly the queued peer messages.
+      expect(queue.countAgentPeerMessageEntries()).toBe(1);
+      expect(queue.getVisibleMessages()).toEqual(["User follow-up"]);
+
+      const peerEntry = queue.dequeueNext();
+      expect(peerEntry.message).toBe("<mux_agent_message>...</mux_agent_message>");
+      expect(peerEntry.options?.muxMetadata).toEqual(peerMetadata);
+      expect(queue.countAgentPeerMessageEntries()).toBe(0);
+      expect(queue.dequeueNext().message).toBe("User follow-up");
+    });
+
     it("should return rawCommand for compaction request", () => {
       const metadata: MuxMessageMetadata = {
         type: "compaction-request",
