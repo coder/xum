@@ -11354,6 +11354,36 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     }
   });
 
+  test("archive gating stays closed while an editor recording is in flight", async () => {
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+
+    // Freeze the recording at its marker write: the pending-recording count must keep the
+    // untrackable-app probe true for the whole in-flight window even though no durable
+    // marker or cache entry exists yet (a concurrent rollback may have collapsed them).
+    let releaseWrite!: () => void;
+    const writeGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    const writeSpy = spyOn(fsPromises, "writeFile").mockImplementationOnce(async () => {
+      await writeGate;
+    });
+    try {
+      const pending = workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
+      expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
+
+      releaseWrite();
+      const admitted = await pending;
+      expect(admitted.success).toBe(true);
+      if (!admitted.success) return;
+      // Clean up: the gated write never created a real marker, so a failed-launch rollback
+      // clears the in-memory record.
+      await admitted.data.rollbackAfterFailedLaunch();
+      expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
+
   test("rollbackAfterFailedLaunch preserves a marker that predates the recording", async () => {
     // An earlier session's editor may still be running behind a pre-existing marker; a later
     // failed launch must not delete the evidence protecting it.

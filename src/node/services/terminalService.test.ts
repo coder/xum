@@ -1338,6 +1338,52 @@ describe("TerminalService.openNative", () => {
       expect(await restartedService.hasOpenedNativeTerminal("ws-marker-concurrent")).toBe(false);
     });
 
+    it("keeps gating archives while a sibling open is still in flight", async () => {
+      // A fails after marker admission while B still awaits workspace metadata: A's rollback
+      // collapses the shared marker and cache entry, but B already passed the archive guard
+      // and will launch after its awaits without rechecking — the pending-open count must
+      // keep the probe true for B's whole pre-marker window.
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 })); // every launch fails
+      const metadata = [
+        {
+          id: "ws-pending-sibling",
+          projectPath: "/tmp/project",
+          name: "main",
+          namedWorkspacePath: "/tmp/project/main",
+          runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
+        },
+      ];
+      let releaseSecondLookup!: () => void;
+      const secondLookupGate = new Promise<void>((resolve) => {
+        releaseSecondLookup = resolve;
+      });
+      let lookups = 0;
+      const config = {
+        ...(configWithLocalWorkspace as unknown as Record<string, unknown>),
+        getAllWorkspaceMetadata: mock(async () => {
+          lookups += 1;
+          if (lookups >= 2) {
+            await secondLookupGate;
+          }
+          return metadata;
+        }),
+      } as unknown as Config;
+      service = new TerminalService(config, mockPTYService);
+
+      const first = service.openNative("ws-pending-sibling");
+      const second = service.openNative("ws-pending-sibling");
+      await first.catch(() => undefined);
+
+      // B is still pre-marker (frozen in its metadata lookup) after A's rollback: the
+      // workspace must still gate snapshot/Coder-stop archives.
+      expect(await service.hasOpenedNativeTerminal("ws-pending-sibling")).toBe(true);
+
+      releaseSecondLookup();
+      await second.catch(() => undefined);
+      // The whole group failed and settled: nothing gates anymore.
+      expect(await service.hasOpenedNativeTerminal("ws-pending-sibling")).toBe(false);
+    });
+
     it("preserves a marker that predates the failed launch", async () => {
       const config = configWithWorkspace("ws-marker-preexisting");
       // First open succeeds and persists the durable marker.

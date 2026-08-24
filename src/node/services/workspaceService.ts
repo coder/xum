@@ -7764,6 +7764,17 @@ export class WorkspaceService extends EventEmitter {
    */
   private readonly externalEditorMarkerLocks = new MutexMap<string>();
 
+  /**
+   * Editor-open recordings currently in flight per workspace, counted synchronously at
+   * entry and released when the recording settles. An in-flight recording has already
+   * passed (or will synchronously fail) the admission checks and its launch follows without
+   * rechecking, so hasExternalEditorOpen counts these alongside durable evidence — a
+   * concurrent failed launch's rollback may collapse the shared marker and cache entry, and
+   * without this count that collapse would make a still-recording sibling invisible to an
+   * archive that then removes the environment beneath the launching editor.
+   */
+  private readonly pendingExternalEditorRecordings = new Map<string, number>();
+
   private externalEditorMarkerPath(workspaceId: string): string {
     return path.join(this.config.getSessionDir(workspaceId), "external-editor-opened");
   }
@@ -7846,23 +7857,38 @@ export class WorkspaceService extends EventEmitter {
   async recordExternalEditorOpenForLaunch(
     workspaceId: string
   ): Promise<Result<{ rollbackAfterFailedLaunch: () => Promise<void> }>> {
-    // Refused opens roll back a newly added reservation (no editor launches, so nothing needs
-    // gating); a pre-existing entry or durable marker from an earlier successful open is
-    // preserved — hasExternalEditorOpen re-probes the marker regardless of the Set.
-    const previouslyRecorded = this.externalEditorWorkspaces.has(workspaceId);
-    this.externalEditorWorkspaces.add(workspaceId);
-    const rollbackReservation = () => {
-      if (!previouslyRecorded) this.externalEditorWorkspaces.delete(workspaceId);
-    };
+    // Pending-recording admission pairing (mirrors TerminalService.openNative): the count is
+    // registered before any await — including the marker-lock wait, where a concurrent
+    // failed launch's rollback may collapse the shared marker and cache entry — so
+    // hasExternalEditorOpen stays true for the whole in-flight window. Refused recordings
+    // record nothing durable; the count simply releases in the finally.
+    this.pendingExternalEditorRecordings.set(
+      workspaceId,
+      (this.pendingExternalEditorRecordings.get(workspaceId) ?? 0) + 1
+    );
+    try {
+      return await this.recordExternalEditorOpenAdmitted(workspaceId);
+    } finally {
+      const remaining = (this.pendingExternalEditorRecordings.get(workspaceId) ?? 1) - 1;
+      if (remaining <= 0) {
+        this.pendingExternalEditorRecordings.delete(workspaceId);
+      } else {
+        this.pendingExternalEditorRecordings.set(workspaceId, remaining);
+      }
+    }
+  }
+
+  /** Body of recordExternalEditorOpenForLaunch after pending-recording admission. */
+  private async recordExternalEditorOpenAdmitted(
+    workspaceId: string
+  ): Promise<Result<{ rollbackAfterFailedLaunch: () => Promise<void> }>> {
     if (this.archivingWorkspaces.has(workspaceId)) {
-      rollbackReservation();
       return Err(
         `Workspace is being archived: ${workspaceId}. Unarchive it before opening an editor.`
       );
     }
     const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
     if (workspaceEntry == null) {
-      rollbackReservation();
       // Also a path-safety boundary: the marker path joins the raw ID beneath the sessions
       // directory, so an unknown (possibly traversal-crafted, e.g. "../../.ssh") ID must
       // never reach the filesystem.
@@ -7879,7 +7905,6 @@ export class WorkspaceService extends EventEmitter {
         workspaceEntry.workspace.unarchivedAt
       )
     ) {
-      rollbackReservation();
       return Err(`Workspace is archived: ${workspaceId}. Unarchive it before opening an editor.`);
     }
     // Durable marker: the editor can outlive Xum, so a restart must not forget the open.
@@ -7916,6 +7941,9 @@ export class WorkspaceService extends EventEmitter {
           }
           throw error;
         }
+        // The sticky in-memory record is a cache of the just-written marker; before this
+        // point the pending-recording count already keeps archive gates closed.
+        this.externalEditorWorkspaces.add(workspaceId);
         // Launch evidence is registered under the same lock as the write so a concurrent
         // failed launch's rollback can never observe the marker without the token.
         const token = Symbol("external-editor-launch");
@@ -7924,7 +7952,6 @@ export class WorkspaceService extends EventEmitter {
       });
     } catch (error) {
       log.error("Failed to persist external editor marker", { workspaceId, error });
-      rollbackReservation();
       return Err(
         `Cannot open an editor for ${workspaceId}: persisting the editor-open marker failed (${getErrorMessage(error)}), and without it archive safety checks would forget the editor after a restart.`
       );
@@ -7978,6 +8005,10 @@ export class WorkspaceService extends EventEmitter {
   }
 
   private async hasExternalEditorOpen(workspaceId: string): Promise<boolean> {
+    // Recordings still in flight count as open: see pendingExternalEditorRecordings.
+    if ((this.pendingExternalEditorRecordings.get(workspaceId) ?? 0) > 0) {
+      return true;
+    }
     if (this.externalEditorWorkspaces.has(workspaceId)) {
       return true;
     }

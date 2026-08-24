@@ -113,6 +113,17 @@ export class TerminalService {
    */
   private readonly nativeTerminalMarkerLocks = new MutexMap<string>();
 
+  /**
+   * openNative calls currently in flight per workspace, counted synchronously at entry
+   * (before the archive guard check) and released when the call settles. An in-flight open
+   * has already passed the archive guard and will launch after its awaits without
+   * rechecking, so hasOpenedNativeTerminal counts these alongside durable evidence — a
+   * concurrent failed open's rollback may collapse the shared marker and cache entry, and
+   * without this count that collapse would make a still-launching sibling invisible to an
+   * archive that then removes the environment beneath its shell.
+   */
+  private readonly pendingNativeTerminalOpens = new Map<string, number>();
+
   private nativeTerminalMarkerPath(workspaceId: string): string {
     return path.join(this.config.getSessionDir(workspaceId), "native-terminal-opened");
   }
@@ -134,6 +145,10 @@ export class TerminalService {
 
   /** Whether a native terminal was ever opened for this workspace (survives app restarts). */
   async hasOpenedNativeTerminal(workspaceId: string): Promise<boolean> {
+    // Opens still in flight count as opened: see pendingNativeTerminalOpens.
+    if ((this.pendingNativeTerminalOpens.get(workspaceId) ?? 0) > 0) {
+      return true;
+    }
     if (this.nativeTerminalWorkspaces.has(workspaceId)) {
       return true;
     }
@@ -554,28 +569,40 @@ export class TerminalService {
    * For SSH workspaces, opens a terminal that SSHs into the remote host.
    */
   async openNative(workspaceId: string): Promise<void> {
-    // Recorded before any awaits so archive gates observe the intent immediately; see the
-    // nativeTerminalWorkspaces doc comment for why entries are sticky. Failed opens launch no
-    // shell (see the catch below), so they roll a newly added reservation back — and, once
-    // the durable marker is persisted, roll that back too when no other launch evidence
-    // remains, because a sticky false positive would permanently refuse future model-driven
-    // snapshot/Coder-stop archives of this workspace.
-    const previouslyRecorded = this.nativeTerminalWorkspaces.has(workspaceId);
-    this.nativeTerminalWorkspaces.add(workspaceId);
-    const rollbackReservation = () => {
-      if (!previouslyRecorded) this.nativeTerminalWorkspaces.delete(workspaceId);
-    };
-    // Archive admission pairing (same synchronous block as the recording above, mirroring
-    // create()): an archive gate armed first refuses this open, while an open recorded first
-    // is observed by the sink's native-terminal check before snapshot capture. Without this,
-    // an open entering after that check could launch a native shell in a checkout the same
-    // archive is about to remove.
-    if (this.workspaceArchiveGuard?.(workspaceId) === true) {
-      rollbackReservation();
-      throw new Error(
-        `Workspace is being archived: ${workspaceId}. Unarchive it before opening a terminal.`
-      );
+    // Pending-open admission pairing (same synchronous block as the archive guard check
+    // below, mirroring create()): the count is registered before any await so archive gates
+    // observe the intent immediately, and it keeps hasOpenedNativeTerminal true for the
+    // whole in-flight window — including the pre-marker awaits, where a concurrent failed
+    // open's rollback may collapse the shared marker and cache entry. Failed opens launch
+    // no shell (see the catch below), so the count simply releases in the finally; durable
+    // recording happens at marker-write time.
+    this.pendingNativeTerminalOpens.set(
+      workspaceId,
+      (this.pendingNativeTerminalOpens.get(workspaceId) ?? 0) + 1
+    );
+    try {
+      // Archive admission pairing: an archive gate armed first refuses this open, while an
+      // open counted first is observed by the sink's native-terminal check before snapshot
+      // capture. Without this, an open entering after that check could launch a native shell
+      // in a checkout the same archive is about to remove.
+      if (this.workspaceArchiveGuard?.(workspaceId) === true) {
+        throw new Error(
+          `Workspace is being archived: ${workspaceId}. Unarchive it before opening a terminal.`
+        );
+      }
+      await this.openNativeAdmitted(workspaceId);
+    } finally {
+      const remaining = (this.pendingNativeTerminalOpens.get(workspaceId) ?? 1) - 1;
+      if (remaining <= 0) {
+        this.pendingNativeTerminalOpens.delete(workspaceId);
+      } else {
+        this.pendingNativeTerminalOpens.set(workspaceId, remaining);
+      }
     }
+  }
+
+  /** Body of openNative after pending-open admission; see openNative. */
+  private async openNativeAdmitted(workspaceId: string): Promise<void> {
     let admissionToken: symbol | null = null;
     try {
       const allMetadata = await this.config.getAllWorkspaceMetadata();
@@ -631,6 +658,9 @@ export class TerminalService {
             }
             throw error;
           }
+          // The sticky in-memory record is a cache of the just-written marker; before this
+          // point the pending-open count already keeps archive gates closed.
+          this.nativeTerminalWorkspaces.add(workspaceId);
           // Launch evidence is registered under the same lock as the write so a concurrent
           // failed launch's rollback can never observe the marker without the token.
           const token = Symbol("native-terminal-launch");
@@ -686,14 +716,13 @@ export class TerminalService {
       }
     } catch (err) {
       // No failure path in openNative launches a shell: pre-marker failures (unknown/archived
-      // workspace, marker persistence) never reach a launcher, and launcher errors propagate
-      // only from before their detached spawn (nothing after spawn()/unref() throws). The
-      // in-memory reservation always rolls back; a marker this call created is a false
-      // positive that would permanently refuse future model-driven snapshot/Coder-stop
-      // archives, so it rolls back too unless other launch evidence remains.
-      if (admissionToken == null) {
-        rollbackReservation();
-      } else {
+      // workspace, marker persistence) never reach a launcher and recorded nothing durable
+      // (the pending-open count covers that window and releases in openNative's finally). A
+      // marker this call created is a false positive that would permanently refuse future
+      // model-driven snapshot/Coder-stop archives, so it rolls back unless other launch
+      // evidence remains; launcher errors propagate only from before their detached spawn
+      // (nothing after spawn()/unref() throws).
+      if (admissionToken != null) {
         await this.rollbackNativeTerminalMarkerAfterFailedLaunch(workspaceId, admissionToken);
       }
       const message = getErrorMessage(err);
