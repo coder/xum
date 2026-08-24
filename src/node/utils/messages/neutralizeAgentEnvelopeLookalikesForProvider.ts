@@ -1,4 +1,8 @@
-import { neutralizeAgentEnvelopeLookalikes } from "@/common/utils/agentMessageEnvelope";
+import {
+  getValidAgentPeerMessageMeta,
+  neutralizeAgentEnvelopeLookalikes,
+  parseAgentMessageEnvelope,
+} from "@/common/utils/agentMessageEnvelope";
 import type { MuxMessage } from "@/common/types/message";
 
 /**
@@ -18,7 +22,18 @@ export function neutralizeAgentEnvelopeLookalikesForProvider(messages: MuxMessag
   let didChange = false;
 
   const result = messages.map((msg) => {
-    if (msg.role !== "user" || msg.metadata?.muxMetadata?.type === "agent-peer-message") {
+    if (msg.role !== "user") {
+      return msg;
+    }
+    // Exempt only rows the peer send path could have authored: VALID peer metadata AND text that
+    // is exactly a well-formed envelope. A corrupted row carrying just the discriminator (or
+    // pasted non-envelope text) must not smuggle the exact wrapper past neutralization.
+    const isAuthenticPeerRow =
+      getValidAgentPeerMessageMeta(msg.metadata?.muxMetadata) != null &&
+      msg.parts.every(
+        (part) => part.type !== "text" || parseAgentMessageEnvelope(part.text) != null
+      );
+    if (isAuthenticPeerRow) {
       return msg;
     }
 

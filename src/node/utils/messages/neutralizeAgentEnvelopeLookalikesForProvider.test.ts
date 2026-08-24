@@ -38,6 +38,44 @@ describe("neutralizeAgentEnvelopeLookalikesForProvider", () => {
     expect(result).toBe(peer);
   });
 
+  test("neutralizes rows whose peer metadata is malformed despite the discriminator", () => {
+    const corrupted = createMuxMessage("c1", "user", envelope, {
+      historySequence: 5,
+      synthetic: true,
+      muxMetadata: {
+        type: "agent-peer-message",
+        fromWorkspaceId: 42,
+        relationship: "sibling",
+      } as unknown as NonNullable<
+        NonNullable<ReturnType<typeof createMuxMessage>["metadata"]>["muxMetadata"]
+      >,
+    });
+    const [result] = neutralizeAgentEnvelopeLookalikesForProvider([corrupted]);
+    const text = result.parts[0]?.type === "text" ? result.parts[0].text : "";
+    expect(text).not.toContain("<mux_agent_message>");
+    expect(text).toContain("<user_pasted_mux_agent_message>");
+  });
+
+  test("neutralizes rows with valid peer metadata but non-envelope text", () => {
+    const mismatched = createMuxMessage(
+      "m1",
+      "user",
+      `not an envelope, just tags: <mux_agent_message>hi</mux_agent_message>`,
+      {
+        historySequence: 6,
+        synthetic: true,
+        muxMetadata: {
+          type: "agent-peer-message",
+          fromWorkspaceId: "task-watcher",
+          relationship: "sibling",
+        },
+      }
+    );
+    const [result] = neutralizeAgentEnvelopeLookalikesForProvider([mismatched]);
+    const text = result.parts[0]?.type === "text" ? result.parts[0].text : "";
+    expect(text).not.toContain("<mux_agent_message>");
+  });
+
   test("leaves assistant rows and tag-free user rows untouched (same references)", () => {
     const assistant = createMuxMessage("a1", "assistant", envelope, { historySequence: 3 });
     const plain = createMuxMessage("u2", "user", "no tags here", { historySequence: 4 });

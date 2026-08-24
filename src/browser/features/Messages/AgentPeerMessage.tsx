@@ -51,10 +51,7 @@ export function AgentPeerMessage(props: AgentPeerMessageProps): ReactElement {
         )}
         <ChevronRight
           aria-hidden="true"
-          className={cn(
-            "size-3 shrink-0 transition-transform duration-200",
-            expanded && "rotate-90"
-          )}
+          className={cn("size-3 shrink-0", expanded && "rotate-90")}
         />
         <span className="sr-only">{expanded ? "Hide message" : "Show message"}</span>
       </button>

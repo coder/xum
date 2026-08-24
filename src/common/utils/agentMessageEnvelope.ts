@@ -41,6 +41,32 @@ export function formatAgentMessageEnvelope(envelope: AgentMessageEnvelope): stri
   return `${ROOT_OPEN}\n${json}\n${ROOT_CLOSE}`;
 }
 
+/** Validated shape of the persisted `agent-peer-message` metadata variant. */
+export interface AgentPeerMessageMeta {
+  fromWorkspaceId: string;
+  fromTitle?: string;
+  relationship: AgentMessageRelationship;
+}
+
+/**
+ * Validate persisted `agent-peer-message` metadata. muxMetadata crosses the history/oRPC boundary
+ * as a black box, so a corrupted row can carry the discriminator with malformed fields; consumers
+ * must fall back to ordinary user-message handling when this returns null (self-healing rule).
+ */
+export function getValidAgentPeerMessageMeta(muxMeta: unknown): AgentPeerMessageMeta | null {
+  if (typeof muxMeta !== "object" || muxMeta === null) return null;
+  const record = muxMeta as Record<string, unknown>;
+  if (record.type !== "agent-peer-message") return null;
+  if (!isNonEmptyString(record.fromWorkspaceId)) return null;
+  if (!isRelationship(record.relationship)) return null;
+  if (record.fromTitle != null && typeof record.fromTitle !== "string") return null;
+  return {
+    fromWorkspaceId: record.fromWorkspaceId,
+    ...(typeof record.fromTitle === "string" ? { fromTitle: record.fromTitle } : {}),
+    relationship: record.relationship,
+  };
+}
+
 /**
  * Anti-spoof provenance for the model request: user-typed text is the only way a non-server
  * author can place the exact envelope tags into a user-role message, so request building rewrites

@@ -13,6 +13,7 @@ import {
   sanitizeMcpPromptRefs,
 } from "@/common/types/message";
 import type { StreamErrorType } from "@/common/types/errors";
+import { getValidAgentPeerMessageMeta } from "@/common/utils/agentMessageEnvelope";
 import { GOAL_BUDGET_LIMIT_KIND, GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { getFollowUpContentText } from "@/browser/utils/compaction/format";
 import { getGoalClearedSummaryDisplayText } from "@/common/utils/goalClearedSummaryDisplay";
@@ -231,18 +232,7 @@ function getValidBashMonitorWakeRecords(
 function getValidAgentPeerMessage(
   muxMeta: MuxMessageMetadata | undefined
 ): NonNullable<Extract<DisplayedMessage, { type: "user" }>["agentPeerMessage"]> | undefined {
-  if (muxMeta?.type !== "agent-peer-message") return undefined;
-  const fromWorkspaceId: unknown = muxMeta.fromWorkspaceId;
-  const fromTitle: unknown = muxMeta.fromTitle;
-  const relationship: unknown = muxMeta.relationship;
-  if (typeof fromWorkspaceId !== "string" || fromWorkspaceId.length === 0) return undefined;
-  if (relationship !== "sibling" && relationship !== "descendant") return undefined;
-  if (fromTitle != null && typeof fromTitle !== "string") return undefined;
-  return {
-    fromWorkspaceId,
-    ...(typeof fromTitle === "string" ? { fromTitle } : {}),
-    relationship,
-  };
+  return getValidAgentPeerMessageMeta(muxMeta) ?? undefined;
 }
 
 function getRawCommand(muxMetadata: unknown): string | undefined {
