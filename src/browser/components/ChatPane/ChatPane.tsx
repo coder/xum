@@ -740,8 +740,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     [handleScrollContainerKeyDown, isComposerDockEvent]
   );
 
-  const handleJumpToBottom = jumpToBottom;
-
   // Handler to navigate (scroll) to a specific message by historyId
   const handleNavigateToMessage = useCallback(
     (historyId: string) => {
@@ -1013,8 +1011,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     // send success can be too late because the backend may not resolve until the
     // stream has already produced rows, leaving the first deltas offscreen when the
     // user had previously scrolled up.
-    handleJumpToBottom();
-  }, [handleJumpToBottom]);
+    jumpToBottom();
+  }, [jumpToBottom]);
 
   const handleMessageSent = useCallback(
     (dispatchMode: QueueDispatchMode = "tool-end") => {
@@ -1027,15 +1025,15 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
       // Slash-command send paths still report after backend success; keep this
       // harmless duplicate pin so those paths also re-arm auto-scroll.
-      handleJumpToBottom();
+      jumpToBottom();
     },
-    [autoBackgroundOnSend, handleJumpToBottom]
+    [autoBackgroundOnSend, jumpToBottom]
   );
 
   const handleClearHistory = useCallback(
     async (percentage = 1.0) => {
       // Re-arm the tail before clearing so the empty/starting state owns the bottom.
-      handleJumpToBottom();
+      jumpToBottom();
 
       // Truncate history in backend
       const result = await api?.workspace.truncateHistory({ workspaceId, percentage });
@@ -1047,18 +1045,18 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
         throw new Error(result.error);
       }
     },
-    [workspaceId, handleJumpToBottom, api]
+    [workspaceId, jumpToBottom, api]
   );
 
   const handleResetContext = useCallback(async (): Promise<"reset" | "noop"> => {
-    handleJumpToBottom();
+    jumpToBottom();
 
     const result = await api?.workspace.resetContext({ workspaceId });
     if (!result?.success) {
       throw new Error(result?.error ?? "Failed to reset context");
     }
     return result.data;
-  }, [workspaceId, handleJumpToBottom, api]);
+  }, [workspaceId, jumpToBottom, api]);
 
   const openInEditor = useOpenInEditor();
   const handleOpenInEditor = useCallback(() => {
@@ -1077,8 +1075,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // the ref-backed auto-scroll flag and pins any cached rows before paint; if rows are still
   // hydrating, the next content resize owns the tail instead of showing the prior workspace's state.
   useLayoutEffect(() => {
-    handleJumpToBottom();
-  }, [hasLoadedTranscriptRows, handleJumpToBottom, workspaceId]);
+    jumpToBottom();
+  }, [hasLoadedTranscriptRows, jumpToBottom, workspaceId]);
 
   // Compute showRetryBarrier once for both keybinds and UI.
   // Track if last message was interrupted or errored (for RetryBarrier).
@@ -1233,7 +1231,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       (workspaceState?.canInterrupt ?? false) || (workspaceState?.isStreamStarting ?? false),
     showRetryBarrier,
     chatInputAPI,
-    jumpToBottom: handleJumpToBottom,
+    jumpToBottom,
     loadOlderHistory: shouldRenderLoadOlderMessagesButton ? handleLoadOlderHistory : null,
     handleOpenTerminal: onOpenTerminal,
     handleOpenInEditor,
@@ -1678,7 +1676,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                 >
                   {!autoScroll && (
                     <button
-                      onClick={handleJumpToBottom}
+                      onClick={jumpToBottom}
                       type="button"
                       // Sit just above the composer dock (8px gap), tracking its live
                       // height through normal layout instead of a measured offset.
