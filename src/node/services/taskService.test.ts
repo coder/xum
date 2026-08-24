@@ -476,6 +476,7 @@ function createWorkspaceServiceMocks(
     archive: ReturnType<typeof mock>;
     unarchive: ReturnType<typeof mock>;
     preflightArchive: ReturnType<typeof mock>;
+    listLiveWorkspaceActivity: ReturnType<typeof mock>;
     deleteWorktree: ReturnType<typeof mock>;
     remove: ReturnType<typeof mock>;
     emit: ReturnType<typeof mock>;
@@ -508,6 +509,7 @@ function createWorkspaceServiceMocks(
   archive: ReturnType<typeof mock>;
   unarchive: ReturnType<typeof mock>;
   preflightArchive: ReturnType<typeof mock>;
+  listLiveWorkspaceActivity: ReturnType<typeof mock>;
   deleteWorktree: ReturnType<typeof mock>;
   remove: ReturnType<typeof mock>;
   emit: ReturnType<typeof mock>;
@@ -556,6 +558,9 @@ function createWorkspaceServiceMocks(
   const preflightArchive =
     overrides?.preflightArchive ??
     mock((): Promise<Result<{ kind: "ready" }>> => Promise.resolve(Ok({ kind: "ready" })));
+  const listLiveWorkspaceActivity =
+    overrides?.listLiveWorkspaceActivity ??
+    mock(() => ({ streaming: false, terminalSessions: false, desktopSession: false }));
   const deleteWorktree =
     overrides?.deleteWorktree ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
   const remove =
@@ -608,6 +613,7 @@ function createWorkspaceServiceMocks(
       archive,
       unarchive,
       preflightArchive,
+      listLiveWorkspaceActivity,
       deleteWorktree,
       removeWhileTaskTreeLocked: remove,
       remove,
@@ -639,6 +645,7 @@ function createWorkspaceServiceMocks(
     archive,
     unarchive,
     preflightArchive,
+    listLiveWorkspaceActivity,
     deleteWorktree,
     remove,
     emit,
@@ -915,6 +922,8 @@ describe("TaskService", () => {
       archive?: ReturnType<typeof mock>;
       unarchive?: ReturnType<typeof mock>;
       preflightArchive?: ReturnType<typeof mock>;
+      listLiveWorkspaceActivity?: ReturnType<typeof mock>;
+      create?: ReturnType<typeof mock>;
     } = {}
   ) {
     const config = await createTestConfig(rootDir);
@@ -945,6 +954,10 @@ describe("TaskService", () => {
       ...(options.archive != null ? { archive: options.archive } : {}),
       ...(options.unarchive != null ? { unarchive: options.unarchive } : {}),
       ...(options.preflightArchive != null ? { preflightArchive: options.preflightArchive } : {}),
+      ...(options.listLiveWorkspaceActivity != null
+        ? { listLiveWorkspaceActivity: options.listLiveWorkspaceActivity }
+        : {}),
+      ...(options.create != null ? { create: options.create } : {}),
     });
     const { taskService } = createTaskServiceHarness(config, {
       workspaceService: workspaceMocks.workspaceService,
@@ -1002,7 +1015,9 @@ describe("TaskService", () => {
         displayName: "Child workspace",
       })
     );
-    expect(archive).toHaveBeenCalledWith("childworkspace", undefined);
+    expect(archive).toHaveBeenCalledWith("childworkspace", undefined, {
+      forbidWorktreeCheckoutDeletion: true,
+    });
 
     const unowned = await taskService.archiveOwnedWorkspaceTurnWorkspace(
       parentId,
@@ -1047,7 +1062,9 @@ describe("TaskService", () => {
         displayName: "Child workspace",
       })
     );
-    expect(archive).toHaveBeenCalledWith("childworkspace", undefined);
+    expect(archive).toHaveBeenCalledWith("childworkspace", undefined, {
+      forbidWorktreeCheckoutDeletion: true,
+    });
   });
 
   test("workspace lifecycle serializes concurrent handles that resolve to the same workspace", async () => {
@@ -1163,7 +1180,9 @@ describe("TaskService", () => {
         paths: ["scratch.txt"],
       })
     );
-    expect(confirmationArchive).toHaveBeenCalledWith("childworkspace", ["scratch.txt"]);
+    expect(confirmationArchive).toHaveBeenCalledWith("childworkspace", ["scratch.txt"], {
+      forbidWorktreeCheckoutDeletion: true,
+    });
 
     const confirmationByTaskId = await taskService.archiveOwnedWorkspaceTurnWorkspace(
       parentId,
@@ -1181,7 +1200,9 @@ describe("TaskService", () => {
         paths: ["scratch.txt"],
       })
     );
-    expect(confirmationArchive).toHaveBeenCalledWith("childworkspace", ["task-scratch.txt"]);
+    expect(confirmationArchive).toHaveBeenCalledWith("childworkspace", ["task-scratch.txt"], {
+      forbidWorktreeCheckoutDeletion: true,
+    });
 
     await config.editConfig((cfg) => {
       const child = cfg.projects
@@ -1269,7 +1290,9 @@ describe("TaskService", () => {
         displayName: "Child workspace",
       })
     );
-    expect(archive).toHaveBeenCalledWith("childworkspace", undefined);
+    expect(archive).toHaveBeenCalledWith("childworkspace", undefined, {
+      forbidWorktreeCheckoutDeletion: true,
+    });
     const runningRecord = await taskHandleStore.getWorkspaceTurn(parentId, "wst_running");
     expect(runningRecord?.status).toBe("interrupted");
   });
@@ -1632,8 +1655,12 @@ describe("TaskService", () => {
         displayName: "Child workspace",
       })
     );
-    expect(preflightArchive).toHaveBeenCalledTimes(1);
-    expect(archive).toHaveBeenCalledWith("childworkspace", ["scratch.txt"]);
+    // Preflight runs before interruption on BOTH calls; the acknowledged set covering the
+    // reported paths is what lets the second call proceed.
+    expect(preflightArchive).toHaveBeenCalledTimes(2);
+    expect(archive).toHaveBeenCalledWith("childworkspace", ["scratch.txt"], {
+      forbidWorktreeCheckoutDeletion: true,
+    });
     const interrupted = await harness.taskHandleStore.getWorkspaceTurn(
       harness.parentId,
       "wst_running"
@@ -1642,16 +1669,9 @@ describe("TaskService", () => {
   });
 
   test("workspace lifecycle refuses archive when worktree archive behavior deletes checkouts", async () => {
-    const { config, parentId, projectPath, taskService, archive } =
-      await createWorkspaceLifecycleHarness();
+    const { config, parentId, taskService, archive } = await createWorkspaceLifecycleHarness();
     await config.editConfig((cfg) => {
       cfg.worktreeArchiveBehavior = "delete";
-      const child = cfg.projects
-        .get(projectPath)
-        ?.workspaces.find((workspace) => workspace.id === "childworkspace");
-      assert(child, "child workspace must exist");
-      // Legacy local + srcBaseDir is treated as a managed worktree runtime.
-      child.runtimeConfig = { type: "local", srcBaseDir: projectPath };
       return cfg;
     });
 
@@ -1666,6 +1686,256 @@ describe("TaskService", () => {
     expect(data?.status).toBe("error");
     expect(data?.status === "error" ? data.error : "").toContain("Delete checkout");
     expect(archive).not.toHaveBeenCalled();
+  });
+
+  test("workspace lifecycle serializes nested turn creation with archiving its owner", async () => {
+    const harnessRefs: { config?: Config; projectPath?: string } = {};
+    let releaseArchive: (() => void) | undefined;
+    const archiveGate = new Promise<void>((resolve) => {
+      releaseArchive = resolve;
+    });
+    const archive = mock(async (): Promise<Result<{ kind: "archived" }>> => {
+      await archiveGate;
+      const config = harnessRefs.config;
+      const projectPath = harnessRefs.projectPath;
+      assert(config, "harness config must be assigned before archive runs");
+      assert(projectPath, "harness project path must be assigned before archive runs");
+      await config.editConfig((cfg) => {
+        const child = cfg.projects
+          .get(projectPath)
+          ?.workspaces.find((workspace) => workspace.id === "childworkspace");
+        assert(child, "child workspace must exist");
+        child.archivedAt = new Date().toISOString();
+        return cfg;
+      });
+      return Ok({ kind: "archived" });
+    });
+    const create = mock(async (): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+      const config = harnessRefs.config;
+      const projectPath = harnessRefs.projectPath;
+      assert(config, "harness config must be assigned before create runs");
+      assert(projectPath, "harness project path must be assigned before create runs");
+      await config.editConfig((cfg) => {
+        const project = cfg.projects.get(projectPath);
+        assert(project, "test project must exist");
+        project.workspaces.push({
+          path: path.join(projectPath, "grandchild"),
+          id: "grandchildworkspace",
+          name: "grandchild",
+          createdAt: new Date().toISOString(),
+          runtimeConfig: { type: "local" },
+        });
+        return cfg;
+      });
+      return Ok({
+        metadata: {
+          id: "grandchildworkspace",
+          name: "grandchild",
+          projectName: "repo",
+          projectPath,
+          runtimeConfig: { type: "local" },
+          createdAt: new Date().toISOString(),
+        },
+      });
+    });
+    const harness = await createWorkspaceLifecycleHarness({ archive, create });
+    harnessRefs.config = harness.config;
+    harnessRefs.projectPath = harness.projectPath;
+
+    const archivePromise = harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+      harness.parentId,
+      { workspaceId: "childworkspace" },
+      {}
+    );
+    const waitStart = Date.now();
+    while (archive.mock.calls.length === 0) {
+      if (Date.now() - waitStart > 5000) throw new Error("archive mock was never invoked");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    // The peer starts a nested workspace turn while its own archive is mid-flight. The
+    // persist section locks on the OWNER too, so it must serialize behind the archive and be
+    // refused instead of leaving an active nested handle owned by an archived workspace.
+    const nestedPromise = harness.taskService.createWorkspaceTurn({
+      ownerWorkspaceId: "childworkspace",
+      prompt: "Nested work",
+      title: "Nested work",
+      workspace: { mode: "new" },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    releaseArchive?.();
+
+    const [archived, nested] = await Promise.all([archivePromise, nestedPromise]);
+    expect(archived).toEqual(
+      Ok({
+        status: "archived",
+        action: "archive",
+        workspaceId: "childworkspace",
+        displayName: "Child workspace",
+      })
+    );
+    expect(nested.success).toBe(false);
+    expect(nested.success ? "" : nested.error).toMatch(/owner workspace was archived/);
+    const nestedHandles = await harness.taskService.listWorkspaceTurnTasks("childworkspace", {
+      statuses: ["queued", "starting", "running"],
+    });
+    expect(nestedHandles).toEqual([]);
+  });
+
+  test("workspace lifecycle refuses archive while the target has live non-turn activity", async () => {
+    const listLiveWorkspaceActivity = mock(() => ({
+      streaming: true,
+      terminalSessions: true,
+      desktopSession: false,
+    }));
+    const { parentId, taskService, archive } = await createWorkspaceLifecycleHarness({
+      listLiveWorkspaceActivity,
+    });
+
+    // No delegated turns explain the stream, and terminals are never turn-driven; even
+    // interrupt_active must not let the tool kill user activity.
+    const result = await taskService.archiveOwnedWorkspaceTurnWorkspace(
+      parentId,
+      { workspaceId: "childworkspace" },
+      { interruptActive: true }
+    );
+
+    expect(result.success).toBe(true);
+    const data = result.success ? result.data : undefined;
+    expect(data?.status).toBe("active");
+    expect(data?.status === "active" ? data.note : "").toContain("an active stream");
+    expect(data?.status === "active" ? data.note : "").toContain("open terminal sessions");
+    expect(archive).not.toHaveBeenCalled();
+  });
+
+  test("workspace lifecycle re-confirms when acknowledged paths no longer cover the preflight", async () => {
+    const preflightArchive = mock(
+      (): Promise<Result<{ kind: "confirm-lossy-untracked-files"; paths: string[] }>> =>
+        Promise.resolve(
+          Ok({ kind: "confirm-lossy-untracked-files", paths: ["scratch.txt", "new-file.txt"] })
+        )
+    );
+    const archive = mock(
+      (): Promise<Result<{ kind: "archived" }>> => Promise.resolve(Ok({ kind: "archived" }))
+    );
+    const harness = await createWorkspaceLifecycleHarness({ archive, preflightArchive });
+    await harness.taskHandleStore.upsertWorkspaceTurn({
+      kind: "workspace_turn",
+      handleId: "wst_running",
+      ownerWorkspaceId: harness.parentId,
+      workspaceId: "childworkspace",
+      turnId: "turn-running",
+      status: "running",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      createdWorkspace: false,
+      disposableWorkspace: false,
+    });
+    markWorkspaceTurnActive(harness.taskService, "childworkspace", "wst_running", harness.parentId);
+
+    // The acknowledged set predates a new untracked file: surface a fresh confirmation
+    // BEFORE interrupting instead of destroying the turn and then failing the archive.
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+      harness.parentId,
+      { workspaceId: "childworkspace" },
+      { interruptActive: true, acknowledgedUntrackedPaths: ["scratch.txt"] }
+    );
+
+    expect(result).toEqual(
+      Ok({
+        status: "requires_confirmation",
+        action: "archive",
+        workspaceId: "childworkspace",
+        displayName: "Child workspace",
+        paths: ["scratch.txt", "new-file.txt"],
+      })
+    );
+    expect(archive).not.toHaveBeenCalled();
+    const stillRunning = await harness.taskHandleStore.getWorkspaceTurn(
+      harness.parentId,
+      "wst_running"
+    );
+    expect(stillRunning?.status).toBe("running");
+  });
+
+  test("workspace lifecycle interruption tolerates turns that settled after collection", async () => {
+    // The preflight runs between collection and interruption; settle one of the two active
+    // turns there to prove a now-terminal handle is skipped instead of aborting the archive.
+    const harnessRefs: {
+      taskHandleStore?: TaskHandleStore;
+      taskService?: TaskService;
+      parentId?: string;
+    } = {};
+    const preflightArchive = mock(async (): Promise<Result<{ kind: "ready" }>> => {
+      const { taskHandleStore, taskService, parentId } = harnessRefs;
+      assert(taskHandleStore && taskService && parentId, "harness refs must be assigned");
+      const settled = await taskHandleStore.getWorkspaceTurn(parentId, "wst_settling");
+      assert(settled, "settling turn must exist");
+      await taskHandleStore.upsertWorkspaceTurn({
+        ...settled,
+        status: "completed",
+        updatedAt: new Date().toISOString(),
+      });
+      (
+        taskService as unknown as {
+          activeWorkspaceTurnHandleByWorkspaceId: Map<string, unknown>;
+        }
+      ).activeWorkspaceTurnHandleByWorkspaceId.delete("childworkspace");
+      return Ok({ kind: "ready" });
+    });
+    const harness = await createWorkspaceLifecycleHarness({ preflightArchive });
+    harnessRefs.taskHandleStore = harness.taskHandleStore;
+    harnessRefs.taskService = harness.taskService;
+    harnessRefs.parentId = harness.parentId;
+    const baseRecord = {
+      kind: "workspace_turn" as const,
+      ownerWorkspaceId: harness.parentId,
+      workspaceId: "childworkspace",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      createdWorkspace: false,
+      disposableWorkspace: false,
+    };
+    await harness.taskHandleStore.upsertWorkspaceTurn({
+      ...baseRecord,
+      handleId: "wst_settling",
+      turnId: "turn-settling",
+      status: "running",
+    });
+    await harness.taskHandleStore.upsertWorkspaceTurn({
+      ...baseRecord,
+      handleId: "wst_queued",
+      turnId: "turn-queued",
+      status: "queued",
+    });
+    markWorkspaceTurnActive(
+      harness.taskService,
+      "childworkspace",
+      "wst_settling",
+      harness.parentId
+    );
+
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+      harness.parentId,
+      { workspaceId: "childworkspace" },
+      { interruptActive: true }
+    );
+
+    expect(result).toEqual(
+      Ok({
+        status: "archived",
+        action: "archive",
+        workspaceId: "childworkspace",
+        displayName: "Child workspace",
+      })
+    );
+    const settled = await harness.taskHandleStore.getWorkspaceTurn(
+      harness.parentId,
+      "wst_settling"
+    );
+    expect(settled?.status).toBe("completed");
+    const queued = await harness.taskHandleStore.getWorkspaceTurn(harness.parentId, "wst_queued");
+    expect(queued?.status).toBe("interrupted");
   });
 
   test("createWorkspaceTurn creates a normal workspace and starts a correlated turn", async () => {

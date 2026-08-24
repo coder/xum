@@ -182,6 +182,11 @@ export class DesktopSessionManager {
     return session.action(actionType, params);
   }
 
+  /** Whether a live desktop session exists for this workspace. */
+  has(workspaceId: string): boolean {
+    return this.sessions.has(workspaceId);
+  }
+
   async close(workspaceId: string): Promise<void> {
     const session = this.sessions.get(workspaceId);
     const startupPromise = this.startupPromises.get(workspaceId);

@@ -585,6 +585,16 @@ const POST_COMPACTION_METADATA_REFRESH_DEBOUNCE_MS = 100;
 
 const DESCENDANT_WORKSPACE_REMOVE_ERROR =
   "This workspace has descendant sub-agent workspaces. Remove those descendants deepest-first before removing their parent.";
+export interface ArchiveWorkspaceOptions {
+  /**
+   * Refuse to archive when the effective worktree archive behavior would delete the checkout
+   * ("delete"). Model-facing callers set this so a concurrent settings flip cannot turn an
+   * agent-driven archive into an unconfirmed checkout deletion; enforced against the same
+   * behavior read that drives the snapshot/deletion decisions.
+   */
+  forbidWorktreeCheckoutDeletion?: boolean;
+}
+
 const ACTIVE_DESCENDANT_ARCHIVE_ERROR =
   "This workspace has active descendant sub-agents. Stop them before archiving their parent.";
 const MULTI_PROJECT_WORKSPACES_DISABLED_ERROR = "Multi-project workspaces experiment is disabled";
@@ -7535,12 +7545,30 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
+  /**
+   * Live user-facing activity that archiveUnlocked would silently terminate via
+   * stopLiveWorkspaceActivityForArchive. Model-facing lifecycle paths consult this to refuse
+   * archiving instead of killing activity that has no delegated workspace-turn handle.
+   */
+  listLiveWorkspaceActivity(workspaceId: string): {
+    streaming: boolean;
+    terminalSessions: boolean;
+    desktopSession: boolean;
+  } {
+    return {
+      streaming: this.aiService.isStreaming(workspaceId),
+      terminalSessions: this.terminalService?.hasWorkspaceSessions(workspaceId) === true,
+      desktopSession: this.desktopSessionManager?.has(workspaceId) === true,
+    };
+  }
+
   async archive(
     workspaceId: string,
-    acknowledgedUntrackedPaths?: string[]
+    acknowledgedUntrackedPaths?: string[],
+    options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
     return await this.withTaskTreeLifecycleLock(workspaceId, async () =>
-      this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths)
+      this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths, options)
     );
   }
 
@@ -7556,7 +7584,8 @@ export class WorkspaceService extends EventEmitter {
    */
   private async archiveUnlocked(
     workspaceId: string,
-    acknowledgedUntrackedPaths?: string[]
+    acknowledgedUntrackedPaths?: string[],
+    options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
     this.archivingWorkspaces.add(workspaceId);
 
@@ -7604,6 +7633,17 @@ export class WorkspaceService extends EventEmitter {
 
       const { projectPath, workspacePath } = workspace;
       const worktreeArchiveBehavior = this.getWorktreeArchiveBehavior();
+      // Enforced at the sink, not just in callers: this read is the same snapshot passed to the
+      // afterArchive worktree-deletion hook, so a concurrent settings flip cannot slip a
+      // checkout deletion past a caller that forbade it.
+      if (
+        options?.forbidWorktreeCheckoutDeletion === true &&
+        worktreeArchiveBehavior === "delete"
+      ) {
+        return Err(
+          'Worktree archive behavior is set to "Delete checkout", which this caller forbids because it deletes the checkout without user confirmation.'
+        );
+      }
       const snapshotBehaviorEnabled =
         !this.isSharedTaskWorkspace(workspaceId) &&
         worktreeArchiveBehavior === "snapshot" &&
@@ -7781,6 +7821,9 @@ export class WorkspaceService extends EventEmitter {
           await this.workspaceLifecycleHooks.runAfterArchive({
             workspaceId,
             workspaceMetadata: hookMetadata,
+            // Same read that decided snapshot capture above; keeps the deletion decision
+            // consistent with the capture decision under concurrent settings changes.
+            worktreeArchiveBehavior,
           });
           await this.emitCurrentWorkspaceMetadata(workspaceId);
         }

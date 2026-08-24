@@ -1,4 +1,5 @@
 import type { WorkspaceMetadata } from "@/common/types/workspace";
+import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import { log } from "@/node/services/log";
@@ -14,6 +15,12 @@ export type BeforeArchiveHook = (args: BeforeArchiveHookArgs) => Promise<Result<
 export interface AfterArchiveHookArgs {
   workspaceId: string;
   workspaceMetadata: WorkspaceMetadata;
+  /**
+   * Behavior snapshot taken by the archive operation when it decided whether to capture a
+   * worktree snapshot. Hooks that delete checkouts must use this value (not a fresh config
+   * read) so a concurrent settings flip cannot delete a checkout that was never snapshotted.
+   */
+  worktreeArchiveBehavior?: WorktreeArchiveBehavior;
 }
 
 export type AfterArchiveHook = (args: AfterArchiveHookArgs) => Promise<Result<void>>;

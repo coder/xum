@@ -927,6 +927,14 @@ export class TerminalService {
   }
 
   /**
+   * Whether any live terminal PTY sessions are tracked for a workspace. Model-facing
+   * lifecycle paths consult this to refuse archiving instead of silently killing PTYs.
+   */
+  hasWorkspaceSessions(workspaceId: string): boolean {
+    return this.getTrackedSessionIdsForWorkspace(workspaceId).length > 0;
+  }
+
+  /**
    * Close all terminal sessions for a workspace.
    * Called when a workspace is archived or removed to prevent resource leaks.
    */
