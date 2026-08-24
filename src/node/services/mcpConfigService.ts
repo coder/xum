@@ -17,8 +17,35 @@ import type {
   AgentPluginsMcpContext,
   AgentPluginsMcpProvider,
 } from "@/node/services/agentPlugins/mcpConfig";
+import { isCanonicalPluginServerKey } from "@/node/services/agentPlugins/mcpConfig";
 import { log } from "@/node/services/log";
 import { getErrorMessage } from "@/common/utils/errors";
+
+/**
+ * Canonical `plugin:<16-hex>:<server>` keys are RESERVED for Agent Plugin
+ * servers: a plugin uninstall prunes workspace overrides for these keys by
+ * shape, so an ordinary user-configured server occupying one would shadow
+ * the plugin server (user layers win on key collision) yet lose its own
+ * enablement/allowlist state during that plugin's uninstall. Reserved keys
+ * found in user config are ignored at runtime — the on-disk entry is
+ * preserved verbatim (loss-preserving rewrites) but never listed or started.
+ */
+function omitReservedPluginKeys(
+  servers: Record<string, MCPServerInfo>,
+  layer: "global" | "project"
+): Record<string, MCPServerInfo> {
+  const result: Record<string, MCPServerInfo> = {};
+  for (const [name, info] of Object.entries(servers)) {
+    if (isCanonicalPluginServerKey(name)) {
+      log.debug(
+        `[MCP] Ignoring ${layer} MCP server '${name}': the canonical plugin key namespace is reserved for Agent Plugin servers`
+      );
+      continue;
+    }
+    result[name] = info;
+  }
+  return result;
+}
 
 export class MCPConfigService {
   private readonly config: Config;
@@ -295,16 +322,21 @@ export class MCPConfigService {
     }
 
     const globalCfg = await this.getGlobalConfig();
+    const globalServers = omitReservedPluginKeys(globalCfg.servers, "global");
 
     if (!projectPath || !trusted) {
       if (projectPath && !trusted) {
         log.debug("[MCP] Skipping project-local MCP config for untrusted project", { projectPath });
       }
-      return { plugin: pluginServers, global: globalCfg.servers, project: {} };
+      return { plugin: pluginServers, global: globalServers, project: {} };
     }
 
     const repoCfg = await this.getRepoOverrideConfig(projectPath);
-    return { plugin: pluginServers, global: globalCfg.servers, project: repoCfg.servers };
+    return {
+      plugin: pluginServers,
+      global: globalServers,
+      project: omitReservedPluginKeys(repoCfg.servers, "project"),
+    };
   }
 
   async addServer(
@@ -318,6 +350,12 @@ export class MCPConfigService {
   ): Promise<Result<void>> {
     if (!name.trim()) {
       return Err("Server name is required");
+    }
+    if (isCanonicalPluginServerKey(name.trim())) {
+      // See omitReservedPluginKeys: a user server on a canonical plugin key
+      // would be stripped of its workspace overrides by that plugin's
+      // uninstall.
+      return Err("Server names of the form 'plugin:<id>:<name>' are reserved for Agent Plugins");
     }
 
     const transport: MCPServerTransport = input.transport ?? "stdio";

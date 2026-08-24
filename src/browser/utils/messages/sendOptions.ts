@@ -96,6 +96,7 @@ export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptio
       programmaticToolCallingExclusive: isExperimentEnabled(
         EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE
       ),
+      rlm: isExperimentEnabled(EXPERIMENT_IDS.RLM),
       advisorTool: isExperimentEnabled(EXPERIMENT_IDS.ADVISOR_TOOL),
       dynamicWorkflows: isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS),
       memory: isExperimentEnabled(EXPERIMENT_IDS.MEMORY),

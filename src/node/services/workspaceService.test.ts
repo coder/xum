@@ -22,6 +22,15 @@ import { createTestHistoryService } from "./testHistoryService";
 import type { SessionTimingService } from "./sessionTimingService";
 import { SessionUsageService } from "./sessionUsageService";
 import type { AIService } from "./aiService";
+import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
+import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import type { ExperimentsService } from "./experimentsService";
+import {
+  awaitPendingBranchSummary,
+  startAbandonedBranchSummaryInBackground,
+  type BranchSummaryAiService,
+} from "./branchSummary";
 import type { InitStateManager, InitStatus } from "./initStateManager";
 import {
   ExtensionMetadataService,
@@ -69,6 +78,7 @@ import {
 // `./testDispatchHelpers` (Coder-agents-review P3 DEREM-41 + nit DEREM-48 +
 // nit DEREM-50) — import instead of defining local copies.
 import { drainPendingDispatches, waitForCondition } from "./testDispatchHelpers";
+import { sandboxHostService } from "./sandbox/sandboxHostService";
 
 // Helper to access private renamingWorkspaces set
 function addToRenamingWorkspaces(service: WorkspaceService, workspaceId: string): void {
@@ -4407,6 +4417,813 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     }
   });
 
+  test("context reset discards persisted post-compaction carryover", async () => {
+    // An RLM compaction persists cumulative read-file paths / loaded skills
+    // (post-compaction.json). A reset starts a NEW context segment: without
+    // discarding that state, a later turn would inject PRE-reset read paths
+    // (even in a fresh session after a restart), resurrecting context the
+    // reset was meant to discard.
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "context-reset-post-compaction";
+    try {
+      await config.addWorkspace("/tmp/context-reset-post-compaction-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "context-reset-post-compaction-project",
+        projectPath: "/tmp/context-reset-post-compaction-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createXumMessage("pre-reset-user", "user", "before reset", {})
+      );
+      const sessionDir = config.getSessionDir(workspaceId);
+      await fsPromises.mkdir(sessionDir, { recursive: true });
+      const pendingStatePath = path.join(sessionDir, "post-compaction.json");
+      await fsPromises.writeFile(
+        pendingStatePath,
+        JSON.stringify({
+          version: 1,
+          createdAt: Date.now(),
+          diffs: [],
+          loadedSkills: [],
+          readFiles: ["/tmp/pre-reset-read.ts"],
+        })
+      );
+
+      expect(await workspaceService.resetContext(workspaceId)).toEqual({
+        success: true,
+        data: "reset",
+      });
+
+      const stateExists = await fsPromises.access(pendingStatePath).then(
+        () => true,
+        () => false
+      );
+      expect(stateExists).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("context reset fails when the post-compaction carryover discard is not durable", async () => {
+    // Best-effort deletion of post-compaction.json swallowed unlink failures
+    // while resetContext still reported success — after a restart the stale
+    // file re-injects PRE-reset read paths/skills/diffs. The discard must be
+    // durable-or-fail, matching the sandbox invalidation posture.
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "context-reset-carryover-not-durable";
+    try {
+      await config.addWorkspace("/tmp/context-reset-carryover-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "context-reset-carryover-project",
+        projectPath: "/tmp/context-reset-carryover-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createXumMessage("pre-reset-user", "user", "before reset", {})
+      );
+      // Deterministic unlink failure: a DIRECTORY at the pending-state path
+      // fails unlink with EISDIR (read errors are swallowed at load, so this
+      // models exactly the stale-undeletable-file case).
+      const pendingStatePath = path.join(config.getSessionDir(workspaceId), "post-compaction.json");
+      await fsPromises.mkdir(pendingStatePath, { recursive: true });
+
+      const result = await workspaceService.resetContext(workspaceId);
+      expect(result.success).toBe(false);
+      expect(result.success ? "" : result.error).toContain("post-compaction carryover");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("context reset fails when the sandbox invalidation is not durable", async () => {
+    // The reset's kernel-vars invalidation is only durable once the
+    // empty-snapshot tombstone publishes; the in-memory reset-pending guard
+    // dies with the process. Reporting Ok on a failed publish would hide that
+    // a restart can resurrect the cleared (potentially sensitive) vars, so
+    // the failure must reach the caller as a partial-failure error.
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "context-reset-sandbox-invalidation";
+    try {
+      await config.addWorkspace("/tmp/context-reset-sandbox-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "context-reset-sandbox-project",
+        projectPath: "/tmp/context-reset-sandbox-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createXumMessage("pre-reset-user", "user", "before reset", {})
+      );
+      const discardSpy = spyOn(sandboxHostService, "discardScope").mockImplementationOnce(() =>
+        Promise.reject(new Error("journal write failed"))
+      );
+
+      try {
+        const result = await workspaceService.resetContext(workspaceId);
+        expect(result.success).toBe(false);
+        expect(result.success ? "" : result.error).toContain("durably invalidated");
+        expect(result.success ? "" : result.error).toContain("journal write failed");
+
+        // A retry reaches the no-op branch (the boundary row already
+        // landed) — it must RE-ATTEMPT the pending cleanup, not report
+        // success while the invalidation is still not durable: a restart
+        // could otherwise restore pre-reset kernel vars across the boundary.
+        discardSpy.mockImplementationOnce(() => Promise.reject(new Error("journal write failed")));
+        const retry = await workspaceService.resetContext(workspaceId);
+        expect(retry.success).toBe(false);
+        expect(retry.success ? "" : retry.error).toContain("durably invalidated");
+      } finally {
+        discardSpy.mockRestore();
+      }
+
+      // Once cleanup succeeds, the retry settles as a clean noop (the
+      // chat-side boundary already applied; the real discard re-runs and
+      // lands durably).
+      expect(await workspaceService.resetContext(workspaceId)).toEqual({
+        success: true,
+        data: "noop",
+      });
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("full history clear durably discards sandbox kernel state", async () => {
+    // A full /clear removes the transcript; kernel vars DERIVED from it (and
+    // restorable from the latest durable snapshot after a restart) must not
+    // stay readable through the sandbox — same invalidation boundary as
+    // resetContext. Partial truncation keeps context, so it must NOT discard.
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "full-clear-sandbox-discard";
+    try {
+      await config.addWorkspace("/tmp/full-clear-sandbox-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "full-clear-sandbox-project",
+        projectPath: "/tmp/full-clear-sandbox-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createXumMessage("pre-clear-user", "user", "before clear", {})
+      );
+      const discardSpy = spyOn(sandboxHostService, "discardScope").mockImplementation(() =>
+        Promise.resolve()
+      );
+      try {
+        expect(await workspaceService.truncateHistory(workspaceId, 0.5)).toEqual({
+          success: true,
+          data: undefined,
+        });
+        expect(discardSpy).not.toHaveBeenCalled();
+
+        expect(await workspaceService.truncateHistory(workspaceId)).toEqual({
+          success: true,
+          data: undefined,
+        });
+        expect(discardSpy).toHaveBeenCalledTimes(1);
+
+        // Same partial-failure posture as resetContext: history IS cleared,
+        // but a non-durable invalidation must fail the operation (a restart
+        // could otherwise resurrect the cleared vars from the snapshot).
+        await historyService.appendToHistory(
+          workspaceId,
+          createXumMessage("pre-clear-user-2", "user", "before second clear", {})
+        );
+        discardSpy.mockImplementationOnce(() => Promise.reject(new Error("journal write failed")));
+        const failed = await workspaceService.truncateHistory(workspaceId);
+        expect(failed.success).toBe(false);
+        expect(failed.success ? "" : failed.error).toContain("durably invalidated");
+      } finally {
+        discardSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("context-discarding mutations drain in-flight refine passes", async () => {
+    // A streaming refine pass distills the current transcript; reset and
+    // full clear discard it, so both must cancel + drain the pass before
+    // mutating (a late proposal would otherwise describe discarded context).
+    // Partial truncation keeps context and must NOT drain.
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "clear-drains-refine";
+    try {
+      await config.addWorkspace("/tmp/clear-drains-refine-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "clear-drains-refine-project",
+        projectPath: "/tmp/clear-drains-refine-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createXumMessage("pre-clear-user", "user", "before clear", {})
+      );
+      const drained: string[] = [];
+      workspaceService.setRefinePassCanceller({
+        cancelInFlightRefinePass: (id) => {
+          drained.push(id);
+          return Promise.resolve();
+        },
+      });
+
+      expect((await workspaceService.truncateHistory(workspaceId, 0.5)).success).toBe(true);
+      expect(drained).toHaveLength(0);
+
+      expect((await workspaceService.truncateHistory(workspaceId)).success).toBe(true);
+      expect(drained).toEqual([workspaceId]);
+
+      await historyService.appendToHistory(
+        workspaceId,
+        createXumMessage("pre-reset-user", "user", "before reset", {})
+      );
+      expect((await workspaceService.resetContext(workspaceId)).success).toBe(true);
+      expect(drained).toEqual([workspaceId, workspaceId]);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("context-discarding mutations block send admission across their awaits (r40)", async () => {
+    // SECURITY: a full clear awaits the refine drain + cross-process lock
+    // BETWEEN its busy check and the truncation. A send admitted during that
+    // window would snapshot the pre-clear transcript and stream across the
+    // clear, repopulating the cleared context — so the mutation publishes an
+    // admission guard BEFORE its first await: new sends reject at the door
+    // and concurrent mutations are refused.
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "clear-blocks-sends";
+    try {
+      await config.addWorkspace("/tmp/clear-blocks-sends-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "clear-blocks-sends-project",
+        projectPath: "/tmp/clear-blocks-sends-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createXumMessage("pre-clear-user", "user", "before clear", {})
+      );
+      const drainStarted = createDeferred<void>();
+      const releaseDrain = createDeferred<void>();
+      workspaceService.setRefinePassCanceller({
+        cancelInFlightRefinePass: async () => {
+          drainStarted.resolve();
+          await releaseDrain.promise;
+        },
+      });
+
+      const clearPromise = workspaceService.truncateHistory(workspaceId);
+      await drainStarted.promise;
+
+      // Mid-await: the guard is already published.
+      const sendResult = await workspaceService.sendMessage(workspaceId, "hello", {
+        model: "anthropic:claude-sonnet-4-6",
+        thinkingLevel: "off",
+        toolPolicy: [],
+        agentId: "exec",
+      });
+      expect(sendResult).toEqual({
+        success: false,
+        error: {
+          type: "unknown",
+          raw: "Workspace history is being cleared or reset. Please wait and try again.",
+        },
+      });
+      expect(await workspaceService.resetContext(workspaceId)).toEqual({
+        success: false,
+        error: "A context reset or clear is already in progress for this workspace.",
+      });
+
+      releaseDrain.resolve();
+      expect(await clearPromise).toEqual({ success: true, data: undefined });
+      // Guard released: a follow-up mutation is admitted again.
+      expect(await workspaceService.resetContext(workspaceId)).toEqual({
+        success: true,
+        data: "noop",
+      });
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("full clear fails closed when a turn starts during its awaits (r40)", async () => {
+    // A turn start that bypasses send admission (in-turn compaction retries
+    // crossing a transient idle gap) can begin streaming while the clear sits
+    // in its refine drain/lock awaits. The busy recheck under the guard +
+    // lock must fail the mutation instead of truncating under a live stream.
+    let streaming = false;
+    const aiService = {
+      on: mock(() => undefined),
+      isStreaming: mock(() => streaming),
+    } as unknown as AIService;
+    const { config, historyService, workspaceService, cleanup } = await createServices(aiService);
+    const workspaceId = "clear-recheck-busy";
+    try {
+      await config.addWorkspace("/tmp/clear-recheck-busy-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "clear-recheck-busy-project",
+        projectPath: "/tmp/clear-recheck-busy-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createXumMessage("pre-clear-user", "user", "before clear", {})
+      );
+      workspaceService.setRefinePassCanceller({
+        cancelInFlightRefinePass: () => {
+          // A stream starts exactly inside the mutation's await window.
+          streaming = true;
+          return Promise.resolve();
+        },
+      });
+
+      const result = await workspaceService.truncateHistory(workspaceId);
+      expect(result).toEqual({
+        success: false,
+        error:
+          "Cannot truncate history while a turn is active. Press Esc to stop the stream first.",
+      });
+      // Failed closed: nothing was truncated under the live stream.
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success ? history.data : []).toHaveLength(1);
+
+      // Once the stream ends, the clear (and its admission guard) work again.
+      streaming = false;
+      workspaceService.setRefinePassCanceller({
+        cancelInFlightRefinePass: () => Promise.resolve(),
+      });
+      expect(await workspaceService.truncateHistory(workspaceId)).toEqual({
+        success: true,
+        data: undefined,
+      });
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("acquireIdleTurnExclusion refuses busy workspaces and blocks turn admission while held (r40)", async () => {
+    // /refine publication rides this exclusion: it must fail closed when a
+    // turn is active and, while held, refuse new turn admission so the
+    // published row cannot land inside a PREPARING snapshot window.
+    let streaming = true;
+    const aiService = {
+      on: mock(() => undefined),
+      isStreaming: mock(() => streaming),
+    } as unknown as AIService;
+    const { config, workspaceService, cleanup } = await createServices(aiService);
+    const workspaceId = "refine-turn-exclusion";
+    try {
+      await config.addWorkspace("/tmp/refine-turn-exclusion-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "refine-turn-exclusion-project",
+        projectPath: "/tmp/refine-turn-exclusion-project",
+        runtimeConfig: { type: "local" },
+      });
+
+      expect(workspaceService.acquireIdleTurnExclusion(workspaceId)).toEqual({
+        success: false,
+        error: "a turn is preparing or streaming",
+      });
+
+      streaming = false;
+      const exclusion = workspaceService.acquireIdleTurnExclusion(workspaceId);
+      expect(exclusion.success).toBe(true);
+      if (!exclusion.success) return;
+      try {
+        const sendResult = await workspaceService.sendMessage(workspaceId, "hello", {
+          model: "anthropic:claude-sonnet-4-6",
+          thinkingLevel: "off",
+          toolPolicy: [],
+          agentId: "exec",
+        });
+        expect(sendResult).toEqual({
+          success: false,
+          error: {
+            type: "unknown",
+            raw: "Workspace history is being cleared or reset. Please wait and try again.",
+          },
+        });
+      } finally {
+        exclusion.data[Symbol.dispose]();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("acquireIdleTurnExclusion refuses while a send is in its pre-admission window (r41)", async () => {
+    // Release-before-resume: a send past the entry check may have already
+    // persisted its user row while the session still looks idle. If refine
+    // published and released here, the proposal row would land after that
+    // user row and enter the send's request as a trailing foreign assistant
+    // row — the exclusion must refuse instead.
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "refine-preflight-send";
+    try {
+      await config.addWorkspace("/tmp/refine-preflight-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "refine-preflight-project",
+        projectPath: "/tmp/refine-preflight-project",
+        runtimeConfig: { type: "local" },
+      });
+
+      const appendReached = createDeferred<void>();
+      const releaseAppend = createDeferred<void>();
+      const originalAppend = historyService.appendToHistory.bind(historyService);
+      const appendSpy = spyOn(historyService, "appendToHistory").mockImplementationOnce(
+        async (...args: Parameters<HistoryService["appendToHistory"]>) => {
+          appendReached.resolve();
+          await releaseAppend.promise;
+          return originalAppend(...args);
+        }
+      );
+      try {
+        const sendPromise = workspaceService.sendMessage(workspaceId, "hello", {
+          model: "anthropic:claude-sonnet-4-6",
+          thinkingLevel: "off",
+          toolPolicy: [],
+          agentId: "exec",
+        });
+        await appendReached.promise;
+
+        expect(workspaceService.acquireIdleTurnExclusion(workspaceId)).toEqual({
+          success: false,
+          error: "a send is being admitted",
+        });
+
+        releaseAppend.resolve();
+        // The send fails at stream startup (no provider in this fixture) —
+        // only its settled outcome matters here.
+        await sendPromise;
+
+        // Preflight released: the exclusion is available again.
+        const exclusion = workspaceService.acquireIdleTurnExclusion(workspaceId);
+        expect(exclusion.success).toBe(true);
+        if (exclusion.success) {
+          exclusion.data[Symbol.dispose]();
+        }
+      } finally {
+        appendSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("context mutations are refused while a send is in its pre-admission window (r42)", async () => {
+    // SECURITY: a send past the entry check may have passed its pre-persist
+    // gate but not yet appended its rows (family payload + user row). A
+    // mutation committing in that window would leave those rows — composed
+    // against, and possibly influenced by, the discarded context — durably in
+    // the fresh transcript: the epoch gate blocks the send's stream but
+    // cannot un-append. The mutation must refuse while the send is in
+    // preflight, and succeed again once it settles.
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "mutation-refuses-preflight";
+    try {
+      await config.addWorkspace("/tmp/mutation-refuses-preflight-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "mutation-refuses-preflight-project",
+        projectPath: "/tmp/mutation-refuses-preflight-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createXumMessage("pre-clear-user", "user", "before clear", {})
+      );
+
+      // Park the send at its user-row append: past every entry check and the
+      // pre-persist gate, strictly before its rows land.
+      const appendReached = createDeferred<void>();
+      const releaseAppend = createDeferred<void>();
+      const originalAppend = historyService.appendToHistory.bind(historyService);
+      const appendSpy = spyOn(historyService, "appendToHistory").mockImplementationOnce(
+        async (...args: Parameters<HistoryService["appendToHistory"]>) => {
+          appendReached.resolve();
+          await releaseAppend.promise;
+          return originalAppend(...args);
+        }
+      );
+      try {
+        const sendPromise = workspaceService.sendMessage(workspaceId, "hello", {
+          model: "anthropic:claude-sonnet-4-6",
+          thinkingLevel: "off",
+          toolPolicy: [],
+          agentId: "exec",
+        });
+        await appendReached.promise;
+
+        expect(await workspaceService.truncateHistory(workspaceId)).toEqual({
+          success: false,
+          error: "Cannot truncate history while a message is being sent. Try again in a moment.",
+        });
+        expect(await workspaceService.resetContext(workspaceId)).toEqual({
+          success: false,
+          error: "Cannot reset context while a message is being sent. Try again in a moment.",
+        });
+
+        releaseAppend.resolve();
+        // The send fails at stream startup (no provider in this fixture) —
+        // only its settled outcome matters here.
+        await sendPromise;
+
+        // Preflight settled: the clear is admitted and discards everything,
+        // including the send's rows — nothing straddles the mutation.
+        expect(await workspaceService.truncateHistory(workspaceId)).toEqual({
+          success: true,
+          data: undefined,
+        });
+        const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(history.success ? history.data : ["unexpected"]).toHaveLength(0);
+      } finally {
+        appendSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("context mutations and refine exclusion refuse while mid-stream compaction is pending (r43)", async () => {
+    // interruptForCompaction stops the original stream, waits for idle, then
+    // calls AgentSession.sendMessage directly — bypassing WorkspaceService
+    // entry accounting. During that window the session looks idle, so
+    // mutations and refine publication must treat pending mid-stream
+    // compaction as turn work and refuse.
+    const { config, workspaceService, cleanup } = await createServices();
+    const workspaceId = "midstream-compaction-guard";
+    try {
+      await config.addWorkspace("/tmp/midstream-compaction-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "midstream-compaction-project",
+        projectPath: "/tmp/midstream-compaction-project",
+        runtimeConfig: { type: "local" },
+      });
+      const session = workspaceService.getOrCreateSession(workspaceId);
+      const pendingSpy = spyOn(session, "hasActiveOrPendingTurnWork").mockReturnValue(true);
+      try {
+        expect(await workspaceService.truncateHistory(workspaceId)).toEqual({
+          success: false,
+          error:
+            "Cannot truncate history while a turn is active. Press Esc to stop the stream first.",
+        });
+        expect(await workspaceService.resetContext(workspaceId)).toEqual({
+          success: false,
+          error: "Cannot reset context while a turn is active. Press Esc to stop the stream first.",
+        });
+        expect(workspaceService.acquireIdleTurnExclusion(workspaceId)).toEqual({
+          success: false,
+          error: "a turn is preparing or streaming",
+        });
+      } finally {
+        pendingSpy.mockRestore();
+      }
+      // Window closed: mutations are admitted again.
+      expect(await workspaceService.resetContext(workspaceId)).toEqual({
+        success: true,
+        data: "noop",
+      });
+    } finally {
+      await cleanup();
+    }
+  });
+
+  /**
+   * Seed a fork-shaped history and drive a background abandoned-branch
+   * summary until its row is durably appended, leaving the registration
+   * settled but unconsumed (the r43/r44 scenario: settled before the fork's
+   * first send). History ends up with 3 rows: m1, m2, summary.
+   */
+  async function seedSettledBranchSummaryRegistration(
+    historyService: HistoryService,
+    workspaceId: string
+  ): Promise<void> {
+    // Fork shape: kept rows end at the guard tail; the abandoned branch is
+    // meaty enough to clear the summarization threshold.
+    await historyService.appendToHistory(
+      workspaceId,
+      createXumMessage("m1", "user", "original question", { timestamp: 1 })
+    );
+    await historyService.appendToHistory(
+      workspaceId,
+      createXumMessage("m2", "assistant", "branch point answer", { timestamp: 2 })
+    );
+    const filler = "investigated the flaky test and traced the race ".repeat(200);
+    const abandonedMessages = [
+      createXumMessage("abandoned-user", "user", `Please fix this: ${filler}`, { timestamp: 3 }),
+      createXumMessage("abandoned-assistant", "assistant", `Findings: ${filler}`, {
+        timestamp: 4,
+      }),
+    ];
+    const summaryAiService: BranchSummaryAiService = {
+      createModelWithPinnedMetadata: (modelString: string) =>
+        Promise.resolve(
+          Ok({
+            model: new MockLanguageModelV3({
+              doStream: () =>
+                Promise.resolve({
+                  stream: simulateReadableStream({
+                    chunks: [
+                      { type: "text-start", id: "t1" },
+                      { type: "text-delta", id: "t1", delta: "Abandoned: explored a race." },
+                      { type: "text-end", id: "t1" },
+                      {
+                        type: "finish",
+                        finishReason: { unified: "stop", raw: "stop" },
+                        usage: {
+                          inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
+                          outputTokens: { total: 5, text: 5, reasoning: 0 },
+                        },
+                      } satisfies LanguageModelV3StreamPart,
+                    ] satisfies LanguageModelV3StreamPart[],
+                  }),
+                }),
+            }),
+            metadataModel: modelString,
+          })
+        ) as ReturnType<BranchSummaryAiService["createModelWithPinnedMetadata"]>,
+      getWorkspaceMetadata: () =>
+        Promise.resolve(Ok({ aiSettings: { model: "anthropic:claude-haiku-4-5" } })) as ReturnType<
+          BranchSummaryAiService["getWorkspaceMetadata"]
+        >,
+    };
+    await startAbandonedBranchSummaryInBackground({
+      historyService,
+      aiService: summaryAiService,
+      workspaceId,
+      abandonedMessages,
+      experiments: { rlm: true, programmaticToolCalling: true },
+      guardTailMessageId: "m2",
+    });
+    // Wait for the background generation to append + settle WITHOUT
+    // consuming the registration.
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      if (history.success && history.data.length === 3) return;
+      if (Date.now() > deadline) {
+        throw new Error("branch summary row never appended");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+
+  test("a full clear drops a settled-but-unconsumed branch-summary registration (r43)", async () => {
+    // A fork's summary can append and settle before the fork's first send;
+    // the registration stays consumable so that send can emit the row. A
+    // full clear deletes the row — the registration must be dropped with it,
+    // or the next send re-emits the discarded summary into the live
+    // transcript (absent from history after reload).
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "clear-drops-summary-registration";
+    try {
+      await config.addWorkspace("/tmp/clear-drops-summary-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "clear-drops-summary-project",
+        projectPath: "/tmp/clear-drops-summary-project",
+        runtimeConfig: { type: "local" },
+      });
+      await seedSettledBranchSummaryRegistration(historyService, workspaceId);
+
+      expect(await workspaceService.truncateHistory(workspaceId)).toEqual({
+        success: true,
+        data: undefined,
+      });
+
+      // The registration went with the row: nothing left to re-emit.
+      expect(await awaitPendingBranchSummary(workspaceId)).toBeNull();
+      const cleared = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(cleared.success ? cleared.data : ["unexpected"]).toHaveLength(0);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a failed full clear retains the settled branch-summary registration (r44)", async () => {
+    // The registration is dropped only AFTER the truncation commits: dropping
+    // it first and then failing the write would leave the durable summary row
+    // in history with nothing left to emit it — the provider would see
+    // assistant context the user cannot see until a reload.
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "failed-clear-retains-registration";
+    try {
+      await config.addWorkspace("/tmp/failed-clear-retains-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "failed-clear-retains-project",
+        projectPath: "/tmp/failed-clear-retains-project",
+        runtimeConfig: { type: "local" },
+      });
+      await seedSettledBranchSummaryRegistration(historyService, workspaceId);
+
+      const truncateSpy = spyOn(historyService, "truncateHistory").mockImplementationOnce(() =>
+        Promise.resolve(Err("disk full"))
+      );
+      try {
+        expect(await workspaceService.truncateHistory(workspaceId)).toEqual({
+          success: false,
+          error: "disk full",
+        });
+      } finally {
+        truncateSpy.mockRestore();
+      }
+
+      // The registration survived the failed clear: the next send still
+      // consumes and emits the row, which remains in history.
+      const summary = await awaitPendingBranchSummary(workspaceId);
+      expect(summary).not.toBeNull();
+      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success).toBe(true);
+      if (history.success) {
+        expect(history.data.some((row) => row.id === summary?.id)).toBe(true);
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("context-discarding mutations drop pending partials so retries cannot replay them (r41)", async () => {
+    // A retry scheduled during backoff would fire after the guard releases,
+    // commit the pre-mutation partial, and stream a request derived from the
+    // discarded context — mutations must durably drop that state first, and
+    // fail closed when they cannot.
+    const { config, historyService, workspaceService, cleanup } = await createServices();
+    const workspaceId = "clear-discards-partial";
+    try {
+      await config.addWorkspace("/tmp/clear-discards-partial-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "clear-discards-partial-project",
+        projectPath: "/tmp/clear-discards-partial-project",
+        runtimeConfig: { type: "local" },
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createXumMessage("pre-clear-user", "user", "before clear", {})
+      );
+      const seedPartial = () =>
+        historyService.writePartial(
+          workspaceId,
+          createXumMessage("partial-1", "assistant", "pre-mutation partial", {})
+        );
+
+      // getOrCreateSession must exist for the discard hook to run.
+      await seedPartial();
+      expect(await workspaceService.truncateHistory(workspaceId)).toEqual({
+        success: true,
+        data: undefined,
+      });
+      expect(await historyService.readPartial(workspaceId)).toBeNull();
+
+      // Reset drops the partial too — even on its no-op branch the discard
+      // runs before the history read, so stale retry state cannot survive.
+      await seedPartial();
+      expect(await workspaceService.resetContext(workspaceId)).toEqual({
+        success: true,
+        data: "noop",
+      });
+      expect(await historyService.readPartial(workspaceId)).toBeNull();
+
+      // Fail closed: an undeletable partial blocks the clear.
+      await historyService.appendToHistory(
+        workspaceId,
+        createXumMessage("post-clear-user", "user", "again", {})
+      );
+      await seedPartial();
+      const deleteSpy = spyOn(historyService, "deletePartial").mockImplementationOnce(() =>
+        Promise.resolve(Err("disk full"))
+      );
+      try {
+        const blocked = await workspaceService.truncateHistory(workspaceId);
+        expect(blocked).toEqual({
+          success: false,
+          error: "Cannot clear history: pending retry state could not be discarded (disk full)",
+        });
+        // Nothing was truncated.
+        const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(history.success ? history.data : []).toHaveLength(1);
+      } finally {
+        deleteSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("context reset surfaces active-context history read failures", async () => {
     const { config, historyService, workspaceService, cleanup } = await createServices();
     const workspaceId = "context-reset-history-read-fails";
@@ -4621,7 +5438,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         const duplicateReset = await workspaceService.resetContext(workspaceId);
         expect(duplicateReset).toEqual({
           success: false,
-          error: "Context reset is already in progress for this workspace.",
+          error: "A context reset or clear is already in progress for this workspace.",
         });
 
         const sendResult = await workspaceService.sendMessage(workspaceId, "hello", {
@@ -4634,7 +5451,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
           success: false,
           error: {
             type: "unknown",
-            raw: "Workspace context is resetting. Please wait and try again.",
+            raw: "Workspace history is being cleared or reset. Please wait and try again.",
           },
         });
 
@@ -8663,6 +9480,256 @@ describe("WorkspaceService remove lifecycle coordination", () => {
   });
 });
 
+describe("WorkspaceService registration-time plugin override sanitization", () => {
+  // A LocalRuntime checkout preserves .mux/mcp.local.jsonc across workspace
+  // removal, and a removed workspace is invisible to the Agent Plugin
+  // uninstaller's pruning/tombstones. Consent dies with the workspace:
+  // registering the directory as a NEW workspace sanitizes canonical plugin
+  // keys — unless a live sibling still resolves to the same path (its consent
+  // context is alive), and a failed sanitize aborts creation instead of
+  // silently activating stale enables.
+  interface SanitizeAccess {
+    sanitizeStalePluginOverridesForNewWorkspace(
+      workspaceId: string,
+      workspacePath: string,
+      persistentSiblingConfig?: Pick<Config, "loadConfigOrDefault">
+    ): Promise<string | undefined>;
+    pendingPluginSanitizations: Set<string>;
+    rollbackUnsanitizedWorkspaceRegistration(workspaceId: string): Promise<boolean>;
+  }
+
+  function makeService(
+    existingWorkspaces: Array<{ id: string; path: string; runtimeConfig?: unknown }>
+  ): WorkspaceService {
+    return createWorkspaceServiceForTest({
+      config: {
+        srcDir: "/tmp/src",
+        loadConfigOrDefault: mock(() => ({
+          projects: new Map([["/tmp/proj", { workspaces: existingWorkspaces }]]),
+        })),
+      } as unknown as Config,
+    });
+  }
+
+  test("sanitizes canonical plugin keys when no sibling shares the path", async () => {
+    const service = makeService([{ id: "ws-new", path: "/tmp/proj" }]);
+    const pruned: string[] = [];
+    service.setWorkspaceMcpOverridesService({
+      prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
+        pruned.push(`${workspaceId}:${keyPrefix}`);
+        return Promise.resolve();
+      },
+    });
+    const error = await (
+      service as unknown as SanitizeAccess
+    ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", "/tmp/proj");
+    expect(error).toBeUndefined();
+    expect(pruned).toEqual(["ws-new:plugin:"]);
+  });
+
+  test("skips sanitization when the live sibling is only visible in the persistent config", async () => {
+    // xum run / xum workflow register on an EPHEMERAL temp config whose
+    // project entries carry no workspace records; a desktop workspace live on
+    // the same checkout exists only in the persistent config. Pruning would
+    // strip enables that live consent context still owns from the shared
+    // .xum/mcp.local.jsonc — the persistent sibling must force a skip, while
+    // a persistent record for a DIFFERENT checkout must not.
+    const service = makeService([{ id: "ws-new", path: "/tmp/proj" }]);
+    const pruned: string[] = [];
+    service.setWorkspaceMcpOverridesService({
+      prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
+        pruned.push(`${workspaceId}:${keyPrefix}`);
+        return Promise.resolve();
+      },
+    });
+    const persistentWith = (workspacePath: string): Pick<Config, "loadConfigOrDefault"> =>
+      ({
+        loadConfigOrDefault: () => ({
+          projects: new Map([
+            ["/tmp/proj", { workspaces: [{ id: "ws-desktop", path: workspacePath }] }],
+          ]),
+        }),
+      }) as unknown as Pick<Config, "loadConfigOrDefault">;
+
+    const skip = await (
+      service as unknown as SanitizeAccess
+    ).sanitizeStalePluginOverridesForNewWorkspace(
+      "ws-new",
+      "/tmp/proj",
+      persistentWith("/tmp/proj")
+    );
+    expect(skip).toBeUndefined();
+    expect(pruned).toEqual([]);
+
+    const prune = await (
+      service as unknown as SanitizeAccess
+    ).sanitizeStalePluginOverridesForNewWorkspace(
+      "ws-new",
+      "/tmp/proj",
+      persistentWith("/tmp/other")
+    );
+    expect(prune).toBeUndefined();
+    expect(pruned).toEqual(["ws-new:plugin:"]);
+  });
+
+  test("refuses to prune when the persistent sibling config is unreadable", async () => {
+    // The lenient loadConfigOrDefault swallows a malformed ~/.xum/config.json
+    // into an EMPTY project map — which reads as "no live sibling" and would
+    // prune enables a live desktop workspace still owns. The persistent
+    // source must be read in throwing mode and sanitization must fail closed
+    // (abort the registration, leave the override file untouched).
+    const service = makeService([{ id: "ws-new", path: "/tmp/proj" }]);
+    const pruned: string[] = [];
+    service.setWorkspaceMcpOverridesService({
+      prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
+        pruned.push(`${workspaceId}:${keyPrefix}`);
+        return Promise.resolve();
+      },
+    });
+    const broken = {
+      loadConfigOrDefault: (options?: { throwOnError?: boolean }) => {
+        if (options?.throwOnError) {
+          throw new Error("config.json is malformed");
+        }
+        // A lenient read would hide the corruption behind an empty map.
+        return { projects: new Map() };
+      },
+    } as unknown as Pick<Config, "loadConfigOrDefault">;
+    const error = await (
+      service as unknown as SanitizeAccess
+    ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", "/tmp/proj", broken);
+    expect(error).toContain("unreadable");
+    expect(pruned).toEqual([]);
+  });
+
+  test("skips sanitization while a live sibling resolves to the same path", async () => {
+    // Conversation forks of a local workspace share the checkout: the
+    // sibling's consent context is alive, so its enables must survive.
+    const service = makeService([
+      { id: "ws-sibling", path: "/tmp/proj" },
+      { id: "ws-new", path: "/tmp/proj/" },
+    ]);
+    const pruned: string[] = [];
+    service.setWorkspaceMcpOverridesService({
+      prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
+        pruned.push(`${workspaceId}:${keyPrefix}`);
+        return Promise.resolve();
+      },
+    });
+    const error = await (
+      service as unknown as SanitizeAccess
+    ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", "/tmp/proj");
+    expect(error).toBeUndefined();
+    expect(pruned).toEqual([]);
+  });
+
+  test("a failed sanitize surfaces an error so creation aborts", async () => {
+    const service = makeService([{ id: "ws-new", path: "/tmp/proj" }]);
+    service.setWorkspaceMcpOverridesService({
+      prunePluginOverrideKeys: () =>
+        Promise.reject(new Error('duplicate "enabledServers" properties')),
+    });
+    const error = await (
+      service as unknown as SanitizeAccess
+    ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", "/tmp/proj");
+    expect(error).toContain("could not be sanitized");
+    expect(error).toContain("mcp.local.jsonc");
+  });
+
+  test("an off-host workspace with an equal path string is not a sibling", async () => {
+    // SSH/container paths occupy a different filesystem namespace: an equal
+    // STRING proves nothing about the local overrides file, and skipping
+    // would leave a stale enable to activate on the next local request.
+    const service = makeService([
+      { id: "ws-ssh", path: "/tmp/proj", runtimeConfig: { type: "ssh", host: "box" } },
+      { id: "ws-new", path: "/tmp/proj" },
+    ]);
+    const pruned: string[] = [];
+    service.setWorkspaceMcpOverridesService({
+      prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
+        pruned.push(`${workspaceId}:${keyPrefix}`);
+        return Promise.resolve();
+      },
+    });
+    const error = await (
+      service as unknown as SanitizeAccess
+    ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", "/tmp/proj");
+    expect(error).toBeUndefined();
+    expect(pruned).toEqual(["ws-new:plugin:"]);
+  });
+
+  test("a sibling registered through a symlinked spelling still forces a skip", async () => {
+    // Canonical (realpath) identity, not just spelling: pruning here would
+    // strip the live symlink-spelled sibling's enables from the shared file.
+    const realDir = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-sanitize-real-"));
+    const linkPath = `${realDir}-link`;
+    await fsPromises.symlink(realDir, linkPath);
+    try {
+      const service = makeService([
+        { id: "ws-symlink-sibling", path: linkPath },
+        { id: "ws-new", path: realDir },
+      ]);
+      const pruned: string[] = [];
+      service.setWorkspaceMcpOverridesService({
+        prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
+          pruned.push(`${workspaceId}:${keyPrefix}`);
+          return Promise.resolve();
+        },
+      });
+      const error = await (
+        service as unknown as SanitizeAccess
+      ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", realDir);
+      expect(error).toBeUndefined();
+      expect(pruned).toEqual([]);
+    } finally {
+      await fsPromises.rm(linkPath, { force: true });
+      await fsPromises.rm(realDir, { recursive: true, force: true });
+    }
+  });
+
+  test("an overlapping registration pending its own sanitization is not a sibling", async () => {
+    // Two creations for the same checkout can both persist config entries
+    // before either sanitizes; a not-yet-sanitized entry is no proof of live
+    // consent, so the scan must ignore it or BOTH creations skip pruning.
+    const service = makeService([
+      { id: "ws-concurrent", path: "/tmp/proj" },
+      { id: "ws-new", path: "/tmp/proj" },
+    ]);
+    (service as unknown as SanitizeAccess).pendingPluginSanitizations.add("ws-concurrent");
+    const pruned: string[] = [];
+    service.setWorkspaceMcpOverridesService({
+      prunePluginOverrideKeys: (workspaceId, keyPrefix) => {
+        pruned.push(`${workspaceId}:${keyPrefix}`);
+        return Promise.resolve();
+      },
+    });
+    const error = await (
+      service as unknown as SanitizeAccess
+    ).sanitizeStalePluginOverridesForNewWorkspace("ws-new", "/tmp/proj");
+    expect(error).toBeUndefined();
+    expect(pruned).toEqual(["ws-new:plugin:"]);
+  });
+
+  test("rollback verification detects a swallowed config write failure", async () => {
+    // Config.saveConfig logs and swallows write errors, so removeWorkspace
+    // can resolve while the entry survives on disk; the rollback must verify
+    // absence rather than trust the resolved promise.
+    const stuckWorkspaces = [{ id: "ws-stuck", path: "/tmp/proj" }];
+    const service = createWorkspaceServiceForTest({
+      config: {
+        removeWorkspace: mock(() => Promise.resolve()),
+        loadConfigOrDefault: mock(() => ({
+          projects: new Map([["/tmp/proj", { workspaces: stuckWorkspaces }]]),
+        })),
+      } as unknown as Config,
+    });
+    const access = service as unknown as SanitizeAccess;
+    expect(await access.rollbackUnsanitizedWorkspaceRegistration("ws-stuck")).toBe(false);
+    // A rollback that actually lands verifies clean.
+    expect(await access.rollbackUnsanitizedWorkspaceRegistration("ws-gone")).toBe(true);
+  });
+});
+
 describe("WorkspaceService remove timing rollup", () => {
   let historyService: HistoryService;
   let cleanupHistory: () => Promise<void>;
@@ -8722,6 +9789,7 @@ describe("WorkspaceService remove timing rollup", () => {
 
       const aiService = new FakeAIService() as unknown as AIService;
       const mockConfig: Partial<Config> = {
+        rootDir: path.join(tempRoot, "root"),
         srcDir: "/tmp/src",
         getSessionDir: mock((id: string) => path.join(sessionRoot, id)),
         removeWorkspace: mock(() => Promise.resolve()),
@@ -8769,6 +9837,9 @@ describe("WorkspaceService remove shared-workspace guard", () => {
 
   function buildConfig(taskIsolation?: "none" | "fork"): Partial<Config> {
     return {
+      // Unique per-build root: removal publishes durable tombstones under
+      // <rootDir>/locks, which must not leak across tests or runs.
+      rootDir: path.join(tmpdir(), "mux-shared-guard", `root-${crypto.randomUUID()}`),
       srcDir: "/tmp/src",
       getSessionDir: mock((id: string) => path.join(tmpdir(), "mux-shared-guard", id)),
       removeWorkspace: mock(() => Promise.resolve()),
@@ -8860,6 +9931,7 @@ describe("WorkspaceService remove shared-workspace guard", () => {
   // Inverse direction: removing the PARENT while a live shared child points at its checkout.
   function buildParentConfig(childTaskStatus: string): Partial<Config> {
     return {
+      rootDir: path.join(tmpdir(), "mux-shared-guard", `root-${crypto.randomUUID()}`),
       srcDir: "/tmp/src",
       getSessionDir: mock((id: string) => path.join(tmpdir(), "mux-shared-guard", id)),
       removeWorkspace: mock(() => Promise.resolve()),
@@ -9006,6 +10078,9 @@ describe("WorkspaceService remove desktop session cleanup", () => {
 
     const mockConfig: Partial<Config> = {
       srcDir: "/tmp/src",
+      // r63: removal serializes session-dir deletion with the memory target
+      // locks and removal tombstones under `<rootDir>/locks`.
+      rootDir: tempRoot,
       getSessionDir: mock((id: string) => path.join(tempRoot, "sessions", id)),
       removeWorkspace: removeWorkspaceMock,
       findWorkspace: mock(() => null),
@@ -12070,6 +13145,7 @@ describe("WorkspaceService init cancellation", () => {
       } as unknown as AIService;
 
       const mockConfig: Partial<Config> = {
+        rootDir: path.join(tempRoot, "root"),
         srcDir: "/tmp/src",
         getSessionDir: mock((id: string) => path.join(tempRoot, id)),
         removeWorkspace: mock(() => Promise.resolve()),
@@ -12213,6 +13289,7 @@ describe("WorkspaceService init cancellation", () => {
       } as unknown as AIService;
 
       const mockConfig: Partial<Config> = {
+        rootDir: path.join(tempRoot, "root"),
         srcDir: "/tmp/src",
         getSessionDir: mock((id: string) => path.join(tempRoot, id)),
         removeWorkspace: mock(() => Promise.resolve()),
@@ -12604,8 +13681,8 @@ describe("WorkspaceService fork", () => {
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
-    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
-      () => undefined
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+      Promise.resolve(undefined)
     );
     const copyPlanSpy = spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(
       undefined
@@ -12733,8 +13810,8 @@ describe("WorkspaceService fork", () => {
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
-    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
-      () => undefined
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+      Promise.resolve(undefined)
     );
     const copyPlanSpy = spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(
       undefined
@@ -12850,8 +13927,8 @@ describe("WorkspaceService fork", () => {
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
-    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
-      () => undefined
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+      Promise.resolve(undefined)
     );
     const copyPlanSpy = spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(
       undefined
@@ -12962,8 +14039,8 @@ describe("WorkspaceService fork", () => {
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
-    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
-      () => undefined
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+      Promise.resolve(undefined)
     );
     const copyPlanSpy = spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(
       undefined
@@ -13072,8 +14149,8 @@ describe("WorkspaceService fork", () => {
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
-    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
-      () => undefined
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+      Promise.resolve(undefined)
     );
     const copyPlanSpy = spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(
       undefined
@@ -13181,8 +14258,8 @@ describe("WorkspaceService fork", () => {
     const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue(
       {} as ReturnType<typeof runtimeFactory.createRuntime>
     );
-    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(
-      () => undefined
+    const runBackgroundInitSpy = spyOn(runtimeFactory, "runBackgroundInit").mockImplementation(() =>
+      Promise.resolve(undefined)
     );
     const copyPlanSpy = spyOn(runtimeExecHelpers, "copyPlanFileAcrossRuntimes").mockResolvedValue(
       undefined
@@ -14192,5 +15269,411 @@ describe("WorkspaceService.getLastUserPrompt", () => {
     });
 
     expect(prompt).toBe("newest prompt");
+  });
+});
+
+describe("WorkspaceService.remove usage-rollup ordering", () => {
+  test("usage recorded while draining background producers reaches the parent rollup", async () => {
+    // Codex round 13: the child's usage snapshot was read BEFORE the
+    // cancel-and-drain calls for the pending branch summary and in-flight
+    // /refine pass. A draining producer records headless usage as it
+    // settles, so that spend landed after the snapshot and was permanently
+    // lost from parent accounting (the child is deleted with no second
+    // rollup). Drains must complete before the snapshot is read.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const projectDir = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-rollup-"));
+    const parentId = "rollup-parent-ws";
+    const childId = "rollup-child-ws";
+    try {
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectDir, {
+          trusted: true,
+          workspaces: [
+            { path: projectDir, id: parentId, name: parentId },
+            { path: projectDir, id: childId, name: childId, parentWorkspaceId: parentId },
+          ],
+        });
+        return cfg;
+      });
+
+      // Fake usage ledger: the draining refine pass records the child's
+      // spend only when cancelInFlightRefinePass runs (modelling a settle-
+      // time recordHeadlessUsage write).
+      const usageByWorkspace = new Map<string, Record<string, unknown>>();
+      const rollupCalls: Array<{ parent: string; child: string; byModel: object }> = [];
+      const sessionUsageService = {
+        getSessionUsage: (workspaceId: string) =>
+          Promise.resolve({ byModel: usageByWorkspace.get(workspaceId) ?? {} }),
+        rollUpUsageIntoParent: (parent: string, child: string, byModel: object) => {
+          rollupCalls.push({ parent, child, byModel });
+          return Promise.resolve({ didRollUp: true });
+        },
+      } as unknown as SessionUsageService;
+      const cancelInFlightRefinePass = mock((workspaceId: string) => {
+        // The drained pass settles and records its spend against the child.
+        usageByWorkspace.set(workspaceId, {
+          "anthropic:claude-sonnet-4-5": { input: { tokens: 42, cost_usd: 0.01 } },
+        });
+        return Promise.resolve();
+      });
+
+      const service = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        sessionUsageService,
+        aiService: createMockAIService({
+          getWorkspaceMetadata: (async (workspaceId: string) => {
+            const metadata = (await config.getAllWorkspaceMetadata()).find(
+              (m) => m.id === workspaceId
+            );
+            return metadata ? Ok(metadata) : Err("workspace not found");
+          }) as AIService["getWorkspaceMetadata"],
+        }),
+      });
+      service.setRefinePassCanceller({ cancelInFlightRefinePass });
+
+      const result = await service.remove(childId);
+      expect(result.success).toBe(true);
+      expect(cancelInFlightRefinePass).toHaveBeenCalled();
+
+      // The drain-recorded spend made it into the parent rollup snapshot.
+      expect(rollupCalls).toHaveLength(1);
+      expect(rollupCalls[0].parent).toBe(parentId);
+      expect(rollupCalls[0].child).toBe(childId);
+      expect(Object.keys(rollupCalls[0].byModel)).toContain("anthropic:claude-sonnet-4-5");
+    } finally {
+      await fsPromises.rm(projectDir, { recursive: true, force: true });
+      await cleanup();
+    }
+  });
+
+  test("a failed non-forced deletion defers the one-shot rollups until removal commits", async () => {
+    // rollUpUsageIntoParent / rollUpTimingIntoParent record the child in the
+    // one-shot rolledUpFrom guard. Rolling up BEFORE runtime deletion meant a
+    // force=false deletion failure left the child usable, and the eventual
+    // successful removal skipped the rollup — permanently losing the child's
+    // post-failure spend from parent accounting. Rollups must run only after
+    // deletion can no longer fail, so a failed attempt rolls up nothing and
+    // the retry captures the child's full (including post-failure) usage.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const projectDir = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-rollup-retry-"));
+    const parentId = "rollup-retry-parent-ws";
+    const childId = "rollup-retry-child-ws";
+    let deletionFails = true;
+    const deleteWorkspaceMock = mock(() =>
+      deletionFails
+        ? Promise.resolve({ success: false as const, error: "worktree has uncommitted changes" })
+        : Promise.resolve({ success: true as const, deletedPath: projectDir })
+    );
+    const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime").mockReturnValue({
+      deleteWorkspace: deleteWorkspaceMock,
+    } as unknown as ReturnType<typeof runtimeFactory.createRuntime>);
+    try {
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectDir, {
+          trusted: true,
+          workspaces: [
+            { path: projectDir, id: parentId, name: parentId },
+            { path: projectDir, id: childId, name: childId, parentWorkspaceId: parentId },
+          ],
+        });
+        return cfg;
+      });
+
+      const childUsage: Record<string, unknown> = {
+        "anthropic:claude-sonnet-4-5": { input: { tokens: 42, cost_usd: 0.01 } },
+      };
+      const usageRollups: Array<{ parent: string; child: string; byModel: object }> = [];
+      const sessionUsageService = {
+        getSessionUsage: () => Promise.resolve({ byModel: { ...childUsage } }),
+        rollUpUsageIntoParent: (parent: string, child: string, byModel: object) => {
+          usageRollups.push({ parent, child, byModel });
+          return Promise.resolve({ didRollUp: true });
+        },
+      } as unknown as SessionUsageService;
+      const timingRollups: string[] = [];
+      const sessionTimingService = {
+        waitForIdle: () => Promise.resolve(),
+        rollUpTimingIntoParent: (_parent: string, child: string) => {
+          timingRollups.push(child);
+          return Promise.resolve();
+        },
+      } as unknown as SessionTimingService;
+
+      const service = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        sessionUsageService,
+        sessionTimingService,
+        aiService: createMockAIService({
+          getWorkspaceMetadata: (async (workspaceId: string) => {
+            const metadata = (await config.getAllWorkspaceMetadata()).find(
+              (m) => m.id === workspaceId
+            );
+            return metadata ? Ok(metadata) : Err("workspace not found");
+          }) as AIService["getWorkspaceMetadata"],
+        }),
+      });
+
+      // Non-forced removal fails at runtime deletion: the child stays usable,
+      // so neither one-shot rollup may have been consumed.
+      const failedAttempt = await service.remove(childId);
+      expect(failedAttempt.success).toBe(false);
+      expect(deleteWorkspaceMock).toHaveBeenCalledTimes(1);
+      expect(usageRollups).toHaveLength(0);
+      expect(timingRollups).toHaveLength(0);
+
+      // The still-usable child accrues more spend before the retry.
+      childUsage["openai:gpt-5.2"] = { input: { tokens: 7, cost_usd: 0.002 } };
+
+      deletionFails = false;
+      const retry = await service.remove(childId);
+      expect(retry.success).toBe(true);
+
+      // The retry rolls up exactly once, with the full post-failure snapshot.
+      expect(timingRollups).toEqual([childId]);
+      expect(usageRollups).toHaveLength(1);
+      expect(usageRollups[0].parent).toBe(parentId);
+      expect(usageRollups[0].child).toBe(childId);
+      expect(Object.keys(usageRollups[0].byModel)).toEqual([
+        "anthropic:claude-sonnet-4-5",
+        "openai:gpt-5.2",
+      ]);
+    } finally {
+      createRuntimeSpy.mockRestore();
+      await fsPromises.rm(projectDir, { recursive: true, force: true });
+      await cleanup();
+    }
+  });
+});
+
+describe("WorkspaceService.remove checkout-deletion ordering", () => {
+  test("an admitted apply's checkout write completes before removal deletes the workdir", async () => {
+    // Codex round 15: the refine drain ran AFTER runtime/workdir deletion, so
+    // an admitted /refine apply's agent_skill_write could race checkout
+    // deletion — recreating .mux/skills inside the deleted tree (orphaned
+    // state) or failing midway with the failure swallowed. The drain must
+    // complete before any disk mutation.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const scratchId = "scratch-apply-race";
+    const scratchDir = path.join(config.rootDir, "scratch", scratchId);
+    try {
+      await fsPromises.mkdir(scratchDir, { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(SCRATCH_PROJECT_CONFIG_KEY, {
+          workspaces: [{ path: scratchDir, id: scratchId, name: scratchId, kind: "scratch" }],
+        });
+        return cfg;
+      });
+      const scratchMetadata: WorkspaceMetadata = {
+        id: scratchId,
+        name: scratchId,
+        projectName: "scratch",
+        projectPath: scratchDir,
+        runtimeConfig: { type: "local" },
+        kind: "scratch",
+      };
+      // Models the admitted apply completing during the drain: it writes a
+      // project skill into the CHECKOUT as it settles. Only the FIRST drain
+      // has an in-flight pass (matching the real idempotent canceller — later
+      // calls find nothing to drain and no-op).
+      let drained = false;
+      const cancelInFlightRefinePass = mock(async () => {
+        if (drained) return;
+        drained = true;
+        await fsPromises.mkdir(path.join(scratchDir, ".mux", "skills", "lesson"), {
+          recursive: true,
+        });
+        await fsPromises.writeFile(
+          path.join(scratchDir, ".mux", "skills", "lesson", "SKILL.md"),
+          "distilled\n"
+        );
+      });
+      const service = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          getWorkspaceMetadata: (() =>
+            Promise.resolve(Ok(scratchMetadata))) as AIService["getWorkspaceMetadata"],
+        }),
+      });
+      service.setRefinePassCanceller({ cancelInFlightRefinePass });
+
+      const result = await service.remove(scratchId);
+      expect(result.success).toBe(true);
+      expect(cancelInFlightRefinePass).toHaveBeenCalled();
+
+      // The drain's checkout write happened BEFORE workdir deletion, so the
+      // removal deleted everything — no recreated .mux/skills orphan.
+      const workdirExists = await fsPromises.access(scratchDir).then(
+        () => true,
+        () => false
+      );
+      expect(workdirExists).toBe(false);
+    } finally {
+      await fsPromises.rm(scratchDir, { recursive: true, force: true });
+      await cleanup();
+    }
+  });
+});
+
+describe("WorkspaceService.fork branch-summary rollback ordering", () => {
+  test("a fork whose setup fails never leaves a summary writer or registration behind", async () => {
+    // Codex round-11: the background summary writer used to start BEFORE
+    // staged-attachment copying and usage reset. Their failure handler
+    // deletes newSessionDir without cancelling the registration, so a racing
+    // guarded append (tail verified pre-rollback, append landing after)
+    // recreated the failed fork's session dir, and the settled entry leaked
+    // forever because the fork never returned. The writer now starts only
+    // after all failure-prone setup completed.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const projectDir = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-fork-src-"));
+    const sourceId = "fork-src-ws";
+    // Gate the guarded append so the writer (old ordering) is mid-append when
+    // the rollback deletes the session dir — Codex's exact race window.
+    let releaseAppend: () => void = () => undefined;
+    const appendGate = new Promise<void>((resolve) => {
+      releaseAppend = resolve;
+    });
+    const realGuardedAppend = historyService.appendToHistoryIfTailMatches.bind(historyService);
+    const guardedAppendSpy = spyOn(
+      historyService,
+      "appendToHistoryIfTailMatches"
+    ).mockImplementation(async (workspaceId, message, tailMessageId) => {
+      await appendGate;
+      // Model the lost race deterministically: the tail was verified before
+      // the rollback, so the append itself lands unconditionally.
+      void tailMessageId;
+      const result = await historyService.appendToHistory(workspaceId, message);
+      return result.success ? Ok("appended" as const) : result;
+    });
+    try {
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectDir, {
+          trusted: true,
+          workspaces: [{ path: projectDir, id: sourceId, name: sourceId }],
+        });
+        return cfg;
+      });
+      // Meaty abandoned tail (clears BRANCH_SUMMARY_MIN_SEGMENT_TOKENS).
+      const filler = "explored the fork rollback race and traced the write path ".repeat(200);
+      const branchPoint = createXumMessage("fork-bp", "assistant", "branch point", {
+        timestamp: 1,
+      });
+      for (const message of [
+        createXumMessage("fork-m1", "user", "original question", { timestamp: 0 }),
+        branchPoint,
+        createXumMessage("fork-tail-u", "user", filler, { timestamp: 2 }),
+        createXumMessage("fork-tail-a", "assistant", filler, { timestamp: 3 }),
+      ]) {
+        expect((await historyService.appendToHistory(sourceId, message)).success).toBe(true);
+      }
+
+      const sourceMetadata: WorkspaceMetadata = {
+        id: sourceId,
+        name: sourceId,
+        projectName: "fork-src",
+        projectPath: projectDir,
+        runtimeConfig: { type: "local" },
+      };
+      const summaryChunks: LanguageModelV3StreamPart[] = [
+        { type: "text-start", id: "t1" },
+        { type: "text-delta", id: "t1", delta: "The abandoned branch explored a race." },
+        { type: "text-end", id: "t1" },
+        {
+          type: "finish",
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: {
+            inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+            outputTokens: { total: 1, text: 1, reasoning: 0 },
+          },
+        },
+      ];
+      const aiService = {
+        on: mock(() => undefined),
+        off: mock(() => undefined),
+        isStreaming: mock(() => false),
+        getWorkspaceMetadata: mock((workspaceId: string) =>
+          Promise.resolve(
+            workspaceId === sourceId ? Ok(sourceMetadata) : Err("workspace not found")
+          )
+        ),
+        createModelWithPinnedMetadata: mock((modelString: string) =>
+          Promise.resolve(
+            Ok({
+              model: new MockLanguageModelV3({
+                doStream: () =>
+                  Promise.resolve({ stream: simulateReadableStream({ chunks: summaryChunks }) }),
+              }),
+              metadataModel: modelString,
+            })
+          )
+        ),
+      } as unknown as AIService;
+      const initStateManager = {
+        on: mock(() => undefined),
+        off: mock(() => undefined),
+        getInitState: mock(() => undefined),
+        startInit: mock(() => undefined),
+        appendOutput: mock(() => undefined),
+        endInit: mock(() => Promise.resolve()),
+        enterHookPhase: mock(() => undefined),
+        clearInMemoryState: mock(() => undefined),
+      } as unknown as InitStateManager;
+      // Failure injection: the usage reset (the LAST failure-prone setup
+      // step) rejects, driving the fork into its rollback path.
+      const sessionUsageService = {
+        resetSessionUsage: mock(() => Promise.reject(new Error("usage reset failed"))),
+        recordHeadlessUsage: mock(() => Promise.resolve(undefined)),
+      } as unknown as SessionUsageService;
+      const experimentsService = {
+        isExperimentEnabled: (id: string) =>
+          id === EXPERIMENT_IDS.RLM || id === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
+      } as unknown as ExperimentsService;
+
+      const service = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService,
+        initStateManager,
+        sessionUsageService,
+        experimentsService,
+      });
+      let newWorkspaceId = "";
+      const realGenerateId = config.generateStableId.bind(config);
+      const idSpy = spyOn(config, "generateStableId").mockImplementation(() => {
+        newWorkspaceId = realGenerateId();
+        return newWorkspaceId;
+      });
+      try {
+        const forkResult = await service.fork(sourceId, "fork-rollback-target", "fork-bp");
+        expect(forkResult.success).toBe(false);
+        if (forkResult.success) return;
+        expect(forkResult.error).toContain("Failed to copy fork state");
+        expect(newWorkspaceId.length).toBeGreaterThan(0);
+
+        // Unblock any (old-ordering) writer mid-append and let it settle.
+        releaseAppend();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        // No writer ran, so no registration leaked and the rolled-back
+        // session's chat.jsonl was not recreated by a late guarded append.
+        expect(await awaitPendingBranchSummary(newWorkspaceId)).toBeNull();
+        expect(guardedAppendSpy).not.toHaveBeenCalled();
+        const chatFile = path.join(config.getSessionDir(newWorkspaceId), "chat.jsonl");
+        const chatExists = await fsPromises.access(chatFile).then(
+          () => true,
+          () => false
+        );
+        expect(chatExists).toBe(false);
+      } finally {
+        idSpy.mockRestore();
+      }
+    } finally {
+      guardedAppendSpy.mockRestore();
+      void realGuardedAppend;
+      await fsPromises.rm(projectDir, { recursive: true, force: true });
+      await cleanup();
+    }
   });
 });

@@ -357,4 +357,48 @@ describe("AgentSession.sendMessage (editMessageId)", () => {
       }
     }
   });
+
+  it("holds isBusy through the edit's truncate window (r32 admission reservation)", async () => {
+    // The edit path truncates history and can spend up to the branch-summary
+    // deadline before its turn reaches PREPARING. Without a reservation a
+    // concurrent ordinary send observes an idle session and starts
+    // immediately, interleaving its rows with the edit's against moved
+    // history.
+    const workspaceId = "ws-edit-admission";
+    const { session, historyService } = await createSessionHarness(workspaceId);
+    await historyService.appendToHistory(
+      workspaceId,
+      createXumMessage("user-original", "user", "original", { historySequence: 0 })
+    );
+
+    let releaseTruncate: (() => void) | null = null;
+    const truncateGate = new Promise<void>((resolve) => {
+      releaseTruncate = resolve;
+    });
+    const observed: { busyDuringTruncate: boolean | null } = { busyDuringTruncate: null };
+    const realTruncate = historyService.truncateAfterMessage.bind(historyService);
+    spyOn(historyService, "truncateAfterMessage").mockImplementation(async (wsId, messageId) => {
+      observed.busyDuringTruncate = session.isBusy();
+      await truncateGate;
+      return realTruncate(wsId, messageId);
+    });
+
+    const sendPromise = session.sendMessage("edited", {
+      model: TEST_MODEL,
+      agentId: "exec",
+      editMessageId: "user-original",
+    });
+    await waitForCondition(() => observed.busyDuringTruncate !== null);
+    // Observed both from inside the truncate window and from a concurrent
+    // caller's perspective right now.
+    expect(observed.busyDuringTruncate).toBe(true);
+    expect(session.isBusy()).toBe(true);
+
+    releaseTruncate!();
+    const result = await sendPromise;
+    expect(result.success).toBe(true);
+    await session.waitForIdle();
+    // The reservation released with the turn: the session is not stuck busy.
+    expect(session.isBusy()).toBe(false);
+  });
 });

@@ -106,8 +106,8 @@ export const createMemoryTool: ToolFactory = (config: ToolConfiguration) => {
   return tool({
     description: buildMemoryDescription(config),
     inputSchema: TOOL_DEFINITIONS.memory.schema,
-    execute: (input): Promise<MemoryToolResult> =>
-      executeMemoryCommand(memoryService, ctx, input, checkWriteAccess),
+    execute: (input, { toolCallId }): Promise<MemoryToolResult> =>
+      executeMemoryCommand(memoryService, ctx, input, checkWriteAccess, toolCallId),
   });
 };
 
@@ -122,12 +122,34 @@ export type MemoryCommandInput = z.infer<(typeof TOOL_DEFINITIONS.memory)["schem
  * scope restriction, op budget, dry-run interception). The guard runs for
  * every mutating command with the path(s) it would touch; returning a result
  * short-circuits the dispatch.
+ *
+ * `toolCallId` (absent for the consolidation runner) is threaded into the
+ * refinement journal row each mutating command appends (evidence attribution).
  */
 export async function executeMemoryCommand(
   memoryService: MemoryService,
   ctx: MemoryScopeContext,
   input: MemoryCommandInput,
-  checkWriteAccess: (virtualPath: string) => MemoryToolResult | null
+  checkWriteAccess: (virtualPath: string) => MemoryToolResult | null,
+  toolCallId?: string,
+  options?: {
+    /**
+     * Staged refine mutations only (r55 deletes, r58 inserts): staging-time
+     * fingerprint of the mutation target, re-verified by MemoryService
+     * INSIDE its target mutation lock immediately before the write. Deletes
+     * have no command-level conflict semantics; inserts carry a numeric line
+     * position with no content anchor. Ignored by every other command.
+     */
+    expectedTargetFingerprint?: string;
+    /**
+     * Caller-teardown guard (r59): re-checked by MemoryService INSIDE its
+     * target mutation lock immediately before the first durable write, so a
+     * mutation detached by a cancelled consolidation pass cannot commit (or
+     * journal into a deleted session directory) once its wedged pre-commit
+     * I/O unblocks. Ignored by reads.
+     */
+    abortSignal?: AbortSignal;
+  }
 ): Promise<MemoryToolResult> {
   try {
     switch (input.command) {
@@ -146,7 +168,14 @@ export async function executeMemoryCommand(
         }
         return (
           checkWriteAccess(input.path) ??
-          (await memoryService.create(ctx, input.path, input.file_text, "agent"))
+          (await memoryService.create(
+            ctx,
+            input.path,
+            input.file_text,
+            "agent",
+            toolCallId,
+            options?.abortSignal
+          ))
         );
       }
       case "str_replace": {
@@ -160,7 +189,9 @@ export async function executeMemoryCommand(
             input.path,
             input.old_str,
             input.new_str ?? "",
-            "agent"
+            "agent",
+            toolCallId,
+            options?.abortSignal
           ))
         );
       }
@@ -178,7 +209,10 @@ export async function executeMemoryCommand(
             input.path,
             input.insert_line,
             input.insert_text,
-            "agent"
+            "agent",
+            toolCallId,
+            options?.expectedTargetFingerprint,
+            options?.abortSignal
           ))
         );
       }
@@ -187,7 +221,15 @@ export async function executeMemoryCommand(
           return { success: false, error: "delete requires 'path'" };
         }
         return (
-          checkWriteAccess(input.path) ?? (await memoryService.deletePath(ctx, input.path, "agent"))
+          checkWriteAccess(input.path) ??
+          (await memoryService.deletePath(
+            ctx,
+            input.path,
+            "agent",
+            toolCallId,
+            options?.expectedTargetFingerprint,
+            options?.abortSignal
+          ))
         );
       }
       case "rename": {
@@ -199,7 +241,14 @@ export async function executeMemoryCommand(
         return (
           checkWriteAccess(oldPath) ??
           checkWriteAccess(input.new_path) ??
-          (await memoryService.rename(ctx, oldPath, input.new_path, "agent"))
+          (await memoryService.rename(
+            ctx,
+            oldPath,
+            input.new_path,
+            "agent",
+            toolCallId,
+            options?.abortSignal
+          ))
         );
       }
     }

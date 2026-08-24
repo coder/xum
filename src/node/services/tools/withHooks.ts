@@ -94,48 +94,80 @@ export function withHooks<TParameters, TResult>(
   const wrappedToolRecord = wrappedTool as any as Record<string, unknown>;
 
   wrappedToolRecord.execute = async (args: TParameters, options: unknown) => {
-    ensureShellToolHookMiddleware();
-
     // Extract abort signal from tool options (if present)
     const abortSignal =
       options && typeof options === "object" && "abortSignal" in options
         ? (options as { abortSignal?: AbortSignal }).abortSignal
         : undefined;
 
-    const ctx: ToolExecuteContext = {
+    const outcome = await runThroughToolHookPipeline({
       toolName,
       args,
-      host: {
-        runtime: config.runtime,
-        runtimeTempDir: config.runtimeTempDir,
-        cwd: config.cwd,
-        workspaceId: config.workspaceId,
-        env: config.env,
-      },
+      config,
       abortSignal,
-      executed: false,
-    };
-
-    await eventSpine.run("tool.execute", ctx, async (c) => {
-      assert(!c.blocked, `tool.execute terminal reached with blocked context (${toolName})`);
-      // Middleware may have rewritten args; execute with the current ones.
-      c.result = await (executeFn.call(tool, c.args as TParameters, options) as
-        | TResult
-        | Promise<TResult>);
-      c.executed = true;
+      execute: (currentArgs) =>
+        Promise.resolve(executeFn.call(tool, currentArgs, options) as TResult | Promise<TResult>),
     });
-
-    if (ctx.blocked) {
-      return ctx.blocked.result as TResult;
-    }
-    assert(
-      ctx.executed,
-      `tool.execute middleware for ${toolName} neither executed nor blocked the tool`
-    );
-    return ctx.result as TResult;
+    // Blocked executions surface the hook's error object as the tool result.
+    return outcome.result as TResult;
   };
 
   return wrappedTool;
+}
+
+/** Outcome of one hook-gated execution (see runThroughToolHookPipeline). */
+export type ToolHookPipelineOutcome<TResult> =
+  | { blocked: true; result: unknown }
+  | { blocked: false; result: TResult };
+
+/**
+ * Run one execution through the event spine's `tool.execute` waterfall — the
+ * same pipeline (plugin middleware + shell tool_pre/tool_post/tool_hook
+ * protocol) every hook-wrapped tool runs through. Exported so non-tool
+ * executions that must honor the same trust boundary (mux.load's bulk read
+ * riding file_read's hook gate) share this pipeline instead of reimplementing
+ * or bypassing it. Middleware may rewrite args; `execute` receives the
+ * current ones.
+ */
+export async function runThroughToolHookPipeline<TArgs, TResult>(input: {
+  toolName: string;
+  args: TArgs;
+  config: HookConfig;
+  abortSignal?: AbortSignal;
+  execute: (args: TArgs) => Promise<TResult>;
+}): Promise<ToolHookPipelineOutcome<TResult>> {
+  const { toolName, config } = input;
+  ensureShellToolHookMiddleware();
+
+  const ctx: ToolExecuteContext = {
+    toolName,
+    args: input.args,
+    host: {
+      runtime: config.runtime,
+      runtimeTempDir: config.runtimeTempDir,
+      cwd: config.cwd,
+      workspaceId: config.workspaceId,
+      env: config.env,
+    },
+    abortSignal: input.abortSignal,
+    executed: false,
+  };
+
+  await eventSpine.run("tool.execute", ctx, async (c) => {
+    assert(!c.blocked, `tool.execute terminal reached with blocked context (${toolName})`);
+    // Middleware may have rewritten args; execute with the current ones.
+    c.result = await input.execute(c.args as TArgs);
+    c.executed = true;
+  });
+
+  if (ctx.blocked) {
+    return { blocked: true, result: ctx.blocked.result };
+  }
+  assert(
+    ctx.executed,
+    `tool.execute middleware for ${toolName} neither executed nor blocked the tool`
+  );
+  return { blocked: false, result: ctx.result as TResult };
 }
 
 // ---------------------------------------------------------------------------

@@ -44,6 +44,26 @@ describe("validateTypes", () => {
     xumTypes = await generateXumTypes(tools);
   });
 
+  test("accepts guest code branching on load's hookResult annotation (r58)", async () => {
+    // xum.load returns hookResult when a repo tool hook or plugin middleware
+    // annotated the read. Kernel programs are TypeScript-analyzed before
+    // execution, so an undeclared runtime property would make the annotation
+    // unreachable to guest code even though the value supports it.
+    const kernelTypes = await generateXumTypes({}, { kernel: true, load: true });
+    const result = validateTypes(
+      `
+      const loaded = xum.load({ path: "a.txt", key: "a" });
+      if (loaded.hookResult !== undefined) {
+        console.log(loaded.hookResult);
+      }
+      return loaded.bytes;
+    `,
+      kernelTypes
+    );
+    expect(result.valid).toBe(true);
+    expect(result.errors).toHaveLength(0);
+  });
+
   test("finds bundled TypeScript libs from Docker server bundle layout", async () => {
     using tmp = new DisposableTempDir("type-validator");
     const runtimeDir = path.join(tmp.path, "dist", "runtime");

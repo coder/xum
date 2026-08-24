@@ -26,6 +26,7 @@ import { HistoryService } from "./historyService";
 import { MemoryService } from "./memoryService";
 import { SessionUsageService } from "./sessionUsageService";
 import { TestTempDir } from "./tools/testHelpers";
+import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
 
 /**
  * Behavior under test: the orchestration rails around the runner —
@@ -341,6 +342,69 @@ async function seedCompactionEpoch(
 }
 
 describe("MemoryConsolidationService", () => {
+  it("teardown blocks follow-on consolidation runs (r61)", async () => {
+    // The one-shot abort loop cannot reach runs registered after it (the
+    // post-harvest sweep, retryable-harvest recovery): entry must refuse
+    // once teardown began, locally or via a foreign backend's durable
+    // removal tombstone.
+    using fixture = await createFixture();
+    await fixture.service.cancelInFlightConsolidation("ws-dream");
+    const followOn = await fixture.service.maybeRun("ws-dream", "manual");
+    expect(followOn.success).toBe(false);
+    if (!followOn.success) expect(followOn.error).toContain("being removed");
+
+    // Durable tombstone alone (removal performed by another backend).
+    await fixture.addWorkspace("ws-foreign");
+    const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-foreign");
+    await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+    await fsPromises.writeFile(
+      tombstonePath,
+      JSON.stringify({ workspaceId: "ws-foreign", removedAt: Date.now() })
+    );
+    const foreign = await fixture.service.maybeRun("ws-foreign", "manual");
+    expect(foreign.success).toBe(false);
+    if (!foreign.success) expect(foreign.error).toContain("being removed");
+  });
+
+  it("workspace removal aborts and drains an in-flight consolidation run (r60)", async () => {
+    // Removal only ever raced the run's hard timeout before: the drain must
+    // abort the stream itself, settle the run, and return promptly so
+    // removal is never wedged behind an open provider stream.
+    let streamStarted!: () => void;
+    const started = new Promise<void>((resolve) => (streamStarted = resolve));
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: (options) => {
+            streamStarted();
+            // Emits nothing and never closes; like a real provider stream it
+            // errors only when the request's abort signal fires.
+            return Promise.resolve({
+              stream: new ReadableStream<LanguageModelV3StreamPart>({
+                start(controller) {
+                  options.abortSignal?.addEventListener("abort", () => {
+                    controller.error(new Error("request aborted"));
+                  });
+                },
+              }),
+            });
+          },
+        }),
+    });
+    const run = fixture.service.maybeRun("ws-dream", "manual");
+    await started;
+    await fixture.service.cancelInFlightConsolidation("ws-dream");
+    // The run settled (abort surfaced as a stream failure) instead of
+    // holding the in-flight lock until its multi-minute timeout.
+    const result = await run;
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("stream failed");
+    }
+    // Idempotent with nothing in flight (the phantom-metadata removal path).
+    await fixture.service.cancelInFlightConsolidation("ws-dream");
+  });
+
   it("runs, persists the journal record, and reports it via getRecord", async () => {
     using fixture = await createFixture();
     const result = await fixture.service.maybeRun("ws-dream", "compaction");
@@ -1452,5 +1516,46 @@ describe("MemoryConsolidationService", () => {
       return cfg;
     });
     expect(resolveDreamModelString(fixture.config, "ws-dream")).toBe("anthropic:claude-test-dream");
+  });
+
+  it("keeps the dream fallback on the workspace's selected route (r31 security)", async () => {
+    using fixture = await createFixture();
+    // The workspace's CURRENT model lives in the selected agent's per-agent
+    // bucket; legacy aiSettings is stale (updateAgentAISettings never rewrites
+    // it). Without a dream override the fallback must follow the selected
+    // route, not the stale legacy model or the built-in default.
+    await fixture.config.editConfig((cfg) => {
+      cfg.agentAiDefaults = {};
+      for (const project of cfg.projects.values()) {
+        const workspace = project.workspaces.find((entry) => entry.id === "ws-dream");
+        if (workspace) {
+          workspace.agentId = "exec";
+          workspace.aiSettingsByAgent = {
+            exec: { model: "coder:private-gw/claude-sonnet", thinkingLevel: "off" },
+          };
+          workspace.aiSettings = { model: "anthropic:stale-legacy", thinkingLevel: "off" };
+        }
+      }
+      return cfg;
+    });
+    expect(resolveDreamModelString(fixture.config, "ws-dream")).toBe(
+      "coder:private-gw/claude-sonnet"
+    );
+
+    // An explicit per-workspace dream override remains higher-precedence
+    // consent for a different route.
+    await fixture.config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        const workspace = project.workspaces.find((entry) => entry.id === "ws-dream");
+        if (workspace?.aiSettingsByAgent) {
+          workspace.aiSettingsByAgent.dream = {
+            model: "anthropic:explicit-dream",
+            thinkingLevel: "off",
+          };
+        }
+      }
+      return cfg;
+    });
+    expect(resolveDreamModelString(fixture.config, "ws-dream")).toBe("anthropic:explicit-dream");
   });
 });

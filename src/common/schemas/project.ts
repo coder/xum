@@ -181,6 +181,10 @@ export const WorkspaceConfigSchema = z.object({
     .object({
       programmaticToolCalling: z.boolean().optional(),
       programmaticToolCallingExclusive: z.boolean().optional(),
+      // RLM mode is stamped at spawn so child sessions keep RLM-gated features
+      // (persistent sandbox kernel, family messaging tools) across app restarts
+      // without depending on live frontend experiment state.
+      rlm: z.boolean().optional(),
       advisorTool: z.boolean().optional(),
       dynamicWorkflows: z.boolean().optional(),
     })
@@ -299,6 +303,10 @@ export const ProjectConfigSchema = z.object({
   customInstructions: z.string().optional().meta({
     description:
       "Custom system prompt appended for every workspace in this project (Settings → Instructions)",
+  }),
+  codeWorkspaceSyncPath: z.string().optional().meta({
+    description:
+      "Path to a VS Code .code-workspace file kept in sync with this project's active worktrees (relative paths resolve against the project root). Unset = sync disabled.",
   }),
 });
 

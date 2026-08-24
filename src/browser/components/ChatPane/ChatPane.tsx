@@ -1027,7 +1027,14 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       handleJumpToBottom();
 
       // Truncate history in backend
-      await api?.workspace.truncateHistory({ workspaceId, percentage });
+      const result = await api?.workspace.truncateHistory({ workspaceId, percentage });
+      // A partial failure (history already deleted but durable cleanup —
+      // e.g. sandbox kernel invalidation — failed) carries the only warning
+      // that cleared state may reappear after a restart. Throw so callers
+      // (slash command, dialogs) surface it instead of reporting success.
+      if (result && !result.success) {
+        throw new Error(result.error);
+      }
     },
     [workspaceId, handleJumpToBottom, api]
   );

@@ -373,6 +373,9 @@ async function createWorkflowContext(options: {
     );
     services.aiService.setCoderOauthService(coderOauthService);
 
+    // Const capture: `services` is a `let`, so the deferred sanitize closure
+    // below would lose TypeScript's definite-assignment narrowing.
+    const workspaceServiceForSanitize = services.workspaceService;
     session = new AgentSession({
       workspaceId,
       config,
@@ -381,6 +384,19 @@ async function createWorkflowContext(options: {
       initStateManager: services.initStateManager,
       backgroundProcessManager: services.backgroundProcessManager,
       workspaceGoalService: services.workspaceGoalService,
+      // Direct CLI registration bypasses WorkspaceService.create, so a
+      // preserved checkout could carry a stale `plugin:` MCP override into a
+      // same-name reinstall on the first send; sanitize before announcing.
+      // realConfig: the ephemeral CLI config has no workspace records, so the
+      // live-sibling scan needs the persistent one or it would prune enables a
+      // desktop workspace on this checkout still owns.
+      sanitizeCliWorkspaceRegistration: (args) =>
+        workspaceServiceForSanitize.sanitizeCliRegisteredWorkspace(
+          args.workspaceId,
+          args.workspacePath,
+          args.runtimeConfig,
+          realConfig
+        ),
     });
     services.workspaceService.registerSession(workspaceId, session);
 

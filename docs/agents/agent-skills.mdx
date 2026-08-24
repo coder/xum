@@ -65,6 +65,8 @@ Enable the **Agent Plugins** experiment (Settings → Experiments) to also disco
 
 Plugin skills have the lowest precedence within their scope and are read-only. A broken plugin (or a broken skill inside one) never affects other plugins or skills. Plugins can also ship MCP servers; see [MCP servers](/config/mcp-servers#agent-plugins-servers-experiment).
 
+Global plugins can be installed from git via **Settings → Plugins** (paste a git URL or `owner/repo[@ref]`); the install preview lists every skill the plugin would contribute before anything is written.
+
 ## Skill layout
 
 A skill is a directory named after the skill:

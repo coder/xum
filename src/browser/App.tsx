@@ -217,6 +217,7 @@ function AppInner() {
 
   const [isMultiProjectWorkspaceModalOpen, setMultiProjectWorkspaceModalOpen] = useState(false);
   const multiProjectWorkspacesEnabled = useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
+  const agentPluginsEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
 
   // Left sidebar is drag-resizable (mirrors RightSidebar). Width is persisted globally;
   // collapse remains a separate toggle and the drag handle is hidden in mobile-touch overlay mode.
@@ -993,6 +994,7 @@ function AppInner() {
     onStartWorkspaceCreation: openNewWorkspaceFromPalette,
     onStartMultiProjectWorkspaceCreation: openNewMultiProjectWorkspaceFromPalette,
     multiProjectWorkspacesEnabled,
+    agentPluginsEnabled,
     onArchiveMergedWorkspacesInProject: archiveMergedWorkspacesInProjectFromPalette,
     getBranchesForProject,
     onSelectWorkspace: selectWorkspaceFromPalette,

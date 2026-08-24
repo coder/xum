@@ -193,6 +193,25 @@ describe("PortableDesktopExperimentWarning", () => {
     expect(view.queryByLabelText("Default goal budget in dollars")).toBeNull();
   });
 
+  test("shows RLM Mode nested under Programmatic Tool Calling only when PTC is enabled", () => {
+    experimentEnabled = false;
+    experimentValues = {
+      [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: false,
+    };
+
+    const view = render(<ExperimentsSection />);
+
+    // Hidden from the flat list and no nested panel while the parent is off.
+    expect(view.queryByLabelText("Toggle RLM Mode")).toBeNull();
+
+    experimentValues = {
+      [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: true,
+    };
+    view.rerender(<ExperimentsSection />);
+
+    expect(view.getByLabelText("Toggle RLM Mode")).toBeTruthy();
+  });
+
   test("reloads experiment settings when inline controls remount", async () => {
     // Only the heartbeat panel still triggers an inline `getConfig`.
     experimentEnabled = false;

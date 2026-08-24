@@ -5217,6 +5217,53 @@ export function showAllMessages(workspaceId: string): void {
 }
 
 /**
+ * Newest staged /refine proposal hash RENDERED in this window (r64).
+ * /refine apply must bind approval to the proposal THIS user saw: with
+ * XUM_ALLOW_MULTIPLE_INSTANCES=1 the shared chat transcript can contain a
+ * newer proposal from another backend that this renderer never displayed,
+ * so the backend cannot infer the displayed proposal from the transcript
+ * alone. Scans newest-first for a refine-summary row carrying a
+ * stagedSetHash, restricted to rows the transcript actually RENDERS (r68):
+ * the DOM display cap can hide a proposal row from internal history (e.g. a
+ * window opened after a foreign backend staged it, with enough later chat
+ * to push it past the cap), and approving a hidden proposal would apply
+ * memory/skill edits the user never saw. A hidden newer proposal also
+ * cannot be applied via an older visible hash — the backend re-hashes the
+ * staged set and refuses the mismatch — so filtering here fails safe.
+ */
+export function getDisplayedRefineProposalHash(workspaceId: string): string | null {
+  const aggregator = getStoreInstance().getAggregator(workspaceId);
+  return aggregator ? findRenderedRefineProposalHash(aggregator) : null;
+}
+
+/** Pure scan behind getDisplayedRefineProposalHash, exported for tests. */
+export function findRenderedRefineProposalHash(
+  aggregator: StreamingMessageAggregator
+): string | null {
+  // The rendered row set: display-capped unless "Load all" disabled the cap.
+  const renderedHistoryIds = new Set<string>();
+  for (const displayed of aggregator.getDisplayedMessages()) {
+    if ("historyId" in displayed) {
+      renderedHistoryIds.add(displayed.historyId);
+    }
+  }
+  const messages = aggregator.getAllMessages();
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    const muxMetadata = message.metadata?.muxMetadata;
+    if (
+      muxMetadata?.type === "refine-summary" &&
+      typeof muxMetadata.stagedSetHash === "string" &&
+      muxMetadata.stagedSetHash.length > 0 &&
+      renderedHistoryIds.has(message.id)
+    ) {
+      return muxMetadata.stagedSetHash;
+    }
+  }
+  return null;
+}
+
+/**
  * Add an ephemeral message to a workspace and trigger a re-render.
  * Used for displaying frontend-only messages like /plan output.
  */

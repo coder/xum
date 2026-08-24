@@ -182,6 +182,8 @@ export const XumMessageSchema = z.object({
       partial: z.boolean().optional(),
       synthetic: z.boolean().optional(),
       uiVisible: z.boolean().optional(),
+      // RLM keep-recent floor: sanitized post-boundary copy of a pre-compaction row.
+      rlmPreservedTailCopy: z.boolean().optional(),
       transcriptAnchor: TranscriptAnchorSchema.optional().catch(undefined),
 
       // Ignore malformed snapshot metadata so one row cannot fail the whole history parse.

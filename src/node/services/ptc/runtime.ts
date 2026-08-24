@@ -38,8 +38,18 @@ export interface IJSRuntime extends Disposable {
   /**
    * Register an object with methods (for namespaced tools like mux.bash).
    * Each method on the object becomes callable from the sandbox.
+   *
+   * `syncMethods` are registered as plain synchronous host functions (no
+   * asyncify). Asyncified methods can only suspend inside the evalCodeAsync
+   * stack, so guest continuations resumed after `await somePromise` cannot
+   * call them — namespace members that must stay callable post-await (e.g.
+   * mux.events) go here instead.
    */
-  registerObject(name: string, obj: Record<string, (...args: unknown[]) => Promise<unknown>>): void;
+  registerObject(
+    name: string,
+    obj: Record<string, (...args: unknown[]) => Promise<unknown>>,
+    syncMethods?: Record<string, (...args: unknown[]) => unknown>
+  ): void;
 
   /**
    * Register a host function that returns a real Promise INTO the guest
@@ -59,6 +69,28 @@ export interface IJSRuntime extends Disposable {
    * they block the guest.
    */
   registerSyncFunction(name: string, fn: (...args: unknown[]) => unknown): void;
+
+  /**
+   * Write a string property onto the guest `vars` global from the host.
+   * Safe to call from inside a registered host function (the VM is suspended
+   * but the context is usable — the same window marshal/dump already use) or
+   * between evals. Recreates `vars` if the guest clobbered it. Throws when
+   * the write does not stick (r29: a guest Proxy vars can swallow writes),
+   * so callers surface an honest failure instead of a fake success. Used by
+   * mux.load (r12) to place bulk file content into the kernel without ever
+   * transiting the model-visible record.
+   */
+  setVarsProperty(key: string, value: string): void;
+
+  /**
+   * Bound guest-supplied args/results captured into tool-call records and
+   * streamed events at CREATION time (kernel mode). Post-eval compaction
+   * cannot protect host memory or the session history that streamed events
+   * land in: a guest looping `xum.tool({big: vars.large})` would otherwise
+   * retain and emit every full payload. Pass undefined to disable (ephemeral
+   * mode keeps full records — the byte-identical supplement contract).
+   */
+  setKernelRecordBounds(bounds: KernelRecordBounds | undefined): void;
 
   /**
    * Route late guest-continuation execution through a host-provided gate.
@@ -99,6 +131,14 @@ export interface IJSRuntime extends Disposable {
    * Clean up resources. Called automatically with `using` declarations.
    */
   dispose(): void;
+}
+
+/** Caps applied to record/event capture when kernel record bounding is on. */
+export interface KernelRecordBounds {
+  /** Max serialized bytes of `args` kept in a record/event. */
+  argsCapBytes: number;
+  /** Max serialized bytes of `result` kept in a record/event. */
+  resultCapBytes: number;
 }
 
 /**

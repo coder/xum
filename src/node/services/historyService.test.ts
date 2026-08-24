@@ -8,6 +8,11 @@ import assert from "node:assert";
 import { createHash } from "node:crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import {
+  historyWriteLockPath,
+  workspaceRemovalTombstonePath,
+} from "@/node/services/workspaceRemoval";
 
 /** Collect all messages via iterateFullHistory (replaces removed getFullHistory). */
 async function collectFullHistory(service: HistoryService, workspaceId: string) {
@@ -290,6 +295,294 @@ describe("HistoryService", () => {
       };
 
       expect(persisted.workspaceId).toBe(workspaceId);
+    });
+  });
+
+  describe("appendToHistoryIfTailMatches", () => {
+    it("appends when the expected tail is still current", async () => {
+      const workspaceId = "workspace1";
+      await service.appendToHistory(workspaceId, createXumMessage("msg1", "user", "Hello"));
+      await service.appendToHistory(workspaceId, createXumMessage("msg2", "assistant", "Hi"));
+
+      const result = await service.appendToHistoryIfTailMatches(
+        workspaceId,
+        createXumMessage("msg3", "user", "Guarded"),
+        "msg2"
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.success && result.data).toBe("appended");
+      const messages = await collectFullHistory(service, workspaceId);
+      expect(messages.map((m) => m.id)).toEqual(["msg1", "msg2", "msg3"]);
+      expect(messages[2].metadata?.historySequence).toBe(2);
+    });
+
+    it("skips the append when another row landed first", async () => {
+      const workspaceId = "workspace1";
+      await service.appendToHistory(workspaceId, createXumMessage("msg1", "user", "Hello"));
+      await service.appendToHistory(workspaceId, createXumMessage("msg2", "assistant", "Hi"));
+
+      const result = await service.appendToHistoryIfTailMatches(
+        workspaceId,
+        createXumMessage("msg3", "user", "Guarded"),
+        "msg1"
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.success && result.data).toBe("tail-mismatch");
+      const messages = await collectFullHistory(service, workspaceId);
+      expect(messages.map((m) => m.id)).toEqual(["msg1", "msg2"]);
+    });
+
+    it("skips the append when the workspace has no history", async () => {
+      const result = await service.appendToHistoryIfTailMatches(
+        "workspace-empty",
+        createXumMessage("msg1", "user", "Guarded"),
+        "missing"
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.success && result.data).toBe("tail-mismatch");
+    });
+  });
+
+  describe("appendManyToHistory", () => {
+    it("terminates a torn crash tail so every batch row survives intact (r50)", async () => {
+      const workspaceId = "workspace1";
+      const workspaceDir = config.getSessionDir(workspaceId);
+      await fs.mkdir(workspaceDir, { recursive: true });
+      // A crash mid-write can leave chat.jsonl ending in an unterminated JSON
+      // fragment. Without healing, the first batch row glues onto those bytes
+      // and the self-healing reader drops payload+corruption as ONE malformed
+      // line while KEEPING the trigger — a durable trigger referencing an
+      // absent payload.
+      const intact = messageLine(
+        workspaceId,
+        createXumMessage("msg1", "user", "Hello", { historySequence: 0 })
+      );
+      await fs.writeFile(
+        path.join(workspaceDir, "chat.jsonl"),
+        intact + "\n" + '{"id":"torn-row","role":"assis'
+      );
+
+      const result = await service.appendManyToHistory(workspaceId, [
+        createXumMessage("payload-1", "assistant", "family payload"),
+        createXumMessage("trigger-1", "user", "family trigger"),
+      ]);
+      expect(result.success).toBe(true);
+
+      const messages = await collectFullHistory(service, workspaceId);
+      expect(messages.map((m) => m.id)).toEqual(["msg1", "payload-1", "trigger-1"]);
+    });
+
+    it("waits on the cross-process append lock before replacing the file (r50)", async () => {
+      const workspaceId = "workspace1";
+      const seeded = await service.appendToHistory(
+        workspaceId,
+        createXumMessage("msg1", "user", "Hello")
+      );
+      expect(seeded.success).toBe(true);
+
+      // A foreign backend (XUM_ALLOW_MULTIPLE_INSTANCES=1) holds the
+      // session-dir append lock: the batch's read+replace must wait, or its
+      // replacement — built from contents read before the foreign append —
+      // would silently delete the foreign row.
+      const foreign = await acquireProcessFileLock({
+        // r63: the history write lock lives outside the session directory so
+        // removal can hold it across its tombstone+delete critical section.
+        lockPath: historyWriteLockPath(config.rootDir, workspaceId),
+        timeoutMs: 5_000,
+        label: "test foreign backend",
+      });
+      const batch = service.appendManyToHistory(workspaceId, [
+        createXumMessage("payload-1", "assistant", "family payload"),
+        createXumMessage("trigger-1", "user", "family trigger"),
+      ]);
+      const sentinel = Symbol("still-pending");
+      expect(
+        await Promise.race([
+          batch,
+          new Promise((resolve) => setTimeout(() => resolve(sentinel), 250)),
+        ])
+      ).toBe(sentinel);
+
+      await foreign[Symbol.asyncDispose]();
+      const result = await batch;
+      expect(result.success).toBe(true);
+      const messages = await collectFullHistory(service, workspaceId);
+      expect(messages.map((m) => m.id)).toEqual(["msg1", "payload-1", "trigger-1"]);
+    });
+
+    it("refuses partial writes for a removed workspace without recreating its session dir (r66)", async () => {
+      // A foreign backend's active stream keeps flushing partials after the
+      // remover's process-local cancellation; the flush's ensurePrivateDir
+      // must not resurrect the deleted session directory.
+      const workspaceId = "removed-partial-workspace";
+      const tombstonePath = workspaceRemovalTombstonePath(config.rootDir, workspaceId);
+      await fs.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await fs.writeFile(tombstonePath, JSON.stringify({ workspaceId, removedAt: Date.now() }));
+
+      const result = await service.writePartial(
+        workspaceId,
+        createXumMessage("late-partial", "assistant", "must not land")
+      );
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("was removed");
+      const sessionDirExists = await fs.stat(config.getSessionDir(workspaceId)).then(
+        () => true,
+        () => false
+      );
+      expect(sessionDirExists).toBe(false);
+    });
+
+    it("read-path truncation recovery waits on the cross-process lock (r64)", async () => {
+      const workspaceId = "workspace1";
+      const seeded = await service.appendToHistory(
+        workspaceId,
+        createXumMessage("msg1", "user", "Hello")
+      );
+      expect(seeded.success).toBe(true);
+
+      // Simulate another backend's IN-FLIGHT truncation: the marker and the
+      // archive tombstone exist while it holds the write lock. An unlocked
+      // read-path recovery cannot tell this from a crash and would roll the
+      // live transaction back mid-flight — restoring the old archive between
+      // the foreign writer's archive and chat writes, so discarded history
+      // reappears with mismatched archive/chat state.
+      const sessionDir = config.getSessionDir(workspaceId);
+      const archivePath = path.join(sessionDir, "chat-archive.jsonl");
+      const tombstonePath = `${archivePath}.truncate`;
+      const markerPath = `${archivePath}.truncate.json`;
+      const oldArchiveRow = `${JSON.stringify({ id: "old-archive-row" })}\n`;
+      await fs.writeFile(tombstonePath, oldArchiveRow);
+      await fs.writeFile(
+        markerPath,
+        JSON.stringify({ finalArchiveHash: "in-flight", finalChatHash: "in-flight" })
+      );
+
+      const foreign = await acquireProcessFileLock({
+        lockPath: historyWriteLockPath(config.rootDir, workspaceId),
+        timeoutMs: 5_000,
+        label: "test foreign truncation",
+      });
+      const read = service.iterateFullHistory(workspaceId, "forward", () => undefined);
+      const sentinel = Symbol("still-pending");
+      expect(
+        await Promise.race([
+          read,
+          new Promise((resolve) => setTimeout(() => resolve(sentinel), 250)),
+        ])
+      ).toBe(sentinel);
+      // The live transaction's artifacts were not rolled back while the
+      // foreign lock was held.
+      const exists = (p: string) =>
+        fs.stat(p).then(
+          () => true,
+          () => false
+        );
+      expect(await exists(markerPath)).toBe(true);
+      expect(await exists(tombstonePath)).toBe(true);
+
+      await foreign[Symbol.asyncDispose]();
+      const result = await read;
+      expect(result.success).toBe(true);
+      // Once the lock was released, recovery ran under it: rollback restored
+      // the archive from the tombstone and consumed the marker.
+      expect(await exists(markerPath)).toBe(false);
+      expect(await exists(tombstonePath)).toBe(false);
+      expect(await fs.readFile(archivePath, "utf8")).toBe(oldArchiveRow);
+    });
+
+    it("refuses history mutations for a removed workspace without recreating its session dir (r63)", async () => {
+      // A foreign backend's in-flight stream survives the remover's
+      // process-local cancellation; once removal's tombstone is durable, a
+      // late append must fail instead of recreating the deleted session
+      // directory via ensurePrivateDir.
+      const workspaceId = "removed-history-workspace";
+      const tombstonePath = workspaceRemovalTombstonePath(config.rootDir, workspaceId);
+      await fs.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await fs.writeFile(tombstonePath, JSON.stringify({ workspaceId, removedAt: Date.now() }));
+
+      const result = await service.appendToHistory(
+        workspaceId,
+        createXumMessage("late-append", "assistant", "must not land")
+      );
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("removed");
+      expect(
+        await fs.access(config.getSessionDir(workspaceId)).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+    });
+
+    it("advances the sequence counter past foreign rows under the write lock (r51)", async () => {
+      const workspaceId = "workspace1";
+      // Cache a counter in this instance (msg1 takes sequence 0, counter -> 1).
+      const seeded = await service.appendToHistory(
+        workspaceId,
+        createXumMessage("msg1", "user", "Hello")
+      );
+      expect(seeded.success).toBe(true);
+      // A foreign backend (XUM_ALLOW_MULTIPLE_INSTANCES=1) appends a row with
+      // a higher sequence from its own counter.
+      const foreignLine = messageLine(
+        workspaceId,
+        createXumMessage("foreign-1", "assistant", "foreign row", { historySequence: 7 })
+      );
+      await fs.appendFile(
+        path.join(config.getSessionDir(workspaceId), "chat.jsonl"),
+        foreignLine + "\n"
+      );
+      // Without the in-lock counter refresh this batch would assign stale
+      // sequences from the cached counter; updateHistory replaces the FIRST
+      // row matching a sequence, so a duplicate would let a later stream
+      // finalization overwrite an unrelated foreign row.
+      const result = await service.appendManyToHistory(workspaceId, [
+        createXumMessage("payload-1", "assistant", "family payload"),
+        createXumMessage("trigger-1", "user", "family trigger"),
+      ]);
+      expect(result.success).toBe(true);
+      const messages = await collectFullHistory(service, workspaceId);
+      const seqById = new Map(messages.map((m) => [m.id, m.metadata?.historySequence]));
+      expect(seqById.get("payload-1")).toBe(8);
+      expect(seqById.get("trigger-1")).toBe(9);
+    });
+  });
+
+  describe("persistBoundaryWithTailCopies", () => {
+    it("advances the sequence counter past foreign rows before assigning tail copies (r52)", async () => {
+      const workspaceId = "workspace1";
+      const seeded = await service.appendToHistory(
+        workspaceId,
+        createXumMessage("msg1", "user", "Hello")
+      );
+      expect(seeded.success).toBe(true);
+      // A foreign backend appended a higher-sequence row after this process
+      // cached its counter; the boundary path assigns fresh sequences to the
+      // summary and every tail copy, so it needs the same in-lock refresh as
+      // the append family.
+      const foreignLine = messageLine(
+        workspaceId,
+        createXumMessage("foreign-1", "assistant", "foreign row", { historySequence: 7 })
+      );
+      await fs.appendFile(
+        path.join(config.getSessionDir(workspaceId), "chat.jsonl"),
+        foreignLine + "\n"
+      );
+
+      const summary = createXumMessage("summary-1", "assistant", "compaction summary");
+      const tailCopy = createXumMessage("tail-1", "user", "preserved tail");
+      const result = await service.persistBoundaryWithTailCopies(
+        workspaceId,
+        summary,
+        [tailCopy],
+        false
+      );
+      expect(result.success).toBe(true);
+      expect(summary.metadata?.historySequence).toBe(8);
+      expect(tailCopy.metadata?.historySequence).toBe(9);
     });
   });
 

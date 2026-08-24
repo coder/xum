@@ -6,6 +6,7 @@ import type {
   EditedFilesReferenceAttachment,
   CompletedReportEntry,
   CompletedReportsIndexAttachment,
+  ReadFilesReferenceAttachment,
 } from "@/common/types/attachment";
 import { isNestedWorkflowRun, type WorkflowRunEvent } from "@/common/types/workflow";
 import { getPlanFilePath, getLegacyPlanFilePath } from "@/common/utils/planStorage";
@@ -226,6 +227,20 @@ export class AttachmentService {
     return {
       type: "completed_reports_index",
       reports: entries.slice(0, MAX_POST_COMPACTION_REPORT_INDEX_ENTRIES),
+    };
+  }
+
+  /**
+   * Generate the RLM read-files attachment (paths only, newest-first).
+   * Returns null when nothing was tracked; callers gate on RLM mode.
+   */
+  static generateReadFilesAttachment(readFilePaths: string[]): ReadFilesReferenceAttachment | null {
+    if (readFilePaths.length === 0) {
+      return null;
+    }
+    return {
+      type: "read_files_reference",
+      paths: readFilePaths,
     };
   }
 

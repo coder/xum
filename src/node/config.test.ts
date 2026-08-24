@@ -729,6 +729,28 @@ describe("Config", () => {
         "Keep this guidance."
       );
     });
+
+    it("discards malformed non-string codeWorkspaceSyncPath and keeps valid ones", () => {
+      const configFile = path.join(tempDir, "config.json");
+      fs.writeFileSync(
+        configFile,
+        JSON.stringify({
+          projects: [
+            ["/home/user/number", { workspaces: [], codeWorkspaceSyncPath: 42 }],
+            ["/home/user/blank", { workspaces: [], codeWorkspaceSyncPath: "   " }],
+            ["/home/user/valid", { workspaces: [], codeWorkspaceSyncPath: "a.code-workspace" }],
+          ],
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+
+      expect(loaded.projects.get("/home/user/number")?.codeWorkspaceSyncPath).toBeUndefined();
+      expect(loaded.projects.get("/home/user/blank")?.codeWorkspaceSyncPath).toBeUndefined();
+      expect(loaded.projects.get("/home/user/valid")?.codeWorkspaceSyncPath).toBe(
+        "a.code-workspace"
+      );
+    });
   });
 
   describe("legacy workflow schedule cleanup", () => {

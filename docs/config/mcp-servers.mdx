@@ -62,6 +62,8 @@ With the **Agent Plugins** experiment enabled (Settings → Experiments), MCP se
 
 Stdio plugin servers launch with the spec's `PLUGIN_ROOT` and `PLUGIN_DATA` environment variables; per-plugin data directories live under `~/.xum/plugin-data/`.
 
+**Settings → Plugins** installs plugins from git into `~/.xum/plugins` (paste a git URL or `owner/repo[@ref]`); the exact location derives from the active Xum home (a legacy `~/.mux` home keeps working) and is shown in the section. Before anything is written, a consent preview lists the plugin's manifest, every skill, and every MCP server command line. Installs are pinned to the resolved commit; update checks compare the tracked branch or tag against the pinned commit and never auto-apply. Applying an update replaces the plugin directory wholesale — local edits to a managed plugin directory are discarded — and restarts that plugin's running MCP servers. Uninstalling removes the directory, the registry entry, and the plugin's per-workspace server overrides, but keeps `~/.xum/plugin-data/` unless you opt in to deleting it.
+
 ## Behavior
 
 - **Hot reload** — Config changes apply on your next message (no restart needed)

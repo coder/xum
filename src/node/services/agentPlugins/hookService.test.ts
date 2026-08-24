@@ -28,7 +28,8 @@ import {
 } from "@/node/services/replay/replayFixture";
 import { collectFullHistory, replayVerifySession } from "@/node/services/replay/replayVerify";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
-import { AgentPluginHookService } from "./hookService";
+import { AgentPluginHookService, readHookSourceCapped } from "./hookService";
+import { bumpContainerMutationEpoch, STAGING_DIR_NAME } from "./journals";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 
 const WORKSPACE_ID = "plugin-hooks-test";
@@ -146,6 +147,83 @@ function blockedError(ctx: ToolExecuteContext): string {
   expect(typeof result.error).toBe("string");
   return result.error as string;
 }
+
+describe("readHookSourceCapped", () => {
+  test("enforces the hook size ceiling at the read itself", async () => {
+    // Discovery's stat-based cap and the consuming read are separated by an
+    // update-sized TOCTOU window (a managed update can promote a replacement
+    // hooks.js between them), so the ceiling must hold at read time: an
+    // oversized source is refused, a normal one round-trips byte-exact.
+    using tmp = new DisposableTempDir("hook-source-cap");
+    const smallPath = path.join(tmp.path, "hooks.js");
+    await fs.writeFile(smallPath, "({ 'tool.execute.before': () => undefined })", "utf8");
+    expect(await readHookSourceCapped(smallPath, tmp.path)).toBe(
+      "({ 'tool.execute.before': () => undefined })"
+    );
+
+    const bigPath = path.join(tmp.path, "big-hooks.js");
+    await fs.writeFile(bigPath, `// ${"x".repeat(2 * 1024 * 1024)}\n({})`, "utf8");
+    // try/catch instead of .rejects: bun:test types trip await-thenable.
+    try {
+      await readHookSourceCapped(bigPath, tmp.path);
+      expect.unreachable("an oversized hooks.js must be refused at read time");
+    } catch (error) {
+      expect((error as Error).message).toContain("too large");
+    }
+  });
+
+  test("follows a CONTAINED hooks.js symlink but refuses one escaping the plugin root", async () => {
+    // Consent-time validation (staging + discovery) accepts relative symlinks
+    // that stay inside the plugin, so the consuming read must too — but a
+    // replacement link whose target resolves OUTSIDE the plugin root (staged
+    // validation reads that as a capability removal) must be refused instead
+    // of evaluating the outside file as hook code.
+    using tmp = new DisposableTempDir("hook-source-symlink");
+    const root = path.join(tmp.path, "plugin-root");
+    await fs.mkdir(root);
+    const inside = path.join(root, "impl.js");
+    await fs.writeFile(inside, "({ 'tool.execute.before': () => undefined })", "utf8");
+    const containedLink = path.join(root, "hooks.js");
+    await fs.symlink(inside, containedLink);
+    expect(await readHookSourceCapped(containedLink, root)).toContain("tool.execute.before");
+
+    const outside = path.join(tmp.path, "outside.js");
+    await fs.writeFile(outside, "({ 'tool.execute.before': () => undefined })", "utf8");
+    const escapingLink = path.join(root, "escaping-hooks.js");
+    await fs.symlink(outside, escapingLink);
+    try {
+      await readHookSourceCapped(escapingLink, root);
+      expect.unreachable("a hooks.js symlink escaping the plugin root must be refused");
+    } catch (error) {
+      expect((error as Error).message).toContain("outside containment root");
+    }
+  });
+
+  test("refuses a hooks.js reached through a symlinked ancestor directory", async () => {
+    // The leaf lstat check cannot catch a replacement symlink at an ANCESTOR
+    // component (lib/hooks.js where `lib` becomes a link to an outside dir):
+    // lstat follows ancestor links and reports the outside file as regular
+    // with matching dev/ino. The post-open containment recheck must reject
+    // the resolved path escaping the plugin root.
+    using tmp = new DisposableTempDir("hook-source-ancestor-symlink");
+    const outsideDir = path.join(tmp.path, "outside");
+    await fs.mkdir(outsideDir);
+    await fs.writeFile(
+      path.join(outsideDir, "hooks.js"),
+      "({ 'tool.execute.before': () => undefined })",
+      "utf8"
+    );
+    const root = path.join(tmp.path, "plugin-root");
+    await fs.mkdir(root);
+    await fs.symlink(outsideDir, path.join(root, "lib"));
+    try {
+      await readHookSourceCapped(path.join(root, "lib", "hooks.js"), root);
+      expect.unreachable("an ancestor-symlinked hooks.js must be refused at read time");
+    } catch (error) {
+      expect((error as Error).message).toContain("outside containment root");
+    }
+  });
+});
 
 describe("AgentPluginHookService", () => {
   test("tool.execute.before blocks .env reads with a clear model-visible error", async () => {
@@ -554,7 +632,10 @@ describe("replay determinism with hooks active", () => {
     expect(hookRows[0].data.text).toBe("House rule: never commit secrets.");
 
     // ...and byte-level replay verification passes with the hook active.
-    const historyService = new HistoryService({ getSessionDir: () => harness.sessionDir });
+    const historyService = new HistoryService({
+      getSessionDir: () => harness.sessionDir,
+      rootDir: path.dirname(harness.sessionDir),
+    });
     const history = await collectFullHistory(historyService, REPLAY_FIXTURE_WORKSPACE_ID);
     expect(history.success).toBe(true);
     if (!history.success) throw new Error("history read failed");
@@ -568,5 +649,45 @@ describe("replay determinism with hooks active", () => {
     expect(result.turns[0].status).toBe("PASS");
 
     await harness.service.disposeWorkspace(REPLAY_FIXTURE_WORKSPACE_ID);
+  });
+});
+
+describe("epoch-based hook retirement", () => {
+  test("a managed plugin mutation (epoch bump) retires live hooks before the next invocation", async () => {
+    // An uninstall/update/install committed in ANY process bumps the managed
+    // container's mutation epoch. Already-registered hooks must stop seeing
+    // tool traffic at the next invocation — not survive until the workspace's
+    // next send calls ensureWorkspaceHooks — or a mid-stream uninstall would
+    // keep exposing tool args/results to (and accepting denials/rewrites
+    // from) the removed plugin.
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "epoch-demo",
+      "({ 'tool.execute.before': () => ({ deny: 'blocked by hook' }) })",
+      { tools: ["dangerous_tool"] }
+    );
+    await harness.ensure();
+
+    // Live: the hook denies the granted tool.
+    const before = makeToolCtx("dangerous_tool", { a: 1 });
+    await runTool(harness.spine, before);
+    expect(blockedError(before)).toContain("blocked by hook");
+
+    const stagingRoot = path.join(harness.tmp.path, STAGING_DIR_NAME);
+    await fs.mkdir(stagingRoot, { recursive: true });
+    await bumpContainerMutationEpoch(stagingRoot);
+
+    // Stale epoch: the registration is torn down before the hook sees input.
+    const after = makeToolCtx("dangerous_tool", { a: 2 });
+    await runTool(harness.spine, after);
+    expect(after.blocked).toBeUndefined();
+    expect(after.executed).toBe(true);
+
+    // The next ensure re-registers from disk with the fresh epoch.
+    await harness.ensure();
+    const reensured = makeToolCtx("dangerous_tool", { a: 3 });
+    await runTool(harness.spine, reensured);
+    expect(blockedError(reensured)).toContain("blocked by hook");
   });
 });

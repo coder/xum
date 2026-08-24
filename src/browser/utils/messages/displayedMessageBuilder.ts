@@ -484,7 +484,17 @@ function reconstructCodeExecutionNestedCalls(part: DynamicToolPart): NestedToolC
       toolName: record.toolName,
       input: record.args,
       output:
-        record.result ?? (typeof record.error === "string" ? { error: record.error } : undefined),
+        record.result ??
+        (typeof record.error === "string"
+          ? { error: record.error }
+          : typeof record.bytes === "number" && typeof record.ok === "boolean"
+            ? // RLM kernel-mode compact record (r12): the full nested result
+              // never persists in the tool output — degraded detail after
+              // reload is expected. Surface the summary so the card still
+              // renders something meaningful. Live streaming keeps full
+              // detail via part.nestedCalls, which takes precedence here.
+              { suppressed: true, ok: record.ok, bytes: record.bytes }
+            : undefined),
       state: "output-available",
       timestamp: part.timestamp,
     });

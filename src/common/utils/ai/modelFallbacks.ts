@@ -1,7 +1,7 @@
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
-import { isCustomOpenAICompatibleProviderConfig } from "@/common/utils/providers/customProviders";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import type { ModelFallbacks } from "@/common/config/schemas/appConfigOnDisk";
 
 /**
@@ -70,7 +70,7 @@ export function normalizeFallbackModelKey(
     return trimmed; // non-canonical instance names are already gateway-scoped
   }
   const coderSection = providersConfig?.coder;
-  if (isCustomOpenAICompatibleProviderConfig(coderSection)) {
+  if (isCustomProviderConfig(coderSection)) {
     return trimmed; // custom provider shadows the prefix; raw IS the identity
   }
   const wire = resolveCoderWireCanonicalModel(

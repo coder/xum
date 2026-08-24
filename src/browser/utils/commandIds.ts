@@ -41,6 +41,7 @@ export const CommandIds = {
   navPrev: () => "nav:prev" as const,
   navToggleSidebar: () => "nav:toggleSidebar" as const,
   navToggleHideSubAgents: () => "nav:toggle-hide-subagents" as const,
+  navToggleTerminalBadge: () => "nav:toggle-terminal-badge" as const,
   navRightSidebarFocusTerminal: () => "nav:rightSidebar:focusTerminal" as const,
   navRightSidebarSplitHorizontal: () => "nav:rightSidebar:splitHorizontal" as const,
   navRightSidebarSplitVertical: () => "nav:rightSidebar:splitVertical" as const,
@@ -94,6 +95,13 @@ export const CommandIds = {
   settingsOpenSection: (section: string) => `settings:open:${section}` as const,
   coderDisconnect: () => "providers:coder:disconnect" as const,
   coderRefreshModels: () => "providers:coder:refresh-models" as const,
+
+  // Agent Plugin commands (agent-plugins experiment)
+  pluginsInstall: () => "plugins:install" as const,
+  pluginsUninstall: () => "plugins:uninstall" as const,
+  pluginsCheckUpdates: () => "plugins:check-updates" as const,
+  pluginsUpdateAll: () => "plugins:update-all" as const,
+  pluginsUpdateOne: () => "plugins:update-one" as const,
 
   // Help commands
   helpKeybinds: () => "help:keybinds" as const,

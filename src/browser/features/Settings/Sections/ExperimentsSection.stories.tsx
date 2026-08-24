@@ -74,6 +74,13 @@ export const ExperimentsToggleOn: Story = {
       <ExperimentsSection />
     </SettingsSectionStory>
   ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+
+    // With PTC enabled, the RLM Mode sub-experiment renders in the nested
+    // panel under the parent row.
+    await canvas.findByLabelText("Toggle RLM Mode");
+  },
 };
 
 export const HeartbeatSettingsEnabled: Story = {

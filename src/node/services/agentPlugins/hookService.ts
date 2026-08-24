@@ -24,7 +24,7 @@
 
 import assert from "node:assert";
 import * as crypto from "node:crypto";
-import * as fsPromises from "node:fs/promises";
+import * as path from "node:path";
 import { isBridgeToolGranted, type CapabilityGrants } from "@/common/types/capabilityGrants";
 import { getErrorMessage } from "@/common/utils/errors";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
@@ -48,9 +48,12 @@ import { ensurePathContained } from "@/node/services/tools/skillFileUtils";
 import {
   computeAgentPluginContainers,
   discoverAgentPlugins,
+  MAX_PLUGIN_HOOK_SOURCE_BYTES,
+  readPluginFileWithinRootCapped,
   type AgentPluginContainer,
   type AgentPluginInfo,
 } from "./discovery";
+import { readMutationEpochToken, STAGING_DIR_NAME } from "./journals";
 import {
   buildHookInvokeScript,
   buildHookLoadScript,
@@ -111,6 +114,16 @@ interface WorkspaceHookRegistration {
   fingerprint: string;
   unregisters: Array<() => void>;
   states: LoadedPluginHookState[];
+  /**
+   * Managed-container mutation epoch captured when this registration's
+   * plugins were (re)discovered. Every hook invocation revalidates it so an
+   * install/update/uninstall committed in ANY process (the epoch bump is the
+   * commit signal, same as the MCP manager's cross-process retire sweep)
+   * stops already-registered hooks from seeing tool traffic mid-stream,
+   * instead of them surviving until the workspace's next send.
+   */
+  epochStagingRoot: string;
+  epochToken: string | undefined;
   /**
    * Fingerprint lines of discovered candidates that failed to load. Retried
    * on later sends WITHOUT tearing down healthy siblings: a full-teardown
@@ -176,6 +189,12 @@ export class AgentPluginHookService {
       return;
     }
 
+    // Capture the epoch BEFORE discovery: a mutation landing between this
+    // read and registration makes the stored token stale, so the dispatch
+    // check retires the registration (over-blocking; safe direction).
+    const epochStagingRoot = path.join(args.xumHome, STAGING_DIR_NAME);
+    const epochToken = await readMutationEpochToken(epochStagingRoot);
+
     const discovered = await this.discoverHookPlugins(args);
     const fingerprintLines = discovered.map(
       (candidate) =>
@@ -186,6 +205,12 @@ export class AgentPluginHookService {
 
     const existing = this.registrations.get(args.workspaceId);
     if (existing?.fingerprint === fingerprint) {
+      // This ensure re-measured everything from disk and found identical
+      // content, so the registration is current as of the token captured
+      // above — refresh it (an uninstall+identical-reinstall cycle would
+      // otherwise leave a permanently stale token that retires the
+      // registration on every dispatch).
+      existing.epochToken = epochToken;
       // Unchanged configuration. Retry ONLY previously-failed candidates so
       // healthy siblings keep their persistent mounts (cross-turn guest state)
       // instead of being torn down and re-initialized on every send while one
@@ -230,7 +255,14 @@ export class AgentPluginHookService {
       unregisters.push(...loaded.unregisters);
     }
 
-    this.registrations.set(args.workspaceId, { fingerprint, unregisters, states, failedLines });
+    this.registrations.set(args.workspaceId, {
+      fingerprint,
+      unregisters,
+      states,
+      failedLines,
+      epochStagingRoot,
+      epochToken,
+    });
   }
 
   /**
@@ -326,7 +358,7 @@ export class AgentPluginHookService {
       }
       let source: string;
       try {
-        source = await fsPromises.readFile(plugin.hooksPath, "utf8");
+        source = await readHookSourceCapped(plugin.hooksPath, plugin.rootPath);
       } catch (error) {
         log.warn(`Agent plugin hooks: failed to read ${plugin.hooksPath}; skipping`, { error });
         continue;
@@ -398,7 +430,7 @@ export class AgentPluginHookService {
     if (!isBridgeToolGranted(state.grants, ctx.toolName)) {
       return;
     }
-    const output = await this.invokeHook(state, "tool.execute.before", {
+    const output = await this.invokeHook(workspaceId, state, "tool.execute.before", {
       toolName: ctx.toolName,
       args: ctx.args,
       workspaceId,
@@ -465,7 +497,7 @@ export class AgentPluginHookService {
     } catch {
       input.resultOmitted = true;
     }
-    const output = await this.invokeHook(state, "tool.execute.after", input);
+    const output = await this.invokeHook(workspaceId, state, "tool.execute.after", input);
     const annotation = output?.annotation;
     if (typeof annotation === "string" && annotation.length > 0) {
       ctx.result = annotateResult(ctx.result, annotation, state.pluginName);
@@ -480,7 +512,7 @@ export class AgentPluginHookService {
     if (ctx.workspaceId !== args.workspaceId) {
       return;
     }
-    const output = await this.invokeHook(state, "request.assemble", {
+    const output = await this.invokeHook(args.workspaceId, state, "request.assemble", {
       workspaceId: args.workspaceId,
       modelString: ctx.modelString,
     });
@@ -506,12 +538,14 @@ export class AgentPluginHookService {
           data: { hookId, placement: "system-prompt", text: context },
         });
       } else {
-        const { ref } = await args.journal.blobs.put(context);
-        await args.journal.append({
+        // publishWithBlob: put + append under the journal blob lock so a
+        // concurrent reclamation pass can never treat the freshly stored
+        // blob as unreferenced (content addressing can share hashes).
+        await args.journal.publishWithBlob(context, (ref) => ({
           workspaceId: args.workspaceId,
           kind: "hook-context",
           data: { hookId, placement: "system-prompt", blobHash: ref },
-        });
+        }));
       }
     } catch (error) {
       log.warn(
@@ -526,15 +560,57 @@ export class AgentPluginHookService {
   // --- invocation ---
 
   /**
+   * Revalidate the registration's managed-container mutation epoch before a
+   * hook sees any input. A committed install/update/uninstall (this process
+   * or a sibling — the epoch file is the cross-process commit signal) must
+   * stop already-registered hooks from observing tool args/results or
+   * injecting rewrites/denials/context for the rest of the current stream;
+   * without this they would survive until the workspace's next send calls
+   * ensureWorkspaceHooks. On staleness the registration is torn down and the
+   * invocation is refused; the next send re-discovers from disk.
+   */
+  private async retireIfEpochStale(workspaceId: string): Promise<boolean> {
+    const registration = this.registrations.get(workspaceId);
+    if (!registration) {
+      // Torn down since the middleware fired (teardown unregisters first,
+      // but an in-flight dispatch may already hold the callback).
+      return true;
+    }
+    const current = await readMutationEpochToken(registration.epochStagingRoot);
+    if (current === registration.epochToken) {
+      return false;
+    }
+    await using _guard = await this.lockFor(workspaceId).acquire();
+    // Recheck under the lock: a concurrent ensure may have already replaced
+    // the registration with a freshly-discovered (current) one.
+    if (this.registrations.get(workspaceId) === registration) {
+      log.info(
+        `Agent plugin hooks: managed plugin mutation detected; retiring workspace ${workspaceId} hooks until the next send`
+      );
+      await this.teardownLocked(workspaceId);
+    }
+    return true;
+  }
+
+  /**
    * Invoke one hook in the plugin's mount. Returns null on any failure
    * (crash, timeout, malformed output) — log, skip, continue.
    */
   private async invokeHook(
+    workspaceId: string,
     state: LoadedPluginHookState,
     hookName: PluginHookPoint,
     input: Record<string, unknown>
   ): Promise<Record<string, unknown> | null> {
     if (state.disposed) {
+      return null;
+    }
+    if (await this.retireIfEpochStale(workspaceId)) {
+      return null;
+    }
+    if (state.disposed) {
+      // Re-check: the epoch validation above may have awaited; a concurrent
+      // teardown could have disposed this state in the meantime.
       return null;
     }
     try {
@@ -622,6 +698,25 @@ function annotateResult(result: unknown, annotation: string, pluginName: string)
   }
   log.debug(`Agent plugin hooks: '${pluginName}' annotation skipped (non-object tool result)`);
   return result;
+}
+
+/**
+ * Read hooks.js through one file handle with a same-handle size check.
+ * Discovery's stat-based cap and this read are separated by an update-sized
+ * TOCTOU window — a managed update can promote a replacement tree between
+ * them, making the canonical path name a file discovery never measured — so
+ * the ceiling must be enforced at the read itself. Reading exactly the
+ * fstat-reported byte count through the same handle also bounds the read if
+ * the file grows mid-read. Exported for tests.
+ */
+export async function readHookSourceCapped(hooksPath: string, pluginRoot: string): Promise<string> {
+  const result = await readPluginFileWithinRootCapped({
+    filePath: hooksPath,
+    pluginRoot,
+    maxBytes: MAX_PLUGIN_HOOK_SOURCE_BYTES,
+    label: "hooks.js",
+  });
+  return result.content;
 }
 
 /** Process-wide singleton (mirrors eventSpine/sandboxHostService). */

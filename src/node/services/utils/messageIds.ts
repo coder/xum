@@ -33,6 +33,26 @@ export const createMcpPromptSnapshotMessageId = (): string =>
 export const createCompactionSummaryMessageId = (): string =>
   `summary-${Date.now()}-${randomSuffix(9)}`;
 
+/**
+ * RLM keep-recent tail copy IDs: rlm-tail-{timestamp}-{random}.
+ * Fresh IDs (never the original row's) so UI aggregation keyed by message ID
+ * cannot collapse a hidden post-boundary copy over its visible original.
+ */
+export const createPreservedTailCopyMessageId = (): string =>
+  `rlm-tail-${Date.now()}-${randomSuffix(9)}`;
+
+/** Abandoned-branch summary IDs (rlm-mode fork/edit truncation): branch-summary-{timestamp}-{random} */
+export const createBranchSummaryMessageId = (): string =>
+  `branch-summary-${Date.now()}-${randomSuffix(9)}`;
+
+/** Refine pass summary IDs (rlm-mode /refine): refine-summary-{timestamp}-{random} */
+export const createRefineSummaryMessageId = (): string =>
+  `refine-summary-${Date.now()}-${randomSuffix(9)}`;
+
+/** Family-message payload row IDs (task_message_parent): family-message-{timestamp}-{random} */
+export const createFamilyMessageId = (): string =>
+  `family-message-${Date.now()}-${randomSuffix(9)}`;
+
 /** Context reset boundary IDs: context-reset-{timestamp}-{random} */
 export const createContextResetBoundaryMessageId = (): string =>
   `context-reset-${Date.now()}-${randomSuffix(9)}`;

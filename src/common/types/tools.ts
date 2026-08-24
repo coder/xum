@@ -83,6 +83,23 @@ export type AgentSkillDeleteToolResult =
   | { success: true; deleted: "file" | "skill" }
   | { success: false; error: string };
 
+// refinement_rollback result (RLM mode only)
+export type RefinementRollbackToolResult =
+  | {
+      success: true;
+      /** Refinement row id that was rolled back. */
+      rollbackOf: string;
+      /** Envelope id of the journaled rollback row; null if journaling failed. */
+      rollbackRowId: string | null;
+      /** Files restored to their recorded prior contents. */
+      restored: string[];
+      /** Files deleted (the target row had created them). */
+      deleted: string[];
+      /** Rename that was undone. */
+      renamed?: { from: string; to: string };
+    }
+  | { success: false; error: string };
+
 // skills_catalog_search result
 export interface SkillsCatalogSearchSkill {
   skillId: string;
@@ -221,6 +238,13 @@ export const FILE_EDIT_TOOL_NAMES = [
   "file_edit_replace_lines",
   "file_edit_insert",
 ] as const;
+
+/**
+ * Read-flavored tools whose successful results mark a workspace file as
+ * "already seen" for RLM post-compaction read tracking (paths only, never
+ * contents).
+ */
+export const FILE_READ_TOOL_NAMES = ["file_read"] as const;
 
 /**
  * Prefix for edit failure notes (agent-only messages).

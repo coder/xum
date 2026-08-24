@@ -6,6 +6,7 @@ import * as os from "os";
 import * as path from "path";
 import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import { Config } from "@/node/config";
+import { ProjectService } from "@/node/services/projectService";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
@@ -1140,5 +1141,165 @@ describe("router config.saveConfig", () => {
     expect(savedTaskSettings.maxTaskNestingDepth).toBe(5);
     expect(savedTaskSettings.preserveSubagentsUntilArchive).toBe(true);
     expect(savedTaskSettings.proposePlanImplementReplacesChatHistory).toBe(true);
+  });
+});
+
+describe("projects.setCodeWorkspaceSyncPath", () => {
+  let tempDir: string;
+  let config: Config;
+  let projectPath: string;
+
+  beforeEach(async () => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-router-codews-test-"));
+    config = new Config(tempDir);
+    projectPath = path.join(tempDir, "project");
+    fs.mkdirSync(projectPath, { recursive: true });
+    await config.editConfig((current) => {
+      current.projects.set(projectPath, { workspaces: [] });
+      return current;
+    });
+  });
+
+  afterEach(() => {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  function createClient() {
+    return createRouterClient(router(), {
+      context: { config } as unknown as ORPCContext,
+    });
+  }
+
+  test("rejects paths without the .code-workspace extension with a client-visible error", async () => {
+    const client = createClient();
+    let thrown: unknown;
+    try {
+      await client.projects.setCodeWorkspaceSyncPath({
+        projectPath,
+        codeWorkspaceSyncPath: "/tmp/notes.txt",
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    // Must be an ORPCError so the extension hint reaches the UI instead of
+    // a generic "Internal server error".
+    expect(thrown).toBeInstanceOf(ORPCError);
+    expect((thrown as ORPCError<string, unknown>).message).toContain(".code-workspace");
+    expect(
+      config.loadConfigOrDefault().projects.get(projectPath)?.codeWorkspaceSyncPath
+    ).toBeUndefined();
+  });
+
+  test("stores the path and writes the workspace file immediately", async () => {
+    const client = createClient();
+    await client.projects.setCodeWorkspaceSyncPath({
+      projectPath,
+      codeWorkspaceSyncPath: "  proj.code-workspace  ",
+    });
+
+    expect(config.loadConfigOrDefault().projects.get(projectPath)?.codeWorkspaceSyncPath).toBe(
+      "proj.code-workspace"
+    );
+    const written = JSON.parse(
+      fs.readFileSync(path.join(projectPath, "proj.code-workspace"), "utf-8")
+    ) as { folders: Array<{ path: string }> };
+    expect(written.folders).toEqual([{ path: projectPath }]);
+  });
+
+  test("surfaces sync failures on explicit save and rolls the setting back", async () => {
+    // A malformed target must fail the save visibly instead of persisting a
+    // broken integration that silently retries on every lifecycle event.
+    fs.writeFileSync(path.join(projectPath, "broken.code-workspace"), "{ not valid jsonc");
+    const client = createClient();
+
+    let thrown: unknown;
+    try {
+      await client.projects.setCodeWorkspaceSyncPath({
+        projectPath,
+        codeWorkspaceSyncPath: "broken.code-workspace",
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(ORPCError);
+    expect((thrown as ORPCError<string, unknown>).message).toContain("not valid JSONC");
+    expect(
+      config.loadConfigOrDefault().projects.get(projectPath)?.codeWorkspaceSyncPath
+    ).toBeUndefined();
+  });
+
+  test("clearing the setting removes it without deleting the existing file", async () => {
+    const client = createClient();
+    await client.projects.setCodeWorkspaceSyncPath({
+      projectPath,
+      codeWorkspaceSyncPath: "proj.code-workspace",
+    });
+    await client.projects.setCodeWorkspaceSyncPath({
+      projectPath,
+      codeWorkspaceSyncPath: null,
+    });
+
+    expect(
+      config.loadConfigOrDefault().projects.get(projectPath)?.codeWorkspaceSyncPath
+    ).toBeUndefined();
+    expect(fs.existsSync(path.join(projectPath, "proj.code-workspace"))).toBe(true);
+  });
+
+  test("reassigning a workspace between sub-projects syncs both workspace files", async () => {
+    const subProjectA = path.join(projectPath, "packages", "a");
+    const subProjectB = path.join(projectPath, "packages", "b");
+    fs.mkdirSync(subProjectA, { recursive: true });
+    fs.mkdirSync(subProjectB, { recursive: true });
+    const worktreePath = path.join(config.srcDir, "project", "feat-1");
+    // Checkout must exist on disk or metadata is marked transcript-only.
+    fs.mkdirSync(worktreePath, { recursive: true });
+    await config.editConfig((current) => {
+      current.projects.set(projectPath, {
+        workspaces: [
+          {
+            path: worktreePath,
+            id: "aaaaaaaaaa",
+            name: "feat-1",
+            runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+            subProjectPath: subProjectA,
+          },
+        ],
+      });
+      current.projects.set(subProjectA, {
+        workspaces: [],
+        parentProjectPath: projectPath,
+        codeWorkspaceSyncPath: "a.code-workspace",
+      });
+      current.projects.set(subProjectB, {
+        workspaces: [],
+        parentProjectPath: projectPath,
+        codeWorkspaceSyncPath: "b.code-workspace",
+      });
+      return current;
+    });
+    const fileA = path.join(subProjectA, "a.code-workspace");
+    const fileB = path.join(subProjectB, "b.code-workspace");
+    // File A already lists the workspace, as a prior sync would have left it.
+    fs.writeFileSync(fileA, JSON.stringify({ folders: [{ path: worktreePath }] }));
+
+    const client = createRouterClient(router(), {
+      context: {
+        config,
+        projectService: new ProjectService(config),
+        workspaceService: { refreshAndEmitMetadata: async () => undefined },
+      } as unknown as ORPCContext,
+    });
+    const result = await client.projects.subProjects.assignWorkspace({
+      projectPath,
+      workspaceId: "aaaaaaaaaa",
+      subProjectPath: subProjectB,
+    });
+
+    expect(result.success).toBe(true);
+    const foldersOf = (file: string) =>
+      (JSON.parse(fs.readFileSync(file, "utf-8")) as { folders: Array<{ path: string }> }).folders;
+    expect(foldersOf(fileA).map((f) => f.path)).not.toContain(worktreePath);
+    expect(foldersOf(fileB).map((f) => f.path)).toContain(worktreePath);
   });
 });

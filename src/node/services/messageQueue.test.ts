@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "bun:test";
 import { MessageQueue } from "./messageQueue";
-import type { XumMessageMetadata } from "@/common/types/message";
+import { createXumMessage, type XumMessageMetadata } from "@/common/types/message";
 import type { SendMessageOptions } from "@/common/orpc/types";
 
 describe("MessageQueue", () => {
@@ -1112,6 +1112,57 @@ describe("MessageQueue", () => {
       queue.add("", { model: "gpt-4", agentId: "exec", fileParts: [image] });
 
       expect(queue.getDisplayText()).toBe("");
+    });
+  });
+
+  describe("preTurnMessages", () => {
+    const preTurnRow = (id: string) =>
+      createXumMessage(id, "assistant", `payload ${id}`, { timestamp: 0, synthetic: true });
+
+    it("seals entries carrying pre-turn rows and returns them from dequeueNext", () => {
+      // r30: a family trigger and its payload row must stay 1:1 — a later
+      // synthetic message batching into the same entry would join the trigger
+      // texts while both payloads pile onto one dispatch.
+      queue.add(
+        "trigger one",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { synthetic: true, agentInitiated: true, preTurnMessages: [preTurnRow("fam-1")] }
+      );
+      queue.add(
+        "trigger two",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { synthetic: true, agentInitiated: true, preTurnMessages: [preTurnRow("fam-2")] }
+      );
+
+      const first = queue.dequeueNext();
+      expect(first.message).toBe("trigger one");
+      expect(first.internal?.preTurnMessages?.map((row) => row.id)).toEqual(["fam-1"]);
+
+      const second = queue.dequeueNext();
+      expect(second.message).toBe("trigger two");
+      expect(second.internal?.preTurnMessages?.map((row) => row.id)).toEqual(["fam-2"]);
+      expect(queue.isEmpty()).toBe(true);
+    });
+
+    it("keeps later plain synthetic messages out of a pre-turn entry", () => {
+      queue.add(
+        "trigger",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { synthetic: true, agentInitiated: true, preTurnMessages: [preTurnRow("fam-3")] }
+      );
+      queue.add(
+        "unrelated background wake",
+        { model: "gpt-4", agentId: "exec", queueDispatchMode: "tool-end" },
+        { synthetic: true, agentInitiated: true }
+      );
+
+      const first = queue.dequeueNext();
+      expect(first.message).toBe("trigger");
+      expect(first.internal?.preTurnMessages?.map((row) => row.id)).toEqual(["fam-3"]);
+
+      const second = queue.dequeueNext();
+      expect(second.message).toBe("unrelated background wake");
+      expect(second.internal?.preTurnMessages).toBeUndefined();
     });
   });
 });

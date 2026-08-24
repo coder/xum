@@ -1008,6 +1008,66 @@ function mergeConsecutiveUserMessages(messages: ModelMessage[]): ModelMessage[] 
   return merged;
 }
 
+type AssistantContentArray = Exclude<AssistantModelMessage["content"], string>;
+
+/** True when the content is plain text: a string, or an array of only text parts. */
+function isTextOnlyAssistantContent(content: AssistantModelMessage["content"]): boolean {
+  if (typeof content === "string") return true;
+  return content.every((part) => part.type === "text");
+}
+
+/**
+ * Merge a text-only assistant message into a directly preceding assistant
+ * message. Synthetic assistant rows (branch summaries; potentially other
+ * generated notices) can land right after a streamed assistant turn, and
+ * Anthropic requires alternating user/assistant roles. Deliberately narrow:
+ * the INCOMING message must be text-only, and the previous message must not
+ * end in tool calls (their tool-result adjacency must stay intact — a
+ * tool-call assistant message is followed by a tool message, so those pairs
+ * never reach this merge anyway). Reasoning parts already in the previous
+ * message are preserved ahead of the appended text.
+ */
+function mergeConsecutiveAssistantTextMessages(messages: ModelMessage[]): ModelMessage[] {
+  const merged: ModelMessage[] = [];
+
+  for (const msg of messages) {
+    const prev = merged[merged.length - 1];
+    if (
+      msg.role === "assistant" &&
+      prev?.role === "assistant" &&
+      isTextOnlyAssistantContent(msg.content) &&
+      (typeof prev.content === "string" || !prev.content.some((part) => part.type === "tool-call"))
+    ) {
+      // Preserve the original text parts verbatim instead of re-joining them
+      // into one string: rebuilding parts as plain {type,text} would discard
+      // part-level providerOptions (e.g. cacheControl) carried by the folded
+      // row. Only the message envelope of the merged-away row is dropped.
+      // Empty and whitespace-only text parts are filtered from BOTH sides —
+      // the previous row can itself carry one (extended thinking preserves
+      // signed-reasoning rows whose text part is empty, and an interrupted
+      // stream can persist a whitespace-only delta) and Anthropic rejects
+      // text blocks without non-whitespace content; non-text parts
+      // (reasoning) pass through with their providerOptions.
+      const dropEmptyText = <T extends { type: string; text?: unknown }>(part: T) =>
+        part.type !== "text" || (typeof part.text === "string" && part.text.trim().length > 0);
+      const currentParts: AssistantContentArray =
+        typeof msg.content === "string"
+          ? msg.content.trim().length > 0
+            ? [{ type: "text", text: msg.content }]
+            : []
+          : msg.content.filter(dropEmptyText);
+      const prevParts: AssistantContentArray =
+        typeof prev.content === "string" ? [{ type: "text", text: prev.content }] : prev.content;
+      const prevContent: AssistantContentArray = prevParts.filter(dropEmptyText);
+      merged[merged.length - 1] = { ...prev, content: [...prevContent, ...currentParts] };
+      continue;
+    }
+    merged.push(msg);
+  }
+
+  return merged;
+}
+
 function ensureAnthropicThinkingBeforeToolCalls(messages: ModelMessage[]): ModelMessage[] {
   const result: ModelMessage[] = [];
 
@@ -1171,7 +1231,13 @@ export function transformModelMessages(
   // Pass 5: Merge consecutive user messages (applies to all providers)
   const merged = mergeConsecutiveUserMessages(reasoningHandled);
 
-  return merged;
+  // Pass 6: Merge text-only synthetic assistant rows (branch summaries) into
+  // a preceding assistant turn — Anthropic rejects consecutive assistant
+  // messages just as it rejects consecutive user messages. Anthropic-only:
+  // other providers accept adjacent assistant rows, and an unconditional
+  // merge would change provider-request bytes for histories that contain
+  // them outside this path (recovery, imported history).
+  return provider === "anthropic" ? mergeConsecutiveAssistantTextMessages(merged) : merged;
 }
 
 /**

@@ -13,6 +13,11 @@ import { Err, Ok } from "@/common/types/result";
 import { resolveProviderCredentials } from "@/node/utils/providerRequirements";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { isPathInsideDir, stripTrailingSlashes } from "@/node/utils/pathUtils";
+import {
+  CODE_WORKSPACE_EXTENSION,
+  managedRootsByProject,
+  syncProjectCodeWorkspace,
+} from "@/node/worktree/codeWorkspaceSync";
 import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
 import {
   WorkspaceGoalChildWorkspaceError,
@@ -50,6 +55,7 @@ import {
   resolveWorkspaceRootPath,
 } from "@/node/runtime/runtimeHelpers";
 import {
+  buildAddedPluginKeyValidator,
   resolveAgentPluginsMcpContext,
   type AgentPluginsMcpContext,
 } from "@/node/services/agentPlugins/mcpConfig";
@@ -2269,12 +2275,10 @@ export const router = (authToken?: string) => {
         .input(schemas.providers.getConfig.input)
         .output(schemas.providers.getConfig.output)
         .handler(({ context }) => context.providerService.getConfig()),
-      addCustomOpenAICompatibleProvider: t
-        .input(schemas.providers.addCustomOpenAICompatibleProvider.input)
-        .output(schemas.providers.addCustomOpenAICompatibleProvider.output)
-        .handler(({ context, input }) =>
-          context.providerService.addCustomOpenAICompatibleProvider(input)
-        ),
+      addCustomProvider: t
+        .input(schemas.providers.addCustomProvider.input)
+        .output(schemas.providers.addCustomProvider.output)
+        .handler(({ context, input }) => context.providerService.addCustomProvider(input)),
       removeCustomProvider: t
         .input(schemas.providers.removeCustomProvider.input)
         .output(schemas.providers.removeCustomProvider.output)
@@ -3187,6 +3191,85 @@ export const router = (authToken?: string) => {
           return result;
         }),
     },
+    // Managed Agent Plugin installs (agent-plugins experiment). The service
+    // gates every method on the experiment flag and throws user-facing
+    // errors; handlers translate them into Result values.
+    agentPlugins: {
+      preview: t
+        .input(schemas.agentPlugins.preview.input)
+        .output(schemas.agentPlugins.preview.output)
+        .handler(async ({ context, input }) => {
+          try {
+            const data = await context.agentPluginInstallService.preview({
+              input: input.input,
+              ref: input.ref ?? undefined,
+              subpath: input.subpath ?? undefined,
+            });
+            return { success: true, data };
+          } catch (error) {
+            return { success: false, error: getErrorMessage(error) };
+          }
+        }),
+      install: t
+        .input(schemas.agentPlugins.install.input)
+        .output(schemas.agentPlugins.install.output)
+        .handler(async ({ context, input }) => {
+          try {
+            const data = await context.agentPluginInstallService.install(input);
+            return { success: true, data };
+          } catch (error) {
+            return { success: false, error: getErrorMessage(error) };
+          }
+        }),
+      list: t
+        .input(schemas.agentPlugins.list.input)
+        .output(schemas.agentPlugins.list.output)
+        .handler(async ({ context }) => {
+          try {
+            const data = await context.agentPluginInstallService.list();
+            return { success: true, data };
+          } catch (error) {
+            return { success: false, error: getErrorMessage(error) };
+          }
+        }),
+      containerLocation: t
+        .input(schemas.agentPlugins.containerLocation.input)
+        .output(schemas.agentPlugins.containerLocation.output)
+        .handler(({ context }) => context.agentPluginInstallService.containerLocation()),
+      uninstall: t
+        .input(schemas.agentPlugins.uninstall.input)
+        .output(schemas.agentPlugins.uninstall.output)
+        .handler(async ({ context, input }) => {
+          try {
+            await context.agentPluginInstallService.uninstall(input);
+            return { success: true, data: undefined };
+          } catch (error) {
+            return { success: false, error: getErrorMessage(error) };
+          }
+        }),
+      checkUpdates: t
+        .input(schemas.agentPlugins.checkUpdates.input)
+        .output(schemas.agentPlugins.checkUpdates.output)
+        .handler(async ({ context }) => {
+          try {
+            const data = await context.agentPluginInstallService.checkUpdates();
+            return { success: true, data };
+          } catch (error) {
+            return { success: false, error: getErrorMessage(error) };
+          }
+        }),
+      update: t
+        .input(schemas.agentPlugins.update.input)
+        .output(schemas.agentPlugins.update.output)
+        .handler(async ({ context, input }) => {
+          try {
+            const data = await context.agentPluginInstallService.update(input);
+            return { success: true, data };
+          } catch (error) {
+            return { success: false, error: getErrorMessage(error) };
+          }
+        }),
+    },
     mcpOauth: {
       startDesktopFlow: t
         .input(schemas.mcpOauth.startDesktopFlow.input)
@@ -3427,6 +3510,51 @@ export const router = (authToken?: string) => {
               : undefined;
             return config;
           });
+        }),
+      setCodeWorkspaceSyncPath: t
+        .input(schemas.projects.setCodeWorkspaceSyncPath.input)
+        .output(schemas.projects.setCodeWorkspaceSyncPath.output)
+        .handler(async ({ context, input }) => {
+          const normalizedPath = stripTrailingSlashes(input.projectPath);
+          const trimmed = input.codeWorkspaceSyncPath?.trim() ?? "";
+          if (trimmed && !trimmed.endsWith(CODE_WORKSPACE_EXTENSION)) {
+            // The sync read-modify-writes this file, so refuse arbitrary targets.
+            // ORPCError so the message reaches the UI instead of "Internal server error".
+            throw new ORPCError("BAD_REQUEST", {
+              message: `Path must end with ${CODE_WORKSPACE_EXTENSION}`,
+            });
+          }
+          let previousValue: string | undefined;
+          await context.config.editConfig((config) => {
+            const project = config.projects.get(normalizedPath);
+            if (!project) {
+              throw new Error(`Project not found: ${normalizedPath}`);
+            }
+            previousValue = project.codeWorkspaceSyncPath;
+            // Store undefined for blank input to keep config.json minimal.
+            project.codeWorkspaceSyncPath = trimmed ? trimmed : undefined;
+            return config;
+          });
+          // Sync immediately so enabling takes effect without waiting for the
+          // next workspace lifecycle event. Clearing or changing the path never
+          // deletes previously written files (they belong to the user).
+          if (trimmed) {
+            const result = await syncProjectCodeWorkspace(context.config, normalizedPath);
+            if (!result.ok) {
+              // Roll back so a broken integration is not retried on every
+              // later lifecycle event, and surface the reason to the user.
+              // Guarded: a concurrent save may have stored a newer value that
+              // this failing request must not discard.
+              await context.config.editConfig((config) => {
+                const project = config.projects.get(normalizedPath);
+                if (project?.codeWorkspaceSyncPath === trimmed) {
+                  project.codeWorkspaceSyncPath = previousValue;
+                }
+                return config;
+              });
+              throw new ORPCError("BAD_REQUEST", { message: result.error });
+            }
+          }
         }),
       remove: t
         .input(schemas.projects.remove.input)
@@ -3863,6 +3991,14 @@ export const router = (authToken?: string) => {
           .input(schemas.projects.subProjects.assignWorkspace.input)
           .output(schemas.projects.subProjects.assignWorkspace.output)
           .handler(async ({ context, input }) => {
+            // Reassignment moves the workspace between sub-project workspace
+            // files. Capture the previous assignment (and the managed roots
+            // the workspace contributed to it) before it changes: afterwards
+            // the old file could no longer remove the entry, for the same
+            // reason workspace removal captures managedRootsByProject.
+            const previousMetadata = (await context.config.getAllWorkspaceMetadata()).find(
+              (m) => m.id === input.workspaceId
+            );
             const result = await context.projectService.assignWorkspaceToSubProject(
               input.projectPath,
               input.workspaceId,
@@ -3870,6 +4006,28 @@ export const router = (authToken?: string) => {
             );
             if (result.success) {
               await context.workspaceService.refreshAndEmitMetadata(input.workspaceId);
+              // Best-effort (results logged inside): reconcile both sides of
+              // the reassignment so the old file drops the entry and the new
+              // one gains it without waiting for the next lifecycle event.
+              if (input.subProjectPath !== null) {
+                await syncProjectCodeWorkspace(context.config, input.subProjectPath);
+              }
+              const previousSubProjectPath =
+                previousMetadata?.subProjectPath != null
+                  ? stripTrailingSlashes(previousMetadata.subProjectPath)
+                  : null;
+              const newSubProjectPath =
+                input.subProjectPath !== null ? stripTrailingSlashes(input.subProjectPath) : null;
+              if (
+                previousMetadata &&
+                previousSubProjectPath !== null &&
+                previousSubProjectPath !== newSubProjectPath
+              ) {
+                await syncProjectCodeWorkspace(context.config, previousSubProjectPath, {
+                  extraManagedRootDirs:
+                    managedRootsByProject(previousMetadata).get(previousSubProjectPath),
+                });
+              }
             }
             return result;
           }),
@@ -4141,6 +4299,34 @@ export const router = (authToken?: string) => {
             context.memoryService.off("change", onChange);
             context.memoryConsolidationService.off("statusChange", onStatusChange);
           }
+        }),
+    },
+    refinements: {
+      // /refine trajectory distillation (RLM r11). Gating lives in the
+      // service: it refuses when the rlm-mode machine overrides are off.
+      run: t
+        .input(schemas.refinements.run.input)
+        .output(schemas.refinements.run.output)
+        .handler(async ({ context, input }) => {
+          const result = await context.refineService.run(input.workspaceId, input.experiments);
+          return result.success
+            ? { success: true as const, data: result.data }
+            : { success: false as const, error: result.error };
+        }),
+      // Explicit approval step: applies the staged edits from the last run
+      // through the same journaled tool paths (rollback keeps working).
+      apply: t
+        .input(schemas.refinements.apply.input)
+        .output(schemas.refinements.apply.output)
+        .handler(async ({ context, input }) => {
+          const result = await context.refineService.apply(
+            input.workspaceId,
+            input.approvedProposalHash,
+            input.experiments
+          );
+          return result.success
+            ? { success: true as const, data: result.data }
+            : { success: false as const, error: result.error };
         }),
     },
     workspace: {
@@ -5629,7 +5815,7 @@ export const router = (authToken?: string) => {
               policy.mcp.allowUserDefined.remote === false;
 
             if (mcpDisabledByPolicy) {
-              return {};
+              return { overrides: {}, revision: "mcp-disabled-by-policy" };
             }
 
             try {
@@ -5637,8 +5823,10 @@ export const router = (authToken?: string) => {
                 input.workspaceId
               );
             } catch {
-              // Defensive: overrides must never brick workspace UI.
-              return {};
+              // Defensive: overrides must never brick workspace UI. The
+              // sentinel revision never matches a real one, so a save from
+              // this unknown state is rejected instead of clobbering data.
+              return { overrides: {}, revision: "unavailable" };
             }
           }),
         prompts: {
@@ -5674,9 +5862,10 @@ export const router = (authToken?: string) => {
               if (!readyResult.ready) {
                 throw new Error(readyResult.error);
               }
-              const overrides = await context.workspaceMcpOverridesService.getOverridesForWorkspace(
-                input.workspaceId
-              );
+              const { overrides } =
+                await context.workspaceMcpOverridesService.getOverridesForWorkspace(
+                  input.workspaceId
+                );
               // Match streamMessage and the prompt-invocation resolver: multi-project
               // workspaces need every project's secrets, not just the primary's.
               const projectSecrets = await secretsToRecord(
@@ -5710,13 +5899,45 @@ export const router = (authToken?: string) => {
             try {
               await context.workspaceMcpOverridesService.setOverridesForWorkspace(
                 input.workspaceId,
-                input.overrides
-              );
-              // Prompt invocation can hit cached servers before the next stream
-              // recomputes enablement, so sync the manager's view immediately.
-              await context.mcpServerManager.applyWorkspaceOverrides(
-                input.workspaceId,
-                input.overrides
+                input.overrides,
+                {
+                  expectedRevision: input.expectedRevision,
+                  // Content-derived revisions cannot detect an uninstall that
+                  // left overrides byte-identical ({} before and after), so a
+                  // stale dialog could persist a plugin: key for a plugin
+                  // that is gone. Validate additions against the DISCOVERED
+                  // plugin server keys for this workspace (managed installs,
+                  // project containers, ~/.agents/plugins, unmanaged dirs) —
+                  // the same set the modal lists from.
+                  validateAgainstCurrent: buildAddedPluginKeyValidator(async () => {
+                    const metadataResult = await context.aiService.getWorkspaceMetadata(
+                      input.workspaceId
+                    );
+                    if (!metadataResult.success) {
+                      throw new Error(metadataResult.error);
+                    }
+                    const projectPath = metadataResult.data.projectPath;
+                    const servers = await context.mcpConfigService.listServers(
+                      projectPath,
+                      isTrustedProjectPath(context, projectPath),
+                      {
+                        agentPlugins: await resolveWorkspaceAgentPluginsMcpContext(
+                          context,
+                          input.workspaceId,
+                          projectPath
+                        ),
+                      }
+                    );
+                    return new Set(Object.keys(servers).filter((key) => key.startsWith("plugin:")));
+                  }),
+                  // Prompt invocation can hit cached servers before the next
+                  // stream recomputes enablement, so sync the manager's view —
+                  // INSIDE the write queue, so a concurrent plugin-uninstall
+                  // prune cannot interleave its own publication and leave the
+                  // cache holding the older snapshot (in either direction).
+                  publish: (persisted) =>
+                    context.mcpServerManager.applyWorkspaceOverrides(input.workspaceId, persisted),
+                }
               );
               return { success: true, data: undefined };
             } catch (error) {
@@ -6080,7 +6301,11 @@ export const router = (authToken?: string) => {
         .input(schemas.terminal.openWindow.input)
         .output(schemas.terminal.openWindow.output)
         .handler(async ({ context, input }) => {
-          return context.terminalService.openWindow(input.workspaceId, input.sessionId);
+          return context.terminalService.openWindow(
+            input.workspaceId,
+            input.sessionId,
+            input.initialTitle
+          );
         }),
       closeWindow: t
         .input(schemas.terminal.closeWindow.input)

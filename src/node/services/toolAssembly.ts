@@ -11,6 +11,12 @@
 
 import type { Tool } from "ai";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
+import { getErrorMessage } from "@/common/utils/errors";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import type { SendMessageOptions } from "@/common/orpc/types";
+
+/** Renderer-sent experiment flags (SendMessageOptions.experiments). */
+type SendMessageExperiments = SendMessageOptions["experiments"];
 
 import { applyToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { applyCapabilityGrants } from "@/common/utils/tools/capabilityGrants";
@@ -25,6 +31,8 @@ import type { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { ToolBridge } from "@/node/services/ptc/toolBridge";
 import type { PTCExecutionResult } from "@/node/services/ptc/types";
 import { sandboxHostService, type SandboxMount } from "@/node/services/sandbox/sandboxHostService";
+import { createRefinementRollbackTool } from "@/node/services/tools/refinement_rollback";
+import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import { log } from "./log";
 import type { MCPWorkspaceStats } from "@/node/services/mcpServerManager";
 import type { TelemetryService } from "@/node/services/telemetryService";
@@ -124,17 +132,25 @@ export interface ApplyToolPolicyAndExperimentsOptions {
   experiments?: {
     programmaticToolCalling?: boolean;
     programmaticToolCallingExclusive?: boolean;
+    /**
+     * RLM mode: graduate code_execution onto the persistent per-workspace
+     * kernel mount (shared `vars`, snapshot/restore). Gated on the PTC parent
+     * by construction — this flag is only read inside the PTC branch below.
+     */
+    rlm?: boolean;
   };
   /** Callback to forward nested PTC tool events to the stream. */
   emitNestedToolEvent: (event: PTCEventWithParent) => void;
   /**
    * Sandbox host context for code_execution. When set AND persistent mounts
-   * are enabled (MUX_SANDBOX_PERSISTENT_MOUNTS=1), code_execution reuses a
-   * per-workspace persistent mount (shared `vars`, snapshot/restore) instead
-   * of an ephemeral per-call runtime. Foundation-level opt-in only; the
-   * persistent-kernel UX belongs to the RLM track.
+   * are enabled (RLM mode experiment or MUX_SANDBOX_PERSISTENT_MOUNTS=1),
+   * code_execution reuses a per-workspace persistent mount (shared `vars`,
+   * snapshot/restore) instead of an ephemeral per-call runtime.
+   * kernelFileLoader backs mux.load (r12 bulk ingestion) — built by the
+   * caller from the workspace cwd/runtime pair the file tools use; only
+   * honored in kernel mode with file_read bridged.
    */
-  sandbox?: { workspaceId: string; sessionDir: string };
+  sandbox?: { workspaceId: string; sessionDir: string; kernelFileLoader?: KernelFileLoader };
   /**
    * Capability grants for this assembly (registry-with-filters posture).
    * Omitted = session-scope full grants (identical to pre-grants behavior).
@@ -147,6 +163,31 @@ export interface ApplyToolPolicyAndExperimentsOptions {
 /** Env opt-in for persistent code_execution mounts (dogfooding/Track 2). */
 export function persistentSandboxMountsEnabled(): boolean {
   return resolveXumEnvironmentValue("SANDBOX_PERSISTENT_MOUNTS", process.env) === "1";
+}
+
+/**
+ * Backfill the PTC/RLM experiment trio from the backend's persisted overrides
+ * (same `?? isExperimentEnabled` pattern as other backend-gated experiments in
+ * streamMessage). A renderer with no origin-local override sends `undefined`
+ * for these flags while the effective UI and /refine gate resolve against the
+ * backend override — tool assembly must agree or a persisted-RLM workspace
+ * silently streams with the non-persistent flat/PTC toolset. Explicit
+ * renderer values (true or false) always win over the backend fallback.
+ */
+export function resolveBackendGatedPtcExperiments(
+  experiments: SendMessageExperiments | undefined,
+  isExperimentEnabled: (experimentId: ExperimentId) => boolean
+): NonNullable<SendMessageExperiments> {
+  return {
+    ...experiments,
+    programmaticToolCalling:
+      experiments?.programmaticToolCalling ??
+      isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
+    programmaticToolCallingExclusive:
+      experiments?.programmaticToolCallingExclusive ??
+      isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE),
+    rlm: experiments?.rlm ?? isExperimentEnabled(EXPERIMENT_IDS.RLM),
+  };
 }
 
 /**
@@ -192,6 +233,12 @@ export async function applyToolPolicyAndExperiments(
 
   // Handle PTC experiments — add or replace tools with code_execution
   let toolsForModel = policyFilteredTools;
+  // RLM is exclusive-only: supplement-mode RLM measured ~2x flat tokens/cost
+  // (flat schemas + kernel type defs shipped while models still take the flat
+  // path), so enabling RLM forces the kernel-first exclusive toolset. The
+  // standalone exclusive experiment stays usable without RLM (no kernel).
+  const rlmActive = experiments?.rlm === true;
+  const exclusiveActive = experiments?.programmaticToolCallingExclusive === true || rlmActive;
   if (experiments?.programmaticToolCalling || experiments?.programmaticToolCallingExclusive) {
     try {
       // Lazy-load PTC modules only when experiments are enabled
@@ -217,8 +264,10 @@ export async function applyToolPolicyAndExperiments(
       // The lease runner (withPersistentMount) holds the scope lock from
       // acquisition through execution.
       const bridgeKey = toolBridge.getBridgeableToolNames().sort().join(",");
+      // RLM mode is the user-facing opt-in; the env var stays as a dev/test
+      // override so persistent mounts can be dogfooded without the experiment.
       const withMount =
-        sandbox && persistentSandboxMountsEnabled()
+        sandbox && (experiments?.rlm === true || persistentSandboxMountsEnabled())
           ? (fn: (mount: SandboxMount) => Promise<PTCExecutionResult>) =>
               sandboxHostService.withPersistentMount(
                 {
@@ -237,10 +286,18 @@ export async function applyToolPolicyAndExperiments(
         runtimeFactory,
         toolBridge,
         emitNestedToolEvent,
-        withMount
+        withMount,
+        // Kernel-first description preamble rides RLM (which is exclusive-only
+        // now); exclusive alone (or the env-var mount override) keeps today's
+        // exclusive descriptions byte-identical. createCodeExecutionTool
+        // additionally requires a live persistent mount before honoring it.
+        {
+          kernelFirst: rlmActive,
+          loadFile: sandbox?.kernelFileLoader,
+        }
       );
 
-      if (experiments?.programmaticToolCallingExclusive) {
+      if (exclusiveActive) {
         // Exclusive mode: code_execution is mandatory — it's the only way to use bridged
         // tools. The experiment flag is the opt-in; policy cannot disable it here since
         // that would leave no way to access tools. nonBridgeable is policy-filtered but
@@ -265,8 +322,43 @@ export async function applyToolPolicyAndExperiments(
           effectiveToolPolicy
         );
       }
+
+      // RLM-only model surface: ID-addressed rollback of journaled harness
+      // self-modifications (refinement rows). Read inside the PTC branch by
+      // construction (RLM is nested under the PTC parent) — with the
+      // experiment off the tool never exists and provider requests stay
+      // byte-identical. The env-var mount override deliberately does NOT
+      // expose it: persistent mounts are a dev override, RLM is the opt-in.
+      if (experiments?.rlm === true && sandbox) {
+        // Policy and grants are both ceilings over the whole model-visible
+        // set; this tool is synthesized after they were applied above, so
+        // re-apply BOTH here — a least-privilege assembly (or a policy that
+        // disables the tool, e.g. a broad regex disable rule) must not gain a
+        // harness-rollback surface. Unlike code_execution in exclusive mode,
+        // rollback is never mandatory, so policy may freely remove it.
+        let rollback: Record<string, Tool> = {
+          refinement_rollback: createRefinementRollbackTool(sandbox),
+        };
+        rollback = applyToolPolicy(rollback, effectiveToolPolicy);
+        if (opts.capabilityGrants) {
+          rollback = applyCapabilityGrants(rollback, opts.capabilityGrants);
+        }
+        toolsForModel = { ...toolsForModel, ...rollback };
+      }
     } catch (error) {
-      // Fall back to policy-filtered tools if PTC creation fails
+      // RLM fails CLOSED (r49): silently degrading to the complete flat
+      // toolset would drop the exclusive persistent kernel and its
+      // nested-result context isolation while the run is still recorded as
+      // RLM — bulk tool results would leak into model context and corrupt
+      // RLM evaluations. Surfacing the failure lets the send fail visibly
+      // and the user retry once the cause (e.g. QuickJS WASM load) clears.
+      if (rlmActive) {
+        throw new Error(
+          `RLM kernel assembly failed and RLM must not silently fall back to flat tools: ${getErrorMessage(error)}`
+        );
+      }
+      // Non-RLM PTC keeps the legacy behavior: fall back to policy-filtered
+      // tools if code_execution creation fails.
       log.error("Failed to create code_execution tool, falling back to base tools", { error });
     }
   }

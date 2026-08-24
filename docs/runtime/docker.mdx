@@ -26,6 +26,10 @@ Select Docker in the workspace creation UI and specify an image:
 - `python:3.12` - Python with git pre-installed
 - Custom images with your toolchain
 
+## Using Podman
+
+When Docker is unavailable, Xum automatically uses Podman as a drop-in container engine. Set `XUM_CONTAINER_CLI` to force a specific container CLI binary instead.
+
 ## Credential sharing
 
 Check "Share credentials" when creating a Docker workspace to enable git authentication:

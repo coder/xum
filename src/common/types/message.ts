@@ -542,6 +542,15 @@ export type XumMessageMetadata = XumMessageMetadataBase &
          * - auto-compaction: threshold-triggered compaction (on-send / mid-stream)
          */
         source?: "idle-compaction" | "auto-compaction";
+        /**
+         * RLM keep-recent floor (rlm-mode experiment): history rows at or after
+         * this historySequence are excluded from the summarization request and
+         * preserved verbatim (re-appended after the boundary) instead of being
+         * summarized. Stamped at request-persist time so live assembly,
+         * compaction completion, and replay all derive the same tail from
+         * durable rows. Absent when RLM is off — behavior is then unchanged.
+         */
+        keepRecentTail?: { startHistorySequence: number };
         /** Transient status to display in sidebar during this operation */
         displayStatus?: DisplayStatus;
       }
@@ -585,6 +594,35 @@ export type XumMessageMetadata = XumMessageMetadataBase &
       }
     | {
         type: "goal-pause-boundary";
+      }
+    | {
+        // Durable, provider-visible summary of an abandoned history branch
+        // (rlm-mode experiment): appended after a fork-from-message or an
+        // edit-resend truncation so the new branch retains context from the
+        // discarded tail. The labeled summary stays in the message text for
+        // the model; this marker identifies the row for UI/tests.
+        type: "branch-summary";
+      }
+    | {
+        // Durable summary of a completed /refine pass (rlm-mode experiment):
+        // lists each applied self-modification with its refinement journal id
+        // so users can audit and roll edits back (r6). The labeled summary
+        // stays in the message text; this marker identifies the row for
+        // UI/tests.
+        type: "refine-summary";
+        /**
+         * Staged-mode proposals only: sha256 over the canonical staged-edit
+         * set rendered in this row. /refine apply verifies refine-staged.json
+         * still hashes to this value, binding approval to the displayed bytes.
+         */
+        stagedSetHash?: string;
+      }
+    | {
+        // Child-controlled family-message payload (task_message_parent),
+        // stored as an ASSISTANT-role synthetic row so prompt-injected child
+        // output never gains user-priority trust; a separate fixed-content
+        // user trigger row (no child bytes) wakes the parent turn.
+        type: "family-message";
       }
     | {
         type: "heartbeat-request";
@@ -778,6 +816,15 @@ export interface XumMetadata {
    * match terminal events to the originating ACP request in shared workspaces.
    */
   acpPromptId?: string;
+
+  /**
+   * RLM keep-recent floor: marks a sanitized copy of a pre-compaction message
+   * re-appended after its compaction boundary so the model keeps the recent
+   * tail verbatim. Copies are synthetic (UI-hidden — the originals remain
+   * visible above the boundary) and carry no usage/cost metadata so session
+   * usage rebuilds never double-count them.
+   */
+  rlmPreservedTailCopy?: boolean;
 
   /**
    * @file mention snapshot token(s) this message provides content for.

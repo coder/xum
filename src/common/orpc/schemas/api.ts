@@ -10,6 +10,7 @@ import {
   MAX_STAGED_ATTACHMENT_BASE64_CHARS,
   MAX_STAGED_ATTACHMENT_SIZE_BYTES,
 } from "@/common/constants/stagedAttachments";
+import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
 import { ChatStatsSchema, SessionUsageFileSchema } from "./chatStats";
 import { AdditionalSystemContextSchema, WorkspaceInstructionsSchema } from "./instructions";
 import {
@@ -51,6 +52,7 @@ import {
 import { SecretSchema } from "./secrets";
 import {
   CompletedMessagePartSchema,
+  ExperimentsSchema,
   HeartbeatEventSchema,
   OnChatModeSchema,
   SendMessageOptionsSchema,
@@ -119,6 +121,13 @@ import {
   MCPTestResultSchema,
   WorkspaceMCPOverridesSchema,
 } from "./mcp";
+import {
+  AgentPluginGitSourceSchema,
+  AgentPluginInstallEntrySchema,
+  AgentPluginInstallPreviewSchema,
+  AgentPluginListItemSchema,
+  AgentPluginUpdateCheckSchema,
+} from "./agentPlugins";
 import { PolicyGetResponseSchema } from "./policy";
 import {
   AgentAiDefaultsSchema,
@@ -239,7 +248,7 @@ export const ProviderConfigInfoSchema = z.object({
   baseUrlSource: z.enum(["config", "env"]).nullish(),
   /** Active base URL for display only. Env values must not be persisted from this field. */
   baseUrlResolved: z.string().nullish(),
-  providerType: z.literal("openai-compatible").optional(),
+  providerType: z.enum(CUSTOM_PROVIDER_TYPES).optional(),
   displayName: z.string().optional(),
   isCustom: z.boolean().optional(),
   models: z.array(ProviderModelEntrySchema).optional(),
@@ -348,9 +357,10 @@ export const CustomProviderMutationErrorSchema = z.discriminatedUnion("code", [
 ]);
 
 export const providers = {
-  addCustomOpenAICompatibleProvider: {
+  addCustomProvider: {
     input: z.object({
       provider: z.string(),
+      providerType: z.enum(CUSTOM_PROVIDER_TYPES).optional(),
       displayName: z.string().optional(),
       baseUrl: z.string(),
       apiKey: z.string().optional(),
@@ -802,6 +812,15 @@ export const projects = {
       .passthrough(),
     output: z.void(),
   },
+  setCodeWorkspaceSyncPath: {
+    input: z
+      .object({
+        projectPath: z.string(),
+        codeWorkspaceSyncPath: z.string().nullish(),
+      })
+      .passthrough(),
+    output: z.void(),
+  },
   mcp: {
     list: {
       input: z.object({ projectPath: z.string() }),
@@ -986,6 +1005,60 @@ export const mcp = {
 };
 
 /**
+ * Managed Agent Plugin installs (agent-plugins experiment; global scope only).
+ *
+ * Human-driven surfaces only (Settings + palette) — there is deliberately no
+ * agent-facing installer tool in v1. All endpoints return Result values; the
+ * backend service gates on the experiment flag.
+ */
+export const agentPlugins = {
+  /** Temp shallow clone + validation of the staged tree; writes nothing permanent. */
+  preview: {
+    input: z.object({
+      input: z.string(),
+      ref: z.string().nullish(),
+      subpath: z.string().nullish(),
+    }),
+    output: ResultSchema(AgentPluginInstallPreviewSchema, z.string()),
+  },
+  /** Fetch the consented SHA, promote into ~/.mux/plugins, write the registry entry. */
+  install: {
+    input: z.object({
+      source: AgentPluginGitSourceSchema,
+      /** SHA from the preview the user consented to. */
+      expectedSha: z.string(),
+    }),
+    output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
+  },
+  list: {
+    input: z.void(),
+    output: ResultSchema(z.array(AgentPluginListItemSchema), z.string()),
+  },
+  /** Display path of the ACTIVE managed plugin container (config-derived root; never hardcode it in UI). */
+  containerLocation: {
+    input: z.void(),
+    output: z.string(),
+  },
+  uninstall: {
+    input: z.object({
+      name: z.string(),
+      /** Also delete ~/.mux/plugin-data/<instanceId> (default off — preserve data). */
+      deletePluginData: z.boolean(),
+    }),
+    output: ResultSchema(z.void(), z.string()),
+  },
+  /** git ls-remote per managed entry vs lockedSha; no fetch, no timers. */
+  checkUpdates: {
+    input: z.void(),
+    output: ResultSchema(z.array(AgentPluginUpdateCheckSchema), z.string()),
+  },
+  update: {
+    input: z.object({ name: z.string() }),
+    output: ResultSchema(AgentPluginInstallEntrySchema, z.string()),
+  },
+};
+
+/**
  * Secrets store.
  *
  * - When no projectPath is provided: global secrets
@@ -1116,6 +1189,75 @@ export const memory = {
   consolidate: {
     input: z.object({ workspaceId: z.string() }),
     output: ResultSchema(MemoryConsolidationRecordSchema, z.string()),
+  },
+};
+
+/** /refine (RLM r11): one applied self-modification, correlated to its r2 journal row. */
+export const RefineAppliedEditSchema = z.object({
+  /** Envelope id of the refinement journal row (rollback address for r6). */
+  refinementId: z.string(),
+  /** Human-readable action, e.g. "memory str_replace /memories/project/x.md". */
+  description: z.string(),
+});
+
+export const RefineRecordSchema = z.object({
+  applied: z.array(RefineAppliedEditSchema),
+  /** Model's closing text (per-edit rationales, or the no-op statement). */
+  summary: z.string(),
+  /** True when the pass finished cleanly without applying any edit. */
+  noOp: z.boolean(),
+  /**
+   * Edits the tools reported as applied but whose r2 journal row never landed
+   * (journal/blob failures are swallowed by design so user writes stay
+   * self-healing). Files changed with no rollback id — surfaced instead of
+   * silently classifying the pass as a no-op.
+   */
+  untrackedApplied: z.number().optional(),
+  /**
+   * Edits a /refine run STAGED for explicit approval (security: the pass
+   * never auto-applies model output). Present only on staging results;
+   * applied via refinements.apply.
+   */
+  staged: z.array(z.object({ description: z.string() })).optional(),
+  /**
+   * Approved staged edits that failed to apply (tool unavailable, input
+   * rejected by the tool schema, tool failure). Surfaced instead of folding
+   * an all-failed apply into a successful no-op.
+   */
+  failed: z.array(z.object({ description: z.string(), reason: z.string() })).optional(),
+  usage: z.object({ inputTokens: z.number(), outputTokens: z.number() }).optional(),
+});
+
+// Node-side types derive from these schemas (z.infer single source) so fields
+// can never silently be stripped by output validation.
+export type RefineAppliedEditPayload = z.infer<typeof RefineAppliedEditSchema>;
+export type RefineRecordPayload = z.infer<typeof RefineRecordSchema>;
+
+export const refinements = {
+  /** Manual /refine trajectory-distillation pass (RLM mode only; the backend refuses otherwise). Stages edits; nothing is applied until `apply`. */
+  run: {
+    // experiments: the renderer's effective flags ride the request (same
+    // authority as send options.experiments) because persisting overrides to
+    // the backend is asynchronous/best-effort — a backend-only gate could
+    // refuse /refine while the workspace already runs with the RLM kernel.
+    input: z.object({ workspaceId: z.string(), experiments: ExperimentsSchema.optional() }),
+    output: ResultSchema(RefineRecordSchema, z.string()),
+  },
+  /** Apply the staged edits from the last run (explicit user approval step). */
+  apply: {
+    input: z.object({
+      workspaceId: z.string(),
+      /**
+       * Hash of the newest staged proposal this renderer DISPLAYED (r64).
+       * Required: with XUM_ALLOW_MULTIPLE_INSTANCES=1 the shared transcript
+       * can hold a newer foreign proposal this window never rendered, so the
+       * backend cannot infer the displayed proposal from the transcript
+       * alone; apply refuses when this hash no longer matches the staged set.
+       */
+      approvedProposalHash: z.string().min(1),
+      experiments: ExperimentsSchema.optional(),
+    }),
+    output: ResultSchema(RefineRecordSchema, z.string()),
   },
 };
 
@@ -1852,7 +1994,11 @@ export const workspace = {
   mcp: {
     get: {
       input: z.object({ workspaceId: z.string() }),
-      output: WorkspaceMCPOverridesSchema,
+      output: z.object({
+        overrides: WorkspaceMCPOverridesSchema,
+        /** Opaque token for optimistic-concurrency saves (set.expectedRevision). */
+        revision: z.string(),
+      }),
     },
     prompts: {
       list: {
@@ -1864,6 +2010,13 @@ export const workspace = {
       input: z.object({
         workspaceId: z.string(),
         overrides: WorkspaceMCPOverridesSchema,
+        /**
+         * Revision returned by get. The save is rejected if the stored
+         * overrides changed since then, so a stale dialog snapshot cannot
+         * silently restore entries removed by a concurrent writer (e.g. an
+         * Agent Plugin uninstall pruning its `plugin:` keys).
+         */
+        expectedRevision: z.string(),
       }),
       output: ResultSchema(z.void(), z.string()),
     },
@@ -2122,6 +2275,8 @@ export const terminal = {
       workspaceId: z.string(),
       /** Optional session ID to reattach to an existing terminal session (for pop-out handoff) */
       sessionId: z.string().optional(),
+      /** Last known OSC title, so the pop-out badge doesn't reset to "Terminal" */
+      initialTitle: z.string().optional(),
     }),
     output: z.void(),
   },

@@ -66,7 +66,7 @@ import { dispatchWorkspaceSwitch } from "./workspaceEvents";
 import { getRuntimeKey, copyWorkspaceStorage } from "@/common/constants/storage";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
-import { isCustomOpenAICompatibleProviderConfig } from "@/common/utils/providers/customProviders";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import { isValidProvider } from "@/common/constants/providers";
 import { openInEditor } from "@/browser/utils/openInEditor";
 import {
@@ -84,7 +84,10 @@ import {
   createInvalidCompactModelToast,
 } from "@/browser/features/ChatInput/ChatInputToasts";
 import { trackCommandUsed } from "@/common/telemetry";
-import { addEphemeralMessage } from "@/browser/stores/WorkspaceStore";
+import {
+  addEphemeralMessage,
+  getDisplayedRefineProposalHash,
+} from "@/browser/stores/WorkspaceStore";
 import { setGoalWithConflictRetry } from "@/browser/utils/goals/setGoalWithConflictRetry";
 import { loadGoalDefaults, resolveGoalSetIntent } from "@/browser/utils/goals/resolveGoalSetIntent";
 import {
@@ -346,7 +349,7 @@ export async function processSlashCommand(
       }
 
       const providerConfig = providersConfig?.[provider];
-      if (!isValidProvider(provider) && !isCustomOpenAICompatibleProviderConfig(providerConfig)) {
+      if (!isValidProvider(provider) && !isCustomProviderConfig(providerConfig)) {
         setToast({
           id: Date.now().toString(),
           type: "error",
@@ -811,6 +814,103 @@ export async function processSlashCommand(
               id: Date.now().toString(),
               type: "error",
               message: `Memory consolidation failed: ${String(error)}`,
+            });
+          });
+        return { clearInput: true, toastShown: true };
+      }
+      case "refine": {
+        if (!context.workspaceId) throw new Error("Workspace ID required");
+        const refineClient = requireClient();
+        if (!refineClient) {
+          return { clearInput: false, toastShown: true };
+        }
+        // Fire-and-forget like /dream: the pass runs in the background and
+        // posts its own labeled summary row into the chat when edits were
+        // staged/applied. Only the settle toast is shown — an optimistic
+        // "started" toast would flash green-then-red when the backend rejects
+        // immediately (RLM off, run already in flight). Plain /refine only
+        // STAGES edits (security: model output is never auto-applied);
+        // /refine apply is the explicit approval step.
+        const refineWorkspaceId = context.workspaceId;
+        const refineApply = parsed.apply === true;
+        // Ride the renderer's effective experiment flags with the request:
+        // backend override persistence is asynchronous/best-effort, so a
+        // backend-only gate could refuse /refine while this client already
+        // offers the command and runs with the RLM kernel.
+        const refineExperiments = context.sendMessageOptions.experiments;
+        // r64: bind approval to the proposal THIS window rendered. The shared
+        // transcript can hold a newer foreign proposal (second app instance
+        // over the same root) that this renderer never displayed; the backend
+        // refuses to apply when the staged set no longer hashes to the
+        // proposal we send here.
+        const displayedProposalHash = refineApply
+          ? getDisplayedRefineProposalHash(refineWorkspaceId)
+          : null;
+        if (refineApply && displayedProposalHash === null) {
+          context.setToast({
+            id: Date.now().toString(),
+            type: "error",
+            message:
+              "Refine failed: no staged /refine proposal is visible in this chat; run /refine first",
+          });
+          return { clearInput: true, toastShown: true };
+        }
+        void (
+          refineApply && displayedProposalHash !== null
+            ? refineClient.refinements.apply({
+                workspaceId: refineWorkspaceId,
+                approvedProposalHash: displayedProposalHash,
+                experiments: refineExperiments,
+              })
+            : refineClient.refinements.run({
+                workspaceId: refineWorkspaceId,
+                experiments: refineExperiments,
+              })
+        )
+          .then((result) => {
+            // untrackedApplied: edits that succeeded but could not be
+            // journaled (no rollback id) — still real, so counted.
+            const appliedCount = result.success
+              ? result.data.applied.length + (result.data.untrackedApplied ?? 0)
+              : 0;
+            const failedCount = result.success ? (result.data.failed?.length ?? 0) : 0;
+            // r55: an apply where every edit failed (e.g. all staged targets
+            // changed) returns success:true with zero applied edits — a green
+            // "0 edit(s) applied, N failed" toast would read like the
+            // approved changes landed. Surface it as an error instead.
+            const allFailed =
+              result.success &&
+              refineApply &&
+              !result.data.noOp &&
+              appliedCount === 0 &&
+              failedCount > 0;
+            context.setToast(
+              result.success
+                ? {
+                    id: Date.now().toString(),
+                    type: allFailed ? "error" : "success",
+                    message: result.data.noOp
+                      ? refineApply
+                        ? "Refine: nothing was applied"
+                        : "Refine: nothing worth distilling"
+                      : refineApply
+                        ? `Refine: ${appliedCount} edit(s) applied${
+                            failedCount > 0 ? `, ${failedCount} failed` : ""
+                          } (see chat summary)`
+                        : `Refine: ${result.data.staged?.length ?? 0} edit(s) staged — approve with /refine apply`,
+                  }
+                : {
+                    id: Date.now().toString(),
+                    type: "error",
+                    message: `Refine failed: ${result.error}`,
+                  }
+            );
+          })
+          .catch((error: unknown) => {
+            context.setToast({
+              id: Date.now().toString(),
+              type: "error",
+              message: `Refine failed: ${String(error)}`,
             });
           });
         return { clearInput: true, toastShown: true };

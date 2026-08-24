@@ -4,6 +4,8 @@ import writeFileAtomic from "write-file-atomic";
 import assert from "@/common/utils/assert";
 import type { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
+import { isWorkspaceRemovalTombstoned } from "@/node/services/workspaceRemoval";
+import { withTargetMutationLock } from "@/node/services/refinement/targetMutationLocks";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
 import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
 import { sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
@@ -237,6 +239,56 @@ export class SessionUsageService {
     }
   ): Promise<{ model: string; usage: ChatUsageDisplay } | undefined> {
     if (!usage) return undefined;
+    try {
+      // r62/r63: headless writers (dream/harvest consolidation, status
+      // generation) can settle AFTER workspace removal — a foreign backend's
+      // run survives the remover's process-local cancellation entirely. The
+      // sidecar mkdir + append and the ledger write below would recreate the
+      // deleted session directory, so the durable removal tombstone gates
+      // these usage commit points too — and gate + commits run INSIDE the
+      // session-dir target mutation lock that removal's tombstone+delete
+      // critical section also holds (r63), so the check cannot go stale
+      // between here and the writes. Callers never hold memory target locks
+      // while recording usage, so this single-key acquisition cannot ABBA
+      // with removal's sorted multi-key acquisition. Dropping the spend row
+      // is correct: the workspace whose dashboards it would feed no longer
+      // exists.
+      return await withTargetMutationLock(
+        this.config.rootDir,
+        this.config.getSessionDir(workspaceId),
+        async () => {
+          if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+            log.debug("Skipping headless usage write for removed workspace", { workspaceId });
+            return undefined;
+          }
+          return await this.recordHeadlessUsageLocked(
+            workspaceId,
+            modelString,
+            usage,
+            providerMetadata,
+            options
+          );
+        }
+      );
+    } catch (error) {
+      log.warn("Failed to record headless usage", { workspaceId, modelString, error });
+      return undefined;
+    }
+  }
+
+  /** Body of recordHeadlessUsage; runs inside the session-dir target lock (r63). */
+  private async recordHeadlessUsageLocked(
+    workspaceId: string,
+    modelString: string,
+    usage: AiSdkUsageLike,
+    providerMetadata?: Record<string, unknown>,
+    options?: {
+      costsIncluded?: boolean;
+      analyticsSource?: string;
+      skipSessionLedger?: boolean;
+      metadataModel?: string;
+    }
+  ): Promise<{ model: string; usage: ChatUsageDisplay } | undefined> {
     try {
       // Headless callers pass live AI SDK usage. Normalize to mux's persisted
       // flat shape and re-inject cache-write tokens (moved off providerMetadata

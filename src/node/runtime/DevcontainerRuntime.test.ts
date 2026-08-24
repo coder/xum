@@ -179,6 +179,37 @@ describe("DevcontainerRuntime.resolveHostPathForMounted", () => {
     expect(resolveHostPathForMounted(runtime, filePath)).toBe(filePath);
   });
 });
+describe("DevcontainerRuntime.mapPathForExec", () => {
+  it("maps workspace roots and nested paths into the container", () => {
+    const runtime = createRuntime({
+      remoteWorkspaceFolder: "/workspaces/project",
+      currentWorkspacePath: "/home/user/xum/project/branch",
+    });
+
+    expect(runtime.mapPathForExec("/home/user/xum/project/branch")).toBe("/workspaces/project");
+    expect(runtime.mapPathForExec("/home/user/xum/project/branch/nested/file")).toBe(
+      "/workspaces/project/nested/file"
+    );
+  });
+
+  it("keeps paths outside the workspace unchanged", () => {
+    const runtime = createRuntime({
+      remoteWorkspaceFolder: "/workspaces/project",
+      currentWorkspacePath: "/home/user/xum/project/branch",
+    });
+
+    expect(runtime.mapPathForExec("/tmp/other")).toBe("/tmp/other");
+  });
+
+  it("keeps paths unchanged when the container workspace is unknown", () => {
+    const runtime = createRuntime({ currentWorkspacePath: "/home/user/xum/project/branch" });
+
+    expect(runtime.mapPathForExec("/home/user/xum/project/branch/nested/file")).toBe(
+      "/home/user/xum/project/branch/nested/file"
+    );
+  });
+});
+
 describe("DevcontainerRuntime.mapHostPathToContainer", () => {
   // Access the private method for testing
   function mapHostPathToContainer(runtime: DevcontainerRuntime, hostPath: string): string | null {

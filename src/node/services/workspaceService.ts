@@ -2,6 +2,7 @@ import { TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS } from "@/constants/termination
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { EventEmitter } from "events";
 import * as path from "path";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import * as fsPromises from "fs/promises";
 import assert from "@/common/utils/assert";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
@@ -29,6 +30,7 @@ import { isPathInsideDir } from "@/node/utils/pathUtils";
 import {
   AgentSession,
   clearProviderConfigFixableAbandonMarkers,
+  CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE,
   type StreamErrorRecoveryOutcome,
 } from "@/node/services/agentSession";
 import type { HistoryService } from "@/node/services/historyService";
@@ -99,6 +101,19 @@ import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers"
 import { deriveTodoStatus } from "@/common/utils/todoList";
 import { createContextResetBoundaryMessageId } from "@/node/services/utils/messageIds";
 import { fileExists } from "@/node/utils/runtime/fileExists";
+import {
+  clearPendingBranchSummary,
+  deriveSideChannelModelCandidates,
+  startAbandonedBranchSummaryInBackground,
+} from "@/node/services/branchSummary";
+import {
+  healRemovalTombstonesForRegisteredWorkspaces,
+  removeSessionDirUnderMemoryLocks,
+  refineApplyLockPath,
+  rollbackRemovalTombstoneIfOwned,
+  startRemovalTombstoneLease,
+  TombstoneNotDurableError,
+} from "@/node/services/workspaceRemoval";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
   ADDITIONAL_SYSTEM_CONTEXT_DISABLED_FILENAME,
@@ -116,6 +131,7 @@ import {
 import { isWorktreeRuntime } from "@/node/runtime/worktreeLifecycleHooks";
 import { expandTilde, expandTildeForSSH } from "@/node/runtime/tildeExpansion";
 import { removeManagedGitWorktree } from "@/node/worktree/removeManagedGitWorktree";
+import { managedRootsByProject, syncProjectCodeWorkspace } from "@/node/worktree/codeWorkspaceSync";
 
 import {
   copyStagedWorkspaceAttachments,
@@ -262,6 +278,8 @@ import type {
 } from "@/node/services/backgroundProcessManager";
 import { BashMonitorRegistryStore } from "@/node/services/bashMonitorRegistryStore";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS } from "@/constants/refine";
 import {
   BashMonitorWakeStore,
   buildBashMonitorWakeMetadata,
@@ -319,6 +337,9 @@ const MAX_WORKSPACE_NAME_COLLISION_RETRIES = 3;
  * for far longer and get reaped on a later startup.
  */
 const ORPHAN_SESSION_DIR_GRACE_MS = 24 * 60 * 60 * 1000;
+
+// Upper bound on startup .code-workspace reconciliation (see initialize()).
+const STARTUP_CODE_WORKSPACE_SYNC_TIMEOUT_MS = 10_000;
 
 /**
  * Base name used when /new auto-generates a branch name. Numbered suffixes
@@ -1986,8 +2007,27 @@ export class WorkspaceService extends EventEmitter {
     | ((workspaceId: string, outcome: IdleCompactionOutcome) => void)
     | undefined;
 
-  // Blocks new sends while a context reset is committing its durable boundary and cleanup.
-  private readonly resettingContextWorkspaces = new Set<string>();
+  // Blocks new sends while a context-discarding history mutation (reset, full
+  // clear, destructive replace) is in flight, and enforces one such mutation
+  // at a time (r40). Sends already past this entry check are refused by the
+  // session-level turn-admission block (AgentSession.holdTurnAdmission).
+  private readonly contextMutationWorkspaces = new Set<string>();
+
+  // r41: monotonic count of COMPLETED context-discarding mutations per
+  // workspace. Sends capture it synchronously with the entry check above and
+  // re-verify at their admission gates: the level-triggered admission block
+  // cannot catch a mutation that started and finished while a send sat in
+  // pre-admission awaits (e.g. branch-summary generation).
+  private readonly contextMutationEpochs = new Map<string, number>();
+
+  // r41: sends currently between the entry check and their settled outcome
+  // (queued, refused, or admitted — PREPARING is set before any early
+  // background-start return). Refine publication must not interleave with a
+  // send's pre-admission window: a proposal row published and RELEASED while
+  // a send with an already-persisted user row awaits admission would land
+  // after that user row and enter the send's request as a trailing foreign
+  // assistant row (see acquireIdleTurnExclusion).
+  private readonly preflightSendCounts = new Map<string, number>();
 
   // Tracks in-flight fork auto-title generations so only the first accepted continue
   // message can claim the workspace title.
@@ -2048,6 +2088,14 @@ export class WorkspaceService extends EventEmitter {
     this.aiService.on("providers-config-changed", this.providerConfigChangedListener);
     this.setupMetadataListeners();
     this.setupInitMetadataListeners();
+    // r63 startup self-heal: reclaim removal tombstones left behind by a
+    // removal whose config deregistration AND tombstone rollback both failed
+    // — otherwise that workspace stays registered but refused every mutation
+    // across restarts. Fire-and-forget with an explicit catch (startup
+    // initialization must never crash the app).
+    healRemovalTombstonesForRegisteredWorkspaces(this.config).catch((error: unknown) => {
+      log.debug("Removal tombstone self-heal failed at startup", { error });
+    });
   }
 
   /**
@@ -2720,12 +2768,19 @@ export class WorkspaceService extends EventEmitter {
   private memoryConsolidationService?: {
     triggerInBackground(workspaceId: string, trigger: "compaction" | "archive"): void;
     triggerHarvestThenSweepInBackground(metadata: CompactionCompletionMetadata): void;
+    cancelInFlightConsolidation(workspaceId: string): Promise<void>;
   };
   private worktreeArchiveSnapshotService?: WorktreeArchiveSnapshotLifecycleService;
   private taskService?: TaskService;
   private workspaceGoalService?: WorkspaceGoalService;
   /** Narrow DevTools cleanup surface; wired by coreServices when a DevToolsService exists. */
   private devToolsService?: { removeWorkspaceData(workspaceId: string): Promise<void> };
+  /** Cancels running /refine passes before removal deletes the session dir; wired post-construction (RefineService is built later). */
+  private refinePassCanceller?: { cancelInFlightRefinePass(workspaceId: string): Promise<void> };
+  /** Narrow overrides-cleanup surface; wired by ServiceContainer for stale plugin-key sanitization. */
+  private workspaceMcpOverridesService?: {
+    prunePluginOverrideKeys(workspaceId: string, keyPrefix: string): Promise<void>;
+  };
 
   setTimelineRecorder(recorder: TimelineRecorder): void {
     this.timelineRecorder = recorder;
@@ -2737,6 +2792,272 @@ export class WorkspaceService extends EventEmitter {
    */
   setMCPServerManager(manager: MCPServerManager): void {
     this.mcpServerManager = manager;
+  }
+
+  setWorkspaceMcpOverridesService(service: {
+    prunePluginOverrideKeys(workspaceId: string, keyPrefix: string): Promise<void>;
+  }): void {
+    this.workspaceMcpOverridesService = service;
+  }
+
+  /**
+   * Workspace IDs whose creation persisted a config entry but has not yet
+   * finished registration-time plugin-override sanitization. Two overlapping
+   * creations for the same checkout would otherwise each see the other's
+   * just-persisted entry as a live sibling and BOTH skip sanitizing; entries
+   * in this set never qualify as siblings, so the first sanitize to run
+   * prunes (a concurrent double-prune is idempotent) and later ones see a
+   * completed registration.
+   */
+  private readonly pendingPluginSanitizations = new Set<string>();
+
+  /**
+   * Serializes persist + sanitize of a new host-local registration across
+   * PROCESSES sharing this config root. pendingPluginSanitizations only
+   * covers this process: two processes registering the same preserved
+   * checkout could otherwise each persist an entry and then each read the
+   * other's unsanitized entry as a live sibling — both skipping the prune,
+   * letting a stale canonical enable activate a same-name reinstall's
+   * default-disabled server. Under the lock the second registrant scans only
+   * after the first's prune committed, so it correctly sees a completed live
+   * sibling.
+   */
+  private acquireRegistrationSanitizeLock(): Promise<() => Promise<void>> {
+    return acquireCrossProcessLock({
+      lockPath: path.join(this.config.rootDir, "workspace-registration.lock"),
+      // Persist + sibling scan + one override-file prune; canonicalization is
+      // bounded per entry, so a minute outlasts any legitimate holder.
+      acquireTimeoutMs: 60_000,
+      staleMs: 5 * 60_000,
+      timeoutMessage:
+        "Another Mux process is currently registering a workspace. Wait for it to finish and try again.",
+    });
+  }
+
+  /**
+   * TaskService entry point: task worktrees are REGISTERED before their
+   * checkout exists (queued/reserved launches persist the entry with a future
+   * path), so creation-time sanitization cannot cover them and an uninstall's
+   * override pruning enumerates a path with nothing to prune — the later
+   * materialization then restores a committed stale `plugin:` enable. Call
+   * this after the checkout materializes and BEFORE the first send. Off-host
+   * runtimes are skipped (plugin servers never spawn there in v1); shared
+   * parent checkouts are skipped by the live-sibling scan inside.
+   * Returns an error string (the launch must fail) or undefined on success.
+   */
+  async sanitizeMaterializedTaskWorkspace(
+    workspaceId: string,
+    workspacePath: string,
+    runtimeConfig: RuntimeConfig | undefined,
+    persistentSiblingConfig?: Pick<Config, "loadConfigOrDefault">
+  ): Promise<string | undefined> {
+    const hostLocal =
+      runtimeConfig === undefined ||
+      runtimeConfig.type === "local" ||
+      runtimeConfig.type === "worktree";
+    if (!hostLocal) {
+      return undefined;
+    }
+    return this.sanitizeStalePluginOverridesForNewWorkspace(
+      workspaceId,
+      workspacePath,
+      persistentSiblingConfig
+    );
+  }
+
+  /**
+   * Registration-time sanitization for workspaces that AgentSession registers
+   * directly (CLI `xum run` / `xum workflow` in a directory without existing
+   * metadata) — a path that bypasses WorkspaceService.create/fork and the
+   * task-materialization flows. Called between the config write and the
+   * metadata announcement; on failure the registration is rolled back so a
+   * preserved checkout's stale `plugin:` enables can never activate a
+   * same-name reinstall's default-disabled server on the first CLI send.
+   * Returns an error string (the caller must abort) or undefined on success.
+   */
+  async sanitizeCliRegisteredWorkspace(
+    workspaceId: string,
+    workspacePath: string,
+    runtimeConfig: RuntimeConfig | undefined,
+    /**
+     * CLI sessions run on an EPHEMERAL config whose project entries carry no
+     * workspace records, so the live-sibling scan below would never see a
+     * desktop workspace registered for the same checkout — and would prune
+     * plugin enables that live consent context still owns from the shared
+     * .xum/mcp.local.jsonc. Callers on a temp config must pass the persistent
+     * config so those siblings are visible.
+     */
+    persistentSiblingConfig?: Pick<Config, "loadConfigOrDefault">
+  ): Promise<string | undefined> {
+    this.pendingPluginSanitizations.add(workspaceId);
+    try {
+      const sanitizeError = await this.sanitizeMaterializedTaskWorkspace(
+        workspaceId,
+        workspacePath,
+        runtimeConfig,
+        persistentSiblingConfig
+      );
+      if (sanitizeError !== undefined) {
+        await this.rollbackUnsanitizedWorkspaceRegistration(workspaceId);
+      }
+      return sanitizeError;
+    } finally {
+      this.pendingPluginSanitizations.delete(workspaceId);
+    }
+  }
+
+  /**
+   * Registration-time sanitization of stale Agent Plugin override keys.
+   *
+   * A host-local workspace's `.mux/mcp.local.jsonc` lives in the checkout,
+   * which removal PRESERVES — while a removed workspace is invisible to the
+   * plugin uninstaller's pruning/tombstones. Plugin-server consent must die
+   * with the workspace that granted it: when a directory is REGISTERED as a
+   * new local workspace and no other live workspace resolves to the same
+   * path, canonical `plugin:<16-hex>:` keys are pruned before the workspace
+   * is announced, so a stale enable can never silently re-activate a
+   * same-name reinstall's default-disabled server.
+   *
+   * Deliberately NOT done at removal time: a removal-time prune edits a file
+   * that sibling workspaces (conversation forks share the local checkout) may
+   * still be using, has no durable retry if it fails (the workspace becomes
+   * unresolvable), and races Workspace MCP dialog saves that land between the
+   * prune and the metadata drop. Sanitizing at the moment the NEW workspace
+   * identity is created has none of those windows: siblings force a skip,
+   * a failure aborts creation (nothing announced, no silent activation), and
+   * no dialog can target a workspace that has not been announced yet.
+   *
+   * Returns an error string (creation must abort) or undefined on success.
+   */
+  private async sanitizeStalePluginOverridesForNewWorkspace(
+    workspaceId: string,
+    workspacePath: string,
+    persistentSiblingConfig?: Pick<Config, "loadConfigOrDefault">
+  ): Promise<string | undefined> {
+    if (!this.workspaceMcpOverridesService) {
+      return undefined;
+    }
+    // A sibling workspace resolving to the same checkout (local-runtime
+    // conversation forks) means the consent context is still ALIVE — its
+    // enables must survive, and the uninstaller can still reach the file
+    // through that sibling. Qualification is deliberately strict on runtime
+    // KIND and loose on path SPELLING:
+    // - Only host-local workspaces (project-dir local / worktree, including
+    //   legacy entries without a runtimeConfig) qualify: an SSH or container
+    //   workspace whose persisted remote path merely equals this local path
+    //   string lives in a different filesystem namespace and preserves no
+    //   consent context for the local file.
+    // - Paths compare by canonical filesystem identity (realpath) IN ADDITION
+    //   to normalized spelling: a sibling registered through a symlinked or
+    //   differently-cased spelling of the same checkout must still be
+    //   recognized, or pruning would strip a live workspace's enables.
+    //   Failures fall back to spelling so an unresolvable path errs toward
+    //   skipping (leaving keys) rather than pruning live consent.
+    // Bounded canonicalization: realpath against a stalled filesystem (e.g. a
+    // dead NFS mount backing an UNRELATED persistent workspace record) must
+    // not hang CLI registration indefinitely. Timeouts join ordinary realpath
+    // failures in the spelling fallback below.
+    const CANONICALIZE_TIMEOUT_MS = 2_000;
+    const canonicalize = async (candidate: string): Promise<string> => {
+      const stripped = stripTrailingSlashes(candidate);
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        return await Promise.race([
+          fsPromises.realpath(stripped),
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(
+              () => reject(new Error("realpath timed out")),
+              CANONICALIZE_TIMEOUT_MS
+            );
+          }),
+        ]);
+      } catch {
+        return stripped;
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    const isHostLocalConfig = (runtimeConfig: RuntimeConfig | undefined): boolean =>
+      runtimeConfig === undefined ||
+      runtimeConfig.type === "local" ||
+      runtimeConfig.type === "worktree";
+    const normalizedPath = stripTrailingSlashes(workspacePath);
+    const canonicalPath = await canonicalize(workspacePath);
+    // Scan the service's own config AND (when provided) the persistent one:
+    // ephemeral CLI configs carry no workspace records, so a desktop
+    // workspace live on the same checkout is only visible in the latter.
+    // The persistent source reads in THROWING mode: the lenient read swallows
+    // a malformed/unreadable config into an empty project map, which reads as
+    // "no live sibling" and would prune enables a live desktop workspace
+    // still owns. A missing file still yields the default (genuinely no
+    // siblings). this.config keeps the lenient read — it is the service's own
+    // store, whose desktop/task registration paths already depend on it.
+    let configSnapshots: ProjectsConfig[];
+    try {
+      configSnapshots = [
+        this.config.loadConfigOrDefault(),
+        ...(persistentSiblingConfig
+          ? [persistentSiblingConfig.loadConfigOrDefault({ throwOnError: true })]
+          : []),
+      ];
+    } catch (error) {
+      return `Cannot verify live sibling workspaces for plugin override sanitization (the persistent config is unreadable: ${getErrorMessage(error)}). Refusing to prune; fix the config and retry.`;
+    }
+    for (const config of configSnapshots) {
+      for (const project of config.projects.values()) {
+        for (const workspace of project.workspaces) {
+          if (
+            workspace.id === workspaceId ||
+            // Registered-but-unsanitized entries from an overlapping creation
+            // are not live consent contexts (see pendingPluginSanitizations).
+            (workspace.id !== undefined && this.pendingPluginSanitizations.has(workspace.id)) ||
+            !isHostLocalConfig(workspace.runtimeConfig)
+          ) {
+            continue;
+          }
+          if (
+            stripTrailingSlashes(workspace.path) === normalizedPath ||
+            (await canonicalize(workspace.path)) === canonicalPath
+          ) {
+            return undefined;
+          }
+        }
+      }
+    }
+    try {
+      await this.workspaceMcpOverridesService.prunePluginOverrideKeys(workspaceId, "plugin:");
+      return undefined;
+    } catch (error) {
+      // Abort creation instead of proceeding with the stale file: continuing
+      // would re-create the silent-activation path this sanitization exists
+      // to close, with no durable record left to retry it.
+      return `The directory's existing MCP overrides file could not be sanitized: ${getErrorMessage(error)}. Fix or remove the workspace MCP overrides file (.xum/mcp.local.jsonc, or legacy .mux/mcp.local.jsonc) in ${workspacePath} and try again.`;
+    }
+  }
+
+  /**
+   * Roll back a just-persisted workspace registration and VERIFY it left the
+   * on-disk config. Config.saveConfig logs and swallows write failures, so
+   * removeWorkspace can resolve while the entry is still persisted — after a
+   * restart that entry would resurrect with the unsanitized overrides file
+   * this rollback exists to keep unreachable. Returns whether the entry is
+   * provably gone from disk.
+   */
+  private async rollbackUnsanitizedWorkspaceRegistration(workspaceId: string): Promise<boolean> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await this.config.removeWorkspace(workspaceId).catch(() => undefined);
+      const persisted = this.config.loadConfigOrDefault();
+      const stillPresent = Array.from(persisted.projects.values()).some((project) =>
+        project.workspaces.some((workspace) => workspace.id === workspaceId)
+      );
+      if (!stillPresent) {
+        return true;
+      }
+    }
+    log.error(
+      `Failed to roll back workspace ${workspaceId} after plugin-override sanitization aborted creation`
+    );
+    return false;
   }
 
   setWorkspaceGoalService(service: WorkspaceGoalService): void {
@@ -2771,6 +3092,7 @@ export class WorkspaceService extends EventEmitter {
   setMemoryConsolidationService(service: {
     triggerInBackground(workspaceId: string, trigger: "compaction" | "archive"): void;
     triggerHarvestThenSweepInBackground(metadata: CompactionCompletionMetadata): void;
+    cancelInFlightConsolidation(workspaceId: string): Promise<void>;
   }): void {
     this.memoryConsolidationService = service;
   }
@@ -2794,6 +3116,142 @@ export class WorkspaceService extends EventEmitter {
   /** DevTools debug-log cleanup on archive/remove; wired by coreServices. */
   setDevToolsService(service: { removeWorkspaceData(workspaceId: string): Promise<void> }): void {
     this.devToolsService = service;
+  }
+
+  /** Refine-pass cancellation on remove; wired by the service container. */
+  setRefinePassCanceller(service: {
+    cancelInFlightRefinePass(workspaceId: string): Promise<void>;
+  }): void {
+    this.refinePassCanceller = service;
+  }
+
+  /**
+   * Serialize a context-discarding history mutation (reset, full clear,
+   * destructive replace) with refine staging/apply, which hold the same
+   * per-workspace lockfile across their recheck-and-publish write sections.
+   * Without it, a refine pass could recheck before the mutation and publish
+   * after it, landing a proposal distilled from the discarded rows where the
+   * approval-hash scan accepts it. Callers must cancel+drain in-flight
+   * passes BEFORE acquiring (a drained pass may be waiting on this lock).
+   */
+  private async acquireRefineSerializationLock(
+    workspaceId: string,
+    operation: string
+  ): Promise<Result<AsyncDisposable>> {
+    try {
+      return Ok(
+        await acquireProcessFileLock({
+          // r66: session-dir-external (see refineApplyLockPath) — acquiring
+          // the old in-session lockfile after removal recreated the deleted
+          // directory via the lock's own mkdir.
+          lockPath: refineApplyLockPath(this.config.rootDir, workspaceId),
+          timeoutMs: REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS,
+          label: `refine serialization lock (${operation})`,
+        })
+      );
+    } catch (error) {
+      return Err(
+        `Cannot ${operation} while a refine operation is in progress: ${getErrorMessage(error)}`
+      );
+    }
+  }
+
+  /** r41: mark a context-discarding mutation as durably committed (see contextMutationEpochs). */
+  private advanceContextMutationEpoch(workspaceId: string): void {
+    this.contextMutationEpochs.set(
+      workspaceId,
+      (this.contextMutationEpochs.get(workspaceId) ?? 0) + 1
+    );
+  }
+
+  /**
+   * Admission guard for context-discarding history mutations (r40): reject
+   * new sends at the door (contextMutationWorkspaces), block turn admission
+   * inside the session, and only then verify idleness — all in one
+   * synchronous block, so no turn can slip between the check and the guard
+   * (see AgentSession.holdTurnAdmission for the pairing argument). Callers
+   * hold the guard across the whole mutation — including the refine
+   * drain/lock awaits — and must recheck busy-ness after those awaits for
+   * the turn starts that bypass admission gating (in-turn compaction
+   * retries observing a transient idle gap).
+   *
+   * Scope: process-local, like every send/rename/remove/busy guard in this
+   * service. Under XUM_ALLOW_MULTIPLE_INSTANCES=1 a second backend sharing
+   * the workspace can admit a send this guard never sees; sends do not
+   * participate in a cross-process admission protocol (only refine's
+   * durable staging/apply state does, via refine-apply.lock). Multi-instance
+   * mode is a development escape hatch — concurrent turn traffic against one
+   * workspace from two backends is unsupported beyond those durable-state
+   * locks.
+   */
+  private acquireContextMutationAdmissionGuard(
+    workspaceId: string,
+    operation: "truncate history" | "reset context" | "replace history"
+  ): Result<Disposable> {
+    if (this.contextMutationWorkspaces.has(workspaceId)) {
+      return Err("A context reset or clear is already in progress for this workspace.");
+    }
+    const session = this.getOrCreateSession(workspaceId);
+    this.contextMutationWorkspaces.add(workspaceId);
+    const admissionHold = session.holdTurnAdmission();
+    const guard: Disposable = {
+      [Symbol.dispose]: () => {
+        this.contextMutationWorkspaces.delete(workspaceId);
+        admissionHold[Symbol.dispose]();
+      },
+    };
+    // Busy check AFTER arming the block: a turn admitted first is observed
+    // here; a turn admitted later observes the block and refuses. Pending
+    // mid-stream compaction counts as turn work (r43): its direct session
+    // send bypasses this service's entry accounting.
+    if (session.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId)) {
+      guard[Symbol.dispose]();
+      return Err(`Cannot ${operation} while a turn is active. Press Esc to stop the stream first.`);
+    }
+    // r42: a send between its entry check and admission may have passed its
+    // pre-persist gate but not yet appended its rows. If this mutation
+    // committed first, those rows — including attacker-influenced family
+    // payload rows — would land durably in the fresh context: the epoch gate
+    // blocks the send's stream but cannot un-append. Refuse instead; sends
+    // settle in bounded time and the user retries. Counted synchronously at
+    // the send's entry, so one side always observes the other.
+    if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
+      guard[Symbol.dispose]();
+      return Err(`Cannot ${operation} while a message is being sent. Try again in a moment.`);
+    }
+    return Ok(guard);
+  }
+
+  /**
+   * Block turn admission while a background service (/refine) publishes rows
+   * into an idle workspace's history or applies refinements (r40). Fails
+   * when a turn is active: foreign rows must not land inside a PREPARING
+   * snapshot window or between a streaming turn's user row and its response.
+   * Same Dekker pairing as acquireContextMutationAdmissionGuard, without the
+   * send entry-set — sends admitted after release see the completed append.
+   */
+  acquireIdleTurnExclusion(workspaceId: string): Result<Disposable> {
+    const session = this.getOrCreateSession(workspaceId);
+    const hold = session.holdTurnAdmission();
+    // Pending mid-stream compaction counts as turn work (r43): its direct
+    // session send bypasses this service's entry accounting, so publishing
+    // between the stopped stream and the compaction request would interleave
+    // exactly like publishing mid-turn.
+    if (session.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId)) {
+      hold[Symbol.dispose]();
+      return Err("a turn is preparing or streaming");
+    }
+    // r41: a send between its entry check and admission looks idle here, but
+    // may have already persisted its user row — publishing and releasing
+    // before it resumes would slip the published row into its request as a
+    // trailing foreign assistant row. Refuse instead; the caller reports a
+    // retryable failure. Counted synchronously at the send's entry, so on a
+    // single thread one side always observes the other.
+    if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
+      hold[Symbol.dispose]();
+      return Err("a send is being admitted");
+    }
+    return Ok(hold);
   }
 
   private getWorktreeArchiveBehavior(): "keep" | "delete" | "snapshot" {
@@ -2906,6 +3364,23 @@ export class WorkspaceService extends EventEmitter {
         this.startStartupRecovery(metadata.id);
         scheduledCount += 1;
       }
+
+      // Repair .code-workspace drift from lifecycle changes that happened while
+      // the app was not running. Each sync is internally bounded, but startup
+      // additionally caps the whole loop: many enabled projects on a stalled
+      // filesystem must never delay launch. Past the deadline the loop keeps
+      // running in the background; syncProjectCodeWorkspace never throws, so
+      // the orphaned promise cannot reject unhandled.
+      const codeWorkspaceSyncAll = (async () => {
+        for (const [projectPath, projectConfig] of this.config.loadConfigOrDefault().projects) {
+          if (projectConfig.codeWorkspaceSyncPath?.trim()) {
+            await syncProjectCodeWorkspace(this.config, projectPath);
+          }
+        }
+      })();
+      await raceWithAbortAndTimeout(codeWorkspaceSyncAll, {
+        timeoutMs: STARTUP_CODE_WORKSPACE_SYNC_TIMEOUT_MS,
+      });
 
       log.info("[startup] WorkspaceService.initialize completed", {
         totalMs: Date.now() - startupStartedAt,
@@ -3549,6 +4024,14 @@ export class WorkspaceService extends EventEmitter {
       initStateManager: this.initStateManager,
       workspaceGoalService: this.workspaceGoalService,
       backgroundProcessManager: this.backgroundProcessManager,
+      // Branch-summary side-channel spend recording (edit-resend path).
+      sessionUsageService: this.sessionUsageService,
+      sanitizeCliWorkspaceRegistration: (args) =>
+        this.sanitizeCliRegisteredWorkspace(
+          args.workspaceId,
+          args.workspacePath,
+          args.runtimeConfig
+        ),
       onCompactionComplete: (metadata) => {
         this.schedulePostCompactionMetadataRefresh(workspaceId);
         // Compaction marks a long session with accumulated learnings: harvest
@@ -4344,37 +4827,129 @@ export class WorkspaceService extends EventEmitter {
         createdAt: new Date().toISOString(),
       };
 
-      await this.config.editConfig((config) => {
-        let projectConfig = config.projects.get(owningProjectPath);
-        if (!projectConfig) {
-          projectConfig = { workspaces: [] };
-          config.projects.set(owningProjectPath, projectConfig);
-        }
-        projectConfig.workspaces.push({
-          path: createResult!.workspacePath!,
-          id: workspaceId,
-          name: finalWorkspaceName,
-          title,
-          createdAt: metadata.createdAt,
-          runtimeConfig: finalRuntimeConfig,
-          subProjectPath: effectiveSubProjectPath,
-          // Persist tags atomically with creation so orchestration loops that
-          // look workspaces up by tag (e.g. workspace.ensure) never observe a
-          // created-but-untagged window after a crash.
-          ...(tags != null && Object.keys(tags).length > 0 ? { tags } : {}),
-          // Mirror /fork: when /new is invoked with a start message, defer title
-          // selection until the first message can drive LLM-based generation.
-          ...(pendingAutoTitle === true ? { pendingAutoTitle: true } : {}),
-        });
-        return config;
-      });
-
-      const allMetadata = await this.config.getAllWorkspaceMetadata();
-      const completeMetadata = allMetadata.find((m) => m.id === workspaceId);
-      if (!completeMetadata) {
-        initLogger.logComplete(-1);
-        return Err("Failed to retrieve workspace metadata");
+      // Host-local checkouts (project-dir local and worktree) get their
+      // preserved/tracked .mux/mcp.local.jsonc sanitized below. Mark this
+      // registration pending BEFORE the entry persists so an overlapping
+      // creation for the same checkout cannot mistake the not-yet-sanitized
+      // entry for a live sibling and skip its own sanitization.
+      const isHostLocalCheckout =
+        finalRuntimeConfig.type === "local" || finalRuntimeConfig.type === "worktree";
+      let completeMetadata: FrontendWorkspaceMetadata | undefined;
+      if (isHostLocalCheckout) {
+        this.pendingPluginSanitizations.add(workspaceId);
       }
+      let releaseRegistrationLock: (() => Promise<void>) | undefined;
+      try {
+        if (isHostLocalCheckout) {
+          // Cross-process: persist + sanitize must not interleave with a
+          // sibling process registering the same checkout (see
+          // acquireRegistrationSanitizeLock).
+          releaseRegistrationLock = await this.acquireRegistrationSanitizeLock();
+        }
+        await this.config.editConfig((config) => {
+          let projectConfig = config.projects.get(owningProjectPath);
+          if (!projectConfig) {
+            projectConfig = { workspaces: [] };
+            config.projects.set(owningProjectPath, projectConfig);
+          }
+          projectConfig.workspaces.push({
+            path: createResult!.workspacePath!,
+            id: workspaceId,
+            name: finalWorkspaceName,
+            title,
+            createdAt: metadata.createdAt,
+            runtimeConfig: finalRuntimeConfig,
+            subProjectPath: effectiveSubProjectPath,
+            // Persist tags atomically with creation so orchestration loops that
+            // look workspaces up by tag (e.g. workspace.ensure) never observe a
+            // created-but-untagged window after a crash.
+            ...(tags != null && Object.keys(tags).length > 0 ? { tags } : {}),
+            // Mirror /fork: when /new is invoked with a start message, defer title
+            // selection until the first message can drive LLM-based generation.
+            ...(pendingAutoTitle === true ? { pendingAutoTitle: true } : {}),
+          });
+          return config;
+        });
+
+        const allMetadata = await this.config.getAllWorkspaceMetadata();
+        completeMetadata = allMetadata.find((m) => m.id === workspaceId);
+        if (!completeMetadata) {
+          initLogger.logComplete(-1);
+          return Err("Failed to retrieve workspace metadata");
+        }
+
+        // The checkout being registered may already hold plugin enables no
+        // live workspace consented to: LocalRuntime registers an EXISTING
+        // directory whose preserved .mux/mcp.local.jsonc can carry enables
+        // from a since-removed workspace, and a fresh WORKTREE checkout
+        // materializes the file when the repository tracks it (project plugin
+        // instance IDs are stable across a project's worktrees, so committed
+        // enables would silently activate here). Sanitize before announcing;
+        // a failure aborts the creation so nothing stale ever activates.
+        // SSH/container runtimes exec off-host, where plugin servers never
+        // spawn (host-path containers only in v1).
+        if (isHostLocalCheckout) {
+          const sanitizeError = await this.sanitizeStalePluginOverridesForNewWorkspace(
+            workspaceId,
+            createResult!.workspacePath
+          );
+          if (sanitizeError !== undefined) {
+            const rolledBack = await this.rollbackUnsanitizedWorkspaceRegistration(workspaceId);
+            // WORKTREE runtimes created a fresh checkout above; without
+            // deleting it, retrying the same branch collides with the
+            // orphaned worktree and leaks a suffixed checkout per attempt.
+            // LocalRuntime registered an EXISTING user directory, which must
+            // be preserved (its deleteWorkspace is a no-op by design, but we
+            // never call it here to keep that contract explicit). Only after
+            // a successful config rollback: while the entry persists, the
+            // checkout is still referenced.
+            if (rolledBack && isWorktreeRuntime(finalRuntimeConfig)) {
+              const deleteResult = await runtime
+                .deleteWorkspace(
+                  owningProjectPath,
+                  // Worktree directories are named after the sanitized
+                  // workspace name (branch names may contain "/").
+                  finalWorkspaceName,
+                  false,
+                  undefined,
+                  projectConfig.trusted ?? false
+                )
+                .catch((error: unknown) => ({
+                  success: false as const,
+                  error: getErrorMessage(error),
+                }));
+              if (!deleteResult.success) {
+                log.warn("Failed to remove created worktree after sanitization aborted creation", {
+                  workspaceId,
+                  error: deleteResult.error,
+                });
+              }
+            }
+            // Tear down the in-memory state registered earlier in this
+            // creation (session, init record, abort controller) exactly like
+            // workspace removal would; without this every aborted retry
+            // against the same bad file leaks another unreachable session
+            // for the process lifetime.
+            initAbortController.abort();
+            this.initAbortControllers.delete(workspaceId);
+            this.initStateManager.clearInMemoryState(workspaceId);
+            this.disposeSession(workspaceId);
+            initLogger.logComplete(-1);
+            return Err(
+              rolledBack
+                ? sanitizeError
+                : `${sanitizeError} Additionally, the half-created workspace registration could not be rolled back; remove workspace ${workspaceId} manually before retrying.`
+            );
+          }
+        }
+      } finally {
+        await releaseRegistrationLock?.();
+        this.pendingPluginSanitizations.delete(workspaceId);
+      }
+      assert(
+        completeMetadata !== undefined,
+        "create: registration must have produced workspace metadata"
+      );
 
       session.emitMetadata(this.enrichFrontendMetadata(completeMetadata));
 
@@ -4385,7 +4960,7 @@ export class WorkspaceService extends EventEmitter {
       // If the user cancelled creation while create() was still in flight, avoid spawning
       // additional background work for a workspace that's already being removed.
       if (!this.removingWorkspaces.has(workspaceId) && !initAbortController.signal.aborted) {
-        runBackgroundInit(
+        void runBackgroundInit(
           runtime,
           {
             projectPath: owningProjectPath,
@@ -4410,6 +4985,7 @@ export class WorkspaceService extends EventEmitter {
         session.emitMetadata(this.enrichFrontendMetadata(completeMetadata));
       }
 
+      await this.syncCodeWorkspaceFiles(completeMetadata);
       eventSpine.emit("workspace.created", { workspaceId });
       return Ok({ metadata: this.enrichFrontendMetadata(completeMetadata) });
     } catch (error) {
@@ -4827,6 +5403,7 @@ export class WorkspaceService extends EventEmitter {
         session.emitMetadata(this.enrichFrontendMetadata(completeMetadata));
       }
 
+      await this.syncCodeWorkspaceFiles(completeMetadata);
       eventSpine.emit("workspace.created", { workspaceId });
       return Ok(enrichedMetadata);
     } catch (error) {
@@ -5003,6 +5580,36 @@ export class WorkspaceService extends EventEmitter {
                 activeSharedTaskStatuses.has(ws.taskStatus ?? "")
             )
           );
+
+        parentWorkspaceId = metadata.parentWorkspaceId ?? null;
+        childTaskModelString = metadata.taskModelString;
+        childTaskThinkingLevel = coerceThinkingLevel(metadata.taskThinkingLevel);
+
+        // Cancel and drain BOTH background producers BEFORE any disk
+        // mutation below. Two invariants depend on this ordering:
+        // (1) an admitted /refine apply runs to completion and can write
+        //     project skills into the CHECKOUT — draining after
+        //     runtime.deleteWorkspace() let that write race checkout
+        //     deletion (recreating .mux/skills in a deleted tree, or failing
+        //     midway with the failure swallowed);
+        // (2) a draining producer records headless usage as it settles, so
+        //     the usage rollup below must read its snapshot only after both
+        //     drains (spend landing later is lost — the child is deleted
+        //     with no second rollup).
+        // Trade-off: a force=false deletion failure below keeps the
+        // workspace but its producers were already drained. That loss is
+        // recoverable (rerun /refine, refork); a checkout write racing
+        // deletion is not. Both calls are idempotent; they run again later
+        // for the phantom-metadata path.
+        // Dream/harvest consolidation is a third producer (r60): its runs
+        // ride only a hard timeout, so removal must abort them explicitly or
+        // a detached run could mutate memory and journal into the deleted
+        // session directory. Cancel BEFORE clearPendingBranchSummary so
+        // residual wedged runs it hands to the usage-write registry get that
+        // drain's bounded second chance.
+        await this.memoryConsolidationService?.cancelInFlightConsolidation(workspaceId);
+        await clearPendingBranchSummary(workspaceId);
+        await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
 
         if (isMultiProject(metadata)) {
           const projects = getProjects(metadata);
@@ -5233,12 +5840,15 @@ export class WorkspaceService extends EventEmitter {
           // Note: Coder workspace deletion is handled by CoderSSHRuntime.deleteWorkspace()
         }
 
-        parentWorkspaceId = metadata.parentWorkspaceId ?? null;
-        childTaskModelString = metadata.taskModelString;
-        childTaskThinkingLevel = coerceThinkingLevel(metadata.taskThinkingLevel);
-
-        // If this workspace is a sub-agent/task, roll its accumulated timing into the parent BEFORE
-        // deleting ~/.xum/sessions/<workspaceId>/session-timing.json.
+        // Roll accumulated child timing/usage into the parent only AFTER runtime deletion is
+        // committed (every force=false early return is behind us) and BEFORE the session
+        // directory (session-timing.json / session-usage.json) is deleted below. rolledUpFrom
+        // is a one-shot idempotency guard: rolling up before a failed non-forced deletion left
+        // the child usable, and its post-failure spend was permanently skipped by the eventual
+        // successful removal. Crash-safety is preserved: a crash between deletion and these
+        // rollups keeps config + session files, and retrying removal re-runs deletion (a no-op
+        // for an already-missing checkout) before rolling up, so drained spend is not lost.
+        // Both producer drains above already ran, so the snapshots read here are complete.
         if (parentWorkspaceId && this.sessionTimingService) {
           try {
             // Flush any last timing write (e.g. from stream-abort) before reading.
@@ -5253,8 +5863,6 @@ export class WorkspaceService extends EventEmitter {
           }
         }
 
-        // If this workspace is a sub-agent/task, roll its accumulated usage into the parent BEFORE
-        // deleting ~/.xum/sessions/<workspaceId>/session-usage.json.
         if (parentWorkspaceId && this.sessionUsageService) {
           try {
             const childUsage = await this.sessionUsageService.getSessionUsage(workspaceId);
@@ -5305,6 +5913,24 @@ export class WorkspaceService extends EventEmitter {
       // delete, recreating the session directory for a workspace the user removed.
       this.disposeSession(workspaceId);
 
+      // Same for in-flight dream/harvest consolidation (r60): abort + drain
+      // before the session directory disappears (idempotent; normally
+      // already cancelled before the usage rollup above).
+      await this.memoryConsolidationService?.cancelInFlightConsolidation(workspaceId);
+
+      // Cancel and drain any background branch-summary writer BEFORE deleting
+      // the session directory: a mid-flight append could otherwise recreate
+      // the directory after removal, leaving an orphaned session. This also
+      // drops the retained registration a fork that never sent would leak.
+      // Normally already drained before the usage rollup above (idempotent);
+      // this covers the phantom-metadata path, which skips that block.
+      await clearPendingBranchSummary(workspaceId);
+
+      // Same posture for a running /refine pass: abort + drain so its
+      // tool-driven memory/skill writes and summary-row append cannot land
+      // after the session directory is deleted.
+      await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
+
       // Drop any persistent sandbox mount BEFORE deleting the session
       // directory: dropScope disposes the runtime without disk writes and
       // waits for in-flight evaluation, so a late vars snapshot cannot
@@ -5325,9 +5951,12 @@ export class WorkspaceService extends EventEmitter {
       }
 
       // Remove session data
+      const sessionDir = this.config.getSessionDir(workspaceId);
+      // r66: identifies THIS removal attempt in the durable tombstone so the
+      // compensating rollback below cannot delete a concurrent backend
+      // attempt's marker.
+      const removalAttemptId = crypto.randomUUID();
       try {
-        const sessionDir = this.config.getSessionDir(workspaceId);
-
         if (parentWorkspaceId) {
           try {
             const parentSessionDir = this.config.getSessionDir(parentWorkspaceId);
@@ -5348,10 +5977,39 @@ export class WorkspaceService extends EventEmitter {
           }
         }
 
-        await fsPromises.rm(sessionDir, { recursive: true, force: true });
+        // r61: serialized with the memory target mutation locks and preceded
+        // by a durable removal tombstone (see workspaceRemoval.ts) — a memory
+        // write stalled inside its commit either lands before this deletion
+        // (and is deleted with the directory) or observes the tombstone under
+        // its own lock and refuses, so a late write can never recreate the
+        // directory. Fail-closed on a wedged writer: the catch below keeps
+        // the directory as a recoverable orphan instead of deleting it out
+        // from under a live commit.
+        await removeSessionDirUnderMemoryLocks({
+          rootDir: this.config.rootDir,
+          sessionDir,
+          workspaceId,
+          attemptId: removalAttemptId,
+        });
       } catch (error) {
+        // r63: without a durable tombstone the retained orphan stays
+        // writable by foreign backends forever — abort the removal (the
+        // workspace stays registered and retryable) instead of proceeding
+        // to deregistration below.
+        if (error instanceof TombstoneNotDurableError) {
+          throw error;
+        }
         log.error(`Failed to remove session directory for ${workspaceId}:`, error);
       }
+      // r65: the tombstone is durable here (both the locked path and the
+      // orphan fallback published it). Keep renewing its mtime until this
+      // removal settles so a foreign backend's startup self-heal cannot
+      // mistake a merely SLOW removal (e.g. a hung MCP server close below)
+      // for crash residue and delete the marker while removal is live.
+      // Disposal at scope exit (after deregistration or its rollback) is
+      // safe: a late renewal of a retained terminal marker is meaningless,
+      // and utimes on a rolled-back (deleted) marker is a swallowed ENOENT.
+      using _tombstoneLease = startRemovalTombstoneLease(this.config.rootDir, workspaceId);
 
       // The on-disk devtools.jsonl died with the session directory above; also drop any
       // in-memory DevTools state so stale runs cannot outlive the workspace.
@@ -5373,10 +6031,75 @@ export class WorkspaceService extends EventEmitter {
       this.terminalService?.closeWorkspaceSessions(workspaceId);
       await this.closeDesktopSessionBestEffort(workspaceId, "remove");
 
+      // Capture managed roots before the config entry disappears: a worktree
+      // under a custom/legacy srcBaseDir cannot be reconstructed afterwards,
+      // which would leave its folder entry in the .code-workspace file forever.
+      // Best-effort: removal must proceed even when the capture fails.
+      let removedMetadata: FrontendWorkspaceMetadata | undefined;
+      let removedWorkspaceRoots: Map<string, string[]> | undefined;
+      try {
+        removedMetadata = (await this.config.getAllWorkspaceMetadata()).find(
+          (m) => m.id === workspaceId
+        );
+        removedWorkspaceRoots = removedMetadata
+          ? managedRootsByProject(removedMetadata)
+          : undefined;
+      } catch (error) {
+        log.debug("Failed to capture removed workspace roots for .code-workspace sync", {
+          workspaceId,
+          error,
+        });
+      }
+
       // Remove from config
-      await this.config.removeWorkspace(workspaceId);
+      try {
+        await this.config.removeWorkspace(workspaceId);
+      } catch (error) {
+        // r62: the session directory and its durable removal tombstone are
+        // already committed above. If deregistration fails here (e.g. the
+        // config lock timed out), the workspace would survive REGISTERED but
+        // permanently tombstoned — every memory mutation refused forever.
+        // Un-tombstone so the surviving workspace stays usable (its missing
+        // session state self-heals on demand) and removal can be retried.
+        // In-process consolidation stays cancelled until restart, matching
+        // the drained-producers tradeoff documented above. Ownership-checked
+        // (r66): only delete the marker while it still carries THIS
+        // attempt's ID and the workspace is still registered — a concurrent
+        // backend's removal may have republished or completed with it.
+        try {
+          await rollbackRemovalTombstoneIfOwned({
+            rootDir: this.config.rootDir,
+            sessionDir,
+            workspaceId,
+            attemptId: removalAttemptId,
+            workspaceStillRegistered: () => this.config.findWorkspace(workspaceId) != null,
+          });
+        } catch (rollbackError) {
+          // r63: a failed rollback must not be silent — the workspace
+          // would stay registered but refused every mutation across
+          // restarts. The startup self-heal
+          // (healRemovalTombstonesForRegisteredWorkspaces) reclaims this
+          // exact residue once the tombstone ages past its guard window.
+          log.error(
+            "Failed to roll back the removal tombstone after config deregistration failed; " +
+              "the startup self-heal will reclaim it",
+            { workspaceId, rollbackError }
+          );
+        }
+        throw error;
+      }
       removedFromConfig = true;
       this.autoTitlingWorkspaces.delete(workspaceId);
+
+      if (removedMetadata || persistedWorkspace) {
+        await this.syncCodeWorkspaceFiles(
+          removedMetadata ?? {
+            projectPath: persistedWorkspace!.projectPath,
+            projects: persistedWorkspace!.projects,
+          },
+          removedWorkspaceRoots
+        );
+      }
 
       this.emit("metadata", {
         workspaceId,
@@ -5395,6 +6118,37 @@ export class WorkspaceService extends EventEmitter {
       return Err(`Failed to remove workspace: ${message}`);
     } finally {
       this.removingWorkspaces.delete(workspaceId);
+    }
+  }
+
+  /**
+   * Best-effort .code-workspace reconcile for every project involved in a
+   * workspace lifecycle change (multi-project workspaces touch several).
+   * syncProjectCodeWorkspace never throws, so lifecycle ops cannot fail here.
+   */
+  private async syncCodeWorkspaceFiles(
+    workspace: {
+      projectPath: string;
+      projects?: ReadonlyArray<{ projectPath: string }>;
+      subProjectPath?: string;
+    },
+    extraManagedRootDirsByProject?: ReadonlyMap<string, string[]>
+  ): Promise<void> {
+    const involvedPaths = new Set([
+      workspace.projectPath,
+      // A registered sub-project's file lists workspaces assigned to it even
+      // though they live in the parent's bucket.
+      ...(workspace.subProjectPath != null ? [workspace.subProjectPath] : []),
+      ...(workspace.projects ?? []).map((ref) => ref.projectPath),
+    ]);
+    for (const involvedPath of involvedPaths) {
+      await syncProjectCodeWorkspace(this.config, involvedPath, {
+        // Extras are scoped per project so one project's file never gains
+        // removal rights under another project's root.
+        extraManagedRootDirs: extraManagedRootDirsByProject?.get(
+          stripTrailingSlashes(involvedPath)
+        ),
+      });
     }
   }
 
@@ -6308,6 +7062,8 @@ export class WorkspaceService extends EventEmitter {
         this.emit("metadata", { workspaceId, metadata: enrichedMetadata });
       }
 
+      await this.syncCodeWorkspaceFiles(updatedMetadata);
+
       return Ok({ newWorkspaceId: workspaceId });
     } catch (error) {
       const message = getErrorMessage(error);
@@ -7129,6 +7885,11 @@ export class WorkspaceService extends EventEmitter {
       // disposal here only frees runtimes and spine middleware. Never throws.
       await agentPluginHookService.disposeWorkspace(workspaceId);
 
+      await this.syncCodeWorkspaceFiles({
+        projectPath,
+        projects: beforeArchiveMetadata?.projects,
+        subProjectPath: beforeArchiveMetadata?.subProjectPath,
+      });
       eventSpine.emit("workspace.archived", { workspaceId });
       return Ok({ kind: "archived" as const });
     } catch (error) {
@@ -7255,6 +8016,12 @@ export class WorkspaceService extends EventEmitter {
       if (this.workspaceLifecycleHooks || this.worktreeArchiveSnapshotService) {
         await this.emitCurrentWorkspaceMetadata(workspaceId);
       }
+
+      await this.syncCodeWorkspaceFiles({
+        projectPath,
+        projects: hookMetadata?.projects,
+        subProjectPath: hookMetadata?.subProjectPath,
+      });
 
       return Ok(undefined);
     } catch (error) {
@@ -8190,7 +8957,12 @@ export class WorkspaceService extends EventEmitter {
       }
 
       const secrets = await resolveProjectEnv(foundProjectPath);
-      runBackgroundInit(
+      // Fire-and-forget on the happy path, but keep the termination handle:
+      // the sanitization-abort cleanup below deletes the fresh worktree, and
+      // doing that while init still runs against the checkout races its
+      // writes/open handles (a failed delete leaves an orphaned worktree that
+      // collides with the next fork of the same branch).
+      const initSettled = runBackgroundInit(
         targetRuntime,
         {
           projectPath: foundProjectPath,
@@ -8217,6 +8989,9 @@ export class WorkspaceService extends EventEmitter {
       const sourceSessionDir = this.config.getSessionDir(sourceWorkspaceId);
       const newSessionDir = this.config.getSessionDir(newWorkspaceId);
 
+      // Removed tail captured inside the try, summarized only after setup
+      // survives the rollback window (see the comment at the capture site).
+      let abandonedBranchMessages: XumMessage[] | null = null;
       try {
         const historyCopyResult = await this.historyService.copyHistorySnapshotToNewWorkspace(
           sourceWorkspaceId,
@@ -8260,6 +9035,16 @@ export class WorkspaceService extends EventEmitter {
           } else {
             await fsPromises.rm(path.join(newSessionDir, "session-timing.json"), { force: true });
           }
+
+          // The abandoned tail is summarized in the background — but only
+          // AFTER the failure-prone fork setup below completes (see the
+          // startAbandonedBranchSummaryInBackground call past the catch).
+          // Starting the writer here let a setup failure delete newSessionDir
+          // without cancelling the registration: a racing append could
+          // recreate the failed fork's session dir, and an early-settling
+          // summary left its map entry permanently unconsumed because the
+          // fork never returned.
+          abandonedBranchMessages = truncateResult.data.removedMessages;
         }
 
         await materializeForkedPartialSnapshot({
@@ -8382,12 +9167,120 @@ export class WorkspaceService extends EventEmitter {
           : {}),
       };
 
-      await this.config.addWorkspace(foundProjectPath, metadata);
+      // Same pre-announcement sanitization as create(): a worktree fork of a
+      // trusted repo materializes tracked files, so a committed
+      // .mux/mcp.local.jsonc can carry a stale canonical plugin: enable that
+      // no live workspace consented to — announced unpruned, the first agent
+      // request would spawn that plugin's default-disabled MCP server. Local
+      // (project-dir) forks share the source checkout, which the sibling scan
+      // detects and skips (the source's consent context is alive).
+      const forkIsHostLocalCheckout =
+        forkedRuntimeConfig.type === "local" || forkedRuntimeConfig.type === "worktree";
+      if (forkIsHostLocalCheckout) {
+        this.pendingPluginSanitizations.add(newWorkspaceId);
+      }
+      let releaseRegistrationLock: (() => Promise<void>) | undefined;
+      try {
+        if (forkIsHostLocalCheckout) {
+          // Cross-process: persist + sanitize must not interleave with a
+          // sibling process registering the same checkout (see
+          // acquireRegistrationSanitizeLock).
+          releaseRegistrationLock = await this.acquireRegistrationSanitizeLock();
+        }
+        await this.config.addWorkspace(foundProjectPath, metadata);
+        if (forkIsHostLocalCheckout) {
+          const sanitizeError = await this.sanitizeStalePluginOverridesForNewWorkspace(
+            newWorkspaceId,
+            workspacePath
+          );
+          if (sanitizeError !== undefined) {
+            // Background init is still running against this checkout: abort
+            // it and AWAIT termination before deleting the worktree, or the
+            // delete races init's writes/open handles and can fail, leaving
+            // an orphaned worktree that collides with the next fork attempt.
+            initAbortController.abort();
+            await initSettled;
+            const rolledBack = await this.rollbackUnsanitizedWorkspaceRegistration(newWorkspaceId);
+            if (rolledBack && isWorktreeRuntime(forkedRuntimeConfig)) {
+              // Matches the copy-failure cleanup above: the fork's checkout
+              // is known fresh, so force-delete is safe here.
+              await targetRuntime
+                .deleteWorkspace(
+                  foundProjectPath,
+                  resolvedName,
+                  true,
+                  undefined,
+                  projectConfig.trusted ?? false
+                )
+                .catch((error: unknown) => {
+                  log.warn("Failed to remove forked worktree after sanitization abort", {
+                    newWorkspaceId,
+                    error: getErrorMessage(error),
+                  });
+                });
+            }
+            await fsPromises
+              .rm(newSessionDir, { recursive: true, force: true })
+              .catch(() => undefined);
+            this.initAbortControllers.delete(newWorkspaceId);
+            this.initStateManager.clearInMemoryState(newWorkspaceId);
+            this.disposeSession(newWorkspaceId);
+            initLogger.logComplete(-1);
+            return Err(
+              rolledBack
+                ? sanitizeError
+                : `${sanitizeError} Additionally, the half-created workspace registration could not be rolled back; remove workspace ${newWorkspaceId} manually before retrying.`
+            );
+          }
+        }
+      } finally {
+        await releaseRegistrationLock?.();
+        this.pendingPluginSanitizations.delete(newWorkspaceId);
+      }
       await this.workspaceGoalService?.inheritFromFork(sourceWorkspaceId, newWorkspaceId);
+
+      if (sourceMessageId && abandonedBranchMessages !== null) {
+        // RLM mode: summarize the abandoned tail into a durable labeled row on
+        // the fork. Runs in the BACKGROUND so the user-facing fork returns
+        // immediately (a synchronous wait stalled forks for the full deadline
+        // when generation missed it). Ordering stays safe: the fork's first
+        // send awaits the pending summary before building its request, and
+        // the tail guard drops the row if anything else landed first.
+        // Deliberately started only AFTER every failure-prone setup step and
+        // config registration: a rollback can no longer race the writer, and
+        // once the workspace is in config, removal can always cancel + drain
+        // the registration. Also keeps the summary's recorded usage from
+        // being wiped by resetForkedSessionUsage above. Fork IPC carries no
+        // send-option experiments, so gating falls back to the persisted
+        // machine overrides. Best-effort — never fails the fork (the promise
+        // never rejects). Awaited so the cross-process pending marker is
+        // stat-visible before the fork IPC returns (r55): an immediate first
+        // send handled by another backend must find it; generation itself
+        // still runs in the background.
+        await startAbandonedBranchSummaryInBackground({
+          historyService: this.historyService,
+          aiService: this.aiService,
+          workspaceId: newWorkspaceId,
+          // Cross-process pending marker home (r48): lets a first send served
+          // by another backend wait for the in-flight summary.
+          sessionDir: this.config.getSessionDir(newWorkspaceId),
+          abandonedMessages: abandonedBranchMessages,
+          isExperimentEnabled: (experimentId) => this.isExperimentEnabled(experimentId),
+          guardTailMessageId: sourceMessageId,
+          // The fork target's metadata carries no model settings yet (its
+          // first send would populate them, but that send awaits this very
+          // summary), so candidates must be snapshotted from the SOURCE
+          // workspace or generation silently no-ops on an empty list.
+          modelCandidates: deriveSideChannelModelCandidates(sourceMetadata),
+          // Side-channel spend must reach session usage / the cost UI.
+          ...(this.sessionUsageService ? { sessionUsageService: this.sessionUsageService } : {}),
+        });
+      }
 
       const enrichedMetadata = this.enrichFrontendMetadata(metadata);
       session.emitMetadata(enrichedMetadata);
 
+      await this.syncCodeWorkspaceFiles(metadata);
       eventSpine.emit("workspace.created", { workspaceId: newWorkspaceId });
       return Ok({ metadata: enrichedMetadata, projectPath: foundProjectPath });
     } catch (error) {
@@ -8625,6 +9518,15 @@ export class WorkspaceService extends EventEmitter {
       cancelState?: { canceledBeforeAcceptance: boolean };
       /** Cancels a synthetic send even after it has left MessageQueue for PREPARING. */
       cancelSignal?: AbortSignal;
+      /**
+       * Synthetic assistant rows persisted just before the turn's user row
+       * (family-message payloads). Delivered atomically with the message —
+       * queued alongside it when the workspace is busy — so they never land
+       * inside another turn's PREPARING window (see AgentSession.sendMessage).
+       */
+      preTurnMessages?: XumMessage[];
+      /** r54: fired once pre-turn rows cross the rollback horizon (see AgentSession). */
+      onPreTurnRowsPersisted?: () => void;
       /** Return once the user message is accepted; stream startup continues asynchronously. */
       startStreamInBackground?: boolean;
       /** When true, reject instead of queueing if the workspace is busy. */
@@ -8673,13 +9575,42 @@ export class WorkspaceService extends EventEmitter {
         });
       }
 
-      if (this.resettingContextWorkspaces.has(workspaceId)) {
-        log.debug("sendMessage blocked: context reset is in progress", { workspaceId });
+      if (this.contextMutationWorkspaces.has(workspaceId)) {
+        log.debug("sendMessage blocked: a context-discarding history mutation is in progress", {
+          workspaceId,
+        });
         return Err({
           type: "unknown",
-          raw: "Workspace context is resetting. Please wait and try again.",
+          raw: CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE,
         });
       }
+      // r41: capture the mutation epoch in the same synchronous block as the
+      // entry check; the session's admission gates re-verify it so a
+      // reset/clear/replace that completes while this send is still doing
+      // pre-admission work refuses the send instead of letting it append and
+      // stream stale content into the fresh context.
+      const admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
+      const admissionEpochStale = () =>
+        (this.contextMutationEpochs.get(workspaceId) ?? 0) !== admissionEpoch;
+      // r41: count this send as in-preflight until it settles so refine
+      // publication refuses to interleave with its pre-admission window
+      // (context mutations instead refuse the send itself via the epoch
+      // probe above). Released on every exit path; admitted sends have set
+      // PREPARING (busy) by the time sendMessage returns.
+      this.preflightSendCounts.set(
+        workspaceId,
+        (this.preflightSendCounts.get(workspaceId) ?? 0) + 1
+      );
+      using _preflightSend = {
+        [Symbol.dispose]: () => {
+          const remaining = (this.preflightSendCounts.get(workspaceId) ?? 1) - 1;
+          if (remaining <= 0) {
+            this.preflightSendCounts.delete(workspaceId);
+          } else {
+            this.preflightSendCounts.set(workspaceId, remaining);
+          }
+        },
+      };
 
       // Guard: avoid creating sessions for workspaces that don't exist anymore.
       const workspaceConfig = this.config.findWorkspace(workspaceId);
@@ -8782,6 +9713,7 @@ export class WorkspaceService extends EventEmitter {
             onAcceptedPreStreamFailure: internal?.onAcceptedPreStreamFailure,
             startStreamInBackground: internal?.startStreamInBackground,
             goalContinuation: internal?.goalContinuation,
+            admissionEpochStale,
           });
         }
         return Err(pricingGate.error);
@@ -8876,6 +9808,8 @@ export class WorkspaceService extends EventEmitter {
             onCanceled: continuationSendState.onCanceled,
             onAccepted: internal?.onAccepted,
             onAcceptedPreStreamFailure: continuationSendState.onAcceptedPreStreamFailure,
+            preTurnMessages: internal?.preTurnMessages,
+            onPreTurnRowsPersisted: internal?.onPreTurnRowsPersisted,
           }
         );
 
@@ -8956,6 +9890,9 @@ export class WorkspaceService extends EventEmitter {
         onCanceled: continuationSendState.onCanceled,
         onAccepted: internal?.onAccepted,
         onAcceptedPreStreamFailure,
+        preTurnMessages: internal?.preTurnMessages,
+        onPreTurnRowsPersisted: internal?.onPreTurnRowsPersisted,
+        admissionEpochStale,
       });
       if (!result.success) {
         log.error("sendMessage handler: session returned error", {
@@ -9849,15 +10786,75 @@ export class WorkspaceService extends EventEmitter {
   }
 
   async truncateHistory(workspaceId: string, percentage?: number): Promise<Result<void>> {
-    const session = this.sessions.get(workspaceId);
-    if (session?.isBusy() || this.aiService.isStreaming(workspaceId)) {
+    const effectivePercentage = percentage ?? 1.0;
+    const isFullClear = effectivePercentage >= 1.0;
+    // A full clear holds the admission guard across the refine drain/lock
+    // awaits below: without it, a send admitted during those awaits could
+    // snapshot the pre-clear transcript and stream across the truncation,
+    // repopulating the cleared context. Partial truncation keeps the plain
+    // pre-check — no awaits sit between it and the truncation.
+    let admissionGuard: Disposable | null = null;
+    if (isFullClear) {
+      const guardResult = this.acquireContextMutationAdmissionGuard(
+        workspaceId,
+        "truncate history"
+      );
+      if (!guardResult.success) {
+        return Err(guardResult.error);
+      }
+      admissionGuard = guardResult.data;
+    } else if (
+      this.sessions.get(workspaceId)?.isBusy() ||
+      this.aiService.isStreaming(workspaceId)
+    ) {
       return Err(
         "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
       );
     }
+    using _admissionGuard = admissionGuard;
+    const session = this.sessions.get(workspaceId);
 
-    const effectivePercentage = percentage ?? 1.0;
-    const isFullClear = effectivePercentage >= 1.0;
+    // A full clear discards the transcript a streaming refine pass may be
+    // distilling — and unlike a reset it appends NO boundary marker, so the
+    // pass's boundary identity stays null-to-null; only its segment-anchor
+    // recheck (first-row identity) catches the mutation. Drain the pass and
+    // hold the shared refine lock across the truncation so the recheck and
+    // this mutation cannot interleave (see acquireRefineSerializationLock).
+    let refineLock: AsyncDisposable | null = null;
+    if (isFullClear) {
+      await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
+      const refineLockResult = await this.acquireRefineSerializationLock(
+        workspaceId,
+        "clear history"
+      );
+      if (!refineLockResult.success) {
+        return Err(refineLockResult.error);
+      }
+      refineLock = refineLockResult.data;
+    }
+    await using _refineLock = refineLock;
+    // Recheck under the guard + lock: the admission block refuses ordinary
+    // turn starts during the awaits above, but in-turn compaction retries
+    // bypass admission gating when they cross a transient idle gap.
+    if (
+      isFullClear &&
+      (session?.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId))
+    ) {
+      return Err(
+        "Cannot truncate history while a turn is active. Press Esc to stop the stream first."
+      );
+    }
+    // r41: a retry scheduled before this clear would replay the discarded
+    // context after the guard releases — cancel it and drop the partial
+    // durably before the transcript goes away.
+    if (isFullClear && session) {
+      const retryDiscard = await session.discardAutoRetryForContextMutation();
+      if (!retryDiscard.success) {
+        return Err(
+          `Cannot clear history: pending retry state could not be discarded (${retryDiscard.error})`
+        );
+      }
+    }
     if (effectivePercentage > 0) {
       session?.clearUsageState();
     }
@@ -9870,6 +10867,26 @@ export class WorkspaceService extends EventEmitter {
         : await truncate();
     if (!truncateResult.success) {
       return Err(truncateResult.error);
+    }
+
+    // r41: the discard is durable — sends that entered before it must not be
+    // admitted afterwards (their content references the discarded context).
+    if (isFullClear) {
+      this.advanceContextMutationEpoch(workspaceId);
+    }
+    // r43: a fork's settled branch-summary registration stays consumable
+    // until the first send; its row was just deleted, so drop the
+    // registration too or the next send would re-emit the discarded summary
+    // into the live transcript (resurfacing pre-clear content that is absent
+    // from history after reload). Only AFTER the truncation commits (r44): a
+    // failed clear keeps the row in history, and dropping the registration
+    // first would leave that never-emitted row with nothing to emit it —
+    // hidden assistant context the user cannot see until a reload. Late
+    // in-flight writer appends stay safe either way via the compare-and-
+    // append tail guard, and the admission guard blocks consuming sends for
+    // this whole window.
+    if (isFullClear) {
+      await clearPendingBranchSummary(workspaceId);
     }
 
     const deletedSequences = truncateResult.data;
@@ -9901,24 +10918,56 @@ export class WorkspaceService extends EventEmitter {
         return Err(getErrorMessage(error));
       }
       this.sessions.get(workspaceId)?.clearFileState();
+      // Same new-segment invariant as resetContext: pre-clear read/skill
+      // carryover must not be injected after the transcript is gone, and the
+      // discard must be durable before the clear reports success (a stale
+      // persisted file would re-inject pre-clear context after a restart).
+      try {
+        await this.getOrCreateSession(workspaceId).clearPostCompactionState();
+      } catch (error) {
+        return Err(
+          `History was cleared, but the persisted post-compaction carryover could not be ` +
+            `durably discarded (${getErrorMessage(error)}). Pre-clear read/skill context may ` +
+            `be re-injected after a restart; retry once the session storage is writable.`
+        );
+      }
+      // The persistent RLM sandbox holds context DERIVED from the cleared
+      // transcript (vars populated by code execution), and its latest durable
+      // snapshot would restore it after a restart — later turns could read
+      // data from the supposedly cleared context through the kernel. Same
+      // durable invalidation + partial-failure posture as resetContext.
+      try {
+        await sandboxHostService.discardScope(workspaceId, this.config.getSessionDir(workspaceId));
+      } catch (error) {
+        log.error(
+          `Failed to durably invalidate sandbox state for ${workspaceId} after history clear; ` +
+            `the sandbox kernel stays unavailable until invalidation succeeds`,
+          error
+        );
+        return Err(
+          `History was cleared, but the sandbox kernel state could not be durably invalidated ` +
+            `(${getErrorMessage(error)}). The sandbox stays unavailable and cleared variables ` +
+            `may reappear after a restart; retry once the session storage is writable.`
+        );
+      }
     }
 
     return Ok(undefined);
   }
 
   async resetContext(workspaceId: string): Promise<Result<"reset" | "noop">> {
-    if (this.resettingContextWorkspaces.has(workspaceId)) {
-      return Err("Context reset is already in progress for this workspace.");
+    // Admission guard (r40): rejects duplicate mutations and new sends at the
+    // door, blocks turn admission inside the session, and verifies idleness —
+    // held across the refine drain/lock awaits below so a send admitted
+    // mid-reset cannot snapshot the pre-reset transcript and stream across
+    // the boundary.
+    const guardResult = this.acquireContextMutationAdmissionGuard(workspaceId, "reset context");
+    if (!guardResult.success) {
+      return Err(guardResult.error);
     }
-
-    this.resettingContextWorkspaces.add(workspaceId);
+    const admissionGuard = guardResult.data;
     try {
       const session = this.sessions.get(workspaceId);
-      if (session?.isBusy() || this.aiService.isStreaming(workspaceId)) {
-        return Err(
-          "Cannot reset context while a turn is active. Press Esc to stop the stream first."
-        );
-      }
 
       if (this.hasPendingQueuedOrPreparingTurn(workspaceId)) {
         return Err(
@@ -9926,6 +10975,48 @@ export class WorkspaceService extends EventEmitter {
         );
       }
 
+      // A refine pass distills the PRE-reset transcript. Letting it stream on
+      // and publish AFTER the boundary lands would make its proposal the
+      // newest hashed row of the post-reset segment — approvable edits
+      // derived from the very context this reset discards. Cancel and drain
+      // it first (never rejects): a pass already in its write section
+      // finishes before the boundary is appended, leaving its proposal
+      // pre-boundary where the approval-hash scan refuses it.
+      await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
+      // The one-shot drain cannot exclude a pass admitted right after it, so
+      // the rest of the reset runs under the SAME per-workspace lockfile the
+      // refine staging/apply write sections hold. That forces an ordering: a
+      // pass that wins the lock publishes BEFORE the boundary lands (its
+      // proposal stays pre-boundary, refused by the approval-hash scan), and
+      // a pass that loses rechecks the boundary/anchor identity after
+      // release and fails closed. The drain stays BEFORE acquisition —
+      // draining while holding the lock would deadlock against a pass
+      // waiting for it.
+      const refineLockResult = await this.acquireRefineSerializationLock(workspaceId, "reset");
+      if (!refineLockResult.success) {
+        return Err(refineLockResult.error);
+      }
+      await using _refineLock = refineLockResult.data;
+
+      // Recheck under the guard + lock: the admission block refuses ordinary
+      // turn starts during the awaits above, but in-turn compaction retries
+      // bypass admission gating when they cross a transient idle gap.
+      if (session?.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId)) {
+        return Err(
+          "Cannot reset context while a turn is active. Press Esc to stop the stream first."
+        );
+      }
+      // r41: a retry scheduled before this reset would commit the pre-reset
+      // partial past the boundary and replay the discarded context after the
+      // guard releases — cancel it and drop the partial durably first.
+      if (session) {
+        const retryDiscard = await session.discardAutoRetryForContextMutation();
+        if (!retryDiscard.success) {
+          return Err(
+            `Cannot reset context: pending retry state could not be discarded (${retryDiscard.error})`
+          );
+        }
+      }
       const historyResult = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
       if (!historyResult.success) {
         return Err(`Failed to read active context before reset: ${historyResult.error}`);
@@ -9935,6 +11026,37 @@ export class WorkspaceService extends EventEmitter {
         historyResult.data
       );
       if (!hasProviderEligibleMessages(activeContextMessages)) {
+        // An earlier reset may have failed AFTER writing its boundary but
+        // BEFORE its durable cleanup landed (the partial-failure Errs below).
+        // A retry then reaches this branch — no provider-eligible rows after
+        // the boundary — so pending cleanup must be re-attempted before the
+        // no-op is reported, or the UI claims success while a restart can
+        // still restore pre-reset carryover or kernel vars across the reset
+        // boundary. Both steps are idempotent: the pending-state unlink
+        // treats ENOENT as success and a discard tombstone re-publish is
+        // harmless, so a genuinely clean no-op stays a no-op.
+        try {
+          await this.getOrCreateSession(workspaceId).clearPostCompactionState();
+        } catch (error) {
+          return Err(
+            `Nothing to reset, but persisted post-compaction carryover from an earlier partial ` +
+              `reset could not be durably discarded (${getErrorMessage(error)}). Pre-reset ` +
+              `read/skill context may be re-injected after a restart; retry once the session ` +
+              `storage is writable.`
+          );
+        }
+        try {
+          await sandboxHostService.discardScope(
+            workspaceId,
+            this.config.getSessionDir(workspaceId)
+          );
+        } catch (error) {
+          return Err(
+            `Nothing to reset, but the sandbox kernel state could not be durably invalidated ` +
+              `(${getErrorMessage(error)}). The sandbox stays unavailable and cleared variables ` +
+              `may reappear after a restart; retry once the session storage is writable.`
+          );
+        }
         return Ok("noop");
       }
 
@@ -9952,6 +11074,20 @@ export class WorkspaceService extends EventEmitter {
       if (!appendResult.success) {
         return Err(`Failed to append context reset boundary: ${appendResult.error}`);
       }
+      // r41: the boundary is durable — sends that entered before it must not
+      // be admitted afterwards (their content references the discarded
+      // context).
+      this.advanceContextMutationEpoch(workspaceId);
+      // r43: drop any settled-but-unconsumed branch-summary registration —
+      // its row now sits behind the new boundary, and the next send would
+      // otherwise re-emit that pre-reset summary into the live transcript.
+      // Only AFTER the boundary append commits (r44): a reset failing before
+      // the boundary lands keeps the row in the active context, and dropping
+      // the registration first would leave that never-emitted row invisible
+      // to the user until a reload while the provider still sees it. The
+      // later cleanup steps may still Err, but the discard itself is durable
+      // by this point, so the registration goes regardless.
+      await clearPendingBranchSummary(workspaceId);
 
       session?.clearUsageState();
 
@@ -9968,16 +11104,60 @@ export class WorkspaceService extends EventEmitter {
         log.error("Failed to require goal acknowledgment after context reset:", error);
       }
       this.sessions.get(workspaceId)?.clearFileState();
+      // A reset starts a NEW context segment: cumulative post-compaction
+      // carryover (read-file paths, loaded skills, pending diff snapshot)
+      // summarizes PRE-reset epochs and must not be injected into later
+      // turns. getOrCreateSession so the persisted pending state is
+      // discarded even when no session exists yet (e.g. reset right after
+      // an app restart).
+      try {
+        await this.getOrCreateSession(workspaceId).clearPostCompactionState();
+      } catch (error) {
+        // Same partial-failure posture as the sandbox invalidation below:
+        // the chat-side reset applied, but the stale persisted carryover
+        // would re-inject pre-reset context after a restart, so success must
+        // not be reported while the discard is not durable.
+        log.error(
+          `Failed to durably discard post-compaction carryover for ${workspaceId} after context reset`,
+          error
+        );
+        return Err(
+          `Context was reset, but the persisted post-compaction carryover could not be durably ` +
+            `discarded (${getErrorMessage(error)}). Pre-reset read/skill context may be ` +
+            `re-injected after a restart; retry once the session storage is writable.`
+        );
+      }
 
       // Persistent sandbox mounts are scoped to the workspace session; a
       // context reset ends that session, so sandbox state is DISCARDED (not
       // snapshotted) — vars must not survive a reset the way they survive
       // archive/un-archive.
-      await sandboxHostService.discardScope(workspaceId, this.config.getSessionDir(workspaceId));
+      try {
+        await sandboxHostService.discardScope(workspaceId, this.config.getSessionDir(workspaceId));
+      } catch (error) {
+        // The chat-side reset already applied, but the sandbox invalidation
+        // is NOT durable: the empty-snapshot tombstone failed to publish, and
+        // the only remaining record is the in-memory reset-pending guard,
+        // which blocks mounts and retries for THIS process only. A crash
+        // before a retry lands would let the next process restore — resurrect
+        // — the pre-reset snapshot the user explicitly cleared. Invalidation
+        // must be durable before success is reported, so surface the partial
+        // failure to the caller instead of returning Ok.
+        log.error(
+          `Failed to durably invalidate sandbox state for ${workspaceId} after context reset; ` +
+            `the sandbox kernel stays unavailable until invalidation succeeds`,
+          error
+        );
+        return Err(
+          `Context was reset, but the sandbox kernel state could not be durably invalidated ` +
+            `(${getErrorMessage(error)}). The sandbox stays unavailable and cleared variables ` +
+            `may reappear after a restart; retry once the session storage is writable.`
+        );
+      }
 
       return Ok("reset");
     } finally {
-      this.resettingContextWorkspaces.delete(workspaceId);
+      admissionGuard[Symbol.dispose]();
     }
   }
 
@@ -9991,14 +11171,20 @@ export class WorkspaceService extends EventEmitter {
   ): Promise<Result<void>> {
     // Support both new enum ("user"|"idle") and legacy boolean (true)
     const isCompaction = !!summaryMessage.metadata?.compacted;
+    // Non-compaction replaces hold the admission guard (r40): the destructive
+    // path awaits the refine drain/lock below, and a send admitted during
+    // those awaits could snapshot the pre-replace transcript and stream
+    // across the mutation. Compaction replaces preserve context and run
+    // inside an active turn, so they stay unguarded.
+    let admissionGuard: Disposable | null = null;
     if (!isCompaction) {
-      const session = this.sessions.get(workspaceId);
-      if (session?.isBusy() || this.aiService.isStreaming(workspaceId)) {
-        return Err(
-          "Cannot replace history while a turn is active. Press Esc to stop the stream first."
-        );
+      const guardResult = this.acquireContextMutationAdmissionGuard(workspaceId, "replace history");
+      if (!guardResult.success) {
+        return Err(guardResult.error);
       }
+      admissionGuard = guardResult.data;
     }
+    using _admissionGuard = admissionGuard;
 
     const replaceMode = options?.mode ?? "destructive";
 
@@ -10063,6 +11249,47 @@ export class WorkspaceService extends EventEmitter {
           `replaceHistory received unsupported replace mode: ${String(replaceMode)}`
         );
 
+        // Same context-discard boundary as a full clear: drain + serialize
+        // with refine so a mid-pass proposal cannot publish into the
+        // replaced history (compaction replaces are exempt — they preserve
+        // context and the compaction boundary flips the recheck identity).
+        let refineLock: AsyncDisposable | null = null;
+        if (!isCompaction) {
+          await this.refinePassCanceller?.cancelInFlightRefinePass(workspaceId);
+          const refineLockResult = await this.acquireRefineSerializationLock(
+            workspaceId,
+            "replace history"
+          );
+          if (!refineLockResult.success) {
+            return Err(refineLockResult.error);
+          }
+          refineLock = refineLockResult.data;
+        }
+        await using _refineLock = refineLock;
+        // Recheck under the guard + lock: the admission block refuses
+        // ordinary turn starts during the awaits above, but in-turn
+        // compaction retries bypass admission gating when they cross a
+        // transient idle gap.
+        if (
+          !isCompaction &&
+          (this.sessions.get(workspaceId)?.hasActiveOrPendingTurnWork() ||
+            this.aiService.isStreaming(workspaceId))
+        ) {
+          return Err(
+            "Cannot replace history while a turn is active. Press Esc to stop the stream first."
+          );
+        }
+        // r41: same retry hygiene as full clear — a pending retry would
+        // replay the replaced context after the guard releases.
+        const replaceSession = this.sessions.get(workspaceId);
+        if (!isCompaction && replaceSession) {
+          const retryDiscard = await replaceSession.discardAutoRetryForContextMutation();
+          if (!retryDiscard.success) {
+            return Err(
+              `Cannot replace history: pending retry state could not be discarded (${retryDiscard.error})`
+            );
+          }
+        }
         this.sessions.get(workspaceId)?.clearUsageState();
         const clearResult = await this.clearHistoryWithRetiredBashMonitorWakes(
           workspaceId,
@@ -10071,6 +11298,53 @@ export class WorkspaceService extends EventEmitter {
         );
         if (!clearResult.success) {
           return Err(`Failed to clear history: ${clearResult.error}`);
+        }
+        if (!isCompaction) {
+          // r41: the destructive replacement is durable — refuse sends that
+          // entered before it (see contextMutationEpochs).
+          this.advanceContextMutationEpoch(workspaceId);
+          // r43: same branch-summary hygiene as full clear, and same r44
+          // ordering — drop the registration only after the clear commits
+          // (see truncateHistory).
+          await clearPendingBranchSummary(workspaceId);
+          // A destructive non-compaction replace (e.g. "start here") begins a
+          // new context segment: discard pre-boundary post-compaction
+          // carryover like resetContext does, durable-or-fail for the same
+          // reason (a stale persisted file re-injects after a restart).
+          // Compaction summaries instead RELY on the pending post-compaction
+          // state persisted for them.
+          try {
+            await this.getOrCreateSession(workspaceId).clearPostCompactionState();
+          } catch (error) {
+            return Err(
+              `History was cleared, but the persisted post-compaction carryover could not be ` +
+                `durably discarded (${getErrorMessage(error)}). Pre-boundary read/skill context ` +
+                `may be re-injected after a restart; retry once the session storage is writable.`
+            );
+          }
+          // Same boundary as the full-clear path above: a destructive
+          // non-compaction replace discards the transcript, so kernel vars
+          // derived from it must not stay readable (or restorable from the
+          // durable snapshot) afterwards. Compaction replaces instead KEEP
+          // sandbox state — surviving compaction is the kernel's purpose.
+          try {
+            await sandboxHostService.discardScope(
+              workspaceId,
+              this.config.getSessionDir(workspaceId)
+            );
+          } catch (error) {
+            log.error(
+              `Failed to durably invalidate sandbox state for ${workspaceId} after destructive ` +
+                `history replace; the sandbox kernel stays unavailable until invalidation succeeds`,
+              error
+            );
+            return Err(
+              `History was replaced, but the sandbox kernel state could not be durably ` +
+                `invalidated (${getErrorMessage(error)}). The sandbox stays unavailable and ` +
+                `cleared variables may reappear after a restart; retry once the session storage ` +
+                `is writable.`
+            );
+          }
         }
         this.timelineRecorder.record(workspaceId, {
           kind: "history.cleared",

@@ -741,6 +741,11 @@ export const ToolPolicySchema = z.array(ToolPolicyFilterSchema).meta({
 export const ExperimentsSchema = z.object({
   programmaticToolCalling: z.boolean().optional(),
   programmaticToolCallingExclusive: z.boolean().optional(),
+  /**
+   * RLM mode (sub-experiment of Programmatic Tool Calling): persistent
+   * sandbox kernel for code_execution. Inert unless a PTC flag is also on.
+   */
+  rlm: z.boolean().optional(),
   advisorTool: z.boolean().optional(),
   dynamicWorkflows: z.boolean().optional(),
   memory: z.boolean().optional(),

@@ -360,13 +360,33 @@ export abstract class RemoteRuntime implements Runtime {
    * Read file contents as a stream via exec.
    */
   readFile(filePath: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
+    // Internal controller so CANCELLING the returned stream kills the remote
+    // cat: the eager pump below has no other path to the exec, and without
+    // it a cancelled wrapper (e.g. mux.load's byte ceiling) left cat blocked
+    // until its 300s timeout, accumulating remote processes (r18). The
+    // caller's abortSignal forwards into the same controller.
+    const readAbort = new AbortController();
+    const forwardAbort = () => readAbort.abort();
+    if (abortSignal?.aborted) {
+      readAbort.abort();
+    } else {
+      abortSignal?.addEventListener("abort", forwardAbort, { once: true });
+    }
+    const cleanupAbortForwarder = () => {
+      abortSignal?.removeEventListener("abort", forwardAbort);
+    };
+
     return new ReadableStream<Uint8Array>({
+      cancel: () => {
+        readAbort.abort();
+        cleanupAbortForwarder();
+      },
       start: async (controller: ReadableStreamDefaultController<Uint8Array>) => {
         try {
           const stream = await this.exec(`cat ${this.quoteForRemote(filePath)}`, {
             cwd: this.getBasePath(),
             timeout: 300,
-            abortSignal,
+            abortSignal: readAbort.signal,
           });
 
           const reader = stream.stdout.getReader();
@@ -397,6 +417,10 @@ export abstract class RemoteRuntime implements Runtime {
               )
             );
           }
+        } finally {
+          // Natural completion/error: stop listening on the caller's signal
+          // so long-lived signals don't accumulate forwarders.
+          cleanupAbortForwarder();
         }
       },
     });

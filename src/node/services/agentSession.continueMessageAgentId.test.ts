@@ -60,6 +60,30 @@ function compactionSummaryMessage(
   } satisfies XumMessage;
 }
 
+/**
+ * RLM keep-recent floor: a durable compaction boundary summary followed by
+ * preserved-tail copies. The startup follow-up recovery branch must locate the
+ * summary through the epoch read when the last history row is a tail copy.
+ */
+function rlmSummaryBoundaryMessage(pendingFollowUp: CompactionFollowUpRequest): XumMessage {
+  return createXumMessage("rlm-summary", "assistant", "Compaction summary", {
+    compacted: true,
+    compactionBoundary: true,
+    compactionEpoch: 1,
+    muxMetadata: {
+      type: "compaction-summary",
+      pendingFollowUp,
+    },
+  });
+}
+
+function preservedTailCopy(id: string, role: "user" | "assistant", text: string): XumMessage {
+  return createXumMessage(id, role, text, {
+    synthetic: true,
+    rlmPreservedTailCopy: true,
+  });
+}
+
 function heartbeatBoundaryMessage(pendingFollowUp = idleFollowUp()): XumMessage {
   return createXumMessage("heartbeat-boundary", "assistant", "Reset boundary", {
     compacted: "heartbeat",
@@ -441,5 +465,63 @@ describe("AgentSession continue-message agentId fallback", () => {
 
     expect(sendCount).toBe(2);
     expect(internals.startupRecoveryScheduled).toBe(true);
+  });
+
+  // RLM keep-recent floor: post-crash recovery when the compaction summary is
+  // no longer the last history row because preserved-tail copies trail it.
+  test("startup recovery dispatches the follow-up when preserved-tail copies trail the summary", async () => {
+    let dispatchedMessage: string | undefined;
+    const { internals } = await createSession([
+      rlmSummaryBoundaryMessage({
+        text: "follow up after tail",
+        model: "openai:gpt-4o",
+        agentId: "exec",
+      }),
+      preservedTailCopy("tail-copy-1", "user", "original user message"),
+      preservedTailCopy("tail-copy-2", "assistant", "original assistant reply"),
+    ]);
+    internals.sendMessage = mock((message: string) => {
+      dispatchedMessage = message;
+      return Promise.resolve({ success: true as const });
+    });
+
+    internals.scheduleStartupRecovery();
+    await internals.startupRecoveryPromise;
+
+    expect(dispatchedMessage).toBe("follow up after tail");
+    expect(internals.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("startup recovery declines a trailing tail copy when a non-copy row follows the boundary", async () => {
+    // Staleness guard: the epoch is not exactly [summary, ...tail copies], so
+    // "compaction just completed" no longer holds and the follow-up must stay
+    // parked on the summary for a later legitimate recovery.
+    const { historyService, internals } = await createSession([
+      rlmSummaryBoundaryMessage({
+        text: "stale follow up",
+        model: "openai:gpt-4o",
+        agentId: "exec",
+      }),
+      preservedTailCopy("tail-copy-1", "user", "original user message"),
+      createXumMessage("post-compaction-turn", "assistant", "new turn after compaction"),
+      preservedTailCopy("tail-copy-2", "assistant", "trailing copy"),
+    ]);
+    internals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+
+    const dispatched = await internals.dispatchPendingFollowUp();
+
+    expect(dispatched).toBe(false);
+    expect(internals.sendMessage).not.toHaveBeenCalled();
+
+    const historyResult = await historyService.getLastMessages("ws", 10);
+    expect(historyResult.success).toBe(true);
+    if (!historyResult.success) {
+      throw new Error(`Expected history read to succeed: ${historyResult.error}`);
+    }
+    const summary = historyResult.data.find((message) => message.id === "rlm-summary");
+    expect(summary?.metadata?.muxMetadata).toMatchObject({
+      type: "compaction-summary",
+      pendingFollowUp: { text: "stale follow up" },
+    });
   });
 });

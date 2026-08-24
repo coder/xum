@@ -10,6 +10,7 @@ import { eventSpine } from "@/node/services/events/eventSpine";
 import type { Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { HistoryService } from "@/node/services/historyService";
+import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 
@@ -95,6 +96,10 @@ import {
   type ReviewNoteDataForDisplay,
   type StartupRetrySendOptions,
 } from "@/common/types/message";
+import { selectKeepRecentTailStartIndex } from "@/common/utils/messages/keepRecentTail";
+import { extractReadFilePaths, mergeReadFilePaths } from "@/common/utils/messages/extractReadFiles";
+import { isNonNegativeInteger } from "@/common/utils/numbers";
+import { RLM_KEEP_RECENT_FLOOR_TOKENS } from "@/constants/rlmCompaction";
 import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
@@ -160,7 +165,12 @@ import {
   SKILL_DYNAMIC_COMMAND_TIMEOUT_MS,
   SKILL_DYNAMIC_OUTPUT_CAP_BYTES,
 } from "@/node/services/agentSkills/skillDynamicContext";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import {
+  awaitPendingBranchSummary,
+  isRlmModeEnabled,
+  runInlineAbandonedBranchSummary,
+} from "@/node/services/branchSummary";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { renderAgentSkillSnapshotText } from "@/common/utils/agentSkills/skillSnapshot";
@@ -462,6 +472,15 @@ export async function clearProviderConfigFixableAbandonMarkers(
   );
 }
 
+/**
+ * Rejection surfaced to sends refused because a context-discarding history
+ * mutation (reset, full clear, destructive replace) is in flight (r40).
+ * Shared with WorkspaceService's entry-point rejection so the user sees one
+ * message regardless of where the send was refused.
+ */
+export const CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE =
+  "Workspace history is being cleared or reset. Please wait and try again.";
+
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_BASE_DELAY_MS = 1_000;
 const STARTUP_AUTO_RETRY_HISTORY_FAILURE_MAX_DELAY_MS = 30_000;
 const MAX_STARTUP_RECOVERY_DEFERRED_ATTEMPTS = 4;
@@ -486,8 +505,23 @@ interface AgentSessionOptions {
   telemetryService?: TelemetryService;
   backgroundProcessManager: BackgroundProcessManager;
   workspaceGoalService?: WorkspaceGoalService;
+  /** Cost telemetry sink for headless side-channel calls (branch summaries). */
+  sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
   /** When true, skip terminating background processes on dispose/compaction (for bench/CI) */
   keepBackgroundProcesses?: boolean;
+  /**
+   * Registration-time Agent Plugin override sanitization for workspaces this
+   * session registers itself (ensureMetadata: CLI `xum run`/`xum workflow` in
+   * a directory with no existing metadata). Wired to
+   * WorkspaceService.sanitizeCliRegisteredWorkspace, which rolls the config
+   * write back on failure; ensureMetadata must then abort without announcing
+   * the workspace. Returns an error string or undefined on success.
+   */
+  sanitizeCliWorkspaceRegistration?: (args: {
+    workspaceId: string;
+    workspacePath: string;
+    runtimeConfig: RuntimeConfig | undefined;
+  }) => Promise<string | undefined>;
   /** Called when compaction completes (e.g., to clear idle compaction pending state) */
   onCompactionComplete?: (metadata: CompactionCompletionMetadata) => void;
   /** Called with the terminal outcome of an idle compaction (persisted success / post-stream failure) */
@@ -529,7 +563,9 @@ export class AgentSession {
   private readonly initStateManager: InitStateManager;
   private readonly backgroundProcessManager: BackgroundProcessManager;
   private readonly workspaceGoalService?: WorkspaceGoalService;
+  private readonly sessionUsageService?: Pick<SessionUsageService, "recordHeadlessUsage">;
   private readonly keepBackgroundProcesses: boolean;
+  private readonly sanitizeCliWorkspaceRegistration?: AgentSessionOptions["sanitizeCliWorkspaceRegistration"];
   private readonly onPostCompactionStateChange?: () => void;
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
@@ -538,6 +574,14 @@ export class AgentSession {
     [];
   private disposed = false;
   private turnPhase: TurnPhase = TurnPhase.IDLE;
+  /** Edit-flow admission reservations currently holding busy-ness (see isBusy, r32). */
+  private editAdmissionDepth = 0;
+  /**
+   * Context-discarding history mutations currently blocking turn admission
+   * (see holdTurnAdmission, r40). Deliberately NOT part of isBusy(): the
+   * holder itself requires an idle session.
+   */
+  private turnAdmissionBlocks = 0;
   private activePreparedTurnAbortController: AbortController | null = null;
   /**
    * Per-turn holder for mid-turn thinking-level overrides. Created when a turn
@@ -601,6 +645,13 @@ export class AgentSession {
    * continue reattaching them even after the pending on-disk state is acknowledged.
    */
   private postCompactionLoadedSkills: LoadedSkillSnapshot[] = [];
+
+  /**
+   * Cumulative read-file paths from summarized epochs, mirrored like
+   * postCompactionLoadedSkills so periodic re-injections keep the pre-boundary
+   * reads after the pending on-disk state is acknowledged. RLM-only surface.
+   */
+  private postCompactionReadFilePaths: string[] = [];
 
   /**
    * When true, clear any persisted post-compaction state after the next successful non-compaction stream.
@@ -736,6 +787,15 @@ export class AgentSession {
     source?: "idle-compaction" | "auto-compaction";
   };
 
+  /**
+   * RLM keep-recent floor: summary ID of the just-completed compaction whose
+   * preserved-tail copies were appended after the boundary. With copies, the
+   * summary is no longer the last history row, so the stream-end follow-up
+   * dispatch must target it by ID; null for default (RLM-off) compactions so
+   * their "last message is the summary" staleness guard stays byte-identical.
+   */
+  private pendingCompactionFollowUpSummaryId: string | null = null;
+
   constructor(options: AgentSessionOptions) {
     assert(options, "AgentSession requires options");
     const {
@@ -748,7 +808,9 @@ export class AgentSession {
       telemetryService,
       backgroundProcessManager,
       workspaceGoalService,
+      sessionUsageService,
       keepBackgroundProcesses,
+      sanitizeCliWorkspaceRegistration,
       onCompactionComplete,
       onIdleCompactionOutcome,
       onPostCompactionStateChange,
@@ -766,7 +828,9 @@ export class AgentSession {
     this.initStateManager = initStateManager;
     this.backgroundProcessManager = backgroundProcessManager;
     this.workspaceGoalService = workspaceGoalService;
+    this.sessionUsageService = sessionUsageService;
     this.keepBackgroundProcesses = keepBackgroundProcesses ?? false;
+    this.sanitizeCliWorkspaceRegistration = sanitizeCliWorkspaceRegistration;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
 
     this.compactionHandler = new CompactionHandler({
@@ -775,7 +839,15 @@ export class AgentSession {
       sessionDir: this.config.getSessionDir(this.workspaceId),
       telemetryService,
       emitter: this.emitter,
-      onCompactionComplete,
+      onCompactionComplete: (metadata) => {
+        // RLM keep-recent floor: tail copies after the boundary mean the
+        // summary is no longer the last row; stash its ID so the stream-end
+        // follow-up dispatch can target it directly.
+        if ((metadata.preservedTailMessageCount ?? 0) > 0) {
+          this.pendingCompactionFollowUpSummaryId = metadata.summaryMessageId;
+        }
+        onCompactionComplete?.(metadata);
+      },
       onIdleCompactionOutcome,
     });
 
@@ -2615,6 +2687,20 @@ export class AgentSession {
 
     // Write metadata directly to config.json (single source of truth)
     await this.config.addWorkspace(derivedProjectPath, metadata);
+    // This registration path bypasses WorkspaceService.create/fork and the
+    // task-materialization flows, so it must run the same pre-announcement
+    // Agent Plugin override sanitization: a preserved checkout can carry a
+    // stale canonical `plugin:` enable from a since-removed workspace, which
+    // would start a same-name reinstall's default-disabled server on the
+    // first CLI send. The callback rolls back the config write on failure.
+    const sanitizeError = await this.sanitizeCliWorkspaceRegistration?.({
+      workspaceId: this.workspaceId,
+      workspacePath: normalizedWorkspacePath,
+      runtimeConfig: metadata.runtimeConfig,
+    });
+    if (sanitizeError !== undefined) {
+      throw new Error(`Failed to register workspace: ${sanitizeError}`);
+    }
     this.emitMetadata(metadata);
   }
 
@@ -2632,6 +2718,35 @@ export class AgentSession {
       onCanceled?: (reason: string) => Promise<void> | void;
       cancelState?: { canceledBeforeAcceptance: boolean };
       cancelSignal?: AbortSignal;
+      /**
+       * Synthetic assistant rows persisted immediately before this turn's user
+       * row (family-message payloads). Persisting them inside turn admission —
+       * instead of a direct history append from the sender — keeps them out of
+       * another turn's PREPARING window, where they could land between that
+       * turn's user row and its assistant response (consecutive assistant
+       * messages a tool-using response makes unmergeable) or silently enter an
+       * in-flight request without their trigger (r30).
+       */
+      preTurnMessages?: XumMessage[];
+      /**
+       * r54: fired once the pre-turn batch has crossed the rollback horizon —
+       * durably committed AND past the last cancellation/rollback gate. From
+       * that point every failure (goal sync, acceptance, stream start) keeps
+       * the rows in the transcript, so budget-style accounting must treat the
+       * delivery as persisted. Turn ACCEPTANCE is the wrong signal: it can
+       * fail after the rows are already irrevocable.
+       */
+      onPreTurnRowsPersisted?: () => void;
+      /**
+       * r41: staleness probe for this send's admission epoch, captured
+       * synchronously with WorkspaceService's entry checks. Returns true when
+       * a context-discarding mutation COMPLETED after the send entered — the
+       * level-triggered turnAdmissionBlocks check cannot catch a mutation
+       * that started and finished while the send sat in pre-admission
+       * awaits. Not threaded through queued entries: those dispatch into the
+       * post-mutation context by design.
+       */
+      admissionEpochStale?: () => boolean;
     }
   ): Promise<Result<void, SendMessageError>> {
     this.assertNotDisposed("sendMessage");
@@ -2872,6 +2987,59 @@ export class AgentSession {
       }
     }
 
+    // A fork starts its abandoned-branch summary in the background so the fork
+    // itself returns fast; the first send must then await that pending row so
+    // it keeps its position BEFORE this turn's user message and request build
+    // (the "summary lands before the next request" contract). Bounded by the
+    // generation deadline; resolves immediately when nothing is pending.
+    const pendingBranchSummary = await awaitPendingBranchSummary(
+      this.workspaceId,
+      // Session dir enables the cross-process pending-marker wait (r48): a
+      // fork registered in another backend has no entry in this process.
+      this.config.getSessionDir(this.workspaceId)
+    );
+    // Workspace removal disposes the session and cancels the summary writer
+    // while this send is parked on the await above; every append between here
+    // and the late pre-stream disposed check would recreate the session
+    // directory removal is about to delete. Bail exactly like that check
+    // (nothing durable has been persisted for this turn yet, so a plain Ok is
+    // safe — no monitor wake can be past its point of no return here).
+    if (this.disposed) {
+      return Ok(undefined);
+    }
+    if (pendingBranchSummary) {
+      // The renderer loaded history before the background row landed; surface
+      // it without requiring a reload.
+      this.emitChatEvent({ ...pendingBranchSummary, type: "message" });
+    }
+
+    // r32: reserve turn admission for the whole edit flow. Armed AFTER the
+    // preempt/wait section below (arming earlier would make the edit's own
+    // busy-preemption logic see the reservation as an active turn) and
+    // released automatically on every sendMessage exit: on success the turn
+    // phase has taken over busy-ness by then; on a pre-PREPARING failure the
+    // session returns to idle, so drain anything queued behind the
+    // reservation (mirrors the queued-dispatch failure contract).
+    const editAdmission = {
+      armed: false,
+      arm: () => {
+        if (!editAdmission.armed) {
+          editAdmission.armed = true;
+          this.editAdmissionDepth += 1;
+        }
+      },
+      [Symbol.dispose]: () => {
+        if (!editAdmission.armed) return;
+        editAdmission.armed = false;
+        this.editAdmissionDepth -= 1;
+        assert(this.editAdmissionDepth >= 0, "editAdmissionDepth must not go negative");
+        if (this.editAdmissionDepth === 0 && this.turnPhase === TurnPhase.IDLE) {
+          this.sendQueuedMessages();
+        }
+      },
+    };
+    using _editAdmission = editAdmission;
+
     if (editMessageId) {
       // Ensure no in-flight completion code can append after we truncate.
       if (this.isBusy()) {
@@ -2924,6 +3092,22 @@ export class AgentSession {
         }
       }
 
+      // r40: same admission gate as the acceptance path below — the edit is
+      // about to truncate and rewrite history while a context-discarding
+      // mutation may sit between its busy check and its mutation. Checked in
+      // the same synchronous block that arms the edit reservation (which
+      // claims busy-ness), so whichever side runs first is observed by the
+      // other. The epoch probe (r41) also refuses edits whose target rows a
+      // completed mutation already discarded.
+      if (this.turnAdmissionBlocks > 0 || internal?.admissionEpochStale?.() === true) {
+        return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
+      }
+
+      // Idle (or preempted to idle) now: hold busy-ness from here until the
+      // turn phase takes over, so concurrent sends queue instead of racing the
+      // truncate + summary + append sequence below.
+      editAdmission.arm();
+
       // The edit is about to truncate and rewrite history. Any queued content from
       // the previous turn was written in the old context — return it to the input
       // so the user can re-evaluate, and start the edit stream with an empty queue.
@@ -2955,6 +3139,32 @@ export class AgentSession {
           });
         } else {
           return Err(createUnknownSendMessageError(truncateResult.error));
+        }
+      } else {
+        // RLM mode: summarize the truncated tail into a durable labeled row
+        // BEFORE the edited user message is appended and this turn's request is
+        // built (log purity by construction). Best-effort with a hard deadline —
+        // never blocks or fails the edit beyond that bound. Registered (r57
+        // P1): workspace removal racing this await must find a cancellation
+        // handle in clearPendingBranchSummary, or the writer's late append
+        // could recreate the just-deleted session directory.
+        const branchSummaryMessage = await runInlineAbandonedBranchSummary({
+          historyService: this.historyService,
+          aiService: this.aiService,
+          workspaceId: this.workspaceId,
+          abandonedMessages: truncateResult.data.removedMessages,
+          experiments: options?.experiments,
+          isExperimentEnabled:
+            typeof this.aiService.isExperimentEnabled === "function"
+              ? (experimentId) => this.aiService.isExperimentEnabled(experimentId)
+              : undefined,
+          // Side-channel spend must reach session usage / the cost UI.
+          ...(this.sessionUsageService ? { sessionUsageService: this.sessionUsageService } : {}),
+        });
+        if (branchSummaryMessage) {
+          // The renderer just truncated its visible chat; surface the durable
+          // summary row without requiring a history reload.
+          this.emitChatEvent({ ...branchSummaryMessage, type: "message" });
         }
       }
     }
@@ -3014,6 +3224,14 @@ export class AgentSession {
       ...(delegatedToolNames != null ? { delegatedToolNames } : {}),
     });
 
+    // RLM keep-recent floor: stamp compaction requests (manual /compact,
+    // mid-stream forced, idle) with the durable tail-start sequence before the
+    // row is persisted. No-op when RLM is off.
+    const stampedXumMetadata =
+      isCompactionRequest && typedXumMetadata?.type === "compaction-request"
+        ? await this.withKeepRecentTailStamp(typedXumMetadata, optionsForStream)
+        : typedXumMetadata;
+
     const userMessage = createXumMessage(
       messageId,
       "user",
@@ -3023,7 +3241,7 @@ export class AgentSession {
         toolPolicy: typedToolPolicy,
         disableWorkspaceAgents: options?.disableWorkspaceAgents,
         retrySendOptions: pickStartupRetrySendOptions(optionsForStream, agentInitiated, goalKind),
-        muxMetadata: typedXumMetadata, // Pass through frontend metadata as black-box
+        muxMetadata: stampedXumMetadata, // Pass through frontend metadata as black-box
         ...(acpPromptId != null ? { acpPromptId } : {}),
         ...(goalKind != null ? { kind: goalKind } : {}),
         // Auto-resume and other system-generated messages are synthetic + UI-visible
@@ -3055,7 +3273,13 @@ export class AgentSession {
     // turn in model context (the compaction would otherwise summarize a transcript that already
     // contains the new prompt, then replay it again post-compaction).
     let autoCompactionMessage: XumMessage | null = null;
-    if (!isCompactionRequest && !editMessageId) {
+    // Pre-turn rows cannot ride the on-send compaction follow-up (its durable
+    // metadata carries only text + send options), and compacting a payload row
+    // away would dangle the trigger's message-ID reference. Family sends are
+    // small and bounded, so skip on-send compaction for them; mid-stream
+    // forcing still protects the context limit.
+    const hasPreTurnMessages = (internal?.preTurnMessages?.length ?? 0) > 0;
+    if (!isCompactionRequest && !editMessageId && !hasPreTurnMessages) {
       // Seed usage state from persisted history on the first send after restart
       // so the compaction monitor can detect context limits even before any live
       // stream events have populated lastUsageState.
@@ -3131,6 +3355,15 @@ export class AgentSession {
           reason: "on-send",
         });
 
+        // RLM keep-recent floor: stamp on-send auto-compaction requests with
+        // the durable tail-start sequence. No-op when RLM is off.
+        if (autoCompactionRequest.metadata.type === "compaction-request") {
+          autoCompactionRequest.metadata = await this.withKeepRecentTailStamp(
+            autoCompactionRequest.metadata,
+            optionsForStream
+          );
+        }
+
         autoCompactionMessage = createXumMessage(
           createUserMessageId(),
           "user",
@@ -3175,6 +3408,19 @@ export class AgentSession {
         });
         agentInitiated = autoCompactionRequest.agentInitiated;
       }
+    }
+
+    // r41: reject before persisting the turn's rows when a context-discarding
+    // mutation is in flight or completed after this send entered — otherwise
+    // rows composed against the discarded context (snapshots, family
+    // payloads, the user row) land in the fresh transcript even though the
+    // PREPARING gate below refuses the turn. Still pre-acceptance here, so a
+    // plain Err keeps cancellation/rollback contracts clean. Mutations also
+    // refuse while sends are in preflight (r42), so rows can no longer land
+    // after a mutation commits; this check and the PREPARING gate remain
+    // backstops for entry-accounting bypasses.
+    if (this.turnAdmissionBlocks > 0 || internal?.admissionEpochStale?.() === true) {
+      return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
     }
 
     // Persist snapshots only when this turn will be sent immediately.
@@ -3250,9 +3496,42 @@ export class AgentSession {
       }
     }
 
-    // When on-send compaction triggers, the user message is NOT persisted to history
-    // (it's sent as follow-up after compaction). Otherwise, persist normally.
-    if (!autoCompactionMessage) {
+    // Pre-turn rows persist immediately before the user row so the payload and
+    // its trigger land as one uninterrupted transcript unit (see the internal
+    // option's doc comment). ONE durable write for payload(s) + user row (r32):
+    // separate appends left a crash window where the payload persisted without
+    // the turn that delivers it — in-process rollback cannot repair a process
+    // exit. They still join the rollback set for in-process failures.
+    // hasPreTurnMessages implies autoCompactionMessage === null (exempted above).
+    if (internal?.preTurnMessages != null && internal.preTurnMessages.length > 0) {
+      for (const preTurnMessage of internal.preTurnMessages) {
+        // Family payloads are the only producer today: synthetic assistant rows
+        // only, so a future caller cannot smuggle user-role content past the
+        // provenance rules or non-synthetic rows past queue/restore projections.
+        assert(
+          preTurnMessage.role === "assistant" && preTurnMessage.metadata?.synthetic === true,
+          "sendMessage: preTurnMessages must be synthetic assistant rows"
+        );
+      }
+      const batchAppendResult = await this.historyService.appendManyToHistory(this.workspaceId, [
+        ...internal.preTurnMessages,
+        userMessage,
+      ]);
+      if (!batchAppendResult.success) {
+        await rollbackPersistedTurnRows();
+        return Err(createUnknownSendMessageError(batchAppendResult.error));
+      }
+      persistedCancelableMessageIds.push(
+        ...internal.preTurnMessages.map((message) => message.id),
+        userMessage.id
+      );
+      if (await cancelBeforeAcceptance()) {
+        return Ok(undefined);
+      }
+    } else if (!autoCompactionMessage) {
+      // When on-send compaction triggers, the user message is NOT persisted to
+      // history (it's sent as follow-up after compaction). Otherwise, persist
+      // normally.
       const appendResult = await this.historyService.appendToHistory(this.workspaceId, userMessage);
       if (!appendResult.success) {
         await rollbackPersistedTurnRows();
@@ -3269,6 +3548,12 @@ export class AgentSession {
     // wake finish acceptance rather than delete the row after goal state has already observed it.
     if (cancelSignal != null) {
       cancellationDisabled = true;
+    }
+    // r54: the pre-turn batch is now irrevocable — rollbackPersistedTurnRows
+    // is never invoked past this point, so even a failure in goal sync or
+    // acceptance leaves the payload + trigger rows durable in the transcript.
+    if (internal?.preTurnMessages != null && internal.preTurnMessages.length > 0) {
+      internal.onPreTurnRowsPersisted?.();
     }
     try {
       await this.workspaceGoalService?.syncGoalModeWithChatTail(this.workspaceId);
@@ -3321,6 +3606,13 @@ export class AgentSession {
       }
     }
 
+    // Pre-turn rows emit ahead of the user row, matching their persisted order.
+    if (internal?.preTurnMessages != null) {
+      for (const preTurnMessage of internal.preTurnMessages) {
+        this.emitChatEvent({ ...preTurnMessage, type: "message" });
+      }
+    }
+
     // When on-send compaction triggers, the original user message is NOT emitted now —
     // it was not persisted and will be dispatched (persisted + emitted) as a follow-up
     // after compaction completes. Emitting it here would cause a duplicate in the
@@ -3368,6 +3660,28 @@ export class AgentSession {
       // must remain retryable from the surrounding catch path so durable reservations do not stick.
       acceptedPreStreamFailureNotified = true;
     };
+
+    // r40: a context-discarding mutation (reset, full clear, destructive
+    // replace) may have started while this send was validating and persisting
+    // rows — its busy checks saw an idle session. Refuse admission in the
+    // same synchronous block that would set PREPARING: streaming would
+    // snapshot the transcript the mutation is about to discard and repopulate
+    // the cleared context. The turn rows persisted above land pre-mutation,
+    // so the mutation itself discards them. The epoch probe (r41) is a
+    // backstop for a mutation that COMPLETED during the awaits above —
+    // normally impossible since mutations refuse while sends are in
+    // preflight (r42), but kept for paths that bypass WorkspaceService
+    // entry accounting.
+    if (this.turnAdmissionBlocks > 0 || internal?.admissionEpochStale?.() === true) {
+      const error = createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE);
+      // The turn was already accepted (rows durable, onAccepted ran):
+      // internal callers like the terminal-attention outbox mark state
+      // delivered in onAccepted and rely on the accepted pre-stream failure
+      // callback to revert it — returning without notifying would strand
+      // that bookkeeping (r41).
+      await notifyAcceptedPreStreamFailure(error);
+      return Err(error);
+    }
 
     const preparedTurnAbortController = new AbortController();
     this.activePreparedTurnAbortController = preparedTurnAbortController;
@@ -3508,6 +3822,17 @@ export class AgentSession {
       if (!pricingGate.success) {
         return Err(pricingGate.error);
       }
+    }
+
+    // r40: refuse resume admission while a context-discarding mutation is
+    // mid-flight (see holdTurnAdmission) — checked in the same synchronous
+    // block that sets PREPARING. A non-started resume reads as retriable to
+    // retryActiveStream, but the mutation itself cancels pending retries and
+    // clears the resume request (discardAutoRetryForContextMutation, r41),
+    // so a straggler reschedule self-abandons instead of replaying the
+    // discarded context.
+    if (this.turnAdmissionBlocks > 0) {
+      return Ok({ started: false });
     }
 
     // A resumed attempt becomes the latest live resume request as soon as we
@@ -3859,6 +4184,66 @@ export class AgentSession {
     } catch {
       return {};
     }
+  }
+
+  /**
+   * True when RLM-mode history behaviors (keep-recent compaction floor,
+   * abandoned-branch summaries) apply. Frontend sends carry experiments in
+   * send options; backend-initiated compaction sends (idle loop) do not, so
+   * the shared gate falls back to the persisted machine overrides the
+   * renderer syncs into Settings.
+   */
+  private isRlmCompactionEnabled(options: SendMessageOptions | undefined): boolean {
+    // Guard for test mocks that may not implement isExperimentEnabled.
+    const isExperimentEnabled =
+      typeof this.aiService.isExperimentEnabled === "function"
+        ? (experimentId: ExperimentId) => this.aiService.isExperimentEnabled(experimentId)
+        : undefined;
+    return isRlmModeEnabled(options?.experiments, isExperimentEnabled);
+  }
+
+  /**
+   * Compute the durable keep-recent stamp for a compaction request (RLM mode).
+   *
+   * The stamp records the historySequence where the preserved tail starts so
+   * live request assembly, compaction completion, and replay all derive the
+   * exact same tail from durable rows. Returns undefined when RLM is off,
+   * when history cannot be read (self-healing: compaction proceeds without a
+   * tail), or when the tail clamps away entirely.
+   */
+  private async computeKeepRecentTailStamp(
+    options: SendMessageOptions | undefined
+  ): Promise<{ startHistorySequence: number } | undefined> {
+    if (!this.isRlmCompactionEnabled(options)) {
+      return undefined;
+    }
+
+    const historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+    if (!historyResult.success) {
+      return undefined;
+    }
+
+    const messages = historyResult.data;
+    const startIndex = selectKeepRecentTailStartIndex(messages, RLM_KEEP_RECENT_FLOOR_TOKENS);
+    if (startIndex === -1) {
+      return undefined;
+    }
+
+    const startHistorySequence = messages[startIndex].metadata?.historySequence;
+    assert(
+      isNonNegativeInteger(startHistorySequence),
+      "keep-recent tail selector must only pick rows with a valid historySequence"
+    );
+    return { startHistorySequence };
+  }
+
+  /** Stamp a compaction-request metadata payload with the keep-recent tail (no-op when RLM is off). */
+  private async withKeepRecentTailStamp(
+    metadata: Extract<XumMessageMetadata, { type: "compaction-request" }>,
+    options: SendMessageOptions | undefined
+  ): Promise<XumMessageMetadata> {
+    const stamp = await this.computeKeepRecentTailStamp(options);
+    return stamp === undefined ? metadata : { ...metadata, keepRecentTail: stamp };
   }
 
   private buildAutoCompactionRequest(params: {
@@ -4234,7 +4619,7 @@ export class AgentSession {
     const postCompactionAttachments =
       disablePostCompactionAttachments === true
         ? null
-        : await this.getPostCompactionAttachmentsIfNeeded();
+        : await this.getPostCompactionAttachmentsIfNeeded(this.isRlmCompactionEnabled(options));
     if (isStartupAbortRequested()) {
       return Ok(undefined);
     }
@@ -4581,6 +4966,19 @@ export class AgentSession {
     };
 
     await this.finalizeCompactionRetry(data.messageId);
+
+    // r40: the completion path passes through a transient idle gap here — a
+    // context-discarding mutation admitted during that gap must not race the
+    // retry stream (it would snapshot the transcript the mutation discards).
+    // Skipping leaves the recovery decision to the terminal path, exactly
+    // like a retry that failed to start.
+    if (this.turnAdmissionBlocks > 0) {
+      log.info("Skipping compaction retry: a context-discarding history mutation is in progress", {
+        workspaceId: this.workspaceId,
+      });
+      return false;
+    }
+
     this.setAutoRetryResumeState(retryOptionsForResume, retryAgentInitiated, retryGoalKind);
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnXumMetadata(
       retryOptionsForResume.muxMetadata
@@ -4659,6 +5057,7 @@ export class AgentSession {
 
     // The post-compaction context is likely the culprit; discard it so we don't loop.
     this.postCompactionLoadedSkills = [];
+    this.postCompactionReadFilePaths = [];
     try {
       await this.compactionHandler.discardPendingState("context_exceeded");
       this.onPostCompactionStateChange?.();
@@ -4677,6 +5076,16 @@ export class AgentSession {
       messageId: data.messageId,
     });
     await this.clearFailedAssistantMessage(data.messageId, "post-compaction-retry");
+
+    // r40: same admission gate as the compaction retry above — this path also
+    // crosses a transient idle gap before re-entering PREPARING.
+    if (this.turnAdmissionBlocks > 0) {
+      log.info(
+        "Skipping post-compaction retry: a context-discarding history mutation is in progress",
+        { workspaceId: this.workspaceId }
+      );
+      return false;
+    }
 
     // Retry the same request, but without post-compaction injection.
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnXumMetadata(context.options?.muxMetadata);
@@ -5220,7 +5629,11 @@ export class AgentSession {
         if (handled) {
           // Dispatch follow-up AFTER reset so it can set its own stream state. Child lifecycle
           // settlement defers only when this durable continuation was actually accepted.
-          continuedAfterCompaction = await this.dispatchPendingFollowUp();
+          // RLM keep-recent floor: when tail copies were appended the summary is
+          // not the last row, so target it by ID (stashed in onCompactionComplete).
+          const rlmSummaryId = this.pendingCompactionFollowUpSummaryId;
+          this.pendingCompactionFollowUpSummaryId = null;
+          continuedAfterCompaction = await this.dispatchPendingFollowUp(rlmSummaryId ?? undefined);
         }
 
         // Stream end: auto-send queued messages (for user messages typed during streaming)
@@ -5405,7 +5818,87 @@ export class AgentSession {
   }
 
   isBusy(): boolean {
-    return this.turnPhase !== TurnPhase.IDLE;
+    // editAdmissionDepth covers the edit flow's pre-PREPARING window (r32):
+    // truncation + abandoned-branch summary can take seconds before the edit
+    // turn reaches PREPARING, and a concurrent ordinary send observing an
+    // idle session would interleave its rows with the edit's against moved
+    // history.
+    return this.turnPhase !== TurnPhase.IDLE || this.editAdmissionDepth > 0;
+  }
+
+  /**
+   * r43: true while any turn is active OR mid-stream compaction is between
+   * stopping the original stream and dispatching its compaction request.
+   * During that window the session looks idle (turnPhase IDLE, no stream,
+   * the original send's preflight already settled), but interruptForCompaction
+   * will imminently call sendMessage directly — bypassing WorkspaceService
+   * entry accounting — so context-discarding mutations and refine publication
+   * must treat it as turn work and refuse.
+   */
+  hasActiveOrPendingTurnWork(): boolean {
+    return this.isBusy() || this.midStreamCompactionPending;
+  }
+
+  /**
+   * r41: discard pending auto-retry state and the persisted partial as part
+   * of a context-discarding history mutation. A retry scheduled before the
+   * mutation (session idle during backoff) would otherwise fire after the
+   * admission guard releases, commit the pre-mutation partial, and stream a
+   * request derived from the discarded context. Clearing the resume request
+   * makes any straggler reschedule self-abandon (missing_retry_options), and
+   * deleting the partial removes the discarded transcript's tail durably.
+   */
+  async discardAutoRetryForContextMutation(): Promise<Result<void>> {
+    this.retryManager.cancel();
+    this.setAutoRetryResumeState(undefined);
+    const deleteResult = await this.historyService.deletePartial(this.workspaceId);
+    if (!deleteResult.success) {
+      return Err(deleteResult.error);
+    }
+    return Ok(undefined);
+  }
+
+  /**
+   * Block new turn admission while a context-discarding history mutation
+   * (reset, full clear, destructive replace) runs (r40). Unlike
+   * editAdmissionDepth this does NOT claim busy-ness — the holder requires an
+   * idle session — it refuses turn starts during the mutation's awaits
+   * (refine drain + cross-process lock, up to seconds) that would otherwise
+   * snapshot the about-to-be-discarded transcript and stream across the
+   * mutation, repopulating the cleared context with derived output.
+   *
+   * Every idle→PREPARING entry point checks the counter in the same
+   * synchronous block that sets PREPARING (or arms busy-ness); the mutation
+   * arms this block and only then (re)checks busy-ness. On a single thread
+   * one side always observes the other: a turn admitted first fails the
+   * mutation's busy check, a mutation armed first fails the turn's admission
+   * check.
+   */
+  holdTurnAdmission(): Disposable {
+    this.turnAdmissionBlocks += 1;
+    let released = false;
+    return {
+      [Symbol.dispose]: () => {
+        if (released) {
+          return;
+        }
+        released = true;
+        this.turnAdmissionBlocks -= 1;
+        assert(this.turnAdmissionBlocks >= 0, "turnAdmissionBlocks must not go negative");
+        // Entries left queued while the block was held have no stream-end
+        // drain to dispatch them (the session stayed idle throughout) —
+        // drain now, mirroring the edit-admission release. Only when entries
+        // exist: releases from a session that never queued must stay
+        // side-effect free.
+        if (
+          this.turnAdmissionBlocks === 0 &&
+          this.turnPhase === TurnPhase.IDLE &&
+          !this.messageQueue.isEmpty()
+        ) {
+          this.sendQueuedMessages();
+        }
+      },
+    };
   }
 
   /**
@@ -5519,6 +6012,10 @@ export class AgentSession {
       onCanceled?: (reason: string) => Promise<void> | void;
       cancelState?: { canceledBeforeAcceptance: boolean };
       cancelSignal?: AbortSignal;
+      /** Synthetic assistant rows persisted just before the dispatched turn's user row. */
+      preTurnMessages?: XumMessage[];
+      /** r54: fired once pre-turn rows cross the rollback horizon at dispatch. */
+      onPreTurnRowsPersisted?: () => void;
     }
   ): "tool-end" | "turn-end" | null {
     this.assertNotDisposed("queueMessage");
@@ -5898,6 +6395,13 @@ export class AgentSession {
       return;
     }
 
+    // r40: leave entries queued while a context-discarding mutation blocks
+    // turn admission — dispatching would set PREPARING and stream across the
+    // mutation. The block's release drains the queue (holdTurnAdmission).
+    if (this.turnAdmissionBlocks > 0) {
+      return;
+    }
+
     this.queuedProviderToolEndAbortInFlight = false;
     // Clear the queued message flag (even if queue is empty, to handle race conditions)
     this.backgroundProcessManager.setMessageQueued(this.workspaceId, false);
@@ -6049,10 +6553,24 @@ export class AgentSession {
           `Failed to read history for targeted follow-up recovery: ${historyResult.error}`
         );
       }
-      summaryMessage = historyResult.data.find((message) => message.id === summaryMessageId);
-      if (!summaryMessage) {
+      const summaryIndex = historyResult.data.findIndex(
+        (message) => message.id === summaryMessageId
+      );
+      if (summaryIndex === -1) {
         return false;
       }
+      // Same staleness rule as the startup-recovery branch below: background
+      // writers (family-message and refine-summary rows) can append between
+      // the compaction boundary committing and this stream-end dispatch. Any
+      // non-copy row after the targeted summary means the follow-up would
+      // continue after unrelated content — do not fire.
+      const onlyTailCopiesAfterSummary = historyResult.data
+        .slice(summaryIndex + 1)
+        .every((message) => message.metadata?.rlmPreservedTailCopy === true);
+      if (!onlyTailCopiesAfterSummary) {
+        return false;
+      }
+      summaryMessage = historyResult.data[summaryIndex];
     } else {
       // Read the last message from history — only need 1 message, avoid full-file read.
       // Startup recovery must retry on transient read failures, so bubble errors.
@@ -6069,6 +6587,31 @@ export class AgentSession {
         return false;
       }
       summaryMessage = historyResult.data[0];
+
+      // RLM keep-recent floor: preserved-tail copies sit after the boundary,
+      // so "compaction just completed" means the epoch is exactly
+      // [summary, ...tail copies]. Any non-copy row after the summary means
+      // something else happened and the follow-up must not fire (same
+      // staleness guard as the plain "last message is the summary" check).
+      if (summaryMessage.metadata?.rlmPreservedTailCopy === true) {
+        const epochResult = await this.historyService.getHistoryFromLatestBoundary(
+          this.workspaceId
+        );
+        if (!epochResult.success) {
+          throw new Error(
+            `Failed to read epoch for preserved-tail follow-up recovery: ${epochResult.error}`
+          );
+        }
+        const epoch = epochResult.data;
+        const boundary = epoch[0];
+        const onlyTailCopiesAfterBoundary = epoch
+          .slice(1)
+          .every((message) => message.metadata?.rlmPreservedTailCopy === true);
+        if (boundary === undefined || !onlyTailCopiesAfterBoundary) {
+          return false;
+        }
+        summaryMessage = boundary;
+      }
     }
 
     const lastMessage = summaryMessage;
@@ -6249,6 +6792,34 @@ export class AgentSession {
   }
 
   /**
+   * Discard cumulative post-compaction carryover when a NEW context segment
+   * starts (context reset, full history clear, destructive replace). The
+   * cached read-file paths, loaded skills, and pending diff snapshot
+   * summarize PRE-boundary epochs; injecting them into a later turn would
+   * resurrect context the user explicitly discarded and tell the model files
+   * were "previously read" when their contents are gone from active context.
+   * Covers both injection routes: the immediate pending-state path (on-disk
+   * post-compaction.json + handler caches) and the periodic re-merge path
+   * (compactionOccurred + the in-session mirrors).
+   */
+  async clearPostCompactionState(): Promise<void> {
+    // In-memory clears stay unconditional: they stop THIS session from
+    // injecting carryover even when the durable discard below fails.
+    this.compactionOccurred = false;
+    this.turnsSinceLastAttachment = TURNS_BETWEEN_ATTACHMENTS;
+    this.postCompactionLoadedSkills = [];
+    this.postCompactionReadFilePaths = [];
+    this.ackPendingPostCompactionStateOnStreamEnd = false;
+    // Durable-or-throw: a swallowed unlink failure would leave the stale
+    // post-compaction.json to re-inject pre-boundary carryover after a
+    // restart while the boundary caller reports success — the same
+    // invalidation-must-be-durable invariant as the sandbox reset tombstone.
+    // Boundary callers surface the throw as a partial failure.
+    await this.compactionHandler.discardPendingStateDurably("context-boundary");
+    this.onPostCompactionStateChange?.();
+  }
+
+  /**
    * Resolve the memory session context (index snapshot + optional hot block)
    * for the current session segment.
    *
@@ -6294,7 +6865,9 @@ export class AgentSession {
    *
    * @returns Attachments to inject, or null if none needed
    */
-  private async getPostCompactionAttachmentsIfNeeded(): Promise<PostCompactionAttachment[] | null> {
+  private async getPostCompactionAttachmentsIfNeeded(
+    includeReadFiles: boolean
+  ): Promise<PostCompactionAttachment[] | null> {
     // Check if compaction just occurred (immediate injection with cached post-compaction state)
     const pendingState = await this.compactionHandler.peekPendingState();
     if (pendingState !== null) {
@@ -6302,6 +6875,7 @@ export class AgentSession {
       this.compactionOccurred = true;
       this.turnsSinceLastAttachment = 0;
       this.postCompactionLoadedSkills = pendingState.loadedSkills;
+      this.postCompactionReadFilePaths = pendingState.readFiles;
       // Compaction boundary: invalidate the session-cached memory context so
       // the next stream recomputes the index and hot set from current
       // files/pins/usage stats.
@@ -6312,6 +6886,9 @@ export class AgentSession {
       return this.buildAttachmentsFromContext({
         diffs: pendingState.diffs,
         loadedSkills: pendingState.loadedSkills,
+        // Read tracking is internal bookkeeping in both modes but only ever
+        // model-visible in RLM mode, keeping RLM-off prompts byte-identical.
+        readFilePaths: includeReadFiles ? pendingState.readFiles : [],
         // Compaction just completed, so every already-completed report predates the boundary.
         reportsCompletedBeforeMs: Date.now(),
       });
@@ -6323,7 +6900,7 @@ export class AgentSession {
     // Check cooldown for subsequent injections (re-read from current history)
     if (this.compactionOccurred && this.turnsSinceLastAttachment >= TURNS_BETWEEN_ATTACHMENTS) {
       this.turnsSinceLastAttachment = 0;
-      return this.generatePostCompactionAttachments();
+      return this.generatePostCompactionAttachments(includeReadFiles);
     }
 
     return null;
@@ -6332,7 +6909,9 @@ export class AgentSession {
   /**
    * Generate post-compaction attachments by extracting diffs and loaded skills from message history.
    */
-  private async generatePostCompactionAttachments(): Promise<PostCompactionAttachment[]> {
+  private async generatePostCompactionAttachments(
+    includeReadFiles: boolean
+  ): Promise<PostCompactionAttachment[]> {
     // getHistoryFromLatestBoundary already returns only the active compaction epoch,
     // so no further boundary slicing is needed.
     const historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
@@ -6345,6 +6924,14 @@ export class AgentSession {
       ...this.postCompactionLoadedSkills,
       ...extractLoadedSkillSnapshotsFromMessages(historyResult.data),
     ]);
+    // Mirror loadedSkills: cumulative pre-boundary reads carried in memory,
+    // merged with reads from the current epoch (newest-first, capped).
+    const readFilePaths = includeReadFiles
+      ? mergeReadFilePaths(
+          this.postCompactionReadFilePaths,
+          extractReadFilePaths(historyResult.data)
+        )
+      : [];
 
     // Reports completed before the latest boundary had their tool results summarized away;
     // anything newer is still visible in the active epoch and would be redundant.
@@ -6355,6 +6942,7 @@ export class AgentSession {
     return this.buildAttachmentsFromContext({
       diffs: fileDiffs,
       loadedSkills,
+      readFilePaths,
       reportsCompletedBeforeMs: boundaryTimestampMs ?? Date.now(),
     });
   }
@@ -6367,6 +6955,8 @@ export class AgentSession {
   private async buildAttachmentsFromContext(context: {
     diffs: FileEditDiff[];
     loadedSkills: LoadedSkillSnapshot[];
+    /** RLM read tracking (already gated by the caller); empty means "do not surface". */
+    readFilePaths: string[];
     /** Cutoff for the completed-reports index: reports completed before this were summarized away. */
     reportsCompletedBeforeMs: number;
   }): Promise<PostCompactionAttachment[]> {
@@ -6380,6 +6970,10 @@ export class AgentSession {
       completedBeforeMs: context.reportsCompletedBeforeMs,
     });
 
+    const readFilesAttachment = AttachmentService.generateReadFilesAttachment(
+      context.readFilePaths
+    );
+
     const metadataResult = await this.aiService.getWorkspaceMetadata(this.workspaceId);
     if (!metadataResult.success) {
       // Can't get metadata — skip plan reference but still include other attachments.
@@ -6391,6 +6985,10 @@ export class AgentSession {
 
       if (completedReportsAttachment) {
         attachments.push(completedReportsAttachment);
+      }
+
+      if (readFilesAttachment) {
+        attachments.push(readFilesAttachment);
       }
 
       const loadedSkillsAttachment = AttachmentService.generateLoadedSkillsAttachment(
@@ -6430,6 +7028,10 @@ export class AgentSession {
     if (completedReportsAttachment) {
       // Final injection order is decided by the renderer's priority sort.
       attachments.push(completedReportsAttachment);
+    }
+
+    if (readFilesAttachment) {
+      attachments.push(readFilesAttachment);
     }
 
     return attachments;

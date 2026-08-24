@@ -489,6 +489,55 @@ describe("prepareProviderRequestMessages", () => {
       "next-user",
     ]);
   });
+
+  it("excludes the stamped keep-recent tail from RLM compaction summarization requests", () => {
+    const head = createXumMessage("head-user", "user", "old context", { historySequence: 1 });
+    const headReply = createXumMessage("head-assistant", "assistant", "old reply", {
+      historySequence: 2,
+    });
+    const tail = createXumMessage("tail-user", "user", "recent context", { historySequence: 3 });
+    const tailReply = createXumMessage("tail-assistant", "assistant", "recent reply", {
+      historySequence: 4,
+    });
+    const stampedRequest = createXumMessage("compact-req", "user", "/compact", {
+      historySequence: 5,
+      muxMetadata: {
+        type: "compaction-request",
+        rawCommand: "/compact",
+        parsed: {},
+        keepRecentTail: { startHistorySequence: 3 },
+      },
+    });
+
+    const prepared = prepareProviderRequestMessages(
+      [head, headReply, tail, tailReply, stampedRequest],
+      "openai",
+      "off"
+    );
+
+    expect(prepared.providerRequestMessages.map((message) => message.id)).toEqual([
+      "head-user",
+      "head-assistant",
+      "compact-req",
+    ]);
+  });
+
+  it("keeps whole-epoch summarization for unstamped compaction requests (RLM off)", () => {
+    const head = createXumMessage("head-user", "user", "old context", { historySequence: 1 });
+    const tail = createXumMessage("tail-user", "user", "recent context", { historySequence: 2 });
+    const request = createXumMessage("compact-req", "user", "/compact", {
+      historySequence: 3,
+      muxMetadata: { type: "compaction-request", rawCommand: "/compact", parsed: {} },
+    });
+
+    const prepared = prepareProviderRequestMessages([head, tail, request], "openai", "off");
+
+    expect(prepared.providerRequestMessages.map((message) => message.id)).toEqual([
+      "head-user",
+      "tail-user",
+      "compact-req",
+    ]);
+  });
 });
 
 describe("AIService", () => {
@@ -4432,6 +4481,12 @@ describe("normalizeAnthropicBaseURL", () => {
   it("removes trailing slash after /v1", () => {
     expect(normalizeAnthropicBaseURL("https://api.anthropic.com/v1/")).toBe(
       "https://api.anthropic.com/v1"
+    );
+  });
+
+  it("appends /v1 to the path, not the query or fragment", () => {
+    expect(normalizeAnthropicBaseURL("https://proxy.example/anthropic?token=x")).toBe(
+      "https://proxy.example/anthropic/v1?token=x"
     );
   });
 

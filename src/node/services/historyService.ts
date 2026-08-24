@@ -32,6 +32,20 @@ import { CHAT_FILE_NAME, CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isNonNegativeInteger, isPositiveInteger } from "@/common/utils/numbers";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import {
+  historyWriteLockPath,
+  isWorkspaceRemovalTombstoned,
+} from "@/node/services/workspaceRemoval";
+
+/**
+ * Generous bound on waiting for a foreign backend's write: legitimate holds
+ * are one append or one read+replace of the active file (ms). A timeout
+ * fails the mutation visibly instead of corrupting history. The lockfile
+ * itself lives OUTSIDE the session directory (r63, historyWriteLockPath) so
+ * workspace removal can hold it across its tombstone+delete critical section.
+ */
+const HISTORY_WRITE_LOCK_TIMEOUT_MS = 10_000;
 
 function hasDurableCompactionBoundary(metadata: XumMetadata | undefined): boolean {
   if (metadata?.compactionBoundary !== true) {
@@ -189,9 +203,9 @@ export class HistoryService {
   // Shared file operation lock across all workspace file services
   // This prevents deadlocks when operations compose while touching the same workspace files.
   private readonly fileLocks = workspaceFileLocks;
-  private readonly config: Pick<Config, "getSessionDir">;
+  private readonly config: Pick<Config, "getSessionDir" | "rootDir">;
 
-  constructor(config: Pick<Config, "getSessionDir">) {
+  constructor(config: Pick<Config, "getSessionDir" | "rootDir">) {
     this.config = config;
   }
 
@@ -312,12 +326,62 @@ export class HistoryService {
     return false;
   }
 
+  /**
+   * Cheap unlocked probe for truncation-recovery artifacts. Recovery only
+   * MUTATES files when the marker or the archive tombstone exists, so a
+   * clean probe lets read paths stay lock-free (r64).
+   */
+  private async truncateRecoveryArtifactsPresent(workspaceId: string): Promise<boolean> {
+    const exists = (p: string) =>
+      fs.stat(p).then(
+        () => true,
+        (error: unknown) => {
+          if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+            return false;
+          }
+          throw error;
+        }
+      );
+    const [tombstone, marker] = await Promise.all([
+      exists(`${this.getChatArchivePath(workspaceId)}.truncate`),
+      exists(this.getTruncateTransactionPath(workspaceId)),
+    ]);
+    return tombstone || marker;
+  }
+
+  /**
+   * Read-path truncation recovery (r64). Recovery mutates the archive, chat
+   * file, and marker — and an UNLOCKED recovery cannot distinguish a crashed
+   * truncation from a LIVE rewriteHistoryFilesUnlocked() in another backend
+   * (XUM_ALLOW_MULTIPLE_INSTANCES=1): rolling back a live transaction can
+   * restore the old archive between the foreign writer's archive and chat
+   * writes, letting discarded history reappear with mismatched archive/chat
+   * state. Probe without the lock (no artifacts ⇒ nothing to mutate ⇒ reads
+   * stay lock-free); when artifacts exist, take the cross-process write lock
+   * and re-run recovery inside it — recovery re-stats its inputs, so a live
+   * foreign transaction that commits while we wait leaves nothing to do.
+   * Skips recovery for removal-tombstoned workspaces: recovery must never
+   * resurrect files inside a session directory removal is deleting; the read
+   * proceeds against whatever remains.
+   */
+  private async recoverTruncateTransactionForReads(workspaceId: string): Promise<void> {
+    if (!(await this.truncateRecoveryArtifactsPresent(workspaceId))) {
+      return;
+    }
+    await this.withHistoryWriteFileLock(workspaceId, async () => {
+      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+        return;
+      }
+      await this.recoverTruncateTransactionUnlocked(workspaceId);
+    });
+  }
+
   private async withRecoveredHistoryLock<T>(
     workspaceId: string,
     operation: () => Promise<T>
   ): Promise<T> {
     return this.fileLocks.withLock(workspaceId, async () => {
-      await this.recoverTruncateTransactionUnlocked(workspaceId);
+      await this.recoverTruncateTransactionForReads(workspaceId);
       return operation();
     });
   }
@@ -944,14 +1008,17 @@ export class HistoryService {
     );
   }
 
-  /** Call only while holding workspaceFileLocks for this workspace. */
+  /**
+   * Call only while holding workspaceFileLocks for this workspace (and NOT
+   * the cross-process history write lock — recovery acquires it on demand).
+   */
   async iterateFullHistoryUnderLock(
     workspaceId: string,
     direction: "forward" | "backward",
     visitor: (messages: XumMessage[]) => boolean | void | Promise<boolean | void>
   ): Promise<Result<void>> {
     try {
-      await this.recoverTruncateTransactionUnlocked(workspaceId);
+      await this.recoverTruncateTransactionForReads(workspaceId);
       return await this.iterateFullHistoryUnlocked(workspaceId, direction, visitor);
     } catch (error) {
       return Err(`Failed to iterate history: ${getErrorMessage(error)}`);
@@ -1542,22 +1609,34 @@ export class HistoryService {
   async writePartial(workspaceId: string, message: XumMessage): Promise<Result<void>> {
     return this.fileLocks.withLock(workspaceId, async () => {
       try {
-        const workspaceDir = this.config.getSessionDir(workspaceId);
-        await ensurePrivateDir(workspaceDir);
-        const partialPath = this.getPartialPath(workspaceId);
+        // r66: partial flushes ride the cross-process history lock with an
+        // in-lock removal-tombstone gate — a foreign backend's active stream
+        // survives the remover's process-local cancellation, and its next
+        // delta's ensurePrivateDir would otherwise recreate the deleted
+        // session directory (removal holds this same lock across its
+        // tombstone+delete critical section). Truncation recovery is skipped:
+        // partial.json is not part of the archive/chat transaction.
+        return await this.withHistoryWriteFileLock(workspaceId, async () => {
+          if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+            return Err(`workspace ${workspaceId} was removed; refusing partial write`);
+          }
+          const workspaceDir = this.config.getSessionDir(workspaceId);
+          await ensurePrivateDir(workspaceDir);
+          const partialPath = this.getPartialPath(workspaceId);
 
-        const partialMessage: XumMessage = {
-          ...message,
-          metadata: {
-            ...message.metadata,
-            partial: true,
-          },
-        };
+          const partialMessage: XumMessage = {
+            ...message,
+            metadata: {
+              ...message.metadata,
+              partial: true,
+            },
+          };
 
-        // Atomic write: writes to temp file then renames, preventing corruption
-        // if app crashes mid-write (prevents "Unexpected end of JSON input" on read)
-        await writeFileAtomic(partialPath, JSON.stringify(partialMessage, null, 2));
-        return Ok(undefined);
+          // Atomic write: writes to temp file then renames, preventing corruption
+          // if app crashes mid-write (prevents "Unexpected end of JSON input" on read)
+          await writeFileAtomic(partialPath, JSON.stringify(partialMessage, null, 2));
+          return Ok(undefined);
+        });
       } catch (error) {
         const errorMessage = getErrorMessage(error);
         return Err(`Failed to write partial: ${errorMessage}`);
@@ -1858,11 +1937,116 @@ export class HistoryService {
     }
   }
 
+  /**
+   * Serialize history WRITES across backend processes (r50/r51). The
+   * in-process history mutex cannot exclude a second backend
+   * (XUM_ALLOW_MULTIPLE_INSTANCES=1) writing the same chat.jsonl: plain
+   * appends are O_APPEND and never delete foreign rows, but every
+   * read-modify-write that atomically replaces the file — the family-message
+   * batch, updateHistory's row finalization, deletes, truncations, boundary
+   * persistence — would silently revert or delete a foreign row landing
+   * between its read and its replace. ALL mutation paths therefore hold this
+   * session-dir lock for their whole read+replace (via
+   * withRecoveredHistoryWriteResultLock); reads stay lock-free because
+   * writeFileAtomic's rename means a reader observes either the old or the
+   * new file, never a torn one. Always nested INSIDE the in-process history
+   * mutex, so lock order is fixed and re-entry is impossible.
+   */
+  private async withCrossProcessWriteLock<T>(
+    workspaceId: string,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    const sessionDir = this.config.getSessionDir(workspaceId);
+    // Lock BEFORE any directory creation (r63): the lockfile lives outside
+    // the session dir, and removal holds this same lock while it tombstones
+    // and deletes — so a mutation serializes with removal instead of racing
+    // its own ensurePrivateDir against the deletion.
+    return this.withHistoryWriteFileLock(workspaceId, async () => {
+      // Removal gate (r63), checked IN-LOCK: a foreign backend's in-flight
+      // stream survives the remover's process-local cancellation entirely; its
+      // late append would otherwise recreate the deleted session directory via
+      // ensurePrivateDir below. Throwing here surfaces as a normal Err through
+      // withRecoveredHistoryWriteResultLock.
+      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+        throw new Error(`workspace ${workspaceId} was removed; refusing history mutation`);
+      }
+      // Create the session dir with private permissions only for a live
+      // workspace (writeFileAtomic and appends assume the parent exists).
+      await ensurePrivateDir(sessionDir);
+      // Truncation recovery runs IN-LOCK (r64): recovery mutates the
+      // archive/chat/marker files, and outside the lock it cannot tell a
+      // crashed transaction from another backend's live rewrite — rolling
+      // back a live transaction mid-flight resurrects discarded history with
+      // mismatched archive/chat state.
+      await this.recoverTruncateTransactionUnlocked(workspaceId);
+      return operation();
+    });
+  }
+
+  /** Bare cross-process history file lock; see withCrossProcessWriteLock. */
+  private async withHistoryWriteFileLock<T>(
+    workspaceId: string,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    await using _lock = await acquireProcessFileLock({
+      lockPath: historyWriteLockPath(this.config.rootDir, workspaceId),
+      timeoutMs: HISTORY_WRITE_LOCK_TIMEOUT_MS,
+      label: "history write lock",
+    });
+    return await operation();
+  }
+
+  /**
+   * Advance the cached sequence counter from durable history (r51). Call
+   * FIRST inside the write lock from every path that ASSIGNS new sequences
+   * from the cached counter (the append family): the cache can be stale once
+   * the lock lands — a foreign backend may have appended rows with higher
+   * sequences since this process last looked — and a stale assignment would
+   * duplicate a foreign row's sequence (updateHistory() replaces the first
+   * row matching a sequence, so a duplicate lets a later stream finalization
+   * overwrite an unrelated foreign row). Advance-only: delete/truncate flows
+   * recompute their own counters from the post-mutation file under this same
+   * lock and may deliberately allow removed sequences to be reused, so they
+   * must not be pre-seeded here. Same cost class as the recovery scan that
+   * precedes every operation (active file is bounded by rotation).
+   */
+  private async refreshSequenceCounterUnderWriteLock(workspaceId: string): Promise<void> {
+    const persistedNext = (await this.getMaxHistorySequence(workspaceId)) + 1;
+    const cached = this.sequenceCounters.get(workspaceId);
+    if (cached === undefined || persistedNext > cached) {
+      this.sequenceCounters.set(workspaceId, persistedNext);
+    }
+  }
+
+  /**
+   * Write-path variant of withRecoveredHistoryResultLock: additionally holds
+   * the cross-process write lock (and refreshes the sequence counter under
+   * it). Every method that appends to or atomically replaces chat.jsonl must
+   * use this wrapper; read-only methods stay on the mutex-only variant.
+   */
+  private async withRecoveredHistoryWriteResultLock<T>(
+    workspaceId: string,
+    errorPrefix: string,
+    operation: () => Promise<Result<T>>
+  ): Promise<Result<T>> {
+    // Not composed from withRecoveredHistoryLock: recovery for write paths
+    // runs INSIDE withCrossProcessWriteLock (r64); the read-side conditional
+    // recovery would redundantly acquire and release the same file lock.
+    try {
+      return await this.fileLocks.withLock(workspaceId, () =>
+        this.withCrossProcessWriteLock(workspaceId, operation)
+      );
+    } catch (error) {
+      return Err(`${errorPrefix}: ${getErrorMessage(error)}`);
+    }
+  }
+
   async appendToHistory(workspaceId: string, message: XumMessage): Promise<Result<void>> {
-    return this.withRecoveredHistoryResultLock(
+    return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to append history",
       async () => {
+        await this.refreshSequenceCounterUnderWriteLock(workspaceId);
         const result = await this._appendToHistoryUnlocked(workspaceId, message);
         if (result.success) {
           // A new durable boundary seals the previous epoch — rotate it out of
@@ -1870,6 +2054,114 @@ export class HistoryService {
           await this.rotateAfterBoundaryWriteUnlocked(workspaceId, message);
         }
         return result;
+      }
+    );
+  }
+
+  /**
+   * Append several messages as ONE durable write (a single JSONL append).
+   * Family-message delivery persists its payload row(s) and the trigger's
+   * user row atomically so a crash between separate appends cannot strand a
+   * payload without the turn that delivers it (r32) — in-process rollback
+   * cannot repair that window. Sequences are assigned in array order under
+   * the same per-workspace lock every other history mutation takes. Messages
+   * must not carry pre-assigned historySequence values.
+   */
+  async appendManyToHistory(workspaceId: string, messages: XumMessage[]): Promise<Result<void>> {
+    assert(messages.length > 0, "appendManyToHistory requires at least one message");
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to append history",
+      async () => {
+        try {
+          await this.refreshSequenceCounterUnderWriteLock(workspaceId);
+          const workspaceDir = this.config.getSessionDir(workspaceId);
+          await ensurePrivateDir(workspaceDir);
+          const historyPath = this.getChatHistoryPath(workspaceId);
+          for (const message of messages) {
+            assert(
+              message.metadata?.historySequence === undefined,
+              "appendManyToHistory messages must not carry pre-assigned historySequence values"
+            );
+            const nextSeqNum = await this.getNextHistorySequence(workspaceId);
+            assert(
+              isNonNegativeInteger(nextSeqNum),
+              "getNextHistorySequence must return a non-negative integer"
+            );
+            message.metadata = { ...message.metadata, historySequence: nextSeqNum };
+            this.sequenceCounters.set(workspaceId, nextSeqNum + 1);
+          }
+          // Atomic all-or-nothing commit (r48): fs.appendFile is not
+          // transactional — an ENOSPC or crash mid-write could persist the
+          // payload line without the trigger line, and the caller registers
+          // rollback IDs only after this returns, so the torn prefix would
+          // survive as an undelivered assistant row in future provider
+          // requests. Rewrite the whole file through the same
+          // temp-and-rename helper the other history mutations use, under the
+          // cross-process append lock (r50) so a foreign backend's row cannot
+          // land between this read and the replace and be silently deleted.
+          const existing = await fs.readFile(historyPath, "utf-8").catch((error: unknown) => {
+            if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return "";
+            throw error;
+          });
+          // Terminate a torn tail before concatenating (r50): a crash can
+          // leave chat.jsonl ending in an unterminated JSON line. Gluing the
+          // first payload row directly onto those bytes would make the
+          // self-healing reader drop payload+corruption as ONE malformed line
+          // while KEEPING the following trigger row — a durable trigger
+          // referencing an absent payload, breaking the batch's
+          // all-or-nothing contract. With the newline, only the pre-existing
+          // corrupt line is dropped and every batch row survives intact.
+          const healedExisting =
+            existing.length > 0 && !existing.endsWith("\n") ? existing + "\n" : existing;
+          await writeFileAtomic(
+            historyPath,
+            healedExisting + this.serializeHistoryEntries(messages, workspaceId)
+          );
+          return Ok(undefined);
+        } catch (error) {
+          return Err(`Failed to append to history: ${getErrorMessage(error)}`);
+        }
+      }
+    );
+  }
+
+  /**
+   * Compare-and-append: append `message` only if the workspace's current tail
+   * message id still equals `expectedTailMessageId`, checked atomically under
+   * the same per-workspace lock every other history mutation takes. Used by
+   * background writers (abandoned-branch summaries) that must never land
+   * after unrelated rows: if anything else was appended (or history was
+   * rewritten) since the caller observed the tail, the append is skipped and
+   * `"tail-mismatch"` is returned instead of an error — losing the race is an
+   * expected outcome, not a failure.
+   */
+  async appendToHistoryIfTailMatches(
+    workspaceId: string,
+    message: XumMessage,
+    expectedTailMessageId: string
+  ): Promise<Result<"appended" | "tail-mismatch">> {
+    assert(
+      expectedTailMessageId.length > 0,
+      "appendToHistoryIfTailMatches requires a non-empty expected tail id"
+    );
+    return this.withRecoveredHistoryWriteResultLock<"appended" | "tail-mismatch">(
+      workspaceId,
+      "Failed to append history",
+      async () => {
+        await this.refreshSequenceCounterUnderWriteLock(workspaceId);
+        // Tail check + append under the cross-process lock (r50) so a foreign
+        // backend's append cannot land between the check and this write.
+        const tail = await this.readLastMessagesFromFile(this.getChatHistoryPath(workspaceId), 1);
+        if (tail.length === 0 || tail[0].id !== expectedTailMessageId) {
+          return Ok("tail-mismatch");
+        }
+        const result = await this._appendToHistoryUnlocked(workspaceId, message);
+        if (!result.success) {
+          return Err(result.error);
+        }
+        await this.rotateAfterBoundaryWriteUnlocked(workspaceId, message);
+        return Ok("appended");
       }
     );
   }
@@ -1883,7 +2175,7 @@ export class HistoryService {
    * never in the sealed archive.
    */
   async updateHistory(workspaceId: string, message: XumMessage): Promise<Result<void>> {
-    return this.withRecoveredHistoryResultLock(
+    return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to update history",
       async () => {
@@ -1960,6 +2252,121 @@ export class HistoryService {
   }
 
   /**
+   * Atomically persist a compaction boundary together with its preserved
+   * keep-recent tail copies (RLM keep-recent floor) in ONE file commit.
+   *
+   * Why one commit: the boundary write seals the previous epoch — request
+   * assembly starts at the new boundary and the summarizer already excluded
+   * the stamped tail rows from the summary. If the boundary became durable
+   * while the copies were appended row-by-row, a crash or failure between
+   * the two would leave the tail suffix permanently absent from provider
+   * context with no recovery marker. A single writeFileAtomic (temp+rename,
+   * the same primitive updateHistory relies on) commits the boundary and
+   * every copy together: either all of them land or none do.
+   *
+   * `updateExisting` selects update semantics for the summary row (streamed
+   * summaries already occupy their historySequence in the active epoch) vs
+   * append semantics; tail copies are always appended after the boundary so
+   * sealed-epoch rotation keeps them in the active file.
+   */
+  async persistBoundaryWithTailCopies(
+    workspaceId: string,
+    summaryMessage: XumMessage,
+    tailCopies: readonly XumMessage[],
+    updateExisting: boolean
+  ): Promise<Result<void>> {
+    assert(tailCopies.length > 0, "persistBoundaryWithTailCopies requires at least one tail copy");
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to persist compaction boundary with tail copies",
+      async () => {
+        try {
+          // r52: this path assigns fresh sequences (appended summary + every
+          // preserved tail copy) from the cached counter, so it needs the
+          // same in-lock refresh as the append family — a stale cache would
+          // duplicate a foreign backend's sequences and let a later
+          // updateHistory() replace an unrelated row.
+          await this.refreshSequenceCounterUnderWriteLock(workspaceId);
+          await ensurePrivateDir(this.config.getSessionDir(workspaceId));
+          const historyPath = this.getChatHistoryPath(workspaceId);
+          const messages = await this.readChatHistory(workspaceId);
+
+          let persistedSummary: XumMessage | undefined;
+          if (updateExisting) {
+            // Same replace semantics as updateHistory: match by sequence and
+            // preserve boundary metadata already persisted on the row.
+            const targetSequence = summaryMessage.metadata?.historySequence;
+            if (targetSequence === undefined) {
+              return Err("Cannot update message without historySequence");
+            }
+            assert(
+              isNonNegativeInteger(targetSequence),
+              "persistBoundaryWithTailCopies requires a non-negative historySequence"
+            );
+            for (let i = 0; i < messages.length; i++) {
+              if (messages[i].metadata?.historySequence !== targetSequence) {
+                continue;
+              }
+              const preservedCompactionMetadata = getCompactionMetadataToPreserve(
+                workspaceId,
+                messages[i],
+                summaryMessage
+              );
+              messages[i] = {
+                ...summaryMessage,
+                metadata: {
+                  ...summaryMessage.metadata,
+                  ...(preservedCompactionMetadata ?? {}),
+                  historySequence: targetSequence,
+                },
+              };
+              persistedSummary = messages[i];
+              break;
+            }
+            if (persistedSummary === undefined) {
+              return Err(`No message found with historySequence ${targetSequence}`);
+            }
+          } else {
+            // Append semantics: assign the next sequence in place so callers
+            // observe it, exactly like appendToHistory does.
+            assert(
+              summaryMessage.metadata?.historySequence === undefined,
+              "persistBoundaryWithTailCopies append expects an unsequenced summary"
+            );
+            const nextSeqNum = await this.getNextHistorySequence(workspaceId);
+            summaryMessage.metadata = {
+              ...summaryMessage.metadata,
+              historySequence: nextSeqNum,
+            };
+            this.sequenceCounters.set(workspaceId, nextSeqNum + 1);
+            persistedSummary = summaryMessage;
+            messages.push(summaryMessage);
+          }
+
+          for (const copy of tailCopies) {
+            assert(
+              copy.metadata?.historySequence === undefined,
+              "persistBoundaryWithTailCopies expects unsequenced tail copies"
+            );
+            const seq = await this.getNextHistorySequence(workspaceId);
+            copy.metadata = { ...copy.metadata, historySequence: seq };
+            this.sequenceCounters.set(workspaceId, seq + 1);
+            messages.push(copy);
+          }
+
+          await writeFileAtomic(historyPath, this.serializeHistoryEntries(messages, workspaceId));
+
+          // Seal the previous epoch only after boundary + tail are durable.
+          await this.rotateAfterBoundaryWriteUnlocked(workspaceId, persistedSummary);
+          return Ok(undefined);
+        } catch (error) {
+          return Err(`Failed to persist boundary with tail copies: ${getErrorMessage(error)}`);
+        }
+      }
+    );
+  }
+
+  /**
    * Atomically delete a set of recent active-history messages by ID while preserving later rows.
    * Used to roll back a not-yet-accepted turn without truncating concurrent non-session writers.
    */
@@ -1968,7 +2375,7 @@ export class HistoryService {
     const ids = new Set(messageIds);
     assert(ids.size === messageIds.length, "deleteMessages requires unique message IDs");
 
-    return this.withRecoveredHistoryResultLock(
+    return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to delete messages",
       async () => {
@@ -2030,7 +2437,7 @@ export class HistoryService {
    * messages may already have been appended.
    */
   async deleteMessage(workspaceId: string, messageId: string): Promise<Result<void>> {
-    return this.withRecoveredHistoryResultLock(
+    return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to delete message",
       async () => {
@@ -2114,13 +2521,17 @@ export class HistoryService {
    *
    * By default this removes the target message and all subsequent messages. Callers can retain the
    * target message when branching a new workspace from a specific reply.
+   *
+   * Returns the removed tail (in history order) so branch-point callers (fork,
+   * edit-resend) can summarize the abandoned segment; computed under the
+   * history lock so it exactly matches what was cut.
    */
   async truncateAfterMessage(
     workspaceId: string,
     messageId: string,
     options?: { keepTargetMessage?: boolean }
-  ): Promise<Result<void>> {
-    return this.withRecoveredHistoryResultLock(
+  ): Promise<Result<{ removedMessages: XumMessage[] }>> {
+    return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to truncate history",
       async () => {
@@ -2139,16 +2550,16 @@ export class HistoryService {
             return this.truncateAfterArchivedMessageUnlocked(
               workspaceId,
               messageId,
-              keepTargetMessage
+              keepTargetMessage,
+              messages
             );
           }
 
           // Response-level forks branch from the selected assistant turn, so they retain the target
           // message while discarding anything that came after it.
-          const truncatedMessages = messages.slice(
-            0,
-            keepTargetMessage ? messageIndex + 1 : messageIndex
-          );
+          const cutIndex = keepTargetMessage ? messageIndex + 1 : messageIndex;
+          const truncatedMessages = messages.slice(0, cutIndex);
+          const removedMessages = messages.slice(cutIndex);
 
           // Rewrite the history file with truncated messages
           const historyPath = this.getChatHistoryPath(workspaceId);
@@ -2192,7 +2603,7 @@ export class HistoryService {
           );
           this.sequenceCounters.set(workspaceId, nextSeq);
 
-          return Ok(undefined);
+          return Ok({ removedMessages });
         } catch (error) {
           const message = getErrorMessage(error);
           return Err(`Failed to truncate history: ${message}`);
@@ -2210,8 +2621,10 @@ export class HistoryService {
   private async truncateAfterArchivedMessageUnlocked(
     workspaceId: string,
     messageId: string,
-    keepTargetMessage: boolean
-  ): Promise<Result<void>> {
+    keepTargetMessage: boolean,
+    /** Active-epoch messages already read by the caller; all of them are discarded on this branch. */
+    activeEpochMessages: XumMessage[]
+  ): Promise<Result<{ removedMessages: XumMessage[] }>> {
     try {
       const archiveMessages = await this.readArchivedHistory(workspaceId);
       const messageIndex = archiveMessages.findIndex((msg) => msg.id === messageId);
@@ -2220,10 +2633,10 @@ export class HistoryService {
         return Err(`Message with ID ${messageId} not found in history`);
       }
 
-      const truncatedMessages = archiveMessages.slice(
-        0,
-        keepTargetMessage ? messageIndex + 1 : messageIndex
-      );
+      const cutIndex = keepTargetMessage ? messageIndex + 1 : messageIndex;
+      const truncatedMessages = archiveMessages.slice(0, cutIndex);
+      // The removed tail spans the archive remainder plus the whole active epoch.
+      const removedMessages = [...archiveMessages.slice(cutIndex), ...activeEpochMessages];
 
       await this.rewriteHistoryFilesUnlocked(
         workspaceId,
@@ -2262,7 +2675,7 @@ export class HistoryService {
       );
       this.sequenceCounters.set(workspaceId, nextSeq);
 
-      return Ok(undefined);
+      return Ok({ removedMessages });
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to truncate history: ${message}`);
@@ -2279,7 +2692,7 @@ export class HistoryService {
     workspaceId: string,
     percentage: number
   ): Promise<Result<number[], string>> {
-    return this.withRecoveredHistoryResultLock(
+    return this.withRecoveredHistoryWriteResultLock(
       workspaceId,
       "Failed to truncate history",
       async () => {
@@ -2419,7 +2832,10 @@ export class HistoryService {
    * IMPORTANT: Should be called AFTER the session directory has been renamed
    */
   async migrateWorkspaceId(oldWorkspaceId: string, newWorkspaceId: string): Promise<Result<void>> {
-    return this.withRecoveredHistoryResultLock(
+    // Safe to hold the cross-process write lock: the session directory was
+    // already renamed, so the lockfile lives (and is released) at the new
+    // path.
+    return this.withRecoveredHistoryWriteResultLock(
       newWorkspaceId,
       "Failed to migrate workspace history",
       async () => {

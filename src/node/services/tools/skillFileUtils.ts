@@ -27,7 +27,9 @@ export function isAbsolutePathAny(filePath: string): boolean {
   return /^[A-Za-z]:[\\/]/.test(filePath);
 }
 
-function resolveSkillFilePath(
+// Exported for validateSkillWriteProposal (staging-time validation must run
+// the SAME lexical normalization as the write path, not a re-implementation).
+export function resolveSkillFilePath(
   skillDir: string,
   filePath: string
 ): {

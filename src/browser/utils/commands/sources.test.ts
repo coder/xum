@@ -54,6 +54,7 @@ const mk = (over: Partial<Parameters<typeof buildCoreSources>[0]> = {}) => {
     onStartScratchCreation: () => undefined,
     onStartMultiProjectWorkspaceCreation: () => undefined,
     multiProjectWorkspacesEnabled: true,
+    agentPluginsEnabled: false,
     onArchiveMergedWorkspacesInProject: () => Promise.resolve(),
     onSelectWorkspace: () => undefined,
     onRemoveWorkspace: () => Promise.resolve({ success: true }),

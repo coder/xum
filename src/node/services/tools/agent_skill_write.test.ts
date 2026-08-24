@@ -5,8 +5,23 @@ import { describe, it, expect } from "bun:test";
 import type { XumToolScope } from "@/common/types/toolScope";
 import { FILE_EDIT_DIFF_OMITTED_MESSAGE } from "@/common/types/tools";
 import type { AgentSkillReadToolResult, AgentSkillWriteToolResult } from "@/common/types/tools";
+import {
+  REFINEMENT_CAPTURE_MAX_FILE_BYTES,
+  RefinementEvidenceSchema,
+  RefinementInverseSchema,
+  SkillRefinementActionSchema,
+} from "@/common/types/refinement";
+import {
+  applyRefinementInverse,
+  readRefinementEvents,
+  seedForeignTargetLock,
+} from "@/node/services/refinement/refinementTestHelpers";
 import { createAgentSkillReadTool } from "./agent_skill_read";
-import { createAgentSkillWriteTool } from "./agent_skill_write";
+import {
+  createAgentSkillWriteTool,
+  createStagedAgentSkillWriteTool,
+  hashSkillWriteTargetContent,
+} from "./agent_skill_write";
 import { SKILL_FILENAME } from "./skillFileUtils";
 import {
   createTestToolConfig,
@@ -17,6 +32,8 @@ import {
   skillMarkdown,
   TEST_GLOBAL_WORKSPACE_ID as GLOBAL_WORKSPACE_ID,
   TestTempDir,
+  writeGlobalSkill,
+  writeProjectSkill,
   writeSkill,
 } from "./testHelpers";
 
@@ -181,6 +198,51 @@ describe("agent_skill_write", () => {
     );
     expect(await fs.readFile(path.join(canonicalDir, "references/legacy.txt"), "utf-8")).toBe(
       "legacy"
+    );
+    expect(await fs.readFile(path.join(canonicalDir, "references/new.txt"), "utf-8")).toBe("new");
+  });
+
+  it("does not migrate a legacy package while another process holds the target lock", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-legacy-migration-locked");
+    const projectRoot = path.join(tempDir.path, "project");
+    await writeSkill(path.join(projectRoot, ".mux", "skills"), "demo-skill");
+    const canonicalDir = path.join(projectRoot, ".xum", "skills", "demo-skill");
+
+    // Deterministic cross-process interleaving: occupy the canonical skills
+    // root target lock, as another process's in-flight rollback would.
+    // Migration REWRITES the canonical dir, so run outside the lock it could
+    // land between the rollback's in-lock verify and its inverse apply.
+    const lockPath = await seedForeignTargetLock(
+      tempDir.path,
+      path.join(projectRoot, ".xum", "skills")
+    );
+
+    const tool = await createWriteTool(tempDir.path, GLOBAL_WORKSPACE_ID, {
+      type: "project",
+      xumHome: tempDir.path,
+      projectRoot,
+      projectStorageAuthority: "host-local",
+    });
+    const blocked = (await tool.execute!(
+      { name: "demo-skill", filePath: "references/new.txt", content: "new" },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+    expect(blocked.success).toBe(false);
+    if (blocked.success) throw new Error("unreachable");
+    expect(blocked.error).toContain("Another process is mutating");
+    // Nothing — including the legacy migration — touched the canonical dir.
+    const statErr = await fs.stat(canonicalDir).catch((error: NodeJS.ErrnoException) => error);
+    expect(statErr).toMatchObject({ code: "ENOENT" });
+
+    // Lock released → the same write migrates and lands.
+    await fs.unlink(lockPath);
+    const retried = (await tool.execute!(
+      { name: "demo-skill", filePath: "references/new.txt", content: "new" },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+    expect(retried.success).toBe(true);
+    expect(await fs.readFile(path.join(canonicalDir, SKILL_FILENAME), "utf-8")).toContain(
+      "name: demo-skill"
     );
     expect(await fs.readFile(path.join(canonicalDir, "references/new.txt"), "utf-8")).toBe("new");
   });
@@ -1175,5 +1237,293 @@ printf '%s\\n' "$tmp"
     // Verify no directories were created in external target
     const externalEntries = await fs.readdir(externalDir);
     expect(externalEntries).toEqual([]);
+  });
+});
+
+describe("refinement journal", () => {
+  function sessionDirOf(muxHome: string): string {
+    return path.join(muxHome, "sessions", GLOBAL_WORKSPACE_ID);
+  }
+
+  it("refuses a staged write whose target changed after staging, in-lock (r50)", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-staged-guard");
+
+    // The refine apply loop's own pre-check is UNLOCKED: a concurrent writer
+    // can land between that check and this tool's mutation lock. The tool
+    // itself must therefore re-verify the staged fingerprint under the lock,
+    // immediately before the full-file overwrite.
+    const workspaceSessionDir = await createWorkspaceSessionDir(tempDir.path, GLOBAL_WORKSPACE_ID);
+    const config = createTestToolConfig(tempDir.path, {
+      workspaceId: GLOBAL_WORKSPACE_ID,
+      sessionsDir: workspaceSessionDir,
+    });
+    const skillFile = path.join(tempDir.path, "skills", "demo-skill", SKILL_FILENAME);
+    const original = skillMarkdown("demo-skill", { body: "Original body" });
+    await fs.mkdir(path.dirname(skillFile), { recursive: true });
+    await fs.writeFile(skillFile, original, "utf-8");
+
+    // Proposal staged against `original`; target then edited by someone else.
+    const staleTool = createStagedAgentSkillWriteTool(
+      config,
+      new Map([[mockToolCallOptions.toolCallId, hashSkillWriteTargetContent(original)]])
+    );
+    const newer = skillMarkdown("demo-skill", { body: "Newer manual edit that must survive" });
+    await fs.writeFile(skillFile, newer, "utf-8");
+
+    const refused = (await staleTool.execute!(
+      { name: "demo-skill", content: skillMarkdown("demo-skill", { body: "Stale proposal" }) },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+
+    expect(refused.success).toBe(false);
+    if (!refused.success) {
+      expect(refused.error).toContain("restage");
+    }
+    // The newer content survives and no refinement row was journaled.
+    expect(await fs.readFile(skillFile, "utf-8")).toBe(newer);
+    expect(await readRefinementEvents(sessionDirOf(tempDir.path))).toHaveLength(0);
+
+    // A fingerprint matching the current content writes normally.
+    const freshTool = createStagedAgentSkillWriteTool(
+      config,
+      new Map([[mockToolCallOptions.toolCallId, hashSkillWriteTargetContent(newer)]])
+    );
+    const applied = (await freshTool.execute!(
+      { name: "demo-skill", content: skillMarkdown("demo-skill", { body: "Applied" }) },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+    expect(applied.success).toBe(true);
+    expect(await fs.readFile(skillFile, "utf-8")).toContain("Applied");
+  });
+
+  it("journals a new-file write with a delete inverse that round-trips", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-refinement-create");
+
+    const tool = await createWriteTool(tempDir.path);
+    const content = skillMarkdown("demo-skill");
+    const result = (await tool.execute!(
+      { name: "demo-skill", content },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+    expect(result.success).toBe(true);
+
+    const events = await readRefinementEvents(sessionDirOf(tempDir.path));
+    expect(events).toHaveLength(1);
+    expect(events[0].data.kind).toBe("skill");
+    expect(SkillRefinementActionSchema.parse(events[0].data.action)).toEqual({
+      op: "write",
+      skillName: "demo-skill",
+      filePath: SKILL_FILENAME,
+    });
+    const evidence = RefinementEvidenceSchema.parse(events[0].data.evidence);
+    expect(evidence.toolName).toBe("agent_skill_write");
+    expect(evidence.toolCallId).toBe("test-call-id");
+
+    const skillPath = path.join(tempDir.path, "skills", "demo-skill", SKILL_FILENAME);
+    expect(await fs.readFile(skillPath, "utf-8")).toBe(content);
+    await applyRefinementInverse(sessionDirOf(tempDir.path), events[0].data.inverse);
+    const statErr = await fs.stat(skillPath).catch((error: NodeJS.ErrnoException) => error);
+    expect(statErr).toMatchObject({ code: "ENOENT" });
+  });
+
+  it("journals an overwrite with a blob-backed restore inverse that round-trips", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-refinement-overwrite");
+
+    const tool = await createWriteTool(tempDir.path);
+    // Over the inline cap so the inverse must round-trip through the blob store.
+    const original = skillMarkdown("demo-skill", { body: "x".repeat(5000) });
+    const updated = skillMarkdown("demo-skill", { body: "Updated body" });
+
+    const first = (await tool.execute!(
+      { name: "demo-skill", content: original },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+    expect(first.success).toBe(true);
+    const second = (await tool.execute!(
+      { name: "demo-skill", content: updated },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+    expect(second.success).toBe(true);
+
+    const events = await readRefinementEvents(sessionDirOf(tempDir.path));
+    expect(events).toHaveLength(2);
+    const inverse = RefinementInverseSchema.parse(events[1].data.inverse);
+    expect(inverse.op).toBe("restore-files");
+    if (inverse.op === "restore-files") {
+      expect(inverse.files).toHaveLength(1);
+      expect(inverse.files[0].text).toBeUndefined();
+      expect(inverse.files[0].blobRef).toBeDefined();
+    }
+
+    const skillPath = path.join(tempDir.path, "skills", "demo-skill", SKILL_FILENAME);
+    expect(await fs.readFile(skillPath, "utf-8")).toBe(updated);
+    await applyRefinementInverse(sessionDirOf(tempDir.path), events[1].data.inverse);
+    expect(await fs.readFile(skillPath, "utf-8")).toBe(original);
+  });
+
+  it("skips journaling when the prior file exceeds the capture budget", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-refinement-budget");
+
+    // Prior file created out-of-band (repo-controlled skill content): its
+    // capture would duplicate over-budget bytes into the journal/blob store
+    // on every overwrite.
+    await writeGlobalSkill(tempDir.path, "demo-skill", {
+      description: "fixture",
+      files: { "references/big.txt": "x".repeat(REFINEMENT_CAPTURE_MAX_FILE_BYTES + 1) },
+    });
+
+    const tool = await createWriteTool(tempDir.path);
+    const result = (await tool.execute!(
+      { name: "demo-skill", filePath: "references/big.txt", content: "trimmed\n" },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+
+    // The write itself must still succeed; only journaling is skipped.
+    expect(result.success).toBe(true);
+    const written = path.join(tempDir.path, "skills", "demo-skill", "references", "big.txt");
+    expect(await fs.readFile(written, "utf-8")).toBe("trimmed\n");
+    expect(await readRefinementEvents(sessionDirOf(tempDir.path))).toHaveLength(0);
+  });
+
+  it("skips journaling when the prior file is not valid UTF-8 (binary)", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-refinement-binary");
+
+    await writeGlobalSkill(tempDir.path, "demo-skill", { description: "fixture" });
+    const binPath = path.join(tempDir.path, "skills", "demo-skill", "references", "asset.bin");
+    await fs.mkdir(path.dirname(binPath), { recursive: true });
+    // 0xff/0xfe can never round-trip through utf-8; a captured inverse would
+    // restore U+FFFD-corrupted bytes on rollback.
+    await fs.writeFile(binPath, Buffer.from([0xff, 0xfe, 0x00, 0x01]));
+
+    const tool = await createWriteTool(tempDir.path);
+    const result = (await tool.execute!(
+      { name: "demo-skill", filePath: "references/asset.bin", content: "now text\n" },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+
+    expect(result.success).toBe(true);
+    expect(await readRefinementEvents(sessionDirOf(tempDir.path))).toHaveLength(0);
+  });
+
+  it("skips journaling when an existing runtime prior file cannot be read", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-refinement-unreadable-runtime");
+    const skillName = "my-skill";
+    const remoteWorkspaceRoot = "/remote/workspace";
+
+    await writeProjectSkill(tempDir.path, skillName, {
+      description: "fixture",
+      files: { "references/locked.txt": "precious prior content\n" },
+    });
+
+    // The prior file EXISTS (stat succeeds) but reading it fails — e.g. a
+    // permission error or transient remote failure. Treating that as "did
+    // not exist" would journal a delete-files inverse whose rollback deletes
+    // the pre-existing file instead of restoring it.
+    class UnreadableFileRuntime extends RemotePathMappedRuntime {
+      override readFile(
+        filePath: string,
+        abortSignal?: AbortSignal
+      ): ReturnType<RemotePathMappedRuntime["readFile"]> {
+        if (filePath.endsWith("locked.txt")) {
+          throw new Error("EACCES: permission denied");
+        }
+        return super.readFile(filePath, abortSignal);
+      }
+    }
+
+    const remoteRuntime = new UnreadableFileRuntime(tempDir.path, remoteWorkspaceRoot);
+    const sessionsDir = path.join(tempDir.path, "session-dir");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const baseConfig = createTestToolConfig(tempDir.path, {
+      workspaceId: "regular-workspace",
+      sessionsDir,
+      runtime: remoteRuntime,
+      xumScope: {
+        type: "project",
+        xumHome: tempDir.path,
+        projectRoot: "/host/project",
+        projectStorageAuthority: "runtime",
+      },
+    });
+    const config = { ...baseConfig, cwd: remoteWorkspaceRoot };
+
+    const tool = createAgentSkillWriteTool(config);
+    const result = (await tool.execute!(
+      { name: skillName, filePath: "references/locked.txt", content: "overwritten\n" },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+
+    // The write proceeds; only journaling is skipped (no delete-files row
+    // that would destroy the prior file on rollback).
+    expect(result.success).toBe(true);
+    const written = path.join(
+      tempDir.path,
+      ".xum",
+      "skills",
+      skillName,
+      "references",
+      "locked.txt"
+    );
+    expect(await fs.readFile(written, "utf-8")).toBe("overwritten\n");
+    expect(await readRefinementEvents(sessionsDir)).toHaveLength(0);
+  });
+
+  it("skips journaling oversized prior files on the runtime-backed path", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-refinement-budget-runtime");
+    const skillName = "my-skill";
+    const remoteWorkspaceRoot = "/remote/workspace";
+
+    await writeProjectSkill(tempDir.path, skillName, {
+      description: "fixture",
+      files: { "references/big.txt": "x".repeat(REFINEMENT_CAPTURE_MAX_FILE_BYTES + 1) },
+    });
+
+    const remoteRuntime = new RemotePathMappedRuntime(tempDir.path, remoteWorkspaceRoot);
+    const sessionsDir = path.join(tempDir.path, "session-dir");
+    await fs.mkdir(sessionsDir, { recursive: true });
+    const baseConfig = createTestToolConfig(tempDir.path, {
+      workspaceId: "regular-workspace",
+      sessionsDir,
+      runtime: remoteRuntime,
+      xumScope: {
+        type: "project",
+        xumHome: tempDir.path,
+        projectRoot: "/host/project",
+        projectStorageAuthority: "runtime",
+      },
+    });
+    const config = { ...baseConfig, cwd: remoteWorkspaceRoot };
+
+    const tool = createAgentSkillWriteTool(config);
+    const result = (await tool.execute!(
+      { name: skillName, filePath: "references/big.txt", content: "trimmed\n" },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+
+    expect(result.success).toBe(true);
+    expect(await readRefinementEvents(sessionsDir)).toHaveLength(0);
+  });
+
+  it("does not fail the write when the journal is unavailable", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-write-refinement-broken-journal");
+
+    // Occupy the session dir path with a FILE so journal appends cannot mkdir.
+    const brokenSessionDir = path.join(tempDir.path, "broken-session");
+    await fs.writeFile(brokenSessionDir, "not a directory", "utf-8");
+    const config = createTestToolConfig(tempDir.path, {
+      workspaceId: "ws-broken",
+      sessionsDir: brokenSessionDir,
+    });
+    const tool = createAgentSkillWriteTool(config);
+
+    const content = skillMarkdown("demo-skill");
+    const result = (await tool.execute!(
+      { name: "demo-skill", content },
+      mockToolCallOptions
+    )) as AgentSkillWriteToolResult;
+    expect(result.success).toBe(true);
+    expect(
+      await fs.readFile(path.join(tempDir.path, "skills", "demo-skill", SKILL_FILENAME), "utf-8")
+    ).toBe(content);
   });
 });

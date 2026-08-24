@@ -8,6 +8,8 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { MemoryService, projectMemoryDirName } from "@/node/services/memoryService";
 import { MemoryMetaService } from "@/node/services/memoryMeta";
+import { RefinementEvidenceSchema } from "@/common/types/refinement";
+import { readRefinementEvents } from "@/node/services/refinement/refinementTestHelpers";
 import { createMemoryTool, resolveMemoryAccessPolicy } from "./memory";
 import { TestTempDir, createTestToolConfig, mockToolCallOptions } from "./testHelpers";
 import type { MemoryToolResult } from "@/common/types/tools";
@@ -400,5 +402,25 @@ describe("memory tool", () => {
       const tools = await getRegisteredTools({ memoryExperiment: true });
       expect(tools).not.toContain("memory");
     });
+  });
+});
+
+describe("memory tool refinement journal", () => {
+  it("threads the provider tool call id into the refinement row evidence", async () => {
+    using fixture = await createFixture();
+    const result = await run(fixture.tool, {
+      command: "create",
+      path: "/memories/global/notes.md",
+      file_text: "hello",
+    });
+    expect(result.success).toBe(true);
+
+    // Same session-dir resolution the service uses (Config path derivation is pure).
+    const sessionDir = new Config(fixture.xumHome).getSessionDir("ws-tool");
+    const events = await readRefinementEvents(sessionDir);
+    expect(events).toHaveLength(1);
+    const evidence = RefinementEvidenceSchema.parse(events[0].data.evidence);
+    expect(evidence.toolCallId).toBe("test-call-id");
+    expect(evidence.toolName).toBe("memory");
   });
 });

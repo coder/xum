@@ -49,7 +49,11 @@ function createToolConfig(
 ) {
   const advisorLanguageModel = Object.create(null) as LanguageModel;
   const createModel = mock(() =>
-    Promise.resolve({ model: advisorLanguageModel, optionsModelString: ADVISOR_MODEL })
+    Promise.resolve({
+      model: advisorLanguageModel,
+      optionsModelString: ADVISOR_MODEL,
+      optionsProvidersConfig: null,
+    })
   );
   const transcript = options?.transcript ?? createTranscript();
   const getTranscriptSnapshot = mock(() => transcript);

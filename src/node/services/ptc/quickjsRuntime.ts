@@ -12,8 +12,19 @@ import {
 } from "quickjs-emscripten-core";
 import { QuickJSAsyncFFI } from "@jitl/quickjs-wasmfile-release-asyncify/ffi";
 import crypto from "crypto";
-import type { IJSRuntime, IJSRuntimeFactory, RuntimeLimits } from "./runtime";
+import type { IJSRuntime, IJSRuntimeFactory, KernelRecordBounds, RuntimeLimits } from "./runtime";
 import type { PTCEvent, PTCExecutionResult, PTCToolCallRecord, PTCConsoleRecord } from "./types";
+import { CONSOLE_CAPTURE_BUDGET_BYTES } from "@/constants/kernelOutput";
+import { sliceUtf8Bytes } from "@/common/utils/sliceUtf8Bytes";
+
+/** Capture-time console retention accounting for one eval (see setupConsole). */
+interface ConsoleCaptureBudget {
+  retainedBytes: number;
+  droppedRecords: number;
+  /** The truncation record installed when the budget tripped; its text is
+   * updated in place as later drops accumulate. Null while under budget. */
+  marker: PTCConsoleRecord | null;
+}
 import { UNAVAILABLE_IDENTIFIERS } from "./staticAnalysis";
 
 // Default limits
@@ -169,6 +180,8 @@ export class QuickJSRuntime implements IJSRuntime {
   private consoleSetup = false;
   /** Serializes late-settlement guest continuations; see setPendingJobGate. */
   private pendingJobGate?: (run: () => void) => void;
+  /** Kernel-mode caps on record/event capture; see IJSRuntime.setKernelRecordBounds. */
+  private kernelRecordBounds?: KernelRecordBounds;
   /** Monotonic eval counter + the generation currently inside eval() (null
    * between evals). Distinguishes settlements arriving mid-eval (queued for
    * the eval's own drain points) from truly-late ones between evals (gated).
@@ -203,10 +216,19 @@ export class QuickJSRuntime implements IJSRuntime {
     string,
     Record<string, (...args: unknown[]) => Promise<unknown>>
   >();
+  /** Same late-bound dispatch for registerObject sync methods: guest-saved
+   * references must never pin a replaced implementation. */
+  private readonly registeredObjectSyncMethods = new Map<
+    string,
+    Record<string, (...args: unknown[]) => unknown>
+  >();
 
   // Execution state (reset per eval)
   private toolCalls: PTCToolCallRecord[] = [];
   private consoleOutput: PTCConsoleRecord[] = [];
+  /** Per-eval console capture budgets, keyed by the attribution's console
+   * array (see consoleBudgetFor); WeakMap so budgets die with their eval. */
+  private readonly consoleBudgets = new WeakMap<PTCConsoleRecord[], ConsoleCaptureBudget>();
 
   // In-flight async-capability promises (registerPromiseFunction). eval()'s
   // resolve loop awaits these when the returned value is still pending, so a
@@ -272,12 +294,17 @@ export class QuickJSRuntime implements IJSRuntime {
       // executed in our sandbox, not requested by the model.
       const callId = generateCallId();
 
+      // Kernel mode bounds captured args/results at creation: records and
+      // streamed events must never retain full guest payloads (host memory +
+      // session history growth); the guest still receives full values.
+      const recordArgs = this.boundCaptureArgs(args[0]);
+
       // Emit start event
       this.eventHandler?.({
         type: "tool-call-start",
         callId,
         toolName: name,
-        args: args[0],
+        args: recordArgs,
         startTime,
       });
 
@@ -285,17 +312,23 @@ export class QuickJSRuntime implements IJSRuntime {
         const result = await fn(...args);
         const endTime = Date.now();
         const duration_ms = endTime - startTime;
+        const recordResult = this.boundCaptureResult(result);
 
         // Record tool call
-        this.toolCalls.push({ toolName: name, args: args[0], result, duration_ms });
+        this.toolCalls.push({
+          toolName: name,
+          args: recordArgs,
+          result: recordResult,
+          duration_ms,
+        });
 
         // Emit end event
         this.eventHandler?.({
           type: "tool-call-end",
           callId,
           toolName: name,
-          args: args[0],
-          result,
+          args: recordArgs,
+          result: recordResult,
           startTime,
           endTime,
         });
@@ -306,12 +339,13 @@ export class QuickJSRuntime implements IJSRuntime {
         const endTime = Date.now();
         const duration_ms = endTime - startTime;
         const errorStr = error instanceof Error ? error.message : String(error);
+        const recordError = this.boundCaptureError(errorStr);
 
         // Record failed tool call
         this.toolCalls.push({
           toolName: name,
-          args: args[0],
-          error: errorStr,
+          args: recordArgs,
+          error: recordError,
           duration_ms,
         });
 
@@ -320,8 +354,8 @@ export class QuickJSRuntime implements IJSRuntime {
           type: "tool-call-end",
           callId,
           toolName: name,
-          args: args[0],
-          error: errorStr,
+          args: recordArgs,
+          error: recordError,
           startTime,
           endTime,
         });
@@ -442,18 +476,21 @@ export class QuickJSRuntime implements IJSRuntime {
         try {
           const result = await fn(...args);
           const endTime = Date.now();
+          // Same creation-time bounding as synchronous bridges (kernel mode).
+          const recordArgs = this.boundCaptureArgs(args[0]);
+          const recordResult = this.boundCaptureResult(result);
           toolCalls.push({
             toolName: name,
-            args: args[0],
-            result,
+            args: recordArgs,
+            result: recordResult,
             duration_ms: endTime - startTime,
           });
           eventHandler?.({
             type: "tool-call-end",
             callId,
             toolName: name,
-            args: args[0],
-            result,
+            args: recordArgs,
+            result: recordResult,
             startTime,
             endTime,
           });
@@ -465,18 +502,20 @@ export class QuickJSRuntime implements IJSRuntime {
         } catch (error) {
           const endTime = Date.now();
           const errorStr = error instanceof Error ? error.message : String(error);
+          const recordError = this.boundCaptureError(errorStr);
+          const recordArgs = this.boundCaptureArgs(args[0]);
           toolCalls.push({
             toolName: name,
-            args: args[0],
-            error: errorStr,
+            args: recordArgs,
+            error: recordError,
             duration_ms: endTime - startTime,
           });
           eventHandler?.({
             type: "tool-call-end",
             callId,
             toolName: name,
-            args: args[0],
-            error: errorStr,
+            args: recordArgs,
+            error: recordError,
             startTime,
             endTime,
           });
@@ -522,6 +561,68 @@ export class QuickJSRuntime implements IJSRuntime {
     fnHandle.dispose();
   }
 
+  setKernelRecordBounds(bounds: KernelRecordBounds | undefined): void {
+    this.kernelRecordBounds = bounds;
+  }
+
+  /**
+   * Bound a guest-supplied value at record/event CREATION time (kernel mode
+   * only). Records live in host memory for the whole eval and events land in
+   * partial/final session history via the stream manager, so post-eval
+   * compaction cannot protect either — a guest looping large nested args
+   * would otherwise grow both without bound. The marker keeps the true size
+   * so downstream compaction reports honest byte counts.
+   */
+  private boundCapture(value: unknown, capBytes: number): unknown {
+    if (this.kernelRecordBounds === undefined) return value;
+    let serialized: string;
+    try {
+      serialized = JSON.stringify(value) ?? "";
+    } catch {
+      // Bridged values are JSON round-tripped, so this is unreachable in
+      // practice; suppress rather than risk leaking via toString.
+      return { __kernelBounded: true, bytes: 0, preview: "[unserializable]" };
+    }
+    const bytes = Buffer.byteLength(serialized, "utf8");
+    if (bytes <= capBytes) return value;
+    return {
+      __kernelBounded: true,
+      bytes,
+      // capBytes is a byte budget: slice by UTF-8 bytes, not code units
+      // (multibyte text would otherwise retain up to ~4x the cap).
+      preview: `${sliceUtf8Bytes(serialized, capBytes)}…[${bytes} bytes total; truncated]`,
+    };
+  }
+
+  private boundCaptureArgs(value: unknown): unknown {
+    return this.kernelRecordBounds === undefined
+      ? value
+      : this.boundCapture(value, this.kernelRecordBounds.argsCapBytes);
+  }
+
+  /**
+   * Bound error strings captured into records/events (kernel mode). Host
+   * error messages can embed guest-supplied data verbatim — e.g. ENAMETOOLONG
+   * echoes a multi-megabyte path — and record errors stay model-visible
+   * through compaction, so an unbounded message would reopen the context
+   * leak that args/result bounding closed. The guest-facing rejection keeps
+   * the full message (kernel-side only; return values are bounded anyway).
+   */
+  private boundCaptureError(errorStr: string): string {
+    if (this.kernelRecordBounds === undefined) return errorStr;
+    const capBytes = this.kernelRecordBounds.argsCapBytes;
+    const bytes = Buffer.byteLength(errorStr, "utf8");
+    if (bytes <= capBytes) return errorStr;
+    // Byte-safe truncation for the same reason as boundCapture.
+    return `${sliceUtf8Bytes(errorStr, capBytes)}…[${bytes} bytes total; truncated]`;
+  }
+
+  private boundCaptureResult(value: unknown): unknown {
+    return this.kernelRecordBounds === undefined
+      ? value
+      : this.boundCapture(value, this.kernelRecordBounds.resultCapBytes);
+  }
+
   setPendingJobGate(gate: (run: () => void) => void): void {
     this.pendingJobGate = gate;
   }
@@ -540,11 +641,119 @@ export class QuickJSRuntime implements IJSRuntime {
     fnHandle.dispose();
   }
 
+  /**
+   * Array.isArray over a guest handle. Named properties DO store on a guest
+   * array (the read-back verify passes) but JSON.stringify(vars) ignores
+   * them, so a load landing on `vars = []` would report success while the
+   * next snapshot durably commits `[]` — after a restart the loaded key is
+   * gone (r49, same normalization as storeResultHandle's guest code).
+   */
+  private isGuestArray(handle: QuickJSHandle): boolean {
+    const arrayCtor = this.ctx.getProp(this.ctx.global, "Array");
+    const isArrayFn = this.ctx.getProp(arrayCtor, "isArray");
+    try {
+      const call = this.ctx.callFunction(isArrayFn, this.ctx.undefined, handle);
+      if (call.error) {
+        call.error.dispose();
+        return false;
+      }
+      const result: unknown = this.ctx.dump(call.value);
+      call.value.dispose();
+      return result === true;
+    } finally {
+      isArrayFn.dispose();
+      arrayCtor.dispose();
+    }
+  }
+
+  setVarsProperty(key: string, value: string): void {
+    this.assertNotDisposed("setVarsProperty");
+    const valueHandle = this.ctx.newString(value);
+    let varsHandle = this.ctx.getProp(this.ctx.global, "vars");
+    // vars is guest-writable: if the guest deleted or clobbered it (non-object,
+    // null, or an array whose named properties JSON.stringify would drop),
+    // recreate the namespace instead of crashing the write mid-eval.
+    const clobbered =
+      this.ctx.typeof(varsHandle) !== "object" ||
+      this.ctx.eq(varsHandle, this.ctx.null) ||
+      this.isGuestArray(varsHandle);
+    if (clobbered) {
+      varsHandle.dispose();
+      varsHandle = this.ctx.newObject();
+      this.ctx.setProp(this.ctx.global, "vars", varsHandle);
+    }
+    this.ctx.setProp(varsHandle, key, valueHandle);
+    // r29: a guest Proxy vars whose traps lie (set/defineProperty returning
+    // true without storing) swallows this write silently — mux.load would
+    // then return a successful {key, bytes, lines, preview} record while
+    // vars[key] never existed, and the next snapshot would durably commit
+    // the miss. Read the property back and throw so the caller's error path
+    // reports an honest failure to the model (same in-eval verify as the
+    // handle store in sandboxHostService).
+    let stored = false;
+    try {
+      const readBack = this.ctx.getProp(varsHandle, key);
+      stored = this.ctx.eq(readBack, valueHandle);
+      readBack.dispose();
+      if (stored) {
+        // r54: the identity read-back above goes through the SAME [[Get]] a
+        // lying Proxy controls — a get trap that echoes the just-assigned
+        // value passes it while [[OwnPropertyKeys]] omits the key, so
+        // JSON.stringify(vars) (exactly what the durable snapshot persists)
+        // would drop the load and it would vanish after a restart. Verify
+        // through the serialization itself: stash the expected value in a
+        // temp global (string identity survives) and compare against the
+        // parse(stringify(vars)) round trip.
+        this.ctx.setProp(this.ctx.global, "__xumVarsWriteVerify", valueHandle);
+        const verify = this.ctx.evalCode(
+          `(function () {
+            try {
+              const round = JSON.parse(JSON.stringify(globalThis.vars));
+              return (
+                round !== null &&
+                typeof round === "object" &&
+                round[${JSON.stringify(key)}] === globalThis.__xumVarsWriteVerify
+              );
+            } catch {
+              return false;
+            } finally {
+              delete globalThis.__xumVarsWriteVerify;
+            }
+          })()`
+        );
+        if (verify.error) {
+          verify.error.dispose();
+          stored = false;
+        } else {
+          const survived: unknown = this.ctx.dump(verify.value);
+          verify.value.dispose();
+          stored = survived === true;
+        }
+      }
+    } finally {
+      varsHandle.dispose();
+      valueHandle.dispose();
+    }
+    if (!stored) {
+      throw new Error(
+        `vars assignment did not store ${JSON.stringify(key)} — the guest vars namespace swallows or hides writes from serialization; restore vars to a plain object and retry`
+      );
+    }
+  }
+
   registerObject(
     name: string,
-    obj: Record<string, (...args: unknown[]) => Promise<unknown>>
+    obj: Record<string, (...args: unknown[]) => Promise<unknown>>,
+    syncMethods?: Record<string, (...args: unknown[]) => unknown>
   ): void {
     this.assertNotDisposed("registerObject");
+    for (const methodName of Object.keys(syncMethods ?? {})) {
+      // Impossible-by-construction guard: one name cannot be both asyncified
+      // and sync — the last setProp would silently win.
+      if (methodName in obj) {
+        throw new Error(`registerObject: method ${name}.${methodName} is both async and sync`);
+      }
+    }
 
     // Store the CURRENT registration: guest-side methods dispatch through
     // this map at call time, so re-registering (persistent mounts re-register
@@ -553,6 +762,7 @@ export class QuickJSRuntime implements IJSRuntime {
     // can therefore never pin a replaced tool or bypass a wrapper installed
     // by a later registration.
     this.registeredObjects.set(name, obj);
+    this.registeredObjectSyncMethods.set(name, syncMethods ?? {});
 
     // Create object in QuickJS
     const objHandle = this.ctx.newObject();
@@ -574,12 +784,15 @@ export class QuickJSRuntime implements IJSRuntime {
         const startTime = Date.now();
         const callId = generateCallId();
 
+        // Same creation-time bounding as registerFunction (kernel mode).
+        const recordArgs = this.boundCaptureArgs(args[0]);
+
         // Emit start event
         this.eventHandler?.({
           type: "tool-call-start",
           callId,
           toolName: methodName,
-          args: args[0],
+          args: recordArgs,
           startTime,
         });
 
@@ -587,17 +800,23 @@ export class QuickJSRuntime implements IJSRuntime {
           const result = await fn(...args);
           const endTime = Date.now();
           const duration_ms = endTime - startTime;
+          const recordResult = this.boundCaptureResult(result);
 
           // Record tool call
-          this.toolCalls.push({ toolName: methodName, args: args[0], result, duration_ms });
+          this.toolCalls.push({
+            toolName: methodName,
+            args: recordArgs,
+            result: recordResult,
+            duration_ms,
+          });
 
           // Emit end event
           this.eventHandler?.({
             type: "tool-call-end",
             callId,
             toolName: methodName,
-            args: args[0],
-            result,
+            args: recordArgs,
+            result: recordResult,
             startTime,
             endTime,
           });
@@ -607,11 +826,12 @@ export class QuickJSRuntime implements IJSRuntime {
           const endTime = Date.now();
           const duration_ms = endTime - startTime;
           const errorStr = error instanceof Error ? error.message : String(error);
+          const recordError = this.boundCaptureError(errorStr);
 
           this.toolCalls.push({
             toolName: methodName,
-            args: args[0],
-            error: errorStr,
+            args: recordArgs,
+            error: recordError,
             duration_ms,
           });
 
@@ -619,8 +839,8 @@ export class QuickJSRuntime implements IJSRuntime {
             type: "tool-call-end",
             callId,
             toolName: methodName,
-            args: args[0],
-            error: errorStr,
+            args: recordArgs,
+            error: recordError,
             startTime,
             endTime,
           });
@@ -629,6 +849,26 @@ export class QuickJSRuntime implements IJSRuntime {
         }
       });
 
+      this.ctx.setProp(objHandle, methodName, fnHandle);
+      fnHandle.dispose();
+    }
+
+    // Sync methods: plain (non-asyncified) host functions. Asyncified methods
+    // can only suspend inside the evalCodeAsync stack, so guest continuations
+    // resumed via executePendingJobs (code after `await capability()`) cannot
+    // call them — asyncify replays the call and returns garbage. Sync methods
+    // never suspend, so they stay safe post-await (see registerSyncFunction).
+    for (const methodName of Object.keys(syncMethods ?? {})) {
+      const fnHandle = this.ctx.newFunction(methodName, (...argHandles) => {
+        // Late-bound dispatch (see registeredObjects note above).
+        const fn = this.registeredObjectSyncMethods.get(name)?.[methodName];
+        if (fn === undefined) {
+          throw new Error(`${name}.${methodName} is no longer available in this sandbox`);
+        }
+        const args: unknown[] = argHandles.map((h) => this.ctx.dump(h) as unknown);
+        // Host exceptions propagate to the guest as thrown errors.
+        return this.marshal(fn(...args));
+      });
       this.ctx.setProp(objHandle, methodName, fnHandle);
       fnHandle.dispose();
     }
@@ -996,19 +1236,71 @@ export class QuickJSRuntime implements IJSRuntime {
   }
 
   /**
-   * Set up console.log/warn/error to capture output.
+   * Set up console.log/warn/error to capture output, bounded at CAPTURE time
+   * (r15): every dumped record used to be retained host-side as the guest
+   * ran, so a `console.log` loop over large values could exhaust process
+   * memory over the eval timeout before any post-eval cap executed — the
+   * QuickJS heap limit does not bound host-side retention. Each attribution
+   * array gets a byte budget; once exhausted, further records are neither
+   * dumped nor retained nor streamed (a single mutable marker record counts
+   * the drops), so retained memory is O(budget), not O(guest output).
    */
   private setupConsole(): void {
     const consoleObj = this.ctx.newObject();
 
     for (const level of ["log", "warn", "error"] as const) {
       const fn = this.ctx.newFunction(level, (...argHandles) => {
-        const args: unknown[] = argHandles.map((h) => this.ctx.dump(h) as unknown);
         const timestamp = Date.now();
-
         // Route to the eval that registered the enclosing reaction (falls
         // back to the current drain context for untagged code).
         const attribution = this.currentAttribution();
+        const budget = this.consoleBudgetFor(attribution.consoleOutput);
+
+        if (budget.marker !== null) {
+          // Budget exhausted: do NOT dump the handles (dumping materializes
+          // the values host-side — the very retention being bounded). Count
+          // the drop and keep the marker's text accurate in place.
+          budget.droppedRecords += 1;
+          budget.marker.args[0] =
+            `[console output truncated at capture: ${CONSOLE_CAPTURE_BUDGET_BYTES}-byte ` +
+            `retention budget reached; ${budget.droppedRecords} record(s) dropped]`;
+          return;
+        }
+
+        const args: unknown[] = argHandles.map((h) => this.ctx.dump(h) as unknown);
+        // Same measurement as the post-eval kernel cap: the JSON serialization
+        // of the args. UNLIKE that cap's zero fallback, an unserializable
+        // record (e.g. BigInt — preserved by dump, throws in JSON.stringify)
+        // is treated as OVERFLOW: charging it zero would retain it for free,
+        // so a guest pairing every large payload with one BigInt could grow
+        // host memory unbounded past the budget (r17).
+        let size: number;
+        try {
+          size = Buffer.byteLength(JSON.stringify(args) ?? "", "utf8");
+        } catch {
+          size = Number.POSITIVE_INFINITY;
+        }
+
+        if (budget.retainedBytes + size > CONSOLE_CAPTURE_BUDGET_BYTES) {
+          // Crossing record: drop it whole and install the marker. No
+          // bounded-head slice here — the post-eval kernel cap already does
+          // head-slicing at its (much smaller) model-visible cap, and capture
+          // only needs the memory bound.
+          const marker: PTCConsoleRecord = {
+            level: "warn",
+            args: [
+              `[console output truncated at capture: ${CONSOLE_CAPTURE_BUDGET_BYTES}-byte ` +
+                `retention budget reached; 1 record(s) dropped]`,
+            ],
+            timestamp,
+          };
+          budget.marker = marker;
+          budget.droppedRecords = 1;
+          attribution.consoleOutput.push(marker);
+          return;
+        }
+
+        budget.retainedBytes += size;
         attribution.consoleOutput.push({ level, args, timestamp });
         attribution.eventHandler?.({
           type: "console",
@@ -1023,6 +1315,18 @@ export class QuickJSRuntime implements IJSRuntime {
 
     this.ctx.setProp(this.ctx.global, "console", consoleObj);
     consoleObj.dispose();
+  }
+
+  /** Get-or-create the capture budget for one attribution's console array.
+   * Keyed by the array itself: each eval creates a fresh array, and late
+   * fire-and-forget continuations share their originating eval's budget. */
+  private consoleBudgetFor(consoleOutput: PTCConsoleRecord[]): ConsoleCaptureBudget {
+    let budget = this.consoleBudgets.get(consoleOutput);
+    if (!budget) {
+      budget = { retainedBytes: 0, droppedRecords: 0, marker: null };
+      this.consoleBudgets.set(consoleOutput, budget);
+    }
+    return budget;
   }
 
   /** Install the promise-reaction tagging patch; see REACTION_TAGGING_SCRIPT. */

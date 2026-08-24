@@ -58,6 +58,7 @@ import {
   isTabType,
   isTerminalTab,
   getTerminalSessionId,
+  getTerminalTabFallbackName,
   makeTerminalTabType,
   type TabType,
 } from "@/browser/types/rightSidebar";
@@ -286,6 +287,8 @@ interface RightSidebarTabsetNodeProps {
   onTerminalExit: (tab: TabType) => void;
   /** Map of terminal tab types to their current titles (from OSC sequences) */
   terminalTitles: Map<TabType, string>;
+  /** Workspace-wide 0-based ordering of terminal tabs across all splits */
+  terminalTabOrder: Map<TabType, number>;
   /** Handler to update a terminal's title */
   onTerminalTitleChange: (tab: TabType, title: string) => void;
   /** Map of tab → global position index (0-based) for keybind tooltips */
@@ -411,7 +414,7 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
       const Label = TAB_REGISTRY[tab].Label;
       label = <Label workspaceId={props.workspaceId} reviewStats={props.reviewStats} />;
     } else if (isTerminal) {
-      const terminalIndex = terminalTabs.indexOf(tab);
+      const terminalIndex = props.terminalTabOrder.get(tab) ?? 0;
       label = (
         <TerminalTabLabel
           dynamicTitle={props.terminalTitles.get(tab)}
@@ -555,6 +558,9 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
           // Check if this terminal should be auto-focused (was just opened via keybind)
           const terminalSessionId = getTerminalSessionId(terminalTab);
           const shouldAutoFocus = isActive && terminalSessionId === props.autoFocusTerminalSession;
+          const terminalIndex = props.terminalTabOrder.get(terminalTab) ?? 0;
+          const tabName =
+            props.terminalTitles.get(terminalTab) ?? getTerminalTabFallbackName(terminalIndex);
 
           return (
             <div
@@ -569,6 +575,8 @@ const RightSidebarTabsetNode: React.FC<RightSidebarTabsetNodeProps> = (props) =>
                 workspaceId={props.workspaceId}
                 tabType={terminalTab}
                 visible={isActive}
+                tabName={tabName}
+                tabIndex={terminalIndex}
                 onTitleChange={(title) => props.onTerminalTitleChange(terminalTab, title)}
                 autoFocus={shouldAutoFocus}
                 onAutoFocusConsumed={shouldAutoFocus ? props.onAutoFocusConsumed : undefined}
@@ -1318,6 +1326,13 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     return positions;
   }, [layout.root]);
 
+  // Workspace-wide terminal ordering. Numbering per tabset would restart at
+  // "Terminal"/#1 in every split, defeating the badge's per-tab identity.
+  const terminalTabOrder = new Map<TabType, number>();
+  collectAllTabs(layout.root)
+    .filter(isTerminalTab)
+    .forEach((tab, index) => terminalTabOrder.set(tab, index));
+
   // @dnd-kit state for tracking active drag
   const [activeDragData, setActiveDragData] = React.useState<TabDragData | null>(null);
 
@@ -1525,10 +1540,14 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       // an unhandled promise rejection. We surface it via the same PopoverError used by
       // handleAddTerminal — the user already paid the cost of removing the tab below, so
       // they need to know if the pop-out itself failed.
-      void openTerminalPopout(api, workspaceId, sessionId).catch((err: unknown) => {
-        console.error("[RightSidebar] Failed to open terminal pop-out:", err);
-        terminalCreateError.showError("terminal-popout", getErrorMessage(err));
-      });
+      // Carry the known OSC title into the pop-out; it is deleted from the
+      // sidebar map below and the new window only sees future title changes.
+      void openTerminalPopout(api, workspaceId, sessionId, terminalTitles.get(tab)).catch(
+        (err: unknown) => {
+          console.error("[RightSidebar] Failed to open terminal pop-out:", err);
+          terminalCreateError.showError("terminal-popout", getErrorMessage(err));
+        }
+      );
 
       // Remove the tab from the sidebar (terminal now lives in its own window)
       // Don't close the session - the pop-out window takes over
@@ -1542,7 +1561,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         return next;
       });
     },
-    [workspaceId, api, setLayout, terminalTitlesKey, terminalCreateError]
+    [workspaceId, api, setLayout, terminalTitlesKey, terminalCreateError, terminalTitles]
   );
 
   // Configure sensors with distance threshold for click vs drag disambiguation
@@ -1695,6 +1714,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         onCloseTerminal={handleCloseTerminal}
         onTerminalExit={removeTerminalTab}
         terminalTitles={terminalTitles}
+        terminalTabOrder={terminalTabOrder}
         onTerminalTitleChange={handleTerminalTitleChange}
         tabPositions={tabPositions}
         onRequestTerminalFocus={setAutoFocusTerminalSession}

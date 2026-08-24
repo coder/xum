@@ -24,6 +24,7 @@ import type { SendMessageError } from "@/common/types/errors";
 import { createErrorToast } from "@/browser/features/ChatInput/ChatInputToasts";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
+import { subscribeAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { parseCommand } from "@/browser/utils/slashCommands/parser";
 import {
   readPersistedState,
@@ -322,6 +323,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const agentPluginsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
   const memoryConsolidationExperimentEnabled = useExperimentValue(
     EXPERIMENT_IDS.MEMORY_CONSOLIDATION
+  );
+  const rlmExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.RLM);
+  const ptcExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
+  const ptcExclusiveExperimentEnabled = useExperimentValue(
+    EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE
   );
   const atMentionProjectPath =
     variant === "creation" && props.kind !== "scratch" ? props.projectPath : null;
@@ -1744,6 +1750,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
           memory: memoryExperimentEnabled,
           memoryConsolidation: memoryConsolidationExperimentEnabled,
+          rlm: rlmExperimentEnabled,
+          programmaticToolCalling: ptcExperimentEnabled,
+          programmaticToolCallingExclusive: ptcExclusiveExperimentEnabled,
         }),
     });
     setCommandSuggestions((prev) => replaceSuggestions(prev, suggestions));
@@ -1758,6 +1767,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     dynamicWorkflowsExperimentEnabled,
     memoryExperimentEnabled,
     memoryConsolidationExperimentEnabled,
+    rlmExperimentEnabled,
+    ptcExperimentEnabled,
+    ptcExclusiveExperimentEnabled,
   ]);
 
   // Watch input/cursor for `\symbol` backslash commands and surface the menu.
@@ -1793,6 +1805,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
         memory: memoryExperimentEnabled,
         memoryConsolidation: memoryConsolidationExperimentEnabled,
+        rlm: rlmExperimentEnabled,
+        programmaticToolCalling: ptcExperimentEnabled,
+        programmaticToolCallingExclusive: ptcExclusiveExperimentEnabled,
       }),
   });
 
@@ -1852,6 +1867,19 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     isTranscriptCaughtUp,
     store,
   ]);
+
+  // Agent plugin installs/updates/uninstalls change contributed slash
+  // commands and skills while the composer stays mounted (palette and
+  // Settings flows never remount the workspace); bump a tick so both loader
+  // effects below re-query instead of serving descriptors from the old tree.
+  const [pluginMutationTick, setPluginMutationTick] = useState(0);
+  useEffect(
+    () =>
+      subscribeAgentPluginsMutated(() => {
+        setPluginMutationTick((tick) => tick + 1);
+      }),
+    []
+  );
 
   // Load agent skills for suggestions
   useEffect(() => {
@@ -1917,6 +1945,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     // The backend gates plugin-contributed skills on this experiment, so a
     // toggle must refetch /skill suggestions like it reloads plugin commands.
     agentPluginsExperimentEnabled,
+    pluginMutationTick,
   ]);
 
   // Agent Plugins: load manifest-contributed slash commands for suggestions.
@@ -1945,7 +1974,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     return () => {
       isMounted = false;
     };
-  }, [api, variant, workspaceId, agentPluginsExperimentEnabled]);
+  }, [api, variant, workspaceId, agentPluginsExperimentEnabled, pluginMutationTick]);
 
   // Voice input: track transcription provider availability (subscribe to provider config changes)
   useEffect(() => {

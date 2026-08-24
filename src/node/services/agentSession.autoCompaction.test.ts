@@ -226,6 +226,83 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     session.dispose();
   });
 
+  test("stamps on-send auto-compaction requests with the RLM keep-recent tail only when RLM is on", async () => {
+    const runCase = async (args: {
+      workspaceId: string;
+      experiments?: SendMessageOptions["experiments"];
+    }) => {
+      const streamMessage = mock((_history: XumMessage[]) => Promise.resolve(Ok(undefined)));
+      const { session, historyService } = await createSessionHarness({
+        workspaceId: args.workspaceId,
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      });
+
+      // Seed a prior turn so the keep-recent selector has a safe user boundary
+      // (u1 @ seq 2) with a provider-eligible head (u0, a0) before it.
+      for (const message of [
+        createXumMessage("u0", "user", "old question"),
+        createXumMessage("a0", "assistant", "old answer"),
+        createXumMessage("u1", "user", "recent question"),
+        createXumMessage("a1", "assistant", "recent answer"),
+      ]) {
+        const seedResult = await historyService.appendToHistory(args.workspaceId, message);
+        if (!seedResult.success) throw new Error(seedResult.error);
+      }
+
+      const internals = session as unknown as { compactionMonitor: CompactionMonitor };
+      internals.compactionMonitor = {
+        checkBeforeSend: mock(() => ({
+          shouldShowWarning: true,
+          shouldForceCompact: true,
+          usagePercentage: 99,
+          thresholdPercentage: 85,
+        })),
+        checkMidStream: mock(() => false),
+        resetForNewStream: mock(() => undefined),
+        setThreshold: mock(() => undefined),
+        getThreshold: mock(() => 0.85),
+      } as unknown as CompactionMonitor;
+
+      const result = await session.sendMessage("next question", {
+        model: "openai:gpt-4o",
+        agentId: "exec",
+        ...(args.experiments ? { experiments: args.experiments } : {}),
+      });
+      expect(result.success).toBe(true);
+
+      const historyResult = await historyService.getHistoryFromLatestBoundary(args.workspaceId);
+      if (!historyResult.success) throw new Error(String(historyResult.error));
+      const request = historyResult.data.find(
+        (message) => message.metadata?.muxMetadata?.type === "compaction-request"
+      );
+      expect(request).toBeDefined();
+
+      session.dispose();
+      const muxMetadata = request?.metadata?.muxMetadata;
+      return muxMetadata?.type === "compaction-request" ? muxMetadata.keepRecentTail : undefined;
+    };
+
+    // RLM on (sub-experiment of PTC): stamped with u1's historySequence.
+    const stamped = await runCase({
+      workspaceId: "ws-auto-compaction-rlm-stamp-on",
+      experiments: { programmaticToolCalling: true, rlm: true },
+    });
+    expect(stamped).toEqual({ startHistorySequence: 2 });
+    await historyCleanup?.();
+
+    // RLM flag without a PTC parent flag stays inert.
+    const inert = await runCase({
+      workspaceId: "ws-auto-compaction-rlm-stamp-inert",
+      experiments: { rlm: true },
+    });
+    expect(inert).toBeUndefined();
+    await historyCleanup?.();
+
+    // RLM off: byte-identical request metadata (no stamp).
+    const unstamped = await runCase({ workspaceId: "ws-auto-compaction-rlm-stamp-off" });
+    expect(unstamped).toBeUndefined();
+  });
+
   test("preserves goal kind on auto-compaction follow-up requests", async () => {
     const { session } = await createSessionHarness({
       workspaceId: "ws-auto-compaction-goal-kind",

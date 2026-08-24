@@ -1,12 +1,22 @@
 import { describe, expect, test, mock } from "bun:test";
+import { existsSync } from "node:fs";
+import * as fs from "node:fs/promises";
+import * as nodePath from "node:path";
 import { AgentSession } from "./agentSession";
 import type { Config } from "@/node/config";
 import type { HistoryService } from "./historyService";
+import { createTestHistoryService } from "./testHistoryService";
 import type { AIService } from "./aiService";
 import type { InitStateManager } from "./initStateManager";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { Result } from "@/common/types/result";
-import { Ok } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
+import { createXumMessage } from "@/common/types/message";
+import {
+  clearPendingBranchSummary,
+  startAbandonedBranchSummaryInBackground,
+  type BranchSummaryAiService,
+} from "./branchSummary";
 
 function createDeferred<T>(): {
   promise: Promise<T>;
@@ -118,6 +128,123 @@ describe("AgentSession disposal race conditions", () => {
         startTime: Date.now(),
       })
     ).not.toThrow();
+  });
+
+  test("bails out of a send parked on the branch-summary await when removal disposes the session", async () => {
+    const streamMessage = mock(() => Promise.resolve(Ok(undefined)));
+    const aiService: AIService = {
+      on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
+        return this;
+      },
+      off(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
+        return this;
+      },
+      stopStream: mock(() => Promise.resolve(Ok(undefined))),
+      isStreaming: mock(() => false),
+      streamMessage,
+    } as unknown as AIService;
+
+    // Real HistoryService on a real temp session dir (r55): the assertion
+    // below is about actual disk state — a late append would recreate the
+    // just-deleted session directory — so mock call counts prove nothing.
+    // The race seam stays at the gated MODEL creation, not at history I/O.
+    const { historyService, config, cleanup } = await createTestHistoryService();
+
+    const initStateManager: InitStateManager = {
+      on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
+        return this;
+      },
+      off(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
+        return this;
+      },
+    } as unknown as InitStateManager;
+
+    const backgroundProcessManager: BackgroundProcessManager = {
+      cleanup: mock(() => Promise.resolve()),
+      setMessageQueued: mock(() => undefined),
+    } as unknown as BackgroundProcessManager;
+
+    const workspaceId = "ws-branch-summary-dispose";
+    const sessionDir = config.getSessionDir(workspaceId);
+    try {
+      const session = new AgentSession({
+        workspaceId,
+        config,
+        historyService,
+        aiService,
+        initStateManager,
+        backgroundProcessManager,
+      });
+
+      // Register a gated background summary (generation held open at model
+      // creation) so sendMessage parks on awaitPendingBranchSummary — the exact
+      // window workspace removal races into. Same real HistoryService as the
+      // session, mirroring production.
+      let releaseModel: () => void = () => undefined;
+      const modelGate = new Promise<void>((resolve) => {
+        releaseModel = resolve;
+      });
+      const gatedAiService = {
+        createModelWithPinnedMetadata: async () => {
+          await modelGate;
+          return Err({ type: "api_key_not_found" as const, provider: "anthropic" });
+        },
+        // Side-channel candidates are confined to workspace-configured
+        // providers; metadata must resolve with a model or the writer settles
+        // null before createModelWithPinnedMetadata — the gate above would
+        // never park the send.
+        getWorkspaceMetadata: () =>
+          Promise.resolve(Ok({ aiSettings: { model: "anthropic:claude-sonnet-4-5" } })),
+      } as unknown as BranchSummaryAiService;
+      // Large enough to clear the tiny-segment threshold (chars/4 heuristic).
+      const filler = "investigated the dispose race and traced the write path ".repeat(200);
+      await startAbandonedBranchSummaryInBackground({
+        historyService,
+        aiService: gatedAiService,
+        workspaceId,
+        abandonedMessages: [
+          createXumMessage("bs-u", "user", filler, { timestamp: 1 }),
+          createXumMessage("bs-a", "assistant", filler, { timestamp: 2 }),
+        ],
+        experiments: { rlm: true, programmaticToolCalling: true },
+        guardTailMessageId: "bs-a",
+      });
+
+      const sendPromise = session.sendMessage("first send on the fork", {
+        model: "anthropic:claude-sonnet-4-5",
+        agentId: "exec",
+      });
+      // Let the send reach the pending-summary await: while the gate is closed
+      // it is the only unresolved promise in the send's path, and nothing may
+      // have been appended yet — on disk, not in a mock ledger.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(existsSync(nodePath.join(sessionDir, "chat.jsonl"))).toBe(false);
+
+      // Mirror removeWorkspace: dispose the session, cancel + drain the
+      // writer, then delete the session directory.
+      session.dispose();
+      const clearPromise = clearPendingBranchSummary(workspaceId);
+      releaseModel();
+      await clearPromise;
+      await fs.rm(sessionDir, { recursive: true, force: true });
+
+      const result = await sendPromise;
+      expect(result.success).toBe(true);
+      expect(streamMessage).toHaveBeenCalledTimes(0);
+      // Give any stray late write a macrotask to land before inspecting disk.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      // Neither the resumed send nor the cancelled writer wrote anything: the
+      // just-deleted session directory must not have been recreated.
+      expect(existsSync(sessionDir)).toBe(false);
+      // Read-back through the real service agrees: no history rows survived.
+      const readBack = await historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(readBack.success).toBe(true);
+      if (readBack.success) {
+        expect(readBack.data).toHaveLength(0);
+      }
+    } finally {
+      await cleanup();
+    }
   });
 
   test("forwards task-created events to onChatEvent subscribers for the matching workspace", () => {

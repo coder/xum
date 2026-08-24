@@ -6,6 +6,8 @@ import { normalizeSelectedModel } from "@/common/utils/ai/models";
 export interface ExperimentValues {
   programmaticToolCalling: boolean | undefined;
   programmaticToolCallingExclusive: boolean | undefined;
+  /** RLM mode (sub-experiment of PTC): backend ignores it unless PTC is on. */
+  rlm: boolean | undefined;
   advisorTool: boolean | undefined;
   dynamicWorkflows: boolean | undefined;
   memory: boolean | undefined;

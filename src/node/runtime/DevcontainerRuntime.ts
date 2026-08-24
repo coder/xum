@@ -458,6 +458,11 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
       isDirectory: fileType === "directory",
     };
   }
+  mapPathForExec(filePath: string): string {
+    // Issue #3709: paths embedded in exec scripts must use the container namespace.
+    return this.mapHostPathToContainer(filePath) ?? filePath;
+  }
+
   private mapHostPathToContainer(hostPath: string): string | null {
     if (!this.remoteWorkspaceFolder || !this.currentWorkspacePath) return null;
 

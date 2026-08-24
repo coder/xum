@@ -19,6 +19,16 @@ _Generated with `xum` • Model: `<modelString>` • Thinking: `<thinkingLevel>`
 
 Always check `$XUM_MODEL_STRING`, `$XUM_THINKING_LEVEL`, and `$XUM_COSTS_USD` via bash before creating or updating PRs—include them in the footer if set.
 
+Scheduled automation (non-AI) commits and PRs from GitHub Actions workflows use this footer instead, since model/thinking/cost do not apply:
+
+```md
+---
+
+_Automated by the `<workflow-name>` workflow (GitHub Actions)._
+
+<!-- xum-attribution: workflow=<workflow-name> -->
+```
+
 ## Lifecycle Rules
 
 - Before submitting a PR, ensure the branch name reflects the work and the base branch is correct.

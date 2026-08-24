@@ -51,6 +51,17 @@ export interface PTCToolCallRecord {
   result?: unknown;
   error?: string;
   duration_ms: number;
+  /**
+   * Kernel-mode (RLM persistent mount) compact-record fields: nested results
+   * never enter the model context, so `result` is dropped and replaced by
+   * `ok` (did the call succeed) plus `bytes` (serialized size of the
+   * suppressed result). The guest already received the full value during
+   * execution; its channels for surfacing data are the return value, console
+   * output, and `vars`. Absent in ephemeral/RLM-off records, which keep full
+   * inline results (byte-identical supplement-mode contract).
+   */
+  ok?: boolean;
+  bytes?: number;
 }
 
 /**

@@ -1,5 +1,6 @@
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
 import type { SendMessageError } from "@/common/types/errors";
+import type { XumMessage } from "@/common/types/message";
 import type { ReviewNoteData } from "@/common/types/review";
 
 // Type guard for compaction request metadata (for display text)
@@ -96,6 +97,15 @@ interface QueuedMessageInternalOptions {
   cancelState?: { canceledBeforeAcceptance: boolean };
   /** Cancels a queued entry even after it has been dequeued into PREPARING. */
   cancelSignal?: AbortSignal;
+  /**
+   * Synthetic rows persisted by AgentSession.sendMessage immediately before the
+   * turn's user row (family-message payloads). Deferring them with the trigger
+   * keeps them out of another turn's PREPARING window, where a direct history
+   * append could land between that turn's user row and its assistant response.
+   */
+  preTurnMessages?: XumMessage[];
+  /** r54: fired once pre-turn rows cross the rollback horizon at dispatch. */
+  onPreTurnRowsPersisted?: () => void;
 }
 
 type QueueClearCallbacks = Pick<
@@ -138,6 +148,10 @@ interface QueueEntry {
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
   cancelState?: { canceledBeforeAcceptance: boolean };
   cancelSignal?: AbortSignal;
+  /** Pre-turn rows delivered with this entry (entries carrying them are sealed). */
+  preTurnMessages?: XumMessage[];
+  /** r54: fired once this entry's pre-turn rows cross the rollback horizon. */
+  onPreTurnRowsPersisted?: () => void;
 }
 
 /**
@@ -408,6 +422,10 @@ export class MessageQueue {
       isAgentSkillMetadata(options?.muxMetadata) ||
       isWorkspaceTurnMetadata(options?.muxMetadata) ||
       hasSnapshotRefs(options?.muxMetadata) ||
+      // Pre-turn rows must stay 1:1 with their triggering text: batching two
+      // family sends would join their triggers while both payload rows pile
+      // onto one entry, and the payloads would then persist adjacently.
+      (internal?.preTurnMessages?.length ?? 0) > 0 ||
       incomingHasAcceptedCallbacks;
     // Compaction starts its own entry (its metadata must not adopt earlier batched
     // texts), but stays open so a follow-up typed behind a pending /compact batches
@@ -445,6 +463,10 @@ export class MessageQueue {
       this.entries.push(entry);
     }
 
+    if (internal?.preTurnMessages != null && internal.preTurnMessages.length > 0) {
+      entry.preTurnMessages = [...(entry.preTurnMessages ?? []), ...internal.preTurnMessages];
+    }
+
     // Explicit pause is sticky within an entry (a batched steer must not unpause).
     entry.goalInterventionPolicy =
       entry.goalInterventionPolicy === "pause" || options?.goalInterventionPolicy === "pause"
@@ -477,6 +499,20 @@ export class MessageQueue {
     }
     if (internal?.onAcceptedPreStreamFailure != null) {
       entry.onAcceptedPreStreamFailure = internal.onAcceptedPreStreamFailure;
+    }
+    if (internal?.onPreTurnRowsPersisted != null) {
+      // Callback-carrying sends seal their entries, but pre-turn batches can
+      // in principle concatenate — chain instead of overwrite so no
+      // producer's persistence signal is dropped (r54).
+      const previous = entry.onPreTurnRowsPersisted;
+      const next = internal.onPreTurnRowsPersisted;
+      entry.onPreTurnRowsPersisted =
+        previous == null
+          ? next
+          : () => {
+              previous();
+              next();
+            };
     }
 
     if (internal?.cancelState != null) {
@@ -733,7 +769,8 @@ export class MessageQueue {
       entry.onAccepted != null ||
       entry.onAcceptedPreStreamFailure != null ||
       entry.onCanceled != null ||
-      entry.cancelSignal != null;
+      entry.cancelSignal != null ||
+      (entry.preTurnMessages?.length ?? 0) > 0;
     const internal = hasInternalOptions
       ? {
           ...(allAddsAreSynthetic ? { synthetic: true } : {}),
@@ -744,6 +781,12 @@ export class MessageQueue {
           ...(entry.onAccepted != null ? { onAccepted: entry.onAccepted } : {}),
           ...(entry.onAcceptedPreStreamFailure != null
             ? { onAcceptedPreStreamFailure: entry.onAcceptedPreStreamFailure }
+            : {}),
+          ...(entry.preTurnMessages != null && entry.preTurnMessages.length > 0
+            ? { preTurnMessages: entry.preTurnMessages }
+            : {}),
+          ...(entry.onPreTurnRowsPersisted != null
+            ? { onPreTurnRowsPersisted: entry.onPreTurnRowsPersisted }
             : {}),
         }
       : undefined;

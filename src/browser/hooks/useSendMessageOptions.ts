@@ -58,6 +58,7 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
   const programmaticToolCallingExclusive = useExperimentOverrideValue(
     EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE
   );
+  const rlm = useExperimentOverrideValue(EXPERIMENT_IDS.RLM);
   const advisorTool = useExperimentOverrideValue(EXPERIMENT_IDS.ADVISOR_TOOL);
   const dynamicWorkflows = useExperimentOverrideValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
   const memory = useExperimentOverrideValue(EXPERIMENT_IDS.MEMORY);
@@ -80,6 +81,7 @@ export function useSendMessageOptions(workspaceId: string): SendMessageOptionsWi
     experiments: {
       programmaticToolCalling,
       programmaticToolCallingExclusive,
+      rlm,
       advisorTool,
       dynamicWorkflows,
       memory,

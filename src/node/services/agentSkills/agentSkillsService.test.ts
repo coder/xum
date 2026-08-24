@@ -1441,6 +1441,49 @@ describe("agentSkillsService agent plugins", () => {
     ).rejects.toThrow("not found");
   });
 
+  test("a contained SKILL.md symlink inside a plugin stays discoverable and readable", async () => {
+    // Install preview (collectSkills) canonicalizes and accepts a SKILL.md
+    // that is a relative symlink to a regular file elsewhere INSIDE the same
+    // plugin, so the runtime consuming reads must agree — otherwise a
+    // consented skill silently disappears after install. Escaping links stay
+    // rejected (test above).
+    using project = new DisposableTempDir("agent-skills-plugin-link");
+    using global = new DisposableTempDir("agent-skills-plugin-link-global");
+
+    const pluginDir = await writePlugin(
+      path.join(project.path, ".mux", "plugins"),
+      "link-plugin",
+      []
+    );
+    const skillDir = path.join(pluginDir, "skills", "linked-skill");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(
+      path.join(pluginDir, "shared-skill.md"),
+      "---\nname: linked-skill\ndescription: via contained symlink\n---\nBody\n",
+      "utf-8"
+    );
+    await fs.symlink(path.join("..", "..", "shared-skill.md"), path.join(skillDir, "SKILL.md"));
+
+    const runtime = new LocalRuntime(project.path);
+    const roots = {
+      ...getDefaultAgentSkillsRoots(runtime, project.path, { includeAgentPlugins: true }),
+      globalRoot: global.path,
+      universalRoot: "",
+      globalPluginRoots: [],
+    };
+
+    const skills = await discoverAgentSkills(runtime, project.path, { roots });
+    expect(skills.find((s) => s.name === "linked-skill")).toMatchObject({ scope: "project" });
+
+    const resolved = await readAgentSkill(
+      runtime,
+      project.path,
+      SkillNameSchema.parse("linked-skill"),
+      { roots }
+    );
+    expect(resolved.package.frontmatter.description).toBe("via contained symlink");
+  });
+
   test("experiment off: plugin skills stay invisible with default-shaped roots", async () => {
     using project = new DisposableTempDir("agent-skills-plugin-off");
     using global = new DisposableTempDir("agent-skills-plugin-off-global");

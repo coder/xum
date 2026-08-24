@@ -11,6 +11,7 @@ import {
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { createTestHistoryService } from "./testHistoryService";
+import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
 import { existsSync } from "fs";
 import * as fs from "fs/promises";
 import * as path from "path";
@@ -433,6 +434,32 @@ describe("SessionUsageService", () => {
   });
 
   describe("recordHeadlessUsage", () => {
+    it("refuses writes for a removed workspace (r62)", async () => {
+      // A foreign backend's dream/harvest run survives the remover's
+      // process-local cancellation; its late usage write must not recreate
+      // the deleted session directory.
+      const workspaceId = "removed-workspace";
+      const tombstonePath = workspaceRemovalTombstonePath(config.rootDir, workspaceId);
+      await fs.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await fs.writeFile(tombstonePath, JSON.stringify({ workspaceId, removedAt: Date.now() }));
+
+      const recorded = await service.recordHeadlessUsage(
+        workspaceId,
+        "anthropic:claude-haiku-4-5",
+        { inputTokens: 40, outputTokens: 10, totalTokens: 50 },
+        undefined,
+        { analyticsSource: "memory_consolidation" }
+      );
+      expect(recorded).toBeUndefined();
+      const sessionDir = config.getSessionDir(workspaceId);
+      expect(
+        await fs.access(sessionDir).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+    });
+
     it("accumulates into byModel without replacing lastRequest", async () => {
       const workspaceId = "test-workspace";
       const agentModel = "anthropic:claude-sonnet-4-20250514";

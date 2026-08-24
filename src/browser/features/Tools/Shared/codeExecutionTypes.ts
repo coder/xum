@@ -19,6 +19,9 @@ export interface ToolCallRecord {
   result?: unknown;
   error?: string;
   duration_ms: number;
+  /** RLM kernel-mode compact record (r12): result suppressed, summary only. */
+  ok?: boolean;
+  bytes?: number;
 }
 
 /** Result of code execution (matches PTCExecutionResult) */

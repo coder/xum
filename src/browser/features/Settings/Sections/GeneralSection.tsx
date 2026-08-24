@@ -18,6 +18,9 @@ import {
   DEFAULT_EDITOR_CONFIG,
   TERMINAL_FONT_CONFIG_KEY,
   DEFAULT_TERMINAL_FONT_CONFIG,
+  TERMINAL_BADGE_CONFIG_KEY,
+  TERMINAL_BADGE_POSITIONS,
+  DEFAULT_TERMINAL_BADGE_CONFIG,
   LAUNCH_BEHAVIOR_KEY,
   BASH_COLLAPSED_SUMMARY_MODE_KEY,
   BASH_COLLAPSED_SUMMARY_MODES,
@@ -28,6 +31,7 @@ import {
   TRANSCRIPT_DENSITIES,
   normalizeBashCollapsedSummaryMode,
   normalizeEditorConfig,
+  normalizeTerminalBadgeConfig,
   normalizeTerminalFontConfig,
   normalizeTranscriptDensity,
   type BashCollapsedSummaryMode,
@@ -35,6 +39,8 @@ import {
   type EditorConfig,
   type EditorType,
   type LaunchBehavior,
+  type TerminalBadgeConfig,
+  type TerminalBadgePosition,
   type TerminalFontConfig,
 } from "@/common/constants/storage";
 import {
@@ -126,6 +132,16 @@ const TRANSCRIPT_DENSITY_OPTIONS = TRANSCRIPT_DENSITIES.map((value) => ({
   value,
   label: TRANSCRIPT_DENSITY_LABELS[value],
 }));
+const TERMINAL_BADGE_POSITION_LABELS: Record<TerminalBadgePosition, string> = {
+  "top-left": "Top left",
+  "top-right": "Top right",
+  "bottom-left": "Bottom left",
+  "bottom-right": "Bottom right",
+};
+const TERMINAL_BADGE_POSITION_OPTIONS = TERMINAL_BADGE_POSITIONS.map((value) => ({
+  value,
+  label: TERMINAL_BADGE_POSITION_LABELS[value],
+}));
 const ARCHIVE_BEHAVIOR_OPTIONS = [
   { value: "keep", label: "Keep running" },
   { value: "stop", label: "Stop workspace" },
@@ -183,6 +199,15 @@ export function GeneralSection() {
     String.fromCodePoint(0xe725), // dev-git_branch
     String.fromCodePoint(0xf135), // fa-rocket
   ].join(" ");
+
+  // The command palette also toggles this key, so stay subscribed to
+  // external updates while Settings is mounted.
+  const [rawTerminalBadgeConfig, setTerminalBadgeConfig] = usePersistedState<TerminalBadgeConfig>(
+    TERMINAL_BADGE_CONFIG_KEY,
+    DEFAULT_TERMINAL_BADGE_CONFIG,
+    { listener: true }
+  );
+  const terminalBadgeConfig = normalizeTerminalBadgeConfig(rawTerminalBadgeConfig);
 
   const [rawEditorConfig, setEditorConfig] = usePersistedState<EditorConfig>(
     EDITOR_CONFIG_KEY,
@@ -455,6 +480,39 @@ export function GeneralSection() {
     setEditorConfig((prev) => ({ ...normalizeEditorConfig(prev), customCommand }));
   };
 
+  const handleTerminalBadgeEnabledChange = (enabled: boolean) => {
+    setTerminalBadgeConfig((prev) => ({ ...normalizeTerminalBadgeConfig(prev), enabled }));
+  };
+
+  const handleTerminalBadgeTemplateChange = (template: string) => {
+    setTerminalBadgeConfig((prev) => ({ ...normalizeTerminalBadgeConfig(prev), template }));
+  };
+
+  const handleTerminalBadgePositionChange = (position: TerminalBadgePosition) => {
+    setTerminalBadgeConfig((prev) => ({ ...normalizeTerminalBadgeConfig(prev), position }));
+  };
+
+  const handleTerminalBadgeOpacityChange = (rawValue: string) => {
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 100) {
+      return;
+    }
+
+    setTerminalBadgeConfig((prev) => ({
+      ...normalizeTerminalBadgeConfig(prev),
+      opacity: parsed / 100,
+    }));
+  };
+
+  const handleTerminalBadgeFontSizeChange = (rawValue: string) => {
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return;
+    }
+
+    setTerminalBadgeConfig((prev) => ({ ...normalizeTerminalBadgeConfig(prev), fontSize: parsed }));
+  };
+
   const handleSshHostChange = useCallback(
     (value: string) => {
       setSshHost(value);
@@ -675,6 +733,107 @@ export function GeneralSection() {
               className="border-border-medium bg-background-secondary h-9 w-28"
             />
           </div>
+
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex-1">
+              <div className="text-foreground text-sm">Terminal Badge</div>
+              <div className="text-muted text-xs">
+                Show a scroll-fixed workspace/tab watermark over the terminal
+              </div>
+            </div>
+            <Switch
+              checked={terminalBadgeConfig.enabled}
+              onCheckedChange={handleTerminalBadgeEnabledChange}
+              aria-label="Toggle Terminal Badge"
+            />
+          </div>
+
+          {terminalBadgeConfig.enabled && (
+            <>
+              <div className="flex flex-wrap items-center justify-between gap-4">
+                <div className="flex-1">
+                  <div className="text-foreground text-sm">Terminal Badge Template</div>
+                  <div className="text-muted text-xs">
+                    Tokens: {"{workspace}"}, {"{tab}"}, {"{project}"}, {"{index}"}
+                  </div>
+                  <div className="text-muted text-xs">
+                    {"{tab}"} follows the tab label (shell titles); {"{index}"} is the stable tab
+                    number
+                  </div>
+                </div>
+                <Input
+                  value={terminalBadgeConfig.template}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                    handleTerminalBadgeTemplateChange(e.target.value)
+                  }
+                  placeholder={DEFAULT_TERMINAL_BADGE_CONFIG.template}
+                  aria-label="Terminal Badge Template"
+                  className="border-border-medium bg-background-secondary h-9 w-80 max-w-full"
+                />
+              </div>
+
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex-1">
+                  <div className="text-foreground text-sm">Terminal Badge Position</div>
+                  <div className="text-muted text-xs">
+                    Corner of the terminal to pin the badge to
+                  </div>
+                </div>
+                <Select
+                  value={terminalBadgeConfig.position}
+                  onValueChange={(value) =>
+                    handleTerminalBadgePositionChange(value as TerminalBadgePosition)
+                  }
+                >
+                  <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {TERMINAL_BADGE_POSITION_OPTIONS.map((option) => (
+                      <SelectItem key={option.value} value={option.value}>
+                        {option.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex-1">
+                  <div className="text-foreground text-sm">Terminal Badge Opacity</div>
+                  <div className="text-muted text-xs">Percent (1-100)</div>
+                </div>
+                <Input
+                  type="number"
+                  value={Math.round(terminalBadgeConfig.opacity * 100)}
+                  min={1}
+                  max={100}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                    handleTerminalBadgeOpacityChange(e.target.value)
+                  }
+                  aria-label="Terminal Badge Opacity"
+                  className="border-border-medium bg-background-secondary h-9 w-28"
+                />
+              </div>
+
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex-1">
+                  <div className="text-foreground text-sm">Terminal Badge Font Size</div>
+                  <div className="text-muted text-xs">Font size for the badge text</div>
+                </div>
+                <Input
+                  type="number"
+                  value={terminalBadgeConfig.fontSize}
+                  min={6}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                    handleTerminalBadgeFontSizeChange(e.target.value)
+                  }
+                  aria-label="Terminal Badge Font Size"
+                  className="border-border-medium bg-background-secondary h-9 w-28"
+                />
+              </div>
+            </>
+          )}
         </div>
       </div>
 

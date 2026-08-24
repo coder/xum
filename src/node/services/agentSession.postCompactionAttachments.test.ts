@@ -183,6 +183,7 @@ async function writePendingPostCompactionState(args: {
   sessionDir: string;
   diffs: Array<{ path: string; diff: string; truncated: boolean }>;
   loadedSkills: LoadedSkillSnapshot[];
+  readFiles?: string[];
 }): Promise<void> {
   await fs.writeFile(
     path.join(args.sessionDir, "post-compaction.json"),
@@ -191,14 +192,71 @@ async function writePendingPostCompactionState(args: {
       createdAt: Date.now(),
       diffs: args.diffs,
       loadedSkills: args.loadedSkills,
+      ...(args.readFiles ? { readFiles: args.readFiles } : {}),
     })
   );
+}
+
+function getReadFilePaths(attachments: PostCompactionAttachment[]): string[] {
+  const readFilesAttachment = attachments.find(
+    (
+      attachment
+    ): attachment is Extract<PostCompactionAttachment, { type: "read_files_reference" }> =>
+      attachment.type === "read_files_reference"
+  );
+  return readFilesAttachment?.paths ?? [];
 }
 
 describe("AgentSession post-compaction attachments", () => {
   let historyCleanup: (() => Promise<void>) | undefined;
   afterEach(async () => {
     await historyCleanup?.();
+  });
+
+  test("a context boundary discards read carryover so later turns inject no pre-boundary paths", async () => {
+    using sessionDir = new DisposableTempDir("agent-session-boundary-read-carryover");
+    const { historyService, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+
+    // A compaction persisted cumulative pre-boundary read paths...
+    await writePendingPostCompactionState({
+      sessionDir: sessionDir.path,
+      diffs: [],
+      loadedSkills: [],
+      readFiles: ["/tmp/pre-boundary-read.ts"],
+    });
+
+    const session = createSessionForHistory(historyService, sessionDir.path);
+    const privateSession = session as unknown as {
+      getPostCompactionAttachmentsIfNeeded: (
+        includeReadFiles: boolean
+      ) => Promise<PostCompactionAttachment[] | null>;
+    };
+    try {
+      // ...which a turn injects (guards the fixture against silent rot).
+      const injected = await privateSession.getPostCompactionAttachmentsIfNeeded(true);
+      expect(injected).not.toBeNull();
+      expect(getReadFilePaths(injected ?? [])).toEqual(["/tmp/pre-boundary-read.ts"]);
+
+      // A new context segment starts (context reset / full history clear):
+      // the reset was meant to discard that context, so...
+      await session.clearPostCompactionState();
+
+      // ...no later turn may re-inject pre-boundary paths — neither
+      // immediately from pending state nor via the periodic re-merge.
+      for (let turn = 0; turn <= TURNS_BETWEEN_ATTACHMENTS; turn++) {
+        expect(await privateSession.getPostCompactionAttachmentsIfNeeded(true)).toBeNull();
+      }
+      // The persisted pending state is discarded too, so a NEW session after
+      // an app restart cannot resurrect the carryover either.
+      const stateExists = await fs.access(path.join(sessionDir.path, "post-compaction.json")).then(
+        () => true,
+        () => false
+      );
+      expect(stateExists).toBe(false);
+    } finally {
+      session.dispose();
+    }
   });
 
   test("extracts edited file diffs from the latest durable compaction boundary slice", async () => {

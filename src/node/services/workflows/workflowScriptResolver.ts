@@ -9,6 +9,7 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
 import {
   discoverAgentPlugins,
+  readPluginFileWithinRootCapped,
   type AgentPluginContainer,
   type AgentPluginInfo,
 } from "@/node/services/agentPlugins/discovery";
@@ -320,7 +321,25 @@ async function resolvePluginWorkflowScript(
     throw new Error(sizeValidation.error);
   }
 
-  const source = await readFileString(localRuntime, resolvedPath);
+  // Consuming read revalidates against the PLUGIN ROOT (not just
+  // workflowsDir) with post-open containment + file identity, mirroring
+  // hooks.js and mcp.json: a managed update can replace `workflows/` itself
+  // with an absolute symlink to an outside directory, and the containment
+  // check above would then canonicalize root and file through the SAME link
+  // and accept an outside file as executable workflow source.
+  let source: string;
+  try {
+    source = (
+      await readPluginFileWithinRootCapped({
+        filePath: resolvedPath,
+        pluginRoot: plugin.rootPath,
+        maxBytes: MAX_FILE_SIZE,
+        label: "plugin workflow script",
+      })
+    ).content;
+  } catch (error) {
+    throw new Error(`Plugin workflow script not readable: ${getErrorMessage(error)}`);
+  }
   return buildResolvedScript({
     requestedScriptPath: input.scriptPath,
     canonicalScriptPath: `${PLUGIN_SCRIPT_PATH_PREFIX}${plugin.name}/${parsed.relativePath}`,
@@ -349,6 +368,16 @@ function parsePluginWorkflowScriptPath(scriptPath: string): {
   }
 
   const relativePath = normalizeRelativeWorkflowPath(remainder.slice(slashIndex + 1), "plugin");
+  // Consent alignment: the install preview and the update capability
+  // comparison fingerprint TOP-LEVEL workflows/*.js only (mirroring the
+  // runtime lister), so nested paths must not be executable either — an
+  // attacker-controlled upstream could otherwise add a nested workflow the
+  // consent surface never names and later direct workflow_run at it.
+  if (relativePath.includes("/")) {
+    throw new Error(
+      `plugin:// workflow scripts must be top-level files in the plugin's workflows directory: ${relativePath}`
+    );
+  }
   return { pluginName, relativePath };
 }
 

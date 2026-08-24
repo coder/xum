@@ -370,6 +370,12 @@ export interface Runtime {
   exec(command: string, options: ExecOptions): Promise<ExecStream>;
 
   /**
+   * Translate a host-visible path into the namespace used by exec() scripts.
+   * When absent, file I/O and exec share the same path namespace.
+   */
+  mapPathForExec?(filePath: string): string;
+
+  /**
    * Read file contents as a stream
    * @param path Absolute or relative path to file
    * @param abortSignal Optional abort signal for cancellation
@@ -635,9 +641,16 @@ export class RuntimeError extends Error {
   constructor(
     message: string,
     public readonly type: "exec" | "file_io" | "network" | "unknown",
-    public readonly cause?: Error
+    cause?: unknown
   ) {
-    super(message);
+    // The wrapped original error travels through the NATIVE Error options bag
+    // and is typed `unknown` (matching Error.cause), NOT an `Error`-typed
+    // parameter property: wrap sites catch errors from Node builtins, which
+    // under jest's vm sandbox come from another realm where `instanceof
+    // Error` is false — an Error-typed cause forces wrap sites into
+    // `err instanceof Error ? err : undefined` filters that silently drop
+    // the fs error (and its ENOENT/EACCES code) that unwrapping checks need.
+    super(message, cause !== undefined ? { cause } : undefined);
     this.name = "RuntimeError";
   }
 }

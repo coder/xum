@@ -72,6 +72,7 @@ import {
   HEARTBEAT_TRIGGER_VALUES,
   HEARTBEAT_WHEN_BUSY_VALUES,
 } from "@/constants/heartbeat";
+import { TASK_FAMILY_MESSAGE_MAX_CHARS } from "@/constants/taskMessages";
 
 // -----------------------------------------------------------------------------
 // ask_user_question (plan-mode interactive questions)
@@ -1032,6 +1033,48 @@ export const TaskSendMessageToolResultSchema = z.discriminatedUnion("status", [
   TaskSendMessageToolNotActiveResultSchema,
   TaskSendMessageToolErrorResultSchema,
 ]);
+
+// -----------------------------------------------------------------------------
+// task_message_parent / task_message_sibling (RLM family messaging)
+// -----------------------------------------------------------------------------
+
+export const TaskMessageParentToolArgsSchema = z
+  .object({
+    message: z
+      .string()
+      .trim()
+      .min(1)
+      // Bounded: a kernel guest can synthesize huge strings cheaply; family
+      // messages land in another workspace's transcript and provider requests.
+      .max(TASK_FAMILY_MESSAGE_MAX_CHARS)
+      .describe("Message to queue for your parent workspace."),
+  })
+  .strict();
+
+export const TaskMessageParentToolResultSchema = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("sent"), parentWorkspaceId: z.string() }).strict(),
+  z.object({ status: z.literal("invalid_scope"), error: z.string() }).strict(),
+  z.object({ status: z.literal("error"), error: z.string() }).strict(),
+]);
+
+export const TaskMessageSiblingToolArgsSchema = z
+  .object({
+    task_id: z
+      .string()
+      .min(1)
+      .describe("Sibling task ID; it must share your direct parent workspace."),
+    message: z
+      .string()
+      .trim()
+      .min(1)
+      // Same bound as task_message_parent (see that schema's rationale).
+      .max(TASK_FAMILY_MESSAGE_MAX_CHARS)
+      .describe("Message to deliver to the sibling task."),
+  })
+  .strict();
+
+// Sibling delivery reuses the task_send_message machinery, so the result surface is identical.
+export const TaskMessageSiblingToolResultSchema = TaskSendMessageToolResultSchema;
 
 // -----------------------------------------------------------------------------
 // task_retitle (rename a persistent descendant sub-agent)
@@ -2273,6 +2316,18 @@ export const TOOL_DEFINITIONS = {
       "The stable sub-agent task ID and durable role title remain unchanged, and the child's checkout is not refreshed automatically. Prefer reawakening an inactive child over spawning a replacement when its prior context or expertise is relevant. For repository-dependent work, reuse it only when the retained snapshot is appropriate or tell the child to verify and synchronize its checkout before acting; otherwise spawn a new child. If the new assignment changes the child's reusable responsibility, call task_retitle as well; do not retitle it for ordinary one-off assignments. Best-of children retain candidate metadata, so reawaken them only to continue that same candidate; use a standalone specialist for unrelated work. This tool does not target bash tasks, workflow runs, or workspace-turn handles.",
     schema: TaskSendMessageToolArgsSchema,
   },
+  task_message_parent: {
+    description:
+      "Send a message up to your parent workspace (RLM family messaging). It is appended to the parent's queue as a clearly-labeled child message and coalesces behind a busy parent turn, dispatching at the parent's next tool boundary. " +
+      "The parent has no obligation to reply and no delivery receipt is produced. Keep using agent_report for progress updates and your final report.",
+    schema: TaskMessageParentToolArgsSchema,
+  },
+  task_message_sibling: {
+    description:
+      "Send a message to a sibling sub-agent that shares your DIRECT parent (nuclear-family scoping: exactly one hop up plus one hop down). Any other target — grandparent, grandchild, uncle, or unrelated task — is refused with invalid_scope. " +
+      "The message arrives in the sibling's queue as a clearly-labeled message; a busy sibling picks it up at its next tool boundary.",
+    schema: TaskMessageSiblingToolArgsSchema,
+  },
   task_retitle: {
     description:
       "Change the short, friendly role name of a persistent descendant sub-agent without changing its stable task identity or workspace. Active and inactive user-owned children can be retitled; workflow-owned internal workers cannot.",
@@ -2674,6 +2729,23 @@ CREATE TABLE IF NOT EXISTS delegation_rollups (
     schema: z.object({
       code: z.string().min(1).describe("JavaScript code to execute in the PTC sandbox"),
     }),
+  },
+  refinement_rollback: {
+    description:
+      "Roll back a journaled harness self-modification (a memory or skill edit) by its refinement row id, " +
+      "restoring the exact prior file contents recorded in the session's refinement journal. " +
+      "The rollback is journaled as a refinement row of its own, so it can be rolled back again. " +
+      "Refuses rows that were already rolled back and rows whose files changed since (divergence). " +
+      "Available only in RLM mode.",
+    schema: z
+      .object({
+        id: z.string().min(1).describe("Refinement row id (envelope id) to roll back"),
+        reason: z
+          .string()
+          .min(1)
+          .describe("Why this refinement is being rolled back (recorded in the journal)"),
+      })
+      .strict(),
   },
   // #region NOTIFY_DOCS
   notify: {
@@ -3193,6 +3265,11 @@ export type BridgeableToolName =
   | "task_apply_git_patch"
   | "task_list"
   | "task_send_message"
+  // Family messaging tools are bridged when the RLM experiment enables them;
+  // registering their result schemas keeps generateXumTypes from declaring
+  // them as returning unknown inside the kernel.
+  | "task_message_parent"
+  | "task_message_sibling"
   | "task_retitle"
   | "task_stop"
   | "task_remove"
@@ -3223,6 +3300,8 @@ export const RESULT_SCHEMAS: Record<BridgeableToolName, z.ZodType> = {
   task_apply_git_patch: TaskApplyGitPatchToolResultSchema,
   task_list: TaskListToolResultSchema,
   task_send_message: TaskSendMessageToolResultSchema,
+  task_message_parent: TaskMessageParentToolResultSchema,
+  task_message_sibling: TaskMessageSiblingToolResultSchema,
   task_retitle: TaskRetitleToolResultSchema,
   task_stop: TaskStopToolResultSchema,
   task_remove: TaskRemoveToolResultSchema,
@@ -3273,6 +3352,12 @@ export function getAvailableTools(
   modelString: string,
   options?: {
     enableAgentReport?: boolean;
+    /**
+     * Whether the RLM family messaging tools (task_message_parent /
+     * task_message_sibling) are available. Only true for sub-agent sessions
+     * whose task record was stamped with the rlm experiment at spawn.
+     */
+    enableFamilyMessaging?: boolean;
     enableAnalyticsQuery?: boolean;
     enableAdvisor?: boolean;
     enableDynamicWorkflows?: boolean;
@@ -3296,6 +3381,7 @@ export function getAvailableTools(
 ): string[] {
   const [provider, modelId = ""] = modelString.split(":");
   const enableAgentReport = options?.enableAgentReport ?? true;
+  const enableFamilyMessaging = options?.enableFamilyMessaging ?? false;
   const enableAnalyticsQuery = options?.enableAnalyticsQuery ?? true;
   const enableAdvisor = options?.enableAdvisor ?? false;
   const enableDynamicWorkflows = options?.enableDynamicWorkflows ?? false;
@@ -3350,6 +3436,7 @@ export function getAvailableTools(
     "task_list",
     ...(enableDynamicWorkflows ? ["workflow_run", "workflow_resume"] : []),
     ...(enableAgentReport ? ["agent_report"] : []),
+    ...(enableFamilyMessaging ? ["task_message_parent", "task_message_sibling"] : []),
     "set_goal",
     "get_goal",
     "complete_goal",

@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import {
   dynamicTool,
   jsonSchema,
@@ -205,6 +205,46 @@ describe("buildToolsetManifest", () => {
 });
 
 describe("emitTurnEnvelope", () => {
+  test("append failure removes newly created blobs but preserves pre-existing ones (r55)", async () => {
+    // Reclamation derives candidates from journal references, so a blob
+    // whose envelope row never landed would leak forever — repeated append
+    // failures with changing plans/attachments would grow the session blob
+    // store without bound. Pre-existing blobs (content-addressed dedup) may
+    // be referenced by earlier rows and must survive the cleanup.
+    using tmp = new DisposableTempDir("turn-envelope-orphans");
+    const journal = new DurableEventJournal(tmp.path);
+    // Pre-existing blob with the exact system-prompt content: the failed
+    // emit re-puts it (created=false) and must NOT delete it.
+    await journal.blobs.put("You are a helpful agent.");
+    const blobsBefore = await listBlobFiles(tmp.path);
+    expect(blobsBefore).toHaveLength(1);
+
+    const appendSpy = spyOn(journal, "append").mockImplementation(() =>
+      Promise.reject(new Error("append down"))
+    );
+    try {
+      // Never throws: envelope emission is observability, not control flow.
+      await emitTurnEnvelope({
+        journal,
+        workspaceId: "ws-orphans",
+        systemMessage: "You are a helpful agent.",
+        tools: {},
+        modelString: "anthropic:claude-test",
+        thinkingLevel: "medium",
+        providerOptions: {},
+        // Unique content — its blob is CREATED by this emit and must be
+        // removed when the append fails.
+        planContentForTransition: "unique plan content that only this emit stores",
+      });
+    } finally {
+      appendSpy.mockRestore();
+    }
+
+    // The created plan blob is gone; the pre-existing prompt blob survives.
+    expect(await listBlobFiles(tmp.path)).toEqual(blobsBefore);
+    expect(await journal.read()).toHaveLength(0);
+  });
+
   test("emits one row per turn and dedupes identical prompts to one blob", async () => {
     using tmp = new DisposableTempDir("turn-envelope-test");
     const journal = new DurableEventJournal(tmp.path);

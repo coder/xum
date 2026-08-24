@@ -613,6 +613,16 @@ If a value is too large for the environment, it may be omitted (not set). Xum al
 </details>
 
 <details>
+<summary>refinement_rollback (2)</summary>
+
+| Env var                 | JSON path | Type   | Description                                                        |
+| ----------------------- | --------- | ------ | ------------------------------------------------------------------ |
+| `XUM_TOOL_INPUT_ID`     | `id`      | string | Refinement row id (envelope id) to roll back                       |
+| `XUM_TOOL_INPUT_REASON` | `reason`  | string | Why this refinement is being rolled back (recorded in the journal) |
+
+</details>
+
+<details>
 <summary>review_pane_update (4)</summary>
 
 | Env var                                | JSON path                | Type   | Description                                                                                                                                                                                                                           |
@@ -718,6 +728,25 @@ If a value is too large for the environment, it may be omitted (not set). Xum al
 | `XUM_TOOL_INPUT_INCLUDE_ARCHIVED` | `includeArchived`   | boolean | Compatibility option for archived workspace-turn and bash records. Legacy archived sub-agents remain listable as inactive children regardless.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `XUM_TOOL_INPUT_STATUSES_<INDEX>` | `statuses[<INDEX>]` | enum    | Task statuses to include. Defaults to unfinished tasks and workflow runs: queued, starting, running, awaiting_report, pending, backgrounded. Persistent completed sub-agents are terminal `reported` tasks and are intentionally omitted by default; include `reported` (and `interrupted` when relevant) to rediscover inactive child workspaces after compaction or restart. Omitting statuses is the safe recovery default after an uncertain workflow_run because it includes unfinished workflow runs. Pass ['interrupted', 'failed'] to discover workflow runs that may be resumable via workflow_resume, but do not use only terminal/resumable statuses when checking for a still-running workflow.                                  |
 | `XUM_TOOL_INPUT_STATUSES_COUNT`   | `statuses.length`   | number  | Number of elements in statuses (Task statuses to include. Defaults to unfinished tasks and workflow runs: queued, starting, running, awaiting_report, pending, backgrounded. Persistent completed sub-agents are terminal `reported` tasks and are intentionally omitted by default; include `reported` (and `interrupted` when relevant) to rediscover inactive child workspaces after compaction or restart. Omitting statuses is the safe recovery default after an uncertain workflow_run because it includes unfinished workflow runs. Pass ['interrupted', 'failed'] to discover workflow runs that may be resumable via workflow_resume, but do not use only terminal/resumable statuses when checking for a still-running workflow.) |
+
+</details>
+
+<details>
+<summary>task_message_parent (1)</summary>
+
+| Env var                  | JSON path | Type   | Description                                 |
+| ------------------------ | --------- | ------ | ------------------------------------------- |
+| `XUM_TOOL_INPUT_MESSAGE` | `message` | string | Message to queue for your parent workspace. |
+
+</details>
+
+<details>
+<summary>task_message_sibling (2)</summary>
+
+| Env var                  | JSON path | Type   | Description                                                  |
+| ------------------------ | --------- | ------ | ------------------------------------------------------------ |
+| `XUM_TOOL_INPUT_MESSAGE` | `message` | string | Message to deliver to the sibling task.                      |
+| `XUM_TOOL_INPUT_TASK_ID` | `task_id` | string | Sibling task ID; it must share your direct parent workspace. |
 
 </details>
 

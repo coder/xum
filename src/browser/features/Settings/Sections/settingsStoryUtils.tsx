@@ -23,6 +23,7 @@ import {
 import {
   SELECTED_WORKSPACE_KEY,
   SIDEBAR_AGE_GROUPING_KEY,
+  TERMINAL_BADGE_CONFIG_KEY,
   UI_THEME_KEY,
 } from "@/common/constants/storage";
 import type { ServiceTier } from "@/common/config/schemas/providersConfig";
@@ -54,6 +55,10 @@ export function resetStorybookPersistedStateForStory(): void {
     // Sidebar stories can write sidebarAgeGrouping=false into the shared
     // origin; clear it so the GeneralSection switch snapshots its default.
     localStorage.removeItem(SIDEBAR_AGE_GROUPING_KEY);
+
+    // Terminal badge stories seed an enabled badge config; clear it so the
+    // default GeneralSection story snapshots the disabled (collapsed) rows.
+    localStorage.removeItem(TERMINAL_BADGE_CONFIG_KEY);
   }
 }
 

@@ -21,6 +21,32 @@ describe("resolveSlashCommandExperimentValue", () => {
       })
     ).toBe(true);
   });
+
+  it("requires a PTC parent flag for rlm-mode", () => {
+    // The backend refuses /refine unless RLM AND a PTC flag are on, so the
+    // sub-flag alone must not surface the command.
+    expect(
+      resolveSlashCommandExperimentValue(EXPERIMENT_IDS.RLM, {
+        workspaceHeartbeats: false,
+        rlm: true,
+      })
+    ).toBe(false);
+    expect(
+      resolveSlashCommandExperimentValue(EXPERIMENT_IDS.RLM, {
+        workspaceHeartbeats: false,
+        rlm: true,
+        programmaticToolCalling: true,
+      })
+    ).toBe(true);
+    // Exclusive mode alone is a valid PTC parent too.
+    expect(
+      resolveSlashCommandExperimentValue(EXPERIMENT_IDS.RLM, {
+        workspaceHeartbeats: false,
+        rlm: true,
+        programmaticToolCallingExclusive: true,
+      })
+    ).toBe(true);
+  });
 });
 
 describe("getSlashCommandSuggestions", () => {
@@ -49,6 +75,7 @@ describe("getSlashCommandSuggestions", () => {
 
     expect(labels).not.toContain("/heartbeat");
     expect(labels).not.toContain("/dream");
+    expect(labels).not.toContain("/refine");
     // `/goal` graduated to GA — it must surface regardless of experiment state.
     expect(labels).toContain("/goal");
   });
@@ -57,6 +84,7 @@ describe("getSlashCommandSuggestions", () => {
     const enabledExperiments = new Set<ExperimentId>([
       EXPERIMENT_IDS.WORKSPACE_HEARTBEATS,
       EXPERIMENT_IDS.MEMORY_CONSOLIDATION,
+      EXPERIMENT_IDS.RLM,
     ]);
     const suggestions = getSlashCommandSuggestions("/", {
       isExperimentEnabled: (experimentId) => enabledExperiments.has(experimentId),
@@ -65,6 +93,7 @@ describe("getSlashCommandSuggestions", () => {
 
     expect(labels).toContain("/heartbeat");
     expect(labels).toContain("/dream");
+    expect(labels).toContain("/refine");
     // `/goal` is always available post-GA.
     expect(labels).toContain("/goal");
   });

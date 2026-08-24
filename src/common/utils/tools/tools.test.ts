@@ -123,6 +123,42 @@ describe("getToolsForModel", () => {
     expect(toolsWithReport.agent_report).toBeDefined();
   });
 
+  test("only includes family messaging tools when enableFamilyMessaging=true", async () => {
+    const runtime = new LocalRuntime(process.cwd());
+    const initStateManager = createInitStateManager();
+
+    // A plain sub-agent session (agent_report on, no RLM spawn stamp) must not see
+    // the family messaging tools.
+    const toolsWithout = await getToolsForModel(
+      "noop:model",
+      {
+        cwd: process.cwd(),
+        runtime,
+        runtimeTempDir: "/tmp",
+        enableAgentReport: true,
+      },
+      "ws-1",
+      initStateManager
+    );
+    expect(toolsWithout.task_message_parent).toBeUndefined();
+    expect(toolsWithout.task_message_sibling).toBeUndefined();
+
+    const toolsWith = await getToolsForModel(
+      "noop:model",
+      {
+        cwd: process.cwd(),
+        runtime,
+        runtimeTempDir: "/tmp",
+        enableAgentReport: true,
+        enableFamilyMessaging: true,
+      },
+      "ws-1",
+      initStateManager
+    );
+    expect(toolsWith.task_message_parent).toBeDefined();
+    expect(toolsWith.task_message_sibling).toBeDefined();
+  });
+
   test("includes heartbeat only when the heartbeat service and experiment are configured", async () => {
     const runtime = new LocalRuntime(process.cwd());
     const initStateManager = createInitStateManager();

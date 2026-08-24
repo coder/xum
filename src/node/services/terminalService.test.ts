@@ -494,8 +494,8 @@ describe("TerminalService", () => {
 
   it("should open terminal window via manager", async () => {
     await service.openWindow("ws-1");
-    // openWindow(workspaceId, sessionId?) passes sessionId as undefined when not provided
-    expect(openTerminalWindowMock).toHaveBeenCalledWith("ws-1", undefined);
+    // openWindow(workspaceId, sessionId?, initialTitle?) passes undefined when not provided
+    expect(openTerminalWindowMock).toHaveBeenCalledWith("ws-1", undefined, undefined);
   });
 
   it("should handle session exit", async () => {

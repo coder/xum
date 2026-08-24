@@ -102,6 +102,8 @@ export const CompactionCompletionMetadataSchema = z.object({
   compactionEpoch: z.number(),
   previousBoundaryHistorySequence: z.number().optional(),
   compactionRequestMessageId: z.string(),
+  // RLM keep-recent floor: preserved-tail copies appended after the boundary.
+  preservedTailMessageCount: z.number().optional(),
 });
 
 export const MemoryHarvestRecordSchema = z.object({
