@@ -65,6 +65,8 @@ import { ExperimentsService } from "./experimentsService";
 import type { DevToolsService } from "./devToolsService";
 import { TelemetryService } from "@/node/services/telemetryService";
 import type { WorkspaceGoalService } from "./workspaceGoalService";
+import type { WorkspaceMcpOverridesService } from "./workspaceMcpOverridesService";
+import * as additionalSystemContext from "./additionalSystemContext";
 import * as agentResolution from "./agentResolution";
 import * as streamContextBuilder from "./streamContextBuilder";
 import * as messagePipeline from "./messagePipeline";
@@ -1440,6 +1442,69 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
   afterEach(() => {
     mock.restore();
+  });
+
+  it("starts independent workspace context loads without serial waiting", async () => {
+    using xumHome = new DisposableTempDir("ai-service-concurrent-workspace-context");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-concurrent-context";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    let mcpOverridesLoadStarted = false;
+    let scratchpadLoadStarted = false;
+    const goalLoadStarted = Promise.withResolvers<void>();
+    const goalLoad = Promise.withResolvers<null>();
+    const workspaceMcpOverridesService = {
+      getOverridesForWorkspace: mock(() => {
+        mcpOverridesLoadStarted = true;
+        return Promise.resolve({ overrides: undefined });
+      }),
+    } as unknown as WorkspaceMcpOverridesService;
+    const { config, historyService, initStateManager, providerService } = createBasicAIService(
+      xumHome.path
+    );
+    const concurrentService = new AIService(
+      config,
+      historyService,
+      initStateManager,
+      providerService,
+      undefined,
+      undefined,
+      workspaceMcpOverridesService
+    );
+    stubCommonStreamMessageDependencies({
+      service: concurrentService,
+      config,
+      historyService,
+      initStateManager,
+      metadata,
+    });
+    spyOn(additionalSystemContext, "readAdditionalSystemContext").mockImplementation(() => {
+      scratchpadLoadStarted = true;
+      return Promise.resolve(null);
+    });
+    const goalService = {
+      getGoal: mock(() => {
+        goalLoadStarted.resolve();
+        return goalLoad.promise;
+      }),
+    } as unknown as WorkspaceGoalService;
+
+    const streamPromise = concurrentService.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "hello")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+      workspaceGoalService: goalService,
+    });
+
+    await goalLoadStarted.promise;
+    expect(mcpOverridesLoadStarted).toBe(true);
+    expect(scratchpadLoadStarted).toBe(true);
+
+    goalLoad.resolve(null);
+    expect((await streamPromise).success).toBe(true);
   });
 
   it("keeps set_goal disabled for one-shot streams that do not opt into agent-created goals", async () => {

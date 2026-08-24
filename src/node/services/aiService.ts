@@ -1988,12 +1988,60 @@ export class AIService extends EventEmitter {
       const advisorToolEligible =
         advisorExperimentEnabled && agentAdvisorEnabled && advisorModelString.length > 0;
 
+      // These independent workspace reads can all be slow (especially on remote filesystems),
+      // so start them together once agent resolution has established the request context.
+      const currentGoalForToolsPromise: Promise<GoalRecordV1 | null> = workspaceGoalService
+        ? workspaceGoalService.getGoal(workspaceId)
+        : Promise.resolve(null);
+
+      // Fetch workspace MCP overrides (for filtering servers and tools).
+      // NOTE: Stored in <workspace>/.xum/mcp.local.jsonc (not ~/.xum/config.json).
+      const loadWorkspaceMcpOverridesStartedAt = Date.now();
+      const mcpOverridesPromise: Promise<WorkspaceMCPOverrides | undefined> =
+        this.workspaceMcpOverridesService
+          .getOverridesForWorkspace(workspaceId)
+          .then(({ overrides }) => overrides)
+          .catch((error: unknown) => {
+            log.warn("[MCP] Failed to load workspace MCP overrides; continuing without overrides", {
+              workspaceId,
+              error,
+            });
+            return undefined;
+          })
+          .finally(() => {
+            recordStartupPhaseTiming(
+              "loadWorkspaceMcpOverridesMs",
+              loadWorkspaceMcpOverridesStartedAt
+            );
+          });
+
+      const loadAdditionalSystemContextStartedAt = Date.now();
+      const workspaceAdditionalSystemContextPromise: Promise<string> = (
+        additionalSystemContext != null
+          ? Promise.resolve(additionalSystemContext)
+          : readAdditionalSystemContext(this.config, workspaceId)
+              .then(effectiveAdditionalSystemContext)
+              .catch((error: unknown) => {
+                // The scratchpad is user-editable state, so a transient read failure should not block a send.
+                log.warn(
+                  "Failed to load workspace additional system context; continuing without it",
+                  {
+                    workspaceId,
+                    error,
+                  }
+                );
+                return "";
+              })
+      ).finally(() => {
+        recordStartupPhaseTiming(
+          "loadAdditionalSystemContextMs",
+          loadAdditionalSystemContextStartedAt
+        );
+      });
+
       // Goals graduated to GA: tools are gated solely on the workspace's
       // current goal status + agent capability, not on an experiment flag.
-      let currentGoalForTools: GoalRecordV1 | null = null;
-      if (workspaceGoalService) {
-        currentGoalForTools = await workspaceGoalService.getGoal(workspaceId);
-      }
+      const currentGoalForTools = await currentGoalForToolsPromise;
       const effectiveGoalDefaults = mergeGoalDefaults(
         normalizeGoalDefaults(cfg.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
         metadata.goalDefaults ?? null
@@ -2004,23 +2052,6 @@ export class AIService extends EventEmitter {
         allowAgentSetGoal,
         agentInheritanceChain,
       });
-
-      // Fetch workspace MCP overrides (for filtering servers and tools)
-      // NOTE: Stored in <workspace>/.xum/mcp.local.jsonc (not ~/.xum/config.json).
-      let mcpOverrides: WorkspaceMCPOverrides | undefined;
-      const loadWorkspaceMcpOverridesStartedAt = Date.now();
-      try {
-        mcpOverrides = (
-          await this.workspaceMcpOverridesService.getOverridesForWorkspace(workspaceId)
-        ).overrides;
-      } catch (error) {
-        log.warn("[MCP] Failed to load workspace MCP overrides; continuing without overrides", {
-          workspaceId,
-          error,
-        });
-        mcpOverrides = undefined;
-      }
-      recordStartupPhaseTiming("loadWorkspaceMcpOverridesMs", loadWorkspaceMcpOverridesStartedAt);
 
       // Agent Plugins: discovery follows the active checkout and is disabled
       // for workspaces that exec off-host (SSH/Docker/devcontainer).
@@ -2047,7 +2078,9 @@ export class AIService extends EventEmitter {
         log.warn("Agent plugin hooks: ensure failed; continuing without plugin hooks", { error });
       }
 
-      // Fetch MCP server config for system prompt (before building message).
+      // Fetch MCP server config for system prompt (before building message). Awaiting the
+      // override read here still overlaps it with the goal and scratchpad reads above.
+      const mcpOverrides = await mcpOverridesPromise;
       const listMcpServersStartedAt = Date.now();
       const mcpServers = this.mcpServerManager
         ? await this.mcpServerManager.listServers(
@@ -2059,32 +2092,12 @@ export class AIService extends EventEmitter {
         : undefined;
       recordStartupPhaseTiming("listMcpServersMs", listMcpServersStartedAt);
 
-      const loadAdditionalSystemContextStartedAt = Date.now();
-      let workspaceAdditionalSystemContext = additionalSystemContext;
-      if (workspaceAdditionalSystemContext == null) {
-        try {
-          // Fall back to disk only when the renderer did not send a live snapshot.
-          // `effectiveAdditionalSystemContext` honors the `enabled` toggle: when
-          // the user has disabled the scratchpad, the persisted content is
-          // intentionally not injected.
-          const record = await readAdditionalSystemContext(this.config, workspaceId);
-          workspaceAdditionalSystemContext = effectiveAdditionalSystemContext(record);
-        } catch (error) {
-          // The scratchpad is user-editable state, so a transient read failure should not block a send.
-          log.warn("Failed to load workspace additional system context; continuing without it", {
-            workspaceId,
-            error,
-          });
-          workspaceAdditionalSystemContext = "";
-        }
-      }
+      // Fall back to disk only when the renderer did not send a live snapshot.
+      // `effectiveAdditionalSystemContext` honors the `enabled` toggle: when the user has
+      // disabled the scratchpad, the persisted content is intentionally not injected.
       const scratchpadAdditionalSystemInstructions = mergeAdditionalSystemInstructions(
-        workspaceAdditionalSystemContext,
+        await workspaceAdditionalSystemContextPromise,
         additionalSystemInstructions
-      );
-      recordStartupPhaseTiming(
-        "loadAdditionalSystemContextMs",
-        loadAdditionalSystemContextStartedAt
       );
 
       // Build plan-aware instructions and determine plan→exec transition content.
