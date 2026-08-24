@@ -1316,7 +1316,19 @@ export class RefineService {
   ): Promise<StagedRefineEdit[]> {
     if (!edits.some((edit) => edit.tool === "agent_skill_write")) return edits;
     const projectRoot = await this.resolveSkillWriteProjectRoot(workspaceId);
-    if (projectRoot === undefined) return edits;
+    // FAIL CLOSED (r65, mirrors the r57 memory path): staged skill writes
+    // are full-file overwrites whose only apply-time conflict guard is the
+    // fingerprint captured here. Retaining an edit UNHASHED (project root
+    // transiently unresolvable, EACCES/read error below) disables that guard
+    // — if access recovers and the target changes before /refine apply, the
+    // staged writer would silently overwrite the newer contents. Drop such
+    // edits instead; the user reruns /refine once the cause clears.
+    if (projectRoot === undefined) {
+      log.warn("[Refine] dropping staged skill writes: project root unresolvable", {
+        workspaceId,
+      });
+      return edits.filter((edit) => edit.tool !== "agent_skill_write");
+    }
     // r53: collapse multiple staged writes to the SAME resolved target down
     // to the LAST one (in apply order). Staged skill writes are full-file
     // overwrites, so the final write alone yields the identical end state —
@@ -1341,9 +1353,18 @@ export class RefineService {
       collapsed.map(async (edit) => {
         if (edit.tool !== "agent_skill_write") return edit;
         const targetContentHash = await this.fingerprintSkillWriteTarget(projectRoot, edit.input);
-        return targetContentHash === undefined ? edit : { ...edit, targetContentHash };
+        if (targetContentHash === undefined) {
+          // See the fail-closed note above: an unhashed skill write must not
+          // be proposed (ENOENT is not a failure — it hashes to the absent
+          // sentinel — so this branch is unresolvable targets and read errors).
+          log.warn("[Refine] dropping staged skill write: target fingerprinting failed", {
+            workspaceId,
+          });
+          return undefined;
+        }
+        return { ...edit, targetContentHash };
       })
-    );
+    ).then((results) => results.filter((edit): edit is StagedRefineEdit => edit !== undefined));
   }
 
   /**

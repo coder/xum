@@ -199,6 +199,34 @@ export async function removeSessionDirUnderMemoryLocks(args: {
 export const REMOVAL_TOMBSTONE_HEAL_MIN_AGE_MS = 10 * 60_000;
 
 /**
+ * Keep a just-published removal tombstone visibly ALIVE while the removal
+ * that published it is still running (r65). Marker age alone cannot
+ * distinguish "removal wedged between session deletion and config
+ * deregistration for longer than the guard window" (e.g. a hung MCP server
+ * close) from "removal crashed leaving rollback residue" — both present an
+ * old tombstone plus a still-registered workspace, and healing a LIVE
+ * removal's marker would let foreign history/sidecar writers pass their
+ * durable removal gate and recreate the session directory before
+ * deregistration lands. The remover renews the marker's mtime on an unref'd
+ * timer until the removal settles, and the self-heal ages tombstones by
+ * MTIME: a live (even wedged) removal keeps its marker fresh, while a
+ * crashed one stops renewing and ages into healable residue. A late tick
+ * after the compensating rollback deleted the marker is harmless — utimes
+ * never recreates the file.
+ */
+export function startRemovalTombstoneLease(rootDir: string, workspaceId: string): Disposable {
+  const tombstonePath = workspaceRemovalTombstonePath(rootDir, workspaceId);
+  const timer = setInterval(() => {
+    const now = new Date();
+    void fsPromises.utimes(tombstonePath, now, now).catch(() => undefined);
+  }, REMOVAL_TOMBSTONE_HEAL_MIN_AGE_MS / 4);
+  timer.unref();
+  return {
+    [Symbol.dispose]: () => clearInterval(timer),
+  };
+}
+
+/**
  * Startup self-heal (r63): a REGISTERED workspace with an old removal
  * tombstone is the residue of a removal whose config deregistration failed
  * AND whose compensating tombstone rollback also failed — without healing,
@@ -227,7 +255,13 @@ export async function healRemovalTombstonesForRegisteredWorkspaces(config: {
         removedAt?: unknown;
       };
       if (typeof parsed.workspaceId !== "string" || typeof parsed.removedAt !== "number") continue;
-      if (Date.now() - parsed.removedAt < REMOVAL_TOMBSTONE_HEAL_MIN_AGE_MS) continue;
+      // Age by MTIME, not the immutable removedAt payload (r65): a removal
+      // that is merely SLOW keeps renewing its marker's mtime through
+      // startRemovalTombstoneLease, so it never looks like residue here no
+      // matter how long deregistration takes; only a removal whose process
+      // died stops renewing and ages past the guard window.
+      const stat = await fsPromises.stat(filePath);
+      if (Date.now() - stat.mtimeMs < REMOVAL_TOMBSTONE_HEAL_MIN_AGE_MS) continue;
       if (config.findWorkspace(parsed.workspaceId) == null) continue;
       await fsPromises.rm(filePath, { force: true });
       log.warn(

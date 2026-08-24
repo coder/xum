@@ -9789,6 +9789,7 @@ describe("WorkspaceService remove timing rollup", () => {
 
       const aiService = new FakeAIService() as unknown as AIService;
       const mockConfig: Partial<Config> = {
+        rootDir: path.join(tempRoot, "root"),
         srcDir: "/tmp/src",
         getSessionDir: mock((id: string) => path.join(sessionRoot, id)),
         removeWorkspace: mock(() => Promise.resolve()),
@@ -9836,6 +9837,9 @@ describe("WorkspaceService remove shared-workspace guard", () => {
 
   function buildConfig(taskIsolation?: "none" | "fork"): Partial<Config> {
     return {
+      // Unique per-build root: removal publishes durable tombstones under
+      // <rootDir>/locks, which must not leak across tests or runs.
+      rootDir: path.join(tmpdir(), "mux-shared-guard", `root-${crypto.randomUUID()}`),
       srcDir: "/tmp/src",
       getSessionDir: mock((id: string) => path.join(tmpdir(), "mux-shared-guard", id)),
       removeWorkspace: mock(() => Promise.resolve()),
@@ -9927,6 +9931,7 @@ describe("WorkspaceService remove shared-workspace guard", () => {
   // Inverse direction: removing the PARENT while a live shared child points at its checkout.
   function buildParentConfig(childTaskStatus: string): Partial<Config> {
     return {
+      rootDir: path.join(tmpdir(), "mux-shared-guard", `root-${crypto.randomUUID()}`),
       srcDir: "/tmp/src",
       getSessionDir: mock((id: string) => path.join(tmpdir(), "mux-shared-guard", id)),
       removeWorkspace: mock(() => Promise.resolve()),
@@ -13140,6 +13145,7 @@ describe("WorkspaceService init cancellation", () => {
       } as unknown as AIService;
 
       const mockConfig: Partial<Config> = {
+        rootDir: path.join(tempRoot, "root"),
         srcDir: "/tmp/src",
         getSessionDir: mock((id: string) => path.join(tempRoot, id)),
         removeWorkspace: mock(() => Promise.resolve()),
@@ -13283,6 +13289,7 @@ describe("WorkspaceService init cancellation", () => {
       } as unknown as AIService;
 
       const mockConfig: Partial<Config> = {
+        rootDir: path.join(tempRoot, "root"),
         srcDir: "/tmp/src",
         getSessionDir: mock((id: string) => path.join(tempRoot, id)),
         removeWorkspace: mock(() => Promise.resolve()),

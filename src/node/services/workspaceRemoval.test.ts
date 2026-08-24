@@ -143,17 +143,27 @@ describe("workspaceRemoval", () => {
   test("startup heal reclaims old tombstones only for still-registered workspaces (r63)", async () => {
     using tmp = new DisposableTempDir("workspace-removal-test");
     const rootDir = path.join(tmp.path, "xum-home");
-    const write = async (workspaceId: string, removedAt: number) => {
+    // The healer ages markers by MTIME (r65): a crashed removal stops
+    // renewing, so its marker's mtime matches its removedAt; a live slow
+    // removal keeps the mtime fresh through startRemovalTombstoneLease.
+    const write = async (workspaceId: string, removedAt: number, mtimeMs?: number) => {
       const p = workspaceRemovalTombstonePath(rootDir, workspaceId);
       await fsPromises.mkdir(path.dirname(p), { recursive: true });
       await fsPromises.writeFile(p, JSON.stringify({ workspaceId, removedAt }));
+      const mtime = new Date(mtimeMs ?? removedAt);
+      await fsPromises.utimes(p, mtime, mtime);
     };
     const old = Date.now() - REMOVAL_TOMBSTONE_HEAL_MIN_AGE_MS - 1_000;
     await write("ws-bricked-registered", old); // failure residue → heal
     await write("ws-mid-removal", Date.now()); // fresh: may be a removal in flight → keep
     await write("ws-gone", old); // deregistered long ago (normal terminal state) → keep
+    // r65: published long ago but still lease-renewed (fresh mtime) — a
+    // removal wedged between session deletion and config deregistration is
+    // ACTIVE, not residue; healing it would reopen the durable removal gate
+    // for foreign writers mid-removal.
+    await write("ws-slow-removal", old, Date.now());
 
-    const registered = new Set(["ws-bricked-registered", "ws-mid-removal"]);
+    const registered = new Set(["ws-bricked-registered", "ws-mid-removal", "ws-slow-removal"]);
     await healRemovalTombstonesForRegisteredWorkspaces({
       rootDir,
       findWorkspace: (id) => (registered.has(id) ? { id } : undefined),
@@ -162,5 +172,6 @@ describe("workspaceRemoval", () => {
     expect(await isWorkspaceRemovalTombstoned(rootDir, "ws-bricked-registered")).toBe(false);
     expect(await isWorkspaceRemovalTombstoned(rootDir, "ws-mid-removal")).toBe(true);
     expect(await isWorkspaceRemovalTombstoned(rootDir, "ws-gone")).toBe(true);
+    expect(await isWorkspaceRemovalTombstoned(rootDir, "ws-slow-removal")).toBe(true);
   });
 });

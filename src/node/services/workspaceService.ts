@@ -109,6 +109,7 @@ import {
 import {
   healRemovalTombstonesForRegisteredWorkspaces,
   removeSessionDirUnderMemoryLocks,
+  startRemovalTombstoneLease,
   TombstoneNotDurableError,
   workspaceRemovalTombstonePath,
 } from "@/node/services/workspaceRemoval";
@@ -5972,6 +5973,15 @@ export class WorkspaceService extends EventEmitter {
         }
         log.error(`Failed to remove session directory for ${workspaceId}:`, error);
       }
+      // r65: the tombstone is durable here (both the locked path and the
+      // orphan fallback published it). Keep renewing its mtime until this
+      // removal settles so a foreign backend's startup self-heal cannot
+      // mistake a merely SLOW removal (e.g. a hung MCP server close below)
+      // for crash residue and delete the marker while removal is live.
+      // Disposal at scope exit (after deregistration or its rollback) is
+      // safe: a late renewal of a retained terminal marker is meaningless,
+      // and utimes on a rolled-back (deleted) marker is a swallowed ENOENT.
+      using _tombstoneLease = startRemovalTombstoneLease(this.config.rootDir, workspaceId);
 
       // The on-disk devtools.jsonl died with the session directory above; also drop any
       // in-memory DevTools state so stale runs cannot outlive the workspace.
