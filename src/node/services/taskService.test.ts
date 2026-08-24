@@ -13610,6 +13610,101 @@ describe("TaskService", () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
+  test("sendAgentTreeMessage refuses terminal and archived senders", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        // Reported sender: its stream may still be winding down (a late tool call racing
+        // task_stop/agent_report), but the terminal boundary must win.
+        projectWorkspace(projectPath, "sib-done", "sib-done", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "reported",
+        }),
+        projectWorkspace(projectPath, "sib-arch", "sib-arch", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+          archivedAt: "2026-08-10T00:00:00.000Z",
+        }),
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const senderRefusal = Err({
+      code: "refused" as const,
+      reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
+    });
+    expect(await taskService.sendAgentTreeMessage("sib-done", "sib-b", "late send")).toEqual(
+      senderRefusal
+    );
+    expect(await taskService.sendAgentTreeMessage("sib-arch", "sib-b", "late send")).toEqual(
+      senderRefusal
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("sendAgentTreeMessage carries the target's active workspace-turn correlation on the trigger", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "child-a", "child-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    // The root is executing a delegated workspace turn owned elsewhere: the trigger must keep
+    // that correlation or the queued peer wake would settle the owner's turn as superseded.
+    const turnMetadata = {
+      type: "workspace-turn-task" as const,
+      taskHandleId: "wt-1",
+      ownerWorkspaceId: "owner-1",
+      turnId: "turn-1",
+    };
+    const internals = taskService as unknown as {
+      getActiveWorkspaceTurnMuxMetadataForWorkspace: (
+        workspaceId: string
+      ) => Promise<typeof turnMetadata | null>;
+    };
+    internals.getActiveWorkspaceTurnMuxMetadataForWorkspace = (workspaceId) =>
+      Promise.resolve(workspaceId === "tree-root" ? turnMetadata : null);
+
+    const result = await taskService.sendAgentTreeMessage("child-a", "tree-root", "Blocked.");
+    expect(result.success).toBe(true);
+    const [, , options, internalArg] = sendMessage.mock.calls[0] as [
+      string,
+      string,
+      { muxMetadata?: { type?: string } },
+      { workspaceTurnContinuation?: boolean; preTurnMessages?: MuxMessage[] },
+    ];
+    expect(options.muxMetadata).toEqual(turnMetadata);
+    expect(internalArg.workspaceTurnContinuation).toBe(true);
+    // Peer attribution stays on the assistant payload row.
+    expect(internalArg.preTurnMessages?.[0]?.metadata?.muxMetadata?.type).toBe(
+      "agent-peer-message"
+    );
+  });
+
   test("sendAgentTreeMessage bounds peer message size, sender titles, and aggregate budgets", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
@@ -13712,6 +13807,13 @@ describe("TaskService", () => {
         projectWorkspace(projectPath, "cand-child", "task-cand-child", {
           parentWorkspaceId: "task-cand",
           taskStatus: "running",
+        }),
+        // Archived state is independent of taskStatus; peer sends refuse archived targets, so
+        // discovery must hide the row.
+        projectWorkspace(projectPath, "arch", "task-arch", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+          archivedAt: "2026-08-10T00:00:00.000Z",
         }),
       ],
       testTaskSettings()

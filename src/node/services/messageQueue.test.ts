@@ -70,6 +70,31 @@ describe("MessageQueue", () => {
       expect(queue.dequeueNext().message).toBe("User follow-up");
     });
 
+    it("counts peer triggers by dedupe-key prefix when metadata carries a workspace-turn correlation", () => {
+      // Upward sends into a delegated workspace turn replace the trigger's muxMetadata with the
+      // turn correlation; the agent-msg: dedupe prefix must keep the peer count exact.
+      queue.addOnce(
+        "Peer agent task-sibling sent an agent message…",
+        {
+          model: "gpt-4",
+          agentId: "exec",
+          muxMetadata: {
+            type: "workspace-turn-task",
+            taskHandleId: "wt-1",
+            ownerWorkspaceId: "owner-1",
+            turnId: "turn-1",
+          },
+        },
+        "agent-msg:task-sibling:uuid-1",
+        { synthetic: true, agentInitiated: true, removableDedupeKey: true }
+      );
+      queue.add("User follow-up");
+
+      expect(queue.countAgentPeerMessageEntries()).toBe(1);
+      queue.dequeueNext();
+      expect(queue.countAgentPeerMessageEntries()).toBe(0);
+    });
+
     it("should return rawCommand for compaction request", () => {
       const metadata: MuxMessageMetadata = {
         type: "compaction-request",

@@ -7,7 +7,7 @@ interface CollapsibleMachineMessageProps {
   content: string;
   summary: string;
   icon: ReactNode;
-  marker: "background-work-wake" | "bash-monitor-wake";
+  marker: "background-work-wake" | "bash-monitor-wake" | "agent-peer-message-trigger";
   className?: string;
 }
 
@@ -17,7 +17,9 @@ export function CollapsibleMachineMessage(props: CollapsibleMachineMessageProps)
   const markerAttributes =
     props.marker === "background-work-wake"
       ? { "data-background-work-wake": true }
-      : { "data-bash-monitor-wake": true };
+      : props.marker === "agent-peer-message-trigger"
+        ? { "data-agent-peer-message-trigger": true }
+        : { "data-bash-monitor-wake": true };
 
   return (
     <div

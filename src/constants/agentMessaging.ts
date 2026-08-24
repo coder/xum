@@ -21,6 +21,13 @@ export const PEER_MESSAGE_DEDUPE_WINDOW_MS = 120_000;
 export const MAX_QUEUED_PEER_MESSAGES_PER_TARGET = 10;
 
 /**
+ * Queue dedupe-key prefix for peer-message wake triggers (`agent-msg:<sender>:<uuid>`). The
+ * unique suffix prevents coalescing; the prefix lets the queue count peer entries even when a
+ * trigger's muxMetadata carries a workspace-turn correlation instead of peer attribution.
+ */
+export const AGENT_PEER_MESSAGE_DEDUPE_PREFIX = "agent-msg:";
+
+/**
  * Max peer messages admitted for a target without any user-authored input or parent guidance in
  * between; at the cap the target is deemed to need user attention. Charged when a send is
  * admitted (queued or delivered), so dispatch timing cannot exceed the advertised turn count.

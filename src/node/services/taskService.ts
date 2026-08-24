@@ -32,6 +32,7 @@ import {
 } from "@/common/utils/agentMessageEnvelope";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import {
+  AGENT_PEER_MESSAGE_DEDUPE_PREFIX,
   MAX_CONSECUTIVE_PEER_WAKES,
   MAX_QUEUED_PEER_MESSAGES_PER_TARGET,
   PEER_MESSAGE_DEDUPE_WINDOW_MS,
@@ -5116,6 +5117,26 @@ export class TaskService {
         return Err({ code: "invalid_scope" as const });
       }
 
+      // A sender that already reported or was stopped must not keep waking peers from a
+      // winding-down stream or a late tool call racing task_stop: the terminal/archived
+      // boundary wins, matching the target-side lifecycle rules below.
+      const senderIsAgentTask =
+        coerceNonEmptyString(senderEntry.workspace.parentWorkspaceId) != null;
+      if (senderIsAgentTask) {
+        const senderStatus = senderEntry.workspace.taskStatus ?? "running";
+        const senderArchived = isWorkspaceArchived(
+          senderEntry.workspace.archivedAt,
+          senderEntry.workspace.unarchivedAt
+        );
+        if (senderArchived || (senderStatus !== "running" && senderStatus !== "awaiting_report")) {
+          return Err({
+            code: "refused" as const,
+            reason:
+              "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
+          });
+        }
+      }
+
       // Workflow-owned endpoints exchange I/O through WorkflowRunner's journal; peer messages
       // would break durable replay (same rationale as reportAgentProgress's early return).
       if (
@@ -5267,6 +5288,16 @@ export class TaskService {
       const effectiveDispatchMode =
         params.queueDispatchMode ?? (relation === "target_ancestor" ? "turn-end" : "tool-end");
 
+      // Delegated-turn correlation: if the target is currently executing a delegated workspace
+      // turn, the trigger must carry that correlation (like wakeParentWorkspaceWithSynthetic-
+      // Message) — otherwise the queued peer wake dispatches as an unrelated turn and the next
+      // stream end settles the owner's delegated turn as interrupted/superseded. Peer
+      // attribution stays on the assistant payload row, so no provenance is lost; the queue
+      // still counts these entries by their dedupe-key prefix.
+      const workspaceTurnMuxMetadata =
+        await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(targetId);
+      const triggerMuxMetadata = workspaceTurnMuxMetadata ?? muxMetadata;
+
       let sendOptions: SendMessageOptions;
       if (relation === "target_ancestor") {
         const resumeOptions = await this.resolveParentAutoResumeOptions(
@@ -5279,7 +5310,7 @@ export class TaskService {
           agentId: resumeOptions.agentId,
           thinkingLevel: resumeOptions.thinkingLevel,
           reasoningMode: resumeOptions.reasoningMode,
-          muxMetadata,
+          muxMetadata: triggerMuxMetadata,
           queueDispatchMode: effectiveDispatchMode,
         };
       } else {
@@ -5297,7 +5328,7 @@ export class TaskService {
           thinkingLevel: activeAiSettings?.thinkingLevel ?? targetEntry.workspace.taskThinkingLevel,
           reasoningMode: coerceOpenAIReasoningMode(activeAiSettings?.reasoningMode),
           experiments: targetEntry.workspace.taskExperiments,
-          muxMetadata,
+          muxMetadata: triggerMuxMetadata,
           queueDispatchMode: effectiveDispatchMode,
         };
       }
@@ -5324,8 +5355,9 @@ export class TaskService {
         skipAutoResumeReset: true,
         // Unique key ⇒ never coalesces (removable dedupe keys force a sealed queue entry), so
         // sender attribution, queue caps, and previews survive later queued messages.
-        queueDedupeKey: `agent-msg:${senderWorkspaceId}:${randomUUID()}`,
+        queueDedupeKey: `${AGENT_PEER_MESSAGE_DEDUPE_PREFIX}${senderWorkspaceId}:${randomUUID()}`,
         removableQueueDedupeKey: true,
+        workspaceTurnContinuation: workspaceTurnMuxMetadata != null,
         preTurnMessages: [payloadRow],
         onPreTurnRowsPersisted: () => {
           payloadPersisted = true;
@@ -10268,22 +10300,34 @@ export class TaskService {
 
     const tasks = this.listDescendantAgentTasks(rootWorkspaceId, {
       excludeWorkflowTasks: true,
-    }).map((task): TreeAgentTaskInfo => {
-      const relationship: TreeAgentRelationship =
-        task.taskId === workspaceId
-          ? "self"
-          : this.isDescendantAgentTaskUsingParentById(index.parentById, workspaceId, task.taskId)
-            ? "descendant"
-            : this.isDescendantAgentTaskUsingParentById(index.parentById, task.taskId, workspaceId)
-              ? "ancestor"
-              : "sibling";
-      // sendAgentPeerMessage refuses a candidate's ENTIRE subtree (isBestOfChainUsingIndex walks
-      // ancestors), so discovery must mark nested children of a candidate too: inherit the
-      // nearest ancestor's candidate metadata when the row carries none of its own, keeping the
-      // tree note's "bestOf metadata ⇒ not peer-addressable" rule aligned with refusal behavior.
-      const bestOf = task.bestOf ?? this.findNearestBestOfGroupUsingIndex(index, task.taskId);
-      return { ...task, ...(bestOf != null ? { bestOf } : {}), relationship };
-    });
+    })
+      .filter((task) => {
+        // Archived state is independent of taskStatus (legacy archived rows can still read
+        // "running"), and sendAgentPeerMessage unconditionally refuses archived targets — hide
+        // them from peer discovery so the note's addressability claim stays true.
+        const entry = index.byId.get(task.taskId);
+        return entry == null || !isWorkspaceArchived(entry.archivedAt, entry.unarchivedAt);
+      })
+      .map((task): TreeAgentTaskInfo => {
+        const relationship: TreeAgentRelationship =
+          task.taskId === workspaceId
+            ? "self"
+            : this.isDescendantAgentTaskUsingParentById(index.parentById, workspaceId, task.taskId)
+              ? "descendant"
+              : this.isDescendantAgentTaskUsingParentById(
+                    index.parentById,
+                    task.taskId,
+                    workspaceId
+                  )
+                ? "ancestor"
+                : "sibling";
+        // sendAgentPeerMessage refuses a candidate's ENTIRE subtree (isBestOfChainUsingIndex walks
+        // ancestors), so discovery must mark nested children of a candidate too: inherit the
+        // nearest ancestor's candidate metadata when the row carries none of its own, keeping the
+        // tree note's "bestOf metadata ⇒ not peer-addressable" rule aligned with refusal behavior.
+        const bestOf = task.bestOf ?? this.findNearestBestOfGroupUsingIndex(index, task.taskId);
+        return { ...task, ...(bestOf != null ? { bestOf } : {}), relationship };
+      });
 
     return {
       rootWorkspaceId,

@@ -1,4 +1,5 @@
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
+import { AGENT_PEER_MESSAGE_DEDUPE_PREFIX } from "@/constants/agentMessaging";
 import type { SendMessageError } from "@/common/types/errors";
 import type { MuxMessage } from "@/common/types/message";
 import type { ReviewNoteData } from "@/common/types/review";
@@ -204,7 +205,13 @@ export class MessageQueue {
 
   /** Queued intra-tree agent peer messages (sealed entries, one message each). */
   countAgentPeerMessageEntries(): number {
-    return this.entries.filter((entry) => isAgentPeerMessageMetadata(entry.muxMetadata)).length;
+    // The dedupe-key prefix also matches triggers whose muxMetadata was replaced by a
+    // workspace-turn correlation (upward sends into a delegated turn keep the peer count).
+    return this.entries.filter(
+      (entry) =>
+        isAgentPeerMessageMetadata(entry.muxMetadata) ||
+        [...entry.dedupeKeys].some((key) => key.startsWith(AGENT_PEER_MESSAGE_DEDUPE_PREFIX))
+    ).length;
   }
 
   private getDispatchMode(entries: readonly QueueEntry[]): QueueDispatchMode {

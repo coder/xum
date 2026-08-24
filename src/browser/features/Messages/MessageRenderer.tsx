@@ -7,6 +7,8 @@ import type { EditingMessageState } from "@/browser/utils/chatEditing";
 import { UserMessage, type UserMessageNavigation } from "./UserMessage";
 import { AgentPeerMessage } from "./AgentPeerMessage";
 import { BashMonitorWakeMessage } from "./BashMonitorWakeMessage";
+import { CollapsibleMachineMessage } from "./CollapsibleMachineMessage";
+import { MessageSquare } from "lucide-react";
 import {
   BackgroundWorkWakeMessage,
   getBackgroundWorkWakeSummary,
@@ -98,6 +100,17 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
         renderedMessage =
           message.bashMonitorWake != null ? (
             <BashMonitorWakeMessage message={message} className={className} />
+          ) : message.agentPeerMessageTrigger != null ? (
+            // The wake trigger is backend-generated control text: a full user bubble would
+            // falsely present it as human input (the payload renders separately as the
+            // assistant-side agent-message card).
+            <CollapsibleMachineMessage
+              content={message.content}
+              summary="Agent message notification"
+              icon={<MessageSquare aria-hidden="true" className="size-3.5 shrink-0" />}
+              marker="agent-peer-message-trigger"
+              className={className}
+            />
           ) : backgroundWorkWakeSummary != null ? (
             <BackgroundWorkWakeMessage
               message={message}
