@@ -2163,6 +2163,54 @@ describe("wrapFetchWithXAIServiceTier", () => {
 // Effort "xhigh" and thinking.display flow through the SDK directly as of
 // @ai-sdk/anthropic 4.0.11 (see buildProviderOptions), so the wrapper must NOT
 // rewrite reasoning fields — it only normalizes cache_control.
+describe("wrapFetchWithAnthropicCacheControl — ZDR stripping", () => {
+  it("strips existing cache markers when injection is disabled", async () => {
+    const { calls, fakeFetch } = createCapturingFetch();
+    const wrapped = wrapFetchWithAnthropicCacheControl(fakeFetch, undefined, {
+      injectCacheControl: false,
+    });
+
+    // Markers the request pipeline can serialize before the wrapper runs:
+    // eligibility checks read a policy-filtered view that can hide the
+    // global disableBetaFeatures flag, so the wire must strip them.
+    await wrapped("https://proxy.example/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        system: [{ type: "text", text: "cached system", cache_control: { type: "ephemeral" } }],
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }],
+            providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+          },
+        ],
+        tools: [{ name: "bash", cache_control: { type: "ephemeral" } }],
+      }),
+    });
+
+    expect(calls).toHaveLength(1);
+    const sent = JSON.stringify(parseSentBody(calls[0]));
+    expect(sent).not.toContain("cache_control");
+    expect(sent).not.toContain("cacheControl");
+  });
+
+  it("keeps markers when injection is enabled", async () => {
+    const { calls, fakeFetch } = createCapturingFetch();
+    const wrapped = wrapFetchWithAnthropicCacheControl(fakeFetch);
+
+    await wrapped("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        system: [{ type: "text", text: "cached system", cache_control: { type: "ephemeral" } }],
+        messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      }),
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(JSON.stringify(parseSentBody(calls[0]))).toContain("cache_control");
+  });
+});
+
 describe("wrapFetchWithAnthropicCacheControl — reasoning fields pass through unchanged", () => {
   it("passes native xhigh effort and summarized display through on the direct body", async () => {
     const { calls, fakeFetch } = createCapturingFetch();

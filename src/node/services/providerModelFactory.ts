@@ -402,6 +402,45 @@ export function countAnthropicCacheBreakpoints(requestBody: unknown): number {
 }
 
 /**
+ * Remove every cache marker the request pipeline may have serialized:
+ * `cache_control` on system/message/tool entries and nested content parts,
+ * plus gateway-style providerOptions.anthropic.cacheControl. ZDR enforcement
+ * happens HERE, at the wire, because upstream eligibility checks read a
+ * policy-filtered providers view that can hide the global anthropic
+ * disableBetaFeatures flag.
+ */
+function stripAnthropicCacheControlMarkers(json: Record<string, unknown>): void {
+  const stripEntry = (entry: unknown): void => {
+    if (entry == null || typeof entry !== "object" || Array.isArray(entry)) {
+      return;
+    }
+    const record = entry as Record<string, unknown>;
+    delete record.cache_control;
+    const providerOptions = record.providerOptions;
+    if (providerOptions != null && typeof providerOptions === "object") {
+      const anthropicOptions = (providerOptions as Record<string, unknown>).anthropic;
+      if (anthropicOptions != null && typeof anthropicOptions === "object") {
+        delete (anthropicOptions as Record<string, unknown>).cacheControl;
+      }
+    }
+    if (Array.isArray(record.content)) {
+      for (const part of record.content) {
+        stripEntry(part);
+      }
+    }
+  };
+
+  for (const key of ["system", "messages", "prompt", "tools"]) {
+    const value = json[key];
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        stripEntry(entry);
+      }
+    }
+  }
+}
+
+/**
  * Wrap fetch to normalize Anthropic cache_control directly on the final request body.
  *
  * This keeps routed Anthropic payloads aligned with Xum's manual cache markers
@@ -410,6 +449,9 @@ export function countAnthropicCacheBreakpoints(requestBody: unknown): number {
  * Injects cache_control on:
  * 1. Last tool (caches all tool definitions)
  * 2. Last message's last content part (caches entire conversation)
+ *
+ * When injectCacheControl is false (beta features disabled), existing markers
+ * are STRIPPED instead (see stripAnthropicCacheControlMarkers).
  */
 export function wrapFetchWithAnthropicCacheControl(
   baseFetch: typeof fetch,
@@ -428,6 +470,10 @@ export function wrapFetchWithAnthropicCacheControl(
 
     try {
       const json = JSON.parse(init.body) as Record<string, unknown>;
+
+      if (!injectCacheControl) {
+        stripAnthropicCacheControlMarkers(json);
+      }
 
       // Inject cache_control on the last tool if tools array exists.
       // If the SDK already populated cache_control, preserve it but override ttl
