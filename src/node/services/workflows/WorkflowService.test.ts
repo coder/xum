@@ -54,6 +54,18 @@ describe("WorkflowService archive admission", () => {
     );
     try {
       await expectStartRefused(service, "workspace-archiving");
+      // Background checkpoint retry is a run-starting entry point too: admission is acquired
+      // at method entry, before the run lookup, so the refusal fires even for eligible runs.
+      try {
+        await service.retryRunFromCheckpointInBackground({
+          workspaceId: "workspace-archiving",
+          runId: "wfr_any",
+          projectTrusted: true,
+        });
+        expect.unreachable("retryRunFromCheckpointInBackground must refuse while archiving");
+      } catch (error) {
+        expect(String(error)).toContain("being archived");
+      }
       // No durable run may be created for a refused admission.
       expect(await runStore.listRuns()).toEqual([]);
       expect(hasInProcessWorkflowWork("workspace-archiving")).toBe(false);

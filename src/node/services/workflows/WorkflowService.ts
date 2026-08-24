@@ -322,6 +322,8 @@ export class WorkflowService {
     runId: string;
     projectTrusted: boolean;
   }): Promise<StartNamedWorkflowResult> {
+    // Archive admission pairing; see resumeRunInBackground.
+    using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
     const run = await this.requireRunForWorkspace(input);
     assertRunCanResumeWithCurrentTrust(run, input.projectTrusted);
     assertWorkflowRunCanRetryFromCheckpoint(run);
