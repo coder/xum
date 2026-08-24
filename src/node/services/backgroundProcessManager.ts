@@ -1,11 +1,20 @@
+import type { Dirent } from "node:fs";
+import * as fsPromises from "node:fs/promises";
+import * as nodePath from "node:path";
 import type { Runtime, BackgroundHandle } from "@/node/runtime/Runtime";
-import { spawnProcess } from "./backgroundProcessExecutor";
+import {
+  spawnProcess,
+  localBgWorkspaceDir,
+  BG_META_FILENAME,
+  BG_EXIT_CODE_FILENAME,
+} from "./backgroundProcessExecutor";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "./log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { BASH_MAX_LINE_BYTES } from "@/common/constants/toolLimits";
 import { stripAnsiControlChars } from "@/node/utils/ansi";
+import { isErrnoWithCode } from "@/node/utils/fs";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 
 const DEFAULT_BACKGROUND_BASH_TAIL_BYTES = 64_000;
@@ -29,6 +38,26 @@ export function computeTailStartOffset(fileSizeBytes: number, tailBytes: number)
   );
 
   return Math.max(0, fileSizeBytes - tailBytes);
+}
+
+/**
+ * Narrow a persisted meta.json spawn record to the fields the crash-orphan probe needs.
+ * Records are written by this app but can be truncated by a crash mid-write; anything
+ * malformed is treated as absent rather than trusted.
+ */
+export function parseSpawnRecordMeta(raw: string): { pid: number; status: string } | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  if (!("pid" in parsed) || !("status" in parsed)) return null;
+  const { pid, status } = parsed;
+  if (typeof pid !== "number" || !Number.isInteger(pid)) return null;
+  if (typeof status !== "string") return null;
+  return { pid, status };
 }
 
 import { EventEmitter } from "events";
@@ -1470,6 +1499,76 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     return Array.from(this.processes.values()).some(
       (p) => !p.isForeground && p.workspaceId === workspaceId && p.status === "running"
     );
+  }
+
+  /**
+   * Crash-orphan probe: whether a durable spawn record shows a still-running process for this
+   * workspace that this manager does not track. Processes run under nohup/setsid, so they
+   * survive an unclean app shutdown while the in-memory map resets; without this probe the
+   * archive gates would report "no background processes" after a restart and a model-driven
+   * snapshot archive could remove the checkout while the surviving process still writes to it.
+   * The spawn layout persists per-process meta.json plus an exit_code file written by the
+   * wrapper's exit trap even when the app is gone, so orphans stay detectable: a record still
+   * marked running with no exit_code file and a live PID fails the gate closed.
+   *
+   * Local filesystem only: remote (SSH/Docker) spawn records live on the remote host, and the
+   * checkout-deletion hazard this guards is limited to local managed worktrees. A recycled PID
+   * can cause a false positive, which errs on the safe side — the model-facing caller routes
+   * to user-mediated archive.
+   */
+  async hasOrphanedRunningBackgroundProcesses(workspaceId: string): Promise<boolean> {
+    assert(workspaceId.length > 0, "hasOrphanedRunningBackgroundProcesses requires workspaceId");
+    const workspaceDir = localBgWorkspaceDir(workspaceId);
+    let entries: Dirent[];
+    try {
+      entries = await fsPromises.readdir(workspaceDir, { withFileTypes: true });
+    } catch {
+      // No local spawn records for this workspace (never spawned locally, or already cleaned).
+      return false;
+    }
+    const trackedPids = new Set<number>();
+    for (const proc of this.processes.values()) {
+      if (proc.workspaceId === workspaceId) {
+        trackedPids.add(proc.pid);
+      }
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const processDir = nodePath.join(workspaceDir, entry.name);
+      let meta: { pid: number; status: string } | null = null;
+      try {
+        meta = parseSpawnRecordMeta(
+          await fsPromises.readFile(nodePath.join(processDir, BG_META_FILENAME), "utf-8")
+        );
+      } catch {
+        // Unreadable record — not evidence of a live process.
+      }
+      if (meta?.status !== "running") continue;
+      // pid 0 marks migrated processes with unknown (possibly remote) PIDs; pid 1 would be
+      // init — neither is probeable, and refusing on them forever would be a stuck gate.
+      if (meta.pid <= 1) continue;
+      // Tracked processes are covered by the in-memory live-activity gates (their statuses
+      // refresh via list()); this probe only reports processes nobody tracks.
+      if (trackedPids.has(meta.pid)) continue;
+      try {
+        await fsPromises.access(nodePath.join(processDir, BG_EXIT_CODE_FILENAME));
+        continue; // The wrapper's exit trap ran: the process exited after the crash.
+      } catch {
+        // No exit marker yet — fall through to the PID probe.
+      }
+      try {
+        process.kill(meta.pid, 0);
+        return true; // Alive and untracked: a crash orphan.
+      } catch (error) {
+        if (!isErrnoWithCode(error, "ESRCH")) {
+          // EPERM etc.: the PID exists but is not ours to signal — treat as alive (recycled
+          // PIDs over-refuse, never under-refuse).
+          return true;
+        }
+        // ESRCH: the process is gone (e.g. SIGKILL skipped the exit trap, or a reboot).
+      }
+    }
+    return false;
   }
 
   /**

@@ -531,13 +531,18 @@ export class TerminalService {
     // Durable marker: the detached emulator can outlive Xum, so a restart must not forget the
     // open (the in-memory Set resets, and both archive checks would otherwise let a
     // model-driven snapshot archive remove the checkout under the still-live shell).
-    // Best-effort — the Set above still guards this app session if the write fails.
+    // Persistence failure is fatal to the launch: a terminal opened without the marker would
+    // be invisible to archive gating after a restart, so failing the open here is the only
+    // fail-closed option (the in-memory Set covers just this app session).
     try {
       const markerPath = this.nativeTerminalMarkerPath(workspaceId);
       await fs.promises.mkdir(path.dirname(markerPath), { recursive: true });
       await fs.promises.writeFile(markerPath, new Date().toISOString());
     } catch (error) {
-      log.warn("Failed to persist native terminal marker", { workspaceId, error });
+      log.error("Failed to persist native terminal marker", { workspaceId, error });
+      throw new Error(
+        `Cannot open a native terminal for ${workspaceId}: persisting the terminal-open marker failed (${getErrorMessage(error)}), and without it archive safety checks would forget the terminal after a restart.`
+      );
     }
     try {
       const allMetadata = await this.config.getAllWorkspaceMetadata();

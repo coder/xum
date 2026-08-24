@@ -60,6 +60,22 @@ const OUTPUT_FILENAME = "output.log";
 /** Exit code filename */
 const EXIT_CODE_FILENAME = "exit_code";
 
+/** Per-process spawn-record filenames that survive an app crash (see localBgWorkspaceDir). */
+export const BG_META_FILENAME = "meta.json";
+export const BG_EXIT_CODE_FILENAME = EXIT_CODE_FILENAME;
+
+/**
+ * Local-filesystem directory holding this workspace's background spawn records (one
+ * subdirectory per process with meta.json, output.log, and the wrapper's exit_code trap
+ * file). Mirrors LocalBaseRuntime.tempDir(), which spawnProcess resolves when the process
+ * was spawned on a local runtime. Crash-orphan detection scans this layout because the
+ * records outlive the app while nohup/setsid children keep running.
+ */
+export function localBgWorkspaceDir(workspaceId: string): string {
+  const tempRoot = process.platform === "win32" ? (process.env.TEMP ?? "C:\\Temp") : "/tmp";
+  return `${tempRoot}/${BG_OUTPUT_SUBDIR}/${workspaceId}`;
+}
+
 /**
  * Compute paths for a background process output directory.
  * @param bgOutputDir Base directory (e.g., /tmp/mux-bashes or ~/.xum/sessions)
@@ -279,7 +295,7 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
    */
   async writeMeta(metaJson: string): Promise<void> {
     try {
-      const metaPath = this.quotePath(`${this.outputDir}/meta.json`);
+      const metaPath = this.quotePath(`${this.outputDir}/${BG_META_FILENAME}`);
       await execBuffered(this.runtime, `cat > ${metaPath} << 'METAEOF'\n${metaJson}\nMETAEOF`, {
         cwd: FALLBACK_CWD,
         timeout: 10,
@@ -543,7 +559,7 @@ class MigratedBackgroundHandle implements BackgroundHandle {
 
   async writeMeta(metaJson: string): Promise<void> {
     try {
-      const metaPath = path.join(this.outputDir, "meta.json");
+      const metaPath = path.join(this.outputDir, BG_META_FILENAME);
       await fs.writeFile(metaPath, metaJson);
     } catch (error) {
       log.debug(`MigratedBackgroundHandle.writeMeta: ${errorMsg(error)}`);

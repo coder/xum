@@ -163,6 +163,7 @@ const mockExtensionMetadataService: Partial<ExtensionMetadataService> = {
 const mockBackgroundProcessManager: Partial<BackgroundProcessManager> = {
   cleanup: mock(() => Promise.resolve()),
   hasRunningBackgroundProcesses: mock(() => false),
+  hasOrphanedRunningBackgroundProcesses: mock(() => Promise.resolve(false)),
 };
 
 type WorkspaceServiceArgs = ConstructorParameters<typeof WorkspaceService>;
@@ -11089,6 +11090,26 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(result.success).toBe(false);
     if (!result.success) {
       expect(result.error).toContain("active workflow runs");
+    }
+  });
+
+  test("archive() refuses when durable spawn records show crash-orphaned background processes", async () => {
+    // Simulates the post-unclean-restart state: the manager's in-memory map is empty but a
+    // durable spawn record still points at a live nohup/setsid child (probe behavior itself
+    // is covered in backgroundProcessManager.test.ts).
+    (
+      mockBackgroundProcessManager.hasOrphanedRunningBackgroundProcesses as Mock<
+        (workspaceId: string) => Promise<boolean>
+      >
+    ).mockImplementationOnce(() => Promise.resolve(true));
+
+    const result = await workspaceService.archive(workspaceId, undefined, {
+      refuseLiveUserActivity: true,
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("previous app session");
     }
   });
 

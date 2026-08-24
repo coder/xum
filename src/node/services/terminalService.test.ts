@@ -1171,6 +1171,27 @@ describe("TerminalService.openNative", () => {
       expect(await service.hasOpenedNativeTerminal("ws-local")).toBe(true);
     });
 
+    it("refuses the native launch when the durable marker cannot be persisted", async () => {
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      // Session dir rooted under /dev/null: marker persistence (mkdir/writeFile) must fail.
+      const configWithUnwritableSessions = {
+        ...(configWithLocalWorkspace as unknown as Record<string, unknown>),
+        getSessionDir: mock((id: string) => `/dev/null/sessions/${id}`),
+      } as unknown as Config;
+      service = new TerminalService(configWithUnwritableSessions, mockPTYService);
+
+      // A terminal launched without the marker would be invisible to archive gating after
+      // a restart (the in-memory record dies with the app), so persistence failure must
+      // abort the launch itself rather than proceed unguarded.
+      try {
+        await service.openNative("ws-local");
+        expect.unreachable("openNative must refuse when the marker cannot be persisted");
+      } catch (error) {
+        expect(String(error)).toContain("terminal-open marker");
+      }
+      expect(spawnSpy).not.toHaveBeenCalled();
+    });
+
     it("should open Ghostty for local workspace when available", async () => {
       // Make ghostty available via fs.stat (common install path)
       fsStatSpy.mockImplementation((path: string) => {

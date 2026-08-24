@@ -9,8 +9,10 @@ import {
   type MonitorStoppedPayload,
   type OutputShownPayload,
 } from "./backgroundProcessManager";
+import { localBgWorkspaceDir } from "./backgroundProcessExecutor";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
+import { spawnSync } from "node:child_process";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
@@ -1904,6 +1906,92 @@ describe("BackgroundProcessManager", () => {
       const exitCodePath = path.join(result.outputDir, "exit_code");
       const exitCodeContent = await fs.readFile(exitCodePath, "utf-8");
       expect(exitCodeContent.trim()).toBe("42");
+    });
+  });
+
+  describe("hasOrphanedRunningBackgroundProcesses", () => {
+    // Unique per run: the probe scans the real durable spawn layout (/tmp/mux-bashes/<ws>),
+    // which is shared machine-wide, so collisions with other runs must be impossible.
+    const orphanWorkspaceId = `orphan-ws-${testRunId}-${process.pid}`;
+    const workspaceDir = localBgWorkspaceDir(orphanWorkspaceId);
+
+    afterEach(async () => {
+      await manager.cleanup(orphanWorkspaceId);
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    });
+
+    async function writeSpawnRecord(
+      processName: string,
+      meta: { pid: number; status: string } | string,
+      options?: { exitCode?: string }
+    ): Promise<void> {
+      const processDir = path.join(workspaceDir, processName);
+      await fs.mkdir(processDir, { recursive: true });
+      await fs.writeFile(
+        path.join(processDir, "meta.json"),
+        typeof meta === "string" ? meta : JSON.stringify(meta)
+      );
+      if (options?.exitCode != null) {
+        await fs.writeFile(path.join(processDir, "exit_code"), options.exitCode);
+      }
+    }
+
+    it("returns false when the workspace has no spawn records", async () => {
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("detects an untracked running record with a live PID", async () => {
+      // This test process itself is the "surviving child": alive and unknown to the manager,
+      // exactly what an unclean app restart leaves behind.
+      await writeSpawnRecord("survivor", { pid: process.pid, status: "running" });
+
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(true);
+    });
+
+    it("trusts the exit trap over the stale running status", async () => {
+      // A crash freezes meta.json at "running", but the wrapper's exit trap still writes
+      // exit_code when the process later exits — that must clear the gate even if the PID
+      // was recycled by another live process.
+      await writeSpawnRecord(
+        "exited-after-crash",
+        { pid: process.pid, status: "running" },
+        {
+          exitCode: "0",
+        }
+      );
+
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("ignores running records whose PID is dead", async () => {
+      // SIGKILL (or a reboot) skips the exit trap: no exit_code file, but the PID is gone.
+      const dead = spawnSync("true");
+      expect(dead.pid).toBeGreaterThan(1);
+      await writeSpawnRecord("killed-by-crash", { pid: dead.pid, status: "running" });
+
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("ignores non-running, unprobeable, and malformed records", async () => {
+      await writeSpawnRecord("clean-exit", { pid: process.pid, status: "exited" });
+      // pid 0 marks migrated processes with unknown (possibly remote) PIDs.
+      await writeSpawnRecord("migrated", { pid: 0, status: "running" });
+      // A crash mid-write can truncate meta.json.
+      await writeSpawnRecord("torn-write", '{"pid": 12');
+
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("skips processes the manager still tracks", async () => {
+      // A live tracked process writes the same durable "running" record an orphan would,
+      // but in-memory gates already cover it — the probe must not double-report it.
+      const result = await manager.spawn(runtime, orphanWorkspaceId, "sleep 5", {
+        cwd: process.cwd(),
+        displayName: "tracked",
+      });
+      expect(result.success).toBe(true);
+
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
     });
   });
 

@@ -7690,13 +7690,19 @@ export class WorkspaceService extends EventEmitter {
       );
     }
     // Durable marker: the editor can outlive Xum, so a restart must not forget the open.
-    // Best-effort — the Set above still guards this app session if the write fails.
+    // Persistence failure is fatal to the open (mirrors TerminalService.openNative): an
+    // editor opened without the marker would be invisible to archive gating after a restart,
+    // so refusing here is the only fail-closed option (the in-memory Set covers just this
+    // app session).
     try {
       const markerPath = this.externalEditorMarkerPath(workspaceId);
       await fsPromises.mkdir(path.dirname(markerPath), { recursive: true });
       await fsPromises.writeFile(markerPath, new Date().toISOString());
     } catch (error) {
-      log.warn("Failed to persist external editor marker", { workspaceId, error });
+      log.error("Failed to persist external editor marker", { workspaceId, error });
+      return Err(
+        `Cannot open an editor for ${workspaceId}: persisting the editor-open marker failed (${getErrorMessage(error)}), and without it archive safety checks would forget the editor after a restart.`
+      );
     }
     return Ok(undefined);
   }
@@ -7731,11 +7737,17 @@ export class WorkspaceService extends EventEmitter {
   /**
    * Fresh background-bash check: refreshes exit statuses first so a long-exited process cannot
    * hold an archive refusal open. Pre-gates use this; the synchronous snapshot in
-   * listLiveWorkspaceActivity covers the sink's same-tick gate.
+   * listLiveWorkspaceActivity covers the sink's same-tick gate. Also consults the durable
+   * spawn records for crash orphans: nohup/setsid children survive an unclean app shutdown
+   * while the manager's in-memory map resets, so a purely in-memory answer would let a
+   * post-restart snapshot archive remove the checkout under a still-running process.
    */
   async hasRunningBackgroundBashProcesses(workspaceId: string): Promise<boolean> {
     const processes = await this.backgroundProcessManager.list(workspaceId);
-    return processes.some((process) => process.status === "running");
+    if (processes.some((process) => process.status === "running")) {
+      return true;
+    }
+    return await this.backgroundProcessManager.hasOrphanedRunningBackgroundProcesses(workspaceId);
   }
 
   /**
@@ -7863,6 +7875,18 @@ export class WorkspaceService extends EventEmitter {
         ) {
           return Err(
             "Workspace has active workflow runs that archiving would orphan. Wait for them to finish or ask the user to archive manually."
+          );
+        }
+        // Crash-orphan background processes: nohup/setsid children of a previous app session
+        // survive an unclean shutdown while the manager's in-memory map (checked in the
+        // synchronous gate above) resets. Orphans are static post-crash artifacts, not racing
+        // admissions, so this sink recheck is defense-in-depth against callers that skipped
+        // the fresh pre-gate.
+        if (
+          await this.backgroundProcessManager.hasOrphanedRunningBackgroundProcesses(workspaceId)
+        ) {
+          return Err(
+            "Workspace has background processes surviving from a previous app session that archiving could strand. Terminate them or ask the user to archive manually."
           );
         }
       }
