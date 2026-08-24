@@ -499,6 +499,16 @@ export class TerminalService {
     // Recorded before any awaits so archive gates observe the intent immediately; see the
     // nativeTerminalWorkspaces doc comment for why entries are sticky.
     this.nativeTerminalWorkspaces.add(workspaceId);
+    // Archive admission pairing (same synchronous block as the recording above, mirroring
+    // create()): an archive gate armed first refuses this open, while an open recorded first
+    // is observed by the sink's native-terminal check before snapshot capture. Without this,
+    // an open entering after that check could launch a native shell in a checkout the same
+    // archive is about to remove.
+    if (this.workspaceArchiveGuard?.(workspaceId) === true) {
+      throw new Error(
+        `Workspace is being archived: ${workspaceId}. Unarchive it before opening a terminal.`
+      );
+    }
     try {
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const workspace = allMetadata.find((w) => w.id === workspaceId);

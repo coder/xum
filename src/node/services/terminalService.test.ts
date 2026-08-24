@@ -1136,6 +1136,22 @@ describe("TerminalService.openNative", () => {
       expect(service.hasOpenedNativeTerminal("ws-untouched")).toBe(false);
     });
 
+    it("refuses native terminal opens while the workspace is being archived", async () => {
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      service = new TerminalService(configWithLocalWorkspace, mockPTYService);
+      service.setWorkspaceArchiveGuard(() => true);
+
+      try {
+        await service.openNative("ws-local");
+        expect.unreachable("openNative must refuse while the workspace is being archived");
+      } catch (error) {
+        expect(String(error)).toContain("being archived");
+      }
+      expect(spawnSpy).not.toHaveBeenCalled();
+      // The recording still happened (fail-safe): a refused open marks intent without a shell.
+      expect(service.hasOpenedNativeTerminal("ws-local")).toBe(true);
+    });
+
     it("should open Ghostty for local workspace when available", async () => {
       // Make ghostty available via fs.stat (common install path)
       fsStatSpy.mockImplementation((path: string) => {
