@@ -340,8 +340,15 @@ function buildUserDisplayedMessages(options: {
       reviews: muxMeta?.reviews,
       bashMonitorWake: bashMonitorWakeRecords ? { records: bashMonitorWakeRecords } : undefined,
       // The peer-message wake trigger is a synthetic machine row: mark it so prompt
-      // navigation skips it (the envelope payload itself is a separate assistant row).
-      agentPeerMessageTrigger: muxMeta?.type === "agent-peer-message" ? true : undefined,
+      // navigation skips it (the envelope payload itself is a separate assistant row). When the
+      // recipient is executing a delegated workspace turn, the trigger carries that turn's
+      // correlation metadata instead of peer attribution — the explicit flag keeps the machine
+      // presentation.
+      agentPeerMessageTrigger:
+        muxMeta?.type === "agent-peer-message" ||
+        (muxMeta?.type === "workspace-turn-task" && muxMeta.agentPeerMessageTrigger === true)
+          ? true
+          : undefined,
     },
   ];
 }

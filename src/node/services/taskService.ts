@@ -5128,7 +5128,20 @@ export class TaskService {
           senderEntry.workspace.archivedAt,
           senderEntry.workspace.unarchivedAt
         );
-        if (senderArchived || (senderStatus !== "running" && senderStatus !== "awaiting_report")) {
+        // A reawakened persistent child keeps its stable terminal taskStatus (e.g. `reported`)
+        // while the new execution runs under a workspace-turn handle; the mirrored
+        // taskExecutionStatus is the effective execution state (the same overlay
+        // isActiveAgentTaskEntry and task_list use), so an actively executing reawakened agent
+        // may send even though its stable status is terminal.
+        const senderExecutionActive = isActiveWorkspaceTurnTaskStatus(
+          senderEntry.workspace.taskExecutionStatus
+        );
+        if (
+          senderArchived ||
+          (!senderExecutionActive &&
+            senderStatus !== "running" &&
+            senderStatus !== "awaiting_report")
+        ) {
           return Err({
             code: "refused" as const,
             reason:
@@ -5183,25 +5196,35 @@ export class TaskService {
         coerceNonEmptyString(targetEntry.workspace.parentWorkspaceId) != null;
       if (targetIsAgentTask) {
         const targetStatus = targetEntry.workspace.taskStatus ?? "running";
-        if (targetStatus === "queued" || targetStatus === "starting") {
-          return Err({
-            code: "not_active" as const,
-            taskStatus: targetStatus,
-            message:
-              "Target has not started yet; only its parent may update a queued task's prompt.",
-          });
-        }
-        // Terminal statuses reject OUTRIGHT, without consulting transient stream/continuation
-        // state: finalizeAgentTaskReport marks a task `reported` while its stream is still
-        // winding down, so an isStreaming rescue would admit a trigger that queues behind the
-        // completing turn and dispatches afterward — reactivating a reported task even though
-        // peer reactivation is prohibited.
-        if (targetStatus !== "running" && targetStatus !== "awaiting_report") {
-          return Err({
-            code: "not_active" as const,
-            taskStatus: targetStatus,
-            message: "Target is inactive; peer messages cannot reactivate it — ask its parent.",
-          });
+        // A reawakened persistent child is effectively executing when its mirrored
+        // workspace-turn execution state is active, even though its stable taskStatus stays
+        // terminal (`reported`) — the same overlay task_list advertises, so an addressable
+        // "running" row must also accept messages. The persisted mirror flips terminal
+        // synchronously with the handle transition, so this is NOT a transient-stream rescue.
+        const targetExecutionActive = isActiveWorkspaceTurnTaskStatus(
+          targetEntry.workspace.taskExecutionStatus
+        );
+        if (!targetExecutionActive) {
+          if (targetStatus === "queued" || targetStatus === "starting") {
+            return Err({
+              code: "not_active" as const,
+              taskStatus: targetStatus,
+              message:
+                "Target has not started yet; only its parent may update a queued task's prompt.",
+            });
+          }
+          // Terminal statuses reject OUTRIGHT, without consulting transient stream/continuation
+          // state: finalizeAgentTaskReport marks a task `reported` while its stream is still
+          // winding down, so an isStreaming rescue would admit a trigger that queues behind the
+          // completing turn and dispatches afterward — reactivating a reported task even though
+          // peer reactivation is prohibited.
+          if (targetStatus !== "running" && targetStatus !== "awaiting_report") {
+            return Err({
+              code: "not_active" as const,
+              taskStatus: targetStatus,
+              message: "Target is inactive; peer messages cannot reactivate it — ask its parent.",
+            });
+          }
         }
       }
 
@@ -5297,7 +5320,13 @@ export class TaskService {
       // still counts these entries by their dedupe-key prefix.
       const workspaceTurnMuxMetadata =
         await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(targetId);
-      const triggerMuxMetadata = workspaceTurnMuxMetadata ?? muxMetadata;
+      // Keep the explicit trigger marker alongside the correlation: displayedMessageBuilder
+      // renders machine notifications from metadata, so a bare workspace-turn replacement would
+      // present the backend trigger as a human prompt (and re-enter prompt navigation).
+      const triggerMuxMetadata: MuxMessageMetadata =
+        workspaceTurnMuxMetadata != null
+          ? { ...workspaceTurnMuxMetadata, agentPeerMessageTrigger: true }
+          : muxMetadata;
 
       let sendOptions: SendMessageOptions;
       if (relation === "target_ancestor") {
@@ -5344,18 +5373,56 @@ export class TaskService {
         muxMetadata,
       });
 
-      // Recheck immediately before admission: resolveParentAutoResumeOptions and the
-      // workspace-turn lookup awaited since the first check, and interruptStream marks
-      // suppression WITHOUT taking the target's event lock — a Stop landing in that window must
-      // still win over the queued wake.
-      if (targetChainInterrupted()) {
+      // Admission staleness probe: neither interruptStream nor stopDescendantAgentTask takes
+      // this target's event lock, so a user Stop or task_stop can land during ANY await between
+      // here and the real admission — including WorkspaceService.sendMessage's own pricing/
+      // settings awaits and the session's turn preparation. The probe is synchronous and
+      // re-evaluated by WorkspaceService at the enqueue block and the session's turn-admission
+      // gates, so a stop in those windows refuses the send instead of queueing a wake or
+      // resurrecting the stopped task via markInterruptedTaskRunning.
+      let admissionRefusal: SendAgentTreeMessageError | null = null;
+      const admissionStale = (): boolean => {
+        if (targetChainInterrupted()) {
+          admissionRefusal = interruptedRefusal;
+          return true;
+        }
+        const freshEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), targetId);
+        if (freshEntry == null) {
+          admissionRefusal = { code: "not_found" as const };
+          return true;
+        }
+        if (targetIsAgentTask) {
+          // task_stop persists taskStatus="interrupted" (and terminal execution mirrors) under
+          // the task-tree lifecycle lock; re-read the persisted state at admission so the stop
+          // always wins the race.
+          const freshStatus = freshEntry.workspace.taskStatus ?? "running";
+          if (
+            !isActiveWorkspaceTurnTaskStatus(freshEntry.workspace.taskExecutionStatus) &&
+            freshStatus !== "running" &&
+            freshStatus !== "awaiting_report"
+          ) {
+            admissionRefusal = {
+              code: "not_active" as const,
+              taskStatus: freshStatus,
+              message:
+                "Target stopped before the message was admitted; peer messages cannot reactivate it.",
+            };
+            return true;
+          }
+        }
+        return false;
+      };
+      // Recheck immediately before dispatch: resolveParentAutoResumeOptions and the
+      // workspace-turn lookup awaited since the first check.
+      if (admissionStale()) {
         refundBudget();
-        return Err(interruptedRefusal);
+        return Err(admissionRefusal ?? interruptedRefusal);
       }
 
       let accepted = false;
       let payloadPersisted = false;
       const sendResult = await this.workspaceService.sendMessage(targetId, trigger, sendOptions, {
+        admissionStale,
         synthetic: true,
         agentInitiated: true,
         startStreamInBackground: true,
@@ -5383,6 +5450,11 @@ export class TaskService {
         // acceptance path is failing (same rationale as the family-message routes).
         if (!payloadPersisted) {
           refundBudget();
+        }
+        // A probe-triggered rejection surfaces the precise refusal (stop won the race), not a
+        // generic transport failure.
+        if (admissionRefusal != null) {
+          return Err(admissionRefusal);
         }
         return Err({
           code: "send_failed" as const,

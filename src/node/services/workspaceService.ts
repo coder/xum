@@ -660,6 +660,10 @@ const WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE =
 // idle-compaction loop must not count it toward suppression.
 const IDLE_ONLY_BUSY_SKIP_MESSAGE = "Workspace is busy; idle-only send was skipped.";
 
+/** Returned when a caller-supplied admission probe (internal.admissionStale) flips mid-send. */
+const SEND_ADMISSION_STALE_MESSAGE =
+  "Send refused: the target was stopped or interrupted while the message was being admitted.";
+
 const BASH_MONITOR_WAKE_QUEUE_KEY_PREFIX = "bash-monitor-wake:";
 const BASH_MONITOR_CANCELED_QUEUE_REASON =
   "Background bash monitor was explicitly canceled before its wake dispatched.";
@@ -9428,6 +9432,14 @@ export class WorkspaceService extends EventEmitter {
       /** Cancels a synthetic send even after it has left MessageQueue for PREPARING. */
       cancelSignal?: AbortSignal;
       /**
+       * Synchronous staleness probe from the caller, re-evaluated at the real admission points
+       * (the enqueue block and the session's turn-admission gates) in addition to the
+       * context-mutation epoch. Peer agent sends use it so a user Stop or task_stop landing
+       * during this method's awaits refuses the send instead of queueing a wake or resurrecting
+       * the stopped task via markInterruptedTaskRunning.
+       */
+      admissionStale?: () => boolean;
+      /**
        * Synthetic assistant rows persisted just before the turn's user row
        * (family-message payloads). Delivered atomically with the message —
        * queued alongside it when the workspace is busy — so they never land
@@ -9501,6 +9513,11 @@ export class WorkspaceService extends EventEmitter {
       const admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
       const admissionEpochStale = () =>
         (this.contextMutationEpochs.get(workspaceId) ?? 0) !== admissionEpoch;
+      // The session's turn-admission gates re-evaluate this combined probe, so a caller-side
+      // staleness signal (peer sends racing a Stop) rejects at the same points as a
+      // context-discarding mutation.
+      const sendAdmissionStale = () =>
+        admissionEpochStale() || internal?.admissionStale?.() === true;
       // r41: count this send as in-preflight until it settles so refine
       // publication refuses to interleave with its pre-admission window
       // (context mutations instead refuse the send itself via the epoch
@@ -9622,7 +9639,7 @@ export class WorkspaceService extends EventEmitter {
             onAcceptedPreStreamFailure: internal?.onAcceptedPreStreamFailure,
             startStreamInBackground: internal?.startStreamInBackground,
             goalContinuation: internal?.goalContinuation,
-            admissionEpochStale,
+            admissionEpochStale: sendAdmissionStale,
           });
         }
         return Err(pricingGate.error);
@@ -9634,6 +9651,11 @@ export class WorkspaceService extends EventEmitter {
       const shouldQueue = !normalizedOptions?.editMessageId && session.isBusy();
 
       if (shouldQueue) {
+        // Everything from here to queueMessage is synchronous, so a probe pass here cannot go
+        // stale before the entry is enqueued.
+        if (internal?.admissionStale?.() === true) {
+          return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
+        }
         const taskStatus = this.taskService?.getAgentTaskStatus?.(workspaceId);
         if (taskStatus === "interrupted") {
           return Err({
@@ -9746,6 +9768,13 @@ export class WorkspaceService extends EventEmitter {
         this.taskService?.resetAutoResumeCount(workspaceId);
       }
 
+      // A stale caller probe must refuse BEFORE the interrupted-task rescue below: a peer send
+      // racing task_stop would otherwise flip the freshly stopped task back to running and start
+      // the very turn the stop was meant to prevent.
+      if (internal?.admissionStale?.() === true) {
+        return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
+      }
+
       // Non-destructive interrupt cascades preserve descendant task workspaces with
       // taskStatus=interrupted. Transition before starting a new stream so TaskService
       // stream-end handling does not early-return on interrupted status.
@@ -9801,7 +9830,7 @@ export class WorkspaceService extends EventEmitter {
         onAcceptedPreStreamFailure,
         preTurnMessages: internal?.preTurnMessages,
         onPreTurnRowsPersisted: internal?.onPreTurnRowsPersisted,
-        admissionEpochStale,
+        admissionEpochStale: sendAdmissionStale,
       });
       if (!result.success) {
         log.error("sendMessage handler: session returned error", {

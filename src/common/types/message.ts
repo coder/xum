@@ -673,6 +673,12 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         taskHandleId: string;
         ownerWorkspaceId: string;
         turnId: string;
+        /**
+         * Marks a peer-message wake trigger that must carry the delegated turn's correlation
+         * instead of peer attribution (stream-end settlement reads this variant's type). The UI
+         * still renders such rows as machine notifications, never as human prompts.
+         */
+        agentPeerMessageTrigger?: true;
       }
     | {
         // Intra-tree agent peer message (sibling/cousin or descendant→ancestor task_send_message).

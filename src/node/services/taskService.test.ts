@@ -13734,14 +13734,102 @@ describe("TaskService", () => {
     const [, , options, internalArg] = sendMessage.mock.calls[0] as [
       string,
       string,
-      { muxMetadata?: { type?: string } },
+      { muxMetadata?: { type?: string; agentPeerMessageTrigger?: true } },
       { workspaceTurnContinuation?: boolean; preTurnMessages?: MuxMessage[] },
     ];
-    expect(options.muxMetadata).toEqual(turnMetadata);
+    // The correlation replaces peer attribution, so the explicit trigger flag must survive it —
+    // it is what keeps the UI rendering this row as a machine notification.
+    expect(options.muxMetadata).toEqual({ ...turnMetadata, agentPeerMessageTrigger: true });
     expect(internalArg.workspaceTurnContinuation).toBe(true);
     // Peer attribution stays on the assistant payload row.
     expect(internalArg.preTurnMessages?.[0]?.metadata?.muxMetadata?.type).toBe(
       "agent-peer-message"
+    );
+  });
+
+  test("sendAgentTreeMessage honors active reawakened executions on both endpoints", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        // Reawakened persistent children: the stable taskStatus stays terminal (`reported`)
+        // while the current execution runs under a workspace-turn handle mirror.
+        projectWorkspace(projectPath, "sib-a", "sib-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "reported",
+          taskExecutionId: "wtt-a",
+          taskExecutionStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "reported",
+          taskExecutionId: "wtt-b",
+          taskExecutionStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    // Both endpoints are effectively executing: the reawakened sender may message peers, and
+    // the reawakened target (advertised as running by task_list's execution overlay) accepts.
+    const result = await taskService.sendAgentTreeMessage("sib-a", "sib-b", "sync up");
+    expect(result).toEqual(
+      Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
+    );
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("sendAgentTreeMessage refuses at the admission probe when the target is stopped mid-send", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const workspaces = (targetStatus: "running" | "interrupted") => [
+      projectWorkspace(projectPath, "root", "tree-root"),
+      projectWorkspace(projectPath, "sib-a", "sib-a", {
+        parentWorkspaceId: "tree-root",
+        taskStatus: "running" as const,
+      }),
+      projectWorkspace(projectPath, "sib-b", "sib-b", {
+        parentWorkspaceId: "tree-root",
+        taskStatus: targetStatus,
+      }),
+    ];
+    await saveWorkspaces(config, projectPath, workspaces("running"), testTaskSettings());
+
+    // Simulate task_stop landing during WorkspaceService.sendMessage's internal awaits (pricing
+    // gate, settings persistence): stopDescendantAgentTask persists taskStatus="interrupted"
+    // under the task-tree lifecycle lock — NOT the target's event lock — so only the admission
+    // probe re-evaluated inside sendMessage can observe it.
+    const sendMessage = mock(
+      async (
+        _targetId: string,
+        _message: string,
+        _options: unknown,
+        internal: { admissionStale?: () => boolean }
+      ) => {
+        await saveWorkspaces(config, projectPath, workspaces("interrupted"), testTaskSettings());
+        // Mirror the real admission points: a stale probe refuses instead of queueing or
+        // resurrecting the stopped task via markInterruptedTaskRunning.
+        expect(internal.admissionStale?.()).toBe(true);
+        return Err({ type: "unknown", raw: "send admission stale" });
+      }
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "status?")).toEqual(
+      Err({
+        code: "not_active",
+        taskStatus: "interrupted",
+        message:
+          "Target stopped before the message was admitted; peer messages cannot reactivate it.",
+      })
     );
   });
 

@@ -56,6 +56,39 @@ describe("buildDisplayedMessagesForMessage agent peer message metadata", () => {
     expect(row.agentPeerMessageTrigger).toBe(true);
   });
 
+  test("keeps the machine marker when the trigger carries a workspace-turn correlation", () => {
+    // Upward sends into a delegated workspace turn replace the trigger's peer attribution with
+    // the turn correlation; the explicit flag must keep the machine presentation while an
+    // ordinary workspace-turn row stays a plain prompt.
+    const correlation = {
+      type: "workspace-turn-task" as const,
+      taskHandleId: "wt-1",
+      ownerWorkspaceId: "owner-1",
+      turnId: "turn-1",
+    };
+    const build = (muxMetadata: MuxMessageMetadata) => {
+      const message = createMuxMessage("trigger-2", "user", "Peer agent sent an agent message…", {
+        historySequence: 4,
+        synthetic: true,
+        uiVisible: true,
+        muxMetadata,
+      });
+      const displayed = buildDisplayedMessagesForMessage({
+        message,
+        hasActiveStream: false,
+        isContextBoundaryMessage: () => false,
+      });
+      const row = displayed[0];
+      if (row?.type !== "user") throw new Error(`expected user row, got ${row?.type}`);
+      return row;
+    };
+
+    expect(build({ ...correlation, agentPeerMessageTrigger: true }).agentPeerMessageTrigger).toBe(
+      true
+    );
+    expect(build(correlation).agentPeerMessageTrigger).toBeUndefined();
+  });
+
   test("ordinary user rows carry no trigger marker", () => {
     const plain = createMuxMessage("user-1", "user", "run the tests", { historySequence: 3 });
     const displayed = buildDisplayedMessagesForMessage({
