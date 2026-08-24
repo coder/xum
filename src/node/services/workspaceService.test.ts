@@ -8252,6 +8252,73 @@ describe("WorkspaceService executeBash archive guards", () => {
       expect(archiveAfter.error).not.toContain("bash command");
     }
   });
+
+  test("stageAttachment refuses while the workspace is being archived", async () => {
+    addToArchivingWorkspaces(workspaceService, "ws-staging");
+
+    const result = await workspaceService.stageAttachment({
+      workspaceId: "ws-staging",
+      filename: "notes.txt",
+      sizeBytes: 1,
+      dataBase64: Buffer.from("x").toString("base64"),
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("being archived");
+    }
+  });
+
+  test("getFileCompletions returns empty without touching the workspace while archiving", async () => {
+    addToArchivingWorkspaces(workspaceService, "ws-completions");
+
+    // The sync entry guard must return before getInfo: this fixture's config has no
+    // getAllWorkspaceMetadata, so reaching metadata/runtime work would throw.
+    const result = await workspaceService.getFileCompletions("ws-completions", "src");
+
+    expect(result.paths).toEqual([]);
+  });
+
+  test("in-flight staging and completion refreshes hold the archive gate", async () => {
+    // Park both requests at getInfo: their admissions were counted in the synchronous entry
+    // blocks, so the archive gate observes them with no timing assumptions.
+    let releaseMetadata: () => void = () => undefined;
+    const metadataGate = new Promise<never[]>((resolve) => {
+      releaseMetadata = () => resolve([]);
+    });
+    const service = createWorkspaceServiceForTest({
+      config: {
+        srcDir: "/tmp/test",
+        getSessionDir: mock(() => "/tmp/test/sessions"),
+        loadConfigOrDefault: mock(() => ({ projects: new Map() })),
+        getAllWorkspaceMetadata: mock(() => metadataGate),
+      } as unknown as Config,
+      historyService,
+    });
+
+    const stagePromise = service.stageAttachment({
+      workspaceId: "ws-gate",
+      filename: "notes.txt",
+      sizeBytes: 1,
+      dataBase64: Buffer.from("x").toString("base64"),
+    });
+    const completionsPromise = service.getFileCompletions("ws-gate", "src");
+
+    const archiveResult = await service.archive("ws-gate", undefined, {
+      refuseLiveUserActivity: true,
+    });
+    expect(archiveResult.success).toBe(false);
+    if (!archiveResult.success) {
+      expect(archiveResult.error).toContain("an attachment upload in progress");
+      expect(archiveResult.error).toContain("a file completion refresh in progress");
+    }
+
+    releaseMetadata();
+    const staged = await stagePromise;
+    expect(staged.success).toBe(false); // Workspace not found in the empty metadata list.
+    const completions = await completionsPromise;
+    expect(completions.paths).toEqual([]);
+  });
 });
 
 describe("WorkspaceService executeBash workspace path resolution", () => {

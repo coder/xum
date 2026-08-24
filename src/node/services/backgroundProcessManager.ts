@@ -261,6 +261,14 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   // so cleanup is automatic when the process is removed from this map.
   private processes = new Map<string, BackgroundProcess>();
 
+  // Process IDs claimed by in-flight spawns that have not yet registered in `processes`.
+  // Allocation must be race-free across the awaits between choosing an ID and registering
+  // the process: two concurrent same-name spawns sharing one directory would also share
+  // meta.json/exit_code, and the first exit would settle the record while the other process
+  // still writes — blinding the crash-orphan archive gates. Reserved synchronously when a
+  // candidate is chosen; released when the spawn registers or fails.
+  private readonly reservedProcessIds = new Set<string>();
+
   // Base directory for process output files
   private readonly bgOutputDir: string;
   // Tracks foreground processes (started via runtime.exec) that can be backgrounded
@@ -726,7 +734,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
     let processId = baseId;
     let suffix = 1;
-    while (this.processes.has(processId)) {
+    while (this.processes.has(processId) || this.reservedProcessIds.has(processId)) {
       processId = `${baseId} (${suffix})`;
       suffix++;
     }
@@ -768,6 +776,14 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     log.debug(`BackgroundProcessManager.spawn() called for workspace ${workspaceId}`);
 
     let processId = this.generateUniqueProcessId(config.displayName);
+    // Reserved synchronously in the same tick each candidate is chosen (see
+    // reservedProcessIds): the awaits below would otherwise let a concurrent same-name spawn
+    // allocate the same directory. Released when this spawn registers or returns — the
+    // disposer reads the current processId, which the disk loop keeps in sync.
+    this.reservedProcessIds.add(processId);
+    using _reservation = {
+      [Symbol.dispose]: () => this.reservedProcessIds.delete(processId),
+    };
     // Restart-unique directories (local runtimes; remote layouts are on the remote host and
     // outside the local crash-orphan guard): skip names whose durable directory may still
     // belong to a surviving process from a previous session — see
@@ -775,10 +791,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     if (runtime instanceof LocalBaseRuntime) {
       let suffix = 2;
       while (await this.localSpawnDirMayHoldLiveProcess(workspaceId, processId)) {
+        this.reservedProcessIds.delete(processId);
         do {
           processId = `${config.displayName} (${suffix})`;
           suffix++;
-        } while (this.processes.has(processId));
+        } while (this.processes.has(processId) || this.reservedProcessIds.has(processId));
+        this.reservedProcessIds.add(processId);
       }
     }
 

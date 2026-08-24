@@ -2088,6 +2088,11 @@ export class WorkspaceService extends EventEmitter {
   // an exec admitted first holds the archive gate open for its full duration, and an exec
   // entering after the gate armed is refused at entry.
   private readonly preflightExecCounts = new Map<string, number>();
+  // Same pairing for renderer attachment staging (writes into the checkout an archive may
+  // capture/remove) and file-completion refreshes (run git through a runtime that could
+  // re-wake a stopped Coder workspace). See acquirePreflightAdmission.
+  private readonly preflightStagingCounts = new Map<string, number>();
+  private readonly preflightFileCompletionCounts = new Map<string, number>();
 
   // Tracks in-flight fork auto-title generations so only the first accepted continue
   // message can claim the workspace title.
@@ -7873,6 +7878,12 @@ export class WorkspaceService extends EventEmitter {
         if ((this.preflightExecCounts.get(workspaceId) ?? 0) > 0) {
           activityLabels.push("a bash command executing");
         }
+        if ((this.preflightStagingCounts.get(workspaceId) ?? 0) > 0) {
+          activityLabels.push("an attachment upload in progress");
+        }
+        if ((this.preflightFileCompletionCounts.get(workspaceId) ?? 0) > 0) {
+          activityLabels.push("a file completion refresh in progress");
+        }
         if (liveActivity.queuedMessages) activityLabels.push("queued messages");
         if (liveActivity.backgroundBashProcesses) {
           activityLabels.push("running background bash processes");
@@ -9811,6 +9822,27 @@ export class WorkspaceService extends EventEmitter {
     return foundDecision && current;
   }
 
+  /**
+   * Increment a preflight admission counter in the caller's synchronous entry block and
+   * return a disposable releasing it. Pairs renderer-initiated workspace activity with the
+   * archive gate (see archiveUnlocked's refuseLiveUserActivity): an activity admitted first
+   * holds the gate open until it settles, and one entering after the gate armed observes
+   * archivingWorkspaces and refuses at entry.
+   */
+  private acquirePreflightAdmission(counts: Map<string, number>, workspaceId: string): Disposable {
+    counts.set(workspaceId, (counts.get(workspaceId) ?? 0) + 1);
+    return {
+      [Symbol.dispose]: () => {
+        const remaining = (counts.get(workspaceId) ?? 1) - 1;
+        if (remaining <= 0) {
+          counts.delete(workspaceId);
+        } else {
+          counts.set(workspaceId, remaining);
+        }
+      },
+    };
+  }
+
   async stageAttachment(input: {
     workspaceId: string;
     filename: string;
@@ -9818,9 +9850,22 @@ export class WorkspaceService extends EventEmitter {
     sizeBytes: number;
     dataBase64: string;
   }): Promise<Result<StagedWorkspaceAttachment, string>> {
+    // Archive admission pairing (same synchronous block, mirroring executeBash): staging
+    // writes into the checkout, so an archive must not capture/remove it mid-upload.
+    if (this.archivingWorkspaces.has(input.workspaceId)) {
+      return Err("Workspace is being archived. Unarchive it before attaching files.");
+    }
+    using _preflightStaging = this.acquirePreflightAdmission(
+      this.preflightStagingCounts,
+      input.workspaceId
+    );
+
     const metadata = await this.getInfo(input.workspaceId);
     if (metadata == null) {
       return Err("Workspace not found");
+    }
+    if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) {
+      return Err("Workspace is archived. Unarchive it before attaching files.");
     }
 
     // Deferred runtimes (Coder/SSH/devcontainer) return from create before
@@ -12180,8 +12225,22 @@ export class WorkspaceService extends EventEmitter {
 
     const resolvedLimit = Math.min(Math.max(1, Math.trunc(limit)), 50);
 
+    // Archive admission pairing (same synchronous block, mirroring executeBash): the refresh
+    // below runs git through the target runtime, which can re-wake a Coder workspace the
+    // archive hook just stopped. Completions degrade gracefully to empty instead of erroring.
+    if (this.archivingWorkspaces.has(workspaceId)) {
+      return { paths: [] };
+    }
+    using _preflightCompletions = this.acquirePreflightAdmission(
+      this.preflightFileCompletionCounts,
+      workspaceId
+    );
+
     const metadata = await this.getInfo(workspaceId);
     if (!metadata) {
+      return { paths: [] };
+    }
+    if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) {
       return { paths: [] };
     }
 
@@ -12198,6 +12257,13 @@ export class WorkspaceService extends EventEmitter {
 
     const isStale = cacheEntry.fetchedAt === 0 || now - cacheEntry.fetchedAt > CACHE_TTL_MS;
     if (isStale && !cacheEntry.refreshing) {
+      // The refresh can outlive this call, so it holds its own admission: acquired here
+      // while the outer admission is still held (no unguarded gap) and released when the
+      // refresh settles, keeping the archive gate closed for the runtime work's duration.
+      const refreshAdmission = this.acquirePreflightAdmission(
+        this.preflightFileCompletionCounts,
+        workspaceId
+      );
       cacheEntry.refreshing = (async () => {
         const previousIndex = cacheEntry.index;
 
@@ -12221,6 +12287,7 @@ export class WorkspaceService extends EventEmitter {
         }
       })().finally(() => {
         cacheEntry.refreshing = undefined;
+        refreshAdmission[Symbol.dispose]();
       });
     }
 

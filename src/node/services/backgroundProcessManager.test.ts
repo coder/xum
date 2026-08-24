@@ -2049,6 +2049,27 @@ describe("BackgroundProcessManager", () => {
       expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
     });
 
+    it("allocates distinct directories for concurrent same-name spawns", async () => {
+      // Both spawns pass the in-memory allocator before either registers; the synchronous
+      // reservation must still keep their directories (and meta.json/exit_code) disjoint,
+      // or the first exit would settle the shared record under the other process.
+      const [a, b] = await Promise.all([
+        manager.spawn(runtime, orphanWorkspaceId, "sleep 2", {
+          cwd: process.cwd(),
+          displayName: "dup",
+        }),
+        manager.spawn(runtime, orphanWorkspaceId, "sleep 2", {
+          cwd: process.cwd(),
+          displayName: "dup",
+        }),
+      ]);
+      expect(a.success).toBe(true);
+      expect(b.success).toBe(true);
+      if (!a.success || !b.success) return;
+      expect(a.processId).not.toBe(b.processId);
+      expect(a.outputDir).not.toBe(b.outputDir);
+    });
+
     it("does not reuse a surviving orphan's directory for a same-name spawn", async () => {
       await writeSpawnRecord("survivor", { pid: process.pid, status: "running" });
 
