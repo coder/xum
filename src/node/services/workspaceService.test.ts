@@ -1,5 +1,6 @@
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn, type Mock } from "bun:test";
 import { WorkspaceService, generateForkBranchName, generateForkTitle } from "./workspaceService";
+import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 import type { IdleCompactionOutcome } from "./idleCompactionService";
 import type { AgentSession } from "./agentSession";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
@@ -161,6 +162,7 @@ const mockExtensionMetadataService: Partial<ExtensionMetadataService> = {
 };
 const mockBackgroundProcessManager: Partial<BackgroundProcessManager> = {
   cleanup: mock(() => Promise.resolve()),
+  hasRunningBackgroundProcesses: mock(() => false),
 };
 
 type WorkspaceServiceArgs = ConstructorParameters<typeof WorkspaceService>;
@@ -11047,6 +11049,47 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     });
     expect(pinned).toEqual(Ok({ kind: "archived" }));
     expect(hookBehavior).toBe("keep");
+  });
+
+  test("archive() refuses while in-process workflow work exists under refuseLiveUserActivity", async () => {
+    // Simulates a workflow admission/runner that entered before the archive gate armed: the
+    // sink's synchronous gate must observe it and refuse instead of orphaning the run.
+    const release = registerInProcessWorkflowRun(workspaceId);
+    try {
+      const refused = await workspaceService.archive(workspaceId, undefined, {
+        refuseLiveUserActivity: true,
+      });
+      expect(refused.success).toBe(false);
+      if (!refused.success) {
+        expect(refused.error).toContain("workflow run starting or running");
+      }
+    } finally {
+      release();
+    }
+
+    const archived = await workspaceService.archive(workspaceId, undefined, {
+      refuseLiveUserActivity: true,
+    });
+    expect(archived).toEqual(Ok({ kind: "archived" }));
+  });
+
+  test("archive() rechecks durably active workflow runs after arming the admission gate", async () => {
+    workspaceService.setTaskService({
+      hasActiveDescendantAgentTasksForWorkspace: mock(() => false),
+      hasActiveTopLevelWorkflowRunsForWorkspace: mock(() => Promise.resolve(true)),
+      withTaskTreeLifecycleLock: mock(
+        <T>(_: string, operation: () => Promise<T>): Promise<T> => operation()
+      ),
+    } as unknown as TaskService);
+
+    const result = await workspaceService.archive(workspaceId, undefined, {
+      refuseLiveUserActivity: true,
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("active workflow runs");
+    }
   });
 
   test("resumeStream refuses while the workspace is being archived", async () => {

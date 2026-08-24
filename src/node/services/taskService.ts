@@ -157,7 +157,7 @@ import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
-import { isSSHRuntime } from "@/common/types/runtime";
+import { isSSHRuntime, isWorktreeRuntime } from "@/common/types/runtime";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import {
@@ -9352,7 +9352,15 @@ export class TaskService {
           const worktreeArchiveBehavior =
             this.config.loadConfigOrDefault().worktreeArchiveBehavior ??
             DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR;
-          if (worktreeArchiveBehavior === "delete") {
+          // The delete policy can only destroy work when the archive would actually run
+          // managed-worktree deletion: non-worktree runtimes (SSH/Coder, Docker, project-dir
+          // local) and isolation:none tasks (which point at an ancestor's checkout) are skipped
+          // by the worktree archive hook, so an unrelated global worktree setting must not make
+          // reversible archive unavailable for those targets. Mirrored at the sink.
+          const runsManagedWorktreeDeletion =
+            isWorktreeRuntime(resolved.metadata.runtimeConfig) &&
+            resolved.metadata.taskIsolation !== "none";
+          if (worktreeArchiveBehavior === "delete" && runsManagedWorktreeDeletion) {
             return Ok({
               status: "error",
               action: "archive",
@@ -10663,6 +10671,16 @@ export class TaskService {
       }
     }
     return blocking;
+  }
+
+  /**
+   * Whether any top-level workflow runs are durably active for this workspace. The archive
+   * sink rechecks this after arming its admission gate (see archiveUnlocked) so a workflow
+   * admitted between the lifecycle caller's earlier snapshot and the sink cannot be orphaned
+   * in an archived workspace.
+   */
+  async hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId: string): Promise<boolean> {
+    return (await this.listActiveWorkflowRunIdsForWorkspace(workspaceId)).length > 0;
   }
 
   private async listActiveWorkflowRunIdsForWorkspace(workspaceId: string): Promise<string[]> {

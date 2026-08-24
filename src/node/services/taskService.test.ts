@@ -1732,6 +1732,14 @@ describe("TaskService", () => {
     const { config, parentId, taskService, archive } = await createWorkspaceLifecycleHarness();
     await config.editConfig((cfg) => {
       cfg.worktreeArchiveBehavior = "delete";
+      // The refusal is scoped to targets the worktree archive hook would actually delete, so
+      // this test's child must be a managed worktree runtime.
+      for (const [, project] of cfg.projects) {
+        const child = project.workspaces.find((w) => w.id === "childworkspace");
+        if (child) {
+          child.runtimeConfig = { type: "local", srcBaseDir: "/tmp/src" };
+        }
+      }
       return cfg;
     });
 
@@ -1746,6 +1754,48 @@ describe("TaskService", () => {
     expect(data?.status).toBe("error");
     expect(data?.status === "error" ? data.error : "").toContain("Delete checkout");
     expect(archive).not.toHaveBeenCalled();
+  });
+
+  test("workspace lifecycle archives non-worktree targets despite the delete worktree policy", async () => {
+    const { config, parentId, taskService, archive } = await createWorkspaceLifecycleHarness();
+    await config.editConfig((cfg) => {
+      cfg.worktreeArchiveBehavior = "delete";
+      // SSH runtime: the worktree archive hook skips non-worktree runtimes, so the unrelated
+      // global delete policy must not make reversible archive unavailable for this peer.
+      for (const [, project] of cfg.projects) {
+        const child = project.workspaces.find((w) => w.id === "childworkspace");
+        if (child) {
+          child.runtimeConfig = {
+            type: "ssh",
+            host: "peer.example",
+            srcBaseDir: "/home/user/src",
+          };
+        }
+      }
+      return cfg;
+    });
+
+    const result = await taskService.archiveOwnedWorkspaceTurnWorkspace(
+      parentId,
+      { workspaceId: "childworkspace" },
+      {}
+    );
+
+    expect(result).toEqual(
+      Ok({
+        status: "archived",
+        action: "archive",
+        workspaceId: "childworkspace",
+        displayName: "Child workspace",
+      })
+    );
+    expect(archive).toHaveBeenCalledWith("childworkspace", undefined, {
+      forbidWorktreeCheckoutDeletion: true,
+      refuseLiveUserActivity: true,
+      forbidCoderWorkspaceDeletion: true,
+      worktreeArchiveBehaviorOverride: "delete",
+      coderWorkspaceArchiveBehaviorOverride: "stop",
+    });
   });
 
   test("workspace lifecycle serializes nested turn creation with archiving its owner", async () => {

@@ -190,6 +190,10 @@ import {
 } from "@/common/types/workflow";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import {
+  hasInProcessWorkflowWork,
+  setWorkflowArchiveAdmissionGuard,
+} from "@/node/services/workflows/workflowArchiveAdmission";
+import {
   WORKFLOW_RESULT_METADATA_TYPE,
   WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE,
   WORKFLOW_TRIGGER_DISPLAY_METADATA_TYPE,
@@ -2136,6 +2140,26 @@ export class WorkspaceService extends EventEmitter {
     this.experimentsService = experimentsService;
     this.sessionTimingService = sessionTimingService;
     this.aiService.on("providers-config-changed", this.providerConfigChangedListener);
+    // Archive admission pairing for workflow starts/resumes: WorkflowService instances are
+    // per-request, so the guard is registered at module scope (see workflowArchiveAdmission).
+    // Entry points check it in the same synchronous block that counts their admission, so
+    // whichever of {archive gate, workflow admission} runs first is observed by the other.
+    setWorkflowArchiveAdmissionGuard((workspaceId) => {
+      if (this.archivingWorkspaces.has(workspaceId)) {
+        return `Workspace is being archived: ${workspaceId}. Unarchive it before starting or resuming workflows.`;
+      }
+      const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+      if (
+        workspaceEntry != null &&
+        isWorkspaceArchived(
+          workspaceEntry.workspace.archivedAt,
+          workspaceEntry.workspace.unarchivedAt
+        )
+      ) {
+        return `Workspace is archived: ${workspaceId}. Unarchive it before starting or resuming workflows.`;
+      }
+      return null;
+    });
     this.setupMetadataListeners();
     this.setupInitMetadataListeners();
     // r63 startup self-heal: reclaim removal tombstones left behind by a
@@ -7739,6 +7763,12 @@ export class WorkspaceService extends EventEmitter {
         }
         if (liveActivity.terminalSessions) activityLabels.push("open terminal sessions");
         if (liveActivity.desktopSession) activityLabels.push("a desktop session");
+        // Workflow admissions pair with this gate (see workflowArchiveAdmission): an admission
+        // whose synchronous entry ran first is counted here; one entering later observes the
+        // archivingWorkspaces guard registered in the constructor and refuses.
+        if (hasInProcessWorkflowWork(workspaceId)) {
+          activityLabels.push("a workflow run starting or running");
+        }
         if (activityLabels.length > 0) {
           return Err(
             `Workspace has live activity (${activityLabels.join(", ")}) that archiving would terminate. Wait for it to finish or ask the user to archive manually.`
@@ -7756,6 +7786,18 @@ export class WorkspaceService extends EventEmitter {
         if (session.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId)) {
           return Err(
             "Workspace has pending turn work that archiving would terminate. Wait for it to finish or ask the user to archive manually."
+          );
+        }
+        // Post-arm workflow recheck: an admission that entered before archivingWorkspaces was
+        // armed either still holds its in-process admission (caught synchronously above) or
+        // released it only after a durably active run record existed (caught here); admissions
+        // entering later observe the armed guard and refuse. This closes the window between
+        // the caller's earlier active-run snapshot and this sink.
+        if (
+          (await this.taskService?.hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId)) === true
+        ) {
+          return Err(
+            "Workspace has active workflow runs that archiving would orphan. Wait for them to finish or ask the user to archive manually."
           );
         }
       }
@@ -7806,29 +7848,38 @@ export class WorkspaceService extends EventEmitter {
       // whole operation coherent under concurrent settings flips.
       const worktreeArchiveBehavior =
         options?.worktreeArchiveBehaviorOverride ?? this.getWorktreeArchiveBehavior();
-      // Enforced at the sink, not just in callers: this read is the same snapshot passed to the
-      // afterArchive worktree-deletion hook, so a concurrent settings flip cannot slip a
-      // checkout deletion past a caller that forbade it.
-      if (
-        options?.forbidWorktreeCheckoutDeletion === true &&
-        worktreeArchiveBehavior === "delete"
-      ) {
-        return Err(
-          'Worktree archive behavior is set to "Delete checkout", which this caller forbids because it deletes the checkout without user confirmation.'
-        );
-      }
+      const forbidDeleteCheckNeeded =
+        options?.forbidWorktreeCheckoutDeletion === true && worktreeArchiveBehavior === "delete";
       const snapshotBehaviorEnabled =
         !this.isSharedTaskWorkspace(workspaceId) &&
         worktreeArchiveBehavior === "snapshot" &&
         this.worktreeArchiveSnapshotService != null;
 
       let beforeArchiveMetadata: WorkspaceMetadata | undefined;
-      if (this.workspaceLifecycleHooks || snapshotBehaviorEnabled) {
+      if (this.workspaceLifecycleHooks || snapshotBehaviorEnabled || forbidDeleteCheckNeeded) {
         const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
         if (!metadataResult.success) {
           return Err(metadataResult.error);
         }
         beforeArchiveMetadata = metadataResult.data;
+      }
+
+      // Enforced at the sink, not just in callers: this read is the same snapshot passed to the
+      // afterArchive worktree-deletion hook, so a concurrent settings flip cannot slip a
+      // checkout deletion past a caller that forbade it. Scoped to targets the worktree
+      // archive hook would actually delete (managed worktrees not shared via isolation:none);
+      // for other runtimes the delete policy cannot destroy a checkout, so it must not make
+      // reversible archive unavailable. Fails closed when metadata is unavailable.
+      if (forbidDeleteCheckNeeded) {
+        const runsManagedWorktreeDeletion =
+          beforeArchiveMetadata == null ||
+          (isWorktreeRuntime(beforeArchiveMetadata.runtimeConfig) &&
+            beforeArchiveMetadata.taskIsolation !== "none");
+        if (runsManagedWorktreeDeletion) {
+          return Err(
+            'Worktree archive behavior is set to "Delete checkout", which this caller forbids because it deletes the checkout without user confirmation.'
+          );
+        }
       }
 
       // Snapshot the Coder archive policy once: the before-archive hook receives this same
