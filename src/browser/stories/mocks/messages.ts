@@ -143,7 +143,10 @@ export function createAgentPeerMessage(
   return {
     type: "message",
     id,
-    role: "user",
+    // SECURITY parity with sendAgentPeerMessage: payloads are assistant-role synthetic pre-turn
+    // rows so peer bytes never gain user-role authority; the turn is triggered separately by a
+    // fixed-content user message.
+    role: "assistant",
     parts: [
       {
         type: "text",

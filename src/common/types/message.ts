@@ -993,12 +993,6 @@ export type DisplayedMessage =
       bashMonitorWake?: {
         records: BashMonitorWakeDisplayRecord[];
       };
-      /** Present when this synthetic turn is an intra-tree agent peer message. */
-      agentPeerMessage?: {
-        fromWorkspaceId: string;
-        fromTitle?: string;
-        relationship: AgentMessageRelationship;
-      };
     }
   | {
       type: "assistant";
@@ -1026,6 +1020,15 @@ export type DisplayedMessage =
       /** Presentation hint for smooth streaming — indicates if this is live or replayed content. */
       streamPresentation?: {
         source: "live" | "replay";
+      };
+      /**
+       * Present when this synthetic assistant row is an intra-tree agent peer message payload
+       * (delivered as an assistant pre-turn row so peer bytes never gain user-role authority).
+       */
+      agentPeerMessage?: {
+        fromWorkspaceId: string;
+        fromTitle?: string;
+        relationship: AgentMessageRelationship;
       };
     }
   | {

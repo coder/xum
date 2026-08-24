@@ -655,12 +655,13 @@ describe("MessageRenderer agent peer message rows", () => {
     globalThis.localStorage = undefined as unknown as Storage;
   });
 
+  // Peer payloads are assistant-role synthetic rows (peer bytes never gain user-role authority).
   function createPeerMessage(overrides?: {
     fromTitle?: string;
     content?: string;
   }): DisplayedMessage {
     return {
-      type: "user",
+      type: "assistant",
       id: "peer-1",
       historyId: "peer-1",
       content:
@@ -672,7 +673,10 @@ describe("MessageRenderer agent peer message rows", () => {
           message: "The schema changed; **re-run** your generator.",
         }),
       historySequence: 5,
-      isSynthetic: true,
+      isStreaming: false,
+      isPartial: false,
+      isCompacted: false,
+      isIdleCompacted: false,
       agentPeerMessage: {
         fromWorkspaceId: "task-watcher",
         ...(overrides?.fromTitle != null ? { fromTitle: overrides.fromTitle } : {}),

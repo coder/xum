@@ -231,7 +231,7 @@ function getValidBashMonitorWakeRecords(
  */
 function getValidAgentPeerMessage(
   muxMeta: MuxMessageMetadata | undefined
-): NonNullable<Extract<DisplayedMessage, { type: "user" }>["agentPeerMessage"]> | undefined {
+): NonNullable<Extract<DisplayedMessage, { type: "assistant" }>["agentPeerMessage"]> | undefined {
   return getValidAgentPeerMessageMeta(muxMeta) ?? undefined;
 }
 
@@ -339,9 +339,6 @@ function buildUserDisplayedMessages(options: {
       compactionRequest,
       reviews: muxMeta?.reviews,
       bashMonitorWake: bashMonitorWakeRecords ? { records: bashMonitorWakeRecords } : undefined,
-      // Backend-attached metadata (never typed by a user) gates the peer-message presentation,
-      // so a user-typed lookalike envelope still renders as an ordinary escaped user message.
-      agentPeerMessage: getValidAgentPeerMessage(muxMeta),
     },
   ];
 }
@@ -448,6 +445,9 @@ function appendAssistantTextRow(
     streamPresentation: options.isStreaming
       ? { source: options.streamIsReplay ? "replay" : "live" }
       : undefined,
+    // Backend-attached metadata (never model-authored text) gates the peer-message card, so a
+    // model-emitted lookalike envelope still renders as an ordinary assistant message.
+    agentPeerMessage: getValidAgentPeerMessage(message.metadata?.muxMetadata),
   });
 }
 

@@ -13109,11 +13109,25 @@ describe("TaskService", () => {
           relationship?: string;
         };
       },
-      { skipAutoResumeReset?: boolean; removableQueueDedupeKey?: boolean; queueDedupeKey?: string },
+      {
+        skipAutoResumeReset?: boolean;
+        removableQueueDedupeKey?: boolean;
+        queueDedupeKey?: string;
+        preTurnMessages?: MuxMessage[];
+      },
     ];
     expect(targetId).toBe("sib-b");
-    // Raw sender text never appears unencoded: the delivery is the escaped envelope.
-    expect(parseAgentMessageEnvelope(message)).toEqual({
+    // SECURITY: the message TEXT is a fixed trigger with zero sender-controlled bytes — the
+    // envelope rides as an assistant-role pre-turn row so peer bytes never gain user authority.
+    expect(message).not.toContain("Schema renamed");
+    expect(message).toContain("untrusted agent output");
+    const payloadRow = internal.preTurnMessages?.[0];
+    expect(internal.preTurnMessages).toHaveLength(1);
+    expect(payloadRow?.role).toBe("assistant");
+    expect(message).toContain(payloadRow!.id);
+    const payloadText = payloadRow?.parts[0]?.type === "text" ? payloadRow.parts[0].text : "";
+    // Raw sender text never appears unencoded: the payload is the escaped envelope.
+    expect(parseAgentMessageEnvelope(payloadText)).toEqual({
       from: "sib-a",
       fromTitle: "Watcher A",
       relationship: "sibling",
@@ -13161,15 +13175,19 @@ describe("TaskService", () => {
     expect(result).toEqual(
       Ok({ delivery: "queued", relation: "target_ancestor", queueDispatchMode: "turn-end" })
     );
-    const [targetId, message, options, internal] = sendMessage.mock.calls[0] as [
+    const [targetId, , options, internal] = sendMessage.mock.calls[0] as [
       string,
       string,
       { queueDispatchMode?: string; muxMetadata?: { relationship?: string } },
-      { skipAutoResumeReset?: boolean },
+      { skipAutoResumeReset?: boolean; preTurnMessages?: MuxMessage[] },
     ];
     expect(targetId).toBe("tree-root");
-    // The envelope carries the SENDER's relationship to the recipient: a descendant.
-    expect(parseAgentMessageEnvelope(message)?.relationship).toBe("descendant");
+    // The envelope (assistant pre-turn row) carries the SENDER's relationship: a descendant.
+    const payloadText =
+      internal.preTurnMessages?.[0]?.parts[0]?.type === "text"
+        ? internal.preTurnMessages[0].parts[0].text
+        : "";
+    expect(parseAgentMessageEnvelope(payloadText)?.relationship).toBe("descendant");
     expect(options.queueDispatchMode).toBe("turn-end");
     expect(options.muxMetadata?.relationship).toBe("descendant");
     expect(internal.skipAutoResumeReset).toBe(true);
@@ -13394,10 +13412,14 @@ describe("TaskService", () => {
     );
 
     for (let i = 2; i <= 5; i++) {
+      // User attention between sends keeps the (stricter) consecutive-wake budget out of this
+      // test's way — the rate window intentionally does NOT reset on user attention.
+      taskService.resetAutoResumeCount("sib-b");
       const result = await taskService.sendAgentTreeMessage("sib-a", "sib-b", `message ${i}`);
       expect(result.success).toBe(true);
     }
 
+    taskService.resetAutoResumeCount("sib-b");
     const limited = await taskService.sendAgentTreeMessage("sib-a", "sib-b", "message 6");
     expect(limited.success).toBe(false);
     if (!limited.success) {
@@ -13609,10 +13631,19 @@ describe("TaskService", () => {
     }
     expect(sendMessage).not.toHaveBeenCalled();
 
-    // Sender titles are attacker-influenced; the envelope carries the capped form.
+    // Sender titles are attacker-influenced; the envelope payload row carries the capped form.
     expect((await taskService.sendAgentTreeMessage("sib-a", "sib-b", "hello")).success).toBe(true);
-    const [, message] = sendMessage.mock.calls[0] as [string, string];
-    const fromTitle = parseAgentMessageEnvelope(message)?.fromTitle;
+    const [, , , internalArg] = sendMessage.mock.calls[0] as [
+      string,
+      string,
+      unknown,
+      { preTurnMessages?: MuxMessage[] },
+    ];
+    const payloadText =
+      internalArg.preTurnMessages?.[0]?.parts[0]?.type === "text"
+        ? internalArg.preTurnMessages[0].parts[0].text
+        : "";
+    const fromTitle = parseAgentMessageEnvelope(payloadText)?.fromTitle;
     expect(fromTitle).toBe(`${longTitle.slice(0, TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS)}…`);
 
     // Peer sends draw from the shared family-message aggregate pools.

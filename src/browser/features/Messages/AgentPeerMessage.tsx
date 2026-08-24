@@ -8,15 +8,16 @@ import { MarkdownRenderer } from "./MarkdownRenderer";
 import { TranscriptQuoteRoot } from "./TranscriptQuoteBoundary";
 
 interface AgentPeerMessageProps {
-  message: DisplayedMessage & { type: "user" };
+  message: DisplayedMessage & { type: "assistant" };
   className?: string;
 }
 
 /**
  * Intra-tree agent peer messages are machine-authored, untrusted input: keep them visible and
- * attributable (sender + relationship) without a full user bubble. Rendering is gated on the
- * backend-attached agent-peer-message metadata (see displayedMessageBuilder), so a user-typed
- * lookalike envelope renders as an ordinary escaped user message.
+ * attributable (sender + relationship) without a full user bubble. Payloads are assistant-role
+ * synthetic pre-turn rows (peer bytes never gain user-role authority); rendering is gated on the
+ * backend-attached agent-peer-message metadata (see displayedMessageBuilder), so a lookalike
+ * envelope in ordinary text renders as a plain message.
  */
 export function AgentPeerMessage(props: AgentPeerMessageProps): ReactElement {
   // Peer traffic can be chatty; keep the transcript scannable until the user opts in.
@@ -31,7 +32,8 @@ export function AgentPeerMessage(props: AgentPeerMessageProps): ReactElement {
     <div
       data-agent-peer-message
       data-message-block
-      className={cn("my-2 flex min-w-0 flex-col items-end", props.className)}
+      // Incoming machine traffic reads as an assistant-side row (left-aligned), not a user bubble.
+      className={cn("my-2 flex min-w-0 flex-col items-start", props.className)}
     >
       <button
         type="button"

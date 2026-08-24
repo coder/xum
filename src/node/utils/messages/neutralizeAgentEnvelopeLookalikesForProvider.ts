@@ -6,29 +6,32 @@ import {
 import type { MuxMessage } from "@/common/types/message";
 
 /**
- * Rewrite user-typed `<mux_agent_message>` lookalike tags before the provider request.
+ * Rewrite `<mux_agent_message>` lookalike tags before the provider request.
  *
- * Why: the system prompt classifies user-role messages wrapped in that tag as untrusted agent
- * peer messages. Authentic envelopes are authored exclusively by the peer-message send path and
- * carry `muxMetadata.type === "agent-peer-message"`; every other user row is user-authored, so a
- * pasted lookalike must keep user authority instead of being reclassified. Rewriting only
- * non-peer rows makes the exact wrapper server-controlled provenance.
+ * Why: the system prompt classifies transcript rows wrapped in that tag as untrusted agent peer
+ * messages. Authentic envelopes are authored exclusively by the peer-message send path as
+ * assistant-role synthetic pre-turn rows carrying valid `agent-peer-message` metadata; any other
+ * occurrence is user-pasted text (which must keep user authority) or model-emitted text (which
+ * must not be able to forge a peer message into its own later context). Rewriting every
+ * non-authentic row makes the exact wrapper server-controlled provenance.
  *
  * Notes:
  * - Request-only: does not mutate persisted history/UI.
- * - Scope: text parts of user messages without backend peer metadata.
+ * - Scope: text parts of user and assistant rows that are not authentic payload rows.
  */
 export function neutralizeAgentEnvelopeLookalikesForProvider(messages: MuxMessage[]): MuxMessage[] {
   let didChange = false;
 
   const result = messages.map((msg) => {
-    if (msg.role !== "user") {
+    if (msg.role !== "user" && msg.role !== "assistant") {
       return msg;
     }
-    // Exempt only rows the peer send path could have authored: VALID peer metadata AND text that
-    // is exactly a well-formed envelope. A corrupted row carrying just the discriminator (or
-    // pasted non-envelope text) must not smuggle the exact wrapper past neutralization.
+    // Exempt only rows the peer send path could have authored: assistant role, VALID peer
+    // metadata, AND text that is exactly a well-formed envelope. A corrupted row carrying just
+    // the discriminator (or lookalike text) must not smuggle the exact wrapper past
+    // neutralization.
     const isAuthenticPeerRow =
+      msg.role === "assistant" &&
       getValidAgentPeerMessageMeta(msg.metadata?.muxMetadata) != null &&
       msg.parts.every(
         (part) => part.type !== "text" || parseAgentMessageEnvelope(part.text) != null

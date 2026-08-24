@@ -3,13 +3,20 @@ import { describe, expect, test } from "bun:test";
 import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
 import { buildDisplayedMessagesForMessage } from "./displayedMessageBuilder";
 
-function buildUserRow(muxMetadata: MuxMessageMetadata) {
-  const message = createMuxMessage("peer-1", "user", "<mux_agent_message>…</mux_agent_message>", {
-    historySequence: 1,
-    synthetic: true,
-    uiVisible: true,
-    muxMetadata,
-  });
+// Peer payloads are assistant-role synthetic pre-turn rows (peer bytes never gain user-role
+// authority), so the card metadata attaches to assistant text rows.
+function buildAssistantRow(muxMetadata: MuxMessageMetadata) {
+  const message = createMuxMessage(
+    "peer-1",
+    "assistant",
+    "<mux_agent_message>…</mux_agent_message>",
+    {
+      historySequence: 1,
+      synthetic: true,
+      uiVisible: true,
+      muxMetadata,
+    }
+  );
   const displayed = buildDisplayedMessagesForMessage({
     message,
     hasActiveStream: false,
@@ -17,13 +24,13 @@ function buildUserRow(muxMetadata: MuxMessageMetadata) {
   });
   expect(displayed).toHaveLength(1);
   const row = displayed[0];
-  if (row?.type !== "user") throw new Error(`expected user row, got ${row?.type}`);
+  if (row?.type !== "assistant") throw new Error(`expected assistant row, got ${row?.type}`);
   return row;
 }
 
 describe("buildDisplayedMessagesForMessage agent peer message metadata", () => {
   test("surfaces well-formed peer metadata for the attributed card", () => {
-    const row = buildUserRow({
+    const row = buildAssistantRow({
       type: "agent-peer-message",
       fromWorkspaceId: "task-watcher",
       fromTitle: "Watcher",
@@ -37,7 +44,7 @@ describe("buildDisplayedMessagesForMessage agent peer message metadata", () => {
   });
 
   test("tolerates a missing title", () => {
-    const row = buildUserRow({
+    const row = buildAssistantRow({
       type: "agent-peer-message",
       fromWorkspaceId: "task-watcher",
       relationship: "descendant",
@@ -50,7 +57,7 @@ describe("buildDisplayedMessagesForMessage agent peer message metadata", () => {
 
   // muxMetadata is z.any() across the oRPC boundary, so corrupted chat.jsonl lines can carry
   // the peer type with malformed fields (e.g. an object fromTitle rendered as a React child
-  // would throw). The builder must fall back to plain full-text rendering instead of crashing.
+  // would throw). The builder must fall back to plain text rendering instead of crashing.
   test.each([
     ["missing sender", { type: "agent-peer-message", relationship: "sibling" }],
     [
@@ -70,8 +77,8 @@ describe("buildDisplayedMessagesForMessage agent peer message metadata", () => {
       "unknown relationship",
       { type: "agent-peer-message", fromWorkspaceId: "task-watcher", relationship: "parent" },
     ],
-  ])("falls back to full-text rendering for %s", (_label, malformed) => {
-    const row = buildUserRow(malformed as unknown as MuxMessageMetadata);
+  ])("falls back to plain text rendering for %s", (_label, malformed) => {
+    const row = buildAssistantRow(malformed as unknown as MuxMessageMetadata);
     expect(row.agentPeerMessage).toBeUndefined();
     expect(row.content).toBe("<mux_agent_message>…</mux_agent_message>");
   });

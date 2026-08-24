@@ -98,8 +98,6 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
         renderedMessage =
           message.bashMonitorWake != null ? (
             <BashMonitorWakeMessage message={message} className={className} />
-          ) : message.agentPeerMessage != null ? (
-            <AgentPeerMessage message={message} className={className} />
           ) : backgroundWorkWakeSummary != null ? (
             <BackgroundWorkWakeMessage
               message={message}
@@ -118,14 +116,19 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
         break;
       }
       case "assistant":
-        renderedMessage = (
-          <AssistantMessage
-            message={message}
-            className={className}
-            workspaceId={workspaceId}
-            isCompacting={isCompacting}
-          />
-        );
+        // Peer message payloads are assistant-role synthetic rows (peer bytes never gain
+        // user-role authority); backend-attached metadata gates the card presentation.
+        renderedMessage =
+          message.agentPeerMessage != null ? (
+            <AgentPeerMessage message={message} className={className} />
+          ) : (
+            <AssistantMessage
+              message={message}
+              className={className}
+              workspaceId={workspaceId}
+              isCompacting={isCompacting}
+            />
+          );
         break;
       case "tool":
         renderedMessage = (
