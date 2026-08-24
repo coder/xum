@@ -138,6 +138,11 @@ async function waitForTurn(
       const meta = isRecord(row.metadata) ? row.metadata : undefined;
       // Preserved-tail copies duplicate rows already counted above them.
       if (meta?.rlmPreservedTailCopy === true) continue;
+      // Synthetic rows (@file / agent-skill / MCP-prompt snapshots) are
+      // model context, not scenario turns nor settle evidence (r70): they
+      // carry synthetic:true but no non-normal muxMetadata type, so the
+      // muxType check below cannot catch them. Mirrors extractMetrics.
+      if (meta?.synthetic === true) continue;
       const muxType =
         isRecord(meta?.muxMetadata) && typeof meta.muxMetadata.type === "string"
           ? meta.muxMetadata.type

@@ -763,23 +763,22 @@ ${xumTypes}
               if (snapshotConflict) {
                 result.success = false;
                 result.result = undefined;
-                // Completed nested calls are NOT rolled back by the conflict
+                // Invoked nested calls are NOT rolled back by the conflict
                 // (r69): a task message sent or file mutated inside this eval
                 // already happened externally — only the vars persistence was
                 // refused. A blanket "re-run" would replay those effects, so
-                // when any completed, name them and instruct reconciliation
-                // instead. Loads are excluded: they are reads whose vars
-                // entries did NOT survive (their records are rewritten below
-                // with re-issue advice), so replaying them is the fix, not a
-                // hazard. Records are inspected BEFORE that rewrite, hence
-                // the explicit toolName check rather than error-field checks.
-                const completedSideEffects = [
+                // when any were invoked, name them and instruct
+                // reconciliation instead. A record with an error is NOT proof
+                // of no side effect (r70): a tool can mutate externally and
+                // then reject (e.g. a post-tool hook throws), so every
+                // invoked non-load call counts conservatively. Loads are
+                // excluded: they are reads whose vars entries did NOT survive
+                // (their records are rewritten below with re-issue advice),
+                // so replaying them is the fix, not a hazard.
+                const invokedSideEffects = [
                   ...new Set(
                     result.toolCalls
-                      .filter(
-                        (record) =>
-                          record.error === undefined && !(loadActive && record.toolName === "load")
-                      )
+                      .filter((record) => !(loadActive && record.toolName === "load"))
                       .map((record) => record.toolName)
                   ),
                 ];
@@ -788,11 +787,11 @@ ${xumTypes}
                   `kernel state while this call ran: the call's vars mutations were discarded ` +
                   `and any value computed from the old state may be stale. The kernel rebuilds ` +
                   `from the newest snapshot on the next call. ` +
-                  (completedSideEffects.length > 0
-                    ? `CAUTION: nested tool call(s) inside this eval already completed and ` +
-                      `their external effects were NOT rolled back (${completedSideEffects.join(", ")}). ` +
+                  (invokedSideEffects.length > 0
+                    ? `CAUTION: nested tool call(s) inside this eval were invoked and any ` +
+                      `external effects were NOT rolled back (${invokedSideEffects.join(", ")}). ` +
                       `Do NOT re-run this call as-is — re-derive the lost vars state with a new ` +
-                      `call that does not repeat the completed side effects.`
+                      `call that does not repeat those side effects.`
                     : `Re-run this call.`);
               }
               // A handle advertised THIS call did not survive (the mount is

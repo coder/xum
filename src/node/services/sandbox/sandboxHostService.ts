@@ -1149,15 +1149,33 @@ export class SandboxHostService {
     event: TaskTerminalEventArgs,
     size: number
   ): Promise<void> {
-    await using _guard = await this.lockFor(scopeKey).acquire();
-    // Re-resolve under the lock: the mount may have been rebuilt or disposed
-    // while we waited (grant change, archive). Vars survive rebuilds via
-    // snapshot/restore, so posting to the CURRENT mount stays correct.
-    const mount = this.persistentMounts.get(scopeKey);
-    if (!mount || mount.isDisposed || !mount.grants.hostEvents) return;
-
     const preview = buildHandlePreview(event.reportMarkdown, size);
     const base = { type: TASK_TERMINAL_EVENT_TYPE, taskId: event.taskId, status: event.status };
+    // Event VISIBILITY must never queue behind the scope lease (r70): a
+    // guest eval polling xum.events() holds the scope lock for its entire
+    // run, so awaiting the lock here would make this completion
+    // unobservable until that eval ends — the guest could poll to its
+    // sandbox timeout for a child that already finished. If the scope is
+    // leased, deliver the bounded preview immediately (postHostEvent is a
+    // plain queue push, safe without the lock, exactly like the
+    // sub-threshold path) and skip the handle upgrade; the preview marks
+    // itself truncated and the full report still arrives via the durable
+    // top-level task wake. The handle path below runs only when the lock is
+    // free at this instant (tryAcquire is synchronous), preserving the
+    // single-event-per-task contract.
+    const guard = this.lockFor(scopeKey).tryAcquire();
+    if (guard === null) {
+      const mount = this.persistentMounts.get(scopeKey);
+      if (!mount || mount.isDisposed || !mount.grants.hostEvents) return;
+      mount.postHostEvent({ ...base, reportMarkdown: preview });
+      return;
+    }
+    await using _guard = guard;
+    // Re-resolve under the lock: the mount may have been rebuilt or disposed
+    // since the caller's check (grant change, archive). Vars survive rebuilds
+    // via snapshot/restore, so posting to the CURRENT mount stays correct.
+    const mount = this.persistentMounts.get(scopeKey);
+    if (!mount || mount.isDisposed || !mount.grants.hostEvents) return;
     if (!mount.grants.vars) {
       // No vars grant => nowhere to store the full report; deliver the
       // bounded preview only (the preview text marks itself as truncated).

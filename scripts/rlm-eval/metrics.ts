@@ -168,6 +168,14 @@ export function extractMetrics(sessionDir: string): CellMetrics {
     })();
     if (msg.role === "user") {
       if (rowMuxType !== undefined && rowMuxType !== "normal") continue;
+      // Synthetic user snapshot rows (@file / agent-skill / MCP-prompt
+      // references) carry synthetic:true but no non-normal muxMetadata type
+      // (r70): counting them as scenario turns adds empty turn entries and
+      // shifts positional verifier answers. Mirrors waitForTurn.
+      {
+        const meta = (row as Record<string, unknown>).metadata;
+        if (isRecord(meta) && meta.synthetic === true) continue;
+      }
       currentTurnText = [];
       metrics.assistantTextPerTurn.push("");
       continue;

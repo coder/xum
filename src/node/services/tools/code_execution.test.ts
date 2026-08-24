@@ -1949,14 +1949,15 @@ describe("createCodeExecutionTool", () => {
       await hostA.disposeScope(scopeKey);
     });
 
-    it("advises a plain re-run when the conflicted eval completed no side-effecting calls (r69)", async () => {
+    it("treats REJECTED nested calls as potentially side-effecting after a conflict (r70)", async () => {
       using tmp = new DisposableTempDir("code-exec-conflict");
       const hostA = new SandboxHostService();
       const hostB = new SandboxHostService();
-      const scopeKey = "ws-snap-conflict-rerun";
-      // The foreign persist lands, then the bridged call THROWS: its record
-      // carries an error, so the eval completed no external side effects and
-      // a plain re-run is safe advice.
+      const scopeKey = "ws-snap-conflict-rejected";
+      // The bridged call mutates externally (here: the foreign persist) and
+      // THEN rejects — e.g. a post-tool hook throwing after the main
+      // operation completed. Its record carries an error, but that is not
+      // proof of no side effect, so the conflict advice must still warn.
       const sabotage = createMockTool("sabotage", z.object({}), async () => {
         const mountB = await hostB.acquireMount({
           lifetime: "persistent",
@@ -1983,8 +1984,51 @@ describe("createCodeExecutionTool", () => {
       )) as PTCExecutionResult;
       expect(conflicted.success).toBe(false);
       expect(conflicted.error).toContain("persisted by another instance");
+      expect(conflicted.error).toContain("NOT rolled back");
+      expect(conflicted.error).toContain("sabotage");
+      expect(conflicted.error).not.toContain("Re-run this call.");
+      await hostB.disposeScope(scopeKey);
+      await hostA.disposeScope(scopeKey);
+    });
+
+    it("advises a plain re-run when the conflicted eval invoked only loads (r70)", async () => {
+      using tmp = new DisposableTempDir("code-exec-conflict");
+      const hostA = new SandboxHostService();
+      const hostB = new SandboxHostService();
+      const scopeKey = "ws-snap-conflict-rerun";
+      // The foreign persist lands inside the LOADER (a read — loads carry no
+      // external side effects, and their vars entries did not survive the
+      // conflict anyway), so a plain re-run is safe advice.
+      const foreignPersistingLoader = async () => {
+        const mountB = await hostB.acquireMount({
+          lifetime: "persistent",
+          runtimeFactory,
+          scopeKey,
+          sessionDir: tmp.path,
+        });
+        await mountB.runtime.eval('vars.foreign = "won"; return true;');
+        await mountB.persistVars();
+        return { content: "hello", bytes: 5, lines: 1, preview: "hello" };
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(fileReadTools()),
+        undefined,
+        kernelRunner(hostA, scopeKey, tmp.path),
+        { loadFile: foreignPersistingLoader }
+      );
+
+      const conflicted = (await tool.execute!(
+        { code: 'mux.load({ path: "x.txt", key: "data" }); return "stale";' },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(conflicted.success).toBe(false);
+      expect(conflicted.error).toContain("persisted by another instance");
       expect(conflicted.error).toContain("Re-run this call.");
       expect(conflicted.error).not.toContain("NOT rolled back");
+      // The load record carries the conflict-specific re-issue advice.
+      const loadRecord = conflicted.toolCalls.find((record) => record.toolName === "load");
+      expect(loadRecord?.error).toContain("changed this workspace's kernel state");
       await hostB.disposeScope(scopeKey);
       await hostA.disposeScope(scopeKey);
     });

@@ -608,6 +608,55 @@ describe("SandboxHostService", () => {
     await host.disposeScope("ws-terminal-big");
   });
 
+  test("oversized task-terminal reports stay visible while the scope lease is held (r70)", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    const bigReport = "R".repeat(20_000); // over the 16KB offload threshold
+    await host.withPersistentMount(
+      {
+        lifetime: "persistent",
+        runtimeFactory,
+        scopeKey: "ws-terminal-busy",
+        sessionDir: tmp.path,
+      },
+      async (mount) => {
+        // This lease stands in for a long-running guest eval polling
+        // xum.events(): pre-r70 the oversized path queued behind this very
+        // lock, so the completion could never be drained in here and the
+        // guest would poll to its sandbox timeout.
+        await host.postTaskTerminalEvent("ws-terminal-busy", {
+          taskId: "child-busy",
+          status: "completed",
+          reportMarkdown: bigReport,
+        });
+        const events = mount.drainHostEvents() as Array<{
+          taskId: string;
+          reportMarkdown?: string;
+          reportHandle?: unknown;
+        }>;
+        expect(events).toHaveLength(1);
+        expect(events[0].taskId).toBe("child-busy");
+        // Busy lease => bounded preview, no handle upgrade (the full report
+        // still reaches the parent via the durable top-level task wake).
+        expect(events[0].reportHandle).toBeUndefined();
+        expect(events[0].reportMarkdown).toContain("middle truncated");
+      }
+    );
+    // Single-event-per-task contract: releasing the lease must not deliver
+    // a duplicate handle event.
+    const later = await host.withPersistentMount(
+      {
+        lifetime: "persistent",
+        runtimeFactory,
+        scopeKey: "ws-terminal-busy",
+        sessionDir: tmp.path,
+      },
+      (mount) => Promise.resolve(mount.drainHostEvents())
+    );
+    expect(later).toHaveLength(0);
+    await host.disposeScope("ws-terminal-busy");
+  });
+
   test("postHostEvent drops oldest events beyond the queue cap", async () => {
     using tmp = new DisposableTempDir("sandbox-host-test");
     const host = new SandboxHostService();

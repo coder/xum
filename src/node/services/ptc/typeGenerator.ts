@@ -330,7 +330,7 @@ export async function generateXumTypes(
       lines.push("");
     }
     lines.push(
-      "  /** Drain queued host→guest events (spawned-task terminal reports). Synchronous — safe to call anywhere. Best-effort: an app restart drops undrained events, but every report still reaches the parent via the top-level task wake. Oversized reports arrive as reportHandle (full text at that vars handle) instead of reportMarkdown. */"
+      "  /** Drain queued host→guest events (spawned-task terminal reports). Synchronous — safe to call anywhere. Best-effort: an app restart drops undrained events, but every report still reaches the parent via the top-level task wake. Oversized reports arrive as reportHandle (full text at that vars handle) instead of reportMarkdown — or, when the kernel was busy at completion time, as a bounded reportMarkdown preview (full report still available at top level). */"
     );
     lines.push(
       `  type HostEvent = { type: "${TASK_TERMINAL_EVENT_TYPE}"; taskId: string; status: "completed"; reportMarkdown?: string; reportHandle?: { handle: string; preview: string; size: number } };`
