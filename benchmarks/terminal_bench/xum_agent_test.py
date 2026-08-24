@@ -189,6 +189,21 @@ def test_empty_canonical_environment_clears_legacy_alias(
     assert "XUM_RUN_AS_GOAL" not in env
 
 
+def test_empty_canonical_providers_file_clears_legacy_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XUM_PROVIDERS_FILE", "")
+    monkeypatch.setenv("MUX_PROVIDERS_FILE", "/legacy/providers.jsonc")
+
+    assert (
+        XumAgent._environment_alias_value(
+            XumAgent._PROVIDERS_FILE_ENV_KEY,
+            XumAgent._LEGACY_PROVIDERS_FILE_ENV_KEY,
+        )
+        == ""
+    )
+
+
 def test_goal_mode_env_is_forwarded(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

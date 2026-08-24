@@ -140,6 +140,13 @@ class XumAgent(BaseInstalledAgent):
     def name() -> str:
         return "xum"
 
+    @staticmethod
+    def _environment_alias_value(canonical_key: str, legacy_key: str) -> str | None:
+        """Prefer the canonical key by presence so an empty value clears legacy state."""
+        if canonical_key in os.environ:
+            return os.environ[canonical_key]
+        return os.environ.get(legacy_key)
+
     @property
     def _env(self) -> dict[str, str]:
         env: dict[str, str] = {}
@@ -154,11 +161,7 @@ class XumAgent(BaseInstalledAgent):
             legacy_key = f"MUX_{suffix}"
             # Presence, not truthiness, determines precedence: an explicit empty
             # canonical value must clear a legacy variable left in the developer shell.
-            value = (
-                os.environ[canonical_key]
-                if canonical_key in os.environ
-                else os.environ.get(legacy_key)
-            )
+            value = self._environment_alias_value(canonical_key, legacy_key)
             if value:
                 env[canonical_key] = value
 
@@ -257,9 +260,10 @@ class XumAgent(BaseInstalledAgent):
         self, environment: BaseEnvironment, env: dict[str, str]
     ) -> None:
         """Upload host providers.jsonc into the sandbox when explicitly requested."""
-        providers_file_raw = os.environ.get(
-            self._PROVIDERS_FILE_ENV_KEY
-        ) or os.environ.get(self._LEGACY_PROVIDERS_FILE_ENV_KEY)
+        providers_file_raw = self._environment_alias_value(
+            self._PROVIDERS_FILE_ENV_KEY,
+            self._LEGACY_PROVIDERS_FILE_ENV_KEY,
+        )
         if not providers_file_raw:
             return
 
