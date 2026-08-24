@@ -26,6 +26,7 @@ BOUNDARY_GLOBS = (
     ".github/workflows/nightly-terminal-bench.yml",
     "scripts/check-bench-agent.sh",
     "scripts/check_tbench_results.py",
+    "src/node/services/agentPlugins/installService.ts",
     "src/node/services/log.ts",
     "src/common/constants/paths.ts",
     "src/cli/server.ts",
@@ -96,6 +97,11 @@ ALLOW_RULES = (
         "legacy workflow-dispatch input",
     ),
     AllowRule(".github/workflows/terminal-bench.yml", re.compile(r"mux-benchmarks"), "existing BigQuery project ID"),
+    AllowRule(
+        "src/node/services/agentPlugins/installService.ts",
+        re.compile(r"[\"']\.mux-promotion-marker[\"']"),
+        "stable crash-recovery marker used by existing staged plugin mutations",
+    ),
     AllowRule(
         "src/node/services/log.ts",
         re.compile(r"common/compat/legacyMux"),

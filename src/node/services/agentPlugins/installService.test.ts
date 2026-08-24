@@ -2910,7 +2910,7 @@ describe("AgentPluginInstallService", () => {
     const preview = await service.preview({ input: remoteDir });
     await expect(
       service.install({ source: preview.source, expectedSha: preview.lockedSha })
-    ).rejects.toThrow(/newer version of Mux/);
+    ).rejects.toThrow(/newer version of Xum/);
     expect(await registry()).toEqual([]);
   });
 
@@ -2947,7 +2947,7 @@ describe("AgentPluginInstallService", () => {
       // uninstall must refuse up-front with the install fully intact.
       await expect(
         serviceWithOverrides.uninstall({ name: "demo-plugin", deletePluginData: false })
-      ).rejects.toThrow(/newer version of Mux/);
+      ).rejects.toThrow(/newer version of Xum/);
       expect((await registry()).map((entry) => (entry as { name: string }).name)).toEqual([
         "demo-plugin",
       ]);

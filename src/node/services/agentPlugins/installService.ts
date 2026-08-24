@@ -78,11 +78,11 @@ import {
 /**
  * Managed Agent Plugin installer (agent-plugins experiment; global scope only).
  *
- * Flow: parse input → shallow clone to a staging dir under ~/.mux →
+ * Flow: parse input → shallow clone to a staging dir under ~/.xum →
  * validate the STAGED clone with the same manifest/component discovery used
  * at runtime → return a consent preview → on confirm, re-clone the exact SHA,
- * promote into ~/.mux/plugins/<name>, and record a registry entry
- * ({source, ref, lockedSha}) in ~/.mux/plugins.json.
+ * promote into ~/.xum/plugins/<name>, and record a registry entry
+ * ({source, ref, lockedSha}) in ~/.xum/plugins.json.
  *
  * The registry is a standalone file (NOT a config.json section): older builds
  * rebuild config.json from known fields on save, so a downgrade would drop an
@@ -104,7 +104,7 @@ import {
  *   and promote + registry-write failures roll back.
  */
 
-/** Registry file name under the mux home dir. */
+/** Registry file name under the Xum home directory. */
 const REGISTRY_FILE_NAME = "plugins.json";
 
 /*
@@ -142,7 +142,7 @@ const STALE_STAGING_MAX_AGE_MS = 60 * 60 * 1000;
 /**
  * Cross-process mutation lock file in the staging root. The in-process
  * mutationQueue serializes one service instance, but two processes sharing
- * the same rootDir (ALLOW_MULTIPLE_INSTANCES, a desktop app alongside `mux
+ * the same rootDir (ALLOW_MULTIPLE_INSTANCES, a desktop app alongside `xum
  * server`) each have their own queue: two concurrent mutations could both
  * read the same plugins.json snapshot and the later atomic write would
  * silently drop the earlier one's entry. Every mutation transaction
@@ -476,7 +476,7 @@ export class AgentPluginInstallService {
     // container at all while the latest attempt has FAILED (the journaled
     // tree may still be sitting in it). Health alone is not enough: a live
     // mutation (in this process or a sibling desktop/server process sharing
-    // the same mux home) can overlap a scan, so keep the journal+epoch
+    // the same Xum home) can overlap a scan, so keep the journal+epoch
     // bracket of the default gate and UNION health suppression onto it.
     setAgentPluginDiscoveryGate(async (containerPaths) => {
       // Serialize behind the latest recovery attempt BEFORE snapshotting the
@@ -562,7 +562,7 @@ export class AgentPluginInstallService {
   }
 
   // ---------------------------------------------------------------------
-  // Registry persistence (~/.mux/plugins.json)
+  // Registry persistence (~/.xum/plugins.json)
   // ---------------------------------------------------------------------
 
   /**
@@ -598,7 +598,7 @@ export class AgentPluginInstallService {
       raw = await fsPromises.readFile(this.registryFile, "utf8");
     } catch (error) {
       // Only a MISSING file is an empty registry. Any other read failure
-      // (e.g. an unreadable mode-000 file in a writable ~/.mux) must block
+      // (e.g. an unreadable mode-000 file in a writable ~/.xum) must block
       // mutations: the atomic write replaces the file wholesale, so treating
       // "unreadable" as "empty" would erase every existing entry.
       if (hasErrorCode(error, "ENOENT")) {
@@ -723,7 +723,7 @@ export class AgentPluginInstallService {
     const entries = this.parseRegistryEntries(rawEntries, mode);
     if (mode === "strict" && entries.length !== rawEntries.length) {
       throw new Error(
-        `The plugin registry (${shortenHome(this.registryFile)}) contains ${rawEntries.length - entries.length} entr${rawEntries.length - entries.length === 1 ? "y" : "ies"} this version cannot read (written by a newer version of Mux, or corrupted).`
+        `The plugin registry (${shortenHome(this.registryFile)}) contains ${rawEntries.length - entries.length} entr${rawEntries.length - entries.length === 1 ? "y" : "ies"} this version cannot read (written by a newer version of Xum, or corrupted).`
       );
     }
     return entries;
@@ -772,7 +772,7 @@ export class AgentPluginInstallService {
         acquireTimeoutMs: MUTATION_LOCK_ACQUIRE_TIMEOUT_MS,
         staleMs: MUTATION_LOCK_STALE_MS,
         timeoutMessage:
-          "Another Mux process is currently modifying plugins. Wait for it to finish and try again.",
+          "Another Xum process is currently modifying plugins. Wait for it to finish and try again.",
       });
       try {
         return await fn();
@@ -810,8 +810,8 @@ export class AgentPluginInstallService {
   // ---------------------------------------------------------------------
 
   /**
-   * Staging lives under ~/.mux (same filesystem as the container) so promote
-   * is a plain rename, and outside ~/.mux/plugins so a staged clone can never
+   * Staging lives under ~/.xum (same filesystem as the container) so promote
+   * is a plain rename, and outside ~/.xum/plugins so a staged clone can never
    * be discovered as an installed plugin.
    */
   private async createStagingDir(): Promise<string> {
@@ -1224,7 +1224,7 @@ export class AgentPluginInstallService {
         (await pathExists(path.join(stagedDir, ".claude-plugin", "marketplace.json")))
       ) {
         throw new Error(
-          "This repository is a Claude Code plugin or marketplace (found .claude-plugin/). Mux implements the vendor-neutral Agent Plugins 1.0.0 format and cannot install Claude Code collections."
+          "This repository is a Claude Code plugin or marketplace (found .claude-plugin/). Xum implements the vendor-neutral Agent Plugins 1.0.0 format and cannot install Claude Code collections."
         );
       }
       throw new Error(
@@ -2738,7 +2738,7 @@ export class AgentPluginInstallService {
       // cleanup metadata — or silently skip recording our own.
       if (workspaceIdsToPrune.length > 0 && this.hasOpaquePendingPrunes(envelope)) {
         throw new Error(
-          `The plugin registry (${shortenHome(this.registryFile)}) contains pending cleanup state written by a newer version of Mux. Run the uninstall with that version, or let it finish its cleanup first.`
+          `The plugin registry (${shortenHome(this.registryFile)}) contains pending cleanup state written by a newer version of Xum. Run the uninstall with that version, or let it finish its cleanup first.`
         );
       }
 
@@ -2980,7 +2980,7 @@ export class AgentPluginInstallService {
               // (same reasoning as the pre-commit guard, which only runs when
               // commit-time workspaces existed).
               throw new Error(
-                "the registry's pending cleanup state was written by a newer version of Mux"
+                "the registry's pending cleanup state was written by a newer version of Xum"
               );
             }
             const pendingSentinel = this.updateRawPendingPrunes(
@@ -3349,7 +3349,7 @@ export class AgentPluginInstallService {
     // servers. Over-blocking until the newer build resolves it is safe.
     if (this.hasOpaquePendingPrunes(envelope)) {
       throw new Error(
-        `The plugin registry (${shortenHome(this.registryFile)}) contains pending cleanup state written by a newer version of Mux. Install with that version, or let it finish its cleanup first.`
+        `The plugin registry (${shortenHome(this.registryFile)}) contains pending cleanup state written by a newer version of Xum. Install with that version, or let it finish its cleanup first.`
       );
     }
     // Same reasoning per ITEM: an unrecognized array entry (a newer build's
@@ -3359,7 +3359,7 @@ export class AgentPluginInstallService {
     // unrecognized entries verbatim.)
     if (this.rawPendingPrunes(envelope).some((item) => !this.isRecognizedPrune(item))) {
       throw new Error(
-        `The plugin registry (${shortenHome(this.registryFile)}) contains pending cleanup records this version cannot read (written by a newer version of Mux, or corrupted). Install with that version, or repair the file's pendingOverridePrunes entries first.`
+        `The plugin registry (${shortenHome(this.registryFile)}) contains pending cleanup records this version cannot read (written by a newer version of Xum, or corrupted). Install with that version, or repair the file's pendingOverridePrunes entries first.`
       );
     }
     const pending = this.parsePendingOverridePrunes(envelope);
@@ -3559,7 +3559,7 @@ export class AgentPluginInstallService {
         // installed subpath snapshot for an unrelated root tree while the
         // registry keeps claiming the subpath source.
         throw new Error(
-          `'${entry.name}' was installed from a repository subpath by a newer version of Mux; update it with that version.`
+          `'${entry.name}' was installed from a repository subpath by a newer version of Xum; update it with that version.`
         );
       }
       // A retained journal means a previous swap's recovery is unfinished
@@ -3748,7 +3748,7 @@ export class AgentPluginInstallService {
             await bumpContainerMutationEpoch(this.stagingRoot);
           } catch (error) {
             throw new Error(
-              `The new plugin tree is in place, but publishing the change to other Mux processes failed (${getErrorMessage(error)}). Retry the update.`
+              `The new plugin tree is in place, but publishing the change to other Xum processes failed (${getErrorMessage(error)}). Retry the update.`
             );
           }
         }

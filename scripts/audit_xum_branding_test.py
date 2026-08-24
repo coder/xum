@@ -16,9 +16,17 @@ class AuditXumBrandingTest(unittest.TestCase):
             stale_path.parent.mkdir(parents=True)
             stale_path.write_text("class Adapter:\n    pass\n")
 
+            stale_plugin_service = root / "src/node/services/agentPlugins/installService.ts"
+            stale_plugin_service.parent.mkdir(parents=True)
+            stale_plugin_service.write_text('throw new Error("Another Mux process is modifying plugins")\n')
+
             violations = audit_paths(
                 root,
-                ["Makefile", "benchmarks/terminal_bench/mux_new_adapter.py"],
+                [
+                    "Makefile",
+                    "benchmarks/terminal_bench/mux_new_adapter.py",
+                    "src/node/services/agentPlugins/installService.ts",
+                ],
             )
 
             self.assertEqual(
@@ -26,6 +34,7 @@ class AuditXumBrandingTest(unittest.TestCase):
                 [
                     ("Makefile", 1),
                     ("benchmarks/terminal_bench/mux_new_adapter.py", 0),
+                    ("src/node/services/agentPlugins/installService.ts", 1),
                 ],
             )
 
@@ -54,6 +63,12 @@ class AuditXumBrandingTest(unittest.TestCase):
                 'path.join(logsDir, `mux.${i}.log`)\n'
             )
 
+            plugin_install_service = root / "src/node/services/agentPlugins/installService.ts"
+            plugin_install_service.parent.mkdir(parents=True)
+            plugin_install_service.write_text(
+                'throw new Error("Another Xum process is modifying plugins")\n'
+            )
+
             violations = audit_paths(
                 root,
                 [
@@ -61,6 +76,7 @@ class AuditXumBrandingTest(unittest.TestCase):
                     "benchmarks/terminal_bench/.leaderboard_cache/Mux__Historical/result.json",
                     "benchmarks/terminal_bench/prepare_leaderboard_submission.py",
                     "src/node/services/log.ts",
+                    "src/node/services/agentPlugins/installService.ts",
                 ],
             )
 
