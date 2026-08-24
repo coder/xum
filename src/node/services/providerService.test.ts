@@ -1128,6 +1128,21 @@ describe("ProviderService custom provider mutations", () => {
     });
   });
 
+  it("rejects providerType writes for absent entries", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      // A late queued UI edit racing a removal must not resurrect the
+      // provider as an unconfigured skeleton.
+      const result = await service.setConfig(
+        "ghost-provider",
+        ["providerType"],
+        "openai-responses"
+      );
+
+      expect(result.success).toBe(false);
+      expect(config.loadProvidersConfig()?.["ghost-provider"]).toBeUndefined();
+    });
+  });
+
   it("still rejects providerType writes that would convert a built-in entry", async () => {
     await withTempConfigAsync(async (config, service) => {
       config.saveProvidersConfig({

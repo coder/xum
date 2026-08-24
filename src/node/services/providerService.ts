@@ -1441,6 +1441,13 @@ export class ProviderService {
         // against the config read INSIDE the lock: a pre-lock read could race
         // another process removing the entry and recreate it as custom.
         if (isProviderTypeEdit && !isCustomProviderConfig(providersConfig[provider])) {
+          if (providersConfig[provider] == null) {
+            // A providerType write must never CREATE an entry: a queued or
+            // late UI edit racing a removal would otherwise resurrect the
+            // provider as an unconfigured skeleton. Creation goes through
+            // addCustomProvider.
+            return `Provider ${provider} does not exist.`;
+          }
           const validation = validateCustomProviderId(provider);
           if (!validation.ok) {
             return `Invalid custom provider id for ${String(value)}: ${validation.reason}`;
