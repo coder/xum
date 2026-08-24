@@ -42,6 +42,7 @@ import { createTaskMessageSiblingTool } from "@/node/services/tools/task_message
 import { createTaskRetitleTool } from "@/node/services/tools/task_retitle";
 import { createTaskStopTool } from "@/node/services/tools/task_stop";
 import { createTaskRemoveTool } from "@/node/services/tools/task_remove";
+import { createTaskWorkspaceLifecycleTool } from "@/node/services/tools/task_workspace_lifecycle";
 import { createTaskListTool } from "@/node/services/tools/task_list";
 import { createAgentSkillReadTool } from "@/node/services/tools/agent_skill_read";
 import { createAgentSkillReadFileTool } from "@/node/services/tools/agent_skill_read_file";
@@ -795,6 +796,7 @@ export async function getToolsForModel(
     task_retitle: wrap(createTaskRetitleTool(config)),
     task_stop: wrap(createTaskStopTool(config)),
     task_remove: wrap(createTaskRemoveTool(config)),
+    task_workspace_lifecycle: wrap(createTaskWorkspaceLifecycleTool(config)),
     task_list: wrap(createTaskListTool(config)),
 
     // Bash execution (foreground/background). Manage background output via task_await/task_list/task_terminate.

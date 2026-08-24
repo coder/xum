@@ -792,6 +792,21 @@ If a value is too large for the environment, it may be omitted (not set). Xum al
 </details>
 
 <details>
+<summary>task_workspace_lifecycle (7)</summary>
+
+| Env var                                                     | JSON path                                      | Type    | Description                                                                                                                                                                                     |
+| ----------------------------------------------------------- | ---------------------------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `XUM_TOOL_INPUT_ACKNOWLEDGED_UNTRACKED_PATHS_<KEY>_<INDEX>` | `acknowledged_untracked_paths[<KEY>][<INDEX>]` | string  | Archive-only confirmations keyed by resolved workspaceId. Use only paths returned by a previous requires_confirmation result.                                                                   |
+| `XUM_TOOL_INPUT_ACKNOWLEDGED_UNTRACKED_PATHS_<KEY>_COUNT`   | `acknowledged_untracked_paths[<KEY>].length`   | number  | Number of elements in acknowledged_untracked_paths[&lt;KEY&gt;] (Archive-only confirmations keyed by resolved workspaceId. Use only paths returned by a previous requires_confirmation result.) |
+| `XUM_TOOL_INPUT_ACTION`                                     | `action`                                       | enum    | Reversible lifecycle action: "archive" hides and suspends the workspace without deleting state, "unarchive" restores it.                                                                        |
+| `XUM_TOOL_INPUT_INTERRUPT_ACTIVE`                           | `interrupt_active`                             | boolean | Archive only: when true, interrupt active workspace turns for the target before archiving. Ignored by unarchive, which never interrupts. Defaults to false.                                     |
+| `XUM_TOOL_INPUT_TARGETS_<INDEX>_TASK_ID`                    | `targets[<INDEX>].taskId`                      | string  | —                                                                                                                                                                                               |
+| `XUM_TOOL_INPUT_TARGETS_<INDEX>_WORKSPACE_ID`               | `targets[<INDEX>].workspaceId`                 | string  | —                                                                                                                                                                                               |
+| `XUM_TOOL_INPUT_TARGETS_COUNT`                              | `targets.length`                               | number  | Number of elements in targets (Workspace-turn targets this workspace created via task(kind="workspace"). Provide exactly one of taskId (wst\_...) or workspaceId for each target.)              |
+
+</details>
+
+<details>
 <summary>timeline_event (2)</summary>
 
 | Env var                      | JSON path     | Type   | Description                            |

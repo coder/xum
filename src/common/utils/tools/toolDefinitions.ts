@@ -1321,6 +1321,38 @@ export const TaskWorkspaceLifecycleToolArgsSchema = z
   })
   .strict();
 
+// Live model-facing input schema for the restored tool. Deliberately narrower than
+// TaskWorkspaceLifecycleToolArgsSchema (which is kept intact so historical transcripts
+// with delete_worktree/remove/force calls still parse and render): only the reversible
+// archive/unarchive verbs are model-invocable; task_remove stays the only irreversible verb.
+export const TaskWorkspaceLifecycleToolInputSchema = z
+  .object({
+    action: z
+      .enum(["archive", "unarchive"])
+      .describe(
+        'Reversible lifecycle action: "archive" hides and suspends the workspace without deleting state, "unarchive" restores it.'
+      ),
+    targets: z
+      .array(TaskWorkspaceLifecycleTargetSchema)
+      .min(1)
+      .describe(
+        'Workspace-turn targets this workspace created via task(kind="workspace"). Provide exactly one of taskId (wst_...) or workspaceId for each target.'
+      ),
+    interrupt_active: z
+      .boolean()
+      .nullish()
+      .describe(
+        "Archive only: when true, interrupt active workspace turns for the target before archiving. Ignored by unarchive, which never interrupts. Defaults to false."
+      ),
+    acknowledged_untracked_paths: z
+      .record(z.string(), z.array(z.string()))
+      .nullish()
+      .describe(
+        "Archive-only confirmations keyed by resolved workspaceId. Use only paths returned by a previous requires_confirmation result."
+      ),
+  })
+  .strict();
+
 const TaskWorkspaceLifecycleBaseResultSchema = z.object({
   action: TaskWorkspaceLifecycleActionSchema,
   taskId: z.string().optional(),
@@ -2343,6 +2375,16 @@ export const TOOL_DEFINITIONS = {
       "Irreversibly remove inactive child task workspaces owned by the current workspace. Use it to prune completed grouped candidates after their results and artifacts are consumed, consolidate substantially overlapping standalone roles, restore the bounded reusable bench, honor an explicit user request, or discard clearly obsolete context. Do not use it for a blanket end-of-turn cleanup: retain a small bench of distinct useful roles. Removed sub-agents cannot be restored or reawakened. Active targets are rejected; descendants must be removed first, so nested batches are processed deepest-first.",
     schema: TaskRemoveToolArgsSchema,
   },
+  task_workspace_lifecycle: {
+    description:
+      'Reversibly archive or unarchive full workspaces that the current workspace created via task(kind="workspace"). ' +
+      "Scoped by durable workspace-turn ownership records: it cannot act on arbitrary user workspaces or sub-agent children (non-wst_ task IDs are invalid_scope). " +
+      'Use action="archive" when a peer workspace\'s work is complete; archived targets refuse task(kind="workspace", mode="existing") follow-ups until unarchived. ' +
+      "Active workspace turns are refused unless interrupt_active is true (archive only; unarchive never interrupts). " +
+      "Archive may return requires_confirmation with untracked paths when a snapshot would be lossy — re-call with acknowledged_untracked_paths to confirm. " +
+      "For irreversible removal of inactive sub-agent children, use task_remove instead.",
+    schema: TaskWorkspaceLifecycleToolInputSchema,
+  },
   task_list: {
     description:
       "List descendant tasks for the current workspace, including status + metadata. " +
@@ -3273,6 +3315,7 @@ export type BridgeableToolName =
   | "task_retitle"
   | "task_stop"
   | "task_remove"
+  | "task_workspace_lifecycle"
   | "heartbeat"
   | "memory"
   | "mcp_prompt_get";
@@ -3305,6 +3348,7 @@ export const RESULT_SCHEMAS: Record<BridgeableToolName, z.ZodType> = {
   task_retitle: TaskRetitleToolResultSchema,
   task_stop: TaskStopToolResultSchema,
   task_remove: TaskRemoveToolResultSchema,
+  task_workspace_lifecycle: TaskWorkspaceLifecycleToolResultSchema,
   heartbeat: HeartbeatToolResultSchema,
   memory: MemoryToolResultSchema,
   mcp_prompt_get: MCPPromptGetToolResultSchema,
@@ -3433,6 +3477,7 @@ export function getAvailableTools(
     "task_retitle",
     "task_stop",
     "task_remove",
+    "task_workspace_lifecycle",
     "task_list",
     ...(enableDynamicWorkflows ? ["workflow_run", "workflow_resume"] : []),
     ...(enableAgentReport ? ["agent_report"] : []),

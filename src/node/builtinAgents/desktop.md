@@ -39,6 +39,7 @@ tools:
     - task_retitle
     - task_stop
     - task_apply_git_patch
+    - task_workspace_lifecycle
     # No planning tools
     - propose_plan
     - ask_user_question

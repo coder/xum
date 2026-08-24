@@ -131,6 +131,7 @@ const PRESERVE_OUTPUT_TOOLS = new Set([
   "task_retitle",
   "task_stop",
   "task_remove",
+  "task_workspace_lifecycle",
   "task_terminate",
   "task_apply_git_patch",
 ]);
