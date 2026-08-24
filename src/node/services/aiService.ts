@@ -87,7 +87,7 @@ import { sumUsageHistory, getTotalCost } from "@/common/utils/tokens/usageAggreg
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { extractChunkDeltaText } from "@/common/utils/ai/streamChunks";
-import { readToolInstructions } from "./systemMessage";
+import { extractToolInstructionsFromSources } from "./systemMessage";
 import {
   effectiveAdditionalSystemContext,
   mergeAdditionalSystemInstructions,
@@ -176,7 +176,11 @@ import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
 import { ProviderModelFactory, modelCostsIncluded } from "./providerModelFactory";
 import { prepareMessagesForProvider } from "./messagePipeline";
 import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
-import { buildPlanInstructions, buildStreamSystemContext } from "./streamContextBuilder";
+import {
+  buildPlanInstructions,
+  buildStreamSystemContext,
+  type StreamSystemContextResult,
+} from "./streamContextBuilder";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import {
   normalizeUsageModelKey,
@@ -2142,12 +2146,16 @@ export class AIService extends EventEmitter {
       // service); tool policy may still strip the tool, which forces a rebuild
       // below so the prompt never advertises an absent tool.
       const memoryToolEligible = memoryExperimentEnabled && this.memoryService !== undefined;
+      const startupInstructionSources: {
+        current?: StreamSystemContextResult["instructionSources"];
+      } = {};
       const buildStreamSystemContextForToolset = (
         toolset: { advisorToolAvailable: boolean; memoryToolAvailable: boolean },
         modelStringForSystem: string = modelString,
         contextForModel: MemorySessionContext | undefined = memoryContext
       ) =>
         buildStreamSystemContext({
+          instructionSources: startupInstructionSources.current,
           runtime,
           metadata,
           workspacePath,
@@ -2180,8 +2188,10 @@ export class AIService extends EventEmitter {
         advisorToolAvailable: advisorToolEligible,
         memoryToolAvailable: memoryToolEligible,
       });
+      startupInstructionSources.current = prePolicyStreamSystemContext.instructionSources;
       recordStartupPhaseTiming("buildStreamSystemContextMs", buildStreamSystemContextStartedAt);
       const {
+        instructionSources,
         agentSystemPromptSections,
         agentDefinitions,
         availableSkills,
@@ -2250,16 +2260,14 @@ export class AIService extends EventEmitter {
       const runtimeTempDir = await this.streamManager.createTempDirForStream(streamToken, runtime);
       recordStartupPhaseTiming("createTempDirForStreamMs", createTempDirForStreamStartedAt);
 
-      // Extract tool-specific instructions from AGENTS.md files and agent definition
+      // Extract tool-specific instructions from the same source snapshot used
+      // for the system message so instruction files are not read twice.
       const readToolInstructionsStartedAt = Date.now();
-      const toolInstructions = await readToolInstructions(
-        metadata,
-        runtime,
-        workspacePath,
+      const toolInstructions = extractToolInstructionsFromSources(
+        instructionSources,
         capabilityModelString,
-        agentSystemPromptSections,
-        cfg.projects,
-        claudeSkillsCompatExperimentEnabled
+        metadata,
+        agentSystemPromptSections
       );
       recordStartupPhaseTiming("readToolInstructionsMs", readToolInstructionsStartedAt);
 

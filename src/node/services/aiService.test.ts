@@ -304,10 +304,16 @@ function stubCommonStreamMessageDependencies(args: {
   useRequestedModelString?: boolean;
   onPlanPayloadMessageIds?: (messageIds: string[]) => void;
   onBuildStreamSystemContext?: (
-    args: Parameters<typeof streamContextBuilder.buildStreamSystemContext>[0]
+    args: Parameters<typeof streamContextBuilder.buildStreamSystemContext>[0],
+    instructionSources: Awaited<
+      ReturnType<typeof streamContextBuilder.buildStreamSystemContext>
+    >["instructionSources"]
   ) => void;
   onPrepareMessagesForProvider?: (
     args: Parameters<typeof messagePipeline.prepareMessagesForProvider>[0]
+  ) => void;
+  onExtractToolInstructions?: (
+    sources: Parameters<typeof systemMessageModule.extractToolInstructionsFromSources>[0]
   ) => void;
 }): ReturnType<typeof spyOn<typeof toolsModule, "getToolsForModel">> {
   spyOn(agentResolution, "resolveAgentForStream").mockResolvedValue(
@@ -322,8 +328,10 @@ function stubCommonStreamMessageDependencies(args: {
     });
   });
   spyOn(streamContextBuilder, "buildStreamSystemContext").mockImplementation((contextArgs) => {
-    args.onBuildStreamSystemContext?.(contextArgs);
+    const instructionSources = { global: [], context: [] };
+    args.onBuildStreamSystemContext?.(contextArgs, instructionSources);
     return Promise.resolve({
+      instructionSources,
       agentSystemPromptSections: ["test-agent-prompt"],
       systemMessage: "test-system-message",
       systemMessageTokens: 1,
@@ -343,7 +351,10 @@ function stubCommonStreamMessageDependencies(args: {
   const getToolsForModelSpy = spyOn(toolsModule, "getToolsForModel").mockResolvedValue(
     args.allTools ?? {}
   );
-  spyOn(systemMessageModule, "readToolInstructions").mockResolvedValue({});
+  spyOn(systemMessageModule, "extractToolInstructionsFromSources").mockImplementation((sources) => {
+    args.onExtractToolInstructions?.(sources);
+    return {};
+  });
 
   const providerModelFactory = Reflect.get(args.service, "providerModelFactory") as
     | ProviderModelFactory
@@ -1440,6 +1451,43 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
 
   afterEach(() => {
     mock.restore();
+  });
+
+  it("reuses the stream context instruction snapshot for tool extraction", async () => {
+    using xumHome = new DisposableTempDir("ai-service-instruction-snapshot");
+    const projectPath = path.join(xumHome.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const workspaceId = "workspace-instruction-snapshot";
+    const metadata = createLocalWorkspaceMetadata(workspaceId, projectPath);
+    const { config, historyService, initStateManager, service } = createBasicAIService(
+      xumHome.path
+    );
+    let builtSources: unknown;
+    let extractedSources: unknown;
+    stubCommonStreamMessageDependencies({
+      service,
+      config,
+      historyService,
+      initStateManager,
+      metadata,
+      onBuildStreamSystemContext: (_args, instructionSources) => {
+        builtSources = instructionSources;
+      },
+      onExtractToolInstructions: (instructionSources) => {
+        extractedSources = instructionSources;
+      },
+    });
+
+    const result = await service.streamMessage({
+      messages: [createMuxMessage("latest-user", "user", "hello")],
+      workspaceId,
+      modelString: "openai:gpt-5.2",
+      thinkingLevel: "off",
+    });
+
+    expect(result.success).toBe(true);
+    expect(extractedSources).toBe(builtSources);
   });
 
   it("keeps set_goal disabled for one-shot streams that do not opt into agent-created goals", async () => {

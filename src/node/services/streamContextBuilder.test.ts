@@ -13,6 +13,7 @@ import { getPlanFilePath } from "@/common/utils/planStorage";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { DisposableTempDir } from "@/node/services/tempDir";
 
+import { extractToolInstructionsFromSources } from "./systemMessage";
 import { buildPlanInstructions, buildStreamSystemContext } from "./streamContextBuilder";
 
 class TestRuntime extends LocalRuntime {
@@ -262,6 +263,50 @@ class RestrictedTestRuntime extends TestRuntime {
 }
 
 describe("buildStreamSystemContext", () => {
+  test("returns the instruction source snapshot used to build the system message", async () => {
+    using tempRoot = new DisposableTempDir("stream-system-context-instruction-snapshot");
+
+    const projectPath = path.join(tempRoot.path, "project");
+    const xumHome = path.join(tempRoot.path, "xum-home");
+    await fs.mkdir(path.join(projectPath, ".xum"), { recursive: true });
+    await fs.mkdir(xumHome, { recursive: true });
+    await fs.writeFile(
+      path.join(projectPath, ".xum", "AGENTS.md"),
+      ["Project prompt guidance.", "", "## Tool: bash", "Use the project bash workflow.", ""].join(
+        "\n"
+      )
+    );
+
+    const metadata = createWorkspaceMetadata({
+      id: "instruction-snapshot-ws",
+      name: "instruction-snapshot-workspace",
+      projectName: "project",
+      projectPath,
+    });
+    const cfg = createProjectsConfig({
+      projectPath,
+      workspaces: [{ id: metadata.id, name: metadata.name }],
+    });
+
+    const result = await buildSystemContextForTest({
+      runtime: new TestRuntime(projectPath, xumHome),
+      metadata,
+      workspacePath: projectPath,
+      cfg,
+      isSubagentWorkspace: false,
+    });
+
+    expect(result.systemMessage).toContain("Project prompt guidance.");
+    expect(
+      extractToolInstructionsFromSources(
+        result.instructionSources,
+        "openai:gpt-5.2",
+        metadata,
+        result.agentSystemPromptSections
+      ).bash
+    ).toContain("Use the project bash workflow.");
+  });
+
   test("includes proactive memory guidance only when the memory tool is available", async () => {
     using tempRoot = new DisposableTempDir("stream-system-context-memory-guidance");
 

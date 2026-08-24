@@ -305,6 +305,28 @@ export function extractToolInstructions(
  * @param agentInstructions - Optional agent definition body (searched first for tool sections)
  * @returns Map of tool names to their additional instructions
  */
+export function extractToolInstructionsFromSources(
+  sources: InstructionSources,
+  modelString: string,
+  metadata: WorkspaceMetadata,
+  agentInstructions?: readonly string[]
+): Record<string, string> {
+  // Tool extraction joins sources highest-precedence first (agent → context →
+  // global), the opposite of prompt order. `sources.global` is compat-first
+  // for the prompt, so reverse it here to keep native guidance ahead of the
+  // ~/.claude/CLAUDE.md compatibility source.
+  const globalContents = collectInstructionContents([...sources.global].reverse());
+  const contextContents = collectInstructionContents(sources.context);
+
+  return extractToolInstructions(globalContents, contextContents, modelString, {
+    ...getToolAvailabilityOptions({
+      workspaceId: metadata.id,
+      parentWorkspaceId: metadata.parentWorkspaceId,
+    }),
+    agentInstructions,
+  });
+}
+
 export async function readToolInstructions(
   metadata: WorkspaceMetadata,
   runtime: Runtime,
@@ -325,20 +347,7 @@ export async function readToolInstructions(
     projectConfigs,
     claudeSkillsCompatEnabled
   );
-  // Tool extraction joins sources highest-precedence first (agent → context →
-  // global), the opposite of prompt order. `sources.global` is compat-first
-  // for the prompt, so reverse it here to keep native guidance ahead of the
-  // ~/.claude/CLAUDE.md compatibility source.
-  const globalContents = collectInstructionContents([...sources.global].reverse());
-  const contextContents = collectInstructionContents(sources.context);
-
-  return extractToolInstructions(globalContents, contextContents, modelString, {
-    ...getToolAvailabilityOptions({
-      workspaceId: metadata.id,
-      parentWorkspaceId: metadata.parentWorkspaceId,
-    }),
-    agentInstructions,
-  });
+  return extractToolInstructionsFromSources(sources, modelString, metadata, agentInstructions);
 }
 
 /**
@@ -481,6 +490,22 @@ function deriveSubProjectRelativePath(projectPath: string, subProjectPath: strin
  * @param claudeSkillsCompatEnabled - Whether to include ~/.claude/CLAUDE.md before native globals
  * @returns Structured instruction sources (ordered global and context entries)
  */
+export async function loadWorkspaceInstructionSources(
+  metadata: WorkspaceMetadata,
+  runtime: Runtime,
+  workspacePath: string,
+  projectConfigs?: Map<string, ProjectConfig>,
+  claudeSkillsCompatEnabled = false
+): Promise<InstructionSources> {
+  return loadInstructionSources(
+    metadata,
+    runtime,
+    subProjectAwareWorkspaceRoot(metadata, runtime, workspacePath),
+    projectConfigs,
+    claudeSkillsCompatEnabled
+  );
+}
+
 export async function loadInstructionSources(
   metadata: WorkspaceMetadata,
   runtime: Runtime,
@@ -589,6 +614,25 @@ function buildProjectSettingsInstructionSets(
  * @param mcpServers - Optional MCP server configuration (name -> command)
  * @throws Error if metadata or workspacePath invalid
  */
+export interface BuildSystemMessageFromSourcesOptions {
+  /**
+   * Resolved agent prompt as independently-authored sections (agent body,
+   * subagent append_prompt, advisor guidance, …). Per-section so a trailing
+   * scoped heading in one section cannot swallow the next section's text.
+   */
+  agentSystemPromptSections?: readonly string[];
+  /**
+   * Active mode identifiers used to extract "Mode: <mode>" sections from
+   * Xum-dedicated instruction sources. The first entry names the injected tag.
+   */
+  modes?: readonly string[];
+}
+
+interface BuildSystemMessageOptions extends BuildSystemMessageFromSourcesOptions {
+  projectConfigs?: Map<string, ProjectConfig>;
+  claudeSkillsCompatEnabled?: boolean;
+}
+
 export async function buildSystemMessage(
   metadata: WorkspaceMetadata,
   runtime: Runtime,
@@ -596,30 +640,39 @@ export async function buildSystemMessage(
   additionalSystemInstructions?: string,
   modelString?: string,
   mcpServers?: MCPServerMap,
-  options?: {
-    /**
-     * Resolved agent prompt as independently-authored sections (agent body,
-     * subagent append_prompt, advisor guidance, …). Per-section so a trailing
-     * scoped heading in one section cannot swallow the next section's text.
-     */
-    agentSystemPromptSections?: readonly string[];
-    /**
-     * Active mode identifiers used to extract "Mode: <mode>" sections from
-     * Xum-dedicated instruction sources: the effective mode (plan/exec/compact)
-     * plus the agent id, so "Mode: plan" covers custom plan-like agents and
-     * "Mode: <agent>" covers per-agent sections. The first entry names the
-     * injected <mode-...> tag. Duplicates are ignored.
-     */
-    modes?: readonly string[];
-    /**
-     * Project configs from ~/.mux/config.json, used to append per-project
-     * `customInstructions` (Settings → Instructions) to the prompt.
-     */
-    projectConfigs?: Map<string, ProjectConfig>;
-    /** Read ~/.claude/CLAUDE.md as a lowest-precedence global compatibility source. */
-    claudeSkillsCompatEnabled?: boolean;
-  }
+  options?: BuildSystemMessageOptions
 ): Promise<string> {
+  if (!metadata) throw new Error("Invalid workspace metadata: metadata is required");
+  if (!workspacePath) throw new Error("Invalid workspace path: workspacePath is required");
+
+  const workspaceRootPath = subProjectAwareWorkspaceRoot(metadata, runtime, workspacePath);
+  const instructionSources = await loadInstructionSources(
+    metadata,
+    runtime,
+    workspaceRootPath,
+    options?.projectConfigs,
+    options?.claudeSkillsCompatEnabled
+  );
+  return buildSystemMessageFromSources(
+    metadata,
+    instructionSources,
+    workspacePath,
+    additionalSystemInstructions,
+    modelString,
+    mcpServers,
+    options
+  );
+}
+
+export function buildSystemMessageFromSources(
+  metadata: WorkspaceMetadata,
+  instructionSources: InstructionSources,
+  workspacePath: string,
+  additionalSystemInstructions?: string,
+  modelString?: string,
+  mcpServers?: MCPServerMap,
+  options?: BuildSystemMessageFromSourcesOptions
+): string {
   if (!metadata) throw new Error("Invalid workspace metadata: metadata is required");
   if (!workspacePath) throw new Error("Invalid workspace path: workspacePath is required");
 
@@ -648,18 +701,6 @@ export async function buildSystemMessage(
   // tool descriptions (agent_skill_read, task) for better model attention per Anthropic
   // best practices. See tools.ts ToolConfiguration.availableSkills/availableSubagents.
 
-  // Read instruction sets
-  // Sub-project workspaces pass the execution path (root + subProject); fall
-  // back to the resolved root so the parent project's AGENTS.md is still read.
-  // For non-sub-project workspaces this is a no-op (root === execution path).
-  const workspaceRootPath = subProjectAwareWorkspaceRoot(metadata, runtime, workspacePath);
-  const instructionSources = await loadInstructionSources(
-    metadata,
-    runtime,
-    workspaceRootPath,
-    options?.projectConfigs,
-    options?.claudeSkillsCompatEnabled
-  );
   // Xum-dedicated per-file contents (<dir>/.xum/AGENTS.md context files, then
   // native ~/.xum global files). Claude compatibility instructions are shared.
   // Scoped Model:/Mode: directives are honored ONLY in Xum-dedicated sources
