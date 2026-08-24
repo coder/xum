@@ -13654,6 +13654,46 @@ describe("TaskService", () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
+  test("sendAgentTreeMessage rechecks hard interruption at admission after awaited lookups", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "child-a", "child-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    // Simulate the user's Stop landing DURING the awaited pre-send lookup (interruptStream
+    // marks suppression without taking the target's event lock): the admission-time recheck
+    // must cancel the send instead of restarting the stopped ancestor.
+    const internals = taskService as unknown as {
+      getActiveWorkspaceTurnMuxMetadataForWorkspace: (workspaceId: string) => Promise<null>;
+    };
+    internals.getActiveWorkspaceTurnMuxMetadataForWorkspace = (workspaceId) => {
+      taskService.markParentWorkspaceInterrupted(workspaceId);
+      return Promise.resolve(null);
+    };
+
+    expect(await taskService.sendAgentTreeMessage("child-a", "tree-root", "status?")).toEqual(
+      Err({
+        code: "refused",
+        reason:
+          "Target was interrupted by the user and will not accept agent messages until the user resumes it.",
+      })
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   test("sendAgentTreeMessage carries the target's active workspace-turn correlation on the trigger", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");

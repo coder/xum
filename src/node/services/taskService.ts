@@ -5210,17 +5210,18 @@ export class TaskService {
       // undo the stop by queueing or starting another turn on the interrupted workspace. The
       // suppression set holds the ANCESTOR the user interrupted, so check the target's whole
       // ancestor chain — the termination cascade may not have reached a lower target yet.
-      if (
+      const targetChainInterrupted = (): boolean =>
         [
           targetId,
           ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, targetId),
-        ].some((id) => this.interruptedParentWorkspaceIds.has(id))
-      ) {
-        return Err({
-          code: "refused" as const,
-          reason:
-            "Target was interrupted by the user and will not accept agent messages until the user resumes it.",
-        });
+        ].some((id) => this.interruptedParentWorkspaceIds.has(id));
+      const interruptedRefusal = {
+        code: "refused" as const,
+        reason:
+          "Target was interrupted by the user and will not accept agent messages until the user resumes it.",
+      };
+      if (targetChainInterrupted()) {
+        return Err(interruptedRefusal);
       }
 
       const throttleError = this.checkPeerMessageThrottles(
@@ -5342,6 +5343,15 @@ export class TaskService {
         uiVisible: true,
         muxMetadata,
       });
+
+      // Recheck immediately before admission: resolveParentAutoResumeOptions and the
+      // workspace-turn lookup awaited since the first check, and interruptStream marks
+      // suppression WITHOUT taking the target's event lock — a Stop landing in that window must
+      // still win over the queued wake.
+      if (targetChainInterrupted()) {
+        refundBudget();
+        return Err(interruptedRefusal);
+      }
 
       let accepted = false;
       let payloadPersisted = false;
