@@ -655,6 +655,19 @@ export class TerminalService {
             // its live tokens.
             if (createdBatch && batch.tokens.size === 0) {
               this.nativeTerminalMarkerBatches.delete(workspaceId);
+              // The failed write may still have created (or truncated) the marker file —
+              // ENOSPC and I/O errors can reject after the open. When this batch's probe
+              // proved absence, that artifact is ours and no launch backs it: left behind,
+              // it reads as durable launch evidence across restarts and classifies as
+              // pre-existing on retry. An "unknown" probe stays fail closed (never unlink
+              // what might predate us); unlink failure only over-refuses archives.
+              if (!batch.markerPreexisted) {
+                try {
+                  await fs.promises.unlink(markerPath);
+                } catch {
+                  // Best-effort (fail closed).
+                }
+              }
             }
             throw error;
           }

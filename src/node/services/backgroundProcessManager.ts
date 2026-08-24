@@ -1603,10 +1603,11 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       if (meta == null) {
         // A record we cannot read or parse cannot prove its process exited: spawn aborts
         // (and terminates the process, writing the exit marker) when the initial record
-        // fails to persist, and failed spawns remove their directory — so a markerless
-        // unreadable record is a crash artifact whose process may still be alive. Trust
-        // only the exit marker; otherwise fail closed (the model-facing caller routes to
-        // user-mediated archive).
+        // fails to persist, and cleanly failed spawns remove their directory — ambiguous
+        // launches (spawn succeeded but the PID echo was garbled) intentionally keep
+        // theirs — so a markerless meta-less record is a crash artifact or untracked
+        // launch whose process may still be alive. Trust only the exit marker; otherwise
+        // fail closed (the model-facing caller routes to user-mediated archive).
         try {
           await fsPromises.access(nodePath.join(processDir, BG_EXIT_CODE_FILENAME));
           continue;

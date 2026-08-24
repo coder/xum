@@ -234,8 +234,15 @@ export async function spawnProcess(
 
     const pid = parsePid(result.stdout);
     if (!pid) {
+      // Ambiguous launch: the spawn command succeeded (exit 0), so the detached shell is
+      // likely running — only its PID echo was garbled (e.g. an SSH login banner prefixing
+      // the output). Unlike the clean failures above, do NOT remove the directory: the
+      // wrapper owns output.log/exit_code there, and on local runtimes a meta-less record
+      // without an exit marker keeps hasOrphanedRunningBackgroundProcesses fail closed
+      // until the trap writes the exit marker (self-healing). Deleting it would leave the
+      // command running with no durable trace for archive gating to see. (Remote records
+      // cannot feed the local probe; remote crash-orphan gating is tracked in #3944.)
       log.debug(`BackgroundProcessExecutor.spawnProcess: Invalid PID: ${result.stdout}`);
-      await removeOutputDirBestEffort();
       return {
         success: false,
         error: `Failed to get valid PID from spawn: ${result.stdout}`,

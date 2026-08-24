@@ -152,13 +152,32 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
           "Cannot open the editor while disconnected from Xum: the open must be recorded first so archive safety checks can see it. Retry once reconnected.",
       };
     }
+    // Generated client-side BEFORE admission so it survives response loss: if the backend
+    // commits the reservation but the connection drops before the response arrives, this
+    // token is the only handle that can still redeem the rollback.
+    const launchToken = crypto.randomUUID();
     try {
-      const recorded = await args.api.general.recordEditorOpen({ workspaceId: args.workspaceId });
+      const recorded = await args.api.general.recordEditorOpen({
+        workspaceId: args.workspaceId,
+        launchToken,
+      });
       if (!recorded.success) {
         return { error: recorded.error };
       }
-      return { launchToken: recorded.data.launchToken };
+      return { launchToken };
     } catch (error) {
+      // Ambiguous outcome: the backend may have committed the reservation even though the
+      // response was lost, and this open will not launch. Best-effort reconciliation with
+      // the client-known token — an idempotent no-op if nothing was committed; if this
+      // also fails, the durable marker stays (fail closed).
+      try {
+        await args.api.general.rollbackEditorOpen({
+          workspaceId: args.workspaceId,
+          launchToken,
+        });
+      } catch {
+        // Fail closed.
+      }
       return {
         error: `Cannot open the editor: recording the open failed (${error instanceof Error ? error.message : String(error)}), and archive safety checks depend on that record.`,
       };

@@ -7795,11 +7795,15 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * Rollback handles for renderer-recorded deep-link opens, keyed by an opaque launch token
-   * returned to the renderer. The renderer redeems a token via rollbackRecordedEditorOpen
-   * only when its placeholder window was closed before navigation (the deep link provably
-   * never launched). Entries for successful launches are retained for the app session —
-   * they pin the batch token that keeps the durable marker protected.
+   * Rollback handles for renderer-recorded deep-link opens, keyed by the CLIENT-generated
+   * launch token (client-side so the renderer can still redeem it when the recording
+   * response is lost mid-connection — a backend-minted token would die with the response).
+   * The renderer redeems a token via rollbackRecordedEditorOpen only when its launch
+   * provably never happened (placeholder closed before navigation, or an ambiguous
+   * recording RPC whose launch was abandoned). Entries for successful launches are retained
+   * for the app session — they pin the batch token that keeps the durable marker protected.
+   * A (buggy) reused token overwrites its old entry, whose pinned launch evidence then only
+   * over-refuses (fail closed).
    */
   private readonly externalEditorLaunchRollbacks = new Map<
     string,
@@ -7813,20 +7817,20 @@ export class WorkspaceService extends EventEmitter {
    * first refuses the open while an open recorded first is observed by the sink's
    * untrackable-app check before snapshot capture.
    */
-  async recordExternalEditorOpen(workspaceId: string): Promise<Result<{ launchToken: string }>> {
+  async recordExternalEditorOpen(workspaceId: string, launchToken: string): Promise<Result<void>> {
     const admitted = await this.recordExternalEditorOpenForLaunch(workspaceId);
     if (!admitted.success) {
       return admitted;
     }
-    // Deep-link opens launch in the renderer immediately after this returns; the token lets
-    // the renderer report the one provable non-launch (its placeholder window was closed
-    // before navigation) so the marker cannot outlive a launch that never happened.
-    const launchToken = crypto.randomUUID();
+    // Deep-link opens launch in the renderer immediately after this returns; the rollback
+    // entry lets the renderer report a launch that provably never happened so the marker
+    // cannot outlive it (see externalEditorLaunchRollbacks for why the token is
+    // client-generated).
     this.externalEditorLaunchRollbacks.set(launchToken, {
       workspaceId,
       rollback: admitted.data.rollbackAfterFailedLaunch,
     });
-    return Ok({ launchToken });
+    return Ok(undefined);
   }
 
   /**
@@ -7938,6 +7942,19 @@ export class WorkspaceService extends EventEmitter {
           // attempt re-probe the recovered disk. A joined batch keeps its live tokens.
           if (createdBatch && batch.tokens.size === 0) {
             this.externalEditorMarkerBatches.delete(workspaceId);
+            // The failed write may still have created (or truncated) the marker file —
+            // ENOSPC and I/O errors can reject after the open. When this batch's probe
+            // proved absence, that artifact is ours and no launch backs it: left behind, it
+            // reads as durable launch evidence across restarts and classifies as
+            // pre-existing on retry. An "unknown" probe stays fail closed (never unlink
+            // what might predate us); unlink failure only over-refuses archives.
+            if (!batch.markerPreexisted) {
+              try {
+                await fsPromises.unlink(markerPath);
+              } catch {
+                // Best-effort (fail closed).
+              }
+            }
           }
           throw error;
         }

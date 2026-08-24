@@ -2845,7 +2845,10 @@ export const router = (authToken?: string) => {
         .input(schemas.general.recordEditorOpen.input)
         .output(schemas.general.recordEditorOpen.output)
         .handler(async ({ context, input }) => {
-          return context.workspaceService.recordExternalEditorOpen(input.workspaceId);
+          return context.workspaceService.recordExternalEditorOpen(
+            input.workspaceId,
+            input.launchToken
+          );
         }),
       rollbackEditorOpen: t
         .input(schemas.general.rollbackEditorOpen.input)

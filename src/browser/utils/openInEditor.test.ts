@@ -76,8 +76,7 @@ describe("openInEditor", () => {
   function createApiStub(extra?: Record<string, unknown>): APIClient {
     return {
       general: {
-        recordEditorOpen: () =>
-          Promise.resolve({ success: true, data: { launchToken: "launch-token" } }),
+        recordEditorOpen: () => Promise.resolve({ success: true }),
       },
       ...extra,
     } as unknown as APIClient;
@@ -178,9 +177,7 @@ describe("openInEditor", () => {
 
   test("does not record the open when a deterministic compatibility check refuses", async () => {
     const calls: OpenCall[] = [];
-    const recordEditorOpen = mock(() =>
-      Promise.resolve({ success: true, data: { launchToken: "launch-token" } })
-    );
+    const recordEditorOpen = mock(() => Promise.resolve({ success: true }));
     const api = { general: { recordEditorOpen } } as unknown as APIClient;
 
     // Zed + Docker is refused deterministically with no launch; recording first would leave
@@ -230,10 +227,10 @@ describe("openInEditor", () => {
   test("refuses to launch when recording the open fails", async () => {
     const calls: OpenCall[] = [];
 
+    const recordEditorOpen = mock(() => Promise.reject(new Error("connection lost")));
+    const rollbackEditorOpen = mock(() => Promise.resolve({ success: true }));
     const api = {
-      general: {
-        recordEditorOpen: () => Promise.reject(new Error("connection lost")),
-      },
+      general: { recordEditorOpen, rollbackEditorOpen },
     } as unknown as APIClient;
 
     const result = await withWindow(createMockWindow(calls), () =>
@@ -248,6 +245,15 @@ describe("openInEditor", () => {
 
     expect(result.success).toBe(false);
     expect(calls.length).toBe(0);
+    // An ambiguous RPC failure may have committed the reservation backend-side; the
+    // client-generated token enables best-effort reconciliation.
+    const recordCall = recordEditorOpen.mock.calls[0] as unknown as [
+      { workspaceId: string; launchToken: string },
+    ];
+    expect(rollbackEditorOpen).toHaveBeenCalledWith({
+      workspaceId,
+      launchToken: recordCall[0].launchToken,
+    });
   });
 
   test("browser mode: opens a placeholder synchronously and navigates it to the deep link", async () => {
@@ -255,9 +261,7 @@ describe("openInEditor", () => {
     const { windowValue, placeholder } = createBrowserModeWindow(calls);
     // Resolving this recording RPC yields the microtask queue, exactly the await that would
     // outlast the click's transient user activation if window.open ran after it.
-    const recordEditorOpen = mock(() =>
-      Promise.resolve({ success: true, data: { launchToken: "launch-token" } })
-    );
+    const recordEditorOpen = mock(() => Promise.resolve({ success: true }));
     const api = { general: { recordEditorOpen } } as unknown as APIClient;
 
     const result = await withWindow(windowValue, () =>
@@ -311,7 +315,7 @@ describe("openInEditor", () => {
     // navigation would target a dead WindowProxy, so the durable marker must be rolled back.
     const recordEditorOpen = mock(() => {
       placeholder.closed = true;
-      return Promise.resolve({ success: true, data: { launchToken: "tok-closed" } });
+      return Promise.resolve({ success: true });
     });
     const rollbackEditorOpen = mock(() => Promise.resolve({ success: true }));
     const api = { general: { recordEditorOpen, rollbackEditorOpen } } as unknown as APIClient;
@@ -328,16 +332,21 @@ describe("openInEditor", () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toContain("closed");
-    expect(rollbackEditorOpen).toHaveBeenCalledWith({ workspaceId, launchToken: "tok-closed" });
+    // The client-generated token given to recordEditorOpen is the one redeemed.
+    const recordCall = recordEditorOpen.mock.calls[0] as unknown as [
+      { workspaceId: string; launchToken: string },
+    ];
+    expect(rollbackEditorOpen).toHaveBeenCalledWith({
+      workspaceId,
+      launchToken: recordCall[0].launchToken,
+    });
     expect(placeholder.navigations.length).toBe(0);
   });
 
   test("browser mode: refuses without recording when the placeholder closed before admission", async () => {
     const calls: OpenCall[] = [];
     const { windowValue, placeholder } = createBrowserModeWindow(calls);
-    const recordEditorOpen = mock(() =>
-      Promise.resolve({ success: true, data: { launchToken: "launch-token" } })
-    );
+    const recordEditorOpen = mock(() => Promise.resolve({ success: true }));
     // The devcontainer-info await runs before admission; the user closes the tab during it.
     const api = {
       general: { recordEditorOpen },

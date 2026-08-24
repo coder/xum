@@ -144,6 +144,21 @@ const PRESERVE_OUTPUT_TOOLS = new Set([
  * renders from.
  */
 function redactWorkspaceLifecycleOutputForSharing(output: unknown): unknown {
+  // Persistence may wrap the result in the SDK JSON container ({ type: "json", value })
+  // — the renderer unwraps this exact shape (see toolUtils.unwrapResult) — so redaction
+  // must unwrap, redact, and rewrap or a wrapped export would leak the local paths this
+  // function exists to remove.
+  if (
+    typeof output === "object" &&
+    output !== null &&
+    "type" in output &&
+    (output as { type: unknown }).type === "json" &&
+    "value" in output
+  ) {
+    const wrapper = output as { value: unknown };
+    const redactedValue = redactWorkspaceLifecycleOutputForSharing(wrapper.value);
+    return redactedValue === wrapper.value ? output : { ...wrapper, value: redactedValue };
+  }
   if (typeof output !== "object" || output === null || !("results" in output)) return output;
   const { results } = output;
   if (!Array.isArray(results)) return output;

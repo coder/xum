@@ -11219,7 +11219,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
     addToArchivingWorkspaces(workspaceService, workspaceId);
 
-    const result = await workspaceService.recordExternalEditorOpen(workspaceId);
+    const result = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-refused");
 
     expect(result.success).toBe(false);
     if (!result.success) {
@@ -11235,7 +11235,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
     // Unknown IDs never reach the marker path (which joins the raw ID beneath the sessions
     // directory), closing both stale-ID requests and traversal-crafted IDs.
-    const result = await workspaceService.recordExternalEditorOpen("../../etc-trap");
+    const result = await workspaceService.recordExternalEditorOpen("../../etc-trap", "tok-trap");
 
     expect(result.success).toBe(false);
     if (!result.success) {
@@ -11257,7 +11257,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
     expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
 
-    const result = await workspaceService.recordExternalEditorOpen(workspaceId);
+    const result = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-marks");
     expect(result.success).toBe(true);
     expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
 
@@ -11305,23 +11305,25 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   test("rollbackRecordedEditorOpen redeems a renderer launch token", async () => {
     await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
 
-    const recorded = await workspaceService.recordExternalEditorOpen(workspaceId);
+    // Client-generated token: the renderer knows it even when the recording response is
+    // lost, so an ambiguous outcome can still be reconciled.
+    const recorded = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-redeem");
     expect(recorded.success).toBe(true);
-    if (!recorded.success) return;
     expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
 
     // The renderer's placeholder window was closed before navigation: the deep link provably
     // never launched, so redeeming the token must roll the durable marker back.
-    const rolledBack = await workspaceService.rollbackRecordedEditorOpen(
-      workspaceId,
-      recorded.data.launchToken
-    );
+    const rolledBack = await workspaceService.rollbackRecordedEditorOpen(workspaceId, "tok-redeem");
     expect(rolledBack.success).toBe(true);
     expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
 
-    // Idempotent: redeeming again is a safe no-op.
+    // Idempotent: redeeming again (or redeeming a token that was never committed) is a
+    // safe no-op.
     expect(
-      (await workspaceService.rollbackRecordedEditorOpen(workspaceId, recorded.data.launchToken))
+      (await workspaceService.rollbackRecordedEditorOpen(workspaceId, "tok-redeem")).success
+    ).toBe(true);
+    expect(
+      (await workspaceService.rollbackRecordedEditorOpen(workspaceId, "tok-never-committed"))
         .success
     ).toBe(true);
   });
@@ -11406,7 +11408,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(failing.success).toBe(true);
     // A deep-link open recorded meanwhile launches in the renderer unconditionally; its
     // evidence must keep protecting the marker when the custom-editor launch fails.
-    const deepLink = await workspaceService.recordExternalEditorOpen(workspaceId);
+    const deepLink = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-deep-link");
     expect(deepLink.success).toBe(true);
     if (!failing.success) return;
 
