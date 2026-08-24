@@ -600,7 +600,7 @@ describe("probeServerForBearerChallenge", () => {
   });
 });
 
-describe("McpOauthService.startDesktopFlow", () => {
+describe("McpOauthService OAuth flows", () => {
   let xumHome: string;
   let projectPath: string;
   let config: Config;
@@ -722,6 +722,141 @@ describe("McpOauthService.startDesktopFlow", () => {
       await service.cancelDesktopFlow(startResult.data.flowId);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  test("reuses authorization server discovery when exchanging the callback code", async () => {
+    let authorizationServerUrl = "";
+    let resourceServerUrl = "";
+    let resourceMetadataUrl = "";
+    let tokenRequest: URLSearchParams | undefined;
+
+    const authorizationServer = createServer((req, res) => {
+      void (async () => {
+        const pathname = (req.url ?? "/").split("?")[0];
+
+        if (pathname === "/.well-known/oauth-authorization-server") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              issuer: authorizationServerUrl,
+              authorization_endpoint: `${authorizationServerUrl}/authorize`,
+              token_endpoint: `${authorizationServerUrl}/token`,
+              registration_endpoint: `${authorizationServerUrl}/register`,
+              response_types_supported: ["code"],
+              code_challenge_methods_supported: ["S256"],
+            })
+          );
+          return;
+        }
+
+        if (pathname === "/register") {
+          let raw = "";
+          for await (const chunk of req) {
+            raw += Buffer.from(chunk as Uint8Array).toString("utf-8");
+          }
+
+          const clientMetadata = JSON.parse(raw) as Record<string, unknown>;
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ...clientMetadata, client_id: "test-client-id" }));
+          return;
+        }
+
+        if (pathname === "/token") {
+          let raw = "";
+          for await (const chunk of req) {
+            raw += Buffer.from(chunk as Uint8Array).toString("utf-8");
+          }
+          tokenRequest = new URLSearchParams(raw);
+
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              access_token: "test-access-token",
+              token_type: "Bearer",
+              refresh_token: "test-refresh-token",
+            })
+          );
+          return;
+        }
+
+        res.statusCode = 404;
+        res.end("Not found");
+      })();
+    });
+
+    const resourceServer = createServer((req, res) => {
+      const pathname = (req.url ?? "/").split("?")[0];
+
+      if (pathname === "/oauth-resource") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            resource: resourceServerUrl,
+            authorization_servers: [authorizationServerUrl],
+          })
+        );
+        return;
+      }
+
+      res.statusCode = 401;
+      res.setHeader(
+        "WWW-Authenticate",
+        `Bearer scope="mcp.read" resource_metadata="${resourceMetadataUrl}"`
+      );
+      res.end("Unauthorized");
+    });
+
+    await new Promise<void>((resolve) => authorizationServer.listen(0, "127.0.0.1", resolve));
+    await new Promise<void>((resolve) => resourceServer.listen(0, "127.0.0.1", resolve));
+
+    try {
+      const authorizationAddress = authorizationServer.address();
+      const resourceAddress = resourceServer.address();
+      if (
+        !authorizationAddress ||
+        typeof authorizationAddress === "string" ||
+        !resourceAddress ||
+        typeof resourceAddress === "string"
+      ) {
+        throw new Error("Failed to bind OAuth test servers");
+      }
+
+      authorizationServerUrl = `http://127.0.0.1:${authorizationAddress.port}`;
+      resourceServerUrl = `http://127.0.0.1:${resourceAddress.port}/mcp`;
+      resourceMetadataUrl = `http://127.0.0.1:${resourceAddress.port}/oauth-resource`;
+
+      const serverName = "oauth-server-separate-issuer";
+      const addResult = await mcpConfigService.addServer(serverName, {
+        transport: "http",
+        url: resourceServerUrl,
+      });
+      expect(addResult).toEqual({ success: true, data: undefined });
+
+      const startResult = await service.startServerFlow({
+        projectPath,
+        serverName,
+        redirectUri: "https://xum.example/callback",
+      });
+      expect(startResult.success).toBe(true);
+      if (!startResult.success) {
+        throw new Error(startResult.error);
+      }
+
+      const callbackResult = await service.handleServerCallbackAndExchange({
+        state: startResult.data.flowId,
+        code: "test-authorization-code",
+        error: null,
+      });
+
+      expect(callbackResult).toEqual({ success: true, data: undefined });
+      expect(tokenRequest?.get("code")).toBe("test-authorization-code");
+      expect(tokenRequest?.get("code_verifier")).toBeTruthy();
+    } finally {
+      await Promise.all([
+        new Promise<void>((resolve) => authorizationServer.close(() => resolve())),
+        new Promise<void>((resolve) => resourceServer.close(() => resolve())),
+      ]);
     }
   });
 
