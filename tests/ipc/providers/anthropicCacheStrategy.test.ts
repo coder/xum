@@ -5,7 +5,11 @@ import { sendMessageWithModel, createStreamCollector, HAIKU_MODEL } from "../hel
 const hasAnthropicKey = Boolean(process.env.ANTHROPIC_API_KEY);
 const shouldRunSuite = shouldRunIntegrationTests() && hasAnthropicKey;
 const describeIntegration = shouldRunSuite ? describe : describe.skip;
-const TEST_TIMEOUT_MS = 45000; // 45s total: setup + 2 messages at 15s each
+// 120s total for setup + 2 live messages: 45s was calibrated for an idle machine, but
+// CI runners under merge-queue load inflate wall clock enough that it was exceeded
+// while sibling suites passed at 100s+ (merge-queue run 32665306160). Peer provider
+// tests already budget 45-150s per live call.
+const TEST_TIMEOUT_MS = 120000;
 
 if (shouldRunIntegrationTests() && !shouldRunSuite) {
   // eslint-disable-next-line no-console
