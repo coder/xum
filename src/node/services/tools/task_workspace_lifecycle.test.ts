@@ -2,6 +2,7 @@ import { describe, it, expect, mock } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 
 import { Ok, type Result } from "@/common/types/result";
+import { TaskWorkspaceLifecycleToolInputSchema } from "@/common/utils/tools/toolDefinitions";
 import type { TaskService } from "@/node/services/taskService";
 import { createTaskWorkspaceLifecycleTool } from "./task_workspace_lifecycle";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
@@ -157,6 +158,67 @@ describe("task_workspace_lifecycle tool", () => {
         acknowledgedUntrackedPathsByWorkspaceId: { "child-a": ["scratch.txt"] },
       }
     );
+  });
+
+  it("rejects blank acknowledged paths at the input schema boundary", () => {
+    // The archive sink asserts trimmed non-empty paths when normalizing acknowledgements; a
+    // blank entry must fail this call's validation instead of throwing inside the service.
+    const base = {
+      action: "archive" as const,
+      targets: [{ workspaceId: "child-a" }],
+    };
+    expect(
+      TaskWorkspaceLifecycleToolInputSchema.safeParse({
+        ...base,
+        acknowledged_untracked_paths: { "child-a": ["  "] },
+      }).success
+    ).toBe(false);
+    expect(
+      TaskWorkspaceLifecycleToolInputSchema.safeParse({
+        ...base,
+        acknowledged_untracked_paths: { "child-a": ["scratch.txt"] },
+      }).success
+    ).toBe(true);
+  });
+
+  it("isolates one target's unexpected throw as a per-target error result", async () => {
+    using tempDir = new TestTempDir("test-task-workspace-lifecycle-isolation");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
+
+    const archiveOwnedWorkspaceTurnWorkspace = mock(
+      (_owner: string, target: { workspaceId?: string }): Promise<Result<unknown, string>> => {
+        if (target.workspaceId === "child-b") {
+          throw new Error("unexpected lifecycle failure");
+        }
+        return Promise.resolve(
+          Ok({ status: "archived" as const, action: "archive" as const, workspaceId: "child-a" })
+        );
+      }
+    );
+    const taskService = { archiveOwnedWorkspaceTurnWorkspace } as unknown as TaskService;
+    const tool = createTaskWorkspaceLifecycleTool({ ...baseConfig, taskService });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!(
+        {
+          action: "archive",
+          targets: [{ workspaceId: "child-a" }, { workspaceId: "child-b" }],
+        },
+        mockToolCallOptions
+      )
+    );
+
+    expect(result).toEqual({
+      results: [
+        { status: "archived", action: "archive", workspaceId: "child-a" },
+        {
+          status: "error",
+          action: "archive",
+          workspaceId: "child-b",
+          error: "unexpected lifecycle failure",
+        },
+      ],
+    });
   });
 
   it("rejects non-workspace-turn task IDs without touching the task service", async () => {

@@ -593,6 +593,16 @@ export interface ArchiveWorkspaceOptions {
    * behavior read that drives the snapshot/deletion decisions.
    */
   forbidWorktreeCheckoutDeletion?: boolean;
+  /**
+   * Refuse to archive when live user activity exists at the sink (a stream, a send still in
+   * its pre-admission window, terminal sessions, or a desktop session). Model-facing callers
+   * set this so an agent-driven archive fails closed instead of silently terminating user
+   * work that started after the caller's earlier activity check. Checked synchronously in the
+   * same block that marks the workspace as archiving, pairing with sendMessage's synchronous
+   * entry guards: whichever side runs first is observed by the other. The user-driven archive
+   * path intentionally omits this and keeps its stop-activity semantics.
+   */
+  refuseLiveUserActivity?: boolean;
 }
 
 const ACTIVE_DESCENDANT_ARCHIVE_ERROR =
@@ -7519,11 +7529,8 @@ export class WorkspaceService extends EventEmitter {
         return Err("Workspace not found");
       }
 
-      const worktreeArchiveBehavior = this.getWorktreeArchiveBehavior();
       const snapshotBehaviorEnabled =
-        !this.isSharedTaskWorkspace(workspaceId) &&
-        worktreeArchiveBehavior === "snapshot" &&
-        this.worktreeArchiveSnapshotService != null;
+        this.isSnapshotArchiveEligibilityMutationSensitive(workspaceId);
 
       if (!snapshotBehaviorEnabled) {
         return Ok({ kind: "ready" as const });
@@ -7554,6 +7561,22 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
+   * True when this workspace's archive eligibility depends on its live untracked-file set:
+   * snapshot-behavior archives require an exact acknowledgement of the current untracked
+   * paths, so any worktree write can flip the archive between proceeding and bouncing with
+   * requires_confirmation. Model-facing lifecycle paths consult this to refuse interrupting
+   * active turns — a turn interrupted for an archive that then bounces would strand the
+   * workspace with destroyed in-flight work and no archive.
+   */
+  isSnapshotArchiveEligibilityMutationSensitive(workspaceId: string): boolean {
+    return (
+      !this.isSharedTaskWorkspace(workspaceId) &&
+      this.getWorktreeArchiveBehavior() === "snapshot" &&
+      this.worktreeArchiveSnapshotService != null
+    );
+  }
+
+  /**
    * Live user-facing activity that archiveUnlocked would silently terminate via
    * stopLiveWorkspaceActivityForArchive. Model-facing lifecycle paths consult this to refuse
    * archiving instead of killing activity that has no delegated workspace-turn handle.
@@ -7581,6 +7604,20 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
+   * Internal entry point for TaskService callers that already hold the task-tree lifecycle
+   * lock. The model-facing workspace lifecycle path pre-acquires that lock before its own
+   * lifecycle locks to preserve the global lock order (task-tree → task-creation mutex →
+   * workspace lifecycle), so the sink must not re-acquire it.
+   */
+  async archiveWhileTaskTreeLocked(
+    workspaceId: string,
+    acknowledgedUntrackedPaths?: string[],
+    options?: ArchiveWorkspaceOptions
+  ): Promise<Result<ArchiveWorkspaceResult>> {
+    return await this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths, options);
+  }
+
+  /**
    * Archive a workspace. Archived workspaces are hidden from the main sidebar
    * but can be viewed on the project page.
    *
@@ -7598,6 +7635,26 @@ export class WorkspaceService extends EventEmitter {
     this.archivingWorkspaces.add(workspaceId);
 
     try {
+      // Fail-closed live-activity gate for model-facing callers. This check and the
+      // archivingWorkspaces.add above run in one synchronous block, pairing with the
+      // synchronous entry guards in sendMessage: a send whose entry block ran first is
+      // visible here (preflightSendCounts or a registered stream) and refuses the archive;
+      // a send entering later observes archivingWorkspaces and is refused instead.
+      if (options?.refuseLiveUserActivity === true) {
+        const liveActivity = this.listLiveWorkspaceActivity(workspaceId);
+        const activityLabels: string[] = [];
+        if (liveActivity.streaming) activityLabels.push("an active stream");
+        if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
+          activityLabels.push("a message send in progress");
+        }
+        if (liveActivity.terminalSessions) activityLabels.push("open terminal sessions");
+        if (liveActivity.desktopSession) activityLabels.push("a desktop session");
+        if (activityLabels.length > 0) {
+          return Err(
+            `Workspace has live activity (${activityLabels.join(", ")}) that archiving would terminate. Wait for it to finish or ask the user to archive manually.`
+          );
+        }
+      }
       const workspace = this.config.findWorkspace(workspaceId);
       if (!workspace) {
         return Err("Workspace not found");
@@ -9526,6 +9583,35 @@ export class WorkspaceService extends EventEmitter {
           type: "unknown",
           raw: "Workspace is being deleted. Please wait and try again.",
         });
+      }
+
+      // Archive admission pairing (see archiveUnlocked's refuseLiveUserActivity gate): these
+      // checks run in the same synchronous block as the preflightSendCounts increment below,
+      // so a send and an archive always observe each other — whichever entry block runs first
+      // refuses the other side. Also refuses sends to already-archived workspaces so no stream
+      // can run hidden in a workspace the UI no longer surfaces.
+      if (this.archivingWorkspaces.has(workspaceId)) {
+        log.debug("sendMessage blocked: workspace is being archived", { workspaceId });
+        return Err({
+          type: "unknown",
+          raw: "Workspace is being archived. Unarchive it before sending messages.",
+        });
+      }
+      {
+        const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+        if (
+          workspaceEntry != null &&
+          isWorkspaceArchived(
+            workspaceEntry.workspace.archivedAt,
+            workspaceEntry.workspace.unarchivedAt
+          )
+        ) {
+          log.debug("sendMessage blocked: workspace is archived", { workspaceId });
+          return Err({
+            type: "unknown",
+            raw: "Workspace is archived. Unarchive it before sending messages.",
+          });
+        }
       }
 
       if (this.contextMutationWorkspaces.has(workspaceId)) {

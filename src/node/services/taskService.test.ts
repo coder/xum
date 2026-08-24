@@ -477,6 +477,7 @@ function createWorkspaceServiceMocks(
     unarchive: ReturnType<typeof mock>;
     preflightArchive: ReturnType<typeof mock>;
     listLiveWorkspaceActivity: ReturnType<typeof mock>;
+    isSnapshotArchiveEligibilityMutationSensitive: ReturnType<typeof mock>;
     deleteWorktree: ReturnType<typeof mock>;
     remove: ReturnType<typeof mock>;
     emit: ReturnType<typeof mock>;
@@ -510,6 +511,7 @@ function createWorkspaceServiceMocks(
   unarchive: ReturnType<typeof mock>;
   preflightArchive: ReturnType<typeof mock>;
   listLiveWorkspaceActivity: ReturnType<typeof mock>;
+  isSnapshotArchiveEligibilityMutationSensitive: ReturnType<typeof mock>;
   deleteWorktree: ReturnType<typeof mock>;
   remove: ReturnType<typeof mock>;
   emit: ReturnType<typeof mock>;
@@ -561,6 +563,10 @@ function createWorkspaceServiceMocks(
   const listLiveWorkspaceActivity =
     overrides?.listLiveWorkspaceActivity ??
     mock(() => ({ streaming: false, terminalSessions: false, desktopSession: false }));
+  // Default false = "keep"-style behavior where archive eligibility never depends on the
+  // untracked-file set, so interrupt_active tests exercise the interruption path.
+  const isSnapshotArchiveEligibilityMutationSensitive =
+    overrides?.isSnapshotArchiveEligibilityMutationSensitive ?? mock(() => false);
   const deleteWorktree =
     overrides?.deleteWorktree ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
   const remove =
@@ -611,9 +617,13 @@ function createWorkspaceServiceMocks(
       waitForPendingCompactionCompletionDecision,
       waitForPendingStreamErrorRecoveryDecision,
       archive,
+      // Same mock: the lifecycle path holds the (real) task-tree lock and calls the
+      // WhileTaskTreeLocked sink; assertions target one archive surface.
+      archiveWhileTaskTreeLocked: archive,
       unarchive,
       preflightArchive,
       listLiveWorkspaceActivity,
+      isSnapshotArchiveEligibilityMutationSensitive,
       deleteWorktree,
       removeWhileTaskTreeLocked: remove,
       remove,
@@ -646,6 +656,7 @@ function createWorkspaceServiceMocks(
     unarchive,
     preflightArchive,
     listLiveWorkspaceActivity,
+    isSnapshotArchiveEligibilityMutationSensitive,
     deleteWorktree,
     remove,
     emit,
@@ -923,6 +934,7 @@ describe("TaskService", () => {
       unarchive?: ReturnType<typeof mock>;
       preflightArchive?: ReturnType<typeof mock>;
       listLiveWorkspaceActivity?: ReturnType<typeof mock>;
+      isSnapshotArchiveEligibilityMutationSensitive?: ReturnType<typeof mock>;
       create?: ReturnType<typeof mock>;
     } = {}
   ) {
@@ -956,6 +968,12 @@ describe("TaskService", () => {
       ...(options.preflightArchive != null ? { preflightArchive: options.preflightArchive } : {}),
       ...(options.listLiveWorkspaceActivity != null
         ? { listLiveWorkspaceActivity: options.listLiveWorkspaceActivity }
+        : {}),
+      ...(options.isSnapshotArchiveEligibilityMutationSensitive != null
+        ? {
+            isSnapshotArchiveEligibilityMutationSensitive:
+              options.isSnapshotArchiveEligibilityMutationSensitive,
+          }
         : {}),
       ...(options.create != null ? { create: options.create } : {}),
     });
@@ -1017,6 +1035,7 @@ describe("TaskService", () => {
     );
     expect(archive).toHaveBeenCalledWith("childworkspace", undefined, {
       forbidWorktreeCheckoutDeletion: true,
+      refuseLiveUserActivity: true,
     });
 
     const unowned = await taskService.archiveOwnedWorkspaceTurnWorkspace(
@@ -1064,6 +1083,7 @@ describe("TaskService", () => {
     );
     expect(archive).toHaveBeenCalledWith("childworkspace", undefined, {
       forbidWorktreeCheckoutDeletion: true,
+      refuseLiveUserActivity: true,
     });
   });
 
@@ -1182,6 +1202,7 @@ describe("TaskService", () => {
     );
     expect(confirmationArchive).toHaveBeenCalledWith("childworkspace", ["scratch.txt"], {
       forbidWorktreeCheckoutDeletion: true,
+      refuseLiveUserActivity: true,
     });
 
     const confirmationByTaskId = await taskService.archiveOwnedWorkspaceTurnWorkspace(
@@ -1202,6 +1223,7 @@ describe("TaskService", () => {
     );
     expect(confirmationArchive).toHaveBeenCalledWith("childworkspace", ["task-scratch.txt"], {
       forbidWorktreeCheckoutDeletion: true,
+      refuseLiveUserActivity: true,
     });
 
     await config.editConfig((cfg) => {
@@ -1292,6 +1314,7 @@ describe("TaskService", () => {
     );
     expect(archive).toHaveBeenCalledWith("childworkspace", undefined, {
       forbidWorktreeCheckoutDeletion: true,
+      refuseLiveUserActivity: true,
     });
     const runningRecord = await taskHandleStore.getWorkspaceTurn(parentId, "wst_running");
     expect(runningRecord?.status).toBe("interrupted");
@@ -1660,6 +1683,7 @@ describe("TaskService", () => {
     expect(preflightArchive).toHaveBeenCalledTimes(2);
     expect(archive).toHaveBeenCalledWith("childworkspace", ["scratch.txt"], {
       forbidWorktreeCheckoutDeletion: true,
+      refuseLiveUserActivity: true,
     });
     const interrupted = await harness.taskHandleStore.getWorkspaceTurn(
       harness.parentId,
@@ -1909,6 +1933,95 @@ describe("TaskService", () => {
       "wst_running"
     );
     expect(stillRunning?.status).toBe("running");
+  });
+
+  test("workspace lifecycle refuses interrupt_active when snapshot eligibility is mutation-sensitive", async () => {
+    const isSnapshotArchiveEligibilityMutationSensitive = mock(() => true);
+    const harness = await createWorkspaceLifecycleHarness({
+      isSnapshotArchiveEligibilityMutationSensitive,
+    });
+    await harness.taskHandleStore.upsertWorkspaceTurn({
+      kind: "workspace_turn",
+      handleId: "wst_running",
+      ownerWorkspaceId: harness.parentId,
+      workspaceId: "childworkspace",
+      turnId: "turn-running",
+      status: "running",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      createdWorkspace: false,
+      disposableWorkspace: false,
+    });
+    markWorkspaceTurnActive(harness.taskService, "childworkspace", "wst_running", harness.parentId);
+
+    // Snapshot archives require an exact untracked-file acknowledgement that running turns can
+    // invalidate mid-interruption, so honoring interrupt_active could destroy in-flight work and
+    // still bounce with requires_confirmation. Refuse instead and leave the turn running.
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+      harness.parentId,
+      { workspaceId: "childworkspace" },
+      { interruptActive: true }
+    );
+
+    expect(result.success).toBe(true);
+    const data = result.success ? result.data : undefined;
+    expect(data?.status).toBe("active");
+    expect(data?.status === "active" ? data.activeTaskIds : []).toEqual(["wst_running"]);
+    expect(data?.status === "active" ? (data.note ?? "") : "").toContain(
+      "interrupt_active was not honored"
+    );
+    expect(harness.archive).not.toHaveBeenCalled();
+    const stillRunning = await harness.taskHandleStore.getWorkspaceTurn(
+      harness.parentId,
+      "wst_running"
+    );
+    expect(stillRunning?.status).toBe("running");
+  });
+
+  test("workspace lifecycle archive interruption never removes a disposable target workspace", async () => {
+    const harness = await createWorkspaceLifecycleHarness();
+    await harness.taskHandleStore.upsertWorkspaceTurn({
+      kind: "workspace_turn",
+      handleId: "wst_disposable",
+      ownerWorkspaceId: harness.parentId,
+      workspaceId: "childworkspace",
+      turnId: "turn-disposable",
+      status: "running",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      createdWorkspace: true,
+      disposableWorkspace: true,
+    });
+    markWorkspaceTurnActive(
+      harness.taskService,
+      "childworkspace",
+      "wst_disposable",
+      harness.parentId
+    );
+
+    // Interrupting a disposable workspace-turn normally auto-removes its workspace; when the
+    // interruption serves an archive (retain), that cleanup would delete the checkout out from
+    // under the subsequent archive call, which would then fail with "Workspace not found".
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+      harness.parentId,
+      { workspaceId: "childworkspace" },
+      { interruptActive: true }
+    );
+
+    expect(result).toEqual(
+      Ok({
+        status: "archived",
+        action: "archive",
+        workspaceId: "childworkspace",
+        displayName: "Child workspace",
+      })
+    );
+    expect(harness.remove).not.toHaveBeenCalled();
+    const interrupted = await harness.taskHandleStore.getWorkspaceTurn(
+      harness.parentId,
+      "wst_disposable"
+    );
+    expect(interrupted?.status).toBe("interrupted");
   });
 
   test("workspace lifecycle interruption tolerates turns that settled after collection", async () => {

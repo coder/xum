@@ -1,5 +1,6 @@
 import { EventEmitter } from "events";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
+import { isWorkspaceArchived } from "@/common/utils/archive";
 import { spawn } from "child_process";
 import { secretsToRecord } from "@/common/types/secrets";
 import type { Config } from "@/node/config";
@@ -116,6 +117,15 @@ export class TerminalService {
 
       if (!workspaceMetadata) {
         throw new Error(`Workspace not found: ${params.workspaceId}`);
+      }
+
+      // Archived workspaces must not accrue hidden live activity: archive stops terminal
+      // sessions, so admitting a new one afterwards would leave a PTY running in a workspace
+      // the UI no longer surfaces. Unarchive first.
+      if (isWorkspaceArchived(workspaceMetadata.archivedAt, workspaceMetadata.unarchivedAt)) {
+        throw new Error(
+          `Workspace is archived: ${params.workspaceId}. Unarchive it before opening a terminal.`
+        );
       }
 
       // Validate required fields before proceeding - projectPath is required for project-dir runtimes

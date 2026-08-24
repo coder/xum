@@ -1,5 +1,6 @@
 import { tool } from "ai";
 
+import { getErrorMessage } from "@/common/utils/errors";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
 import {
   TaskWorkspaceLifecycleToolResultSchema,
@@ -74,35 +75,61 @@ export const createTaskWorkspaceLifecycleTool: ToolFactory = (config: ToolConfig
             return invalidTaskId;
           }
 
-          switch (args.action) {
-            case "archive": {
-              const result = await taskService.archiveOwnedWorkspaceTurnWorkspace(
-                ownerWorkspaceId,
-                target,
-                {
-                  interruptActive,
-                  acknowledgedUntrackedPaths:
-                    target.workspaceId != null
-                      ? (args.acknowledged_untracked_paths?.[target.workspaceId] ?? undefined)
-                      : undefined,
-                  // Targets addressed by taskId resolve to a workspaceId in the backend, so
-                  // forward the full by-workspaceId map for post-resolution lookup.
-                  acknowledgedUntrackedPathsByWorkspaceId:
-                    args.acknowledged_untracked_paths ?? undefined,
-                }
-              );
-              return result.success
-                ? result.data
-                : { status: "error" as const, action: args.action, ...target, error: result.error };
-            }
-            case "unarchive": {
-              const result = await taskService.unarchiveOwnedWorkspaceTurnWorkspace(
-                ownerWorkspaceId,
-                target
-              );
-              return result.success
-                ? result.data
-                : { status: "error" as const, action: args.action, ...target, error: result.error };
+          try {
+            return await runLifecycleAction();
+          } catch (error: unknown) {
+            // Per-target isolation: one target's unexpected throw must degrade to that
+            // target's error result instead of rejecting the whole Promise.all and losing
+            // the sibling results.
+            return {
+              status: "error" as const,
+              action: args.action,
+              ...target,
+              error: getErrorMessage(error),
+            };
+          }
+
+          async function runLifecycleAction() {
+            switch (args.action) {
+              case "archive": {
+                const result = await taskService.archiveOwnedWorkspaceTurnWorkspace(
+                  ownerWorkspaceId,
+                  target,
+                  {
+                    interruptActive,
+                    acknowledgedUntrackedPaths:
+                      target.workspaceId != null
+                        ? (args.acknowledged_untracked_paths?.[target.workspaceId] ?? undefined)
+                        : undefined,
+                    // Targets addressed by taskId resolve to a workspaceId in the backend, so
+                    // forward the full by-workspaceId map for post-resolution lookup.
+                    acknowledgedUntrackedPathsByWorkspaceId:
+                      args.acknowledged_untracked_paths ?? undefined,
+                  }
+                );
+                return result.success
+                  ? result.data
+                  : {
+                      status: "error" as const,
+                      action: args.action,
+                      ...target,
+                      error: result.error,
+                    };
+              }
+              case "unarchive": {
+                const result = await taskService.unarchiveOwnedWorkspaceTurnWorkspace(
+                  ownerWorkspaceId,
+                  target
+                );
+                return result.success
+                  ? result.data
+                  : {
+                      status: "error" as const,
+                      action: args.action,
+                      ...target,
+                      error: result.error,
+                    };
+              }
             }
           }
         })

@@ -1345,7 +1345,17 @@ export const TaskWorkspaceLifecycleToolInputSchema = z
         "Archive only: when true, interrupt active workspace turns for the target before archiving. Ignored by unarchive, which never interrupts. Defaults to false."
       ),
     acknowledged_untracked_paths: z
-      .record(z.string(), z.array(z.string()))
+      .record(
+        z.string(),
+        z.array(
+          // The archive sink asserts trimmed non-empty paths when normalizing acknowledgements;
+          // reject blank entries at the boundary so a malformed acknowledgement fails this one
+          // call's validation instead of throwing inside the lifecycle service.
+          z
+            .string()
+            .refine((path) => path.trim().length > 0, "acknowledged paths must be non-empty")
+        )
+      )
       .nullish()
       .describe(
         "Archive-only confirmations keyed by resolved workspaceId. Use only paths returned by a previous requires_confirmation result."

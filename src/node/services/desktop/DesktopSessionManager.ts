@@ -1,4 +1,6 @@
 import { DESKTOP_DEFAULTS } from "@/common/constants/desktop";
+import { isWorkspaceArchived } from "@/common/utils/archive";
+import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type {
   DesktopActionResult,
@@ -117,6 +119,22 @@ export class DesktopSessionManager {
   }
 
   async ensureStarted(workspaceId: string): Promise<PortableDesktopSession> {
+    // Archived workspaces must not accrue hidden live activity: archive stops desktop
+    // sessions, so admitting a new one afterwards would leave one running in a workspace
+    // the UI no longer surfaces. Unarchive first.
+    const workspaceEntry = findWorkspaceEntry(this.deps.config.loadConfigOrDefault(), workspaceId);
+    if (
+      workspaceEntry != null &&
+      isWorkspaceArchived(
+        workspaceEntry.workspace.archivedAt,
+        workspaceEntry.workspace.unarchivedAt
+      )
+    ) {
+      throw new Error(
+        `Workspace is archived: ${workspaceId}. Unarchive it before starting a desktop session.`
+      );
+    }
+
     const existingSession = this.sessions.get(workspaceId);
     if (existingSession?.isAlive()) {
       return existingSession;
