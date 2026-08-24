@@ -8,6 +8,7 @@ import assert from "@/common/utils/assert";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
+import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import {
@@ -623,6 +624,15 @@ export interface ArchiveWorkspaceOptions {
    * fail closed instead; route that policy through user-mediated archive.
    */
   forbidCoderWorkspaceDeletion?: boolean;
+  /**
+   * Coder archive-policy snapshot read by the caller before it committed to the archive (e.g.
+   * before deciding interrupt_active eligibility and interrupting turns). Mirrors
+   * worktreeArchiveBehaviorOverride: the sink's deletion guard and the before-archive hook honor
+   * this same read, so a keep → stop/delete settings flip after the caller's checks cannot make
+   * the sink run (or refuse on) a remote stop/deletion the caller never admitted — which would
+   * otherwise strand already-interrupted turns behind a failed archive.
+   */
+  coderWorkspaceArchiveBehaviorOverride?: CoderWorkspaceArchiveBehavior;
 }
 
 const ACTIVE_DESCENDANT_ARCHIVE_ERROR =
@@ -3120,6 +3130,11 @@ export class WorkspaceService extends EventEmitter {
 
   setDesktopSessionManager(manager: DesktopSessionManager): void {
     this.desktopSessionManager = manager;
+    // Archive admission pairing for desktop startups (mirrors setTerminalService above):
+    // ensureStarted checks this guard in the same synchronous block that registers its startup
+    // promise, so whichever of {archive gate, desktop startup entry} runs first is observed by
+    // the other.
+    manager.setWorkspaceArchiveGuard((workspaceId) => this.archivingWorkspaces.has(workspaceId));
   }
 
   private async closeDesktopSessionBestEffort(
@@ -7817,8 +7832,11 @@ export class WorkspaceService extends EventEmitter {
       }
 
       // Snapshot the Coder archive policy once: the before-archive hook receives this same
-      // value, so a settings flip cannot slip a remote deletion past the guard below.
+      // value, so a settings flip cannot slip a remote deletion past the guard below. Callers
+      // that already pinned a read before committing to the archive (e.g. before interrupting
+      // turns) pass it as an override so the whole operation honors one policy.
       const coderWorkspaceArchiveBehavior =
+        options?.coderWorkspaceArchiveBehaviorOverride ??
         this.config.loadConfigOrDefault().coderWorkspaceArchiveBehavior ??
         DEFAULT_CODER_ARCHIVE_BEHAVIOR;
       if (options?.forbidCoderWorkspaceDeletion === true && beforeArchiveMetadata != null) {
@@ -10167,6 +10185,52 @@ export class WorkspaceService extends EventEmitter {
           raw: "Workspace is being deleted. Please wait and try again.",
         });
       }
+
+      // Archive admission pairing (see archiveUnlocked's refuseLiveUserActivity gate): resume
+      // is a stream-starting entry point just like sendMessage, so it shares the same
+      // synchronous guards — otherwise a resume admitted after the gate's activity snapshot
+      // could start a provider stream hidden in the archived workspace.
+      if (this.archivingWorkspaces.has(workspaceId)) {
+        log.debug("resumeStream blocked: workspace is being archived", { workspaceId });
+        return Err({
+          type: "unknown",
+          raw: "Workspace is being archived. Unarchive it before resuming.",
+        });
+      }
+      {
+        const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+        if (
+          workspaceEntry != null &&
+          isWorkspaceArchived(
+            workspaceEntry.workspace.archivedAt,
+            workspaceEntry.workspace.unarchivedAt
+          )
+        ) {
+          log.debug("resumeStream blocked: workspace is archived", { workspaceId });
+          return Err({
+            type: "unknown",
+            raw: "Workspace is archived. Unarchive it before resuming.",
+          });
+        }
+      }
+      // Count this resume as in-preflight in the same synchronous block as the checks above
+      // (mirrors sendMessage): the archive gate refuses while a resume that already passed
+      // these guards is still doing pre-admission work, so neither side can slip past the
+      // other's snapshot.
+      this.preflightSendCounts.set(
+        workspaceId,
+        (this.preflightSendCounts.get(workspaceId) ?? 0) + 1
+      );
+      using _preflightResume = {
+        [Symbol.dispose]: () => {
+          const remaining = (this.preflightSendCounts.get(workspaceId) ?? 1) - 1;
+          if (remaining <= 0) {
+            this.preflightSendCounts.delete(workspaceId);
+          } else {
+            this.preflightSendCounts.set(workspaceId, remaining);
+          }
+        },
+      };
 
       // Guard: avoid creating sessions for workspaces that don't exist anymore.
       if (!this.config.findWorkspace(workspaceId)) {

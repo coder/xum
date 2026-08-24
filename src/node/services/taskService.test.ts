@@ -1056,6 +1056,7 @@ describe("TaskService", () => {
       refuseLiveUserActivity: true,
       forbidCoderWorkspaceDeletion: true,
       worktreeArchiveBehaviorOverride: "keep",
+      coderWorkspaceArchiveBehaviorOverride: "stop",
     });
 
     const unowned = await taskService.archiveOwnedWorkspaceTurnWorkspace(
@@ -1106,6 +1107,7 @@ describe("TaskService", () => {
       refuseLiveUserActivity: true,
       forbidCoderWorkspaceDeletion: true,
       worktreeArchiveBehaviorOverride: "keep",
+      coderWorkspaceArchiveBehaviorOverride: "stop",
     });
   });
 
@@ -1227,6 +1229,7 @@ describe("TaskService", () => {
       refuseLiveUserActivity: true,
       forbidCoderWorkspaceDeletion: true,
       worktreeArchiveBehaviorOverride: "keep",
+      coderWorkspaceArchiveBehaviorOverride: "stop",
     });
 
     const confirmationByTaskId = await taskService.archiveOwnedWorkspaceTurnWorkspace(
@@ -1250,6 +1253,7 @@ describe("TaskService", () => {
       refuseLiveUserActivity: true,
       forbidCoderWorkspaceDeletion: true,
       worktreeArchiveBehaviorOverride: "keep",
+      coderWorkspaceArchiveBehaviorOverride: "stop",
     });
 
     await config.editConfig((cfg) => {
@@ -1343,6 +1347,7 @@ describe("TaskService", () => {
       refuseLiveUserActivity: true,
       forbidCoderWorkspaceDeletion: true,
       worktreeArchiveBehaviorOverride: "keep",
+      coderWorkspaceArchiveBehaviorOverride: "stop",
     });
     const runningRecord = await taskHandleStore.getWorkspaceTurn(parentId, "wst_running");
     expect(runningRecord?.status).toBe("interrupted");
@@ -1714,6 +1719,7 @@ describe("TaskService", () => {
       refuseLiveUserActivity: true,
       forbidCoderWorkspaceDeletion: true,
       worktreeArchiveBehaviorOverride: "keep",
+      coderWorkspaceArchiveBehaviorOverride: "stop",
     });
     const interrupted = await harness.taskHandleStore.getWorkspaceTurn(
       harness.parentId,

@@ -9567,6 +9567,7 @@ export class TaskService {
               forbidCoderWorkspaceDeletion: true,
               refuseLiveUserActivity: true,
               worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
+              coderWorkspaceArchiveBehaviorOverride: coderArchiveBehavior,
             }
           );
           if (!result.success) {

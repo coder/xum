@@ -535,6 +535,72 @@ describe("DesktopSessionManager", () => {
     });
   });
 
+  test("ensureStarted refuses while the workspace is being archived", async () => {
+    await withDesktopManagerHarness(async ({ config }) => {
+      const manager = new DesktopSessionManager({
+        config,
+        experimentsService: createExperimentsService(true),
+        workspaceService: createWorkspaceService(() =>
+          Promise.resolve(createWorkspaceMetadata({ type: "local" }))
+        ),
+      });
+      // Archive admission pairing: the gate arms this guard before its activity snapshot, so a
+      // startup entering afterwards must refuse instead of publishing a hidden desktop session.
+      manager.setWorkspaceArchiveGuard(() => true);
+
+      try {
+        await manager.ensureStarted("workspace-archiving");
+        expect.unreachable("ensureStarted must refuse while the workspace is being archived");
+      } catch (error) {
+        expect(String(error)).toContain("being archived");
+      }
+      expect(manager.has("workspace-archiving")).toBe(false);
+    });
+  });
+
+  test("has() ignores sessions whose process already exited", async () => {
+    await withDesktopManagerHarness(async ({ tempDir, config }) => {
+      if (process.platform === "win32") {
+        return;
+      }
+
+      await installPortableDesktopShim({
+        rootDir: tempDir,
+        config: {
+          startupInfo: createStartupInfo({
+            display: 14,
+            vncPort: 5904,
+            geometry: "1024x768",
+            sessionId: "manager-dead",
+          }),
+        },
+      });
+      process.env.PATH = "";
+
+      const manager = new DesktopSessionManager({
+        config,
+        experimentsService: createExperimentsService(true),
+        workspaceService: createWorkspaceService(() =>
+          Promise.resolve(createWorkspaceMetadata({ type: "local" }))
+        ),
+      });
+
+      const session = await manager.ensureStarted("workspace-dead");
+      expect(manager.has("workspace-dead")).toBe(true);
+
+      // Simulate a crash/exit that bypassed manager cleanup: the session dies but its map entry
+      // lingers until the next ensureStarted()/close() touches it. Archive activity gates must
+      // not treat that stale entry as live work.
+      await session.close();
+      const sessions: unknown = Reflect.get(manager, "sessions");
+      assertSessionMap(sessions);
+      expect(sessions.has("workspace-dead")).toBe(true);
+      expect(manager.has("workspace-dead")).toBe(false);
+
+      await manager.closeAll();
+    });
+  });
+
   test("closes individual sessions and clears all tracked sessions", async () => {
     await withDesktopManagerHarness(async ({ tempDir, config }) => {
       if (process.platform === "win32") {

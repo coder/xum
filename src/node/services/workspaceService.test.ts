@@ -49,7 +49,7 @@ import type { TerminalService } from "@/node/services/terminalService";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import type { BashToolResult } from "@/common/types/tools";
-import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
 import { createMuxMessage } from "@/common/types/message";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import {
@@ -10104,6 +10104,7 @@ describe("WorkspaceService remove desktop session cleanup", () => {
     const close = mock(() => Promise.resolve(undefined));
     const desktopSessionManager = {
       close,
+      setWorkspaceArchiveGuard: () => undefined,
     } as unknown as DesktopSessionManager;
     workspaceService.setDesktopSessionManager(desktopSessionManager);
 
@@ -10158,6 +10159,7 @@ describe("WorkspaceService remove desktop session cleanup", () => {
     const close = mock(() => Promise.reject(new Error("close failed")));
     const desktopSessionManager = {
       close,
+      setWorkspaceArchiveGuard: () => undefined,
     } as unknown as DesktopSessionManager;
     workspaceService.setDesktopSessionManager(desktopSessionManager);
 
@@ -10846,6 +10848,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     });
     const terminalService = {
       closeWorkspaceSessions,
+      setWorkspaceArchiveGuard: () => undefined,
     } as unknown as TerminalService;
     workspaceService.setTerminalService(terminalService);
 
@@ -10860,6 +10863,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const closeWorkspaceSessions = mock(() => undefined);
     const terminalService = {
       closeWorkspaceSessions,
+      setWorkspaceArchiveGuard: () => undefined,
     } as unknown as TerminalService;
     workspaceService.setTerminalService(terminalService);
 
@@ -10878,6 +10882,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const closeWorkspaceSessions = mock(() => undefined);
     const terminalService = {
       closeWorkspaceSessions,
+      setWorkspaceArchiveGuard: () => undefined,
     } as unknown as TerminalService;
     workspaceService.setTerminalService(terminalService);
 
@@ -10891,6 +10896,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const close = mock(() => Promise.resolve(undefined));
     const desktopSessionManager = {
       close,
+      setWorkspaceArchiveGuard: () => undefined,
     } as unknown as DesktopSessionManager;
     workspaceService.setDesktopSessionManager(desktopSessionManager);
 
@@ -10909,6 +10915,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const close = mock(() => Promise.resolve(undefined));
     const desktopSessionManager = {
       close,
+      setWorkspaceArchiveGuard: () => undefined,
     } as unknown as DesktopSessionManager;
     workspaceService.setDesktopSessionManager(desktopSessionManager);
 
@@ -10994,6 +11001,90 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(cleanupReportedDescendantsAfterArchive).not.toHaveBeenCalled();
     const entry = configState.projects.get(projectPath)?.workspaces[0];
     expect(entry?.archivedAt).toBeTruthy();
+  });
+
+  test("archive() honors the caller's pinned Coder policy over a flipped config read", async () => {
+    // Dedicated (mux-created) Coder workspace: the remote-deletion guard only applies to these.
+    (mockAIService.getWorkspaceMetadata as ReturnType<typeof mock>).mockReturnValue(
+      Promise.resolve(
+        Ok({
+          ...workspaceMetadata,
+          runtimeConfig: {
+            type: "ssh",
+            host: "coder.example",
+            srcBaseDir: "/home/coder/src",
+            coder: { workspaceName: "mux-child", existingWorkspace: false },
+          },
+        })
+      )
+    );
+    // Simulate a keep → delete settings flip landing AFTER the caller read "keep" and committed
+    // to the archive (e.g. by interrupting turns based on that read).
+    configState.coderWorkspaceArchiveBehavior = "delete";
+
+    const hooks = new WorkspaceLifecycleHooks();
+    let hookBehavior: string | undefined;
+    hooks.registerBeforeArchive((args) => {
+      hookBehavior = args.coderWorkspaceArchiveBehavior;
+      return Promise.resolve(Ok(undefined));
+    });
+    workspaceService.setWorkspaceLifecycleHooks(hooks);
+
+    // Without a pinned read, the sink's fresh config read refuses under the flipped policy.
+    const unpinned = await workspaceService.archive(workspaceId, undefined, {
+      forbidCoderWorkspaceDeletion: true,
+    });
+    expect(unpinned.success).toBe(false);
+    if (!unpinned.success) {
+      expect(unpinned.error).toContain("Coder workspace archive behavior");
+    }
+
+    // With the caller's pinned read, the same flipped config cannot change the operation: the
+    // guard passes and the before-archive hook receives the pinned value.
+    const pinned = await workspaceService.archive(workspaceId, undefined, {
+      forbidCoderWorkspaceDeletion: true,
+      coderWorkspaceArchiveBehaviorOverride: "keep",
+    });
+    expect(pinned).toEqual(Ok({ kind: "archived" }));
+    expect(hookBehavior).toBe("keep");
+  });
+
+  test("resumeStream refuses while the workspace is being archived", async () => {
+    addToArchivingWorkspaces(workspaceService, workspaceId);
+
+    const result = await workspaceService.resumeStream(workspaceId, {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    } satisfies SendMessageOptions);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.type).toBe("unknown");
+      if (result.error.type === "unknown") {
+        expect(result.error.raw).toContain("being archived");
+      }
+    }
+  });
+
+  test("resumeStream refuses archived workspaces", async () => {
+    const entry = configState.projects.get(projectPath)?.workspaces[0];
+    expect(entry).toBeDefined();
+    if (entry) {
+      entry.archivedAt = "2026-01-01T00:00:00.000Z";
+    }
+
+    const result = await workspaceService.resumeStream(workspaceId, {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    } satisfies SendMessageOptions);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.type).toBe("unknown");
+      if (result.error.type === "unknown") {
+        expect(result.error.raw).toContain("archived");
+      }
+    }
   });
 });
 
@@ -11413,11 +11504,13 @@ describe("WorkspaceService archive snapshots", () => {
     const closeWorkspaceSessions = mock(() => undefined);
     workspaceService.setTerminalService({
       closeWorkspaceSessions,
+      setWorkspaceArchiveGuard: () => undefined,
     } as unknown as TerminalService);
 
     const closeDesktopSession = mock(() => Promise.resolve(undefined));
     workspaceService.setDesktopSessionManager({
       close: closeDesktopSession,
+      setWorkspaceArchiveGuard: () => undefined,
     } as unknown as DesktopSessionManager);
 
     const captureSnapshotForArchive = mock(() => Promise.resolve(Err("should not run")));
