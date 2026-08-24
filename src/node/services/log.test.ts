@@ -134,7 +134,8 @@ describe("log file sink state machine", () => {
     await clearLogFiles();
 
     for (const legacyPath of legacyLogPaths) {
-      expect(fs.existsSync(legacyPath)).toBe(false);
+      const legacyStats = await fsPromises.stat(legacyPath).catch(() => null);
+      expect(legacyStats).toBeNull();
     }
   });
 
