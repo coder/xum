@@ -286,17 +286,19 @@ jobs:
         run: | # zizmor: ignore[template-injection]
           set -euo pipefail
 
-          # --maxWorkers=50%, not 100%: jest integration forks peak at ~4.7GiB each
-          # (scripts/lib/worker_budget.js), so 16 workers on the 16-core/64GB runner
-          # oversubscribe memory (~75GiB peak) and thrash. Under that load, wall clock
-          # inflates ~10-20x: suites that normally finish in seconds pass at 100-135s
-          # while tests with tight explicit timeouts (30-45s) die, which is what made
-          # focus/sendModeDropdown/anthropicCacheStrategy flake in the merge queue.
-          # 8 workers fit in memory with headroom and match the repo's own CPU budget.
+          # No --maxWorkers override: jest.config.js sizes the pool via
+          # workerBudgetFor("jest") (scripts/lib/worker_budget.js), which accounts for
+          # per-fork peak memory (~4.7GiB) and live cgroup usage. The old CLI
+          # --maxWorkers=100% took precedence over that budget and forked 16 workers
+          # on the 16-core/64GB runner (~75GiB peak), thrashing memory. Under that
+          # load, wall clock inflated ~10-20x: suites that normally finish in seconds
+          # passed at 100-135s while tests with tight explicit timeouts (30-45s) died,
+          # which is what made focus/sendModeDropdown/anthropicCacheStrategy flake in
+          # the merge queue.
 
           # Manual override (workflow_dispatch input)
           if [[ -n "${{ github.event.inputs.test_filter }}" ]]; then
-            TEST_INTEGRATION=1 bun x jest --coverage --maxWorkers=50% --silent ${{ github.event.inputs.test_filter }}
+            TEST_INTEGRATION=1 bun x jest --coverage --silent ${{ github.event.inputs.test_filter }}
             exit 0
           fi
 
@@ -309,11 +311,11 @@ jobs:
           # Backend changed: run ALL integration tests (includes tests/ui)
           if [[ "$BACKEND" == "true" ]]; then
             echo "Backend changes detected - running all integration tests"
-            TEST_INTEGRATION=1 bun x jest --coverage --maxWorkers=50% --silent tests/
+            TEST_INTEGRATION=1 bun x jest --coverage --silent tests/
           else
             # Browser-only changes: run tests/ui
             echo "Browser changes detected - running tests/ui"
-            TEST_INTEGRATION=1 bun x jest --coverage --maxWorkers=50% --silent tests/ui/
+            TEST_INTEGRATION=1 bun x jest --coverage --silent tests/ui/
           fi
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

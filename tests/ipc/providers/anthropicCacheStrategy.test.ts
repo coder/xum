@@ -37,7 +37,10 @@ describeIntegration("Anthropic cache strategy integration", () => {
           thinkingLevel: "off",
         });
 
-        await firstCollector.waitForEvent("stream-end", 15000);
+        // Pass the suite budget: waitForEvent resolves null on timeout instead of
+        // throwing, so a shorter inner wait would silently null the end event and
+        // fail the toBeDefined assertions below with no useful diagnostics.
+        await firstCollector.waitForEvent("stream-end", TEST_TIMEOUT_MS);
         firstCollector.stop();
 
         // Send a second message to test cache reuse
@@ -52,7 +55,7 @@ describeIntegration("Anthropic cache strategy integration", () => {
           thinkingLevel: "off",
         });
 
-        await secondCollector.waitForEvent("stream-end", 15000);
+        await secondCollector.waitForEvent("stream-end", TEST_TIMEOUT_MS);
         secondCollector.stop();
 
         // Check that both streams completed successfully
