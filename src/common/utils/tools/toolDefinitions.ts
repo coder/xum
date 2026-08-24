@@ -2393,7 +2393,7 @@ export const TOOL_DEFINITIONS = {
       "Active workspace turns involving the target (delegated to it, or owned by it for nested delegation) are refused unless interrupt_active is true (archive only; unarchive never interrupts). " +
       "Live user activity in the target (a manual stream, terminal, or desktop session) also refuses archive and is never interrupted by this tool. " +
       "Archive may return requires_confirmation with untracked paths when a snapshot would be lossy — the confirmation is checked before any interruption; re-call with acknowledged_untracked_paths to confirm. " +
-      'Archive is refused while the "Delete checkout" worktree archive behavior is configured, because that policy deletes the checkout without user confirmation. ' +
+      'Archive of a managed-worktree target is refused while the "Delete checkout" worktree archive behavior is configured, because that policy deletes the checkout without user confirmation; targets the worktree policy cannot delete (SSH/Coder, Docker, project-dir local, or shared isolation-none checkouts) stay archivable. ' +
       "For irreversible removal of inactive sub-agent children, use task_remove instead.",
     schema: TaskWorkspaceLifecycleToolInputSchema,
   },

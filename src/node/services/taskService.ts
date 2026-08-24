@@ -9394,6 +9394,30 @@ export class TaskService {
             });
           }
 
+          // Native terminals spawn detached emulators that never register terminal sessions and
+          // whose lifetime cannot be tracked (they daemonize, so process exit is meaningless).
+          // When the snapshot policy would remove this managed worktree's checkout, archiving
+          // could delete the directory under the user's live native shell/editor — fail closed
+          // and route through user-mediated archive. Scoped exactly to targets where snapshot
+          // capture (and subsequent worktree removal) runs; sticky for the app session because
+          // native terminal closure is undetectable. Re-enforced at the sink.
+          if (
+            this.workspaceService.isSnapshotArchiveEligibilityMutationSensitive(
+              resolved.workspaceId,
+              worktreeArchiveBehavior,
+              resolved.metadata
+            ) &&
+            this.workspaceService.hasOpenedNativeTerminal(resolved.workspaceId)
+          ) {
+            return Ok({
+              status: "error",
+              action: "archive",
+              ...this.lifecycleTargetFields(resolved),
+              error:
+                "A native terminal was opened for this workspace during this session and its lifetime cannot be tracked; the snapshot archive policy would remove the checkout under it. Ask the user to archive this workspace manually.",
+            });
+          }
+
           const acknowledgedUntrackedPaths =
             options.acknowledgedUntrackedPaths ??
             options.acknowledgedUntrackedPathsByWorkspaceId?.[resolved.workspaceId];

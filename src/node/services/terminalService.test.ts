@@ -1117,6 +1117,25 @@ describe("TerminalService.openNative", () => {
       expect(call[2]?.stdio).toBe("ignore");
     });
 
+    it("records native terminal opens stickily for archive gating", async () => {
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      service = new TerminalService(configWithLocalWorkspace, mockPTYService);
+
+      expect(service.hasOpenedNativeTerminal("ws-local")).toBe(false);
+      await service.openNative("ws-local");
+      expect(service.hasOpenedNativeTerminal("ws-local")).toBe(true);
+
+      // Even a failed open records the workspace: spawn success and emulator lifetime are
+      // both unobservable, so archive gating fails safe on attempted opens.
+      try {
+        await service.openNative("ws-missing");
+      } catch {
+        // Workspace not found — the recording must still have happened.
+      }
+      expect(service.hasOpenedNativeTerminal("ws-missing")).toBe(true);
+      expect(service.hasOpenedNativeTerminal("ws-untouched")).toBe(false);
+    });
+
     it("should open Ghostty for local workspace when available", async () => {
       // Make ghostty available via fs.stat (common install path)
       fsStatSpy.mockImplementation((path: string) => {

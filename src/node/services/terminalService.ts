@@ -76,6 +76,20 @@ export class TerminalService {
   // startup and an archive always observe each other.
   private workspaceArchiveGuard: ((workspaceId: string) => boolean) | undefined;
 
+  /**
+   * Workspaces a native terminal was opened for during this app session. Native emulators are
+   * spawned detached and typically daemonize, so neither spawn success nor closure is
+   * observable — entries are recorded at open time (even for failed attempts, failing safe)
+   * and never removed. Model-facing snapshot archives consult this because removing a checkout
+   * under a user's live native shell/editor is unrecoverable.
+   */
+  private readonly nativeTerminalWorkspaces = new Set<string>();
+
+  /** Whether a native terminal was ever opened for this workspace during this app session. */
+  hasOpenedNativeTerminal(workspaceId: string): boolean {
+    return this.nativeTerminalWorkspaces.has(workspaceId);
+  }
+
   setWorkspaceArchiveGuard(guard: (workspaceId: string) => boolean): void {
     this.workspaceArchiveGuard = guard;
   }
@@ -482,6 +496,9 @@ export class TerminalService {
    * For SSH workspaces, opens a terminal that SSHs into the remote host.
    */
   async openNative(workspaceId: string): Promise<void> {
+    // Recorded before any awaits so archive gates observe the intent immediately; see the
+    // nativeTerminalWorkspaces doc comment for why entries are sticky.
+    this.nativeTerminalWorkspaces.add(workspaceId);
     try {
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const workspace = allMetadata.find((w) => w.id === workspaceId);

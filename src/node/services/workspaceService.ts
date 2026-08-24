@@ -7664,6 +7664,16 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
+   * Whether a native terminal was ever opened for this workspace during this app session.
+   * Native emulators are detached and daemonize, so their lifetime cannot be tracked; the
+   * model-facing lifecycle path refuses snapshot archives (which remove the checkout) for
+   * such workspaces instead of pulling the directory out from under a live native shell.
+   */
+  hasOpenedNativeTerminal(workspaceId: string): boolean {
+    return this.terminalService?.hasOpenedNativeTerminal(workspaceId) === true;
+  }
+
+  /**
    * Fresh background-bash check: refreshes exit statuses first so a long-exited process cannot
    * hold an archive refusal open. Pre-gates use this; the synchronous snapshot in
    * listLiveWorkspaceActivity covers the sink's same-tick gate.
@@ -7914,6 +7924,20 @@ export class WorkspaceService extends EventEmitter {
         Array.isArray(beforeArchiveMetadata.projects) &&
         beforeArchiveMetadata.projects.length > 1;
       const needsSnapshotCapture = canSnapshotManagedWorktree && !shouldSkipSnapshotCapture;
+
+      // Native terminals are detached and untrackable (see hasOpenedNativeTerminal): when this
+      // archive would capture a snapshot and remove the managed worktree, a model-driven
+      // archive must not delete the checkout under a user's live native shell. Mirrors the
+      // lifecycle caller's early refusal against the same pinned behavior read.
+      if (
+        options?.refuseLiveUserActivity === true &&
+        needsSnapshotCapture &&
+        this.terminalService?.hasOpenedNativeTerminal(workspaceId) === true
+      ) {
+        return Err(
+          "A native terminal was opened for this workspace during this session and its lifetime cannot be tracked; the snapshot archive policy would remove the checkout under it. Ask the user to archive this workspace manually."
+        );
+      }
 
       if (needsSnapshotCapture && beforeArchiveMetadata) {
         const initialArchiveConfirmationResult = await this.getArchiveUntrackedFilesConfirmation({
