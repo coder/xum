@@ -151,7 +151,7 @@
     if (inputEl) {
       inputEl.disabled = !canChat;
       inputEl.placeholder = canChat
-        ? "Message mux…"
+        ? "Message Xum…"
         : hasSelection
           ? "Chat requires Xum server connection."
           : "Select an Xum workspace to chat.";

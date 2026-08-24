@@ -300,11 +300,17 @@ function clearSink(): Promise<void> {
     const fd = fs.openSync(activeLogPath, "w");
     fs.closeSync(fd);
 
-    // Remove rotated files — missing files are fine.
+    // Remove canonical rotations and pre-rename logs. The home transition keeps the
+    // same directory across upgrades/downgrades, so Clear must not leave old Mux logs
+    // (which may contain the same sensitive output) behind on disk.
+    const removableLogPaths = [path.join(logsDir, "mux.log")];
     for (let i = 1; i <= MAX_LOG_FILES; i++) {
-      const rotatedPath = path.join(logsDir, `xum.${i}.log`);
+      removableLogPaths.push(path.join(logsDir, `xum.${i}.log`));
+      removableLogPaths.push(path.join(logsDir, `mux.${i}.log`));
+    }
+    for (const removableLogPath of removableLogPaths) {
       try {
-        fs.unlinkSync(rotatedPath);
+        fs.unlinkSync(removableLogPath);
       } catch {
         // file may not exist
       }

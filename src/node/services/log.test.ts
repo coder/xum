@@ -119,6 +119,25 @@ describe("log file sink state machine", () => {
     expect(createWriteStreamSpy).toHaveBeenCalledTimes(2);
   });
 
+  test("clearLogFiles removes pre-rename active and rotated logs", async () => {
+    const logsDir = path.join(tempXumRoot, "logs");
+    await fsPromises.mkdir(logsDir, { recursive: true });
+    const legacyLogPaths = [
+      path.join(logsDir, "mux.log"),
+      path.join(logsDir, "mux.1.log"),
+      path.join(logsDir, "mux.3.log"),
+    ];
+    await Promise.all(
+      legacyLogPaths.map((legacyPath) => fsPromises.writeFile(legacyPath, "legacy"))
+    );
+
+    await clearLogFiles();
+
+    for (const legacyPath of legacyLogPaths) {
+      expect(fs.existsSync(legacyPath)).toBe(false);
+    }
+  });
+
   test("clearLogFiles rejects when truncate fails", async () => {
     const openSyncSpy = spyOn(fs, "openSync").mockImplementation(() => {
       throw new Error("truncate failed");
