@@ -15,6 +15,7 @@ import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import type { Config, ProjectsConfig, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
+import { areArchiveUntrackedPathListsEqual } from "@/node/services/workspaceService";
 import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
@@ -3896,6 +3897,26 @@ export class TaskService {
       return Err("Task.createWorkspaceTurn: target workspace was archived during turn creation");
     }
     if (persisted === "owner_archived") {
+      // A workspace created in this call has no persisted ownership handle yet, so refusing
+      // here would leak an unmanageable checkout + config entry (the archived owner can never
+      // reach it through the lifecycle API). It was materialized moments ago and its turn never
+      // started, so force-removing it is lossless. Bypass the task-tree lifecycle lock: we hold
+      // this.mutex and the established order is tree lock → this.mutex (createMany), so
+      // acquiring the tree lock here would invert it; removeUnlocked stays safe regardless via
+      // its own idempotency guard and fail-closed descendant check.
+      if (createdWorkspace) {
+        const cleanup = await this.workspaceService.removeWhileTaskTreeLocked(
+          targetWorkspaceId,
+          true
+        );
+        if (!cleanup.success) {
+          log.error("createWorkspaceTurn: failed to clean up workspace after owner archive", {
+            ownerWorkspaceId,
+            targetWorkspaceId,
+            error: cleanup.error,
+          });
+        }
+      }
       return Err("Task.createWorkspaceTurn: owner workspace was archived during turn creation");
     }
     if (targetIsAgentWorkspace) {
@@ -9365,9 +9386,15 @@ export class TaskService {
           });
         }
         if (preflight.data.kind === "confirm-lossy-untracked-files") {
-          const acknowledged = new Set(acknowledgedUntrackedPaths ?? []);
-          const unacknowledged = preflight.data.paths.filter((path) => !acknowledged.has(path));
-          if (acknowledgedUntrackedPaths == null || unacknowledged.length > 0) {
+          // The archive sink requires exact normalized equality between the acknowledged and
+          // current path lists (a subset check would accept a stale acknowledgement whose extra
+          // paths no longer exist, interrupt the turns, and then still bounce with
+          // requires_confirmation). Mirror the sink's check so interruption only happens when
+          // the acknowledgement would actually be accepted.
+          if (
+            acknowledgedUntrackedPaths == null ||
+            !areArchiveUntrackedPathListsEqual(acknowledgedUntrackedPaths, preflight.data.paths)
+          ) {
             return Ok({
               status: "requires_confirmation",
               action: "archive",

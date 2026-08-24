@@ -1776,6 +1776,9 @@ describe("TaskService", () => {
     );
     expect(nested.success).toBe(false);
     expect(nested.success ? "" : nested.error).toMatch(/owner workspace was archived/);
+    // The refused nested creation had already materialized its workspace; without an ownership
+    // handle the archived owner could never manage it, so it must be removed, not leaked.
+    expect(harness.remove).toHaveBeenCalledWith("grandchildworkspace", true);
     const nestedHandles = await harness.taskService.listWorkspaceTurnTasks("childworkspace", {
       statuses: ["queued", "starting", "running"],
     });
@@ -1848,6 +1851,56 @@ describe("TaskService", () => {
         workspaceId: "childworkspace",
         displayName: "Child workspace",
         paths: ["scratch.txt", "new-file.txt"],
+      })
+    );
+    expect(archive).not.toHaveBeenCalled();
+    const stillRunning = await harness.taskHandleStore.getWorkspaceTurn(
+      harness.parentId,
+      "wst_running"
+    );
+    expect(stillRunning?.status).toBe("running");
+  });
+
+  test("workspace lifecycle re-confirms when acknowledged paths include entries the preflight no longer reports", async () => {
+    const preflightArchive = mock(
+      (): Promise<Result<{ kind: "confirm-lossy-untracked-files"; paths: string[] }>> =>
+        Promise.resolve(Ok({ kind: "confirm-lossy-untracked-files", paths: ["scratch.txt"] }))
+    );
+    const archive = mock(
+      (): Promise<Result<{ kind: "archived" }>> => Promise.resolve(Ok({ kind: "archived" }))
+    );
+    const harness = await createWorkspaceLifecycleHarness({ archive, preflightArchive });
+    await harness.taskHandleStore.upsertWorkspaceTurn({
+      kind: "workspace_turn",
+      handleId: "wst_running",
+      ownerWorkspaceId: harness.parentId,
+      workspaceId: "childworkspace",
+      turnId: "turn-running",
+      status: "running",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      createdWorkspace: false,
+      disposableWorkspace: false,
+    });
+    markWorkspaceTurnActive(harness.taskService, "childworkspace", "wst_running", harness.parentId);
+
+    // The acknowledged set is a stale SUPERSET (one acknowledged file was removed). The archive
+    // sink requires exact list equality, so a subset check here would interrupt the turn and
+    // then still bounce with requires_confirmation — the acknowledgement must be re-confirmed
+    // BEFORE anything is interrupted.
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+      harness.parentId,
+      { workspaceId: "childworkspace" },
+      { interruptActive: true, acknowledgedUntrackedPaths: ["scratch.txt", "stale.txt"] }
+    );
+
+    expect(result).toEqual(
+      Ok({
+        status: "requires_confirmation",
+        action: "archive",
+        workspaceId: "childworkspace",
+        displayName: "Child workspace",
+        paths: ["scratch.txt"],
       })
     );
     expect(archive).not.toHaveBeenCalled();

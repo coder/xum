@@ -634,7 +634,11 @@ function buildArchiveLossyUntrackedFilesConfirmation(
   };
 }
 
-function areArchiveUntrackedPathListsEqual(
+// Exported so TaskService's pre-interruption archive preflight applies the exact
+// acknowledgement semantics enforced at the archive sink (getArchiveUntrackedFilesConfirmation):
+// a drifted acknowledged set — extra OR missing paths — must re-confirm before any
+// destructive interruption, not after.
+export function areArchiveUntrackedPathListsEqual(
   leftPaths: readonly string[],
   rightPaths: readonly string[]
 ): boolean {
@@ -5415,7 +5419,11 @@ export class WorkspaceService extends EventEmitter {
     );
   }
 
-  /** Internal entry point for TaskService callers that already hold the task-tree lifecycle lock. */
+  /**
+   * Internal entry point for TaskService callers that already hold the task-tree lifecycle lock,
+   * or that must not acquire it for lock-ordering reasons (e.g. createWorkspaceTurn cleanup runs
+   * under TaskService's creation mutex, which the tree lock is ordered before).
+   */
   async removeWhileTaskTreeLocked(workspaceId: string, force = false): Promise<Result<void>> {
     return await this.removeUnlocked(workspaceId, force);
   }
