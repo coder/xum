@@ -289,10 +289,13 @@ describe("ProvidersSection", () => {
     fireEvent.pointerDown(within(customCard).getByRole("combobox", { name: "API format" }));
     fireEvent.click(await within(customCard).findByRole("button", { name: "Anthropic Messages" }));
 
-    expect(view.setProviderConfig).toHaveBeenCalledWith({
-      provider: CUSTOM_PROVIDER_ID,
-      keyPath: ["providerType"],
-      value: "anthropic-messages",
+    // The write is queued behind the per-provider chain (a microtask).
+    await waitFor(() => {
+      expect(view.setProviderConfig).toHaveBeenCalledWith({
+        provider: CUSTOM_PROVIDER_ID,
+        keyPath: ["providerType"],
+        value: "anthropic-messages",
+      });
     });
   });
 
@@ -318,6 +321,45 @@ describe("ProvidersSection", () => {
       });
       expect(providersRefreshMock).toHaveBeenCalled();
     });
+  });
+
+  test("ignores a stale API-format failure after a newer selection", async () => {
+    const view = renderProvidersSection();
+    let rejectFirstWrite: ((error: Error) => void) | undefined;
+    view.setProviderConfig.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectFirstWrite = reject;
+        })
+    );
+
+    const customButton = await view.findByRole("button", { name: /Acme OpenAI/ });
+    fireEvent.click(customButton);
+    const customCard = getProviderCard(customButton);
+
+    // First selection: write held pending.
+    fireEvent.pointerDown(within(customCard).getByRole("combobox", { name: "API format" }));
+    fireEvent.click(await within(customCard).findByRole("button", { name: "Anthropic Messages" }));
+    // Second selection while the first write is still in flight.
+    fireEvent.pointerDown(within(customCard).getByRole("combobox", { name: "API format" }));
+    fireEvent.click(await within(customCard).findByRole("button", { name: "OpenAI Responses" }));
+
+    updateOptimisticallyMock.mockClear();
+    rejectFirstWrite?.(new Error("late failure"));
+
+    // The stale failure must not roll back the newer selection: the queued
+    // second write persists and no reconciliation fires.
+    await waitFor(() => {
+      expect(view.setProviderConfig).toHaveBeenCalledWith({
+        provider: CUSTOM_PROVIDER_ID,
+        keyPath: ["providerType"],
+        value: "openai-responses",
+      });
+    });
+    expect(updateOptimisticallyMock).not.toHaveBeenCalledWith(CUSTOM_PROVIDER_ID, {
+      providerType: "openai-compatible",
+    });
+    expect(providersRefreshMock).not.toHaveBeenCalled();
   });
 
   test("validates custom provider IDs in the add form", async () => {

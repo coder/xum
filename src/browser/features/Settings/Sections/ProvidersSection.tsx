@@ -1450,6 +1450,11 @@ export function ProvidersSection() {
     void api.providers.setProviderConfig({ provider, keyPath: [field], value: editValue });
   }, [api, editingField, editValue, updateOptimistically]);
 
+  // Per-provider write sequencing: rapid selections queue in click order and
+  // only the NEWEST write's failure reconciles shared state, so a stale
+  // completion cannot roll back or resurrect an older selection.
+  const providerTypeWritesRef = useRef(new Map<string, { seq: number; chain: Promise<void> }>());
+
   // Plain function: React Compiler handles memoization.
   const handleCustomProviderTypeChange = (
     provider: string,
@@ -1458,8 +1463,10 @@ export function ProvidersSection() {
   ) => {
     if (!api) return;
 
-    updateOptimistically(provider, { providerType: next });
-    void (async () => {
+    const writes = providerTypeWritesRef.current;
+    const entry = writes.get(provider) ?? { seq: 0, chain: Promise.resolve() };
+    const seq = entry.seq + 1;
+    const chain = entry.chain.then(async () => {
       try {
         const result = await api.providers.setProviderConfig({
           provider,
@@ -1470,6 +1477,9 @@ export function ProvidersSection() {
           throw new Error(result.error);
         }
       } catch {
+        if (writes.get(provider)?.seq !== seq) {
+          return; // Stale: a newer selection owns the shared state.
+        }
         // The format decides the request wire protocol, so an optimistic
         // value that failed to persist (policy denial, lock/write failure)
         // must not keep advertising an adapter the backend never adopted.
@@ -1478,7 +1488,9 @@ export function ProvidersSection() {
         updateOptimistically(provider, { providerType: previous });
         void refresh();
       }
-    })();
+    });
+    writes.set(provider, { seq, chain });
+    updateOptimistically(provider, { providerType: next });
   };
 
   const handleClearField = useCallback(
