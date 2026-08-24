@@ -23,6 +23,30 @@ class ExecPathMappingRuntime extends LocalRuntime {
   }
 }
 
+/**
+ * Delegates to a real LocalRuntime but is NOT an instanceof LocalBaseRuntime, so
+ * spawnProcess treats it like a remote runtime; its exec throws for the spawn command
+ * itself, simulating a transport-level (SSH/Coder channel) error after dispatch.
+ */
+function createRemoteLikeThrowingRuntime(base: LocalRuntime): LocalRuntime {
+  return new Proxy({} as LocalRuntime, {
+    get(_target, prop) {
+      if (prop === "exec") {
+        return (command: string, opts: never) => {
+          if (command.includes("output.log")) {
+            throw new Error("SSH channel error after dispatch");
+          }
+          return base.exec(command, opts);
+        };
+      }
+      const value = (base as unknown as Record<PropertyKey, unknown>)[prop];
+      return typeof value === "function"
+        ? (value as (...args: unknown[]) => unknown).bind(base)
+        : value;
+    },
+  });
+}
+
 async function waitForExit(handle: BackgroundHandle): Promise<number | null> {
   for (let attempt = 0; attempt < 100; attempt++) {
     const exitCode = await handle.getExitCode();
@@ -41,6 +65,28 @@ describe("spawnProcess", () => {
     await Promise.all(
       cleanupDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true }))
     );
+  });
+
+  it("preserves the output directory when a remote-like exec throws after dispatch", async () => {
+    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-remote-throw-"));
+    cleanupDirs.push(hostDir);
+    const base = new LocalRuntime(hostDir);
+    const tempDir = await base.tempDir();
+    const workspaceId = `remote-throw-${Date.now()}`;
+    cleanupDirs.push(`${tempDir}/mux-bashes/${workspaceId}`);
+
+    const result = await spawnProcess(createRemoteLikeThrowingRuntime(base), "echo hi", {
+      cwd: hostDir,
+      workspaceId,
+      processId: "ambiguous",
+    });
+
+    expect(result.success).toBe(false);
+    // A transport-level throw after dispatch is ambiguous on non-local runtimes — the
+    // detached job may be running. The directory must survive as durable fail-closed
+    // evidence (remote crash-orphan gating consumes these records; see #3944). Local
+    // runtimes still remove theirs: local exec throws happen before anything dispatched.
+    await fs.access(`${tempDir}/mux-bashes/${workspaceId}/ambiguous/output.log`);
   });
 
   it("runs the wrapper from the cwd mapped into the exec namespace", async () => {

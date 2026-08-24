@@ -5840,6 +5840,16 @@ export class AgentSession {
   }
 
   /**
+   * Number of queued message entries (including synthetic/internal ones). The
+   * interrupt_active archive path compares this against the delegated queued turns it is
+   * about to interrupt: any entry beyond those is user work that the sink would refuse on
+   * only after the turns were already destroyed.
+   */
+  queuedMessageEntryCount(): number {
+    return this.messageQueue.entryCount();
+  }
+
+  /**
    * r41: discard pending auto-retry state and the persisted partial as part
    * of a context-discarding history mutation. A retry scheduled before the
    * mutation (session idle during backoff) would otherwise fire after the

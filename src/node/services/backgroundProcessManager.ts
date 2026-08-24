@@ -5,9 +5,13 @@ import type { Runtime, BackgroundHandle } from "@/node/runtime/Runtime";
 import {
   spawnProcess,
   localBgWorkspaceDir,
+  spawnRecordsAreHostLocal,
+  quotePathForShell,
   BG_META_FILENAME,
   BG_EXIT_CODE_FILENAME,
+  BG_OUTPUT_SUBDIR,
 } from "./backgroundProcessExecutor";
+import { execBuffered } from "@/node/utils/runtime/helpers";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "./log";
@@ -779,18 +783,42 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // Reserved synchronously in the same tick each candidate is chosen (see
     // reservedProcessIds): the awaits below would otherwise let a concurrent same-name spawn
     // allocate the same directory. Released when this spawn registers or returns — the
-    // disposer reads the current processId, which the disk loop keeps in sync.
+    // disposer reads the current processId, which the disk loop keeps in sync. Failed
+    // non-host-record spawns keep their reservation for the app session (see below).
     this.reservedProcessIds.add(processId);
+    let retainReservationAfterFailure = false;
     using _reservation = {
-      [Symbol.dispose]: () => this.reservedProcessIds.delete(processId),
+      [Symbol.dispose]: () => {
+        if (!retainReservationAfterFailure) {
+          this.reservedProcessIds.delete(processId);
+        }
+      },
     };
-    // Restart-unique directories (local runtimes; remote layouts are on the remote host and
-    // outside the local crash-orphan guard): skip names whose durable directory may still
-    // belong to a surviving process from a previous session — see
-    // localSpawnDirMayHoldLiveProcess for why reuse would blind archive gating.
-    if (runtime instanceof LocalBaseRuntime) {
+    // Restart-unique directories: skip names whose durable directory may still belong to a
+    // surviving process from a previous session — see localSpawnDirMayHoldLiveProcess for
+    // why reuse would blind archive gating. Host-local records are probed on the local
+    // filesystem with host PID checks; all other layouts (SSH/Coder, Docker, devcontainer)
+    // live in the runtime's exec namespace and are probed through the runtime instead.
+    if (spawnRecordsAreHostLocal(runtime)) {
       let suffix = 2;
       while (await this.localSpawnDirMayHoldLiveProcess(workspaceId, processId)) {
+        this.reservedProcessIds.delete(processId);
+        do {
+          processId = `${config.displayName} (${suffix})`;
+          suffix++;
+        } while (this.processes.has(processId) || this.reservedProcessIds.has(processId));
+        this.reservedProcessIds.add(processId);
+      }
+    } else {
+      let suffix = 2;
+      for (;;) {
+        const probe = await this.runtimeSpawnDirMayHoldLiveProcess(runtime, workspaceId, processId);
+        if (probe === "free") break;
+        if (probe !== "held") {
+          // Unreachable/garbled probe: abort rather than loop forever against a dead host.
+          // Nothing was written under this name, so the reservation is safe to release.
+          return { success: false, error: probe.error };
+        }
         this.reservedProcessIds.delete(processId);
         do {
           processId = `${config.displayName} (${suffix})`;
@@ -811,6 +839,14 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
     if (!result.success) {
       log.debug(`BackgroundProcessManager: Failed to spawn: ${result.error}`);
+      // Non-host record layouts: a failed spawn may leave the record directory holding a
+      // live detached process (preserved ambiguous PID echo, post-dispatch transport throw,
+      // or a failed best-effort cleanup), and the local disk probe above cannot see those
+      // layouts for a same-session retry. Retain the name reservation for this app session
+      // so a retry of the same display name allocates a fresh directory instead of
+      // truncating the survivor's output and sharing its exit marker (fail closed — the
+      // only cost is a suffixed name).
+      retainReservationAfterFailure = !spawnRecordsAreHostLocal(runtime);
       return { success: false, error: result.error };
     }
 
@@ -836,6 +872,10 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // directory keeps failing that probe closed.
       await handle.terminate();
       await handle.dispose();
+      // Same retention rationale as the spawn-failure path above: if the termination also
+      // failed (e.g. the same transport fault that broke writeMeta), a non-host record
+      // directory may still hold the live process.
+      retainReservationAfterFailure = !spawnRecordsAreHostLocal(runtime);
       return {
         success: false,
         error: `Failed to persist the spawn record (meta.json): ${getErrorMessage(error)}`,
@@ -1556,20 +1596,43 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * wrapper's exit trap even when the app is gone, so orphans stay detectable: a record still
    * marked running with no exit_code file and a live PID fails the gate closed.
    *
-   * Local filesystem only: remote (SSH/Docker) spawn records live on the remote host, and the
-   * checkout-deletion hazard this guards is limited to local managed worktrees. A recycled PID
-   * can cause a false positive, which errs on the safe side — the model-facing caller routes
-   * to user-mediated archive.
+   * Host filesystem only: remote (SSH/Docker) spawn records live on the remote host, and the
+   * checkout-deletion hazard this guards is limited to local managed worktrees. Devcontainer
+   * records live inside the container under `<workspace>/.xum/tmp` — host-visible through the
+   * workspace bind mount — so callers pass that root via extraRecordDirs; its PIDs are
+   * container-namespace and cannot be probed from the host, so any running record there is
+   * treated as live. A recycled PID can cause a false positive, which errs on the safe side —
+   * the model-facing caller routes to user-mediated archive.
    */
-  async hasOrphanedRunningBackgroundProcesses(workspaceId: string): Promise<boolean> {
+  async hasOrphanedRunningBackgroundProcesses(
+    workspaceId: string,
+    options?: { extraRecordDirs?: string[] }
+  ): Promise<boolean> {
     assert(workspaceId.length > 0, "hasOrphanedRunningBackgroundProcesses requires workspaceId");
-    const workspaceDir = localBgWorkspaceDir(workspaceId);
+    const roots: Array<{ dir: string; pidsAreHostNamespace: boolean }> = [
+      { dir: localBgWorkspaceDir(workspaceId), pidsAreHostNamespace: true },
+      ...(options?.extraRecordDirs ?? []).map((dir) => ({ dir, pidsAreHostNamespace: false })),
+    ];
+    for (const root of roots) {
+      if (await this.recordRootHoldsOrphan(workspaceId, root.dir, root.pidsAreHostNamespace)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** One record root's scan for hasOrphanedRunningBackgroundProcesses. */
+  private async recordRootHoldsOrphan(
+    workspaceId: string,
+    workspaceDir: string,
+    pidsAreHostNamespace: boolean
+  ): Promise<boolean> {
     let entries: Dirent[];
     try {
       entries = await fsPromises.readdir(workspaceDir, { withFileTypes: true });
     } catch (error) {
       if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) {
-        // No local spawn records for this workspace (never spawned locally, or cleaned up).
+        // No spawn records under this root (never spawned there, or cleaned up).
         return false;
       }
       // EACCES/EIO/...: the records exist but cannot be read, so absence of a surviving
@@ -1621,6 +1684,13 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         continue; // The exit marker settles the record (wrapper trap or migrated handle).
       } catch {
         // No exit marker yet — fall through to the PID checks.
+      }
+      if (!pidsAreHostNamespace) {
+        // Container-namespace PID (devcontainer record): nothing on the host can probe it,
+        // and a host kill(pid, 0) would answer for an unrelated host process — treat the
+        // running record as a live orphan (fail closed; over-refusal routes to
+        // user-mediated archive).
+        return true;
       }
       if (meta.pid <= 1) {
         // Migrated processes record pid 0 (exec streams expose no PID) and their exit
@@ -1693,6 +1763,50 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     } catch (error) {
       // ESRCH: gone. Anything else (EPERM, ...): not provably dead — treat as live.
       return !isErrnoWithCode(error, "ESRCH");
+    }
+  }
+
+  /**
+   * Counterpart of localSpawnDirMayHoldLiveProcess for runtimes whose spawn records are NOT
+   * host-local (SSH/Coder, Docker, devcontainer — see spawnRecordsAreHostLocal): the record
+   * layout lives in the runtime's exec namespace, so probe it through the runtime. Only the
+   * exit marker (or directory absence) proves the name safe to reuse — a markerless
+   * directory may belong to a live detached process from a previous session or a preserved
+   * ambiguous spawn, and reusing it would truncate its output and let either process's exit
+   * marker settle the other. No PID probe: recorded PIDs are only meaningful in the exec
+   * namespace and a stale-but-settled record merely costs a suffixed name (fail closed).
+   * Marker matching is substring-based because SSH login banners can prefix stdout (the same
+   * garbling that produces ambiguous PID echoes); a reply with neither marker or a failed
+   * exec is an error so callers abort instead of looping forever against a dead host.
+   */
+  private async runtimeSpawnDirMayHoldLiveProcess(
+    runtime: Runtime,
+    workspaceId: string,
+    processId: string
+  ): Promise<"free" | "held" | { error: string }> {
+    try {
+      const tempDir = await runtime.tempDir();
+      const processDir = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}/${processId}`;
+      const exitMarkerPath = `${processDir}/${BG_EXIT_CODE_FILENAME}`;
+      const script = `if [ ! -e ${quotePathForShell(processDir)} ] || [ -e ${quotePathForShell(
+        exitMarkerPath
+      )} ]; then echo __MUX_SPAWN_NAME_FREE__; else echo __MUX_SPAWN_NAME_HELD__; fi`;
+      const result = await execBuffered(runtime, script, { cwd: "/tmp", timeout: 10 });
+      if (result.exitCode === 0) {
+        if (result.stdout.includes("__MUX_SPAWN_NAME_FREE__")) return "free";
+        if (result.stdout.includes("__MUX_SPAWN_NAME_HELD__")) return "held";
+      }
+      return {
+        error: `Could not verify that background process name ${JSON.stringify(
+          processId
+        )} is free on the runtime (exit ${result.exitCode}): ${result.stderr || result.stdout}`,
+      };
+    } catch (error) {
+      return {
+        error: `Could not verify that background process name ${JSON.stringify(
+          processId
+        )} is free on the runtime: ${getErrorMessage(error)}`,
+      };
     }
   }
 

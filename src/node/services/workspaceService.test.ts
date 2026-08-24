@@ -11175,6 +11175,48 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(archived).toEqual(Ok({ kind: "archived" }));
   });
 
+  test("acquirePreInterruptionArchiveHold validates and arms the gate before turn interruption", async () => {
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+
+    // In-flight user activity must refuse BEFORE the caller destroys delegated turns: the
+    // sink's own gate runs only after interruption, when the turns are already lost.
+    const release = registerInProcessWorkflowRun(workspaceId);
+    let refused: ReturnType<typeof workspaceService.acquirePreInterruptionArchiveHold>;
+    try {
+      refused = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+        queuedDelegatedTurnCount: 0,
+      });
+    } finally {
+      release();
+    }
+    expect(refused.success).toBe(false);
+    if (!refused.success) {
+      expect(refused.error).toContain("workflow run");
+    }
+
+    // A refused hold releases the gate; a granted one arms it for the caller to carry
+    // through the sink, refusing new user admissions exactly like the sink's own gate.
+    const hold = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+    });
+    expect(hold.success).toBe(true);
+    if (!hold.success) return;
+    try {
+      const refusedOpen = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-hold");
+      expect(refusedOpen.success).toBe(false);
+      if (!refusedOpen.success) {
+        expect(refusedOpen.error).toContain("being archived");
+      }
+    } finally {
+      hold.data[Symbol.dispose]();
+    }
+
+    // Released (e.g. the archive failed): admissions flow again.
+    const allowed = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-hold-2");
+    expect(allowed.success).toBe(true);
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+  });
+
   test("archive() rechecks durably active workflow runs after arming the admission gate", async () => {
     workspaceService.setTaskService({
       hasActiveDescendantAgentTasksForWorkspace: mock(() => false),
@@ -11326,6 +11368,28 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       (await workspaceService.rollbackRecordedEditorOpen(workspaceId, "tok-never-committed"))
         .success
     ).toBe(true);
+  });
+
+  test("rollbackRecordedEditorOpen tombstones a token whose recording is still in flight", async () => {
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+
+    // The renderer saw its recording RPC reject at the transport while the backend handler
+    // was still persisting the marker, and rolled back immediately. The not-yet-registered
+    // token must not no-op: the handler would then commit a durable marker for a launch the
+    // renderer already abandoned, permanently refusing future model-driven archives.
+    const pending = workspaceService.recordExternalEditorOpen(workspaceId, "tok-inflight");
+    const rolledBack = await workspaceService.rollbackRecordedEditorOpen(
+      workspaceId,
+      "tok-inflight"
+    );
+    expect(rolledBack.success).toBe(true);
+
+    const recorded = await pending;
+    expect(recorded.success).toBe(false);
+    if (!recorded.success) {
+      expect(recorded.error).toContain("rolled back");
+    }
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
   });
 
   test("a failed marker persistence does not leave stale ancestry for the next attempt", async () => {

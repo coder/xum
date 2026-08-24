@@ -207,7 +207,9 @@ import {
   getSrcBaseDir,
   isSSHRuntime,
   isDockerRuntime,
+  isDevcontainerRuntime,
 } from "@/common/types/runtime";
+import { BG_OUTPUT_SUBDIR } from "@/node/services/backgroundProcessExecutor";
 // Backend maintenance sends (goal continuations, idle compaction, heartbeats)
 // normalize persisted models with gateway-preserving normalizeSelectedModel:
 // normalizeToCanonical would rewrite cross-typed Coder selections
@@ -7811,6 +7813,22 @@ export class WorkspaceService extends EventEmitter {
   >();
 
   /**
+   * Rollback requests that arrived before their recording committed, keyed by launch token.
+   * The renderer can observe a transport rejection of its recordEditorOpen RPC while the
+   * backend handler is still awaiting marker persistence; its immediate rollback would find
+   * no rollback entry, no-op, and the handler would then commit a durable marker for a
+   * launch the renderer already abandoned — a false marker that permanently refuses future
+   * model-driven archives. An unknown-token rollback therefore leaves a tombstone that the
+   * recording consumes at commit time (in the same synchronous block that would register
+   * the rollback entry), undoing its own admission instead of committing. Bounded FIFO:
+   * tombstones whose recording never reached the backend are unredeemable, and evicting one
+   * can at worst leave a sticky marker behind (over-refuses archives — fail closed).
+   */
+  private readonly externalEditorRollbackTombstones = new Map<string, string>();
+
+  private static readonly EXTERNAL_EDITOR_ROLLBACK_TOMBSTONE_CAP = 1024;
+
+  /**
    * Record that the user is opening this workspace in an external editor. Refuses while an
    * agent-driven archive is gating the workspace: the check shares the synchronous block with
    * the in-memory recording (mirroring TerminalService.openNative), so an archive gate armed
@@ -7821,6 +7839,16 @@ export class WorkspaceService extends EventEmitter {
     const admitted = await this.recordExternalEditorOpenForLaunch(workspaceId);
     if (!admitted.success) {
       return admitted;
+    }
+    // A rollback for this token that raced ahead of the recording (the renderer saw the RPC
+    // reject while this handler was still persisting the marker) is consumed here, in the
+    // same synchronous block that would otherwise register the rollback entry: the renderer
+    // has already abandoned the launch, so undo the admission instead of committing a marker
+    // no editor will ever sit behind.
+    if (this.externalEditorRollbackTombstones.get(launchToken) === workspaceId) {
+      this.externalEditorRollbackTombstones.delete(launchToken);
+      await admitted.data.rollbackAfterFailedLaunch();
+      return Err(`Editor open for ${workspaceId} was rolled back before its recording finished.`);
     }
     // Deep-link opens launch in the renderer immediately after this returns; the rollback
     // entry lets the renderer report a launch that provably never happened so the marker
@@ -7835,8 +7863,9 @@ export class WorkspaceService extends EventEmitter {
 
   /**
    * Redeems a recordExternalEditorOpen launch token after the renderer's placeholder window
-   * was closed before navigation (no editor launched). Idempotent: unknown or already
-   * redeemed tokens are no-ops, so renderer retries are safe.
+   * was closed before navigation (no editor launched). Idempotent for the renderer: unknown
+   * or already redeemed tokens succeed without touching durable state (they only leave a
+   * tombstone for a possibly in-flight recording), so renderer retries are safe.
    */
   async rollbackRecordedEditorOpen(
     workspaceId: string,
@@ -7844,6 +7873,21 @@ export class WorkspaceService extends EventEmitter {
   ): Promise<Result<void>> {
     const entry = this.externalEditorLaunchRollbacks.get(launchToken);
     if (entry?.workspaceId !== workspaceId) {
+      // Unknown token: the recording may still be in flight (its RPC rejected at the
+      // transport while the handler awaits marker persistence). Tombstone the token so the
+      // commit rolls itself back instead of persisting a marker for an abandoned launch
+      // (see externalEditorRollbackTombstones). Already-redeemed or never-recorded tokens
+      // leave an unredeemable tombstone the FIFO cap eventually evicts.
+      this.externalEditorRollbackTombstones.set(launchToken, workspaceId);
+      if (
+        this.externalEditorRollbackTombstones.size >
+        WorkspaceService.EXTERNAL_EDITOR_ROLLBACK_TOMBSTONE_CAP
+      ) {
+        const oldest = this.externalEditorRollbackTombstones.keys().next().value;
+        if (oldest != null) {
+          this.externalEditorRollbackTombstones.delete(oldest);
+        }
+      }
       return Ok(undefined);
     }
     this.externalEditorLaunchRollbacks.delete(launchToken);
@@ -8066,7 +8110,25 @@ export class WorkspaceService extends EventEmitter {
     if (processes.some((process) => process.status === "running")) {
       return true;
     }
-    return await this.backgroundProcessManager.hasOrphanedRunningBackgroundProcesses(workspaceId);
+    return await this.backgroundProcessManager.hasOrphanedRunningBackgroundProcesses(workspaceId, {
+      extraRecordDirs: this.extraBgRecordDirsForWorkspace(workspaceId),
+    });
+  }
+
+  /**
+   * Devcontainer background spawn records live inside the container under
+   * `<workspaceFolder>/.xum/tmp/mux-bashes/<workspaceId>` (DevcontainerRuntime.tempDir()),
+   * which the standard workspace bind mount makes host-visible at the same path beneath the
+   * checkout. The crash-orphan probe's default root covers only the host /tmp layout, so
+   * devcontainer workspaces pass this root as an extra record dir; PIDs recorded there are
+   * container-namespace, which the scan treats as unprobeable (running records fail closed).
+   */
+  private extraBgRecordDirsForWorkspace(workspaceId: string): string[] {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    const workspace = entry?.workspace;
+    if (workspace == null || !isDevcontainerRuntime(workspace.runtimeConfig)) return [];
+    if (workspace.path.trim().length === 0) return [];
+    return [path.join(workspace.path, ".xum", "tmp", BG_OUTPUT_SUBDIR, workspaceId)];
   }
 
   /**
@@ -8096,6 +8158,87 @@ export class WorkspaceService extends EventEmitter {
       terminalSessions: this.terminalService?.hasWorkspaceSessions(workspaceId) === true,
       desktopSession: this.desktopSessionManager?.has(workspaceId) === true,
     };
+  }
+
+  /**
+   * Arm the archive admission gate BEFORE a destructive pre-archive step (interrupt_active
+   * turn interruption) and validate that no live user activity is already in flight. The
+   * sink's refuseLiveUserActivity gate runs only inside archiveUnlocked — after the caller
+   * has already destroyed the delegated turns — so a renderer send, bash execution,
+   * attachment upload, file-completion refresh, workflow admission, or user queue entry
+   * admitted between the caller's earlier activity snapshot and the sink would refuse the
+   * archive with the turns already lost. This hold adds the workspace to
+   * archivingWorkspaces (refusing new admissions synchronously, exactly like the sink) and
+   * checks the same counters in the same synchronous block; the caller carries the returned
+   * hold through the sink call so nothing can be admitted in between. Turn-shaped activity
+   * (active streams, the delegated queue entries themselves) is intentionally NOT checked:
+   * the caller is about to interrupt those turns, and the sink's admission-hold recheck
+   * re-validates queue emptiness after interruption. Queue entries beyond
+   * queuedDelegatedTurnCount — or any entry already dispatching (PREPARING) — fail closed
+   * here instead.
+   *
+   * The sink adds/removes the same Set entry around its own gate; both operations are
+   * idempotent, and by the time the sink's finally removes it either archivedAt is
+   * persisted (admissions refuse durably) or the archive failed and re-admission is
+   * correct.
+   */
+  acquirePreInterruptionArchiveHold(
+    workspaceId: string,
+    options: { queuedDelegatedTurnCount: number }
+  ): Result<Disposable> {
+    assert(workspaceId.length > 0, "acquirePreInterruptionArchiveHold requires workspaceId");
+    assert(
+      Number.isInteger(options.queuedDelegatedTurnCount) && options.queuedDelegatedTurnCount >= 0,
+      "acquirePreInterruptionArchiveHold requires a non-negative queuedDelegatedTurnCount"
+    );
+    this.archivingWorkspaces.add(workspaceId);
+    const hold: Disposable = {
+      [Symbol.dispose]: () => {
+        this.archivingWorkspaces.delete(workspaceId);
+      },
+    };
+    const activityLabels: string[] = [];
+    if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
+      activityLabels.push("a message send in progress");
+    }
+    if ((this.preflightExecCounts.get(workspaceId) ?? 0) > 0) {
+      activityLabels.push("a bash command executing");
+    }
+    if ((this.preflightStagingCounts.get(workspaceId) ?? 0) > 0) {
+      activityLabels.push("an attachment upload in progress");
+    }
+    if ((this.preflightFileCompletionCounts.get(workspaceId) ?? 0) > 0) {
+      activityLabels.push("a file completion refresh in progress");
+    }
+    if (hasInProcessWorkflowWork(workspaceId)) {
+      activityLabels.push("a workflow run starting or running");
+    }
+    if (this.backgroundProcessManager.hasRunningBackgroundProcesses(workspaceId)) {
+      activityLabels.push("running background bash processes");
+    }
+    if (this.terminalService?.hasWorkspaceSessions(workspaceId) === true) {
+      activityLabels.push("open terminal sessions");
+    }
+    if (this.desktopSessionManager?.has(workspaceId) === true) {
+      activityLabels.push("a desktop session");
+    }
+    if (this.hasPendingQueuedOrPreparingTurn(workspaceId)) {
+      // A dispatching (PREPARING) entry has left the queue but not yet registered a
+      // stream, so the queue comparison below cannot attribute it — fail closed.
+      activityLabels.push("a message dispatching");
+    } else if (
+      this.getOrCreateSession(workspaceId).queuedMessageEntryCount() >
+      options.queuedDelegatedTurnCount
+    ) {
+      activityLabels.push("queued messages beyond the delegated turns");
+    }
+    if (activityLabels.length > 0) {
+      hold[Symbol.dispose]();
+      return Err(
+        `Workspace has live activity (${activityLabels.join(", ")}) that interrupting and archiving would destroy or terminate. Wait for it to finish or ask the user to archive manually.`
+      );
+    }
+    return Ok(hold);
   }
 
   async archive(
@@ -8211,7 +8354,9 @@ export class WorkspaceService extends EventEmitter {
         // admissions, so this sink recheck is defense-in-depth against callers that skipped
         // the fresh pre-gate.
         if (
-          await this.backgroundProcessManager.hasOrphanedRunningBackgroundProcesses(workspaceId)
+          await this.backgroundProcessManager.hasOrphanedRunningBackgroundProcesses(workspaceId, {
+            extraRecordDirs: this.extraBgRecordDirsForWorkspace(workspaceId),
+          })
         ) {
           return Err(
             "Workspace has background processes surviving from a previous app session that archiving could strand. Terminate them or ask the user to archive manually."

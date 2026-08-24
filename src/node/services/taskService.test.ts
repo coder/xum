@@ -480,6 +480,7 @@ function createWorkspaceServiceMocks(
     hasRunningBackgroundBashProcesses: ReturnType<typeof mock>;
     isSnapshotArchiveEligibilityMutationSensitive: ReturnType<typeof mock>;
     hasUntrackableExternalAppOpen: ReturnType<typeof mock>;
+    acquirePreInterruptionArchiveHold: ReturnType<typeof mock>;
     deleteWorktree: ReturnType<typeof mock>;
     remove: ReturnType<typeof mock>;
     emit: ReturnType<typeof mock>;
@@ -600,6 +601,11 @@ function createWorkspaceServiceMocks(
     mock((_workspaceId: string, _message: WorkspaceChatMessage) => undefined);
   const isWorkflowInvocationCurrent =
     overrides?.isWorkflowInvocationCurrent ?? mock(() => Promise.resolve(true));
+  // Granted by default (no live user activity): interrupt_active tests exercise the
+  // interruption/archive flow; the hold's own refusal logic lives in workspaceService.test.ts.
+  const acquirePreInterruptionArchiveHold =
+    overrides?.acquirePreInterruptionArchiveHold ??
+    mock((): Result<Disposable> => Ok({ [Symbol.dispose]: () => undefined }));
 
   const create =
     overrides?.create ??
@@ -642,6 +648,7 @@ function createWorkspaceServiceMocks(
       hasRunningBackgroundBashProcesses,
       isSnapshotArchiveEligibilityMutationSensitive,
       hasUntrackableExternalAppOpen,
+      acquirePreInterruptionArchiveHold,
       // Task launches register their fire-and-forget background inits for archive gating;
       // a no-op suffices since these tests archive nothing mid-init.
       registerExternalBackgroundInit: mock(() => undefined),

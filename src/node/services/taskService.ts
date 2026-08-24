@@ -9528,137 +9528,171 @@ export class TaskService {
             });
           }
 
-          if (activeTurns.length > 0) {
-            if (options.interruptActive !== true) {
-              return Ok({
-                status: "active",
-                action: "archive",
-                ...this.lifecycleTargetFields(resolved),
-                activeTaskIds: activeTurns.map((turn) => turn.handleId),
+          // Held (when interrupting) from before the first turn interruption through the
+          // archive sink so user activity cannot be admitted between turn destruction and
+          // the sink's refuseLiveUserActivity gate (see acquirePreInterruptionArchiveHold).
+          let preInterruptionHold: Disposable | undefined;
+          try {
+            if (activeTurns.length > 0) {
+              if (options.interruptActive !== true) {
+                return Ok({
+                  status: "active",
+                  action: "archive",
+                  ...this.lifecycleTargetFields(resolved),
+                  activeTaskIds: activeTurns.map((turn) => turn.handleId),
+                });
+              }
+              // Snapshot-behavior archives are eligibility-mutation-sensitive: the running turns
+              // being interrupted can create/remove untracked files between any preflight scan and
+              // the sink's exact-acknowledgement recheck, so interruption could destroy in-flight
+              // work and STILL bounce with requires_confirmation, stranding the workspace
+              // interrupted-but-unarchived. No worktree-freeze mechanism exists, so refuse to
+              // interrupt here: the caller stops the listed turns explicitly (task_stop / await),
+              // after which the untracked set is stable and any confirmation round-trip is
+              // deterministic.
+              if (
+                this.workspaceService.isSnapshotArchiveEligibilityMutationSensitive(
+                  resolved.workspaceId,
+                  worktreeArchiveBehavior,
+                  resolved.metadata
+                )
+              ) {
+                return Ok({
+                  status: "active",
+                  action: "archive",
+                  ...this.lifecycleTargetFields(resolved),
+                  activeTaskIds: activeTurns.map((turn) => turn.handleId),
+                  note:
+                    "interrupt_active was not honored: the snapshot archive behavior requires an exact untracked-file acknowledgement, which active turns can invalidate mid-interruption. " +
+                    "Stop the listed turns (task_stop) or wait for them to finish, then archive again.",
+                });
+              }
+              // Same interrupted-but-unarchived hazard from a different source: for a dedicated
+              // Coder workspace under the "stop" policy, the sink's before-archive hook stops the
+              // remote workspace and can fail or time out AFTER turns were already destroyed —
+              // preflightArchive cannot exercise that hook without side effects, and interrupted
+              // streams cannot be restored. Refuse to interrupt; the caller stops the turns
+              // explicitly, after which a failed archive is retryable without further loss.
+              if (isDedicatedCoderWorkspace && coderArchiveBehavior !== "keep") {
+                return Ok({
+                  status: "active",
+                  action: "archive",
+                  ...this.lifecycleTargetFields(resolved),
+                  activeTaskIds: activeTurns.map((turn) => turn.handleId),
+                  note:
+                    "interrupt_active was not honored: archiving this dedicated Coder workspace runs a fallible remote stop step after interruption, which could destroy the turns and still fail the archive. " +
+                    "Stop the listed turns (task_stop) or wait for them to finish, then archive again.",
+                });
+              }
+              // Interruption destroys in-flight work, so surface every archive blocker BEFORE
+              // stopping anything: a refused lossy-untracked-files confirmation, changed paths since
+              // a prior acknowledgement, or archive-blocking errors (e.g. active descendant
+              // sub-agents) must all leave the active turns running.
+              const preflight = await this.workspaceService.preflightArchive(resolved.workspaceId, {
+                worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
               });
-            }
-            // Snapshot-behavior archives are eligibility-mutation-sensitive: the running turns
-            // being interrupted can create/remove untracked files between any preflight scan and
-            // the sink's exact-acknowledgement recheck, so interruption could destroy in-flight
-            // work and STILL bounce with requires_confirmation, stranding the workspace
-            // interrupted-but-unarchived. No worktree-freeze mechanism exists, so refuse to
-            // interrupt here: the caller stops the listed turns explicitly (task_stop / await),
-            // after which the untracked set is stable and any confirmation round-trip is
-            // deterministic.
-            if (
-              this.workspaceService.isSnapshotArchiveEligibilityMutationSensitive(
+              if (!preflight.success) {
+                return Ok({
+                  status: "error",
+                  action: "archive",
+                  ...this.lifecycleTargetFields(resolved),
+                  error: preflight.error,
+                });
+              }
+              if (preflight.data.kind === "confirm-lossy-untracked-files") {
+                // The archive sink requires exact normalized equality between the acknowledged and
+                // current path lists (a subset check would accept a stale acknowledgement whose extra
+                // paths no longer exist, interrupt the turns, and then still bounce with
+                // requires_confirmation). Mirror the sink's check so interruption only happens when
+                // the acknowledgement would actually be accepted.
+                if (
+                  acknowledgedUntrackedPaths == null ||
+                  !areArchiveUntrackedPathListsEqual(
+                    acknowledgedUntrackedPaths,
+                    preflight.data.paths
+                  )
+                ) {
+                  return Ok({
+                    status: "requires_confirmation",
+                    action: "archive",
+                    ...this.lifecycleTargetFields(resolved),
+                    paths: preflight.data.paths,
+                  });
+                }
+              }
+              // Arm the sink's admission gate BEFORE destroying anything: in-flight user
+              // activity the earlier snapshot cannot see (admission counters, workflow
+              // admissions, user queue entries beyond the delegated turns) must refuse the
+              // archive while the turns are still running, and the armed gate keeps new
+              // activity out until the sink completes.
+              const holdResult = this.workspaceService.acquirePreInterruptionArchiveHold(
                 resolved.workspaceId,
-                worktreeArchiveBehavior,
-                resolved.metadata
-              )
-            ) {
-              return Ok({
-                status: "active",
-                action: "archive",
-                ...this.lifecycleTargetFields(resolved),
-                activeTaskIds: activeTurns.map((turn) => turn.handleId),
-                note:
-                  "interrupt_active was not honored: the snapshot archive behavior requires an exact untracked-file acknowledgement, which active turns can invalidate mid-interruption. " +
-                  "Stop the listed turns (task_stop) or wait for them to finish, then archive again.",
-              });
+                {
+                  queuedDelegatedTurnCount: activeTurns.filter(
+                    (turn) => turn.workspaceId === resolved.workspaceId && turn.status === "queued"
+                  ).length,
+                }
+              );
+              if (!holdResult.success) {
+                return Ok({
+                  status: "active",
+                  action: "archive",
+                  ...this.lifecycleTargetFields(resolved),
+                  activeTaskIds: activeTurns.map((turn) => turn.handleId),
+                  note: `interrupt_active was not honored: ${holdResult.error}`,
+                });
+              }
+              preInterruptionHold = holdResult.data;
+              const interruptFailure = await this.interruptActiveWorkspaceLifecycleTurns(
+                resolved,
+                activeTurns,
+                deferredDisposableCleanups
+              );
+              if (interruptFailure != null) return Ok(interruptFailure);
             }
-            // Same interrupted-but-unarchived hazard from a different source: for a dedicated
-            // Coder workspace under the "stop" policy, the sink's before-archive hook stops the
-            // remote workspace and can fail or time out AFTER turns were already destroyed —
-            // preflightArchive cannot exercise that hook without side effects, and interrupted
-            // streams cannot be restored. Refuse to interrupt; the caller stops the turns
-            // explicitly, after which a failed archive is retryable without further loss.
-            if (isDedicatedCoderWorkspace && coderArchiveBehavior !== "keep") {
-              return Ok({
-                status: "active",
-                action: "archive",
-                ...this.lifecycleTargetFields(resolved),
-                activeTaskIds: activeTurns.map((turn) => turn.handleId),
-                note:
-                  "interrupt_active was not honored: archiving this dedicated Coder workspace runs a fallible remote stop step after interruption, which could destroy the turns and still fail the archive. " +
-                  "Stop the listed turns (task_stop) or wait for them to finish, then archive again.",
-              });
-            }
-            // Interruption destroys in-flight work, so surface every archive blocker BEFORE
-            // stopping anything: a refused lossy-untracked-files confirmation, changed paths since
-            // a prior acknowledgement, or archive-blocking errors (e.g. active descendant
-            // sub-agents) must all leave the active turns running.
-            const preflight = await this.workspaceService.preflightArchive(resolved.workspaceId, {
-              worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
-            });
-            if (!preflight.success) {
+
+            // WhileTaskTreeLocked: the tree lock is already held for the whole lifecycle operation
+            // (see the lock-order comment above), so the plain archive() wrapper would self-deadlock.
+            const result = await this.workspaceService.archiveWhileTaskTreeLocked(
+              resolved.workspaceId,
+              acknowledgedUntrackedPaths,
+              // Enforced at the sink: forbidWorktreeCheckoutDeletion / forbidCoderWorkspaceDeletion
+              // close the settings-flip races the early behavior checks above cannot cover,
+              // refuseLiveUserActivity fails closed (and holds turn admission) if user activity was
+              // admitted after the earlier live-activity snapshot, and the behavior override pins
+              // every sink decision to the same read that drove interruption eligibility.
+              {
+                forbidWorktreeCheckoutDeletion: true,
+                forbidCoderWorkspaceDeletion: true,
+                refuseLiveUserActivity: true,
+                worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
+                coderWorkspaceArchiveBehaviorOverride: coderArchiveBehavior,
+              }
+            );
+            if (!result.success) {
               return Ok({
                 status: "error",
                 action: "archive",
                 ...this.lifecycleTargetFields(resolved),
-                error: preflight.error,
+                error: result.error,
               });
             }
-            if (preflight.data.kind === "confirm-lossy-untracked-files") {
-              // The archive sink requires exact normalized equality between the acknowledged and
-              // current path lists (a subset check would accept a stale acknowledgement whose extra
-              // paths no longer exist, interrupt the turns, and then still bounce with
-              // requires_confirmation). Mirror the sink's check so interruption only happens when
-              // the acknowledgement would actually be accepted.
-              if (
-                acknowledgedUntrackedPaths == null ||
-                !areArchiveUntrackedPathListsEqual(acknowledgedUntrackedPaths, preflight.data.paths)
-              ) {
-                return Ok({
-                  status: "requires_confirmation",
-                  action: "archive",
-                  ...this.lifecycleTargetFields(resolved),
-                  paths: preflight.data.paths,
-                });
-              }
+            if (result.data.kind === "confirm-lossy-untracked-files") {
+              return Ok({
+                status: "requires_confirmation",
+                action: "archive",
+                ...this.lifecycleTargetFields(resolved),
+                paths: result.data.paths,
+              });
             }
-            const interruptFailure = await this.interruptActiveWorkspaceLifecycleTurns(
-              resolved,
-              activeTurns,
-              deferredDisposableCleanups
-            );
-            if (interruptFailure != null) return Ok(interruptFailure);
-          }
-
-          // WhileTaskTreeLocked: the tree lock is already held for the whole lifecycle operation
-          // (see the lock-order comment above), so the plain archive() wrapper would self-deadlock.
-          const result = await this.workspaceService.archiveWhileTaskTreeLocked(
-            resolved.workspaceId,
-            acknowledgedUntrackedPaths,
-            // Enforced at the sink: forbidWorktreeCheckoutDeletion / forbidCoderWorkspaceDeletion
-            // close the settings-flip races the early behavior checks above cannot cover,
-            // refuseLiveUserActivity fails closed (and holds turn admission) if user activity was
-            // admitted after the earlier live-activity snapshot, and the behavior override pins
-            // every sink decision to the same read that drove interruption eligibility.
-            {
-              forbidWorktreeCheckoutDeletion: true,
-              forbidCoderWorkspaceDeletion: true,
-              refuseLiveUserActivity: true,
-              worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
-              coderWorkspaceArchiveBehaviorOverride: coderArchiveBehavior,
-            }
-          );
-          if (!result.success) {
             return Ok({
-              status: "error",
+              status: "archived",
               action: "archive",
               ...this.lifecycleTargetFields(resolved),
-              error: result.error,
             });
+          } finally {
+            preInterruptionHold?.[Symbol.dispose]();
           }
-          if (result.data.kind === "confirm-lossy-untracked-files") {
-            return Ok({
-              status: "requires_confirmation",
-              action: "archive",
-              ...this.lifecycleTargetFields(resolved),
-              paths: result.data.paths,
-            });
-          }
-          return Ok({
-            status: "archived",
-            action: "archive",
-            ...this.lifecycleTargetFields(resolved),
-          });
         })
       );
     // Locks are released: run the deferred disposable cleanup for nested turn workspaces whose

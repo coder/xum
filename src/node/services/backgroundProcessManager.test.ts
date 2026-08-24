@@ -22,6 +22,34 @@ import { createBashOutputTool } from "@/node/services/tools/bash_output";
 import { TestTempDir, createTestToolConfig } from "@/node/services/tools/testHelpers";
 import type { BashToolResult, BashOutputToolResult } from "@/common/types/tools";
 
+/**
+ * Delegates to a real LocalRuntime but is NOT an instanceof LocalBaseRuntime, so the
+ * manager treats it like a remote runtime (exec-based record-directory probing, name
+ * reservation retention on failure). Optionally throws on the spawn command itself to
+ * simulate a transport-level (SSH/Coder channel) error after dispatch.
+ */
+function createRemoteLikeRuntime(
+  base: LocalRuntime,
+  options?: { throwOnSpawn?: { value: boolean } }
+): Runtime {
+  return new Proxy({} as Runtime, {
+    get(_target, prop) {
+      if (prop === "exec") {
+        return (command: string, opts: never) => {
+          if (options?.throwOnSpawn?.value === true && command.includes("output.log")) {
+            throw new Error("SSH channel error after dispatch");
+          }
+          return base.exec(command, opts);
+        };
+      }
+      const value = (base as unknown as Record<PropertyKey, unknown>)[prop];
+      return typeof value === "function"
+        ? (value as (...args: unknown[]) => unknown).bind(base)
+        : value;
+    },
+  });
+}
+
 function waitForMonitorMatch(
   manager: BackgroundProcessManager,
   timeoutMs = 2_000
@@ -154,6 +182,64 @@ describe("BackgroundProcessManager", () => {
         expect(meta.status).toBe("running");
         expect(meta.startTime).toBeGreaterThan(0);
       }
+    });
+
+    it("does not reuse a preserved record directory when retrying a failed remote spawn", async () => {
+      // A transport-level throw after dispatch preserves the remote record directory as
+      // fail-closed orphan evidence. A same-session retry of the same display name must not
+      // reuse that directory: truncating its output.log and sharing its exit_code would let
+      // either detached process settle the other and blind the Coder-stop archive gate.
+      const throwOnSpawn = { value: true };
+      const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), { throwOnSpawn });
+
+      const first = await manager.spawn(remote, testWorkspaceId, "echo hi", {
+        cwd: process.cwd(),
+        displayName: "retry-job",
+      });
+      expect(first.success).toBe(false);
+      await fs.access(`/tmp/mux-bashes/${testWorkspaceId}/retry-job/output.log`);
+
+      throwOnSpawn.value = false;
+      const second = await manager.spawn(remote, testWorkspaceId, "echo hi", {
+        cwd: process.cwd(),
+        displayName: "retry-job",
+      });
+      expect(second.success).toBe(true);
+      if (!second.success) return;
+      expect(second.processId).toBe("retry-job (1)");
+      // The preserved evidence stays untouched for crash-orphan gating.
+      await fs.access(`/tmp/mux-bashes/${testWorkspaceId}/retry-job/output.log`);
+    });
+
+    it("probes runtime record directories for non-host runtimes before reusing a name", async () => {
+      // A markerless record directory on the runtime (previous-session survivor or preserved
+      // ambiguous spawn) holds the name; an exit-marker-settled one frees it.
+      const heldDir = `/tmp/mux-bashes/${testWorkspaceId}/held-job`;
+      await fs.mkdir(heldDir, { recursive: true });
+      await fs.writeFile(path.join(heldDir, "output.log"), "previous session output");
+      const settledDir = `/tmp/mux-bashes/${testWorkspaceId}/settled-job`;
+      await fs.mkdir(settledDir, { recursive: true });
+      await fs.writeFile(path.join(settledDir, "exit_code"), "0");
+
+      const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()));
+      const held = await manager.spawn(remote, testWorkspaceId, "echo hi", {
+        cwd: process.cwd(),
+        displayName: "held-job",
+      });
+      expect(held.success).toBe(true);
+      if (!held.success) return;
+      expect(held.processId).toBe("held-job (2)");
+      expect(await fs.readFile(path.join(heldDir, "output.log"), "utf-8")).toBe(
+        "previous session output"
+      );
+
+      const settled = await manager.spawn(remote, testWorkspaceId, "echo hi", {
+        cwd: process.cwd(),
+        displayName: "settled-job",
+      });
+      expect(settled.success).toBe(true);
+      if (!settled.success) return;
+      expect(settled.processId).toBe("settled-job");
     });
   });
 
@@ -1979,6 +2065,41 @@ describe("BackgroundProcessManager", () => {
       await writeSpawnRecord("migrated-exited", { pid: 0, status: "running" }, { exitCode: "0" });
 
       expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("treats running records under extra record dirs as live without host PID probes", async () => {
+      // Devcontainer records (passed via extraRecordDirs) carry container-namespace PIDs: a
+      // host ESRCH proves nothing about the container process, so a running record without
+      // an exit marker must fail closed instead of trusting the host PID probe.
+      const extraRoot = await fs.mkdtemp(path.join(os.tmpdir(), "bg-extra-root-"));
+      try {
+        const dead = spawnSync("true");
+        expect(dead.pid).toBeGreaterThan(1);
+        const processDir = path.join(extraRoot, "container-survivor");
+        await fs.mkdir(processDir, { recursive: true });
+        await fs.writeFile(
+          path.join(processDir, "meta.json"),
+          JSON.stringify({ pid: dead.pid, status: "running" })
+        );
+
+        // Host layout is empty, and the same record under the HOST root would read as dead.
+        expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+        expect(
+          await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId, {
+            extraRecordDirs: [extraRoot],
+          })
+        ).toBe(true);
+
+        // The exit trap still settles extra-root records.
+        await fs.writeFile(path.join(processDir, "exit_code"), "0");
+        expect(
+          await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId, {
+            extraRecordDirs: [extraRoot],
+          })
+        ).toBe(false);
+      } finally {
+        await fs.rm(extraRoot, { recursive: true, force: true });
+      }
     });
 
     it("fails closed on untracked migrated records without an exit marker", async () => {

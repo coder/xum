@@ -25,6 +25,8 @@ import {
   shellQuote,
 } from "@/node/runtime/backgroundCommands";
 import { execBuffered, writeFileString } from "@/node/utils/runtime/helpers";
+import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
+import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { toPosixPath } from "@/node/utils/paths";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -34,9 +36,22 @@ import { getErrorMessage } from "@/common/utils/errors";
  * On Windows, first converts to POSIX format, then shell-quotes.
  * On Unix, just shell-quotes (handles spaces, special chars).
  */
-function quotePathForShell(p: string): string {
+export function quotePathForShell(p: string): string {
   const posixPath = toPosixPath(p);
   return shellQuote(posixPath);
+}
+
+/**
+ * Whether this runtime's background spawn records live on the HOST filesystem at
+ * localBgWorkspaceDir with host-namespace PIDs. Only such records can be probed via local fs
+ * reads and process.kill (crash-orphan archive gating, restart-unique name allocation).
+ * DevcontainerRuntime extends LocalBaseRuntime but execs inside the container: its records
+ * live under the container-side tempDir() (host-visible only through the workspace bind
+ * mount) and its recorded PIDs are container-namespace, so it must be treated like a remote
+ * runtime everywhere a probe would otherwise trust host paths or host PID checks.
+ */
+export function spawnRecordsAreHostLocal(runtime: Runtime): boolean {
+  return runtime instanceof LocalBaseRuntime && !(runtime instanceof DevcontainerRuntime);
 }
 
 /**
@@ -52,7 +67,7 @@ function errorMsg(error: unknown): string {
 }
 
 /** Subdirectory under temp for background process output */
-const BG_OUTPUT_SUBDIR = "mux-bashes";
+export const BG_OUTPUT_SUBDIR = "mux-bashes";
 
 /** Output filename for combined stdout/stderr */
 const OUTPUT_FILENAME = "output.log";
@@ -255,7 +270,18 @@ export async function spawnProcess(
   } catch (error) {
     const errorMessage = errorMsg(error);
     log.debug(`BackgroundProcessExecutor.spawnProcess: Error: ${errorMessage}`);
-    await removeOutputDirBestEffort();
+    // Post-dispatch ambiguity: a transport-level throw (an SSH/Coder channel or container
+    // exec error after the spawn command was sent) cannot prove the detached shell never
+    // started — a remote/container exec can reject after dispatch while the nohup job
+    // survives. Keep the directory as durable evidence: the wrapper's trap settles it with
+    // an exit marker if the job did run, and non-host crash-orphan gating (#3944, plus the
+    // devcontainer bind-mount scan) consumes exactly these records. Host-local exec throws
+    // happen before anything is dispatched (spawn syscall failures), so those directories
+    // are still removed — keeping one would permanently over-refuse archives with a record
+    // no process will ever settle.
+    if (spawnRecordsAreHostLocal(runtime)) {
+      await removeOutputDirBestEffort();
+    }
     return {
       success: false,
       error: `Failed to spawn background process: ${errorMessage}`,

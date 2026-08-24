@@ -808,4 +808,14 @@ export class MessageQueue {
   isEmpty(): boolean {
     return this.entries.length === 0;
   }
+
+  /**
+   * Number of pending entries, including synthetic/internal ones. Archive admission uses
+   * this to compare the queue against the delegated turns it is about to interrupt, so it
+   * must count every entry — a "visible" count could hide user work behind synthetic
+   * entries.
+   */
+  entryCount(): number {
+    return this.entries.length;
+  }
 }
