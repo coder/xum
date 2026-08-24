@@ -875,6 +875,10 @@ export type XumMessage = Omit<UIMessage<XumMetadata, never, never>, "parts"> & {
   parts: Array<XumTextPart | XumReasoningPart | XumFilePart | XumToolPart>;
 };
 
+// @coder/mux-chat-components is a separately published compatibility package. Keep
+// its public type name stable while Xum-owned code uses the canonical identifier.
+export type MuxMessage = XumMessage;
+
 // DisplayedMessage represents a single UI message block
 // This is what the UI components consume, splitting complex messages into separate visual blocks
 export type DisplayedMessage =
