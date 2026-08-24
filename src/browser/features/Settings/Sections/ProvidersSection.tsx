@@ -1796,6 +1796,10 @@ export function ProvidersSection() {
             ...prev,
             [provider]: result.error.message,
           }));
+          // The provider survives, but its queued format writes were already
+          // invalidated above; refetch backend truth so an unpersisted
+          // optimistic format cannot linger.
+          void refresh();
           return;
         }
         if (!result.success && result.error.code === "config_repair_failed") {
@@ -1827,6 +1831,8 @@ export function ProvidersSection() {
           ...prev,
           [provider]: "Failed to remove custom provider.",
         }));
+        // Same reconciliation as the structured-failure path above.
+        void refresh();
       } finally {
         setCustomProviderRemoving((prev) => (prev === provider ? null : prev));
       }
