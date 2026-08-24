@@ -69,6 +69,50 @@ export function isValidCustomProviderId(id: string): boolean {
   return validateCustomProviderId(id).ok;
 }
 
+/**
+ * Every supported SDK adapter builds request URLs by appending the endpoint
+ * path directly onto the configured base URL string (e.g.
+ * `${baseURL}/messages`), so a query string or fragment would swallow the
+ * endpoint path (`https://proxy.example/v1?token=x` becomes
+ * `.../v1?token=x/messages`). Reject such URLs outright instead of silently
+ * stripping them: auth query params can never work with these adapters, and
+ * stripping would resurface as a confusing request-time 401. The contract is
+ * on the raw characters because a bare trailing `?` parses to an empty
+ * `URL.search` yet still breaks raw suffixing.
+ */
+export const BASE_URL_QUERY_FRAGMENT_REASON =
+  'Base URL must not contain a query string ("?") or fragment ("#"); endpoint paths are appended to it directly. Pass authentication via the API key field instead.';
+
+export function baseUrlQueryFragmentError(baseUrl: string): string | null {
+  return baseUrl.includes("?") || baseUrl.includes("#") ? BASE_URL_QUERY_FRAGMENT_REASON : null;
+}
+
+export function validateCustomProviderBaseUrl(
+  baseUrl: string
+): { ok: true } | { ok: false; reason: string } {
+  const trimmed = baseUrl.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, reason: "Base URL is required." };
+  }
+
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    return { ok: false, reason: "Custom providers require an HTTP or HTTPS base URL." };
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return { ok: false, reason: "Custom providers require an HTTP or HTTPS base URL." };
+  }
+
+  const queryFragmentError = baseUrlQueryFragmentError(trimmed);
+  if (queryFragmentError != null) {
+    return { ok: false, reason: queryFragmentError };
+  }
+
+  return { ok: true };
+}
+
 export function isCustomProviderType(value: unknown): value is CustomProviderType {
   return typeof value === "string" && CUSTOM_PROVIDER_TYPE_SET.has(value);
 }

@@ -313,6 +313,30 @@ describeOpenAICompatible("custom OpenAI-compatible providers", () => {
     }
   }, 45000);
 
+  test("rejects custom provider base URLs carrying a query string", async () => {
+    // Every SDK adapter raw-appends endpoint paths onto the base URL
+    // (`${baseURL}/messages`), so a query string would swallow the endpoint.
+    // The IPC surface must reject it up front instead of misrouting requests.
+    const env = await createTestEnvironment();
+    try {
+      const result = await env.orpc.providers.addCustomProvider({
+        provider: "query-proxy",
+        displayName: "Query Proxy",
+        providerType: "anthropic-messages",
+        baseUrl: "https://proxy.example/anthropic?token=x",
+      });
+
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.code).toBe("invalid_base_url");
+        expect(result.error.message).toContain("query");
+      }
+      expect(await env.orpc.providers.list()).not.toContain("query-proxy");
+    } finally {
+      await cleanupTestEnvironment(env);
+    }
+  }, 30000);
+
   test("streams a custom OpenAI Responses provider through /v1/responses", async () => {
     const mock = await createMockServer([
       ({ response }) => writeResponsesCompletion(response, "Hello from responses"),

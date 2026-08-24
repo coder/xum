@@ -72,6 +72,7 @@ import {
   isBuiltInProvider,
   isCustomProviderConfig,
   isCustomProviderType,
+  validateCustomProviderBaseUrl,
   validateCustomProviderId,
   type CustomProviderType,
 } from "@/common/utils/providers/customProviders";
@@ -1630,13 +1631,12 @@ export function ProvidersSection() {
   const customProviderDisplayNameError =
     trimmedCustomProviderDisplayName.length === 0 ? "Display name is required." : null;
   const trimmedCustomProviderBaseUrl = customProviderBaseUrl.trim();
-  const customProviderBaseUrlError =
-    trimmedCustomProviderBaseUrl.length === 0
-      ? "Base URL is required."
-      : trimmedCustomProviderBaseUrl.startsWith("http://") ||
-          trimmedCustomProviderBaseUrl.startsWith("https://")
-        ? null
-        : "Base URL must start with http:// or https://.";
+  const customProviderBaseUrlValidation = validateCustomProviderBaseUrl(
+    trimmedCustomProviderBaseUrl
+  );
+  const customProviderBaseUrlError = customProviderBaseUrlValidation.ok
+    ? null
+    : customProviderBaseUrlValidation.reason;
   const showCustomProviderIdError =
     !customProviderIdValidation.ok &&
     (customProviderTouchedFields.providerId || customProviderSubmitAttempted);
@@ -1690,8 +1690,7 @@ export function ProvidersSection() {
     if (
       !providerIdValidation.ok ||
       displayName.length === 0 ||
-      baseUrl.length === 0 ||
-      (!baseUrl.startsWith("http://") && !baseUrl.startsWith("https://"))
+      !validateCustomProviderBaseUrl(baseUrl).ok
     ) {
       setCustomProviderSubmitError(null);
       return;

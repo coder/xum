@@ -19,11 +19,13 @@ import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderD
 import { modelStringStartsWithProvider } from "@/common/utils/providers/modelString";
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
 import {
+  baseUrlQueryFragmentError,
   getCustomProviderIds,
   getShadowedCustomProviderIds,
   isBuiltInProvider,
   isCustomProviderConfig,
   isCustomProviderType,
+  validateCustomProviderBaseUrl,
   validateCustomProviderId,
   type ProvidersConfigWithProviderType,
 } from "@/common/utils/providers/customProviders";
@@ -115,15 +117,6 @@ function addErrorReason<T extends CustomProviderMutationError>(
   }
 
   return { ...error, reason };
-}
-
-function isValidHttpBaseUrl(baseUrl: string): boolean {
-  try {
-    const url = new URL(baseUrl);
-    return url.protocol === "http:" || url.protocol === "https:";
-  } catch {
-    return false;
-  }
 }
 
 function getProviderConfigRecord(config: unknown): Record<string, BaseProviderConfig> {
@@ -678,12 +671,13 @@ export class ProviderService {
             };
           }
 
-          if (!baseUrl || !isValidHttpBaseUrl(baseUrl)) {
+          const baseUrlValidation = validateCustomProviderBaseUrl(baseUrl);
+          if (!baseUrlValidation.ok) {
             return {
               success: false,
               error: {
                 code: "invalid_base_url",
-                message: "Custom providers require an HTTP or HTTPS base URL.",
+                message: baseUrlValidation.reason,
               },
             };
           }
@@ -1422,6 +1416,18 @@ export class ProviderService {
       const isProviderTypeEdit = keyPath.length === 1 && keyPath[0] === "providerType";
       if (isProviderTypeEdit && !isCustomProviderType(value)) {
         return { success: false, error: `Invalid custom provider type: ${String(value)}` };
+      }
+
+      // Value-only guard shared by every provider: no SDK adapter survives a
+      // query/fragment in its base URL (endpoint paths are raw-appended).
+      // Empty string falls through: it clears the key.
+      const isBaseUrlEdit =
+        keyPath.length === 1 && (keyPath[0] === "baseUrl" || keyPath[0] === "baseURL");
+      if (isBaseUrlEdit && typeof value === "string" && value !== "") {
+        const queryFragmentError = baseUrlQueryFragmentError(value);
+        if (queryFragmentError != null) {
+          return { success: false, error: queryFragmentError };
+        }
       }
 
       // Read-modify-write under the cross-process lock (see setConfigValue).

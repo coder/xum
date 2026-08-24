@@ -9,6 +9,7 @@ import {
   isBuiltInProvider,
   isCustomProviderConfig,
   isValidCustomProviderId,
+  validateCustomProviderBaseUrl,
   validateCustomProviderId,
 } from "./customProviders";
 
@@ -51,6 +52,48 @@ describe("custom provider id validation", () => {
       expect(isValidCustomProviderId(provider)).toBe(false);
       expect(validateCustomProviderId(provider).ok).toBe(false);
       expect(isBuiltInProvider(provider)).toBe(true);
+    }
+  });
+});
+
+describe("custom provider base URL validation", () => {
+  test("accepts http(s) base URLs with optional paths", () => {
+    for (const baseUrl of [
+      "http://localhost:8000",
+      "http://localhost:8000/",
+      "https://api.example.com/v1",
+      "https://proxy.example/anthropic",
+      // Percent-encoded delimiters stay path bytes under raw suffixing.
+      "https://api.example.com/v1%3Ftoken",
+    ]) {
+      expect(validateCustomProviderBaseUrl(baseUrl)).toEqual({ ok: true });
+    }
+  });
+
+  test("rejects empty and non-http(s) base URLs", () => {
+    for (const baseUrl of ["", "   ", "not a url", "ftp://api.example.com/v1", "localhost:8000"]) {
+      const validation = validateCustomProviderBaseUrl(baseUrl);
+      expect(validation.ok).toBe(false);
+      if (!validation.ok) {
+        expect(validation.reason.length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  test("rejects base URLs carrying a query string or fragment", () => {
+    for (const baseUrl of [
+      "https://proxy.example/anthropic?token=x",
+      "https://api.example.com/v1?api-version=2024-01-01",
+      "http://localhost:8000#tag",
+      // A bare trailing "?" parses to an empty URL.search but still breaks
+      // raw suffixing, so the contract is on the raw characters.
+      "http://localhost:8000/v1?",
+    ]) {
+      const validation = validateCustomProviderBaseUrl(baseUrl);
+      expect(validation.ok).toBe(false);
+      if (!validation.ok) {
+        expect(validation.reason).toContain("query");
+      }
     }
   });
 });

@@ -1042,6 +1042,59 @@ describe("ProviderService custom provider mutations", () => {
     });
   }
 
+  for (const baseUrl of [
+    "https://proxy.example/anthropic?token=x",
+    "http://localhost:8000#tag",
+  ] as const) {
+    it(`rejects base URL with query or fragment ${JSON.stringify(baseUrl)}`, async () => {
+      await withTempConfigAsync(async (config, service) => {
+        // Every supported SDK adapter appends endpoint paths onto the base URL
+        // string, so a query/fragment would swallow the endpoint
+        // (.../v1?token=x/messages). Reject instead of silently stripping.
+        const result = await service.addCustomProvider({
+          provider: "local-vllm",
+          baseUrl,
+        });
+
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.error.code).toBe("invalid_base_url");
+          expect(result.error.message).toContain("query");
+        }
+        expect(config.loadProvidersConfig()).toBeNull();
+      });
+    });
+  }
+
+  it("rejects setConfig base URL edits carrying a query string or fragment", async () => {
+    await withTempConfigAsync(async (config, service) => {
+      config.saveProvidersConfig({
+        "local-vllm": localVllmConfig(),
+      });
+
+      // Sweep both spellings: `baseUrl` is the canonical UI key, `baseURL` the
+      // legacy SDK-style alias the edit path still accepts.
+      const queryResult = await service.setConfig(
+        "local-vllm",
+        ["baseUrl"],
+        "https://proxy.example/v1?token=x"
+      );
+      expect(queryResult.success).toBe(false);
+      if (!queryResult.success) {
+        expect(queryResult.error).toContain("query");
+      }
+
+      const fragmentResult = await service.setConfig(
+        "local-vllm",
+        ["baseURL"],
+        "http://localhost:8000#tag"
+      );
+      expect(fragmentResult.success).toBe(false);
+
+      expect(config.loadProvidersConfig()?.["local-vllm"]?.baseUrl).toBe(LOCAL_VLLM_BASE_URL);
+    });
+  });
+
   it("adds a custom OpenAI-compatible provider and returns provider info", async () => {
     await withTempConfigAsync(async (config, service) => {
       const result = await service.addCustomProvider({
