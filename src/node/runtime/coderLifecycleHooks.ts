@@ -58,7 +58,11 @@ export function createCoderArchiveHook(options: {
 }): BeforeArchiveHook {
   const timeoutMs = options.timeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
 
-  return async ({ workspaceId, workspaceMetadata }): Promise<Result<void>> => {
+  return async ({
+    workspaceId,
+    workspaceMetadata,
+    coderWorkspaceArchiveBehavior,
+  }): Promise<Result<void>> => {
     const runtimeConfig = workspaceMetadata.runtimeConfig;
     if (!isSSHRuntime(runtimeConfig) || !runtimeConfig.coder) {
       return Ok(undefined);
@@ -79,7 +83,10 @@ export function createCoderArchiveHook(options: {
       return Ok(undefined);
     }
 
-    const archiveBehavior = options.getArchiveBehavior();
+    // Prefer the archive operation's policy snapshot: it is the same read the sink used to
+    // enforce forbidCoderWorkspaceDeletion, so a concurrent settings flip cannot turn a
+    // guarded archive into a remote deletion.
+    const archiveBehavior = coderWorkspaceArchiveBehavior ?? options.getArchiveBehavior();
     if (archiveBehavior === "keep") {
       return Ok(undefined);
     }

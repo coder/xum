@@ -202,7 +202,10 @@ export class DesktopSessionManager {
 
   /** Whether a live desktop session exists for this workspace. */
   has(workspaceId: string): boolean {
-    return this.sessions.has(workspaceId);
+    // Pending startups count as live activity: a user-initiated start that has not resolved
+    // yet exists only in startupPromises, and archive refusal gates must observe it instead of
+    // letting close() cancel it mid-startup.
+    return this.sessions.has(workspaceId) || this.startupPromises.has(workspaceId);
   }
 
   async close(workspaceId: string): Promise<void> {

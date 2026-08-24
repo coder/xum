@@ -1,3 +1,4 @@
+import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
 import type { Result } from "@/common/types/result";
@@ -8,6 +9,13 @@ import { getErrorMessage } from "@/common/utils/errors";
 export interface BeforeArchiveHookArgs {
   workspaceId: string;
   workspaceMetadata: WorkspaceMetadata;
+  /**
+   * Coder archive-policy snapshot taken by the archive operation when it enforced its
+   * remote-deletion guard. Hooks that stop/delete Coder workspaces must use this value (not a
+   * fresh config read) so a concurrent settings flip cannot delete a remote workspace past a
+   * caller that forbade it.
+   */
+  coderWorkspaceArchiveBehavior?: CoderWorkspaceArchiveBehavior;
 }
 
 export type BeforeArchiveHook = (args: BeforeArchiveHookArgs) => Promise<Result<void>>;

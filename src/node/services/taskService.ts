@@ -156,6 +156,8 @@ import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
+import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
+import { isSSHRuntime } from "@/common/types/runtime";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import {
@@ -9308,189 +9310,273 @@ export class TaskService {
     );
     if ("status" in resolved) return Ok(resolved);
 
+    // Nested disposable workspace-turn workspaces interrupted for this archive: their normal
+    // auto-removal must not run while the archive holds its locks (removal acquires the nested
+    // child's own task-tree lock), so it is deferred until after the locks release.
+    const deferredDisposableCleanups: WorkspaceTurnTaskHandleRecord[] = [];
     // Global lock order: task-tree → task-creation mutex → workspace lifecycle (see the
     // workspaceLifecycleLocks declaration). Pre-acquire the target's task-tree lock here and
     // call the *WhileTaskTreeLocked archive sink so no path holds a lifecycle lock while
     // acquiring a tree lock — that edge closed a three-way cycle with createMany
     // (tree → mutex) and createWorkspaceTurn's persist section (mutex → lifecycle).
-    return await this.withTaskTreeLifecycleLock(resolved.workspaceId, async () =>
-      this.withWorkspaceLifecycleLock(resolved, async (resolved) => {
-        if (resolved.metadata == null) {
-          return Ok({
-            status: "not_found",
-            action: "archive",
-            ...this.lifecycleTargetFields(resolved),
-            note: "Owned workspace metadata is already absent.",
-          });
-        }
-        if (isWorkspaceArchived(resolved.metadata.archivedAt, resolved.metadata.unarchivedAt)) {
-          return Ok({
-            status: "already_archived",
-            action: "archive",
-            ...this.lifecycleTargetFields(resolved),
-          });
-        }
-
-        // Model-facing safety: with the "delete" worktree archive behavior, archiving runs
-        // `git worktree remove --force` with no snapshot and no user confirmation, so an
-        // agent-driven archive could erase uncommitted work. Fail closed and route that
-        // policy through user-mediated archive instead. This early check gives a friendly
-        // refusal before any turn interruption; workspaceService.archive re-enforces it at
-        // the sink (forbidWorktreeCheckoutDeletion) against the same read that drives the
-        // snapshot/deletion decisions, closing the settings-flip race.
-        const worktreeArchiveBehavior =
-          this.config.loadConfigOrDefault().worktreeArchiveBehavior ??
-          DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR;
-        if (worktreeArchiveBehavior === "delete") {
-          return Ok({
-            status: "error",
-            action: "archive",
-            ...this.lifecycleTargetFields(resolved),
-            error:
-              'Worktree archive behavior is set to "Delete checkout", which would irreversibly delete the workspace checkout without user confirmation. Ask the user to archive this workspace manually or switch the archive behavior to "Keep" or "Snapshot".',
-          });
-        }
-
-        const acknowledgedUntrackedPaths =
-          options.acknowledgedUntrackedPaths ??
-          options.acknowledgedUntrackedPathsByWorkspaceId?.[resolved.workspaceId];
-
-        const activeTurns = await this.collectActiveWorkspaceLifecycleTurns(
-          ownerWorkspaceId,
-          resolved
-        );
-
-        // Live activity with no delegated workspace-turn handle (a user-initiated stream,
-        // terminal PTYs, or a desktop session) is user work: the archive path would silently
-        // terminate it, so refuse — interrupt_active covers delegated turns only.
-        const liveActivity = this.workspaceService.listLiveWorkspaceActivity(resolved.workspaceId);
-        const hasRunningDelegatedStream = activeTurns.some(
-          (turn) => turn.workspaceId === resolved.workspaceId && turn.status === "running"
-        );
-        const nonTurnActivity: string[] = [];
-        if (liveActivity.streaming && !hasRunningDelegatedStream) {
-          nonTurnActivity.push("an active stream");
-        }
-        if (liveActivity.terminalSessions) nonTurnActivity.push("open terminal sessions");
-        if (liveActivity.desktopSession) nonTurnActivity.push("a desktop session");
-        if (nonTurnActivity.length > 0) {
-          return Ok({
-            status: "active",
-            action: "archive",
-            ...this.lifecycleTargetFields(resolved),
-            ...(activeTurns.length > 0
-              ? { activeTaskIds: activeTurns.map((turn) => turn.handleId) }
-              : {}),
-            note: `Workspace has live activity outside delegated workspace turns (${nonTurnActivity.join(
-              ", "
-            )}). interrupt_active does not apply to user activity; ask the user to close it or archive manually.`,
-          });
-        }
-
-        if (activeTurns.length > 0) {
-          if (options.interruptActive !== true) {
+    const lifecycleResult: Result<WorkspaceLifecycleResult, string> =
+      await this.withTaskTreeLifecycleLock(resolved.workspaceId, async () =>
+        this.withWorkspaceLifecycleLock(resolved, async (resolved) => {
+          if (resolved.metadata == null) {
             return Ok({
-              status: "active",
+              status: "not_found",
               action: "archive",
               ...this.lifecycleTargetFields(resolved),
-              activeTaskIds: activeTurns.map((turn) => turn.handleId),
+              note: "Owned workspace metadata is already absent.",
             });
           }
-          // Snapshot-behavior archives are eligibility-mutation-sensitive: the running turns
-          // being interrupted can create/remove untracked files between any preflight scan and
-          // the sink's exact-acknowledgement recheck, so interruption could destroy in-flight
-          // work and STILL bounce with requires_confirmation, stranding the workspace
-          // interrupted-but-unarchived. No worktree-freeze mechanism exists, so refuse to
-          // interrupt here: the caller stops the listed turns explicitly (task_stop / await),
-          // after which the untracked set is stable and any confirmation round-trip is
-          // deterministic.
-          if (
-            this.workspaceService.isSnapshotArchiveEligibilityMutationSensitive(
-              resolved.workspaceId
-            )
-          ) {
+          if (isWorkspaceArchived(resolved.metadata.archivedAt, resolved.metadata.unarchivedAt)) {
             return Ok({
-              status: "active",
+              status: "already_archived",
               action: "archive",
               ...this.lifecycleTargetFields(resolved),
-              activeTaskIds: activeTurns.map((turn) => turn.handleId),
-              note:
-                "interrupt_active was not honored: the snapshot archive behavior requires an exact untracked-file acknowledgement, which active turns can invalidate mid-interruption. " +
-                "Stop the listed turns (task_stop) or wait for them to finish, then archive again.",
             });
           }
-          // Interruption destroys in-flight work, so surface every archive blocker BEFORE
-          // stopping anything: a refused lossy-untracked-files confirmation, changed paths since
-          // a prior acknowledgement, or archive-blocking errors (e.g. active descendant
-          // sub-agents) must all leave the active turns running.
-          const preflight = await this.workspaceService.preflightArchive(resolved.workspaceId);
-          if (!preflight.success) {
+
+          // Model-facing safety: with the "delete" worktree archive behavior, archiving runs
+          // `git worktree remove --force` with no snapshot and no user confirmation, so an
+          // agent-driven archive could erase uncommitted work. Fail closed and route that
+          // policy through user-mediated archive instead. This early check gives a friendly
+          // refusal before any turn interruption; workspaceService.archive re-enforces it at
+          // the sink (forbidWorktreeCheckoutDeletion) against the same read that drives the
+          // snapshot/deletion decisions, closing the settings-flip race.
+          // This single read is pinned through the whole operation: it drives the delete refusal,
+          // the mutation-sensitivity check, the preflight, and (via worktreeArchiveBehaviorOverride)
+          // every snapshot/deletion decision at the sink, so a concurrent settings flip cannot
+          // change archive eligibility after turns were interrupted.
+          const worktreeArchiveBehavior =
+            this.config.loadConfigOrDefault().worktreeArchiveBehavior ??
+            DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR;
+          if (worktreeArchiveBehavior === "delete") {
             return Ok({
               status: "error",
               action: "archive",
               ...this.lifecycleTargetFields(resolved),
-              error: preflight.error,
+              error:
+                'Worktree archive behavior is set to "Delete checkout", which would irreversibly delete the workspace checkout without user confirmation. Ask the user to archive this workspace manually or switch the archive behavior to "Keep" or "Snapshot".',
             });
           }
-          if (preflight.data.kind === "confirm-lossy-untracked-files") {
-            // The archive sink requires exact normalized equality between the acknowledged and
-            // current path lists (a subset check would accept a stale acknowledgement whose extra
-            // paths no longer exist, interrupt the turns, and then still bounce with
-            // requires_confirmation). Mirror the sink's check so interruption only happens when
-            // the acknowledgement would actually be accepted.
+
+          // Same fail-closed rule for the Coder policy: under "delete", the before-archive hook
+          // permanently deletes a dedicated (mux-created) remote Coder workspace and unarchive
+          // cannot recreate it, so a nominally reversible agent-driven archive must refuse.
+          // Re-enforced at the sink (forbidCoderWorkspaceDeletion) against the same read passed
+          // to the hook, closing the settings-flip race.
+          {
+            const runtimeConfig = resolved.metadata.runtimeConfig;
+            const coderArchiveBehavior =
+              this.config.loadConfigOrDefault().coderWorkspaceArchiveBehavior ??
+              DEFAULT_CODER_ARCHIVE_BEHAVIOR;
             if (
-              acknowledgedUntrackedPaths == null ||
-              !areArchiveUntrackedPathListsEqual(acknowledgedUntrackedPaths, preflight.data.paths)
+              isSSHRuntime(runtimeConfig) &&
+              runtimeConfig.coder != null &&
+              runtimeConfig.coder.existingWorkspace !== true &&
+              (runtimeConfig.coder.workspaceName?.trim() ?? "") !== "" &&
+              coderArchiveBehavior === "delete"
             ) {
               return Ok({
-                status: "requires_confirmation",
+                status: "error",
                 action: "archive",
                 ...this.lifecycleTargetFields(resolved),
-                paths: preflight.data.paths,
+                error:
+                  'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior to "Keep" or "Stop".',
               });
             }
           }
-          const interruptFailure = await this.interruptActiveWorkspaceLifecycleTurns(
-            resolved,
-            activeTurns
-          );
-          if (interruptFailure != null) return Ok(interruptFailure);
-        }
 
-        // WhileTaskTreeLocked: the tree lock is already held for the whole lifecycle operation
-        // (see the lock-order comment above), so the plain archive() wrapper would self-deadlock.
-        const result = await this.workspaceService.archiveWhileTaskTreeLocked(
-          resolved.workspaceId,
-          acknowledgedUntrackedPaths,
-          // Both enforced at the sink against its own state reads: forbidWorktreeCheckoutDeletion
-          // closes the settings-flip race the early behavior check above cannot cover, and
-          // refuseLiveUserActivity fails closed if user activity was admitted after the earlier
-          // live-activity snapshot (pairs with sendMessage's synchronous entry guards).
-          { forbidWorktreeCheckoutDeletion: true, refuseLiveUserActivity: true }
-        );
-        if (!result.success) {
+          const acknowledgedUntrackedPaths =
+            options.acknowledgedUntrackedPaths ??
+            options.acknowledgedUntrackedPathsByWorkspaceId?.[resolved.workspaceId];
+
+          const activeTurns = await this.collectActiveWorkspaceLifecycleTurns(
+            ownerWorkspaceId,
+            resolved
+          );
+
+          // An active top-level workflow run owned by the target is active owned work even when
+          // no descendant agent or workspace turn is running at this instant (workflows idle
+          // between steps): archiving would break its next step and mark its terminal
+          // notification superseded. Refuse regardless of interrupt_active — workflows are not
+          // interruptible through this API.
+          const activeWorkflowRunIds = await this.listActiveWorkflowRunIdsForWorkspace(
+            resolved.workspaceId
+          );
+          if (activeWorkflowRunIds.length > 0) {
+            return Ok({
+              status: "active",
+              action: "archive",
+              ...this.lifecycleTargetFields(resolved),
+              activeTaskIds: [...activeTurns.map((turn) => turn.handleId), ...activeWorkflowRunIds],
+              note: `Workspace owns active workflow runs (${activeWorkflowRunIds.join(
+                ", "
+              )}). interrupt_active does not apply to workflow runs; wait for them to finish or stop them first.`,
+            });
+          }
+
+          // Live activity with no delegated workspace-turn handle (a user-initiated stream,
+          // queued messages, terminal PTYs, or a desktop session) is user work: the archive path
+          // would silently terminate it, so refuse — interrupt_active covers delegated turns only.
+          const liveActivity = this.workspaceService.listLiveWorkspaceActivity(
+            resolved.workspaceId
+          );
+          const hasRunningDelegatedStream = activeTurns.some(
+            (turn) => turn.workspaceId === resolved.workspaceId && turn.status === "running"
+          );
+          // A queued delegated follow-up also surfaces as a queued message; only unexplained
+          // queue entries are treated as user work. Mixed queues (user + delegated entries)
+          // conservatively fail closed at the sink's admission-hold recheck instead.
+          const hasQueuedDelegatedTurn = activeTurns.some(
+            (turn) => turn.workspaceId === resolved.workspaceId && turn.status === "queued"
+          );
+          const nonTurnActivity: string[] = [];
+          if (liveActivity.streaming && !hasRunningDelegatedStream) {
+            nonTurnActivity.push("an active stream");
+          }
+          if (liveActivity.queuedMessages && !hasQueuedDelegatedTurn) {
+            nonTurnActivity.push("queued messages");
+          }
+          if (liveActivity.terminalSessions) nonTurnActivity.push("open terminal sessions");
+          if (liveActivity.desktopSession) nonTurnActivity.push("a desktop session");
+          if (nonTurnActivity.length > 0) {
+            return Ok({
+              status: "active",
+              action: "archive",
+              ...this.lifecycleTargetFields(resolved),
+              ...(activeTurns.length > 0
+                ? { activeTaskIds: activeTurns.map((turn) => turn.handleId) }
+                : {}),
+              note: `Workspace has live activity outside delegated workspace turns (${nonTurnActivity.join(
+                ", "
+              )}). interrupt_active does not apply to user activity; ask the user to close it or archive manually.`,
+            });
+          }
+
+          if (activeTurns.length > 0) {
+            if (options.interruptActive !== true) {
+              return Ok({
+                status: "active",
+                action: "archive",
+                ...this.lifecycleTargetFields(resolved),
+                activeTaskIds: activeTurns.map((turn) => turn.handleId),
+              });
+            }
+            // Snapshot-behavior archives are eligibility-mutation-sensitive: the running turns
+            // being interrupted can create/remove untracked files between any preflight scan and
+            // the sink's exact-acknowledgement recheck, so interruption could destroy in-flight
+            // work and STILL bounce with requires_confirmation, stranding the workspace
+            // interrupted-but-unarchived. No worktree-freeze mechanism exists, so refuse to
+            // interrupt here: the caller stops the listed turns explicitly (task_stop / await),
+            // after which the untracked set is stable and any confirmation round-trip is
+            // deterministic.
+            if (
+              this.workspaceService.isSnapshotArchiveEligibilityMutationSensitive(
+                resolved.workspaceId,
+                worktreeArchiveBehavior
+              )
+            ) {
+              return Ok({
+                status: "active",
+                action: "archive",
+                ...this.lifecycleTargetFields(resolved),
+                activeTaskIds: activeTurns.map((turn) => turn.handleId),
+                note:
+                  "interrupt_active was not honored: the snapshot archive behavior requires an exact untracked-file acknowledgement, which active turns can invalidate mid-interruption. " +
+                  "Stop the listed turns (task_stop) or wait for them to finish, then archive again.",
+              });
+            }
+            // Interruption destroys in-flight work, so surface every archive blocker BEFORE
+            // stopping anything: a refused lossy-untracked-files confirmation, changed paths since
+            // a prior acknowledgement, or archive-blocking errors (e.g. active descendant
+            // sub-agents) must all leave the active turns running.
+            const preflight = await this.workspaceService.preflightArchive(resolved.workspaceId, {
+              worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
+            });
+            if (!preflight.success) {
+              return Ok({
+                status: "error",
+                action: "archive",
+                ...this.lifecycleTargetFields(resolved),
+                error: preflight.error,
+              });
+            }
+            if (preflight.data.kind === "confirm-lossy-untracked-files") {
+              // The archive sink requires exact normalized equality between the acknowledged and
+              // current path lists (a subset check would accept a stale acknowledgement whose extra
+              // paths no longer exist, interrupt the turns, and then still bounce with
+              // requires_confirmation). Mirror the sink's check so interruption only happens when
+              // the acknowledgement would actually be accepted.
+              if (
+                acknowledgedUntrackedPaths == null ||
+                !areArchiveUntrackedPathListsEqual(acknowledgedUntrackedPaths, preflight.data.paths)
+              ) {
+                return Ok({
+                  status: "requires_confirmation",
+                  action: "archive",
+                  ...this.lifecycleTargetFields(resolved),
+                  paths: preflight.data.paths,
+                });
+              }
+            }
+            const interruptFailure = await this.interruptActiveWorkspaceLifecycleTurns(
+              resolved,
+              activeTurns,
+              deferredDisposableCleanups
+            );
+            if (interruptFailure != null) return Ok(interruptFailure);
+          }
+
+          // WhileTaskTreeLocked: the tree lock is already held for the whole lifecycle operation
+          // (see the lock-order comment above), so the plain archive() wrapper would self-deadlock.
+          const result = await this.workspaceService.archiveWhileTaskTreeLocked(
+            resolved.workspaceId,
+            acknowledgedUntrackedPaths,
+            // Enforced at the sink: forbidWorktreeCheckoutDeletion / forbidCoderWorkspaceDeletion
+            // close the settings-flip races the early behavior checks above cannot cover,
+            // refuseLiveUserActivity fails closed (and holds turn admission) if user activity was
+            // admitted after the earlier live-activity snapshot, and the behavior override pins
+            // every sink decision to the same read that drove interruption eligibility.
+            {
+              forbidWorktreeCheckoutDeletion: true,
+              forbidCoderWorkspaceDeletion: true,
+              refuseLiveUserActivity: true,
+              worktreeArchiveBehaviorOverride: worktreeArchiveBehavior,
+            }
+          );
+          if (!result.success) {
+            return Ok({
+              status: "error",
+              action: "archive",
+              ...this.lifecycleTargetFields(resolved),
+              error: result.error,
+            });
+          }
+          if (result.data.kind === "confirm-lossy-untracked-files") {
+            return Ok({
+              status: "requires_confirmation",
+              action: "archive",
+              ...this.lifecycleTargetFields(resolved),
+              paths: result.data.paths,
+            });
+          }
           return Ok({
-            status: "error",
+            status: "archived",
             action: "archive",
             ...this.lifecycleTargetFields(resolved),
-            error: result.error,
           });
-        }
-        if (result.data.kind === "confirm-lossy-untracked-files") {
-          return Ok({
-            status: "requires_confirmation",
-            action: "archive",
-            ...this.lifecycleTargetFields(resolved),
-            paths: result.data.paths,
-          });
-        }
-        return Ok({
-          status: "archived",
-          action: "archive",
-          ...this.lifecycleTargetFields(resolved),
-        });
-      })
-    );
+        })
+      );
+    // Locks are released: run the deferred disposable cleanup for nested turn workspaces whose
+    // auto-removal was suppressed during interruption. The archived target itself is never in
+    // this list (its records target resolved.workspaceId, which archive retains).
+    for (const record of deferredDisposableCleanups) {
+      await this.cleanupDisposableWorkspaceTurn(record);
+    }
+    return lifecycleResult;
   }
 
   async unarchiveOwnedWorkspaceTurnWorkspace(
@@ -9505,55 +9591,64 @@ export class TaskService {
     );
     if ("status" in resolved) return Ok(resolved);
 
-    return await this.withWorkspaceLifecycleLock(resolved, async (resolved) => {
-      if (resolved.metadata == null) {
-        return Ok({
-          status: "not_found",
-          action: "unarchive",
-          ...this.lifecycleTargetFields(resolved),
-          note: "Owned workspace metadata is already absent.",
-        });
-      }
-      if (!isWorkspaceArchived(resolved.metadata.archivedAt, resolved.metadata.unarchivedAt)) {
-        return Ok({
-          status: "already_unarchived",
-          action: "unarchive",
-          ...this.lifecycleTargetFields(resolved),
-        });
-      }
+    // Same lock order as archive (task-tree → workspace lifecycle): unarchive shares the
+    // task-tree lock with archive so it cannot interleave with an archive's post-persist
+    // cleanup, and pre-acquiring it before the lifecycle lock preserves the global order.
+    return await this.withTaskTreeLifecycleLock(resolved.workspaceId, async () =>
+      this.withWorkspaceLifecycleLock(resolved, async (resolved) => {
+        if (resolved.metadata == null) {
+          return Ok({
+            status: "not_found",
+            action: "unarchive",
+            ...this.lifecycleTargetFields(resolved),
+            note: "Owned workspace metadata is already absent.",
+          });
+        }
+        if (!isWorkspaceArchived(resolved.metadata.archivedAt, resolved.metadata.unarchivedAt)) {
+          return Ok({
+            status: "already_unarchived",
+            action: "unarchive",
+            ...this.lifecycleTargetFields(resolved),
+          });
+        }
 
-      // Defense-in-depth: an archived workspace should never have active turns (archive refuses
-      // while active; createWorkspaceTurn refuses archived targets). If a race/corruption
-      // surfaces one anyway, report it — never interrupt on unarchive, regardless of caller
-      // options (interruptActive intentionally not supported here).
-      const activeTurns = await this.collectActiveWorkspaceLifecycleTurns(
-        ownerWorkspaceId,
-        resolved
-      );
-      if (activeTurns.length > 0) {
-        return Ok({
-          status: "active",
-          action: "unarchive",
-          ...this.lifecycleTargetFields(resolved),
-          activeTaskIds: activeTurns.map((turn) => turn.handleId),
-        });
-      }
+        // Defense-in-depth: an archived workspace should never have active turns (archive refuses
+        // while active; createWorkspaceTurn refuses archived targets). If a race/corruption
+        // surfaces one anyway, report it — never interrupt on unarchive, regardless of caller
+        // options (interruptActive intentionally not supported here).
+        const activeTurns = await this.collectActiveWorkspaceLifecycleTurns(
+          ownerWorkspaceId,
+          resolved
+        );
+        if (activeTurns.length > 0) {
+          return Ok({
+            status: "active",
+            action: "unarchive",
+            ...this.lifecycleTargetFields(resolved),
+            activeTaskIds: activeTurns.map((turn) => turn.handleId),
+          });
+        }
 
-      const result = await this.workspaceService.unarchive(resolved.workspaceId);
-      if (!result.success) {
+        // WhileTaskTreeLocked: the tree lock is already held for this lifecycle operation, so the
+        // plain unarchive() wrapper would self-deadlock.
+        const result = await this.workspaceService.unarchiveWhileTaskTreeLocked(
+          resolved.workspaceId
+        );
+        if (!result.success) {
+          return Ok({
+            status: "error",
+            action: "unarchive",
+            ...this.lifecycleTargetFields(resolved),
+            error: result.error,
+          });
+        }
         return Ok({
-          status: "error",
+          status: "unarchived",
           action: "unarchive",
           ...this.lifecycleTargetFields(resolved),
-          error: result.error,
         });
-      }
-      return Ok({
-        status: "unarchived",
-        action: "unarchive",
-        ...this.lifecycleTargetFields(resolved),
-      });
-    });
+      })
+    );
   }
 
   /** Acquire workspace lifecycle locks for multiple keys; callers must pass sorted keys. */
@@ -9709,17 +9804,31 @@ export class TaskService {
 
   private async interruptActiveWorkspaceLifecycleTurns(
     resolved: ResolvedWorkspaceLifecycleTarget,
-    activeTurns: ReadonlyArray<{ ownerWorkspaceId: string; handleId: string }>
+    activeTurns: ReadonlyArray<{ ownerWorkspaceId: string; handleId: string; workspaceId: string }>,
+    // Receives interrupted nested disposable records (workspaceId !== the archived target)
+    // whose auto-removal was suppressed for lock ordering; the caller cleans them up after
+    // releasing the archive locks so they are not leaked unmanageable under an archived owner.
+    deferredDisposableCleanups: WorkspaceTurnTaskHandleRecord[]
   ): Promise<WorkspaceLifecycleResult | null> {
     for (const turn of activeTurns) {
-      // suppressDisposableCleanup: this interruption serves an archive (retain) of the target,
-      // so the disposable auto-removal must not delete the checkout the archive is about to
-      // keep. It would also self-deadlock on the task-tree lock the lifecycle path holds.
+      // suppressDisposableCleanup: for turns targeting the archived workspace itself, the
+      // disposable auto-removal must not delete the checkout the archive is about to keep.
+      // For nested turns it must not run while the lifecycle path holds its locks (removal
+      // acquires the nested child's task-tree lock), so it is deferred instead of dropped.
       const interruptResult = await this.interruptWorkspaceTurn(
         turn.ownerWorkspaceId,
         turn.handleId,
         { suppressDisposableCleanup: true }
       );
+      if (interruptResult.success && turn.workspaceId !== resolved.workspaceId) {
+        const record = await this.taskHandleStore.getWorkspaceTurn(
+          turn.ownerWorkspaceId,
+          turn.handleId
+        );
+        if (record?.disposableWorkspace === true) {
+          deferredDisposableCleanups.push(record);
+        }
+      }
       if (!interruptResult.success) {
         // Turns can settle between collection and interruption (e.g. during the archive
         // preflight). A now-terminal handle needs no interruption and must not abort the
@@ -9773,7 +9882,9 @@ export class TaskService {
         continue;
       }
       didUnarchive = true;
-      const result = await this.workspaceService.unarchive(workspaceId);
+      // WhileTaskTreeLocked: callers run under the send path's task-tree lock for this same
+      // tree (ancestors share the root), so the plain unarchive() wrapper would self-deadlock.
+      const result = await this.workspaceService.unarchiveWhileTaskTreeLocked(workspaceId);
       if (!result.success) {
         return Err(result.error);
       }

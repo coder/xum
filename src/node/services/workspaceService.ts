@@ -6,6 +6,8 @@ import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import * as fsPromises from "fs/promises";
 import assert from "@/common/utils/assert";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
+import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
+import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import {
@@ -595,14 +597,32 @@ export interface ArchiveWorkspaceOptions {
   forbidWorktreeCheckoutDeletion?: boolean;
   /**
    * Refuse to archive when live user activity exists at the sink (a stream, a send still in
-   * its pre-admission window, terminal sessions, or a desktop session). Model-facing callers
-   * set this so an agent-driven archive fails closed instead of silently terminating user
-   * work that started after the caller's earlier activity check. Checked synchronously in the
-   * same block that marks the workspace as archiving, pairing with sendMessage's synchronous
-   * entry guards: whichever side runs first is observed by the other. The user-driven archive
+   * its pre-admission window, queued/preparing turns, terminal sessions, or a desktop
+   * session). Model-facing callers set this so an agent-driven archive fails closed instead
+   * of silently terminating user work that started after the caller's earlier activity check.
+   * Checked synchronously in the same block that marks the workspace as archiving, pairing
+   * with sendMessage's synchronous entry guards: whichever side runs first is observed by the
+   * other. Also holds the session's turn admission for the rest of the archive so a queued
+   * entry cannot dispatch through AgentSession's internal send path (which bypasses
+   * WorkspaceService.sendMessage) into the workspace mid-archive. The user-driven archive
    * path intentionally omits this and keeps its stop-activity semantics.
    */
   refuseLiveUserActivity?: boolean;
+  /**
+   * Behavior snapshot read by the caller before it committed to the archive (e.g. before
+   * interrupting active turns). The sink uses it for every snapshot/deletion decision instead
+   * of re-reading config, so a concurrent settings flip cannot change archive eligibility
+   * between the caller's checks and the sink — e.g. flipping keep → snapshot after turns were
+   * interrupted would otherwise bounce with requires_confirmation, stranding destroyed work.
+   */
+  worktreeArchiveBehaviorOverride?: WorktreeArchiveBehavior;
+  /**
+   * Refuse to archive when the Coder workspace-on-archive policy would permanently delete a
+   * dedicated (mux-created) remote Coder workspace via the before-archive hook. Unarchive
+   * does not recreate deleted Coder workspaces, so a model-facing "reversible" archive must
+   * fail closed instead; route that policy through user-mediated archive.
+   */
+  forbidCoderWorkspaceDeletion?: boolean;
 }
 
 const ACTIVE_DESCENDANT_ARCHIVE_ERROR =
@@ -7518,7 +7538,10 @@ export class WorkspaceService extends EventEmitter {
    * that snapshot cannot preserve). Returns a discriminated union the frontend uses to decide
    * whether to show a destructive confirmation dialog.
    */
-  async preflightArchive(workspaceId: string): Promise<Result<ArchivePreflightResult>> {
+  async preflightArchive(
+    workspaceId: string,
+    options?: { worktreeArchiveBehaviorOverride?: WorktreeArchiveBehavior }
+  ): Promise<Result<ArchivePreflightResult>> {
     try {
       if (this.taskService?.hasActiveDescendantAgentTasksForWorkspace(workspaceId) === true) {
         return Err(ACTIVE_DESCENDANT_ARCHIVE_ERROR);
@@ -7529,8 +7552,10 @@ export class WorkspaceService extends EventEmitter {
         return Err("Workspace not found");
       }
 
-      const snapshotBehaviorEnabled =
-        this.isSnapshotArchiveEligibilityMutationSensitive(workspaceId);
+      const snapshotBehaviorEnabled = this.isSnapshotArchiveEligibilityMutationSensitive(
+        workspaceId,
+        options?.worktreeArchiveBehaviorOverride ?? this.getWorktreeArchiveBehavior()
+      );
 
       if (!snapshotBehaviorEnabled) {
         return Ok({ kind: "ready" as const });
@@ -7568,10 +7593,15 @@ export class WorkspaceService extends EventEmitter {
    * active turns — a turn interrupted for an archive that then bounces would strand the
    * workspace with destroyed in-flight work and no archive.
    */
-  isSnapshotArchiveEligibilityMutationSensitive(workspaceId: string): boolean {
+  isSnapshotArchiveEligibilityMutationSensitive(
+    workspaceId: string,
+    // Callers that pin one behavior read across an interrupt+archive operation pass it here so
+    // this check agrees with the pinned sink decision.
+    worktreeArchiveBehavior: WorktreeArchiveBehavior = this.getWorktreeArchiveBehavior()
+  ): boolean {
     return (
       !this.isSharedTaskWorkspace(workspaceId) &&
-      this.getWorktreeArchiveBehavior() === "snapshot" &&
+      worktreeArchiveBehavior === "snapshot" &&
       this.worktreeArchiveSnapshotService != null
     );
   }
@@ -7583,11 +7613,15 @@ export class WorkspaceService extends EventEmitter {
    */
   listLiveWorkspaceActivity(workspaceId: string): {
     streaming: boolean;
+    /** Queued or dispatching (PREPARING) messages that would start a stream after archive. */
+    queuedMessages: boolean;
     terminalSessions: boolean;
     desktopSession: boolean;
   } {
     return {
       streaming: this.aiService.isStreaming(workspaceId),
+      queuedMessages:
+        this.hasQueuedMessages(workspaceId) || this.hasPendingQueuedOrPreparingTurn(workspaceId),
       terminalSessions: this.terminalService?.hasWorkspaceSessions(workspaceId) === true,
       desktopSession: this.desktopSessionManager?.has(workspaceId) === true,
     };
@@ -7633,6 +7667,7 @@ export class WorkspaceService extends EventEmitter {
     options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
     this.archivingWorkspaces.add(workspaceId);
+    let admissionHold: Disposable | undefined;
 
     try {
       // Fail-closed live-activity gate for model-facing callers. This check and the
@@ -7647,11 +7682,26 @@ export class WorkspaceService extends EventEmitter {
         if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
           activityLabels.push("a message send in progress");
         }
+        if (liveActivity.queuedMessages) activityLabels.push("queued messages");
         if (liveActivity.terminalSessions) activityLabels.push("open terminal sessions");
         if (liveActivity.desktopSession) activityLabels.push("a desktop session");
         if (activityLabels.length > 0) {
           return Err(
             `Workspace has live activity (${activityLabels.join(", ")}) that archiving would terminate. Wait for it to finish or ask the user to archive manually.`
+          );
+        }
+        // Hold the session's turn admission for the remainder of the archive: queued entries
+        // dispatch through AgentSession's internal send path, which bypasses
+        // WorkspaceService.sendMessage's archived guard, so without the hold a message queued
+        // during this operation could start a hidden stream after archivedAt persists. Armed
+        // synchronously with the checks above and released in this function's finally; the
+        // post-arm recheck mirrors acquireContextMutationAdmissionGuard's pairing argument (a
+        // turn admitted first is observed here; a turn admitted later observes the block).
+        const session = this.getOrCreateSession(workspaceId);
+        admissionHold = session.holdTurnAdmission();
+        if (session.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId)) {
+          return Err(
+            "Workspace has pending turn work that archiving would terminate. Wait for it to finish or ask the user to archive manually."
           );
         }
       }
@@ -7697,7 +7747,11 @@ export class WorkspaceService extends EventEmitter {
       }
 
       const { projectPath, workspacePath } = workspace;
-      const worktreeArchiveBehavior = this.getWorktreeArchiveBehavior();
+      // Prefer the caller's pinned behavior: model-facing callers make interruption and
+      // eligibility decisions against one read, and the sink honoring that same read keeps the
+      // whole operation coherent under concurrent settings flips.
+      const worktreeArchiveBehavior =
+        options?.worktreeArchiveBehaviorOverride ?? this.getWorktreeArchiveBehavior();
       // Enforced at the sink, not just in callers: this read is the same snapshot passed to the
       // afterArchive worktree-deletion hook, so a concurrent settings flip cannot slip a
       // checkout deletion past a caller that forbade it.
@@ -7721,6 +7775,25 @@ export class WorkspaceService extends EventEmitter {
           return Err(metadataResult.error);
         }
         beforeArchiveMetadata = metadataResult.data;
+      }
+
+      // Snapshot the Coder archive policy once: the before-archive hook receives this same
+      // value, so a settings flip cannot slip a remote deletion past the guard below.
+      const coderWorkspaceArchiveBehavior =
+        this.config.loadConfigOrDefault().coderWorkspaceArchiveBehavior ??
+        DEFAULT_CODER_ARCHIVE_BEHAVIOR;
+      if (options?.forbidCoderWorkspaceDeletion === true && beforeArchiveMetadata != null) {
+        const runtimeConfig = beforeArchiveMetadata.runtimeConfig;
+        const isDedicatedCoderWorkspace =
+          isSSHRuntime(runtimeConfig) &&
+          runtimeConfig.coder != null &&
+          runtimeConfig.coder.existingWorkspace !== true &&
+          (runtimeConfig.coder.workspaceName?.trim() ?? "") !== "";
+        if (isDedicatedCoderWorkspace && coderWorkspaceArchiveBehavior === "delete") {
+          return Err(
+            'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior.'
+          );
+        }
       }
 
       const canSnapshotManagedWorktree =
@@ -7756,6 +7829,7 @@ export class WorkspaceService extends EventEmitter {
         const hookResult = await this.workspaceLifecycleHooks.runBeforeArchive({
           workspaceId,
           workspaceMetadata: beforeArchiveMetadata,
+          coderWorkspaceArchiveBehavior,
         });
         if (!hookResult.success) {
           return Err(hookResult.error);
@@ -7913,6 +7987,7 @@ export class WorkspaceService extends EventEmitter {
       const message = getErrorMessage(error);
       return Err(`Failed to archive workspace: ${message}`);
     } finally {
+      admissionHold?.[Symbol.dispose]();
       this.archivingWorkspaces.delete(workspaceId);
     }
   }
@@ -7921,6 +7996,25 @@ export class WorkspaceService extends EventEmitter {
    * Unarchive a workspace. Restores it to the main sidebar view.
    */
   async unarchive(workspaceId: string): Promise<Result<void>> {
+    // Serialize with archive under the same task-tree lifecycle lock: an unarchive admitted
+    // while an archive is still running its post-persist cleanup (e.g. worktree deletion after
+    // a snapshot) could restore a checkout the archive hook then removes, leaving a visible
+    // workspace with a missing checkout.
+    return await this.withTaskTreeLifecycleLock(workspaceId, async () =>
+      this.unarchiveUnlocked(workspaceId)
+    );
+  }
+
+  /**
+   * Internal entry point for TaskService callers that already hold the task-tree lifecycle
+   * lock (the model-facing unarchive path pre-acquires it for lock ordering; agent-task
+   * ancestry unarchive runs under the send path's tree lock).
+   */
+  async unarchiveWhileTaskTreeLocked(workspaceId: string): Promise<Result<void>> {
+    return await this.unarchiveUnlocked(workspaceId);
+  }
+
+  private async unarchiveUnlocked(workspaceId: string): Promise<Result<void>> {
     try {
       const workspace = this.config.findWorkspace(workspaceId);
       if (!workspace) {

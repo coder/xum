@@ -67,6 +67,9 @@ export class TerminalService {
   // Per-session activity tracking for sidebar indicator.
   // Maps sessionId -> { workspaceId, isRunning (derived from terminal title) }.
   private readonly sessionActivity = new Map<string, { workspaceId: string; isRunning: boolean }>();
+  // In-flight create() reservations per workspace (see create): counted before any await so
+  // archive admission gates observe startups that have not yet registered a session.
+  private readonly pendingSessionCreations = new Map<string, number>();
   // Tracks sessions that have received at least one OSC signal (0, 2, or 133).
   // OSC-driven sessions rely on shell-provided idle/running signals and skip the fallback timer.
   private readonly sessionsWithOscActivity = new Set<string>();
@@ -110,6 +113,27 @@ export class TerminalService {
   }
 
   async create(params: TerminalCreateParams): Promise<TerminalSession> {
+    // Reserve the startup synchronously: a creation that has passed its archived check but is
+    // still awaiting metadata/secrets/PTY spawn is not yet in sessionActivity, so without this
+    // reservation an archive's live-activity gate could pass and the pending creation would
+    // then publish a PTY into the archived workspace.
+    this.pendingSessionCreations.set(
+      params.workspaceId,
+      (this.pendingSessionCreations.get(params.workspaceId) ?? 0) + 1
+    );
+    try {
+      return await this.createUnreserved(params);
+    } finally {
+      const remaining = (this.pendingSessionCreations.get(params.workspaceId) ?? 1) - 1;
+      if (remaining <= 0) {
+        this.pendingSessionCreations.delete(params.workspaceId);
+      } else {
+        this.pendingSessionCreations.set(params.workspaceId, remaining);
+      }
+    }
+  }
+
+  private async createUnreserved(params: TerminalCreateParams): Promise<TerminalSession> {
     try {
       // 1. Resolve workspace
       const allMetadata = await this.config.getAllWorkspaceMetadata();
@@ -205,6 +229,20 @@ export class TerminalService {
 
       // 5. Create session
       const projectsConfig = this.config.loadConfigOrDefault();
+      // Recheck archived state after the awaits above: a user-driven archive (which force-closes
+      // rather than refuses) may have completed since the entry check, and a PTY spawned now
+      // would run hidden in the archived workspace.
+      const latestMetadata = (await this.config.getAllWorkspaceMetadata()).find(
+        (w) => w.id === params.workspaceId
+      );
+      if (
+        latestMetadata != null &&
+        isWorkspaceArchived(latestMetadata.archivedAt, latestMetadata.unarchivedAt)
+      ) {
+        throw new Error(
+          `Workspace is archived: ${params.workspaceId}. Unarchive it before opening a terminal.`
+        );
+      }
       const session = await this.ptyService.createSession(
         params,
         runtime,
@@ -941,7 +979,12 @@ export class TerminalService {
    * lifecycle paths consult this to refuse archiving instead of silently killing PTYs.
    */
   hasWorkspaceSessions(workspaceId: string): boolean {
-    return this.getTrackedSessionIdsForWorkspace(workspaceId).length > 0;
+    return (
+      this.getTrackedSessionIdsForWorkspace(workspaceId).length > 0 ||
+      // Startups reserved in create() but not yet tracked in sessionActivity count as live:
+      // archive refusal gates must see them before their PTY publishes.
+      (this.pendingSessionCreations.get(workspaceId) ?? 0) > 0
+    );
   }
 
   /**
