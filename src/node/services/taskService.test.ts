@@ -2139,6 +2139,31 @@ describe("TaskService", () => {
     expect(interrupted?.status).toBe("interrupted");
   });
 
+  test("workspace lifecycle refuses archive when the workflow activity scan fails", async () => {
+    const harness = await createWorkspaceLifecycleHarness();
+    // A corrupt run record makes the strict activity scan throw: the absence of active
+    // workflow runs is no longer provable, so archive must refuse instead of proceeding
+    // while a crash-recovered run might still resume into the archived workspace.
+    await fsPromises.mkdir(
+      path.join(harness.config.getSessionDir("childworkspace"), "workflows", "wfr_corrupt"),
+      { recursive: true }
+    );
+
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(harness.parentId, {
+      workspaceId: "childworkspace",
+    });
+
+    expect(result.success).toBe(true);
+    const data = result.success ? result.data : undefined;
+    expect(data?.status).toBe("error");
+    expect(data?.status === "error" ? data.error : "").toContain("Could not verify");
+    expect(harness.archive).not.toHaveBeenCalled();
+    // The sink-side recheck fails closed on the same unreadable store.
+    expect(
+      await harness.taskService.hasActiveTopLevelWorkflowRunsForWorkspace("childworkspace")
+    ).toBe(true);
+  });
+
   test("workspace lifecycle refuses archive while the target owns an active workflow run", async () => {
     const harness = await createWorkspaceLifecycleHarness();
     const runStore = new WorkflowRunStore({

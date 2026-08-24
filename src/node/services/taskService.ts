@@ -9436,10 +9436,21 @@ export class TaskService {
           // no descendant agent or workspace turn is running at this instant (workflows idle
           // between steps): archiving would break its next step and mark its terminal
           // notification superseded. Refuse regardless of interrupt_active — workflows are not
-          // interruptible through this API.
-          const activeWorkflowRunIds = await this.listActiveWorkflowRunIdsForWorkspace(
-            resolved.workspaceId
-          );
+          // interruptible through this API. Strict scan: an unreadable run store cannot prove
+          // the absence of active runs, so scan failures refuse instead of reading as none.
+          let activeWorkflowRunIds: string[];
+          try {
+            activeWorkflowRunIds = await this.listActiveWorkflowRunIdsForWorkspaceStrict(
+              resolved.workspaceId
+            );
+          } catch (error: unknown) {
+            return Ok({
+              status: "error",
+              action: "archive",
+              ...this.lifecycleTargetFields(resolved),
+              error: `Could not verify that this workspace has no active workflow runs (${getErrorMessage(error)}); refusing to archive. Ask the user to archive this workspace manually.`,
+            });
+          }
           if (activeWorkflowRunIds.length > 0) {
             return Ok({
               status: "active",
@@ -10709,22 +10720,50 @@ export class TaskService {
    * in an archived workspace.
    */
   async hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId: string): Promise<boolean> {
-    return (await this.listActiveWorkflowRunIdsForWorkspace(workspaceId)).length > 0;
+    try {
+      return (await this.listActiveWorkflowRunIdsForWorkspaceStrict(workspaceId)).length > 0;
+    } catch (error: unknown) {
+      // Fail closed: this feeds the archive sink, and an unreadable run store cannot prove
+      // the absence of active runs (a crash-recovered run may still resume later).
+      log.warn("Workflow activity scan failed; treating workspace as having active runs", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      return true;
+    }
   }
 
+  /**
+   * Strict variant for archive gates: scan failures (unreadable run store or run records)
+   * propagate instead of reading as "no runs". A crash-recovered run with a delayed resume
+   * would otherwise restart inside a workspace whose archive was admitted on the false
+   * empty answer.
+   */
+  private async listActiveWorkflowRunIdsForWorkspaceStrict(workspaceId: string): Promise<string[]> {
+    assert(
+      workspaceId.length > 0,
+      "listActiveWorkflowRunIdsForWorkspaceStrict requires workspaceId"
+    );
+    const runStore = new WorkflowRunStore({ sessionDir: this.config.getSessionDir(workspaceId) });
+    const runs = await runStore.listRunsForActivityScan();
+    return runs
+      .filter(
+        (run) =>
+          run.workspaceId === workspaceId &&
+          run.parentWorkflow == null &&
+          isActiveWorkflowRunStatus(run.status)
+      )
+      .map((run) => run.id);
+  }
+
+  /**
+   * Lenient variant for heuristics (task-owned-work and terminal-drain checks) where a
+   * transient scan failure should not abort the surrounding flow. Archive gates must use
+   * the strict variant (or hasActiveTopLevelWorkflowRunsForWorkspace, which fails closed).
+   */
   private async listActiveWorkflowRunIdsForWorkspace(workspaceId: string): Promise<string[]> {
-    assert(workspaceId.length > 0, "listActiveWorkflowRunIdsForWorkspace requires workspaceId");
     try {
-      const runStore = new WorkflowRunStore({ sessionDir: this.config.getSessionDir(workspaceId) });
-      const runs = await runStore.listRuns();
-      return runs
-        .filter(
-          (run) =>
-            run.workspaceId === workspaceId &&
-            run.parentWorkflow == null &&
-            isActiveWorkflowRunStatus(run.status)
-        )
-        .map((run) => run.id);
+      return await this.listActiveWorkflowRunIdsForWorkspaceStrict(workspaceId);
     } catch (error: unknown) {
       log.warn("Failed to list active workflow runs for workspace", {
         workspaceId,

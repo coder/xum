@@ -2082,6 +2082,12 @@ export class WorkspaceService extends EventEmitter {
   // after that user row and enter the send's request as a trailing foreign
   // assistant row (see acquireIdleTurnExclusion).
   private readonly preflightSendCounts = new Map<string, number>();
+  // In-flight renderer executeBash requests per workspace. Incremented in the same
+  // synchronous block as executeBash's archivingWorkspaces check (mirroring
+  // preflightSendCounts) so archive admission and bash execution always observe each other:
+  // an exec admitted first holds the archive gate open for its full duration, and an exec
+  // entering after the gate armed is refused at entry.
+  private readonly preflightExecCounts = new Map<string, number>();
 
   // Tracks in-flight fork auto-title generations so only the first accepted continue
   // message can claim the workspace title.
@@ -7864,6 +7870,9 @@ export class WorkspaceService extends EventEmitter {
         if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
           activityLabels.push("a message send in progress");
         }
+        if ((this.preflightExecCounts.get(workspaceId) ?? 0) > 0) {
+          activityLabels.push("a bash command executing");
+        }
         if (liveActivity.queuedMessages) activityLabels.push("queued messages");
         if (liveActivity.backgroundBashProcesses) {
           activityLabels.push("running background bash processes");
@@ -12256,6 +12265,24 @@ export class WorkspaceService extends EventEmitter {
     if (this.archivingWorkspaces.has(workspaceId)) {
       return Err(`Workspace ${workspaceId} is being archived; cannot execute bash`);
     }
+    // Archive admission pairing (same synchronous block as the guard above, mirroring
+    // sendMessage's preflightSendCounts): the metadata/init awaits below would otherwise
+    // hide this in-flight exec from the archive gate, letting an archive capture/remove the
+    // checkout (or stop a dedicated Coder workspace) while the admitted command resumes
+    // against it — on Coder even waking the workspace the archive hook just stopped. Held
+    // until the command settles; an archive arming later observes the count, and an exec
+    // entering after the gate armed is refused above.
+    this.preflightExecCounts.set(workspaceId, (this.preflightExecCounts.get(workspaceId) ?? 0) + 1);
+    using _preflightExec = {
+      [Symbol.dispose]: () => {
+        const remaining = (this.preflightExecCounts.get(workspaceId) ?? 1) - 1;
+        if (remaining <= 0) {
+          this.preflightExecCounts.delete(workspaceId);
+        } else {
+          this.preflightExecCounts.set(workspaceId, remaining);
+        }
+      },
+    };
 
     const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
     if (!metadataResult.success) {

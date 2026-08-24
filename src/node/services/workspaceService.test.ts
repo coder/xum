@@ -8218,6 +8218,40 @@ describe("WorkspaceService executeBash archive guards", () => {
     expect(waitForInitMock).toHaveBeenCalledTimes(0);
     expect(getWorkspaceMetadataMock).toHaveBeenCalledTimes(0);
   });
+
+  test("in-flight executeBash holds the archive gate until it settles", async () => {
+    const workspaceId = "ws-exec-pairing";
+
+    // Park executeBash at its first await (metadata fetch): the admission was counted in its
+    // synchronous entry block, so the archive gate must observe it with no timing games.
+    let releaseMetadata: () => void = () => undefined;
+    const metadataGate = new Promise<{ success: false; error: string }>((resolve) => {
+      releaseMetadata = () => resolve({ success: false, error: "metadata unavailable (test)" });
+    });
+    getWorkspaceMetadataMock.mockReturnValue(metadataGate);
+
+    const execPromise = workspaceService.executeBash(workspaceId, "echo hello");
+
+    const archiveResult = await workspaceService.archive(workspaceId, undefined, {
+      refuseLiveUserActivity: true,
+    });
+    expect(archiveResult.success).toBe(false);
+    if (!archiveResult.success) {
+      expect(archiveResult.error).toContain("bash command");
+    }
+
+    releaseMetadata();
+    const execResult = await execPromise;
+    expect(execResult.success).toBe(false);
+
+    // Once the exec settled, its admission is released and the gate no longer reports it.
+    const archiveAfter = await workspaceService.archive(workspaceId, undefined, {
+      refuseLiveUserActivity: true,
+    });
+    if (!archiveAfter.success) {
+      expect(archiveAfter.error).not.toContain("bash command");
+    }
+  });
 });
 
 describe("WorkspaceService executeBash workspace path resolution", () => {

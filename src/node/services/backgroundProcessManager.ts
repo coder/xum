@@ -767,7 +767,20 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   > {
     log.debug(`BackgroundProcessManager.spawn() called for workspace ${workspaceId}`);
 
-    const processId = this.generateUniqueProcessId(config.displayName);
+    let processId = this.generateUniqueProcessId(config.displayName);
+    // Restart-unique directories (local runtimes; remote layouts are on the remote host and
+    // outside the local crash-orphan guard): skip names whose durable directory may still
+    // belong to a surviving process from a previous session — see
+    // localSpawnDirMayHoldLiveProcess for why reuse would blind archive gating.
+    if (runtime instanceof LocalBaseRuntime) {
+      let suffix = 2;
+      while (await this.localSpawnDirMayHoldLiveProcess(workspaceId, processId)) {
+        do {
+          processId = `${config.displayName} (${suffix})`;
+          suffix++;
+        } while (this.processes.has(processId));
+      }
+    }
 
     // Spawn via executor with background infrastructure
     // spawnProcess uses runtime.tempDir() internally for output directory
@@ -1536,9 +1549,15 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     let entries: Dirent[];
     try {
       entries = await fsPromises.readdir(workspaceDir, { withFileTypes: true });
-    } catch {
-      // No local spawn records for this workspace (never spawned locally, or already cleaned).
-      return false;
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) {
+        // No local spawn records for this workspace (never spawned locally, or cleaned up).
+        return false;
+      }
+      // EACCES/EIO/...: the records exist but cannot be read, so absence of a surviving
+      // process is unprovable — fail closed (the model-facing caller routes to
+      // user-mediated archive).
+      return true;
     }
     const trackedPids = new Set<number>();
     for (const proc of this.processes.values()) {
@@ -1597,6 +1616,55 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       }
     }
     return false;
+  }
+
+  /**
+   * Whether the local durable spawn directory for this process name may still belong to a
+   * live process from a previous app session. Used to keep process directories unique across
+   * restarts: the in-memory ID allocator resets with the app, and reusing a surviving crash
+   * orphan's directory would hand two live processes one meta.json/exit_code — the newer
+   * process's exit marker would then settle the survivor's record and blind the crash-orphan
+   * archive gate. Settled records (exit marker present, non-running status, or dead PID) are
+   * safe to reuse; anything unprovable is treated as live so the allocator picks a new name.
+   */
+  private async localSpawnDirMayHoldLiveProcess(
+    workspaceId: string,
+    processId: string
+  ): Promise<boolean> {
+    const processDir = nodePath.join(localBgWorkspaceDir(workspaceId), processId);
+    try {
+      await fsPromises.access(nodePath.join(processDir, BG_EXIT_CODE_FILENAME));
+      return false; // The exit trap ran: settled — spawn clears the stale marker on reuse.
+    } catch {
+      // No exit marker — consult the meta record.
+    }
+    let raw: string;
+    try {
+      raw = await fsPromises.readFile(nodePath.join(processDir, BG_META_FILENAME), "utf-8");
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) {
+        try {
+          await fsPromises.access(processDir);
+          // Metaless, markerless directory: a crash artifact the orphan probe fails closed
+          // on — leave it undisturbed rather than overwrite whatever evidence remains.
+          return true;
+        } catch {
+          return false; // Directory absent: the name is free.
+        }
+      }
+      return true; // Unreadable record: may belong to a live process.
+    }
+    const meta = parseSpawnRecordMeta(raw);
+    if (meta == null) return true; // Torn record without an exit marker: may be live.
+    if (meta.status !== "running") return false; // Settled.
+    if (meta.pid <= 1) return true; // Unprobeable pid recorded as running: do not reuse.
+    try {
+      process.kill(meta.pid, 0);
+      return true; // Alive.
+    } catch (error) {
+      // ESRCH: gone. Anything else (EPERM, ...): not provably dead — treat as live.
+      return !isErrnoWithCode(error, "ESRCH");
+    }
   }
 
   /**

@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import {
   BackgroundProcessManager,
   computeTailStartOffset,
+  parseSpawnRecordMeta,
   type BackgroundProcessMeta,
   type MonitorArmedPayload,
   type MonitorMatchPayload,
@@ -2031,6 +2032,42 @@ describe("BackgroundProcessManager", () => {
       );
       expect(exitMarker.length).toBeGreaterThan(0);
       expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("fails closed when the spawn-record directory is unreadable", async () => {
+      // chmod-based EACCES cannot be provoked when running as root (e.g. some CI containers).
+      if (process.getuid?.() === 0) return;
+      await writeSpawnRecord("settled", { pid: process.pid, status: "exited" });
+      await fs.chmod(workspaceDir, 0o000);
+      try {
+        // Records exist but cannot be read: absence of a surviving process is unprovable, so
+        // the gate must refuse rather than let a snapshot archive proceed blind.
+        expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(true);
+      } finally {
+        await fs.chmod(workspaceDir, 0o755);
+      }
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("does not reuse a surviving orphan's directory for a same-name spawn", async () => {
+      await writeSpawnRecord("survivor", { pid: process.pid, status: "running" });
+
+      const result = await manager.spawn(runtime, orphanWorkspaceId, "sleep 5", {
+        cwd: process.cwd(),
+        displayName: "survivor",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      // The in-memory allocator resets across restarts, so the disk pass must skip the
+      // survivor's directory: sharing it would hand both processes one exit_code/meta.json
+      // and settle the survivor's record once the new process exits.
+      expect(result.processId).toBe("survivor (2)");
+      const survivorMeta = parseSpawnRecordMeta(
+        await fs.readFile(path.join(workspaceDir, "survivor", "meta.json"), "utf-8")
+      );
+      expect(survivorMeta?.pid).toBe(process.pid);
+      // The survivor still trips the crash-orphan gate even while the new process runs.
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(true);
     });
 
     it("clears a stale exit_code file when a restart reuses the process directory", async () => {
