@@ -70,6 +70,23 @@ describe("MessageQueue", () => {
       expect(queue.dequeueNext().message).toBe("User follow-up");
     });
 
+    it("threads the admission probe onto its own sealed entry and re-emits it at dispatch", () => {
+      // A Stop landing after dequeue is invisible to queue clearing, so the probe must ride
+      // the entry into the session's turn-admission gates — and it must not gate unrelated
+      // batched messages.
+      const admissionStale = () => true;
+      queue.add("wake trigger", undefined, { synthetic: true, admissionStale });
+      queue.add("User follow-up");
+
+      const probeEntry = queue.dequeueNext();
+      expect(probeEntry.message).toBe("wake trigger");
+      expect(probeEntry.internal?.admissionStale).toBe(admissionStale);
+
+      const followUp = queue.dequeueNext();
+      expect(followUp.message).toBe("User follow-up");
+      expect(followUp.internal?.admissionStale).toBeUndefined();
+    });
+
     it("counts peer triggers by dedupe-key prefix when metadata carries a workspace-turn correlation", () => {
       // Upward sends into a delegated workspace turn replace the trigger's muxMetadata with the
       // turn correlation; the agent-msg: dedupe prefix must keep the peer count exact.

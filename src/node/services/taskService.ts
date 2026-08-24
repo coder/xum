@@ -5120,34 +5120,33 @@ export class TaskService {
       // A sender that already reported or was stopped must not keep waking peers from a
       // winding-down stream or a late tool call racing task_stop: the terminal/archived
       // boundary wins, matching the target-side lifecycle rules below.
-      const senderIsAgentTask =
-        coerceNonEmptyString(senderEntry.workspace.parentWorkspaceId) != null;
-      if (senderIsAgentTask) {
-        const senderStatus = senderEntry.workspace.taskStatus ?? "running";
-        const senderArchived = isWorkspaceArchived(
-          senderEntry.workspace.archivedAt,
-          senderEntry.workspace.unarchivedAt
-        );
-        // A reawakened persistent child keeps its stable terminal taskStatus (e.g. `reported`)
-        // while the new execution runs under a workspace-turn handle; the mirrored
-        // taskExecutionStatus is the effective execution state (the same overlay
-        // isActiveAgentTaskEntry and task_list use), so an actively executing reawakened agent
-        // may send even though its stable status is terminal.
-        const senderExecutionActive = isActiveWorkspaceTurnTaskStatus(
-          senderEntry.workspace.taskExecutionStatus
-        );
-        if (
-          senderArchived ||
-          (!senderExecutionActive &&
-            senderStatus !== "running" &&
-            senderStatus !== "awaiting_report")
-        ) {
-          return Err({
-            code: "refused" as const,
-            reason:
-              "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
-          });
+      //
+      // A reawakened persistent child keeps its stable terminal taskStatus (e.g. `reported`)
+      // while the new execution runs under a workspace-turn handle; the mirrored
+      // taskExecutionStatus is the effective execution state (the same overlay
+      // isActiveAgentTaskEntry and task_list use), so an actively executing reawakened agent
+      // may send even though its stable status is terminal. interruptWorkspaceTurn marks that
+      // mirror terminal WITH the handle transition, so the admission probe below can also
+      // trust it as the authoritative stop signal.
+      const senderInactiveRefusal = {
+        code: "refused" as const,
+        reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
+      };
+      const isInactivePeerSender = (workspace: WorkspaceConfigEntry): boolean => {
+        if (coerceNonEmptyString(workspace.parentWorkspaceId) == null) {
+          // Root workspaces have no task lifecycle to go terminal.
+          return false;
         }
+        const status = workspace.taskStatus ?? "running";
+        return (
+          isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) ||
+          (!isActiveWorkspaceTurnTaskStatus(workspace.taskExecutionStatus) &&
+            status !== "running" &&
+            status !== "awaiting_report")
+        );
+      };
+      if (isInactivePeerSender(senderEntry.workspace)) {
+        return Err(senderInactiveRefusal);
       }
 
       // Workflow-owned endpoints exchange I/O through WorkflowRunner's journal; peer messages
@@ -5386,7 +5385,17 @@ export class TaskService {
           admissionRefusal = interruptedRefusal;
           return true;
         }
-        const freshEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), targetId);
+        const freshCfg = this.config.loadConfigOrDefault();
+        // Sender revalidation: a reawakened child stopped mid-send (its owner interrupted the
+        // workspace turn) must not wake an idle peer from its winding-down tool call. The
+        // execution mirror is marked terminal with the handle transition, so this re-read
+        // observes the stop before stopStream completes.
+        const freshSender = findWorkspaceEntry(freshCfg, senderWorkspaceId);
+        if (freshSender == null || isInactivePeerSender(freshSender.workspace)) {
+          admissionRefusal = senderInactiveRefusal;
+          return true;
+        }
+        const freshEntry = findWorkspaceEntry(freshCfg, targetId);
         if (freshEntry == null) {
           admissionRefusal = { code: "not_found" as const };
           return true;
@@ -9772,6 +9781,13 @@ export class TaskService {
       return result;
     }
 
+    if (workspaceId != null) {
+      // Mark the persisted execution mirror terminal WITH the handle transition, before the
+      // stopStream await below: peer-message admission trusts taskExecutionStatus as the
+      // effective execution state, so a mirror that lags until after stopStream would let the
+      // stopped child's in-flight sends pass lifecycle checks during that gap.
+      await this.updateAgentTaskExecutionState(workspaceId, handleId, "interrupted");
+    }
     if (shouldClearQueuedPrompt && workspaceId != null) {
       // Targeted removal: the queue can hold unrelated user messages before/behind
       // this turn's entry, so clearing the whole queue would drop real input.
@@ -9788,9 +9804,6 @@ export class TaskService {
       } catch (error: unknown) {
         log.debug("interruptWorkspaceTurn: stopStream threw", { handleId, error });
       }
-    }
-    if (workspaceId != null) {
-      await this.updateAgentTaskExecutionState(workspaceId, handleId, "interrupted");
     }
     if (interruptedRecord != null) {
       await this.cleanupDisposableWorkspaceTurn(interruptedRecord);

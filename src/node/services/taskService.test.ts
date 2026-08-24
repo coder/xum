@@ -13833,6 +13833,53 @@ describe("TaskService", () => {
     );
   });
 
+  test("sendAgentTreeMessage refuses at the admission probe when the sender is stopped mid-send", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const workspaces = (senderExecution: "running" | "interrupted") => [
+      projectWorkspace(projectPath, "root", "tree-root"),
+      // Reawakened persistent child: stable status stays `reported` while the current
+      // execution runs under a workspace-turn handle mirror.
+      projectWorkspace(projectPath, "sib-a", "sib-a", {
+        parentWorkspaceId: "tree-root",
+        taskStatus: "reported" as const,
+        taskExecutionId: "wtt-a",
+        taskExecutionStatus: senderExecution,
+      }),
+      projectWorkspace(projectPath, "sib-b", "sib-b", {
+        parentWorkspaceId: "tree-root",
+        taskStatus: "running" as const,
+      }),
+    ];
+    await saveWorkspaces(config, projectPath, workspaces("running"), testTaskSettings());
+
+    // Simulate the sender's owner interrupting its workspace turn while the send is in
+    // flight: interruptWorkspaceTurn marks the execution mirror terminal WITH the handle
+    // transition (before stopStream), so the admission probe observes the stop and the
+    // winding-down tool call cannot wake an idle peer.
+    const sendMessage = mock(
+      async (
+        _targetId: string,
+        _message: string,
+        _options: unknown,
+        internal: { admissionStale?: () => boolean }
+      ) => {
+        await saveWorkspaces(config, projectPath, workspaces("interrupted"), testTaskSettings());
+        expect(internal.admissionStale?.()).toBe(true);
+        return Err({ type: "unknown", raw: "send admission stale" });
+      }
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "still there?")).toEqual(
+      Err({
+        code: "refused",
+        reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
+      })
+    );
+  });
+
   test("sendAgentTreeMessage bounds peer message size, sender titles, and aggregate budgets", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");

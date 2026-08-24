@@ -2747,6 +2747,14 @@ export class AgentSession {
        * post-mutation context by design.
        */
       admissionEpochStale?: () => boolean;
+      /**
+       * Caller-supplied staleness probe that, unlike the epoch probe above, IS threaded
+       * through queued entries (MessageQueue stores it per entry and re-emits it at
+       * dispatch). Peer agent sends use it so a Stop/task_stop landing after dequeue —
+       * where queue clearing can no longer see the entry — still refuses the turn at
+       * these admission gates instead of starting a privileged turn on a stopped target.
+       */
+      admissionStale?: () => boolean;
     }
   ): Promise<Result<void, SendMessageError>> {
     this.assertNotDisposed("sendMessage");
@@ -2754,6 +2762,10 @@ export class AgentSession {
     assert(typeof message === "string", "sendMessage requires a string message");
 
     const isManualUserMessage = internal?.synthetic !== true;
+
+    // Single admission-staleness predicate for all three turn-admission gates below.
+    const isAdmissionStale = () =>
+      internal?.admissionEpochStale?.() === true || internal?.admissionStale?.() === true;
 
     const cancelSignal = internal?.cancelSignal;
     const persistedCancelableMessageIds: string[] = [];
@@ -3099,7 +3111,7 @@ export class AgentSession {
       // claims busy-ness), so whichever side runs first is observed by the
       // other. The epoch probe (r41) also refuses edits whose target rows a
       // completed mutation already discarded.
-      if (this.turnAdmissionBlocks > 0 || internal?.admissionEpochStale?.() === true) {
+      if (this.turnAdmissionBlocks > 0 || isAdmissionStale()) {
         return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
       }
 
@@ -3419,7 +3431,7 @@ export class AgentSession {
     // refuse while sends are in preflight (r42), so rows can no longer land
     // after a mutation commits; this check and the PREPARING gate remain
     // backstops for entry-accounting bypasses.
-    if (this.turnAdmissionBlocks > 0 || internal?.admissionEpochStale?.() === true) {
+    if (this.turnAdmissionBlocks > 0 || isAdmissionStale()) {
       return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
     }
 
@@ -3672,7 +3684,7 @@ export class AgentSession {
     // normally impossible since mutations refuse while sends are in
     // preflight (r42), but kept for paths that bypass WorkspaceService
     // entry accounting.
-    if (this.turnAdmissionBlocks > 0 || internal?.admissionEpochStale?.() === true) {
+    if (this.turnAdmissionBlocks > 0 || isAdmissionStale()) {
       const error = createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE);
       // The turn was already accepted (rows durable, onAccepted ran):
       // internal callers like the terminal-attention outbox mark state
@@ -6016,6 +6028,8 @@ export class AgentSession {
       preTurnMessages?: MuxMessage[];
       /** r54: fired once pre-turn rows cross the rollback horizon at dispatch. */
       onPreTurnRowsPersisted?: () => void;
+      /** Caller staleness probe re-checked at this entry's dispatch admission. */
+      admissionStale?: () => boolean;
     }
   ): "tool-end" | "turn-end" | null {
     this.assertNotDisposed("queueMessage");

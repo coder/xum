@@ -9513,11 +9513,6 @@ export class WorkspaceService extends EventEmitter {
       const admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
       const admissionEpochStale = () =>
         (this.contextMutationEpochs.get(workspaceId) ?? 0) !== admissionEpoch;
-      // The session's turn-admission gates re-evaluate this combined probe, so a caller-side
-      // staleness signal (peer sends racing a Stop) rejects at the same points as a
-      // context-discarding mutation.
-      const sendAdmissionStale = () =>
-        admissionEpochStale() || internal?.admissionStale?.() === true;
       // r41: count this send as in-preflight until it settles so refine
       // publication refuses to interleave with its pre-admission window
       // (context mutations instead refuse the send itself via the epoch
@@ -9639,7 +9634,8 @@ export class WorkspaceService extends EventEmitter {
             onAcceptedPreStreamFailure: internal?.onAcceptedPreStreamFailure,
             startStreamInBackground: internal?.startStreamInBackground,
             goalContinuation: internal?.goalContinuation,
-            admissionEpochStale: sendAdmissionStale,
+            admissionEpochStale,
+            admissionStale: internal?.admissionStale,
           });
         }
         return Err(pricingGate.error);
@@ -9741,6 +9737,10 @@ export class WorkspaceService extends EventEmitter {
             onAcceptedPreStreamFailure: continuationSendState.onAcceptedPreStreamFailure,
             preTurnMessages: internal?.preTurnMessages,
             onPreTurnRowsPersisted: internal?.onPreTurnRowsPersisted,
+            // Thread the probe onto the queued entry: a Stop landing after dequeue is
+            // invisible to queue clearing, so the session's turn-admission gates must
+            // re-check it at dispatch.
+            admissionStale: internal?.admissionStale,
           }
         );
 
@@ -9830,7 +9830,8 @@ export class WorkspaceService extends EventEmitter {
         onAcceptedPreStreamFailure,
         preTurnMessages: internal?.preTurnMessages,
         onPreTurnRowsPersisted: internal?.onPreTurnRowsPersisted,
-        admissionEpochStale: sendAdmissionStale,
+        admissionEpochStale,
+        admissionStale: internal?.admissionStale,
       });
       if (!result.success) {
         log.error("sendMessage handler: session returned error", {

@@ -115,6 +115,12 @@ interface QueuedMessageInternalOptions {
   preTurnMessages?: MuxMessage[];
   /** r54: fired once pre-turn rows cross the rollback horizon at dispatch. */
   onPreTurnRowsPersisted?: () => void;
+  /**
+   * Caller staleness probe re-emitted at dispatch and re-checked by the session's
+   * turn-admission gates. Peer agent sends use it so a Stop/task_stop landing after
+   * dequeue — where queue clearing can no longer see the entry — still refuses the turn.
+   */
+  admissionStale?: () => boolean;
 }
 
 type QueueClearCallbacks = Pick<
@@ -161,6 +167,8 @@ interface QueueEntry {
   preTurnMessages?: MuxMessage[];
   /** r54: fired once this entry's pre-turn rows cross the rollback horizon. */
   onPreTurnRowsPersisted?: () => void;
+  /** Caller staleness probe re-checked at this entry's dispatch admission (entries carrying it are sealed). */
+  admissionStale?: () => boolean;
 }
 
 /**
@@ -446,6 +454,9 @@ export class MessageQueue {
       // family sends would join their triggers while both payload rows pile
       // onto one entry, and the payloads would then persist adjacently.
       (internal?.preTurnMessages?.length ?? 0) > 0 ||
+      // A staleness probe gates exactly one dispatch; batching would let one
+      // sender's stop-refusal veto unrelated queued messages.
+      internal?.admissionStale != null ||
       incomingHasAcceptedCallbacks;
     // Compaction starts its own entry (its metadata must not adopt earlier batched
     // texts), but stays open so a follow-up typed behind a pending /compact batches
@@ -540,6 +551,9 @@ export class MessageQueue {
     }
     if (internal?.cancelSignal != null) {
       entry.cancelSignal = internal.cancelSignal;
+    }
+    if (internal?.admissionStale != null) {
+      entry.admissionStale = internal.admissionStale;
     }
 
     entry.addCount += 1;
@@ -790,6 +804,7 @@ export class MessageQueue {
       entry.onAcceptedPreStreamFailure != null ||
       entry.onCanceled != null ||
       entry.cancelSignal != null ||
+      entry.admissionStale != null ||
       (entry.preTurnMessages?.length ?? 0) > 0;
     const internal = hasInternalOptions
       ? {
@@ -808,6 +823,7 @@ export class MessageQueue {
           ...(entry.onPreTurnRowsPersisted != null
             ? { onPreTurnRowsPersisted: entry.onPreTurnRowsPersisted }
             : {}),
+          ...(entry.admissionStale != null ? { admissionStale: entry.admissionStale } : {}),
         }
       : undefined;
 
