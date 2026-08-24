@@ -11092,6 +11092,31 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     }
   });
 
+  test("recordExternalEditorOpen refuses while the workspace is being archived", async () => {
+    addToArchivingWorkspaces(workspaceService, workspaceId);
+
+    const result = await workspaceService.recordExternalEditorOpen(workspaceId);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("being archived");
+    }
+  });
+
+  test("recordExternalEditorOpen marks the workspace as having an untrackable app open", async () => {
+    // A crashed prior run may have leaked the shared-session-dir marker; clear it first.
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
+
+    const result = await workspaceService.recordExternalEditorOpen(workspaceId);
+    expect(result.success).toBe(true);
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
+
+    // The durable marker outlives this test run; remove it so "not yet opened" assertions in
+    // future runs (this fixture shares one session dir) stay deterministic.
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+  });
+
   test("resumeStream refuses while the workspace is being archived", async () => {
     addToArchivingWorkspaces(workspaceService, workspaceId);
 

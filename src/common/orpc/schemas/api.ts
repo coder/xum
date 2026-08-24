@@ -2963,6 +2963,19 @@ export const general = {
     }),
     output: ResultSchema(z.void(), z.string()),
   },
+  /**
+   * Record that the user is opening this workspace in an external editor (built-in deep link
+   * or custom command). External editors are untrackable once open, so model-driven snapshot
+   * archives consult this durable record; refuses while the workspace is being archived.
+   * Called by the renderer before launching editor deep links (custom-editor opens record on
+   * the backend openInEditor route itself).
+   */
+  recordEditorOpen: {
+    input: z.object({
+      workspaceId: z.string(),
+    }),
+    output: ResultSchema(z.void(), z.string()),
+  },
   getLogPath: {
     input: z.void(),
     output: z.object({ path: z.string() }),

@@ -2819,11 +2819,25 @@ export const router = (authToken?: string) => {
         .input(schemas.general.openInEditor.input)
         .output(schemas.general.openInEditor.output)
         .handler(async ({ context, input }) => {
+          // Custom editors spawn detached and untrackable; record the open (refusing while
+          // the workspace is archiving) before launching. See recordExternalEditorOpen.
+          const recorded = await context.workspaceService.recordExternalEditorOpen(
+            input.workspaceId
+          );
+          if (!recorded.success) {
+            return recorded;
+          }
           return context.editorService.openInEditor(
             input.workspaceId,
             input.targetPath,
             input.editorConfig
           );
+        }),
+      recordEditorOpen: t
+        .input(schemas.general.recordEditorOpen.input)
+        .output(schemas.general.recordEditorOpen.output)
+        .handler(async ({ context, input }) => {
+          return context.workspaceService.recordExternalEditorOpen(input.workspaceId);
         }),
     },
     secrets: {

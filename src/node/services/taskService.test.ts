@@ -479,7 +479,7 @@ function createWorkspaceServiceMocks(
     listLiveWorkspaceActivity: ReturnType<typeof mock>;
     hasRunningBackgroundBashProcesses: ReturnType<typeof mock>;
     isSnapshotArchiveEligibilityMutationSensitive: ReturnType<typeof mock>;
-    hasOpenedNativeTerminal: ReturnType<typeof mock>;
+    hasUntrackableExternalAppOpen: ReturnType<typeof mock>;
     deleteWorktree: ReturnType<typeof mock>;
     remove: ReturnType<typeof mock>;
     emit: ReturnType<typeof mock>;
@@ -515,7 +515,7 @@ function createWorkspaceServiceMocks(
   listLiveWorkspaceActivity: ReturnType<typeof mock>;
   hasRunningBackgroundBashProcesses: ReturnType<typeof mock>;
   isSnapshotArchiveEligibilityMutationSensitive: ReturnType<typeof mock>;
-  hasOpenedNativeTerminal: ReturnType<typeof mock>;
+  hasUntrackableExternalAppOpen: ReturnType<typeof mock>;
   deleteWorktree: ReturnType<typeof mock>;
   remove: ReturnType<typeof mock>;
   emit: ReturnType<typeof mock>;
@@ -580,7 +580,8 @@ function createWorkspaceServiceMocks(
   // untracked-file set, so interrupt_active tests exercise the interruption path.
   const isSnapshotArchiveEligibilityMutationSensitive =
     overrides?.isSnapshotArchiveEligibilityMutationSensitive ?? mock(() => false);
-  const hasOpenedNativeTerminal = overrides?.hasOpenedNativeTerminal ?? mock(() => false);
+  const hasUntrackableExternalAppOpen =
+    overrides?.hasUntrackableExternalAppOpen ?? mock(() => false);
   const deleteWorktree =
     overrides?.deleteWorktree ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
   const remove =
@@ -640,7 +641,7 @@ function createWorkspaceServiceMocks(
       listLiveWorkspaceActivity,
       hasRunningBackgroundBashProcesses,
       isSnapshotArchiveEligibilityMutationSensitive,
-      hasOpenedNativeTerminal,
+      hasUntrackableExternalAppOpen,
       deleteWorktree,
       removeWhileTaskTreeLocked: remove,
       remove,
@@ -675,7 +676,7 @@ function createWorkspaceServiceMocks(
     listLiveWorkspaceActivity,
     hasRunningBackgroundBashProcesses,
     isSnapshotArchiveEligibilityMutationSensitive,
-    hasOpenedNativeTerminal,
+    hasUntrackableExternalAppOpen,
     deleteWorktree,
     remove,
     emit,
@@ -955,7 +956,7 @@ describe("TaskService", () => {
       listLiveWorkspaceActivity?: ReturnType<typeof mock>;
       hasRunningBackgroundBashProcesses?: ReturnType<typeof mock>;
       isSnapshotArchiveEligibilityMutationSensitive?: ReturnType<typeof mock>;
-      hasOpenedNativeTerminal?: ReturnType<typeof mock>;
+      hasUntrackableExternalAppOpen?: ReturnType<typeof mock>;
       create?: ReturnType<typeof mock>;
     } = {}
   ) {
@@ -999,8 +1000,8 @@ describe("TaskService", () => {
               options.isSnapshotArchiveEligibilityMutationSensitive,
           }
         : {}),
-      ...(options.hasOpenedNativeTerminal != null
-        ? { hasOpenedNativeTerminal: options.hasOpenedNativeTerminal }
+      ...(options.hasUntrackableExternalAppOpen != null
+        ? { hasUntrackableExternalAppOpen: options.hasUntrackableExternalAppOpen }
         : {}),
       ...(options.create != null ? { create: options.create } : {}),
     });
@@ -1770,7 +1771,7 @@ describe("TaskService", () => {
     // checkout) must fail closed instead of deleting the directory under the user's shell.
     const harness = await createWorkspaceLifecycleHarness({
       isSnapshotArchiveEligibilityMutationSensitive: mock(() => true),
-      hasOpenedNativeTerminal: mock(() => true),
+      hasUntrackableExternalAppOpen: mock(() => true),
     });
 
     const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(harness.parentId, {

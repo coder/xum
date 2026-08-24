@@ -7664,13 +7664,68 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * Whether a native terminal was ever opened for this workspace during this app session.
-   * Native emulators are detached and daemonize, so their lifetime cannot be tracked; the
-   * model-facing lifecycle path refuses snapshot archives (which remove the checkout) for
-   * such workspaces instead of pulling the directory out from under a live native shell.
+   * Workspaces an external editor (VS Code/Cursor/Zed deep link or a custom editor command)
+   * was opened for. Like native terminals, external editors are untrackable once open (deep
+   * links leave no process handle; custom commands spawn detached), so opens are recorded
+   * stickily in memory and as a durable per-workspace marker that survives app restarts.
    */
-  async hasOpenedNativeTerminal(workspaceId: string): Promise<boolean> {
-    return (await this.terminalService?.hasOpenedNativeTerminal(workspaceId)) === true;
+  private readonly externalEditorWorkspaces = new Set<string>();
+
+  private externalEditorMarkerPath(workspaceId: string): string {
+    return path.join(this.config.getSessionDir(workspaceId), "external-editor-opened");
+  }
+
+  /**
+   * Record that the user is opening this workspace in an external editor. Refuses while an
+   * agent-driven archive is gating the workspace: the check shares the synchronous block with
+   * the in-memory recording (mirroring TerminalService.openNative), so an archive gate armed
+   * first refuses the open while an open recorded first is observed by the sink's
+   * untrackable-app check before snapshot capture.
+   */
+  async recordExternalEditorOpen(workspaceId: string): Promise<Result<void>> {
+    this.externalEditorWorkspaces.add(workspaceId);
+    if (this.archivingWorkspaces.has(workspaceId)) {
+      return Err(
+        `Workspace is being archived: ${workspaceId}. Unarchive it before opening an editor.`
+      );
+    }
+    // Durable marker: the editor can outlive Xum, so a restart must not forget the open.
+    // Best-effort — the Set above still guards this app session if the write fails.
+    try {
+      const markerPath = this.externalEditorMarkerPath(workspaceId);
+      await fsPromises.mkdir(path.dirname(markerPath), { recursive: true });
+      await fsPromises.writeFile(markerPath, new Date().toISOString());
+    } catch (error) {
+      log.warn("Failed to persist external editor marker", { workspaceId, error });
+    }
+    return Ok(undefined);
+  }
+
+  private async hasExternalEditorOpen(workspaceId: string): Promise<boolean> {
+    if (this.externalEditorWorkspaces.has(workspaceId)) {
+      return true;
+    }
+    try {
+      await fsPromises.access(this.externalEditorMarkerPath(workspaceId));
+      this.externalEditorWorkspaces.add(workspaceId);
+      return true;
+    } catch {
+      // Missing marker (or an unreadable one — probing must never break archive gating).
+      return false;
+    }
+  }
+
+  /**
+   * Whether an untrackable local app (native terminal or external editor) was ever opened for
+   * this workspace. Such apps are detached and daemonize, so their lifetime cannot be tracked;
+   * the model-facing lifecycle path refuses snapshot archives (which remove the checkout) for
+   * such workspaces instead of pulling the directory out from under a live shell or editor.
+   */
+  async hasUntrackableExternalAppOpen(workspaceId: string): Promise<boolean> {
+    if ((await this.terminalService?.hasOpenedNativeTerminal(workspaceId)) === true) {
+      return true;
+    }
+    return await this.hasExternalEditorOpen(workspaceId);
   }
 
   /**
@@ -7925,17 +7980,18 @@ export class WorkspaceService extends EventEmitter {
         beforeArchiveMetadata.projects.length > 1;
       const needsSnapshotCapture = canSnapshotManagedWorktree && !shouldSkipSnapshotCapture;
 
-      // Native terminals are detached and untrackable (see hasOpenedNativeTerminal): when this
-      // archive would capture a snapshot and remove the managed worktree, a model-driven
-      // archive must not delete the checkout under a user's live native shell. Mirrors the
-      // lifecycle caller's early refusal against the same pinned behavior read.
+      // Native terminals and external editors are detached and untrackable (see
+      // hasUntrackableExternalAppOpen): when this archive would capture a snapshot and remove
+      // the managed worktree, a model-driven archive must not delete the checkout under a
+      // user's live shell or editor. Mirrors the lifecycle caller's early refusal against the
+      // same pinned behavior read.
       if (
         options?.refuseLiveUserActivity === true &&
         needsSnapshotCapture &&
-        (await this.terminalService?.hasOpenedNativeTerminal(workspaceId)) === true
+        (await this.hasUntrackableExternalAppOpen(workspaceId))
       ) {
         return Err(
-          "A native terminal was opened for this workspace during this session and its lifetime cannot be tracked; the snapshot archive policy would remove the checkout under it. Ask the user to archive this workspace manually."
+          "A native terminal or external editor was opened for this workspace and its lifetime cannot be tracked; the snapshot archive policy would remove the checkout under it. Ask the user to archive this workspace manually."
         );
       }
 
