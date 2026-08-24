@@ -5,29 +5,16 @@
 import { describe, test, expect } from "@jest/globals";
 import { KNOWN_MODELS, MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
 import modelsJson from "@/common/utils/tokens/models.json";
-import { modelsExtra } from "@/common/utils/tokens/models-extra";
+import { findMissingKnownModels } from "@/common/utils/tokens/updateModelsData";
 
 describe("Known Models Integration", () => {
   test("all known models exist in token metadata", () => {
-    const missingModels: string[] = [];
-
-    for (const [key, model] of Object.entries(KNOWN_MODELS)) {
-      const modelId = model.providerModelId;
-
-      // xAI and Moonshot models are provider-prefixed in token metadata.
-      const lookupKey =
-        model.provider === "xai" || model.provider === "moonshotai"
-          ? `${model.provider}/${modelId}`
-          : modelId;
-      if (!(lookupKey in modelsJson) && !(lookupKey in modelsExtra) && !(modelId in modelsExtra)) {
-        missingModels.push(`${key}: ${model.provider}:${modelId}`);
-      }
-    }
+    const missingModels = findMissingKnownModels(modelsJson);
 
     if (missingModels.length > 0) {
       throw new Error(
         `The following known models are missing from token metadata:\n${missingModels.join("\n")}\n\n` +
-          `Run 'bun scripts/update_models.ts' to refresh models.json from LiteLLM.`
+          `Run 'make update-models' to refresh models.json from LiteLLM.`
       );
     }
   });

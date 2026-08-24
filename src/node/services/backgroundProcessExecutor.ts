@@ -124,17 +124,18 @@ export async function spawnProcess(
   // Get temp directory from runtime (absolute path, runtime-agnostic)
   const tempDir = await runtime.tempDir();
   const bgOutputDir = `${tempDir}/${BG_OUTPUT_SUBDIR}`;
+  const execCwd = runtime.mapPathForExec?.(options.cwd) ?? options.cwd;
 
   // Use shell-safe quoting for paths (handles spaces, special chars)
   const quotePath = quotePathForShell;
 
   // Verify working directory exists
-  const cwdCheck = await execBuffered(runtime, `cd ${quotePath(options.cwd)}`, {
+  const cwdCheck = await execBuffered(runtime, `cd ${quotePath(execCwd)}`, {
     cwd: FALLBACK_CWD,
     timeout: 10,
   });
   if (cwdCheck.exitCode !== 0) {
-    return { success: false, error: `Working directory does not exist: ${options.cwd}` };
+    return { success: false, error: `Working directory does not exist: ${execCwd}` };
   }
 
   // Compute output paths (unified output.log instead of separate stdout/stderr)
@@ -159,7 +160,7 @@ export async function spawnProcess(
   // Note: buildWrapperScript handles quoting internally via shellQuote
   const wrapperScript = buildWrapperScript({
     exitCodePath,
-    cwd: options.cwd,
+    cwd: execCwd,
     env: { ...options.env, ...NON_INTERACTIVE_ENV_VARS },
     script,
   });

@@ -32,6 +32,14 @@ function shellEscape(str: string): string {
   return `'${str.replace(/'/g, "'\\''")}'`;
 }
 
+/**
+ * Hooks execute in the runtime's exec namespace, so the documented
+ * XUM_PROJECT_DIR env value must be valid there (issue #3709).
+ */
+function resolveExecProjectDir(runtime: Runtime, projectDir: string): string {
+  return runtime.mapPathForExec?.(projectDir) ?? projectDir;
+}
+
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return (
     typeof value === "object" &&
@@ -76,7 +84,10 @@ async function getProjectOrGlobalConfigPath(
 ): Promise<string | null> {
   for (const relativePath of listProjectMetadataRelativePaths(filename)) {
     const projectPath = joinPathLike(projectDir, relativePath);
-    if (await isFile(runtime, projectPath)) return projectPath;
+    if (await isFile(runtime, projectPath)) {
+      // Hook and tool_env paths are embedded in exec scripts, so return them in that namespace.
+      return runtime.mapPathForExec?.(projectPath) ?? projectPath;
+    }
   }
   return getUserGlobalConfigPath(runtime, filename);
 }
@@ -265,7 +276,7 @@ export async function runWithHook<T>(
     // Ensure the base JSON env var cannot be overwritten by flattened fields.
     XUM_TOOL_INPUT: toolInputEnv,
     XUM_WORKSPACE_ID: context.workspaceId,
-    XUM_PROJECT_DIR: context.projectDir,
+    XUM_PROJECT_DIR: resolveExecProjectDir(runtime, context.projectDir),
     XUM_EXEC: execMarker,
   };
   if (toolInputPath) {
@@ -612,7 +623,7 @@ export async function runPreHook(
     // Ensure the base JSON env var cannot be overwritten by flattened fields.
     XUM_TOOL_INPUT: toolInputEnv,
     XUM_WORKSPACE_ID: context.workspaceId,
-    XUM_PROJECT_DIR: context.projectDir,
+    XUM_PROJECT_DIR: resolveExecProjectDir(runtime, context.projectDir),
   };
   if (toolInputPath) {
     canonicalHookEnv.XUM_TOOL_INPUT_PATH = toolInputPath;
@@ -708,7 +719,7 @@ export async function runPostHook(
     // Ensure base JSON env vars cannot be overwritten by flattened fields.
     XUM_TOOL_INPUT: toolInputEnv,
     XUM_WORKSPACE_ID: context.workspaceId,
-    XUM_PROJECT_DIR: context.projectDir,
+    XUM_PROJECT_DIR: resolveExecProjectDir(runtime, context.projectDir),
     XUM_TOOL_RESULT: resultEnv,
   };
   if (toolInputPath) {

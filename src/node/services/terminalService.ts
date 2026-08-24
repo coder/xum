@@ -19,6 +19,7 @@ import {
 } from "@/node/runtime/runtimeHelpers";
 import { log } from "@/node/services/log";
 import { isCommandAvailable, findAvailableCommand } from "@/node/utils/commandDiscovery";
+import { resolveContainerCli } from "@/node/runtime/containerCli";
 import { sanitizeXumChildEnv } from "@/node/runtime/childProcessEnv";
 import { Terminal } from "@xterm/headless";
 import { SerializeAddon } from "@xterm/addon-serialize";
@@ -417,10 +418,11 @@ export class TerminalService {
         if (!containerName) {
           throw new Error("Docker container not initialized");
         }
+        const containerCli = quoteForNativeTerminalCommandArg(await resolveContainerCli());
         await this.openNativeTerminal({
           type: "local",
           workspacePath: process.cwd(), // cwd doesn't matter, we're running docker exec
-          command: `docker exec -it ${containerName} /bin/sh -c "cd ${workspace.namedWorkspacePath} && exec /bin/sh"`,
+          command: `${containerCli} exec -it ${containerName} /bin/sh -c "cd ${workspace.namedWorkspacePath} && exec /bin/sh"`,
         });
       } else if (isDevcontainerRuntime(runtimeConfig)) {
         // These arguments are executed via `sh -c` in terminal launchers, so they

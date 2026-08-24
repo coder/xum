@@ -370,6 +370,12 @@ export interface Runtime {
   exec(command: string, options: ExecOptions): Promise<ExecStream>;
 
   /**
+   * Translate a host-visible path into the namespace used by exec() scripts.
+   * When absent, file I/O and exec share the same path namespace.
+   */
+  mapPathForExec?(filePath: string): string;
+
+  /**
    * Read file contents as a stream
    * @param path Absolute or relative path to file
    * @param abortSignal Optional abort signal for cancellation

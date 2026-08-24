@@ -7,7 +7,11 @@
  */
 
 import type { APIClient } from "@/browser/contexts/API";
-import { expandProjects, selectWorkspace } from "@/browser/stories/helpers/uiState";
+import {
+  expandLeftSidebar,
+  expandProjects,
+  selectWorkspace,
+} from "@/browser/stories/helpers/uiState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 import type { AppStory } from "@/browser/stories/meta.js";
@@ -29,6 +33,9 @@ function setupProjectCreateStory(): APIClient {
   const workspaces = [createWorkspace({ id: "ws-1", name: "main", projectName: "my-app" })];
   selectWorkspace(workspaces[0]);
   expandProjects(["/mock/my-app"]);
+  // The sidebar defaults to collapsed at phone widths; the play functions need
+  // its "Add project" button visible to open the modal.
+  expandLeftSidebar();
   return createMockORPCClient({
     projects: groupWorkspacesByProject(workspaces),
     workspaces,

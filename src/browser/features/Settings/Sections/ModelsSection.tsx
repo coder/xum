@@ -19,6 +19,7 @@ import { useMinThinkingLevels } from "@/browser/hooks/useMinThinkingLevels";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { listModelCatalogIds } from "@/common/utils/tokens/modelCatalog";
 import { isCodexOauthRequiredModelId } from "@/common/constants/codexOAuth";
 import { usePolicy } from "@/browser/contexts/PolicyContext";
 import {
@@ -160,12 +161,10 @@ export function ModelsSection() {
   // cross-hook timing mismatches while settings are loading/refetching.
   const codexOauthConfigured = config?.openai?.codexOauthSet === true;
 
-  // "Treat as" dropdown should only list known models — custom models don't have
-  // the metadata (pricing, context window, tokenizer) that mapping inherits.
-  // Static list — React Compiler handles memoization; no manual useMemo needed.
-  const knownModelIds = Object.values(KNOWN_MODELS)
-    .map((model) => model.id)
-    .sort();
+  // "Treat as" targets must carry the metadata (pricing, context window) that
+  // mapping inherits: any model in the token catalog qualifies, not just the
+  // curated KNOWN_MODELS list (#3727).
+  const treatAsModelIds = listModelCatalogIds();
 
   // Check if a model already exists (for duplicate prevention)
   const modelExists = useCallback(
@@ -473,7 +472,7 @@ export function ModelsSection() {
                       editMappedToModel={isModelEditing ? editing.mappedToModel : undefined}
                       editAutofocus={isModelEditing ? editing.focus : undefined}
                       customContextWindowTokens={model.contextWindowTokens}
-                      allModels={knownModelIds}
+                      allModels={treatAsModelIds}
                       editError={isModelEditing ? error : undefined}
                       saving={false}
                       hasActiveEdit={editing !== null}

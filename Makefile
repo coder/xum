@@ -60,7 +60,10 @@ endif
 
 # Issue #3831: macOS may SIGKILL the copied esbuild inode while the platform binary still execs.
 # ESBUILD_BINARY_PATH is not used because only esbuild's JS API honors it, not the Go CLI.
-ESBUILD_BIN = $(firstword $(wildcard node_modules/@esbuild/*/bin/esbuild) node_modules/esbuild/bin/esbuild)
+# Prefer the host platform package: ensure-mac-sharp-runtime-deps adds darwin packages on any
+# host, and a bare wildcard would sort @esbuild/darwin-arm64 first (issue #3338).
+ESBUILD_HOST_PLATFORM := $(subst Linux,linux,$(subst Darwin,darwin,$(shell uname -s)))-$(subst x86_64,x64,$(subst aarch64,arm64,$(shell uname -m)))
+ESBUILD_BIN = $(firstword $(wildcard node_modules/@esbuild/$(ESBUILD_HOST_PLATFORM)/bin/esbuild) $(wildcard node_modules/@esbuild/*/bin/esbuild) node_modules/esbuild/bin/esbuild)
 
 # Common esbuild flags for CLI API bundle (ESM format for trpc-cli)
 ESBUILD_CLI_FLAGS := --bundle --format=esm --platform=node --target=node20 --outfile=dist/cli/api.mjs --external:zod --external:commander --external:jsonc-parser --external:@trpc/server --external:ssh2 --external:cpu-features --banner:js="import{createRequire}from'module';globalThis.require=createRequire(import.meta.url);"
@@ -80,7 +83,7 @@ include fmt.mk
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
 .PHONY: lint lint-fix typecheck static-check static-check-full
 .PHONY: test test-unit test-integration test-watch test-coverage test-e2e test-e2e-perf smoke-test
-.PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 check-appimage-icons check-mac-attach-file-runtime
+.PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-run storybook-build test-storybook
@@ -222,6 +225,20 @@ start: node_modules/.installed build-main build-preload build-static ## Build an
 ## Build targets (can run in parallel)
 build: node_modules/.installed src/version.ts build-renderer build-main build-preload build-icons build-static ## Build all targets
 
+.PHONY: update-models
+update-models: node_modules/.installed ## Fetch latest LiteLLM model data, validate it, update models.json if changed
+	@bun scripts/update_models.ts
+
+# #3727: `make build UPDATE_MODELS=1` refreshes the vendored models.json before
+# building; plain `make build` stays network-free and reproducible. The refresh
+# must be a prerequisite of every catalog-consuming bundle (not just `build`) so
+# parallel make cannot bundle the old catalog, and the phony prerequisite forces
+# those bundles stale because models.json is not part of $(TS_SOURCES).
+ifeq ($(UPDATE_MODELS),1)
+build: update-models
+build-renderer dist/cli/index.js dist/cli/api.mjs: update-models
+endif
+
 build-main: node_modules/.installed dist/cli/index.js dist/cli/api.mjs ## Build main process
 
 BUILTIN_AGENTS_GENERATED := src/node/services/agentDefinitions/builtInAgentContent.generated.ts
@@ -238,7 +255,9 @@ $(BUILTIN_SKILLS_GENERATED): $(BUILTIN_SKILL_SOURCES) $(DOCS_SOURCES) scripts/ge
 $(WORKFLOW_RUNTIME_SOURCES_GENERATED): $(WORKFLOW_RUNTIME_SOURCES) scripts/gen_workflow_runtime_sources.ts
 	@bun scripts/gen_workflow_runtime_sources.ts
 
-dist/cli/index.js: src/cli/index.ts src/desktop/main.ts src/cli/server.ts src/version.ts tsconfig.main.json tsconfig.json $(TS_SOURCES) $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
+# models.json is bundled but not in $(TS_SOURCES); without this prerequisite a
+# catalog-only refresh would leave a stale main bundle (#3727).
+dist/cli/index.js: src/cli/index.ts src/desktop/main.ts src/cli/server.ts src/version.ts tsconfig.main.json tsconfig.json $(TS_SOURCES) src/common/utils/tokens/models.json $(BUILTIN_AGENTS_GENERATED) $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
 	@echo "Building main process..."
 	@NODE_ENV=production $(TSGO) -p tsconfig.main.json
 	@NODE_ENV=production bun x tsc-alias -p tsconfig.main.json
@@ -454,7 +473,27 @@ test-e2e-perf: ## Run automated performance profiling scenarios
 dist: build ## Build distributable packages
 	@bun x electron-builder --publish never
 
+# Issue #3338: bun installs host-only optional deps, but electron-builder packages both mac
+# architectures from one node_modules tree, which otherwise omits the x64 sharp runtime.
+ensure-mac-sharp-runtime-deps: node_modules/.installed
+	@bun install --frozen-lockfile --os=darwin --cpu=x64
+	@bun install --frozen-lockfile --os=darwin --cpu=arm64
+	@# Cross-arch installs repoint node_modules/.bin at the last-installed platform; a
+	@# host-native install restores them and keeps the darwin packages added above.
+	@bun install --frozen-lockfile
+	@for dir in \
+		node_modules/@img/sharp-darwin-x64 \
+		node_modules/@img/sharp-libvips-darwin-x64 \
+		node_modules/@img/sharp-darwin-arm64 \
+		node_modules/@img/sharp-libvips-darwin-arm64; do \
+		if [ ! -d "$$dir" ]; then \
+			echo "Missing $$dir after platform installs. bun >= 1.3 is required because older versions silently ignore --os/--cpu." >&2; \
+			exit 1; \
+		fi; \
+	done
+
 dist-mac: build ## Build macOS distributables (x64 + arm64)
+	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@if [ -n "$$CSC_LINK" ]; then \
 		echo "🔐 Code signing enabled - using unified build for correct yml..."; \
 		bun x electron-builder --mac --x64 --arm64 --publish never; \
@@ -467,15 +506,18 @@ dist-mac: build ## Build macOS distributables (x64 + arm64)
 	@echo "✅ Both architectures built successfully"
 
 dist-mac-release: build ## Build and publish macOS distributables (x64 + arm64)
+	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "🔐 Building macOS x64 + arm64 (unified for correct yml)..."
 	@bun x electron-builder --mac --x64 --arm64 --publish always
 	@echo "✅ Both architectures built and published successfully"
 
 dist-mac-x64: build ## Build macOS x64 distributable only
+	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "Building macOS x64..."
 	@bun x electron-builder --mac --x64 --publish never
 
 dist-mac-arm64: build ## Build macOS arm64 distributable only
+	@$(MAKE) --no-print-directory ensure-mac-sharp-runtime-deps
 	@echo "Building macOS arm64..."
 	@bun x electron-builder --mac --arm64 --publish never
 
