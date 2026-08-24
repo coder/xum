@@ -1697,13 +1697,15 @@ describe("ProviderService.setConfig", () => {
     );
   });
 
-  it("rejects invalid ids when setConfig creates an OpenAI-compatible provider", async () => {
+  it("rejects providerType writes that would create an entry, even with invalid ids", async () => {
     await withTempConfigAsync(async (config, service) => {
+      // Creation through setConfig is forbidden outright (see the absent-entry
+      // guard); the invalid id must never be persisted either way.
       const result = await service.setConfig("bad provider", ["providerType"], "openai-compatible");
 
       expect(result.success).toBe(false);
       if (!result.success) {
-        expect(result.error).toContain("Invalid custom provider id");
+        expect(result.error).toContain("does not exist");
       }
       expect(config.loadProvidersConfig()?.["bad provider"]).toBeUndefined();
     });
