@@ -609,14 +609,28 @@ export class TerminalService {
           // earlier in-flight open of this same batch cannot masquerade as evidence of a
           // real prior launch. "unknown" probes count as pre-existing (fail closed).
           let batch = this.nativeTerminalMarkerBatches.get(workspaceId);
+          const createdBatch = batch == null;
           if (batch == null) {
             const preexisting = await this.probeNativeTerminalMarkerOnDisk(workspaceId);
             batch = { markerPreexisted: preexisting !== "absent", tokens: new Set() };
             this.nativeTerminalMarkerBatches.set(workspaceId, batch);
           }
           const markerPath = this.nativeTerminalMarkerPath(workspaceId);
-          await fs.promises.mkdir(path.dirname(markerPath), { recursive: true });
-          await fs.promises.writeFile(markerPath, new Date().toISOString());
+          try {
+            await fs.promises.mkdir(path.dirname(markerPath), { recursive: true });
+            await fs.promises.writeFile(markerPath, new Date().toISOString());
+          } catch (error) {
+            // A newly created, still-empty batch must not outlive a failed persistence
+            // attempt: its probe (possibly a fail-closed "unknown" during the same
+            // filesystem hiccup) would become stale ancestry for a later retry, permanently
+            // preserving a marker that retry writes even when its launch fails. Discarding
+            // it makes the next attempt re-probe the recovered disk. A joined batch keeps
+            // its live tokens.
+            if (createdBatch && batch.tokens.size === 0) {
+              this.nativeTerminalMarkerBatches.delete(workspaceId);
+            }
+            throw error;
+          }
           // Launch evidence is registered under the same lock as the write so a concurrent
           // failed launch's rollback can never observe the marker without the token.
           const token = Symbol("native-terminal-launch");

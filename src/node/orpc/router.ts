@@ -2847,6 +2847,15 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) => {
           return context.workspaceService.recordExternalEditorOpen(input.workspaceId);
         }),
+      rollbackEditorOpen: t
+        .input(schemas.general.rollbackEditorOpen.input)
+        .output(schemas.general.rollbackEditorOpen.output)
+        .handler(async ({ context, input }) => {
+          return context.workspaceService.rollbackRecordedEditorOpen(
+            input.workspaceId,
+            input.launchToken
+          );
+        }),
     },
     secrets: {
       get: t

@@ -11302,6 +11302,58 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
   });
 
+  test("rollbackRecordedEditorOpen redeems a renderer launch token", async () => {
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+
+    const recorded = await workspaceService.recordExternalEditorOpen(workspaceId);
+    expect(recorded.success).toBe(true);
+    if (!recorded.success) return;
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
+
+    // The renderer's placeholder window was closed before navigation: the deep link provably
+    // never launched, so redeeming the token must roll the durable marker back.
+    const rolledBack = await workspaceService.rollbackRecordedEditorOpen(
+      workspaceId,
+      recorded.data.launchToken
+    );
+    expect(rolledBack.success).toBe(true);
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
+
+    // Idempotent: redeeming again is a safe no-op.
+    expect(
+      (await workspaceService.rollbackRecordedEditorOpen(workspaceId, recorded.data.launchToken))
+        .success
+    ).toBe(true);
+  });
+
+  test("a failed marker persistence does not leave stale ancestry for the next attempt", async () => {
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+
+    // Same filesystem hiccup hits both the probe (EACCES -> fail-closed "unknown", so the
+    // batch records markerPreexisted: true) and the write. The failed attempt must discard
+    // that batch; otherwise the retry below would join it and its rollback would preserve a
+    // marker no launch ever backed.
+    const accessSpy = spyOn(fsPromises, "access").mockImplementationOnce(() =>
+      Promise.reject(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }))
+    );
+    const writeSpy = spyOn(fsPromises, "writeFile").mockImplementationOnce(() =>
+      Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
+    );
+    try {
+      const failed = await workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
+      expect(failed.success).toBe(false);
+
+      const retried = await workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
+      expect(retried.success).toBe(true);
+      if (!retried.success) return;
+      await retried.data.rollbackAfterFailedLaunch();
+      expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
+    } finally {
+      accessSpy.mockRestore();
+      writeSpy.mockRestore();
+    }
+  });
+
   test("rollbackAfterFailedLaunch preserves a marker that predates the recording", async () => {
     // An earlier session's editor may still be running behind a pre-existing marker; a later
     // failed launch must not delete the evidence protecting it.

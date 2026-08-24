@@ -2123,6 +2123,33 @@ export class WorkspaceService extends EventEmitter {
    */
   private readonly initSettlementPromises = new Map<string, Promise<void>>();
 
+  /**
+   * Registers a fire-and-forget background init started outside this service (TaskService
+   * starts inits for task workspaces after materializing their checkouts) with the same
+   * abort-and-settlement mechanism archive uses: archiveUnlocked aborts the registered
+   * controller when init state is still running, and always awaits the retained settlement
+   * before snapshot capture, checkout deletion, or Coder hooks can proceed. The controller
+   * entry self-cleans on settlement.
+   */
+  registerExternalBackgroundInit(
+    workspaceId: string,
+    abortController: AbortController,
+    settled: Promise<unknown>
+  ): void {
+    this.initAbortControllers.set(workspaceId, abortController);
+    this.retainInitSettlement(workspaceId, settled);
+    void settled
+      .then(
+        () => undefined,
+        () => undefined
+      )
+      .then(() => {
+        if (this.initAbortControllers.get(workspaceId) === abortController) {
+          this.initAbortControllers.delete(workspaceId);
+        }
+      });
+  }
+
   /** See initSettlementPromises. */
   private retainInitSettlement(workspaceId: string, settled: Promise<unknown>): void {
     const swallowed = settled.then(
@@ -7757,17 +7784,56 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
+   * Rollback handles for renderer-recorded deep-link opens, keyed by an opaque launch token
+   * returned to the renderer. The renderer redeems a token via rollbackRecordedEditorOpen
+   * only when its placeholder window was closed before navigation (the deep link provably
+   * never launched). Entries for successful launches are retained for the app session —
+   * they pin the batch token that keeps the durable marker protected.
+   */
+  private readonly externalEditorLaunchRollbacks = new Map<
+    string,
+    { workspaceId: string; rollback: () => Promise<void> }
+  >();
+
+  /**
    * Record that the user is opening this workspace in an external editor. Refuses while an
    * agent-driven archive is gating the workspace: the check shares the synchronous block with
    * the in-memory recording (mirroring TerminalService.openNative), so an archive gate armed
    * first refuses the open while an open recorded first is observed by the sink's
    * untrackable-app check before snapshot capture.
    */
-  async recordExternalEditorOpen(workspaceId: string): Promise<Result<void>> {
+  async recordExternalEditorOpen(workspaceId: string): Promise<Result<{ launchToken: string }>> {
     const admitted = await this.recordExternalEditorOpenForLaunch(workspaceId);
-    // Deep-link opens launch in the renderer immediately after this returns and cannot report
-    // launch failures back, so their launch evidence is retained unconditionally.
-    return admitted.success ? Ok(undefined) : admitted;
+    if (!admitted.success) {
+      return admitted;
+    }
+    // Deep-link opens launch in the renderer immediately after this returns; the token lets
+    // the renderer report the one provable non-launch (its placeholder window was closed
+    // before navigation) so the marker cannot outlive a launch that never happened.
+    const launchToken = crypto.randomUUID();
+    this.externalEditorLaunchRollbacks.set(launchToken, {
+      workspaceId,
+      rollback: admitted.data.rollbackAfterFailedLaunch,
+    });
+    return Ok({ launchToken });
+  }
+
+  /**
+   * Redeems a recordExternalEditorOpen launch token after the renderer's placeholder window
+   * was closed before navigation (no editor launched). Idempotent: unknown or already
+   * redeemed tokens are no-ops, so renderer retries are safe.
+   */
+  async rollbackRecordedEditorOpen(
+    workspaceId: string,
+    launchToken: string
+  ): Promise<Result<void>> {
+    const entry = this.externalEditorLaunchRollbacks.get(launchToken);
+    if (entry?.workspaceId !== workspaceId) {
+      return Ok(undefined);
+    }
+    this.externalEditorLaunchRollbacks.delete(launchToken);
+    await entry.rollback();
+    return Ok(undefined);
   }
 
   /**
@@ -7829,14 +7895,27 @@ export class WorkspaceService extends EventEmitter {
         // earlier in-flight open of this same batch cannot masquerade as evidence of a real
         // prior launch. "unknown" probes count as pre-existing (fail closed).
         let batch = this.externalEditorMarkerBatches.get(workspaceId);
+        const createdBatch = batch == null;
         if (batch == null) {
           const preexisting = await this.probeExternalEditorMarkerOnDisk(workspaceId);
           batch = { markerPreexisted: preexisting !== "absent", tokens: new Set() };
           this.externalEditorMarkerBatches.set(workspaceId, batch);
         }
         const markerPath = this.externalEditorMarkerPath(workspaceId);
-        await fsPromises.mkdir(path.dirname(markerPath), { recursive: true });
-        await fsPromises.writeFile(markerPath, new Date().toISOString());
+        try {
+          await fsPromises.mkdir(path.dirname(markerPath), { recursive: true });
+          await fsPromises.writeFile(markerPath, new Date().toISOString());
+        } catch (error) {
+          // A newly created, still-empty batch must not outlive a failed persistence attempt:
+          // its probe (possibly a fail-closed "unknown" during the same filesystem hiccup)
+          // would become stale ancestry for a later retry, permanently preserving a marker
+          // that retry writes even when its launch fails. Discarding it makes the next
+          // attempt re-probe the recovered disk. A joined batch keeps its live tokens.
+          if (createdBatch && batch.tokens.size === 0) {
+            this.externalEditorMarkerBatches.delete(workspaceId);
+          }
+          throw error;
+        }
         // Launch evidence is registered under the same lock as the write so a concurrent
         // failed launch's rollback can never observe the marker without the token.
         const token = Symbol("external-editor-launch");

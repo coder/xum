@@ -2974,6 +2974,20 @@ export const general = {
     input: z.object({
       workspaceId: z.string(),
     }),
+    // launchToken lets the renderer redeem rollbackEditorOpen for the one provable
+    // non-launch: its placeholder window was closed before the deep-link navigation.
+    output: ResultSchema(z.object({ launchToken: z.string() }), z.string()),
+  },
+  /**
+   * Undo a recordEditorOpen whose deep-link launch provably never happened (the renderer's
+   * placeholder window was closed before navigation), so the durable editor-open marker
+   * cannot permanently gate model-driven snapshot/Coder-stop archives. Idempotent.
+   */
+  rollbackEditorOpen: {
+    input: z.object({
+      workspaceId: z.string(),
+      launchToken: z.string(),
+    }),
     output: ResultSchema(z.void(), z.string()),
   },
   getLogPath: {

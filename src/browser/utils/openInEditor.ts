@@ -135,7 +135,66 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
     }
   }
   let launched = false;
-  const launch = (deepLink: string): void => {
+
+  // Record the open immediately before launching a deep link: external editors are
+  // untrackable once open (deep links leave no process handle), so model-driven snapshot
+  // archives consult this durable record — and an archive already in progress must refuse
+  // the open. Called after every deterministic compatibility check so a refused open can
+  // never persist a sticky marker that permanently gates future archives. Fail closed: a
+  // transient client disconnect (api null while reconnecting) or a failed recording RPC
+  // does not stop backend agents, so launching unrecorded would let a concurrent archive
+  // remove the checkout under the new editor. Custom-editor opens are recorded by the
+  // backend route instead.
+  const recordOpenBeforeLaunch = async (): Promise<{ launchToken: string } | { error: string }> => {
+    if (!args.api) {
+      return {
+        error:
+          "Cannot open the editor while disconnected from Xum: the open must be recorded first so archive safety checks can see it. Retry once reconnected.",
+      };
+    }
+    try {
+      const recorded = await args.api.general.recordEditorOpen({ workspaceId: args.workspaceId });
+      if (!recorded.success) {
+        return { error: recorded.error };
+      }
+      return { launchToken: recorded.data.launchToken };
+    } catch (error) {
+      return {
+        error: `Cannot open the editor: recording the open failed (${error instanceof Error ? error.message : String(error)}), and archive safety checks depend on that record.`,
+      };
+    }
+  };
+
+  const placeholderClosedError =
+    "The editor window was closed before the editor could open. Retry to reopen it.";
+  // Read through a call so TypeScript cannot narrow the readonly `closed` across awaits —
+  // the user can flip it at any time.
+  const isPlaceholderClosed = (): boolean => placeholder?.closed === true;
+
+  const recordThenLaunch = async (deepLink: string): Promise<OpenInEditorResult> => {
+    // The user can close the blank placeholder during any await that ran before this point
+    // (devcontainer/SSH discovery); refuse before recording so no marker needs rolling back.
+    if (isPlaceholderClosed()) {
+      return { success: false, error: placeholderClosedError };
+    }
+    const admission = await recordOpenBeforeLaunch();
+    if ("error" in admission) {
+      return { success: false, error: admission.error };
+    }
+    // Closed while the recording RPC was awaiting: navigating the dead WindowProxy would be
+    // silently ignored, so no editor can open — redeem the launch token to roll the durable
+    // marker back (best-effort: a failed rollback keeps the sticky marker, fail closed).
+    if (isPlaceholderClosed()) {
+      try {
+        await args.api?.general.rollbackEditorOpen({
+          workspaceId: args.workspaceId,
+          launchToken: admission.launchToken,
+        });
+      } catch {
+        // Fail closed: the marker stays until the next successful open or restart.
+      }
+      return { success: false, error: placeholderClosedError };
+    }
     launched = true;
     if (placeholder != null) {
       placeholder.location.href = deepLink;
@@ -143,9 +202,11 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
       // Electron: no placeholder was needed.
       openUrl(deepLink);
     }
+    return { success: true };
   };
+
   try {
-    return await openInEditorWithLaunch(args, editorConfig, launch);
+    return await openInEditorWithLaunch(args, editorConfig, recordThenLaunch);
   } finally {
     if (placeholder != null && !launched) {
       placeholder.close();
@@ -156,7 +217,7 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
 async function openInEditorWithLaunch(
   args: OpenInEditorArgs,
   editorConfig: EditorConfig,
-  launch: (deepLink: string) => void
+  launch: (deepLink: string) => Promise<OpenInEditorResult>
 ): Promise<OpenInEditorResult> {
   const isSSH = isSSHRuntime(args.runtimeConfig);
   const isDocker = isDockerRuntime(args.runtimeConfig);
@@ -176,30 +237,6 @@ async function openInEditorWithLaunch(
       };
     }
   }
-
-  // Record the open immediately before launching a deep link: external editors are
-  // untrackable once open (deep links leave no process handle), so model-driven snapshot
-  // archives consult this durable record — and an archive already in progress must refuse
-  // the open. Called after every deterministic compatibility check so a refused open can
-  // never persist a sticky marker that permanently gates future archives. Fail closed: a
-  // transient client disconnect (api null while reconnecting) or a failed recording RPC
-  // does not stop backend agents, so launching unrecorded would let a concurrent archive
-  // remove the checkout under the new editor. Custom-editor opens are recorded by the
-  // backend route instead.
-  const recordOpenBeforeLaunch = async (): Promise<string | null> => {
-    if (!args.api) {
-      return "Cannot open the editor while disconnected from Xum: the open must be recorded first so archive safety checks can see it. Retry once reconnected.";
-    }
-    try {
-      const recorded = await args.api.general.recordEditorOpen({ workspaceId: args.workspaceId });
-      if (!recorded.success) {
-        return recorded.error;
-      }
-    } catch (error) {
-      return `Cannot open the editor: recording the open failed (${error instanceof Error ? error.message : String(error)}), and archive safety checks depend on that record.`;
-    }
-    return null;
-  };
 
   // Docker workspaces always use deep links (VS Code connects to container remotely)
   if (isDocker && args.runtimeConfig?.type === "docker") {
@@ -231,12 +268,7 @@ async function openInEditorWithLaunch(
       return { success: false, error: `${editorConfig.editor} does not support Docker containers` };
     }
 
-    const recordError = await recordOpenBeforeLaunch();
-    if (recordError != null) {
-      return { success: false, error: recordError };
-    }
-    launch(deepLink);
-    return { success: true };
+    return launch(deepLink);
   }
 
   // Devcontainer workspaces use deep links with container info from backend
@@ -289,12 +321,7 @@ async function openInEditorWithLaunch(
       return { success: false, error: `${editorConfig.editor} does not support Dev Containers` };
     }
 
-    const recordError = await recordOpenBeforeLaunch();
-    if (recordError != null) {
-      return { success: false, error: recordError };
-    }
-    launch(deepLink);
-    return { success: true };
+    return launch(deepLink);
   }
 
   // VS Code / Cursor / Zed: always use deep links (works in browser + Electron)
@@ -330,12 +357,7 @@ async function openInEditorWithLaunch(
       };
     }
 
-    const recordError = await recordOpenBeforeLaunch();
-    if (recordError != null) {
-      return { success: false, error: recordError };
-    }
-    launch(deepLink);
-    return { success: true };
+    return launch(deepLink);
   }
 
   // Custom editor:

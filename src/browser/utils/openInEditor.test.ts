@@ -76,7 +76,8 @@ describe("openInEditor", () => {
   function createApiStub(extra?: Record<string, unknown>): APIClient {
     return {
       general: {
-        recordEditorOpen: () => Promise.resolve({ success: true }),
+        recordEditorOpen: () =>
+          Promise.resolve({ success: true, data: { launchToken: "launch-token" } }),
       },
       ...extra,
     } as unknown as APIClient;
@@ -177,7 +178,9 @@ describe("openInEditor", () => {
 
   test("does not record the open when a deterministic compatibility check refuses", async () => {
     const calls: OpenCall[] = [];
-    const recordEditorOpen = mock(() => Promise.resolve({ success: true }));
+    const recordEditorOpen = mock(() =>
+      Promise.resolve({ success: true, data: { launchToken: "launch-token" } })
+    );
     const api = { general: { recordEditorOpen } } as unknown as APIClient;
 
     // Zed + Docker is refused deterministically with no launch; recording first would leave
@@ -252,7 +255,9 @@ describe("openInEditor", () => {
     const { windowValue, placeholder } = createBrowserModeWindow(calls);
     // Resolving this recording RPC yields the microtask queue, exactly the await that would
     // outlast the click's transient user activation if window.open ran after it.
-    const recordEditorOpen = mock(() => Promise.resolve({ success: true }));
+    const recordEditorOpen = mock(() =>
+      Promise.resolve({ success: true, data: { launchToken: "launch-token" } })
+    );
     const api = { general: { recordEditorOpen } } as unknown as APIClient;
 
     const result = await withWindow(windowValue, () =>
@@ -297,6 +302,72 @@ describe("openInEditor", () => {
     // A refused open must not leave a stray blank tab behind.
     expect(placeholder.navigations.length).toBe(0);
     expect(placeholder.closed).toBe(true);
+  });
+
+  test("browser mode: rolls back the recorded open when the placeholder closes during recording", async () => {
+    const calls: OpenCall[] = [];
+    const { windowValue, placeholder } = createBrowserModeWindow(calls);
+    // Simulates the user closing the blank tab while the recording RPC is in flight: the
+    // navigation would target a dead WindowProxy, so the durable marker must be rolled back.
+    const recordEditorOpen = mock(() => {
+      placeholder.closed = true;
+      return Promise.resolve({ success: true, data: { launchToken: "tok-closed" } });
+    });
+    const rollbackEditorOpen = mock(() => Promise.resolve({ success: true }));
+    const api = { general: { recordEditorOpen, rollbackEditorOpen } } as unknown as APIClient;
+
+    const result = await withWindow(windowValue, () =>
+      openInEditor({
+        api,
+        workspaceId,
+        targetPath: filePath,
+        runtimeConfig: { type: "ssh", host: "devbox", srcBaseDir: "~/xum" },
+        isFile: true,
+      })
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("closed");
+    expect(rollbackEditorOpen).toHaveBeenCalledWith({ workspaceId, launchToken: "tok-closed" });
+    expect(placeholder.navigations.length).toBe(0);
+  });
+
+  test("browser mode: refuses without recording when the placeholder closed before admission", async () => {
+    const calls: OpenCall[] = [];
+    const { windowValue, placeholder } = createBrowserModeWindow(calls);
+    const recordEditorOpen = mock(() =>
+      Promise.resolve({ success: true, data: { launchToken: "launch-token" } })
+    );
+    // The devcontainer-info await runs before admission; the user closes the tab during it.
+    const api = {
+      general: { recordEditorOpen },
+      workspace: {
+        getDevcontainerInfo: () => {
+          placeholder.closed = true;
+          return Promise.resolve({
+            containerName: "jovial_newton",
+            containerWorkspacePath: "/workspaces/myapp",
+            hostWorkspacePath: "/Users/me/projects/myapp",
+          });
+        },
+      },
+    } as unknown as APIClient;
+
+    const result = await withWindow(windowValue, () =>
+      openInEditor({
+        api,
+        workspaceId,
+        targetPath: "/Users/me/projects/myapp/src/app.ts",
+        runtimeConfig: { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
+        isFile: true,
+      })
+    );
+
+    // Closed before admission: refused with no marker recorded, so nothing needs rollback.
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("closed");
+    expect(recordEditorOpen).not.toHaveBeenCalled();
+    expect(placeholder.navigations.length).toBe(0);
   });
 
   test("browser mode: refuses before recording when the placeholder is popup-blocked", async () => {

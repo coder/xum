@@ -3587,21 +3587,31 @@ export class TaskService {
       const secrets = await secretsToRecord(
         this.config.getEffectiveSecrets(plan.parentMeta.projectPath)
       );
-      void runBackgroundInit(
-        runtimeForTaskWorkspace,
-        {
-          projectPath: plan.parentMeta.projectPath,
-          branchName: plan.workspaceName,
-          trunkBranch,
-          workspacePath,
-          initLogger,
-          env: secrets,
-          skipInitHook: plan.skipInitHook,
-          trusted:
-            this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ??
-            false,
-        },
-        plan.taskId
+      // Registered (not just fired) with WorkspaceService's abort-and-settlement mechanism:
+      // a model-driven archive of this task workspace must be able to cancel the init and
+      // must wait for the hook process's actual exit before snapshot capture, checkout
+      // deletion, or Coder hooks can proceed (see initSettlementPromises).
+      const initAbortController = new AbortController();
+      this.workspaceService.registerExternalBackgroundInit(
+        plan.taskId,
+        initAbortController,
+        runBackgroundInit(
+          runtimeForTaskWorkspace,
+          {
+            projectPath: plan.parentMeta.projectPath,
+            branchName: plan.workspaceName,
+            trunkBranch,
+            workspacePath,
+            initLogger,
+            env: secrets,
+            abortSignal: initAbortController.signal,
+            skipInitHook: plan.skipInitHook,
+            trusted:
+              this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ??
+              false,
+          },
+          plan.taskId
+        )
       );
     }
 
@@ -4628,20 +4638,30 @@ export class TaskService {
       const secrets = await secretsToRecord(
         this.config.getEffectiveSecrets(parentMeta.projectPath)
       );
-      void runBackgroundInit(
-        runtimeForTaskWorkspace,
-        {
-          projectPath: parentMeta.projectPath,
-          branchName: workspaceName,
-          trunkBranch,
-          workspacePath,
-          initLogger,
-          env: secrets,
-          skipInitHook,
-          trusted:
-            this.config.loadConfigOrDefault().projects.get(configProjectPath)?.trusted ?? false,
-        },
-        taskId
+      // Registered (not just fired) with WorkspaceService's abort-and-settlement mechanism:
+      // a model-driven archive of this task workspace must be able to cancel the init and
+      // must wait for the hook process's actual exit before snapshot capture, checkout
+      // deletion, or Coder hooks can proceed (see initSettlementPromises).
+      const initAbortController = new AbortController();
+      this.workspaceService.registerExternalBackgroundInit(
+        taskId,
+        initAbortController,
+        runBackgroundInit(
+          runtimeForTaskWorkspace,
+          {
+            projectPath: parentMeta.projectPath,
+            branchName: workspaceName,
+            trunkBranch,
+            workspacePath,
+            initLogger,
+            env: secrets,
+            abortSignal: initAbortController.signal,
+            skipInitHook,
+            trusted:
+              this.config.loadConfigOrDefault().projects.get(configProjectPath)?.trusted ?? false,
+          },
+          taskId
+        )
       );
     }
 

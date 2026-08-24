@@ -642,6 +642,9 @@ function createWorkspaceServiceMocks(
       hasRunningBackgroundBashProcesses,
       isSnapshotArchiveEligibilityMutationSensitive,
       hasUntrackableExternalAppOpen,
+      // Task launches register their fire-and-forget background inits for archive gating;
+      // a no-op suffices since these tests archive nothing mid-init.
+      registerExternalBackgroundInit: mock(() => undefined),
       deleteWorktree,
       removeWhileTaskTreeLocked: remove,
       remove,
