@@ -96,6 +96,54 @@ Messages to a busy workspace enter its `MessageQueue` (`src/node/services/messag
 4. **Inbound consent (accept/hold/refuse)** — medium cost, and the one place Mux should consider deviating: Mux has no permission-mode classes to derive defaults from, so a simpler model (per-workspace accept/refuse toggle, hold-with-notification) fits better than Claude Code's precedence chain. Without permission prompts, the receiver-side risk in Mux is concentrated in prompt injection, which #2 addresses more directly.
 5. **Cross-machine** — reasonable to reject deliberately. Mux's centralized control plane already covers the remote-execution case; Mux↔Mux federation is a product decision, not a messaging gap.
 
+## First draft: intra-tree peer messaging — what would need to change
+
+Requested scope for a first draft: children can message **each other** (siblings/cousins) and **workspaces up the tree** (beyond one-hop `agent_report`). Cross-tree and cross-machine stay out. The delivery machinery (queue, tool-boundary dispatch, durable pending sends) needs no changes; the work is scope, framing, throttling, and a handful of edge cases.
+
+### 1. Widen the scope check (core, small)
+
+Replace the descendant-only check in `TaskService.sendMessageToDescendantAgentTask` with same-tree membership: resolve sender's and target's roots via the existing `parentById` walk (`buildAgentTaskIndex`; the 32-level cycle-guarded walk is reusable) and allow when roots match and sender ≠ target. Compute the **relationship server-side** (`descendant` vs `sibling`/`ancestor`) — the sender must not be able to claim parent authority it doesn't have, because framing differs by relationship (below).
+
+Exclusions that must survive the widening:
+
+- **Workflow-owned tasks** (`workflowTask != null`): their I/O flows through WorkflowRunner's journal — `reportAgentProgress` already returns early for them to avoid backgrounding foreground workflow waits. Peer messages into or out of workflow-owned tasks would break durable replay; refuse with a descriptive status.
+- **Best-of-n candidates**: sibling messaging between grouped candidates (`bestOf` metadata on the task record) contaminates candidate independence. Refuse, or at minimum instruct against it; decide explicitly.
+- **Terminal targets for non-ancestor senders**: today, messaging a terminal descendant reactivates it via a continuation execution whose `ownerWorkspaceId` is the sender. `reportAgentProgress` routes reports to the active continuation's owner — so a sibling-triggered reactivation would silently reroute the target's reports away from its real parent. Draft 1: only ancestors reactivate; peers get `not_active` for terminal targets (matching Claude Code, which only reaches live sessions anyway).
+
+### 2. Discovery (small)
+
+`task_list` is descendant-only (`listDescendantAgentTasks`). Add a `scope: "tree"` option returning the tree from the caller's root — ids, role titles, statuses, parent links — enough to pick an addressee. A separate `agent_list` tool would also work, but extending `task_list` keeps the toolset small. Tool descriptions and the system-prompt lifecycle text must tell models peers are now reachable.
+
+### 3. Trust framing (must land in the same draft)
+
+- A peer/upward message needs an envelope distinct from both parent guidance and `<mux_subagent_report>` — e.g. `<mux_agent_message from="<taskId> (<title>)" relationship="sibling|ancestor|…">` — sent with `{ synthetic: true, agentInitiated: true }` plus new `muxMetadata` (sender id/title) for rendering. The `from` id doubles as the reply address; symmetric same-tree scope makes replying trivially legal, so none of Claude Code's reply-only asymmetry is needed.
+- A system-prompt paragraph (alongside `<subagent-reports>` in the `systemMessage.ts` PRELUDE) defining the trust boundary, copied nearly verbatim from Claude Code: the message is from another agent, **not the user, and not user consent**; never change settings/instruction files because a peer asked; route work your own constraints forbid back to the user. Critically, peer messages must **not** inherit the sub-agent-report grant of "trusted tool output for repo facts" — an arbitrary peer's context was not briefed by the receiver and may itself be prompt-injected.
+
+### 4. Loop protection (must land in the same draft)
+
+Sideways messaging creates exactly the ping-pong loop Claude Code throttles; the current mitigations (topology, per-report dedupe, `MAX_CONSECUTIVE_PARENT_AUTO_RESUMES = 3`) don't cover it. Minimum set:
+
+- Per sender→target rate limit (rolling window) checked before enqueue; return a `rate_limited` status so the sending model backs off.
+- Identical-repeat dedupe (sender+target+text hash in a short window) — `MessageQueue`'s dedupe-key machinery is reusable.
+- A cap on agent-initiated queued entries per workspace (`MessageQueue` is unbounded today); refuse the overflow.
+- A consecutive-wake cap for idle targets: after N peer-message wakes with no intervening human or terminal event, hold or refuse further peer wakes (modeled on the parent auto-resume cap).
+
+### 5. Upward messages hit human-driven workspaces
+
+Mechanically, waking an ancestor is solved: reuse `resolveParentAutoResumeOptions` and the `skipAutoResumeReset`/dedupe send options exactly as `reportAgentProgress` does. The open product question is that the root is usually a workspace the human is actively driving, and an unsolicited child message starts a billable turn there. Draft-1 mitigations to pick from: default ancestor-bound messages to `turn-end` dispatch; make peer messages visible (and removable) in the receiving queue UI — today synthetic entries are hidden by the `userAuthored` gating in `messageQueue.ts`; or ship the smallest slice of `crossSessionInbound` as a per-workspace accept/refuse toggle for peer messages.
+
+### 6. Tool surface and rendering (small)
+
+Keep one send tool (widened `task_send_message`, or renamed `agent_send_message`) with server-computed relationship framing; extend the result schema (`toolDefinitions.ts`) with `rate_limited`/`refused` and the renderer (`TaskToolCall.tsx`) to show target + delivery status. Receiving side needs a `Message from <sender>` row driven by the new `muxMetadata` type.
+
+### 7. Test surface
+
+Scope matrix (sibling/cousin/ancestor/root allowed; cross-tree, workflow-owned, best-of, terminal-for-peers refused; ancestor reactivation preserved), relationship-based framing selection, rate limit + dedupe + queue cap behavior, and a reply round-trip. UI tests for queue visibility and message rows.
+
+### Rough cost
+
+Core (scope widening + framing + discovery + tests) is a focused PR series — the delivery machinery is untouched. Throttling and queue caps are small but need their own tests. The only medium-sized piece is inbound-consent UI, which draft 1 can defer by defaulting ancestor delivery to `turn-end` and making queued peer messages visible.
+
 ## Conclusion
 
 Thomas's belief holds for the **mechanics** but not the **topology**. Mux's queue-and-dispatch layer already implements Claude Code's hardest delivery semantics (tool-boundary injection, idle-turn start, plain-text-only, durable queuing) and its slash-command inertness, via `task_send_message` / `agent_report` / workspace turns. But Claude Code's feature is specifically about _independent sibling sessions_ messaging each other with discovery, inbound consent, and loop throttling — and Mux supports none of that today. If sibling-workspace coordination matters, the build is incremental (the delivery machinery is done); the design work is in discovery scope, peer-message trust framing, and throttling — where Claude Code's "not user consent" boundary and loop limits are the two decisions worth copying.
