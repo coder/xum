@@ -948,6 +948,90 @@ describe("SandboxHostService", () => {
     await hostA.disposeScope("ws-stale-persist");
   });
 
+  test("a foreign backend's ordinary snapshot invalidates a live mount at the next lease (r67)", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const hostA = new SandboxHostService();
+    const hostB = new SandboxHostService();
+    // B mounts first (empty scope) and stays alive across A's persist.
+    const mountB = await hostB.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-foreign-snap",
+      sessionDir: tmp.path,
+    });
+    const mountA = await hostA.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-foreign-snap",
+      sessionDir: tmp.path,
+    });
+    await mountA.runtime.eval('vars.x = "from-A"; return true;');
+    await mountA.persistVars();
+
+    // The reset generation is unchanged (no reset happened), so only the
+    // snapshot lineage can tell B its process-local mount is now stale.
+    const released = await hostB.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-foreign-snap",
+      sessionDir: tmp.path,
+    });
+    expect(released).not.toBe(mountB);
+    expect(mountB.isDisposed).toBe(true);
+    const probe = await released.runtime.eval("return vars.x;");
+    expect(probe.success).toBe(true);
+    expect(probe.result).toBe("from-A");
+    await hostB.disposeScope("ws-foreign-snap");
+    await hostA.disposeScope("ws-foreign-snap");
+  });
+
+  test("a stale mount's persist cannot supersede a foreign ordinary snapshot (r67)", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const hostA = new SandboxHostService();
+    const hostB = new SandboxHostService();
+    const mountB = await hostB.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-snap-race",
+      sessionDir: tmp.path,
+    });
+    await mountB.runtime.eval('vars.x = "stale-B"; return true;');
+
+    // A persists while B's mount is still live: B's namespace no longer
+    // descends from the scope's newest snapshot.
+    const mountA = await hostA.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-snap-race",
+      sessionDir: tmp.path,
+    });
+    await mountA.runtime.eval('vars.x = "from-A"; return true;');
+    await mountA.persistVars();
+
+    // B's persist must refuse (verified inside the same blob lock every
+    // snapshot publisher serializes on) instead of silently discarding A's
+    // write by publishing the stale namespace as the newest snapshot.
+    try {
+      await mountB.persistVars();
+      expect.unreachable("stale persist must be refused");
+    } catch (error) {
+      expect(String(error)).toContain("persisted by another instance");
+    }
+
+    // The newest snapshot is still A's: a fresh lease restores it.
+    const fresh = await hostB.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-snap-race",
+      sessionDir: tmp.path,
+    });
+    const probe = await fresh.runtime.eval("return vars.x;");
+    expect(probe.success).toBe(true);
+    expect(probe.result).toBe("from-A");
+    await hostB.disposeScope("ws-snap-race");
+    await hostA.disposeScope("ws-snap-race");
+  });
+
   test("context reset never resurrects pre-reset vars when the tombstone publish fails once", async () => {
     using tmp = new DisposableTempDir("sandbox-host-test");
     const host = new SandboxHostService();

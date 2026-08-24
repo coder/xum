@@ -51,7 +51,9 @@ export interface RefinementFileCapture {
 /** Inverse draft with captured contents inline; blob offload happens at append. */
 export type RefinementInverseDraft =
   | { op: "delete-files"; paths: string[] }
-  | { op: "restore-files"; files: RefinementFileCapture[] }
+  // deletePaths (r67): mixed force-apply pre-state — restore `files` AND
+  // delete the paths the forced rollback created (see RefinementInverseSchema).
+  | { op: "restore-files"; files: RefinementFileCapture[]; deletePaths?: string[] }
   | { op: "rename"; from: string; to: string };
 
 export interface RefinementEmitArgs {
@@ -118,7 +120,17 @@ export async function resolveRefinementInverse(
       return { path: file.path, blobRef: ref };
     })
   );
-  return { inverse: { op: "restore-files", files }, publishedBlobs };
+  return {
+    inverse: {
+      op: "restore-files",
+      files,
+      // Mixed force-apply pre-state (r67): carry the deletion half through.
+      ...(draft.deletePaths !== undefined && draft.deletePaths.length > 0
+        ? { deletePaths: draft.deletePaths }
+        : {}),
+    },
+    publishedBlobs,
+  };
 }
 
 /**

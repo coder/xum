@@ -177,6 +177,27 @@ export async function removeSessionDirUnderMemoryLocks(args: {
     );
   };
   try {
+    // Refine serialization (r66) — acquired FIRST (r67): a /refine apply in
+    // ANOTHER backend is untouched by the remover's process-local
+    // cancellation and holds this same (session-dir-external) lock across
+    // its staged-set loads, per-edit progress rewrites, and skill/journal
+    // commits. An admitted apply acquires the refine lock and THEN needs the
+    // memory-target and history locks (per-edit mutations + the audit-row
+    // append); if removal took those inner locks before contending on the
+    // refine lock, the two paths would wait in opposite order until timeout,
+    // and an apply that already mutated memory could lose its audit/rollback
+    // record when removal then deletes the retained staged state and session
+    // journal. Refine lock first means admitted applies deterministically
+    // drain before teardown takes the inner locks; an apply starting after
+    // this acquisition refuses on the in-lock tombstone gate in
+    // RefineService. Fail-closed like the other locks: a long apply blocks
+    // removal into the orphan path rather than having the directory deleted
+    // out from under its writes.
+    await using _refineLock = await acquireProcessFileLock({
+      lockPath: refineApplyLockPath(args.rootDir, args.workspaceId),
+      timeoutMs: 10_000,
+      label: "refine serialization lock (removal)",
+    });
     await withTargetMutationLocks(
       args.rootDir,
       [sessionDirKey, workspaceMemoryKey, sharedMemoryKey],
@@ -190,20 +211,6 @@ export async function removeSessionDirUnderMemoryLocks(args: {
           lockPath: historyWriteLockPath(args.rootDir, args.workspaceId),
           timeoutMs: 10_000,
           label: "history write lock (removal)",
-        });
-        // Refine serialization (r66): a /refine apply in ANOTHER backend is
-        // untouched by the remover's process-local cancellation and holds
-        // this same (session-dir-external) lock across its staged-set loads,
-        // per-edit progress rewrites, and skill/journal commits. Acquiring
-        // it here means an in-flight apply completes before the deletion
-        // below, and one starting afterwards refuses on the in-lock
-        // tombstone gate in RefineService. Fail-closed like the other locks:
-        // a long apply blocks removal into the orphan path rather than
-        // having the directory deleted out from under its writes.
-        await using _refineLock = await acquireProcessFileLock({
-          lockPath: refineApplyLockPath(args.rootDir, args.workspaceId),
-          timeoutMs: 10_000,
-          label: "refine serialization lock (removal)",
         });
         // Tombstone BEFORE rm: once the locks release, any waiting writer
         // re-checks it pre-commit (inside its own lock) and refuses, so the

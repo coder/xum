@@ -77,7 +77,21 @@ export type RefinementFile = z.infer<typeof RefinementFileSchema>;
  */
 export const RefinementInverseSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("delete-files"), paths: z.array(z.string().min(1)).min(1) }),
-  z.object({ op: z.literal("restore-files"), files: z.array(RefinementFileSchema) }),
+  z.object({
+    op: z.literal("restore-files"),
+    files: z.array(RefinementFileSchema),
+    /**
+     * Paths this inverse must DELETE in addition to restoring `files` (r67):
+     * a rollback row captured from a mixed force-apply pre-state (some
+     * targets existed, others were about to be force-created) must both
+     * restore the edited files and delete the force-created ones, or the
+     * rollback chain silently leaves files behind on a double rollback.
+     * Optional for compatibility: rows from older binaries never carry it,
+     * and older binaries parsing new rows strip the field (degrading to the
+     * pre-r67 restore-only behavior instead of failing).
+     */
+    deletePaths: z.array(z.string().min(1)).optional(),
+  }),
   z.object({ op: z.literal("rename"), from: z.string().min(1), to: z.string().min(1) }),
 ]);
 export type RefinementInverse = z.infer<typeof RefinementInverseSchema>;

@@ -324,6 +324,51 @@ describe("refinementRollback", () => {
     expect(await fsPromises.readFile(physicalPath, "utf-8")).toBe("v1\n");
   });
 
+  it("double rollback after a mixed force apply deletes the force-created files (r67)", async () => {
+    using fixture = await createFixture();
+    await fixture.service.create(fixture.ctx, "/memories/global/dir/a.md", "a original\n", "agent");
+    await fixture.service.create(fixture.ctx, "/memories/global/dir/b.md", "b original\n", "agent");
+    await fixture.service.deletePath(fixture.ctx, "/memories/global/dir", "agent");
+    const deleteRow = await lastRow(fixture.sessionDir);
+    const aPath = path.join(fixture.muxHome, "memory", "global", "dir", "a.md");
+    const bPath = path.join(fixture.muxHome, "memory", "global", "dir", "b.md");
+
+    // Out-of-band recreation of ONE deleted file → the delete row's
+    // multi-file restore-files inverse now faces a mixed pre-state
+    // (a.md exists, b.md absent), which is only applyable with force.
+    await fsPromises.mkdir(path.dirname(aPath), { recursive: true });
+    await fsPromises.writeFile(aPath, "a manual\n");
+
+    const forced = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: deleteRow.id,
+      evidence: EVIDENCE,
+      force: true,
+    });
+    expect(forced.success).toBe(true);
+    expect(await fsPromises.readFile(aPath, "utf-8")).toBe("a original\n");
+    expect(await fsPromises.readFile(bPath, "utf-8")).toBe("b original\n");
+
+    // The captured pre-state carries BOTH halves: restore a.md's manual
+    // content AND delete the force-created b.md.
+    const rollbackRow = await lastRow(fixture.sessionDir);
+    expect(rollbackRow.data.rollbackOf).toBe(deleteRow.id);
+    const inverse = rollbackRow.data.inverse as { op: string; deletePaths?: string[] };
+    expect(inverse.op).toBe("restore-files");
+    expect(inverse.deletePaths).toEqual([bPath]);
+
+    // Rolling back the rollback must leave NO residue of the forced apply:
+    // a.md returns to its manual content and b.md is deleted again.
+    const double = await rollbackRefinement({
+      sessionDir: fixture.sessionDir,
+      id: rollbackRow.id,
+      evidence: EVIDENCE,
+    });
+    expect(double.success).toBe(true);
+    expect(await fsPromises.readFile(aPath, "utf-8")).toBe("a manual\n");
+    expect(await pathExists(bPath)).toBe(false);
+  });
+
   it("refuses when the file was manually edited after the refinement, applies with force", async () => {
     using fixture = await createFixture();
     await fixture.service.create(fixture.ctx, "/memories/global/hand.md", "v1\n", "agent");

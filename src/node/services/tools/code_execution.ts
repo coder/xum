@@ -288,24 +288,6 @@ async function offloadOversizedReturnValue(
 }
 
 /**
- * Keys successfully loaded by mux.load THIS call (r12): their compact records
- * carry the {key, ...} summary result, failed loads carry only an error.
- */
-function collectNewLoadKeys(result: PTCExecutionResult, loadActive: boolean): string[] {
-  if (!loadActive) return [];
-  const keys = new Set<string>();
-  for (const record of result.toolCalls) {
-    if (record.toolName !== "load" || record.error !== undefined) continue;
-    const key =
-      typeof record.result === "object" && record.result !== null
-        ? (record.result as { key?: unknown }).key
-        : undefined;
-    if (typeof key === "string" && key.length > 0) keys.add(key);
-  }
-  return [...keys];
-}
-
-/**
  * Kernel-mode record suppression (r12): the point of the persistent kernel is
  * that in-kernel data does NOT transit the model context. Every nested
  * mux.* record becomes a compact {toolName, args, ok, bytes, error?} summary —
@@ -714,7 +696,12 @@ ${xumTypes}
             // (handles + loads) beyond the cap. Keys the model was JUST told
             // about (new loads + the fresh return handle) are protected.
             // Retention failure must never fail the call (self-healing).
-            const newLoadKeys = collectNewLoadKeys(result, loadActive);
+            // Keys come from the bridge's host-side buffer (r67), not the
+            // model-visible records: an oversized hookResult annotation can
+            // get a load record replaced by a keyless __kernelBounded
+            // marker, and record-derived keys would then miss the vars
+            // entry, letting repeated annotated loads bypass the cap.
+            const newLoadKeys = activeBridge.drainNewlyLoadedVarsKeys();
             if (newLoadKeys.length > 0 || returnHandleKey !== null) {
               try {
                 await mount.enforceVarsRetention({

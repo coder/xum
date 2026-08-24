@@ -766,6 +766,17 @@ export class SandboxHostService {
    * state that must be neither exposed to guest code nor re-persisted.
    */
   private readonly mountResetGenerations = new WeakMap<SandboxMount, number>();
+  /**
+   * Snapshot lineage per live mount (r67): the journal seq of the newest
+   * vars-snapshot row this mount restored from or published. The reset
+   * generation above only notices explicit context resets; a foreign backend
+   * (XUM_ALLOW_MULTIPLE_INSTANCES=1) publishing an ORDINARY snapshot would
+   * otherwise go unseen — this mount would keep serving its stale namespace
+   * and later persist it as the newest snapshot, silently discarding the
+   * foreign write. Held as a shared mutable holder so the persist callback
+   * (created before the mount) and the lease check can observe one value.
+   */
+  private readonly mountSnapshotLineages = new WeakMap<SandboxMount, { seq: number | null }>();
   /** Per-scope mutex serializing acquisition, exclusive runs, and disposal.
    * Kept for the process lifetime (bounded by workspace count). */
   private readonly scopeLocks = new Map<string, AsyncMutex>();
@@ -857,8 +868,19 @@ export class SandboxHostService {
       // mount would expose pre-reset vars to guest code, so it is disposed
       // WITHOUT persisting (disposeScopeLocked's snapshot would resurrect
       // exactly the vars the reset discarded) and rebuilt fresh below.
-      const currentGeneration = countScopeResets(await journal.read(), scopeKey);
-      if (this.mountResetGenerations.get(existing) !== currentGeneration) {
+      // Snapshot lineage extends the same check to ORDINARY foreign
+      // snapshots (r67): a foreign backend persisting vars advances the
+      // scope's newest snapshot row; reusing this mount would expose the
+      // superseded namespace and later persist it over the foreign write.
+      // Dispose without persisting for the same reason as the reset case —
+      // the rebuild below restores the newest (foreign) snapshot.
+      const leaseEvents = await journal.read();
+      const currentGeneration = countScopeResets(leaseEvents, scopeKey);
+      const lineage = this.mountSnapshotLineages.get(existing);
+      if (
+        this.mountResetGenerations.get(existing) !== currentGeneration ||
+        lineage?.seq !== latestScopeSnapshotSeq(leaseEvents, scopeKey)
+      ) {
         this.persistentMounts.delete(scopeKey);
         existing.dispose();
       } else if (
@@ -932,6 +954,10 @@ export class SandboxHostService {
     // precondition compares against the binding's CURRENT value.
     let creationEvents = await journal.read();
     let mountResetGeneration = countScopeResets(creationEvents, scopeKey);
+    // Shared mutable snapshot lineage (r67): see mountSnapshotLineages. The
+    // persist callback below both verifies against and advances it, so it
+    // must be one holder object rather than a rebinding local.
+    const snapshotLineage = { seq: latestScopeSnapshotSeq(creationEvents, scopeKey) };
     const mount = new SandboxMount(
       runtime,
       "persistent",
@@ -940,7 +966,7 @@ export class SandboxHostService {
       async (varsJson) => {
         // Blob + event publish as one unit under the journal blob lock, so a
         // concurrent reclamation pass can never observe the put→append window.
-        const { ref } = await journal.publishWithBlob(
+        const { event, ref } = await journal.publishWithBlob(
           varsJson,
           (blobHash, size) => ({
             workspaceId: scopeKey,
@@ -956,16 +982,33 @@ export class SandboxHostService {
             // snapshot, superseding the tombstone and resurrecting context
             // the user discarded.
             precondition: async () => {
-              const current = countScopeResets(await journal.read(), scopeKey);
+              const currentEvents = await journal.read();
+              const current = countScopeResets(currentEvents, scopeKey);
               if (current !== mountResetGeneration) {
                 throw new Error(
                   `sandbox scope '${scopeKey}' was reset by another instance; ` +
                     `refusing to persist this mount's stale vars`
                 );
               }
+              // Snapshot-lineage verification (r67), same lock, same shape:
+              // every snapshot publisher serializes on the blob lock, so a
+              // foreign backend's ORDINARY persist landing after this
+              // mount's restore/last persist is always visible here.
+              // Refusing (rather than last-writer-wins) keeps the loss loud:
+              // the caller disposes the mount and the next lease rebuilds
+              // from the newest snapshot.
+              if (latestScopeSnapshotSeq(currentEvents, scopeKey) !== snapshotLineage.seq) {
+                throw new Error(
+                  `sandbox scope '${scopeKey}' vars were persisted by another instance; ` +
+                    `refusing to overwrite the newer snapshot with this mount's stale vars`
+                );
+              }
             },
           }
         );
+        // Our own publish is now the scope's newest snapshot row: advance the
+        // lineage so subsequent persists from THIS mount verify cleanly.
+        snapshotLineage.seq = event.seq;
         // Reclaim superseded snapshot blobs: only the LATEST snapshot per
         // scope is ever restored, so older versions are pure disk growth
         // (per-call persistence would otherwise retain every unique vars
@@ -1011,20 +1054,29 @@ export class SandboxHostService {
       // pre-reset vars to guest code even though the persist precondition
       // blocks saving them. Restore, then re-read: only a pass whose
       // post-restore read observes the same generation the restore used can
-      // return the mount. Terminates because each extra iteration requires
-      // ANOTHER foreign reset (a rare explicit user action) landing inside
-      // the restore window; initializeVars is idempotent (vars = {} then
-      // restore-latest).
+      // return the mount. Also stabilizes on snapshot lineage (r67): a
+      // foreign ORDINARY snapshot landing inside the restore window would
+      // otherwise birth the mount already stale (its first persist refused).
+      // Terminates because each extra iteration requires ANOTHER foreign
+      // publication landing inside the restore window; initializeVars is
+      // idempotent (vars = {} then restore-latest).
       for (;;) {
+        snapshotLineage.seq = latestScopeSnapshotSeq(creationEvents, scopeKey);
         await this.initializeVars(mount, journal, scopeKey, creationEvents);
         const recheckEvents = await journal.read();
         const recheckGeneration = countScopeResets(recheckEvents, scopeKey);
-        if (recheckGeneration === mountResetGeneration) break;
+        if (
+          recheckGeneration === mountResetGeneration &&
+          latestScopeSnapshotSeq(recheckEvents, scopeKey) === snapshotLineage.seq
+        ) {
+          break;
+        }
         creationEvents = recheckEvents;
         mountResetGeneration = recheckGeneration;
       }
     }
     this.mountResetGenerations.set(mount, mountResetGeneration);
+    this.mountSnapshotLineages.set(mount, snapshotLineage);
     if (grants.hostEvents) {
       // Queue + drain: the guest polls for host events (task completions,
       // lifecycle notifications). Must be a SYNC bridge function: guests call
@@ -1336,6 +1388,23 @@ function countScopeResets(events: DurableEvent[], scopeKey: string): number {
     }
   }
   return count;
+}
+
+/**
+ * Journal seq of the newest vars-snapshot row for a scope (reset tombstones
+ * included — they are snapshot rows too), or null for a never-persisted
+ * scope (r67). Together with the reset generation this identifies exactly
+ * which durable state a live mount's namespace descends from, so a foreign
+ * backend's ordinary persist is as visible as its resets.
+ */
+function latestScopeSnapshotSeq(events: DurableEvent[], scopeKey: string): number | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.kind === "sandbox-vars-snapshot" && event.data.scopeKey === scopeKey) {
+      return event.seq;
+    }
+  }
+  return null;
 }
 
 /**

@@ -413,7 +413,9 @@ function inversePaths(inverse: RefinementInverse): string[] {
     case "delete-files":
       return inverse.paths;
     case "restore-files":
-      return inverse.files.map((file) => file.path);
+      // deletePaths are mutated (deleted) by the apply, so they need the
+      // same confinement checks and target locks as the restored files (r67).
+      return [...inverse.files.map((file) => file.path), ...(inverse.deletePaths ?? [])];
     case "rename":
       return [inverse.from, inverse.to];
   }
@@ -681,6 +683,15 @@ async function collectRollbackTargetDivergence(
           complaints.push(`'${file.path}' was edited since the rollback restored it`);
         }
       }
+      // Mixed force-apply inverse (r67): the rollback also deleted these
+      // paths, so their recreation since is divergence too.
+      for (const p of applied.data.deletePaths ?? []) {
+        if (await fileExists(p)) {
+          complaints.push(
+            `expected '${p}' to be absent (the rollback deleted it), but it was recreated since`
+          );
+        }
+      }
       break;
     case "rename":
       // Structural rename expectations are already covered by the target's
@@ -888,8 +899,15 @@ export async function rollbackRefinement(
               await writeFileAtomic(file.path, file.content, { encoding: "utf-8" });
               applied.restored.push(file.path);
             }
+            // Mixed force-apply inverse (r67): delete the files the forced
+            // rollback created. Their pre-apply contents are in newInverse,
+            // so the compensation below can restore them too.
+            for (const p of inverse.deletePaths ?? []) {
+              await fsPromises.rm(p, { force: true });
+              applied.deleted.push(p);
+            }
           } catch (error) {
-            await compensatePartialApply(applied.restored, newInverse);
+            await compensatePartialApply([...applied.restored, ...applied.deleted], newInverse);
             throw error;
           }
           break;
@@ -1061,9 +1079,9 @@ async function compensatePartialApply(
  * - delete-files → restore the current contents of the files it will delete.
  * - restore-files → restore current contents where files exist; where they do
  *   not (the restore will create them), delete them again. A mixed state is
- *   only reachable with force; the single-op inverse contract cannot express
- *   "restore some, delete others", so restoring existing files wins and the
- *   force-created files are left behind on a double rollback (logged).
+ *   only reachable with force; it is expressed as one restore-files inverse
+ *   carrying the missing half in `deletePaths` (r67), so a double rollback
+ *   both restores the edited files and deletes the force-created ones.
  * - rename → the mirrored rename.
  */
 async function capturePreRollbackInverse(
@@ -1094,16 +1112,22 @@ async function capturePreRollbackInverse(
           missing.push(file.path);
         }
       }
+      // The apply also DELETES inverse.deletePaths (r67): capture their
+      // current contents so this inverse can restore them. Already-absent
+      // deletePaths need no inverse half — the rm is a no-op.
+      for (const p of inverse.deletePaths ?? []) {
+        if (await fileExists(p)) {
+          existing.push({ path: p, content: await fsPromises.readFile(p, "utf-8") });
+        }
+      }
       if (existing.length === 0 && missing.length > 0) {
         return { op: "delete-files", paths: missing };
       }
-      if (existing.length > 0 && missing.length > 0) {
-        log.warn(
-          "[refinement] mixed pre-rollback state (force apply): double rollback will not delete force-created files",
-          { missing }
-        );
-      }
-      return { op: "restore-files", files: existing };
+      return {
+        op: "restore-files",
+        files: existing,
+        ...(missing.length > 0 ? { deletePaths: missing } : {}),
+      };
     }
   }
 }

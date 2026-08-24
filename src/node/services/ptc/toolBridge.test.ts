@@ -483,6 +483,26 @@ describe("ToolBridge", () => {
         expect(summary).toEqual({ key: "data", bytes: 11, lines: 2, preview: "line1\nline2" });
       });
 
+      it("tracks successful load keys host-side, immune to record bounding (r67)", async () => {
+        // Retention bookkeeping must not depend on the model-visible record:
+        // an oversized hookResult annotation can get a load record replaced
+        // by a keyless __kernelBounded marker, so keys are recorded at the
+        // moment the vars write succeeds and drained by code_execution.
+        const bridge = new ToolBridge({ file_read: fileReadTool() });
+        const captured = registerCapturing(
+          bridge,
+          { drainHostEvents: () => [], loadFile: () => Promise.resolve(loaded) },
+          { setVarsProperty: mock((_key: string, _value: string) => undefined) }
+        );
+        const load = captured.mux.load as (...args: unknown[]) => Promise<unknown>;
+        await load({ path: "a.txt", key: "data" });
+        await load({ path: "a.txt", key: "data" }); // same key: deduplicated
+        await load({ path: "b.txt", key: "other" });
+        expect(bridge.drainNewlyLoadedVarsKeys()).toEqual(["data", "other"]);
+        // One-shot drain: the next call yields only newer loads.
+        expect(bridge.drainNewlyLoadedVarsKeys()).toEqual([]);
+      });
+
       it("passes the kernel abort signal to the loader and refuses to mutate vars after abort", async () => {
         // Without propagation, a stalled remote read rides RemoteRuntime's
         // 300s cat timeout regardless of the execution deadline; and an abort
@@ -513,6 +533,8 @@ describe("ToolBridge", () => {
         }
         expect(loaderSignal).toBe(controller.signal);
         expect(setVarsProperty).not.toHaveBeenCalled();
+        // A load that never wrote vars must not register a retention key (r67).
+        expect(bridge.drainNewlyLoadedVarsKeys()).toEqual([]);
       });
 
       it("is absent without a loader, and absent when file_read is not bridged", () => {

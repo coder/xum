@@ -139,6 +139,10 @@ export class ToolBridge {
    * into the model-visible set via getNonBridgeableTools in exclusive mode). */
   private readonly deniedToolNames = new Set<string>();
   private readonly grants: CapabilityGrants;
+  /** Vars keys written by xum.load since the last drain (r67): the
+   * authoritative host-side record of successful loads, immune to
+   * model-visible record bounding (see drainNewlyLoadedVarsKeys). */
+  private newlyLoadedVarsKeys: string[] = [];
 
   constructor(tools: Record<string, Tool>, grants?: CapabilityGrants) {
     this.bridgeableTools = new Map();
@@ -163,6 +167,19 @@ export class ToolBridge {
   /** Get list of tools that will be exposed in sandbox */
   getBridgeableToolNames(): string[] {
     return Array.from(this.bridgeableTools.keys());
+  }
+
+  /**
+   * Keys xum.load successfully wrote into vars since the last drain (r67).
+   * Evals under a persistent mount are serialized by the scope lock, so a
+   * post-eval drain yields exactly that eval's loads — plus, after a hard
+   * eval crash, any loads the crashed eval completed first, which still
+   * belong in retention bookkeeping (their vars entries exist).
+   */
+  drainNewlyLoadedVarsKeys(): string[] {
+    const keys = [...new Set(this.newlyLoadedVarsKeys)];
+    this.newlyLoadedVarsKeys = [];
+    return keys;
   }
 
   /** Get the bridgeable tools as a Record */
@@ -345,6 +362,13 @@ export class ToolBridge {
           // vars[key] without passing through the return value below (which
           // is all the record, the events, and the model ever see).
           runtime.setVarsProperty(key, loaded.content);
+          // Authoritative load-key tracking (r67): the vars entry exists the
+          // moment the write above succeeds, regardless of what happens to
+          // the model-visible record (an oversized hookResult annotation can
+          // get the whole record replaced by a keyless __kernelBounded
+          // marker). Retention bookkeeping reads this buffer, not the
+          // records, so annotated loads can never bypass the managed-vars cap.
+          this.newlyLoadedVarsKeys.push(key);
           return {
             key,
             bytes: loaded.bytes,

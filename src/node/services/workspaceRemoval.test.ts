@@ -8,10 +8,11 @@ import {
   targetMutationLockFilePath,
   withTargetMutationLock,
 } from "@/node/services/refinement/targetMutationLocks";
-import { getProcessBirth } from "@/node/utils/concurrency/fileLock";
+import { acquireProcessFileLock, getProcessBirth } from "@/node/utils/concurrency/fileLock";
 import {
   healRemovalTombstonesForRegisteredWorkspaces,
   isWorkspaceRemovalTombstoned,
+  refineApplyLockPath,
   REMOVAL_TOMBSTONE_HEAL_MIN_AGE_MS,
   removeSessionDirUnderMemoryLocks,
   rollbackRemovalTombstoneIfOwned,
@@ -78,6 +79,52 @@ describe("workspaceRemoval", () => {
     );
     expect((JSON.parse(raw) as { workspaceId: string }).workspaceId).toBe(workspaceId);
   });
+
+  test("waits on the refine lock BEFORE taking the teardown target locks (r67)", async () => {
+    using tmp = new DisposableTempDir("workspace-removal-test");
+    const rootDir = path.join(tmp.path, "xum-home");
+    const workspaceId = "ws-refine-order";
+    const sessionDir = path.join(rootDir, "sessions", workspaceId);
+    await fsPromises.mkdir(path.join(sessionDir, "memory"), { recursive: true });
+
+    // Simulated admitted /refine apply in another backend: it holds the
+    // refine serialization lock and still needs the memory target lock for
+    // its per-edit mutations.
+    const refineLock = await acquireProcessFileLock({
+      lockPath: refineApplyLockPath(rootDir, workspaceId),
+      timeoutMs: 1_000,
+      label: "refine serialization lock (test apply)",
+    });
+    const removal = removeSessionDirUnderMemoryLocks({
+      rootDir,
+      sessionDir,
+      workspaceId,
+      attemptId: "test-attempt",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    // The pre-r67 ordering held the memory target lock while waiting on the
+    // refine lock — the OPPOSITE order from an admitted apply, deadlocking
+    // both paths until timeout. Refine-lock-first ordering leaves the target
+    // lock free here, so the apply's mutation can drain...
+    let applyMutationRan = false;
+    await withTargetMutationLock(rootDir, path.join(sessionDir, "memory"), () => {
+      applyMutationRan = true;
+      return Promise.resolve();
+    });
+    expect(applyMutationRan).toBe(true);
+
+    // ...and removal proceeds once the apply releases the refine lock.
+    await refineLock[Symbol.asyncDispose]();
+    await removal;
+    expect(
+      await fsPromises.access(sessionDir).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
+    expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(true);
+  }, 20_000);
 
   test("publishes the tombstone even when lock acquisition fails (r62)", async () => {
     // Fail-closed orphan path: the caller deregisters the workspace even
