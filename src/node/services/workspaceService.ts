@@ -7708,14 +7708,20 @@ export class WorkspaceService extends EventEmitter {
         `Workspace is being archived: ${workspaceId}. Unarchive it before opening an editor.`
       );
     }
+    const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    if (workspaceEntry == null) {
+      rollbackReservation();
+      // Also a path-safety boundary: the marker path joins the raw ID beneath the sessions
+      // directory, so an unknown (possibly traversal-crafted, e.g. "../../.ssh") ID must
+      // never reach the filesystem.
+      return Err(`Workspace not found: ${workspaceId}`);
+    }
     // Persisted archived state (not just an in-progress archive): a stale renderer can request
     // an editor for an already-archived workspace whose checkout may already be snapshot and
     // removed (mirrors TerminalService.openNative and the send/PTY/desktop admissions).
     // Checked before the durable marker write so a refused open cannot permanently gate
     // future snapshot archives of this workspace.
-    const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
     if (
-      workspaceEntry != null &&
       isWorkspaceArchived(
         workspaceEntry.workspace.archivedAt,
         workspaceEntry.workspace.unarchivedAt

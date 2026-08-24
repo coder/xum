@@ -11230,6 +11230,28 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
   });
 
+  test("recordExternalEditorOpen rejects workspace IDs without a config entry", async () => {
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+
+    // Unknown IDs never reach the marker path (which joins the raw ID beneath the sessions
+    // directory), closing both stale-ID requests and traversal-crafted IDs.
+    const result = await workspaceService.recordExternalEditorOpen("../../etc-trap");
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("not found");
+    }
+    let markerExists = true;
+    try {
+      await fsPromises.access("/tmp/test/sessions/external-editor-opened");
+    } catch {
+      markerExists = false;
+    }
+    expect(markerExists).toBe(false);
+    // The rejected reservation rolled back too.
+    expect(await workspaceService.hasUntrackableExternalAppOpen("../../etc-trap")).toBe(false);
+  });
+
   test("recordExternalEditorOpen marks the workspace as having an untrackable app open", async () => {
     // A crashed prior run may have leaked the shared-session-dir marker; clear it first.
     await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });

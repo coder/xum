@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
 import type { APIClient } from "@/browser/contexts/API";
 import { openInEditor } from "./openInEditor";
 import type { RuntimeConfig } from "@/common/types/runtime";
@@ -143,6 +143,35 @@ describe("openInEditor", () => {
     expect(target).toBe("_blank");
     expect(url.endsWith(filePath)).toBe(false);
     expect(url.endsWith(`/${parentDir}`)).toBe(true);
+  });
+
+  test("does not record the open when a deterministic compatibility check refuses", async () => {
+    const calls: OpenCall[] = [];
+    const recordEditorOpen = mock(() => Promise.resolve({ success: true }));
+    const api = { general: { recordEditorOpen } } as unknown as APIClient;
+
+    // Zed + Docker is refused deterministically with no launch; recording first would leave
+    // a sticky durable marker permanently refusing snapshot archives of the workspace.
+    const windowWithZed = {
+      localStorage: { getItem: () => JSON.stringify({ editor: "zed" }) },
+      open: (url: string, target?: string) => {
+        calls.push([url, target]);
+        return null;
+      },
+    };
+    const result = await withWindow(windowWithZed, () =>
+      openInEditor({
+        api,
+        workspaceId,
+        targetPath: filePath,
+        runtimeConfig: { type: "docker", image: "node:20", containerName: "mux-ws" },
+        isFile: true,
+      })
+    );
+
+    expect(result.success).toBe(false);
+    expect(recordEditorOpen).not.toHaveBeenCalled();
+    expect(calls.length).toBe(0);
   });
 
   test("refuses to launch while disconnected (open cannot be recorded)", async () => {

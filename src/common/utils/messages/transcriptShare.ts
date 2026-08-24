@@ -136,10 +136,41 @@ const PRESERVE_OUTPUT_TOOLS = new Set([
   "task_apply_git_patch",
 ]);
 
+/**
+ * task_workspace_lifecycle results stay preserved so shared lifecycle cards keep their
+ * per-target statuses, but some fields carry local filenames the exporter chose not to
+ * share: `paths` (the requires_confirmation untracked-file list) plus free-text `error`
+ * and `note`. Redact those fields while keeping the status/action/id fields the card
+ * renders from.
+ */
+function redactWorkspaceLifecycleOutputForSharing(output: unknown): unknown {
+  if (typeof output !== "object" || output === null || !("results" in output)) return output;
+  const { results } = output;
+  if (!Array.isArray(results)) return output;
+  return {
+    ...output,
+    results: results.map((target: unknown) => {
+      if (typeof target !== "object" || target === null) return target;
+      const redacted = { ...(target as Record<string, unknown>) };
+      delete redacted.paths;
+      delete redacted.error;
+      delete redacted.note;
+      return redacted;
+    }),
+  };
+}
+
 function stripToolPartOutput(part: MuxToolPart): MuxToolPart {
   const nestedCalls = part.nestedCalls?.map(stripNestedToolCallOutput);
 
   if (PRESERVE_OUTPUT_TOOLS.has(part.toolName)) {
+    if (part.toolName === "task_workspace_lifecycle" && part.state === "output-available") {
+      return {
+        ...part,
+        output: redactWorkspaceLifecycleOutputForSharing(part.output),
+        ...(nestedCalls ? { nestedCalls } : {}),
+      };
+    }
     return nestedCalls ? { ...part, nestedCalls } : part;
   }
 

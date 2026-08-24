@@ -120,32 +120,29 @@ export async function openInEditor(args: {
     }
   }
 
-  // Record the open before launching any editor: external editors are untrackable once open
-  // (deep links leave no process handle), so model-driven snapshot archives consult this
-  // durable record — and an archive already in progress must refuse the open. Recording is
-  // conservative: refusals below this point leave a sticky false positive, which only makes
-  // archive gating stricter. Custom-editor opens are recorded again on the backend route;
-  // recording is idempotent. Fail closed: a transient client disconnect (api null while
-  // reconnecting) or a failed recording RPC does not stop backend agents, so launching
-  // unrecorded would let a concurrent archive remove the checkout under the new editor.
-  if (!args.api) {
-    return {
-      success: false,
-      error:
-        "Cannot open the editor while disconnected from Xum: the open must be recorded first so archive safety checks can see it. Retry once reconnected.",
-    };
-  }
-  try {
-    const recorded = await args.api.general.recordEditorOpen({ workspaceId: args.workspaceId });
-    if (!recorded.success) {
-      return { success: false, error: recorded.error };
+  // Record the open immediately before launching a deep link: external editors are
+  // untrackable once open (deep links leave no process handle), so model-driven snapshot
+  // archives consult this durable record — and an archive already in progress must refuse
+  // the open. Called after every deterministic compatibility check so a refused open can
+  // never persist a sticky marker that permanently gates future archives. Fail closed: a
+  // transient client disconnect (api null while reconnecting) or a failed recording RPC
+  // does not stop backend agents, so launching unrecorded would let a concurrent archive
+  // remove the checkout under the new editor. Custom-editor opens are recorded by the
+  // backend route instead.
+  const recordOpenBeforeLaunch = async (): Promise<string | null> => {
+    if (!args.api) {
+      return "Cannot open the editor while disconnected from Xum: the open must be recorded first so archive safety checks can see it. Retry once reconnected.";
     }
-  } catch (error) {
-    return {
-      success: false,
-      error: `Cannot open the editor: recording the open failed (${error instanceof Error ? error.message : String(error)}), and archive safety checks depend on that record.`,
-    };
-  }
+    try {
+      const recorded = await args.api.general.recordEditorOpen({ workspaceId: args.workspaceId });
+      if (!recorded.success) {
+        return recorded.error;
+      }
+    } catch (error) {
+      return `Cannot open the editor: recording the open failed (${error instanceof Error ? error.message : String(error)}), and archive safety checks depend on that record.`;
+    }
+    return null;
+  };
 
   // Docker workspaces always use deep links (VS Code connects to container remotely)
   if (isDocker && args.runtimeConfig?.type === "docker") {
@@ -177,6 +174,10 @@ export async function openInEditor(args: {
       return { success: false, error: `${editorConfig.editor} does not support Docker containers` };
     }
 
+    const recordError = await recordOpenBeforeLaunch();
+    if (recordError != null) {
+      return { success: false, error: recordError };
+    }
     openUrl(deepLink);
     return { success: true };
   }
@@ -231,6 +232,10 @@ export async function openInEditor(args: {
       return { success: false, error: `${editorConfig.editor} does not support Dev Containers` };
     }
 
+    const recordError = await recordOpenBeforeLaunch();
+    if (recordError != null) {
+      return { success: false, error: recordError };
+    }
     openUrl(deepLink);
     return { success: true };
   }
@@ -268,6 +273,10 @@ export async function openInEditor(args: {
       };
     }
 
+    const recordError = await recordOpenBeforeLaunch();
+    if (recordError != null) {
+      return { success: false, error: recordError };
+    }
     openUrl(deepLink);
     return { success: true };
   }
