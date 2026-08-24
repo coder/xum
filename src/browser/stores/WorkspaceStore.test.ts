@@ -10,8 +10,12 @@ import {
   spyOn,
   type Mock,
 } from "bun:test";
-import type { CompactionFollowUpRequest, DisplayedMessage } from "@/common/types/message";
-import type { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
+import {
+  createMuxMessage,
+  type CompactionFollowUpRequest,
+  type DisplayedMessage,
+} from "@/common/types/message";
+import { StreamingMessageAggregator } from "@/browser/utils/messages/StreamingMessageAggregator";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import type { StreamStartEvent, ToolCallStartEvent } from "@/common/types/stream";
@@ -26,7 +30,11 @@ import {
 } from "@/common/constants/storage";
 import type { TodoItem } from "@/common/types/tools";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
-import { mergeTimelineEvents, WorkspaceStore } from "./WorkspaceStore";
+import {
+  findRenderedRefineProposalHash,
+  mergeTimelineEvents,
+  WorkspaceStore,
+} from "./WorkspaceStore";
 import { createControllableAsyncIterable } from "@/browser/testUtils";
 import type { ResponseCompleteEvent } from "@/browser/utils/messages/responseCompletionMetadata";
 
@@ -5767,5 +5775,42 @@ describe("WorkspaceStore", () => {
       expect(store.getWorkspaceHistoryEpoch(workspaceId)).toBeGreaterThan(epoch);
       expect(store.getWorkspaceLastUserPrompt(workspaceId)).toBeNull();
     });
+  });
+});
+
+describe("findRenderedRefineProposalHash", () => {
+  const HASH = "a".repeat(64);
+  const CREATED_AT = "2024-01-01T00:00:00.000Z";
+  const proposalRow = () =>
+    createMuxMessage("refine-1", "assistant", "Staged 2 edits", {
+      timestamp: 1,
+      historySequence: 1,
+      muxMetadata: { type: "refine-summary", stagedSetHash: HASH },
+    });
+  const assistantFiller = (count: number, startSeq: number) =>
+    Array.from({ length: count }, (_, i) =>
+      createMuxMessage(`filler-${i}`, "assistant", `row ${i}`, {
+        timestamp: startSeq + i,
+        historySequence: startSeq + i,
+      })
+    );
+
+  it("returns the newest rendered proposal hash", () => {
+    const aggregator = new StreamingMessageAggregator(CREATED_AT);
+    aggregator.loadHistoricalMessages([proposalRow(), ...assistantFiller(3, 2)], false);
+    expect(findRenderedRefineProposalHash(aggregator)).toBe(HASH);
+  });
+
+  it("ignores a proposal row hidden by the display cap until Load all reveals it (r68)", () => {
+    // A staged proposal (e.g. from a foreign backend) buried behind enough
+    // later chat falls out of the rendered window: approving it would apply
+    // edits this user never saw, so the scan must not surface its hash from
+    // internal history.
+    const aggregator = new StreamingMessageAggregator(CREATED_AT);
+    aggregator.loadHistoricalMessages([proposalRow(), ...assistantFiller(200, 2)], false);
+    expect(findRenderedRefineProposalHash(aggregator)).toBeNull();
+    // "Load all" disables the cap: the proposal is now actually rendered.
+    aggregator.setShowAllMessages(true);
+    expect(findRenderedRefineProposalHash(aggregator)).toBe(HASH);
   });
 });

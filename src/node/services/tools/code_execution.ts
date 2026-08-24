@@ -16,7 +16,10 @@ import type {
   ResultHandlePersistArgs,
   SandboxMount,
 } from "@/node/services/sandbox/sandboxHostService";
-import { VarsSnapshotBudgetError } from "@/node/services/sandbox/sandboxHostService";
+import {
+  SandboxSnapshotConflictError,
+  VarsSnapshotBudgetError,
+} from "@/node/services/sandbox/sandboxHostService";
 import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 
 import { analyzeCode } from "@/node/services/ptc/staticAnalysis";
@@ -748,6 +751,24 @@ ${xumTypes}
                   timestamp: Date.now(),
                 });
               }
+              // Foreign-instance conflict (r68): the eval may have READ stale
+              // vars (the foreign publish can land after the lease check,
+              // mid-eval) and its mutations were refused, so returning the
+              // eval as successful would silently drop them and leave stale
+              // computed results model-visible. Fail the whole call as a
+              // retryable conflict instead; the rewrites below still make the
+              // records honest, and the next call rebuilds from the newest
+              // (foreign) snapshot.
+              const snapshotConflict = persistError instanceof SandboxSnapshotConflictError;
+              if (snapshotConflict) {
+                result.success = false;
+                result.result = undefined;
+                result.error =
+                  `${persistError.message}. Another Xum instance changed this workspace's ` +
+                  `kernel state while this call ran: the call's vars mutations were discarded ` +
+                  `and any value computed from the old state may be stale. The kernel rebuilds ` +
+                  `from the newest snapshot on the next call — re-run this call.`;
+              }
               // A handle advertised THIS call did not survive (the mount is
               // being disposed and the next call restores the previous
               // durable snapshot). Applies to EVERY persist failure — over-
@@ -774,10 +795,13 @@ ${xumTypes}
                 for (const record of result.toolCalls) {
                   if (record.toolName !== "load" || record.error !== undefined) continue;
                   record.result = undefined;
-                  record.error =
-                    "load succeeded in-kernel, but its vars entry did NOT survive: the " +
-                    "post-call vars snapshot failed and the kernel was reset to the last " +
-                    "durable state. Free vars space (or load less), then re-issue the load.";
+                  record.error = snapshotConflict
+                    ? "load succeeded in-kernel, but its vars entry did NOT survive: another " +
+                      "Xum instance changed this workspace's kernel state concurrently. " +
+                      "Re-issue the load."
+                    : "load succeeded in-kernel, but its vars entry did NOT survive: the " +
+                      "post-call vars snapshot failed and the kernel was reset to the last " +
+                      "durable state. Free vars space (or load less), then re-issue the load.";
                 }
               }
               mount.dispose();

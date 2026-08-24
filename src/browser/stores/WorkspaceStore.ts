@@ -5222,21 +5222,40 @@ export function showAllMessages(workspaceId: string): void {
  * XUM_ALLOW_MULTIPLE_INSTANCES=1 the shared chat transcript can contain a
  * newer proposal from another backend that this renderer never displayed,
  * so the backend cannot infer the displayed proposal from the transcript
- * alone. Scans the live aggregator — exactly what the transcript view
- * renders — newest-first for a refine-summary row carrying a stagedSetHash.
+ * alone. Scans newest-first for a refine-summary row carrying a
+ * stagedSetHash, restricted to rows the transcript actually RENDERS (r68):
+ * the DOM display cap can hide a proposal row from internal history (e.g. a
+ * window opened after a foreign backend staged it, with enough later chat
+ * to push it past the cap), and approving a hidden proposal would apply
+ * memory/skill edits the user never saw. A hidden newer proposal also
+ * cannot be applied via an older visible hash — the backend re-hashes the
+ * staged set and refuses the mismatch — so filtering here fails safe.
  */
 export function getDisplayedRefineProposalHash(workspaceId: string): string | null {
   const aggregator = getStoreInstance().getAggregator(workspaceId);
-  if (!aggregator) {
-    return null;
+  return aggregator ? findRenderedRefineProposalHash(aggregator) : null;
+}
+
+/** Pure scan behind getDisplayedRefineProposalHash, exported for tests. */
+export function findRenderedRefineProposalHash(
+  aggregator: StreamingMessageAggregator
+): string | null {
+  // The rendered row set: display-capped unless "Load all" disabled the cap.
+  const renderedHistoryIds = new Set<string>();
+  for (const displayed of aggregator.getDisplayedMessages()) {
+    if ("historyId" in displayed) {
+      renderedHistoryIds.add(displayed.historyId);
+    }
   }
   const messages = aggregator.getAllMessages();
   for (let i = messages.length - 1; i >= 0; i--) {
-    const muxMetadata = messages[i].metadata?.muxMetadata;
+    const message = messages[i];
+    const muxMetadata = message.metadata?.muxMetadata;
     if (
       muxMetadata?.type === "refine-summary" &&
       typeof muxMetadata.stagedSetHash === "string" &&
-      muxMetadata.stagedSetHash.length > 0
+      muxMetadata.stagedSetHash.length > 0 &&
+      renderedHistoryIds.has(message.id)
     ) {
       return muxMetadata.stagedSetHash;
     }

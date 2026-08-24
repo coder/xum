@@ -48,6 +48,17 @@ import {
 } from "@/constants/resultHandles";
 
 /**
+ * Thrown by the vars-persist precondition when a FOREIGN instance changed the
+ * scope's durable state — an explicit context reset (r52) or an ordinary
+ * newer snapshot (r67) — while this mount was live (r68). Typed so
+ * code_execution can surface the call as a retryable conflict instead of a
+ * generic snapshot failure: the eval may have read stale vars and its
+ * mutations were refused, so reporting success would silently drop them and
+ * leave stale computed results model-visible.
+ */
+export class SandboxSnapshotConflictError extends Error {}
+
+/**
  * Thrown when a vars snapshot exceeds VARS_SNAPSHOT_MAX_BYTES. A distinct
  * class so code_execution can surface a targeted "trim your vars" notice to
  * the model instead of a generic snapshot failure.
@@ -985,7 +996,7 @@ export class SandboxHostService {
               const currentEvents = await journal.read();
               const current = countScopeResets(currentEvents, scopeKey);
               if (current !== mountResetGeneration) {
-                throw new Error(
+                throw new SandboxSnapshotConflictError(
                   `sandbox scope '${scopeKey}' was reset by another instance; ` +
                     `refusing to persist this mount's stale vars`
                 );
@@ -998,7 +1009,7 @@ export class SandboxHostService {
               // the caller disposes the mount and the next lease rebuilds
               // from the newest snapshot.
               if (latestScopeSnapshotSeq(currentEvents, scopeKey) !== snapshotLineage.seq) {
-                throw new Error(
+                throw new SandboxSnapshotConflictError(
                   `sandbox scope '${scopeKey}' vars were persisted by another instance; ` +
                     `refusing to overwrite the newer snapshot with this mount's stale vars`
                 );

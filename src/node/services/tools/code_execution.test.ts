@@ -1894,6 +1894,56 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-load-budget");
     });
 
+    it("fails the call as a retryable conflict when a foreign instance persists mid-eval (r68)", async () => {
+      // The lease-time lineage check (r67) cannot see a foreign persist that
+      // lands WHILE the eval runs; the persist precondition refuses it, but
+      // reporting the eval as successful would silently drop this call's
+      // vars mutations and leave stale computed results model-visible.
+      using tmp = new DisposableTempDir("code-exec-conflict");
+      const hostA = new SandboxHostService();
+      const hostB = new SandboxHostService();
+      const scopeKey = "ws-snap-conflict";
+      // Bridged tool that lands a foreign backend's persist inside our eval
+      // window — deterministic stand-in for a concurrent instance.
+      const sabotage = createMockTool("sabotage", z.object({}), async () => {
+        const mountB = await hostB.acquireMount({
+          lifetime: "persistent",
+          runtimeFactory,
+          scopeKey,
+          sessionDir: tmp.path,
+        });
+        await mountB.runtime.eval('vars.foreign = "won"; return true;');
+        await mountB.persistVars();
+        return { ok: true };
+      });
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({ sabotage }),
+        undefined,
+        kernelRunner(hostA, scopeKey, tmp.path)
+      );
+
+      const conflicted = (await tool.execute!(
+        { code: 'mux.sabotage({}); vars.mine = "lost"; return "computed-from-stale";' },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(conflicted.success).toBe(false);
+      expect(conflicted.error).toContain("persisted by another instance");
+      expect(conflicted.error).toContain("re-run");
+      expect(conflicted.result).toBeUndefined();
+
+      // The next call rebuilds from the FOREIGN snapshot: the conflicted
+      // call's mutation is gone and the foreign write is visible.
+      const next = (await tool.execute!(
+        { code: "return { mine: typeof vars.mine, foreign: vars.foreign };" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(next.success).toBe(true);
+      expect(next.result).toEqual({ mine: "undefined", foreign: "won" });
+      await hostB.disposeScope(scopeKey);
+      await hostA.disposeScope(scopeKey);
+    });
+
     it("rejects reserved __ keys and surfaces loader errors as catchable guest errors", async () => {
       using tmp = new DisposableTempDir("code-exec-load");
       const host = new SandboxHostService();
