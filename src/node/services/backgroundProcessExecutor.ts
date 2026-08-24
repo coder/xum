@@ -597,9 +597,10 @@ class MigratedBackgroundHandle implements BackgroundHandle {
   }
 
   async writeMeta(metaJson: string): Promise<void> {
-    // Swallowed on purpose (unlike RuntimeBackgroundHandle): migrated records carry pid 0,
-    // which the crash-orphan probe ignores, and registerMigratedProcess writes fire-and-forget
-    // (a rethrow would surface as an unhandled rejection).
+    // Swallowed on purpose (unlike RuntimeBackgroundHandle): registerMigratedProcess writes
+    // fire-and-forget (a rethrow would surface as an unhandled rejection), and a missing
+    // migrated record errs toward over-refusal, never under-refusal — the crash-orphan probe
+    // fails closed on markerless pid-0 records and on unreadable ones alike.
     try {
       const metaPath = path.join(this.outputDir, BG_META_FILENAME);
       await fs.writeFile(metaPath, metaJson);

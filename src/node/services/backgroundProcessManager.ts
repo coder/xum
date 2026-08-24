@@ -1578,13 +1578,19 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       return true;
     }
     const trackedPids = new Set<number>();
+    const trackedProcessIds = new Set<string>();
     for (const proc of this.processes.values()) {
       if (proc.workspaceId === workspaceId) {
         trackedPids.add(proc.pid);
+        trackedProcessIds.add(proc.id);
       }
     }
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
+      // Tracked processes (directory name = process ID) are covered by the in-memory
+      // live-activity gates, whose statuses refresh via list(); this probe only reports
+      // processes nobody tracks. ID-based so migrated records (pid 0) are matched too.
+      if (trackedProcessIds.has(entry.name)) continue;
       const processDir = nodePath.join(workspaceDir, entry.name);
       let meta: { pid: number; status: string } | null = null;
       try {
@@ -1609,18 +1615,22 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         }
       }
       if (meta.status !== "running") continue;
-      // pid 0 marks migrated processes with unknown (possibly remote) PIDs; pid 1 would be
-      // init — neither is probeable, and refusing on them forever would be a stuck gate.
-      if (meta.pid <= 1) continue;
-      // Tracked processes are covered by the in-memory live-activity gates (their statuses
-      // refresh via list()); this probe only reports processes nobody tracks.
-      if (trackedPids.has(meta.pid)) continue;
       try {
         await fsPromises.access(nodePath.join(processDir, BG_EXIT_CODE_FILENAME));
-        continue; // The wrapper's exit trap ran: the process exited after the crash.
+        continue; // The exit marker settles the record (wrapper trap or migrated handle).
       } catch {
-        // No exit marker yet — fall through to the PID probe.
+        // No exit marker yet — fall through to the PID checks.
       }
+      if (meta.pid <= 1) {
+        // Migrated processes record pid 0 (exec streams expose no PID) and their exit
+        // marker is written by the in-process handle, not a detached trap. The child can
+        // outlive an unclean shutdown on Unix, and nothing can probe it afterwards — fail
+        // closed rather than skip. Clean shutdowns and natural exits rewrite the record
+        // (status via updateMetaFile, or the exit marker above), so only genuine
+        // unclean-exit survivors reach this branch.
+        return true;
+      }
+      if (trackedPids.has(meta.pid)) continue;
       try {
         process.kill(meta.pid, 0);
         return true; // Alive and untracked: a crash orphan.

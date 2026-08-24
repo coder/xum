@@ -12,7 +12,7 @@ import {
 } from "./backgroundProcessManager";
 import { localBgWorkspaceDir } from "./backgroundProcessExecutor";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import type { Runtime } from "@/node/runtime/Runtime";
+import type { BackgroundHandle, Runtime } from "@/node/runtime/Runtime";
 import { spawnSync } from "node:child_process";
 import * as fs from "fs/promises";
 import * as path from "path";
@@ -1973,10 +1973,45 @@ describe("BackgroundProcessManager", () => {
       expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
     });
 
-    it("ignores non-running and unprobeable records", async () => {
+    it("ignores non-running and marker-settled records", async () => {
       await writeSpawnRecord("clean-exit", { pid: process.pid, status: "exited" });
-      // pid 0 marks migrated processes with unknown (possibly remote) PIDs.
-      await writeSpawnRecord("migrated", { pid: 0, status: "running" });
+      // A migrated process (pid 0) whose in-process handle wrote the exit marker is settled.
+      await writeSpawnRecord("migrated-exited", { pid: 0, status: "running" }, { exitCode: "0" });
+
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("fails closed on untracked migrated records without an exit marker", async () => {
+      // Migrated processes record pid 0 (unprobeable) and their exit marker is written by
+      // the in-process handle: after an unclean shutdown the child may survive with nothing
+      // left to prove it exited, so the gate must refuse rather than skip.
+      await writeSpawnRecord("migrated-survivor", { pid: 0, status: "running" });
+
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(true);
+    });
+
+    it("skips migrated records the manager still tracks", async () => {
+      await writeSpawnRecord("migrated-live", { pid: 0, status: "running" });
+      // While Xum runs, the migrated process is tracked in-memory under the same ID (the
+      // record's directory name); the in-memory live-activity gates own it, so the probe
+      // must not double-report it as a crash orphan.
+      const stubHandle: BackgroundHandle = {
+        outputDir: path.join(workspaceDir, "migrated-live"),
+        getExitCode: () => Promise.resolve(null),
+        terminate: () => Promise.resolve(),
+        dispose: () => Promise.resolve(),
+        writeMeta: () => Promise.resolve(),
+        getOutputFileSize: () => Promise.resolve(0),
+        readOutput: () => Promise.resolve({ content: "", newOffset: 0 }),
+      };
+      manager.registerMigratedProcess(
+        stubHandle,
+        "migrated-live",
+        orphanWorkspaceId,
+        "echo hi",
+        path.join(workspaceDir, "migrated-live"),
+        "migrated-live"
+      );
 
       expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
     });
