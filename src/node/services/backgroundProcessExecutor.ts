@@ -165,6 +165,21 @@ export async function spawnProcess(
   try {
     await runtime.ensureDir(outputDir);
     await writeFileString(runtime, outputPath, "");
+    // Process IDs are display-name based and only deduplicated within one app session, so a
+    // restart can reuse a previous session's directory. A stale exit_code from that prior
+    // process would be trusted as proof that the NEW process exited — both by getExitCode()
+    // and by crash-orphan archive gating — so it must be gone before the wrapper's trap owns
+    // the file again.
+    const rmResult = await execBuffered(runtime, `rm -f ${quotePath(exitCodePath)}`, {
+      cwd: FALLBACK_CWD,
+      timeout: 10,
+    });
+    if (rmResult.exitCode !== 0) {
+      return {
+        success: false,
+        error: `Failed to clear stale exit_code file: ${rmResult.stderr}`,
+      };
+    }
   } catch (error) {
     return {
       success: false,

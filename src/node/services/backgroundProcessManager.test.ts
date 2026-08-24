@@ -1982,6 +1982,33 @@ describe("BackgroundProcessManager", () => {
       expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
     });
 
+    it("clears a stale exit_code file when a restart reuses the process directory", async () => {
+      // Process IDs are display-name based and deduplicated only in memory, so after a
+      // restart a new spawn can land in a prior session's directory whose exit trap already
+      // wrote exit_code. That stale marker must not survive the new spawn: it would flip the
+      // live process to "exited" and let crash-orphan gating treat it as exited too.
+      const displayName = "reused-name";
+      const processDir = path.join(workspaceDir, displayName);
+      await fs.mkdir(processDir, { recursive: true });
+      await fs.writeFile(path.join(processDir, "exit_code"), "0");
+
+      const result = await manager.spawn(runtime, orphanWorkspaceId, "sleep 2", {
+        cwd: process.cwd(),
+        displayName,
+      });
+      expect(result.success).toBe(true);
+
+      let staleMarkerExists = true;
+      try {
+        await fs.access(path.join(processDir, "exit_code"));
+      } catch {
+        staleMarkerExists = false;
+      }
+      expect(staleMarkerExists).toBe(false);
+      const processes = await manager.list(orphanWorkspaceId);
+      expect(processes.find((p) => p.id === displayName)?.status).toBe("running");
+    });
+
     it("skips processes the manager still tracks", async () => {
       // A live tracked process writes the same durable "running" record an orphan would,
       // but in-memory gates already cover it — the probe must not double-report it.

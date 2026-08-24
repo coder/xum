@@ -1171,6 +1171,36 @@ describe("TerminalService.openNative", () => {
       expect(await service.hasOpenedNativeTerminal("ws-local")).toBe(true);
     });
 
+    it("refuses native terminal opens for archived workspaces", async () => {
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      const configWithArchivedWorkspace = {
+        ...(configWithLocalWorkspace as unknown as Record<string, unknown>),
+        getAllWorkspaceMetadata: mock(() =>
+          Promise.resolve([
+            {
+              id: "ws-local",
+              projectPath: "/tmp/project",
+              name: "main",
+              namedWorkspacePath: "/tmp/project/main",
+              runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
+              archivedAt: "2026-01-01T00:00:00.000Z",
+            },
+          ])
+        ),
+      } as unknown as Config;
+      service = new TerminalService(configWithArchivedWorkspace, mockPTYService);
+
+      // Persisted archived state (e.g. a stale renderer) must refuse like the other
+      // admissions: the checkout may already be snapshot and removed.
+      try {
+        await service.openNative("ws-local");
+        expect.unreachable("openNative must refuse archived workspaces");
+      } catch (error) {
+        expect(String(error)).toContain("is archived");
+      }
+      expect(spawnSpy).not.toHaveBeenCalled();
+    });
+
     it("refuses the native launch when the durable marker cannot be persisted", async () => {
       spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
       // Session dir rooted under /dev/null: marker persistence (mkdir/writeFile) must fail.

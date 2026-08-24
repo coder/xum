@@ -7689,6 +7689,21 @@ export class WorkspaceService extends EventEmitter {
         `Workspace is being archived: ${workspaceId}. Unarchive it before opening an editor.`
       );
     }
+    // Persisted archived state (not just an in-progress archive): a stale renderer can request
+    // an editor for an already-archived workspace whose checkout may already be snapshot and
+    // removed (mirrors TerminalService.openNative and the send/PTY/desktop admissions).
+    // Checked before the durable marker write so a refused open cannot permanently gate
+    // future snapshot archives of this workspace.
+    const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    if (
+      workspaceEntry != null &&
+      isWorkspaceArchived(
+        workspaceEntry.workspace.archivedAt,
+        workspaceEntry.workspace.unarchivedAt
+      )
+    ) {
+      return Err(`Workspace is archived: ${workspaceId}. Unarchive it before opening an editor.`);
+    }
     // Durable marker: the editor can outlive Xum, so a restart must not forget the open.
     // Persistence failure is fatal to the open (mirrors TerminalService.openNative): an
     // editor opened without the marker would be invisible to archive gating after a restart,
@@ -7715,9 +7730,14 @@ export class WorkspaceService extends EventEmitter {
       await fsPromises.access(this.externalEditorMarkerPath(workspaceId));
       this.externalEditorWorkspaces.add(workspaceId);
       return true;
-    } catch {
-      // Missing marker (or an unreadable one — probing must never break archive gating).
-      return false;
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT")) {
+        return false;
+      }
+      // Any other probe failure (EACCES, EIO, ...) cannot prove the marker is absent, and a
+      // false "absent" would let a snapshot archive remove the checkout under a surviving
+      // editor — fail closed without caching (the marker may still prove readable later).
+      return true;
     }
   }
 
@@ -7979,13 +7999,14 @@ export class WorkspaceService extends EventEmitter {
         options?.coderWorkspaceArchiveBehaviorOverride ??
         this.config.loadConfigOrDefault().coderWorkspaceArchiveBehavior ??
         DEFAULT_CODER_ARCHIVE_BEHAVIOR;
-      if (options?.forbidCoderWorkspaceDeletion === true && beforeArchiveMetadata != null) {
-        const runtimeConfig = beforeArchiveMetadata.runtimeConfig;
-        const isDedicatedCoderWorkspace =
-          isSSHRuntime(runtimeConfig) &&
-          runtimeConfig.coder != null &&
-          runtimeConfig.coder.existingWorkspace !== true &&
-          (runtimeConfig.coder.workspaceName?.trim() ?? "") !== "";
+      const beforeArchiveRuntimeConfig = beforeArchiveMetadata?.runtimeConfig;
+      const isDedicatedCoderWorkspace =
+        beforeArchiveRuntimeConfig != null &&
+        isSSHRuntime(beforeArchiveRuntimeConfig) &&
+        beforeArchiveRuntimeConfig.coder != null &&
+        beforeArchiveRuntimeConfig.coder.existingWorkspace !== true &&
+        (beforeArchiveRuntimeConfig.coder.workspaceName?.trim() ?? "") !== "";
+      if (options?.forbidCoderWorkspaceDeletion === true) {
         if (isDedicatedCoderWorkspace && coderWorkspaceArchiveBehavior === "delete") {
           return Err(
             'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior.'
@@ -8006,16 +8027,20 @@ export class WorkspaceService extends EventEmitter {
 
       // Native terminals and external editors are detached and untrackable (see
       // hasUntrackableExternalAppOpen): when this archive would capture a snapshot and remove
-      // the managed worktree, a model-driven archive must not delete the checkout under a
-      // user's live shell or editor. Mirrors the lifecycle caller's early refusal against the
-      // same pinned behavior read.
+      // the managed worktree — or stop a dedicated remote Coder workspace the user may still
+      // be connected to through such an app — a model-driven archive must not pull the
+      // environment out from under a user's live shell or editor. Mirrors the lifecycle
+      // caller's early refusal against the same pinned behavior reads. ("delete" for a
+      // dedicated Coder workspace is refused outright above, so non-"keep" here means stop.)
+      const stopsDedicatedCoderWorkspace =
+        isDedicatedCoderWorkspace && coderWorkspaceArchiveBehavior !== "keep";
       if (
         options?.refuseLiveUserActivity === true &&
-        needsSnapshotCapture &&
+        (needsSnapshotCapture || stopsDedicatedCoderWorkspace) &&
         (await this.hasUntrackableExternalAppOpen(workspaceId))
       ) {
         return Err(
-          "A native terminal or external editor was opened for this workspace and its lifetime cannot be tracked; the snapshot archive policy would remove the checkout under it. Ask the user to archive this workspace manually."
+          "A native terminal or external editor was opened for this workspace and its lifetime cannot be tracked; the archive policy would remove the checkout or stop the dedicated remote Coder workspace under it. Ask the user to archive this workspace manually."
         );
       }
 

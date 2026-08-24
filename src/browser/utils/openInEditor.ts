@@ -125,16 +125,26 @@ export async function openInEditor(args: {
   // durable record — and an archive already in progress must refuse the open. Recording is
   // conservative: refusals below this point leave a sticky false positive, which only makes
   // archive gating stricter. Custom-editor opens are recorded again on the backend route;
-  // recording is idempotent.
-  if (args.api) {
-    try {
-      const recorded = await args.api.general.recordEditorOpen({ workspaceId: args.workspaceId });
-      if (!recorded.success) {
-        return { success: false, error: recorded.error };
-      }
-    } catch {
-      // Best-effort: an unreachable backend cannot be mid-archive, so proceed with the open.
+  // recording is idempotent. Fail closed: a transient client disconnect (api null while
+  // reconnecting) or a failed recording RPC does not stop backend agents, so launching
+  // unrecorded would let a concurrent archive remove the checkout under the new editor.
+  if (!args.api) {
+    return {
+      success: false,
+      error:
+        "Cannot open the editor while disconnected from Xum: the open must be recorded first so archive safety checks can see it. Retry once reconnected.",
+    };
+  }
+  try {
+    const recorded = await args.api.general.recordEditorOpen({ workspaceId: args.workspaceId });
+    if (!recorded.success) {
+      return { success: false, error: recorded.error };
     }
+  } catch (error) {
+    return {
+      success: false,
+      error: `Cannot open the editor: recording the open failed (${error instanceof Error ? error.message : String(error)}), and archive safety checks depend on that record.`,
+    };
   }
 
   // Docker workspaces always use deep links (VS Code connects to container remotely)

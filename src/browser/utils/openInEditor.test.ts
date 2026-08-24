@@ -41,6 +41,17 @@ describe("openInEditor", () => {
     };
   }
 
+  // Editor opens must be recorded on the backend before any launch (archive safety), so
+  // every launch-path test needs an api stub whose recording succeeds.
+  function createApiStub(extra?: Record<string, unknown>): APIClient {
+    return {
+      general: {
+        recordEditorOpen: () => Promise.resolve({ success: true }),
+      },
+      ...extra,
+    } as unknown as APIClient;
+  }
+
   test("opens SSH file deep link (does not fall back to parent dir)", async () => {
     const calls: OpenCall[] = [];
 
@@ -52,7 +63,7 @@ describe("openInEditor", () => {
 
     const result = await withWindow(createMockWindow(calls), () =>
       openInEditor({
-        api: null,
+        api: createApiStub(),
         workspaceId,
         targetPath: filePath,
         runtimeConfig,
@@ -77,7 +88,7 @@ describe("openInEditor", () => {
       configPath: ".devcontainer/devcontainer.json",
     };
 
-    const api = {
+    const api = createApiStub({
       workspace: {
         getDevcontainerInfo: () =>
           Promise.resolve({
@@ -86,7 +97,7 @@ describe("openInEditor", () => {
             hostWorkspacePath: "/Users/me/projects/myapp",
           }),
       },
-    } as unknown as APIClient;
+    });
 
     const result = await withWindow(createMockWindow(calls), () =>
       openInEditor({
@@ -117,7 +128,7 @@ describe("openInEditor", () => {
 
     const result = await withWindow(createMockWindow(calls), () =>
       openInEditor({
-        api: null,
+        api: createApiStub(),
         workspaceId,
         targetPath: filePath,
         runtimeConfig,
@@ -132,5 +143,47 @@ describe("openInEditor", () => {
     expect(target).toBe("_blank");
     expect(url.endsWith(filePath)).toBe(false);
     expect(url.endsWith(`/${parentDir}`)).toBe(true);
+  });
+
+  test("refuses to launch while disconnected (open cannot be recorded)", async () => {
+    const calls: OpenCall[] = [];
+
+    // api is null while the UI reconnects, but backend agents keep running: an unrecorded
+    // launch could race a concurrent archive, so the open must fail closed.
+    const result = await withWindow(createMockWindow(calls), () =>
+      openInEditor({
+        api: null,
+        workspaceId,
+        targetPath: filePath,
+        runtimeConfig: { type: "ssh", host: "devbox", srcBaseDir: "~/xum" },
+        isFile: true,
+      })
+    );
+
+    expect(result.success).toBe(false);
+    expect(calls.length).toBe(0);
+  });
+
+  test("refuses to launch when recording the open fails", async () => {
+    const calls: OpenCall[] = [];
+
+    const api = {
+      general: {
+        recordEditorOpen: () => Promise.reject(new Error("connection lost")),
+      },
+    } as unknown as APIClient;
+
+    const result = await withWindow(createMockWindow(calls), () =>
+      openInEditor({
+        api,
+        workspaceId,
+        targetPath: filePath,
+        runtimeConfig: { type: "ssh", host: "devbox", srcBaseDir: "~/xum" },
+        isFile: true,
+      })
+    );
+
+    expect(result.success).toBe(false);
+    expect(calls.length).toBe(0);
   });
 });

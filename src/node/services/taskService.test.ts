@@ -2231,6 +2231,42 @@ describe("TaskService", () => {
     expect(harness.archive).not.toHaveBeenCalled();
   });
 
+  test("workspace lifecycle refuses stopping a dedicated Coder workspace under an untrackable app", async () => {
+    // Snapshot capture never runs for SSH runtimes, but a "stop" Coder policy still pulls the
+    // remote environment out from under a native terminal/editor the user may be connected
+    // through — the untrackable-app refusal must cover that hazard too.
+    const harness = await createWorkspaceLifecycleHarness({
+      hasUntrackableExternalAppOpen: mock(() => true),
+    });
+    await harness.config.editConfig((cfg) => {
+      cfg.coderWorkspaceArchiveBehavior = "stop";
+      for (const [, project] of cfg.projects) {
+        const child = project.workspaces.find((w) => w.id === "childworkspace");
+        if (child) {
+          child.runtimeConfig = {
+            type: "ssh",
+            host: "coder.example",
+            srcBaseDir: "/home/coder/src",
+            coder: { workspaceName: "mux-child", existingWorkspace: false },
+          };
+        }
+      }
+      return cfg;
+    });
+
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(harness.parentId, {
+      workspaceId: "childworkspace",
+    });
+
+    expect(result.success).toBe(true);
+    const data = result.success ? result.data : undefined;
+    expect(data?.status).toBe("error");
+    expect(data?.status === "error" ? data.error : "").toContain(
+      "stop the dedicated remote Coder workspace"
+    );
+    expect(harness.archive).not.toHaveBeenCalled();
+  });
+
   test("workspace lifecycle defers nested disposable cleanup until after the archive", async () => {
     const harness = await createWorkspaceLifecycleHarness();
     await harness.config.editConfig((cfg) => {

@@ -9397,16 +9397,21 @@ export class TaskService {
           // Native terminals and external editors spawn detached apps that never register
           // session activity and whose lifetime cannot be tracked (they daemonize or are deep
           // links, so process exit is meaningless). When the snapshot policy would remove this
-          // managed worktree's checkout, archiving could delete the directory under the user's
-          // live shell/editor — fail closed and route through user-mediated archive. Scoped
-          // exactly to targets where snapshot capture (and subsequent worktree removal) runs;
-          // sticky (durable markers) because closure is undetectable. Re-enforced at the sink.
-          if (
+          // managed worktree's checkout — or the pinned Coder policy would stop the dedicated
+          // remote workspace the user's shell/editor may still be connected to ("delete" is
+          // refused above, so non-"keep" here means stop) — archiving could pull the
+          // environment out from under the user's live app — fail closed and route through
+          // user-mediated archive. Sticky (durable markers) because closure is undetectable.
+          // Re-enforced at the sink.
+          const untrackableAppArchiveHazard =
             this.workspaceService.isSnapshotArchiveEligibilityMutationSensitive(
               resolved.workspaceId,
               worktreeArchiveBehavior,
               resolved.metadata
-            ) &&
+            ) ||
+            (isDedicatedCoderWorkspace && coderArchiveBehavior !== "keep");
+          if (
+            untrackableAppArchiveHazard &&
             (await this.workspaceService.hasUntrackableExternalAppOpen(resolved.workspaceId))
           ) {
             return Ok({
@@ -9414,7 +9419,7 @@ export class TaskService {
               action: "archive",
               ...this.lifecycleTargetFields(resolved),
               error:
-                "A native terminal or external editor was opened for this workspace and its lifetime cannot be tracked; the snapshot archive policy would remove the checkout under it. Ask the user to archive this workspace manually.",
+                "A native terminal or external editor was opened for this workspace and its lifetime cannot be tracked; the archive policy would remove the checkout or stop the dedicated remote Coder workspace under it. Ask the user to archive this workspace manually.",
             });
           }
 
