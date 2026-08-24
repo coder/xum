@@ -1837,6 +1837,13 @@ export class AgentSession {
         toolPolicy: [{ regex_match: ".*", action: "disable" }],
         allowAgentSetGoal: persistedAllowAgentSetGoal,
         disableWorkspaceAgents: persistedDisableWorkspaceAgents,
+        // Carry the original compaction metadata so the resumed stream still
+        // identifies as a compaction request. Without it, resolveCompactionRequest
+        // aborts its backward scan at any trailing synthetic row (file-change
+        // notice, [CONTINUE] sentinel), activeCompactionRequest stays undefined,
+        // and the summary is recorded as a plain assistant response instead of
+        // collapsing history at a compaction boundary.
+        muxMetadata: lastUserMuxMetadata,
       };
 
       if (persistedAdditionalSystemInstructions !== undefined) {

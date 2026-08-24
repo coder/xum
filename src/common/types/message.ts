@@ -93,8 +93,16 @@ export type StartupRetrySendOptions = Pick<
   | "disableWorkspaceAgents"
   | "allowAgentSetGoal"
 > & {
-  /** Correlation for a delegated workspace turn that must survive restart recovery. */
-  muxMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+  /**
+   * Correlation metadata that must survive restart recovery: delegated
+   * workspace turns and interrupted compaction requests. A resumed compaction
+   * stream needs its original metadata so trailing synthetic rows cannot break
+   * compaction detection (resolveCompactionRequest only skips synthetic rows
+   * when the stream itself identifies as a compaction request).
+   */
+  muxMetadata?:
+    | Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+    | Extract<MuxMessageMetadata, { type: "compaction-request" }>;
   /** Internal-only Copilot billing override for startup auto-retry. */
   agentInitiated?: boolean;
   /** Internal goal continuation classification for startup auto-retry accounting. */

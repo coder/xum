@@ -1273,3 +1273,289 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     session.dispose();
   });
 });
+
+describe("AgentSession on-send auto-compaction for synthetic guidance sends", () => {
+  let historyCleanup: (() => Promise<void>) | undefined;
+
+  afterEach(async () => {
+    await historyCleanup?.();
+  });
+
+  interface GuidanceStreamFixture {
+    session: AgentSession;
+    historyService: Awaited<ReturnType<typeof createTestHistoryService>>["historyService"];
+    aiEmitter: EventEmitter;
+    streamHistories: MuxMessage[][];
+    events: WorkspaceChatMessage[];
+  }
+
+  /**
+   * Harness that mimics a parent workspace sending guidance to a child task:
+   * sendMessage with internal {synthetic, agentInitiated} and a mock AI stream
+   * that completes with a prose summary so compaction can finish end-to-end.
+   */
+  async function createGuidanceHarness(args: {
+    workspaceId: string;
+    summaryText?: string;
+  }): Promise<GuidanceStreamFixture> {
+    const workspaceId = args.workspaceId;
+    const streamHistories: MuxMessage[][] = [];
+
+    const aiEmitter = new EventEmitter();
+    const streamMessage = mock((request: unknown) => {
+      const requestMessages =
+        typeof request === "object" && request !== null && "messages" in request
+          ? (request as { messages?: unknown }).messages
+          : undefined;
+      streamHistories.push(Array.isArray(requestMessages) ? (requestMessages as MuxMessage[]) : []);
+
+      aiEmitter.emit("stream-start", {
+        type: "stream-start",
+        workspaceId,
+        messageId: `assistant-${streamHistories.length}`,
+        model: "openai:gpt-4o",
+        historySequence: streamHistories.length,
+        startTime: Date.now(),
+      });
+
+      const usage = {
+        inputTokens: 42,
+        outputTokens: 10,
+        totalTokens: 52,
+      };
+      aiEmitter.emit("stream-end", {
+        type: "stream-end",
+        workspaceId,
+        messageId: `assistant-${streamHistories.length}`,
+        parts: [{ type: "text", text: args.summaryText ?? "Summary of the conversation so far." }],
+        metadata: {
+          model: "openai:gpt-4o",
+          usage,
+          contextUsage: usage,
+        },
+      });
+
+      return Promise.resolve(Ok(undefined));
+    });
+
+    const harness = await createAgentSessionHarness({
+      workspaceId,
+      captureEvents: true,
+      aiEmitter,
+      aiServiceOverrides: {
+        isStreaming: mock((_workspaceId: string) => false),
+        stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
+        getWorkspaceMetadata: mock((_workspaceId: string) =>
+          // No real workspace behind the test session; skip @file snapshot materialization.
+          Promise.resolve(Err("no workspace metadata in test"))
+        ),
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      },
+    });
+    historyCleanup = harness.cleanup;
+
+    // Cross the on-send threshold unconditionally.
+    (harness.session as unknown as { compactionMonitor: CompactionMonitor }).compactionMonitor = {
+      checkBeforeSend: mock(() => ({
+        shouldShowWarning: true,
+        shouldForceCompact: true,
+        usagePercentage: 95,
+        thresholdPercentage: 70,
+      })),
+      checkMidStream: mock(() => false),
+      resetForNewStream: mock(() => undefined),
+      setThreshold: mock(() => undefined),
+      getThreshold: mock(() => 0.7),
+    } as unknown as CompactionMonitor;
+
+    return {
+      session: harness.session,
+      historyService: harness.historyService,
+      aiEmitter,
+      streamHistories,
+      events: harness.events,
+    };
+  }
+
+  async function waitFor(
+    predicate: () => boolean | Promise<boolean>,
+    timeoutMs = 2000
+  ): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (!(await predicate()) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    return predicate();
+  }
+
+  test("applies compaction when synthetic agent-initiated send crosses the threshold", async () => {
+    const fixture = await createGuidanceHarness({
+      workspaceId: "ws-auto-compaction-synthetic-guidance",
+    });
+
+    const result = await fixture.session.sendMessage(
+      "Updated guidance from parent: focus on the failing tests.",
+      { model: "openai:gpt-4o", agentId: "exec" },
+      { synthetic: true, agentInitiated: true, startStreamInBackground: true }
+    );
+    expect(result.success).toBe(true);
+
+    // First stream must carry the persisted compaction request.
+    await waitFor(() => fixture.streamHistories.length >= 1);
+    expect(fixture.streamHistories.length).toBeGreaterThanOrEqual(1);
+    const firstRequestHasCompactionRequest = fixture.streamHistories[0].some(
+      (message) => message.metadata?.muxMetadata?.type === "compaction-request"
+    );
+    expect(firstRequestHasCompactionRequest).toBe(true);
+
+    // Compaction must complete: a boundary summary lands in durable history.
+    const boundaryLanded = await waitFor(async () => {
+      const historyResult = await fixture.historyService.getHistoryFromLatestBoundary(
+        "ws-auto-compaction-synthetic-guidance"
+      );
+      return (
+        historyResult.success &&
+        historyResult.data.some((message) => message.metadata?.compactionBoundary === true)
+      );
+    });
+    expect(boundaryLanded).toBe(true);
+
+    // The original guidance text is re-dispatched as the post-compaction follow-up.
+    const followUpDispatched = await waitFor(() =>
+      fixture.streamHistories.some((history) =>
+        history.some(
+          (message) =>
+            message.role === "user" &&
+            message.parts.some(
+              (part) => part.type === "text" && part.text.includes("focus on the failing tests")
+            )
+        )
+      )
+    );
+    expect(followUpDispatched).toBe(true);
+
+    expect(
+      fixture.events.some(
+        (event) => (event as { type?: string }).type === "auto-compaction-triggered"
+      )
+    ).toBe(true);
+    expect(
+      fixture.events.some(
+        (event) => (event as { type?: string }).type === "auto-compaction-completed"
+      )
+    ).toBe(true);
+
+    fixture.session.dispose();
+  });
+
+  // Characterization: sends carrying preTurnMessages (family-message payloads)
+  // intentionally skip on-send compaction. The trigger row references its
+  // payload by message ID, so compacting the payload away would dangle that
+  // reference, and the follow-up metadata cannot carry pre-turn rows. Mid-stream
+  // forcing remains the context-limit backstop for these sends.
+  test("family-payload sends with preTurnMessages skip on-send compaction", async () => {
+    const fixture = await createGuidanceHarness({
+      workspaceId: "ws-auto-compaction-family-payload",
+    });
+
+    const payloadRow = createMuxMessage("payload-1", "assistant", "[Untrusted family message]", {
+      timestamp: Date.now(),
+      synthetic: true,
+      uiVisible: true,
+      muxMetadata: { type: "family-message" },
+    });
+
+    const result = await fixture.session.sendMessage(
+      "Child task abc sent a family message recorded in assistant message payload-1.",
+      { model: "openai:gpt-4o", agentId: "exec" },
+      { synthetic: true, agentInitiated: true, preTurnMessages: [payloadRow] }
+    );
+    expect(result.success).toBe(true);
+
+    // No on-send compaction request is created for family-payload sends.
+    expect(fixture.streamHistories.length).toBeGreaterThanOrEqual(1);
+    const firstRequestHasCompactionRequest = fixture.streamHistories[0].some(
+      (message) => message.metadata?.muxMetadata?.type === "compaction-request"
+    );
+    expect(firstRequestHasCompactionRequest).toBe(false);
+
+    // The payload and trigger persist as a normal turn instead.
+    const historyResult = await fixture.historyService.getHistoryFromLatestBoundary(
+      "ws-auto-compaction-family-payload"
+    );
+    expect(historyResult.success).toBe(true);
+    if (!historyResult.success) {
+      throw new Error(`failed to load history: ${String(historyResult.error)}`);
+    }
+    expect(historyResult.data.some((message) => message.id === "payload-1")).toBe(true);
+
+    fixture.session.dispose();
+  });
+
+  test("startup retry of an interrupted compaction keeps compaction identity", async () => {
+    const workspaceId = "ws-compaction-startup-retry";
+    const fixture = await createGuidanceHarness({ workspaceId });
+
+    // Simulate a crash mid-compaction: durable compaction request row followed
+    // by a synthetic row (e.g. a file-change notice) appended before resume.
+    await fixture.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("assistant-prior", "assistant", "prior context", {
+        timestamp: Date.now(),
+        model: "openai:gpt-4o",
+      })
+    );
+    await fixture.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("compaction-req-1", "user", "Summarize the conversation.", {
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: {
+          type: "compaction-request",
+          rawCommand: "/compact",
+          commandPrefix: "/compact",
+          parsed: {},
+          requestedModel: "openai:gpt-4o",
+          source: "auto-compaction",
+        },
+      })
+    );
+    await fixture.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("file-change-1", "user", "<system-file-update>foo.ts</system-file-update>", {
+        timestamp: Date.now(),
+        synthetic: true,
+      })
+    );
+
+    const outcome = await (
+      fixture.session as unknown as {
+        scheduleStartupAutoRetryIfNeeded: () => Promise<string>;
+      }
+    ).scheduleStartupAutoRetryIfNeeded();
+    expect(outcome).toBe("completed");
+
+    // The resumed stream must still be tracked as a compaction request.
+    const streamed = await waitFor(() => fixture.streamHistories.length >= 1, 5000);
+    expect(streamed).toBe(true);
+    const retriedRequestHasCompactionRow = fixture.streamHistories[0].some(
+      (message) =>
+        message.id === "compaction-req-1" ||
+        message.metadata?.muxMetadata?.type === "compaction-request"
+    );
+    expect(retriedRequestHasCompactionRow).toBe(true);
+
+    // Compaction must complete on the resumed stream instead of the summary
+    // being recorded as a plain assistant response.
+    const boundaryLanded = await waitFor(async () => {
+      const historyResult = await fixture.historyService.getHistoryFromLatestBoundary(workspaceId);
+      return (
+        historyResult.success &&
+        historyResult.data.some((message) => message.metadata?.compactionBoundary === true)
+      );
+    });
+    expect(boundaryLanded).toBe(true);
+
+    fixture.session.dispose();
+  });
+});
