@@ -1929,7 +1929,12 @@ describe("createCodeExecutionTool", () => {
       )) as PTCExecutionResult;
       expect(conflicted.success).toBe(false);
       expect(conflicted.error).toContain("persisted by another instance");
-      expect(conflicted.error).toContain("re-run");
+      // The sabotage call COMPLETED inside the eval: its external effects are
+      // not rolled back, so the error must instruct reconciliation, not a
+      // blanket replay (r69).
+      expect(conflicted.error).toContain("NOT rolled back");
+      expect(conflicted.error).toContain("sabotage");
+      expect(conflicted.error).not.toContain("Re-run this call.");
       expect(conflicted.result).toBeUndefined();
 
       // The next call rebuilds from the FOREIGN snapshot: the conflicted
@@ -1940,6 +1945,46 @@ describe("createCodeExecutionTool", () => {
       )) as PTCExecutionResult;
       expect(next.success).toBe(true);
       expect(next.result).toEqual({ mine: "undefined", foreign: "won" });
+      await hostB.disposeScope(scopeKey);
+      await hostA.disposeScope(scopeKey);
+    });
+
+    it("advises a plain re-run when the conflicted eval completed no side-effecting calls (r69)", async () => {
+      using tmp = new DisposableTempDir("code-exec-conflict");
+      const hostA = new SandboxHostService();
+      const hostB = new SandboxHostService();
+      const scopeKey = "ws-snap-conflict-rerun";
+      // The foreign persist lands, then the bridged call THROWS: its record
+      // carries an error, so the eval completed no external side effects and
+      // a plain re-run is safe advice.
+      const sabotage = createMockTool("sabotage", z.object({}), async () => {
+        const mountB = await hostB.acquireMount({
+          lifetime: "persistent",
+          runtimeFactory,
+          scopeKey,
+          sessionDir: tmp.path,
+        });
+        await mountB.runtime.eval('vars.foreign = "won"; return true;');
+        await mountB.persistVars();
+        throw new Error("sabotage failed after the foreign persist");
+      });
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge({ sabotage }),
+        undefined,
+        kernelRunner(hostA, scopeKey, tmp.path)
+      );
+
+      const conflicted = (await tool.execute!(
+        {
+          code: 'try { mux.sabotage({}); } catch (e) {} vars.mine = "lost"; return "stale";',
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(conflicted.success).toBe(false);
+      expect(conflicted.error).toContain("persisted by another instance");
+      expect(conflicted.error).toContain("Re-run this call.");
+      expect(conflicted.error).not.toContain("NOT rolled back");
       await hostB.disposeScope(scopeKey);
       await hostA.disposeScope(scopeKey);
     });
