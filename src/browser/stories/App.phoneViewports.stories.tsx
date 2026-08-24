@@ -9,6 +9,8 @@ import { userEvent, within, waitFor } from "@storybook/test";
 import type { ComponentType } from "react";
 
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
@@ -414,6 +416,109 @@ export const IPhone17ProMaxTouchReviewImmersive: AppStory = {
         if (document.querySelectorAll("[data-bottom-inset-owner]").length > 0) {
           throw new Error("Immersive review left the bottom safe-area inset unowned.");
         }
+      },
+      { timeout: 10_000 }
+    );
+
+    blurActiveElement();
+  },
+};
+
+const TIMELINE_DIALOG_WORKSPACE_ID = "ws-iphone-16e-timeline";
+const TIMELINE_DIALOG_BASE_TS = Date.UTC(2020, 0, 15, 15, 0, 0);
+const TIMELINE_DIALOG_EVENTS: TimelineEvent[] = [
+  {
+    v: 1,
+    id: "turn-completed",
+    kind: "turn.completed",
+    seq: 3,
+    ts: TIMELINE_DIALOG_BASE_TS,
+    source: { system: "chat" },
+    status: "completed",
+    data: { model: "anthropic/claude-sonnet-4", mode: "exec", durationMs: 84_000 },
+    anchor: { messageId: "msg-2" },
+  },
+  {
+    v: 1,
+    id: "agent-milestone",
+    kind: "agent.event",
+    seq: 2,
+    ts: TIMELINE_DIALOG_BASE_TS - 45_000,
+    source: { system: "agent", key: "timeline-event:milestone" },
+    data: {
+      description: "Wired the mobile timeline dialog behind the workspace actions menu",
+      category: "milestone",
+    },
+  },
+  {
+    v: 1,
+    id: "goal-set",
+    kind: "goal.set",
+    seq: 1,
+    ts: TIMELINE_DIALOG_BASE_TS - 90_000,
+    source: { system: "goal" },
+    status: "started",
+    data: { digest: "Make the timeline reachable at phone widths" },
+  },
+];
+
+/**
+ * Timeline on small viewports: the right sidebar (the timeline's usual home) is
+ * hidden at phone widths, so the workspace actions menu offers a Timeline entry
+ * that opens the panel in a dialog instead.
+ */
+export const IPhone16eTimelineDialog: AppStory = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        const client = setupSimpleChatStory({
+          workspaceId: TIMELINE_DIALOG_WORKSPACE_ID,
+          workspaceName: "mobile-timeline",
+          projectName: "mux",
+          messages: [...MESSAGES],
+          timelineEvents: TIMELINE_DIALOG_EVENTS,
+        });
+        updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TIMELINE), true);
+        return client;
+      }}
+    />
+  ),
+  decorators: [IPhone16eDecorator],
+  parameters: {
+    ...appMeta.parameters,
+    pixel: {
+      matrix: { themes: ["dark", "light"], viewports: ["phone"] },
+    },
+  },
+  play: async ({ canvasElement }) => {
+    await stabilizePhoneViewportStory(canvasElement);
+
+    // The Timeline menu action is gated on `window.matchMedia`, which the fixed-width
+    // decorator cannot move; only assert where the viewport is genuinely narrow (Pixel's
+    // phone viewport). The test-runner executes at desktop window size and skips here.
+    if (!window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches) {
+      return;
+    }
+
+    const canvas = within(canvasElement);
+    await userEvent.click(await canvas.findByTestId("workspace-more-actions"));
+    await userEvent.click(
+      await waitFor(() => within(document.body).getByTestId("workspace-timeline-button"))
+    );
+
+    // The dialog portals to document.body, outside the story canvas.
+    await waitFor(
+      () => {
+        const dialog = document.querySelector('[data-testid="timeline-dialog"]');
+        if (!dialog) {
+          throw new Error("Timeline dialog did not open");
+        }
+        within(dialog as HTMLElement).getByText(
+          "Wired the mobile timeline dialog behind the workspace actions menu"
+        );
       },
       { timeout: 10_000 }
     );

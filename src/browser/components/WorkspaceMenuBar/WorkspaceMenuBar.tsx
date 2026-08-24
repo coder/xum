@@ -48,7 +48,11 @@ import { forkWorkspace } from "@/browser/utils/chatCommands";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
-import { WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX } from "@/constants/layout";
+import {
+  NARROW_VIEWPORT_MAX_WIDTH_PX,
+  WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
+} from "@/constants/layout";
+import { TimelineDialog } from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
 import type { AgentSkillDescriptor, AgentSkillIssue } from "@/common/types/agentSkill";
 
 interface WorkspaceMenuBarProps {
@@ -91,6 +95,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const { preflightArchiveWorkspace, archiveWorkspace, setWorkspacePinned } = useWorkspaceActions();
   const { workspaceMetadata } = useWorkspaceContext();
   const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
+  const timelineExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.TIMELINE);
   const openTerminalPopout = useOpenTerminal();
   const openInEditor = useOpenInEditor();
   const runtimeStatus = useRuntimeStatus(workspaceId);
@@ -117,6 +122,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const [debugLlmRequestOpen, setDebugLlmRequestOpen] = useState(false);
   const [mcpModalOpen, setMcpModalOpen] = useState(false);
   const [heartbeatModalOpen, setHeartbeatModalOpen] = useState(false);
+  const [timelineDialogOpen, setTimelineDialogOpen] = useState(false);
   const [availableSkills, setAvailableSkills] = useState<AgentSkillDescriptor[]>([]);
   const [invalidSkills, setInvalidSkills] = useState<AgentSkillIssue[]>([]);
   const isSkillsMountedRef = useRef(true);
@@ -175,6 +181,12 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const isTouchMobileScreen =
     typeof window !== "undefined" &&
     window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
+
+  // Any pointer type: the right sidebar (home of the Timeline tab) is CSS-hidden
+  // at this width, so the timeline needs a dialog entry point instead.
+  const isNarrowScreen =
+    typeof window !== "undefined" &&
+    window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches;
 
   const isDevcontainerWorkspace = isDevcontainerRuntime(runtimeConfig);
   const isRuntimeRunning = isDevcontainerWorkspace && runtimeStatus === "running";
@@ -749,6 +761,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
               onEnterImmersiveReview={
                 hasRepository && !isTouchMobileScreen ? handleEnterImmersiveReview : null
               }
+              onOpenTimeline={
+                timelineExperimentEnabled && isNarrowScreen
+                  ? () => setTimelineDialogOpen(true)
+                  : null
+              }
               onStopRuntime={isRuntimeRunning ? () => void handleStopRuntime() : null}
               // Scratch chats have no repo: review events are ignored by
               // RightSidebar and fork is unsupported on the backend, so hide
@@ -796,6 +813,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         projectPath={projectPath}
         open={mcpModalOpen}
         onOpenChange={setMcpModalOpen}
+      />
+      <TimelineDialog
+        workspaceId={workspaceId}
+        open={timelineDialogOpen}
+        onOpenChange={setTimelineDialogOpen}
       />
       <DebugLlmRequestModal
         workspaceId={workspaceId}

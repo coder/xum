@@ -28,9 +28,15 @@ import * as PopoverErrorModule from "../PopoverError/PopoverError";
 import * as WorkspaceActionsMenuContentModule from "../WorkspaceActionsMenuContent/WorkspaceActionsMenuContent";
 import * as WorkspaceTerminalIconModule from "../icons/WorkspaceTerminalIcon/WorkspaceTerminalIcon";
 import * as SkillIndicatorModule from "../SkillIndicator/SkillIndicator";
+import * as TimelineDialogModule from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
 
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX } from "@/constants/layout";
+import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  NARROW_VIEWPORT_MAX_WIDTH_PX,
+  WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
+} from "@/constants/layout";
 
 let WorkspaceMenuBar!: typeof WorkspaceMenuBarComponent;
 
@@ -53,6 +59,7 @@ function getLastMenuContentProps() {
             onForkChat?: ((anchorEl: HTMLElement) => void) | null;
             onEnterImmersiveReview?: (() => void) | null;
             onOpenTouchFullscreenReview?: (() => void) | null;
+            onOpenTimeline?: (() => void) | null;
           },
         ]
       >;
@@ -257,6 +264,33 @@ function installWorkspaceMenuBarTestDoubles() {
   spyOn(SkillIndicatorModule, "SkillIndicator").mockImplementation(
     (() => null) as unknown as typeof SkillIndicatorModule.SkillIndicator
   );
+  spyOn(TimelineDialogModule, "TimelineDialog").mockImplementation(
+    (() => null) as unknown as typeof TimelineDialogModule.TimelineDialog
+  );
+}
+
+// Records render props like the WorkspaceActionsMenuContent double, so tests can
+// assert the dialog opened without rendering the real timeline panel.
+function getLastTimelineDialogProps() {
+  const spy = TimelineDialogModule.TimelineDialog as unknown as {
+    mock: { calls: Array<[{ workspaceId: string; open: boolean }]> };
+  };
+  return spy.mock.calls.at(-1)?.[0];
+}
+
+/** Replace window.matchMedia so viewport-gated actions can be exercised per test. */
+function stubMatchMedia(matches: (query: string) => boolean) {
+  window.matchMedia = ((query: string) =>
+    ({
+      matches: matches(query),
+      media: query,
+      onchange: null,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      dispatchEvent: () => false,
+    }) as unknown as MediaQueryList) as typeof window.matchMedia;
 }
 
 const defaultProps: ComponentProps<typeof WorkspaceMenuBarComponent> = {
@@ -360,6 +394,41 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     const menuProps = getLastMenuContentProps();
     expect(typeof menuProps?.onForkChat).toBe("function");
     expect(typeof menuProps?.onEnterImmersiveReview).toBe("function");
+  });
+
+  it("offers the Timeline action on narrow viewports and opens the dialog", () => {
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TIMELINE), true);
+    stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    const menuProps = getLastMenuContentProps();
+    expect(typeof menuProps?.onOpenTimeline).toBe("function");
+
+    act(() => {
+      menuProps?.onOpenTimeline?.();
+    });
+
+    const dialogProps = getLastTimelineDialogProps();
+    expect(dialogProps?.open).toBe(true);
+    expect(dialogProps?.workspaceId).toBe(workspaceId);
+  });
+
+  it("hides the Timeline action on wide viewports", () => {
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TIMELINE), true);
+    stubMatchMedia(() => false);
+
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    expect(getLastMenuContentProps()?.onOpenTimeline).toBeNull();
+  });
+
+  it("hides the Timeline action when the timeline experiment is disabled", () => {
+    stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    expect(getLastMenuContentProps()?.onOpenTimeline).toBeNull();
   });
 
   it("applies the collapsed-left-sidebar inset immediately from props", () => {
