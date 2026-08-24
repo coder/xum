@@ -955,7 +955,13 @@ export const TaskSendMessageToolArgsSchema = z
       .describe(
         'Tree target ID returned by task or task_list — a descendant sub-agent task ID or, for sibling/upward messages, a same-tree peer, ancestor, or root workspace ID (task_list scope:"tree").'
       ),
-    message: z.string().trim().min(1).describe("Plain-text message to deliver to the target."),
+    message: z
+      .string()
+      .trim()
+      .min(1)
+      .describe(
+        `Plain-text message to deliver to the target. Sibling/upward sends are capped at ${TASK_FAMILY_MESSAGE_MAX_CHARS} characters and draw from shared per-pair/per-target session budgets; descendant guidance is uncapped.`
+      ),
     queue_dispatch_mode: z
       .enum(["tool-end", "turn-end"])
       .nullish()
@@ -2389,7 +2395,7 @@ export const TOOL_DEFINITIONS = {
       "Use this after compaction, interruptions, workflow_run errors/aborts, or an app restart to rediscover active tasks, inactive persistent sub-agents, and resumable workflow runs. Sub-agent rows from grouped runs include `bestOf` metadata so they can be distinguished from the standalone reusable bench. The default statuses find unfinished work; request `reported` explicitly for completed persistent sub-agents. " +
       "When recovering an uncertain workflow_run, omit statuses first or include pending/running/backgrounded as well as interrupted/failed/completed; terminal-only filters can hide unfinished workflow runs. Pending runs may need workflow_resume because no runner may be active yet. " +
       "Workflow rows may include compact `workflowProgress` so callers can see the latest phase before deciding whether to await, resume, or leave the run alone. " +
-      'Pass scope:"tree" to list every agent workspace in this task tree instead — ancestors, siblings/cousins, descendants, and the root workspace row (status "workspace") — each tagged with its relationship to you. Tree rows are all addressable via task_send_message; the root row is included by default and filtered like any other row when explicit statuses are passed. ' +
+      'Pass scope:"tree" to list every agent workspace in this task tree instead — ancestors, siblings/cousins, descendants, and the root workspace row (status "workspace") — each tagged with its relationship to you. Tree rows are addressable via task_send_message except your own "self" row and best-of candidate rows (`bestOf` metadata), which refuse peer messages to keep candidates independent; the root row is included by default and filtered like any other row when explicit statuses are passed. ' +
       "The legacy includeArchived option only affects archived workspace-turn and bash records; sub-agents remain one inactive/active task identity. " +
       "This is a discovery tool, NOT a waiting mechanism. If the current request actually depends on a task's output, call task_await with the specific task IDs you need; do not await all active tasks just because they appear here.",
     schema: TaskListToolArgsSchema,

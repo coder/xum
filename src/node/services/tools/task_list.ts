@@ -73,7 +73,7 @@ function taskListStatusFromExecution(status: WorkspaceTurnTaskStatus): TaskListS
 const INACTIVE_CHILD_RETENTION_NOTE = `Inactive persistent children remain available under stable task IDs. Rows with bestOf metadata are temporary grouped candidates rather than standalone bench members; after their results and artifacts are consumed and no same-candidate follow-up is expected, remove them with task_remove. Keep each parent's direct standalone bench role-based: aim for at most ${SUBAGENT_REUSABLE_BENCH_TARGET} and keep it below ${SUBAGENT_REUSABLE_BENCH_EXCLUSIVE_LIMIT}. Prefer reawakening relevant context and use task_retitle when responsibility changes; prune substantially overlapping, obsolete, or least-useful inactive roles with task_remove when the bench exceeds those bounds. Do not sweep a small bench merely because a turn, task, or PR ended. A reawakened child keeps its checkout, so for repository-dependent work verify the retained snapshot or tell it to synchronize. Interrupted children were stopped before a terminal report; reawaken and ask them to finalize if their work should count as completed.`;
 
 const TREE_SCOPE_NOTE =
-  'Every row (including the root "workspace" row) is addressable via task_send_message; ' +
+  'Rows (including the root "workspace" row) are addressable via task_send_message, except your own "self" row and best-of candidate rows (`bestOf` metadata), which refuse peer messages to preserve candidate independence; ' +
   "the relationship field is computed relative to this workspace.";
 
 const MAX_ARCHIVE_ANCESTOR_DEPTH = 32;

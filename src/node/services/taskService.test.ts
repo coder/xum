@@ -13497,6 +13497,134 @@ describe("TaskService", () => {
     );
     expect(sendMessage).not.toHaveBeenCalled();
   });
+  test("sendAgentTreeMessage counts queued peer entries against the consecutive-wake budget", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "sib-a", "sib-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    // Queued entries have not dispatched yet (no onAccepted), so consecutivePeerWakes is 0 —
+    // the reservation must still refuse once queued wakes-in-waiting fill the budget.
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      countQueuedAgentPeerMessages: mock(() => 3),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "hi")).toEqual(
+      Err({
+        code: "refused",
+        reason:
+          "Target reached its consecutive peer-wake limit and needs user or parent attention.",
+      })
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("sendAgentTreeMessage refuses targets hard-interrupted by the user", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "child-a", "child-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    // The user's stop must win a race against a descendant's message: no queued or started turn.
+    taskService.markParentWorkspaceInterrupted("tree-root");
+    expect(await taskService.sendAgentTreeMessage("child-a", "tree-root", "status?")).toEqual(
+      Err({
+        code: "refused",
+        reason:
+          "Target was interrupted by the user and will not accept agent messages until the user resumes it.",
+      })
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("sendAgentTreeMessage bounds peer message size, sender titles, and aggregate budgets", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const longTitle = "T".repeat(TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS + 40);
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "sib-a", "sib-a", {
+          parentWorkspaceId: "tree-root",
+          title: longTitle,
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    // Per-message cap: refused before any delivery side effects.
+    const oversized = "x".repeat(TASK_FAMILY_MESSAGE_MAX_CHARS + 1);
+    const tooLong = await taskService.sendAgentTreeMessage("sib-a", "sib-b", oversized);
+    expect(tooLong.success).toBe(false);
+    if (!tooLong.success) {
+      expect(tooLong.error.code).toBe("refused");
+    }
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    // Sender titles are attacker-influenced; the envelope carries the capped form.
+    expect((await taskService.sendAgentTreeMessage("sib-a", "sib-b", "hello")).success).toBe(true);
+    const [, message] = sendMessage.mock.calls[0] as [string, string];
+    const fromTitle = parseAgentMessageEnvelope(message)?.fromTitle;
+    expect(fromTitle).toBe(`${longTitle.slice(0, TASK_FAMILY_MESSAGE_MAX_TITLE_CHARS)}…`);
+
+    // Peer sends draw from the shared family-message aggregate pools.
+    const internals = taskService as unknown as {
+      familyMessageTargetTotals: Map<string, { count: number; chars: number }>;
+    };
+    internals.familyMessageTargetTotals.set("sib-b", {
+      count: TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES,
+      chars: 0,
+    });
+    const exhausted = await taskService.sendAgentTreeMessage("sib-a", "sib-b", "one more");
+    expect(exhausted.success).toBe(false);
+    if (!exhausted.success) {
+      expect(exhausted.error.code).toBe("refused");
+      if (exhausted.error.code === "refused") {
+        expect(exhausted.error.reason).toContain("budget");
+      }
+    }
+  });
 
   test("listTaskTreeAgents tags relationships relative to the caller and excludes workflow subtrees", async () => {
     const config = await createTestConfig(rootDir);

@@ -5090,6 +5090,15 @@ export class TaskService {
     >
   > {
     const { senderWorkspaceId, targetId, relation } = params;
+    // Per-message cap mirrors the RLM family-message bound: peer text is embedded verbatim into
+    // the recipient's transcript and provider input, so an unbounded message would let a
+    // prompt-influenced sender overflow the receiver's context or memory.
+    if (params.message.length > TASK_FAMILY_MESSAGE_MAX_CHARS) {
+      return Err({
+        code: "refused" as const,
+        reason: `Message exceeds the ${TASK_FAMILY_MESSAGE_MAX_CHARS}-character peer-message limit; send a shorter summary.`,
+      });
+    }
     return this.workspaceEventLocks.withLock(targetId, async () => {
       const cfg = this.config.loadConfigOrDefault();
       const targetEntry = findWorkspaceEntry(cfg, targetId);
@@ -5178,6 +5187,17 @@ export class TaskService {
         }
       }
 
+      // A hard interrupt is an explicit user stop: markParentWorkspaceInterrupted suppresses
+      // auto-resume until real user input, and an agent message racing that cascade must not
+      // undo the stop by queueing or starting another turn on the interrupted workspace.
+      if (this.interruptedParentWorkspaceIds.has(targetId)) {
+        return Err({
+          code: "refused" as const,
+          reason:
+            "Target was interrupted by the user and will not accept agent messages until the user resumes it.",
+        });
+      }
+
       const throttleError = this.checkPeerMessageThrottles(
         senderWorkspaceId,
         targetId,
@@ -5188,9 +5208,13 @@ export class TaskService {
         return Err(throttleError);
       }
 
-      const senderTitle =
+      // Titles are attacker-influenced (auto-titling/retitle impose no cap); reuse the
+      // family-message sanity bound before interpolating into the envelope.
+      const rawSenderTitle =
         coerceNonEmptyString(senderEntry.workspace.title) ??
         coerceNonEmptyString(senderEntry.workspace.name);
+      const senderTitle =
+        rawSenderTitle != null ? this.capFamilyMessageTitle(rawSenderTitle) : undefined;
       // The envelope carries the SENDER's relationship to the recipient (what the target reads).
       const relationship: AgentMessageRelationship =
         relation === "target_ancestor" ? "descendant" : "sibling";
@@ -5206,6 +5230,21 @@ export class TaskService {
         ...(senderTitle != null ? { fromTitle: senderTitle } : {}),
         relationship,
       };
+
+      // Peer sends share the family-message aggregate budgets: both paths persist sender-authored
+      // text into another workspace's transcript, so one pool bounds the combined worst case per
+      // sender→target pair and per receiver. Charged on the full rendered envelope.
+      const refundBudget = this.reserveFamilyMessageBudget(
+        senderWorkspaceId,
+        targetId,
+        envelope.length
+      );
+      if (refundBudget == null) {
+        return Err({
+          code: "refused" as const,
+          reason: this.familyMessageBudgetExhaustedError().message,
+        });
+      }
 
       // Ancestor targets are often human-driven: default to turn-end so a peer message does not
       // cut into an active turn unless the sender explicitly asks. Sibling sends keep tool-end.
@@ -5269,6 +5308,8 @@ export class TaskService {
         },
       });
       if (!sendResult.success) {
+        // A flaky target must not burn the sender's aggregate budget.
+        refundBudget();
         return Err({
           code: "send_failed" as const,
           message: formatSendMessageError(sendResult.error).message,
@@ -5322,20 +5363,27 @@ export class TaskService {
       };
     }
 
-    if ((this.consecutivePeerWakes.get(targetId) ?? 0) >= MAX_CONSECUTIVE_PEER_WAKES) {
-      return {
-        code: "refused",
-        reason:
-          "Target reached its consecutive peer-wake limit and needs user or parent attention.",
-      };
-    }
-
     // Optional chaining: test harnesses mock WorkspaceService with a narrow method surface.
     const queuedCount = this.workspaceService.countQueuedAgentPeerMessages?.(targetId) ?? 0;
     if (queuedCount >= MAX_QUEUED_PEER_MESSAGES_PER_TARGET) {
       return {
         code: "refused",
         reason: "Target already has the maximum number of queued peer messages.",
+      };
+    }
+
+    // consecutivePeerWakes increments only when an entry dispatches (onAccepted), so queued
+    // entries against a busy target are undispatched wakes-in-waiting: count them as reserved
+    // budget or parallel senders could enqueue up to the queue cap and blow past the advertised
+    // consecutive-wake maximum once the target drains its queue.
+    if (
+      (this.consecutivePeerWakes.get(targetId) ?? 0) + queuedCount >=
+      MAX_CONSECUTIVE_PEER_WAKES
+    ) {
+      return {
+        code: "refused",
+        reason:
+          "Target reached its consecutive peer-wake limit and needs user or parent attention.",
       };
     }
 

@@ -12,6 +12,7 @@ import { convertToModelMessages, type AssistantModelMessage, type ModelMessage }
 import { applyToolOutputRedaction } from "@/browser/utils/messages/applyToolOutputRedaction";
 import { sanitizeToolInputs } from "@/browser/utils/messages/sanitizeToolInput";
 import { inlineSvgAsTextForProvider } from "@/node/utils/messages/inlineSvgAsTextForProvider";
+import { neutralizeAgentEnvelopeLookalikesForProvider } from "@/node/utils/messages/neutralizeAgentEnvelopeLookalikesForProvider";
 import { extractToolMediaAsUserMessages } from "@/node/utils/messages/extractToolMediaAsUserMessages";
 import { sanitizeAnthropicPdfFilenames } from "@/node/utils/messages/sanitizeAnthropicDocumentFilename";
 import { convertDataUriFilePartsForSdk } from "@/node/utils/messages/convertDataUriFilePartsForSdk";
@@ -72,14 +73,15 @@ export interface PrepareMessagesOptions {
  * 3. Redacting heavy tool outputs
  * 4. Sanitizing tool inputs
  * 5. Inlining SVG attachments as text
- * 6. Sanitizing PDF filenames for Anthropic
- * 7. Extracting tool-result media as user message attachments
- * 8. Rewriting data-URI file parts to SDK-safe inline base64
- * 9. Converting to Vercel AI SDK ModelMessage format
- * 10. Self-healing: filtering empty/whitespace assistant messages
- * 11. Applying provider-specific message transforms
- * 12. Applying cache control headers
- * 13. Validating Anthropic compliance (logs warnings only)
+ * 6. Neutralizing user-typed <mux_agent_message> lookalikes (peer-envelope provenance)
+ * 7. Sanitizing PDF filenames for Anthropic
+ * 8. Extracting tool-result media as user message attachments
+ * 9. Rewriting data-URI file parts to SDK-safe inline base64
+ * 10. Converting to Vercel AI SDK ModelMessage format
+ * 11. Self-healing: filtering empty/whitespace assistant messages
+ * 12. Applying provider-specific message transforms
+ * 13. Applying cache control headers
+ * 14. Validating Anthropic compliance (logs warnings only)
  *
  * Log purity: this pipeline never reads live workspace state (disk, file
  * trackers). File-change notifications and @file mention snapshots are
@@ -138,12 +140,17 @@ export async function prepareMessagesForProvider(
   // Request-only — does not mutate persisted history.
   const messagesWithInlinedSvg = inlineSvgAsTextForProvider(sanitizedMessages);
 
+  // Rewrite user-typed <mux_agent_message> lookalikes so only server-authored peer envelopes
+  // reach the provider with the exact wrapper (pasted envelopes keep user authority).
+  const messagesWithNeutralizedEnvelopes =
+    neutralizeAgentEnvelopeLookalikesForProvider(messagesWithInlinedSvg);
+
   // Sanitize PDF filenames for Anthropic (request-only, preserves original in UI/history).
   // Anthropic rejects document names containing periods, underscores, etc.
   const messagesWithSanitizedPdf =
     providerForMessages === "anthropic"
-      ? sanitizeAnthropicPdfFilenames(messagesWithInlinedSvg)
-      : messagesWithInlinedSvg;
+      ? sanitizeAnthropicPdfFilenames(messagesWithNeutralizedEnvelopes)
+      : messagesWithNeutralizedEnvelopes;
 
   // Rewrite supported tool-result attachments to small text placeholders + file parts.
   // Prevents providers from treating large base64 payloads as text/JSON context.

@@ -41,6 +41,21 @@ export function formatAgentMessageEnvelope(envelope: AgentMessageEnvelope): stri
   return `${ROOT_OPEN}\n${json}\n${ROOT_CLOSE}`;
 }
 
+/**
+ * Anti-spoof provenance for the model request: user-typed text is the only way a non-server
+ * author can place the exact envelope tags into a user-role message, so request building rewrites
+ * lookalike tags in rows that were NOT authored by the peer-message send path. The exact wrapper a
+ * provider sees is therefore server provenance, and a pasted envelope keeps user authority instead
+ * of being reclassified as untrusted peer input. Renamed rather than stripped so the model still
+ * sees what the user pasted.
+ */
+export function neutralizeAgentEnvelopeLookalikes(text: string): string {
+  if (!text.includes("mux_agent_message")) return text;
+  return text
+    .replaceAll(ROOT_OPEN, "<user_pasted_mux_agent_message>")
+    .replaceAll(ROOT_CLOSE, "</user_pasted_mux_agent_message>");
+}
+
 export function parseAgentMessageEnvelope(content: string): AgentMessageEnvelope | null {
   const root = /^<mux_agent_message>\n([\s\S]*)\n<\/mux_agent_message>$/.exec(content);
   if (!root) return null;

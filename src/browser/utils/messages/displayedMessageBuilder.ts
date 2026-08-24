@@ -223,6 +223,28 @@ function getValidBashMonitorWakeRecords(
   return records.every(isValidRecord) ? records : undefined;
 }
 
+/**
+ * Same self-healing contract as getValidBashMonitorWakeRecords: peer metadata is persisted
+ * black-box data, so a corrupted row (e.g. object-valued fromTitle rendered as a React child)
+ * must fall back to normal user-message rendering instead of bricking the transcript.
+ */
+function getValidAgentPeerMessage(
+  muxMeta: MuxMessageMetadata | undefined
+): NonNullable<Extract<DisplayedMessage, { type: "user" }>["agentPeerMessage"]> | undefined {
+  if (muxMeta?.type !== "agent-peer-message") return undefined;
+  const fromWorkspaceId: unknown = muxMeta.fromWorkspaceId;
+  const fromTitle: unknown = muxMeta.fromTitle;
+  const relationship: unknown = muxMeta.relationship;
+  if (typeof fromWorkspaceId !== "string" || fromWorkspaceId.length === 0) return undefined;
+  if (relationship !== "sibling" && relationship !== "descendant") return undefined;
+  if (fromTitle != null && typeof fromTitle !== "string") return undefined;
+  return {
+    fromWorkspaceId,
+    ...(typeof fromTitle === "string" ? { fromTitle } : {}),
+    relationship,
+  };
+}
+
 function getRawCommand(muxMetadata: unknown): string | undefined {
   if (!isPlainObject(muxMetadata) || typeof muxMetadata.type !== "string") {
     return undefined;
@@ -329,14 +351,7 @@ function buildUserDisplayedMessages(options: {
       bashMonitorWake: bashMonitorWakeRecords ? { records: bashMonitorWakeRecords } : undefined,
       // Backend-attached metadata (never typed by a user) gates the peer-message presentation,
       // so a user-typed lookalike envelope still renders as an ordinary escaped user message.
-      agentPeerMessage:
-        muxMeta?.type === "agent-peer-message"
-          ? {
-              fromWorkspaceId: muxMeta.fromWorkspaceId,
-              ...(muxMeta.fromTitle != null ? { fromTitle: muxMeta.fromTitle } : {}),
-              relationship: muxMeta.relationship,
-            }
-          : undefined,
+      agentPeerMessage: getValidAgentPeerMessage(muxMeta),
     },
   ];
 }
