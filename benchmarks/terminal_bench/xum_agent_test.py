@@ -174,6 +174,18 @@ def test_canonical_environment_wins_over_legacy_alias(
     assert env["XUM_MODEL"] == "anthropic:claude-sonnet-4-5"
 
 
+def test_empty_canonical_repo_root_clears_legacy_alias(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    stale_legacy_root = tmp_path / "missing-legacy-checkout"
+    monkeypatch.setenv("XUM_AGENT_REPO_ROOT", "")
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(stale_legacy_root))
+
+    agent = XumAgent(logs_dir=tmp_path / "logs")
+
+    assert agent._repo_root == _repo_root()
+
+
 def test_empty_canonical_environment_clears_legacy_alias(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

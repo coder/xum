@@ -114,8 +114,9 @@ class XumAgent(BaseInstalledAgent):
             if self._timeout_sec is not None
             else None
         )
-        repo_root_env = os.environ.get("XUM_AGENT_REPO_ROOT") or os.environ.get(
-            "MUX_AGENT_REPO_ROOT"
+        repo_root_env = self._environment_alias_value(
+            "XUM_AGENT_REPO_ROOT",
+            "MUX_AGENT_REPO_ROOT",
         )
         repo_root = (
             Path(repo_root_env).resolve()
