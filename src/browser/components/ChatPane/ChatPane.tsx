@@ -995,7 +995,12 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
   const handleCancelEdit = useCallback(() => {
     setEditingMessage(undefined);
-  }, [setEditingMessage]);
+    // handleEditLastUserMessage disabled auto-scroll to keep the view centered
+    // on the edited message. Dismissing the edit hands scroll ownership back to
+    // the transcript tail; without this the view stays scrolled up until the
+    // user manually returns to the bottom.
+    jumpToBottom();
+  }, [jumpToBottom, setEditingMessage]);
 
   const handleMessageSendStarted = useCallback(() => {
     // Re-arm and pin before the send request crosses the IPC boundary. Waiting for
