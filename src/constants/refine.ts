@@ -32,11 +32,8 @@ export const REFINE_SUMMARY_LABEL = "Refine pass applied durable lessons:";
  */
 export const REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS = 10_000;
 
-/**
- * Session-dir lockfile serializing refine staging/apply with context-
- * discarding history mutations (reset, clear, destructive replace) across
- * processes. One shared spelling (r57): WorkspaceService and both refine
- * paths must hold the SAME file or the publish-after-reset and double-apply
- * races these locks close would silently reopen.
- */
-export const REFINE_APPLY_LOCK_FILENAME = "refine-apply.lock";
+// The shared refine serialization lockfile path is built by
+// refineApplyLockPath (workspaceRemoval.ts): one derivation for
+// WorkspaceService, removal, and both refine paths (r57), placed OUTSIDE the
+// session directory (r66) because acquiring an in-session lockfile after
+// removal recreated the deleted directory via the lock's own mkdir.

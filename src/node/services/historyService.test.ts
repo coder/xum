@@ -413,6 +413,28 @@ describe("HistoryService", () => {
       expect(messages.map((m) => m.id)).toEqual(["msg1", "payload-1", "trigger-1"]);
     });
 
+    it("refuses partial writes for a removed workspace without recreating its session dir (r66)", async () => {
+      // A foreign backend's active stream keeps flushing partials after the
+      // remover's process-local cancellation; the flush's ensurePrivateDir
+      // must not resurrect the deleted session directory.
+      const workspaceId = "removed-partial-workspace";
+      const tombstonePath = workspaceRemovalTombstonePath(config.rootDir, workspaceId);
+      await fs.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await fs.writeFile(tombstonePath, JSON.stringify({ workspaceId, removedAt: Date.now() }));
+
+      const result = await service.writePartial(
+        workspaceId,
+        createMuxMessage("late-partial", "assistant", "must not land")
+      );
+      expect(result.success).toBe(false);
+      if (!result.success) expect(result.error).toContain("was removed");
+      const sessionDirExists = await fs.stat(config.getSessionDir(workspaceId)).then(
+        () => true,
+        () => false
+      );
+      expect(sessionDirExists).toBe(false);
+    });
+
     it("read-path truncation recovery waits on the cross-process lock (r64)", async () => {
       const workspaceId = "workspace1";
       const seeded = await service.appendToHistory(

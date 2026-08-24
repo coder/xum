@@ -38,14 +38,12 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import {
   REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS,
-  REFINE_APPLY_LOCK_FILENAME,
   REFINE_MAX_MESSAGES,
   REFINE_OP_BUDGET,
   REFINE_SUMMARY_LABEL,
   REFINE_TIMELINE_EVENT_LIMIT,
   REFINE_TIMEOUT_MS,
 } from "@/constants/refine";
-import * as path from "node:path";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { Config } from "@/node/config";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
@@ -60,6 +58,10 @@ import {
   sliceMessagesForProviderFromLatestContextBoundary,
 } from "@/common/utils/messages/compactionBoundary";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import {
+  isWorkspaceRemovalTombstoned,
+  refineApplyLockPath,
+} from "@/node/services/workspaceRemoval";
 import type { HistoryService } from "@/node/services/historyService";
 import { runLanguageModelCleanup } from "@/node/services/languageModelCleanup";
 import { trackPendingUsageWrite } from "@/node/services/branchSummary";
@@ -447,7 +449,12 @@ export class RefineService {
     let applyLock: Awaited<ReturnType<typeof acquireProcessFileLock>>;
     try {
       applyLock = await acquireProcessFileLock({
-        lockPath: path.join(sessionDir, REFINE_APPLY_LOCK_FILENAME),
+        // r66: session-dir-external (see refineApplyLockPath) — removal holds
+        // this same lock across its tombstone+delete critical section, so an
+        // in-flight apply completes before the deletion and a late one
+        // refuses on the tombstone gate below instead of recreating the
+        // directory through its progress writes.
+        lockPath: refineApplyLockPath(this.config.rootDir, workspaceId),
         timeoutMs: this.options.applyLockTimeoutMs ?? REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS,
         label: "refine apply lock",
       });
@@ -457,6 +464,13 @@ export class RefineService {
       );
     }
     await using _applyLock = applyLock;
+    // Removal gate (r66), checked IN-LOCK: a removal that completed while we
+    // waited (or before we started) left a durable tombstone; applying now
+    // would journal edits and rewrite staged progress into a recreated
+    // session directory.
+    if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+      return Err(`workspace ${workspaceId} was removed; refusing to apply staged refine edits`);
+    }
     const staged = await loadStagedRefineSet(sessionDir);
     if (staged === null) {
       return Err("no staged refine edits (run /refine first)");
@@ -1098,7 +1112,8 @@ export class RefineService {
       let stagingLock: Awaited<ReturnType<typeof acquireProcessFileLock>>;
       try {
         stagingLock = await acquireProcessFileLock({
-          lockPath: path.join(sessionDir, REFINE_APPLY_LOCK_FILENAME),
+          // r66: session-dir-external (see refineApplyLockPath).
+          lockPath: refineApplyLockPath(this.config.rootDir, workspaceId),
           timeoutMs: this.options.applyLockTimeoutMs ?? REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS,
           label: "refine staging lock",
         });
@@ -1109,6 +1124,13 @@ export class RefineService {
         );
       }
       await using _stagingLock = stagingLock;
+      // Removal gate (r66), checked IN-LOCK: publication writes
+      // refine-staged.json (mkdir sessionDir) before the proposal row's own
+      // gated append could refuse — a removal that landed during generation
+      // must refuse the whole publication, not resurrect the directory.
+      if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+        return Err(`workspace ${workspaceId} was removed; refusing to publish the refine proposal`);
+      }
 
       // r40: block turn admission across the recheck + staged-set
       // replacement + proposal append, failing closed when a turn is already

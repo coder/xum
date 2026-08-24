@@ -109,9 +109,10 @@ import {
 import {
   healRemovalTombstonesForRegisteredWorkspaces,
   removeSessionDirUnderMemoryLocks,
+  refineApplyLockPath,
+  rollbackRemovalTombstoneIfOwned,
   startRemovalTombstoneLease,
   TombstoneNotDurableError,
-  workspaceRemovalTombstonePath,
 } from "@/node/services/workspaceRemoval";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
@@ -277,10 +278,7 @@ import type {
 import { BashMonitorRegistryStore } from "@/node/services/bashMonitorRegistryStore";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
-import {
-  REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS,
-  REFINE_APPLY_LOCK_FILENAME,
-} from "@/constants/refine";
+import { REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS } from "@/constants/refine";
 import {
   BashMonitorWakeStore,
   buildBashMonitorWakeMetadata,
@@ -3139,7 +3137,10 @@ export class WorkspaceService extends EventEmitter {
     try {
       return Ok(
         await acquireProcessFileLock({
-          lockPath: path.join(this.config.getSessionDir(workspaceId), REFINE_APPLY_LOCK_FILENAME),
+          // r66: session-dir-external (see refineApplyLockPath) — acquiring
+          // the old in-session lockfile after removal recreated the deleted
+          // directory via the lock's own mkdir.
+          lockPath: refineApplyLockPath(this.config.rootDir, workspaceId),
           timeoutMs: REFINE_APPLY_CROSS_PROCESS_LOCK_TIMEOUT_MS,
           label: `refine serialization lock (${operation})`,
         })
@@ -5927,9 +5928,12 @@ export class WorkspaceService extends EventEmitter {
       }
 
       // Remove session data
+      const sessionDir = this.config.getSessionDir(workspaceId);
+      // r66: identifies THIS removal attempt in the durable tombstone so the
+      // compensating rollback below cannot delete a concurrent backend
+      // attempt's marker.
+      const removalAttemptId = crypto.randomUUID();
       try {
-        const sessionDir = this.config.getSessionDir(workspaceId);
-
         if (parentWorkspaceId) {
           try {
             const parentSessionDir = this.config.getSessionDir(parentWorkspaceId);
@@ -5962,6 +5966,7 @@ export class WorkspaceService extends EventEmitter {
           rootDir: this.config.rootDir,
           sessionDir,
           workspaceId,
+          attemptId: removalAttemptId,
         });
       } catch (error) {
         // r63: without a durable tombstone the retained orphan stays
@@ -6014,21 +6019,30 @@ export class WorkspaceService extends EventEmitter {
         // Un-tombstone so the surviving workspace stays usable (its missing
         // session state self-heals on demand) and removal can be retried.
         // In-process consolidation stays cancelled until restart, matching
-        // the drained-producers tradeoff documented above.
-        await fsPromises
-          .rm(workspaceRemovalTombstonePath(this.config.rootDir, workspaceId), { force: true })
-          .catch((rollbackError: unknown) => {
-            // r63: a failed rollback must not be silent — the workspace
-            // would stay registered but refused every mutation across
-            // restarts. The startup self-heal
-            // (healRemovalTombstonesForRegisteredWorkspaces) reclaims this
-            // exact residue once the tombstone ages past its guard window.
-            log.error(
-              "Failed to roll back the removal tombstone after config deregistration failed; " +
-                "the startup self-heal will reclaim it",
-              { workspaceId, rollbackError }
-            );
+        // the drained-producers tradeoff documented above. Ownership-checked
+        // (r66): only delete the marker while it still carries THIS
+        // attempt's ID and the workspace is still registered — a concurrent
+        // backend's removal may have republished or completed with it.
+        try {
+          await rollbackRemovalTombstoneIfOwned({
+            rootDir: this.config.rootDir,
+            sessionDir,
+            workspaceId,
+            attemptId: removalAttemptId,
+            workspaceStillRegistered: () => this.config.findWorkspace(workspaceId) != null,
           });
+        } catch (rollbackError) {
+          // r63: a failed rollback must not be silent — the workspace
+          // would stay registered but refused every mutation across
+          // restarts. The startup self-heal
+          // (healRemovalTombstonesForRegisteredWorkspaces) reclaims this
+          // exact residue once the tombstone ages past its guard window.
+          log.error(
+            "Failed to roll back the removal tombstone after config deregistration failed; " +
+              "the startup self-heal will reclaim it",
+            { workspaceId, rollbackError }
+          );
+        }
         throw error;
       }
       removedFromConfig = true;

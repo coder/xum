@@ -1609,22 +1609,34 @@ export class HistoryService {
   async writePartial(workspaceId: string, message: MuxMessage): Promise<Result<void>> {
     return this.fileLocks.withLock(workspaceId, async () => {
       try {
-        const workspaceDir = this.config.getSessionDir(workspaceId);
-        await ensurePrivateDir(workspaceDir);
-        const partialPath = this.getPartialPath(workspaceId);
+        // r66: partial flushes ride the cross-process history lock with an
+        // in-lock removal-tombstone gate — a foreign backend's active stream
+        // survives the remover's process-local cancellation, and its next
+        // delta's ensurePrivateDir would otherwise recreate the deleted
+        // session directory (removal holds this same lock across its
+        // tombstone+delete critical section). Truncation recovery is skipped:
+        // partial.json is not part of the archive/chat transaction.
+        return await this.withHistoryWriteFileLock(workspaceId, async () => {
+          if (await isWorkspaceRemovalTombstoned(this.config.rootDir, workspaceId)) {
+            return Err(`workspace ${workspaceId} was removed; refusing partial write`);
+          }
+          const workspaceDir = this.config.getSessionDir(workspaceId);
+          await ensurePrivateDir(workspaceDir);
+          const partialPath = this.getPartialPath(workspaceId);
 
-        const partialMessage: MuxMessage = {
-          ...message,
-          metadata: {
-            ...message.metadata,
-            partial: true,
-          },
-        };
+          const partialMessage: MuxMessage = {
+            ...message,
+            metadata: {
+              ...message.metadata,
+              partial: true,
+            },
+          };
 
-        // Atomic write: writes to temp file then renames, preventing corruption
-        // if app crashes mid-write (prevents "Unexpected end of JSON input" on read)
-        await writeFileAtomic(partialPath, JSON.stringify(partialMessage, null, 2));
-        return Ok(undefined);
+          // Atomic write: writes to temp file then renames, preventing corruption
+          // if app crashes mid-write (prevents "Unexpected end of JSON input" on read)
+          await writeFileAtomic(partialPath, JSON.stringify(partialMessage, null, 2));
+          return Ok(undefined);
+        });
       } catch (error) {
         const errorMessage = getErrorMessage(error);
         return Err(`Failed to write partial: ${errorMessage}`);

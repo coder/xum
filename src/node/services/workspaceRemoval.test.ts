@@ -14,6 +14,7 @@ import {
   isWorkspaceRemovalTombstoned,
   REMOVAL_TOMBSTONE_HEAL_MIN_AGE_MS,
   removeSessionDirUnderMemoryLocks,
+  rollbackRemovalTombstoneIfOwned,
   TombstoneNotDurableError,
   workspaceRemovalTombstonePath,
 } from "./workspaceRemoval";
@@ -45,7 +46,12 @@ describe("workspaceRemoval", () => {
     await entered;
 
     // Removal must serialize behind the writer, not delete under it.
-    const removal = removeSessionDirUnderMemoryLocks({ rootDir, sessionDir, workspaceId });
+    const removal = removeSessionDirUnderMemoryLocks({
+      rootDir,
+      sessionDir,
+      workspaceId,
+      attemptId: "test-attempt",
+    });
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(
       await fsPromises.access(sessionDir).then(
@@ -98,7 +104,12 @@ describe("workspaceRemoval", () => {
     await fsPromises.writeFile(lockPath, token, { flag: "wx" });
 
     try {
-      await removeSessionDirUnderMemoryLocks({ rootDir, sessionDir, workspaceId });
+      await removeSessionDirUnderMemoryLocks({
+        rootDir,
+        sessionDir,
+        workspaceId,
+        attemptId: "test-attempt",
+      });
       expect.unreachable("removal must fail closed while the target lock is held");
     } catch (error) {
       expect(String(error)).toContain("Another process is mutating");
@@ -127,7 +138,12 @@ describe("workspaceRemoval", () => {
     await fsPromises.writeFile(path.join(rootDir, "locks"), "not a directory");
 
     try {
-      await removeSessionDirUnderMemoryLocks({ rootDir, sessionDir, workspaceId });
+      await removeSessionDirUnderMemoryLocks({
+        rootDir,
+        sessionDir,
+        workspaceId,
+        attemptId: "test-attempt",
+      });
       expect.unreachable("removal must abort when the tombstone cannot be published");
     } catch (error) {
       expect(error).toBeInstanceOf(TombstoneNotDurableError);
@@ -139,6 +155,62 @@ describe("workspaceRemoval", () => {
       )
     ).toBe(true);
   }, 15_000);
+
+  test("rollback deletes the tombstone only for the owning, still-registered attempt (r66)", async () => {
+    using tmp = new DisposableTempDir("workspace-removal-test");
+    const rootDir = path.join(tmp.path, "xum-home");
+    const sessionDir = path.join(tmp.path, "sessions", "ws-rollback");
+    const workspaceId = "ws-rollback";
+    const write = async (attemptId: string) => {
+      const p = workspaceRemovalTombstonePath(rootDir, workspaceId);
+      await fsPromises.mkdir(path.dirname(p), { recursive: true });
+      await fsPromises.writeFile(
+        p,
+        JSON.stringify({ workspaceId, removedAt: Date.now(), attemptId })
+      );
+    };
+
+    // Foreign attempt's marker: a concurrent backend republished (or its
+    // completed removal relies on it) — never delete it.
+    await write("attempt-foreign");
+    expect(
+      await rollbackRemovalTombstoneIfOwned({
+        rootDir,
+        sessionDir,
+        workspaceId,
+        attemptId: "attempt-ours",
+        workspaceStillRegistered: () => true,
+      })
+    ).toBe(false);
+    expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(true);
+
+    // Own marker but the workspace is no longer registered: another
+    // backend's removal completed — the marker is its terminal state.
+    await write("attempt-ours");
+    expect(
+      await rollbackRemovalTombstoneIfOwned({
+        rootDir,
+        sessionDir,
+        workspaceId,
+        attemptId: "attempt-ours",
+        workspaceStillRegistered: () => false,
+      })
+    ).toBe(false);
+    expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(true);
+
+    // Own marker, workspace still registered: the failed attempt restores
+    // usability by deleting its own tombstone.
+    expect(
+      await rollbackRemovalTombstoneIfOwned({
+        rootDir,
+        sessionDir,
+        workspaceId,
+        attemptId: "attempt-ours",
+        workspaceStillRegistered: () => true,
+      })
+    ).toBe(true);
+    expect(await isWorkspaceRemovalTombstoned(rootDir, workspaceId)).toBe(false);
+  });
 
   test("startup heal reclaims old tombstones only for still-registered workspaces (r63)", async () => {
     using tmp = new DisposableTempDir("workspace-removal-test");

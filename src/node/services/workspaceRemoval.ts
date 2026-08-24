@@ -85,6 +85,24 @@ export function workspaceRemovalTombstonePath(rootDir: string, workspaceId: stri
 }
 
 /**
+ * Cross-process refine serialization lock path (r66) — OUTSIDE the session
+ * directory, for the same reason as historyWriteLockPath (r63): the lock
+ * used to live at `<sessionDir>/refine-apply.lock`, and acquireProcessFileLock
+ * mkdirs the lock's parent — so a foreign backend's /refine (or a
+ * context-discard serialization) landing after removal would RECREATE the
+ * deleted session directory just by acquiring the lock. External placement
+ * lets removal hold this same lock across its tombstone+delete critical
+ * section, serializing with a foreign apply's staged-set/progress writes.
+ * (Same mixed-version rolling-upgrade caveat as the history lock; the
+ * multi-instance mode this protects is an experimental env flag.)
+ */
+export function refineApplyLockPath(rootDir: string, workspaceId: string): string {
+  assert(workspaceId.length > 0, "refineApplyLockPath requires a workspace id");
+  const digest = crypto.createHash("sha256").update(workspaceId).digest("hex").slice(0, 32);
+  return path.join(rootDir, "locks", `refine-apply-${digest}.lock`);
+}
+
+/**
  * True when a durable removal tombstone exists for this workspace. This is
  * the authoritative pre-commit gate for memory/usage writers, so it FAILS
  * CLOSED (r62): only a provable ENOENT means "not removed" — any other
@@ -115,6 +133,15 @@ export async function removeSessionDirUnderMemoryLocks(args: {
   rootDir: string;
   sessionDir: string;
   workspaceId: string;
+  /**
+   * Unique ID of THIS removal attempt, stamped into the tombstone (r66).
+   * The caller's compensating rollback deletes the marker only while it
+   * still carries this attempt's ID (see rollbackRemovalTombstoneIfOwned):
+   * with two backends removing the same workspace concurrently, an
+   * unconditional rollback rm would delete the marker the OTHER (possibly
+   * succeeding or still-active) attempt relies on.
+   */
+  attemptId: string;
 }): Promise<void> {
   assert(args.sessionDir.length > 0, "removeSessionDirUnderMemoryLocks requires a session dir");
   // Crash clearly on a malformed config (test stubs, future refactors): an
@@ -136,12 +163,17 @@ export async function removeSessionDirUnderMemoryLocks(args: {
   // sidecar writers (headless usage) serialize their tombstone check +
   // commit against this same key, closing their check→write window.
   const sessionDirKey = path.resolve(args.sessionDir);
+  assert(args.attemptId.length > 0, "removeSessionDirUnderMemoryLocks requires an attemptId");
   const publishTombstone = async (): Promise<void> => {
     const tombstonePath = workspaceRemovalTombstonePath(args.rootDir, args.workspaceId);
     await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
     await writeFileAtomic(
       tombstonePath,
-      JSON.stringify({ workspaceId: args.workspaceId, removedAt: Date.now() })
+      JSON.stringify({
+        workspaceId: args.workspaceId,
+        removedAt: Date.now(),
+        attemptId: args.attemptId,
+      })
     );
   };
   try {
@@ -158,6 +190,20 @@ export async function removeSessionDirUnderMemoryLocks(args: {
           lockPath: historyWriteLockPath(args.rootDir, args.workspaceId),
           timeoutMs: 10_000,
           label: "history write lock (removal)",
+        });
+        // Refine serialization (r66): a /refine apply in ANOTHER backend is
+        // untouched by the remover's process-local cancellation and holds
+        // this same (session-dir-external) lock across its staged-set loads,
+        // per-edit progress rewrites, and skill/journal commits. Acquiring
+        // it here means an in-flight apply completes before the deletion
+        // below, and one starting afterwards refuses on the in-lock
+        // tombstone gate in RefineService. Fail-closed like the other locks:
+        // a long apply blocks removal into the orphan path rather than
+        // having the directory deleted out from under its writes.
+        await using _refineLock = await acquireProcessFileLock({
+          lockPath: refineApplyLockPath(args.rootDir, args.workspaceId),
+          timeoutMs: 10_000,
+          label: "refine serialization lock (removal)",
         });
         // Tombstone BEFORE rm: once the locks release, any waiting writer
         // re-checks it pre-commit (inside its own lock) and refuses, so the
@@ -186,6 +232,59 @@ export async function removeSessionDirUnderMemoryLocks(args: {
     }
     throw error;
   }
+}
+
+/**
+ * Compensating tombstone rollback for a removal whose config deregistration
+ * failed (r66). Deletes the marker ONLY while it still records this
+ * attempt's ID and the workspace is still registered: with
+ * XUM_ALLOW_MULTIPLE_INSTANCES=1 two backends can remove the same workspace
+ * concurrently (removingWorkspaces is process-local), and an unconditional
+ * rm here would delete the marker a CONCURRENT attempt republished (its
+ * removal may be mid-flight or already deregistered) — leaving a completed
+ * removal without its durable gate, so late foreign writers could recreate
+ * the deleted session directory. Runs under the sessionDir target mutation
+ * lock so the read→verify→delete cannot interleave with a concurrent
+ * attempt's locked republication. Fails closed: an unreadable or foreign
+ * marker is retained (the age-gated startup self-heal reclaims true
+ * residue). Returns true when the marker was deleted.
+ */
+export async function rollbackRemovalTombstoneIfOwned(args: {
+  rootDir: string;
+  sessionDir: string;
+  workspaceId: string;
+  attemptId: string;
+  workspaceStillRegistered: () => boolean;
+}): Promise<boolean> {
+  const tombstonePath = workspaceRemovalTombstonePath(args.rootDir, args.workspaceId);
+  return await withTargetMutationLocks(args.rootDir, [path.resolve(args.sessionDir)], async () => {
+    let parsed: { attemptId?: unknown };
+    try {
+      parsed = JSON.parse(await fsPromises.readFile(tombstonePath, "utf-8")) as {
+        attemptId?: unknown;
+      };
+    } catch (error) {
+      // Missing marker: nothing to roll back. Unreadable: keep it.
+      if (!hasErrorCode(error, "ENOENT")) {
+        log.warn("Removal tombstone unreadable during rollback; retaining it", {
+          workspaceId: args.workspaceId,
+        });
+      }
+      return false;
+    }
+    if (parsed.attemptId !== args.attemptId) {
+      return false;
+    }
+    // A concurrent attempt that already DEREGISTERED the workspace relies
+    // on this marker as its terminal state even if it never republished
+    // (it may have reused our marker's window); only restore usability
+    // when the workspace is provably still registered.
+    if (!args.workspaceStillRegistered()) {
+      return false;
+    }
+    await fsPromises.rm(tombstonePath, { force: true });
+    return true;
+  });
 }
 
 /**

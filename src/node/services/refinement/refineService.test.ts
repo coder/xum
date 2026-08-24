@@ -3,6 +3,10 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import {
+  refineApplyLockPath,
+  workspaceRemovalTombstonePath,
+} from "@/node/services/workspaceRemoval";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 
@@ -381,7 +385,7 @@ describe("RefineService", () => {
     await fixture.seedTrajectory();
     await fsPromises.mkdir(fixture.sessionDir, { recursive: true });
     const foreignLock = await acquireProcessFileLock({
-      lockPath: path.join(fixture.sessionDir, "refine-apply.lock"),
+      lockPath: refineApplyLockPath(fixture.config.rootDir, WORKSPACE_ID),
       timeoutMs: 1_000,
       label: "test foreign apply lock",
     });
@@ -423,7 +427,7 @@ describe("RefineService", () => {
     await fixture.seedTrajectory();
     await fsPromises.mkdir(fixture.sessionDir, { recursive: true });
     const foreignLock = await acquireProcessFileLock({
-      lockPath: path.join(fixture.sessionDir, "refine-apply.lock"),
+      lockPath: refineApplyLockPath(fixture.config.rootDir, WORKSPACE_ID),
       timeoutMs: 1_000,
       label: "test foreign apply lock",
     });
@@ -1726,6 +1730,26 @@ describe("RefineService", () => {
     const inserted = await fixture.memoryService.view(ctx, LESSON_PATH, {});
     expect(inserted.success).toBe(true);
     if (inserted.success) expect(inserted.output).toContain("inserted after line one");
+  });
+
+  it("refuses to apply for a removal-tombstoned workspace (r66)", async () => {
+    // A removal that completed before (or while) this apply waited on the
+    // cross-process lock left a durable tombstone; applying would journal
+    // edits and rewrite staged progress into a recreated session directory.
+    using fixture = await createFixture();
+    await fixture.seedTrajectory();
+    expect((await fixture.service.run(WORKSPACE_ID)).success).toBe(true);
+
+    const tombstonePath = workspaceRemovalTombstonePath(fixture.config.rootDir, WORKSPACE_ID);
+    await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+    await fsPromises.writeFile(
+      tombstonePath,
+      JSON.stringify({ workspaceId: WORKSPACE_ID, removedAt: Date.now() })
+    );
+
+    const result = await fixture.applyShown();
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("was removed");
   });
 
   it("refuses to apply a proposal this window never displayed (r64)", async () => {
