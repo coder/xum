@@ -753,6 +753,10 @@ export async function getToolsForModel(
 ): Promise<Record<string, Tool>> {
   const capabilityModelString = config.capabilityModelString ?? modelString;
   const [provider, modelId] = modelString.split(":");
+  // Provider-native tool availability keys on the RESOLVED capability
+  // identity so mappedToModel aliases inherit their base model's native
+  // tools (web_search/web_fetch); the raw alias id says nothing about them.
+  const capabilityModelId = capabilityModelString.split(":")[1] ?? modelId;
 
   // Helper to reduce repetition when wrapping runtime tools
   const wrap = <TParameters, TResult>(tool: Tool<TParameters, TResult>) =>
@@ -886,7 +890,7 @@ export async function getToolsForModel(
         // - Not bridgeable in the PTC sandbox (no execute()); see BridgeableToolName comment.
         // - Tool hooks (.xum/tool_pre/.xum/tool_post) are skipped because withHooks() returns
         //   early when execute() is absent — same limitation as web_search (provider-native).
-        if (supportsAnthropicNativeWebFetch(modelId)) {
+        if (supportsAnthropicNativeWebFetch(capabilityModelId)) {
           allTools = {
             ...baseTools,
             ...(mcpTools ?? {}),
@@ -914,7 +918,10 @@ export async function getToolsForModel(
         const useResponsesTools = config.openaiWireFormat !== "chatCompletions";
 
         // Only add web search for models that support it
-        if (useResponsesTools && (modelId.includes("gpt-5") || modelId.includes("gpt-4"))) {
+        if (
+          useResponsesTools &&
+          (capabilityModelId.includes("gpt-5") || capabilityModelId.includes("gpt-4"))
+        ) {
           const { openai } = await import("@ai-sdk/openai");
           allTools = {
             ...baseTools,
