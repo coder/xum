@@ -51,7 +51,7 @@ function isUrlLike(input: string): boolean {
 }
 
 /**
- * Plugin sources are persisted verbatim in ~/.mux/plugins.json and rendered
+ * Plugin sources are persisted verbatim in ~/.xum/plugins.json and rendered
  * in Settings/consent previews, so a credential-bearing URL (userinfo or
  * known token query parameters) would land on disk and on screen. Reject it
  * up front — git credential helpers are the supported path for private
@@ -126,7 +126,7 @@ export function parseAgentPluginSourceInput(rawInput: string): ParsedAgentPlugin
   const segments = pathPart.split("/");
   if (segments.length < 2 || segments.some((segment) => segment.length === 0)) {
     throw new Error(
-      `'${input}' is not a git URL or owner/repo shorthand. Examples: coder/mux, coder/mux@main, https://github.com/coder/mux.git`
+      `'${input}' is not a git URL or owner/repo shorthand. Examples: coder/xum, coder/xum@main, https://github.com/coder/xum.git`
     );
   }
 

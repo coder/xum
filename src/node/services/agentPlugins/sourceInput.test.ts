@@ -124,7 +124,9 @@ describe("parseAgentPluginSourceInput", () => {
 
   test("rejects unusable inputs with actionable messages", () => {
     expect(() => parseAgentPluginSourceInput("")).toThrow(/git URL or owner\/repo/);
-    expect(() => parseAgentPluginSourceInput("just-a-name")).toThrow(/not a git URL/);
+    expect(() => parseAgentPluginSourceInput("just-a-name")).toThrow(
+      /not a git URL.*Examples: coder\/xum/
+    );
     expect(() => parseAgentPluginSourceInput("./relative/path")).toThrow(/relative path/);
     expect(() => parseAgentPluginSourceInput("coder/mux@")).toThrow(/must not be empty/);
     expect(() => parseAgentPluginSourceInput("-bad/owner")).toThrow(/not a valid owner\/repo/);

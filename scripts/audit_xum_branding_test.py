@@ -13,11 +13,15 @@ class AuditXumBrandingTest(unittest.TestCase):
             root = Path(temp_dir)
             (root / "Makefile").write_text("# Mux build instructions\n")
             stale_path = root / "benchmarks/terminal_bench/mux_new_adapter.py"
-            stale_path.parent.mkdir(parents=True)
+            stale_path.parent.mkdir(parents=True, exist_ok=True)
             stale_path.write_text("class Adapter:\n    pass\n")
 
+            stale_source_input = root / "src/node/services/agentPlugins/sourceInput.ts"
+            stale_source_input.parent.mkdir(parents=True, exist_ok=True)
+            stale_source_input.write_text('throw new Error("Example: coder/mux")\n')
+
             stale_plugin_service = root / "src/node/services/agentPlugins/installService.ts"
-            stale_plugin_service.parent.mkdir(parents=True)
+            stale_plugin_service.parent.mkdir(parents=True, exist_ok=True)
             stale_plugin_service.write_text('throw new Error("Another Mux process is modifying plugins")\n')
 
             violations = audit_paths(
@@ -26,6 +30,7 @@ class AuditXumBrandingTest(unittest.TestCase):
                     "Makefile",
                     "benchmarks/terminal_bench/mux_new_adapter.py",
                     "src/node/services/agentPlugins/installService.ts",
+                    "src/node/services/agentPlugins/sourceInput.ts",
                 ],
             )
 
@@ -35,6 +40,7 @@ class AuditXumBrandingTest(unittest.TestCase):
                     ("Makefile", 1),
                     ("benchmarks/terminal_bench/mux_new_adapter.py", 0),
                     ("src/node/services/agentPlugins/installService.ts", 1),
+                    ("src/node/services/agentPlugins/sourceInput.ts", 1),
                 ],
             )
 
@@ -49,14 +55,14 @@ class AuditXumBrandingTest(unittest.TestCase):
                 root
                 / "benchmarks/terminal_bench/.leaderboard_cache/Mux__Historical/result.json"
             )
-            history_path.parent.mkdir(parents=True)
+            history_path.parent.mkdir(parents=True, exist_ok=True)
             history_path.write_text('{"agent": "Mux"}\n')
             leaderboard_script = root / "benchmarks/terminal_bench/prepare_leaderboard_submission.py"
             leaderboard_script.write_text(
                 'ignore_patterns("mux-app.tar.gz", "mux-tokens.json")\n'
             )
             log_service = root / "src/node/services/log.ts"
-            log_service.parent.mkdir(parents=True)
+            log_service.parent.mkdir(parents=True, exist_ok=True)
             log_service.write_text(
                 '// Clear old Mux logs after the rename\n'
                 'path.join(logsDir, "mux.log")\n'
@@ -64,10 +70,14 @@ class AuditXumBrandingTest(unittest.TestCase):
             )
 
             plugin_install_service = root / "src/node/services/agentPlugins/installService.ts"
-            plugin_install_service.parent.mkdir(parents=True)
+            plugin_install_service.parent.mkdir(parents=True, exist_ok=True)
             plugin_install_service.write_text(
                 'throw new Error("Another Xum process is modifying plugins")\n'
             )
+
+            source_input = root / "src/node/services/agentPlugins/sourceInput.ts"
+            source_input.parent.mkdir(parents=True, exist_ok=True)
+            source_input.write_text('throw new Error("Example: coder/xum")\n')
 
             violations = audit_paths(
                 root,
@@ -77,6 +87,7 @@ class AuditXumBrandingTest(unittest.TestCase):
                     "benchmarks/terminal_bench/prepare_leaderboard_submission.py",
                     "src/node/services/log.ts",
                     "src/node/services/agentPlugins/installService.ts",
+                    "src/node/services/agentPlugins/sourceInput.ts",
                 ],
             )
 

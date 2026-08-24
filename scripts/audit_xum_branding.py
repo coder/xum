@@ -26,6 +26,7 @@ BOUNDARY_GLOBS = (
     ".github/workflows/nightly-terminal-bench.yml",
     "scripts/check-bench-agent.sh",
     "scripts/check_tbench_results.py",
+    "src/node/services/agentPlugins/sourceInput.ts",
     "src/node/services/agentPlugins/installService.ts",
     "src/node/services/log.ts",
     "src/common/constants/paths.ts",
@@ -89,7 +90,16 @@ ALLOW_RULES = (
         "existing BigQuery project ID",
     ),
     AllowRule("benchmarks/terminal_bench/analyze_failure_rates.py", re.compile(r"mux-benchmarks"), "existing BigQuery project ID"),
-    AllowRule("benchmarks/terminal_bench/analyze_failure_rates.py", re.compile(r"--mux-model|[\"']mux[\"']|historical Mux"), "legacy CLI alias and leaderboard history"),
+    AllowRule(
+        "benchmarks/terminal_bench/analyze_failure_rates.py",
+        re.compile(r"--mux-model|[\"']mux[\"']|historical Mux|mux_(?:fail_rate|agent)"),
+        "legacy CLI alias, leaderboard history, and stable JSON output keys",
+    ),
+    AllowRule(
+        "benchmarks/terminal_bench/analyze_failure_rates_test.py",
+        re.compile(r"mux_(?:fail_rate|agent)"),
+        "compatibility coverage for stable pre-rename JSON keys",
+    ),
     AllowRule(".github/workflows/terminal-bench.yml", re.compile(r"inputs\.mux_|^\s*mux_"), "legacy reusable-workflow input"),
     AllowRule(
         ".github/workflows/nightly-terminal-bench.yml",

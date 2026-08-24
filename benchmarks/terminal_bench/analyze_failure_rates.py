@@ -357,6 +357,19 @@ class OptimizationOpportunity:
     n_other_agents: int
 
 
+def opportunity_json(opportunity: OptimizationOpportunity) -> dict[str, object]:
+    """Return canonical output plus stable pre-rename keys for existing consumers."""
+    return {
+        "task_id": opportunity.task_id,
+        "xum_fail_rate": opportunity.xum_fail_rate,
+        "mux_fail_rate": opportunity.xum_fail_rate,
+        "avg_other_fail_rate": opportunity.avg_other_fail_rate,
+        "ratio": opportunity.ratio,
+        "xum_agent": opportunity.xum_agent,
+        "mux_agent": opportunity.xum_agent,
+    }
+
+
 def find_optimization_opportunities(
     results: list[TaskResult],
     xum_filter: str | None = None,
@@ -542,14 +555,7 @@ def main() -> None:
 
     if args.json:
         output = [
-            {
-                "task_id": o.task_id,
-                "xum_fail_rate": o.xum_fail_rate,
-                "avg_other_fail_rate": o.avg_other_fail_rate,
-                "ratio": o.ratio,
-                "xum_agent": o.xum_agent,
-            }
-            for o in opportunities[: args.top]
+            opportunity_json(opportunity) for opportunity in opportunities[: args.top]
         ]
         print(json.dumps(output, indent=2))
     else:
