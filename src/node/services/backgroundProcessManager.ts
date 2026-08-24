@@ -1460,6 +1460,19 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   }
 
   /**
+   * Synchronous snapshot: whether any tracked background (non-foreground) process for the
+   * workspace is still marked running. Statuses refresh lazily (see list()), so a just-exited
+   * process may briefly read as running; archive admission gates treat that as fail-safe
+   * over-refusal — callers wanting fresh statuses should await list() first.
+   */
+  hasRunningBackgroundProcesses(workspaceId: string): boolean {
+    assert(workspaceId.length > 0, "hasRunningBackgroundProcesses requires workspaceId");
+    return Array.from(this.processes.values()).some(
+      (p) => !p.isForeground && p.workspaceId === workspaceId && p.status === "running"
+    );
+  }
+
+  /**
    * List background processes (not including foreground ones being waited on).
    * Optionally filtered by workspace.
    * Refreshes status of running processes before returning.

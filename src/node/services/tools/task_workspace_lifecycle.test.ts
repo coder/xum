@@ -221,6 +221,39 @@ describe("task_workspace_lifecycle tool", () => {
     });
   });
 
+  it("selects a valid workspaceId when the accompanying taskId is blank", async () => {
+    using tempDir = new TestTempDir("test-task-workspace-lifecycle-blank-task-id");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
+
+    const archiveOwnedWorkspaceTurnWorkspace = mock(
+      (): Promise<Result<unknown, string>> =>
+        Promise.resolve(
+          Ok({ status: "archived" as const, action: "archive" as const, workspaceId: "child-a" })
+        )
+    );
+    const taskService = { archiveOwnedWorkspaceTurnWorkspace } as unknown as TaskService;
+    const tool = createTaskWorkspaceLifecycleTool({ ...baseConfig, taskService });
+
+    // The input schema treats a whitespace-only identifier as absent; target normalization must
+    // apply the same trimmed-presence rule instead of selecting the blank taskId and failing
+    // invalid_scope.
+    const result: unknown = await Promise.resolve(
+      tool.execute!(
+        { action: "archive", targets: [{ taskId: "   ", workspaceId: "child-a" }] },
+        mockToolCallOptions
+      )
+    );
+
+    expect(archiveOwnedWorkspaceTurnWorkspace).toHaveBeenCalledWith(
+      "root-workspace",
+      { workspaceId: "child-a" },
+      expect.anything()
+    );
+    expect(result).toEqual({
+      results: [{ status: "archived", action: "archive", workspaceId: "child-a" }],
+    });
+  });
+
   it("rejects non-workspace-turn task IDs without touching the task service", async () => {
     using tempDir = new TestTempDir("test-task-workspace-lifecycle-invalid-scope");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });

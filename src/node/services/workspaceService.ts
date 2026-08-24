@@ -3109,6 +3109,13 @@ export class WorkspaceService extends EventEmitter {
    */
   setTerminalService(terminalService: TerminalService): void {
     this.terminalService = terminalService;
+    // Archive admission pairing for terminal startups: create() checks this guard in the same
+    // synchronous block as its startup reservation, so whichever of {archive gate, terminal
+    // entry} runs first is observed by the other (see archiveUnlocked's refuseLiveUserActivity
+    // gate and TerminalService.create).
+    terminalService.setWorkspaceArchiveGuard((workspaceId) =>
+      this.archivingWorkspaces.has(workspaceId)
+    );
   }
 
   setDesktopSessionManager(manager: DesktopSessionManager): void {
@@ -7597,13 +7604,34 @@ export class WorkspaceService extends EventEmitter {
     workspaceId: string,
     // Callers that pin one behavior read across an interrupt+archive operation pass it here so
     // this check agrees with the pinned sink decision.
-    worktreeArchiveBehavior: WorktreeArchiveBehavior = this.getWorktreeArchiveBehavior()
+    worktreeArchiveBehavior: WorktreeArchiveBehavior = this.getWorktreeArchiveBehavior(),
+    // When provided, mirrors the sink's snapshot-capture scoping: only single-project managed
+    // worktrees ever capture a snapshot, so other runtimes (SSH/Docker) and multi-project
+    // targets are never untracked-file sensitive and may be interrupted safely.
+    metadata?: WorkspaceMetadata
   ): boolean {
+    if (
+      metadata != null &&
+      (!isWorktreeRuntime(metadata.runtimeConfig) ||
+        (Array.isArray(metadata.projects) && metadata.projects.length > 1))
+    ) {
+      return false;
+    }
     return (
       !this.isSharedTaskWorkspace(workspaceId) &&
       worktreeArchiveBehavior === "snapshot" &&
       this.worktreeArchiveSnapshotService != null
     );
+  }
+
+  /**
+   * Fresh background-bash check: refreshes exit statuses first so a long-exited process cannot
+   * hold an archive refusal open. Pre-gates use this; the synchronous snapshot in
+   * listLiveWorkspaceActivity covers the sink's same-tick gate.
+   */
+  async hasRunningBackgroundBashProcesses(workspaceId: string): Promise<boolean> {
+    const processes = await this.backgroundProcessManager.list(workspaceId);
+    return processes.some((process) => process.status === "running");
   }
 
   /**
@@ -7615,6 +7643,12 @@ export class WorkspaceService extends EventEmitter {
     streaming: boolean;
     /** Queued or dispatching (PREPARING) messages that would start a stream after archive. */
     queuedMessages: boolean;
+    /**
+     * Detached background bash processes still running (sync snapshot; may briefly read
+     * stale-running until the next lazy refresh — callers wanting freshness should await
+     * hasRunningBackgroundBashProcesses first).
+     */
+    backgroundBashProcesses: boolean;
     terminalSessions: boolean;
     desktopSession: boolean;
   } {
@@ -7622,6 +7656,8 @@ export class WorkspaceService extends EventEmitter {
       streaming: this.aiService.isStreaming(workspaceId),
       queuedMessages:
         this.hasQueuedMessages(workspaceId) || this.hasPendingQueuedOrPreparingTurn(workspaceId),
+      backgroundBashProcesses:
+        this.backgroundProcessManager.hasRunningBackgroundProcesses(workspaceId),
       terminalSessions: this.terminalService?.hasWorkspaceSessions(workspaceId) === true,
       desktopSession: this.desktopSessionManager?.has(workspaceId) === true,
     };
@@ -7683,6 +7719,9 @@ export class WorkspaceService extends EventEmitter {
           activityLabels.push("a message send in progress");
         }
         if (liveActivity.queuedMessages) activityLabels.push("queued messages");
+        if (liveActivity.backgroundBashProcesses) {
+          activityLabels.push("running background bash processes");
+        }
         if (liveActivity.terminalSessions) activityLabels.push("open terminal sessions");
         if (liveActivity.desktopSession) activityLabels.push("a desktop session");
         if (activityLabels.length > 0) {

@@ -9367,26 +9367,23 @@ export class TaskService {
           // cannot recreate it, so a nominally reversible agent-driven archive must refuse.
           // Re-enforced at the sink (forbidCoderWorkspaceDeletion) against the same read passed
           // to the hook, closing the settings-flip race.
-          {
-            const runtimeConfig = resolved.metadata.runtimeConfig;
-            const coderArchiveBehavior =
-              this.config.loadConfigOrDefault().coderWorkspaceArchiveBehavior ??
-              DEFAULT_CODER_ARCHIVE_BEHAVIOR;
-            if (
-              isSSHRuntime(runtimeConfig) &&
-              runtimeConfig.coder != null &&
-              runtimeConfig.coder.existingWorkspace !== true &&
-              (runtimeConfig.coder.workspaceName?.trim() ?? "") !== "" &&
-              coderArchiveBehavior === "delete"
-            ) {
-              return Ok({
-                status: "error",
-                action: "archive",
-                ...this.lifecycleTargetFields(resolved),
-                error:
-                  'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior to "Keep" or "Stop".',
-              });
-            }
+          const targetRuntimeConfig = resolved.metadata.runtimeConfig;
+          const coderArchiveBehavior =
+            this.config.loadConfigOrDefault().coderWorkspaceArchiveBehavior ??
+            DEFAULT_CODER_ARCHIVE_BEHAVIOR;
+          const isDedicatedCoderWorkspace =
+            isSSHRuntime(targetRuntimeConfig) &&
+            targetRuntimeConfig.coder != null &&
+            targetRuntimeConfig.coder.existingWorkspace !== true &&
+            (targetRuntimeConfig.coder.workspaceName?.trim() ?? "") !== "";
+          if (isDedicatedCoderWorkspace && coderArchiveBehavior === "delete") {
+            return Ok({
+              status: "error",
+              action: "archive",
+              ...this.lifecycleTargetFields(resolved),
+              error:
+                'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior to "Keep" or "Stop".',
+            });
           }
 
           const acknowledgedUntrackedPaths =
@@ -9440,6 +9437,13 @@ export class TaskService {
           if (liveActivity.queuedMessages && !hasQueuedDelegatedTurn) {
             nonTurnActivity.push("queued messages");
           }
+          // Detached background bash outlives its spawning turn: interruption does not stop it,
+          // and a snapshot archive could remove the worktree under a process still writing.
+          // Fresh check (refreshes exit statuses) so a long-exited process cannot hold the
+          // refusal open; the sink's synchronous snapshot covers races after this gate.
+          if (await this.workspaceService.hasRunningBackgroundBashProcesses(resolved.workspaceId)) {
+            nonTurnActivity.push("running background bash processes");
+          }
           if (liveActivity.terminalSessions) nonTurnActivity.push("open terminal sessions");
           if (liveActivity.desktopSession) nonTurnActivity.push("a desktop session");
           if (nonTurnActivity.length > 0) {
@@ -9476,7 +9480,8 @@ export class TaskService {
             if (
               this.workspaceService.isSnapshotArchiveEligibilityMutationSensitive(
                 resolved.workspaceId,
-                worktreeArchiveBehavior
+                worktreeArchiveBehavior,
+                resolved.metadata
               )
             ) {
               return Ok({
@@ -9486,6 +9491,23 @@ export class TaskService {
                 activeTaskIds: activeTurns.map((turn) => turn.handleId),
                 note:
                   "interrupt_active was not honored: the snapshot archive behavior requires an exact untracked-file acknowledgement, which active turns can invalidate mid-interruption. " +
+                  "Stop the listed turns (task_stop) or wait for them to finish, then archive again.",
+              });
+            }
+            // Same interrupted-but-unarchived hazard from a different source: for a dedicated
+            // Coder workspace under the "stop" policy, the sink's before-archive hook stops the
+            // remote workspace and can fail or time out AFTER turns were already destroyed —
+            // preflightArchive cannot exercise that hook without side effects, and interrupted
+            // streams cannot be restored. Refuse to interrupt; the caller stops the turns
+            // explicitly, after which a failed archive is retryable without further loss.
+            if (isDedicatedCoderWorkspace && coderArchiveBehavior !== "keep") {
+              return Ok({
+                status: "active",
+                action: "archive",
+                ...this.lifecycleTargetFields(resolved),
+                activeTaskIds: activeTurns.map((turn) => turn.handleId),
+                note:
+                  "interrupt_active was not honored: archiving this dedicated Coder workspace runs a fallible remote stop step after interruption, which could destroy the turns and still fail the archive. " +
                   "Stop the listed turns (task_stop) or wait for them to finish, then archive again.",
               });
             }

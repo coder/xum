@@ -1,6 +1,7 @@
 import { EventEmitter } from "events";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { spawn } from "child_process";
 import { secretsToRecord } from "@/common/types/secrets";
 import type { Config } from "@/node/config";
@@ -70,6 +71,22 @@ export class TerminalService {
   // In-flight create() reservations per workspace (see create): counted before any await so
   // archive admission gates observe startups that have not yet registered a session.
   private readonly pendingSessionCreations = new Map<string, number>();
+  // Injected by WorkspaceService: true while an archive admission gate is active for the
+  // workspace. Checked synchronously with the startup reservation (see create) so a terminal
+  // startup and an archive always observe each other.
+  private workspaceArchiveGuard: ((workspaceId: string) => boolean) | undefined;
+
+  setWorkspaceArchiveGuard(guard: (workspaceId: string) => boolean): void {
+    this.workspaceArchiveGuard = guard;
+  }
+
+  /** Synchronous persisted-archived check for terminal admission (see create). */
+  private isArchivedNow(workspaceId: string): boolean {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    return (
+      entry != null && isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)
+    );
+  }
   // Tracks sessions that have received at least one OSC signal (0, 2, or 133).
   // OSC-driven sessions rely on shell-provided idle/running signals and skip the fallback timer.
   private readonly sessionsWithOscActivity = new Set<string>();
@@ -116,12 +133,19 @@ export class TerminalService {
     // Reserve the startup synchronously: a creation that has passed its archived check but is
     // still awaiting metadata/secrets/PTY spawn is not yet in sessionActivity, so without this
     // reservation an archive's live-activity gate could pass and the pending creation would
-    // then publish a PTY into the archived workspace.
+    // then publish a PTY into the archived workspace. The archive-guard check shares this
+    // synchronous block: an archive gate armed first refuses this startup here; a reservation
+    // counted first is observed by that gate via hasWorkspaceSessions.
     this.pendingSessionCreations.set(
       params.workspaceId,
       (this.pendingSessionCreations.get(params.workspaceId) ?? 0) + 1
     );
     try {
+      if (this.workspaceArchiveGuard?.(params.workspaceId) === true) {
+        throw new Error(
+          `Workspace is being archived: ${params.workspaceId}. Unarchive it before opening a terminal.`
+        );
+      }
       return await this.createUnreserved(params);
     } finally {
       const remaining = (this.pendingSessionCreations.get(params.workspaceId) ?? 1) - 1;
@@ -229,15 +253,12 @@ export class TerminalService {
 
       // 5. Create session
       const projectsConfig = this.config.loadConfigOrDefault();
-      // Recheck archived state after the awaits above: a user-driven archive (which force-closes
-      // rather than refuses) may have completed since the entry check, and a PTY spawned now
-      // would run hidden in the archived workspace.
-      const latestMetadata = (await this.config.getAllWorkspaceMetadata()).find(
-        (w) => w.id === params.workspaceId
-      );
+      // Recheck archived/archiving state after the awaits above: a user-driven archive (which
+      // force-closes rather than refuses) may have completed since the entry check, and a PTY
+      // spawned now would run hidden in the archived workspace.
       if (
-        latestMetadata != null &&
-        isWorkspaceArchived(latestMetadata.archivedAt, latestMetadata.unarchivedAt)
+        this.workspaceArchiveGuard?.(params.workspaceId) === true ||
+        this.isArchivedNow(params.workspaceId)
       ) {
         throw new Error(
           `Workspace is archived: ${params.workspaceId}. Unarchive it before opening a terminal.`
@@ -254,6 +275,24 @@ export class TerminalService {
       );
 
       tempSessionId = session.sessionId;
+
+      // Post-spawn recheck: a user-driven archive (which force-closes rather than refuses) may
+      // have run closeWorkspaceSessions while createSession was awaiting — that close only
+      // terminates tracked sessions, so an unchecked publish here would leave a hidden PTY in
+      // the archived workspace. Kill the just-spawned PTY instead of registering it.
+      if (
+        this.workspaceArchiveGuard?.(params.workspaceId) === true ||
+        this.isArchivedNow(params.workspaceId)
+      ) {
+        try {
+          this.ptyService.closeSession(session.sessionId);
+        } finally {
+          this.cleanup(session.sessionId);
+        }
+        throw new Error(
+          `Workspace was archived while the terminal was starting: ${params.workspaceId}.`
+        );
+      }
 
       // Initialize emitters and headless terminal for state tracking
       this.outputEmitters.set(session.sessionId, new EventEmitter());

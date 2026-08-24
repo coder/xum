@@ -19,11 +19,16 @@ interface LifecycleTarget {
 }
 
 function normalizeTarget(target: LifecycleTarget): { taskId?: string; workspaceId?: string } {
-  if (target.taskId != null) {
-    return { taskId: target.taskId };
+  // Trimmed presence, matching the input schema's superRefine: a blank identifier is absent,
+  // so a valid workspaceId next to a whitespace-only taskId must select the workspaceId
+  // instead of failing invalid_scope on the blank task ID.
+  const taskId = target.taskId?.trim();
+  if (taskId) {
+    return { taskId };
   }
-  if (target.workspaceId != null) {
-    return { workspaceId: target.workspaceId };
+  const workspaceId = target.workspaceId?.trim();
+  if (workspaceId) {
+    return { workspaceId };
   }
   throw new Error("task_workspace_lifecycle requires exactly one target identifier");
 }

@@ -477,6 +477,7 @@ function createWorkspaceServiceMocks(
     unarchive: ReturnType<typeof mock>;
     preflightArchive: ReturnType<typeof mock>;
     listLiveWorkspaceActivity: ReturnType<typeof mock>;
+    hasRunningBackgroundBashProcesses: ReturnType<typeof mock>;
     isSnapshotArchiveEligibilityMutationSensitive: ReturnType<typeof mock>;
     deleteWorktree: ReturnType<typeof mock>;
     remove: ReturnType<typeof mock>;
@@ -511,6 +512,7 @@ function createWorkspaceServiceMocks(
   unarchive: ReturnType<typeof mock>;
   preflightArchive: ReturnType<typeof mock>;
   listLiveWorkspaceActivity: ReturnType<typeof mock>;
+  hasRunningBackgroundBashProcesses: ReturnType<typeof mock>;
   isSnapshotArchiveEligibilityMutationSensitive: ReturnType<typeof mock>;
   deleteWorktree: ReturnType<typeof mock>;
   remove: ReturnType<typeof mock>;
@@ -565,9 +567,13 @@ function createWorkspaceServiceMocks(
     mock(() => ({
       streaming: false,
       queuedMessages: false,
+      backgroundBashProcesses: false,
       terminalSessions: false,
       desktopSession: false,
     }));
+  const hasRunningBackgroundBashProcesses =
+    overrides?.hasRunningBackgroundBashProcesses ??
+    mock((): Promise<boolean> => Promise.resolve(false));
   // Default false = "keep"-style behavior where archive eligibility never depends on the
   // untracked-file set, so interrupt_active tests exercise the interruption path.
   const isSnapshotArchiveEligibilityMutationSensitive =
@@ -629,6 +635,7 @@ function createWorkspaceServiceMocks(
       unarchiveWhileTaskTreeLocked: unarchive,
       preflightArchive,
       listLiveWorkspaceActivity,
+      hasRunningBackgroundBashProcesses,
       isSnapshotArchiveEligibilityMutationSensitive,
       deleteWorktree,
       removeWhileTaskTreeLocked: remove,
@@ -662,6 +669,7 @@ function createWorkspaceServiceMocks(
     unarchive,
     preflightArchive,
     listLiveWorkspaceActivity,
+    hasRunningBackgroundBashProcesses,
     isSnapshotArchiveEligibilityMutationSensitive,
     deleteWorktree,
     remove,
@@ -940,6 +948,7 @@ describe("TaskService", () => {
       unarchive?: ReturnType<typeof mock>;
       preflightArchive?: ReturnType<typeof mock>;
       listLiveWorkspaceActivity?: ReturnType<typeof mock>;
+      hasRunningBackgroundBashProcesses?: ReturnType<typeof mock>;
       isSnapshotArchiveEligibilityMutationSensitive?: ReturnType<typeof mock>;
       create?: ReturnType<typeof mock>;
     } = {}
@@ -974,6 +983,9 @@ describe("TaskService", () => {
       ...(options.preflightArchive != null ? { preflightArchive: options.preflightArchive } : {}),
       ...(options.listLiveWorkspaceActivity != null
         ? { listLiveWorkspaceActivity: options.listLiveWorkspaceActivity }
+        : {}),
+      ...(options.hasRunningBackgroundBashProcesses != null
+        ? { hasRunningBackgroundBashProcesses: options.hasRunningBackgroundBashProcesses }
         : {}),
       ...(options.isSnapshotArchiveEligibilityMutationSensitive != null
         ? {
@@ -2193,6 +2205,77 @@ describe("TaskService", () => {
       "wst_nested"
     );
     expect(interrupted?.status).toBe("interrupted");
+  });
+
+  test("workspace lifecycle refuses archive while background bash processes are running", async () => {
+    const hasRunningBackgroundBashProcesses = mock((): Promise<boolean> => Promise.resolve(true));
+    const harness = await createWorkspaceLifecycleHarness({ hasRunningBackgroundBashProcesses });
+
+    // Detached background bash outlives its spawning turn: interruption cannot stop it, and a
+    // snapshot archive could remove the worktree under a process still writing.
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+      harness.parentId,
+      { workspaceId: "childworkspace" },
+      { interruptActive: true }
+    );
+
+    expect(result.success).toBe(true);
+    const data = result.success ? result.data : undefined;
+    expect(data?.status).toBe("active");
+    expect(data?.status === "active" ? (data.note ?? "") : "").toContain(
+      "running background bash processes"
+    );
+    expect(harness.archive).not.toHaveBeenCalled();
+  });
+
+  test("workspace lifecycle refuses interrupt_active for a dedicated Coder workspace under the stop policy", async () => {
+    const harness = await createWorkspaceLifecycleHarness();
+    await harness.config.editConfig((cfg) => {
+      // Default Coder policy is "stop": the sink's before-archive hook stops the remote
+      // workspace and can fail AFTER interruption destroyed the turns.
+      for (const [, project] of cfg.projects) {
+        const child = project.workspaces.find((w) => w.id === "childworkspace");
+        if (child) {
+          child.runtimeConfig = {
+            type: "ssh",
+            host: "coder.example",
+            srcBaseDir: "/home/coder/src",
+            coder: { workspaceName: "mux-child", existingWorkspace: false },
+          };
+        }
+      }
+      return cfg;
+    });
+    await harness.taskHandleStore.upsertWorkspaceTurn({
+      kind: "workspace_turn",
+      handleId: "wst_running",
+      ownerWorkspaceId: harness.parentId,
+      workspaceId: "childworkspace",
+      turnId: "turn-running",
+      status: "running",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      createdWorkspace: false,
+      disposableWorkspace: false,
+    });
+    markWorkspaceTurnActive(harness.taskService, "childworkspace", "wst_running", harness.parentId);
+
+    const result = await harness.taskService.archiveOwnedWorkspaceTurnWorkspace(
+      harness.parentId,
+      { workspaceId: "childworkspace" },
+      { interruptActive: true }
+    );
+
+    expect(result.success).toBe(true);
+    const data = result.success ? result.data : undefined;
+    expect(data?.status).toBe("active");
+    expect(data?.status === "active" ? (data.note ?? "") : "").toContain("fallible remote stop");
+    expect(harness.archive).not.toHaveBeenCalled();
+    const stillRunning = await harness.taskHandleStore.getWorkspaceTurn(
+      harness.parentId,
+      "wst_running"
+    );
+    expect(stillRunning?.status).toBe("running");
   });
 
   test("workspace lifecycle interruption tolerates turns that settled after collection", async () => {
