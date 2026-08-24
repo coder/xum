@@ -9407,7 +9407,7 @@ export class TaskService {
               worktreeArchiveBehavior,
               resolved.metadata
             ) &&
-            this.workspaceService.hasOpenedNativeTerminal(resolved.workspaceId)
+            (await this.workspaceService.hasOpenedNativeTerminal(resolved.workspaceId))
           ) {
             return Ok({
               status: "error",

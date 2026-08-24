@@ -1,4 +1,6 @@
 import { EventEmitter } from "events";
+import * as fs from "fs";
+import * as path from "path";
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
@@ -77,17 +79,34 @@ export class TerminalService {
   private workspaceArchiveGuard: ((workspaceId: string) => boolean) | undefined;
 
   /**
-   * Workspaces a native terminal was opened for during this app session. Native emulators are
-   * spawned detached and typically daemonize, so neither spawn success nor closure is
-   * observable — entries are recorded at open time (even for failed attempts, failing safe)
-   * and never removed. Model-facing snapshot archives consult this because removing a checkout
-   * under a user's live native shell/editor is unrecoverable.
+   * Workspaces a native terminal was opened for. Native emulators are spawned detached and
+   * typically daemonize, so neither spawn success nor closure is observable — entries are
+   * recorded at open time (even for failed attempts, failing safe) and never removed.
+   * Model-facing snapshot archives consult this because removing a checkout under a user's
+   * live native shell/editor is unrecoverable. Detached emulators can also outlive Xum
+   * itself, so opens are additionally persisted as a durable per-workspace marker that
+   * survives app restarts (see nativeTerminalMarkerPath); this Set doubles as a read cache.
    */
   private readonly nativeTerminalWorkspaces = new Set<string>();
 
-  /** Whether a native terminal was ever opened for this workspace during this app session. */
-  hasOpenedNativeTerminal(workspaceId: string): boolean {
-    return this.nativeTerminalWorkspaces.has(workspaceId);
+  private nativeTerminalMarkerPath(workspaceId: string): string {
+    return path.join(this.config.getSessionDir(workspaceId), "native-terminal-opened");
+  }
+
+  /** Whether a native terminal was ever opened for this workspace (survives app restarts). */
+  async hasOpenedNativeTerminal(workspaceId: string): Promise<boolean> {
+    if (this.nativeTerminalWorkspaces.has(workspaceId)) {
+      return true;
+    }
+    try {
+      await fs.promises.access(this.nativeTerminalMarkerPath(workspaceId));
+      this.nativeTerminalWorkspaces.add(workspaceId);
+      return true;
+    } catch {
+      // Missing marker (or an unreadable one — probing must never break archive gating; the
+      // in-memory record above still covers opens from this app session).
+      return false;
+    }
   }
 
   setWorkspaceArchiveGuard(guard: (workspaceId: string) => boolean): void {
@@ -508,6 +527,17 @@ export class TerminalService {
       throw new Error(
         `Workspace is being archived: ${workspaceId}. Unarchive it before opening a terminal.`
       );
+    }
+    // Durable marker: the detached emulator can outlive Xum, so a restart must not forget the
+    // open (the in-memory Set resets, and both archive checks would otherwise let a
+    // model-driven snapshot archive remove the checkout under the still-live shell).
+    // Best-effort — the Set above still guards this app session if the write fails.
+    try {
+      const markerPath = this.nativeTerminalMarkerPath(workspaceId);
+      await fs.promises.mkdir(path.dirname(markerPath), { recursive: true });
+      await fs.promises.writeFile(markerPath, new Date().toISOString());
+    } catch (error) {
+      log.warn("Failed to persist native terminal marker", { workspaceId, error });
     }
     try {
       const allMetadata = await this.config.getAllWorkspaceMetadata();

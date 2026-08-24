@@ -8,6 +8,10 @@ import type { RuntimeConfig } from "@/common/types/runtime";
 import * as childProcess from "child_process";
 import * as fs from "fs/promises";
 
+// Unique per test run: native-terminal markers persist on disk, so a shared path would leak
+// sticky state across runs and flake the "not yet opened" assertions.
+const NATIVE_TERMINAL_SESSIONS_DIR = `/tmp/xum-test-native-terminal-sessions-${process.pid}-${Date.now()}`;
+
 const getEffectiveSecretsMock = mock(() => [{ key: "TEST_SECRET", value: "secret-value" }]);
 
 // Mock dependencies
@@ -45,6 +49,7 @@ function createConfigWithMetadata(metadata: {
       projects: new Map(),
       terminalDefaultShell: undefined,
     })),
+    getSessionDir: mock((id: string) => `${NATIVE_TERMINAL_SESSIONS_DIR}/${id}`),
     srcDir: "/tmp",
   } as unknown as Config;
 }
@@ -982,6 +987,7 @@ describe("TerminalService.openNative", () => {
       projects: new Map(),
       terminalDefaultShell: undefined,
     })),
+    getSessionDir: mock((id: string) => `${NATIVE_TERMINAL_SESSIONS_DIR}/${id}`),
     srcDir: "/tmp",
   } as unknown as Config;
 
@@ -1007,6 +1013,7 @@ describe("TerminalService.openNative", () => {
       projects: new Map(),
       terminalDefaultShell: undefined,
     })),
+    getSessionDir: mock((id: string) => `${NATIVE_TERMINAL_SESSIONS_DIR}/${id}`),
     srcDir: "/tmp",
   } as unknown as Config;
 
@@ -1029,6 +1036,7 @@ describe("TerminalService.openNative", () => {
       projects: new Map(),
       terminalDefaultShell: undefined,
     })),
+    getSessionDir: mock((id: string) => `${NATIVE_TERMINAL_SESSIONS_DIR}/${id}`),
     srcDir: "/tmp",
   } as unknown as Config;
 
@@ -1051,6 +1059,7 @@ describe("TerminalService.openNative", () => {
       projects: new Map(),
       terminalDefaultShell: undefined,
     })),
+    getSessionDir: mock((id: string) => `${NATIVE_TERMINAL_SESSIONS_DIR}/${id}`),
     srcDir: "/tmp",
   } as unknown as Config;
 
@@ -1121,19 +1130,29 @@ describe("TerminalService.openNative", () => {
       spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
       service = new TerminalService(configWithLocalWorkspace, mockPTYService);
 
-      expect(service.hasOpenedNativeTerminal("ws-local")).toBe(false);
-      await service.openNative("ws-local");
-      expect(service.hasOpenedNativeTerminal("ws-local")).toBe(true);
-
-      // Even a failed open records the workspace: spawn success and emulator lifetime are
-      // both unobservable, so archive gating fails safe on attempted opens.
+      // Unique IDs: other tests open ws-local and its durable marker would leak in here.
+      expect(await service.hasOpenedNativeTerminal("ws-sticky")).toBe(false);
+      // Even a failed open (unknown workspace) records: spawn success and emulator lifetime
+      // are both unobservable, so archive gating fails safe on attempted opens.
       try {
-        await service.openNative("ws-missing");
+        await service.openNative("ws-sticky");
       } catch {
         // Workspace not found — the recording must still have happened.
       }
-      expect(service.hasOpenedNativeTerminal("ws-missing")).toBe(true);
-      expect(service.hasOpenedNativeTerminal("ws-untouched")).toBe(false);
+      expect(await service.hasOpenedNativeTerminal("ws-sticky")).toBe(true);
+      expect(await service.hasOpenedNativeTerminal("ws-untouched")).toBe(false);
+    });
+
+    it("remembers native terminal opens across service instances via the durable marker", async () => {
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      service = new TerminalService(configWithLocalWorkspace, mockPTYService);
+      await service.openNative("ws-local");
+
+      // Detached emulators outlive Xum restarts; a fresh service (fresh in-memory Set) must
+      // still observe the open through the persisted marker.
+      const restartedService = new TerminalService(configWithLocalWorkspace, mockPTYService);
+      expect(await restartedService.hasOpenedNativeTerminal("ws-local")).toBe(true);
+      expect(await restartedService.hasOpenedNativeTerminal("ws-never-opened")).toBe(false);
     });
 
     it("refuses native terminal opens while the workspace is being archived", async () => {
@@ -1149,7 +1168,7 @@ describe("TerminalService.openNative", () => {
       }
       expect(spawnSpy).not.toHaveBeenCalled();
       // The recording still happened (fail-safe): a refused open marks intent without a shell.
-      expect(service.hasOpenedNativeTerminal("ws-local")).toBe(true);
+      expect(await service.hasOpenedNativeTerminal("ws-local")).toBe(true);
     });
 
     it("should open Ghostty for local workspace when available", async () => {
