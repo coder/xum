@@ -13353,7 +13353,11 @@ describe("TaskService", () => {
     );
 
     const { workspaceService, sendMessage, create } = createWorkspaceServiceMocks();
-    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    // isStreaming true: finalizeAgentTaskReport marks a task `reported` while its stream is
+    // still winding down — terminal statuses must reject WITHOUT a transient-stream rescue, or
+    // the trigger would queue behind the completing turn and reactivate the reported task.
+    const { aiService } = createAIServiceMocks(config, { isStreaming: mock(() => true) });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
 
     // Queued target: only an ancestor may mutate the durable launch prompt.
     const queuedResult = await taskService.sendAgentTreeMessage("sib-a", "sib-q", "hi");

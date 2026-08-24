@@ -339,6 +339,9 @@ function buildUserDisplayedMessages(options: {
       compactionRequest,
       reviews: muxMeta?.reviews,
       bashMonitorWake: bashMonitorWakeRecords ? { records: bashMonitorWakeRecords } : undefined,
+      // The peer-message wake trigger is a synthetic machine row: mark it so prompt
+      // navigation skips it (the envelope payload itself is a separate assistant row).
+      agentPeerMessageTrigger: muxMeta?.type === "agent-peer-message" ? true : undefined,
     },
   ];
 }

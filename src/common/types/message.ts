@@ -993,6 +993,11 @@ export type DisplayedMessage =
       bashMonitorWake?: {
         records: BashMonitorWakeDisplayRecord[];
       };
+      /**
+       * True for the fixed user-role notification that wakes a peer-message recipient (the
+       * payload itself is a separate assistant row). Excluded from human-prompt navigation.
+       */
+      agentPeerMessageTrigger?: true;
     }
   | {
       type: "assistant";

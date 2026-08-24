@@ -5170,15 +5170,12 @@ export class TaskService {
               "Target has not started yet; only its parent may update a queued task's prompt.",
           });
         }
-        const executionId = targetEntry.workspace.taskExecutionId;
-        const activeTurn = this.activeWorkspaceTurnHandleByWorkspaceId.get(targetId);
-        const continuationActive = executionId != null && activeTurn?.handleId === executionId;
-        if (
-          targetStatus !== "running" &&
-          targetStatus !== "awaiting_report" &&
-          !this.aiService.isStreaming(targetId) &&
-          !continuationActive
-        ) {
+        // Terminal statuses reject OUTRIGHT, without consulting transient stream/continuation
+        // state: finalizeAgentTaskReport marks a task `reported` while its stream is still
+        // winding down, so an isStreaming rescue would admit a trigger that queues behind the
+        // completing turn and dispatches afterward — reactivating a reported task even though
+        // peer reactivation is prohibited.
+        if (targetStatus !== "running" && targetStatus !== "awaiting_report") {
           return Err({
             code: "not_active" as const,
             taskStatus: targetStatus,
