@@ -795,7 +795,21 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       status: "running",
       displayName: config.displayName,
     };
-    await handle.writeMeta(JSON.stringify(meta, null, 2));
+    try {
+      await handle.writeMeta(JSON.stringify(meta, null, 2));
+    } catch (error) {
+      // The durable spawn record is what lets crash-orphan archive gating see this process
+      // after an unclean restart — a process that cannot be recorded must not run (fail
+      // closed). terminate() also writes the exit_code marker, so even this directory reads
+      // as exited to the unreadable-record probe; if termination fails too, the markerless
+      // directory keeps failing that probe closed.
+      await handle.terminate();
+      await handle.dispose();
+      return {
+        success: false,
+        error: `Failed to persist the spawn record (meta.json): ${getErrorMessage(error)}`,
+      };
+    }
 
     const proc: BackgroundProcess = {
       id: processId,
@@ -1541,9 +1555,23 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
           await fsPromises.readFile(nodePath.join(processDir, BG_META_FILENAME), "utf-8")
         );
       } catch {
-        // Unreadable record — not evidence of a live process.
+        // Missing/unreadable record: handled with the parse-failure case below.
       }
-      if (meta?.status !== "running") continue;
+      if (meta == null) {
+        // A record we cannot read or parse cannot prove its process exited: spawn aborts
+        // (and terminates the process, writing the exit marker) when the initial record
+        // fails to persist, and failed spawns remove their directory — so a markerless
+        // unreadable record is a crash artifact whose process may still be alive. Trust
+        // only the exit marker; otherwise fail closed (the model-facing caller routes to
+        // user-mediated archive).
+        try {
+          await fsPromises.access(nodePath.join(processDir, BG_EXIT_CODE_FILENAME));
+          continue;
+        } catch {
+          return true;
+        }
+      }
+      if (meta.status !== "running") continue;
       // pid 0 marks migrated processes with unknown (possibly remote) PIDs; pid 1 would be
       // init — neither is probeable, and refusing on them forever would be a stuck gate.
       if (meta.pid <= 1) continue;

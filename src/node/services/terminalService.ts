@@ -521,18 +521,26 @@ export class TerminalService {
    */
   async openNative(workspaceId: string): Promise<void> {
     // Recorded before any awaits so archive gates observe the intent immediately; see the
-    // nativeTerminalWorkspaces doc comment for why entries are sticky.
+    // nativeTerminalWorkspaces doc comment for why entries are sticky. Refused opens roll a
+    // newly added reservation back (no shell launches, so nothing needs gating) — but only
+    // until the durable marker is persisted; after that the Set is just a cache of the marker.
+    const previouslyRecorded = this.nativeTerminalWorkspaces.has(workspaceId);
     this.nativeTerminalWorkspaces.add(workspaceId);
+    const rollbackReservation = () => {
+      if (!previouslyRecorded) this.nativeTerminalWorkspaces.delete(workspaceId);
+    };
     // Archive admission pairing (same synchronous block as the recording above, mirroring
     // create()): an archive gate armed first refuses this open, while an open recorded first
     // is observed by the sink's native-terminal check before snapshot capture. Without this,
     // an open entering after that check could launch a native shell in a checkout the same
     // archive is about to remove.
     if (this.workspaceArchiveGuard?.(workspaceId) === true) {
+      rollbackReservation();
       throw new Error(
         `Workspace is being archived: ${workspaceId}. Unarchive it before opening a terminal.`
       );
     }
+    let markerPersisted = false;
     try {
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const workspace = allMetadata.find((w) => w.id === workspaceId);
@@ -568,6 +576,7 @@ export class TerminalService {
           `Cannot open a native terminal for ${workspaceId}: persisting the terminal-open marker failed (${getErrorMessage(error)}), and without it archive safety checks would forget the terminal after a restart.`
         );
       }
+      markerPersisted = true;
 
       const runtimeConfig = workspace.runtimeConfig;
 
@@ -610,6 +619,12 @@ export class TerminalService {
         });
       }
     } catch (err) {
+      // Pre-marker failures (unknown/archived workspace, marker persistence) launched no
+      // shell, so the in-memory reservation rolls back; once the durable marker exists the
+      // Set is a cache of it and rolling back would be meaningless.
+      if (!markerPersisted) {
+        rollbackReservation();
+      }
       const message = getErrorMessage(err);
       log.error(`Failed to open native terminal: ${message}`);
       throw err;

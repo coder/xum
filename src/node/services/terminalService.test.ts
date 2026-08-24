@@ -1126,20 +1126,22 @@ describe("TerminalService.openNative", () => {
       expect(call[2]?.stdio).toBe("ignore");
     });
 
-    it("records native terminal opens stickily for archive gating", async () => {
+    it("rolls back the recording when the open fails before the marker persists", async () => {
       spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
       service = new TerminalService(configWithLocalWorkspace, mockPTYService);
 
       // Unique IDs: other tests open ws-local and its durable marker would leak in here.
       expect(await service.hasOpenedNativeTerminal("ws-sticky")).toBe(false);
-      // Even a failed open (unknown workspace) records: spawn success and emulator lifetime
-      // are both unobservable, so archive gating fails safe on attempted opens.
+      // Unknown workspace: refused before any shell launches, so the reservation rolls back —
+      // a sticky record here would permanently refuse model-driven snapshot/Coder-stop
+      // archives for a workspace that never had a terminal.
       try {
         await service.openNative("ws-sticky");
-      } catch {
-        // Workspace not found — the recording must still have happened.
+        expect.unreachable("openNative must fail for unknown workspaces");
+      } catch (error) {
+        expect(String(error)).toContain("not found");
       }
-      expect(await service.hasOpenedNativeTerminal("ws-sticky")).toBe(true);
+      expect(await service.hasOpenedNativeTerminal("ws-sticky")).toBe(false);
       expect(await service.hasOpenedNativeTerminal("ws-untouched")).toBe(false);
     });
 
@@ -1160,15 +1162,18 @@ describe("TerminalService.openNative", () => {
       service = new TerminalService(configWithLocalWorkspace, mockPTYService);
       service.setWorkspaceArchiveGuard(() => true);
 
+      // Fresh id: ws-local's durable marker may exist from earlier tests in this run, and
+      // this test asserts the refused open leaves no recording behind.
       try {
-        await service.openNative("ws-local");
+        await service.openNative("ws-guard-refused");
         expect.unreachable("openNative must refuse while the workspace is being archived");
       } catch (error) {
         expect(String(error)).toContain("being archived");
       }
       expect(spawnSpy).not.toHaveBeenCalled();
-      // The recording still happened (fail-safe): a refused open marks intent without a shell.
-      expect(await service.hasOpenedNativeTerminal("ws-local")).toBe(true);
+      // A refused open launches no shell, so its reservation rolls back: leaving it sticky
+      // would permanently refuse model-driven snapshot/Coder-stop archives after unarchive.
+      expect(await service.hasOpenedNativeTerminal("ws-guard-refused")).toBe(false);
     });
 
     it("refuses native terminal opens for archived workspaces", async () => {

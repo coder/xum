@@ -11114,6 +11114,8 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("recordExternalEditorOpen refuses while the workspace is being archived", async () => {
+    // A crashed prior run may have leaked the shared-session-dir marker; clear it first.
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
     addToArchivingWorkspaces(workspaceService, workspaceId);
 
     const result = await workspaceService.recordExternalEditorOpen(workspaceId);
@@ -11122,6 +11124,9 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     if (!result.success) {
       expect(result.error).toContain("being archived");
     }
+    // The refused open launched nothing, so its reservation rolls back: a sticky entry would
+    // permanently refuse model-driven snapshot/Coder-stop archives after unarchive.
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
   });
 
   test("recordExternalEditorOpen marks the workspace as having an untrackable app open", async () => {

@@ -7683,8 +7683,16 @@ export class WorkspaceService extends EventEmitter {
    * untrackable-app check before snapshot capture.
    */
   async recordExternalEditorOpen(workspaceId: string): Promise<Result<void>> {
+    // Refused opens roll back a newly added reservation (no editor launches, so nothing needs
+    // gating); a pre-existing entry or durable marker from an earlier successful open is
+    // preserved — hasExternalEditorOpen re-probes the marker regardless of the Set.
+    const previouslyRecorded = this.externalEditorWorkspaces.has(workspaceId);
     this.externalEditorWorkspaces.add(workspaceId);
+    const rollbackReservation = () => {
+      if (!previouslyRecorded) this.externalEditorWorkspaces.delete(workspaceId);
+    };
     if (this.archivingWorkspaces.has(workspaceId)) {
+      rollbackReservation();
       return Err(
         `Workspace is being archived: ${workspaceId}. Unarchive it before opening an editor.`
       );
@@ -7702,6 +7710,7 @@ export class WorkspaceService extends EventEmitter {
         workspaceEntry.workspace.unarchivedAt
       )
     ) {
+      rollbackReservation();
       return Err(`Workspace is archived: ${workspaceId}. Unarchive it before opening an editor.`);
     }
     // Durable marker: the editor can outlive Xum, so a restart must not forget the open.
@@ -7715,6 +7724,7 @@ export class WorkspaceService extends EventEmitter {
       await fsPromises.writeFile(markerPath, new Date().toISOString());
     } catch (error) {
       log.error("Failed to persist external editor marker", { workspaceId, error });
+      rollbackReservation();
       return Err(
         `Cannot open an editor for ${workspaceId}: persisting the editor-open marker failed (${getErrorMessage(error)}), and without it archive safety checks would forget the editor after a restart.`
       );

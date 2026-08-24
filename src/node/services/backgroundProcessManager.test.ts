@@ -1972,13 +1972,64 @@ describe("BackgroundProcessManager", () => {
       expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
     });
 
-    it("ignores non-running, unprobeable, and malformed records", async () => {
+    it("ignores non-running and unprobeable records", async () => {
       await writeSpawnRecord("clean-exit", { pid: process.pid, status: "exited" });
       // pid 0 marks migrated processes with unknown (possibly remote) PIDs.
       await writeSpawnRecord("migrated", { pid: 0, status: "running" });
-      // A crash mid-write can truncate meta.json.
+
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("fails closed on unreadable records without an exit marker", async () => {
+      // A crash mid-write can truncate meta.json while the detached process survives; an
+      // unreadable record cannot prove the process exited, so only the exit marker clears it.
       await writeSpawnRecord("torn-write", '{"pid": 12');
 
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(true);
+
+      await fs.writeFile(path.join(workspaceDir, "torn-write", "exit_code"), "137");
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("aborts the spawn (and self-heals the record) when meta.json cannot be persisted", async () => {
+      // Fail exactly the meta.json heredoc write; every other exec (spawn, terminate)
+      // proceeds normally. Proxy keeps original-receiver calls so runtime internals work.
+      const proxyHandler: ProxyHandler<Runtime> = {
+        get(target, prop, receiver) {
+          if (prop === "exec") {
+            const failingExec: Runtime["exec"] = (command, options) => {
+              if (command.includes("METAEOF")) {
+                throw new Error("injected meta write failure");
+              }
+              return target.exec(command, options);
+            };
+            return failingExec;
+          }
+          const value: unknown = Reflect.get(target, prop, receiver);
+          if (typeof value === "function") {
+            return (value as (...args: unknown[]) => unknown).bind(target);
+          }
+          return value;
+        },
+      };
+      const failingRuntime = new Proxy(runtime, proxyHandler);
+
+      const result = await manager.spawn(failingRuntime, orphanWorkspaceId, "sleep 5", {
+        cwd: process.cwd(),
+        displayName: "unrecordable",
+      });
+
+      // Without a durable spawn record the crash-orphan gate could never see this process
+      // after a restart, so the spawn must fail closed instead of running unrecorded.
+      expect(result.success).toBe(false);
+      expect(await manager.getProcess("unrecordable")).toBeNull();
+      // The abort terminated the process, which wrote the exit marker — so the markerless
+      // unreadable-record probe reads the leftover directory as exited, not as an orphan.
+      const exitMarker = await fs.readFile(
+        path.join(workspaceDir, "unrecordable", "exit_code"),
+        "utf-8"
+      );
+      expect(exitMarker.length).toBeGreaterThan(0);
       expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
     });
 

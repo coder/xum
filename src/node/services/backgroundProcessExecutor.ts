@@ -161,6 +161,19 @@ export async function spawnProcess(
     options.processId
   );
 
+  // A failed spawn must not leave a recordless process directory behind: the crash-orphan
+  // probe fails closed on directories without readable metadata or an exit marker.
+  const removeOutputDirBestEffort = async () => {
+    try {
+      await execBuffered(runtime, `rm -rf ${quotePath(outputDir)}`, {
+        cwd: FALLBACK_CWD,
+        timeout: 10,
+      });
+    } catch {
+      // Best-effort: a leftover directory only over-refuses model-driven archives.
+    }
+  };
+
   // Create output directory and empty file
   try {
     await runtime.ensureDir(outputDir);
@@ -175,12 +188,14 @@ export async function spawnProcess(
       timeout: 10,
     });
     if (rmResult.exitCode !== 0) {
+      await removeOutputDirBestEffort();
       return {
         success: false,
         error: `Failed to clear stale exit_code file: ${rmResult.stderr}`,
       };
     }
   } catch (error) {
+    await removeOutputDirBestEffort();
     return {
       success: false,
       error: `Failed to create output directory: ${errorMsg(error)}`,
@@ -210,6 +225,7 @@ export async function spawnProcess(
 
     if (result.exitCode !== 0) {
       log.debug(`BackgroundProcessExecutor.spawnProcess: spawn command failed: ${result.stderr}`);
+      await removeOutputDirBestEffort();
       return {
         success: false,
         error: `Failed to spawn background process: ${result.stderr}`,
@@ -219,6 +235,7 @@ export async function spawnProcess(
     const pid = parsePid(result.stdout);
     if (!pid) {
       log.debug(`BackgroundProcessExecutor.spawnProcess: Invalid PID: ${result.stdout}`);
+      await removeOutputDirBestEffort();
       return {
         success: false,
         error: `Failed to get valid PID from spawn: ${result.stdout}`,
@@ -231,6 +248,7 @@ export async function spawnProcess(
   } catch (error) {
     const errorMessage = errorMsg(error);
     log.debug(`BackgroundProcessExecutor.spawnProcess: Error: ${errorMessage}`);
+    await removeOutputDirBestEffort();
     return {
       success: false,
       error: `Failed to spawn background process: ${errorMessage}`,
@@ -309,14 +327,20 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
    * Write meta.json to the output directory.
    */
   async writeMeta(metaJson: string): Promise<void> {
-    try {
-      const metaPath = this.quotePath(`${this.outputDir}/${BG_META_FILENAME}`);
-      await execBuffered(this.runtime, `cat > ${metaPath} << 'METAEOF'\n${metaJson}\nMETAEOF`, {
+    // Persistence failures propagate: the initial spawn record is load-bearing for
+    // crash-orphan archive gating (BackgroundProcessManager.spawn aborts the spawn when it
+    // cannot be written); status-update callers wrap this in their own best-effort catch.
+    const metaPath = this.quotePath(`${this.outputDir}/${BG_META_FILENAME}`);
+    const result = await execBuffered(
+      this.runtime,
+      `cat > ${metaPath} << 'METAEOF'\n${metaJson}\nMETAEOF`,
+      {
         cwd: FALLBACK_CWD,
         timeout: 10,
-      });
-    } catch (error) {
-      log.debug(`RuntimeBackgroundHandle.writeMeta: Error: ${errorMsg(error)}`);
+      }
+    );
+    if (result.exitCode !== 0) {
+      throw new Error(`writeMeta failed with exit code ${result.exitCode}: ${result.stderr}`);
     }
   }
 
@@ -573,6 +597,9 @@ class MigratedBackgroundHandle implements BackgroundHandle {
   }
 
   async writeMeta(metaJson: string): Promise<void> {
+    // Swallowed on purpose (unlike RuntimeBackgroundHandle): migrated records carry pid 0,
+    // which the crash-orphan probe ignores, and registerMigratedProcess writes fire-and-forget
+    // (a rethrow would surface as an unhandled rejection).
     try {
       const metaPath = path.join(this.outputDir, BG_META_FILENAME);
       await fs.writeFile(metaPath, metaJson);
