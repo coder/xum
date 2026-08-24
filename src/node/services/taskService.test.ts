@@ -13577,6 +13577,10 @@ describe("TaskService", () => {
           parentWorkspaceId: "tree-root",
           taskStatus: "running",
         }),
+        projectWorkspace(projectPath, "child-b", "child-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
       ],
       testTaskSettings()
     );
@@ -13584,14 +13588,20 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
+    const interruptRefusal = Err({
+      code: "refused" as const,
+      reason:
+        "Target was interrupted by the user and will not accept agent messages until the user resumes it.",
+    });
     // The user's stop must win a race against a descendant's message: no queued or started turn.
     taskService.markParentWorkspaceInterrupted("tree-root");
     expect(await taskService.sendAgentTreeMessage("child-a", "tree-root", "status?")).toEqual(
-      Err({
-        code: "refused",
-        reason:
-          "Target was interrupted by the user and will not accept agent messages until the user resumes it.",
-      })
+      interruptRefusal
+    );
+    // The suppression set holds the interrupted ANCESTOR: a sibling target under it must also
+    // refuse even before the termination cascade reaches that sibling.
+    expect(await taskService.sendAgentTreeMessage("child-a", "child-b", "psst")).toEqual(
+      interruptRefusal
     );
     expect(sendMessage).not.toHaveBeenCalled();
   });
@@ -13690,6 +13700,15 @@ describe("TaskService", () => {
           taskStatus: "running",
           workflowTask: { runId: "wfr_tree", stepId: "step" },
         }),
+        projectWorkspace(projectPath, "cand", "task-cand", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+          bestOf: { groupId: "grp-1", index: 1, total: 2 },
+        }),
+        projectWorkspace(projectPath, "cand-child", "task-cand-child", {
+          parentWorkspaceId: "task-cand",
+          taskStatus: "running",
+        }),
       ],
       testTaskSettings()
     );
@@ -13705,8 +13724,14 @@ describe("TaskService", () => {
         "task-a": "self",
         "task-b": "sibling",
         "task-a1": "descendant",
+        "task-cand": "sibling",
+        "task-cand-child": "sibling",
       }
     );
+    // A candidate's nested children inherit its bestOf marker: peer sends refuse the whole
+    // candidate subtree, so discovery must not present these rows as addressable.
+    const candChild = fromA.tasks.find((task) => task.taskId === "task-cand-child");
+    expect(candChild?.bestOf).toEqual({ groupId: "grp-1", index: 1, total: 2 });
 
     const fromRoot = taskService.listTaskTreeAgents("tree-root");
     expect(fromRoot.rootRelationship).toBe("self");

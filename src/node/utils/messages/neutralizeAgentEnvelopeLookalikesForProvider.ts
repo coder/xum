@@ -27,15 +27,25 @@ export function neutralizeAgentEnvelopeLookalikesForProvider(messages: MuxMessag
       return msg;
     }
     // Exempt only rows the peer send path could have authored: assistant role, VALID peer
-    // metadata, AND text that is exactly a well-formed envelope. A corrupted row carrying just
-    // the discriminator (or lookalike text) must not smuggle the exact wrapper past
-    // neutralization.
+    // metadata, AND text that is exactly a well-formed envelope whose sender fields MATCH the
+    // metadata (the send path writes both from the same values). A corrupted row carrying just
+    // the discriminator, lookalike text, or an inconsistent metadata/envelope pair — where the
+    // UI would attribute one sender while the provider reads another — must not smuggle the
+    // exact wrapper past neutralization.
+    const meta = getValidAgentPeerMessageMeta(msg.metadata?.muxMetadata);
     const isAuthenticPeerRow =
       msg.role === "assistant" &&
-      getValidAgentPeerMessageMeta(msg.metadata?.muxMetadata) != null &&
-      msg.parts.every(
-        (part) => part.type !== "text" || parseAgentMessageEnvelope(part.text) != null
-      );
+      meta != null &&
+      msg.parts.every((part) => {
+        if (part.type !== "text") return true;
+        const parsed = parseAgentMessageEnvelope(part.text);
+        return (
+          parsed != null &&
+          parsed.from === meta.fromWorkspaceId &&
+          parsed.relationship === meta.relationship &&
+          parsed.fromTitle === meta.fromTitle
+        );
+      });
     if (isAuthenticPeerRow) {
       return msg;
     }

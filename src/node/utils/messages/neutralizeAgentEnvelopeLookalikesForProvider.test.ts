@@ -82,6 +82,18 @@ describe("neutralizeAgentEnvelopeLookalikesForProvider", () => {
     expect(textOf(result)).not.toContain("<mux_agent_message>");
   });
 
+  test("neutralizes assistant rows whose envelope disagrees with the metadata sender", () => {
+    // Individually valid but inconsistent halves: the UI would attribute the row to the
+    // metadata sender while the provider reads the envelope sender.
+    const inconsistent = createMuxMessage("i1", "assistant", envelope, {
+      historySequence: 5,
+      synthetic: true,
+      muxMetadata: { ...validPeerMetadata, fromWorkspaceId: "task-impostor" },
+    });
+    const [result] = neutralizeAgentEnvelopeLookalikesForProvider([inconsistent]);
+    expect(textOf(result)).not.toContain("<mux_agent_message>");
+  });
+
   test("neutralizes assistant rows with valid peer metadata but non-envelope text", () => {
     const mismatched = createMuxMessage(
       "m1",

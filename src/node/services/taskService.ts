@@ -5189,8 +5189,15 @@ export class TaskService {
 
       // A hard interrupt is an explicit user stop: markParentWorkspaceInterrupted suppresses
       // auto-resume until real user input, and an agent message racing that cascade must not
-      // undo the stop by queueing or starting another turn on the interrupted workspace.
-      if (this.interruptedParentWorkspaceIds.has(targetId)) {
+      // undo the stop by queueing or starting another turn on the interrupted workspace. The
+      // suppression set holds the ANCESTOR the user interrupted, so check the target's whole
+      // ancestor chain — the termination cascade may not have reached a lower target yet.
+      if (
+        [
+          targetId,
+          ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, targetId),
+        ].some((id) => this.interruptedParentWorkspaceIds.has(id))
+      ) {
         return Err({
           code: "refused" as const,
           reason:
@@ -10218,17 +10225,26 @@ export class TaskService {
 
   /** True when the workspace or any agent-task ancestor carries best-of candidate metadata. */
   private isBestOfChainUsingIndex(index: AgentTaskIndex, workspaceId: string): boolean {
+    return this.findNearestBestOfGroupUsingIndex(index, workspaceId) != null;
+  }
+
+  /** Nearest best-of candidate metadata on the workspace or any agent-task ancestor. */
+  private findNearestBestOfGroupUsingIndex(
+    index: AgentTaskIndex,
+    workspaceId: string
+  ): TaskCreateArgs["bestOf"] {
     let current = workspaceId;
     for (let i = 0; i < 32; i++) {
       const entry = index.byId.get(current);
-      if (entry != null && this.getEffectiveTaskGroup(current, entry) != null) return true;
+      const group = entry != null ? this.getEffectiveTaskGroup(current, entry) : undefined;
+      if (group != null) return group;
       const parent = index.parentById.get(current);
-      if (!parent) return false;
+      if (!parent) return undefined;
       current = parent;
     }
 
     throw new Error(
-      `isBestOfChainUsingIndex: possible parentWorkspaceId cycle starting at ${workspaceId}`
+      `findNearestBestOfGroupUsingIndex: possible parentWorkspaceId cycle starting at ${workspaceId}`
     );
   }
 
@@ -10264,7 +10280,12 @@ export class TaskService {
             : this.isDescendantAgentTaskUsingParentById(index.parentById, task.taskId, workspaceId)
               ? "ancestor"
               : "sibling";
-      return { ...task, relationship };
+      // sendAgentPeerMessage refuses a candidate's ENTIRE subtree (isBestOfChainUsingIndex walks
+      // ancestors), so discovery must mark nested children of a candidate too: inherit the
+      // nearest ancestor's candidate metadata when the row carries none of its own, keeping the
+      // tree note's "bestOf metadata ⇒ not peer-addressable" rule aligned with refusal behavior.
+      const bestOf = task.bestOf ?? this.findNearestBestOfGroupUsingIndex(index, task.taskId);
+      return { ...task, ...(bestOf != null ? { bestOf } : {}), relationship };
     });
 
     return {
