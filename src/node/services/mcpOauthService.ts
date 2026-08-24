@@ -1179,9 +1179,11 @@ export class McpOauthService {
         });
       },
       saveDiscoveryState: (state) => {
-        // Cache only for downgrade-compatible writes; read-back would change SDK discovery behavior.
         flow.discoveryState = state;
       },
+      // The SDK compares this redirect-leg issuer with callback discovery before
+      // sending the authorization code and PKCE verifier to the token endpoint.
+      discoveryState: () => Promise.resolve(flow.discoveryState),
       redirectToAuthorization: (authorizationUrl) => {
         flow.authorizeUrl = authorizationUrl.toString();
         return Promise.resolve();
