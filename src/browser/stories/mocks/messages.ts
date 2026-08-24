@@ -158,7 +158,10 @@ export function createAgentPeerMessage(
     metadata: {
       historySequence: opts.historySequence,
       timestamp: opts.timestamp ?? STABLE_TIMESTAMP,
+      // Match the backend send path: synthetic sends are marked uiVisible so the
+      // aggregator does not hide them from the transcript (agentSession internal sends).
       synthetic: true,
+      uiVisible: true,
       muxMetadata: {
         type: "agent-peer-message",
         fromWorkspaceId: opts.fromWorkspaceId,
