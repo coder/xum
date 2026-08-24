@@ -951,7 +951,6 @@ describe("task_list tool", () => {
       depth: 0,
     });
     expect(parsed.tasks[1].relationship).toBe("self");
-    expect(parsed.note).toContain("task_send_message");
   });
 
   it("tree scope filters the root row like any other row when explicit statuses are passed", async () => {

@@ -13497,7 +13497,7 @@ describe("TaskService", () => {
     );
     expect(sendMessage).not.toHaveBeenCalled();
   });
-  test("sendAgentTreeMessage counts queued peer entries against the consecutive-wake budget", async () => {
+  test("sendAgentTreeMessage charges the consecutive-wake budget at admission, before dispatch", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
 
@@ -13518,21 +13518,28 @@ describe("TaskService", () => {
       testTaskSettings()
     );
 
-    // Queued entries have not dispatched yet (no onAccepted), so consecutivePeerWakes is 0 —
-    // the reservation must still refuse once queued wakes-in-waiting fill the budget.
-    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
-      countQueuedAgentPeerMessages: mock(() => 3),
-    });
+    // The busy-target mock never dequeues entries (no onAccepted), so this exercises the
+    // admission-time charge: undispatched sends must fill the budget with no
+    // dequeue-to-acceptance gap for parallel senders to slip through.
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "hi")).toEqual(
+    for (let i = 1; i <= 3; i++) {
+      const result = await taskService.sendAgentTreeMessage("sib-a", "sib-b", `queued wake ${i}`);
+      expect(result).toEqual(
+        Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
+      );
+    }
+    expect(sendMessage).toHaveBeenCalledTimes(3);
+
+    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "queued wake 4")).toEqual(
       Err({
         code: "refused",
         reason:
           "Target reached its consecutive peer-wake limit and needs user or parent attention.",
       })
     );
-    expect(sendMessage).not.toHaveBeenCalled();
+    expect(sendMessage).toHaveBeenCalledTimes(3);
   });
 
   test("sendAgentTreeMessage refuses targets hard-interrupted by the user", async () => {

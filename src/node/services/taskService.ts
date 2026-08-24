@@ -1459,7 +1459,7 @@ export class TaskService {
   private readonly peerMessageSendTimesByTarget = new Map<string, number[]>();
   /** Key: sender\u0000target\u0000trimmedText → last send timestamp (duplicate suppression). */
   private readonly peerMessageDedupeTimes = new Map<string, number>();
-  /** Consecutive turns a target started from peer messages since its last user/parent attention. */
+  /** Peer sends ADMITTED for a target since its last user/parent attention (charged at admission, not dispatch, so queue timing opens no gap). */
   private readonly consecutivePeerWakes = new Map<string, number>();
 
   private async findLatestWorkflowSupersession(workspaceId: string): Promise<{
@@ -5301,10 +5301,6 @@ export class TaskService {
         removableQueueDedupeKey: true,
         onAccepted: () => {
           accepted = true;
-          this.consecutivePeerWakes.set(
-            targetId,
-            (this.consecutivePeerWakes.get(targetId) ?? 0) + 1
-          );
         },
       });
       if (!sendResult.success) {
@@ -5316,6 +5312,12 @@ export class TaskService {
         });
       }
 
+      // Charge the wake budget at ADMISSION (still inside the target's event lock), not at
+      // dispatch: acceptance callbacks fire only when an entry is dequeued into a turn, so any
+      // dispatch-time accounting leaves a dequeue-to-acceptance window where a parallel sender
+      // sees neither a queued entry nor an incremented counter. Counting admitted sends makes
+      // the budget independent of queue state; user attention still resets it.
+      this.consecutivePeerWakes.set(targetId, (this.consecutivePeerWakes.get(targetId) ?? 0) + 1);
       this.recordPeerMessageSend(senderWorkspaceId, targetId, params.message, Date.now());
       return Ok(
         accepted
@@ -5372,14 +5374,10 @@ export class TaskService {
       };
     }
 
-    // consecutivePeerWakes increments only when an entry dispatches (onAccepted), so queued
-    // entries against a busy target are undispatched wakes-in-waiting: count them as reserved
-    // budget or parallel senders could enqueue up to the queue cap and blow past the advertised
-    // consecutive-wake maximum once the target drains its queue.
-    if (
-      (this.consecutivePeerWakes.get(targetId) ?? 0) + queuedCount >=
-      MAX_CONSECUTIVE_PEER_WAKES
-    ) {
+    // consecutivePeerWakes counts ADMITTED sends since the target's last user attention (charged
+    // synchronously under the target's event lock), so queued, dispatching, and delivered entries
+    // are all covered with no dequeue-to-acceptance gap for parallel senders to slip through.
+    if ((this.consecutivePeerWakes.get(targetId) ?? 0) >= MAX_CONSECUTIVE_PEER_WAKES) {
       return {
         code: "refused",
         reason:
