@@ -11266,6 +11266,53 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
   });
 
+  test("recordExternalEditorOpenForLaunch rolls back a freshly created marker after a failed launch", async () => {
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+
+    const admitted = await workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
+    expect(admitted.success).toBe(true);
+    if (!admitted.success) return;
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
+
+    // EditorService failures occur only before its detached spawn (missing executable,
+    // unsupported runtime), so nothing launched: the marker this recording created must not
+    // permanently refuse future model-driven snapshot/Coder-stop archives.
+    await admitted.data.rollbackAfterFailedLaunch();
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
+  });
+
+  test("rollbackAfterFailedLaunch preserves a marker that predates the recording", async () => {
+    // An earlier session's editor may still be running behind a pre-existing marker; a later
+    // failed launch must not delete the evidence protecting it.
+    await fsPromises.mkdir("/tmp/test/sessions", { recursive: true });
+    await fsPromises.writeFile("/tmp/test/sessions/external-editor-opened", "earlier session");
+
+    const admitted = await workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
+    expect(admitted.success).toBe(true);
+    if (!admitted.success) return;
+    await admitted.data.rollbackAfterFailedLaunch();
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
+
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+  });
+
+  test("rollbackAfterFailedLaunch preserves the marker while another open holds launch evidence", async () => {
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+
+    const failing = await workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
+    expect(failing.success).toBe(true);
+    // A deep-link open recorded meanwhile launches in the renderer unconditionally; its
+    // evidence must keep protecting the marker when the custom-editor launch fails.
+    const deepLink = await workspaceService.recordExternalEditorOpen(workspaceId);
+    expect(deepLink.success).toBe(true);
+    if (!failing.success) return;
+
+    await failing.data.rollbackAfterFailedLaunch();
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
+
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+  });
+
   test("resumeStream refuses while the workspace is being archived", async () => {
     addToArchivingWorkspaces(workspaceService, workspaceId);
 

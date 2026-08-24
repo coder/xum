@@ -23,6 +23,7 @@ import {
   resolveWorkspaceExecutionPath,
 } from "@/node/runtime/runtimeHelpers";
 import { log } from "@/node/services/log";
+import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { isCommandAvailable, findAvailableCommand } from "@/node/utils/commandDiscovery";
 import { resolveContainerCli } from "@/node/runtime/containerCli";
 import { sanitizeXumChildEnv } from "@/node/runtime/childProcessEnv";
@@ -90,8 +91,38 @@ export class TerminalService {
    */
   private readonly nativeTerminalWorkspaces = new Set<string>();
 
+  /**
+   * Launch evidence for openNative calls this session: one token per call that persisted the
+   * durable marker and has not failed before its launcher could spawn. A failed launch may
+   * delete a marker it just created only when no token remains — any survivor means another
+   * open launched (or may still launch) a shell the marker must keep protecting.
+   */
+  private readonly nativeTerminalOpenTokens = new Map<string, Set<object>>();
+
+  /**
+   * Serializes marker writes against failed-launch rollbacks per workspace: an unserialized
+   * rollback's unlink could interleave with a concurrent open's write and delete the marker
+   * protecting that open's live shell.
+   */
+  private readonly nativeTerminalMarkerLocks = new MutexMap<string>();
+
   private nativeTerminalMarkerPath(workspaceId: string): string {
     return path.join(this.config.getSessionDir(workspaceId), "native-terminal-opened");
+  }
+
+  /**
+   * Disk probe for the durable marker. "unknown" means the probe failed in a way that cannot
+   * prove absence (EACCES, EIO, ...).
+   */
+  private async probeNativeTerminalMarkerOnDisk(
+    workspaceId: string
+  ): Promise<"present" | "absent" | "unknown"> {
+    try {
+      await fs.promises.access(this.nativeTerminalMarkerPath(workspaceId));
+      return "present";
+    } catch (error) {
+      return isErrnoWithCode(error, "ENOENT") ? "absent" : "unknown";
+    }
   }
 
   /** Whether a native terminal was ever opened for this workspace (survives app restarts). */
@@ -99,19 +130,15 @@ export class TerminalService {
     if (this.nativeTerminalWorkspaces.has(workspaceId)) {
       return true;
     }
-    try {
-      await fs.promises.access(this.nativeTerminalMarkerPath(workspaceId));
+    const probe = await this.probeNativeTerminalMarkerOnDisk(workspaceId);
+    if (probe === "present") {
       this.nativeTerminalWorkspaces.add(workspaceId);
       return true;
-    } catch (error) {
-      if (isErrnoWithCode(error, "ENOENT")) {
-        return false;
-      }
-      // Any other probe failure (EACCES, EIO, ...) cannot prove the marker is absent, and a
-      // false "absent" would let a snapshot archive remove the checkout under a surviving
-      // terminal — fail closed without caching (the marker may still prove readable later).
-      return true;
     }
+    // An "unknown" probe (EACCES, EIO, ...) cannot prove the marker is absent, and a false
+    // "absent" would let a snapshot archive remove the checkout under a surviving terminal —
+    // fail closed without caching (the marker may still prove readable later).
+    return probe !== "absent";
   }
 
   setWorkspaceArchiveGuard(guard: (workspaceId: string) => boolean): void {
@@ -521,9 +548,11 @@ export class TerminalService {
    */
   async openNative(workspaceId: string): Promise<void> {
     // Recorded before any awaits so archive gates observe the intent immediately; see the
-    // nativeTerminalWorkspaces doc comment for why entries are sticky. Refused opens roll a
-    // newly added reservation back (no shell launches, so nothing needs gating) — but only
-    // until the durable marker is persisted; after that the Set is just a cache of the marker.
+    // nativeTerminalWorkspaces doc comment for why entries are sticky. Failed opens launch no
+    // shell (see the catch below), so they roll a newly added reservation back — and, once
+    // the durable marker is persisted, roll that back too when no other launch evidence
+    // remains, because a sticky false positive would permanently refuse future model-driven
+    // snapshot/Coder-stop archives of this workspace.
     const previouslyRecorded = this.nativeTerminalWorkspaces.has(workspaceId);
     this.nativeTerminalWorkspaces.add(workspaceId);
     const rollbackReservation = () => {
@@ -540,7 +569,7 @@ export class TerminalService {
         `Workspace is being archived: ${workspaceId}. Unarchive it before opening a terminal.`
       );
     }
-    let markerPersisted = false;
+    let admission: { token: object; markerPreexisted: boolean } | null = null;
     try {
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const workspace = allMetadata.find((w) => w.id === workspaceId);
@@ -567,16 +596,32 @@ export class TerminalService {
       // would be invisible to archive gating after a restart, so failing the open here is the
       // only fail-closed option (the in-memory Set covers just this app session).
       try {
-        const markerPath = this.nativeTerminalMarkerPath(workspaceId);
-        await fs.promises.mkdir(path.dirname(markerPath), { recursive: true });
-        await fs.promises.writeFile(markerPath, new Date().toISOString());
+        admission = await this.nativeTerminalMarkerLocks.withLock(workspaceId, async () => {
+          // Probed before the write so a launch failure below can tell a marker this call
+          // created (safe to roll back — see the catch) from one that predates it (an earlier
+          // session's shell may still be running; must survive). "unknown" counts as
+          // pre-existing (fail closed).
+          const preexisting = await this.probeNativeTerminalMarkerOnDisk(workspaceId);
+          const markerPath = this.nativeTerminalMarkerPath(workspaceId);
+          await fs.promises.mkdir(path.dirname(markerPath), { recursive: true });
+          await fs.promises.writeFile(markerPath, new Date().toISOString());
+          // Launch evidence is registered under the same lock as the write so a concurrent
+          // failed launch's rollback can never observe the marker without the token.
+          const token = {};
+          let tokens = this.nativeTerminalOpenTokens.get(workspaceId);
+          if (tokens == null) {
+            tokens = new Set();
+            this.nativeTerminalOpenTokens.set(workspaceId, tokens);
+          }
+          tokens.add(token);
+          return { token, markerPreexisted: preexisting !== "absent" };
+        });
       } catch (error) {
         log.error("Failed to persist native terminal marker", { workspaceId, error });
         throw new Error(
           `Cannot open a native terminal for ${workspaceId}: persisting the terminal-open marker failed (${getErrorMessage(error)}), and without it archive safety checks would forget the terminal after a restart.`
         );
       }
-      markerPersisted = true;
 
       const runtimeConfig = workspace.runtimeConfig;
 
@@ -619,16 +664,58 @@ export class TerminalService {
         });
       }
     } catch (err) {
-      // Pre-marker failures (unknown/archived workspace, marker persistence) launched no
-      // shell, so the in-memory reservation rolls back; once the durable marker exists the
-      // Set is a cache of it and rolling back would be meaningless.
-      if (!markerPersisted) {
+      // No failure path in openNative launches a shell: pre-marker failures (unknown/archived
+      // workspace, marker persistence) never reach a launcher, and launcher errors propagate
+      // only from before their detached spawn (nothing after spawn()/unref() throws). The
+      // in-memory reservation always rolls back; a marker this call created is a false
+      // positive that would permanently refuse future model-driven snapshot/Coder-stop
+      // archives, so it rolls back too unless other launch evidence remains.
+      if (admission == null) {
         rollbackReservation();
+      } else {
+        await this.rollbackNativeTerminalMarkerAfterFailedLaunch(workspaceId, admission);
       }
       const message = getErrorMessage(err);
       log.error(`Failed to open native terminal: ${message}`);
       throw err;
     }
+  }
+
+  /**
+   * Undo a failed openNative's durable marker. Deletes the marker only when this call
+   * provably created it and no shell could be relying on it: the marker must not predate the
+   * call (an earlier session's shell may still be running) and no other open may hold launch
+   * evidence (its shell launched or may still launch). Serialized with marker writes so the
+   * unlink can never race a concurrent open's write; deletion failure keeps the sticky
+   * marker (fail closed).
+   */
+  private async rollbackNativeTerminalMarkerAfterFailedLaunch(
+    workspaceId: string,
+    admission: { token: object; markerPreexisted: boolean }
+  ): Promise<void> {
+    await this.nativeTerminalMarkerLocks.withLock(workspaceId, async () => {
+      const tokens = this.nativeTerminalOpenTokens.get(workspaceId);
+      tokens?.delete(admission.token);
+      if (tokens?.size === 0) {
+        this.nativeTerminalOpenTokens.delete(workspaceId);
+      }
+      if (admission.markerPreexisted || (tokens?.size ?? 0) > 0) {
+        return;
+      }
+      try {
+        await fs.promises.unlink(this.nativeTerminalMarkerPath(workspaceId));
+      } catch (error) {
+        if (!isErrnoWithCode(error, "ENOENT")) {
+          // The marker may still exist, so the in-memory cache entry must stay to match it.
+          log.error("Failed to roll back native terminal marker after a failed launch", {
+            workspaceId,
+            error,
+          });
+          return;
+        }
+      }
+      this.nativeTerminalWorkspaces.delete(workspaceId);
+    });
   }
 
   /**

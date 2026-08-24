@@ -2821,17 +2821,25 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) => {
           // Custom editors spawn detached and untrackable; record the open (refusing while
           // the workspace is archiving) before launching. See recordExternalEditorOpen.
-          const recorded = await context.workspaceService.recordExternalEditorOpen(
+          const recorded = await context.workspaceService.recordExternalEditorOpenForLaunch(
             input.workspaceId
           );
           if (!recorded.success) {
             return recorded;
           }
-          return context.editorService.openInEditor(
+          const result = await context.editorService.openInEditor(
             input.workspaceId,
             input.targetPath,
             input.editorConfig
           );
+          if (!result.success) {
+            // EditorService errors occur only before its detached spawn (missing/invalid
+            // command, unsupported runtime), so no editor launched — roll back a marker this
+            // call created, or it would stick and permanently refuse future model-driven
+            // snapshot/Coder-stop archives of the workspace.
+            await recorded.data.rollbackAfterFailedLaunch();
+          }
+          return result;
         }),
       recordEditorOpen: t
         .input(schemas.general.recordEditorOpen.input)

@@ -7682,8 +7682,40 @@ export class WorkspaceService extends EventEmitter {
    */
   private readonly externalEditorWorkspaces = new Set<string>();
 
+  /**
+   * Launch evidence for recorded editor opens this session: one token per recorded open that
+   * has not reported a failed launch. A failed launch may delete a marker it just created
+   * only when no token remains — any survivor means another open launched (or may still
+   * launch) an editor the marker must keep protecting. Deep-link opens recorded via
+   * recordExternalEditorOpen retain their token unconditionally: they launch in the renderer
+   * immediately after recording and cannot report failures back.
+   */
+  private readonly externalEditorOpenTokens = new Map<string, Set<object>>();
+
+  /**
+   * Serializes marker writes against failed-launch rollbacks per workspace: an unserialized
+   * rollback's unlink could interleave with a concurrent open's write and delete the marker
+   * protecting that open's live editor.
+   */
+  private readonly externalEditorMarkerLocks = new MutexMap<string>();
+
   private externalEditorMarkerPath(workspaceId: string): string {
     return path.join(this.config.getSessionDir(workspaceId), "external-editor-opened");
+  }
+
+  /**
+   * Disk probe for the durable marker. "unknown" means the probe failed in a way that cannot
+   * prove absence (EACCES, EIO, ...).
+   */
+  private async probeExternalEditorMarkerOnDisk(
+    workspaceId: string
+  ): Promise<"present" | "absent" | "unknown"> {
+    try {
+      await fsPromises.access(this.externalEditorMarkerPath(workspaceId));
+      return "present";
+    } catch (error) {
+      return isErrnoWithCode(error, "ENOENT") ? "absent" : "unknown";
+    }
   }
 
   /**
@@ -7694,6 +7726,22 @@ export class WorkspaceService extends EventEmitter {
    * untrackable-app check before snapshot capture.
    */
   async recordExternalEditorOpen(workspaceId: string): Promise<Result<void>> {
+    const admitted = await this.recordExternalEditorOpenForLaunch(workspaceId);
+    // Deep-link opens launch in the renderer immediately after this returns and cannot report
+    // launch failures back, so their launch evidence is retained unconditionally.
+    return admitted.success ? Ok(undefined) : admitted;
+  }
+
+  /**
+   * Like recordExternalEditorOpen, but for callers that launch the editor themselves and can
+   * observe deterministic launch failures (the custom-editor route: EditorService validates
+   * the command and spawns nothing on failure). A failed launch must call
+   * rollbackAfterFailedLaunch so a marker this call created cannot become a sticky false
+   * positive that permanently refuses future model-driven snapshot/Coder-stop archives.
+   */
+  async recordExternalEditorOpenForLaunch(
+    workspaceId: string
+  ): Promise<Result<{ rollbackAfterFailedLaunch: () => Promise<void> }>> {
     // Refused opens roll back a newly added reservation (no editor launches, so nothing needs
     // gating); a pre-existing entry or durable marker from an earlier successful open is
     // preserved — hasExternalEditorOpen re-probes the marker regardless of the Set.
@@ -7735,10 +7783,27 @@ export class WorkspaceService extends EventEmitter {
     // editor opened without the marker would be invisible to archive gating after a restart,
     // so refusing here is the only fail-closed option (the in-memory Set covers just this
     // app session).
+    let admission: { token: object; markerPreexisted: boolean };
     try {
-      const markerPath = this.externalEditorMarkerPath(workspaceId);
-      await fsPromises.mkdir(path.dirname(markerPath), { recursive: true });
-      await fsPromises.writeFile(markerPath, new Date().toISOString());
+      admission = await this.externalEditorMarkerLocks.withLock(workspaceId, async () => {
+        // Probed before the write so a launch failure can tell a marker this call created
+        // (safe to roll back) from one that predates it (an earlier session's editor may
+        // still be running; must survive). "unknown" counts as pre-existing (fail closed).
+        const preexisting = await this.probeExternalEditorMarkerOnDisk(workspaceId);
+        const markerPath = this.externalEditorMarkerPath(workspaceId);
+        await fsPromises.mkdir(path.dirname(markerPath), { recursive: true });
+        await fsPromises.writeFile(markerPath, new Date().toISOString());
+        // Launch evidence is registered under the same lock as the write so a concurrent
+        // failed launch's rollback can never observe the marker without the token.
+        const token = {};
+        let tokens = this.externalEditorOpenTokens.get(workspaceId);
+        if (tokens == null) {
+          tokens = new Set();
+          this.externalEditorOpenTokens.set(workspaceId, tokens);
+        }
+        tokens.add(token);
+        return { token, markerPreexisted: preexisting !== "absent" };
+      });
     } catch (error) {
       log.error("Failed to persist external editor marker", { workspaceId, error });
       rollbackReservation();
@@ -7746,26 +7811,62 @@ export class WorkspaceService extends EventEmitter {
         `Cannot open an editor for ${workspaceId}: persisting the editor-open marker failed (${getErrorMessage(error)}), and without it archive safety checks would forget the editor after a restart.`
       );
     }
-    return Ok(undefined);
+    return Ok({
+      rollbackAfterFailedLaunch: () =>
+        this.rollbackExternalEditorMarkerAfterFailedLaunch(workspaceId, admission),
+    });
+  }
+
+  /**
+   * Undo a failed editor launch's durable marker. Deletes the marker only when the recording
+   * provably created it and no editor could be relying on it: the marker must not predate the
+   * recording (an earlier session's editor may still be running) and no other recorded open
+   * may hold launch evidence (its editor launched or may still launch). Serialized with
+   * marker writes so the unlink can never race a concurrent open's write; deletion failure
+   * keeps the sticky marker (fail closed).
+   */
+  private async rollbackExternalEditorMarkerAfterFailedLaunch(
+    workspaceId: string,
+    admission: { token: object; markerPreexisted: boolean }
+  ): Promise<void> {
+    await this.externalEditorMarkerLocks.withLock(workspaceId, async () => {
+      const tokens = this.externalEditorOpenTokens.get(workspaceId);
+      tokens?.delete(admission.token);
+      if (tokens?.size === 0) {
+        this.externalEditorOpenTokens.delete(workspaceId);
+      }
+      if (admission.markerPreexisted || (tokens?.size ?? 0) > 0) {
+        return;
+      }
+      try {
+        await fsPromises.unlink(this.externalEditorMarkerPath(workspaceId));
+      } catch (error) {
+        if (!isErrnoWithCode(error, "ENOENT")) {
+          // The marker may still exist, so the in-memory cache entry must stay to match it.
+          log.error("Failed to roll back external editor marker after a failed launch", {
+            workspaceId,
+            error,
+          });
+          return;
+        }
+      }
+      this.externalEditorWorkspaces.delete(workspaceId);
+    });
   }
 
   private async hasExternalEditorOpen(workspaceId: string): Promise<boolean> {
     if (this.externalEditorWorkspaces.has(workspaceId)) {
       return true;
     }
-    try {
-      await fsPromises.access(this.externalEditorMarkerPath(workspaceId));
+    const probe = await this.probeExternalEditorMarkerOnDisk(workspaceId);
+    if (probe === "present") {
       this.externalEditorWorkspaces.add(workspaceId);
       return true;
-    } catch (error) {
-      if (isErrnoWithCode(error, "ENOENT")) {
-        return false;
-      }
-      // Any other probe failure (EACCES, EIO, ...) cannot prove the marker is absent, and a
-      // false "absent" would let a snapshot archive remove the checkout under a surviving
-      // editor — fail closed without caching (the marker may still prove readable later).
-      return true;
     }
+    // An "unknown" probe (EACCES, EIO, ...) cannot prove the marker is absent, and a false
+    // "absent" would let a snapshot archive remove the checkout under a surviving editor —
+    // fail closed without caching (the marker may still prove readable later).
+    return probe !== "absent";
   }
 
   /**

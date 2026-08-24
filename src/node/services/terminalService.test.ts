@@ -1275,6 +1275,71 @@ describe("TerminalService.openNative", () => {
     });
   });
 
+  describe("marker rollback on failed launches", () => {
+    beforeEach(() => {
+      setPlatform("linux");
+    });
+
+    const configWithWorkspace = (id: string) =>
+      ({
+        ...(configWithLocalWorkspace as unknown as Record<string, unknown>),
+        getAllWorkspaceMetadata: mock(() =>
+          Promise.resolve([
+            {
+              id,
+              projectPath: "/tmp/project",
+              name: "main",
+              namedWorkspacePath: "/tmp/project/main",
+              runtimeConfig: { type: "local", srcBaseDir: "/tmp" },
+            },
+          ])
+        ),
+      }) as unknown as Config;
+
+    it("rolls back a freshly created marker when the launch fails after it persists", async () => {
+      // No terminal emulator is available: the launch fails deterministically after the
+      // durable marker was written, and no shell was spawned.
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      const config = configWithWorkspace("ws-marker-rollback");
+      service = new TerminalService(config, mockPTYService);
+
+      try {
+        await service.openNative("ws-marker-rollback");
+        expect.unreachable("openNative must fail when no terminal emulator exists");
+      } catch (error) {
+        expect(String(error)).toContain("No terminal emulator found");
+      }
+      expect(spawnSpy).not.toHaveBeenCalled();
+      // The failed launch opened no shell, so a sticky marker would be a false positive that
+      // permanently refuses model-driven snapshot/Coder-stop archives — it must roll back
+      // durably (visible to a fresh service instance too).
+      expect(await service.hasOpenedNativeTerminal("ws-marker-rollback")).toBe(false);
+      const restartedService = new TerminalService(config, mockPTYService);
+      expect(await restartedService.hasOpenedNativeTerminal("ws-marker-rollback")).toBe(false);
+    });
+
+    it("preserves a marker that predates the failed launch", async () => {
+      const config = configWithWorkspace("ws-marker-preexisting");
+      // First open succeeds and persists the durable marker.
+      spawnSyncSpy.mockImplementation(() => ({ status: 0 }));
+      service = new TerminalService(config, mockPTYService);
+      await service.openNative("ws-marker-preexisting");
+      expect(spawnSpy).toHaveBeenCalledTimes(1);
+
+      // A relaunch after a restart fails (say the emulator was uninstalled): the earlier
+      // session's shell may still be running, so the pre-existing marker must survive.
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      const restartedService = new TerminalService(config, mockPTYService);
+      try {
+        await restartedService.openNative("ws-marker-preexisting");
+        expect.unreachable("openNative must fail when no terminal emulator exists");
+      } catch (error) {
+        expect(String(error)).toContain("No terminal emulator found");
+      }
+      expect(await restartedService.hasOpenedNativeTerminal("ws-marker-preexisting")).toBe(true);
+    });
+  });
+
   describe("Windows (win32)", () => {
     beforeEach(() => {
       setPlatform("win32");

@@ -31,14 +31,44 @@ describe("openInEditor", () => {
 
   type OpenCall = [url: string, target?: string];
 
+  // Electron-like window (`api` present via preload): deep links launch directly through
+  // window.open with no placeholder. Browser-mode behavior is covered separately below.
   function createMockWindow(calls: OpenCall[]) {
     return {
+      api: {},
       localStorage: { getItem: () => null },
       open: (url: string, target?: string) => {
         calls.push([url, target]);
         return null;
       },
     };
+  }
+
+  // Browser-mode window (no `api`): window.open returns a placeholder that records
+  // navigations and close() calls, mirroring a real popup.
+  function createBrowserModeWindow(calls: OpenCall[], opts?: { popupBlocked?: boolean }) {
+    const placeholder = {
+      closed: false,
+      navigations: [] as string[],
+      location: {},
+      close(): void {
+        this.closed = true;
+      },
+    };
+    Object.defineProperty(placeholder.location, "href", {
+      set(value: string) {
+        placeholder.navigations.push(value);
+      },
+    });
+    const windowValue = {
+      localStorage: { getItem: () => null },
+      location: { hostname: "localhost" },
+      open: (url: string, target?: string) => {
+        calls.push([url, target]);
+        return opts?.popupBlocked ? null : placeholder;
+      },
+    };
+    return { windowValue, placeholder };
   }
 
   // Editor opens must be recorded on the backend before any launch (archive safety), so
@@ -153,6 +183,7 @@ describe("openInEditor", () => {
     // Zed + Docker is refused deterministically with no launch; recording first would leave
     // a sticky durable marker permanently refusing snapshot archives of the workspace.
     const windowWithZed = {
+      api: {},
       localStorage: { getItem: () => JSON.stringify({ editor: "zed" }) },
       open: (url: string, target?: string) => {
         calls.push([url, target]);
@@ -214,5 +245,80 @@ describe("openInEditor", () => {
 
     expect(result.success).toBe(false);
     expect(calls.length).toBe(0);
+  });
+
+  test("browser mode: opens a placeholder synchronously and navigates it to the deep link", async () => {
+    const calls: OpenCall[] = [];
+    const { windowValue, placeholder } = createBrowserModeWindow(calls);
+    // Resolving this recording RPC yields the microtask queue, exactly the await that would
+    // outlast the click's transient user activation if window.open ran after it.
+    const recordEditorOpen = mock(() => Promise.resolve({ success: true }));
+    const api = { general: { recordEditorOpen } } as unknown as APIClient;
+
+    const result = await withWindow(windowValue, () =>
+      openInEditor({
+        api,
+        workspaceId,
+        targetPath: filePath,
+        runtimeConfig: { type: "ssh", host: "devbox", srcBaseDir: "~/xum" },
+        isFile: true,
+      })
+    );
+
+    expect(result.success).toBe(true);
+    // The only window.open call is the synchronous placeholder; the deep link reaches the
+    // already-open window via navigation, immune to popup blocking.
+    expect(calls).toEqual([["about:blank", "_blank"]]);
+    expect(placeholder.navigations.length).toBe(1);
+    expect(placeholder.navigations[0]).toContain("ssh-remote+devbox");
+    expect(placeholder.closed).toBe(false);
+  });
+
+  test("browser mode: closes the placeholder when the open is refused", async () => {
+    const calls: OpenCall[] = [];
+    const { windowValue, placeholder } = createBrowserModeWindow(calls);
+    const api = {
+      general: {
+        recordEditorOpen: () => Promise.resolve({ success: false, error: "being archived" }),
+      },
+    } as unknown as APIClient;
+
+    const result = await withWindow(windowValue, () =>
+      openInEditor({
+        api,
+        workspaceId,
+        targetPath: filePath,
+        runtimeConfig: { type: "ssh", host: "devbox", srcBaseDir: "~/xum" },
+        isFile: true,
+      })
+    );
+
+    expect(result.success).toBe(false);
+    // A refused open must not leave a stray blank tab behind.
+    expect(placeholder.navigations.length).toBe(0);
+    expect(placeholder.closed).toBe(true);
+  });
+
+  test("browser mode: falls back to a direct open when the placeholder is popup-blocked", async () => {
+    const calls: OpenCall[] = [];
+    const { windowValue, placeholder } = createBrowserModeWindow(calls, { popupBlocked: true });
+
+    const result = await withWindow(windowValue, () =>
+      openInEditor({
+        api: createApiStub(),
+        workspaceId,
+        targetPath: filePath,
+        runtimeConfig: { type: "ssh", host: "devbox", srcBaseDir: "~/xum" },
+        isFile: true,
+      })
+    );
+
+    expect(result.success).toBe(true);
+    // Placeholder attempt first, then the legacy direct open (which shares the blocked
+    // popup's fate but never regresses it).
+    expect(calls.length).toBe(2);
+    expect(calls[0]).toEqual(["about:blank", "_blank"]);
+    expect(calls[1][0]).toContain("ssh-remote+devbox");
+    expect(placeholder.navigations.length).toBe(0);
   });
 });

@@ -21,8 +21,12 @@ export interface OpenInEditorResult {
   error?: string;
 }
 
-// Browser mode: window.api is not set (only exists in Electron via preload)
-const isBrowserMode = typeof window !== "undefined" && !window.api;
+// Browser mode: window.api is not set (only exists in Electron via preload). Evaluated at
+// call time so tests can install a window; in production the preload bridge exists before
+// any renderer code runs, so this is equivalent to a load-time constant.
+function isBrowserModeNow(): boolean {
+  return typeof window !== "undefined" && !window.api;
+}
 
 // Helper for opening URLs - allows testing in Node environment
 function openUrl(url: string): void {
@@ -83,7 +87,7 @@ function getParentDirectory(path: string): string {
   return isRootLevelPath ? "/" : path.substring(0, lastSlash) || "/";
 }
 
-export async function openInEditor(args: {
+interface OpenInEditorArgs {
   api: APIClient | null | undefined;
   openSettings?: (section?: string) => void;
   workspaceId: string;
@@ -96,11 +100,59 @@ export async function openInEditor(args: {
    * open folders/workspaces, so we fall back to opening the parent directory.
    */
   isFile?: boolean;
-}): Promise<OpenInEditorResult> {
+}
+
+export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditorResult> {
   const editorConfig = normalizeEditorConfig(
     readPersistedState<EditorConfig>(EDITOR_CONFIG_KEY, DEFAULT_EDITOR_CONFIG)
   );
 
+  // Browser mode: window.open must run while the click's transient user activation is still
+  // valid — the awaited backend lookups and the open-recording RPC below can outlast that
+  // window, after which the deep link would be popup-blocked even though we would report
+  // success and have persisted a durable editor-open marker. Open a blank placeholder
+  // synchronously (before any await) and navigate it once admission succeeds; close it on
+  // any refusal. Electron routes window.open through the main-process window-open handler
+  // (no transient-activation gating), and custom editors never deep-link, so neither needs
+  // a placeholder.
+  let placeholder: Window | null = null;
+  if (
+    isBrowserModeNow() &&
+    editorConfig.editor !== "custom" &&
+    typeof window !== "undefined" &&
+    window.open
+  ) {
+    try {
+      placeholder = window.open("about:blank", "_blank");
+    } catch {
+      placeholder = null;
+    }
+  }
+  let launched = false;
+  const launch = (deepLink: string): void => {
+    launched = true;
+    if (placeholder != null) {
+      placeholder.location.href = deepLink;
+    } else {
+      // No placeholder was needed (Electron) or it was popup-blocked: fall back to a direct
+      // open, which shares the blocked popup's fate but never regresses it.
+      openUrl(deepLink);
+    }
+  };
+  try {
+    return await openInEditorWithLaunch(args, editorConfig, launch);
+  } finally {
+    if (placeholder != null && !launched) {
+      placeholder.close();
+    }
+  }
+}
+
+async function openInEditorWithLaunch(
+  args: OpenInEditorArgs,
+  editorConfig: EditorConfig,
+  launch: (deepLink: string) => void
+): Promise<OpenInEditorResult> {
   const isSSH = isSSHRuntime(args.runtimeConfig);
   const isDocker = isDockerRuntime(args.runtimeConfig);
 
@@ -178,7 +230,7 @@ export async function openInEditor(args: {
     if (recordError != null) {
       return { success: false, error: recordError };
     }
-    openUrl(deepLink);
+    launch(deepLink);
     return { success: true };
   }
 
@@ -236,7 +288,7 @@ export async function openInEditor(args: {
     if (recordError != null) {
       return { success: false, error: recordError };
     }
-    openUrl(deepLink);
+    launch(deepLink);
     return { success: true };
   }
 
@@ -250,7 +302,7 @@ export async function openInEditor(args: {
       if (editorConfig.editor === "zed" && args.runtimeConfig.port != null) {
         sshHost = sshHost + ":" + args.runtimeConfig.port;
       }
-    } else if (isBrowserMode && !isLocalhost(window.location.hostname)) {
+    } else if (isBrowserModeNow() && !isLocalhost(window.location.hostname)) {
       // Remote server + local workspace: need SSH to reach server's files
       const serverSshHost = await args.api?.server.getSshHost();
       sshHost = serverSshHost ?? window.location.hostname;
@@ -277,14 +329,14 @@ export async function openInEditor(args: {
     if (recordError != null) {
       return { success: false, error: recordError };
     }
-    openUrl(deepLink);
+    launch(deepLink);
     return { success: true };
   }
 
   // Custom editor:
   // - Browser mode: can't spawn processes on the server
   // - Electron mode: spawn via backend API
-  if (isBrowserMode) {
+  if (isBrowserModeNow()) {
     return {
       success: false,
       error: "Custom editors are not supported in browser mode. Use VS Code, Cursor, or Zed.",
