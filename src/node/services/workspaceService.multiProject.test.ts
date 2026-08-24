@@ -1381,6 +1381,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
       const projectBPath = path.join(rootDir, "project-b");
       const removeWorkspaceMock = mock(() => Promise.resolve());
       const mockConfig: Partial<Config> = {
+        rootDir,
         srcDir: path.join(rootDir, "src"),
         loadConfigOrDefault: mock(() => ({
           projects: new Map([
@@ -1476,6 +1477,7 @@ describe("WorkspaceService multi-project lifecycle", () => {
       const projectBPath = path.join(rootDir, "project-b");
       const removeWorkspaceMock = mock(() => Promise.resolve());
       const mockConfig: Partial<Config> = {
+        rootDir,
         srcDir: path.join(rootDir, "src"),
         loadConfigOrDefault: mock(() => ({
           projects: new Map([
