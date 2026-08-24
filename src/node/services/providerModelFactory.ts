@@ -2567,10 +2567,17 @@ export class ProviderModelFactory {
       );
     }
 
+    // Custom providers own their canonical prefix (including shadowed
+    // built-in ids); their requests are always direct, never gateway-routed.
+    const canonicalCustomEntry = providersConfigForShadowCheck[canonicalProviderName];
+    const canonicalIsCustomProvider = isCustomProviderConfig(canonicalCustomEntry);
+
     // Stream result normalization currently only understands Xum gateway responses,
     // so keep this flag mux-gateway-specific until the downstream normalization path
-    // is generalized too.
-    const routedThroughGateway = effectiveModelString.startsWith("mux-gateway:");
+    // is generalized too. A custom provider shadowing the mux-gateway id is
+    // direct: gateway attribution/quota handling must not engage for it.
+    const routedThroughGateway =
+      !canonicalIsCustomProvider && effectiveModelString.startsWith("mux-gateway:");
     const [effectiveRouteProvider] = parseModelString(effectiveModelString);
     const routeProvider = Object.hasOwn(PROVIDER_REGISTRY, effectiveRouteProvider)
       ? (effectiveRouteProvider as ProviderName)
@@ -2636,8 +2643,6 @@ export class ProviderModelFactory {
     // the custom prefix (same rationale as the Coder-gateway remap above).
     // Must mirror resolveOptionsCanonicalModel so the extras-merge namespace
     // key matches what buildProviderOptions computes internally.
-    const canonicalCustomEntry = providersConfigForShadowCheck[canonicalProviderName];
-    const canonicalIsCustomProvider = isCustomProviderConfig(canonicalCustomEntry);
     if (canonicalIsCustomProvider) {
       const customWireOrigin = customProviderWireOrigin(canonicalCustomEntry.providerType);
       if (customWireOrigin) {

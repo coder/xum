@@ -605,6 +605,42 @@ describe("ProvidersSection", () => {
     expect(repairRemovedProviderMock).toHaveBeenCalledWith(CUSTOM_PROVIDER_ID, expect.any(Set));
   });
 
+  test("invalidates queued format writes when the provider is removed", async () => {
+    const view = renderProvidersSection();
+    window.confirm = mock(() => true);
+    let resolveFirstWrite: ((value: { success: true; data: undefined }) => void) | undefined;
+    view.setProviderConfig.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveFirstWrite = resolve;
+        })
+    );
+
+    const customButton = await view.findByRole("button", { name: /Acme OpenAI/ });
+    fireEvent.click(customButton);
+    const customCard = getProviderCard(customButton);
+
+    // First selection blocks in flight; second queues behind it.
+    fireEvent.pointerDown(within(customCard).getByRole("combobox", { name: "API format" }));
+    fireEvent.click(await within(customCard).findByRole("button", { name: "Anthropic Messages" }));
+    await waitFor(() => {
+      expect(view.setProviderConfig).toHaveBeenCalledTimes(1);
+    });
+    fireEvent.pointerDown(within(customCard).getByRole("combobox", { name: "API format" }));
+    fireEvent.click(await within(customCard).findByRole("button", { name: "OpenAI Responses" }));
+
+    // Removal invalidates the queue, then the in-flight write completes.
+    fireEvent.click(within(customCard).getByRole("button", { name: "Remove" }));
+    await waitFor(() => {
+      expect(view.removeCustomProvider).toHaveBeenCalledWith({ provider: CUSTOM_PROVIDER_ID });
+    });
+    resolveFirstWrite?.({ success: true, data: undefined });
+    await Promise.resolve();
+
+    // The queued write must never fire: it would recreate the removed entry.
+    expect(view.setProviderConfig).toHaveBeenCalledTimes(1);
+  });
+
   test("startCoderLogin hint launches the Coder OAuth flow against the configured deployment", async () => {
     // Regression: the "Settings: Login with Coder" palette command passes a
     // one-shot startCoderLogin hint through SettingsContext; ProvidersSection

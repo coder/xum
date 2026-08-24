@@ -428,6 +428,27 @@ describe("ProviderModelFactory.createModel", () => {
     }
   });
 
+  it("keeps a custom provider shadowing mux-gateway off gateway attribution", async () => {
+    await withTempConfig(async (config, factory) => {
+      // The request goes directly to the custom endpoint, so gateway
+      // attribution and quota handling must not engage.
+      config.saveProvidersConfig({
+        "mux-gateway": {
+          providerType: "openai-compatible",
+          baseUrl: "http://localhost:8000/v1",
+          models: ["qwen3-coder"],
+        },
+      });
+
+      const result = await factory.resolveAndCreateModel("mux-gateway:qwen3-coder", "off");
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.routedThroughGateway).toBe(false);
+        expect(result.data.routeProvider).toBeUndefined();
+      }
+    });
+  });
+
   it("merges backend OpenAI store policy for custom openai-responses providers", async () => {
     await withTempConfig(async (config, factory) => {
       // ZDR: providers.openai.store applies to every Responses-wire route,

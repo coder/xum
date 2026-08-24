@@ -1452,8 +1452,11 @@ export function ProvidersSection() {
 
   // Per-provider write sequencing: rapid selections queue in click order and
   // only the NEWEST write's failure reconciles shared state, so a stale
-  // completion cannot roll back or resurrect an older selection.
+  // completion cannot roll back or resurrect an older selection. Sequence
+  // numbers are globally monotonic so a queued write can never match a
+  // same-named provider re-added after removal.
   const providerTypeWritesRef = useRef(new Map<string, { seq: number; chain: Promise<void> }>());
+  const providerTypeWriteSeqRef = useRef(0);
 
   // Plain function: React Compiler handles memoization.
   const handleCustomProviderTypeChange = (
@@ -1465,8 +1468,14 @@ export function ProvidersSection() {
 
     const writes = providerTypeWritesRef.current;
     const entry = writes.get(provider) ?? { seq: 0, chain: Promise.resolve() };
-    const seq = entry.seq + 1;
+    const seq = ++providerTypeWriteSeqRef.current;
     const chain = entry.chain.then(async () => {
+      if (writes.get(provider)?.seq !== seq) {
+        // Superseded by a newer selection, or the provider was removed while
+        // this write was queued; issuing it would resurrect the removed
+        // entry (setConfig creates absent provider sections).
+        return;
+      }
       try {
         const result = await api.providers.setProviderConfig({
           provider,
@@ -1767,6 +1776,10 @@ export function ProvidersSection() {
       if (!confirmed) {
         return;
       }
+
+      // Invalidate queued format writes: a write draining after removal
+      // would recreate the entry (setConfig creates absent sections).
+      providerTypeWritesRef.current.delete(provider);
 
       const workspaceIds = new Set(workspaceMetadata.keys());
       if (selectedWorkspace) {
