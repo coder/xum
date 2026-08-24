@@ -8,6 +8,7 @@ import {
   computeBaseSkipScope,
   MAX_INHERITANCE_DEPTH,
   readAgentDefinition,
+  type AgentDefinitionRequestCache,
 } from "./agentDefinitionsService";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -27,6 +28,8 @@ interface ResolveAgentInheritanceChainOptions {
   agentDefinition: AgentDefinitionPackage;
   workspaceId: string;
   maxDepth?: number;
+  /** Request-scoped parsed definition reuse. */
+  cache?: AgentDefinitionRequestCache;
   /** agent-plugins experiment: also resolve base agents contributed by Agent Plugins. */
   includeAgentPlugins?: boolean;
 }
@@ -83,6 +86,7 @@ export async function resolveAgentInheritanceChain(
 
     try {
       currentDefinition = await readAgentDefinition(runtime, workspacePath, baseId, {
+        cache: options.cache,
         includeAgentPlugins: options.includeAgentPlugins,
         skipScopesAbove,
       });

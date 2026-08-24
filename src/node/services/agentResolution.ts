@@ -27,6 +27,7 @@ import { type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
 import type { Runtime } from "@/node/runtime/Runtime";
 import {
+  createAgentDefinitionRequestCache,
   getSkipScopesAboveForKnownScope,
   readAgentDefinition,
   resolveAgentFrontmatter,
@@ -65,6 +66,8 @@ export interface ResolveAgentOptions {
 export interface AgentResolutionResult {
   effectiveAgentId: string;
   agentDefinition: Awaited<ReturnType<typeof readAgentDefinition>>;
+  /** Request-scoped parsed definitions shared with later stream-context discovery. */
+  agentDefinitionCache: ReturnType<typeof createAgentDefinitionRequestCache>;
   /** Runtime used for agent discovery (child workspace or parent fallback for untracked agents). */
   agentDiscoveryRuntime: Runtime;
   /** Path used for agent discovery (workspace path or project path if agents disabled). */
@@ -193,6 +196,7 @@ export async function resolveAgentForStream(
     includeAgentPlugins,
   } = opts;
 
+  const agentDefinitionCache = createAgentDefinitionRequestCache();
   const workspaceLog = log.withFields({ workspaceId, workspaceName: metadata.name });
 
   // --- Agent ID resolution ---
@@ -238,7 +242,7 @@ export async function resolveAgentForStream(
           discovery.runtime,
           discovery.workspacePath,
           candidateAgentId,
-          { includeAgentPlugins }
+          { includeAgentPlugins, cache: agentDefinitionCache }
         );
         if (definition.scope === "project") {
           agentDefinition = definition;
@@ -272,6 +276,7 @@ export async function resolveAgentForStream(
     });
     agentDefinition = await readAgentDefinition(agentDiscoveryRuntime, agentDiscoveryPath, "exec", {
       includeAgentPlugins,
+      cache: agentDefinitionCache,
     });
   }
 
@@ -289,6 +294,7 @@ export async function resolveAgentForStream(
         agentDiscoveryPath,
         agentDefinition.id,
         {
+          cache: agentDefinitionCache,
           includeAgentPlugins,
           skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
         }
@@ -323,7 +329,7 @@ export async function resolveAgentForStream(
           agentDiscoveryRuntime,
           agentDiscoveryPath,
           "exec",
-          { includeAgentPlugins }
+          { includeAgentPlugins, cache: agentDefinitionCache }
         );
         effectiveAgentId = agentDefinition.id;
       }
@@ -342,6 +348,7 @@ export async function resolveAgentForStream(
     workspacePath: agentDiscoveryPath,
     agentId: agentDefinition.id,
     agentDefinition,
+    cache: agentDefinitionCache,
     workspaceId,
     includeAgentPlugins,
   });
@@ -386,6 +393,7 @@ export async function resolveAgentForStream(
 
   return Ok({
     effectiveAgentId,
+    agentDefinitionCache,
     agentDefinition,
     agentDiscoveryRuntime,
     agentDiscoveryPath,

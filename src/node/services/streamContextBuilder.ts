@@ -37,6 +37,7 @@ import {
   resolveAgentFrontmatter,
   discoverAgentDefinitions,
   getSkipScopesAboveForKnownScope,
+  type AgentDefinitionRequestCache,
   type AgentDefinitionsRoots,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
@@ -240,6 +241,7 @@ export interface BuildStreamSystemContextOptions {
    */
   effectiveMode: "plan" | "exec" | "compact";
   /** Runtime that resolved the active agent definition. May be the parent workspace runtime for subagents. */
+  agentDefinitionCache?: AgentDefinitionRequestCache;
   agentDiscoveryRuntime: Runtime;
   agentDiscoveryPath: string;
   isSubagentWorkspace: boolean;
@@ -535,6 +537,7 @@ export async function buildStreamSystemContext(
     agentDiscoveryPath,
     agentDefinition.id,
     {
+      cache: opts.agentDefinitionCache,
       includeAgentPlugins: opts.agentPluginsEnabled,
       skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
     }
@@ -548,6 +551,7 @@ export async function buildStreamSystemContext(
         agentDiscoveryPath,
         agentDefinition.id,
         {
+          cache: opts.agentDefinitionCache,
           includeAgentPlugins: opts.agentPluginsEnabled,
           skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
         }
@@ -584,6 +588,7 @@ export async function buildStreamSystemContext(
     agentDefinitions = await discoverAvailableSubagentsForToolContext({
       runtime: agentDiscoveryRuntime,
       workspacePath: agentDiscoveryPath,
+      cache: opts.agentDefinitionCache,
       cfg,
       loadDesktopCapability,
       includeAgentPlugins: opts.agentPluginsEnabled,
@@ -690,6 +695,8 @@ export async function discoverAvailableSubagentsForToolContext(args: {
   runtime: Parameters<typeof discoverAgentDefinitions>[0];
   workspacePath: string;
   cfg: ProjectsConfig;
+  definitions?: Awaited<ReturnType<typeof discoverAgentDefinitions>>;
+  cache?: AgentDefinitionRequestCache;
   roots?: AgentDefinitionsRoots;
   loadDesktopCapability?: () => Promise<DesktopCapability>;
   /** agent-plugins experiment: also discover agents contributed by Agent Plugins. */
@@ -703,10 +710,13 @@ export async function discoverAvailableSubagentsForToolContext(args: {
   );
   assert(args.cfg, "discoverAvailableSubagentsForToolContext: cfg is required");
 
-  const discovered = await discoverAgentDefinitions(args.runtime, args.workspacePath, {
-    roots: args.roots,
-    includeAgentPlugins: args.includeAgentPlugins,
-  });
+  const discovered =
+    args.definitions ??
+    (await discoverAgentDefinitions(args.runtime, args.workspacePath, {
+      cache: args.cache,
+      roots: args.roots,
+      includeAgentPlugins: args.includeAgentPlugins,
+    }));
 
   let desktopAvailablePromise: Promise<boolean> | undefined;
   const isDesktopAvailable = async (): Promise<boolean> => {
@@ -731,6 +741,7 @@ export async function discoverAvailableSubagentsForToolContext(args: {
           args.workspacePath,
           descriptor.id,
           {
+            cache: args.cache,
             roots: args.roots,
             includeAgentPlugins: args.includeAgentPlugins,
             skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
