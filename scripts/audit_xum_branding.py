@@ -101,6 +101,11 @@ ALLOW_RULES = (
         re.compile(r"common/compat/legacyMux"),
         "centralized compatibility resolver import",
     ),
+    AllowRule(
+        "src/node/services/log.ts",
+        re.compile(r"old Mux logs|[\"'`]mux(?:\.\$?\{?i\}?|\.log)"),
+        "clear action removes pre-rename log files that may contain sensitive output",
+    ),
     AllowRule("src/node/services/log.ts", re.compile(r"MUX_(?:DEBUG|LOG_LEVEL)"), "legacy logging environment input"),
     AllowRule(
         "src/common/constants/paths.ts",

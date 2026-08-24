@@ -46,6 +46,13 @@ class AuditXumBrandingTest(unittest.TestCase):
             leaderboard_script.write_text(
                 'ignore_patterns("mux-app.tar.gz", "mux-tokens.json")\n'
             )
+            log_service = root / "src/node/services/log.ts"
+            log_service.parent.mkdir(parents=True)
+            log_service.write_text(
+                '// Clear old Mux logs after the rename\n'
+                'path.join(logsDir, "mux.log")\n'
+                'path.join(logsDir, `mux.${i}.log`)\n'
+            )
 
             violations = audit_paths(
                 root,
@@ -53,6 +60,7 @@ class AuditXumBrandingTest(unittest.TestCase):
                     "Makefile",
                     "benchmarks/terminal_bench/.leaderboard_cache/Mux__Historical/result.json",
                     "benchmarks/terminal_bench/prepare_leaderboard_submission.py",
+                    "src/node/services/log.ts",
                 ],
             )
 
