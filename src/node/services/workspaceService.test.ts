@@ -11281,6 +11281,27 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
   });
 
+  test("rollbackAfterFailedLaunch removes the marker when every open in a concurrent batch fails", async () => {
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+
+    // Two first-time recordings overlap in flight: the second sees the marker written by the
+    // first, but that in-flight marker must not masquerade as evidence of a real prior
+    // launch — when both launches fail, the whole batch failed and the marker must go.
+    const [first, second] = await Promise.all([
+      workspaceService.recordExternalEditorOpenForLaunch(workspaceId),
+      workspaceService.recordExternalEditorOpenForLaunch(workspaceId),
+    ]);
+    expect(first.success).toBe(true);
+    expect(second.success).toBe(true);
+    if (!first.success || !second.success) return;
+
+    await first.data.rollbackAfterFailedLaunch();
+    // One failed launch alone must not delete the marker (the other may still launch).
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
+    await second.data.rollbackAfterFailedLaunch();
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
+  });
+
   test("rollbackAfterFailedLaunch preserves a marker that predates the recording", async () => {
     // An earlier session's editor may still be running behind a pre-existing marker; a later
     // failed launch must not delete the evidence protecting it.
@@ -11311,6 +11332,32 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
 
     await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+  });
+
+  test("archive waits for a retained background-init settlement before proceeding", async () => {
+    // Aborting init only signals: the fire-and-forget init hook process settles later, and
+    // snapshot capture / checkout deletion / Coder hooks must not run under its writes.
+    let releaseInit!: () => void;
+    const settlement = new Promise<void>((resolve) => {
+      releaseInit = resolve;
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call
+    (workspaceService as any).initSettlementPromises.set(workspaceId, settlement);
+
+    let archiveSettled = false;
+    const archivePromise = workspaceService.archive(workspaceId).then((result) => {
+      archiveSettled = true;
+      return result;
+    });
+    // Generous scheduling room: without the settlement await, this mock-backed archive
+    // completes within these turns and the assertion below goes red.
+    for (let i = 0; i < 50; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(archiveSettled).toBe(false);
+
+    releaseInit();
+    expect(await archivePromise).toEqual(Ok({ kind: "archived" }));
   });
 
   test("resumeStream refuses while the workspace is being archived", async () => {

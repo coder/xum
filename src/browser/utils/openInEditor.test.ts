@@ -299,13 +299,15 @@ describe("openInEditor", () => {
     expect(placeholder.closed).toBe(true);
   });
 
-  test("browser mode: falls back to a direct open when the placeholder is popup-blocked", async () => {
+  test("browser mode: refuses before recording when the placeholder is popup-blocked", async () => {
     const calls: OpenCall[] = [];
     const { windowValue, placeholder } = createBrowserModeWindow(calls, { popupBlocked: true });
+    const recordEditorOpen = mock(() => Promise.resolve({ success: true }));
+    const api = { general: { recordEditorOpen } } as unknown as APIClient;
 
     const result = await withWindow(windowValue, () =>
       openInEditor({
-        api: createApiStub(),
+        api,
         workspaceId,
         targetPath: filePath,
         runtimeConfig: { type: "ssh", host: "devbox", srcBaseDir: "~/xum" },
@@ -313,12 +315,13 @@ describe("openInEditor", () => {
       })
     );
 
-    expect(result.success).toBe(true);
-    // Placeholder attempt first, then the legacy direct open (which shares the blocked
-    // popup's fate but never regresses it).
-    expect(calls.length).toBe(2);
-    expect(calls[0]).toEqual(["about:blank", "_blank"]);
-    expect(calls[1][0]).toContain("ssh-remote+devbox");
+    // A blocked placeholder means the post-await launch would be silently blocked too;
+    // succeeding would persist a sticky editor-open marker for an editor that never opened,
+    // permanently refusing model-driven archives — so the open is refused before recording.
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("popup");
+    expect(recordEditorOpen).not.toHaveBeenCalled();
+    expect(calls).toEqual([["about:blank", "_blank"]]);
     expect(placeholder.navigations.length).toBe(0);
   });
 });

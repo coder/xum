@@ -2114,6 +2114,29 @@ export class WorkspaceService extends EventEmitter {
   // cancel any fire-and-forget init work to avoid orphaned processes (e.g., SSH sync, .xum/init).
   private readonly initAbortControllers = new Map<string, AbortController>();
 
+  /**
+   * Settlement promises of fire-and-forget background inits (create/createMulti/fork), kept
+   * so archive can wait for the init hook process to actually exit after aborting it: the
+   * abort only signals, and snapshot capture, checkout deletion, or a Coder stop under a
+   * still-writing init would race its writes. Entries self-clean on settlement; the stored
+   * promises never reject (init failures are reported through the init logger).
+   */
+  private readonly initSettlementPromises = new Map<string, Promise<void>>();
+
+  /** See initSettlementPromises. */
+  private retainInitSettlement(workspaceId: string, settled: Promise<unknown>): void {
+    const swallowed = settled.then(
+      () => undefined,
+      () => undefined
+    );
+    this.initSettlementPromises.set(workspaceId, swallowed);
+    void swallowed.then(() => {
+      if (this.initSettlementPromises.get(workspaceId) === swallowed) {
+        this.initSettlementPromises.delete(workspaceId);
+      }
+    });
+  }
+
   // ExtensionMetadataService now serializes all mutations globally because every
   // workspace shares the same extensionMetadata.json file.
 
@@ -5040,20 +5063,24 @@ export class WorkspaceService extends EventEmitter {
       // If the user cancelled creation while create() was still in flight, avoid spawning
       // additional background work for a workspace that's already being removed.
       if (!this.removingWorkspaces.has(workspaceId) && !initAbortController.signal.aborted) {
-        void runBackgroundInit(
-          runtime,
-          {
-            projectPath: owningProjectPath,
-            branchName: finalBranchName,
-            trunkBranch: normalizedTrunkBranch,
-            workspacePath: createResult!.workspacePath,
-            initLogger,
-            env: secrets,
-            abortSignal: initAbortController.signal,
-            trusted: projectConfig.trusted ?? false,
-          },
+        // Retained (not just fired) so archive can await the hook process's actual exit.
+        this.retainInitSettlement(
           workspaceId,
-          log
+          runBackgroundInit(
+            runtime,
+            {
+              projectPath: owningProjectPath,
+              branchName: finalBranchName,
+              trunkBranch: normalizedTrunkBranch,
+              workspacePath: createResult!.workspacePath,
+              initLogger,
+              env: secrets,
+              abortSignal: initAbortController.signal,
+              trusted: projectConfig.trusted ?? false,
+            },
+            workspaceId,
+            log
+          )
         );
       } else {
         initAbortController.abort();
@@ -5401,77 +5428,81 @@ export class WorkspaceService extends EventEmitter {
       // Multi-project creation should mirror create(): return metadata immediately, but only mark init
       // complete after initialization work has run.
       if (!this.removingWorkspaces.has(workspaceId) && !initAbortController.signal.aborted) {
-        void (async () => {
-          let initFailed = false;
+        // Retained (not just fired) so archive can await the per-project init loop's exit.
+        this.retainInitSettlement(
+          workspaceId,
+          (async () => {
+            let initFailed = false;
 
-          for (const createdWorkspace of createdWorkspaces) {
-            if (this.removingWorkspaces.has(workspaceId) || initAbortController.signal.aborted) {
-              break;
-            }
+            for (const createdWorkspace of createdWorkspaces) {
+              if (this.removingWorkspaces.has(workspaceId) || initAbortController.signal.aborted) {
+                break;
+              }
 
-            const trusted =
-              configSnapshot.projects.get(
-                stripTrailingSlashes(createdWorkspace.project.projectPath)
-              )?.trusted ?? false;
+              const trusted =
+                configSnapshot.projects.get(
+                  stripTrailingSlashes(createdWorkspace.project.projectPath)
+                )?.trusted ?? false;
 
-            const projectInitLogger = {
-              ...initLogger,
-              // Each runtime's init path reports completion. Suppress per-project completion so
-              // multi-project workspaces only transition out of initializing after all runtimes finish.
-              logComplete: (_exitCode: number) => undefined,
-            };
+              const projectInitLogger = {
+                ...initLogger,
+                // Each runtime's init path reports completion. Suppress per-project completion so
+                // multi-project workspaces only transition out of initializing after all runtimes finish.
+                logComplete: (_exitCode: number) => undefined,
+              };
 
-            try {
-              const secrets = await secretsToRecord(
-                this.config.getEffectiveSecrets(createdWorkspace.project.projectPath)
-              );
+              try {
+                const secrets = await secretsToRecord(
+                  this.config.getEffectiveSecrets(createdWorkspace.project.projectPath)
+                );
 
-              const initResult = await runFullInit(createdWorkspace.runtime, {
-                projectPath: createdWorkspace.project.projectPath,
-                branchName,
-                trunkBranch: createdWorkspace.trunkBranch,
-                workspacePath: createdWorkspace.workspacePath,
-                initLogger: projectInitLogger,
-                env: secrets,
-                abortSignal: initAbortController.signal,
-                trusted,
-              });
+                const initResult = await runFullInit(createdWorkspace.runtime, {
+                  projectPath: createdWorkspace.project.projectPath,
+                  branchName,
+                  trunkBranch: createdWorkspace.trunkBranch,
+                  workspacePath: createdWorkspace.workspacePath,
+                  initLogger: projectInitLogger,
+                  env: secrets,
+                  abortSignal: initAbortController.signal,
+                  trusted,
+                });
 
-              if (!initResult.success) {
+                if (!initResult.success) {
+                  initFailed = true;
+                  log.error("Multi-project workspace init failed", {
+                    workspaceId,
+                    projectPath: createdWorkspace.project.projectPath,
+                    error: initResult.error ?? "Unknown initialization failure",
+                  });
+                }
+              } catch (error: unknown) {
                 initFailed = true;
+                const message = getErrorMessage(error);
                 log.error("Multi-project workspace init failed", {
                   workspaceId,
                   projectPath: createdWorkspace.project.projectPath,
-                  error: initResult.error ?? "Unknown initialization failure",
+                  error: message,
                 });
+                initLogger.logStderr(
+                  `Initialization failed for ${createdWorkspace.project.projectName}: ${message}`
+                );
               }
-            } catch (error: unknown) {
-              initFailed = true;
-              const message = getErrorMessage(error);
-              log.error("Multi-project workspace init failed", {
-                workspaceId,
-                projectPath: createdWorkspace.project.projectPath,
-                error: message,
-              });
-              initLogger.logStderr(
-                `Initialization failed for ${createdWorkspace.project.projectName}: ${message}`
-              );
             }
-          }
 
-          if (this.removingWorkspaces.has(workspaceId) || initAbortController.signal.aborted) {
-            initAbortController.abort();
-            this.initAbortControllers.delete(workspaceId);
+            if (this.removingWorkspaces.has(workspaceId) || initAbortController.signal.aborted) {
+              initAbortController.abort();
+              this.initAbortControllers.delete(workspaceId);
 
-            // Background init will never fully complete, so init-end won’t fire.
-            // Clear init state + re-emit fresh metadata so the sidebar doesn’t stay stuck on isInitializing.
-            this.initStateManager.clearInMemoryState(workspaceId);
-            session.emitMetadata(this.enrichFrontendMetadata(completeMetadata));
-            return;
-          }
+              // Background init will never fully complete, so init-end won’t fire.
+              // Clear init state + re-emit fresh metadata so the sidebar doesn’t stay stuck on isInitializing.
+              this.initStateManager.clearInMemoryState(workspaceId);
+              session.emitMetadata(this.enrichFrontendMetadata(completeMetadata));
+              return;
+            }
 
-          initLogger.logComplete(initFailed ? -1 : 0);
-        })();
+            initLogger.logComplete(initFailed ? -1 : 0);
+          })()
+        );
       } else {
         initAbortController.abort();
         this.initAbortControllers.delete(workspaceId);
@@ -7683,14 +7714,21 @@ export class WorkspaceService extends EventEmitter {
   private readonly externalEditorWorkspaces = new Set<string>();
 
   /**
-   * Launch evidence for recorded editor opens this session: one token per recorded open that
-   * has not reported a failed launch. A failed launch may delete a marker it just created
-   * only when no token remains — any survivor means another open launched (or may still
-   * launch) an editor the marker must keep protecting. Deep-link opens recorded via
-   * recordExternalEditorOpen retain their token unconditionally: they launch in the renderer
-   * immediately after recording and cannot report failures back.
+   * Marker ancestry batches per workspace. A batch begins with a disk probe (did a durable
+   * marker exist before this batch wrote one?) and collects one launch-evidence token per
+   * recorded open; tokens are removed only by failed launches. When the last token of a
+   * batch is removed, every open in the batch failed, so the batch's marker is deleted
+   * unless it predated the batch (an earlier session's editor may still be running behind
+   * it). Deep-link opens recorded via recordExternalEditorOpen retain their token forever
+   * (they launch in the renderer immediately after recording and cannot report failures
+   * back), pinning the marker. Probing per batch — not per call — prevents a marker written
+   * by an earlier in-flight open of the same batch from masquerading as pre-existing
+   * evidence when every open in the batch fails.
    */
-  private readonly externalEditorOpenTokens = new Map<string, Set<object>>();
+  private readonly externalEditorMarkerBatches = new Map<
+    string,
+    { markerPreexisted: boolean; tokens: Set<symbol> }
+  >();
 
   /**
    * Serializes marker writes against failed-launch rollbacks per workspace: an unserialized
@@ -7783,26 +7821,27 @@ export class WorkspaceService extends EventEmitter {
     // editor opened without the marker would be invisible to archive gating after a restart,
     // so refusing here is the only fail-closed option (the in-memory Set covers just this
     // app session).
-    let admission: { token: object; markerPreexisted: boolean };
+    let admissionToken: symbol;
     try {
-      admission = await this.externalEditorMarkerLocks.withLock(workspaceId, async () => {
-        // Probed before the write so a launch failure can tell a marker this call created
-        // (safe to roll back) from one that predates it (an earlier session's editor may
-        // still be running; must survive). "unknown" counts as pre-existing (fail closed).
-        const preexisting = await this.probeExternalEditorMarkerOnDisk(workspaceId);
+      admissionToken = await this.externalEditorMarkerLocks.withLock(workspaceId, async () => {
+        // Batch-scoped ancestry (see externalEditorMarkerBatches): the pre-existence probe
+        // runs once per batch, before the batch's first write, so a marker written by an
+        // earlier in-flight open of this same batch cannot masquerade as evidence of a real
+        // prior launch. "unknown" probes count as pre-existing (fail closed).
+        let batch = this.externalEditorMarkerBatches.get(workspaceId);
+        if (batch == null) {
+          const preexisting = await this.probeExternalEditorMarkerOnDisk(workspaceId);
+          batch = { markerPreexisted: preexisting !== "absent", tokens: new Set() };
+          this.externalEditorMarkerBatches.set(workspaceId, batch);
+        }
         const markerPath = this.externalEditorMarkerPath(workspaceId);
         await fsPromises.mkdir(path.dirname(markerPath), { recursive: true });
         await fsPromises.writeFile(markerPath, new Date().toISOString());
         // Launch evidence is registered under the same lock as the write so a concurrent
         // failed launch's rollback can never observe the marker without the token.
-        const token = {};
-        let tokens = this.externalEditorOpenTokens.get(workspaceId);
-        if (tokens == null) {
-          tokens = new Set();
-          this.externalEditorOpenTokens.set(workspaceId, tokens);
-        }
-        tokens.add(token);
-        return { token, markerPreexisted: preexisting !== "absent" };
+        const token = Symbol("external-editor-launch");
+        batch.tokens.add(token);
+        return token;
       });
     } catch (error) {
       log.error("Failed to persist external editor marker", { workspaceId, error });
@@ -7813,29 +7852,34 @@ export class WorkspaceService extends EventEmitter {
     }
     return Ok({
       rollbackAfterFailedLaunch: () =>
-        this.rollbackExternalEditorMarkerAfterFailedLaunch(workspaceId, admission),
+        this.rollbackExternalEditorMarkerAfterFailedLaunch(workspaceId, admissionToken),
     });
   }
 
   /**
-   * Undo a failed editor launch's durable marker. Deletes the marker only when the recording
-   * provably created it and no editor could be relying on it: the marker must not predate the
-   * recording (an earlier session's editor may still be running) and no other recorded open
-   * may hold launch evidence (its editor launched or may still launch). Serialized with
-   * marker writes so the unlink can never race a concurrent open's write; deletion failure
-   * keeps the sticky marker (fail closed).
+   * Undo a failed editor launch's durable marker. The marker is deleted only when its whole
+   * ancestry batch failed (no launch-evidence token remains, so no editor launched or can
+   * still launch under it) and it did not predate the batch (an earlier session's editor may
+   * still be running behind it). Serialized with marker writes so the unlink can never race
+   * a concurrent open's write; deletion failure keeps the sticky marker (fail closed).
    */
   private async rollbackExternalEditorMarkerAfterFailedLaunch(
     workspaceId: string,
-    admission: { token: object; markerPreexisted: boolean }
+    token: symbol
   ): Promise<void> {
     await this.externalEditorMarkerLocks.withLock(workspaceId, async () => {
-      const tokens = this.externalEditorOpenTokens.get(workspaceId);
-      tokens?.delete(admission.token);
-      if (tokens?.size === 0) {
-        this.externalEditorOpenTokens.delete(workspaceId);
+      const batch = this.externalEditorMarkerBatches.get(workspaceId);
+      if (batch == null) {
+        // Unknown batch (cannot happen: batches are only closed here): keep everything.
+        return;
       }
-      if (admission.markerPreexisted || (tokens?.size ?? 0) > 0) {
+      batch.tokens.delete(token);
+      if (batch.tokens.size > 0) {
+        return;
+      }
+      // Every open in the batch failed: close it so the next open starts a fresh probe.
+      this.externalEditorMarkerBatches.delete(workspaceId);
+      if (batch.markerPreexisted) {
         return;
       }
       try {
@@ -8086,6 +8130,17 @@ export class WorkspaceService extends EventEmitter {
             error: getErrorMessage(error),
           });
         }
+      }
+
+      // The abort above only signals: the fire-and-forget init hook process (create/
+      // createMulti/fork) may still be writing to the checkout or reconnecting. Wait for its
+      // retained settlement — a deterministic exit signal, not a timer — before snapshot
+      // capture, checkout deletion, or Coder hooks can proceed under it. Checked outside the
+      // init-state branch because state may already be cleared while the process is exiting;
+      // the retained promise never rejects.
+      const initSettlement = this.initSettlementPromises.get(workspaceId);
+      if (initSettlement != null) {
+        await initSettlement;
       }
 
       const { projectPath, workspacePath } = workspace;
@@ -9456,6 +9511,8 @@ export class WorkspaceService extends EventEmitter {
         newWorkspaceId,
         log
       );
+      // Also retained for archive: see initSettlementPromises.
+      this.retainInitSettlement(newWorkspaceId, initSettled);
 
       // Create a fresh source runtime handle because DockerRuntime.forkWorkspace() can
       // mutate the original runtime's container identity to target the new workspace.

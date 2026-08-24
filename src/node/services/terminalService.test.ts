@@ -1318,6 +1318,26 @@ describe("TerminalService.openNative", () => {
       expect(await restartedService.hasOpenedNativeTerminal("ws-marker-rollback")).toBe(false);
     });
 
+    it("rolls back the marker when every launch in a concurrent batch fails", async () => {
+      // Two first-time opens overlap in flight and both fail: the second admission sees the
+      // marker written by the first, but that in-flight marker must not masquerade as
+      // evidence of a real prior launch — with no launch in the whole batch, the marker
+      // must not survive.
+      spawnSyncSpy.mockImplementation(() => ({ status: 1 }));
+      const config = configWithWorkspace("ws-marker-concurrent");
+      service = new TerminalService(config, mockPTYService);
+
+      const results = await Promise.allSettled([
+        service.openNative("ws-marker-concurrent"),
+        service.openNative("ws-marker-concurrent"),
+      ]);
+      expect(results.every((r) => r.status === "rejected")).toBe(true);
+      expect(spawnSpy).not.toHaveBeenCalled();
+      expect(await service.hasOpenedNativeTerminal("ws-marker-concurrent")).toBe(false);
+      const restartedService = new TerminalService(config, mockPTYService);
+      expect(await restartedService.hasOpenedNativeTerminal("ws-marker-concurrent")).toBe(false);
+    });
+
     it("preserves a marker that predates the failed launch", async () => {
       const config = configWithWorkspace("ws-marker-preexisting");
       // First open succeeds and persists the durable marker.

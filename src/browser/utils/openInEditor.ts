@@ -112,20 +112,26 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
   // window, after which the deep link would be popup-blocked even though we would report
   // success and have persisted a durable editor-open marker. Open a blank placeholder
   // synchronously (before any await) and navigate it once admission succeeds; close it on
-  // any refusal. Electron routes window.open through the main-process window-open handler
-  // (no transient-activation gating), and custom editors never deep-link, so neither needs
-  // a placeholder.
+  // any refusal. If the placeholder itself is blocked, refuse now — before anything is
+  // recorded — because the post-await fallback would be blocked too, silently: reporting
+  // success then would persist a sticky editor-open marker for an editor that never opened,
+  // permanently refusing model-driven snapshot/Coder-stop archives. Electron routes
+  // window.open through the main-process window-open handler (no transient-activation
+  // gating), and custom editors never deep-link, so neither needs a placeholder.
   let placeholder: Window | null = null;
-  if (
-    isBrowserModeNow() &&
-    editorConfig.editor !== "custom" &&
-    typeof window !== "undefined" &&
-    window.open
-  ) {
+  if (isBrowserModeNow() && editorConfig.editor !== "custom") {
     try {
-      placeholder = window.open("about:blank", "_blank");
+      placeholder =
+        typeof window !== "undefined" && window.open ? window.open("about:blank", "_blank") : null;
     } catch {
       placeholder = null;
+    }
+    if (placeholder == null) {
+      return {
+        success: false,
+        error:
+          "The browser blocked the editor window (popup blocked). Allow popups for this site and retry.",
+      };
     }
   }
   let launched = false;
@@ -134,8 +140,7 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
     if (placeholder != null) {
       placeholder.location.href = deepLink;
     } else {
-      // No placeholder was needed (Electron) or it was popup-blocked: fall back to a direct
-      // open, which shares the blocked popup's fate but never regresses it.
+      // Electron: no placeholder was needed.
       openUrl(deepLink);
     }
   };

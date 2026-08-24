@@ -92,12 +92,19 @@ export class TerminalService {
   private readonly nativeTerminalWorkspaces = new Set<string>();
 
   /**
-   * Launch evidence for openNative calls this session: one token per call that persisted the
-   * durable marker and has not failed before its launcher could spawn. A failed launch may
-   * delete a marker it just created only when no token remains — any survivor means another
-   * open launched (or may still launch) a shell the marker must keep protecting.
+   * Marker ancestry batches per workspace. A batch begins with a disk probe (did a durable
+   * marker exist before this batch wrote one?) and collects one launch-evidence token per
+   * admitted open; tokens are removed only by failed launches. When the last token of a
+   * batch is removed, every open in the batch failed, so the batch's marker is deleted
+   * unless it predated the batch (an earlier session's shell may still be running behind
+   * it). Successful opens retain their token forever, pinning the marker. Probing per batch
+   * — not per call — prevents a marker written by an earlier in-flight open of the same
+   * batch from masquerading as pre-existing evidence when every open in the batch fails.
    */
-  private readonly nativeTerminalOpenTokens = new Map<string, Set<object>>();
+  private readonly nativeTerminalMarkerBatches = new Map<
+    string,
+    { markerPreexisted: boolean; tokens: Set<symbol> }
+  >();
 
   /**
    * Serializes marker writes against failed-launch rollbacks per workspace: an unserialized
@@ -569,7 +576,7 @@ export class TerminalService {
         `Workspace is being archived: ${workspaceId}. Unarchive it before opening a terminal.`
       );
     }
-    let admission: { token: object; markerPreexisted: boolean } | null = null;
+    let admissionToken: symbol | null = null;
     try {
       const allMetadata = await this.config.getAllWorkspaceMetadata();
       const workspace = allMetadata.find((w) => w.id === workspaceId);
@@ -596,25 +603,25 @@ export class TerminalService {
       // would be invisible to archive gating after a restart, so failing the open here is the
       // only fail-closed option (the in-memory Set covers just this app session).
       try {
-        admission = await this.nativeTerminalMarkerLocks.withLock(workspaceId, async () => {
-          // Probed before the write so a launch failure below can tell a marker this call
-          // created (safe to roll back — see the catch) from one that predates it (an earlier
-          // session's shell may still be running; must survive). "unknown" counts as
-          // pre-existing (fail closed).
-          const preexisting = await this.probeNativeTerminalMarkerOnDisk(workspaceId);
+        admissionToken = await this.nativeTerminalMarkerLocks.withLock(workspaceId, async () => {
+          // Batch-scoped ancestry (see nativeTerminalMarkerBatches): the pre-existence probe
+          // runs once per batch, before the batch's first write, so a marker written by an
+          // earlier in-flight open of this same batch cannot masquerade as evidence of a
+          // real prior launch. "unknown" probes count as pre-existing (fail closed).
+          let batch = this.nativeTerminalMarkerBatches.get(workspaceId);
+          if (batch == null) {
+            const preexisting = await this.probeNativeTerminalMarkerOnDisk(workspaceId);
+            batch = { markerPreexisted: preexisting !== "absent", tokens: new Set() };
+            this.nativeTerminalMarkerBatches.set(workspaceId, batch);
+          }
           const markerPath = this.nativeTerminalMarkerPath(workspaceId);
           await fs.promises.mkdir(path.dirname(markerPath), { recursive: true });
           await fs.promises.writeFile(markerPath, new Date().toISOString());
           // Launch evidence is registered under the same lock as the write so a concurrent
           // failed launch's rollback can never observe the marker without the token.
-          const token = {};
-          let tokens = this.nativeTerminalOpenTokens.get(workspaceId);
-          if (tokens == null) {
-            tokens = new Set();
-            this.nativeTerminalOpenTokens.set(workspaceId, tokens);
-          }
-          tokens.add(token);
-          return { token, markerPreexisted: preexisting !== "absent" };
+          const token = Symbol("native-terminal-launch");
+          batch.tokens.add(token);
+          return token;
         });
       } catch (error) {
         log.error("Failed to persist native terminal marker", { workspaceId, error });
@@ -670,10 +677,10 @@ export class TerminalService {
       // in-memory reservation always rolls back; a marker this call created is a false
       // positive that would permanently refuse future model-driven snapshot/Coder-stop
       // archives, so it rolls back too unless other launch evidence remains.
-      if (admission == null) {
+      if (admissionToken == null) {
         rollbackReservation();
       } else {
-        await this.rollbackNativeTerminalMarkerAfterFailedLaunch(workspaceId, admission);
+        await this.rollbackNativeTerminalMarkerAfterFailedLaunch(workspaceId, admissionToken);
       }
       const message = getErrorMessage(err);
       log.error(`Failed to open native terminal: ${message}`);
@@ -682,24 +689,29 @@ export class TerminalService {
   }
 
   /**
-   * Undo a failed openNative's durable marker. Deletes the marker only when this call
-   * provably created it and no shell could be relying on it: the marker must not predate the
-   * call (an earlier session's shell may still be running) and no other open may hold launch
-   * evidence (its shell launched or may still launch). Serialized with marker writes so the
-   * unlink can never race a concurrent open's write; deletion failure keeps the sticky
-   * marker (fail closed).
+   * Undo a failed openNative's durable marker. The marker is deleted only when its whole
+   * ancestry batch failed (no launch-evidence token remains, so no shell launched or can
+   * still launch under it) and it did not predate the batch (an earlier session's shell may
+   * still be running behind it). Serialized with marker writes so the unlink can never race
+   * a concurrent open's write; deletion failure keeps the sticky marker (fail closed).
    */
   private async rollbackNativeTerminalMarkerAfterFailedLaunch(
     workspaceId: string,
-    admission: { token: object; markerPreexisted: boolean }
+    token: symbol
   ): Promise<void> {
     await this.nativeTerminalMarkerLocks.withLock(workspaceId, async () => {
-      const tokens = this.nativeTerminalOpenTokens.get(workspaceId);
-      tokens?.delete(admission.token);
-      if (tokens?.size === 0) {
-        this.nativeTerminalOpenTokens.delete(workspaceId);
+      const batch = this.nativeTerminalMarkerBatches.get(workspaceId);
+      if (batch == null) {
+        // Unknown batch (cannot happen: batches are only closed here): keep everything.
+        return;
       }
-      if (admission.markerPreexisted || (tokens?.size ?? 0) > 0) {
+      batch.tokens.delete(token);
+      if (batch.tokens.size > 0) {
+        return;
+      }
+      // Every open in the batch failed: close it so the next open starts a fresh probe.
+      this.nativeTerminalMarkerBatches.delete(workspaceId);
+      if (batch.markerPreexisted) {
         return;
       }
       try {
