@@ -131,6 +131,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   // Keyed by workspace so switching workspaces (e.g. the timeline's "Open child
   // workspace" action) implicitly closes the dialog instead of covering the new view.
   const [timelineDialogWorkspaceId, setTimelineDialogWorkspaceId] = useState<string | null>(null);
+  if (timelineDialogWorkspaceId !== null && timelineDialogWorkspaceId !== workspaceId) {
+    // Render-time adjustment (not an effect): leaving the dialog's workspace closes it
+    // for good; merely deriving open=false would reopen it when navigating back.
+    setTimelineDialogWorkspaceId(null);
+  }
   const timelineDialogOpen = timelineDialogWorkspaceId === workspaceId;
   const [availableSkills, setAvailableSkills] = useState<AgentSkillDescriptor[]>([]);
   const [invalidSkills, setInvalidSkills] = useState<AgentSkillIssue[]>([]);

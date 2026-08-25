@@ -564,6 +564,12 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
 
     expect(getLastTimelineDialogProps()?.open).toBe(false);
+
+    // Returning to the original workspace must not resurrect the dialog: the
+    // retained id is cleared on leave, not merely masked by the comparison.
+    view.rerender(<WorkspaceMenuBar {...defaultProps} />);
+
+    expect(getLastTimelineDialogProps()?.open).toBe(false);
   });
 
   it("keeps the Timeline action hidden when immersive review hides the sidebar", () => {
