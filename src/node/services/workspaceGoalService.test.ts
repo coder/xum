@@ -2477,6 +2477,113 @@ describe("WorkspaceGoalService", () => {
     expect(await service.getGoal(workspaceId)).toMatchObject({ createdAtMs: created.createdAtMs });
   });
 
+  test("direct idle creation persists the publication stamp in a single durable write", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cDhNO): the previous re-stamp scheme wrote the
+    // construction stamp first and re-wrote the publication stamp after the
+    // snapshot push — a crash between the two writes durably stranded the
+    // earlier stamp, so restart reconciliation misread a manual row authored
+    // during validation as a post-goal intervention and paused the
+    // never-driven goal. The record and its visibility stamp must commit in
+    // one atomic write.
+    const dispatcher = new IdleDispatcher();
+    service.registerGoalContinuationConsumer(dispatcher, {
+      ...continuationBridge(),
+      getKickoffSendOptions: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return { model: "openai:gpt-4o", agentId: "exec" };
+      },
+    });
+    const serviceAccess = service as unknown as {
+      writeGoal: (workspaceId: string, goal: GoalRecordV1) => Promise<void>;
+    };
+    const originalWriteGoal = serviceAccess.writeGoal.bind(service);
+    const writtenStamps: number[] = [];
+    spyOn(serviceAccess, "writeGoal").mockImplementation(async (id: string, goal: GoalRecordV1) => {
+      writtenStamps.push(goal.createdAtMs);
+      return originalWriteGoal(id, goal);
+    });
+
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Atomic publication stamp",
+      budgetCents: 500,
+    });
+
+    // Every durable write of this goal already carries the final publication
+    // stamp — no window exists where a crash leaves an earlier construction
+    // stamp on disk.
+    expect(writtenStamps.length).toBeGreaterThan(0);
+    expect(writtenStamps).toEqual(writtenStamps.map(() => created.createdAtMs));
+  });
+
+  test("maintenance streams after a restart preserve durable user-origin wrap-up suppression", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cDhNX): a user-origin budget_limited goal
+    // recovers from restart without a wrap-up candidate, but the suppressing
+    // in-memory stamp is gone too. The first background wake's stream-end
+    // accounting must not record a wrap-up-eligible maintenance stamp — that
+    // would let the next stream-end request dispatch the autonomous wrap-up
+    // the persisted budgetLimitOriginKind: "user" was meant to suppress.
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "User exhausts budget then restarts",
+      budgetCents: 100,
+    });
+    await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1.25,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "user",
+    });
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      status: "budget_limited",
+      budgetLimitOriginKind: "user",
+    });
+
+    // Simulate restart: fresh service, empty in-memory stream stamps.
+    const restartedService = new WorkspaceGoalService(
+      config,
+      historyService,
+      extensionMetadata,
+      analytics
+    );
+    const dispatcher = new IdleDispatcher();
+    const execute = mock(() => Promise.resolve(true));
+    restartedService.registerGoalContinuationConsumer(dispatcher, {
+      ...continuationBridge(execute),
+      getKickoffSendOptions: () => Promise.resolve({ model: "openai:gpt-4o", agentId: "exec" }),
+    });
+
+    // A background wake turn ends on the restarted service.
+    await restartedService.recordStreamAccounting({
+      workspaceId,
+      costUsd: 0.01,
+      streamStartedAtMs: Date.now(),
+      streamOriginKind: "other",
+    });
+
+    const stamps = (
+      restartedService as unknown as {
+        lastGoalStreamStamps: Map<string, { originKind: string }>;
+      }
+    ).lastGoalStreamStamps;
+    expect(stamps.get(workspaceId)?.originKind).toBe("user");
+
+    // Behavioral proof: a stream-end continuation request must not dispatch
+    // the wrap-up that user-origin suppression blocked.
+    await restartedService.requestContinuationAfterStreamEnd({
+      workspaceId,
+      sendOptions: { model: "openai:gpt-4o", agentId: "exec" },
+      streamEndedAtMs: Date.now(),
+    });
+    await drainPendingDispatches();
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(await restartedService.getGoal(workspaceId)).toMatchObject({
+      status: "budget_limited",
+      budgetLimitInjectedForGoalId: null,
+    });
+  });
+
   test("setters that span a stream-end drain persist directly instead of queueing", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cBr9Q): a setGoal admitted while the (stale)
     // streaming flag still reads live can reach its in-lock recheck after the

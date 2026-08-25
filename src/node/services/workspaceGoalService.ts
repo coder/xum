@@ -2639,18 +2639,22 @@ export class WorkspaceGoalService {
           return stoppedAfterArchive;
         }
       }
-      await this.writeGoal(input.workspaceId, next);
-      await this.pushSnapshot(input.workspaceId, next);
       if (options?.replacementCreatedAtMs == null) {
         // Codex P2 (PRRT_kwDOPxxmWM6cBr9B): direct creations must also carry a
-        // publication-time createdAtMs. The construction stamp above predates
-        // the kickoff-model validation, history-archive, and write/push awaits
-        // — a message the user authored during those awaits would postdate it
-        // and be misread as an intervention against a goal not yet visible.
-        // No await sits between the snapshot push resolving and this re-stamp,
-        // so nothing can be admitted in between; the durable record carries
-        // the publication stamp (crash between the writes leaves the
-        // provisional stamp — today's behavior). Drained queued mutations pass
+        // publication-time createdAtMs. The construction stamp predates the
+        // kickoff-model validation and history-archive awaits — a message the
+        // user authored during those long awaits would postdate it and be
+        // misread as an intervention against a goal not yet visible.
+        //
+        // Codex P2 (PRRT_kwDOPxxmWM6cDhNO): the stamp is taken BEFORE the
+        // single durable write below (not re-stamped after the snapshot push)
+        // so the record and its visibility stamp commit atomically — a crash
+        // can never leave the provisional construction stamp on disk for
+        // restart reconciliation to misread. The residual gap is only the
+        // write+push awaits themselves (local file I/O, milliseconds): a
+        // message authored inside that gap fails toward a pause the user can
+        // Resume, whereas a crash-stranded stale stamp silently paused a
+        // never-driven goal with no signal. Drained queued mutations pass
         // replacementCreatedAtMs and already carry their publication stamp.
         const publishedAtMs = Date.now();
         next = GoalRecordV1Schema.parse({
@@ -2658,8 +2662,9 @@ export class WorkspaceGoalService {
           createdAtMs: publishedAtMs,
           updatedAtMs: publishedAtMs,
         });
-        await this.writeGoal(input.workspaceId, next);
       }
+      await this.writeGoal(input.workspaceId, next);
+      await this.pushSnapshot(input.workspaceId, next);
       this.emitBudgetChanged(current, next, input);
       this.emitLifecycle(current ? "goal_replaced" : "goal_created", {
         sameObjective: current?.objective === objective,
@@ -3175,7 +3180,19 @@ export class WorkspaceGoalService {
         const preserveExistingStamp =
           current.status === "budget_limited" && existingStamp?.goalId === current.goalId;
         if (!preserveExistingStamp) {
-          this.recordLastGoalStream(input.workspaceId, originKind, current.goalId);
+          // Codex P2 (PRRT_kwDOPxxmWM6cDhNX): with no in-memory stamp (e.g.
+          // after a restart), consult the durable origin before stamping. A
+          // user-origin budget hit was deliberately suppressed pre-restart
+          // (`recoverPendingDispatchAfterRestart` honors it) — recording the
+          // maintenance stream's wrap-up-eligible origin here would let the
+          // next stream-end request dispatch the autonomous wrap-up that
+          // suppression blocked. Re-record "user" instead so the durable
+          // suppression survives maintenance activity.
+          const stampOriginKind =
+            current.status === "budget_limited" && current.budgetLimitOriginKind === "user"
+              ? "user"
+              : originKind;
+          this.recordLastGoalStream(input.workspaceId, stampOriginKind, current.goalId);
         }
         await this.pushSnapshot(input.workspaceId, current);
         return current;
