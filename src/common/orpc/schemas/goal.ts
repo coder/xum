@@ -26,9 +26,16 @@ export const GoalBudgetLimitOriginKindSchema = z
   .enum(["goal_continuation", "goal_budget_limit", "user", "other"])
   .nullable();
 
+/**
+ * Durable goal identifiers are always UUIDs (`crypto.randomUUID()` at
+ * creation). Share this schema wherever an unchecked value claims to be a
+ * goal ID so validation stays as strict as the persisted record contract.
+ */
+export const GoalIdSchema = z.string().uuid();
+
 export const GoalRecordV1Schema = z.object({
   version: z.literal(1),
-  goalId: z.string().uuid(),
+  goalId: GoalIdSchema,
   objective: z.string().min(1),
   status: GoalStatusSchema,
   budgetCents: z.number().int().nonnegative().nullable(),

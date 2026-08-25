@@ -4218,6 +4218,11 @@ export class WorkspaceService extends EventEmitter {
       onPostCompactionStateChange: () => {
         this.schedulePostCompactionMetadataRefresh(workspaceId);
       },
+      // Codex P1 (PRRT_kwDOPxxmWM6cRJD-): expose service-level send
+      // preflights (manual sends counted below but not yet queued or busy) to
+      // the session's follow-up idle probes so redispatched synthetic turns
+      // yield to them.
+      hasExternalSendPreflight: () => (this.preflightSendCounts.get(workspaceId) ?? 0) > 0,
     });
   }
 

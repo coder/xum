@@ -12,7 +12,11 @@ import { createMuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { GoalRecordV1, GoalStatus } from "@/common/types/goal";
-import { GOAL_CONTINUATION_IDLE_CONSUMER_NAME, GOAL_CONTINUATION_KIND } from "@/constants/goals";
+import {
+  GOAL_BUDGET_LIMIT_KIND,
+  GOAL_CONTINUATION_IDLE_CONSUMER_NAME,
+  GOAL_CONTINUATION_KIND,
+} from "@/constants/goals";
 import { waitForCondition } from "./testDispatchHelpers";
 import { IdleDispatcher } from "./idleDispatcher";
 
@@ -361,6 +365,175 @@ describe("AgentSession goal safety hooks", () => {
       const meta = history.data.find((message) => message.id === summary.id)?.metadata?.muxMetadata;
       expect(meta && "pendingFollowUp" in meta ? meta.pendingFollowUp : undefined).toBeUndefined();
     }
+    session.dispose();
+  });
+
+  test("a service-level send preflight defers redispatched follow-ups", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cRJD-): a manual WorkspaceService send can be
+    // counted in preflight without queueing or holding the turn phase. The
+    // entry idle check must consult the injected probe.
+    const workspaceId = "compaction-followup-service-preflight";
+    const { session, goalService, historyService, cleanup } =
+      await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const created = await setGoalOk(goalService, { workspaceId, objective: "Preflight race" });
+    const summary = createMuxMessage(
+      `summary-${crypto.randomUUID()}`,
+      "assistant",
+      "Compacted conversation.",
+      {
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: {
+            text: "Continue working on the goal.",
+            agentId: "exec",
+            model: "openai:gpt-4o",
+            goalKind: GOAL_CONTINUATION_KIND,
+            goalId: created.goalId,
+          },
+        },
+      }
+    );
+    expect((await historyService.appendToHistory(workspaceId, summary)).success).toBe(true);
+    (session as unknown as { hasExternalSendPreflight?: () => boolean }).hasExternalSendPreflight =
+      () => true;
+    const sendSpy = spyOn(session, "sendMessage").mockImplementation(() =>
+      Promise.resolve(Ok(undefined))
+    );
+
+    const dispatched = await (
+      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
+    ).dispatchPendingFollowUp();
+
+    expect(dispatched).toBe(false);
+    expect(sendSpy).not.toHaveBeenCalled();
+    const tail = await historyService.getLastMessages(workspaceId, 1);
+    expect(tail.success).toBe(true);
+    if (tail.success) {
+      const meta = tail.data[0]?.metadata?.muxMetadata;
+      expect(meta && "pendingFollowUp" in meta ? meta.pendingFollowUp : undefined).toBeUndefined();
+    }
+    sendSpy.mockRestore();
+    session.dispose();
+  });
+
+  test("a service preflight starting mid-redispatch flips the live admission probe", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cRJD-): the preflight can also begin AFTER
+    // the entry sample, during the awaited goal read — the live probe carried
+    // through the send-admission gates must observe it.
+    const workspaceId = "compaction-followup-preflight-mid-read";
+    const { session, goalService, historyService, cleanup } =
+      await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const created = await setGoalOk(goalService, { workspaceId, objective: "Late preflight" });
+    const summary = createMuxMessage(
+      `summary-${crypto.randomUUID()}`,
+      "assistant",
+      "Compacted conversation.",
+      {
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: {
+            text: "Continue working on the goal.",
+            agentId: "exec",
+            model: "openai:gpt-4o",
+            goalKind: GOAL_CONTINUATION_KIND,
+            goalId: created.goalId,
+          },
+        },
+      }
+    );
+    expect((await historyService.appendToHistory(workspaceId, summary)).success).toBe(true);
+
+    let preflightActive = false;
+    (session as unknown as { hasExternalSendPreflight?: () => boolean }).hasExternalSendPreflight =
+      () => preflightActive;
+    const realBuild = goalService.buildGoalRedispatchAdmission.bind(goalService);
+    const buildSpy = spyOn(goalService, "buildGoalRedispatchAdmission").mockImplementationOnce(
+      async (...args: Parameters<typeof realBuild>) => {
+        const admission = await realBuild(...args);
+        preflightActive = true;
+        return admission;
+      }
+    );
+
+    const dispatched = await (
+      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
+    ).dispatchPendingFollowUp();
+    buildSpy.mockRestore();
+
+    expect(dispatched).toBe(false);
+    const history = await historyService.getLastMessages(workspaceId, 10);
+    expect(history.success).toBe(true);
+    if (history.success) {
+      expect(
+        history.data.some((message) =>
+          message.parts.some(
+            (part) => part.type === "text" && part.text === "Continue working on the goal."
+          )
+        )
+      ).toBe(false);
+    }
+    session.dispose();
+  });
+
+  test("a recovered budget wrap-up follow-up installs its missing reservation", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cRJEE): a crash between wrap-up send
+    // acceptance and tryMarkBudgetLimitInjected leaves the goal unmarked.
+    // The redispatched follow-up must install the reservation or the
+    // recovered stream's end arms a second wrap-up.
+    const workspaceId = "compaction-followup-wrapup-reservation";
+    const { session, goalService, historyService, cleanup } =
+      await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const created = await setGoalOk(goalService, {
+      workspaceId,
+      objective: "Recover the owed wrap-up",
+      budgetCents: 100,
+    });
+    await goalService.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1.25,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    expect(await goalService.getGoal(workspaceId)).toMatchObject({
+      status: "budget_limited",
+      budgetLimitInjectedForGoalId: null,
+    });
+    const summary = createMuxMessage(
+      `summary-${crypto.randomUUID()}`,
+      "assistant",
+      "Compacted conversation.",
+      {
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: {
+            text: "Wrap up the budget-limited goal.",
+            agentId: "exec",
+            model: "openai:gpt-4o",
+            goalKind: GOAL_BUDGET_LIMIT_KIND,
+            goalId: created.goalId,
+          },
+        },
+      }
+    );
+    expect((await historyService.appendToHistory(workspaceId, summary)).success).toBe(true);
+    const sendSpy = spyOn(session, "sendMessage").mockImplementation(() =>
+      Promise.resolve(Ok(undefined))
+    );
+
+    const dispatched = await (
+      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
+    ).dispatchPendingFollowUp();
+
+    expect(dispatched).toBe(true);
+    expect(sendSpy).toHaveBeenCalledTimes(1);
+    expect(await goalService.getGoal(workspaceId)).toMatchObject({
+      status: "budget_limited",
+      budgetLimitInjectedForGoalId: created.goalId,
+    });
+    sendSpy.mockRestore();
     session.dispose();
   });
 

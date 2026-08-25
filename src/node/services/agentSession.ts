@@ -96,6 +96,7 @@ import {
   type ReviewNoteDataForDisplay,
   type StartupRetrySendOptions,
 } from "@/common/types/message";
+import { toValidGoalId } from "@/common/types/goal";
 import { selectKeepRecentTailStartIndex } from "@/common/utils/messages/keepRecentTail";
 import { extractReadFilePaths, mergeReadFilePaths } from "@/common/utils/messages/extractReadFiles";
 import { isNonNegativeInteger } from "@/common/utils/numbers";
@@ -245,8 +246,10 @@ function coerceGoalSyntheticMessageKind(value: unknown): GoalSyntheticMessageKin
   return undefined;
 }
 
+// Durable goal IDs are UUIDs — see toValidGoalId for the corruption contract
+// (Codex P2 PRRT_kwDOPxxmWM6cRJEC extends it to every recovery-path reader).
 function coerceGoalId(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+  return toValidGoalId(value) ?? undefined;
 }
 
 const PDF_MEDIA_TYPE = "application/pdf";
@@ -534,6 +537,14 @@ interface AgentSessionOptions {
   onIdleCompactionOutcome?: (success: boolean) => void;
   /** Called when post-compaction context state may have changed (plan/file edits) */
   onPostCompactionStateChange?: () => void;
+  /**
+   * Codex P1 (PRRT_kwDOPxxmWM6cRJD-): true while a service-level send is in
+   * its preflight (counted in WorkspaceService.preflightSendCounts but not
+   * yet queued or holding the turn phase). Session queue/phase state cannot
+   * see that window, so redispatched idle-rule follow-ups consult this probe
+   * to yield to a manual send that is still awaiting pricing/settings.
+   */
+  hasExternalSendPreflight?: () => boolean;
 }
 
 enum TurnPhase {
@@ -573,6 +584,7 @@ export class AgentSession {
   private readonly keepBackgroundProcesses: boolean;
   private readonly sanitizeCliWorkspaceRegistration?: AgentSessionOptions["sanitizeCliWorkspaceRegistration"];
   private readonly onPostCompactionStateChange?: () => void;
+  private readonly hasExternalSendPreflight?: () => boolean;
   private readonly emitter = new EventEmitter();
   private readonly aiListeners: Array<{ event: string; handler: (...args: unknown[]) => void }> =
     [];
@@ -822,6 +834,7 @@ export class AgentSession {
       onCompactionComplete,
       onIdleCompactionOutcome,
       onPostCompactionStateChange,
+      hasExternalSendPreflight,
     } = options;
 
     assert(typeof workspaceId === "string", "workspaceId must be a string");
@@ -840,6 +853,7 @@ export class AgentSession {
     this.keepBackgroundProcesses = keepBackgroundProcesses ?? false;
     this.sanitizeCliWorkspaceRegistration = sanitizeCliWorkspaceRegistration;
     this.onPostCompactionStateChange = onPostCompactionStateChange;
+    this.hasExternalSendPreflight = hasExternalSendPreflight;
 
     this.compactionHandler = new CompactionHandler({
       workspaceId: this.workspaceId,
@@ -6923,7 +6937,14 @@ export class AgentSession {
       followUp.dispatchOptions?.requireIdle === true || persistedGoalKind != null;
     const hasQueuedMessages = this.hasPendingManualFollowUp();
     const hasActiveNonCompletingTurn = this.isBusy() && this.turnPhase !== TurnPhase.COMPLETING;
-    if (enforceIdleRule && (hasQueuedMessages || hasActiveNonCompletingTurn)) {
+    // Codex P1 (PRRT_kwDOPxxmWM6cRJD-): a manual service-level send can sit
+    // in its preflight (awaiting pricing/settings) without queueing or
+    // holding the turn phase — it must win over the synthetic follow-up too.
+    const hasExternalPreflightSend = this.hasExternalSendPreflight?.() === true;
+    if (
+      enforceIdleRule &&
+      (hasQueuedMessages || hasActiveNonCompletingTurn || hasExternalPreflightSend)
+    ) {
       log.info("Skipping pending follow-up because the workspace is no longer idle", {
         workspaceId: this.workspaceId,
         summaryMessageId: lastMessage.id,
@@ -6979,6 +7000,7 @@ export class AgentSession {
     const idleRuleStale = enforceIdleRule
       ? () =>
           this.hasPendingManualFollowUp() ||
+          this.hasExternalSendPreflight?.() === true ||
           (this.isBusy() && this.turnPhase !== TurnPhase.COMPLETING)
       : undefined;
     const followUpAdmissionStale =
@@ -7078,6 +7100,26 @@ export class AgentSession {
       }
       const message = this.extractRetryFailureMessage(sendResult.error) ?? sendResult.error.type;
       throw new Error(`Failed to dispatch pending follow-up: ${message}`);
+    }
+
+    // Codex P2 (PRRT_kwDOPxxmWM6cRJEE): if the original wrap-up dispatcher
+    // crashed between send acceptance and its tryMarkBudgetLimitInjected
+    // commit, this redispatched follow-up owns the wrap-up now — install the
+    // missing reservation so the recovered stream's end cannot arm a second
+    // one. Best-effort: a failed marker write must not fail the already
+    // dispatched wrap-up turn.
+    if (persistedGoalKind === GOAL_BUDGET_LIMIT_KIND && persistedGoalId != null) {
+      try {
+        await this.workspaceGoalService?.reserveBudgetWrapupForRedispatch(
+          this.workspaceId,
+          persistedGoalId
+        );
+      } catch (error) {
+        log.warn("Failed to reserve budget wrap-up after redispatch", {
+          workspaceId: this.workspaceId,
+          error,
+        });
+      }
     }
 
     return true;

@@ -2998,6 +2998,43 @@ describe("WorkspaceGoalService", () => {
     });
   });
 
+  test("a non-UUID boundary goalId degrades to a conservative unscoped pause", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cRJEC): durable goal IDs are UUIDs, so a
+    // corrupt non-UUID STRING on a pause boundary is not another goal's
+    // boundary either. Treating it as scoped-different would skip it, reach
+    // the goal's own older continuation row, and reactivate a durably paused
+    // goal after restart.
+    const created = await setGoalOk(service, { workspaceId, objective: "Non-UUID boundary" });
+    await appendUserHistoryMessage(historyService, workspaceId, "Continue working on the goal.", {
+      timestamp: Date.now(),
+      synthetic: true,
+      kind: "goal_continuation",
+      goalId: created.goalId,
+    });
+    const corruptBoundary = createMuxMessage(
+      `goal-paused-nonuuid-${crypto.randomUUID()}`,
+      "user",
+      "Goal paused by the user. Do not continue the goal until a later goal continuation message.",
+      {
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: { type: "goal-pause-boundary", goalId: "broken" },
+      }
+    );
+    expect((await historyService.appendToHistory(workspaceId, corruptBoundary)).success).toBe(true);
+    // Durable pause written directly (no boundary append, no in-memory pause
+    // bookkeeping) — models the post-restart state where only the persisted
+    // artifacts remain.
+    await (
+      service as unknown as { writeGoal: (id: string, goal: GoalRecordV1) => Promise<void> }
+    ).writeGoal(workspaceId, { ...created, status: "paused", updatedAtMs: Date.now() });
+
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: created.goalId,
+      status: "paused",
+    });
+  });
+
   test("a malformed continuation goalId is not legacy activity evidence", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cOHpI): legacy any-goal semantics apply only
     // when the scoping ID is genuinely absent. A present-but-malformed ID on

@@ -5,6 +5,7 @@ import assert from "@/common/utils/assert";
 import {
   toGoalSnapshot,
   toPendingGoalSnapshot,
+  toValidGoalId,
   type GoalHistoryEndReason,
   type GoalHistoryEntry,
   type GoalRecordV1,
@@ -233,24 +234,6 @@ interface GoalPersistenceOptions {
  */
 function toValidEpochMs(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
-}
-
-/**
- * Codex P2 (PRRT_kwDOPxxmWM6cNxUY): chat.jsonl metadata is unchecked JSON, so
- * a goal-scoping ID persisted on a continuation or pause-boundary row can be
- * any shape at runtime. A malformed non-string value must not satisfy a
- * `!== currentGoalId` mismatch test (it is not evidence the row belongs to a
- * DIFFERENT goal) — skipping a pause boundary on corrupt data would let the
- * scan reach an older continuation row and reactivate a durably paused goal
- * after restart.
- *
- * Callers treat a present-but-invalid ID by failure direction (Codex P2
- * PRRT_kwDOPxxmWM6cOHpI): a pause BOUNDARY degrades to legacy unscoped
- * semantics (conservative paused, never scoped), while a CONTINUATION row is
- * skipped outright — corrupt data must not manufacture activity evidence.
- */
-function toValidGoalId(value: unknown): string | null {
-  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 interface ChatTailGoalModeResult {
@@ -1594,6 +1577,37 @@ export class WorkspaceGoalService {
         (this.terminalStatusGenerations.get(workspaceId) ?? 0) !== terminalGenerationAtBuild ||
         (this.goalIdentityGenerations.get(workspaceId) ?? 0) !== identityGenerationAtBuild,
     };
+  }
+
+  /**
+   * Codex P2 (PRRT_kwDOPxxmWM6cRJEE): a budget wrap-up send accepted before a
+   * crash can resume through a persisted compaction follow-up whose original
+   * dispatcher never committed tryMarkBudgetLimitInjected. The redispatched
+   * follow-up owns the wrap-up now: install the missing reservation (an
+   * existing matching reservation is already correct and left untouched) so
+   * the recovered stream's end cannot arm and fire a second wrap-up.
+   */
+  async reserveBudgetWrapupForRedispatch(workspaceId: string, goalId: string): Promise<void> {
+    assert(workspaceId.trim().length > 0, "reserveBudgetWrapupForRedispatch requires workspaceId");
+    assert(goalId.trim().length > 0, "reserveBudgetWrapupForRedispatch requires goalId");
+    await this.fileLocks.withLock(workspaceId, async () => {
+      const current = await this.readGoalFile(workspaceId);
+      if (
+        current?.goalId !== goalId ||
+        current.status !== "budget_limited" ||
+        current.budgetLimitOriginKind === "user" ||
+        current.budgetLimitInjectedForGoalId != null
+      ) {
+        return;
+      }
+      const next = GoalRecordV1Schema.parse({
+        ...current,
+        budgetLimitInjectedForGoalId: goalId,
+        updatedAtMs: Date.now(),
+      });
+      await this.writeGoal(workspaceId, next);
+      await this.pushSnapshot(workspaceId, next);
+    });
   }
 
   /**
