@@ -259,6 +259,10 @@ describe("extractToolMediaAsUserMessages", () => {
               result: { image: mediaContainer, note: "kept" },
               toolCalls: [{ toolName: "mcp__shots__take", args: {}, result: mediaContainer }],
               consoleOutput: [{ level: "log", args: [{ wrapped: mediaContainer }], timestamp: 1 }],
+              // Sibling field beside the toolCalls-shaped structure: the
+              // nested rewrite must walk it too, not return early (round 16
+              // security straggler).
+              sibling: { stashed: mediaContainer },
             },
           },
         ],
@@ -274,10 +278,11 @@ describe("extractToolMediaAsUserMessages", () => {
       throw new Error("Expected an output-available dynamic-tool part");
     }
     const outputText = JSON.stringify(toolPart.output);
-    // All three copies (record, wrapped outer result, wrapped console arg)
-    // are replaced; sibling wrapper fields survive untouched.
+    // All four copies (record, wrapped outer result, wrapped console arg,
+    // sibling field) are replaced; non-media wrapper fields survive.
     expect(outputText).not.toContain(base64);
     expect(outputText).toContain('"note":"kept"');
+    expect(outputText).toContain('"stashed"');
 
     // Identical media across all copies dedupes into ONE attachment.
     const syntheticUser = rewritten[1];

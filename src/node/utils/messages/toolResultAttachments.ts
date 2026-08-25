@@ -328,6 +328,25 @@ function extractAttachmentsFromNestedToolCalls(
     }
   }
 
+  // Sibling wrapper fields beyond toolCalls/result/consoleOutput: classic
+  // sandbox code can return a wrapper holding BOTH a toolCalls-shaped
+  // structure and other media-bearing fields, and returning after only the
+  // nested rewrite would leave sibling base64 in request-ready JSON (capture
+  // retains supported media under its budget by design).
+  const siblingRewrites: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(output as Record<string, unknown>)) {
+    if (key === "toolCalls" || key === "result" || key === "consoleOutput") {
+      continue;
+    }
+    const extracted = extractAttachmentsFromToolOutput(item, depth + 1);
+    if (extracted == null) {
+      continue;
+    }
+    didChange = true;
+    pushUnique(extracted.attachments);
+    siblingRewrites[key] = extracted.newOutput;
+  }
+
   if (!didChange) {
     return null;
   }
@@ -338,6 +357,7 @@ function extractAttachmentsFromNestedToolCalls(
       toolCalls: newToolCalls,
       ...(extractedOuter != null ? { result: extractedOuter.newOutput } : {}),
       ...(newConsoleOutput !== consoleOutput ? { consoleOutput: newConsoleOutput } : {}),
+      ...siblingRewrites,
     },
     attachments,
   };
