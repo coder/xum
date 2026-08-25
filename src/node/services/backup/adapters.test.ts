@@ -565,6 +565,69 @@ describe("backup adapters", () => {
     expect(mode & 0o111).not.toBe(0);
   });
 
+  it("restores a legacy mux/ backup when the configured path is xum/", async () => {
+    // A mux-era client pushed its backup under the pre-rename default path.
+    await writeFixtureFile(muxRoot, "AGENTS.md", "legacy instructions\n");
+    const gitRepo = createBackupGitRepo({ cacheRoot });
+    const payload = createBackupPayloadStore({ config });
+    const legacy = await gitRepo.prepare({ ...settings, path: "mux/" });
+    await payload.exportTo({ repositoryRoot: legacy.rootDir, managedPath: "mux/" });
+    await gitRepo.commitAndPush(legacy, {
+      message: "Back up Mux settings",
+      expectedRemoteCommit: legacy.remoteCommit,
+    });
+
+    // After the rename, the same repository is read through the new default path.
+    await writeFixtureFile(muxRoot, "AGENTS.md", "post-rename local state\n");
+    const prepared = await gitRepo.prepare({ ...settings, path: "xum/" });
+    const preview = await payload.previewRestore({
+      repositoryRoot: prepared.rootDir,
+      managedPath: "xum/",
+    });
+    expect(preview.changes).toEqual([{ status: "M", path: "AGENTS.md" }]);
+
+    await payload.validateRestore({ repositoryRoot: prepared.rootDir, managedPath: "xum/" });
+    const restored = await payload.restore({
+      repositoryRoot: prepared.rootDir,
+      managedPath: "xum/",
+    });
+    expect(restored.changedFiles).toEqual(["AGENTS.md"]);
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "legacy instructions\n"
+    );
+  });
+
+  it("prefers the configured xum/ backup over the legacy mux/ spelling", async () => {
+    const gitRepo = createBackupGitRepo({ cacheRoot });
+    const payload = createBackupPayloadStore({ config });
+
+    await writeFixtureFile(muxRoot, "AGENTS.md", "legacy\n");
+    const legacy = await gitRepo.prepare({ ...settings, path: "mux/" });
+    await payload.exportTo({ repositoryRoot: legacy.rootDir, managedPath: "mux/" });
+    await gitRepo.commitAndPush(legacy, {
+      message: "Back up Mux settings",
+      expectedRemoteCommit: legacy.remoteCommit,
+    });
+
+    await writeFixtureFile(muxRoot, "AGENTS.md", "canonical\n");
+    const canonical = await gitRepo.prepare({ ...settings, path: "xum/" });
+    await payload.exportTo({ repositoryRoot: canonical.rootDir, managedPath: "xum/" });
+    await gitRepo.commitAndPush(canonical, {
+      message: "Back up Xum settings",
+      expectedRemoteCommit: canonical.remoteCommit,
+    });
+
+    // Both spellings now hold a backup; the configured path must win.
+    await writeFixtureFile(muxRoot, "AGENTS.md", "local edit\n");
+    const prepared = await gitRepo.prepare({ ...settings, path: "xum/" });
+    const restored = await payload.restore({
+      repositoryRoot: prepared.rootDir,
+      managedPath: "xum/",
+    });
+    expect(restored.changedFiles).toEqual(["AGENTS.md"]);
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe("canonical\n");
+  });
+
   it("reports preferences as changed only when the merge would change them", async () => {
     config.state = { projects: new Map(), userPreferences: { appearance: { theme: "dark" } } };
     const gitRepo = createBackupGitRepo({ cacheRoot });

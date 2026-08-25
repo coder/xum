@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { listBackupManagedPathSpellings } from "@/common/compat/legacyMux";
 import { execFileAsync, type ExecFileAsyncOptions } from "@/node/utils/disposableExec";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import {
@@ -1033,6 +1034,22 @@ export class BackupRepoCache {
     }
   }
 
+  /**
+   * The trees this cache materializes and reads: the configured managed path first, then
+   * the legacy `mux` spelling when it differs. Backups pushed before the product rename
+   * live under the legacy spelling, and a restore can only read what the sparse checkout
+   * materialized. Writes (stage, commit, status) stay scoped to the configured path.
+   */
+  private managedReadPaths(): readonly string[] {
+    return [
+      ...new Set(
+        listBackupManagedPathSpellings(this.options.managedPath).map((spelling) =>
+          safeRelativePath(spelling)
+        )
+      ),
+    ];
+  }
+
   private async listManagedBlobs(remoteCommit: string): Promise<ManagedBlobEntry[]> {
     let stdout: string;
     try {
@@ -1044,7 +1061,7 @@ export class BackupRepoCache {
           "-z",
           remoteCommit,
           "--",
-          `:(top,literal)${safeRelativePath(this.options.managedPath)}`,
+          ...this.managedReadPaths().map((readPath) => `:(top,literal)${readPath}`),
         ],
         {
           env: { GIT_NO_LAZY_FETCH: "1" },
@@ -1132,13 +1149,14 @@ export class BackupRepoCache {
       );
     }
 
-    const managedPrefix = `${safeRelativePath(this.options.managedPath)}/`;
+    const managedPrefixes = this.managedReadPaths().map((readPath) => `${readPath}/`);
     try {
       const payloadPaths = entries.map((entry) => {
-        if (!entry.path.startsWith(managedPrefix)) {
+        const prefix = managedPrefixes.find((candidate) => entry.path.startsWith(candidate));
+        if (prefix === undefined) {
           throw new Error(`Backup tree contains invalid path '${entry.path}'`);
         }
-        return entry.path.slice(managedPrefix.length);
+        return entry.path.slice(prefix.length);
       });
       assertBackupPathComplexity(payloadPaths);
     } catch (error) {
@@ -1212,7 +1230,9 @@ export class BackupRepoCache {
     await writeOwnedGitInfoFile(
       this.cachePath,
       "sparse-checkout",
-      `/${escapeSparsePattern(safeRelativePath(this.options.managedPath))}/*\n`
+      this.managedReadPaths()
+        .map((readPath) => `/${escapeSparsePattern(readPath)}/*\n`)
+        .join("")
     );
   }
 

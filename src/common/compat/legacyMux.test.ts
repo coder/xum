@@ -7,6 +7,7 @@ import {
   installLegacyMuxEnvironmentAliases,
   LEGACY_CMUX_HOME_DIR_NAME,
   LEGACY_MUX_HOME_DIR_NAME,
+  listBackupManagedPathSpellings,
   listProjectMetadataRelativePaths,
   normalizeProjectMetadataIdentityPath,
   parseXumHomeLegacyFallbackDirName,
@@ -54,6 +55,23 @@ describe("project metadata compatibility", () => {
     expect(normalizeProjectMetadataIdentityPath(".xum/plugins/demo")).toBe(".mux/plugins/demo");
     expect(normalizeProjectMetadataIdentityPath(".xum\\plugins\\demo")).toBe(".mux\\plugins\\demo");
     expect(getCanonicalProjectMetadataRelativePath("skills/demo")).toBe(".xum/skills/demo");
+  });
+});
+
+describe("backup managed path compatibility", () => {
+  test("falls back from xum segments to the legacy mux spelling", () => {
+    expect(listBackupManagedPathSpellings("xum/")).toEqual(["xum/", "mux/"]);
+    expect(listBackupManagedPathSpellings("dotfiles/xum")).toEqual([
+      "dotfiles/xum",
+      "dotfiles/mux",
+    ]);
+  });
+
+  test("keeps paths without a xum segment as the only spelling", () => {
+    expect(listBackupManagedPathSpellings("mux/")).toEqual(["mux/"]);
+    expect(listBackupManagedPathSpellings("backups")).toEqual(["backups"]);
+    // Only whole segments alias; substrings must not be rewritten.
+    expect(listBackupManagedPathSpellings("xum-settings")).toEqual(["xum-settings"]);
   });
 });
 
