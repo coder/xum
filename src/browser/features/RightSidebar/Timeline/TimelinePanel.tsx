@@ -775,9 +775,12 @@ interface TimelinePanelViewProps extends TimelinePanelProps {
 export function TimelinePanelView(props: TimelinePanelViewProps) {
   const timeline = props.timeline;
   const workspaceStore = props.workspaceStore;
+  // listener keeps duplicate mounts in sync: a CSS-hidden sidebar tab and the mobile
+  // timeline dialog can both be mounted, sharing this persisted filter.
   const [storedFilter, setStoredFilter] = usePersistedState<string>(
     `timeline-filter:${props.workspaceId}`,
-    "all"
+    "all",
+    { listener: true }
   );
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [expandedRuns, setExpandedRuns] = useState<Record<string, boolean>>({});

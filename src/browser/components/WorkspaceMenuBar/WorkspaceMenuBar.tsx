@@ -207,6 +207,28 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     return window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches;
   }, []);
 
+  // Keep the gate reactive: resizing re-evaluates CSS instantly, but a render-time read
+  // would leave the More menu stale until an unrelated state update. The media-query
+  // listener covers viewport transitions and the ResizeObserver covers the shell
+  // container query (e.g. expanding the left sidebar squeezes the shell under 684px).
+  const [timelineSidebarHidden, setTimelineSidebarHidden] = useState(false);
+  useEffect(() => {
+    const compute = () => setTimelineSidebarHidden(isTimelineSidebarHidden());
+    compute();
+    const mql = window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+    mql.addEventListener("change", compute);
+    const shell = menuBarRef.current?.closest("[data-workspace-shell]");
+    let resizeObserver: ResizeObserver | undefined;
+    if (shell instanceof HTMLElement && typeof ResizeObserver !== "undefined") {
+      resizeObserver = new ResizeObserver(compute);
+      resizeObserver.observe(shell);
+    }
+    return () => {
+      mql.removeEventListener("change", compute);
+      resizeObserver?.disconnect();
+    };
+  }, [isTimelineSidebarHidden]);
+
   // The dialog is the only timeline entry point while the sidebar is hidden, and every
   // operation needs a keyboard shortcut. Evaluated at keydown time so the gate tracks
   // live viewport/layout changes without a resize subscription.
@@ -804,7 +826,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                 hasRepository && !isTouchMobileScreen ? handleEnterImmersiveReview : null
               }
               onOpenTimeline={
-                timelineExperimentEnabled && isTimelineSidebarHidden()
+                timelineExperimentEnabled && timelineSidebarHidden
                   ? () => setTimelineDialogOpen(true)
                   : null
               }

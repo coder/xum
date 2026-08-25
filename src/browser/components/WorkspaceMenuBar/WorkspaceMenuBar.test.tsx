@@ -278,19 +278,35 @@ function getLastTimelineDialogProps() {
   return spy.mock.calls.at(-1)?.[0];
 }
 
-/** Replace window.matchMedia so viewport-gated actions can be exercised per test. */
+/**
+ * Replace window.matchMedia so viewport-gated actions can be exercised per test.
+ * `matches` is re-read on every access and registered change listeners are returned
+ * so tests can simulate live viewport transitions.
+ */
 function stubMatchMedia(matches: (query: string) => boolean) {
+  const changeListeners: Array<() => void> = [];
   window.matchMedia = ((query: string) =>
     ({
-      matches: matches(query),
+      get matches() {
+        return matches(query);
+      },
       media: query,
       onchange: null,
       addListener: () => undefined,
       removeListener: () => undefined,
-      addEventListener: () => undefined,
+      addEventListener: (_type: string, listener: () => void) => {
+        changeListeners.push(listener);
+      },
       removeEventListener: () => undefined,
       dispatchEvent: () => false,
     }) as unknown as MediaQueryList) as typeof window.matchMedia;
+  return {
+    fireChange: () => {
+      for (const listener of changeListeners) {
+        listener();
+      }
+    },
+  };
 }
 
 const defaultProps: ComponentProps<typeof WorkspaceMenuBarComponent> = {
@@ -447,13 +463,28 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     const mount = document.createElement("div");
     shell.appendChild(mount);
 
-    const view = render(<WorkspaceMenuBar {...defaultProps} />, { container: mount });
-    // First render computes the gate before the menu bar ref attaches; any re-render
-    // (opening the More menu in production) re-evaluates it against the shell.
-    view.rerender(<WorkspaceMenuBar {...defaultProps} />);
+    render(<WorkspaceMenuBar {...defaultProps} />, { container: mount });
 
     expect(typeof getLastMenuContentProps()?.onOpenTimeline).toBe("function");
     shell.remove();
+  });
+
+  it("re-gates the Timeline action when the viewport crosses the narrow breakpoint", () => {
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TIMELINE), true);
+    let narrow = false;
+    const media = stubMatchMedia(
+      (query) => narrow && query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`
+    );
+
+    render(<WorkspaceMenuBar {...defaultProps} />);
+    expect(getLastMenuContentProps()?.onOpenTimeline).toBeNull();
+
+    narrow = true;
+    act(() => {
+      media.fireChange();
+    });
+
+    expect(typeof getLastMenuContentProps()?.onOpenTimeline).toBe("function");
   });
 
   it("opens the timeline dialog with the keyboard shortcut on narrow viewports", () => {
