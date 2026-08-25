@@ -257,6 +257,15 @@ describe("xum CLI", () => {
       expect(result.output).toContain('Unknown or unsupported experiment "agent-browser"');
     });
 
+    test("Object.prototype property names are rejected as experiments", async () => {
+      // The validity check must be an own-property lookup: `in` would accept
+      // "constructor"/"toString" via the prototype chain and then build a
+      // garbage experiments field from the inherited function.
+      const result = await runRunDirect(["-e", "constructor", "test message"]);
+      expect(result.exitCode).toBe(1);
+      expect(result.output).toContain('Unknown or unsupported experiment "constructor"');
+    });
+
     test("rlm-mode experiment is accepted", async () => {
       // Regression: rlm-mode parsed fine but was silently dropped when building
       // SendMessageOptions.experiments, so PTC+RLM CLI runs degraded to the

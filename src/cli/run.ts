@@ -278,7 +278,10 @@ const SEND_MESSAGE_EXPERIMENT_FIELDS = {
   [EXPERIMENT_IDS.ADVISOR_TOOL]: "advisorTool",
   [EXPERIMENT_IDS.DYNAMIC_WORKFLOWS]: "dynamicWorkflows",
   [EXPERIMENT_IDS.MEMORY]: "memory",
-  [EXPERIMENT_IDS.TIMELINE]: "timeline",
+  // TIMELINE is deliberately absent: AIService resolves the timeline
+  // experiment exclusively from the backend ExperimentsService (the schema's
+  // `timeline` request field is never read), and `xum run` wires no timeline
+  // service — accepting `-e timeline` would be a silent no-op.
   [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: "workspaceHeartbeats",
   [EXPERIMENT_IDS.TOOL_SEARCH]: "toolSearch",
 } as const satisfies Partial<
@@ -288,7 +291,10 @@ const SEND_MESSAGE_EXPERIMENT_FIELDS = {
 function isSendMessageExperimentId(
   value: string
 ): value is keyof typeof SEND_MESSAGE_EXPERIMENT_FIELDS {
-  return value in SEND_MESSAGE_EXPERIMENT_FIELDS;
+  // Own-property check: `in` would also accept Object.prototype names like
+  // "constructor" or "toString", which have no mapping and would silently
+  // produce a garbage experiments field.
+  return Object.hasOwn(SEND_MESSAGE_EXPERIMENT_FIELDS, value);
 }
 
 function collectExperiments(value: string, previous: string[]): string[] {
