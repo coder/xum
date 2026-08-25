@@ -143,6 +143,17 @@ export class TerminalService {
     }
   }
 
+  /**
+   * Synchronous slice of hasOpenedNativeTerminal: whether an open is still in flight
+   * (admitted but its durable marker not yet persisted). The pre-interruption archive hold
+   * checks this in its synchronous validation block, where the async marker probe cannot
+   * run and is unnecessary — established opens are refused by the caller's earlier
+   * untrackable-app gate.
+   */
+  hasPendingNativeTerminalOpen(workspaceId: string): boolean {
+    return (this.pendingNativeTerminalOpens.get(workspaceId) ?? 0) > 0;
+  }
+
   /** Whether a native terminal was ever opened for this workspace (survives app restarts). */
   async hasOpenedNativeTerminal(workspaceId: string): Promise<boolean> {
     // Opens still in flight count as opened: see pendingNativeTerminalOpens.

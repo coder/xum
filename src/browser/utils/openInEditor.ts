@@ -39,6 +39,18 @@ function trimTrailingSlash(path: string): string {
   return path.length > 1 && path.endsWith("/") ? path.slice(0, -1) : path;
 }
 
+// Guarded token generator (mirrors createLayoutPresetId/createHeaderRowId): Crypto.randomUUID
+// exists only in secure contexts, and Xum's browser UI can be served from a plain-HTTP remote
+// origin. Throwing here would reject every built-in editor open before the recording RPC's
+// try/catch; the fallback only needs to be unique enough to key one launch's rollback.
+function createEditorLaunchToken(): string {
+  const maybeCrypto = globalThis.crypto;
+  if (maybeCrypto && typeof maybeCrypto.randomUUID === "function") {
+    return maybeCrypto.randomUUID();
+  }
+  return `editor_launch_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
 function isAbsolutePath(path: string): boolean {
   return path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path);
 }
@@ -155,7 +167,7 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
     // Generated client-side BEFORE admission so it survives response loss: if the backend
     // commits the reservation but the connection drops before the response arrives, this
     // token is the only handle that can still redeem the rollback.
-    const launchToken = crypto.randomUUID();
+    const launchToken = createEditorLaunchToken();
     try {
       const recorded = await args.api.general.recordEditorOpen({
         workspaceId: args.workspaceId,

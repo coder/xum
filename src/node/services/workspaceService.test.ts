@@ -11185,6 +11185,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     try {
       refused = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
         queuedDelegatedTurnCount: 0,
+        expectRunningDelegatedStream: false,
       });
     } finally {
       release();
@@ -11194,10 +11195,29 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       expect(refused.error).toContain("workflow run");
     }
 
+    // In-flight editor/terminal opens are visible only through the pending-open counters
+    // until their durable markers persist; the hold must refuse on them before the caller
+    // interrupts anything (the sink's untrackable-app check would refuse only afterwards).
+    const pendingOpen = workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
+    const refusedByOpen = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectRunningDelegatedStream: false,
+    });
+    expect(refusedByOpen.success).toBe(false);
+    if (!refusedByOpen.success) {
+      expect(refusedByOpen.error).toContain("external editor open in progress");
+    }
+    const admittedOpen = await pendingOpen;
+    expect(admittedOpen.success).toBe(true);
+    if (admittedOpen.success) {
+      await admittedOpen.data.rollbackAfterFailedLaunch();
+    }
+
     // A refused hold releases the gate; a granted one arms it for the caller to carry
     // through the sink, refusing new user admissions exactly like the sink's own gate.
     const hold = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
       queuedDelegatedTurnCount: 0,
+      expectRunningDelegatedStream: false,
     });
     expect(hold.success).toBe(true);
     if (!hold.success) return;
@@ -11215,6 +11235,19 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const allowed = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-hold-2");
     expect(allowed.success).toBe(true);
     await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+  });
+
+  test("fork() refuses while the source workspace is being archived", async () => {
+    // Source-fork admission pairs with the archive gates: a Coder-stop archive must not stop
+    // the dedicated remote workspace mid-clone while a fork shares it.
+    addToArchivingWorkspaces(workspaceService, workspaceId);
+
+    const result = await workspaceService.fork(workspaceId);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("being archived");
+    }
   });
 
   test("archive() rechecks durably active workflow runs after arming the admission gate", async () => {

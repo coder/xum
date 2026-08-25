@@ -2095,6 +2095,14 @@ export class WorkspaceService extends EventEmitter {
   // re-wake a stopped Coder workspace). See acquirePreflightAdmission.
   private readonly preflightStagingCounts = new Map<string, number>();
   private readonly preflightFileCompletionCounts = new Map<string, number>();
+  /**
+   * In-flight forks counted per SOURCE workspace. A fork clones the source checkout and (for
+   * SSH/Coder runtimes) shares its remote workspace, so a model-driven archive admitted
+   * mid-fork could stop or snapshot the environment under the clone. Pairs with the archive
+   * gates like the other preflight counters: a fork admitted first is visible to the sink
+   * and the pre-interruption hold; one entering later observes archivingWorkspaces.
+   */
+  private readonly preflightForkCounts = new Map<string, number>();
 
   // Tracks in-flight fork auto-title generations so only the first accepted continue
   // message can claim the workspace title.
@@ -8184,7 +8192,7 @@ export class WorkspaceService extends EventEmitter {
    */
   acquirePreInterruptionArchiveHold(
     workspaceId: string,
-    options: { queuedDelegatedTurnCount: number }
+    options: { queuedDelegatedTurnCount: number; expectRunningDelegatedStream: boolean }
   ): Result<Disposable> {
     assert(workspaceId.length > 0, "acquirePreInterruptionArchiveHold requires workspaceId");
     assert(
@@ -8201,6 +8209,13 @@ export class WorkspaceService extends EventEmitter {
     if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
       activityLabels.push("a message send in progress");
     }
+    // A user stream admitted after the caller's activity snapshot has already released its
+    // send preflight, so the counter above cannot see it — recheck streaming itself. The one
+    // stream a workspace can run is expected only when the caller collected a delegated turn
+    // RUNNING on this workspace; anything else is user work the sink would refuse on.
+    if (!options.expectRunningDelegatedStream && this.aiService.isStreaming(workspaceId)) {
+      activityLabels.push("an active stream");
+    }
     if ((this.preflightExecCounts.get(workspaceId) ?? 0) > 0) {
       activityLabels.push("a bash command executing");
     }
@@ -8209,6 +8224,19 @@ export class WorkspaceService extends EventEmitter {
     }
     if ((this.preflightFileCompletionCounts.get(workspaceId) ?? 0) > 0) {
       activityLabels.push("a file completion refresh in progress");
+    }
+    if ((this.preflightForkCounts.get(workspaceId) ?? 0) > 0) {
+      activityLabels.push("a fork of this workspace in progress");
+    }
+    // In-flight native-terminal/editor opens passed their own archive guards before this
+    // hold armed and surface only through the pending-open counters until their durable
+    // markers persist; the sink's untrackable-app check would refuse on them after the
+    // turns were already destroyed.
+    if ((this.pendingExternalEditorRecordings.get(workspaceId) ?? 0) > 0) {
+      activityLabels.push("an external editor open in progress");
+    }
+    if (this.terminalService?.hasPendingNativeTerminalOpen(workspaceId) === true) {
+      activityLabels.push("a native terminal open in progress");
     }
     if (hasInProcessWorkflowWork(workspaceId)) {
       activityLabels.push("a workflow run starting or running");
@@ -8222,14 +8250,15 @@ export class WorkspaceService extends EventEmitter {
     if (this.desktopSessionManager?.has(workspaceId) === true) {
       activityLabels.push("a desktop session");
     }
-    if (this.hasPendingQueuedOrPreparingTurn(workspaceId)) {
+    const session = this.getOrCreateSession(workspaceId);
+    // Narrow PREPARING/auto-retry check, NOT hasPendingQueuedOrPreparingTurn: that predicate
+    // also reports plain queued messages, which would refuse every interrupt_active on a
+    // queued delegated turn before the entry-count comparison below could attribute it.
+    if (session.isPreparingTurn() || session.hasPendingAutoRetry()) {
       // A dispatching (PREPARING) entry has left the queue but not yet registered a
       // stream, so the queue comparison below cannot attribute it — fail closed.
       activityLabels.push("a message dispatching");
-    } else if (
-      this.getOrCreateSession(workspaceId).queuedMessageEntryCount() >
-      options.queuedDelegatedTurnCount
-    ) {
+    } else if (session.queuedMessageEntryCount() > options.queuedDelegatedTurnCount) {
       activityLabels.push("queued messages beyond the delegated turns");
     }
     if (activityLabels.length > 0) {
@@ -8304,6 +8333,9 @@ export class WorkspaceService extends EventEmitter {
         }
         if ((this.preflightFileCompletionCounts.get(workspaceId) ?? 0) > 0) {
           activityLabels.push("a file completion refresh in progress");
+        }
+        if ((this.preflightForkCounts.get(workspaceId) ?? 0) > 0) {
+          activityLabels.push("a fork of this workspace in progress");
         }
         if (liveActivity.queuedMessages) activityLabels.push("queued messages");
         if (liveActivity.backgroundBashProcesses) {
@@ -9585,6 +9617,19 @@ export class WorkspaceService extends EventEmitter {
     sourceMessageId?: string,
     pendingAutoTitle?: boolean
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; projectPath: string }>> {
+    // Source-fork admission pairs with the model-facing archive gates (same synchronous
+    // block as the entry guards in sendMessage/executeBash): a fork admitted first is
+    // visible to the sink and the pre-interruption hold via preflightForkCounts and refuses
+    // the archive; a fork entering later observes archivingWorkspaces and refuses here.
+    // Without this pairing, a Coder-stop archive could stop the dedicated remote workspace
+    // mid-clone while the fork shares it, and the child's init could restart it afterwards.
+    if (this.archivingWorkspaces.has(sourceWorkspaceId)) {
+      return Err(`Workspace is being archived: ${sourceWorkspaceId}. Unarchive it before forking.`);
+    }
+    using _preflightFork = this.acquirePreflightAdmission(
+      this.preflightForkCounts,
+      sourceWorkspaceId
+    );
     try {
       const sourceMetadataResult = await this.aiService.getWorkspaceMetadata(sourceWorkspaceId);
       if (!sourceMetadataResult.success) {

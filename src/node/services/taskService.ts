@@ -9631,6 +9631,12 @@ export class TaskService {
                   queuedDelegatedTurnCount: activeTurns.filter(
                     (turn) => turn.workspaceId === resolved.workspaceId && turn.status === "queued"
                   ).length,
+                  // The workspace's one active stream is expected (and interruptible) only
+                  // when a collected delegated turn is RUNNING on the target itself; any
+                  // other stream is user work the hold must refuse on.
+                  expectRunningDelegatedStream: activeTurns.some(
+                    (turn) => turn.workspaceId === resolved.workspaceId && turn.status === "running"
+                  ),
                 }
               );
               if (!holdResult.success) {
