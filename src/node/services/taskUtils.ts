@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { execBuffered } from "@/node/utils/runtime/helpers";
+import { shellQuote } from "@/common/utils/shell";
 import { resolveModelFallbackChain } from "@/common/utils/ai/modelFallbacks";
 
 export function coerceNonEmptyString(value: unknown): string | undefined {
@@ -92,11 +93,13 @@ export async function tryReadGitBranchMatchesOrigin(
     return undefined;
   }
   try {
-    const result = await execBuffered(
-      runtime,
-      `git rev-parse --verify --quiet 'origin/${branch}^{commit}'`,
-      { cwd: workspacePath, timeout: 10 }
-    );
+    // SECURITY: branch names are repo-controlled input (a git-valid branch can contain
+    // quotes); the full revision argument must be shell-quoted before interpolation.
+    const revision = shellQuote(`origin/${branch}^{commit}`);
+    const result = await execBuffered(runtime, `git rev-parse --verify --quiet ${revision}`, {
+      cwd: workspacePath,
+      timeout: 10,
+    });
     if (result.exitCode !== 0) {
       // No origin ref for this branch: the local commit is the only candidate base.
       return true;
@@ -124,7 +127,7 @@ export async function tryReadGitPathsClean(
   assert(pathspecs.length > 0, "tryReadGitPathsClean: pathspecs must be non-empty");
 
   try {
-    const quoted = pathspecs.map((pathspec) => `'${pathspec}'`).join(" ");
+    const quoted = pathspecs.map((pathspec) => shellQuote(pathspec)).join(" ");
     const result = await execBuffered(runtime, `git status --porcelain --ignored -- ${quoted}`, {
       cwd: workspacePath,
       timeout: 10,
