@@ -66,7 +66,7 @@ ESBUILD_HOST_PLATFORM := $(subst Linux,linux,$(subst Darwin,darwin,$(shell uname
 ESBUILD_BIN = $(firstword $(wildcard node_modules/@esbuild/$(ESBUILD_HOST_PLATFORM)/bin/esbuild) $(wildcard node_modules/@esbuild/*/bin/esbuild) node_modules/esbuild/bin/esbuild)
 
 # Common esbuild flags for CLI API bundle (ESM format for trpc-cli)
-ESBUILD_CLI_FLAGS := --bundle --format=esm --platform=node --target=node20 --outfile=dist/cli/api.mjs --external:zod --external:commander --external:jsonc-parser --external:@trpc/server --external:ssh2 --external:cpu-features --banner:js="import{createRequire}from'module';globalThis.require=createRequire(import.meta.url);"
+ESBUILD_CLI_FLAGS := --bundle --format=esm --platform=node --target=node20 --outfile=dist/cli/api.mjs --external:zod --external:commander --external:jsonc-parser --external:@trpc/server --external:ssh2 --external:cpu-features --banner:js="import{createRequire}from\"module\";globalThis.require=createRequire(import.meta.url);"
 
 # Common esbuild flags for server runtime Docker bundle.
 # Place runtime bundles under dist/runtime so frontend dist/*.js layers remain stable.

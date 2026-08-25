@@ -60,6 +60,8 @@ interface Zod4Like {
   _def?: Zod4Def;
   description?: string;
   describe?: (desc: string) => Zod4Like;
+  /** Standard Schema validator (own, non-enumerable on Zod 4 instances). */
+  "~standard"?: unknown;
 }
 
 /**
@@ -497,10 +499,19 @@ function enhanceInputSchema(schema: unknown): unknown {
   // so we explicitly copy it. We also update _zod.def.shape to use our enhanced shape,
   // since toJSONSchema reads from _zod.def, not schema.def.
   const enhancedDef = { ...def, shape: enhancedShape };
+  // Preserve the Standard Schema validator: oRPC validates call inputs via
+  // schema["~standard"].validate, but `~standard` is non-enumerable on Zod 4
+  // instances so object spread drops it — every procedure that took this
+  // enhancement path then crashed at call time with "Cannot read properties
+  // of undefined (reading 'validate')" (e.g. `xum api workspace create`).
+  // Reusing the ORIGINAL schema's validator is deliberate: enhancements only
+  // prettify CLI help text and must not change validation semantics.
+  const originalStandard = schema["~standard"];
   const enhanced = {
     ...schema,
     def: enhancedDef,
     _def: enhancedDef,
+    ...(originalStandard !== undefined ? { "~standard": originalStandard } : {}),
   };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment
   const originalZod = (schema as any)._zod;

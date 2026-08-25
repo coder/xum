@@ -230,6 +230,9 @@ function buildExperimentsObject(experimentIds: readonly string[]) {
     programmaticToolCallingExclusive: experimentIds.includes(
       EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE
     ),
+    // RLM rides the PTC parent; without this passthrough `-e rlm-mode` was
+    // silently dropped and workflow sends ran the non-kernel PTC toolset.
+    rlm: experimentIds.includes(EXPERIMENT_IDS.RLM),
     // Invoking `xum workflow` is an explicit opt-in, so the dynamic-workflows
     // experiment is enabled implicitly for this invocation (never persisted).
     dynamicWorkflows: true,
