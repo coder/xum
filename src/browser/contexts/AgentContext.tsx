@@ -170,9 +170,15 @@ function AgentProviderWithState(props: {
           persistSelectedAgentId: true,
         })
         .then((result) => {
-          if (!result.success) {
-            rollback();
+          if (result.success) {
+            // A no-op write (backend already on this agent) emits no metadata
+            // echo, so release the guard deterministically. For changed writes
+            // the echo is ordered after any stale broadcast, so releasing on
+            // the response cannot strand a stale value.
+            clearPendingWorkspaceAgentId(workspaceId, nextAgentId);
+            return;
           }
+          rollback();
         })
         .catch(rollback);
     },

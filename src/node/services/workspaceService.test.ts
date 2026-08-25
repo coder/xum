@@ -9262,6 +9262,61 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
     expect(persistSpy).toHaveBeenCalledTimes(1);
   });
 
+  test("refuses agent-only switch to an unpriced stored agent for budgeted goals", async () => {
+    workspaceService.setWorkspaceGoalService({
+      getGoal: mock(() => Promise.resolve({ status: "active", budgetCents: 500 })),
+    } as unknown as WorkspaceGoalService);
+    (
+      workspaceService as unknown as { config: { loadConfigOrDefault: () => unknown } }
+    ).config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        [
+          "/tmp/proj",
+          {
+            workspaces: [
+              {
+                id: "ws",
+                path: "/tmp/proj/ws",
+                name: "ws",
+                aiSettingsByAgent: {
+                  plan: { model: "openai:not-priced-model", thinkingLevel: "off" },
+                },
+              },
+            ],
+          },
+        ],
+      ]),
+    }));
+
+    const result = await workspaceService.updateAgentAISettings("ws", "plan", null, {
+      persistSelectedAgentId: true,
+    });
+
+    expect(result).toEqual({
+      success: false,
+      error: "Target model has no pricing data. Pick a priced model before switching.",
+    });
+  });
+
+  test("allows agent-only switch when the target agent has no stored model", async () => {
+    const persistSpy = mock(() => Promise.resolve({ success: true as const, data: true }));
+    workspaceService.setWorkspaceGoalService({
+      getGoal: mock(() => Promise.resolve({ status: "active", budgetCents: 500 })),
+    } as unknown as WorkspaceGoalService);
+    (
+      workspaceService as unknown as {
+        persistWorkspaceAISettingsForAgent: (...args: unknown[]) => unknown;
+      }
+    ).persistWorkspaceAISettingsForAgent = persistSpy;
+
+    const result = await workspaceService.updateAgentAISettings("ws", "plan", null, {
+      persistSelectedAgentId: true,
+    });
+
+    expect(result.success).toBe(true);
+    expect(persistSpy).toHaveBeenCalledTimes(1);
+  });
+
   test("persists agent AI settings for custom agent", async () => {
     const persistSpy = mock(() => Promise.resolve({ success: true as const, data: true }));
 

@@ -543,6 +543,43 @@ describe("WorkspaceContext", () => {
     );
   });
 
+  test("does not hydrate another agent's settings when the active agent has no bucket", async () => {
+    const workspaceId = "ws-agent-no-bucket";
+
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createWorkspaceMetadata({
+              id: workspaceId,
+              agentId: "custom",
+              aiSettingsByAgent: {
+                exec: { model: "openai:gpt-5.2", thinkingLevel: "low" },
+              },
+            }),
+          ]),
+      },
+      localStorage: {
+        [getAgentIdKey(workspaceId)]: JSON.stringify("custom"),
+        // Locally resolved settings for the bucket-less active agent.
+        [getModelKey(workspaceId)]: JSON.stringify("openai:custom-model"),
+        [getThinkingLevelKey(workspaceId)]: JSON.stringify("high"),
+      },
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
+
+    // exec's bucket must not overwrite the active agent's resolved settings.
+    expect(JSON.parse(globalThis.localStorage.getItem(getModelKey(workspaceId))!)).toBe(
+      "openai:custom-model"
+    );
+    expect(JSON.parse(globalThis.localStorage.getItem(getThinkingLevelKey(workspaceId))!)).toBe(
+      "high"
+    );
+  });
+
   test("stale metadata does not clobber a pending local agent switch", async () => {
     const workspaceId = "ws-agent-pending";
     let emitMetadata:

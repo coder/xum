@@ -521,6 +521,12 @@ describe("ProposePlanToolCall", () => {
       expect(JSON.parse(window.localStorage.getItem(modelKey)!)).toBe(execModel);
       expect(JSON.parse(window.localStorage.getItem(thinkingKey)!)).toBe(execThinking);
     }
+
+    // The guard is released once the send settles (a successful no-op
+    // persistence emits no echo), so backend agent updates apply again.
+    await waitFor(() =>
+      expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true)
+    );
   });
 
   test("clears the pending agent guard when the Implement send fails", async () => {

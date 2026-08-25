@@ -247,7 +247,11 @@ function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadat
     getAgentIdKey(workspaceId),
     WORKSPACE_DEFAULTS.agentId
   );
-  const active = nextByAgent[activeAgentId] ?? nextByAgent.exec ?? nextByAgent.plan;
+  // Only hydrate from the ACTIVE agent's own bucket. Falling back to another
+  // agent's bucket would overwrite the locally resolved settings of an agent
+  // that has no persisted bucket yet (e.g. right after an agent-only switch),
+  // and WorkspaceModeAISync does not re-run to correct such an overwrite.
+  const active = nextByAgent[activeAgentId];
   if (!active) {
     return;
   }

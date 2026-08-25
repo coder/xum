@@ -9673,6 +9673,28 @@ export class WorkspaceService extends EventEmitter {
     return this.updateAgentAISettings(workspaceId, mode, aiSettings);
   }
 
+  /**
+   * Model a selected-agent switch would make authoritative for backend
+   * dispatches (heartbeats, goal continuations): the target agent's stored
+   * workspace bucket, then the legacy shared workspace settings.
+   */
+  private getStoredWorkspaceAgentModel(workspaceId: string, agentId: string): string | undefined {
+    const found = this.config.findWorkspace(workspaceId);
+    if (!found) {
+      return undefined;
+    }
+    const normalizedAgentId = normalizeAgentId(agentId, "");
+    if (!normalizedAgentId) {
+      return undefined;
+    }
+    const entry = this.findFreshWorkspaceEntry(this.config.loadConfigOrDefault(), {
+      projectPath: found.projectPath,
+      workspaceId,
+      workspacePath: found.workspacePath,
+    });
+    return entry?.aiSettingsByAgent?.[normalizedAgentId]?.model ?? entry?.aiSettings?.model;
+  }
+
   async updateAgentAISettings(
     workspaceId: string,
     agentId: string,
@@ -9689,18 +9711,28 @@ export class WorkspaceService extends EventEmitter {
           return Err(normalized.error);
         }
         normalizedSettings = normalized.data;
+      }
 
-        if (this.workspaceGoalService) {
-          const goal = await this.workspaceGoalService.getGoal(workspaceId);
-          // Use the resumable check rather than active-only: a paused or
-          // budget-limited budgeted goal will resume accounting when the user
-          // un-pauses or raises the budget. Letting them switch to an unpriced
-          // model in the meantime silently records 0 cost on the next stream
-          // and budget enforcement quietly stops working.
+      if (this.workspaceGoalService) {
+        const goal = await this.workspaceGoalService.getGoal(workspaceId);
+        // Use the resumable check rather than active-only: a paused or
+        // budget-limited budgeted goal will resume accounting when the user
+        // un-pauses or raises the budget. Letting them switch to an unpriced
+        // model in the meantime silently records 0 cost on the next stream
+        // and budget enforcement quietly stops working.
+        if (hasBudgetedResumableGoal(goal)) {
+          // Agent-only switches (null aiSettings) still redirect heartbeat and
+          // goal-continuation dispatches to the target agent's stored settings,
+          // so gate on the model the switch would make authoritative.
+          const gatedModel =
+            normalizedSettings?.model ??
+            (options?.persistSelectedAgentId === true
+              ? this.getStoredWorkspaceAgentModel(workspaceId, agentId)
+              : undefined);
           if (
-            hasBudgetedResumableGoal(goal) &&
+            gatedModel != null &&
             !modelHasPricingData(
-              normalizedSettings.model,
+              gatedModel,
               typeof this.config.loadProvidersConfig === "function"
                 ? this.config.loadProvidersConfig()
                 : null

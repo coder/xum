@@ -562,7 +562,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       });
       const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
 
-      const sendResult = await api.workspace.sendMessage({
+      await api.workspace.sendMessage({
         workspaceId,
         message: "Implement the plan",
         options: {
@@ -572,11 +572,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
           thinkingLevel: resolvedThinking,
         },
       });
-      if (!sendResult.success) {
-        // The send was what would persist the switch; without it the guard
-        // would block backend agent seeds for this workspace indefinitely.
-        clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
-      }
+      // Success: the send persisted the switch, and a no-op persistence emits
+      // no metadata echo, so release the guard once the send settles (a real
+      // echo is ordered after any stale broadcast). Failure: nothing will echo
+      // and a stuck guard would block backend agent seeds indefinitely.
+      clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
     } catch {
       // Best-effort: user can retry manually if sending fails.
       clearPendingWorkspaceAgentId(workspaceId, "exec");
@@ -621,7 +621,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       });
       const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
 
-      const sendResult = await api.workspace.sendMessage({
+      await api.workspace.sendMessage({
         workspaceId,
         message: "Implement the plan",
         options: {
@@ -631,9 +631,8 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
           thinkingLevel: resolvedThinking,
         },
       });
-      if (!sendResult.success) {
-        clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
-      }
+      // See handleImplement: release the guard once the send settles.
+      clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
     } catch {
       // Best-effort: user can retry manually if sending fails.
       clearPendingWorkspaceAgentId(workspaceId, "auto");
