@@ -825,6 +825,21 @@ export const SendMessageOptionsSchema = z.object({
          * itself when known.
          */
         expectedSource: z.string().optional(),
+        /**
+         * Provenance of the full resolved base chain (leaf first), pinned because
+         * stream-time inheritance resolution reloads every base independently — a
+         * vanished base shadow must not silently swap a different definition into
+         * the chain's prompt/tool policy.
+         */
+        expectedChain: z
+          .array(
+            z.object({
+              id: AgentIdSchema,
+              scope: AgentDefinitionScopeSchema,
+              source: z.string().optional(),
+            })
+          )
+          .optional(),
       }),
     ])
     .optional(),

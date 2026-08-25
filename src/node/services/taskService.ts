@@ -58,12 +58,14 @@ import type { InitLogger, Runtime } from "@/node/runtime/Runtime";
 import { readPlanFile } from "@/node/utils/runtime/helpers";
 import {
   coerceNonEmptyString,
+  tryReadGitBranchMatchesOrigin,
   tryReadGitCurrentBranch,
   tryReadGitHeadCommitSha,
   tryReadGitPathsClean,
   findWorkspaceEntry,
 } from "@/node/services/taskUtils";
 import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
+import { findInitHookRelativePath } from "@/node/runtime/initHook";
 import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
 import { getTaskGroupCount } from "@/common/utils/tools/taskGroups";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
@@ -538,6 +540,13 @@ const AGENT_DEFINITION_PROJECT_PATHSPECS: readonly string[] = [
   ...listProjectMetadataRelativePaths("plugins"),
   ".agents/plugins",
 ];
+
+/** Provenance of one hop of a validated agent's base chain (strict-send pinning). */
+interface WorkspaceTurnAgentChainEntry {
+  id: string;
+  scope: AgentDefinitionScope;
+  source?: string;
+}
 
 /** Agent-discovery context for a workspace involved in a workspace turn. */
 interface WorkspaceTurnAgentContext {
@@ -3707,23 +3716,35 @@ export class TaskService {
   private async validateWorkspaceTurnAgentId(params: {
     cfg: ReturnType<Config["loadConfigOrDefault"]>;
     agentId: string;
+    /** Workspace the validation is for (log correlation in chain resolution). */
+    workspaceId: string;
     /** Discovery context of the workspace whose turn will run (or the owner pre-create). */
     runtime: Runtime;
     workspacePath: string;
     includeAgentPlugins: boolean;
-  }): Promise<Result<{ scope: AgentDefinitionScope; source?: string }, string>> {
+  }): Promise<
+    Result<
+      {
+        scope: AgentDefinitionScope;
+        source?: string;
+        chain: WorkspaceTurnAgentChainEntry[];
+      },
+      string
+    >
+  > {
     assert(params.agentId.length > 0, "validateWorkspaceTurnAgentId: agentId must be non-empty");
     const parsedAgentId = AgentIdSchema.safeParse(params.agentId);
     if (!parsedAgentId.success) {
       return Err(`Task.createWorkspaceTurn: invalid agentId (${params.agentId})`);
     }
-    // The winning definition's scope AND exact source are captured so the dispatched
-    // turn can pin the validated provenance at stream time (strictAgentResolution):
-    // a validated definition vanishing must not let a different candidate with the
-    // same id (lower scope, or a same-scope sibling like a plugin) run under a
+    // The winning definition's provenance (scope + exact source) AND the resolved
+    // base chain's provenance are captured so the dispatched turn can pin them at
+    // stream time (strictAgentResolution): a validated definition or base shadow
+    // vanishing must not let a different candidate with the same id run under a
     // strict send.
     let scope: AgentDefinitionScope;
     let source: string | undefined;
+    let chain: WorkspaceTurnAgentChainEntry[];
     try {
       const definition = await readAgentDefinition(
         params.runtime,
@@ -3733,6 +3754,19 @@ export class TaskService {
       );
       scope = definition.scope;
       source = definition.source;
+      const resolvedChain = await resolveAgentInheritanceChain({
+        runtime: params.runtime,
+        workspacePath: params.workspacePath,
+        agentId: parsedAgentId.data,
+        agentDefinition: definition,
+        workspaceId: params.workspaceId,
+        includeAgentPlugins: params.includeAgentPlugins,
+      });
+      chain = resolvedChain.map((entry) => ({
+        id: entry.id,
+        scope: entry.scope,
+        ...(entry.source != null ? { source: entry.source } : {}),
+      }));
     } catch {
       return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
     }
@@ -3761,7 +3795,7 @@ export class TaskService {
     ) {
       return Err(`Task.createWorkspaceTurn: agentId is disabled (${params.agentId})`);
     }
-    return Ok({ scope, ...(source != null ? { source } : {}) });
+    return Ok({ scope, ...(source != null ? { source } : {}), chain });
   }
 
   /**
@@ -3791,6 +3825,8 @@ export class TaskService {
   private async validateWorkspaceTurnAgentIdForTarget(params: {
     cfg: ReturnType<Config["loadConfigOrDefault"]>;
     agentId: string;
+    /** Target workspace id (log correlation in chain resolution). */
+    workspaceId: string;
     target: WorkspaceTurnAgentContext;
     owner: WorkspaceTurnAgentContext;
     /** Whether the target workspace's init hook is still running (see doc above). */
@@ -3811,6 +3847,7 @@ export class TaskService {
         validatedContext: WorkspaceTurnAgentContext;
         scope: AgentDefinitionScope;
         source?: string;
+        chain: WorkspaceTurnAgentChainEntry[];
       },
       string
     >
@@ -3820,6 +3857,7 @@ export class TaskService {
       const validation = await this.validateWorkspaceTurnAgentId({
         cfg: params.cfg,
         agentId: params.agentId,
+        workspaceId: params.workspaceId,
         ...params.target,
       });
       if (validation.success) {
@@ -3866,6 +3904,7 @@ export class TaskService {
     const validation = await this.validateWorkspaceTurnAgentId({
       cfg: params.cfg,
       agentId: params.agentId,
+      workspaceId: params.workspaceId,
       ...params.owner,
     });
     return validation.success
@@ -3957,10 +3996,13 @@ export class TaskService {
     // agent-authored frontmatter `ai` defaults participate in AI-settings resolution
     // (mirrors the sub-agent creation path). Left unset for default exec/resume turns.
     let agentDefinitionContext: NodeAgentDefinitionContext | undefined;
-    // Provenance (scope + exact source) of the definition that authorized the
-    // dispatch; pinned at stream time via strictAgentResolution so a vanished
-    // definition cannot silently hand the id to a different candidate.
-    let validatedAgentProvenance: { scope: AgentDefinitionScope; source?: string } | undefined;
+    // Provenance (scope + exact source + base chain) of the definition that
+    // authorized the dispatch; pinned at stream time via strictAgentResolution so a
+    // vanished definition or base shadow cannot silently hand any hop to a
+    // different candidate.
+    let validatedAgentProvenance:
+      | { scope: AgentDefinitionScope; source?: string; chain: WorkspaceTurnAgentChainEntry[] }
+      | undefined;
     // Post-create target validation failure. Deferred (not returned immediately) so the
     // workspace-turn record is still written first: the record marks the created workspace
     // as owner-owned and retryable via mode="existing", and the failure settles through the
@@ -4050,6 +4092,7 @@ export class TaskService {
         const validation = await this.validateWorkspaceTurnAgentIdForTarget({
           cfg,
           agentId: requestedAgentId,
+          workspaceId: existingWorkspaceId,
           target: targetContext,
           owner: ownerContext,
           targetInitPending:
@@ -4064,6 +4107,7 @@ export class TaskService {
         validatedAgentProvenance = {
           scope: validation.data.scope,
           ...(validation.data.source != null ? { source: validation.data.source } : {}),
+          chain: validation.data.chain,
         };
         agentDefinitionContext = {
           ...validation.data.validatedContext,
@@ -4128,7 +4172,22 @@ export class TaskService {
               AGENT_DEFINITION_PROJECT_PATHSPECS
             )
           : undefined;
-        ownerVouchesForTargetBase = ownerBranchMatchesTargetBase && ownerAgentDirsClean === true;
+        // Nor is the owner's HEAD necessarily the target's base COMMIT: worktree
+        // creation may branch from origin/<trunkBranch> when the local branch can
+        // fast-forward, so a stale (or diverged) owner cannot vouch for definitions
+        // added or removed in the newer remote commit.
+        const ownerCommitMatchesOrigin =
+          ownerBranchMatchesTargetBase && ownerAgentDirsClean === true
+            ? await tryReadGitBranchMatchesOrigin(
+                ownerContext.runtime,
+                ownerContext.workspacePath,
+                effectiveTrunkBranch
+              )
+            : undefined;
+        ownerVouchesForTargetBase =
+          ownerBranchMatchesTargetBase &&
+          ownerAgentDirsClean === true &&
+          ownerCommitMatchesOrigin === true;
         // Pre-create stage: catch obviously bad ids (unknown/hidden/disabled) against the
         // OWNER's checkout before creating any workspace. Fatal only when the owner's
         // checked-out branch provably IS the target's base (an omitted trunkBranch still
@@ -4138,25 +4197,20 @@ export class TaskService {
         const validation = await this.validateWorkspaceTurnAgentId({
           cfg,
           agentId: requestedAgentId,
+          workspaceId: ownerWorkspaceId,
           ...ownerContext,
         });
         if (!validation.success) {
           // Fatal only when the owner provably equals the base AND target init cannot
-          // add definitions: a committed project init hook runs at target creation and
-          // may install the requested agent even though the owner (initialized before
-          // the hook existed, or with per-workspace conditions) legitimately lacks it.
-          const ownerDiscovery = ownerContext;
-          const ownerInitHookResults = ownerVouchesForTargetBase
-            ? await Promise.all(
-                listProjectMetadataRelativePaths("init").map((relativePath) =>
-                  runtimePathExists(
-                    ownerDiscovery.runtime,
-                    ownerDiscovery.runtime.normalizePath(relativePath, ownerDiscovery.workspacePath)
-                  )
-                )
-              )
-            : [];
-          if (ownerVouchesForTargetBase && !ownerInitHookResults.some(Boolean)) {
+          // add definitions: an EXECUTABLE committed project init hook (the same
+          // findInitHookRelativePath rule the init runner uses — non-executable files
+          // never run) runs at target creation and may install the requested agent even
+          // though the owner (initialized before the hook existed, or with
+          // per-workspace conditions) legitimately lacks it.
+          const ownerInitHook = ownerVouchesForTargetBase
+            ? await findInitHookRelativePath(ownerContext.runtime, ownerContext.workspacePath)
+            : null;
+          if (ownerVouchesForTargetBase && ownerInitHook == null) {
             return Err(validation.error);
           }
           log.debug(
@@ -4208,6 +4262,7 @@ export class TaskService {
         const validation = await this.validateWorkspaceTurnAgentIdForTarget({
           cfg,
           agentId: requestedAgentId,
+          workspaceId: targetWorkspaceId,
           target: targetContext,
           owner: ownerContext,
           // create() starts runBackgroundInit asynchronously; a reachable checkout whose
@@ -4229,6 +4284,7 @@ export class TaskService {
           validatedAgentProvenance = {
             scope: validation.data.scope,
             ...(validation.data.source != null ? { source: validation.data.source } : {}),
+            chain: validation.data.chain,
           };
           agentDefinitionContext = {
             ...validation.data.validatedContext,
@@ -4423,6 +4479,7 @@ export class TaskService {
                       ...(validatedAgentProvenance.source != null
                         ? { expectedSource: validatedAgentProvenance.source }
                         : {}),
+                      expectedChain: validatedAgentProvenance.chain,
                     }
                   : true,
             }

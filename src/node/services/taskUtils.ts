@@ -69,6 +69,45 @@ export async function tryReadGitCurrentBranch(
 }
 
 /**
+ * True when the checkout's HEAD commit matches its origin ref for the given
+ * branch (or no origin ref exists, making local HEAD the only base candidate);
+ * false when they differ; undefined when this cannot be determined. Worktree
+ * creation may branch from origin/<branch> when the local branch can
+ * fast-forward, so callers must not treat a stale local checkout as the
+ * authoritative base commit.
+ */
+export async function tryReadGitBranchMatchesOrigin(
+  runtime: Runtime,
+  workspacePath: string,
+  branch: string
+): Promise<boolean | undefined> {
+  assert(
+    workspacePath.length > 0,
+    "tryReadGitBranchMatchesOrigin: workspacePath must be non-empty"
+  );
+  assert(branch.length > 0, "tryReadGitBranchMatchesOrigin: branch must be non-empty");
+
+  const headSha = await tryReadGitHeadCommitSha(runtime, workspacePath);
+  if (headSha == null) {
+    return undefined;
+  }
+  try {
+    const result = await execBuffered(
+      runtime,
+      `git rev-parse --verify --quiet 'origin/${branch}^{commit}'`,
+      { cwd: workspacePath, timeout: 10 }
+    );
+    if (result.exitCode !== 0) {
+      // No origin ref for this branch: the local commit is the only candidate base.
+      return true;
+    }
+    return result.stdout.trim() === headSha;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * True when the checkout has no uncommitted changes (including untracked AND
  * gitignored files — an ignored local file still shadows committed state for
  * discovery-style readers) under the given pathspecs; undefined when this cannot

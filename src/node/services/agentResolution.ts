@@ -435,6 +435,45 @@ export async function resolveAgentForStream(
     includeAgentPlugins,
   });
 
+  // Strict chain pin: inheritance resolution reloads every base independently, so a
+  // vanished base shadow could otherwise silently swap a different definition into
+  // the chain's prompt/tool policy even though the validated leaf is unchanged.
+  const strictExpectedChain =
+    typeof strictAgentResolution === "object" ? strictAgentResolution.expectedChain : undefined;
+  if (strictTopLevel && strictExpectedChain != null) {
+    const chainMatches =
+      agentsForInheritance.length === strictExpectedChain.length &&
+      strictExpectedChain.every((expected, index) => {
+        const actual = agentsForInheritance[index];
+        return (
+          actual != null &&
+          actual.id === expected.id &&
+          actual.scope === expected.scope &&
+          (expected.source == null || actual.source === expected.source)
+        );
+      });
+    if (!chainMatches) {
+      const describeChain = (
+        entries: ReadonlyArray<{ id: string; scope: string; source?: string }>
+      ) =>
+        entries
+          .map(
+            (entry) =>
+              `${entry.id}(${entry.scope}${entry.source != null ? ` @ ${entry.source}` : ""})`
+          )
+          .join(" -> ");
+      const errorMessage = `Agent '${requestedAgentId}' base chain now resolves differently than launch validation saw (expected ${describeChain(strictExpectedChain)}, found ${describeChain(agentsForInheritance)}); refusing to stream an explicit agent request.`;
+      emitError(
+        createErrorEvent(workspaceId, {
+          messageId: createAssistantMessageId(),
+          error: errorMessage,
+          errorType: "unknown",
+        })
+      );
+      return Err({ type: "unknown", raw: errorMessage });
+    }
+  }
+
   const agentIsPlanLike = isPlanLikeInResolvedChain(agentsForInheritance);
   const effectiveMode =
     agentDefinition.id === "compact" ? "compact" : agentIsPlanLike ? "plan" : "exec";

@@ -1020,7 +1020,13 @@ describe("TaskService", () => {
     // swapping in exec (or running a different definition for the same id) post-init.
     expect(sendMessageCall[2]).toMatchObject({
       agentId: "plan",
-      strictAgentResolution: { expectedScope: "built-in", expectedSource: "built-in" },
+      strictAgentResolution: {
+        expectedScope: "built-in",
+        expectedSource: "built-in",
+        // The full base chain is pinned too: stream-time inheritance resolution
+        // reloads every base independently.
+        expectedChain: [{ id: "plan", scope: "built-in", source: "built-in" }],
+      },
     });
   });
 
@@ -1083,7 +1089,8 @@ describe("TaskService", () => {
     // lacks it, so an owner-side miss must not reject the launch pre-create.
     const muxDir = path.join(projectPath, ".mux");
     await fsPromises.mkdir(muxDir, { recursive: true });
-    await fsPromises.writeFile(path.join(muxDir, "init"), "#!/bin/sh\nexit 0\n");
+    // Executable: only hooks passing the init runner's test -x rule can ever run.
+    await fsPromises.writeFile(path.join(muxDir, "init"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     commitOwnerAgentFiles(projectPath);
 
     const createWorkspace = mock(
@@ -1107,6 +1114,85 @@ describe("TaskService", () => {
     // The miss defers to the created checkout, which is authoritative (validated
     // post-create; here the hook did not actually install it, so the launch still
     // fails — but only AFTER the target had its chance).
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("no turn was dispatched");
+    }
+    expect(createWorkspace).toHaveBeenCalledTimes(1);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("createWorkspaceTurn keeps misses fatal when the committed init hook is not executable", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    checkoutOwnerBranch(projectPath, "parent");
+    // Only executable hooks can run (the init runner's test -x rule): a committed but
+    // non-executable init file cannot install agents, so the miss stays fatal and no
+    // unnecessary owned workspace is created.
+    const muxDir = path.join(projectPath, ".mux");
+    await fsPromises.mkdir(muxDir, { recursive: true });
+    await fsPromises.writeFile(path.join(muxDir, "init"), "#!/bin/sh\nexit 0\n", { mode: 0o644 });
+    commitOwnerAgentFiles(projectPath);
+
+    const createWorkspace = mock(
+      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
+        Promise.resolve(Ok({ metadata: createWorkspaceTurnMetadata(projectPath) }))
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "doesnotexist",
+      prompt: "Should not run",
+      title: "Non-executable hook",
+      workspace: { mode: "new" },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("unknown agentId");
+    expect(createWorkspace).not.toHaveBeenCalled();
+  });
+
+  test("createWorkspaceTurn defers owner-side misses when the owner is behind its origin ref", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    checkoutOwnerBranch(projectPath, "parent");
+    // Worktree creation may branch from origin/<trunkBranch> when the local branch can
+    // fast-forward: an owner behind its origin cannot vouch for the base commit — an
+    // agent added only in the newer remote commit would be wrongly rejected pre-create.
+    const bareRemote = path.join(rootDir, "origin-behind.git");
+    execSync(`git init --bare -q '${bareRemote}'`, { cwd: rootDir, stdio: "ignore" });
+    execSync(`git remote add origin '${bareRemote}'`, { cwd: projectPath, stdio: "ignore" });
+    execSync("git commit -q --allow-empty -m newer", { cwd: projectPath, stdio: "ignore" });
+    execSync("git push -q origin parent", { cwd: projectPath, stdio: "ignore" });
+    execSync("git reset -q --hard HEAD~1", { cwd: projectPath, stdio: "ignore" });
+
+    const createWorkspace = mock(
+      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
+        Promise.resolve(Ok({ metadata: createWorkspaceTurnMetadata(projectPath) }))
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "remoteonly",
+      prompt: "Should defer to the target",
+      title: "Owner behind origin",
+      workspace: { mode: "new" },
+    });
+
+    // The miss defers to the created checkout (authoritative for the actual base
+    // commit); here the target lacks the agent too, so the launch still fails — but
+    // only after the target had its chance.
     expect(result.success).toBe(false);
     if (!result.success) {
       expect(result.error).toContain("no turn was dispatched");

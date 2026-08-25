@@ -488,7 +488,15 @@ describe("resolveAgentForStream strict resolution", () => {
     agentId: string;
     strictAgentResolution:
       | boolean
-      | { expectedScope: "project" | "global" | "built-in"; expectedSource?: string };
+      | {
+          expectedScope: "project" | "global" | "built-in";
+          expectedSource?: string;
+          expectedChain?: Array<{
+            id: string;
+            scope: "project" | "global" | "built-in";
+            source?: string;
+          }>;
+        };
     agentAiDefaults?: ProjectsConfig["agentAiDefaults"];
   }) {
     const cfg: ProjectsConfig = {
@@ -656,6 +664,53 @@ describe("resolveAgentForStream strict resolution", () => {
     });
     expect(matching.success).toBe(true);
     if (matching.success) expect(matching.data.effectiveAgentId).toBe("plan");
+  });
+
+  test("strict mode rejects a base chain resolving differently than validated", async () => {
+    using tempDir = new DisposableTempDir("agent-resolution-strict-chain");
+    const projectPath = path.join(tempDir.path, "project");
+    const agentsDir = path.join(projectPath, ".mux", "agents");
+    await fs.mkdir(agentsDir, { recursive: true });
+    await fs.writeFile(
+      path.join(agentsDir, "custom.md"),
+      ["---", "name: Custom", "base: plan", "---", "Custom agent."].join("\n")
+    );
+
+    // Launch validation saw the custom agent inheriting a project plan shadow that has
+    // since been removed: the leaf provenance is unchanged, but the built-in plan now
+    // takes over the base hop — the strict chain pin must fail the send.
+    const staleChain = await resolveTopLevel({
+      projectPath,
+      agentId: "custom",
+      strictAgentResolution: {
+        expectedScope: "project",
+        expectedChain: [
+          { id: "custom", scope: "project" },
+          { id: "plan", scope: "project" },
+        ],
+      },
+    });
+    expect(staleChain.success).toBe(false);
+    if (!staleChain.success && staleChain.error.type === "unknown") {
+      expect(staleChain.error.raw).toContain("base chain");
+    } else {
+      expect(staleChain.success === false && staleChain.error.type).toBe("unknown");
+    }
+
+    // The chain as it actually resolves streams normally.
+    const matching = await resolveTopLevel({
+      projectPath,
+      agentId: "custom",
+      strictAgentResolution: {
+        expectedScope: "project",
+        expectedChain: [
+          { id: "custom", scope: "project" },
+          { id: "plan", scope: "built-in", source: "built-in" },
+        ],
+      },
+    });
+    expect(matching.success).toBe(true);
+    if (matching.success) expect(matching.data.effectiveAgentId).toBe("custom");
   });
 
   test("strict mode fails closed when eligibility resolution throws", async () => {
