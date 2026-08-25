@@ -49,7 +49,7 @@ import type { TerminalService } from "@/node/services/terminalService";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import type { BashToolResult } from "@/common/types/tools";
-import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
 import { createMuxMessage } from "@/common/types/message";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import {
@@ -14573,6 +14573,108 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
     } finally {
       await cleanup();
     }
+  });
+
+  // --------------------------------------------------------------------------
+  // getDelegatedTurnContinuationSendOptions — bash-monitor wake continuations
+  // --------------------------------------------------------------------------
+
+  describe("delegated-turn continuation send options", () => {
+    async function makeServiceWithHistory(): Promise<{
+      service: WorkspaceService;
+      historyService: HistoryService;
+    }> {
+      const mockAIService = {
+        isStreaming: mock(() => false),
+        on: mock(() => undefined),
+        off: mock(() => undefined),
+      } as unknown as AIService;
+      const mockInitStateManager: Partial<InitStateManager> = {
+        on: mock(() => undefined as unknown as InitStateManager),
+        getInitState: mock(() => undefined),
+      };
+      const mockConfig: Partial<Config> = {
+        srcDir: "/tmp/test",
+        getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
+        getSessionDir: mock(() => "/tmp/test/sessions"),
+        generateStableId: mock(() => "test-id"),
+      };
+      const { historyService } = await createTestHistoryService();
+      const service = new WorkspaceService(
+        mockConfig as Config,
+        historyService,
+        mockAIService,
+        mockInitStateManager as InitStateManager,
+        {} as ExtensionMetadataService,
+        {} as BackgroundProcessManager
+      );
+      return { service, historyService };
+    }
+
+    interface DelegatedContinuationInternals {
+      getDelegatedTurnContinuationSendOptions: (
+        workspaceId: string
+      ) => Promise<SendMessageOptions | null>;
+    }
+
+    const delegatedTurnMessage = (id: string) =>
+      createMuxMessage(id, "user", "Delegated prompt", {
+        timestamp: Date.now(),
+        muxMetadata: {
+          type: "workspace-turn-task" as const,
+          taskHandleId: "wst_handle",
+          ownerWorkspaceId: "owner-ws",
+          turnId: "turn-1",
+        },
+        retrySendOptions: {
+          model: "anthropic:claude-opus-4-6",
+          agentId: "plan",
+          strictAgentResolution: true,
+          agentInitiated: true,
+        },
+      });
+
+    test("continues an in-flight delegated turn under its own per-turn options", async () => {
+      const workspaceId = "ws-delegated-continuation";
+      const { service, historyService } = await makeServiceWithHistory();
+      await historyService.appendToHistory(workspaceId, delegatedTurnMessage("delegated-1"));
+      // A previous wake continuation must not hide the delegated turn's options.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("wake-1", "user", "Monitor matched", {
+          timestamp: Date.now(),
+          muxMetadata: { type: "bash-monitor-wake" as const, records: [] },
+        })
+      );
+
+      const internals = service as unknown as DelegatedContinuationInternals;
+      const options = await internals.getDelegatedTurnContinuationSendOptions(workspaceId);
+
+      expect(options).not.toBeNull();
+      // Per-turn overrides (agent, strictness) continue the turn; they never become
+      // workspace defaults, and internal-only fields are not forwarded.
+      expect(options).toMatchObject({
+        model: "anthropic:claude-opus-4-6",
+        agentId: "plan",
+        strictAgentResolution: true,
+        skipAiSettingsPersistence: true,
+      });
+      expect(options && "agentInitiated" in options).toBe(false);
+      expect(options?.muxMetadata).toBeUndefined();
+    });
+
+    test("yields nothing once another user send follows the delegated prompt", async () => {
+      const workspaceId = "ws-delegated-superseded";
+      const { service, historyService } = await makeServiceWithHistory();
+      await historyService.appendToHistory(workspaceId, delegatedTurnMessage("delegated-2"));
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-1", "user", "Manual user message", { timestamp: Date.now() })
+      );
+
+      const internals = service as unknown as DelegatedContinuationInternals;
+      expect(await internals.getDelegatedTurnContinuationSendOptions(workspaceId)).toBeNull();
+    });
   });
 
   // --------------------------------------------------------------------------

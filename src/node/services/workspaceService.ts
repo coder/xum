@@ -2459,7 +2459,11 @@ export class WorkspaceService extends EventEmitter {
       return;
     }
 
-    const sendOptions = await this.getWorkflowContinuationSendOptions(ownerWorkspaceId);
+    // An in-flight delegated workspace turn continues under its own send options
+    // (per-turn agent/model overrides are not in the workspace's persisted defaults).
+    const sendOptions =
+      (await this.getDelegatedTurnContinuationSendOptions(ownerWorkspaceId)) ??
+      (await this.getWorkflowContinuationSendOptions(ownerWorkspaceId));
     if (sendOptions == null) {
       log.debug("Bash monitor wake has no send options; leaving pending", { ownerWorkspaceId });
       return;
@@ -12171,6 +12175,56 @@ export class WorkspaceService extends EventEmitter {
 
   getWorkflowContinuationSendOptions(workspaceId: string): Promise<SendMessageOptions | null> {
     return this.getGoalContinuationKickoffSendOptions(workspaceId);
+  }
+
+  /**
+   * Send options for continuing an in-flight delegated workspace turn (bash-monitor
+   * wakes cut turns at tool boundaries). The delegated prompt's persisted
+   * retrySendOptions carry the turn's own settings — including per-turn overrides
+   * (agentId, model, strictAgentResolution) that are deliberately NOT in the
+   * workspace's persisted defaults when the launch used skipAiSettingsPersistence —
+   * so resolving from workspace defaults would continue the turn under the wrong
+   * agent. Walks user messages backwards, skipping this mechanism's own wake
+   * continuations, and yields nothing once any other user send follows the delegated
+   * prompt (the delegated turn is no longer the active conversation context).
+   * Continuations never persist these options as workspace defaults.
+   */
+  private async getDelegatedTurnContinuationSendOptions(
+    workspaceId: string
+  ): Promise<SendMessageOptions | null> {
+    const history = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) {
+      return null;
+    }
+    for (let i = history.data.length - 1; i >= 0; i--) {
+      const message = history.data[i];
+      if (message.role !== "user") {
+        continue;
+      }
+      const muxMetadata = message.metadata?.muxMetadata;
+      if (muxMetadata?.type === "bash-monitor-wake") {
+        continue;
+      }
+      if (muxMetadata?.type !== "workspace-turn-task") {
+        return null;
+      }
+      const retrySendOptions = message.metadata?.retrySendOptions;
+      if (retrySendOptions == null) {
+        return null;
+      }
+      const {
+        muxMetadata: _turnCorrelation,
+        agentInitiated: _agentInitiated,
+        goalKind: _goalKind,
+        ...sendOptions
+      } = retrySendOptions;
+      return {
+        ...sendOptions,
+        // Per-turn continuation settings must not become workspace defaults.
+        skipAiSettingsPersistence: true,
+      };
+    }
+    return null;
   }
 
   /**

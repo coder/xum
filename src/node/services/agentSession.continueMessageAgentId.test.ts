@@ -231,6 +231,29 @@ describe("AgentSession continue-message agentId fallback", () => {
     expect(internals.lastAutoRetryResumeRequest?.agentInitiated).toBe(true);
   });
 
+  test("dispatchPendingFollowUp forwards strictAgentResolution to the resumed turn", async () => {
+    let dispatchedOptions: SendOptions | undefined;
+    const { internals } = await createSession([
+      compactionSummaryMessage("summary-strict", {
+        text: "continue delegated work",
+        model: "openai:gpt-4o",
+        agentId: "plan",
+        strictAgentResolution: true,
+      }),
+    ]);
+    internals.sendMessage = mock((_message: string, options?: SendOptions) => {
+      dispatchedOptions = options;
+      return Promise.resolve({ success: true as const });
+    });
+
+    await internals.dispatchPendingFollowUp();
+
+    // The requested agent may have been removed/hidden/disabled while compaction ran;
+    // the resumed turn must stay loud instead of silently falling back to exec.
+    expect(dispatchedOptions?.agentId).toBe("plan");
+    expect(dispatchedOptions?.strictAgentResolution).toBe(true);
+  });
+
   test("dispatchPendingFollowUp skips idle-only follow-ups when queued user input exists", async () => {
     const { session, historyService, internals } = await createSession([
       compactionSummaryMessage("summary-idle-only", idleFollowUp()),

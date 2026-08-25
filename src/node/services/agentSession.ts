@@ -6714,6 +6714,9 @@ export class AgentSession {
       experiments: followUp.experiments,
       allowAgentSetGoal: followUp.allowAgentSetGoal,
       disableWorkspaceAgents: followUp.disableWorkspaceAgents,
+      // Explicit-agent turns stay loud on the resumed turn too: the requested agent
+      // may have been removed/hidden/disabled while compaction ran.
+      strictAgentResolution: followUp.strictAgentResolution,
       skipAiSettingsPersistence: followUp.skipAiSettingsPersistence,
     };
 
