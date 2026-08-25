@@ -261,6 +261,13 @@ export class ToolBridge {
         // Validate args against the tool's schema (Zod or AI SDK wrapper)
         const validatedArgs = await this.validateArgs(toolName, boundTool, args);
 
+        // An abort can land while an async wrapper validator is outstanding;
+        // without this recheck the tool would still execute after a timeout or
+        // user interrupt (mirrors the post-await recheck in mux.load).
+        if (abortSignal?.aborted) {
+          throw new Error("Execution aborted");
+        }
+
         // Execute tool with full options (toolCallId and messages are required by type
         // but not used by most tools - generate synthetic values for sandbox context)
         const result: unknown = await boundTool.execute!(validatedArgs, {
@@ -318,6 +325,11 @@ export class ToolBridge {
           ...baseArgs,
           run_in_background: true,
         });
+        // Same post-validation recheck as regular bridged tools: an abort that
+        // lands during an async validator must not spawn the child.
+        if (abortSignal?.aborted) {
+          throw new Error("Execution aborted");
+        }
         const result: unknown = await taskTool.execute!(validatedArgs, {
           abortSignal,
           toolCallId: syntheticToolCallId("task_spawn"),

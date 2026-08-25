@@ -305,6 +305,53 @@ describe("ToolBridge", () => {
       expect(result).toEqual({ echoed: { query: "eng" } });
     });
 
+    it("does not execute after an abort that lands during async validation", async () => {
+      const controller = new AbortController();
+      const mockExecute = mock((_args: unknown) => ({ ok: true }));
+      const tools: Record<string, Tool> = {
+        mcp_slow: {
+          description: "JSON-Schema tool whose validator races an abort",
+          inputSchema: jsonSchema<{ q?: string }>(
+            { type: "object", properties: { q: { type: "string" } } },
+            {
+              validate: (value) => {
+                // Abort lands while validation is outstanding; validation
+                // itself still succeeds.
+                controller.abort();
+                return Promise.resolve({ success: true as const, value: value as { q?: string } });
+              },
+            }
+          ),
+          execute: (args) => Promise.resolve(mockExecute(args)),
+        },
+      };
+
+      const bridge = new ToolBridge(tools);
+
+      let registeredMux: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+      const mockRegisterObject = mock(
+        (name: string, obj: Record<string, (...args: unknown[]) => Promise<unknown>>) => {
+          if (name === "mux") registeredMux = obj;
+          return undefined;
+        }
+      );
+      bridge.register(
+        createMockRuntime({
+          registerObject: mockRegisterObject,
+          getAbortSignal: mock(() => controller.signal),
+        })
+      );
+
+      const slow = registeredMux.mcp_slow as (...args: unknown[]) => Promise<unknown>;
+      try {
+        await slow({ q: "x" });
+        expect.unreachable("Should have thrown");
+      } catch (e) {
+        expect(String(e)).toContain("Execution aborted");
+      }
+      expect(mockExecute).not.toHaveBeenCalled();
+    });
+
     it("serializes non-JSON values", async () => {
       // Tool that returns a non-plain object (with circular reference)
       const circularObj: Record<string, unknown> = { a: 1 };
