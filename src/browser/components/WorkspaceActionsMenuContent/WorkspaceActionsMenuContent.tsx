@@ -140,6 +140,8 @@ export const WorkspaceActionsMenuContent: React.FC<WorkspaceActionsMenuContentPr
       {props.onOpenTimeline && (
         <WorkspaceActionButton
           label="Timeline"
+          shortcut={formatKeybind(KEYBINDS.OPEN_TIMELINE_DIALOG)}
+          shortcutClassName={props.shortcutClassName}
           icon={<History className="h-3 w-3 shrink-0" />}
           onClick={(e) => {
             e.stopPropagation();

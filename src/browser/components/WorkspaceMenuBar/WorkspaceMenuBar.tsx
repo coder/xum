@@ -16,7 +16,12 @@ import { WorkspaceMCPModal } from "../WorkspaceMCPModal/WorkspaceMCPModal";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { Popover, PopoverTrigger, PopoverContent } from "../Popover/Popover";
 import { Checkbox } from "../Checkbox/Checkbox";
-import { formatKeybind, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import {
+  formatKeybind,
+  isEditableElement,
+  KEYBINDS,
+  matchesKeybind,
+} from "@/browser/utils/ui/keybinds";
 import { useRuntimeStatus, useRuntimeStatusStoreRaw } from "@/browser/stores/RuntimeStatusStore";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import { Button } from "@/browser/components/Button/Button";
@@ -127,6 +132,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const [invalidSkills, setInvalidSkills] = useState<AgentSkillIssue[]>([]);
   const isSkillsMountedRef = useRef(true);
   const moreActionsButtonRef = useRef<HTMLButtonElement | null>(null);
+  const menuBarRef = useRef<HTMLDivElement | null>(null);
 
   const skillsRequestIdRef = useRef(0);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
@@ -182,11 +188,46 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     typeof window !== "undefined" &&
     window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
 
-  // Any pointer type: the right sidebar (home of the Timeline tab) is CSS-hidden
-  // at this width, so the timeline needs a dialog entry point instead.
-  const isNarrowScreen =
-    typeof window !== "undefined" &&
-    window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches;
+  // The right sidebar (home of the Timeline tab) is CSS-hidden by two independent
+  // rules: a viewport media query (<=768px, any pointer) and the workspace-shell
+  // container query (<=684px shell, e.g. a ~900px window with the left sidebar
+  // expanded). Read the sidebar's actual computed visibility so the timeline dialog
+  // gate matches the CSS truth; fall back to the media query when no shell is in
+  // the DOM (scratch pages, first render before refs attach, tests).
+  const isTimelineSidebarHidden = useCallback((): boolean => {
+    if (typeof window === "undefined") {
+      return false;
+    }
+    const sidebar = menuBarRef.current
+      ?.closest("[data-workspace-shell]")
+      ?.querySelector(".mobile-hide-right-sidebar");
+    if (sidebar instanceof HTMLElement) {
+      return window.getComputedStyle(sidebar).display === "none";
+    }
+    return window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches;
+  }, []);
+
+  // The dialog is the only timeline entry point while the sidebar is hidden, and every
+  // operation needs a keyboard shortcut. Evaluated at keydown time so the gate tracks
+  // live viewport/layout changes without a resize subscription.
+  useEffect(() => {
+    if (!timelineExperimentEnabled) {
+      return;
+    }
+    const handler = (e: KeyboardEvent) => {
+      if (
+        !matchesKeybind(e, KEYBINDS.OPEN_TIMELINE_DIALOG) ||
+        isEditableElement(e.target) ||
+        !isTimelineSidebarHidden()
+      ) {
+        return;
+      }
+      e.preventDefault();
+      setTimelineDialogOpen(true);
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [timelineExperimentEnabled, isTimelineSidebarHidden]);
 
   const isDevcontainerWorkspace = isDevcontainerRuntime(runtimeConfig);
   const isRuntimeRunning = isDevcontainerWorkspace && runtimeStatus === "running";
@@ -500,6 +541,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
 
   return (
     <div
+      ref={menuBarRef}
       data-testid="workspace-menu-bar"
       className={cn(
         "bg-sidebar border-border-light flex items-center justify-between border-b px-2",
@@ -762,7 +804,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
                 hasRepository && !isTouchMobileScreen ? handleEnterImmersiveReview : null
               }
               onOpenTimeline={
-                timelineExperimentEnabled && isNarrowScreen
+                timelineExperimentEnabled && isTimelineSidebarHidden()
                   ? () => setTimelineDialogOpen(true)
                   : null
               }

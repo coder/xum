@@ -431,6 +431,58 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(getLastMenuContentProps()?.onOpenTimeline).toBeNull();
   });
 
+  it("offers the Timeline action when the shell container hides the sidebar at wide viewports", () => {
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TIMELINE), true);
+    stubMatchMedia(() => false);
+
+    // Mimic WorkspaceShell: the shell wraps the menu bar and a CSS-hidden right sidebar
+    // (the <=684px container query), which the gate reads via computed style.
+    const shell = document.createElement("div");
+    shell.setAttribute("data-workspace-shell", "");
+    document.body.appendChild(shell);
+    const sidebar = document.createElement("div");
+    sidebar.className = "mobile-hide-right-sidebar";
+    sidebar.style.display = "none";
+    shell.appendChild(sidebar);
+    const mount = document.createElement("div");
+    shell.appendChild(mount);
+
+    const view = render(<WorkspaceMenuBar {...defaultProps} />, { container: mount });
+    // First render computes the gate before the menu bar ref attaches; any re-render
+    // (opening the More menu in production) re-evaluates it against the shell.
+    view.rerender(<WorkspaceMenuBar {...defaultProps} />);
+
+    expect(typeof getLastMenuContentProps()?.onOpenTimeline).toBe("function");
+    shell.remove();
+  });
+
+  it("opens the timeline dialog with the keyboard shortcut on narrow viewports", () => {
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TIMELINE), true);
+    stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "T", shiftKey: true });
+    });
+
+    const dialogProps = getLastTimelineDialogProps();
+    expect(dialogProps?.open).toBe(true);
+  });
+
+  it("ignores the timeline shortcut while the sidebar is visible", () => {
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TIMELINE), true);
+    stubMatchMedia(() => false);
+
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "T", shiftKey: true });
+    });
+
+    expect(getLastTimelineDialogProps()?.open).toBe(false);
+  });
+
   it("applies the collapsed-left-sidebar inset immediately from props", () => {
     const view = render(<WorkspaceMenuBar {...defaultProps} leftSidebarCollapsed />);
 
