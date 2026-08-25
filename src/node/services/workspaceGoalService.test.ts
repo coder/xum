@@ -3241,6 +3241,88 @@ describe("WorkspaceGoalService", () => {
     expect(capturedProbe!()).toBe(true);
   });
 
+  test("the continuation admission probe goes stale when the goal is replaced", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cPuM6): an active→active replacement bumps
+    // neither the pause nor the terminal generation, and the replaced goal's
+    // candidate can stay installed until the replacement's kickoff finalizer
+    // arms — the captured continuation for goal A would be admitted after
+    // goal B is durable and its accounting would charge B for A's work. The
+    // identity generation must flip the probe.
+    const dispatcher = new IdleDispatcher();
+    let capturedProbe: (() => boolean) | undefined;
+    let kickoffOptionsAvailable = true;
+    service.registerGoalContinuationConsumer(dispatcher, {
+      hasActiveDescendantTasks: () => false,
+      getRuntimeState: () => ({ isRuntimeCompatible: true }),
+      executeGoalContinuation: (input) => {
+        capturedProbe = input.admissionStale;
+        return Promise.resolve(false);
+      },
+      getKickoffSendOptions: () =>
+        Promise.resolve(
+          kickoffOptionsAvailable ? { model: "openai:gpt-4o", agentId: "exec" } : null
+        ),
+    });
+    await setGoalOk(service, { workspaceId, objective: "Goal A" });
+    await drainPendingDispatches();
+    await waitForCondition(() => capturedProbe != null, { timeoutMs: 5_000 });
+    expect(capturedProbe!()).toBe(false);
+
+    // Models B's kickoff finalizer not having armed yet (no send options →
+    // arming skipped): the candidate reference cannot flip the probe, only
+    // the identity change can.
+    kickoffOptionsAvailable = false;
+    const candidates = (
+      service as unknown as { pendingContinuationCandidates: Map<string, { goalId: string }> }
+    ).pendingContinuationCandidates;
+    const candidateBefore = candidates.get(workspaceId);
+    await setGoalOk(service, { workspaceId, objective: "Goal B replaces A" });
+    // Precondition for the clause under test: the candidate did not change.
+    expect(candidates.get(workspaceId)).toBe(candidateBefore);
+    expect(capturedProbe!()).toBe(true);
+  });
+
+  test("goal redispatch admission revalidates durable state and observes later transitions", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cPuMw): a redispatched goal turn (compaction
+    // follow-up) lost its original admission guards. buildGoalRedispatchAdmission
+    // re-derives them: durable revalidation plus a staleness probe.
+    const created = await setGoalOk(service, { workspaceId, objective: "Redispatch admission" });
+    const admission = await service.buildGoalRedispatchAdmission(
+      workspaceId,
+      created.goalId,
+      GOAL_CONTINUATION_KIND
+    );
+    expect(admission.admissible).toBe(true);
+    if (!admission.admissible) {
+      throw new Error("expected admissible");
+    }
+    expect(admission.admissionStale()).toBe(false);
+
+    // An explicit pause after the build flips the probe; a rebuild refuses.
+    await setGoalOk(service, { workspaceId, status: "paused" });
+    expect(admission.admissionStale()).toBe(true);
+    expect(
+      (
+        await service.buildGoalRedispatchAdmission(
+          workspaceId,
+          created.goalId,
+          GOAL_CONTINUATION_KIND
+        )
+      ).admissible
+    ).toBe(false);
+
+    // Identity mismatch refuses outright.
+    expect(
+      (
+        await service.buildGoalRedispatchAdmission(
+          workspaceId,
+          "other-goal",
+          GOAL_CONTINUATION_KIND
+        )
+      ).admissible
+    ).toBe(false);
+  });
+
   test("a stop landing during auto-promotion reads restores the completed goal", async () => {
     // Codex P1 (PRRT_kwDOPxxmWM6cOgXV): maybeAutoPromoteOnComplete awaits
     // board/streaming/pricing reads after the caller's publication sample. A

@@ -582,6 +582,22 @@ export class WorkspaceGoalService {
    */
   private readonly terminalStatusGenerations = new Map<string, number>();
 
+  /**
+   * Codex P1 (PRRT_kwDOPxxmWM6cPuM6): monotonic per-workspace count of
+   * durable writes that change the goal identity (bumped inside `writeGoal`
+   * when the written goalId differs from the last one written by this
+   * process). An active→active replacement bumps neither the pause nor the
+   * terminal generation, and the replaced goal's candidate can stay
+   * installed until the replacement's kickoff finalizer arms — without this,
+   * a captured continuation for goal A could be admitted after goal B became
+   * durable and its stream accounting would charge B for A's work. The first
+   * write of a process also bumps (last-written unknown): a spuriously
+   * refused send just re-requests dispatch, whereas a missed replacement
+   * corrupts the successor's budget.
+   */
+  private readonly goalIdentityGenerations = new Map<string, number>();
+  private readonly lastWrittenGoalIds = new Map<string, string>();
+
   private armPauseFinalizationHold(workspaceId: string, goalId: string): void {
     this.explicitPauseGenerations.set(
       workspaceId,
@@ -1113,6 +1129,15 @@ export class WorkspaceGoalService {
         (this.terminalStatusGenerations.get(workspaceId) ?? 0) + 1
       );
     }
+    // See goalIdentityGenerations: identity changes (replacement, revival,
+    // first write of the process) invalidate captured dispatch admissions.
+    if (this.lastWrittenGoalIds.get(workspaceId) !== goal.goalId) {
+      this.lastWrittenGoalIds.set(workspaceId, goal.goalId);
+      this.goalIdentityGenerations.set(
+        workspaceId,
+        (this.goalIdentityGenerations.get(workspaceId) ?? 0) + 1
+      );
+    }
   }
 
   private async renameCorruptGoal(
@@ -1513,6 +1538,50 @@ export class WorkspaceGoalService {
   }
 
   /**
+   * Codex P1 (PRRT_kwDOPxxmWM6cPuMw): admission revalidation for a goal-loop
+   * synthetic turn that is being REDISPATCHED outside its original guarded
+   * send — e.g. a compaction follow-up whose original `requireIdle` +
+   * `admissionStale` guards did not survive the durable handoff. The
+   * original closure cannot be persisted, so re-derive: verify the durable
+   * goal still admits the kind (continuation → active; budget wrap-up →
+   * budget_limited and still owed) and return a fresh staleness probe over
+   * the pause/terminal/identity generations for the send's admission gates.
+   */
+  async buildGoalRedispatchAdmission(
+    workspaceId: string,
+    goalId: string,
+    kind: GoalSyntheticMessageKind
+  ): Promise<{ admissible: false } | { admissible: true; admissionStale: () => boolean }> {
+    assert(workspaceId.trim().length > 0, "buildGoalRedispatchAdmission requires workspaceId");
+    assert(goalId.trim().length > 0, "buildGoalRedispatchAdmission requires goalId");
+    const current = await this.readGoalFile(workspaceId);
+    if (current?.goalId !== goalId || current.requireUserAcknowledgmentSinceMs != null) {
+      return { admissible: false };
+    }
+    if (kind === GOAL_BUDGET_LIMIT_KIND) {
+      const wrapupStillOwed =
+        current.status === "budget_limited" &&
+        current.budgetLimitOriginKind !== "user" &&
+        current.budgetLimitInjectedForGoalId !== goalId;
+      if (!wrapupStillOwed) {
+        return { admissible: false };
+      }
+    } else if (current.status !== "active") {
+      return { admissible: false };
+    }
+    const pauseGenerationAtBuild = this.explicitPauseGenerations.get(workspaceId) ?? 0;
+    const terminalGenerationAtBuild = this.terminalStatusGenerations.get(workspaceId) ?? 0;
+    const identityGenerationAtBuild = this.goalIdentityGenerations.get(workspaceId) ?? 0;
+    return {
+      admissible: true,
+      admissionStale: () =>
+        (this.explicitPauseGenerations.get(workspaceId) ?? 0) !== pauseGenerationAtBuild ||
+        (this.terminalStatusGenerations.get(workspaceId) ?? 0) !== terminalGenerationAtBuild ||
+        (this.goalIdentityGenerations.get(workspaceId) ?? 0) !== identityGenerationAtBuild,
+    };
+  }
+
+  /**
    * Treat an agent's text-only `goal_continuation` turn as implicit
    * completion. The continuation prompt asks the agent to call
    * `complete_goal` explicitly, but real models sometimes finish with a
@@ -1709,6 +1778,10 @@ export class WorkspaceGoalService {
           // updates) up to the last gate before the send is irrevocable.
           const wrapupTerminalGenerationAtDispatch =
             this.terminalStatusGenerations.get(workspaceId) ?? 0;
+          // Codex P1 (PRRT_kwDOPxxmWM6cPuM6): replacement of the
+          // budget-limited goal during the preflight is an identity change.
+          const wrapupIdentityGenerationAtDispatch =
+            this.goalIdentityGenerations.get(workspaceId) ?? 0;
           const accepted = await this.goalContinuationBridge?.executeGoalContinuation({
             workspaceId,
             message,
@@ -1729,7 +1802,9 @@ export class WorkspaceGoalService {
               }
               return (
                 (this.terminalStatusGenerations.get(workspaceId) ?? 0) !==
-                wrapupTerminalGenerationAtDispatch
+                  wrapupTerminalGenerationAtDispatch ||
+                (this.goalIdentityGenerations.get(workspaceId) ?? 0) !==
+                  wrapupIdentityGenerationAtDispatch
               );
             },
           });
@@ -1784,6 +1859,11 @@ export class WorkspaceGoalService {
         // generation covers those, refusing a normal continuation against a
         // completed goal or one that now owes the budget wrap-up instead.
         const terminalGenerationAtDispatch = this.terminalStatusGenerations.get(workspaceId) ?? 0;
+        // Codex P1 (PRRT_kwDOPxxmWM6cPuM6): an active→active replacement
+        // bumps neither generation above and may leave this candidate
+        // installed until the replacement's kickoff finalizer arms — the
+        // identity generation covers it.
+        const identityGenerationAtDispatch = this.goalIdentityGenerations.get(workspaceId) ?? 0;
         const accepted = await this.goalContinuationBridge?.executeGoalContinuation({
           workspaceId,
           message,
@@ -1794,7 +1874,9 @@ export class WorkspaceGoalService {
           admissionStale: () =>
             this.pendingContinuationCandidates.get(workspaceId) !== candidate ||
             (this.explicitPauseGenerations.get(workspaceId) ?? 0) !== pauseGenerationAtDispatch ||
-            (this.terminalStatusGenerations.get(workspaceId) ?? 0) !== terminalGenerationAtDispatch,
+            (this.terminalStatusGenerations.get(workspaceId) ?? 0) !==
+              terminalGenerationAtDispatch ||
+            (this.goalIdentityGenerations.get(workspaceId) ?? 0) !== identityGenerationAtDispatch,
         });
         if (accepted !== true) {
           this.scheduleContinuationReRequest(workspaceId, Date.now() + 1_000);

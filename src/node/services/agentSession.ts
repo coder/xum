@@ -6889,8 +6889,12 @@ export class AgentSession {
 
     const hasQueuedMessages = this.hasPendingManualFollowUp();
     const hasActiveNonCompletingTurn = this.isBusy() && this.turnPhase !== TurnPhase.COMPLETING;
+    // Codex P1 (PRRT_kwDOPxxmWM6cPuMw): goal-loop follow-ups were originally
+    // requireIdle sends — enforce the idle rule for them unconditionally so a
+    // user message queued during the compaction stream wins the race instead
+    // of the synthetic continuation starting first.
     if (
-      followUp.dispatchOptions?.requireIdle === true &&
+      (followUp.dispatchOptions?.requireIdle === true || followUp.goalKind != null) &&
       (hasQueuedMessages || hasActiveNonCompletingTurn)
     ) {
       log.info("Skipping pending follow-up because the workspace is no longer idle", {
@@ -6926,6 +6930,31 @@ export class AgentSession {
     // Model fallback for legacy follow-ups that may lack the model field.
     // DEFAULT_MODEL is a safe fallback that's always available.
     const effectiveModel = followUp.model ?? DEFAULT_MODEL;
+
+    // Codex P1 (PRRT_kwDOPxxmWM6cPuMw): the durable handoff preserves the
+    // goal identity but not the original send's admission guards. An explicit
+    // Pause (or a replacement/completion/suppression) persisted while the
+    // compaction stream ran must veto the redispatch — otherwise the
+    // synthetic row lands after the pause boundary and reads as fresh active
+    // evidence. Revalidate against durable goal state and carry a fresh
+    // staleness probe through the redispatched send's admission gates.
+    let goalAdmissionStale: (() => boolean) | undefined;
+    if (followUp.goalKind != null && followUp.goalId != null && this.workspaceGoalService) {
+      const admission = await this.workspaceGoalService.buildGoalRedispatchAdmission(
+        this.workspaceId,
+        followUp.goalId,
+        followUp.goalKind
+      );
+      if (!admission.admissible) {
+        log.info("Skipping goal-scoped pending follow-up: goal no longer admits it", {
+          workspaceId: this.workspaceId,
+          goalKind: followUp.goalKind,
+        });
+        await this.clearPendingFollowUpFromSummary(lastMessage);
+        return false;
+      }
+      goalAdmissionStale = admission.admissionStale;
+    }
 
     log.debug("Dispatching pending follow-up from compaction summary", {
       workspaceId: this.workspaceId,
@@ -6997,6 +7026,9 @@ export class AgentSession {
       // reconciliation (Codex P2 PRRT_kwDOPxxmWM6cIv2E).
       goalId: followUp.goalId,
       goalContinuation: followUp.goalKind === GOAL_CONTINUATION_KIND,
+      // Codex P1 (PRRT_kwDOPxxmWM6cPuMw): re-derived admission guard for the
+      // redispatched goal turn (see buildGoalRedispatchAdmission above).
+      admissionStale: goalAdmissionStale,
     });
     if (!sendResult.success) {
       const message = this.extractRetryFailureMessage(sendResult.error) ?? sendResult.error.type;

@@ -12,7 +12,7 @@ import { createMuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { GoalRecordV1, GoalStatus } from "@/common/types/goal";
-import { GOAL_CONTINUATION_IDLE_CONSUMER_NAME } from "@/constants/goals";
+import { GOAL_CONTINUATION_IDLE_CONSUMER_NAME, GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { waitForCondition } from "./testDispatchHelpers";
 import { IdleDispatcher } from "./idleDispatcher";
 
@@ -239,6 +239,65 @@ describe("AgentSession goal safety hooks", () => {
       status: "budget_limited",
       budgetLimitOriginKind: "user",
     });
+    session.dispose();
+  });
+
+  test("a paused goal vetoes a redispatched compaction follow-up continuation", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cPuMw): the compaction handoff preserves the
+    // continuation's goal identity but not its original requireIdle /
+    // admissionStale guards. An explicit Pause persisted while the compaction
+    // stream ran must veto the redispatch instead of letting the synthetic
+    // row land after the pause boundary as fresh active evidence.
+    const workspaceId = "compaction-followup-paused-veto";
+    const { session, goalService, historyService, cleanup } =
+      await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const created = await setGoalOk(goalService, {
+      workspaceId,
+      objective: "Paused during compaction",
+    });
+    // Pause persists first (its boundary row lands), then the compaction
+    // summary carrying the goal-scoped follow-up commits.
+    await setGoalOk(goalService, { workspaceId, status: "paused" });
+    const summary = createMuxMessage(
+      `summary-${crypto.randomUUID()}`,
+      "assistant",
+      "Compacted conversation.",
+      {
+        timestamp: Date.now(),
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: {
+            text: "Continue working on the goal.",
+            agentId: "exec",
+            model: "openai:gpt-4o",
+            agentInitiated: true,
+            goalKind: GOAL_CONTINUATION_KIND,
+            goalId: created.goalId,
+          },
+        },
+      }
+    );
+    expect((await historyService.appendToHistory(workspaceId, summary)).success).toBe(true);
+
+    const sendSpy = spyOn(session, "sendMessage").mockImplementation(() =>
+      Promise.resolve(Ok(undefined))
+    );
+    const dispatched = await (
+      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
+    ).dispatchPendingFollowUp();
+    sendSpy.mockRestore();
+
+    // Vetoed: nothing dispatched, and the stale follow-up was cleared so it
+    // cannot re-fire on a later recovery pass.
+    expect(dispatched).toBe(false);
+    expect(sendSpy).not.toHaveBeenCalled();
+    const tail = await historyService.getLastMessages(workspaceId, 1);
+    expect(tail.success).toBe(true);
+    if (tail.success) {
+      const meta = tail.data[0]?.metadata?.muxMetadata;
+      expect(meta && "pendingFollowUp" in meta ? meta.pendingFollowUp : undefined).toBeUndefined();
+    }
     session.dispose();
   });
 
