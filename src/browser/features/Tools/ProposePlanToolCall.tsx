@@ -587,14 +587,24 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       return;
     }
     try {
-      await api.workspace.updateAgentAISettings({
+      const restoreResult = await api.workspace.updateAgentAISettings({
         workspaceId,
         agentId: snapshot.previousAgentId,
         aiSettings: null,
         persistSelectedAgentId: true,
       });
+      if (!restoreResult.success) {
+        // The backend refused the restore (e.g. the prior agent now fails the
+        // budgeted-goal pricing gate) and stays on the target agent with no
+        // echo coming — keep the local switch so local and backend state stay
+        // converged.
+        return;
+      }
     } catch {
-      // Best-effort restore only.
+      // Transport failure: backend state is unknown and no echo is coming
+      // now. Keep the local switch; after the pending guard is released, the
+      // next metadata delivery re-seeds the authoritative backend agent.
+      return;
     }
     rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
   };
