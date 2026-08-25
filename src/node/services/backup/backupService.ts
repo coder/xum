@@ -29,6 +29,13 @@ export interface PreparedBackupRepository {
   rootDir: string;
   credential: BackupCredentialKind;
   remoteCommit: string | null;
+  /**
+   * The managed path the prepared cache actually holds: the configured spelling, or its
+   * legacy `mux` spelling when only that tree carries a backup manifest (backups pushed
+   * before the product rename). Payload reads and writes must use this path — only this
+   * tree is materialized, validated, and staged.
+   */
+  managedPath: string;
 }
 
 export interface BackupGitRepo {
@@ -304,11 +311,11 @@ export class BackupService {
       const { restorePreview, exported } = await this.withLocalPayload(async () => ({
         restorePreview: await this.dependencies.payload.previewRestore({
           repositoryRoot: repository.rootDir,
-          managedPath: normalized.path,
+          managedPath: repository.managedPath,
         }),
         exported: await this.dependencies.payload.exportTo({
           repositoryRoot: repository.rootDir,
-          managedPath: normalized.path,
+          managedPath: repository.managedPath,
         }),
       }));
       const pushChanges = await this.dependencies.gitRepo.getPushChanges(repository);
@@ -342,7 +349,7 @@ export class BackupService {
       const exported = await this.withLocalPayload(() =>
         this.dependencies.payload.exportTo({
           repositoryRoot: repository.rootDir,
-          managedPath: normalized.path,
+          managedPath: repository.managedPath,
         })
       );
       // Approval is bound to the exact flagged bytes, so an override the user granted for
@@ -396,7 +403,7 @@ export class BackupService {
         // unredacted copy of the local settings on disk.
         await this.dependencies.payload.validateRestore({
           repositoryRoot: repository.rootDir,
-          managedPath: normalized.path,
+          managedPath: repository.managedPath,
           approvedCommandTokens,
         });
         const snapshotPath = await this.createSnapshotPath();
@@ -411,7 +418,7 @@ export class BackupService {
         try {
           const restored = await this.dependencies.payload.restore({
             repositoryRoot: repository.rootDir,
-            managedPath: normalized.path,
+            managedPath: repository.managedPath,
             approvedCommandTokens,
           });
           await this.persistSettings(normalized, { lastRestoredCommit: remoteCommit });

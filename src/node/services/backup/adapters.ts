@@ -96,6 +96,7 @@ export function createBackupGitRepo(options: {
         rootDir: cache.cachePath,
         credential: cache.credential ?? "ambient",
         remoteCommit,
+        managedPath: cache.effectiveManagedPath,
       };
       prepared.set(repository, cache);
       return repository;
@@ -147,7 +148,12 @@ function sameMode(a: BackupFile, b: BackupFile): boolean {
   return (a.executable === true) === (b.executable === true);
 }
 
-/** Names every spelling a restore looked in, so the error explains the legacy fallback. */
+/**
+ * Names every spelling that was considered, so the error explains the legacy fallback.
+ * The repository preparation selects the legacy `mux` spelling whenever it holds a
+ * manifest and the configured spelling does not, so reaching this with the configured
+ * path means the legacy spelling was checked and held no backup either.
+ */
 function describeMissingBackup(managedPath: string): string {
   const [, ...legacySpellings] = listBackupManagedPathSpellings(managedPath);
   const fallbacks = legacySpellings.map((spelling) => `'${spelling}'`).join(" or ");
@@ -164,21 +170,6 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
   async function managedDir(repositoryRoot: string, managedPath: string): Promise<string> {
     const segments = managedPath.split("/").filter((segment) => segment !== "");
     return await resolveContainedPath(repositoryRoot, segments.join("/"));
-  }
-
-  // Backups pushed before the product rename live under the legacy `mux` spelling, which
-  // BackupRepoCache materializes alongside the configured path. Restore-side reads fall
-  // back to it when the configured path holds no payload; exports keep writing the
-  // configured path so the backup migrates forward on the next push.
-  async function findRestoreSourceDir(
-    repositoryRoot: string,
-    managedPath: string
-  ): Promise<string | null> {
-    for (const spelling of listBackupManagedPathSpellings(managedPath)) {
-      const dir = await managedDir(repositoryRoot, spelling);
-      if (await backupPayloadExists(dir)) return dir;
-    }
-    return null;
   }
 
   function localPreferences() {
@@ -226,14 +217,11 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
     },
 
     async previewRestore(previewOptions) {
-      const sourceDir = await findRestoreSourceDir(
-        previewOptions.repositoryRoot,
-        previewOptions.managedPath
-      );
+      const sourceDir = await managedDir(previewOptions.repositoryRoot, previewOptions.managedPath);
       const local = await localFilesByPath();
       // A repository with no backup yet is a normal first-run state, not an error:
       // nothing would be restored, and every local file is local-only.
-      if (sourceDir === null) {
+      if (!(await backupPayloadExists(sourceDir))) {
         return { changes: [], localOnlyFiles: [...local.keys()].sort(), commandApprovals: [] };
       }
 
@@ -294,11 +282,11 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
     },
 
     async validateRestore(validateOptions) {
-      const sourceDir = await findRestoreSourceDir(
+      const sourceDir = await managedDir(
         validateOptions.repositoryRoot,
         validateOptions.managedPath
       );
-      if (sourceDir === null) {
+      if (!(await backupPayloadExists(sourceDir))) {
         throw new BackupServiceError(
           "INVALID_BACKUP",
           describeMissingBackup(validateOptions.managedPath)
@@ -324,18 +312,9 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
     },
 
     async restore(restoreOptions) {
-      const sourceDir = await findRestoreSourceDir(
-        restoreOptions.repositoryRoot,
-        restoreOptions.managedPath
+      const payload = await readBackupPayload(
+        await managedDir(restoreOptions.repositoryRoot, restoreOptions.managedPath)
       );
-      // The service validates before restoring, so this only guards direct callers.
-      if (sourceDir === null) {
-        throw new BackupServiceError(
-          "INVALID_BACKUP",
-          describeMissingBackup(restoreOptions.managedPath)
-        );
-      }
-      const payload = await readBackupPayload(sourceDir);
       const before = await localFilesByPath();
       const result = await restoreBackupPayload({
         muxRoot,

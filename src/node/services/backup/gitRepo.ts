@@ -157,7 +157,10 @@ export interface BackupRepoCacheOptions extends Omit<GitCredentialOptions, "repo
   repoUrl: string;
   branch: string;
   cacheRoot: string;
-  /** Scopes the sparse checkout, so nothing outside it is ever materialized. */
+  /**
+   * Scopes the sparse checkout, so nothing outside it is ever materialized. materialize()
+   * may swap in the legacy `mux` spelling of this path; see `effectiveManagedPath`.
+   */
   managedPath: string;
   materializationLimits?: {
     maxFileBytes?: number;
@@ -210,6 +213,9 @@ interface ManagedBlobEntry {
 }
 
 const BLOB_PREFETCH_BATCH_SIZE = 16;
+
+/** One non-recursive ls-tree record for a bounded-length path; anything larger is hostile. */
+const MANIFEST_LOOKUP_MAX_OUTPUT_BYTES = 16384;
 
 export interface RemoteRefs {
   credential: BackupCredential;
@@ -677,6 +683,7 @@ export class BackupRepoCache {
   private readonly maxCacheObjectKib: number;
   private baseRemoteCommit: string | null | undefined;
   private usedCredential: BackupCredential | undefined;
+  private selectedManagedPath: string | undefined;
 
   constructor(private readonly options: BackupRepoCacheOptions) {
     this.cachePath = backupCachePath(options.cacheRoot, options.repoUrl, options.branch);
@@ -707,6 +714,16 @@ export class BackupRepoCache {
 
   get credential(): BackupCredential | undefined {
     return this.usedCredential;
+  }
+
+  /**
+   * The managed path this cache actually uses, resolved by materialize(). It is the
+   * configured spelling unless that tree has no backup manifest while the legacy `mux`
+   * spelling from before the product rename does — then reads and writes both follow the
+   * legacy spelling, so a pre-rename backup keeps working and pushes update it in place.
+   */
+  get effectiveManagedPath(): string {
+    return this.selectedManagedPath ?? this.options.managedPath;
   }
 
   private credentialOptions(): GitCredentialOptions {
@@ -1036,59 +1053,52 @@ export class BackupRepoCache {
   }
 
   /**
-   * The trees this cache materializes and reads: the configured managed path, plus the
-   * legacy `mux` spelling only when the configured path holds no backup manifest at the
-   * fetched commit. Backups pushed before the product rename live under the legacy
-   * spelling, and a restore can only read what the sparse checkout materialized. Scoping
-   * the fallback to the missing-manifest case keeps an unused legacy tree out of
-   * validation and the checkout, so a broken or oversized leftover cannot block a valid
-   * canonical backup. Writes (stage, commit, status) stay scoped to the configured path.
+   * The one managed path this cache materializes, reads, and writes: the configured
+   * spelling, unless it holds no backup manifest at the fetched commit while a legacy
+   * spelling (`mux/`, from before the product rename) does. Selecting a single tree keeps
+   * every unselected spelling out of validation, the sparse checkout, and staging, so a
+   * broken or oversized tree under the other spelling can never block the backup that is
+   * actually in use, and pushes update the backup where it lives instead of forking it.
    */
-  private async resolveManagedReadPaths(remoteCommit: string | null): Promise<readonly string[]> {
-    const [configured, ...legacySpellings] = [
-      ...new Set(
-        listBackupManagedPathSpellings(this.options.managedPath).map((spelling) =>
-          safeRelativePath(spelling)
-        )
-      ),
-    ];
-    if (remoteCommit !== null && !(await this.treeHasBackupManifest(remoteCommit, configured))) {
-      for (const legacy of legacySpellings) {
-        if (await this.treeHasBackupManifest(remoteCommit, legacy)) return [configured, legacy];
-      }
+  private async resolveEffectiveManagedPath(remoteCommit: string | null): Promise<string> {
+    const [configured, ...legacySpellings] = listBackupManagedPathSpellings(
+      this.options.managedPath
+    );
+    if (remoteCommit === null) return configured;
+    if (await this.treeHasBackupManifest(remoteCommit, safeRelativePath(configured))) {
+      return configured;
     }
-    return [configured];
+    for (const legacy of legacySpellings) {
+      if (await this.treeHasBackupManifest(remoteCommit, safeRelativePath(legacy))) return legacy;
+    }
+    return configured;
   }
 
-  /** Reads only tree objects, which a blob-filtered fetch always transfers. */
+  /**
+   * True only when `<readPath>/manifest.json` is a blob at the given commit. Deliberately
+   * non-recursive: a directory spelled like the manifest is then a single `tree` record the
+   * type check rejects, rather than an unbounded listing of its descendants. Reads only
+   * tree objects, which a blob-filtered fetch always transfers.
+   */
   private async treeHasBackupManifest(remoteCommit: string, readPath: string): Promise<boolean> {
-    const { stdout } = await this.localGit([
-      "ls-tree",
-      "-r",
-      "-z",
-      remoteCommit,
-      "--",
-      `:(top,literal)${readPath}/${BACKUP_MANIFEST_FILE}`,
-    ]);
-    return stdout.length > 0;
+    const { stdout } = await this.localGit(
+      ["ls-tree", "-z", remoteCommit, "--", `:(top,literal)${readPath}/${BACKUP_MANIFEST_FILE}`],
+      { env: { GIT_NO_LAZY_FETCH: "1" }, maxOutputBytes: MANIFEST_LOOKUP_MAX_OUTPUT_BYTES }
+    );
+    const record = stdout.split("\0")[0] ?? "";
+    const separator = record.indexOf("\t");
+    if (separator < 0) return false;
+    return record.slice(0, separator).trim().split(/\s+/)[1] === "blob";
   }
 
   private async listManagedBlobs(
     remoteCommit: string,
-    readPaths: readonly string[]
+    managedPath: string
   ): Promise<ManagedBlobEntry[]> {
     let stdout: string;
     try {
       ({ stdout } = await this.localGit(
-        [
-          "ls-tree",
-          "-r",
-          "-l",
-          "-z",
-          remoteCommit,
-          "--",
-          ...readPaths.map((readPath) => `:(top,literal)${readPath}`),
-        ],
+        ["ls-tree", "-r", "-l", "-z", remoteCommit, "--", `:(top,literal)${managedPath}`],
         {
           env: { GIT_NO_LAZY_FETCH: "1" },
           maxOutputBytes: MAX_BACKUP_TOTAL_BYTES,
@@ -1169,23 +1179,22 @@ export class BackupRepoCache {
 
   private async validateManagedTreeBeforeCheckout(
     remoteCommit: string,
-    readPaths: readonly string[]
+    managedPath: string
   ): Promise<void> {
-    const entries = await this.listManagedBlobs(remoteCommit, readPaths);
+    const entries = await this.listManagedBlobs(remoteCommit, managedPath);
     if (entries.length > this.materializationLimits.maxFileCount) {
       throw new BackupInvalidPayloadError(
         new Error(`Backup has more than ${this.materializationLimits.maxFileCount} files`)
       );
     }
 
-    const managedPrefixes = readPaths.map((readPath) => `${readPath}/`);
+    const managedPrefix = `${managedPath}/`;
     try {
       const payloadPaths = entries.map((entry) => {
-        const prefix = managedPrefixes.find((candidate) => entry.path.startsWith(candidate));
-        if (prefix === undefined) {
+        if (!entry.path.startsWith(managedPrefix)) {
           throw new Error(`Backup tree contains invalid path '${entry.path}'`);
         }
-        return entry.path.slice(prefix.length);
+        return entry.path.slice(managedPrefix.length);
       });
       assertBackupPathComplexity(payloadPaths);
     } catch (error) {
@@ -1222,7 +1231,7 @@ export class BackupRepoCache {
 
       const fetchedSizes = new Map<string, number>();
       const fetchedObjectIds = new Set(objectIds);
-      for (const entry of await this.listManagedBlobs(remoteCommit, readPaths)) {
+      for (const entry of await this.listManagedBlobs(remoteCommit, managedPath)) {
         if (entry.size !== null && fetchedObjectIds.has(entry.objectId)) {
           fetchedSizes.set(entry.objectId, entry.size);
         }
@@ -1255,22 +1264,23 @@ export class BackupRepoCache {
    * and the checkout that follows is what applies it. Pre-checkout size validation fetches any
    * missing managed blobs through the credential ladder.
    */
-  private async applySparseCheckout(readPaths: readonly string[]): Promise<void> {
+  private async applySparseCheckout(managedPath: string): Promise<void> {
     await writeOwnedGitInfoFile(
       this.cachePath,
       "sparse-checkout",
-      readPaths.map((readPath) => `/${escapeSparsePattern(readPath)}/*\n`).join("")
+      `/${escapeSparsePattern(managedPath)}/*\n`
     );
   }
 
   async resetHardToRemote(): Promise<string | null> {
-    // The read paths depend on the fetched commit's tree, so resolve them before the
-    // sparse patterns are written and the checkout materializes anything.
+    // The managed path selection depends on the fetched commit's tree, so resolve it
+    // before the sparse pattern is written and the checkout materializes anything.
     const remoteCommit = await this.remoteBranchCommit();
-    const readPaths = await this.resolveManagedReadPaths(remoteCommit);
-    await this.applySparseCheckout(readPaths);
+    this.selectedManagedPath = await this.resolveEffectiveManagedPath(remoteCommit);
+    const managedPath = safeRelativePath(this.selectedManagedPath);
+    await this.applySparseCheckout(managedPath);
     if (remoteCommit) {
-      await this.validateManagedTreeBeforeCheckout(remoteCommit, readPaths);
+      await this.validateManagedTreeBeforeCheckout(remoteCommit, managedPath);
       // -f because a previous preview leaves modified tracked files in this cache. Without
       // it the checkout keeps them and the next preview reads the local export as if it
       // were the remote's backup.
@@ -1350,7 +1360,7 @@ export class BackupRepoCache {
   }
 
   async stageAndCommit(message: string): Promise<string | null> {
-    const target = safeRelativePath(this.options.managedPath);
+    const target = safeRelativePath(this.effectiveManagedPath);
     // -f because the target may be a dotfiles repo whose ignore rules match payload
     // names. Skipping one file would push a manifest that references missing content.
     await this.localGit(["add", "-A", "-f", "--", target]);
@@ -1415,7 +1425,7 @@ export class BackupRepoCache {
         "-z",
         "--untracked-files=all",
         "--",
-        safeRelativePath(this.options.managedPath),
+        safeRelativePath(this.effectiveManagedPath),
       ])
     ).stdout;
   }
