@@ -592,6 +592,7 @@ function createWorkspaceServiceMocks(
   emitChatEvent: ReturnType<typeof mock>;
   isWorkflowInvocationCurrent: ReturnType<typeof mock>;
   create: ReturnType<typeof mock>;
+  discardExtensionMetadataEntry: ReturnType<typeof mock>;
 } {
   const sendMessage =
     overrides?.sendMessage ?? mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
@@ -678,10 +679,12 @@ function createWorkspaceServiceMocks(
       (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
         Promise.resolve(Err("workspaceService.create not mocked"))
     );
+  const discardExtensionMetadataEntry = mock((): Promise<void> => Promise.resolve());
 
   return {
     workspaceService: {
       create,
+      discardExtensionMetadataEntry,
       // No-op by default: task-create tests exercise launch flow, not the
       // registration-time plugin-override sanitizer (workspaceService.test.ts
       // covers it). Returning undefined means "clean".
@@ -731,6 +734,7 @@ function createWorkspaceServiceMocks(
       countQueuedAgentPeerMessages,
     } as unknown as WorkspaceService,
     create,
+    discardExtensionMetadataEntry,
     sendMessage,
     resumeStream,
     clearQueue,
@@ -23799,7 +23803,9 @@ describe("TaskService", () => {
     );
     const { aiService } = createAIServiceMocks(config);
     const failingSendMessage = mock(() => Promise.resolve(Err("send failed")));
-    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage: failingSendMessage });
+    const { workspaceService, discardExtensionMetadataEntry } = createWorkspaceServiceMocks({
+      sendMessage: failingSendMessage,
+    });
     const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
 
     const created = await createAgentTask(taskService, parentId, "do the thing");
@@ -23811,6 +23817,11 @@ describe("TaskService", () => {
       .flatMap((p) => p.workspaces)
       .some((w) => w.id === "aaaaaaaaaa");
     expect(stillExists).toBe(false);
+
+    // Rollback must also drop the extension-metadata entry: the failed send
+    // may already have scheduled metadata writes that would otherwise leak a
+    // stale key after deregistration (#3959).
+    expect(discardExtensionMetadataEntry).toHaveBeenCalledWith("aaaaaaaaaa");
 
     const workspaceName = "agent_explore_aaaaaaaaaa";
     const workspacePath = runtime.getWorkspacePath(projectPath, workspaceName);

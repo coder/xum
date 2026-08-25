@@ -3282,6 +3282,28 @@ describe("WorkspaceService activity list scoping", () => {
       await cleanup();
     }
   });
+
+  test("discardExtensionMetadataEntry swallows deletion failures", async () => {
+    // Rollback paths (e.g. TaskService's failed task-create rollback) call
+    // this best-effort; a metadata disk failure must not abort the rollback.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const deleteWorkspace = mock(() => Promise.reject(new Error("disk full")));
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata: {
+          ...mockExtensionMetadataService,
+          deleteWorkspace,
+        } as unknown as ExtensionMetadataService,
+      });
+
+      await workspaceService.discardExtensionMetadataEntry("rollback-ws");
+      expect(deleteWorkspace).toHaveBeenCalledWith("rollback-ws");
+    } finally {
+      await cleanup();
+    }
+  });
 });
 
 describe("WorkspaceService workflow invocation events", () => {

@@ -7319,6 +7319,13 @@ export class TaskService {
       });
     }
 
+    // A create that failed after sendMessage may already have scheduled
+    // extension-metadata writes (e.g. the recency update), which would
+    // recreate the entry after the deregistration above and leak a stale key
+    // until the next process start's lazy prune. Best-effort, like the
+    // config removal above.
+    await this.workspaceService.discardExtensionMetadataEntry(taskId);
+
     this.workspaceService.emit("metadata", { workspaceId: taskId, metadata: null });
 
     if (options?.preservePhysicalWorkspace) {

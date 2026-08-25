@@ -427,6 +427,31 @@ describe("ExtensionMetadataService", () => {
     ).toEqual({ nested: true });
   });
 
+  test("pruneMissingWorkspaces fetches known ids only after loading the file", async () => {
+    // The cross-process loss-safety argument (see the pruneMissingWorkspaces
+    // doc comment) requires the known-ids fetch to observe every workspace
+    // registration that preceded an entry visible in the loaded file — i.e.
+    // load first, fetch second. Fetch-first would misclassify a concurrently
+    // created workspace's fresh entry as stale.
+    await service.updateRecency("known-workspace", 100);
+    const order: string[] = [];
+    const internals = service as unknown as ExtensionMetadataServiceInternals;
+    const originalLoad = internals.load.bind(service);
+    internals.load = async () => {
+      order.push("load");
+      return originalLoad();
+    };
+    try {
+      await service.pruneMissingWorkspaces(() => {
+        order.push("fetch-known-ids");
+        return Promise.resolve(new Set(["known-workspace"]));
+      });
+    } finally {
+      internals.load = originalLoad;
+    }
+    expect(order).toEqual(["load", "fetch-known-ids"]);
+  });
+
   test("pruneMissingWorkspaces does not rewrite the file when nothing is stale", async () => {
     // Compact (non-pretty) serialization: any rewrite through save() would
     // change the raw bytes, so byte-equality proves no write happened.

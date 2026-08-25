@@ -394,11 +394,19 @@ export class ExtensionMetadataService {
    * bounded afterwards.
    *
    * Loss safety: `getKnownWorkspaceIds` is invoked INSIDE the serialized
-   * mutation, before the file is loaded. All in-process writers go through the
-   * same mutation queue, so any entry visible in the loaded file was written
-   * by a mutation that completed before this one started — and a workspace is
-   * registered in config before its first metadata write, so a live
-   * workspace's id is always present in the fetched set.
+   * mutation and strictly AFTER the file is loaded, and the callback reads
+   * config fresh from disk. A workspace is durably registered in config
+   * before its first metadata write, so every entry visible in the loaded
+   * file belongs to a workspace whose registration is already on disk — the
+   * post-load fetch therefore always includes live entries' ids, even for
+   * workspaces created concurrently by another backend process
+   * (XUM_ALLOW_MULTIPLE_INSTANCES). Fetching before the load would leave a
+   * window where another process registers + writes a fresh entry that the
+   * stale known-ids set misclassifies as prunable.
+   *
+   * (A concurrent foreign-process write landing between our load and save can
+   * still be lost to this whole-file rewrite — that lost-update window is
+   * inherent to every existing writer of this file and unchanged here.)
    *
    * Upgrade↔downgrade safety: surviving entries are round-tripped verbatim
    * (no coercion), so fields written by other builds are preserved and the
@@ -408,8 +416,8 @@ export class ExtensionMetadataService {
     getKnownWorkspaceIds: () => Promise<ReadonlySet<string>>
   ): Promise<number> {
     return this.withSerializedMutation(async () => {
-      const knownWorkspaceIds = await getKnownWorkspaceIds();
       const data = await this.load();
+      const knownWorkspaceIds = await getKnownWorkspaceIds();
       let prunedCount = 0;
       for (const workspaceId of Object.keys(data.workspaces)) {
         if (!knownWorkspaceIds.has(workspaceId)) {

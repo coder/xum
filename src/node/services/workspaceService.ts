@@ -6350,16 +6350,7 @@ export class WorkspaceService extends EventEmitter {
       // Deregistration succeeded: drop the workspace's activity/status entry
       // so extensionMetadata.json stays bounded (stale entries were
       // historically never pruned and grew monotonically, issue #3959).
-      // Best-effort: a missed delete is reclaimed by the one-time
-      // pruneStaleExtensionMetadataOnce pass on a later process start.
-      try {
-        await this.extensionMetadata.deleteWorkspace(workspaceId);
-      } catch (error) {
-        log.debug("Failed to prune extension metadata after workspace removal", {
-          workspaceId,
-          error: getErrorMessage(error),
-        });
-      }
+      await this.discardExtensionMetadataEntry(workspaceId);
 
       if (removedMetadata || persistedWorkspace) {
         await this.syncCodeWorkspaceFiles(
@@ -12763,6 +12754,26 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
+   * Best-effort removal of a deregistered workspace's activity/status entry
+   * from extensionMetadata.json. Used by remove() and by rollback paths that
+   * deregister via config.removeWorkspace directly (e.g. TaskService's failed
+   * task-create rollback, where a send that failed mid-create may already
+   * have scheduled metadata writes that would recreate the entry after
+   * deregistration). A missed delete is reclaimed by the one-time
+   * pruneStaleExtensionMetadataOnce pass on a later process start.
+   */
+  async discardExtensionMetadataEntry(workspaceId: string): Promise<void> {
+    try {
+      await this.extensionMetadata.deleteWorkspace(workspaceId);
+    } catch (error) {
+      log.debug("Failed to prune extension metadata after workspace deregistration", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
+  /**
    * One-time lazy cleanup for pre-existing deployments: drop
    * extensionMetadata.json entries whose workspace no longer exists in
    * config. remove() prunes going forward, but entries that leaked before
@@ -12781,9 +12792,10 @@ export class WorkspaceService extends EventEmitter {
     this.prunedStaleExtensionMetadata = true;
     try {
       const prunedCount = await this.extensionMetadata.pruneMissingWorkspaces(async () => {
-        // Fetched inside the file's serialized mutation (see
-        // pruneMissingWorkspaces) so a concurrently created workspace cannot
-        // lose its just-written entry.
+        // Invoked inside the file's serialized mutation AFTER the file load,
+        // reading config fresh from disk (see pruneMissingWorkspaces), so a
+        // concurrently created workspace — even in another backend process —
+        // cannot lose its just-written entry.
         const allMetadata = await this.config.getAllWorkspaceMetadata();
         return new Set(allMetadata.map((metadata) => metadata.id));
       });
