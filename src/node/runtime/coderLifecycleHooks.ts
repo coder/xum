@@ -3,6 +3,7 @@ import { isSSHRuntime } from "@/common/types/runtime";
 import { Err, Ok, type Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { CoderService, WorkspaceStatusResult } from "@/node/services/coderService";
+import type { WorkspaceMetadata } from "@/common/types/workspace";
 import { log } from "@/node/services/log";
 import type {
   AfterUnarchiveHook,
@@ -54,6 +55,15 @@ function isAlreadyRunningOrStarting(status: WorkspaceStatusResult): boolean {
 export function createCoderArchiveHook(options: {
   coderService: CoderService;
   getArchiveBehavior: () => CoderWorkspaceArchiveBehavior;
+  /**
+   * Probe for detached background jobs surviving on the remote workspace (spawn records in
+   * the runtime's temp layout, invisible to host-local crash-orphan scans). Consulted only
+   * for model-driven archives (refuseStopUnderUnverifiedRemoteJobs) about to stop a RUNNING
+   * workspace: Ok(true) or Err refuses the stop (fail closed).
+   */
+  hasUnsettledRemoteBackgroundJobs?: (
+    workspaceMetadata: WorkspaceMetadata
+  ) => Promise<Result<boolean>>;
   timeoutMs?: number;
 }): BeforeArchiveHook {
   const timeoutMs = options.timeoutMs ?? DEFAULT_STOP_TIMEOUT_MS;
@@ -62,6 +72,7 @@ export function createCoderArchiveHook(options: {
     workspaceId,
     workspaceMetadata,
     coderWorkspaceArchiveBehavior,
+    refuseStopUnderUnverifiedRemoteJobs,
   }): Promise<Result<void>> => {
     const runtimeConfig = workspaceMetadata.runtimeConfig;
     if (!isSSHRuntime(runtimeConfig) || !runtimeConfig.coder) {
@@ -114,6 +125,30 @@ export function createCoderArchiveHook(options: {
 
     if (isAlreadyStoppedOrGone(status)) {
       return Ok(undefined);
+    }
+
+    // The workspace is up (or its status is unknown) and this stop would kill any detached
+    // background job that survived an unclean Xum exit — remote spawn records are invisible
+    // to the host-local crash-orphan scans, so model-driven archives must probe them through
+    // the runtime here and fail closed when absence cannot be proven. User-mediated archives
+    // skip this (refuseStopUnderUnverifiedRemoteJobs unset): they are the escape hatch.
+    if (refuseStopUnderUnverifiedRemoteJobs === true) {
+      if (options.hasUnsettledRemoteBackgroundJobs == null) {
+        return Err(
+          `Cannot verify that no background process is still running on Coder workspace "${workspaceName}" (no remote probe is configured); stopping it could terminate a surviving job. Ask the user to archive this workspace manually.`
+        );
+      }
+      const probe = await options.hasUnsettledRemoteBackgroundJobs(workspaceMetadata);
+      if (!probe.success) {
+        return Err(
+          `Cannot verify that no background process is still running on Coder workspace "${workspaceName}" (${probe.error}); stopping it could terminate a surviving job. Ask the user to archive this workspace manually.`
+        );
+      }
+      if (probe.data) {
+        return Err(
+          `A background process from a previous session may still be running on Coder workspace "${workspaceName}"; stopping it would terminate that job. Terminate the process (or wait for it to finish) or ask the user to archive this workspace manually.`
+        );
+      }
     }
 
     log.debug("Stopping Coder workspace before mux archive", {

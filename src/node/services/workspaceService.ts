@@ -8563,6 +8563,9 @@ export class WorkspaceService extends EventEmitter {
           workspaceId,
           workspaceMetadata: beforeArchiveMetadata,
           coderWorkspaceArchiveBehavior,
+          // Model-facing archives (refuseLiveUserActivity) must not stop a running remote
+          // workspace under a surviving detached job the host-local orphan scans cannot see.
+          refuseStopUnderUnverifiedRemoteJobs: options?.refuseLiveUserActivity === true,
         });
         if (!hookResult.success) {
           return Err(hookResult.error);

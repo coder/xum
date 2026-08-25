@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { Ok } from "@/common/types/result";
 import {
   BackgroundProcessManager,
   computeTailStartOffset,
@@ -2065,6 +2066,46 @@ describe("BackgroundProcessManager", () => {
       await writeSpawnRecord("migrated-exited", { pid: 0, status: "running" }, { exitCode: "0" });
 
       expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("probes remote spawn records through the runtime before a Coder stop", async () => {
+      // The remote-like runtime executes the probe locally against the same /tmp layout the
+      // records were written to, so PID semantics match the probe's namespace.
+      const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()));
+
+      // No records at all: clear.
+      expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
+        Ok(false)
+      );
+
+      // A markerless, meta-less directory (preserved ambiguous/transport-failure spawn)
+      // cannot prove its process exited: unsettled.
+      await fs.mkdir(path.join(workspaceDir, "ambiguous"), { recursive: true });
+      expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
+        Ok(true)
+      );
+      await fs.rm(path.join(workspaceDir, "ambiguous"), { recursive: true, force: true });
+
+      // Running record with a live PID (this test process): unsettled.
+      await writeSpawnRecord("remote-survivor", { pid: process.pid, status: "running" });
+      expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
+        Ok(true)
+      );
+
+      // The exit trap settles it even though the stale status still says running.
+      await fs.writeFile(path.join(workspaceDir, "remote-survivor", "exit_code"), "0");
+      expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
+        Ok(false)
+      );
+      await fs.rm(path.join(workspaceDir, "remote-survivor"), { recursive: true, force: true });
+
+      // Running record whose PID is dead (SIGKILL/reboot skipped the trap): settled.
+      const dead = spawnSync("true");
+      expect(dead.pid).toBeGreaterThan(1);
+      await writeSpawnRecord("remote-killed", { pid: dead.pid, status: "running" });
+      expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
+        Ok(false)
+      );
     });
 
     it("treats running records under extra record dirs as live without host PID probes", async () => {

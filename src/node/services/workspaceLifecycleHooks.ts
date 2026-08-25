@@ -16,6 +16,14 @@ export interface BeforeArchiveHookArgs {
    * caller that forbade it.
    */
   coderWorkspaceArchiveBehavior?: CoderWorkspaceArchiveBehavior;
+  /**
+   * Set by model-driven archives: a hook that would stop a running remote environment must
+   * first verify that no detached background job survives on it (remote spawn records are
+   * invisible to the host-local crash-orphan scans), failing closed when the probe cannot
+   * prove absence. User-mediated archives leave this unset — they are the documented escape
+   * hatch for over-refusals.
+   */
+  refuseStopUnderUnverifiedRemoteJobs?: boolean;
 }
 
 export type BeforeArchiveHook = (args: BeforeArchiveHookArgs) => Promise<Result<void>>;

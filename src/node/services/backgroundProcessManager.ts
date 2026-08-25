@@ -12,6 +12,7 @@ import {
   BG_OUTPUT_SUBDIR,
 } from "./backgroundProcessExecutor";
 import { execBuffered } from "@/node/utils/runtime/helpers";
+import { Ok, Err, type Result } from "@/common/types/result";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "./log";
@@ -1807,6 +1808,59 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
           processId
         )} is free on the runtime: ${getErrorMessage(error)}`,
       };
+    }
+  }
+
+  /**
+   * Remote counterpart of the crash-orphan probe for SSH/Coder targets, executed through the
+   * runtime because those spawn records live on the remote host. Called before a
+   * model-driven archive stops a running Coder workspace: stopping the VM would kill any
+   * detached job that survived an unclean Xum exit. Trusts only exit markers and
+   * remote-namespace liveness — a markerless meta-less record (a preserved ambiguous or
+   * transport-failure spawn) or a running-status record whose PID is alive (or unprobeable,
+   * including recycled-PID EPERM via /proc) reports Ok(true); a garbled or failed probe
+   * reports Err so the caller fails closed. Marker matching is substring-based because SSH
+   * login banners can prefix stdout.
+   */
+  async hasUnsettledRemoteSpawnRecords(
+    runtime: Runtime,
+    workspaceId: string
+  ): Promise<Result<boolean>> {
+    assert(workspaceId.length > 0, "hasUnsettledRemoteSpawnRecords requires workspaceId");
+    try {
+      const tempDir = await runtime.tempDir();
+      const root = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}`;
+      // One POSIX-shell pass over the per-process record dirs (see localSpawnDirMayHoldLiveProcess
+      // for the host-local equivalent of these rules):
+      // - exit marker present → settled; missing meta.json (or one without a "status" field,
+      //   i.e. torn/unreadable) → unsettled; non-"running" status → settled.
+      // - running status: dead PID means SIGKILL/reboot skipped the trap → settled; a live or
+      //   recycled PID (kill -0 success, or /proc entry on EPERM) → unsettled.
+      const script = [
+        `root=${quotePathForShell(root)}`,
+        `if [ ! -e "$root" ]; then echo __MUX_BG_REMOTE_CLEAR__; exit 0; fi`,
+        `unsettled=0`,
+        `for p in "$root"/*/; do`,
+        `  [ -d "$p" ] || continue`,
+        `  [ -e "$p/${BG_EXIT_CODE_FILENAME}" ] && continue`,
+        `  if ! grep -q '"status"' "$p/${BG_META_FILENAME}" 2>/dev/null; then unsettled=1; break; fi`,
+        `  grep -q '"status"[[:space:]]*:[[:space:]]*"running"' "$p/${BG_META_FILENAME}" 2>/dev/null || continue`,
+        `  pid=$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p' "$p/${BG_META_FILENAME}" 2>/dev/null | head -n 1)`,
+        `  if [ -z "$pid" ] || [ "$pid" -le 1 ]; then unsettled=1; break; fi`,
+        `  if kill -0 "$pid" 2>/dev/null || [ -e "/proc/$pid" ]; then unsettled=1; break; fi`,
+        `done`,
+        `if [ "$unsettled" = 1 ]; then echo __MUX_BG_REMOTE_UNSETTLED__; else echo __MUX_BG_REMOTE_CLEAR__; fi`,
+      ].join("\n");
+      const result = await execBuffered(runtime, script, { cwd: "/tmp", timeout: 15 });
+      if (result.exitCode === 0) {
+        if (result.stdout.includes("__MUX_BG_REMOTE_UNSETTLED__")) return Ok(true);
+        if (result.stdout.includes("__MUX_BG_REMOTE_CLEAR__")) return Ok(false);
+      }
+      return Err(
+        `remote spawn-record probe failed (exit ${result.exitCode}): ${result.stderr || result.stdout}`
+      );
+    } catch (error) {
+      return Err(`remote spawn-record probe failed: ${getErrorMessage(error)}`);
     }
   }
 
