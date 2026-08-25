@@ -2,8 +2,9 @@
  * Tool Bridge for PTC
  *
  * Bridges Xum tools into the QuickJS sandbox, making them callable via `xum.*`
- * (canonical) and `mux.*` (compatibility alias). Handles argument validation via
- * Zod schemas and result serialization.
+ * (canonical) and `mux.*` (compatibility alias). Handles argument validation
+ * (Zod-schema tools validate host-side; JSON-Schema-based tools such as MCP
+ * pass through to server-side validation) and result serialization.
  */
 
 import { randomUUID } from "node:crypto";
@@ -396,12 +397,22 @@ export class ToolBridge {
   }
 
   private validateArgs(toolName: string, tool: Tool, args: unknown): unknown {
-    // Access the tool's Zod schema - AI SDK tools use 'inputSchema', some use 'parameters'
-    const toolRecord = tool as { inputSchema?: z.ZodType; parameters?: z.ZodType };
+    // AI SDK tools carry their schema on 'inputSchema'; some legacy tools use 'parameters'.
+    const toolRecord = tool as { inputSchema?: unknown; parameters?: unknown };
     const schema = toolRecord.inputSchema ?? toolRecord.parameters;
-    if (!schema) return args;
+    if (schema == null) return args;
 
-    const result = schema.safeParse(args);
+    // Built-in tools carry Zod schemas and are validated here for early,
+    // readable errors. MCP tools instead carry the AI SDK's jsonSchema()
+    // wrapper ({ jsonSchema: <raw JSON Schema> }), which has no safeParse:
+    // pass their args through untouched, matching the direct (non-kernel)
+    // call path, where a jsonSchema wrapper without a validate function is
+    // also pass-through. The MCP server validates (and mcpServerManager
+    // sanitizes) on its side. Zod detection mirrors
+    // typeGenerator.getInputJsonSchema's "_def" check.
+    if (typeof schema !== "object" || !("_def" in schema)) return args;
+
+    const result = (schema as z.ZodType).safeParse(args);
     if (!result.success) {
       const issues = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
       throw new Error(`Invalid arguments for ${toolName}: ${issues}`);

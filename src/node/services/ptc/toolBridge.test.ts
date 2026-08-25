@@ -4,7 +4,7 @@
 
 import { describe, it, expect, mock } from "bun:test";
 import { ToolBridge, type KernelBridgeOptions } from "./toolBridge";
-import type { Tool } from "ai";
+import { jsonSchema, type Tool } from "ai";
 import type { IJSRuntime, RuntimeLimits } from "./runtime";
 import type { PTCEvent, PTCExecutionResult } from "./types";
 import { z } from "zod";
@@ -214,6 +214,41 @@ describe("ToolBridge", () => {
       // Call with valid args - should succeed
       await fileRead({ filePath: "test.txt" });
       expect(mockExecute).toHaveBeenCalledTimes(1);
+    });
+
+    it("passes args through for JSON-Schema (MCP-style) tools", async () => {
+      // MCP tools carry the AI SDK's jsonSchema() wrapper instead of a Zod
+      // schema. Regression: validateArgs called schema.safeParse on it and
+      // every kernel-bridged MCP call died with a TypeError.
+      const mockExecute = mock((args: unknown) => ({ echoed: args }));
+      const tools: Record<string, Tool> = {
+        mcp_search: {
+          description: "MCP-style tool",
+          inputSchema: jsonSchema<{ query?: string }>({
+            type: "object",
+            properties: { query: { type: "string" } },
+          }),
+          execute: (args) => Promise.resolve(mockExecute(args)),
+        },
+      };
+
+      const bridge = new ToolBridge(tools);
+
+      let registeredMux: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+      const mockRegisterObject = mock(
+        (name: string, obj: Record<string, (...args: unknown[]) => Promise<unknown>>) => {
+          if (name === "mux") registeredMux = obj;
+          return undefined;
+        }
+      );
+      bridge.register(createMockRuntime({ registerObject: mockRegisterObject }));
+
+      const search = registeredMux.mcp_search as (...args: unknown[]) => Promise<unknown>;
+      const result = await search({ query: "eng" });
+
+      // Args flow through untouched — the MCP server is the validator of record.
+      expect(mockExecute).toHaveBeenCalledWith({ query: "eng" });
+      expect(result).toEqual({ echoed: { query: "eng" } });
     });
 
     it("serializes non-JSON values", async () => {
