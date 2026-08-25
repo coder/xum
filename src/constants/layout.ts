@@ -34,6 +34,11 @@ export const MOBILE_TOUCH_TARGET_PX = 44;
 // constant, so `[@media(max-width:768px)]` class strings repeat this literal.
 export const NARROW_VIEWPORT_MAX_WIDTH_PX = 768;
 
+// `matchMedia` form of the breakpoint above. Renderer code and its tests have to agree on a
+// byte-identical query string — stubs match the argument by equality — so a per-callsite copy of
+// this template can desync a caller into a query that silently never matches.
+export const NARROW_VIEWPORT_MEDIA_QUERY = `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`;
+
 // Keep composer controls aligned without relying on individual component defaults. This is a floor,
 // not a fixed height: mobile raises touch targets to MOBILE_TOUCH_TARGET_PX, and a pill that caps
 // its height would clip the controls inside it instead of growing with them.

@@ -14,7 +14,7 @@ import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
-import { MOBILE_TOUCH_TARGET_PX, NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
+import { MOBILE_TOUCH_TARGET_PX, NARROW_VIEWPORT_MEDIA_QUERY } from "@/constants/layout";
 
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
@@ -205,7 +205,7 @@ export const IPhone16ePRLinkPlacement: AppStory = {
   play: async ({ canvasElement }) => {
     await stabilizePhoneViewportStory(canvasElement);
 
-    const narrow = window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches;
+    const narrow = window.matchMedia(NARROW_VIEWPORT_MEDIA_QUERY).matches;
     await waitFor(
       () => {
         const inHeader = countVisiblePRLinks("workspace-menu-bar");
@@ -499,7 +499,7 @@ export const IPhone16eTimelineDialog: AppStory = {
     // The Timeline menu action is gated on `window.matchMedia`, which the fixed-width
     // decorator cannot move; only assert where the viewport is genuinely narrow (Pixel's
     // phone viewport). The test-runner executes at desktop window size and skips here.
-    if (!window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches) {
+    if (!window.matchMedia(NARROW_VIEWPORT_MEDIA_QUERY).matches) {
       return;
     }
 

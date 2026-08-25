@@ -34,7 +34,7 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type * as ExperimentsModuleType from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
-  NARROW_VIEWPORT_MAX_WIDTH_PX,
+  NARROW_VIEWPORT_MEDIA_QUERY,
   WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
 } from "@/constants/layout";
 
@@ -429,7 +429,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
 
   it("offers the Timeline action on narrow viewports and opens the dialog", () => {
     mockTimelineExperimentEnabled = true;
-    stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+    stubMatchMedia((query) => query === NARROW_VIEWPORT_MEDIA_QUERY);
 
     render(<WorkspaceMenuBar {...defaultProps} />);
 
@@ -455,7 +455,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   it("hides the Timeline action when the timeline experiment is disabled", () => {
-    stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+    stubMatchMedia((query) => query === NARROW_VIEWPORT_MEDIA_QUERY);
 
     render(<WorkspaceMenuBar {...defaultProps} />);
 
@@ -487,9 +487,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   it("re-gates the Timeline action when the viewport crosses the narrow breakpoint", () => {
     mockTimelineExperimentEnabled = true;
     let narrow = false;
-    const media = stubMatchMedia(
-      (query) => narrow && query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`
-    );
+    const media = stubMatchMedia((query) => narrow && query === NARROW_VIEWPORT_MEDIA_QUERY);
 
     render(<WorkspaceMenuBar {...defaultProps} />);
     expect(getLastMenuContentProps()?.onOpenTimeline).toBeNull();
@@ -504,7 +502,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
 
   it("opens the timeline dialog with the keyboard shortcut on narrow viewports", () => {
     mockTimelineExperimentEnabled = true;
-    stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+    stubMatchMedia((query) => query === NARROW_VIEWPORT_MEDIA_QUERY);
 
     render(<WorkspaceMenuBar {...defaultProps} />);
 
@@ -531,7 +529,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
 
   it("ignores the timeline shortcut while another modal is open", () => {
     mockTimelineExperimentEnabled = true;
-    stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+    stubMatchMedia((query) => query === NARROW_VIEWPORT_MEDIA_QUERY);
 
     const modal = document.createElement("div");
     modal.setAttribute("role", "dialog");
@@ -550,7 +548,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
 
   it("closes the timeline dialog when switching workspaces", () => {
     mockTimelineExperimentEnabled = true;
-    stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+    stubMatchMedia((query) => query === NARROW_VIEWPORT_MEDIA_QUERY);
 
     const view = render(<WorkspaceMenuBar {...defaultProps} />);
 

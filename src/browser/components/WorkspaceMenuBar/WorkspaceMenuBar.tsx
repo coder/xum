@@ -56,7 +56,7 @@ import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import {
   MOBILE_TOUCH_MEDIA_QUERY,
-  NARROW_VIEWPORT_MAX_WIDTH_PX,
+  NARROW_VIEWPORT_MEDIA_QUERY,
   WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
 } from "@/constants/layout";
 import { TimelineDialog } from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
@@ -218,7 +218,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       }
       return window.getComputedStyle(sidebar).display === "none";
     }
-    return window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches;
+    return window.matchMedia(NARROW_VIEWPORT_MEDIA_QUERY).matches;
   }, []);
 
   // Keep the gate reactive: resizing re-evaluates CSS instantly, but a render-time read
@@ -229,7 +229,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   useEffect(() => {
     const compute = () => setTimelineSidebarHidden(isTimelineSidebarHidden());
     compute();
-    const mql = window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+    const mql = window.matchMedia(NARROW_VIEWPORT_MEDIA_QUERY);
     mql.addEventListener("change", compute);
     const shell = menuBarRef.current?.closest("[data-workspace-shell]");
     let resizeObserver: ResizeObserver | undefined;
