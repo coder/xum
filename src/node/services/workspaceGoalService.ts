@@ -2060,6 +2060,7 @@ export class WorkspaceGoalService {
         // here so the optimistic Goal tab snapshot preserves id/accounting
         // and applies budget-driven status before stream end.
         let projected: GoalRecordV1;
+        let projectedIsFreshGoal = false;
         if (input.editInPlace === true && current) {
           const renamed = GoalRecordV1Schema.parse({
             ...current,
@@ -2083,6 +2084,7 @@ export class WorkspaceGoalService {
             status: input.status,
             completionSummary: input.completionSummary,
           });
+          projectedIsFreshGoal = true;
         }
         if (
           (projected.status === "active" || projected.status === "budget_limited") &&
@@ -2097,6 +2099,22 @@ export class WorkspaceGoalService {
           // Avoid queueing after the one stream-end drain has already observed no
           // pending mutation.
           return null;
+        }
+        if (projectedIsFreshGoal) {
+          // Codex P2 (PRRT_kwDOPxxmWM6b-CH5): createGoal() stamped createdAtMs
+          // before the kickoff-model validation and streaming re-check awaits
+          // above. A message queued during those awaits postdates that stamp
+          // yet predates the goal becoming visible, so the pre-goal guard
+          // (enqueuedAtMs <= createdAtMs) would misread it as an intervention
+          // against a goal the user could not have seen. Stamp creation at
+          // publication instead. Existing-goal branches keep their original
+          // durable createdAtMs — those goals were published long ago.
+          const publishedAtMs = Date.now();
+          projected = GoalRecordV1Schema.parse({
+            ...projected,
+            createdAtMs: publishedAtMs,
+            updatedAtMs: publishedAtMs,
+          });
         }
         this.pendingGoalMutations.set(input.workspaceId, {
           objective,

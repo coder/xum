@@ -2268,6 +2268,39 @@ describe("WorkspaceGoalService", () => {
     expect(drained?.createdAtMs).toBe(projected?.createdAtMs ?? -1);
   });
 
+  test("queued mid-stream goal creation stamps creation at publication time", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6b-CH5): awaits between goal construction and
+    // publication (kickoff-model pricing validation, streaming re-check) leave
+    // a window where a user can queue a message after createdAtMs was stamped
+    // but before the goal is visible anywhere. Creation must date from
+    // publication so the pre-goal guard (enqueuedAtMs <= createdAtMs) covers
+    // messages typed during that window.
+    const dispatcher = new IdleDispatcher();
+    let midValidationMs = 0;
+    service.registerGoalContinuationConsumer(dispatcher, {
+      ...continuationBridge(),
+      getKickoffSendOptions: async () => {
+        // Hold the validation await so wall-clock time observably advances
+        // between construction and publication.
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        midValidationMs = Date.now();
+        return { model: "openai:gpt-4o", agentId: "exec" };
+      },
+    });
+    await extensionMetadata.setStreaming(workspaceId, true);
+
+    const queued = await service.setGoal({
+      workspaceId,
+      objective: "Publication stamp",
+      budgetCents: 500,
+    });
+
+    expect(queued.success).toBe(true);
+    expect(midValidationMs).toBeGreaterThan(0);
+    const projected = queued.success ? queued.data : null;
+    expect(projected?.createdAtMs ?? -1).toBeGreaterThanOrEqual(midValidationMs);
+  });
+
   test("queued mid-stream goal replacement preserves expectedGoalId at drain time", async () => {
     const created = await setGoalOk(service, { workspaceId, objective: "Original" });
     await extensionMetadata.setStreaming(workspaceId, true);
