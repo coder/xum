@@ -3026,25 +3026,40 @@ export class WorkspaceGoalService {
 
   async applyPendingAfterStreamEnd(workspaceId: string): Promise<GoalRecordV1 | null> {
     this.liveGoalPreviewSnapshots.delete(workspaceId);
-    let pending = this.pendingGoalMutations.get(workspaceId);
-    if (pending) {
-      // Codex P2 (PRRT_kwDOPxxmWM6b_KgE): a queued setGoal may be holding the
-      // goal file lock mid-publication; its post-publication re-stamp replaces
-      // this mutation object with one carrying the finalized publication
-      // createdAtMs. Taking the mutation here without the locked handoff would
-      // drain the pre-publication construction stamp, and a message authored
-      // during the publication await would then be misclassified as a
-      // post-goal intervention.
-      //
-      // Codex P2 (PRRT_kwDOPxxmWM6cANQH): the claim (read + delete) must
-      // happen INSIDE one lock tenure. Setters install/replace mutations only
-      // while holding this lock, so an unlocked reread-then-delete after a
-      // bare barrier could interleave with a setter that queued behind the
-      // barrier: the drain would persist the older mutation and strand the
-      // setter's newer one with no remaining stream-end hook. The claim also
-      // honors discards that landed in the window (user abort / clearGoal),
-      // which delete the mutation before the claim runs.
-      pending = await this.fileLocks.withLock(workspaceId, () => {
+    let drained: GoalRecordV1 | null = null;
+
+    // Codex P2 (PRRT_kwDOPxxmWM6b_KgE): a queued setGoal may be holding the
+    // goal file lock mid-publication; its post-publication re-stamp replaces
+    // the mutation object with one carrying the finalized publication
+    // createdAtMs. Taking the mutation without the locked handoff would drain
+    // the pre-publication construction stamp, and a message authored during
+    // the publication await would then be misclassified as a post-goal
+    // intervention.
+    //
+    // Codex P2 (PRRT_kwDOPxxmWM6cANQH): the claim (read + delete) must happen
+    // INSIDE one lock tenure — setters install/replace mutations only while
+    // holding this lock, so an unlocked reread-then-delete could steal an
+    // older mutation mid-setter. The claim also honors discards that landed
+    // in the window (user abort / clearGoal), which delete the mutation
+    // before the claim runs.
+    //
+    // Codex P2 (PRRT_kwDOPxxmWM6cAl6e): persistence (setGoalImmediately) is a
+    // separate lock tenure, and the async streaming=false metadata update can
+    // still report the ended stream as live — a setter interleaving between
+    // claim and persistence can therefore install a NEWER mutation expecting
+    // a stream-end drain that would otherwise never come (this is the last
+    // one). Loop until no pending mutation remains so any replacement is
+    // deterministically drained; the newest mutation persists last and wins.
+    // The pass cap is defensive — installs require a live-looking stream, so
+    // replacements cannot arrive indefinitely after stream end.
+    for (let pass = 0; pass < 10; pass += 1) {
+      // Unlocked fast path: setters install before publication, so a setter
+      // mid-publication always has a visible mutation here; an empty map means
+      // there is nothing to hand off (the common no-mutation stream end).
+      if (this.pendingGoalMutations.get(workspaceId) == null) {
+        break;
+      }
+      const pending = await this.fileLocks.withLock(workspaceId, () => {
         const claimed = this.pendingGoalMutations.get(workspaceId);
         if (claimed != null) {
           this.pendingGoalMutations.delete(workspaceId);
@@ -3052,10 +3067,10 @@ export class WorkspaceGoalService {
         }
         return Promise.resolve(claimed);
       });
-    }
-    let drained: GoalRecordV1 | null = null;
+      if (pending == null) {
+        break;
+      }
 
-    if (pending) {
       // Mirror the `setGoal` wrapper here: invalid queued transitions must
       // be logged and swallowed so the stream-end pipeline stays alive.
       // The caller already treats null as "no apply happened".
@@ -3068,7 +3083,7 @@ export class WorkspaceGoalService {
             replacementCreatedAtMs: projectedCreatedAtMs ?? null,
           }
         );
-        drained = result.success ? result.data : null;
+        drained = result.success ? result.data : drained;
       } catch (error) {
         log.warn("applyPendingAfterStreamEnd: dropped invalid queued goal mutation", {
           workspaceId,

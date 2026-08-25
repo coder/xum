@@ -2416,6 +2416,53 @@ describe("WorkspaceGoalService", () => {
     expect(persisted?.createdAtMs ?? -1).toBeGreaterThanOrEqual(lastActivityReadMs);
   });
 
+  test("drain loops to persist a replacement mutation installed between claim and persistence", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cAl6e): the drain's claim and its persistence
+    // run in separate lock tenures, and a setter interleaving between them can
+    // still see the ended stream as live (async streaming=false update) and
+    // install a NEWER mutation expecting a stream-end drain that would never
+    // come. The drain must loop so the replacement is persisted too — a
+    // single-pass drain persists the older mutation and strands the newer one.
+    await extensionMetadata.setStreaming(workspaceId, true);
+    const first = await service.setGoal({ workspaceId, objective: "First goal" });
+    expect(first.success).toBe(true);
+
+    const serviceAccess = service as unknown as {
+      fileLocks: { withLock: <T>(key: string, fn: () => Promise<T>) => Promise<T> };
+      pendingGoalMutations: Map<string, unknown>;
+    };
+    // Hold the goal file lock with a gate so lock-queue order is
+    // deterministic: [gate] -> drain claim -> replacement setter -> drain
+    // persistence. The replacement setter therefore provably lands between
+    // the drain's claim and its persistence tenure.
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const gateTenure = serviceAccess.fileLocks.withLock(workspaceId, () => gate);
+
+    // Queues the claim tenure behind the gate synchronously (the unlocked
+    // fast-path check and withLock call run before the first await).
+    const drainPromise = service.applyPendingAfterStreamEnd(workspaceId);
+    const replacementPromise = service.setGoal({
+      workspaceId,
+      objective: "Replacement goal",
+      forceNewGoal: true,
+    });
+    // Let the replacement setter finish its pre-lock streaming check and
+    // queue on the lock before the gate opens.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    releaseGate();
+    await gateTenure;
+
+    const [drained, replacement] = await Promise.all([drainPromise, replacementPromise]);
+
+    expect(replacement.success).toBe(true);
+    expect(drained).toMatchObject({ objective: "Replacement goal" });
+    // Nothing may be left stranded for a stream-end hook that will not come.
+    expect(serviceAccess.pendingGoalMutations.get(workspaceId)).toBeUndefined();
+  });
+
   test("queued mid-stream goal replacement preserves expectedGoalId at drain time", async () => {
     const created = await setGoalOk(service, { workspaceId, objective: "Original" });
     await extensionMetadata.setStreaming(workspaceId, true);
