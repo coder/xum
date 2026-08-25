@@ -170,6 +170,12 @@ export function extractAttachmentsFromToolOutput(
  * instead of raw base64 riding as JSON text. Kernel-compacted records drop
  * result contents, so there is nothing to extract (the guest still received
  * the full data and can offload it via vars/return handles).
+ *
+ * The outer `result` (the guest's return value) is processed too: sandbox
+ * code that does `return xum.<mediaTool>(...)` duplicates the media container
+ * in both the record and the return value, and rewriting only the record
+ * would still ship the oversized JSON. Identical media appearing in both
+ * places is deduplicated into a single attachment.
  */
 function extractAttachmentsFromNestedToolCalls(
   output: unknown
@@ -183,6 +189,17 @@ function extractAttachmentsFromNestedToolCalls(
   }
 
   const attachments: ExtractedToolAttachment[] = [];
+  const seen = new Set<string>();
+  const pushUnique = (items: ExtractedToolAttachment[]) => {
+    for (const item of items) {
+      const key = `${item.mediaType}:${item.filename ?? ""}:${item.data}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        attachments.push(item);
+      }
+    }
+  };
+
   let didChange = false;
   const newToolCalls = toolCalls.map((record: unknown) => {
     if (typeof record !== "object" || record === null) {
@@ -193,15 +210,29 @@ function extractAttachmentsFromNestedToolCalls(
       return record;
     }
     didChange = true;
-    attachments.push(...extracted.attachments);
+    pushUnique(extracted.attachments);
     return { ...record, result: extracted.newOutput };
   });
+
+  const outerResult = (output as { result?: unknown }).result;
+  const extractedOuter = extractAttachmentsFromToolOutput(outerResult);
+  if (extractedOuter != null) {
+    didChange = true;
+    pushUnique(extractedOuter.attachments);
+  }
 
   if (!didChange) {
     return null;
   }
 
-  return { newOutput: { ...output, toolCalls: newToolCalls }, attachments };
+  return {
+    newOutput: {
+      ...output,
+      toolCalls: newToolCalls,
+      ...(extractedOuter != null ? { result: extractedOuter.newOutput } : {}),
+    },
+    attachments,
+  };
 }
 
 type ProviderReadyToolAttachment =

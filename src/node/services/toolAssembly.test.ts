@@ -38,13 +38,24 @@ describe("applyToolPolicyAndExperiments", () => {
     // hide the prompt catalog.
     expect(names).toContain("mcp_prompt_get");
     expect(result.mcp_prompt_get.description).toContain("mcp__s__p");
+
+    // Promoted tools must not ALSO stay bridged: request.assemble hooks see
+    // only top-level tools, and a bridged duplicate would keep dispatching
+    // the pre-hook implementation behind a hook's filter or wrapper.
+    const evalResult = (await result.code_execution.execute!(
+      { code: "return typeof mux.mcp_prompt_get;" },
+      { toolCallId: "test-call-id", messages: [], context: undefined }
+    )) as { success: boolean; result?: unknown };
+    expect(evalResult.success).toBe(true);
+    expect(evalResult.result).toBe("undefined");
   });
 
   test("context-coupled and media tools stay model-visible under PTC", async () => {
     // memory/advisor: AIService keys system-prompt context (memory index /
     // hot set, advisor guidance) off their top-level presence. attach_file /
-    // desktop_screenshot: extractToolMediaAsUserMessages only converts
-    // TOP-LEVEL media outputs into model-visible multimodal parts.
+    // desktop_screenshot: top-level outputs guarantee model-visible media in
+    // both classic and kernel modes (kernel-compacted nested records drop
+    // result contents, so nested media would be lost to the model there).
     const result = await applyToolPolicyAndExperiments({
       allTools: {
         bash: executableTool("Run a command"),
@@ -93,6 +104,15 @@ describe("applyToolPolicyAndExperiments", () => {
       emitNestedToolEvent: () => undefined,
     });
     expect(Object.keys(result).sort()).toEqual(["bash", "code_execution"]);
+
+    // The promoted tool leaves the bridge entirely (no duplicated dispatch
+    // path that assemble hooks cannot see); other bridgeable tools remain.
+    const evalResult = (await result.code_execution.execute!(
+      { code: "return [typeof mux.bash, typeof mux.file_read];" },
+      { toolCallId: "test-call-id", messages: [], context: undefined }
+    )) as { success: boolean; result?: unknown };
+    expect(evalResult.success).toBe(true);
+    expect(evalResult.result).toEqual(["undefined", "function"]);
   });
 
   test("grant-denied tools are hidden from the model but stubbed in the sandbox", async () => {

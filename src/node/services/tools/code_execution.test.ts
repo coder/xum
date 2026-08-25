@@ -869,6 +869,52 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-offload");
     });
 
+    it("keeps results on persistence-critical records (file_edit_*/agent_skill_read) in kernel mode", async () => {
+      // Post-compaction persistence extractors mine nested file_edit_* diffs
+      // (extractEditedFileDiffs) and agent_skill_read snapshots
+      // (loadedSkillSnapshots) from history; suppressing these like ordinary
+      // kernel records would silently lose that context after compaction.
+      using tmp = new DisposableTempDir("code-exec-persist-records");
+      const host = new SandboxHostService();
+      const tools: Record<string, Tool> = {
+        file_edit_insert: createMockTool(
+          "file_edit_insert",
+          z.object({ path: z.string() }),
+          () => ({
+            success: true,
+            diff: "@@ -0,0 +1 @@\n+hello",
+          })
+        ),
+        agent_skill_read: createMockTool(
+          "agent_skill_read",
+          z.object({ name: z.string() }),
+          () => ({
+            success: true,
+            content: "---\nname: demo\n---\nBody",
+          })
+        ),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(tools),
+        undefined,
+        persistentRunner(host, "ws-persist-records", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        {
+          code: 'mux.file_edit_insert({path: "/a.ts"}); mux.agent_skill_read({name: "demo"}); return true;',
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const editRecord = result.toolCalls.find((r) => r.toolName === "file_edit_insert");
+      expect((editRecord?.result as { diff?: string })?.diff).toContain("+hello");
+      const skillRecord = result.toolCalls.find((r) => r.toolName === "agent_skill_read");
+      expect((skillRecord?.result as { content?: string })?.content).toContain("name: demo");
+      await host.disposeScope("ws-persist-records");
+    });
+
     it("marks compact records not-ok when the tool resolved with success:false", async () => {
       // file_read-style tools resolve normally with {success:false} for
       // missing/oversized/directory paths — no thrown error. The compact

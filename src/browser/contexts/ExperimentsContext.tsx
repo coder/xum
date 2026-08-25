@@ -15,6 +15,7 @@ import {
   isExperimentSupportedOnPlatform,
 } from "@/common/constants/experiments";
 import { getStorageChangeEvent } from "@/common/constants/events";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useAPI } from "@/browser/contexts/API";
 
 /**
@@ -54,11 +55,7 @@ function isExperimentSupported(experimentId: ExperimentId): boolean {
  * build.
  */
 export function hasLegacyPtcExclusiveOverride(): boolean {
-  try {
-    return window.localStorage.getItem(getLegacyPtcExclusiveExperimentKey()) === "true";
-  } catch {
-    return false;
-  }
+  return readPersistedState<unknown>(getLegacyPtcExclusiveExperimentKey(), undefined) === true;
 }
 
 /**
@@ -127,8 +124,11 @@ function setExperimentState(experimentId: ExperimentId, enabled: boolean): void 
     // wins over the mirrored backend value in its send options, so a stale
     // entry would resurrect supplement mode (stale false) or re-enable PTC
     // after the user turned it off (stale true). Keep it equal to PTC.
+    // Routed through updatePersistedState so the mirror participates in the
+    // shared write-listener/subscriber notification path like other
+    // persisted preferences.
     if (experimentId === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING) {
-      window.localStorage.setItem(getLegacyPtcExclusiveExperimentKey(), JSON.stringify(enabled));
+      updatePersistedState(getLegacyPtcExclusiveExperimentKey(), enabled);
     }
 
     // Dispatch custom event for same-tab synchronization

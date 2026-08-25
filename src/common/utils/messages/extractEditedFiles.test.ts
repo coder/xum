@@ -118,8 +118,10 @@ describe("nested PTC edit records (exclusive posture)", () => {
   });
 
   it("kernel-compacted records surface the path but no diff", () => {
-    // Kernel record compaction drops result contents (ok bit only): the edit
-    // is still tracked by path, but no diff content survives to preserve.
+    // Current kernel compaction exempts file_edit_* records (results kept for
+    // exactly this extractor), but result-less compact records still exist in
+    // history persisted by earlier builds and must degrade to path-only
+    // tracking instead of being dropped.
     const messages: MuxMessage[] = [
       createCodeExecutionMessage([
         { toolName: "file_edit_replace_string", args: { path: "/kernel.ts" }, ok: true, bytes: 9 },

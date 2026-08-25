@@ -2925,7 +2925,10 @@ export class AIService extends EventEmitter {
         tools = assembleCtx.tools;
         // PTC needs no post-hook bridge reconcile: bridgeable tools are not
         // in the hook-visible record, so middleware cannot invalidate the
-        // ToolBridge code_execution closes over.
+        // ToolBridge code_execution closes over. Tools promoted to the
+        // model-visible set (policy-required tools, mcp_prompt_get) are
+        // excluded from the bridge at assembly time (see toolAssembly), so
+        // a hook that filters or wraps them affects the only dispatch path.
         // Tool-search state was classified from the pre-hook record; a hook
         // that added/removed tools would leave allToolNames/deferred/active
         // sets stale (prepareStep scoping + sentinel names both read them).

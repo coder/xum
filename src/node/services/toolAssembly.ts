@@ -210,9 +210,38 @@ export async function applyToolPolicyAndExperiments(
       // Lazy-load PTC modules only when experiments are enabled
       const ptc = await getPTCModules();
 
+      // Keep mcp_prompt_get direct because sandbox declarations omit its
+      // multiline prompt catalog.
+      const promptGet = policyFilteredTools.mcp_prompt_get;
+      // Policy-REQUIRED tools stay model-visible: "require" gates run
+      // completion on a top-level toolResult for that name
+      // (StreamManager.createStopWhenCondition), which a nested xum.* call
+      // inside a code_execution record never satisfies. Sourced from the
+      // grant-and-policy-filtered record so both ceilings still apply.
+      const requiredPatterns = buildRequiredToolPatterns(effectiveToolPolicy);
+      const requiredTools = Object.fromEntries(
+        Object.entries(policyFilteredTools).filter(([name]) =>
+          requiredPatterns.some((pattern) => pattern.test(name))
+        )
+      );
+
+      // Tools promoted to the model-visible set must NOT also stay bridged:
+      // the request.assemble hook contract lets middleware filter or wrap
+      // top-level tools, and a bridged duplicate would keep dispatching the
+      // pre-hook implementation behind the hook's back (the assemble-hook
+      // rebuild machinery was removed on the premise that bridged tools are
+      // never hook-visible — promotion must preserve that premise).
+      const promotedToolNames = new Set(Object.keys(requiredTools));
+      if (promptGet !== undefined) {
+        promotedToolNames.add("mcp_prompt_get");
+      }
+
       // ToolBridge uses the pre-grant policy-filtered tools — the bridge
       // enforces grants itself (denied tools become explicit error stubs).
-      const toolBridge = new ptc.ToolBridge(policyFilteredPreGrant, opts.capabilityGrants);
+      const bridgeInput = Object.fromEntries(
+        Object.entries(policyFilteredPreGrant).filter(([name]) => !promotedToolNames.has(name))
+      );
+      const toolBridge = new ptc.ToolBridge(bridgeInput, opts.capabilityGrants);
 
       // Singleton runtime factory (WASM module is expensive to load)
       ptc.runtimeFactory ??= new ptc.QuickJSRuntimeFactory();
@@ -271,21 +300,6 @@ export async function applyToolPolicyAndExperiments(
       const nonBridgeable = opts.capabilityGrants
         ? applyCapabilityGrants(toolBridge.getNonBridgeableTools(), opts.capabilityGrants)
         : toolBridge.getNonBridgeableTools();
-      // Keep mcp_prompt_get direct because sandbox declarations omit its
-      // multiline prompt catalog.
-      const promptGet = policyFilteredTools.mcp_prompt_get;
-      // Policy-REQUIRED tools stay model-visible: "require" gates run
-      // completion on a top-level toolResult for that name
-      // (StreamManager.createStopWhenCondition), which a nested xum.* call
-      // inside a code_execution record never satisfies. Sourced from the
-      // grant-and-policy-filtered record so both ceilings still apply; the
-      // tool also stays bridged, which is harmless duplication.
-      const requiredPatterns = buildRequiredToolPatterns(effectiveToolPolicy);
-      const requiredTools = Object.fromEntries(
-        Object.entries(policyFilteredTools).filter(([name]) =>
-          requiredPatterns.some((pattern) => pattern.test(name))
-        )
-      );
       toolsForModel = {
         ...nonBridgeable,
         ...requiredTools,

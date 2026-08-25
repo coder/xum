@@ -157,6 +157,68 @@ describe("extractToolMediaAsUserMessages", () => {
     expect(filePart.url).toContain(base64.slice(0, 100));
   });
 
+  it("dedupes media returned from code_execution (record + outer result carry the same payload)", async () => {
+    // `return xum.<mediaTool>(...)` duplicates the media container in the
+    // nested record AND the outer result; both copies must be replaced, and
+    // the model should receive a single attachment.
+    const base64 = (
+      await sharp({
+        create: {
+          width: 10,
+          height: 10,
+          channels: 3,
+          background: { r: 0, g: 255, b: 0 },
+        },
+      })
+        .png()
+        .toBuffer()
+    ).toString("base64");
+
+    const mediaContainer = {
+      type: "content",
+      value: [{ type: "media", mediaType: "image/png", data: base64 }],
+    };
+    const input: MuxMessage[] = [
+      {
+        id: "ce2",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call1",
+            toolName: "code_execution",
+            input: { code: "return xum.mcp__shots__take({});" },
+            state: "output-available",
+            output: {
+              success: true,
+              result: mediaContainer,
+              toolCalls: [{ toolName: "mcp__shots__take", args: {}, result: mediaContainer }],
+            },
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    expect(rewritten).toHaveLength(2);
+
+    const toolPart = rewritten[0].parts[0];
+    if (toolPart.type !== "dynamic-tool" || toolPart.state !== "output-available") {
+      throw new Error("Expected an output-available dynamic-tool part");
+    }
+    // Both copies replaced — no base64 rides as JSON text anywhere.
+    expect(JSON.stringify(toolPart.output)).not.toContain(base64);
+
+    const syntheticUser = rewritten[1];
+    const fileParts = syntheticUser.parts.filter((part) => part.type === "file");
+    expect(fileParts).toHaveLength(1);
+    expect(syntheticUser.parts[0]).toEqual({
+      type: "text",
+      text: "[Attached 1 attachment(s) from tool output]",
+    });
+  });
+
   it("self-heals oversized raster tool attachments by downscaling them for provider requests", async () => {
     const oversizedPng = await sharp({
       create: {

@@ -32,6 +32,7 @@ import {
 } from "@/constants/resultHandles";
 import { KERNEL_COMPACT_ARGS_CAP_BYTES, KERNEL_CONSOLE_CAP_BYTES } from "@/constants/kernelOutput";
 import { sliceUtf8Bytes } from "@/common/utils/sliceUtf8Bytes";
+import { FILE_EDIT_TOOL_NAMES } from "@/common/types/tools";
 
 // Default limits
 const DEFAULT_MEMORY_BYTES = 64 * 1024 * 1024; // 64MB
@@ -279,6 +280,10 @@ async function offloadOversizedReturnValue(
  * touches the record), and the model needs the key/shape it just created.
  * When the kernel load is inactive, a bridged tool that happens to be named
  * "load" gets no exception (its records are ordinary and must not leak).
+ *
+ * Exception: agent_skill_read and file_edit_* records keep their result —
+ * post-compaction persistence extractors depend on it (see the inline
+ * comment below).
  */
 function compactKernelToolCallRecords(result: PTCExecutionResult, loadActive: boolean): void {
   result.toolCalls = result.toolCalls.map((record) => {
@@ -291,6 +296,25 @@ function compactKernelToolCallRecords(result: PTCExecutionResult, loadActive: bo
     // messages echo guest paths verbatim (ENAMETOOLONG), so bound both like
     // every other record.
     if (loadActive && record.toolName === "load") {
+      return {
+        ...record,
+        args: boundCompactRecordArgs(record.args),
+        ...(record.error !== undefined ? { error: boundCompactRecordError(record.error) } : {}),
+      };
+    }
+    // Persistence-critical records also keep their result: compaction mines
+    // successful nested file_edit_* diffs (extractEditedFileDiffs /
+    // extractEditedFilePaths) and agent_skill_read snapshots
+    // (loadedSkillSnapshots) out of history, so suppressing these like
+    // ordinary kernel records would silently lose edited-file diffs and
+    // loaded-skill gating context after compaction in RLM mode. Their results
+    // are repo-controlled (unified diffs / SKILL.md snapshots) — the same
+    // trust and size class classic-mode records already expose — and
+    // creation-time kernel record bounds still stub oversized values.
+    if (
+      record.toolName === "agent_skill_read" ||
+      FILE_EDIT_TOOL_NAMES.includes(record.toolName as (typeof FILE_EDIT_TOOL_NAMES)[number])
+    ) {
       return {
         ...record,
         args: boundCompactRecordArgs(record.args),
