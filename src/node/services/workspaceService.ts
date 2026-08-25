@@ -12192,6 +12192,11 @@ export class WorkspaceService extends EventEmitter {
   private async getDelegatedTurnContinuationSendOptions(
     workspaceId: string
   ): Promise<SendMessageOptions | null> {
+    // Tests construct WorkspaceService with partial HistoryService mocks (same
+    // defensive pattern as the iterateFullHistory caller above).
+    if (typeof this.historyService.getHistoryFromLatestBoundary !== "function") {
+      return null;
+    }
     const history = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
     if (!history.success) {
       return null;
