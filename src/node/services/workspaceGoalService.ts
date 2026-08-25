@@ -236,6 +236,15 @@ interface ChatTailGoalModeResult {
    */
   pausedBy?: "pause_boundary" | "manual_user";
   /**
+   * When `pausedBy === "pause_boundary"`: true when the boundary row carried a
+   * goalId matching the reconciled goal. Scoped boundaries are only appended
+   * AFTER their pause persisted durably, so a durably ACTIVE goal beneath a
+   * matching scoped boundary proves a later Resume — reconciliation must not
+   * let the stale boundary undo it. Legacy unscoped boundaries keep the old
+   * any-goal semantics (Codex P2 PRRT_kwDOPxxmWM6cLpIT).
+   */
+  boundaryGoalScoped?: boolean;
+  /**
    * When `pausedBy === "manual_user"`: the moment the user authored the pausing
    * row — its persisted enqueue time (queued sends) or the row timestamp.
    * Reconciliation compares this against `goal.createdAtMs` to tell pre-goal
@@ -686,7 +695,13 @@ export class WorkspaceGoalService {
           // old any-goal semantics.
           continue;
         }
-        return { mode: "paused", pausedBy: "pause_boundary" };
+        return {
+          mode: "paused",
+          pausedBy: "pause_boundary",
+          ...(boundaryGoalId != null && boundaryGoalId === currentGoalId
+            ? { boundaryGoalScoped: true }
+            : {}),
+        };
       }
       if (message.metadata?.synthetic === true) {
         continue;
@@ -768,6 +783,22 @@ export class WorkspaceGoalService {
       if (candidate?.source === "kickoff" && candidate.goalId === goal.goalId) {
         return goal;
       }
+    }
+
+    // Codex P2 (PRRT_kwDOPxxmWM6cLpIT): every pause path persists the durable
+    // paused status BEFORE its finalizer appends the goal-scoped boundary, so
+    // a durably ACTIVE goal beneath its own scoped boundary proves an explicit
+    // Resume postdated the pause (the finalizer's append raced the Resume) or
+    // a crash interrupted the resumed goal's kickoff window. Either way the
+    // Resume is the newer user intent — the stale boundary must not write the
+    // goal back to paused. Legacy unscoped boundaries keep any-goal semantics.
+    if (
+      goal.status === "active" &&
+      chatTailMode.mode === "paused" &&
+      chatTailMode.pausedBy === "pause_boundary" &&
+      chatTailMode.boundaryGoalScoped === true
+    ) {
+      return goal;
     }
 
     // Codex P1 (PRRT_kwDOPxxmWM6cIyKW): between a durable pause write and its
@@ -2800,6 +2831,21 @@ export class WorkspaceGoalService {
             });
           }
           await this.writeGoal(input.workspaceId, updated);
+          // Codex P1 (PRRT_kwDOPxxmWM6cLpIP): the write itself yields. A model
+          // complete_goal takes this direct branch during the live stream; a
+          // Stop landing inside writeGoal advances the generation
+          // synchronously but its locked section queues behind this tenure —
+          // and for an already-complete goal it neither discards nor installs
+          // an acknowledgment gate. Recheck after the write and restore the
+          // prior record before releasing the lock so the aborted turn's
+          // mutation never survives (the stop's queued section then gates the
+          // restored record normally).
+          const stoppedDuringMutableWrite = discardIfUserStopLanded();
+          if (stoppedDuringMutableWrite) {
+            await this.writeGoal(input.workspaceId, current);
+            await this.pushSnapshot(input.workspaceId, current);
+            return stoppedDuringMutableWrite;
+          }
           await this.pushSnapshot(input.workspaceId, updated);
           await this.pushLiveGoalPreviewOverlay(input.workspaceId, updated);
           this.emitBudgetChanged(current, updated, input);
@@ -3280,14 +3326,22 @@ export class WorkspaceGoalService {
    * P2 PRRT_kwDOPxxmWM6cJ6NM). Re-stamping the origin as `"user"` reuses the
    * existing durable suppression the recovery path already honors.
    */
-  async suppressBudgetWrapupForManualUserMessage(workspaceId: string): Promise<void> {
+  async suppressBudgetWrapupForManualUserMessage(
+    workspaceId: string,
+    goalId: string
+  ): Promise<void> {
     assert(
       workspaceId.trim().length > 0,
       "suppressBudgetWrapupForManualUserMessage requires workspaceId"
     );
+    assert(goalId.trim().length > 0, "suppressBudgetWrapupForManualUserMessage requires goalId");
     return this.fileLocks.withLock(workspaceId, async () => {
       const current = await this.readGoalFile(workspaceId);
-      if (current?.status !== "budget_limited") {
+      // Codex P2 (PRRT_kwDOPxxmWM6cLpID): scope the suppression to the goal
+      // the manual message actually acknowledged. A replacement goal that
+      // persisted while the acknowledgment await unwound owes its own wrap-up
+      // — a pre-replacement message cannot have been intervening against it.
+      if (current?.status !== "budget_limited" || current.goalId !== goalId) {
         return;
       }
       // Codex P2 (PRRT_kwDOPxxmWM6cLA0M): persist the durable origin FIRST.

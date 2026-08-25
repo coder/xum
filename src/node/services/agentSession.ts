@@ -1685,7 +1685,10 @@ export class AgentSession {
       // in-memory only — persist the suppression so a restart cannot
       // re-synthesize the autonomous wrap-up over the user's intervention.
       try {
-        await goalService.suppressBudgetWrapupForManualUserMessage(this.workspaceId);
+        // Scoped to the acknowledged goal's identity: a replacement goal that
+        // persisted during the acknowledgment await must not be suppressed by
+        // a message that predates it (Codex P2 PRRT_kwDOPxxmWM6cLpID).
+        await goalService.suppressBudgetWrapupForManualUserMessage(this.workspaceId, goal.goalId);
       } catch (error) {
         // A transient write failure must not break the user's manual send;
         // suppression fails closed (durable-first, so no in-memory state was

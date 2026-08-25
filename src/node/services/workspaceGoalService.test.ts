@@ -3075,8 +3075,13 @@ describe("WorkspaceGoalService", () => {
       budgetLimitInjectedForGoalId: null,
     });
 
+    // Codex P2 (PRRT_kwDOPxxmWM6cLpID): suppression is scoped to the goal the
+    // manual message acknowledged — a different goal's identity is a no-op.
+    await service.suppressBudgetWrapupForManualUserMessage(workspaceId, "goal-someone-else");
+    expect((await service.getGoal(workspaceId))?.budgetLimitOriginKind).not.toBe("user");
+
     // The manual-message hook persists the suppression.
-    await service.suppressBudgetWrapupForManualUserMessage(workspaceId);
+    await service.suppressBudgetWrapupForManualUserMessage(workspaceId, created.goalId);
     expect(await service.getGoal(workspaceId)).toMatchObject({
       status: "budget_limited",
       budgetLimitOriginKind: "user",
@@ -3174,7 +3179,7 @@ describe("WorkspaceGoalService", () => {
     );
     let threw = false;
     try {
-      await service.suppressBudgetWrapupForManualUserMessage(workspaceId);
+      await service.suppressBudgetWrapupForManualUserMessage(workspaceId, created.goalId);
     } catch {
       threw = true;
     }
@@ -3189,9 +3194,112 @@ describe("WorkspaceGoalService", () => {
     expect((await service.getGoal(workspaceId))?.budgetLimitOriginKind).not.toBe("user");
 
     // A retry (next manual message) succeeds and completes both halves.
-    await service.suppressBudgetWrapupForManualUserMessage(workspaceId);
+    await service.suppressBudgetWrapupForManualUserMessage(workspaceId, created.goalId);
     expect(serviceAccess.lastGoalStreamStamps.get(workspaceId)?.originKind).toBe("user");
     expect(await service.getGoal(workspaceId)).toMatchObject({ budgetLimitOriginKind: "user" });
+  });
+
+  test("a stop landing inside the goal write restores the prior record", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cLpIP): a model complete_goal takes the
+    // direct mutable branch during the live stream. The final pre-write stop
+    // check can pass, then the Stop lands while writeGoal is replacing
+    // goal.json; the stop's locked section queues behind the setter's tenure
+    // and, seeing an already-complete goal, neither discards nor gates it.
+    // The setter must recheck after the write and restore the prior record
+    // before releasing the lock.
+    const created = await setGoalOk(service, { workspaceId, objective: "Abort mid-write" });
+    await extensionMetadata.setStreaming(workspaceId, true);
+
+    const serviceAccess = service as unknown as {
+      writeGoal: (id: string, goal: GoalRecordV1) => Promise<void>;
+    };
+    const realWrite = serviceAccess.writeGoal.bind(service);
+    let releaseWrite!: () => void;
+    const writeGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    let writeStarted = false;
+    const writeSpy = spyOn(serviceAccess, "writeGoal").mockImplementationOnce(
+      async (id: string, goal: GoalRecordV1) => {
+        writeStarted = true;
+        await writeGate;
+        return realWrite(id, goal);
+      }
+    );
+
+    const completePromise = service.setGoal({
+      workspaceId,
+      status: "complete",
+      completionSummary: "Done before the user could stop it",
+      initiator: "model",
+    });
+    await waitForCondition(() => writeStarted, { timeoutMs: 5_000 });
+    // Stop lands mid-write: generation bumps synchronously, locked section queues.
+    const stopPromise = service.recordUserStoppedStream(workspaceId);
+    releaseWrite();
+
+    const completed = await completePromise;
+    expect(completed.success).toBe(false);
+    if (!completed.success) {
+      expect(completed.error.type).toBe("invalid_transition");
+    }
+    await stopPromise;
+    writeSpy.mockRestore();
+
+    // Prior record restored; the stop's queued section then gated it normally.
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: created.goalId,
+      status: "active",
+    });
+    expect(typeof (await service.getGoal(workspaceId))?.requireUserAcknowledgmentSinceMs).toBe(
+      "number"
+    );
+  });
+
+  test("an explicit Resume during pause finalization survives the stale boundary", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cLpIT): a same-goal Resume can durably set the
+    // goal active while the old pause finalizer is appending its boundary.
+    // The boundary matches the goalId, so the finalizer's post-append
+    // chat-tail sync (and any later reconciliation) would write the goal back
+    // to paused — undoing the Resume. Durable-active + own scoped boundary
+    // proves the Resume postdated the pause; it must win.
+    const created = await setGoalOk(service, { workspaceId, objective: "Resume during pause" });
+    await appendUserHistoryMessage(historyService, workspaceId, "Continue working on the goal.", {
+      timestamp: Date.now(),
+      synthetic: true,
+      kind: "goal_continuation",
+      goalId: created.goalId,
+    });
+
+    // Gate the finalizer's boundary append; Resume lands inside the window.
+    const realAppend = historyService.appendToHistory.bind(historyService);
+    let releaseAppend!: () => void;
+    const appendGate = new Promise<void>((resolve) => {
+      releaseAppend = resolve;
+    });
+    let appendStarted = false;
+    const appendSpy = spyOn(historyService, "appendToHistory").mockImplementationOnce(
+      async (id, message) => {
+        appendStarted = true;
+        await appendGate;
+        return realAppend(id, message);
+      }
+    );
+
+    const pausePromise = service.setGoal({ workspaceId, status: "paused" });
+    await waitForCondition(() => appendStarted, { timeoutMs: 5_000 });
+    const resumed = await service.setGoal({ workspaceId, status: "active" });
+    expect(resumed.success).toBe(true);
+    releaseAppend();
+    await pausePromise;
+    appendSpy.mockRestore();
+
+    // The stale boundary sits at the tail, but the Resume wins — both in the
+    // finalizer's own post-append sync and in later reconciliations.
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: created.goalId,
+      status: "active",
+    });
   });
 
   test("getGoal during pause finalization does not reactivate the goal being paused", async () => {
