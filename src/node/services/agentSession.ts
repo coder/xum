@@ -245,6 +245,10 @@ function coerceGoalSyntheticMessageKind(value: unknown): GoalSyntheticMessageKin
   return undefined;
 }
 
+function coerceGoalId(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
 const PDF_MEDIA_TYPE = "application/pdf";
 const ACP_PROMPT_ID_METADATA_KEY = "acpPromptId";
 const ACP_DELEGATED_TOOLS_METADATA_KEY = "acpDelegatedTools";
@@ -6887,6 +6891,23 @@ export class AgentSession {
       imageParts?: FilePart[];
     };
 
+    // Compaction summaries are unchecked chat.jsonl. Reject malformed persisted
+    // goal attribution instead of forwarding it into goal-service assertions or
+    // repeatedly crashing startup recovery on the same row.
+    const persistedGoalKind = coerceGoalSyntheticMessageKind(followUp.goalKind);
+    const persistedGoalId = coerceGoalId(followUp.goalId);
+    if (
+      (followUp.goalKind !== undefined && persistedGoalKind == null) ||
+      (followUp.goalId !== undefined && persistedGoalId == null)
+    ) {
+      log.warn("Discarding pending follow-up with malformed goal attribution", {
+        workspaceId: this.workspaceId,
+        summaryMessageId: lastMessage.id,
+      });
+      await this.clearPendingFollowUpFromSummary(lastMessage);
+      return false;
+    }
+
     const hasQueuedMessages = this.hasPendingManualFollowUp();
     const hasActiveNonCompletingTurn = this.isBusy() && this.turnPhase !== TurnPhase.COMPLETING;
     // Codex P1 (PRRT_kwDOPxxmWM6cPuMw): goal-loop follow-ups were originally
@@ -6894,7 +6915,7 @@ export class AgentSession {
     // user message queued during the compaction stream wins the race instead
     // of the synthetic continuation starting first.
     if (
-      (followUp.dispatchOptions?.requireIdle === true || followUp.goalKind != null) &&
+      (followUp.dispatchOptions?.requireIdle === true || persistedGoalKind != null) &&
       (hasQueuedMessages || hasActiveNonCompletingTurn)
     ) {
       log.info("Skipping pending follow-up because the workspace is no longer idle", {
@@ -6939,16 +6960,16 @@ export class AgentSession {
     // evidence. Revalidate against durable goal state and carry a fresh
     // staleness probe through the redispatched send's admission gates.
     let goalAdmissionStale: (() => boolean) | undefined;
-    if (followUp.goalKind != null && followUp.goalId != null && this.workspaceGoalService) {
+    if (persistedGoalKind != null && persistedGoalId != null && this.workspaceGoalService) {
       const admission = await this.workspaceGoalService.buildGoalRedispatchAdmission(
         this.workspaceId,
-        followUp.goalId,
-        followUp.goalKind
+        persistedGoalId,
+        persistedGoalKind
       );
       if (!admission.admissible) {
         log.info("Skipping goal-scoped pending follow-up: goal no longer admits it", {
           workspaceId: this.workspaceId,
-          goalKind: followUp.goalKind,
+          goalKind: persistedGoalKind,
         });
         await this.clearPendingFollowUpFromSummary(lastMessage);
         return false;
@@ -7008,8 +7029,8 @@ export class AgentSession {
     this.setAutoRetryResumeState(
       options,
       followUp.agentInitiated,
-      followUp.goalKind,
-      followUp.goalId
+      persistedGoalKind,
+      persistedGoalId
     );
 
     // Await sendMessage to ensure the follow-up is persisted before returning.
@@ -7020,12 +7041,12 @@ export class AgentSession {
     const sendResult = await this.sendMessage(finalText, options, {
       synthetic: true,
       agentInitiated: followUp.agentInitiated,
-      goalKind: followUp.goalKind,
+      goalKind: persistedGoalKind,
       // Keep the re-dispatched continuation row goal-scoped so a replaced
       // goal's follow-up cannot reactivate its successor during chat-tail
       // reconciliation (Codex P2 PRRT_kwDOPxxmWM6cIv2E).
-      goalId: followUp.goalId,
-      goalContinuation: followUp.goalKind === GOAL_CONTINUATION_KIND,
+      goalId: persistedGoalId,
+      goalContinuation: persistedGoalKind === GOAL_CONTINUATION_KIND,
       // Codex P1 (PRRT_kwDOPxxmWM6cPuMw): re-derived admission guard for the
       // redispatched goal turn (see buildGoalRedispatchAdmission above).
       admissionStale: goalAdmissionStale,

@@ -301,6 +301,50 @@ describe("AgentSession goal safety hooks", () => {
     session.dispose();
   });
 
+  test("malformed persisted follow-up goal IDs are discarded during recovery", async () => {
+    const workspaceId = "compaction-followup-malformed-goal-id";
+    const { session, goalService, historyService, cleanup } =
+      await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    await setGoalOk(goalService, { workspaceId, objective: "Recover safely" });
+    const summary = createMuxMessage(
+      `summary-${crypto.randomUUID()}`,
+      "assistant",
+      "Compacted conversation.",
+      {
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: {
+            text: "Continue working on the goal.",
+            agentId: "exec",
+            model: "openai:gpt-4o",
+            goalKind: GOAL_CONTINUATION_KIND,
+            goalId: { malformed: true } as unknown as string,
+          },
+        },
+      }
+    );
+    expect((await historyService.appendToHistory(workspaceId, summary)).success).toBe(true);
+    const sendSpy = spyOn(session, "sendMessage").mockImplementation(() =>
+      Promise.resolve(Ok(undefined))
+    );
+
+    const dispatched = await (
+      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
+    ).dispatchPendingFollowUp();
+
+    expect(dispatched).toBe(false);
+    expect(sendSpy).not.toHaveBeenCalled();
+    const tail = await historyService.getLastMessages(workspaceId, 1);
+    expect(tail.success).toBe(true);
+    if (tail.success) {
+      const meta = tail.data[0]?.metadata?.muxMetadata;
+      expect(meta && "pendingFollowUp" in meta ? meta.pendingFollowUp : undefined).toBeUndefined();
+    }
+    sendSpy.mockRestore();
+    session.dispose();
+  });
+
   test("synthetic messages do not auto-pause active goals", async () => {
     const workspaceId = "synthetic-does-not-pause";
     const { session, goalService, cleanup } = await createSessionHarness(workspaceId);
