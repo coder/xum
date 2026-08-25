@@ -639,11 +639,15 @@ function installProjectSidebarTestDoubles() {
     ((props: {
       isOpen: boolean;
       projectName: string;
+      activeCount: number;
+      archivedCount: number;
       onConfirm: () => void;
       onCancel: () => void;
     }) =>
       props.isOpen ? (
-        <div data-testid="project-delete-confirmation-modal">{props.projectName}</div>
+        <div data-testid="project-delete-confirmation-modal">
+          {`${props.projectName}:${props.activeCount}:${props.archivedCount}`}
+        </div>
       ) : null) as unknown as typeof ProjectDeleteConfirmationModalModule.ProjectDeleteConfirmationModal
   );
   installProviderIconSvgMocks();
@@ -2368,11 +2372,21 @@ describe("ProjectSidebar project actions menu", () => {
     expect(view.getByRole("button", { name: "Edit name" })).toBeTruthy();
   });
 
-  test("menu actions route to settings and delete confirmation", () => {
+  test("menu actions route to settings and delete confirmation", async () => {
+    const removeProjectCalls: Array<{ path: string; options?: { force?: boolean } }> = [];
     projectContextValue = createProjectContextValue({
       userProjects: new Map([
         [demoProjectPath, { workspaces: [{ path: `${demoProjectPath}/ws-1` }] }],
       ]),
+      removeProject: (path, options) => {
+        removeProjectCalls.push({ path, options });
+        // projects.list excludes archived workspaces, so the delete flow gets
+        // blocker counts from the backend's non-forced rejection.
+        return Promise.resolve({
+          success: false,
+          error: { type: "workspace_blockers", activeCount: 2, archivedCount: 3 },
+        });
+      },
     });
 
     const view = renderSidebar();
@@ -2394,7 +2408,34 @@ describe("ProjectSidebar project actions menu", () => {
     fireEvent.click(view.getByRole("button", { name: "Project options for demo-project" }));
     fireEvent.click(view.getByRole("button", { name: "Delete..." }));
 
-    expect(view.getByTestId("project-delete-confirmation-modal").textContent).toBe("demo-project");
+    // The confirmation dialog shows the backend-reported counts.
+    await waitFor(() => {
+      expect(view.getByTestId("project-delete-confirmation-modal").textContent).toBe(
+        "demo-project:2:3"
+      );
+    });
+    expect(removeProjectCalls).toEqual([{ path: demoProjectPath, options: undefined }]);
+  });
+
+  test("delete removes an empty project immediately without a confirmation dialog", async () => {
+    const removeProjectCalls: Array<{ path: string; options?: { force?: boolean } }> = [];
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([[demoProjectPath, { workspaces: [] }]]),
+      removeProject: (path, options) => {
+        removeProjectCalls.push({ path, options });
+        return Promise.resolve({ success: true });
+      },
+    });
+
+    const view = renderSidebar();
+
+    fireEvent.click(view.getByRole("button", { name: "Project options for demo-project" }));
+    fireEvent.click(view.getByRole("button", { name: "Delete..." }));
+
+    await waitFor(() => {
+      expect(removeProjectCalls).toEqual([{ path: demoProjectPath, options: undefined }]);
+    });
+    expect(view.queryByTestId("project-delete-confirmation-modal")).toBeNull();
   });
 
   test("reopening the color picker does not apply stale pending color", async () => {

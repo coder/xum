@@ -2364,6 +2364,94 @@ exit 1
     });
   });
 
+  describe("list", () => {
+    it("excludes archived workspaces while preserving live ones", async () => {
+      const projectPath = "/fake/project";
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          { id: "live-1", path: "/fake/project/ws-live" },
+          { id: "archived-1", path: "/fake/project/ws-archived", archivedAt: ARCHIVED_AT },
+          {
+            id: "unarchived-1",
+            path: "/fake/project/ws-unarchived",
+            archivedAt: ARCHIVED_AT,
+            unarchivedAt: "2026-01-02T00:00:00.000Z",
+          },
+        ],
+      });
+      await config.editConfig(() => cfg);
+
+      const listed = service.list();
+
+      const project = listed.find(([listedPath]) => listedPath === projectPath)?.[1];
+      expect(project).toBeDefined();
+      expect(project?.workspaces.map((workspace) => workspace.id)).toEqual([
+        "live-1",
+        "unarchived-1",
+      ]);
+    });
+
+    it("keeps live multi-project workspaces in their bucket", async () => {
+      const projectPath = "/fake/project";
+      const otherProjectPath = "/fake/other";
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          {
+            id: "multi-live",
+            path: "/fake/project/ws-multi",
+            projects: [
+              { projectPath, projectName: "project" },
+              { projectPath: otherProjectPath, projectName: "other" },
+            ],
+          },
+          {
+            id: "multi-archived",
+            path: "/fake/project/ws-multi-archived",
+            archivedAt: ARCHIVED_AT,
+            projects: [
+              { projectPath, projectName: "project" },
+              { projectPath: otherProjectPath, projectName: "other" },
+            ],
+          },
+        ],
+      });
+      await config.editConfig(() => cfg);
+
+      const listed = service.list();
+
+      const project = listed.find(([listedPath]) => listedPath === projectPath)?.[1];
+      expect(project?.workspaces.map((workspace) => workspace.id)).toEqual(["multi-live"]);
+      expect(project?.workspaces[0]?.projects?.map((ref) => ref.projectPath)).toEqual([
+        projectPath,
+        otherProjectPath,
+      ]);
+    });
+
+    it("does not modify archived entries in persisted config", async () => {
+      const projectPath = "/fake/project";
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          { id: "live-1", path: "/fake/project/ws-live" },
+          { id: "archived-1", path: "/fake/project/ws-archived", archivedAt: ARCHIVED_AT },
+        ],
+      });
+      await config.editConfig(() => cfg);
+
+      service.list();
+
+      // The projection must not leak into the in-memory or persisted config:
+      // archived entries stay on disk for older builds (downgrade safety).
+      const after = config.loadConfigOrDefault();
+      expect(after.projects.get(projectPath)?.workspaces.map((workspace) => workspace.id)).toEqual([
+        "live-1",
+        "archived-1",
+      ]);
+    });
+  });
+
   describe("remove", () => {
     it("removes project with no workspaces", async () => {
       const projectPath = "/fake/project";

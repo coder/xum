@@ -140,7 +140,6 @@ import { isMultiProject } from "@/common/utils/multiProject";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
-import { getProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { HexColorPicker } from "react-colorful";
@@ -1390,6 +1389,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         : undefined;
 
     // Removing a sub-project unregisters it and clears the cwd pointer from its workspaces.
+    // projects.list excludes archived workspaces, so this count covers live ones only;
+    // that matches the sidebar view this dialog describes, and the action itself is
+    // non-destructive (workspaces just move back to the parent project).
     const workspacesInSection = (userProjects.get(projectPath)?.workspaces ?? []).filter(
       (workspace) => workspace.subProjectPath === subProjectPath
     );
@@ -1480,28 +1482,35 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   );
 
   const handleRequestProjectRemoval = useCallback(
-    (projectPath: string, buttonElement?: HTMLElement) => {
+    async (projectPath: string, buttonElement?: HTMLElement) => {
       const projectConfig = userProjects.get(projectPath);
       if (!projectConfig) {
         return;
       }
 
       const projectName = projectConfig.displayName ?? getProjectNameFromPath(projectPath);
-      const counts = getProjectWorkspaceCounts(projectConfig.workspaces);
-      const total = counts.activeCount + counts.archivedCount;
-      if (total > 0) {
+      // projects.list excludes archived workspaces (read-side projection), so
+      // blocker counts can't be derived from the embedded workspace arrays.
+      // Attempt a non-forced removal instead: empty projects are removed
+      // immediately (same as before), and the backend's workspace_blockers
+      // rejection carries authoritative active/archived counts (including
+      // cross-project references) for the confirmation dialog.
+      const result = await onRemoveProject(projectPath);
+      if (result.success) {
+        return;
+      }
+      if (result.error.type === "workspace_blockers") {
         setDeleteConfirmation({
           projectPath,
           projectName,
-          activeCount: counts.activeCount,
-          archivedCount: counts.archivedCount,
+          activeCount: result.error.activeCount,
+          archivedCount: result.error.archivedCount,
         });
         return;
       }
-
-      void removeProjectWithFeedback(projectPath, undefined, buttonElement);
+      showProjectRemoveError(projectPath, result.error, buttonElement);
     },
-    [removeProjectWithFeedback, userProjects]
+    [onRemoveProject, showProjectRemoveError, userProjects]
   );
 
   const cancelProjectDisplayNameEditing = useCallback(() => {
@@ -1573,7 +1582,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         return;
       }
 
-      handleRequestProjectRemoval(projectMenuTargetPath, buttonElement);
+      void handleRequestProjectRemoval(projectMenuTargetPath, buttonElement);
       closeProjectContextMenu();
     },
     [closeProjectContextMenu, handleRequestProjectRemoval, projectMenuTargetPath]

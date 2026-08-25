@@ -1271,9 +1271,9 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
               updated.set(event.workspaceId, meta);
             }
 
-            // Reload projects when archive state changes so that
-            // getProjectWorkspaceCounts (used for removal eligibility) sees
-            // up-to-date archivedAt timestamps in the project config.
+            // Reload projects when archive state changes so the sidebar's
+            // embedded workspace arrays stay in sync (projects.list excludes
+            // archived workspaces, so archiving/unarchiving changes them).
             const wasInActiveMap = prev.has(event.workspaceId);
             const archiveStateChanged = isNowArchived
               ? wasInActiveMap // was active, now archived

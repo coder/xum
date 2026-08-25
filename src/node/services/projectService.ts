@@ -42,6 +42,7 @@ import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { getErrorMessage } from "@/common/utils/errors";
 import { deriveProjectHierarchy, isPathDescendant } from "@/common/utils/subProjects";
 import { getProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
+import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { z } from "zod";
 
 function orderWorkspacesForCascadeRemoval(
@@ -1411,7 +1412,24 @@ export class ProjectService {
   list(): Array<[string, ProjectConfig]> {
     try {
       const config = this.config.loadConfigOrDefault();
-      return Array.from(deriveProjectHierarchy(config.projects).entries());
+      // Read-side projection: exclude archived workspaces from the listing. On
+      // archive-heavy configs they dominate the payload (measured 84% of a
+      // 1.1 MB projects.list response re-fetched on every config change), and
+      // the UI loads archived workspaces on demand via
+      // workspace.list({ archived: true }). Build new arrays instead of
+      // mutating the loaded config: persisted config.json must keep archived
+      // entries (upgrade/downgrade safety).
+      return Array.from(deriveProjectHierarchy(config.projects).entries()).map(
+        ([projectPath, project]): [string, ProjectConfig] => [
+          projectPath,
+          {
+            ...project,
+            workspaces: project.workspaces.filter(
+              (workspace) => !isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
+            ),
+          },
+        ]
+      );
     } catch (error) {
       log.error("Failed to list projects:", error);
       return [];
