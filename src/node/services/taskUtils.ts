@@ -69,6 +69,36 @@ export async function tryReadGitCurrentBranch(
 }
 
 /**
+ * True when the checkout has no uncommitted changes (including untracked files)
+ * under the given pathspecs; undefined when this cannot be determined (no git,
+ * unreachable runtime). Callers use this as proof that the committed base equals
+ * the working tree for those paths, so "unknown" must stay distinguishable from
+ * "clean".
+ */
+export async function tryReadGitPathsClean(
+  runtime: Runtime,
+  workspacePath: string,
+  pathspecs: readonly string[]
+): Promise<boolean | undefined> {
+  assert(workspacePath.length > 0, "tryReadGitPathsClean: workspacePath must be non-empty");
+  assert(pathspecs.length > 0, "tryReadGitPathsClean: pathspecs must be non-empty");
+
+  try {
+    const quoted = pathspecs.map((pathspec) => `'${pathspec}'`).join(" ");
+    const result = await execBuffered(runtime, `git status --porcelain -- ${quoted}`, {
+      cwd: workspacePath,
+      timeout: 10,
+    });
+    if (result.exitCode !== 0) {
+      return undefined;
+    }
+    return result.stdout.trim().length === 0;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Resolve the effective refusal-fallback chain for a workspace's turn.
  * Task children can opt out via taskOnRefusal: "fail" (e.g. workflow verifier
  * steps that demand an honest terminal failure instead of a silent model

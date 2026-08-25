@@ -659,6 +659,9 @@ export async function readAgentDefinition(
         scope: candidate.scope,
         frontmatter: parsed.frontmatter,
         body: parsed.body,
+        // Exact provenance for strict-send pinning; per-plugin candidate roots are
+        // unique per plugin, so root identity distinguishes file vs plugin sources.
+        source: candidate.root,
       };
 
       const validated = AgentDefinitionPackageSchema.safeParse(pkg);
@@ -677,7 +680,7 @@ export async function readAgentDefinition(
   if (!skipScopes.has("built-in")) {
     const builtIn = getBuiltInAgentDefinitions().find((pkg) => pkg.id === agentId);
     if (builtIn) {
-      const validated = AgentDefinitionPackageSchema.safeParse(builtIn);
+      const validated = AgentDefinitionPackageSchema.safeParse({ ...builtIn, source: "built-in" });
       if (!validated.success) {
         throw new Error(
           `Invalid built-in agent definition '${agentId}': ${validated.error.message}`

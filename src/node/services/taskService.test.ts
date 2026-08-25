@@ -107,6 +107,15 @@ function checkoutOwnerBranch(projectPath: string, branch: string): void {
   execSync(`git checkout -b ${branch}`, { cwd: projectPath, stdio: "ignore" });
 }
 
+/**
+ * Commit pending agent-definition files: owner-side vouching additionally requires the
+ * agent-definition paths to be clean (uncommitted changes diverge from the committed
+ * base a new checkout is created from).
+ */
+function commitOwnerAgentFiles(projectPath: string): void {
+  execSync("git add -A && git commit -q -m agents", { cwd: projectPath, stdio: "ignore" });
+}
+
 async function collectFullHistory(service: HistoryService, workspaceId: string) {
   const messages: MuxMessage[] = [];
   const result = await service.iterateFullHistory(workspaceId, "forward", (chunk) => {
@@ -1006,13 +1015,60 @@ describe("TaskService", () => {
     const sendMessageCall = sendMessage.mock.calls[0] as unknown[];
     expect(sendMessageCall[0]).toBe("childworkspace");
     // Explicit overrides also arm stream-time strict resolution, pinning the validated
-    // definition's provenance: pre-dispatch validation races init hooks/user edits, so
-    // the stream must fail loudly instead of silently swapping in exec (or running a
-    // different-scope definition for the same id) post-init.
+    // definition's provenance (scope + exact source): pre-dispatch validation races
+    // init hooks/user edits, so the stream must fail loudly instead of silently
+    // swapping in exec (or running a different definition for the same id) post-init.
     expect(sendMessageCall[2]).toMatchObject({
       agentId: "plan",
-      strictAgentResolution: { expectedScope: "built-in" },
+      strictAgentResolution: { expectedScope: "built-in", expectedSource: "built-in" },
     });
+  });
+
+  test("createWorkspaceTurn keeps prechecks advisory when the owner has uncommitted agent changes", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    checkoutOwnerBranch(projectPath, "parent");
+    // An UNCOMMITTED hidden shadow of the built-in plan exists only in the owner's
+    // working tree: the new checkout is created from committed branch state and
+    // validly resolves the built-in, so the owner-side miss must stay advisory
+    // (branch equality is not checkout equality).
+    const agentsDir = path.join(projectPath, ".mux", "agents");
+    await fsPromises.mkdir(agentsDir, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(agentsDir, "plan.md"),
+      ["---", "name: Plan", "base: plan", "ui:", "  hidden: true", "---", "Shadow."].join("\n")
+    );
+
+    const cleanCheckout = path.join(rootDir, "clean-target-checkout");
+    await fsPromises.mkdir(cleanCheckout, { recursive: true });
+    const targetMetadata: WorkspaceMetadata & { namedWorkspacePath: string } = {
+      ...createWorkspaceTurnMetadata(projectPath),
+      runtimeConfig: { type: "worktree", srcBaseDir: path.join(rootDir, "wt") },
+      namedWorkspacePath: cleanCheckout,
+    };
+    const createWorkspace = mock(
+      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
+        Promise.resolve(Ok({ metadata: targetMetadata }))
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "plan",
+      prompt: "Plan from the committed base",
+      title: "Dirty owner shadow",
+      workspace: { mode: "new" },
+    });
+
+    expect(result.success).toBe(true);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const sendMessageCall = sendMessage.mock.calls[0] as unknown[];
+    expect(sendMessageCall[2]).toMatchObject({ agentId: "plan" });
   });
 
   test("createWorkspaceTurn rejects invalid, unknown, and internal agent ids before creating a workspace", async () => {
@@ -1063,6 +1119,7 @@ describe("TaskService", () => {
     });
     checkoutOwnerBranch(projectPath, "parent");
     await writeCustomAgentDefinition(projectPath);
+    commitOwnerAgentFiles(projectPath);
 
     const createWorkspace = mock(
       (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
@@ -1183,6 +1240,7 @@ describe("TaskService", () => {
       ].join("\n"),
       "utf-8"
     );
+    commitOwnerAgentFiles(projectPath);
 
     const createWorkspace = mock(
       (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
@@ -1306,6 +1364,7 @@ describe("TaskService", () => {
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
     checkoutOwnerBranch(projectPath, "parent");
     await writeCustomAgentDefinition(projectPath);
+    commitOwnerAgentFiles(projectPath);
     // Deferred-provisioning runtimes return from create before the checkout is reachable.
     const unreachableCheckout = path.join(rootDir, "not-provisioned-yet");
 

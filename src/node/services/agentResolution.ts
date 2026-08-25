@@ -308,23 +308,27 @@ export async function resolveAgentForStream(
 
   // Strict provenance pin: launch validation approved a specific definition, not just
   // an id. If that definition vanished (e.g. an init hook or edit deleted a validated
-  // project shadow) and a lower-priority scope now resolves the same id, the turn
-  // would run a different prompt/tool policy with AI settings derived from the
-  // validated one — fail instead.
-  if (
-    strictTopLevel &&
-    strictExpectedScope != null &&
-    agentDefinition.scope !== strictExpectedScope
-  ) {
-    const errorMessage = `Agent '${requestedAgentId}' now resolves from a different scope than launch validation saw (expected ${strictExpectedScope}, found ${agentDefinition.scope}); refusing to stream an explicit agent request.`;
-    emitError(
-      createErrorEvent(workspaceId, {
-        messageId: createAssistantMessageId(),
-        error: errorMessage,
-        errorType: "unknown",
-      })
-    );
-    return Err({ type: "unknown", raw: errorMessage });
+  // project shadow) and a different candidate now resolves the same id — a lower
+  // scope, or a same-scope sibling like a project plugin taking over for a removed
+  // project file — the turn would run a different prompt/tool policy with AI settings
+  // derived from the validated one. Scope alone is not a provenance identifier, so
+  // the exact source (discovery root / "built-in") is compared when pinned.
+  if (strictTopLevel && strictExpectedScope != null) {
+    const expectedSource =
+      typeof strictAgentResolution === "object" ? strictAgentResolution.expectedSource : undefined;
+    const scopeMismatch = agentDefinition.scope !== strictExpectedScope;
+    const sourceMismatch = expectedSource != null && agentDefinition.source !== expectedSource;
+    if (scopeMismatch || sourceMismatch) {
+      const errorMessage = `Agent '${requestedAgentId}' now resolves from a different definition than launch validation saw (expected ${strictExpectedScope}${expectedSource != null ? ` @ ${expectedSource}` : ""}, found ${agentDefinition.scope}${agentDefinition.source != null ? ` @ ${agentDefinition.source}` : ""}); refusing to stream an explicit agent request.`;
+      emitError(
+        createErrorEvent(workspaceId, {
+          messageId: createAssistantMessageId(),
+          error: errorMessage,
+          errorType: "unknown",
+        })
+      );
+      return Err({ type: "unknown", raw: errorMessage });
+    }
   }
 
   // Keep agent ID aligned with the actual definition used (may fall back to exec).

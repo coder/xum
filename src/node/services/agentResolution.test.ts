@@ -486,7 +486,9 @@ describe("resolveAgentForStream strict resolution", () => {
   async function resolveTopLevel(params: {
     projectPath: string;
     agentId: string;
-    strictAgentResolution: boolean | { expectedScope: "project" | "global" | "built-in" };
+    strictAgentResolution:
+      | boolean
+      | { expectedScope: "project" | "global" | "built-in"; expectedSource?: string };
     agentAiDefaults?: ProjectsConfig["agentAiDefaults"];
   }) {
     const cfg: ProjectsConfig = {
@@ -624,16 +626,33 @@ describe("resolveAgentForStream strict resolution", () => {
     });
     expect(strict.success).toBe(false);
     if (!strict.success && strict.error.type === "unknown") {
-      expect(strict.error.raw).toContain("different scope");
+      expect(strict.error.raw).toContain("different definition");
     } else {
       expect(strict.success === false && strict.error.type).toBe("unknown");
     }
 
-    // A matching scope streams normally.
+    // Scope alone is not a provenance identifier (project files and project plugins
+    // both report "project"): a same-scope pin with a different exact source must
+    // also fail.
+    const sameScopeDifferentSource = await resolveTopLevel({
+      projectPath,
+      agentId: "plan",
+      strictAgentResolution: { expectedScope: "built-in", expectedSource: ".xum/agents" },
+    });
+    expect(sameScopeDifferentSource.success).toBe(false);
+    if (!sameScopeDifferentSource.success && sameScopeDifferentSource.error.type === "unknown") {
+      expect(sameScopeDifferentSource.error.raw).toContain("different definition");
+    } else {
+      expect(
+        sameScopeDifferentSource.success === false && sameScopeDifferentSource.error.type
+      ).toBe("unknown");
+    }
+
+    // A matching scope + source streams normally.
     const matching = await resolveTopLevel({
       projectPath,
       agentId: "plan",
-      strictAgentResolution: { expectedScope: "built-in" },
+      strictAgentResolution: { expectedScope: "built-in", expectedSource: "built-in" },
     });
     expect(matching.success).toBe(true);
     if (matching.success) expect(matching.data.effectiveAgentId).toBe("plan");

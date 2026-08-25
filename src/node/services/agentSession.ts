@@ -37,7 +37,7 @@ import {
   type GoalSyntheticMessageKind,
 } from "@/constants/goals";
 import type { SendMessageError } from "@/common/types/errors";
-import { AgentIdSchema, SkillNameSchema } from "@/common/orpc/schemas";
+import { AgentIdSchema, SendMessageOptionsSchema, SkillNameSchema } from "@/common/orpc/schemas";
 import { normalizeAgentId, resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
 import {
   buildStreamErrorEventData,
@@ -1902,10 +1902,21 @@ export class AgentSession {
     }
     // Explicit-agent delegated turns must stay loud across restart recovery: without
     // this, a replay after the agent was removed/disabled would silently run exec.
-    // Copied verbatim so the object form keeps its provenance pin (expectedScope).
-    const persistedStrictAgentResolution = persistedRetrySendOptions?.strictAgentResolution;
-    if (persistedStrictAgentResolution != null && persistedStrictAgentResolution !== false) {
-      retryRequest.strictAgentResolution = persistedStrictAgentResolution;
+    // History stores retrySendOptions as an untyped blob, so the persisted value is
+    // re-validated against the canonical schema first — a malformed provenance pin
+    // must be discarded (lenient replay) rather than failing every recovered attempt
+    // with a false mismatch. A valid pin is copied verbatim (keeps expectedScope/
+    // expectedSource).
+    const persistedStrictAgentResolution =
+      SendMessageOptionsSchema.shape.strictAgentResolution.safeParse(
+        persistedRetrySendOptions?.strictAgentResolution
+      );
+    if (
+      persistedStrictAgentResolution.success &&
+      persistedStrictAgentResolution.data != null &&
+      persistedStrictAgentResolution.data !== false
+    ) {
+      retryRequest.strictAgentResolution = persistedStrictAgentResolution.data;
     }
 
     if (persistedRetrySendOptions?.agentInitiated === true) {

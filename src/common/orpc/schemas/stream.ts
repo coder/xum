@@ -814,7 +814,19 @@ export const SendMessageOptionsSchema = z.object({
    * a sibling flag) so every option-preservation path copies it verbatim.
    */
   strictAgentResolution: z
-    .union([z.boolean(), z.object({ expectedScope: AgentDefinitionScopeSchema })])
+    .union([
+      z.boolean(),
+      z.object({
+        expectedScope: AgentDefinitionScopeSchema,
+        /**
+         * Exact source identity from AgentDefinitionPackage.source ("built-in" or the
+         * discovery root). Scope alone collapses distinct candidates (project files
+         * and project plugins both report "project"), so this pins the definition
+         * itself when known.
+         */
+        expectedSource: z.string().optional(),
+      }),
+    ])
     .optional(),
   /**
    * Desktop/app-only capability: expose set_goal so an agent can create a
