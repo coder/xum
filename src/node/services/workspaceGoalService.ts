@@ -428,6 +428,14 @@ export class WorkspaceGoalService {
   private lastUserStopAtMsByWorkspace = new Map<string, number>();
   private recordedStreamStartedAtMsByWorkspace = new Map<string, number>();
   private lastGoalStreamStamps = new Map<string, GoalStreamStamp>();
+  /**
+   * Monotonic per-workspace stream-end drain counter. Bumped when
+   * `applyPendingAfterStreamEnd` starts and again when it exits, so a queued
+   * setGoal can detect that a drain ran while it was in flight and must not
+   * install a pending mutation nothing will drain (Codex P2
+   * PRRT_kwDOPxxmWM6cBr9Q).
+   */
+  private readonly streamEndDrainGenerations = new Map<string, number>();
   private nextGoalStreamStampSequence = 1;
   private goalContinuationBridge: GoalContinuationRuntimeBridge | null = null;
   private goalContinuationDispatcher: IdleDispatcher | null = null;
@@ -2039,6 +2047,13 @@ export class WorkspaceGoalService {
   private async setGoalInternal(input: SetGoalInput): Promise<Result<GoalRecordV1, GoalSetError>> {
     const objective = input.objective?.trim();
     this.assertParentWorkspace(input.workspaceId);
+    // Codex P2 (PRRT_kwDOPxxmWM6cBr9Q): captured synchronously at entry so the
+    // in-lock recheck below can detect a stream-end drain that started or
+    // finished while this setter was in flight. The extension-metadata
+    // streaming flag updates asynchronously after stream end, so it alone can
+    // hold a stale "live" long enough for a setter to queue a mutation the
+    // drain has already stopped watching for.
+    const drainGenerationAtEntry = this.streamEndDrainGenerations.get(input.workspaceId) ?? 0;
 
     if (!objective && this.pendingGoalSnapshots.has(input.workspaceId)) {
       // Until stream-end persists the queued objective, status/budget-only edits
@@ -2060,9 +2075,15 @@ export class WorkspaceGoalService {
     // -----------------------------------------------------------------------
     if (objective && (await this.isWorkspaceStreaming(input.workspaceId))) {
       const deferredResult = await this.fileLocks.withLock(input.workspaceId, async () => {
-        if (!(await this.isWorkspaceStreaming(input.workspaceId))) {
+        if (
+          !(await this.isWorkspaceStreaming(input.workspaceId)) ||
+          (this.streamEndDrainGenerations.get(input.workspaceId) ?? 0) !== drainGenerationAtEntry
+        ) {
           // The stream can end while this caller waits for the goal file lock.
-          // Persist immediately instead of queueing after stream-end already drained.
+          // Persist immediately instead of queueing after stream-end already
+          // drained. The drain-generation check covers the stale-streaming
+          // window: the async streaming flag can still read "live" after the
+          // drain finished, and a mutation installed then would be stranded.
           return null;
         }
         const current = await this.readGoalFile(input.workspaceId);
@@ -2112,9 +2133,13 @@ export class WorkspaceGoalService {
             message: UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
           });
         }
-        if (!(await this.isWorkspaceStreaming(input.workspaceId))) {
+        if (
+          !(await this.isWorkspaceStreaming(input.workspaceId)) ||
+          (this.streamEndDrainGenerations.get(input.workspaceId) ?? 0) !== drainGenerationAtEntry
+        ) {
           // Avoid queueing after the one stream-end drain has already observed no
-          // pending mutation.
+          // pending mutation (stale-streaming reads included — see the
+          // drain-generation comment on the first recheck above).
           return null;
         }
         // Codex P1 (PRRT_kwDOPxxmWM6b-orH): the mutation must be installed
@@ -2375,7 +2400,7 @@ export class WorkspaceGoalService {
         return Ok(updated);
       }
 
-      const next = this.createGoal({
+      let next = this.createGoal({
         objective,
         budgetCents: input.budgetCents ?? null,
         turnCap: input.turnCap ?? null,
@@ -2408,6 +2433,25 @@ export class WorkspaceGoalService {
       }
       await this.writeGoal(input.workspaceId, next);
       await this.pushSnapshot(input.workspaceId, next);
+      if (options?.replacementCreatedAtMs == null) {
+        // Codex P2 (PRRT_kwDOPxxmWM6cBr9B): direct creations must also carry a
+        // publication-time createdAtMs. The construction stamp above predates
+        // the kickoff-model validation, history-archive, and write/push awaits
+        // — a message the user authored during those awaits would postdate it
+        // and be misread as an intervention against a goal not yet visible.
+        // No await sits between the snapshot push resolving and this re-stamp,
+        // so nothing can be admitted in between; the durable record carries
+        // the publication stamp (crash between the writes leaves the
+        // provisional stamp — today's behavior). Drained queued mutations pass
+        // replacementCreatedAtMs and already carry their publication stamp.
+        const publishedAtMs = Date.now();
+        next = GoalRecordV1Schema.parse({
+          ...next,
+          createdAtMs: publishedAtMs,
+          updatedAtMs: publishedAtMs,
+        });
+        await this.writeGoal(input.workspaceId, next);
+      }
       this.emitBudgetChanged(current, next, input);
       this.emitLifecycle(current ? "goal_replaced" : "goal_created", {
         sameObjective: current?.objective === objective,
@@ -2865,18 +2909,20 @@ export class WorkspaceGoalService {
       const isGoalDrivenStream =
         originKind === "goal_continuation" || originKind === "goal_budget_limit";
       if (current.status !== "active" && !isGoalDrivenStream) {
-        // Codex P2 (PRRT_kwDOPxxmWM6cBACb): a skipped maintenance stream on a
-        // budget_limited goal must not overwrite the goal-driven stamp that
-        // keeps the pending budget wrap-up eligible — replacing it with a
-        // user/other stamp would make checkGoalContinuationEligibility
-        // classify the wrap-up as budget_wrapup_suppressed and delete its
-        // candidate, stranding the goal without its final wrap-up turn.
+        // Codex P2 (PRRT_kwDOPxxmWM6cBACb, PRRT_kwDOPxxmWM6cBr9I): a skipped
+        // maintenance stream on a budget_limited goal must never overwrite
+        // the stamp of the stream that hit the budget. A goal-driven stamp
+        // keeps the pending wrap-up eligible (overwriting it would suppress
+        // the final wrap-up turn); a user-origin stamp deliberately
+        // suppresses the wrap-up (overwriting it with a wake's "other" stamp
+        // would dispatch an autonomous wrap-up the user's own budget-limited
+        // stream intentionally blocked). Only stamp when no stamp exists for
+        // this goal (e.g. after restart, where suppression is handled by the
+        // durable budgetLimitInjectedForGoalId gate).
         const existingStamp = this.lastGoalStreamStamps.get(input.workspaceId);
-        const preservesWrapupEligibility =
-          current.status === "budget_limited" &&
-          existingStamp?.goalId === current.goalId &&
-          this.isBudgetWrapupEligibleOrigin(existingStamp.originKind);
-        if (!preservesWrapupEligibility) {
+        const preserveExistingStamp =
+          current.status === "budget_limited" && existingStamp?.goalId === current.goalId;
+        if (!preserveExistingStamp) {
           this.recordLastGoalStream(input.workspaceId, originKind, current.goalId);
         }
         await this.pushSnapshot(input.workspaceId, current);
@@ -3065,8 +3111,20 @@ export class WorkspaceGoalService {
     }
   }
 
+  private bumpStreamEndDrainGeneration(workspaceId: string): void {
+    this.streamEndDrainGenerations.set(
+      workspaceId,
+      (this.streamEndDrainGenerations.get(workspaceId) ?? 0) + 1
+    );
+  }
+
   async applyPendingAfterStreamEnd(workspaceId: string): Promise<GoalRecordV1 | null> {
     this.liveGoalPreviewSnapshots.delete(workspaceId);
+    // Codex P2 (PRRT_kwDOPxxmWM6cBr9Q): bump the drain generation at entry so
+    // setters admitted BEFORE this drain detect it at their in-lock recheck
+    // and persist directly instead of installing a mutation this drain may
+    // already have stopped watching for.
+    this.bumpStreamEndDrainGeneration(workspaceId);
     let drained: GoalRecordV1 | null = null;
 
     // Codex P2 (PRRT_kwDOPxxmWM6b_KgE): a queued setGoal may be holding the
@@ -3150,6 +3208,13 @@ export class WorkspaceGoalService {
         }
       }
     }
+
+    // Codex P2 (PRRT_kwDOPxxmWM6cBr9Q): bump again on exit, synchronously with
+    // the loop's final empty-map check (no await sits between them). A setter
+    // admitted DURING this drain whose in-lock recheck runs after that final
+    // check therefore sees a changed generation and persists directly; one
+    // whose recheck ran earlier installed a mutation the loop drained.
+    this.bumpStreamEndDrainGeneration(workspaceId);
 
     // Stream-end deferred auto-promotion.
     //

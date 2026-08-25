@@ -2408,6 +2408,100 @@ describe("WorkspaceGoalService", () => {
     expect(stamps.get(workspaceId)?.originKind).toBe("goal_continuation");
   });
 
+  test("background wakes preserve user-origin budget wrap-up suppression", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cBr9I): when a manual user stream exhausts the
+    // budget, its user-origin stamp deliberately suppresses the autonomous
+    // wrap-up. A later background wake ("other" origin) must not replace that
+    // stamp, or the wrap-up the user's own stream blocked would dispatch.
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "User-exhausted budget",
+      budgetCents: 100,
+    });
+    await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 2,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "user",
+    });
+    expect(await service.getGoal(workspaceId)).toMatchObject({ status: "budget_limited" });
+
+    // Background bash-monitor wake ends while the goal sits budget_limited.
+    await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 0.01,
+      streamStartedAtMs: created.createdAtMs + 2,
+      streamOriginKind: "other",
+    });
+
+    const stamps = (
+      service as unknown as {
+        lastGoalStreamStamps: Map<string, { originKind: string; goalId: string | null }>;
+      }
+    ).lastGoalStreamStamps;
+    expect(stamps.get(workspaceId)?.originKind).toBe("user");
+  });
+
+  test("direct idle goal creation stamps creation at publication time", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cBr9B): the direct (non-streaming) creation
+    // path stamped createdAtMs at construction, before kickoff-model
+    // validation and the write/push awaits. A message the user authored while
+    // the create request was in flight postdated that stamp and was misread
+    // as an intervention against a goal not yet visible. Creation must date
+    // from publication here too.
+    const dispatcher = new IdleDispatcher();
+    let midValidationMs = 0;
+    service.registerGoalContinuationConsumer(dispatcher, {
+      ...continuationBridge(),
+      getKickoffSendOptions: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        if (midValidationMs === 0) {
+          // Only the FIRST call is the pre-persist kickoff-model validation;
+          // kickoff arming calls this again after persistence completes.
+          midValidationMs = Date.now();
+        }
+        return { model: "openai:gpt-4o", agentId: "exec" };
+      },
+    });
+
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Direct publication stamp",
+      budgetCents: 500,
+    });
+
+    expect(midValidationMs).toBeGreaterThan(0);
+    expect(created.createdAtMs).toBeGreaterThanOrEqual(midValidationMs);
+    expect(await service.getGoal(workspaceId)).toMatchObject({ createdAtMs: created.createdAtMs });
+  });
+
+  test("setters that span a stream-end drain persist directly instead of queueing", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cBr9Q): a setGoal admitted while the (stale)
+    // streaming flag still reads live can reach its in-lock recheck after the
+    // stream-end drain already gave up watching the mutation map. It must
+    // detect the drain via the generation counter and persist directly —
+    // installing a queued mutation at that point would leave its projected
+    // success non-durable with no remaining stream-end hook.
+    await extensionMetadata.setStreaming(workspaceId, true);
+
+    // Fire the setter first (captures the pre-drain generation), then run the
+    // drain before the setter's pre-lock await resolves.
+    const setterPromise = service.setGoal({ workspaceId, objective: "Late goal" });
+    const drainPromise = service.applyPendingAfterStreamEnd(workspaceId);
+
+    const [setter, drained] = await Promise.all([setterPromise, drainPromise]);
+    expect(setter.success).toBe(true);
+    expect(drained).toBeNull();
+
+    // The setter must have persisted durably; nothing may sit in the mutation
+    // map waiting for a stream-end drain that will not come.
+    const serviceAccess = service as unknown as {
+      pendingGoalMutations: Map<string, unknown>;
+    };
+    expect(serviceAccess.pendingGoalMutations.get(workspaceId)).toBeUndefined();
+    expect(await service.getGoal(workspaceId)).toMatchObject({ objective: "Late goal" });
+  });
+
   test("stream-end drain racing publication persists the publication stamp", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6b_KgE): the stream can end while the queued
     // setter is still inside its publication await. The drain used to take the
