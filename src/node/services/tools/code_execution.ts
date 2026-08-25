@@ -32,7 +32,7 @@ import {
 } from "@/constants/resultHandles";
 import { KERNEL_COMPACT_ARGS_CAP_BYTES, KERNEL_CONSOLE_CAP_BYTES } from "@/constants/kernelOutput";
 import { sliceUtf8Bytes } from "@/common/utils/sliceUtf8Bytes";
-import { isKernelRecordResultExempt } from "@/node/services/ptc/types";
+import { isKernelRecordResultExempt, sanitizeCapturedMediaValue } from "@/node/services/ptc/types";
 
 // Default limits
 const DEFAULT_MEMORY_BYTES = 64 * 1024 * 1024; // 64MB
@@ -671,6 +671,17 @@ ${xumTypes}
           if (mount?.lifetime === "persistent") {
             compactKernelToolCallRecords(result, loadActive);
             capKernelConsoleOutput(result);
+          } else {
+            // Classic executions have no offload stage, so a guest that
+            // RETURNS a bridged media container assigns the raw multi-image
+            // payload directly to the outer result, which persists into this
+            // record's history row — the capture sanitizer only covers nested
+            // tool-call records and console args, and request-time attachment
+            // extraction rewrites only the provider copy, never
+            // partial.json/chat.jsonl. Budget it at the same boundary. Kernel
+            // mode is excluded on purpose: its outer result feeds vars-handle
+            // offloading, which must store full fidelity for the guest.
+            result.result = sanitizeCapturedMediaValue(result.result);
           }
 
           // RLM return-value offloading BEFORE the vars snapshot below, so the

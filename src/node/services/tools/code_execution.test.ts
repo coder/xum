@@ -1083,6 +1083,57 @@ describe("createCodeExecutionTool", () => {
       expect(value?.[1]?.text).toContain("aggregate media budget exceeded");
     });
 
+    it("sanitizes returned and console-logged media containers in classic mode", async () => {
+      // Classic executions have no offload stage: `return xum.<mediaTool>()`
+      // assigns the guest value directly to the outer PTCExecutionResult
+      // result, which persists into partial.json/chat.jsonl — the
+      // record-level sanitizer alone leaves that copy unbudgeted (round 9).
+      // Console args are sanitized at CAPTURE (streamed events included);
+      // over-budget console records are separately dropped whole by the
+      // console capture budget, so the observable case here is unsupported
+      // media riding under that budget.
+      const bigImage = "A".repeat(2 * 1024 * 1024);
+      const audioData = "d2F2".repeat(50);
+      const tools: Record<string, Tool> = {
+        mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
+          type: "content",
+          value: [
+            { type: "media", mediaType: "image/png", data: bigImage },
+            { type: "media", mediaType: "image/png", data: bigImage },
+          ],
+        })),
+        mcp__rec__capture: createMockTool("mcp__rec__capture", z.object({}), () => ({
+          type: "content",
+          value: [{ type: "media", mediaType: "audio/wav", data: audioData }],
+        })),
+      };
+      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge(tools));
+
+      const result = (await tool.execute!(
+        {
+          code: "const r = mux.mcp__shots__take({}); console.log(mux.mcp__rec__capture({})); return r;",
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+
+      const outer = (
+        result.result as { value?: Array<{ type?: string; data?: string; text?: string }> }
+      )?.value;
+      expect(outer?.[0]?.data).toBe(bigImage);
+      expect(outer?.[1]?.type).toBe("text");
+      expect(outer?.[1]?.text).toContain("aggregate media budget exceeded");
+
+      const consoleArg = (
+        result.consoleOutput[0]?.args[0] as {
+          value?: Array<{ type?: string; text?: string }>;
+        }
+      )?.value;
+      expect(consoleArg?.[0]?.type).toBe("text");
+      expect(consoleArg?.[0]?.text).toContain("not supported as a model attachment");
+      expect(JSON.stringify(result.consoleOutput)).not.toContain(audioData);
+    });
+
     it("charges retained media against an aggregate budget", async () => {
       // MCP applies only a per-part guard: many individually-allowed images
       // must not persist unbounded aggregate base64 into records/events.

@@ -257,10 +257,31 @@ function boundRetainedEditDiff(diff: string): { diff?: string; diffTruncated?: t
   return { diff: diff.slice(0, end), diffTruncated: true };
 }
 
-/** JSON.stringify length, or undefined when unserializable (cycles, BigInt). */
+/**
+ * JSON.stringify length in CHARACTERS, or undefined when unserializable
+ * (cycles, BigInt). Used for the persistence-critical caps, which are char
+ * caps by design: MAX_FILE_CONTENT_SIZE bounds repo-controlled diff/skill
+ * text everywhere else in the codebase via .length/.slice(), and the
+ * downstream extractors compare the same way.
+ */
 function serializedJsonLength(value: unknown): number | undefined {
   try {
     return JSON.stringify(value)?.length;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * JSON.stringify length in UTF-8 BYTES, or undefined when unserializable.
+ * The media budget is a byte bound on persisted history: charging chars
+ * would let server-controlled multibyte metadata (e.g. "image/" + millions
+ * of CJK characters) occupy ~3x the documented budget on disk.
+ */
+function serializedJsonByteLength(value: unknown): number | undefined {
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized === undefined ? undefined : Buffer.byteLength(serialized, "utf8");
   } catch {
     return undefined;
   }
@@ -317,7 +338,7 @@ function sanitizeRetainedMediaContainer(result: unknown): unknown {
         text: `[media bounded at capture: ${boundedMediaTypeLabel(media.mediaType)}, ${media.data.length} base64 chars — not supported as a model attachment]`,
       };
     }
-    const serialized = serializedJsonLength(item);
+    const serialized = serializedJsonByteLength(item);
     if (
       serialized !== undefined &&
       retainedBytes + serialized <= KERNEL_RETAINED_MEDIA_BUDGET_BYTES
@@ -333,7 +354,7 @@ function sanitizeRetainedMediaContainer(result: unknown): unknown {
         }
       : {
           type: "text",
-          text: `[part bounded at capture: ${serialized ?? "unserializable"} serialized chars — aggregate media budget exceeded]`,
+          text: `[part bounded at capture: ${serialized ?? "unserializable"} serialized bytes — aggregate media budget exceeded]`,
         };
   });
   if (parts.length < container.value.length) {
@@ -357,7 +378,18 @@ function sanitizeRetainedMediaContainer(result: unknown): unknown {
  * in default (non-RLM) PTC mode. The guest still receives the full value.
  */
 export function sanitizeMediaRecordCapture(_toolName: string, result: unknown): unknown {
-  return isMediaContentContainer(result) ? sanitizeRetainedMediaContainer(result) : result;
+  return sanitizeCapturedMediaValue(result);
+}
+
+/**
+ * Tool-name-free form of sanitizeMediaRecordCapture for values that are not
+ * nested tool records: the classic execution's outer return value and console
+ * args also persist into the code_execution history row (see
+ * createCodeExecutionTool), and `return xum.<mediaTool>(...)` /
+ * `console.log(...)` would otherwise carry the raw unbudgeted container.
+ */
+export function sanitizeCapturedMediaValue(value: unknown): unknown {
+  return isMediaContentContainer(value) ? sanitizeRetainedMediaContainer(value) : value;
 }
 
 /**

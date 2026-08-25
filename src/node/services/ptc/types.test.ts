@@ -103,6 +103,22 @@ describe("retainExemptKernelRecordResult", () => {
       expect(retained.value[1]?.text!.length).toBeLessThan(300);
     });
 
+    it("charges the budget in UTF-8 bytes, not UTF-16 code units", () => {
+      // ~1.5M CJK chars ≈ 4.5 MiB in UTF-8 history — a character-based check
+      // would retain this part under the 3 MiB budget.
+      const junkType = `image/${"画".repeat(1_500_000)}`;
+      const retained = retainExemptKernelRecordResult("mcp__shots__take", {
+        type: "content",
+        value: [
+          { type: "media", mediaType: "image/png", data: "aGVsbG8=" },
+          { type: "media", mediaType: junkType, data: "" },
+        ],
+      }) as RetainedContainer;
+      expect(retained.value[0]?.data).toBe("aGVsbG8=");
+      expect(retained.value[1]?.type).toBe("text");
+      expect(retained.value[1]?.text).toContain("aggregate media budget exceeded");
+    });
+
     it("charges non-media sibling parts against the budget", () => {
       const retained = retainExemptKernelRecordResult("mcp__shots__take", {
         type: "content",

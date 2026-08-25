@@ -1328,11 +1328,19 @@ export class QuickJSRuntime implements IJSRuntime {
         }
 
         budget.retainedBytes += size;
-        attribution.consoleOutput.push({ level, args, timestamp });
+        // Media containers are budgeted at capture like tool-call records
+        // (see setCaptureResultSanitizer): console events stream into session
+        // history immediately, so any later sanitization would miss the
+        // streamed copy. Budget accounting stays on the raw size above —
+        // sanitization only shrinks, never grows.
+        const sanitizer = this.captureResultSanitizer;
+        const captured =
+          sanitizer !== undefined ? args.map((arg) => sanitizer("console", arg)) : args;
+        attribution.consoleOutput.push({ level, args: captured, timestamp });
         attribution.eventHandler?.({
           type: "console",
           level,
-          args,
+          args: captured,
           timestamp,
         });
       });
