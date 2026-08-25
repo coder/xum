@@ -222,7 +222,7 @@ export GIT_SSH_COMMAND="\${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes -o StrictHostK
 if [ "$(git config --local --get remote.origin.partialclonefilter 2>/dev/null)" = "blob:none" ]; then
   COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
   NOW=$(date +%s)
-  # A refetch can succeed while objects stay missing (see the completeness
+  # A backfill can succeed while objects stay missing (see the completeness
   # check below); that outcome may never improve, so retry it at most daily
   # instead of hammering the network with a full refetch every poll.
   LAST_INCOMPLETE=$(git config --local --get xum.promisorHealIncompleteAt 2>/dev/null || echo 0)
@@ -243,37 +243,73 @@ if [ "$(git config --local --get remote.origin.partialclonefilter 2>/dev/null)" 
     if mkdir "$HEAL_LOCK" 2>/dev/null; then
       echo "$NOW" > "$HEAL_LOCK/started"
       echo "HEAL: backfilling promisor partial clone"
-      # --refetch (git >= 2.36) negotiates as if the repo had nothing, so the
-      # server re-sends every object reachable from the fetch refspec,
-      # including previously filtered-out blobs.
-      if git -c protocol.version=2 \\
-          fetch origin \\
-          --refetch \\
-          --no-filter \\
-          --prune \\
-          --no-tags \\
-          --no-recurse-submodules \\
-          --no-write-fetch-head \\
-          2>&1; then
-        # A successful refetch is not proof of completeness: it only re-sends
-        # objects reachable from the *remote's current refs*. Blobs referenced
-        # only by local refs into upstream-deleted branches can remain
-        # missing, and unsetting the promisor config then would turn a
-        # recoverable partial clone into a repo whose checkouts hard-fail
-        # ("unable to read sha1 file") with no lazy-fetch fallback. Only
-        # unset once every locally reachable object is actually present.
-        if git rev-list --objects --missing=print --all 2>/dev/null | grep -q '^?'; then
-          echo "HEAL: objects still missing after refetch; keeping promisor config"
-          git config --local xum.promisorHealIncompleteAt "$NOW" 2>/dev/null
-        else
-${PROMISOR_CONFIG_KEYS.map((key) => `          git config --local --unset-all ${key} 2>/dev/null`).join("\n")}
-          git config --local --unset-all xum.promisorHealIncompleteAt 2>/dev/null
+      # Enumerate locally reachable objects the repo does not have. --reflog
+      # matters: an upstream force-push strands the displaced commit in the
+      # remote-tracking reflog, and recovery (e.g. git reset --hard
+      # origin/main@{1}) must keep lazy-fetching after an unsafe unset would
+      # have broken it, so reflog-only gaps count as missing too.
+      xum_missing_objects() {
+        git rev-list --objects --missing=print --all --reflog 2>/dev/null | sed -n 's/^?//p'
+      }
+      HEAL_FETCHED=""
+      MISSING=$(xum_missing_objects)
+      # Stage 1: batch-fetch exactly the missing objects by OID. Downloads
+      # only the gaps (a --refetch re-sends the whole repo) and works on
+      # hosts whose git predates --refetch (2.36), e.g. Ubuntu 22.04's 2.34.
+      # OID wants ride the same protocol-v2 server capability the repo's
+      # lazy fetch already depends on (this is a batched lazy fetch), and
+      # explicit wants bypass the persisted partial-clone filter.
+      if [ -n "$MISSING" ]; then
+        if printf '%s\\n' "$MISSING" | git -c protocol.version=2 \\
+            fetch origin \\
+            --stdin \\
+            --no-tags \\
+            --no-recurse-submodules \\
+            --no-write-fetch-head \\
+            2>&1; then
+          HEAL_FETCHED=1
         fi
+        MISSING=$(xum_missing_objects)
+      fi
+      # Stage 2: full --refetch (git >= 2.36, hence feature-detected) for
+      # servers that refuse OID wants: it negotiates as if the repo had
+      # nothing, so the server re-sends every object reachable from its
+      # current refs, including previously filtered-out blobs.
+      if [ -n "$MISSING" ] && git fetch -h 2>&1 | grep -q refetch; then
+        if git -c protocol.version=2 \\
+            fetch origin \\
+            --refetch \\
+            --no-filter \\
+            --prune \\
+            --no-tags \\
+            --no-recurse-submodules \\
+            --no-write-fetch-head \\
+            2>&1; then
+          HEAL_FETCHED=1
+        fi
+        MISSING=$(xum_missing_objects)
+      fi
+      if [ -z "$MISSING" ]; then
+        # Every locally reachable object is present, so dropping the promisor
+        # config is safe. Doing it with objects still missing would turn a
+        # recoverable partial clone into a repo whose checkouts hard-fail
+        # ("unable to read sha1 file") with no lazy-fetch fallback.
+${PROMISOR_CONFIG_KEYS.map((key) => `        git config --local --unset-all ${key} 2>/dev/null`).join("\n")}
+        git config --local --unset-all xum.promisorHealIncompleteAt 2>/dev/null
+        echo "HEAL: promisor config removed"
+        rm -rf "$HEAL_LOCK"
+      elif [ -n "$HEAL_FETCHED" ]; then
+        # The server was reachable yet objects are still missing (e.g. blobs
+        # only ever fetched bloblessly whose refs were deleted and GC'd
+        # upstream). That may never improve, so keep the lazy-fetch fallback
+        # and record the attempt; the marker throttles retries to daily.
+        echo "HEAL: objects still missing after backfill; keeping promisor config"
+        git config --local xum.promisorHealIncompleteAt "$NOW" 2>/dev/null
         rm -rf "$HEAL_LOCK"
       fi
-      # On refetch failure the lock (with its timestamp) stays in place so the
-      # next attempt waits out the 1h staleness window instead of re-running a
-      # full refetch on every status poll.
+      # When every fetch attempt failed (offline, auth): transient, so the
+      # lock (with its timestamp) stays in place and the 1h staleness window
+      # paces the retries.
     fi
   fi
 fi
