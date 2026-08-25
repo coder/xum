@@ -251,6 +251,60 @@ describe("ToolBridge", () => {
       expect(result).toEqual({ echoed: { query: "eng" } });
     });
 
+    it("honors a jsonSchema wrapper's custom validator (reject + normalize)", async () => {
+      const mockExecute = mock((args: unknown) => ({ echoed: args }));
+      const tools: Record<string, Tool> = {
+        mcp_guarded: {
+          description: "JSON-Schema tool with a wrapper validator",
+          inputSchema: jsonSchema<{ query: string }>(
+            { type: "object", properties: { query: { type: "string" } } },
+            {
+              // Async on purpose: covers the awaited PromiseLike path. Rejects
+              // invalid input and normalizes valid input, like direct AI SDK
+              // calls that honor Schema.validate.
+              validate: (value) => {
+                const query = (value as { query?: unknown }).query;
+                return Promise.resolve(
+                  typeof query === "string"
+                    ? { success: true as const, value: { query: query.trim() } }
+                    : { success: false as const, error: new Error("query must be a string") }
+                );
+              },
+            }
+          ),
+          execute: (args) => Promise.resolve(mockExecute(args)),
+        },
+      };
+
+      const bridge = new ToolBridge(tools);
+
+      let registeredMux: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+      const mockRegisterObject = mock(
+        (name: string, obj: Record<string, (...args: unknown[]) => Promise<unknown>>) => {
+          if (name === "mux") registeredMux = obj;
+          return undefined;
+        }
+      );
+      bridge.register(createMockRuntime({ registerObject: mockRegisterObject }));
+
+      const guarded = registeredMux.mcp_guarded as (...args: unknown[]) => Promise<unknown>;
+
+      // Rejection surfaces as a readable bridge error and never reaches execute.
+      try {
+        await guarded({ query: 42 });
+        expect.unreachable("Should have thrown");
+      } catch (e) {
+        expect(String(e)).toContain("Invalid arguments for mcp_guarded");
+        expect(String(e)).toContain("query must be a string");
+      }
+      expect(mockExecute).not.toHaveBeenCalled();
+
+      // Valid input reaches execute with the validator's normalized value.
+      const result = await guarded({ query: "  eng  " });
+      expect(mockExecute).toHaveBeenCalledWith({ query: "eng" });
+      expect(result).toEqual({ echoed: { query: "eng" } });
+    });
+
     it("serializes non-JSON values", async () => {
       // Tool that returns a non-plain object (with circular reference)
       const circularObj: Record<string, unknown> = { a: 1 };

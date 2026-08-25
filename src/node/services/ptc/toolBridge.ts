@@ -21,6 +21,12 @@ import {
 } from "@/common/types/capabilityGrants";
 
 /**
+ * Result shape of an AI SDK Schema's optional custom validator
+ * (provider-utils ValidationResult, which the 'ai' package does not re-export).
+ */
+type SchemaValidationResult = { success: true; value: unknown } | { success: false; error: Error };
+
+/**
  * RLM kernel extras for register(): host bindings that only exist on
  * persistent mounts. Presence of this options object is the availability
  * gate — RLM off (no persistent mount) => mux.task_spawn / mux.events /
@@ -252,8 +258,8 @@ export class ToolBridge {
           throw new Error("Execution aborted");
         }
 
-        // Validate args against tool's Zod schema
-        const validatedArgs = this.validateArgs(toolName, boundTool, args);
+        // Validate args against the tool's schema (Zod or AI SDK wrapper)
+        const validatedArgs = await this.validateArgs(toolName, boundTool, args);
 
         // Execute tool with full options (toolCallId and messages are required by type
         // but not used by most tools - generate synthetic values for sandbox context)
@@ -308,7 +314,7 @@ export class ToolBridge {
           throw new Error("Execution aborted");
         }
         const baseArgs = typeof args === "object" && args !== null ? args : {};
-        const validatedArgs = this.validateArgs("task", taskTool, {
+        const validatedArgs = await this.validateArgs("task", taskTool, {
           ...baseArgs,
           run_in_background: true,
         });
@@ -396,28 +402,47 @@ export class ToolBridge {
     return typeof tool.execute === "function";
   }
 
-  private validateArgs(toolName: string, tool: Tool, args: unknown): unknown {
+  private async validateArgs(toolName: string, tool: Tool, args: unknown): Promise<unknown> {
     // AI SDK tools carry their schema on 'inputSchema'; some legacy tools use 'parameters'.
     const toolRecord = tool as { inputSchema?: unknown; parameters?: unknown };
     const schema = toolRecord.inputSchema ?? toolRecord.parameters;
     if (schema == null) return args;
 
     // Built-in tools carry Zod schemas and are validated here for early,
-    // readable errors. MCP tools instead carry the AI SDK's jsonSchema()
-    // wrapper ({ jsonSchema: <raw JSON Schema> }), which has no safeParse:
-    // pass their args through untouched, matching the direct (non-kernel)
-    // call path, where a jsonSchema wrapper without a validate function is
-    // also pass-through. The MCP server validates (and mcpServerManager
-    // sanitizes) on its side. Zod detection mirrors
+    // readable errors. Zod detection mirrors
     // typeGenerator.getInputJsonSchema's "_def" check.
-    if (typeof schema !== "object" || !("_def" in schema)) return args;
-
-    const result = (schema as z.ZodType).safeParse(args);
-    if (!result.success) {
-      const issues = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
-      throw new Error(`Invalid arguments for ${toolName}: ${issues}`);
+    if (typeof schema === "object" && "_def" in schema) {
+      const result = (schema as z.ZodType).safeParse(args);
+      if (!result.success) {
+        const issues = result.error.issues
+          .map((i) => `${i.path.join(".")}: ${i.message}`)
+          .join("; ");
+        throw new Error(`Invalid arguments for ${toolName}: ${issues}`);
+      }
+      return result.data;
     }
-    return result.data;
+
+    // Non-Zod tools carry the AI SDK's jsonSchema() wrapper
+    // ({ jsonSchema: <raw JSON Schema>, validate? }), which has no safeParse.
+    // A wrapper-provided validator must be honored exactly like the direct
+    // (non-kernel) call path does: it may reject invalid input or return a
+    // normalized value, and may be async (ValidationResult | PromiseLike).
+    const validate = (schema as { validate?: unknown }).validate;
+    if (typeof validate === "function") {
+      const result = await (
+        validate as (value: unknown) => SchemaValidationResult | PromiseLike<SchemaValidationResult>
+      )(args);
+      if (!result.success) {
+        const message = result.error instanceof Error ? result.error.message : String(result.error);
+        throw new Error(`Invalid arguments for ${toolName}: ${message}`);
+      }
+      return result.value;
+    }
+
+    // Validator-less JSON Schema (e.g. MCP tools): pass through untouched,
+    // matching the direct call path; the MCP server validates (and
+    // mcpServerManager sanitizes) on its side.
+    return args;
   }
 
   private serializeResult(result: unknown): unknown {
