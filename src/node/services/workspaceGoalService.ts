@@ -253,6 +253,15 @@ interface ChatTailGoalModeResult {
    * a crash).
    */
   manualRowAuthoredAtMs?: number;
+  /**
+   * `explicitPauseGenerations` value captured BEFORE the history read that
+   * produced this evidence. Tail reads run outside the goal file lock, so an
+   * explicit Pause can fully commit (durable write, boundary append, hold
+   * release) between the read and the locked apply — "tail says active"
+   * evidence from before that Pause must not reactivate the paused goal
+   * (Codex P1 PRRT_kwDOPxxmWM6cMQqq).
+   */
+  pauseGenerationAtRead: number;
 }
 
 interface GoalContinuationEligibilityResult {
@@ -517,7 +526,24 @@ export class WorkspaceGoalService {
    */
   private readonly pauseFinalizationHolds = new Map<string, { goalId: string; depth: number }>();
 
+  /**
+   * Monotonic per-workspace count of explicit pause admissions, bumped under
+   * the goal file lock alongside each durable paused write (wherever the
+   * pause-finalization hold is armed). Chat-tail reads stamp the value they
+   * captured before their history I/O; automatic paused→active writers
+   * (`applyChatTailGoalMode`, `recordContinuationFired`) refuse when the
+   * generation moved since — the "tail says active" evidence predates an
+   * explicit Pause and must not undo it (Codex P1 PRRT_kwDOPxxmWM6cMQqq).
+   * Reconciliation pauses do not bump it, preserving the kickoff-window
+   * auto-flip recovery.
+   */
+  private readonly explicitPauseGenerations = new Map<string, number>();
+
   private armPauseFinalizationHold(workspaceId: string, goalId: string): void {
+    this.explicitPauseGenerations.set(
+      workspaceId,
+      (this.explicitPauseGenerations.get(workspaceId) ?? 0) + 1
+    );
     const existing = this.pauseFinalizationHolds.get(workspaceId);
     if (existing?.goalId === goalId) {
       existing.depth += 1;
@@ -635,6 +661,18 @@ export class WorkspaceGoalService {
     workspaceId: string,
     currentGoalId?: string | null
   ): Promise<ChatTailGoalModeResult> {
+    // Codex P1 (PRRT_kwDOPxxmWM6cMQqq): capture the explicit-pause generation
+    // BEFORE the history I/O so consumers can tell whether an explicit Pause
+    // committed after this evidence was read (see field doc on the result).
+    const pauseGenerationAtRead = this.explicitPauseGenerations.get(workspaceId) ?? 0;
+    const evidence = await this.scanChatTailGoalMode(workspaceId, currentGoalId);
+    return { ...evidence, pauseGenerationAtRead };
+  }
+
+  private async scanChatTailGoalMode(
+    workspaceId: string,
+    currentGoalId?: string | null
+  ): Promise<Omit<ChatTailGoalModeResult, "pauseGenerationAtRead">> {
     const historyResult = await this.historyService.getLastMessages(workspaceId, 100);
     if (!historyResult.success) {
       log.warn("Failed to read chat tail for goal mode reconciliation", {
@@ -792,6 +830,11 @@ export class WorkspaceGoalService {
     // a crash interrupted the resumed goal's kickoff window. Either way the
     // Resume is the newer user intent — the stale boundary must not write the
     // goal back to paused. Legacy unscoped boundaries keep any-goal semantics.
+    // The inference is sound only because AUTOMATIC paused→active writers
+    // (the branch below and recordContinuationFired) refuse across an explicit
+    // Pause via the finalization hold + explicit-pause generation (Codex P1
+    // PRRT_kwDOPxxmWM6cMQqq) — a user Resume is the only remaining writer that
+    // can leave a durably active goal beneath its own scoped boundary.
     if (
       goal.status === "active" &&
       chatTailMode.mode === "paused" &&
@@ -809,10 +852,19 @@ export class WorkspaceGoalService {
     // just told succeeded. Suppress same-goal automatic reactivation while the
     // finalization is in flight; genuine user mutations (resume, replacement)
     // write through setGoal directly and still win.
+    //
+    // Codex P1 (PRRT_kwDOPxxmWM6cMQqq): the hold only covers the in-flight
+    // window. Tail reads run outside the goal lock, so an explicit Pause can
+    // fully commit (write, boundary append, hold release) between the read
+    // and this apply — the generation stamp detects that the "active"
+    // evidence predates the Pause. The next read sees the appended boundary
+    // and reconciles paused normally, so this only refuses stale evidence.
     if (
       goal.status === "paused" &&
       chatTailMode.mode === "active" &&
-      this.pauseFinalizationHolds.get(workspaceId)?.goalId === goal.goalId
+      (this.pauseFinalizationHolds.get(workspaceId)?.goalId === goal.goalId ||
+        (this.explicitPauseGenerations.get(workspaceId) ?? 0) !==
+          chatTailMode.pauseGenerationAtRead)
     ) {
       return goal;
     }
@@ -1874,9 +1926,22 @@ export class WorkspaceGoalService {
       if (current?.goalId !== expectedGoalId) {
         return;
       }
+      // Codex P1 (PRRT_kwDOPxxmWM6cMQqq): the paused→active acceptance exists
+      // for reconciliation's spurious kickoff-window pause (see the paused
+      // kickoff comment in requestContinuationAfterStreamEnd), but an EXPLICIT
+      // Pause admitted after this continuation was dispatched must not be
+      // undone — flipping active here lands durably beneath the pause's own
+      // scoped boundary, which the Resume-wins reconciliation rule then
+      // preserves as if the user had resumed. Refuse while the pause
+      // finalization is in flight (hold armed) or when an explicit pause
+      // committed after the tail evidence above was read (stale evidence).
+      const explicitPauseSupersedes =
+        this.pauseFinalizationHolds.get(workspaceId)?.goalId === current.goalId ||
+        (this.explicitPauseGenerations.get(workspaceId) ?? 0) !==
+          chatTailMode.pauseGenerationAtRead;
       const continuationAccepted =
         current.status === "active" ||
-        (current.status === "paused" && chatTailMode.mode === "active");
+        (current.status === "paused" && chatTailMode.mode === "active" && !explicitPauseSupersedes);
       if (!continuationAccepted) {
         return;
       }

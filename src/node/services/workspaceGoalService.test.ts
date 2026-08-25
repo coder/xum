@@ -3412,6 +3412,141 @@ describe("WorkspaceGoalService", () => {
     });
   });
 
+  test("an admitted continuation firing mid-pause-finalization does not undo the pause", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cMQqq): a goal continuation already admitted
+    // (dispatch accepted) calls recordContinuationFired while an explicit
+    // Pause is finalizing. The tail still ends at the goal's own continuation
+    // row (boundary append in flight), so the paused→active acceptance would
+    // flip the goal back — and once the scoped boundary lands, the
+    // Resume-wins rule preserves that automatic flip as if the user resumed.
+    // The firing must honor the pause-finalization hold.
+    const created = await setGoalOk(service, { workspaceId, objective: "Pause vs continuation" });
+    await appendUserHistoryMessage(historyService, workspaceId, "Continue working on the goal.", {
+      timestamp: Date.now(),
+      synthetic: true,
+      kind: "goal_continuation",
+      goalId: created.goalId,
+    });
+
+    // Gate the finalizer's boundary append so the firing runs mid-window.
+    const realAppend = historyService.appendToHistory.bind(historyService);
+    let releaseAppend!: () => void;
+    const appendGate = new Promise<void>((resolve) => {
+      releaseAppend = resolve;
+    });
+    let appendStarted = false;
+    const appendSpy = spyOn(historyService, "appendToHistory").mockImplementationOnce(
+      async (id, message) => {
+        appendStarted = true;
+        await appendGate;
+        return realAppend(id, message);
+      }
+    );
+
+    const pausePromise = service.setGoal({ workspaceId, status: "paused" });
+    await waitForCondition(() => appendStarted, { timeoutMs: 5_000 });
+
+    // Mid-window: the admitted continuation fires. Without the hold check it
+    // would flip the paused goal back to active on "tail says active" evidence.
+    const serviceAccess = service as unknown as {
+      recordContinuationFired: (id: string, goalId: string, firedAtMs: number) => Promise<void>;
+    };
+    await serviceAccess.recordContinuationFired(workspaceId, created.goalId, Date.now());
+
+    releaseAppend();
+    const pauseResult = await pausePromise;
+    expect(pauseResult.success).toBe(true);
+    appendSpy.mockRestore();
+
+    // The Pause wins — durably and against later reconciliation.
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: created.goalId,
+      status: "paused",
+    });
+  });
+
+  test("a continuation fired against pre-pause tail evidence does not reactivate the goal", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cMQqq): recordContinuationFired reads the
+    // chat tail outside the goal lock. An explicit Pause can fully commit
+    // (durable write, scoped boundary append, hold release) between that read
+    // and the locked apply — the stale "tail says active" evidence must not
+    // flip the paused goal back to active, because the scoped boundary at the
+    // tail would then make the Resume-wins rule preserve the flip durably.
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Stale-read continuation",
+    });
+    await appendUserHistoryMessage(historyService, workspaceId, "Continue working on the goal.", {
+      timestamp: Date.now(),
+      synthetic: true,
+      kind: "goal_continuation",
+      goalId: created.goalId,
+    });
+
+    // One-shot: the real tail read completes first (pre-pause evidence), then
+    // the full explicit Pause commits before the caller's locked section.
+    const serviceAccess = service as unknown as {
+      readChatTailGoalMode: (id: string, goalId?: string | null) => Promise<unknown>;
+      recordContinuationFired: (id: string, goalId: string, firedAtMs: number) => Promise<void>;
+    };
+    const realRead = serviceAccess.readChatTailGoalMode.bind(service);
+    serviceAccess.readChatTailGoalMode = async (id: string, goalId?: string | null) => {
+      const evidence = await realRead(id, goalId);
+      // Restore before pausing: the pause's own finalization reads the tail.
+      serviceAccess.readChatTailGoalMode = realRead;
+      const paused = await service.setGoal({ workspaceId, status: "paused" });
+      expect(paused.success).toBe(true);
+      return evidence;
+    };
+
+    await serviceAccess.recordContinuationFired(workspaceId, created.goalId, Date.now());
+
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: created.goalId,
+      status: "paused",
+    });
+  });
+
+  test("reconciliation with pre-pause tail evidence does not reactivate an explicitly paused goal", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cMQqq): syncGoalStatusToChatTail shares the
+    // unlocked-tail-read shape, and its in-flight hold check cannot see a
+    // Pause that fully committed between the read and the locked apply. The
+    // generation stamp must refuse the stale continuation-row evidence.
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Stale-read reconciliation",
+    });
+    await appendUserHistoryMessage(historyService, workspaceId, "Continue working on the goal.", {
+      timestamp: Date.now(),
+      synthetic: true,
+      kind: "goal_continuation",
+      goalId: created.goalId,
+    });
+
+    const serviceAccess = service as unknown as {
+      readChatTailGoalMode: (id: string, goalId?: string | null) => Promise<unknown>;
+    };
+    const realRead = serviceAccess.readChatTailGoalMode.bind(service);
+    serviceAccess.readChatTailGoalMode = async (id: string, goalId?: string | null) => {
+      const evidence = await realRead(id, goalId);
+      serviceAccess.readChatTailGoalMode = realRead;
+      const paused = await service.setGoal({ workspaceId, status: "paused" });
+      expect(paused.success).toBe(true);
+      return evidence;
+    };
+
+    // A routine read (heartbeat / tool assembly) reconciles with the stale
+    // evidence — the explicit Pause must win, now and on the next clean read.
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: created.goalId,
+      status: "paused",
+    });
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: created.goalId,
+      status: "paused",
+    });
+  });
+
   test("cost previews reset when the goal becomes ineligible for accounting mid-stream", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cEl4P): a status transition during the stream
     // (pause, complete, or a budget edit flipping the goal budget_limited)
