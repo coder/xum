@@ -3215,24 +3215,23 @@ describe("WorkspaceService activity list scoping", () => {
         path.join(config.rootDir, "extensionMetadata.json")
       );
       await extensionMetadata.updateRecency("possibly-live", 100);
-      const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
-        Promise.reject(new Error("config unavailable"))
-      );
-      try {
-        const workspaceService = createWorkspaceServiceForTest({
-          config,
-          historyService,
-          extensionMetadata,
-        });
-        // Fail open: without the config view, stale ids cannot be told apart
-        // from live ones, so nothing may be dropped from the list or pruned
-        // from disk.
-        const activityList = await workspaceService.getActivityList();
-        expect(activityList["possibly-live"]?.recency).toBe(100);
-        expect((await extensionMetadata.getAllSnapshots()).has("possibly-live")).toBe(true);
-      } finally {
-        metadataSpy.mockRestore();
-      }
+      // Real on-disk corruption: loadConfigOrDefault SWALLOWS this and
+      // resolves with the empty default unless callers opt into the strict
+      // read. Without throwOnError, this state would silently wipe every
+      // metadata entry (prune sees an "empty" config) and drop every live
+      // entry from the list instead of reaching the fail-open fallback.
+      await fsPromises.writeFile(path.join(config.rootDir, "config.json"), "{not json");
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+      // Fail open: without the config view, stale ids cannot be told apart
+      // from live ones, so nothing may be dropped from the list or pruned
+      // from disk.
+      const activityList = await workspaceService.getActivityList();
+      expect(activityList["possibly-live"]?.recency).toBe(100);
+      expect((await extensionMetadata.getAllSnapshots()).has("possibly-live")).toBe(true);
     } finally {
       await cleanup();
     }

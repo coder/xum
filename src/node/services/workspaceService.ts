@@ -12796,7 +12796,14 @@ export class WorkspaceService extends EventEmitter {
         // reading config fresh from disk (see pruneMissingWorkspaces), so a
         // concurrently created workspace — even in another backend process —
         // cannot lose its just-written entry.
-        const allMetadata = await this.config.getAllWorkspaceMetadata();
+        //
+        // throwOnError: a corrupted/unreadable config.json otherwise resolves
+        // as the swallowed-failure EMPTY default, which this destructive
+        // prune cannot distinguish from a truly empty config — it would
+        // delete every entry. Throwing aborts the prune (caught below); a
+        // missing file still resolves as a healthy empty config. Same
+        // precedent as cleanupOrphanSessionDirs' internal strict read.
+        const allMetadata = await this.config.getAllWorkspaceMetadata({ throwOnError: true });
         return new Set(allMetadata.map((metadata) => metadata.id));
       });
       if (prunedCount > 0) {
@@ -12821,8 +12828,13 @@ export class WorkspaceService extends EventEmitter {
       // scoping only drops ids that are not in config at all.
       let workspaceIds: Set<string>;
       try {
+        // throwOnError so a corrupted config.json actually reaches the
+        // fail-open fallback below instead of silently resolving as the
+        // empty default and dropping every live entry from the list.
         workspaceIds = new Set(
-          (await this.config.getAllWorkspaceMetadata()).map((metadata) => metadata.id)
+          (await this.config.getAllWorkspaceMetadata({ throwOnError: true })).map(
+            (metadata) => metadata.id
+          )
         );
       } catch (error) {
         // Fail open: without the config view, stale ids cannot be told apart

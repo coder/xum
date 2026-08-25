@@ -2200,8 +2200,18 @@ export class Config {
    * If missing from config or legacy metadata, a new timestamp is assigned and
    * saved to config for subsequent loads.
    */
-  async getAllWorkspaceMetadata(): Promise<FrontendWorkspaceMetadata[]> {
-    const config = this.loadConfigOrDefault();
+  async getAllWorkspaceMetadata(options?: {
+    /**
+     * Throw on config read/parse failure instead of silently resolving with
+     * the empty default. Callers that make destructive decisions based on
+     * "workspace is not in config" (e.g. extension-metadata pruning) must use
+     * this: the swallowed-failure default is indistinguishable from a truly
+     * empty config. A missing config file still resolves as empty (healthy
+     * fresh install), matching loadConfigOrDefault.
+     */
+    throwOnError?: boolean;
+  }): Promise<FrontendWorkspaceMetadata[]> {
+    const config = this.loadConfigOrDefault({ throwOnError: options?.throwOnError });
     const workspaceMetadata: FrontendWorkspaceMetadata[] = [];
     // Read-time migrations recorded here are re-applied to a FRESH config snapshot inside
     // editConfig below. Persisting the local `config` snapshot directly (the old
