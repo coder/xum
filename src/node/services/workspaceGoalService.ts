@@ -2100,21 +2100,30 @@ export class WorkspaceGoalService {
           // pending mutation.
           return null;
         }
+        // A user can run /goal while the first turn is still streaming. The
+        // durable goal write must wait for stream accounting, but the Goal panel
+        // reads activity snapshots, so publish the projected goal immediately
+        // without persisting this crash-unsafe optimistic state.
+        await this.publishPendingGoalSnapshot(input.workspaceId, projected);
         if (projectedIsFreshGoal) {
-          // Codex P2 (PRRT_kwDOPxxmWM6b-CH5): createGoal() stamped createdAtMs
-          // before the kickoff-model validation and streaming re-check awaits
-          // above. A message queued during those awaits postdates that stamp
-          // yet predates the goal becoming visible, so the pre-goal guard
-          // (enqueuedAtMs <= createdAtMs) would misread it as an intervention
-          // against a goal the user could not have seen. Stamp creation at
-          // publication instead. Existing-goal branches keep their original
-          // durable createdAtMs — those goals were published long ago.
+          // Codex P2 (PRRT_kwDOPxxmWM6b-CH5, PRRT_kwDOPxxmWM6b-Uli): stamp
+          // fresh-goal creation AFTER publication completes. createGoal()'s
+          // construction stamp predates the kickoff-model validation await,
+          // the streaming re-check, and the async activity-snapshot read
+          // inside publication — a message queued during any of those awaits
+          // postdated that stamp while the goal was not yet visible anywhere,
+          // so the pre-goal guard (enqueuedAtMs <= createdAtMs) misread it as
+          // an intervention against a goal the user could not have seen.
+          // Existing-goal branches keep their original durable createdAtMs —
+          // those goals were published long ago. Sync the in-memory pending
+          // snapshot so later re-publishes match what the drain will persist.
           const publishedAtMs = Date.now();
           projected = GoalRecordV1Schema.parse({
             ...projected,
             createdAtMs: publishedAtMs,
             updatedAtMs: publishedAtMs,
           });
+          this.pendingGoalSnapshots.set(input.workspaceId, toPendingGoalSnapshot(projected));
         }
         this.pendingGoalMutations.set(input.workspaceId, {
           objective,
@@ -2139,11 +2148,6 @@ export class WorkspaceGoalService {
           // pending mutation drains.
           ...(input.editInPlace != null ? { editInPlace: input.editInPlace } : {}),
         });
-        // A user can run /goal while the first turn is still streaming. The
-        // durable goal write must wait for stream accounting, but the Goal panel
-        // reads activity snapshots, so publish the projected goal immediately
-        // without persisting this crash-unsafe optimistic state.
-        await this.publishPendingGoalSnapshot(input.workspaceId, projected);
         return Ok(projected);
       });
       if (deferredResult != null) {

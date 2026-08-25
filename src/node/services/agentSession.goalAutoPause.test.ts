@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import type { AIService } from "./aiService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
@@ -238,6 +238,38 @@ describe("AgentSession goal safety hooks", () => {
 
     expect(result.success).toBe(true);
     expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "paused" });
+    session.dispose();
+  });
+
+  test("acknowledgment failure still clears the kickoff candidate", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6b-Uln): the manual row is durably appended
+    // before goal safety runs. If acknowledgeUser() throws (goal /
+    // extension-metadata write failure), the pre-goal queue-race guard can
+    // never prove the message predates the goal, so the kickoff candidate must
+    // still be cleared conservatively — a stale candidate could otherwise
+    // dispatch a continuation against the user's persisted intervention once
+    // the failed send returns the workspace to idle.
+    const workspaceId = "ack-failure-clears-candidate";
+    const { session, goalService, cleanup } = await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const created = await setGoalOk(goalService, { workspaceId, objective: "Fresh goal" });
+
+    spyOn(goalService, "acknowledgeUser").mockImplementation(() =>
+      Promise.reject(new Error("goal write failed"))
+    );
+    const clearSpy = spyOn(goalService, "clearPendingContinuationForManualUserMessage");
+
+    let thrown: unknown = null;
+    try {
+      await session.sendMessage("Manual intervention", SEND_OPTIONS, {
+        enqueuedAtMs: created.createdAtMs + 1,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    expect(clearSpy).toHaveBeenCalledWith(workspaceId);
     session.dispose();
   });
 

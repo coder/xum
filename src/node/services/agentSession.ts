@@ -1630,7 +1630,20 @@ export class AgentSession {
     // anything manually typed by the user pauses until Resume appends a fresh
     // continuation. Legacy clients may still send the old "steer" policy; treat
     // it as pause so the invariant holds at this backend boundary.
-    const goal = await goalService.acknowledgeUser(this.workspaceId);
+    let goal: Awaited<ReturnType<typeof goalService.acknowledgeUser>>;
+    try {
+      goal = await goalService.acknowledgeUser(this.workspaceId);
+    } catch (error) {
+      // Codex P2 (PRRT_kwDOPxxmWM6b-Uln): the manual row is already durably
+      // appended by this point. When acknowledgment fails we cannot read the
+      // goal to prove the pre-goal queue race below, so conservatively clear
+      // the kickoff candidate first (the pre-reorder behavior): once the
+      // failed send returns the workspace to idle, a stale candidate could
+      // otherwise dispatch a continuation despite the user's persisted
+      // intervention.
+      goalService.clearPendingContinuationForManualUserMessage(this.workspaceId);
+      throw error;
+    }
 
     // Queue race: a message the user typed while the goal-creating turn was
     // still streaming predates the goal itself — the model's queued set_goal

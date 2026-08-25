@@ -2269,12 +2269,14 @@ describe("WorkspaceGoalService", () => {
   });
 
   test("queued mid-stream goal creation stamps creation at publication time", async () => {
-    // Codex P2 (PRRT_kwDOPxxmWM6b-CH5): awaits between goal construction and
-    // publication (kickoff-model pricing validation, streaming re-check) leave
-    // a window where a user can queue a message after createdAtMs was stamped
-    // but before the goal is visible anywhere. Creation must date from
-    // publication so the pre-goal guard (enqueuedAtMs <= createdAtMs) covers
-    // messages typed during that window.
+    // Codex P2 (PRRT_kwDOPxxmWM6b-CH5, PRRT_kwDOPxxmWM6b-Uli): awaits between
+    // goal construction and completed publication (kickoff-model pricing
+    // validation, streaming re-check, and the async activity-snapshot read
+    // inside publication itself) leave a window where a user can queue a
+    // message after createdAtMs was stamped but before the goal is visible
+    // anywhere. Creation must date from completed publication so the pre-goal
+    // guard (enqueuedAtMs <= createdAtMs) covers messages typed during any of
+    // those awaits.
     const dispatcher = new IdleDispatcher();
     let midValidationMs = 0;
     service.registerGoalContinuationConsumer(dispatcher, {
@@ -2288,6 +2290,17 @@ describe("WorkspaceGoalService", () => {
       },
     });
     await extensionMetadata.setStreaming(workspaceId, true);
+    // Hold every activity-snapshot read (streaming re-check + the read inside
+    // publication) so the last read observably postdates any pre-publication
+    // creation stamp.
+    let lastActivityReadMs = 0;
+    const originalGetSnapshot = extensionMetadata.getSnapshot.bind(extensionMetadata);
+    spyOn(extensionMetadata, "getSnapshot").mockImplementation(async (id: string) => {
+      const snapshot = await originalGetSnapshot(id);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      lastActivityReadMs = Date.now();
+      return snapshot;
+    });
 
     const queued = await service.setGoal({
       workspaceId,
@@ -2297,8 +2310,12 @@ describe("WorkspaceGoalService", () => {
 
     expect(queued.success).toBe(true);
     expect(midValidationMs).toBeGreaterThan(0);
+    expect(lastActivityReadMs).toBeGreaterThan(0);
     const projected = queued.success ? queued.data : null;
     expect(projected?.createdAtMs ?? -1).toBeGreaterThanOrEqual(midValidationMs);
+    // The publication path's own async read is the last pre-visibility await:
+    // the creation stamp must postdate it.
+    expect(projected?.createdAtMs ?? -1).toBeGreaterThanOrEqual(lastActivityReadMs);
   });
 
   test("queued mid-stream goal replacement preserves expectedGoalId at drain time", async () => {
