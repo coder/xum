@@ -137,17 +137,26 @@ function buildDisplayOnlyFilePlaceholder(item: DisplayOnlyFilePart): AISDKTextPa
  * {toolCalls:[{result: …}]} chains deep enough would overflow the stack while
  * preparing provider messages, and since extraction runs on EVERY request,
  * one malformed row would brick the workspace (self-healing rule). Real
- * nesting is 1–2 levels (code_execution → bridged tool results); over-deep
- * values are left unrewritten instead of recursed into.
+ * nesting is 1–2 levels (code_execution → bridged tool results).
+ *
+ * Over-deep subtrees are REPLACED with a bounded placeholder in the provider
+ * copy, not retained: descent only follows tool-output-shaped wrappers, so
+ * anything past the cap is malformed by construction, and retaining it would
+ * keep shipping whatever payload hides at the leaf (e.g. raw base64) on every
+ * later request — trading the stack overflow for context-limit failures.
+ * Persisted history itself is never mutated.
  */
 const MAX_NESTED_TOOL_EXTRACTION_DEPTH = 64;
+
+const OVER_DEPTH_PLACEHOLDER =
+  "[tool output omitted from provider request: nested tool-record depth limit exceeded]";
 
 export function extractAttachmentsFromToolOutput(
   output: unknown,
   depth = 0
 ): { newOutput: unknown; attachments: ExtractedToolAttachment[] } | null {
   if (depth > MAX_NESTED_TOOL_EXTRACTION_DEPTH) {
-    return null;
+    return { newOutput: OVER_DEPTH_PLACEHOLDER, attachments: [] };
   }
   if (isJsonContainer(output)) {
     const extracted = extractAttachmentsFromToolOutput(output.value, depth + 1);
