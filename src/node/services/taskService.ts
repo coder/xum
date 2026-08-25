@@ -3690,10 +3690,12 @@ export class TaskService {
    * Validate an explicit agentId against the TARGET workspace's checkout, tolerating
    * targets that are not reachable yet (deferred provisioning, stopped containers)
    * without permitting a silent exec fallback later:
-   * - reachable checkout: strict validation;
-   * - unreachable + built-in agent: validate against the embedded definitions —
-   *   built-ins exist in every checkout, so the launch is provably safe;
-   * - unreachable + custom agent: fail with a reachability error instead of a
+   * - reachable checkout: strict validation against the target;
+   * - unreachable + built-in agent id: validate against the OWNER's checkout — same
+   *   project, so a project-local shadow of the built-in id (and its ui/disabled
+   *   state) is visible there, while the embedded definition guarantees the id
+   *   resolves in the target even if the shadow is absent;
+   * - unreachable + custom agent id: fail with a reachability error instead of a
    *   misleading "unknown agentId". Dispatching anyway would let
    *   resolveAgentForStream silently fall back to exec if the definition turns out
    *   to be absent after provisioning (wrong prompt/tool policy).
@@ -3703,21 +3705,29 @@ export class TaskService {
   private async validateWorkspaceTurnAgentIdForTarget(params: {
     cfg: ReturnType<Config["loadConfigOrDefault"]>;
     agentId: string;
-    runtime: Runtime;
-    workspacePath: string;
-  }): Promise<Result<void, string>> {
-    const reachable = await runtimePathExists(params.runtime, params.workspacePath);
-    if (
-      !reachable &&
-      !getBuiltInAgentDefinitions().some((definition) => definition.id === params.agentId)
-    ) {
+    target: { runtime: Runtime; workspacePath: string };
+    owner: { runtime: Runtime; workspacePath: string };
+  }): Promise<Result<{ validatedContext: { runtime: Runtime; workspacePath: string } }, string>> {
+    const reachable = await runtimePathExists(params.target.runtime, params.target.workspacePath);
+    if (reachable) {
+      const validation = await this.validateWorkspaceTurnAgentId({
+        cfg: params.cfg,
+        agentId: params.agentId,
+        ...params.target,
+      });
+      return validation.success ? Ok({ validatedContext: params.target }) : validation;
+    }
+    if (!getBuiltInAgentDefinitions().some((definition) => definition.id === params.agentId)) {
       return Err(
-        `Task.createWorkspaceTurn: target checkout is not reachable yet (provisioning or stopped runtime), so non-built-in agentId (${params.agentId}) cannot be verified — omit agentId or retry once the workspace is ready`
+        `Task.createWorkspaceTurn: target checkout is not reachable yet (provisioning or stopped runtime), so non-built-in agentId (${params.agentId}) cannot be verified`
       );
     }
-    // Built-in agents resolve from embedded definitions even when the runtime is
-    // unreachable: per-root discovery failures are swallowed by the scanner.
-    return await this.validateWorkspaceTurnAgentId(params);
+    const validation = await this.validateWorkspaceTurnAgentId({
+      cfg: params.cfg,
+      agentId: params.agentId,
+      ...params.owner,
+    });
+    return validation.success ? Ok({ validatedContext: params.owner }) : validation;
   }
 
   async createWorkspaceTurn(
@@ -3804,6 +3814,11 @@ export class TaskService {
     // agent-authored frontmatter `ai` defaults participate in AI-settings resolution
     // (mirrors the sub-agent creation path). Left unset for default exec/resume turns.
     let agentDefinitionContext: NodeAgentDefinitionContext | undefined;
+    // Post-create target validation failure. Deferred (not returned immediately) so the
+    // workspace-turn record is still written first: the record marks the created workspace
+    // as owner-owned and retryable via mode="existing", and the failure settles through the
+    // normal handle machinery instead of stranding an unowned workspace.
+    let agentValidationError: string | undefined;
     let targetWorkspaceId: string;
     let targetAiSettings: ResolvedWorkspaceAiSettings | undefined;
     let targetTaskModelString: string | undefined;
@@ -3866,31 +3881,35 @@ export class TaskService {
         // never mutates the target workspace's saved agent/settings (the dispatch below
         // skips AI-settings persistence). Validate against the TARGET workspace's checkout
         // (project-local agent definitions can diverge across branches).
-        const targetContext = this.buildWorkspaceTurnAgentContext(
+        const ownerContext = this.buildWorkspaceTurnAgentContext({
+          runtimeConfig: parentMeta.runtimeConfig,
+          projectPath: parentMeta.projectPath,
+          workspaceName: parentMeta.name,
+          persistedWorkspacePath: parentEntry?.workspace.path,
+        });
+        const targetContext =
           targetEntry != null
-            ? {
+            ? this.buildWorkspaceTurnAgentContext({
                 runtimeConfig: targetEntry.workspace.runtimeConfig ?? parentMeta.runtimeConfig,
                 projectPath: targetEntry.projectPath,
                 // Entries created by workspaceService.create always carry a name; the fallback
                 // only satisfies the optional persisted-config type.
                 workspaceName: coerceNonEmptyString(targetEntry.workspace.name) ?? parentMeta.name,
                 persistedWorkspacePath: targetEntry.workspace.path,
-              }
-            : {
-                runtimeConfig: parentMeta.runtimeConfig,
-                projectPath: parentMeta.projectPath,
-                workspaceName: parentMeta.name,
-                persistedWorkspacePath: parentEntry?.workspace.path,
-              }
-        );
+              })
+            : ownerContext;
         const validation = await this.validateWorkspaceTurnAgentIdForTarget({
           cfg,
           agentId: requestedAgentId,
-          ...targetContext,
+          target: targetContext,
+          owner: ownerContext,
         });
         if (!validation.success) return Err(validation.error);
         workspaceTurnAgentId = requestedAgentId;
-        agentDefinitionContext = { ...targetContext, workspaceId: targetWorkspaceId };
+        agentDefinitionContext = {
+          ...validation.data.validatedContext,
+          workspaceId: targetWorkspaceId,
+        };
       }
       // Follow-up sends continue the target workspace's own last-used settings
       // (persisted on every send, or manually changed by the user in that
@@ -3910,10 +3929,11 @@ export class TaskService {
         if (!slot.success) return Err(slot.error);
       }
     } else {
+      let ownerContext: { runtime: Runtime; workspacePath: string } | undefined;
       if (requestedAgentId != null) {
         // Pre-create stage: catch obviously bad ids (unknown/hidden/disabled) against the
         // OWNER's checkout before creating any workspace.
-        const ownerContext = this.buildWorkspaceTurnAgentContext({
+        ownerContext = this.buildWorkspaceTurnAgentContext({
           runtimeConfig: parentMeta.runtimeConfig,
           projectPath: parentMeta.projectPath,
           workspaceName: parentMeta.name,
@@ -3949,11 +3969,14 @@ export class TaskService {
       }
       targetWorkspaceId = createResult.data.metadata.id;
       createdWorkspace = true;
-      if (requestedAgentId != null) {
+      if (requestedAgentId != null && ownerContext != null) {
         // Post-create stage: re-validate against the TARGET checkout — project-local agent
         // definitions can diverge across branches/worktrees, so owner-path resolution is not
-        // an invariant. On failure, do not dispatch the turn; the created workspace is left
-        // behind as failed evidence (no safe pre-record cleanup path exists).
+        // an invariant. On failure, do NOT return before the workspace-turn record exists:
+        // the record marks the created workspace as owner-owned, so a mode="existing" retry
+        // (once the checkout is ready or with a valid agent) passes the ownership check
+        // instead of hitting invalid_scope. The failure settles through the normal handle
+        // machinery below.
         const createdMeta = createResult.data.metadata;
         const targetContext = this.buildWorkspaceTurnAgentContext({
           runtimeConfig: createdMeta.runtimeConfig,
@@ -3964,16 +3987,17 @@ export class TaskService {
         const validation = await this.validateWorkspaceTurnAgentIdForTarget({
           cfg,
           agentId: requestedAgentId,
-          ...targetContext,
+          target: targetContext,
+          owner: ownerContext,
         });
         if (!validation.success) {
-          // The created workspace is left behind as failed evidence (no safe
-          // pre-record cleanup path exists); the error names it.
-          return Err(
-            `${validation.error} — no turn was dispatched to the created workspace (${targetWorkspaceId})`
-          );
+          agentValidationError = `${validation.error} — no turn was dispatched; the created workspace (${targetWorkspaceId}) is owned by this caller and can be retried via workspace.mode="existing" once ready`;
+        } else {
+          agentDefinitionContext = {
+            ...validation.data.validatedContext,
+            workspaceId: targetWorkspaceId,
+          };
         }
-        agentDefinitionContext = { ...targetContext, workspaceId: targetWorkspaceId };
       }
       workspaceTurnAgentId = requestedAgentId ?? workspaceTurnAgentId;
     }
@@ -4058,6 +4082,24 @@ export class TaskService {
         handleId,
         ownerWorkspaceId,
       });
+    }
+
+    if (agentValidationError != null) {
+      // Deferred post-create validation failure: the record above keeps the created
+      // workspace owner-owned (retryable via mode="existing"); settle the handle as a
+      // normal error instead of dispatching the turn.
+      const next: WorkspaceTurnTaskHandleRecord = {
+        ...record,
+        status: "error",
+        updatedAt: getIsoNow(),
+        error: agentValidationError,
+      };
+      await this.settleWorkspaceTurn({
+        record,
+        next,
+        waiterSettlement: { status: "error", error: new Error(agentValidationError) },
+      });
+      return Err(agentValidationError);
     }
 
     const markWorkspaceTurnAccepted = async () => {

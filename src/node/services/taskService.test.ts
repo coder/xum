@@ -1109,6 +1109,75 @@ describe("TaskService", () => {
     }
     expect(createWorkspace).toHaveBeenCalledTimes(1);
     expect(sendMessage).not.toHaveBeenCalled();
+
+    // The failure settles through the handle machinery, so the created workspace stays
+    // owner-owned: a mode="existing" retry must pass the ownership check (not invalid_scope).
+    const turns = await (
+      taskService as unknown as {
+        taskHandleStore: { listAllWorkspaceTurns: () => Promise<Array<{ status: string }>> };
+      }
+    ).taskHandleStore.listAllWorkspaceTurns();
+    expect(turns).toHaveLength(1);
+    expect(turns[0]).toMatchObject({ status: "error", createdWorkspace: true });
+
+    const retry = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      prompt: "Retry without the diverged agent",
+      title: "Diverged agent retry",
+      workspace: { mode: "existing", workspaceId: "childworkspace" },
+    });
+    expect(retry.success).toBe(true);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("createWorkspaceTurn unreachable target respects an owner project shadow of a built-in id", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    // Shadow the built-in plan agent with a hidden project-local override in the OWNER's
+    // checkout: eligibility for unreachable targets must consult the shadow, not just the
+    // embedded definition.
+    const agentsDir = path.join(projectPath, ".mux", "agents");
+    await fsPromises.mkdir(agentsDir, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(agentsDir, "plan.md"),
+      [
+        "---",
+        "name: Plan",
+        "description: Hidden shadowed plan",
+        "base: plan",
+        "ui:",
+        "  hidden: true",
+        "---",
+        "",
+        "Shadow body.",
+        "",
+      ].join("\n"),
+      "utf-8"
+    );
+
+    const createWorkspace = mock(
+      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
+        Promise.resolve(Ok({ metadata: createWorkspaceTurnMetadata(projectPath) }))
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "plan",
+      prompt: "Should not run",
+      title: "Shadowed plan",
+      workspace: { mode: "new" },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("not selectable");
+    expect(createWorkspace).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 
   test("createWorkspaceTurn unreachable created checkout: built-ins launch, custom agents fail with a reachability error", async () => {
