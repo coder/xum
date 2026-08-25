@@ -348,22 +348,31 @@ describe("WorkspaceGoalService", () => {
 
   test("arms a kickoff continuation when a brand-new goal is set on an idle workspace", async () => {
     const dispatcher = new IdleDispatcher();
-    const executed: Array<{ message: string; kind: string | undefined }> = [];
+    const executed: Array<{
+      message: string;
+      kind: string | undefined;
+      goalId: string | undefined;
+    }> = [];
     service.registerGoalContinuationConsumer(dispatcher, {
       hasActiveDescendantTasks: () => false,
       getRuntimeState: () => ({ isRuntimeCompatible: true }),
       executeGoalContinuation: (input) => {
-        executed.push({ message: input.message, kind: input.kind });
+        executed.push({ message: input.message, kind: input.kind, goalId: input.goalId });
         return Promise.resolve(true);
       },
       getKickoffSendOptions: () => Promise.resolve({ model: "openai:gpt-4o", agentId: "exec" }),
     });
 
-    await setGoalOk(service, { workspaceId, objective: "Kick off without a prior stream" });
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Kick off without a prior stream",
+    });
     await waitForCondition(() => executed.length > 0, { timeoutMs: 1_000 });
 
     expect(executed[0]?.message).toContain("<untrusted_objective>");
     expect(executed[0]?.kind).toBe("goal_continuation");
+    // The dispatch carries the goal identity so the persisted row is goal-scoped.
+    expect(executed[0]?.goalId).toBe(created.goalId);
   });
 
   test("arms a kickoff continuation when resuming a paused goal on an idle workspace", async () => {
@@ -2815,6 +2824,60 @@ describe("WorkspaceGoalService", () => {
     expect(await service.getGoal(workspaceId)).toMatchObject({
       goalId: goalB.goalId,
       status: "paused",
+    });
+  });
+
+  test("continuation rows for a replaced goal do not reconcile the newer goal to active", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cH3kV): goal A fired a continuation and was
+    // paused, then replaced with goal B which the user pauses. When B's pause
+    // finalizer cannot land its own boundary (crash / append failure), any
+    // later reconciliation skips A's goal-scoped boundary and would otherwise
+    // reach A's older continuation row and silently reactivate B.
+    // Continuation evidence is goal-scoped.
+    const goalA = await setGoalOk(service, { workspaceId, objective: "Goal A" });
+    await appendUserHistoryMessage(historyService, workspaceId, "Continue working on the goal.", {
+      timestamp: Date.now(),
+      synthetic: true,
+      kind: "goal_continuation",
+      goalId: goalA.goalId,
+    });
+    const pausedBoundary = createMuxMessage(
+      `goal-paused-a-${crypto.randomUUID()}`,
+      "user",
+      "Goal paused by the user. Do not continue the goal until a later goal continuation message.",
+      {
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: { type: "goal-pause-boundary", goalId: goalA.goalId },
+      }
+    );
+    expect((await historyService.appendToHistory(workspaceId, pausedBoundary)).success).toBe(true);
+
+    const goalB = await setGoalOk(service, { workspaceId, objective: "Goal B" });
+    // Simulate B's pause boundary append being lost (crash-equivalent): the
+    // finalizer skips its post-pause chat-tail sync, leaving the tail ending
+    // at goal A's rows while goal.json durably says B is paused.
+    const appendSpy = spyOn(historyService, "appendToHistory").mockImplementationOnce(() =>
+      Promise.resolve({ success: false, error: "injected: boundary append lost" })
+    );
+    await setGoalOk(service, { workspaceId, status: "paused" });
+    appendSpy.mockRestore();
+
+    // Reconciliation skips A's boundary AND A's continuation row — B stays paused.
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: goalB.goalId,
+      status: "paused",
+    });
+
+    // Legacy continuation rows without a goalId keep the old any-goal semantics.
+    await appendUserHistoryMessage(historyService, workspaceId, "Continue working on the goal.", {
+      timestamp: Date.now(),
+      synthetic: true,
+      kind: "goal_continuation",
+    });
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: goalB.goalId,
+      status: "active",
     });
   });
 

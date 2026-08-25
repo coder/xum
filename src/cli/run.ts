@@ -832,6 +832,7 @@ async function main(): Promise<number> {
   });
 
   let goalStopReason: string | null = null;
+  let cliGoalId: string | undefined;
   if (hasGoal) {
     const setGoalResult = await workspaceGoalService.setGoal({
       workspaceId,
@@ -843,6 +844,7 @@ async function main(): Promise<number> {
     if (!setGoalResult.success) {
       throw new Error(`Failed to set CLI goal: ${setGoalResult.error.type}`);
     }
+    cliGoalId = setGoalResult.data.goalId;
     const warning =
       goalBudgetCents == null && goalTurnCap == null
         ? "CLI Goal Run has no --goal-budget or --goal-turns limit. It will continue until the goal is complete or another stop condition occurs."
@@ -1023,6 +1025,7 @@ async function main(): Promise<number> {
             synthetic: true,
             agentInitiated: true,
             goalKind: GOAL_CONTINUATION_KIND,
+            goalId: cliGoalId,
             goalContinuation: true,
           }
         : undefined

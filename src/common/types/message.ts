@@ -882,6 +882,14 @@ export interface MuxMetadata {
   muxMetadata?: MuxMessageMetadata; // Command metadata used by both frontend and backend message flows
   /** Persisted discriminator for synthetic user turns created by the active-goal loop. */
   kind?: "goal_continuation" | "goal_budget_limit";
+  /**
+   * Goal identity for `kind` rows. Chat-tail reconciliation only accepts a
+   * continuation row as "goal is active" evidence when it was dispatched for
+   * the goal being reconciled — a replaced goal's continuation must not
+   * reactivate its successor (Codex P2 PRRT_kwDOPxxmWM6cH3kV). Legacy rows
+   * without a goalId keep the old any-goal semantics.
+   */
+  goalId?: string;
 
   /**
    * ACP-only correlation id propagated through stream events so prompt() can

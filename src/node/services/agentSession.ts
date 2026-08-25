@@ -2754,6 +2754,8 @@ export class AgentSession {
       agentInitiated?: boolean;
       goalContinuation?: boolean;
       goalKind?: GoalSyntheticMessageKind;
+      /** Goal identity persisted alongside goalKind so chat-tail reconciliation can scope the row. */
+      goalId?: string;
       startStreamInBackground?: boolean;
       onAccepted?: () => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
@@ -3324,6 +3326,9 @@ export class AgentSession {
         muxMetadata: stampedMuxMetadata, // Pass through frontend metadata as black-box
         ...(acpPromptId != null ? { acpPromptId } : {}),
         ...(goalKind != null ? { kind: goalKind } : {}),
+        // Scope goal-loop rows to their goal so a replaced goal's continuation
+        // cannot reactivate its successor during chat-tail reconciliation.
+        ...(goalKind != null && internal?.goalId != null ? { goalId: internal.goalId } : {}),
         // Persist the queue-entry authoring time so goal-safety reconciliation
         // can re-derive the pre-goal/post-goal distinction after a restart.
         ...(internal?.enqueuedAtMs != null ? { enqueuedAtMs: internal.enqueuedAtMs } : {}),

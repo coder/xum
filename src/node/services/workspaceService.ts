@@ -10563,6 +10563,8 @@ export class WorkspaceService extends EventEmitter {
       goalContinuation?: boolean;
       /** Specific active-goal synthetic turn kind to persist on the user message. */
       goalKind?: GoalSyntheticMessageKind;
+      /** Goal identity persisted alongside goalKind so reconciliation can scope the row. */
+      goalId?: string;
       /** Force Copilot billing classification to "agent" for internal sends. */
       agentInitiated?: boolean;
       onAccepted?: () => Promise<void> | void;
@@ -10820,6 +10822,7 @@ export class WorkspaceService extends EventEmitter {
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
             goalKind: internal?.goalKind,
+            goalId: internal?.goalId,
             cancelState: internal?.cancelState,
             cancelSignal: internal?.cancelSignal,
             onCanceled: internal?.onCanceled,
@@ -11046,6 +11049,7 @@ export class WorkspaceService extends EventEmitter {
         synthetic: internal?.synthetic,
         agentInitiated: internal?.agentInitiated,
         goalKind: internal?.goalKind,
+        goalId: internal?.goalId,
         goalContinuation: internal?.goalContinuation,
         startStreamInBackground: internal?.startStreamInBackground,
         cancelState: internal?.cancelState,
@@ -13549,6 +13553,7 @@ export class WorkspaceService extends EventEmitter {
     message: string;
     startStreamInBackground?: boolean;
     kind?: GoalSyntheticMessageKind;
+    goalId?: string;
     options: SendMessageOptions;
   }): Promise<boolean> {
     assert(input.workspaceId.trim().length > 0, "executeGoalContinuation requires workspaceId");
@@ -13575,6 +13580,7 @@ export class WorkspaceService extends EventEmitter {
           : undefined,
         requireIdle: true,
         goalKind,
+        goalId: input.goalId,
         goalContinuation: true,
       }
     );

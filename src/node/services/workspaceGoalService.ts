@@ -182,6 +182,8 @@ export interface GoalContinuationRuntimeBridge {
     options: SendMessageOptions;
     startStreamInBackground?: boolean;
     kind?: GoalSyntheticMessageKind;
+    /** Stamped on the synthetic user row so chat-tail reconciliation can scope it to this goal. */
+    goalId?: string;
   }): Promise<boolean>;
   /**
    * Build default SendMessageOptions for a kickoff continuation that is armed
@@ -579,6 +581,18 @@ export class WorkspaceGoalService {
       }
 
       if (message.metadata?.kind === GOAL_CONTINUATION_KIND) {
+        // Codex P2 (PRRT_kwDOPxxmWM6cH3kV): a replaced goal's continuation row
+        // is not proof that the CURRENT goal is active. When goal A is paused
+        // and replaced with an explicitly paused goal B, a reconciliation that
+        // runs before B's pause finalizer appends its boundary skips A's
+        // goal-scoped boundary above and would otherwise reach A's older
+        // continuation row and silently reactivate B. Rows scoped to a
+        // different goal are invisible here, mirroring the boundary skip;
+        // legacy rows without a goalId keep the old any-goal semantics.
+        const rowGoalId = message.metadata.goalId;
+        if (currentGoalId != null && rowGoalId != null && rowGoalId !== currentGoalId) {
+          continue;
+        }
         return { mode: "active" };
       }
       if (message.metadata?.muxMetadata?.type === "goal-pause-boundary") {
@@ -1430,6 +1444,7 @@ export class WorkspaceGoalService {
             options: candidate.sendOptions,
             startStreamInBackground: false,
             kind: GOAL_BUDGET_LIMIT_KIND,
+            goalId: goal.goalId,
           });
           if (accepted !== true) {
             this.scheduleContinuationReRequest(workspaceId, Date.now() + 1_000);
@@ -1471,6 +1486,7 @@ export class WorkspaceGoalService {
           options: candidate.sendOptions,
           startStreamInBackground: candidate.source === "kickoff",
           kind: GOAL_CONTINUATION_KIND,
+          goalId: goal.goalId,
         });
         if (accepted !== true) {
           this.scheduleContinuationReRequest(workspaceId, Date.now() + 1_000);
