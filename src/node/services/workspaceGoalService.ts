@@ -1195,19 +1195,38 @@ export class WorkspaceGoalService {
    * existed — not an intervention). No-op when something newer armed during
    * the suspension. Re-requests dispatch because a dispatch consumed during
    * the suspension found no candidate and nothing else would retry.
+   *
+   * Codex P2 (PRRT_kwDOPxxmWM6cErQ7): verified under the goal file lock — a
+   * concurrent pause can persist while the manual send was being classified,
+   * and kickoff eligibility deliberately accepts paused goals (the durable
+   * kickoff window), so an unverified restore would reactivate the autonomous
+   * loop despite Pause. Pauses persist under this same lock and delete
+   * candidates in their finalization afterwards, so either the pause is
+   * already durable here (we drop the stale candidate) or its finalization
+   * runs after this restore and deletes it.
    */
-  restorePendingContinuationCandidate(
+  async restorePendingContinuationCandidate(
     workspaceId: string,
     candidate: PendingGoalContinuationCandidate
-  ): void {
+  ): Promise<void> {
     assert(
       workspaceId.trim().length > 0,
       "restorePendingContinuationCandidate requires workspaceId"
     );
-    if (this.pendingContinuationCandidates.has(workspaceId)) {
+    const restored = await this.fileLocks.withLock(workspaceId, async () => {
+      if (this.pendingContinuationCandidates.has(workspaceId)) {
+        return false;
+      }
+      const current = await this.readGoalFile(workspaceId);
+      if (current?.goalId !== candidate.goalId || current.status !== "active") {
+        return false;
+      }
+      this.pendingContinuationCandidates.set(workspaceId, candidate);
+      return true;
+    });
+    if (!restored) {
       return;
     }
-    this.pendingContinuationCandidates.set(workspaceId, candidate);
     this.goalContinuationDispatcher
       ?.requestDispatch(workspaceId, GOAL_CONTINUATION_IDLE_CONSUMER_NAME)
       .catch((error: unknown) => {

@@ -2832,6 +2832,37 @@ describe("WorkspaceGoalService", () => {
     expect(snapshots.at(-1)?.goal?.costCents).toBe(0);
   });
 
+  test("restoring a suspended kickoff candidate is dropped when the goal was paused meanwhile", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cErQ7): kickoff eligibility deliberately
+    // accepts paused goals (the durable kickoff window), so restoring a
+    // suspended candidate after a concurrent Pause persisted would reactivate
+    // the autonomous loop despite the pause. The restore must verify the goal
+    // is still active under the goal file lock.
+    const dispatcher = new IdleDispatcher();
+    service.registerGoalContinuationConsumer(dispatcher, {
+      hasActiveDescendantTasks: () => false,
+      getRuntimeState: () => ({ isRuntimeCompatible: true, isBusy: true }),
+      executeGoalContinuation: () => Promise.resolve(true),
+      getKickoffSendOptions: () => Promise.resolve({ model: "openai:gpt-4o", agentId: "exec" }),
+    });
+    await setGoalOk(service, { workspaceId, objective: "Fresh goal" });
+    const candidates = (
+      service as unknown as { pendingContinuationCandidates: Map<string, unknown> }
+    ).pendingContinuationCandidates;
+    expect(candidates.has(workspaceId)).toBe(true);
+
+    const suspended = service.takePendingContinuationCandidateForManualUserMessage(workspaceId);
+    expect(suspended).not.toBeNull();
+    if (!suspended) {
+      throw new Error("expected a suspended candidate");
+    }
+    // The user pauses while the manual send is being classified.
+    await setGoalOk(service, { workspaceId, status: "paused" });
+
+    await service.restorePendingContinuationCandidate(workspaceId, suspended);
+    expect(candidates.has(workspaceId)).toBe(false);
+  });
+
   test("stale pause finalization does not pause a newer replacement goal", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cECpZ): pause finalization runs outside the
     // goal file lock — a replacement queued behind the pause's persist can

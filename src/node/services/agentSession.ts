@@ -1662,7 +1662,10 @@ export class AgentSession {
     // kept the workspace moving while the goal sat paused).
     if (input.enqueuedAtMs != null && goal != null && goal.createdAtMs >= input.enqueuedAtMs) {
       if (suspendedCandidate != null) {
-        goalService.restorePendingContinuationCandidate(this.workspaceId, suspendedCandidate);
+        // The restore re-verifies goal identity + active status under the
+        // goal file lock (Codex P2 PRRT_kwDOPxxmWM6cErQ7): a pause landing
+        // during classification must win over the suspended kickoff.
+        await goalService.restorePendingContinuationCandidate(this.workspaceId, suspendedCandidate);
       }
       return;
     }
