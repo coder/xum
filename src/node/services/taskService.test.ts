@@ -16266,6 +16266,62 @@ describe("TaskService", () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
+  test("unconfirmed stream stop retains the latch for a completed descendant with live execution", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "branch-a", "branch-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        // Reawakened completed child: the cascade preserves its terminal report, so it persists
+        // neither an interrupted status nor a terminal execution mirror.
+        projectWorkspace(projectPath, "leaf-a", "leaf-a", {
+          parentWorkspaceId: "branch-a",
+          taskStatus: "reported",
+          taskExecutionId: "wst_leaf",
+          taskExecutionStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    // The child's stream cancellation fails (contained by the cascade): with the report
+    // preserved, nothing admission-visible would mark the stop once the latch drops, so the
+    // still-running child could message a cousin right after Stop.
+    const { aiService } = createAIServiceMocks(config, {
+      stopStream: mock((): Promise<Result<void>> => Promise.resolve(Err("cancel failed"))),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
+    await registerLiveWorkspaceTurnHandle(taskService, "leaf-a", "wst_leaf");
+
+    taskService.markParentWorkspaceInterrupted("branch-a");
+    await taskService.terminateAllDescendantAgentTasks("branch-a");
+    expect(findWorkspaceInConfig(config, "leaf-a")?.taskStatus).toBe("reported");
+
+    // User resume clears the level-triggered suppression; only the retained latch refuses.
+    taskService.resetAutoResumeCount("branch-a");
+    expect(
+      await taskService.sendAgentTreeMessage("leaf-a", "sib-b", "escape the unconfirmed stop")
+    ).toEqual(
+      Err({
+        code: "refused",
+        reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
+      })
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   test("sendAgentTreeMessage refuses sends latched at the hard-stop request boundary", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");

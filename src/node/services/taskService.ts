@@ -6502,8 +6502,11 @@ export class TaskService {
 
             // Best-effort: stop any active stream immediately to avoid further token usage
             // while preserving commit-worthy partial progress for inspection/resume.
+            let streamStopConfirmed = false;
             try {
               const stopResult = await this.aiService.stopStream(id, { abandonPartial: false });
+              // No-active-stream stops report success, so idle descendants confirm trivially.
+              streamStopConfirmed = stopResult.success;
               if (!stopResult.success) {
                 log.debug("terminateAllDescendantAgentTasks: stopStream failed", { taskId: id });
               }
@@ -6540,6 +6543,20 @@ export class TaskService {
             }
 
             if (preservedCompletedDescendant) {
+              // A reawakened completed child executes under a live workspace-turn handle while
+              // its STABLE status stays terminal, so this branch persists neither an interrupted
+              // status nor a terminal execution mirror. If its stream cancellation also failed,
+              // nothing admission-visible marks the stop once the latch drops — the still-running
+              // child could message a root or cousin right after Stop. Retain the latch (fail
+              // closed, same contract as the catch below) until stream termination or terminal
+              // execution settlement is confirmed.
+              if (!streamStopConfirmed && this.activeWorkspaceTurnHandleByWorkspaceId.has(id)) {
+                releaseById.delete(id);
+                log.error(
+                  "terminateAllDescendantAgentTasks: unconfirmed stream stop for completed descendant with live execution; retaining stop latch",
+                  { taskId: id }
+                );
+              }
               log.debug(
                 "terminateAllDescendantAgentTasks: preserving completed descendant report",
                 {
