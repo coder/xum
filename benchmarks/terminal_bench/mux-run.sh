@@ -196,8 +196,14 @@ for line in open(sys.argv[1]):
             cumulative_by_msg[msg_id] = (usage, meta)
         elif payload.get("type") == "session-usage-delta":
             for model_usage in (payload.get("byModelDelta") or {}).values():
+                # Sub-agent ChatUsageDisplay already separates uncached input
+                # from cache traffic (input/cached/cacheCreate buckets), so
+                # accumulate each into its own result bucket; skipping the
+                # cache buckets would understate delegated run totals.
                 subagent_input += (model_usage.get("input") or {}).get("tokens", 0)
                 subagent_output += (model_usage.get("output") or {}).get("tokens", 0)
+                result["cache_read"] += (model_usage.get("cached") or {}).get("tokens", 0)
+                result["cache_write"] += (model_usage.get("cacheCreate") or {}).get("tokens", 0)
     except Exception:
         pass
 # No run-complete found — aggregate the last usage-delta per message + sub-agent totals

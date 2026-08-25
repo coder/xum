@@ -100,7 +100,11 @@ export async function findMainRepoDir(projectDir: string): Promise<string | null
     if (mainRepoDir === projectDir) {
       return null;
     }
-    return (await isRegisteredWorktreeOf(mainRepoDir, projectDir)) ? mainRepoDir : null;
+    // Registration lists checkout roots, so resolve a nested projectDir to its
+    // git toplevel before comparing; otherwise subdirectories of registered
+    // worktrees would lose the main-repo trust fallback.
+    const checkoutRoot = (await findGitRoot(projectDir)) ?? projectDir;
+    return (await isRegisteredWorktreeOf(mainRepoDir, checkoutRoot)) ? mainRepoDir : null;
   } catch {
     return null;
   }

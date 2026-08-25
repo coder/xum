@@ -130,6 +130,15 @@ describe("xum trust CLI", () => {
     expect(await materializeResolvedTrust(realConfig, targetConfig, other)).toBe(false);
     expect(targetConfig.loadConfigOrDefault().projects.has(other)).toBe(false);
 
+    // A subdirectory inside a registered worktree keeps the fallback:
+    // registration lists worktree roots, so the check compares the git
+    // toplevel, while trust still materializes onto the requested
+    // subdirectory (the task-spawn gate's exact-path lookup).
+    const nested = path.join(worktree, "packages", "app");
+    await fs.mkdir(nested, { recursive: true });
+    expect(await materializeResolvedTrust(realConfig, targetConfig, nested)).toBe(true);
+    expect(targetConfig.loadConfigOrDefault().projects.get(nested)?.trusted).toBe(true);
+
     // A crafted .git file pointing gitdir at the trusted repository must not
     // inherit its trust: the checkout is not registered as a linked worktree,
     // so treating it as one would let arbitrary directories run repo-controlled
