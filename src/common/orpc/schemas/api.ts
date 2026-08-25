@@ -755,6 +755,15 @@ export const projects = {
     input: z.object({ projectPath: z.string(), force: z.boolean().nullish() }).passthrough(),
     output: ResultSchema(z.void(), ProjectRemoveErrorSchema),
   },
+  // Read-only preflight for the delete confirmation dialog: projects.list no
+  // longer embeds archived workspaces, so blocker counts come from the backend.
+  getRemovalBlockers: {
+    input: z.object({ projectPath: z.string() }),
+    output: z.object({
+      activeCount: z.number().int().nonnegative(),
+      archivedCount: z.number().int().nonnegative(),
+    }),
+  },
   list: {
     input: z.void(),
     output: z.array(z.tuple([z.string(), ProjectConfigSchema])),

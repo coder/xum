@@ -716,6 +716,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     userProjects,
     openProjectCreateModal: onAddProject,
     removeProject: onRemoveProject,
+    getRemovalBlockers,
     updateDisplayName,
     updateColor: updateProjectColor,
     assignWorkspaceToSubProject,
@@ -1481,6 +1482,11 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     [projectContextMenu]
   );
 
+  // Monotonic token so a slower earlier removal preflight can never overwrite
+  // the confirmation dialog (or trigger removal) for a project the user
+  // selected afterwards.
+  const removalPreflightSeq = useRef(0);
+
   const handleRequestProjectRemoval = useCallback(
     async (projectPath: string, buttonElement?: HTMLElement) => {
       const projectConfig = userProjects.get(projectPath);
@@ -1490,27 +1496,40 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
 
       const projectName = projectConfig.displayName ?? getProjectNameFromPath(projectPath);
       // projects.list excludes archived workspaces (read-side projection), so
-      // blocker counts can't be derived from the embedded workspace arrays.
-      // Attempt a non-forced removal instead: empty projects are removed
-      // immediately (same as before), and the backend's workspace_blockers
-      // rejection carries authoritative active/archived counts (including
-      // cross-project references) for the confirmation dialog.
-      const result = await onRemoveProject(projectPath);
-      if (result.success) {
+      // blocker counts come from a read-only backend preflight instead of the
+      // embedded workspace arrays. remove() is deliberately NOT used as the
+      // probe: it prunes stale workspace entries and deletes the project when
+      // nothing remains, which must not happen before the user confirms.
+      const seq = ++removalPreflightSeq.current;
+      let counts: { activeCount: number; archivedCount: number };
+      try {
+        counts = await getRemovalBlockers(projectPath);
+      } catch (error) {
+        if (seq === removalPreflightSeq.current) {
+          showProjectRemoveError(
+            projectPath,
+            { type: "unknown", message: getErrorMessage(error) },
+            buttonElement
+          );
+        }
         return;
       }
-      if (result.error.type === "workspace_blockers") {
+      if (seq !== removalPreflightSeq.current) {
+        return;
+      }
+      if (counts.activeCount + counts.archivedCount > 0) {
         setDeleteConfirmation({
           projectPath,
           projectName,
-          activeCount: result.error.activeCount,
-          archivedCount: result.error.archivedCount,
+          activeCount: counts.activeCount,
+          archivedCount: counts.archivedCount,
         });
         return;
       }
-      showProjectRemoveError(projectPath, result.error, buttonElement);
+
+      void removeProjectWithFeedback(projectPath, undefined, buttonElement);
     },
-    [onRemoveProject, showProjectRemoveError, userProjects]
+    [getRemovalBlockers, removeProjectWithFeedback, showProjectRemoveError, userProjects]
   );
 
   const cancelProjectDisplayNameEditing = useCallback(() => {

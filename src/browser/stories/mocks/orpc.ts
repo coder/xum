@@ -1387,6 +1387,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         }
         return Promise.resolve({ success: true as const });
       },
+      // Read-only preflight used by the delete confirmation dialog.
+      getRemovalBlockers: (input: { projectPath: string }) => {
+        const project = projects.get(input.projectPath);
+        return Promise.resolve(getProjectWorkspaceCounts(project?.workspaces ?? []));
+      },
       remove: (input: { projectPath: string; force?: boolean | null }) => {
         if (onProjectRemove) {
           return Promise.resolve(onProjectRemove(input.projectPath));
