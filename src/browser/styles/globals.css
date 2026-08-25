@@ -1135,20 +1135,25 @@ body,
    status-bar-style meta is read at launch, so it cannot follow runtime theme changes.
    Light themes would expose a light surface behind the white glyphs; back the band
    with a constant dark strip instead. Absolute pseudo-element (not fixed) so iOS 26's
-   Liquid Glass edge sampler ignores it; height collapses to 0 without top insets. */
+   Liquid Glass edge sampler ignores it; height collapses to 0 without top insets.
+   The @supports gate limits the strip to iOS/iPadOS WebKit: Android standalone PWAs
+   pick dark status glyphs from the light theme-color, so a dark band would invert
+   contrast there. -webkit-touch-callout only exists on iOS-family WebKit. */
 @media (display-mode: standalone) {
-  :root[data-theme$="light"] body::before {
-    content: "";
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    height: env(safe-area-inset-top, 0px);
-    background-color: var(--color-ios-status-bar-backdrop);
-    /* Above the off-canvas drawer (z-index 1000); the band holds no interactive
-       content (layout pads it away), and pointer-events: none keeps taps working. */
-    z-index: 1001;
-    pointer-events: none;
+  @supports (-webkit-touch-callout: none) {
+    :root[data-theme$="light"] body::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: env(safe-area-inset-top, 0px);
+      background-color: var(--color-ios-status-bar-backdrop);
+      /* Above the off-canvas drawer (z-index 1000); the band holds no interactive
+         content (layout pads it away), and pointer-events: none keeps taps working. */
+      z-index: 1001;
+      pointer-events: none;
+    }
   }
 }
 
