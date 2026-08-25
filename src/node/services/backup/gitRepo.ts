@@ -1107,19 +1107,27 @@ export class BackupRepoCache {
   /**
    * Reads a probed blob's bytes, fetching it once through the credential ladder when the
    * blob-filtered clone has only promised it. Returns null for a blob that still cannot be
-   * read afterwards (including one larger than any legitimate payload), so the probe treats
-   * it as "not a usable manifest" rather than failing the whole preparation.
+   * read afterwards, so the probe treats it as "not a usable manifest" rather than failing
+   * the whole preparation. Capped at the per-file payload limit before parsing: a manifest
+   * the restore path could never read must not be buffered whole in the main process, and
+   * the streaming cap kills the read as soon as it passes the limit.
    */
   private async readProbedBlob(objectId: string): Promise<string | null> {
     const read = () =>
       this.localGit(["cat-file", "blob", objectId], {
         env: { GIT_NO_LAZY_FETCH: "1" },
-        maxOutputBytes: MAX_BACKUP_TOTAL_BYTES,
+        maxOutputBytes: MAX_BACKUP_FILE_BYTES,
       });
+    const isOverLimit = (error: unknown) =>
+      error instanceof Error &&
+      error.message === `Command produced more than ${MAX_BACKUP_FILE_BYTES} bytes of output`;
     try {
       return (await read()).stdout;
-    } catch {
-      // The blob is missing from the partial clone; fetch exactly it, like the
+    } catch (error) {
+      // Over-limit is definitive: the blob exists locally and is too large, so fetching
+      // it again could only re-buffer the same oversized bytes.
+      if (isOverLimit(error)) return null;
+      // Otherwise the blob is missing from the partial clone; fetch exactly it, like the
       // pre-checkout size validation does for payload blobs.
       await this.networkGit([
         "-C",
