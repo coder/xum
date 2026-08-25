@@ -1130,6 +1130,8 @@ export interface QueuedMessage {
   queueDispatchMode?: QueueDispatchMode;
   /** True when the queued message is a compaction request (/compact) */
   hasCompactionRequest?: boolean;
+  /** True when this projection includes an entry being durably accepted. */
+  isDispatching?: boolean;
 }
 
 /** Keep every snapshot kind here so history scans and edits retain it with its user message. */

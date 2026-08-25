@@ -553,7 +553,7 @@ describe("AgentSession disposal race conditions", () => {
       (
         _message: string,
         _options?: { model: string; agentId: string },
-        _internal?: { synthetic?: boolean }
+        _internal?: { synthetic?: boolean; onAccepted?: () => Promise<void> }
       ) => Promise.resolve(Ok(undefined))
     );
 
@@ -567,10 +567,11 @@ describe("AgentSession disposal race conditions", () => {
     session.sendQueuedMessages();
 
     expect(sendMessage).toHaveBeenCalledTimes(1);
-    expect(sendMessage).toHaveBeenCalledWith(
-      "Background compaction request",
-      expect.objectContaining({ model: "anthropic:claude-sonnet-4-5", agentId: "compact" }),
-      { synthetic: true }
-    );
+    const call = sendMessage.mock.calls[0];
+    if (!call) throw new Error("Expected queued message dispatch");
+    expect(call[0]).toBe("Background compaction request");
+    expect(call[1]).toMatchObject({ model: "anthropic:claude-sonnet-4-5", agentId: "compact" });
+    expect(call[2]?.synthetic).toBe(true);
+    expect(typeof call[2]?.onAccepted).toBe("function");
   });
 });

@@ -860,7 +860,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
   const handleEditQueuedMessage = useCallback(async () => {
     const queuedMessage = workspaceState?.queuedMessage;
-    if (!queuedMessage) return;
+    if (!queuedMessage || queuedMessage.isDispatching) return;
 
     await restoreQueuedDraft(queuedMessage);
   }, [restoreQueuedDraft, workspaceState?.queuedMessage]);
@@ -958,7 +958,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     if (!current) return;
 
     if (current.queuedMessage) {
-      await restoreQueuedDraft(current.queuedMessage);
+      if (!current.queuedMessage.isDispatching) {
+        await restoreQueuedDraft(current.queuedMessage);
+      }
       return;
     }
 

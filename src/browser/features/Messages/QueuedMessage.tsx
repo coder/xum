@@ -44,6 +44,7 @@ export const QueuedMessage: React.FC<QueuedMessageProps> = (props) => {
   const queueDispatchMode = props.message.queueDispatchMode ?? "tool-end";
   const queueStatusLabel =
     queueDispatchMode === "turn-end" ? "Sends after this turn" : "Sends after this step";
+  const isDispatching = props.message.isDispatching === true;
   const isActionPending = pendingAction != null;
 
   const handleDispatchModeChange = (mode: QueueDispatchMode) => {
@@ -114,7 +115,7 @@ export const QueuedMessage: React.FC<QueuedMessageProps> = (props) => {
             className="mt-1.5 flex max-w-full flex-wrap items-center justify-end gap-1 text-[11px]"
             data-component="QueuedMessageActions"
           >
-            {props.onEdit && (
+            {!isDispatching && props.onEdit && (
               <button
                 type="button"
                 onClick={props.onEdit}
@@ -141,10 +142,13 @@ export const QueuedMessage: React.FC<QueuedMessageProps> = (props) => {
             >
               <button
                 type="button"
-                onClick={() => setIsMenuOpen((open) => !open)}
-                aria-haspopup="menu"
-                aria-expanded={isMenuOpen}
-                className="text-secondary bg-muted/10 hover:bg-hover hover:text-foreground flex h-6 max-w-full items-center gap-1.5 rounded-md px-2 font-medium transition-colors"
+                onClick={() => {
+                  if (!isDispatching) setIsMenuOpen((open) => !open);
+                }}
+                aria-haspopup={isDispatching ? undefined : "menu"}
+                aria-expanded={isDispatching ? undefined : isMenuOpen}
+                disabled={isDispatching}
+                className="text-secondary bg-muted/10 hover:bg-hover hover:text-foreground flex h-6 max-w-full items-center gap-1.5 rounded-md px-2 font-medium transition-colors disabled:cursor-default"
                 data-component="QueuedMessageStatus"
               >
                 {pendingAction === "mode" ? (
@@ -152,12 +156,14 @@ export const QueuedMessage: React.FC<QueuedMessageProps> = (props) => {
                 ) : (
                   <Clock3 className="text-pending size-3 shrink-0" />
                 )}
-                <span className="text-foreground shrink-0">Queued</span>
-                <span className="truncate">{queueStatusLabel}</span>
-                <ChevronDown className="size-3 shrink-0" />
+                <span className="text-foreground shrink-0">
+                  {isDispatching ? "Sending" : "Queued"}
+                </span>
+                {!isDispatching && <span className="truncate">{queueStatusLabel}</span>}
+                {!isDispatching && <ChevronDown className="size-3 shrink-0" />}
               </button>
 
-              {isMenuOpen && (
+              {!isDispatching && isMenuOpen && (
                 <div
                   role="menu"
                   className="bg-separator border-border-light absolute right-0 bottom-full z-[1020] mb-1 min-w-[12rem] rounded-md border p-1.5 shadow-md"

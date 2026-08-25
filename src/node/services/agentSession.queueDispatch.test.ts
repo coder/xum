@@ -514,6 +514,101 @@ describe("AgentSession queued message tool-call dispatch", () => {
     }
   });
 
+  test("keeps a dequeued user message visible until its durable row is emitted", async () => {
+    const workspaceId = "queue-dispatch-visible-handoff";
+    const goalSyncStarted = Promise.withResolvers<void>();
+    const goalSyncRelease = Promise.withResolvers<void>();
+    const workspaceGoalService = {
+      assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
+      syncGoalModeWithChatTail: mock(async () => {
+        goalSyncStarted.resolve();
+        await goalSyncRelease.promise;
+      }),
+      clearPendingContinuationForManualUserMessage: mock(() => undefined),
+      acknowledgeUser: mock(() => Promise.resolve(null)),
+    } as unknown as WorkspaceGoalService;
+    const { session, cleanup, historyService, events } = await createAgentSessionHarness({
+      workspaceId,
+      workspaceGoalService,
+      initStateManagerOverrides: { replayInit: mock(() => Promise.resolve()) },
+      captureEvents: true,
+    });
+    const originalAppend = historyService.appendToHistory.bind(historyService);
+    const appendStarted = Promise.withResolvers<void>();
+    const appendRelease = Promise.withResolvers<void>();
+    const appendSpy = spyOn(historyService, "appendToHistory").mockImplementation(
+      async (...args) => {
+        appendStarted.resolve();
+        await appendRelease.promise;
+        return originalAppend(...args);
+      }
+    );
+    const followUp = "Follow up after compaction";
+    const nextFollowUp = "A later queued message";
+    const isFollowUpUserMessage = (event: (typeof events)[number]) =>
+      event.type === "message" &&
+      event.role === "user" &&
+      event.parts.some((part) => part.type === "text" && part.text === followUp);
+    const latestQueueEvent = () =>
+      events.filter((event) => event.type === "queued-message-changed").at(-1);
+
+    try {
+      session.queueMessage(followUp, { model: TEST_MODEL, agentId: "exec" });
+      const queueEventCountBeforeDispatch = events.filter(
+        (event) => event.type === "queued-message-changed"
+      ).length;
+      session.sendQueuedMessages();
+      await appendStarted.promise;
+
+      expect(events.filter((event) => event.type === "queued-message-changed").length).toBe(
+        queueEventCountBeforeDispatch + 1
+      );
+      expect(latestQueueEvent()?.queuedMessages).toEqual([followUp]);
+      expect(events.some(isFollowUpUserMessage)).toBe(false);
+
+      // Any queue mutation during persistence must retain the in-flight entry in the
+      // authoritative projection instead of falling back to a stale renderer snapshot.
+      session.queueMessage(nextFollowUp, { model: TEST_MODEL, agentId: "exec" });
+      expect(latestQueueEvent()?.queuedMessages).toEqual([followUp, nextFollowUp]);
+
+      appendRelease.resolve();
+      await goalSyncStarted.promise;
+
+      // Reconnect replay already includes the persisted user row, so its queue snapshot must
+      // omit that dispatch while retaining later queued input.
+      const replayEvents: Array<(typeof events)[number]> = [];
+      await session.replayHistory(({ message }) => replayEvents.push(message));
+      expect(replayEvents.some(isFollowUpUserMessage)).toBe(true);
+      const replayQueueEvent = replayEvents.find(
+        (event) => event.type === "queued-message-changed"
+      );
+      expect(replayQueueEvent?.queuedMessages).toEqual([nextFollowUp]);
+      expect(replayQueueEvent?.isDispatching).toBe(false);
+
+      goalSyncRelease.resolve();
+      expect(await waitForCondition(() => events.some(isFollowUpUserMessage))).toBe(true);
+      expect(
+        await waitForCondition(() => latestQueueEvent()?.queuedMessages.join() === nextFollowUp)
+      ).toBe(true);
+
+      const userMessageIndex = events.findIndex(isFollowUpUserMessage);
+      const handoffIndex = events.findIndex(
+        (event, index) =>
+          index > userMessageIndex &&
+          event.type === "queued-message-changed" &&
+          event.queuedMessages.join() === nextFollowUp
+      );
+      expect(userMessageIndex).toBeGreaterThanOrEqual(0);
+      expect(handoffIndex).toBeGreaterThan(userMessageIndex);
+    } finally {
+      appendRelease.resolve();
+      goalSyncRelease.resolve();
+      appendSpy.mockRestore();
+      session.dispose();
+      await cleanup();
+    }
+  });
+
   test("cancel signal retracts a synthetic entry after dequeue while history append is preparing", async () => {
     const workspaceId = "queue-dispatch-cancel-preparing";
     const { session, cleanup, historyService, events } = await createAgentSessionHarness({

@@ -33,10 +33,12 @@ describe("MessageQueue", () => {
       // Content projection hides backend work, while the visible card reflects the FIFO head's
       // effective boundary until the user explicitly reprioritizes their queued follow-up.
       expect(queue.getMessages()).toEqual(["Background monitor wake", "User follow-up"]);
-      expect(queue.getVisibleMessages()).toEqual(["User follow-up"]);
-      expect(queue.getVisibleDisplayText()).toBe("User follow-up");
+      expect(queue.getVisibleProjection()).toMatchObject({
+        queuedMessages: ["User follow-up"],
+        displayText: "User follow-up",
+        queueDispatchMode: "tool-end",
+      });
       expect(queue.getQueueDispatchMode()).toBe("tool-end");
-      expect(queue.getVisibleQueueDispatchMode()).toBe("tool-end");
       const background = queue.dequeueNext();
       expect(background.message).toBe("Background monitor wake");
       expect(background.internal).toMatchObject({ synthetic: true, agentInitiated: true });

@@ -642,6 +642,8 @@ export const QueuedMessageChangedEventSchema = z.object({
   queueDispatchMode: z.enum(["tool-end", "turn-end"]).optional(),
   /** True when the queued message is a compaction request (/compact) */
   hasCompactionRequest: z.boolean().optional(),
+  /** True when the visible projection includes an entry being durably accepted. */
+  isDispatching: z.boolean().optional(),
 });
 
 export const RestoreToInputEventSchema = z.object({

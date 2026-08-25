@@ -1132,12 +1132,14 @@ export class WorkspaceStore {
               data.reviews?.map((review) => [review.filePath, review.lineRange]) ?? [],
               data.queueDispatchMode,
               data.hasCompactionRequest,
+              data.isDispatching,
             ])}`,
             content: data.displayText,
             fileParts: data.fileParts,
             reviews: data.reviews,
             queueDispatchMode: data.queueDispatchMode,
             hasCompactionRequest: data.hasCompactionRequest,
+            isDispatching: data.isDispatching,
           }
         : null;
 

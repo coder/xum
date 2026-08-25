@@ -65,6 +65,22 @@ describe("QueuedMessage banner", () => {
     expect(view.getAllByRole("menuitem")).toHaveLength(3);
   });
 
+  test("keeps a dispatching message visible without editable queue actions", () => {
+    const view = render(
+      <QueuedMessage
+        message={createQueuedMessage({ isDispatching: true })}
+        onEdit={mock(() => {})}
+        onChangeDispatchMode={mock(async () => {})}
+        onSendImmediately={mock(async () => {})}
+      />
+    );
+
+    expect(view.getByText("Review this change before sending")).toBeTruthy();
+    expect(view.queryByRole("button", { name: "Edit" })).toBeNull();
+    expect(view.getByRole("button", { name: "Sending" }).hasAttribute("disabled")).toBe(true);
+    expect(view.queryByRole("menu")).toBeNull();
+  });
+
   test("renders queued preview text and step-dispatch label", () => {
     const view = render(<QueuedMessage message={createQueuedMessage()} />);
 

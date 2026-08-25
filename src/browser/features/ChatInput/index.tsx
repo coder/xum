@@ -3385,6 +3385,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       variant === "workspace" &&
       !editingMessageForUi &&
       props.queuedMessage != null &&
+      props.queuedMessage.isDispatching !== true &&
       input.trim() === "" &&
       attachments.length === 0 &&
       reviewPanelItems.length === 0;

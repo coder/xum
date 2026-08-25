@@ -113,6 +113,15 @@ type QueueClearCallbacks = Pick<
   "onCanceled" | "onAcceptedPreStreamFailure"
 >;
 
+export interface MessageQueueVisibleProjection {
+  queuedMessages: string[];
+  displayText: string;
+  fileParts: FilePart[];
+  reviews?: ReviewNoteData[];
+  queueDispatchMode: QueueDispatchMode;
+  hasCompactionRequest: boolean;
+}
+
 /**
  * One dispatchable unit in the queue. Plain follow-up messages batch into a single
  * entry (joined text, accumulated file parts); "special" sends (compaction requests,
@@ -572,14 +581,28 @@ export class MessageQueue {
     return reviews.length > 0 ? reviews : undefined;
   }
 
+  private getVisibleProjectionForEntries(
+    entries: readonly QueueEntry[],
+    queueDispatchMode: QueueDispatchMode
+  ): MessageQueueVisibleProjection {
+    return {
+      queuedMessages: this.getMessagesForEntries(entries),
+      displayText: this.getDisplayTextForEntries(entries),
+      fileParts: this.getFilePartsForEntries(entries),
+      reviews: this.getReviewsForEntries(entries),
+      queueDispatchMode,
+      hasCompactionRequest: entries.some((entry) => isCompactionMetadata(entry.muxMetadata)),
+    };
+  }
+
+  getVisibleProjection(): MessageQueueVisibleProjection {
+    const entries = this.getVisibleEntries();
+    return this.getVisibleProjectionForEntries(entries, this.getVisibleQueueDispatchMode());
+  }
+
   /** Get all queued message texts across entries (including synthetic entries). */
   getMessages(): string[] {
     return this.getMessagesForEntries(this.entries);
-  }
-
-  /** Get user-visible queued message texts for the renderer/composer. */
-  getVisibleMessages(): string[] {
-    return this.getMessagesForEntries(this.getVisibleEntries());
   }
 
   /**
@@ -591,34 +614,14 @@ export class MessageQueue {
     return this.getDisplayTextForEntries(this.entries);
   }
 
-  /** Get display text for user-visible entries only. */
-  getVisibleDisplayText(): string {
-    return this.getDisplayTextForEntries(this.getVisibleEntries());
-  }
-
   /** Get accumulated file parts across all entries. */
   getFileParts(): FilePart[] {
     return this.getFilePartsForEntries(this.entries);
   }
 
-  /** Get accumulated file parts for user-visible entries only. */
-  getVisibleFileParts(): FilePart[] {
-    return this.getFilePartsForEntries(this.getVisibleEntries());
-  }
-
   /** Get reviews across all entries' metadata. */
   getReviews(): ReviewNoteData[] | undefined {
     return this.getReviewsForEntries(this.entries);
-  }
-
-  /** Get reviews across user-visible entries' metadata only. */
-  getVisibleReviews(): ReviewNoteData[] | undefined {
-    return this.getReviewsForEntries(this.getVisibleEntries());
-  }
-
-  /** Whether a user-visible queued entry is a compaction request. */
-  hasVisibleCompactionRequest(): boolean {
-    return this.getVisibleEntries().some((entry) => isCompactionMetadata(entry.muxMetadata));
   }
 
   /**
@@ -737,12 +740,16 @@ export class MessageQueue {
     message: string;
     options?: SendMessageOptions & { fileParts?: FilePart[] };
     internal?: QueuedMessageInternalOptions;
+    visibleProjection?: MessageQueueVisibleProjection;
   } {
     const entry = this.entries.shift();
     if (entry === undefined) {
       return { message: "" };
     }
 
+    const visibleProjection = entry.userAuthored
+      ? this.getVisibleProjectionForEntries([entry], entry.dispatchMode)
+      : undefined;
     const joinedMessages = entry.messages.join("\n");
     const options = entry.latestOptions
       ? (() => {
@@ -791,7 +798,7 @@ export class MessageQueue {
         }
       : undefined;
 
-    return { message: joinedMessages, options, internal };
+    return { message: joinedMessages, options, internal, visibleProjection };
   }
 
   /**

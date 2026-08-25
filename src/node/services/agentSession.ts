@@ -104,7 +104,7 @@ import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
 } from "@/node/runtime/runtimeHelpers";
-import { MessageQueue } from "./messageQueue";
+import { MessageQueue, type MessageQueueVisibleProjection } from "./messageQueue";
 import {
   copyStreamLifecycleSnapshot,
   type RuntimeStatusEvent,
@@ -757,14 +757,12 @@ export class AgentSession {
   /** Tracks whether the current stream included post-compaction attachments. */
   private activeStreamHadPostCompactionInjection = false;
 
-  /**
-   * muxMetadata of the queued entry currently being dispatched, held from
-   * dequeue until its sendMessage settles (the stream has started or failed).
-   * Lets hasPendingBashMonitorWakeContinuation see a wake continuation during
-   * the dequeue→stream-start window without consulting stale stream context.
-   */
-  private dispatchingQueuedEntry = false;
-  private dispatchingQueuedEntryMuxMetadata?: unknown;
+  /** Queued entry held through the dequeue→acceptance handoff for projection and correlation. */
+  private dispatchingQueuedEntry?: {
+    muxMetadata?: unknown;
+    visibleProjection?: MessageQueueVisibleProjection;
+    persisted: boolean;
+  };
 
   /** Correlation of the direct send currently in the PREPARING phase, if any. */
   private preparingWorkspaceTurnMetadata?: WorkspaceTurnMuxMetadata;
@@ -2576,21 +2574,11 @@ export class AgentSession {
         emitCurrentReplayTerminalState();
       }
 
-      // Replay queued-message snapshot before caught-up so reconnect clients can
-      // rebuild queue UI state even when history replay errored mid-flight.
+      // Replay the authoritative queue projection before caught-up so reconnect clients
+      // retain a user entry that is between dequeue and durable transcript emission.
       listener({
         workspaceId: this.workspaceId,
-        message: {
-          type: "queued-message-changed",
-          workspaceId: this.workspaceId,
-          hasQueuedMessages: !this.messageQueue.isEmpty(),
-          queuedMessages: this.messageQueue.getVisibleMessages(),
-          displayText: this.messageQueue.getVisibleDisplayText(),
-          fileParts: this.messageQueue.getVisibleFileParts(),
-          reviews: this.messageQueue.getVisibleReviews(),
-          queueDispatchMode: this.messageQueue.getVisibleQueueDispatchMode(),
-          hasCompactionRequest: this.messageQueue.hasVisibleCompactionRequest(),
-        },
+        message: this.getQueuedMessageChangedEvent(false),
       });
 
       // Rehydrate pending auto-retry countdown state on reconnect/reload so
@@ -3540,6 +3528,9 @@ export class AgentSession {
       persistedCancelableMessageIds.push(userMessage.id);
       if (await cancelBeforeAcceptance()) {
         return Ok(undefined);
+      }
+      if (this.dispatchingQueuedEntry) {
+        this.dispatchingQueuedEntry.persisted = true;
       }
     }
 
@@ -5299,8 +5290,7 @@ export class AgentSession {
 
     forward("stream-start", (payload) => {
       if (payload.type === "stream-start") {
-        this.dispatchingQueuedEntry = false;
-        this.dispatchingQueuedEntryMuxMetadata = undefined;
+        this.dispatchingQueuedEntry = undefined;
         this.preparingWorkspaceTurnMetadata = undefined;
         this.activeStreamStartedAtMs = payload.startTime;
         this.queuedProviderToolEndAbortInFlight = false;
@@ -5802,8 +5792,7 @@ export class AgentSession {
     this.emitStreamLifecycleIfChanged();
 
     if (next === TurnPhase.IDLE) {
-      this.dispatchingQueuedEntry = false;
-      this.dispatchingQueuedEntryMuxMetadata = undefined;
+      this.dispatchingQueuedEntry = undefined;
       this.preparingWorkspaceTurnMetadata = undefined;
       // Turn ended: expire any mid-turn thinking override. Safe unconditionally
       // because a replacement turn (e.g. an edit) only creates its holder after
@@ -6154,7 +6143,7 @@ export class AgentSession {
 
     if (this.dispatchingQueuedEntry) {
       const dispatchingMetadata = getWorkspaceTurnMuxMetadata(
-        this.dispatchingQueuedEntryMuxMetadata
+        this.dispatchingQueuedEntry.muxMetadata
       );
       if (!hasSameWorkspaceTurnCorrelation(dispatchingMetadata, continuationMetadata)) {
         return true;
@@ -6189,7 +6178,7 @@ export class AgentSession {
     if (this.messageQueue.isNextEntryBashMonitorWake()) {
       return true;
     }
-    const dispatching = this.dispatchingQueuedEntryMuxMetadata as MuxMessageMetadata | undefined;
+    const dispatching = this.dispatchingQueuedEntry?.muxMetadata as MuxMessageMetadata | undefined;
     return dispatching?.type === "bash-monitor-wake";
   }
 
@@ -6213,7 +6202,7 @@ export class AgentSession {
       return true;
     }
 
-    const dispatching = this.dispatchingQueuedEntryMuxMetadata as MuxMessageMetadata | undefined;
+    const dispatching = this.dispatchingQueuedEntry?.muxMetadata as MuxMessageMetadata | undefined;
     return (
       dispatching?.type === "workspace-turn-task" &&
       dispatching.taskHandleId === metadata.taskHandleId &&
@@ -6334,10 +6323,8 @@ export class AgentSession {
       return;
     }
 
-    const queuedMessages = this.messageQueue.getVisibleMessages();
-    const displayText = this.messageQueue.getVisibleDisplayText();
-    const fileParts = this.messageQueue.getVisibleFileParts();
-    const reviews = this.messageQueue.getVisibleReviews();
+    const { queuedMessages, displayText, fileParts, reviews } =
+      this.messageQueue.getVisibleProjection();
     const hasVisibleContent =
       queuedMessages.length > 0 || fileParts.length > 0 || (reviews?.length ?? 0) > 0;
 
@@ -6356,18 +6343,34 @@ export class AgentSession {
     }
   }
 
-  private emitQueuedMessageChanged(): void {
-    this.emitChatEvent({
+  private getQueuedMessageChangedEvent(
+    includePersistedDispatching = true
+  ): Extract<WorkspaceChatMessage, { type: "queued-message-changed" }> {
+    const pending = this.messageQueue.getVisibleProjection();
+    const dispatchingState = this.dispatchingQueuedEntry;
+    const dispatching =
+      !includePersistedDispatching && dispatchingState?.persisted
+        ? undefined
+        : dispatchingState?.visibleProjection;
+    const reviews = [...(dispatching?.reviews ?? []), ...(pending.reviews ?? [])];
+
+    return {
       type: "queued-message-changed",
       workspaceId: this.workspaceId,
-      hasQueuedMessages: !this.messageQueue.isEmpty(),
-      queuedMessages: this.messageQueue.getVisibleMessages(),
-      displayText: this.messageQueue.getVisibleDisplayText(),
-      fileParts: this.messageQueue.getVisibleFileParts(),
-      reviews: this.messageQueue.getVisibleReviews(),
-      queueDispatchMode: this.messageQueue.getVisibleQueueDispatchMode(),
-      hasCompactionRequest: this.messageQueue.hasVisibleCompactionRequest(),
-    });
+      hasQueuedMessages: this.dispatchingQueuedEntry != null || !this.messageQueue.isEmpty(),
+      queuedMessages: [...(dispatching?.queuedMessages ?? []), ...pending.queuedMessages],
+      displayText: [dispatching?.displayText, pending.displayText].filter(Boolean).join("\n"),
+      fileParts: [...(dispatching?.fileParts ?? []), ...pending.fileParts],
+      reviews: reviews.length > 0 ? reviews : undefined,
+      queueDispatchMode: dispatching?.queueDispatchMode ?? pending.queueDispatchMode,
+      hasCompactionRequest:
+        dispatching?.hasCompactionRequest === true || pending.hasCompactionRequest,
+      isDispatching: dispatching != null,
+    };
+  }
+
+  private emitQueuedMessageChanged(): void {
+    this.emitChatEvent(this.getQueuedMessageChangedEvent());
   }
 
   /**
@@ -6410,10 +6413,27 @@ export class AgentSession {
       // Entries dispatch one at a time (FIFO): special sends (compaction, agent
       // skills, workspace-turn follow-ups) own their turn, and anything queued
       // behind them dispatches on a later drain instead of batching into them.
-      const { message, options, internal } = this.messageQueue.dequeueNext();
-      this.dispatchingQueuedEntry = true;
-      this.dispatchingQueuedEntryMuxMetadata = options?.muxMetadata;
+      const { message, options, internal, visibleProjection } = this.messageQueue.dequeueNext();
+      this.dispatchingQueuedEntry = {
+        muxMetadata: options?.muxMetadata,
+        visibleProjection,
+        persisted: false,
+      };
+      // PREPARING disables queue actions while the authoritative projection includes
+      // the in-flight entry, preventing stale Edit/Send-now operations during persistence.
+      this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(options?.muxMetadata);
+      this.setTurnPhase(TurnPhase.PREPARING);
       this.emitQueuedMessageChanged();
+
+      const finishDispatchWithoutStream = (): void => {
+        this.dispatchingQueuedEntry = undefined;
+        this.emitQueuedMessageChanged();
+        if (this.turnPhase === TurnPhase.PREPARING) {
+          this.setTurnPhase(TurnPhase.IDLE);
+        }
+        // No stream will drain later entries, so continue now (each attempt pops one entry).
+        this.sendQueuedMessages();
+      };
 
       // Re-arm dispatch signals for the remaining entries so the stream we are
       // about to start drains them at its next tool end (or stream end).
@@ -6424,46 +6444,28 @@ export class AgentSession {
         );
       }
 
-      // Set PREPARING synchronously before the async sendMessage to prevent
-      // incoming messages from bypassing the queue during the await gap.
-      this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(options?.muxMetadata);
-      this.setTurnPhase(TurnPhase.PREPARING);
-
-      void this.sendMessage(message, options, internal)
+      void this.sendMessage(message, options, {
+        ...internal,
+        onAccepted: async () => {
+          // sendMessage has emitted the durable user row, so the transient queue projection can hand off.
+          this.dispatchingQueuedEntry = undefined;
+          this.emitQueuedMessageChanged();
+          await internal?.onAccepted?.();
+        },
+      })
         .then(async (result) => {
           // Keep the dispatch marker through the dequeue-to-stream-start window. A background
           // send can resolve before startup emits stream-start, and later reports must not claim
           // that window as the next continuation.
-          // If sendMessage fails before it can start streaming, ensure we don't
-          // leave the session stuck in PREPARING and notify correlated internal callers.
           if (!result.success) {
             await internal?.onAcceptedPreStreamFailure?.(result.error);
-            if (this.turnPhase === TurnPhase.PREPARING) {
-              this.setTurnPhase(TurnPhase.IDLE);
-            }
-            // No stream started, so no stream-end drain will fire for the
-            // remaining entries — try the next one now (each attempt pops an
-            // entry, so this terminates).
-            this.sendQueuedMessages();
-            return;
-          }
-          if (internal?.cancelState?.canceledBeforeAcceptance === true) {
-            // Cancellation can arrive after dequeue while sendMessage is validating or writing
-            // history. No stream will start, so release PREPARING and continue with later entries.
-            if (this.turnPhase === TurnPhase.PREPARING) {
-              this.setTurnPhase(TurnPhase.IDLE);
-            }
-            this.sendQueuedMessages();
+            finishDispatchWithoutStream();
+          } else if (internal?.cancelState?.canceledBeforeAcceptance === true) {
+            // Cancellation can arrive after dequeue while sendMessage is validating or writing.
+            finishDispatchWithoutStream();
           }
         })
-        .catch(() => {
-          this.dispatchingQueuedEntry = false;
-          this.dispatchingQueuedEntryMuxMetadata = undefined;
-          if (this.turnPhase === TurnPhase.PREPARING) {
-            this.setTurnPhase(TurnPhase.IDLE);
-          }
-          this.sendQueuedMessages();
-        });
+        .catch(finishDispatchWithoutStream);
     }
   }
 
