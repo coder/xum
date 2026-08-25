@@ -1,3 +1,9 @@
+import { JSON_SAFE_CLONE_MAX_BIGINT_DIGITS } from "@/constants/json";
+
+// Precomputed so the per-value magnitude gate is a cheap comparison (BigInt
+// comparison short-circuits on digit-count mismatch).
+const BIGINT_ABS_LIMIT = 10n ** BigInt(JSON_SAFE_CLONE_MAX_BIGINT_DIGITS);
+
 /**
  * Clone a value into the exact shape `JSON.parse(JSON.stringify(value))` would
  * produce: `undefined`/function/symbol array elements become `null`, object
@@ -38,6 +44,13 @@ function scrubToJsonSafe(value: unknown, ancestors: WeakSet<object>): unknown {
     case "number":
       return Number.isFinite(value) ? value : null;
     case "bigint":
+      // The sandbox's memory/time caps end at runtime.eval(); a hostile guest
+      // can still hand the host a huge BigInt whose decimal expansion is
+      // superlinear and would block the event loop. Gate magnitude BEFORE
+      // converting.
+      if (value >= BIGINT_ABS_LIMIT || value <= -BIGINT_ABS_LIMIT) {
+        return `[BigInt: >${JSON_SAFE_CLONE_MAX_BIGINT_DIGITS} digits]`;
+      }
       return value.toString();
     case "object":
       break;

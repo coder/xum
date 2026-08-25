@@ -31,6 +31,15 @@ describe("jsonSafeClone", () => {
     expect(jsonSafeClone({ big: 123n, keep: [1n] })).toEqual({ big: "123", keep: ["1"] });
   });
 
+  it("replaces oversized BigInts with a placeholder instead of expanding them", () => {
+    const huge = 10n ** 4096n;
+    expect(jsonSafeClone({ huge })).toEqual({ huge: "[BigInt: >4096 digits]" });
+    expect(jsonSafeClone({ huge: -huge })).toEqual({ huge: "[BigInt: >4096 digits]" });
+    // Values inside the bound still convert exactly.
+    const large = 10n ** 4095n;
+    expect(jsonSafeClone({ large })).toEqual({ large: large.toString() });
+  });
+
   it("replaces circular references instead of throwing", () => {
     const cyclic: { self?: unknown; ok: number } = { ok: 1 };
     cyclic.self = cyclic;
