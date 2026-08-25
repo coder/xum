@@ -623,6 +623,46 @@ describe("AgentSession startup auto-retry recovery", () => {
     session.dispose();
   });
 
+  test("startup auto-retry discards goal attribution when the persisted goal ID is malformed", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cQt3o): chat.jsonl is unchecked JSON. A
+    // present-but-invalid goalId must not resume the turn as goal-driven with
+    // untrustworthy identity — a later compaction would persist a missing-ID
+    // follow-up that bypasses buildGoalRedispatchAdmission entirely.
+    const workspaceId = "startup-retry-malformed-goal-id";
+    const { session, historyService, cleanup } = await createSessionBundle(workspaceId);
+    cleanups.push(cleanup);
+
+    const appendResult = await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("user-1", "user", "Interrupted goal turn", {
+        timestamp: Date.now(),
+        kind: GOAL_CONTINUATION_KIND,
+        goalId: "" as unknown as string,
+        retrySendOptions: {
+          model: "anthropic:claude-sonnet-4-5",
+          agentId: "exec",
+          goalKind: GOAL_CONTINUATION_KIND,
+        },
+      })
+    );
+    expect(appendResult.success).toBe(true);
+
+    session.ensureStartupAutoRetryCheck();
+    await (session as unknown as { startupAutoRetryCheckPromise: Promise<void> | null })
+      .startupAutoRetryCheckPromise;
+
+    const retryOptions = (
+      session as unknown as {
+        lastAutoRetryResumeRequest?: AutoRetryResumeRequest & { goalId?: string };
+      }
+    ).lastAutoRetryResumeRequest;
+    expect(retryOptions).toBeDefined();
+    expect(retryOptions?.goalKind).toBeUndefined();
+    expect(retryOptions?.goalId).toBeUndefined();
+
+    session.dispose();
+  });
+
   test("startup auto-retry prefers child workspace agent settings over stale retry metadata", async () => {
     const workspaceId = "startup-retry-child-stale-agent";
     const workspaceMetadata: WorkspaceMetadata = {

@@ -1830,16 +1830,23 @@ export class AgentSession {
     const workspaceMetadata = await this.getWorkspaceMetadataForRetry();
 
     const persistedRetrySendOptions = lastUserMessage?.metadata?.retrySendOptions;
-    const persistedGoalKind =
-      coerceGoalSyntheticMessageKind(persistedRetrySendOptions?.goalKind) ??
-      coerceGoalSyntheticMessageKind(lastUserMessage?.metadata?.kind);
     // The user row's own metadata.goalId is the durable copy (stamped next to
     // `kind`); recover it so resumed streams keep goal-scoped compaction
-    // follow-ups (Codex P2 PRRT_kwDOPxxmWM6cIv2E).
+    // follow-ups (Codex P2 PRRT_kwDOPxxmWM6cIv2E). Chat metadata is unchecked
+    // JSON (Codex P2 PRRT_kwDOPxxmWM6cQt3o): a PRESENT-but-invalid goalId must
+    // not resume the turn as goal-driven with untrustworthy identity — a later
+    // compaction would persist a missing-ID follow-up that bypasses
+    // buildGoalRedispatchAdmission. Absent IDs keep legacy unscoped semantics;
+    // present-invalid values discard the row's goal attribution entirely.
+    const rawPersistedGoalId: unknown = lastUserMessage?.metadata?.goalId;
+    const goalAttributionCorrupt =
+      rawPersistedGoalId !== undefined && coerceGoalId(rawPersistedGoalId) == null;
+    const persistedGoalKind = goalAttributionCorrupt
+      ? undefined
+      : (coerceGoalSyntheticMessageKind(persistedRetrySendOptions?.goalKind) ??
+        coerceGoalSyntheticMessageKind(lastUserMessage?.metadata?.kind));
     const persistedGoalId =
-      persistedGoalKind != null && typeof lastUserMessage?.metadata?.goalId === "string"
-        ? lastUserMessage.metadata.goalId
-        : undefined;
+      persistedGoalKind != null ? coerceGoalId(rawPersistedGoalId) : undefined;
 
     const workspaceAgentIdCandidates = resolvePersistedAgentIdCandidates(workspaceMetadata);
     const workspaceAgentId = workspaceAgentIdCandidates[0] ?? WORKSPACE_DEFAULTS.agentId;
@@ -6908,36 +6915,22 @@ export class AgentSession {
       return false;
     }
 
-    const hasQueuedMessages = this.hasPendingManualFollowUp();
-    const hasActiveNonCompletingTurn = this.isBusy() && this.turnPhase !== TurnPhase.COMPLETING;
     // Codex P1 (PRRT_kwDOPxxmWM6cPuMw): goal-loop follow-ups were originally
     // requireIdle sends — enforce the idle rule for them unconditionally so a
     // user message queued during the compaction stream wins the race instead
     // of the synthetic continuation starting first.
-    if (
-      (followUp.dispatchOptions?.requireIdle === true || persistedGoalKind != null) &&
-      (hasQueuedMessages || hasActiveNonCompletingTurn)
-    ) {
+    const enforceIdleRule =
+      followUp.dispatchOptions?.requireIdle === true || persistedGoalKind != null;
+    const hasQueuedMessages = this.hasPendingManualFollowUp();
+    const hasActiveNonCompletingTurn = this.isBusy() && this.turnPhase !== TurnPhase.COMPLETING;
+    if (enforceIdleRule && (hasQueuedMessages || hasActiveNonCompletingTurn)) {
       log.info("Skipping pending follow-up because the workspace is no longer idle", {
         workspaceId: this.workspaceId,
         summaryMessageId: lastMessage.id,
         hasQueuedMessages,
         turnPhase: this.turnPhase,
       });
-      if (
-        lastMessage.metadata?.compacted === "heartbeat" &&
-        hasQueuedMessages &&
-        !hasActiveNonCompletingTurn
-      ) {
-        const rollbackResult =
-          await this.compactionHandler.rollbackHeartbeatContextResetBoundary(lastMessage);
-        if (!rollbackResult.success) {
-          throw new Error(`Failed to rollback heartbeat reset boundary: ${rollbackResult.error}`);
-        }
-        this.onPostCompactionStateChange?.();
-      } else {
-        await this.clearPendingFollowUpFromSummary(lastMessage);
-      }
+      await this.skipIdleRuleFollowUp(lastMessage, hasQueuedMessages, hasActiveNonCompletingTurn);
       return false;
     }
 
@@ -6976,6 +6969,22 @@ export class AgentSession {
       }
       goalAdmissionStale = admission.admissionStale;
     }
+
+    // Codex P1 (PRRT_kwDOPxxmWM6cQt3j): the queue/busy sample above ages
+    // across the awaited goal read and the send's own preflight. Re-evaluate
+    // the idle rule through the send-admission gates — all of them run before
+    // this send claims the turn phase, so the probe cannot self-trip — and a
+    // manual message queued during those awaits wins instead of waiting
+    // behind the synthetic follow-up's stream.
+    const idleRuleStale = enforceIdleRule
+      ? () =>
+          this.hasPendingManualFollowUp() ||
+          (this.isBusy() && this.turnPhase !== TurnPhase.COMPLETING)
+      : undefined;
+    const followUpAdmissionStale =
+      idleRuleStale != null || goalAdmissionStale != null
+        ? () => idleRuleStale?.() === true || goalAdmissionStale?.() === true
+        : undefined;
 
     log.debug("Dispatching pending follow-up from compaction summary", {
       workspaceId: this.workspaceId,
@@ -7049,14 +7058,56 @@ export class AgentSession {
       goalContinuation: persistedGoalKind === GOAL_CONTINUATION_KIND,
       // Codex P1 (PRRT_kwDOPxxmWM6cPuMw): re-derived admission guard for the
       // redispatched goal turn (see buildGoalRedispatchAdmission above).
-      admissionStale: goalAdmissionStale,
+      admissionStale: followUpAdmissionStale,
     });
     if (!sendResult.success) {
+      // A stale-admission refusal is the idle rule (or a goal transition)
+      // working as intended, not a recovery failure: route it through the
+      // same skip path as the pre-send check instead of throwing.
+      if (followUpAdmissionStale?.() === true) {
+        log.info("Pending follow-up refused at send admission; skipping it", {
+          workspaceId: this.workspaceId,
+          summaryMessageId: lastMessage.id,
+        });
+        await this.skipIdleRuleFollowUp(
+          lastMessage,
+          this.hasPendingManualFollowUp(),
+          this.isBusy() && this.turnPhase !== TurnPhase.COMPLETING
+        );
+        return false;
+      }
       const message = this.extractRetryFailureMessage(sendResult.error) ?? sendResult.error.type;
       throw new Error(`Failed to dispatch pending follow-up: ${message}`);
     }
 
     return true;
+  }
+
+  /**
+   * Shared skip path for a pending follow-up vetoed by the idle rule (or a
+   * stale goal admission): heartbeat reset boundaries are rolled back so the
+   * queued user turn sees pre-reset context; every other summary just drops
+   * its pending follow-up so it cannot re-fire on a later recovery pass.
+   */
+  private async skipIdleRuleFollowUp(
+    summaryMessage: MuxMessage,
+    hasQueuedMessages: boolean,
+    hasActiveNonCompletingTurn: boolean
+  ): Promise<void> {
+    if (
+      summaryMessage.metadata?.compacted === "heartbeat" &&
+      hasQueuedMessages &&
+      !hasActiveNonCompletingTurn
+    ) {
+      const rollbackResult =
+        await this.compactionHandler.rollbackHeartbeatContextResetBoundary(summaryMessage);
+      if (!rollbackResult.success) {
+        throw new Error(`Failed to rollback heartbeat reset boundary: ${rollbackResult.error}`);
+      }
+      this.onPostCompactionStateChange?.();
+    } else {
+      await this.clearPendingFollowUpFromSummary(summaryMessage);
+    }
   }
 
   private async clearPendingFollowUpFromSummary(summaryMessage: MuxMessage): Promise<void> {

@@ -301,6 +301,69 @@ describe("AgentSession goal safety hooks", () => {
     session.dispose();
   });
 
+  test("a manual message queued during redispatch preflight vetoes the follow-up", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cQt3j): the idle sample taken at entry ages
+    // across the awaited goal read; a manual message queued in that window
+    // must win instead of waiting behind the synthetic follow-up's stream.
+    const workspaceId = "compaction-followup-queued-mid-preflight";
+    const { session, goalService, historyService, cleanup } =
+      await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const created = await setGoalOk(goalService, { workspaceId, objective: "Idle race" });
+    const summary = createMuxMessage(
+      `summary-${crypto.randomUUID()}`,
+      "assistant",
+      "Compacted conversation.",
+      {
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: {
+            text: "Continue working on the goal.",
+            agentId: "exec",
+            model: "openai:gpt-4o",
+            goalKind: GOAL_CONTINUATION_KIND,
+            goalId: created.goalId,
+          },
+        },
+      }
+    );
+    expect((await historyService.appendToHistory(workspaceId, summary)).success).toBe(true);
+
+    // The entry idle check passes (queue empty); the manual message lands
+    // during the awaited admission read, after that sample.
+    const realBuild = goalService.buildGoalRedispatchAdmission.bind(goalService);
+    const buildSpy = spyOn(goalService, "buildGoalRedispatchAdmission").mockImplementationOnce(
+      async (...args: Parameters<typeof realBuild>) => {
+        const admission = await realBuild(...args);
+        session.queueMessage("user returned mid-preflight", SEND_OPTIONS, { synthetic: false });
+        return admission;
+      }
+    );
+
+    const dispatched = await (
+      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
+    ).dispatchPendingFollowUp();
+    buildSpy.mockRestore();
+
+    expect(dispatched).toBe(false);
+    const history = await historyService.getLastMessages(workspaceId, 10);
+    expect(history.success).toBe(true);
+    if (history.success) {
+      // The synthetic follow-up row was refused (and rolled back), and the
+      // summary dropped its pending follow-up so it cannot re-fire later.
+      expect(
+        history.data.some((message) =>
+          message.parts.some(
+            (part) => part.type === "text" && part.text === "Continue working on the goal."
+          )
+        )
+      ).toBe(false);
+      const meta = history.data.find((message) => message.id === summary.id)?.metadata?.muxMetadata;
+      expect(meta && "pendingFollowUp" in meta ? meta.pendingFollowUp : undefined).toBeUndefined();
+    }
+    session.dispose();
+  });
+
   test("malformed persisted follow-up goal IDs are discarded during recovery", async () => {
     const workspaceId = "compaction-followup-malformed-goal-id";
     const { session, goalService, historyService, cleanup } =
