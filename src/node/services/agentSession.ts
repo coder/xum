@@ -216,6 +216,8 @@ interface AutoRetryResumeRequest {
   options: SendMessageOptions;
   agentInitiated?: boolean;
   goalKind?: GoalSyntheticMessageKind;
+  /** Goal identity matching goalKind; keeps retried streams goal-scoped. */
+  goalId?: string;
 }
 
 function stripGoalInterventionPolicy(options: SendMessageOptions): SendMessageOptions {
@@ -777,6 +779,8 @@ export class AgentSession {
     openaiTruncationModeOverride?: "auto" | "disabled";
     providersConfig: ProvidersConfigMap | null;
     goalKind?: GoalSyntheticMessageKind;
+    /** Goal identity matching goalKind, so mid-stream compaction follow-ups stay goal-scoped. */
+    goalId?: string;
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
   };
 
@@ -1166,7 +1170,8 @@ export class AgentSession {
   private setAutoRetryResumeState(
     options: SendMessageOptions | undefined,
     agentInitiated?: boolean,
-    goalKind?: GoalSyntheticMessageKind
+    goalKind?: GoalSyntheticMessageKind,
+    goalId?: string
   ): void {
     if (!options) {
       this.lastAutoRetryResumeRequest = undefined;
@@ -1177,6 +1182,7 @@ export class AgentSession {
       options,
       ...(agentInitiated === true ? { agentInitiated: true } : {}),
       ...(goalKind != null ? { goalKind } : {}),
+      ...(goalId != null ? { goalId } : {}),
     };
   }
 
@@ -1204,6 +1210,7 @@ export class AgentSession {
       const result = await this.resumeStream(request.options, {
         agentInitiated: request.agentInitiated === true ? true : undefined,
         goalKind: request.goalKind,
+        goalId: request.goalId,
       });
       if (result.success) {
         if (!result.data.started) {
@@ -1787,6 +1794,13 @@ export class AgentSession {
     const persistedGoalKind =
       coerceGoalSyntheticMessageKind(persistedRetrySendOptions?.goalKind) ??
       coerceGoalSyntheticMessageKind(lastUserMessage?.metadata?.kind);
+    // The user row's own metadata.goalId is the durable copy (stamped next to
+    // `kind`); recover it so resumed streams keep goal-scoped compaction
+    // follow-ups (Codex P2 PRRT_kwDOPxxmWM6cIv2E).
+    const persistedGoalId =
+      persistedGoalKind != null && typeof lastUserMessage?.metadata?.goalId === "string"
+        ? lastUserMessage.metadata.goalId
+        : undefined;
 
     const workspaceAgentIdCandidates = resolvePersistedAgentIdCandidates(workspaceMetadata);
     const workspaceAgentId = workspaceAgentIdCandidates[0] ?? WORKSPACE_DEFAULTS.agentId;
@@ -1896,6 +1910,9 @@ export class AgentSession {
       if (persistedGoalKind != null) {
         compactionRequest.goalKind = persistedGoalKind;
       }
+      if (persistedGoalId != null) {
+        compactionRequest.goalId = persistedGoalId;
+      }
 
       return compactionRequest;
     }
@@ -1935,6 +1952,9 @@ export class AgentSession {
     }
     if (persistedGoalKind != null) {
       retryRequest.goalKind = persistedGoalKind;
+    }
+    if (persistedGoalId != null) {
+      retryRequest.goalId = persistedGoalId;
     }
     if (typeof persistedAllowAgentSetGoal === "boolean") {
       retryRequest.allowAgentSetGoal = persistedAllowAgentSetGoal;
@@ -2091,8 +2111,8 @@ export class AgentSession {
         return "completed";
       }
 
-      const { agentInitiated, goalKind, ...resumeOptions } = retryRequest;
-      this.setAutoRetryResumeState(resumeOptions, agentInitiated, goalKind);
+      const { agentInitiated, goalKind, goalId, ...resumeOptions } = retryRequest;
+      this.setAutoRetryResumeState(resumeOptions, agentInitiated, goalKind, goalId);
     }
 
     // Disk reads above may race with user actions; retry once the current work settles
@@ -3426,6 +3446,7 @@ export class AgentSession {
           fileParts: followUpFileParts,
           agentInitiated,
           goalKind,
+          goalId: internal?.goalId,
           muxMetadata: typedMuxMetadata,
           workspaceTurnMetadata: inheritedWorkspaceTurnMetadata,
         });
@@ -3760,7 +3781,7 @@ export class AgentSession {
 
     // Same-session retry should resume the exact accepted request we just finalized
     // in history, even if runtime warmup fails before streamWithHistory() starts.
-    this.setAutoRetryResumeState(optionsForStream, agentInitiated, goalKind);
+    this.setAutoRetryResumeState(optionsForStream, agentInitiated, goalKind, internal?.goalId);
     try {
       await internal?.onAccepted?.();
     } catch (error) {
@@ -3849,6 +3870,7 @@ export class AgentSession {
           agentInitiated,
           preparedTurnAbortController.signal,
           goalKind,
+          internal?.goalId,
           turnThinkingOverride
         );
         if (streamResult.success && preparedTurnAbortController.signal.aborted) {
@@ -3918,7 +3940,7 @@ export class AgentSession {
 
   async resumeStream(
     options: SendMessageOptions,
-    internal?: { agentInitiated?: boolean; goalKind?: GoalSyntheticMessageKind }
+    internal?: { agentInitiated?: boolean; goalKind?: GoalSyntheticMessageKind; goalId?: string }
   ): Promise<Result<{ started: boolean }, SendMessageError>> {
     this.assertNotDisposed("resumeStream");
 
@@ -3959,7 +3981,12 @@ export class AgentSession {
 
     // A resumed attempt becomes the latest live resume request as soon as we
     // accept its options, even if startup fails before the stream fully begins.
-    this.setAutoRetryResumeState(optionsForStream, internal?.agentInitiated, internal?.goalKind);
+    this.setAutoRetryResumeState(
+      optionsForStream,
+      internal?.agentInitiated,
+      internal?.goalKind,
+      internal?.goalId
+    );
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata);
     this.setTurnPhase(TurnPhase.PREPARING);
     // Open the mid-turn thinking override window for the resumed turn (after
@@ -3977,6 +4004,7 @@ export class AgentSession {
         internal?.agentInitiated,
         undefined,
         internal?.goalKind,
+        internal?.goalId,
         turnThinkingOverride
       );
       if (!result.success) {
@@ -4246,6 +4274,7 @@ export class AgentSession {
     fileParts?: FilePart[];
     agentInitiated?: boolean;
     goalKind?: GoalSyntheticMessageKind;
+    goalId?: string;
     muxMetadata?: MuxMessageMetadata;
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
   }): CompactionFollowUpRequest {
@@ -4262,6 +4291,10 @@ export class AgentSession {
 
     if (params.goalKind != null) {
       followUp.goalKind = params.goalKind;
+    }
+
+    if (params.goalId != null) {
+      followUp.goalId = params.goalId;
     }
 
     if (params.fileParts && params.fileParts.length > 0) {
@@ -4503,6 +4536,7 @@ export class AgentSession {
         options: streamContext.options,
         agentInitiated: streamContext.agentInitiated,
         goalKind: streamContext.goalKind,
+        goalId: streamContext.goalId,
         modelForStream: streamContext.modelString,
         muxMetadata: streamContext.workspaceTurnMetadata,
       });
@@ -4620,6 +4654,7 @@ export class AgentSession {
     agentInitiated?: boolean,
     abortSignal?: AbortSignal,
     goalKind?: GoalSyntheticMessageKind,
+    goalId?: string,
     // Session-owned per-turn holder for mid-turn thinking changes. Passed
     // explicitly (not read from the field) so a preempted turn can never pick
     // up its replacement's holder. Absent for internal retry paths.
@@ -4646,6 +4681,7 @@ export class AgentSession {
       agentInitiated,
       openaiTruncationModeOverride,
       ...(goalKind != null ? { goalKind } : {}),
+      ...(goalId != null ? { goalId } : {}),
       providersConfig,
     };
     this.activeStreamUserMessageId = undefined;
@@ -5091,6 +5127,7 @@ export class AgentSession {
     // Capture attribution before finalizeCompactionRetry() clears active stream state.
     const retryAgentInitiated = this.activeStreamContext?.agentInitiated;
     const retryGoalKind = this.activeStreamContext?.goalKind;
+    const retryGoalId = this.activeStreamContext?.goalId;
     const retryOptionsForResume = retryOptions ?? {
       model: context.modelString,
       agentId: WORKSPACE_DEFAULTS.agentId,
@@ -5110,7 +5147,12 @@ export class AgentSession {
       return false;
     }
 
-    this.setAutoRetryResumeState(retryOptionsForResume, retryAgentInitiated, retryGoalKind);
+    this.setAutoRetryResumeState(
+      retryOptionsForResume,
+      retryAgentInitiated,
+      retryGoalKind,
+      retryGoalId
+    );
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(
       retryOptionsForResume.muxMetadata
     );
@@ -5124,7 +5166,8 @@ export class AgentSession {
         undefined,
         retryAgentInitiated,
         undefined,
-        retryGoalKind
+        retryGoalKind,
+        retryGoalId
       );
     } finally {
       if (this.turnPhase === TurnPhase.PREPARING) {
@@ -5230,7 +5273,8 @@ export class AgentSession {
         true,
         context.agentInitiated,
         undefined,
-        context.goalKind
+        context.goalKind,
+        context.goalId
       );
     } finally {
       if (this.turnPhase === TurnPhase.PREPARING) {
@@ -6897,7 +6941,12 @@ export class AgentSession {
     // The compaction summary is now the source of truth for the next live resume
     // request. Pre-arm retry state from the reconstructed follow-up so failures
     // before stream startup do not fall back to the already-completed compact turn.
-    this.setAutoRetryResumeState(options, followUp.agentInitiated, followUp.goalKind);
+    this.setAutoRetryResumeState(
+      options,
+      followUp.agentInitiated,
+      followUp.goalKind,
+      followUp.goalId
+    );
 
     // Await sendMessage to ensure the follow-up is persisted before returning.
     // This guarantees ordering: the follow-up message is written to history
@@ -6908,6 +6957,10 @@ export class AgentSession {
       synthetic: true,
       agentInitiated: followUp.agentInitiated,
       goalKind: followUp.goalKind,
+      // Keep the re-dispatched continuation row goal-scoped so a replaced
+      // goal's follow-up cannot reactivate its successor during chat-tail
+      // reconciliation (Codex P2 PRRT_kwDOPxxmWM6cIv2E).
+      goalId: followUp.goalId,
       goalContinuation: followUp.goalKind === GOAL_CONTINUATION_KIND,
     });
     if (!sendResult.success) {

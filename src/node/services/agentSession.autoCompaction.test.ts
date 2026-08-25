@@ -303,7 +303,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     expect(unstamped).toBeUndefined();
   });
 
-  test("preserves goal kind on auto-compaction follow-up requests", async () => {
+  test("preserves goal kind and goal identity on auto-compaction follow-up requests", async () => {
     const { session } = await createSessionHarness({
       workspaceId: "ws-auto-compaction-goal-kind",
     });
@@ -315,6 +315,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
           options: SendMessageOptions;
           modelForStream: string;
           goalKind?: typeof GOAL_CONTINUATION_KIND;
+          goalId?: string;
         }) => CompactionFollowUpRequest;
       }
     ).buildAutoCompactionFollowUp({
@@ -322,9 +323,13 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
       options: { model: "openai:gpt-4o", agentId: "exec" },
       modelForStream: "openai:gpt-4o",
       goalKind: GOAL_CONTINUATION_KIND,
+      goalId: "goal-compaction-scope",
     });
 
     expect(followUp.goalKind).toBe(GOAL_CONTINUATION_KIND);
+    // Codex P2 (PRRT_kwDOPxxmWM6cIv2E): the re-dispatched follow-up row must
+    // stay goal-scoped instead of degrading to a legacy unscoped row.
+    expect(followUp.goalId).toBe("goal-compaction-scope");
     session.dispose();
   });
 

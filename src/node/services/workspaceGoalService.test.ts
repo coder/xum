@@ -2881,6 +2881,58 @@ describe("WorkspaceGoalService", () => {
     });
   });
 
+  test("getGoal during pause finalization does not reactivate the goal being paused", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cIyKW): between the durable pause write and
+    // the finalizer appending the goal-pause-boundary, the tail still ends at
+    // the goal's own continuation row. A concurrent getGoal reconciliation
+    // must not flip the goal back to active — that would make the finalizer's
+    // identity guard bail (status drifted) and skip the candidate delete +
+    // boundary append while the Pause call reports a stale paused result.
+    const created = await setGoalOk(service, { workspaceId, objective: "Pause under load" });
+    await appendUserHistoryMessage(historyService, workspaceId, "Continue working on the goal.", {
+      timestamp: Date.now(),
+      synthetic: true,
+      kind: "goal_continuation",
+      goalId: created.goalId,
+    });
+
+    // Gate the finalizer's boundary append so the test can observe the window
+    // while the pause hold is armed.
+    const realAppend = historyService.appendToHistory.bind(historyService);
+    let releaseBoundaryAppend!: () => void;
+    const boundaryGate = new Promise<void>((resolve) => (releaseBoundaryAppend = resolve));
+    let boundaryAppendStarted = false;
+    const appendSpy = spyOn(historyService, "appendToHistory").mockImplementationOnce(
+      async (id, message) => {
+        boundaryAppendStarted = true;
+        await boundaryGate;
+        return realAppend(id, message);
+      }
+    );
+
+    const pausePromise = service.setGoal({ workspaceId, status: "paused" });
+    await waitForCondition(() => boundaryAppendStarted, { timeoutMs: 5_000 });
+
+    // Mid-window: durable record is paused, boundary not yet in the tail.
+    // Reconciliation must hold the pause instead of trusting the stale tail.
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: created.goalId,
+      status: "paused",
+    });
+
+    releaseBoundaryAppend();
+    const pauseResult = await pausePromise;
+    expect(pauseResult.success).toBe(true);
+    appendSpy.mockRestore();
+
+    // Post-finalization: the boundary landed, so the pause is durable against
+    // reconciliation without the in-memory hold.
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: created.goalId,
+      status: "paused",
+    });
+  });
+
   test("cost previews reset when the goal becomes ineligible for accounting mid-stream", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cEl4P): a status transition during the stream
     // (pause, complete, or a budget edit flipping the goal budget_limited)

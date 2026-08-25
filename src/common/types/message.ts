@@ -103,6 +103,13 @@ export type StartupRetrySendOptions = Pick<
   agentInitiated?: boolean;
   /** Internal goal continuation classification for startup auto-retry accounting. */
   goalKind?: GoalSyntheticMessageKind;
+  /**
+   * Goal identity matching `goalKind`. Not persisted by
+   * pickStartupRetrySendOptions (the user row's own metadata.goalId is the
+   * durable copy); startup recovery re-derives it so resumed streams keep
+   * goal-scoped compaction follow-ups (Codex P2 PRRT_kwDOPxxmWM6cIv2E).
+   */
+  goalId?: string;
 };
 
 /**
@@ -164,6 +171,13 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
   agentInitiated?: boolean;
   /** Internal goal continuation classification for synthetic follow-up accounting. */
   goalKind?: GoalSyntheticMessageKind;
+  /**
+   * Goal identity matching `goalKind`. Preserved through compaction so the
+   * re-dispatched follow-up row stays goal-scoped for chat-tail
+   * reconciliation instead of degrading to a legacy unscoped row (Codex P2
+   * PRRT_kwDOPxxmWM6cIv2E).
+   */
+  goalId?: string;
   /** Internal dispatch guardrails for crash-safe follow-up recovery. */
   dispatchOptions?: CompactionFollowUpDispatchOptions;
   /**

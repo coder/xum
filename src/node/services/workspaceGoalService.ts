@@ -472,6 +472,51 @@ export class WorkspaceGoalService {
    * PRRT_kwDOPxxmWM6cCH_L). Cleared when the next stream start is recorded.
    */
   private readonly drainSettledWorkspaces = new Set<string>();
+
+  /**
+   * workspaceId → goalId whose pause finalization is in flight (armed under
+   * the goal file lock alongside the durable paused write, released after
+   * `finalizeGoalPersistence` returns). Between the paused write and the
+   * finalizer's boundary append the chat tail still ends at this goal's own
+   * continuation row, so a concurrent getGoal reconciliation would flip the
+   * goal back to active — making the finalizer's identity guard bail and skip
+   * the candidate delete + boundary append while the Pause call reports a
+   * stale paused result (Codex P1 PRRT_kwDOPxxmWM6cIyKW). While the hold is
+   * set, chat-tail reconciliation must not reactivate the held goal; genuine
+   * user mutations (resume, replacement) write through setGoal and are
+   * unaffected, so a newer user action still wins over the pause.
+   */
+  private readonly pauseFinalizationHolds = new Map<string, { goalId: string; depth: number }>();
+
+  private armPauseFinalizationHold(workspaceId: string, goalId: string): void {
+    const existing = this.pauseFinalizationHolds.get(workspaceId);
+    if (existing?.goalId === goalId) {
+      existing.depth += 1;
+      return;
+    }
+    // A newer pause (e.g. for a replacement goal) supersedes the older hold;
+    // the superseded finalizer bails on its identity re-check anyway.
+    this.pauseFinalizationHolds.set(workspaceId, { goalId, depth: 1 });
+  }
+
+  private releasePauseFinalizationHold(workspaceId: string, goalId: string): void {
+    const existing = this.pauseFinalizationHolds.get(workspaceId);
+    if (existing?.goalId !== goalId) {
+      return;
+    }
+    existing.depth -= 1;
+    if (existing.depth <= 0) {
+      this.pauseFinalizationHolds.delete(workspaceId);
+    }
+  }
+
+  /** True when a pause persisted durably and its finalization side effects are still owed. */
+  private pauseFinalizationHoldApplies(
+    input: SetGoalInput,
+    result: Result<GoalRecordV1, GoalSetError>
+  ): boolean {
+    return input.status === "paused" && result.success && result.data.status === "paused";
+  }
   /**
    * Monotonic per-workspace stream-start counter, bumped synchronously by
    * `recordStreamStarted`. The stream-end drain captures it at entry and only
@@ -690,6 +735,22 @@ export class WorkspaceGoalService {
       if (candidate?.source === "kickoff" && candidate.goalId === goal.goalId) {
         return goal;
       }
+    }
+
+    // Codex P1 (PRRT_kwDOPxxmWM6cIyKW): between a durable pause write and its
+    // finalizer appending the goal-pause-boundary, the tail still ends at this
+    // goal's own continuation row. Reactivating here would make the
+    // finalizer's identity guard bail (status drifted), skipping the candidate
+    // delete and boundary append — silently unwinding a pause the caller was
+    // just told succeeded. Suppress same-goal automatic reactivation while the
+    // finalization is in flight; genuine user mutations (resume, replacement)
+    // write through setGoal directly and still win.
+    if (
+      goal.status === "paused" &&
+      chatTailMode.mode === "active" &&
+      this.pauseFinalizationHolds.get(workspaceId)?.goalId === goal.goalId
+    ) {
+      return goal;
     }
 
     const desiredStatus = chatTailMode.mode;
@@ -2512,10 +2573,22 @@ export class WorkspaceGoalService {
     input: SetGoalInput & { objective?: string },
     options?: GoalPersistenceOptions
   ): Promise<Result<GoalRecordV1, GoalSetError>> {
-    const result = await this.fileLocks.withLock(input.workspaceId, () =>
-      this.persistGoalMutationLocked(input, options)
-    );
-    return this.finalizeGoalPersistence(input, result, options);
+    const result = await this.fileLocks.withLock(input.workspaceId, async () => {
+      const persisted = await this.persistGoalMutationLocked(input, options);
+      // Arm under the same lock tenure as the paused write so no other locked
+      // writer can observe the paused record before the hold exists.
+      if (this.pauseFinalizationHoldApplies(input, persisted) && persisted.success) {
+        this.armPauseFinalizationHold(input.workspaceId, persisted.data.goalId);
+      }
+      return persisted;
+    });
+    try {
+      return await this.finalizeGoalPersistence(input, result, options);
+    } finally {
+      if (this.pauseFinalizationHoldApplies(input, result) && result.success) {
+        this.releasePauseFinalizationHold(input.workspaceId, result.data.goalId);
+      }
+    }
   }
 
   /**
@@ -3612,19 +3685,31 @@ export class WorkspaceGoalService {
           this.pendingGoalSnapshots.delete(workspaceId);
           const { projectedGoalId, projectedCreatedAtMs, ...pendingInput } = claimed;
           const input = { workspaceId, ...pendingInput };
-          return {
-            input,
-            result: await this.persistGoalMutationLocked(input, {
-              replacementGoalId: projectedGoalId ?? null,
-              replacementCreatedAtMs: projectedCreatedAtMs ?? null,
-            }),
-          };
+          const result = await this.persistGoalMutationLocked(input, {
+            replacementGoalId: projectedGoalId ?? null,
+            replacementCreatedAtMs: projectedCreatedAtMs ?? null,
+          });
+          // Mirror setGoalImmediately: arm the pause-finalization hold under
+          // the same lock tenure as the paused write.
+          if (this.pauseFinalizationHoldApplies(input, result) && result.success) {
+            this.armPauseFinalizationHold(workspaceId, result.data.goalId);
+          }
+          return { input, result };
         });
         if (tenure == null) {
           break;
         }
-        const finalized = await this.finalizeGoalPersistence(tenure.input, tenure.result);
-        drained = finalized.success ? finalized.data : drained;
+        try {
+          const finalized = await this.finalizeGoalPersistence(tenure.input, tenure.result);
+          drained = finalized.success ? finalized.data : drained;
+        } finally {
+          if (
+            this.pauseFinalizationHoldApplies(tenure.input, tenure.result) &&
+            tenure.result.success
+          ) {
+            this.releasePauseFinalizationHold(workspaceId, tenure.result.data.goalId);
+          }
+        }
       } catch (error) {
         log.warn("applyPendingAfterStreamEnd: dropped invalid queued goal mutation", {
           workspaceId,
