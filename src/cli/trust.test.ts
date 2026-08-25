@@ -3,7 +3,8 @@ import * as path from "node:path";
 
 import { describe, expect, test } from "bun:test";
 import { DisposableTempDir } from "@/node/services/tempDir";
-import { resolveProjectDir } from "./trust";
+import { Config } from "@/node/config";
+import { materializeResolvedTrust, resolveProjectDir } from "./trust";
 
 const BUN_EXECUTABLE = process.execPath;
 const TRUST_ENTRY = path.join(import.meta.dir, "trust.ts");
@@ -95,6 +96,39 @@ describe("xum trust CLI", () => {
     const trustByPath = new Map(config.projects.map(([p, c]) => [p, c.trusted]));
     expect(trustByPath.get(repo)).toBe(false);
     expect(trustByPath.get(worktree)).toBe(false);
+  }, 15_000);
+
+  test("materializeResolvedTrust copies main-repo trust onto the exact worktree entry", async () => {
+    using tmp = new DisposableTempDir("trust-materialize");
+    const base = await fs.realpath(tmp.path);
+    const repo = path.join(base, "repo");
+    const worktree = path.join(base, "worktree");
+    await fs.mkdir(repo, { recursive: true });
+    await Bun.$`git init`.cwd(repo).quiet();
+    await Bun.$`git config user.email dogfood@example.com`.cwd(repo).quiet();
+    await Bun.$`git config user.name Dogfood`.cwd(repo).quiet();
+    await fs.writeFile(path.join(repo, "README.md"), "hello\n", "utf-8");
+    await Bun.$`git add README.md`.cwd(repo).quiet();
+    await Bun.$`git commit -m init`.cwd(repo).quiet();
+    await Bun.$`git worktree add ${worktree} -b feature`.cwd(repo).quiet();
+
+    const realConfig = new Config(path.join(base, "real-root"));
+    await realConfig.editConfig((cfg) => {
+      cfg.projects.set(repo, { workspaces: [], trusted: true });
+      return cfg;
+    });
+    const targetConfig = new Config(path.join(base, "ephemeral-root"));
+
+    // Main-repo trust must land on the worktree's own entry in the target config
+    // (the task-spawn gate does an exact-path lookup there).
+    expect(await materializeResolvedTrust(realConfig, targetConfig, worktree)).toBe(true);
+    expect(targetConfig.loadConfigOrDefault().projects.get(worktree)?.trusted).toBe(true);
+
+    // Untrusted paths must not gain entries.
+    const other = path.join(base, "other");
+    await fs.mkdir(other, { recursive: true });
+    expect(await materializeResolvedTrust(realConfig, targetConfig, other)).toBe(false);
+    expect(targetConfig.loadConfigOrDefault().projects.has(other)).toBe(false);
   }, 15_000);
 
   test("fails loudly when the trust change cannot be persisted", async () => {

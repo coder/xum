@@ -455,7 +455,13 @@ class MuxAgent(BaseInstalledAgent):
         if token_file.exists():
             try:
                 data = json.loads(token_file.read_text())
-                context.n_input_tokens = data.get("input", 0)
+                # Harbor's context has no cache-token fields, and "input" is
+                # only the uncached portion. Fold cache read/write into the
+                # reported input total so cached legs are not understated;
+                # the per-bucket breakdown stays in mux-tokens.json.
+                context.n_input_tokens = (
+                    data.get("input", 0) + data.get("cache_read", 0) + data.get("cache_write", 0)
+                )
                 context.n_output_tokens = data.get("output", 0)
                 # cost_usd is computed by mux CLI from model pricing
                 if data.get("cost_usd") is not None:

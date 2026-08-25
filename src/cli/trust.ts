@@ -117,6 +117,35 @@ export async function resolveProjectTrusted(
   return mainRepoDir != null && isProjectTrusted(realConfig, mainRepoDir);
 }
 
+/**
+ * Copy the checkout's *effective* trust (direct entry or main-repo fallback)
+ * onto the exact project path in a target config. Headless `xum run` needs
+ * this: trust for a linked worktree is recorded against the main repository,
+ * but the task-spawn gate looks up the checkout's own project entry in the
+ * ephemeral run config, so without materialization trusted worktrees could
+ * not spawn sub-agents.
+ */
+export async function materializeResolvedTrust(
+  realConfig: Config,
+  targetConfig: Config,
+  projectDir: string
+): Promise<boolean> {
+  const trusted = await resolveProjectTrusted(realConfig, projectDir);
+  if (!trusted) {
+    return false;
+  }
+  await targetConfig.editConfig((config) => {
+    let project = config.projects.get(projectDir);
+    if (!project) {
+      project = { workspaces: [] };
+      config.projects.set(projectDir, project);
+    }
+    project.trusted = true;
+    return config;
+  });
+  return true;
+}
+
 async function runTrust(options: TrustCLIOptions): Promise<number> {
   const projectDir = await resolveProjectDir({
     cwd: process.cwd(),

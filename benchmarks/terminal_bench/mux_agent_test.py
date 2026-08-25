@@ -283,7 +283,9 @@ class _FakeEnvironment:
 
     async def download_file(self, source_path: str, target_path: Path) -> None:
         self.download_attempts.append((source_path, target_path))
-        target_path.write_text('{"input": 7, "output": 11, "cost_usd": 0.42}')
+        target_path.write_text(
+            '{"input": 7, "output": 11, "cache_read": 5, "cache_write": 3, "cost_usd": 0.42}'
+        )
 
 
 def test_run_raises_after_preserving_logs_for_nonzero_exit(
@@ -306,7 +308,8 @@ def test_run_raises_after_preserving_logs_for_nonzero_exit(
     assert environment.download_attempts == [
         (agent._TOKEN_FILE_PATH, tmp_path / "mux-tokens.json")
     ]
-    assert getattr(context, "n_input_tokens") == 7
+    # input(7) + cache_read(5) + cache_write(3): cache traffic counts as input
+    assert getattr(context, "n_input_tokens") == 15
     assert getattr(context, "n_output_tokens") == 11
     assert getattr(context, "cost_usd") == 0.42
 
@@ -328,7 +331,8 @@ def test_run_timeout_surfaces_agent_timeout_error(
     assert environment.download_attempts == [
         (agent._TOKEN_FILE_PATH, tmp_path / "mux-tokens.json")
     ]
-    assert getattr(context, "n_input_tokens") == 7
+    # input(7) + cache_read(5) + cache_write(3): cache traffic counts as input
+    assert getattr(context, "n_input_tokens") == 15
     assert getattr(context, "n_output_tokens") == 11
     assert getattr(context, "cost_usd") == 0.42
 
@@ -433,7 +437,8 @@ def test_run_populates_context_for_successful_exit(
     assert (command_dir / "return-code.txt").read_text() == "0"
     assert (command_dir / MuxAgent._COMMAND_STDOUT_NAME).read_text() == "out"
     assert (command_dir / MuxAgent._COMMAND_STDERR_NAME).read_text() == "err"
-    assert getattr(context, "n_input_tokens") == 7
+    # input(7) + cache_read(5) + cache_write(3): cache traffic counts as input
+    assert getattr(context, "n_input_tokens") == 15
     assert getattr(context, "n_output_tokens") == 11
     assert getattr(context, "cost_usd") == 0.42
 

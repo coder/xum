@@ -28,8 +28,7 @@ export interface AISDKMediaPart {
 
 /**
  * Original attachment-carrying parts a tool result can produce: model
- * attachments (media) and user-preview-only files (display_file). Shared with
- * the PTC ToolBridge, which strips these out of sandbox-visible values.
+ * attachments (media) and user-preview-only files (display_file).
  */
 export type ToolAttachmentPart = AISDKMediaPart | DisplayOnlyFilePart;
 
@@ -72,7 +71,7 @@ function isContentContainer(value: unknown): value is AISDKContentContainer {
   );
 }
 
-function isMediaPart(value: unknown): value is AISDKMediaPart {
+export function isMediaPart(value: unknown): value is AISDKMediaPart {
   if (typeof value !== "object" || value === null) {
     return false;
   }

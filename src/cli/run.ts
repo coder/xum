@@ -16,6 +16,7 @@ import * as path from "path";
 import * as fs from "fs/promises";
 import * as fsSync from "fs";
 import { Config, type ProjectConfig } from "../node/config";
+import { materializeResolvedTrust } from "./trust";
 import { DisposableTempDir } from "../node/services/tempDir";
 import { AgentSession, type AgentSessionChatEvent } from "../node/services/agentSession";
 import { CodexOauthService } from "../node/services/codexOauthService";
@@ -483,6 +484,12 @@ async function main(): Promise<number> {
   const projectDir = path.resolve(opts.dir);
   await ensureDirectory(projectDir);
 
+  // Trust for a linked worktree is recorded against the main repository, but
+  // TaskService's sub-agent gate looks up this exact checkout path in the
+  // ephemeral config. Materialize effective trust (direct or main-repo
+  // fallback) onto projectDir so trusted worktrees can spawn sub-agents.
+  const projectTrusted = await materializeResolvedTrust(realConfig, config, projectDir);
+
   // Shared normalization (alias resolution + gateway migration + format
   // validation); an unrecognized -m value fails up front instead of failing
   // later inside the stream.
@@ -730,8 +737,9 @@ async function main(): Promise<number> {
       // Fallback to main
     }
 
-    // Read trust state from real config so trusted projects can run hooks
-    const trusted = realConfig.loadConfigOrDefault().projects.get(projectDir)?.trusted ?? false;
+    // Effective trust (including main-repo fallback for linked worktrees) was
+    // resolved and materialized into the ephemeral config above.
+    const trusted = projectTrusted;
 
     const createEnv = Object.fromEntries(
       Object.entries(process.env).filter(

@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, mock } from "bun:test";
-import { ToolBridge, type KernelBridgeOptions } from "./toolBridge";
+import { ToolBridge, MEDIA_DATA_STUB, type KernelBridgeOptions } from "./toolBridge";
 import type { Tool } from "ai";
 import type { IJSRuntime, RuntimeLimits } from "./runtime";
 import type { PTCEvent, PTCExecutionResult } from "./types";
@@ -642,13 +642,16 @@ describe("attachment part stripping", () => {
 
     const sandboxValue = (await captured.xum.attach_file({ path: "/board.png" })) as {
       type: string;
-      value: Array<{ type: string }>;
+      value: Array<{ type: string; data?: string; mediaType?: string }>;
     };
-    // Media replaced by a text placeholder; leading text part preserved
+    // Media payload stubbed but the declared part shape survives: guest code
+    // following the generated attach_file type can still read .data/.mediaType.
     expect(JSON.stringify(sandboxValue)).not.toContain("BASE64DATA");
     expect(sandboxValue.type).toBe("content");
     expect(sandboxValue.value).toHaveLength(2);
-    expect(sandboxValue.value[1].type).toBe("text");
+    expect(sandboxValue.value[1].type).toBe("media");
+    expect(sandboxValue.value[1].mediaType).toBe("image/png");
+    expect(sandboxValue.value[1].data).toBe(MEDIA_DATA_STUB);
 
     expect(bridge.drainPendingAttachments(runtime)).toEqual([mediaPart]);
     // Drain empties the pending set
@@ -709,6 +712,35 @@ describe("attachment part stripping", () => {
 
     expect(await captured.xum.bash({ script: "true" })).toEqual(bashResult);
     expect(await captured.xum.attach_file({ path: "/x.bin" })).toEqual(unsupportedMedia);
+    expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
+  });
+
+  it("keeps display_file parts inline so nested UI previews survive", async () => {
+    const displayResult = {
+      type: "content",
+      value: [
+        { type: "text", text: "[File shown to user: notes.md]" },
+        {
+          type: "display_file",
+          data: "RElTUExBWQ==",
+          mediaType: "text/markdown",
+          filename: "notes.md",
+          providerOptions: { mux: { displayOnly: true, size: 7 } },
+        },
+      ],
+    };
+    const bridge = new ToolBridge({
+      attach_file: createMockTool(
+        "attach_file",
+        z.object({ path: z.string() }),
+        () => displayResult
+      ),
+    });
+    const { captured, runtime } = registerCapturingXum(bridge);
+
+    // Display-only files are user-preview data, not model attachments: they
+    // pass through untouched and never ride the attachments carrier.
+    expect(await captured.xum.attach_file({ path: "/notes.md" })).toEqual(displayResult);
     expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
   });
 });

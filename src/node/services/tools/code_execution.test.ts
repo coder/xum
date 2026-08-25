@@ -10,7 +10,7 @@ import {
   type MountRunner,
 } from "./code_execution";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
-import { ToolBridge } from "@/node/services/ptc/toolBridge";
+import { ToolBridge, MEDIA_DATA_STUB } from "@/node/services/ptc/toolBridge";
 import type { Tool, ToolExecutionOptions } from "ai";
 import type { PTCEvent, PTCExecutionResult } from "@/node/services/ptc/types";
 import { z } from "zod";
@@ -2185,9 +2185,13 @@ describe("nested attachment delivery", () => {
     expect(result.success).toBe(true);
     // Original media rides the top-level result for the request-path lift
     expect(result.attachments).toEqual([mediaPart]);
-    // Sandbox-visible values (return value + nested record) carry only placeholders
+    // Sandbox-visible values (return value + nested record) carry the stubbed
+    // media shape, never the real base64 payload
     const sandboxVisible = JSON.stringify({ result: result.result, toolCalls: result.toolCalls });
     expect(sandboxVisible).not.toContain(mediaPart.data);
+    const returned = result.result as { value: Array<{ type: string; data?: string }> };
+    expect(returned.value[1].type).toBe("media");
+    expect(returned.value[1].data).toBe(MEDIA_DATA_STUB);
   });
 
   it("omits attachments when no nested tool produced media", async () => {
