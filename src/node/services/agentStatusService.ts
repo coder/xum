@@ -80,6 +80,14 @@ interface State {
    */
   persistedHashChecked: boolean;
   /**
+   * Whether lastInputHash settled by persisting a sidebar status (true) or
+   * without one, e.g. placeholder rejection (false). Only persisted settles
+   * are invalidated when another writer clears the shared status slot;
+   * invalidating placeholder settles would retry the same
+   * placeholder-producing transcript on every tick.
+   */
+  lastInputHashPersisted: boolean;
+  /**
    * Hash of the transcript the scheduler last examined, even if that input
    * did not settle into a sidebar status (for example, a pre-provider config
    * failure). Used to avoid consuming a recency bump while history is still
@@ -239,7 +247,11 @@ export class AgentStatusService {
       // present-progressive tense when the assistant is mid-response.
       // Snapshots were already read once per tick above.
       const streaming = snapshots.get(id)?.streaming === true;
-      const promise = this.runForWorkspace(id, recency, streaming).finally(() => {
+      // Whether a live sidebar status still backs the shared todoStatus slot;
+      // runForWorkspace uses the false case to drop a settled hash whose
+      // status another writer has since cleared.
+      const hasSidebarStatus = snapshots.get(id)?.todoStatus != null;
+      const promise = this.runForWorkspace(id, recency, streaming, hasSidebarStatus).finally(() => {
         state.inFlight = false;
         this.inFlightPromises.delete(promise);
       });
@@ -250,7 +262,9 @@ export class AgentStatusService {
   private async runForWorkspace(
     workspaceId: string,
     observedRecency: number | null = null,
-    streaming = false
+    streaming = false,
+    // null = caller has no signal about the persisted status slot.
+    hasSidebarStatus: boolean | null = null
   ): Promise<void> {
     try {
       const transcript = await this.buildTrailingTranscript(workspaceId);
@@ -284,7 +298,24 @@ export class AgentStatusService {
       // misses the dedup branch below and regenerates as before.
       if (!state.persistedHashChecked) {
         state.persistedHashChecked = true;
-        state.lastInputHash ??= await this.extensionMetadata.getSidebarStatusInputHash(workspaceId);
+        if (state.lastInputHash === null) {
+          const persisted = await this.extensionMetadata.getSidebarStatusInputHash(workspaceId);
+          if (persisted !== null) {
+            // The reader only returns hashes backed by a live status, so a
+            // seeded hash is by definition a persisted settle.
+            state.lastInputHash = persisted;
+            state.lastInputHashPersisted = true;
+          }
+        }
+      }
+      // Codex review: another writer (the todo path) can clear the shared
+      // status slot after we settled by persisting. Keeping the settled hash
+      // would let the dedup branch skip regeneration and leave the sidebar
+      // blank until the transcript changes, so drop it. Placeholder settles
+      // (lastInputHashPersisted=false) keep their dedup — see the field doc.
+      if (hasSidebarStatus === false && state.lastInputHashPersisted) {
+        state.lastInputHash = null;
+        state.lastInputHashPersisted = false;
       }
 
       const markRecencyObserved = () => {
@@ -299,9 +330,10 @@ export class AgentStatusService {
       // Pre-provider failures and the empty/dedup-hit branches use bare
       // `markRecencyObserved()` because they should still retry on the same
       // transcript when conditions change.
-      const settleOnTranscript = () => {
+      const settleOnTranscript = (persistedStatus: boolean) => {
         markRecencyObserved();
         state.lastInputHash = dedupHash;
+        state.lastInputHashPersisted = persistedStatus;
         resetProviderFailureTracking(state);
       };
 
@@ -450,7 +482,7 @@ export class AgentStatusService {
           workspaceId,
           message: result.data.status.message,
         });
-        settleOnTranscript();
+        settleOnTranscript(false);
         return;
       }
 
@@ -478,7 +510,7 @@ export class AgentStatusService {
           });
           return;
         }
-        settleOnTranscript();
+        settleOnTranscript(true);
         this.workspaceService.emitWorkspaceActivity(workspaceId, snapshot);
       } catch (error) {
         log.error("AgentStatusService: failed to persist generated status", {
@@ -501,6 +533,7 @@ export class AgentStatusService {
         lastRanAt: 0,
         lastInputHash: null,
         persistedHashChecked: false,
+        lastInputHashPersisted: false,
         lastSeenInputHash: null,
         lastObservedRecency: null,
         lastProviderFailureHash: null,

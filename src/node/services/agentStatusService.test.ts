@@ -24,13 +24,15 @@ interface AgentStatusServiceInternals {
   runForWorkspace(
     workspaceId: string,
     observedRecency?: number | null,
-    streaming?: boolean
+    streaming?: boolean,
+    hasSidebarStatus?: boolean | null
   ): Promise<void>;
 }
 
 interface ActivitySnapshotForTest {
   streaming: boolean;
   recency?: number;
+  todoStatus?: { emoji: string; message: string };
 }
 
 describe("AgentStatusService", () => {
@@ -629,7 +631,14 @@ describe("AgentStatusService", () => {
     getAllSnapshotsMock.mockImplementation(() =>
       Promise.resolve(
         new Map<string, ActivitySnapshotForTest>([
-          [staleWorkspaceId, { streaming: false, recency }],
+          // todoStatus present: mirrors production, where the first tick's
+          // successful persist writes the status this scheduler later sees.
+          // Without it the cleared-slot invalidation path would (correctly)
+          // force regeneration and mask the stale-recency behavior under test.
+          [
+            staleWorkspaceId,
+            { streaming: false, recency, todoStatus: { emoji: "🛠️", message: "Editing source" } },
+          ],
         ])
       )
     );
@@ -1077,6 +1086,60 @@ describe("AgentStatusService", () => {
       await newInstance().runForWorkspace(workspaceId, 0);
       expect(generateSpy).toHaveBeenCalledTimes(2);
     });
+  });
+
+  test("invalidates the in-memory settled hash when another writer clears the status slot", async () => {
+    // Codex review round 2: within one process, setTodoStatus(null) can clear
+    // the shared todoStatus slot after we settled by persisting. The cached
+    // hash must not keep the dedup branch skipping on the unchanged
+    // transcript, or the sidebar stays blank until the transcript changes.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Idle workspace")
+    );
+
+    const service = createService();
+    const internals = getInternals(service);
+    await internals.runForWorkspace(workspaceId);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    expect(setSidebarStatusMock).toHaveBeenCalledTimes(1);
+
+    // Status still present: normal dedup skip.
+    await internals.runForWorkspace(workspaceId, null, false, true);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+
+    // Slot cleared by the todo path: the settled hash must drop and the
+    // same transcript must regenerate.
+    await internals.runForWorkspace(workspaceId, null, false, false);
+    expect(generateSpy).toHaveBeenCalledTimes(2);
+    expect(setSidebarStatusMock).toHaveBeenCalledTimes(2);
+  });
+
+  test("a cleared status slot does not retrigger placeholder-settled transcripts", async () => {
+    // Placeholder settles never persisted a status, so "slot has no status"
+    // is their steady state, not an invalidation signal. Dropping their dedup
+    // would re-call the model on the same placeholder-producing transcript
+    // every tick and burn provider budget.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "kick off a task")
+    );
+
+    generateSpy.mockResolvedValueOnce(
+      Ok({
+        status: { emoji: "💤", message: "Awaiting next task" },
+        modelUsed: "anthropic:claude-haiku-4-5",
+      })
+    );
+
+    const service = createService();
+    const internals = getInternals(service);
+    await internals.runForWorkspace(workspaceId, null, false, false);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
+    expect(setSidebarStatusMock).not.toHaveBeenCalled();
+
+    await internals.runForWorkspace(workspaceId, null, false, false);
+    expect(generateSpy).toHaveBeenCalledTimes(1);
   });
 
   test("restart: persisted hash folds the streaming bit so an idle restart regenerates", async () => {
