@@ -553,7 +553,7 @@ describe("AgentSession disposal race conditions", () => {
       (
         _message: string,
         _options?: { model: string; agentId: string },
-        _internal?: { synthetic?: boolean }
+        _internal?: { synthetic?: boolean; enqueuedAtMs?: number }
       ) => Promise.resolve(Ok(undefined))
     );
 
@@ -567,10 +567,12 @@ describe("AgentSession disposal race conditions", () => {
     session.sendQueuedMessages();
 
     expect(sendMessage).toHaveBeenCalledTimes(1);
-    expect(sendMessage).toHaveBeenCalledWith(
-      "Background compaction request",
-      expect.objectContaining({ model: "anthropic:claude-sonnet-4-5", agentId: "compact" }),
-      { synthetic: true }
-    );
+    const [text, options, internal] = sendMessage.mock.calls[0] ?? [];
+    expect(text).toBe("Background compaction request");
+    expect(options).toMatchObject({ model: "anthropic:claude-sonnet-4-5", agentId: "compact" });
+    // Queue dispatch stamps enqueuedAtMs alongside preserved internal flags
+    // (goal safety uses it to detect messages that predate a fresh goal).
+    expect(internal?.synthetic).toBe(true);
+    expect(typeof internal?.enqueuedAtMs).toBe("number");
   });
 });

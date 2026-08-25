@@ -1612,6 +1612,7 @@ export class AgentSession {
 
   private async applyManualUserMessageGoalSafety(input: {
     policy: GoalInterventionPolicy;
+    enqueuedAtMs?: number;
   }): Promise<void> {
     const goalService = this.workspaceGoalService;
     if (!goalService) {
@@ -1629,8 +1630,21 @@ export class AgentSession {
     // anything manually typed by the user pauses until Resume appends a fresh
     // continuation. Legacy clients may still send the old "steer" policy; treat
     // it as pause so the invariant holds at this backend boundary.
-    goalService.clearPendingContinuationForManualUserMessage(this.workspaceId);
     const goal = await goalService.acknowledgeUser(this.workspaceId);
+
+    // Queue race: a message the user typed while the goal-creating turn was
+    // still streaming predates the goal itself — the model's queued set_goal
+    // applies at that turn's stream end, and only then does the queued message
+    // dispatch. The user cannot have been intervening against a goal they had
+    // not seen, so let the fresh goal keep its kickoff continuation instead of
+    // silently pausing it half a second after creation (user report: goals
+    // "paused by heartbeats" were actually killed here, then heartbeat turns
+    // kept the workspace moving while the goal sat paused).
+    if (input.enqueuedAtMs != null && goal != null && goal.createdAtMs >= input.enqueuedAtMs) {
+      return;
+    }
+
+    goalService.clearPendingContinuationForManualUserMessage(this.workspaceId);
     if (goal?.status !== "active") {
       return;
     }
@@ -2719,6 +2733,13 @@ export class AgentSession {
       cancelState?: { canceledBeforeAcceptance: boolean };
       cancelSignal?: AbortSignal;
       /**
+       * For queue-dispatched sends: when the user last added to the queued
+       * entry. Goal safety uses it to skip auto-pausing a goal created AFTER
+       * the message was typed (queued while the goal-creating turn streamed) —
+       * the user cannot have been intervening against a goal they had not seen.
+       */
+      enqueuedAtMs?: number;
+      /**
        * Synthetic assistant rows persisted immediately before this turn's user
        * row (family-message payloads). Persisting them inside turn admission —
        * instead of a direct history append from the sender — keeps them out of
@@ -2871,7 +2892,10 @@ export class AgentSession {
           // payloads (Codex P2 PRRT_kwDOPxxmWM5_tUsx) would otherwise silently
           // disable goal continuation after a blank submit / invalid payload.
           if (persisted) {
-            await this.applyManualUserMessageGoalSafety({ policy: "pause" });
+            await this.applyManualUserMessageGoalSafety({
+              policy: "pause",
+              enqueuedAtMs: internal?.enqueuedAtMs,
+            });
           }
         }
         return Err(pricingGate.error);
@@ -3567,7 +3591,10 @@ export class AgentSession {
     }
 
     if (manualGoalInterventionPolicy != null) {
-      await this.applyManualUserMessageGoalSafety({ policy: manualGoalInterventionPolicy });
+      await this.applyManualUserMessageGoalSafety({
+        policy: manualGoalInterventionPolicy,
+        enqueuedAtMs: internal?.enqueuedAtMs,
+      });
     }
 
     // Workspace may be tearing down while we await filesystem IO.
@@ -6410,7 +6437,7 @@ export class AgentSession {
       // Entries dispatch one at a time (FIFO): special sends (compaction, agent
       // skills, workspace-turn follow-ups) own their turn, and anything queued
       // behind them dispatches on a later drain instead of batching into them.
-      const { message, options, internal } = this.messageQueue.dequeueNext();
+      const { message, options, internal, enqueuedAtMs } = this.messageQueue.dequeueNext();
       this.dispatchingQueuedEntry = true;
       this.dispatchingQueuedEntryMuxMetadata = options?.muxMetadata;
       this.emitQueuedMessageChanged();
@@ -6429,7 +6456,7 @@ export class AgentSession {
       this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(options?.muxMetadata);
       this.setTurnPhase(TurnPhase.PREPARING);
 
-      void this.sendMessage(message, options, internal)
+      void this.sendMessage(message, options, { ...internal, enqueuedAtMs })
         .then(async (result) => {
           // Keep the dispatch marker through the dequeue-to-stream-start window. A background
           // send can resolve before startup emits stream-start, and later reports must not claim

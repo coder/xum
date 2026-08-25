@@ -204,6 +204,43 @@ describe("AgentSession goal safety hooks", () => {
     session.dispose();
   });
 
+  test("queued manual messages that predate the goal do not pause it", async () => {
+    // Queue race: the user types while the goal-creating turn is still
+    // streaming; the model's set_goal applies at stream end, and only then
+    // does the queued message dispatch. It must not pause a goal the user had
+    // not seen (observed as goals "paused by heartbeats" half a second after
+    // creation).
+    const workspaceId = "queued-predates-goal";
+    const { session, goalService, cleanup } = await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const enqueuedAtMs = Date.now();
+    const created = await setGoalOk(goalService, { workspaceId, objective: "Fresh goal" });
+    expect(created.createdAtMs).toBeGreaterThanOrEqual(enqueuedAtMs);
+
+    const result = await session.sendMessage("Queued before the goal existed", SEND_OPTIONS, {
+      enqueuedAtMs,
+    });
+
+    expect(result.success).toBe(true);
+    expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
+    session.dispose();
+  });
+
+  test("queued manual messages enqueued after goal creation still pause it", async () => {
+    const workspaceId = "queued-postdates-goal";
+    const { session, goalService, cleanup } = await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const created = await setGoalOk(goalService, { workspaceId, objective: "Existing goal" });
+
+    const result = await session.sendMessage("Typed with the goal in view", SEND_OPTIONS, {
+      enqueuedAtMs: created.createdAtMs + 1,
+    });
+
+    expect(result.success).toBe(true);
+    expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "paused" });
+    session.dispose();
+  });
+
   test("manual user messages are no-ops when no goal exists", async () => {
     const workspaceId = "manual-no-goal";
     const { session, goalService, cleanup } = await createSessionHarness(workspaceId);

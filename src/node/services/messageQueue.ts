@@ -143,6 +143,13 @@ interface QueueEntry {
   addCount: number;
   syntheticCount: number;
   agentInitiatedCount: number;
+  /**
+   * Timestamp of the latest add batched into this entry. Dispatch exposes it so
+   * goal safety can tell messages typed before a goal existed (queued while the
+   * goal-creating turn was still streaming) from genuine interventions against
+   * a goal the user has already seen.
+   */
+  lastAddedAtMs: number;
   onCanceled?: (reason: string) => Promise<void> | void;
   onAccepted?: () => Promise<void> | void;
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
@@ -459,6 +466,7 @@ export class MessageQueue {
         addCount: 0,
         syntheticCount: 0,
         agentInitiatedCount: 0,
+        lastAddedAtMs: Date.now(),
       };
       this.entries.push(entry);
     }
@@ -523,6 +531,7 @@ export class MessageQueue {
     }
 
     entry.addCount += 1;
+    entry.lastAddedAtMs = Date.now();
     if (internal?.synthetic === true) {
       entry.syntheticCount += 1;
     }
@@ -737,6 +746,8 @@ export class MessageQueue {
     message: string;
     options?: SendMessageOptions & { fileParts?: FilePart[] };
     internal?: QueuedMessageInternalOptions;
+    /** Timestamp of the latest add batched into this entry (see QueueEntry.lastAddedAtMs). */
+    enqueuedAtMs?: number;
   } {
     const entry = this.entries.shift();
     if (entry === undefined) {
@@ -791,7 +802,7 @@ export class MessageQueue {
         }
       : undefined;
 
-    return { message: joinedMessages, options, internal };
+    return { message: joinedMessages, options, internal, enqueuedAtMs: entry.lastAddedAtMs };
   }
 
   /**

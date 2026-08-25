@@ -536,6 +536,20 @@ export class WorkspaceGoalService {
       chatTailMode.mode === "paused" &&
       chatTailMode.pausedBy === "manual_user"
     ) {
+      // Durable kickoff window: a goal that has never fired a continuation has
+      // no goal_continuation row in history yet, so the chat tail necessarily
+      // still ends at a pre-goal manual user row. The in-memory candidate guard
+      // below covers the live process, but candidates are lost on restart and
+      // can be evicted by unrelated paths — after which the very next getGoal
+      // (heartbeat / wake-turn tool assembly, Goal panel reads, stream-end
+      // hooks) would silently pause the goal before it ever ran (user report:
+      // scheduled heartbeats "pausing" fresh goals). Explicit pause paths are
+      // unaffected: they append a goal-pause-boundary row, which reconciles via
+      // the pause_boundary branch, and manual user turns still auto-pause at
+      // dispatch time via applyManualUserMessageGoalSafety.
+      if (goal.lastContinuationFiredAtMs == null) {
+        return goal;
+      }
       const candidate = this.pendingContinuationCandidates.get(workspaceId);
       if (candidate?.source === "kickoff" && candidate.goalId === goal.goalId) {
         return goal;
@@ -2695,7 +2709,16 @@ export class WorkspaceGoalService {
         return null;
       }
 
-      if ((current.status === "paused" || current.status === "complete") && originKind === "user") {
+      // Paused/complete goals only accrue cost from streams that are actually
+      // goal work racing the status change (an in-flight continuation or budget
+      // wrap-up). Maintenance streams — scheduled heartbeats ("user" origin,
+      // no agentInitiated flag) and background wake turns ("other") — must not
+      // charge turns/cost or bump updatedAtMs on a goal that is not running;
+      // doing so made every heartbeat/wake look like it had just touched the
+      // paused goal. Mirrors attributeChildReport's paused/complete skip.
+      const isGoalDrivenStream =
+        originKind === "goal_continuation" || originKind === "goal_budget_limit";
+      if ((current.status === "paused" || current.status === "complete") && !isGoalDrivenStream) {
         this.recordLastGoalStream(input.workspaceId, originKind, current.goalId);
         await this.pushSnapshot(input.workspaceId, current);
         return current;

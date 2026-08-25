@@ -388,8 +388,36 @@ describe("WorkspaceGoalService", () => {
     expect(executed[0]?.message).toContain("<untrusted_objective>");
   });
 
-  test("getGoal reconciles active goals to paused when the latest user turn is not a continuation", async () => {
+  // Drive one real continuation so the goal leaves its kickoff window
+  // (lastContinuationFiredAtMs set + goal_continuation row in history).
+  async function driveOneContinuation(): Promise<void> {
+    const dispatcher = new IdleDispatcher();
+    service.registerGoalContinuationConsumer(
+      dispatcher,
+      continuationBridge(async (input) => {
+        await appendUserHistoryMessage(historyService, input.workspaceId, input.message, {
+          timestamp: Date.now(),
+          synthetic: true,
+          uiVisible: true,
+          kind: input.kind ?? GOAL_CONTINUATION_KIND,
+        });
+        return true;
+      })
+    );
+    await service.requestContinuationAfterStreamEnd({
+      workspaceId,
+      sendOptions: { model: "openai:gpt-4o", agentId: "exec" },
+      streamEndedAtMs: 10_000,
+    });
+    await waitForCondition(
+      async () => (await service.getGoal(workspaceId))?.lastContinuationFiredAtMs != null,
+      { timeoutMs: 1_000 }
+    );
+  }
+
+  test("getGoal reconciles driven active goals to paused when the latest user turn is not a continuation", async () => {
     await setGoalOk(service, { workspaceId, objective: "Follow chat tail" });
+    await driveOneContinuation();
     await appendUserHistoryMessage(historyService, workspaceId, "Manual interruption");
 
     const reconciled = await service.getGoal(workspaceId);
@@ -397,14 +425,25 @@ describe("WorkspaceGoalService", () => {
     expect(reconciled).toMatchObject({ status: "paused" });
   });
 
+  test("getGoal keeps a never-driven active goal active across candidate loss (durable kickoff window)", async () => {
+    // A goal that has never fired a continuation only has pre-goal manual user
+    // rows in its chat tail. Reconciliation must not pause it — the in-memory
+    // kickoff candidate can be lost (restart, eviction), and the next getGoal
+    // (heartbeat/wake tool assembly) would otherwise silently pause the goal
+    // before it ever ran.
+    await setGoalOk(service, { workspaceId, objective: "Follow chat tail" });
+    await appendUserHistoryMessage(historyService, workspaceId, "Manual interruption");
+
+    const reconciled = await service.getGoal(workspaceId);
+
+    expect(reconciled).toMatchObject({ status: "active" });
+  });
+
   test("chat-tail reconciliation ignores synthetic maintenance user rows", async () => {
     await setGoalOk(service, { workspaceId, objective: "Ignore maintenance rows" });
-    await appendUserHistoryMessage(historyService, workspaceId, "Continue goal", {
-      timestamp: Date.now(),
-      synthetic: true,
-      uiVisible: true,
-      kind: GOAL_CONTINUATION_KIND,
-    });
+    // Drive a real continuation first so the goal is past its kickoff window
+    // and the synthetic-row skip below is what keeps it active.
+    await driveOneContinuation();
     await appendUserHistoryMessage(historyService, workspaceId, "Synthetic heartbeat", {
       timestamp: Date.now(),
       synthetic: true,
@@ -2270,6 +2309,31 @@ describe("WorkspaceGoalService", () => {
       costUsd: 0.42,
       streamStartedAtMs: created.createdAtMs + 1,
       streamOriginKind: "user",
+    });
+
+    expect(updated).toMatchObject({ costCents: 0, turnsUsed: 0, status: "paused" });
+  });
+
+  test("paused goals ignore maintenance stream accounting (heartbeats / wake turns)", async () => {
+    // Regression: paused goals were charged turns/cost (and updatedAtMs bumped)
+    // by every background wake turn ("other") and scheduled heartbeat, making
+    // maintenance turns look like they had just touched the paused goal.
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Paused during maintenance",
+      turnCap: 3,
+    });
+    await setGoalOk(service, {
+      workspaceId,
+      objective: created.objective,
+      status: "paused",
+    });
+
+    const updated = await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 0.42,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "other",
     });
 
     expect(updated).toMatchObject({ costCents: 0, turnsUsed: 0, status: "paused" });
