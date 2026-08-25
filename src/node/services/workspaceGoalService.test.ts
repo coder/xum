@@ -3323,6 +3323,96 @@ describe("WorkspaceGoalService", () => {
     ).toBe(false);
   });
 
+  test("goal redispatch admission rejects a goal transition that commits during its state read", async () => {
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Pause races redispatch read",
+    });
+    const serviceAccess = service as unknown as {
+      readGoalFile: (id: string) => Promise<GoalRecordV1 | null>;
+    };
+    const realReadGoalFile = serviceAccess.readGoalFile.bind(service);
+    let releaseStaleRead!: () => void;
+    const staleReadGate = new Promise<void>((resolve) => {
+      releaseStaleRead = resolve;
+    });
+    let staleReadCaptured = false;
+    const readSpy = spyOn(serviceAccess, "readGoalFile").mockImplementationOnce(
+      async (id: string) => {
+        const staleGoal = await realReadGoalFile(id);
+        staleReadCaptured = true;
+        await staleReadGate;
+        return staleGoal;
+      }
+    );
+
+    const admissionPromise = service.buildGoalRedispatchAdmission(
+      workspaceId,
+      created.goalId,
+      GOAL_CONTINUATION_KIND
+    );
+    await waitForCondition(() => staleReadCaptured, { timeoutMs: 5_000 });
+    await setGoalOk(service, { workspaceId, status: "paused" });
+    releaseStaleRead();
+
+    expect((await admissionPromise).admissible).toBe(false);
+    readSpy.mockRestore();
+  });
+
+  test("goal redispatch admission goes stale when the goal is cleared", async () => {
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Clear invalidates redispatch",
+    });
+    const admission = await service.buildGoalRedispatchAdmission(
+      workspaceId,
+      created.goalId,
+      GOAL_CONTINUATION_KIND
+    );
+    expect(admission.admissible).toBe(true);
+    if (!admission.admissible) {
+      throw new Error("expected admissible");
+    }
+
+    await service.clearGoal(workspaceId);
+
+    expect(admission.admissionStale()).toBe(true);
+  });
+
+  test("goal redispatch admission accepts a compacted wrap-up that owns its reservation", async () => {
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Compacted wrap-up keeps reservation",
+      budgetCents: 100,
+    });
+    const dispatcher = new IdleDispatcher();
+    service.registerGoalContinuationConsumer(dispatcher, continuationBridge());
+    await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1.25,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    await service.requestContinuationAfterStreamEnd({
+      workspaceId,
+      sendOptions: { model: "openai:gpt-4o", agentId: "exec" },
+      streamEndedAtMs: created.createdAtMs + 2,
+    });
+    await drainPendingDispatches();
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      status: "budget_limited",
+      budgetLimitInjectedForGoalId: created.goalId,
+    });
+
+    const admission = await service.buildGoalRedispatchAdmission(
+      workspaceId,
+      created.goalId,
+      GOAL_BUDGET_LIMIT_KIND
+    );
+
+    expect(admission.admissible).toBe(true);
+  });
+
   test("a stop landing during auto-promotion reads restores the completed goal", async () => {
     // Codex P1 (PRRT_kwDOPxxmWM6cOgXV): maybeAutoPromoteOnComplete awaits
     // board/streaming/pricing reads after the caller's publication sample. A

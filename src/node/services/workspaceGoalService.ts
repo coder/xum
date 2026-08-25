@@ -1544,7 +1544,8 @@ export class WorkspaceGoalService {
    * `admissionStale` guards did not survive the durable handoff. The
    * original closure cannot be persisted, so re-derive: verify the durable
    * goal still admits the kind (continuation → active; budget wrap-up →
-   * budget_limited and still owed) and return a fresh staleness probe over
+   * budget_limited, unsuppressed, and either unreserved or reserved by this
+   * persisted follow-up) and return a fresh staleness probe over
    * the pause/terminal/identity generations for the send's admission gates.
    */
   async buildGoalRedispatchAdmission(
@@ -1554,24 +1555,38 @@ export class WorkspaceGoalService {
   ): Promise<{ admissible: false } | { admissible: true; admissionStale: () => boolean }> {
     assert(workspaceId.trim().length > 0, "buildGoalRedispatchAdmission requires workspaceId");
     assert(goalId.trim().length > 0, "buildGoalRedispatchAdmission requires goalId");
+    // Snapshot before the async read. A transition may commit after readFile
+    // captured the old bytes but before it resolves; pairing that stale record
+    // with post-transition baselines would make the returned probe look fresh.
+    const pauseGenerationAtBuild = this.explicitPauseGenerations.get(workspaceId) ?? 0;
+    const terminalGenerationAtBuild = this.terminalStatusGenerations.get(workspaceId) ?? 0;
+    const identityGenerationAtBuild = this.goalIdentityGenerations.get(workspaceId) ?? 0;
     const current = await this.readGoalFile(workspaceId);
-    if (current?.goalId !== goalId || current.requireUserAcknowledgmentSinceMs != null) {
+    if (
+      (this.explicitPauseGenerations.get(workspaceId) ?? 0) !== pauseGenerationAtBuild ||
+      (this.terminalStatusGenerations.get(workspaceId) ?? 0) !== terminalGenerationAtBuild ||
+      (this.goalIdentityGenerations.get(workspaceId) ?? 0) !== identityGenerationAtBuild ||
+      current?.goalId !== goalId ||
+      current.requireUserAcknowledgmentSinceMs != null
+    ) {
       return { admissible: false };
     }
     if (kind === GOAL_BUDGET_LIMIT_KIND) {
-      const wrapupStillOwed =
+      // This method is called for the persisted compaction follow-up. If the
+      // original wrap-up send was accepted as an on-send compaction request,
+      // it already reserved this goal ID before the real follow-up dispatches;
+      // the matching pending follow-up owns that reservation.
+      const wrapupAdmitted =
         current.status === "budget_limited" &&
         current.budgetLimitOriginKind !== "user" &&
-        current.budgetLimitInjectedForGoalId !== goalId;
-      if (!wrapupStillOwed) {
+        (current.budgetLimitInjectedForGoalId == null ||
+          current.budgetLimitInjectedForGoalId === goalId);
+      if (!wrapupAdmitted) {
         return { admissible: false };
       }
     } else if (current.status !== "active") {
       return { admissible: false };
     }
-    const pauseGenerationAtBuild = this.explicitPauseGenerations.get(workspaceId) ?? 0;
-    const terminalGenerationAtBuild = this.terminalStatusGenerations.get(workspaceId) ?? 0;
-    const identityGenerationAtBuild = this.goalIdentityGenerations.get(workspaceId) ?? 0;
     return {
       admissible: true,
       admissionStale: () =>
@@ -4110,6 +4125,14 @@ export class WorkspaceGoalService {
       );
 
       await fs.rm(this.getFilePath(workspaceId), { force: true });
+      // Goal deletion is an identity transition too. In-flight admissions only
+      // observe generation counters after their initial durable read, so clear
+      // must invalidate them even when no upcoming goal is promoted.
+      this.lastWrittenGoalIds.delete(workspaceId);
+      this.goalIdentityGenerations.set(
+        workspaceId,
+        (this.goalIdentityGenerations.get(workspaceId) ?? 0) + 1
+      );
       await this.pushSnapshot(workspaceId, null);
       this.emitLifecycle("goal_cleared", {
         finalStatus: current.status,
