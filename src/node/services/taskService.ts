@@ -698,6 +698,8 @@ export interface TaskTreeAgentsResult {
   rootTitle?: string;
   /** "self" when the caller is the root; "ancestor" otherwise. */
   rootRelationship: "self" | "ancestor";
+  /** True when the root workspace is archived: peer sends refuse it, so discovery hides it. */
+  rootArchived?: true;
   tasks: TreeAgentTaskInfo[];
 }
 
@@ -5154,6 +5156,20 @@ export class TaskService {
         code: "refused" as const,
         reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
       };
+      // The persisted execution mirror can outlive its handle (crash between terminal handle
+      // persistence and the config mirror write; failed startup reconciliation deliberately
+      // leaves the mirror untouched), so a stale mirror may claim "running" for a stably
+      // terminal task. Require the matching LIVE handle registration before the mirror bypasses
+      // terminal status — an admitted send without a live handle would be uncorrelated and
+      // would peer-reactivate the terminal task.
+      const hasLiveRunningExecution = (
+        workspace: WorkspaceConfigEntry,
+        workspaceId: string
+      ): boolean =>
+        workspace.taskExecutionStatus === "running" &&
+        workspace.taskExecutionId != null &&
+        this.activeWorkspaceTurnHandleByWorkspaceId.get(workspaceId)?.handleId ===
+          workspace.taskExecutionId;
       const isInactivePeerSender = (workspace: WorkspaceConfigEntry): boolean => {
         if (coerceNonEmptyString(workspace.parentWorkspaceId) == null) {
           // Root workspaces have no task lifecycle to go terminal.
@@ -5162,7 +5178,7 @@ export class TaskService {
         const status = workspace.taskStatus ?? "running";
         return (
           isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt) ||
-          (workspace.taskExecutionStatus !== "running" &&
+          (!hasLiveRunningExecution(workspace, senderWorkspaceId) &&
             status !== "running" &&
             status !== "awaiting_report")
         );
@@ -5218,15 +5234,15 @@ export class TaskService {
       if (targetIsAgentTask) {
         const targetStatus = targetEntry.workspace.taskStatus ?? "running";
         // A reawakened persistent child is effectively executing when its mirrored
-        // workspace-turn execution state is RUNNING, even though its stable taskStatus stays
-        // terminal (`reported`) — the same overlay task_list advertises, so an addressable
-        // "running" row must also accept messages. Queued/starting executions do NOT count:
-        // the reawakening turn has not been admitted, its handle is not registered for
-        // correlation, and an uncorrelated peer entry could cut or trail the delegated replay
-        // as a generic turn — effectively a peer reactivation of the terminal child. The
-        // mirror flips terminal inside interruptWorkspaceTurn's settlement boundary, so this
-        // is NOT a transient-stream rescue.
-        const targetExecutionActive = targetEntry.workspace.taskExecutionStatus === "running";
+        // workspace-turn execution state is RUNNING and backed by a live handle registration —
+        // the same overlay task_list advertises, so an addressable "running" row must also
+        // accept messages. Queued/starting executions do NOT count: the reawakening turn has
+        // not been admitted, its handle is not registered for correlation, and an uncorrelated
+        // peer entry could cut or trail the delegated replay as a generic turn — effectively a
+        // peer reactivation of the terminal child. The mirror flips terminal inside
+        // interruptWorkspaceTurn's settlement boundary, so this is NOT a transient-stream
+        // rescue.
+        const targetExecutionActive = hasLiveRunningExecution(targetEntry.workspace, targetId);
         if (!targetExecutionActive) {
           if (targetStatus === "queued" || targetStatus === "starting") {
             return Err({
@@ -5495,7 +5511,7 @@ export class TaskService {
           // always wins the race.
           const freshStatus = freshEntry.workspace.taskStatus ?? "running";
           if (
-            freshEntry.workspace.taskExecutionStatus !== "running" &&
+            !hasLiveRunningExecution(freshEntry.workspace, targetId) &&
             freshStatus !== "running" &&
             freshStatus !== "awaiting_report"
           ) {
@@ -10527,10 +10543,17 @@ export class TaskService {
         return entry == null || !isWorkspaceArchived(entry.archivedAt, entry.unarchivedAt);
       });
 
+    // An archived root refuses peer sends at sendAgentPeerMessage's archived-target check, so
+    // discovery must not advertise it as an addressable "workspace" row.
+    const rootArchived =
+      rootEntry != null &&
+      isWorkspaceArchived(rootEntry.workspace.archivedAt, rootEntry.workspace.unarchivedAt);
+
     return {
       rootWorkspaceId,
       ...(rootTitle != null ? { rootTitle } : {}),
       rootRelationship: rootWorkspaceId === workspaceId ? "self" : "ancestor",
+      ...(rootArchived ? { rootArchived: true as const } : {}),
       tasks,
     };
   }

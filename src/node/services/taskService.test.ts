@@ -229,6 +229,43 @@ function projectWorkspace(
   };
 }
 
+/**
+ * Register a live workspace-turn handle for a reawakened persistent child. Peer-send admission
+ * only honors a "running" execution mirror when the in-memory handle registration matches, and
+ * the delegated-turn correlation lookup validates the registration against the handle store —
+ * so tests exercising active reawakened executions must seed both.
+ */
+async function registerLiveWorkspaceTurnHandle(
+  taskService: TaskService,
+  workspaceId: string,
+  handleId: string,
+  ownerWorkspaceId = "tree-root"
+): Promise<void> {
+  const internals = taskService as unknown as {
+    activeWorkspaceTurnHandleByWorkspaceId: Map<
+      string,
+      { handleId: string; ownerWorkspaceId: string }
+    >;
+    taskHandleStore: TaskHandleStore;
+  };
+  await internals.taskHandleStore.upsertWorkspaceTurn({
+    kind: "workspace_turn",
+    handleId,
+    ownerWorkspaceId,
+    workspaceId,
+    turnId: `${handleId}-turn`,
+    status: "running",
+    createdAt: "2026-08-24T00:00:00.000Z",
+    updatedAt: "2026-08-24T00:00:00.000Z",
+    createdWorkspace: false,
+    disposableWorkspace: false,
+  });
+  internals.activeWorkspaceTurnHandleByWorkspaceId.set(workspaceId, {
+    handleId,
+    ownerWorkspaceId,
+  });
+}
+
 async function saveTestConfig(
   config: Config,
   projects: Array<[string, ProjectConfig]>,
@@ -13769,13 +13806,56 @@ describe("TaskService", () => {
         projectWorkspace(projectPath, "sib-a", "sib-a", {
           parentWorkspaceId: "tree-root",
           taskStatus: "reported",
-          taskExecutionId: "wtt-a",
+          taskExecutionId: "wst_a",
           taskExecutionStatus: "running",
         }),
         projectWorkspace(projectPath, "sib-b", "sib-b", {
           parentWorkspaceId: "tree-root",
           taskStatus: "reported",
-          taskExecutionId: "wtt-b",
+          taskExecutionId: "wst_b",
+          taskExecutionStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    // The execution mirror only counts when backed by a LIVE handle registration (a stale
+    // mirror can outlive its handle after a crash or failed reconciliation).
+    await registerLiveWorkspaceTurnHandle(taskService, "sib-a", "wst_a");
+    await registerLiveWorkspaceTurnHandle(taskService, "sib-b", "wst_b");
+
+    // Both endpoints are effectively executing: the reawakened sender may message peers, and
+    // the reawakened target (advertised as running by task_list's execution overlay) accepts.
+    const result = await taskService.sendAgentTreeMessage("sib-a", "sib-b", "sync up");
+    expect(result).toEqual(
+      Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
+    );
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("sendAgentTreeMessage refuses a stale running mirror without a live handle", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "sib-a", "sib-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        // Stale mirror: a crash between terminal handle persistence and the config mirror
+        // write (or a failed startup reconciliation) can leave taskExecutionStatus="running"
+        // on a stably reported task with no live handle. Admitting a send here would be
+        // uncorrelated and would peer-reactivate the terminal task.
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "reported",
+          taskExecutionId: "wst_stale",
           taskExecutionStatus: "running",
         }),
       ],
@@ -13785,13 +13865,14 @@ describe("TaskService", () => {
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
-    // Both endpoints are effectively executing: the reawakened sender may message peers, and
-    // the reawakened target (advertised as running by task_list's execution overlay) accepts.
-    const result = await taskService.sendAgentTreeMessage("sib-a", "sib-b", "sync up");
-    expect(result).toEqual(
-      Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
+    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "hello")).toEqual(
+      Err({
+        code: "not_active",
+        taskStatus: "reported",
+        message: "Target is inactive; peer messages cannot reactivate it — ask its parent.",
+      })
     );
-    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 
   test("sendAgentTreeMessage refuses at the admission probe when the target is stopped mid-send", async () => {
@@ -13860,7 +13941,7 @@ describe("TaskService", () => {
         projectWorkspace(projectPath, "sib-b", "sib-b", {
           parentWorkspaceId: "tree-root",
           taskStatus: "reported",
-          taskExecutionId: "wtt-b",
+          taskExecutionId: "wst_b",
           taskExecutionStatus: "queued",
         }),
       ],
@@ -14046,7 +14127,7 @@ describe("TaskService", () => {
       projectWorkspace(projectPath, "sib-a", "sib-a", {
         parentWorkspaceId: "tree-root",
         taskStatus: "reported" as const,
-        taskExecutionId: "wtt-a",
+        taskExecutionId: "wst_a",
         taskExecutionStatus: senderExecution,
       }),
       projectWorkspace(projectPath, "sib-b", "sib-b", {
@@ -14074,6 +14155,9 @@ describe("TaskService", () => {
     );
     const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    // Live handle registration lets the reawakened sender pass the ENTRY check; the mid-send
+    // interruption is then only observable through the admission probe's mirror re-read.
+    await registerLiveWorkspaceTurnHandle(taskService, "sib-a", "wst_a");
 
     expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "still there?")).toEqual(
       Err({
@@ -14224,6 +14308,49 @@ describe("TaskService", () => {
     // Archived descendants stay discoverable: task_send_message's trusted descendant path can
     // restore and reawaken them, so hiding the row would strand a valid reusable task ID.
     expect(fromRoot.tasks.some((task) => task.taskId === "task-arch")).toBe(true);
+  });
+
+  test("listTaskTreeAgents flags an archived root so discovery can hide it", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        // Peer sends refuse archived targets, so an archived root must not be advertised as an
+        // addressable "workspace" row to retained descendants.
+        projectWorkspace(projectPath, "root", "tree-root", {
+          archivedAt: "2026-08-20T00:00:00.000Z",
+        }),
+        projectWorkspace(projectPath, "a", "task-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { taskService } = createTaskServiceHarness(config);
+
+    expect(taskService.listTaskTreeAgents("task-a").rootArchived).toBe(true);
+    // Unarchived roots carry no flag.
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root", {
+          archivedAt: "2026-08-20T00:00:00.000Z",
+          unarchivedAt: "2026-08-21T00:00:00.000Z",
+        }),
+        projectWorkspace(projectPath, "a", "task-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+    expect(taskService.listTaskTreeAgents("task-a").rootArchived).toBeUndefined();
   });
 
   test("pending parent guidance blocks stale report settlement at stream end", async () => {

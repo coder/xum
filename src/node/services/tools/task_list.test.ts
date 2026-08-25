@@ -996,6 +996,31 @@ describe("task_list tool", () => {
     expect(statusById.get("task-sib-live")).toBe("running");
   });
 
+  it("tree scope omits an archived root from discovery", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-archived-root");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+    // Peer sends refuse archived targets, so an archived root must not be published as an
+    // addressable "workspace" row.
+    const listTaskTreeAgents = mock(() => ({
+      rootWorkspaceId: "tree-root",
+      rootTitle: "Root workspace",
+      rootRelationship: "ancestor" as const,
+      rootArchived: true as const,
+      tasks: [
+        { ...buildAgentTask("task-self", "running", "tree-root"), relationship: "self" as const },
+      ],
+    }));
+    const tool = createTaskListTool({
+      ...baseConfig,
+      taskService: { listTaskTreeAgents } as unknown as TaskService,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ scope: "tree" }, mockToolCallOptions)
+    );
+    expect(taskIds(result)).toEqual(["task-self"]);
+  });
+
   it("tree scope filters the root row like any other row when explicit statuses are passed", async () => {
     using tempDir = new TestTempDir("test-task-list-tree-explicit");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });

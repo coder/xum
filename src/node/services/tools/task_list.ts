@@ -227,8 +227,10 @@ async function executeTreeScope(
 
   const tasks: TaskListToolSuccessResult["tasks"] = [];
   // The root is a plain workspace with no task lifecycle: included by default, filtered like any
-  // other row (status "workspace") when explicit statuses were passed.
-  if (statusFilter.has("workspace")) {
+  // other row (status "workspace") when explicit statuses were passed. An ARCHIVED root is
+  // omitted entirely — sendAgentPeerMessage refuses archived targets, so advertising the row
+  // would break the note's addressability claim.
+  if (statusFilter.has("workspace") && tree.rootArchived !== true) {
     tasks.push({
       taskId: tree.rootWorkspaceId,
       status: "workspace",
