@@ -1074,13 +1074,15 @@ describe("TaskService", () => {
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
     // Project-local agent exists in the OWNER's checkout, but the created workspace's checkout
     // diverges (no agent definition there) — post-create re-validation must fail instead of
-    // silently streaming exec.
+    // silently streaming exec. Worktree runtime: the only local runtime whose created
+    // workspaces get a checkout separate from the project root.
     await writeCustomAgentDefinition(projectPath);
     const divergedCheckout = path.join(rootDir, "diverged-checkout");
     await fsPromises.mkdir(divergedCheckout, { recursive: true });
 
     const divergedMetadata: WorkspaceMetadata & { namedWorkspacePath: string } = {
       ...createWorkspaceTurnMetadata(projectPath),
+      runtimeConfig: { type: "worktree", srcBaseDir: path.join(rootDir, "wt") },
       namedWorkspacePath: divergedCheckout,
     };
     const createWorkspace = mock(
@@ -1109,7 +1111,45 @@ describe("TaskService", () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
-  test("createWorkspaceTurn explicit agentId overrides the resumed identity for that turn only", async () => {
+  test("createWorkspaceTurn skips post-create re-validation while the target checkout is unreachable", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await writeCustomAgentDefinition(projectPath);
+    // Deferred-provisioning runtimes return from create before the checkout is reachable.
+    const unreachableCheckout = path.join(rootDir, "not-provisioned-yet");
+
+    const deferredMetadata: WorkspaceMetadata & { namedWorkspacePath: string } = {
+      ...createWorkspaceTurnMetadata(projectPath),
+      runtimeConfig: { type: "worktree", srcBaseDir: path.join(rootDir, "wt") },
+      namedWorkspacePath: unreachableCheckout,
+    };
+    const createWorkspace = mock(
+      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
+        Promise.resolve(Ok({ metadata: deferredMetadata }))
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "custom",
+      prompt: "Launch despite pending provisioning",
+      title: "Deferred runtime",
+      workspace: { mode: "new" },
+    });
+
+    // Owner-side validation passed; strict target re-validation must not strand the launch.
+    expect(result.success).toBe(true);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const sendMessageCall = sendMessage.mock.calls[0] as unknown[];
+    expect(sendMessageCall[2]).toMatchObject({ agentId: "custom" });
+  });
+
+  test("createWorkspaceTurn rejects explicit agentId for descendant agent workspace targets", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["overridehandle", "overrideturn"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
@@ -1131,14 +1171,13 @@ describe("TaskService", () => {
       return cfg;
     });
 
-    const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
-      const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
-      await internal?.onAccepted?.();
-      return Ok(undefined);
-    });
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
     const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
 
+    // Persistent children are pinned to their persisted identity at stream time
+    // (resolveAgentForStream ignores per-send agentId when parentWorkspaceId is set),
+    // so an override must be rejected instead of silently running the old agent.
     const result = await taskService.createWorkspaceTurn({
       ownerWorkspaceId: parentId,
       agentId: "plan",
@@ -1148,17 +1187,73 @@ describe("TaskService", () => {
       workspace: { mode: "existing", workspaceId: childWorkspaceId },
     });
 
-    expect(result.success).toBe(true);
-    expect(sendMessage).toHaveBeenCalledWith(
-      childWorkspaceId,
-      "Re-plan the follow-up",
-      expect.objectContaining({ agentId: "plan" }),
-      expect.any(Object)
-    );
-    // Per-turn override only: the target's persisted agent identity must be untouched.
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("descendant agent workspaces");
+    }
+    expect(sendMessage).not.toHaveBeenCalled();
     const childEntry = findWorkspaceInConfig(config, childWorkspaceId);
     expect(childEntry?.agentType).toBe("explore");
     expect(childEntry?.agentId).toBeUndefined();
+  });
+
+  test("createWorkspaceTurn existing-target agent override dispatches without persisting AI settings", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "firstturn", "followuphandle", "followupturn"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+
+    const createWorkspace = mock(async (): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+      await config.editConfig((cfg) => {
+        const project = cfg.projects.get(projectPath);
+        assert(project, "test project must exist");
+        project.workspaces.push({
+          // Project-dir local workspaces execute in the project root itself.
+          path: projectPath,
+          id: "childworkspace",
+          name: "workspace-turn",
+          title: "Workspace turn",
+          createdAt: "2026-06-19T00:00:00.000Z",
+          runtimeConfig: { type: "local" },
+        });
+        return cfg;
+      });
+      return Ok({ metadata: createWorkspaceTurnMetadata(projectPath) });
+    });
+    const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
+      const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
+      await internal?.onAccepted?.();
+      return Ok(undefined);
+    });
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const first = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      prompt: "Initial turn",
+      title: "Workspace turn",
+      workspace: { mode: "new" },
+    });
+    expect(first.success).toBe(true);
+
+    const followUp = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "plan",
+      prompt: "Per-turn plan follow-up",
+      title: "Override follow-up",
+      workspace: { mode: "existing", workspaceId: "childworkspace" },
+    });
+    expect(followUp.success).toBe(true);
+
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    const followUpCall = sendMessage.mock.calls[1];
+    expect(followUpCall[0]).toBe("childworkspace");
+    // Override reaches the stream (normal workspaces honor the per-send agentId) but must
+    // not overwrite the target's saved agent/settings.
+    expect(followUpCall[2]).toMatchObject({ agentId: "plan", skipAiSettingsPersistence: true });
+    // The default path keeps persisting (first send carries no override).
+    expect(sendMessage.mock.calls[0]?.[2]).not.toMatchObject({ skipAiSettingsPersistence: true });
   });
 
   test("createWorkspaceTurn inherits pro mode from the parent's active non-exec agent", async () => {
