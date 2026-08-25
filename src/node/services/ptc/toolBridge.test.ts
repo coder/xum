@@ -29,6 +29,7 @@ function createMockRuntime(overrides: Partial<IJSRuntime> = {}): IJSRuntime {
     registerSyncFunction: mock((_name: string, _fn: () => unknown) => undefined),
     setVarsProperty: mock((_key: string, _value: string) => undefined),
     setKernelRecordBounds: mock(() => undefined),
+    setCaptureResultSanitizer: mock(() => undefined),
     setPendingJobGate: mock((_gate: (run: () => void) => void) => undefined),
     setLimits: mock((_limits: RuntimeLimits) => undefined),
     onEvent: mock((_handler: (event: PTCEvent) => void) => undefined),

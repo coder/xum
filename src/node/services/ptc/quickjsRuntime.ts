@@ -182,6 +182,8 @@ export class QuickJSRuntime implements IJSRuntime {
   private pendingJobGate?: (run: () => void) => void;
   /** Kernel-mode caps on record/event capture; see IJSRuntime.setKernelRecordBounds. */
   private kernelRecordBounds?: KernelRecordBounds;
+  /** Mode-independent record sanitizer; see IJSRuntime.setCaptureResultSanitizer. */
+  private captureResultSanitizer?: (toolName: string, result: unknown) => unknown;
   /** Monotonic eval counter + the generation currently inside eval() (null
    * between evals). Distinguishes settlements arriving mid-eval (queued for
    * the eval's own drain points) from truly-late ones between evals (gated).
@@ -297,7 +299,7 @@ export class QuickJSRuntime implements IJSRuntime {
       // Kernel mode bounds captured args/results at creation: records and
       // streamed events must never retain full guest payloads (host memory +
       // session history growth); the guest still receives full values.
-      const recordArgs = this.boundCaptureArgs(args[0]);
+      const recordArgs = this.boundCaptureArgs(args[0], name);
 
       // Emit start event
       this.eventHandler?.({
@@ -477,7 +479,7 @@ export class QuickJSRuntime implements IJSRuntime {
           const result = await fn(...args);
           const endTime = Date.now();
           // Same creation-time bounding as synchronous bridges (kernel mode).
-          const recordArgs = this.boundCaptureArgs(args[0]);
+          const recordArgs = this.boundCaptureArgs(args[0], name);
           const recordResult = this.boundCaptureResult(result, name);
           toolCalls.push({
             toolName: name,
@@ -503,7 +505,7 @@ export class QuickJSRuntime implements IJSRuntime {
           const endTime = Date.now();
           const errorStr = error instanceof Error ? error.message : String(error);
           const recordError = this.boundCaptureError(errorStr);
-          const recordArgs = this.boundCaptureArgs(args[0]);
+          const recordArgs = this.boundCaptureArgs(args[0], name);
           toolCalls.push({
             toolName: name,
             args: recordArgs,
@@ -565,6 +567,12 @@ export class QuickJSRuntime implements IJSRuntime {
     this.kernelRecordBounds = bounds;
   }
 
+  setCaptureResultSanitizer(
+    sanitizer: ((toolName: string, result: unknown) => unknown) | undefined
+  ): void {
+    this.captureResultSanitizer = sanitizer;
+  }
+
   /**
    * Bound a guest-supplied value at record/event CREATION time (kernel mode
    * only). Records live in host memory for the whole eval and events land in
@@ -594,10 +602,16 @@ export class QuickJSRuntime implements IJSRuntime {
     };
   }
 
-  private boundCaptureArgs(value: unknown): unknown {
-    return this.kernelRecordBounds === undefined
-      ? value
-      : this.boundCapture(value, this.kernelRecordBounds.argsCapBytes);
+  private boundCaptureArgs(value: unknown, toolName: string): unknown {
+    if (this.kernelRecordBounds === undefined) return value;
+    const bounded = this.boundCapture(value, this.kernelRecordBounds.argsCapBytes);
+    if (bounded === value) return value;
+    // The marker replaced the args entirely: merge back attribution fields
+    // (e.g. the file path of a persistence-critical edit) so post-compaction
+    // extractors can still attribute the record. Marker fields are spread
+    // last so retained fields can never spoof __kernelBounded/bytes/preview.
+    const retained = this.kernelRecordBounds.captureArgsRetained?.(toolName, value);
+    return retained !== undefined ? { ...retained, ...(bounded as object) } : bounded;
   }
 
   /**
@@ -618,14 +632,22 @@ export class QuickJSRuntime implements IJSRuntime {
   }
 
   private boundCaptureResult(value: unknown, toolName: string): unknown {
-    if (this.kernelRecordBounds === undefined) return value;
+    // The mode-independent sanitizer runs first (both classic and kernel
+    // mode): media containers are budgeted at capture because records/events
+    // persist into session history in every mode, and request-time
+    // attachment extraction rewrites only the provider copy.
+    const sanitized =
+      this.captureResultSanitizer !== undefined
+        ? this.captureResultSanitizer(toolName, value)
+        : value;
+    if (this.kernelRecordBounds === undefined) return sanitized;
     // Retained records (persistence-critical tools, media containers) keep a
     // possibly sanitized full result: compaction and request-time extractors
     // reconstruct context from them, so a bounded preview would silently
     // lose it.
-    const retained = this.kernelRecordBounds.captureRetained?.(toolName, value);
+    const retained = this.kernelRecordBounds.captureRetained?.(toolName, sanitized);
     if (retained !== undefined) return retained;
-    return this.boundCapture(value, this.kernelRecordBounds.resultCapBytes);
+    return this.boundCapture(sanitized, this.kernelRecordBounds.resultCapBytes);
   }
 
   setPendingJobGate(gate: (run: () => void) => void): void {
@@ -790,7 +812,7 @@ export class QuickJSRuntime implements IJSRuntime {
         const callId = generateCallId();
 
         // Same creation-time bounding as registerFunction (kernel mode).
-        const recordArgs = this.boundCaptureArgs(args[0]);
+        const recordArgs = this.boundCaptureArgs(args[0], methodName);
 
         // Emit start event
         this.eventHandler?.({

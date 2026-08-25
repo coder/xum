@@ -12,6 +12,13 @@ import { extractToolFilePath } from "@/common/utils/tools/toolInputFilePath";
 interface FileEditToolOutput {
   success?: boolean;
   diff?: string;
+  /**
+   * Kernel-retained records bound oversized diffs at a hunk boundary at
+   * capture (see boundRetainedEditDiff in ptc/types.ts) and flag the loss
+   * here; it propagates to FileEditDiff.truncated so consumers know the
+   * combined diff is incomplete.
+   */
+  diffTruncated?: boolean;
 }
 
 /**
@@ -23,6 +30,8 @@ interface FileEditToolOutput {
 interface NestedEditRecord {
   filePath: string;
   diff?: string;
+  /** See FileEditToolOutput.diffTruncated. */
+  diffTruncated?: boolean;
 }
 
 /**
@@ -66,7 +75,14 @@ function collectNestedEditRecords(output: unknown): NestedEditRecord[] {
       result !== undefined
         ? (getToolOutputUiOnly(result)?.file_edit?.diff ?? result.diff)
         : undefined;
-    records.push({ filePath, ...(diff !== undefined ? { diff } : {}) });
+    records.push({
+      filePath,
+      ...(diff !== undefined ? { diff } : {}),
+      // Propagated even when the bounded diff itself was dropped (no hunk
+      // fit): a later small edit to the same file must still surface as an
+      // incomplete combined diff, not a complete-looking one.
+      ...(result?.diffTruncated === true ? { diffTruncated: true } : {}),
+    });
   }
   return records;
 }
@@ -254,6 +270,9 @@ export function extractEditedFileDiffs(messages: MuxMessage[]): FileEditDiff[] {
   // Collect all diffs per file path in chronological order
   const diffsByPath = new Map<string, string[]>();
   const editOrder: string[] = []; // Track order of last edit per file
+  // Paths whose kernel-retained diff was hunk-truncated at capture: the
+  // combined diff is incomplete no matter how the combination goes.
+  const captureTruncatedPaths = new Set<string>();
 
   const addDiff = (filePath: string, diff: string): void => {
     if (!diffsByPath.has(filePath)) {
@@ -279,6 +298,9 @@ export function extractEditedFileDiffs(messages: MuxMessage[]): FileEditDiff[] {
         // diff); kernel-compacted records surface path-only edits and are
         // skipped here (no diff contents survive compaction of the record).
         for (const record of collectNestedEditRecords(part.output)) {
+          if (record.diffTruncated === true) {
+            captureTruncatedPaths.add(record.filePath);
+          }
           if (record.diff !== undefined && record.diff.length > 0) {
             addDiff(record.filePath, record.diff);
           }
@@ -311,7 +333,9 @@ export function extractEditedFileDiffs(messages: MuxMessage[]): FileEditDiff[] {
 
     const combined = combineDiffs(filePath, diffs);
     if (combined) {
-      results.push(combined);
+      results.push(
+        captureTruncatedPaths.has(filePath) ? { ...combined, truncated: true } : combined
+      );
     }
   }
 

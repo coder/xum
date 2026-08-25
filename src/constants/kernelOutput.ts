@@ -41,11 +41,30 @@ export const KERNEL_COMPACT_ARGS_CAP_BYTES = 2 * 1024;
 export const KERNEL_LOAD_PREVIEW_CHARS = 512;
 
 /**
- * Aggregate base64 budget for supported media parts retained in ONE kernel
- * record/event (see retainExemptKernelRecordResult). MCP applies only a
+ * Aggregate serialized budget for parts retained in ONE media-container
+ * record/event (see sanitizeRetainedMediaContainer). MCP applies only a
  * per-part guard, so a tool returning many individually-allowed images could
  * otherwise persist unbounded aggregate base64 into partial.json/chat.jsonl
- * rows. Sized to fit a typical screenshot or two (base64 of a ~1MB PNG is
- * ~1.4MB); parts beyond the budget become bounded placeholders.
+ * rows. Charged against each part's FULL serialized size (metadata included:
+ * a crafted part can hide megabytes in mediaType with an empty data string).
+ * Sized to fit a typical screenshot or two (base64 of a ~1MB PNG is ~1.4MB);
+ * parts beyond the budget become bounded placeholders.
  */
 export const KERNEL_RETAINED_MEDIA_BUDGET_BYTES = 3 * 1024 * 1024;
+
+/**
+ * Max parts retained in one sanitized media container (see
+ * sanitizeRetainedMediaContainer). Bounds the container's STRUCTURE: without
+ * it, a million zero-cost parts would each earn a placeholder object, growing
+ * the sanitized record without bound even when every payload is bounded.
+ */
+export const KERNEL_RETAINED_CONTAINER_MAX_PARTS = 64;
+
+/**
+ * Max chars of a validated tool-arg file path preserved on a __kernelBounded
+ * args marker (see retainPersistenceCriticalArgsFields). Covers Linux
+ * PATH_MAX (4096); longer strings cannot be real paths of successful edits,
+ * so they are dropped rather than truncated (a truncated path would
+ * misattribute the record to a nonexistent file).
+ */
+export const KERNEL_RETAINED_PATH_MAX_CHARS = 4096;

@@ -965,13 +965,16 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-exempt-bounds");
     });
 
-    it("caps oversized persistence payloads at capture (diff keeps the downstream truncation signal)", async () => {
-      // generateDiff is unbounded upstream; a >50k diff must be sliced at
-      // capture (to cap+1 chars, so extractEditedFileDiffs' `length > cap`
-      // truncation check still fires) instead of persisting megabytes.
+    it("bounds oversized diffs at a hunk boundary at capture (parseable prefix + truncation flag)", async () => {
+      // generateDiff is unbounded upstream; a >50k diff must be bounded at
+      // capture — but a mid-hunk slice is unparseable (parsePatch throws,
+      // combineDiffs falls back to only the LAST diff, erasing this edit), so
+      // whole hunks are kept and diffTruncated carries the loss signal.
       using tmp = new DisposableTempDir("code-exec-oversized-diff");
       const host = new SandboxHostService();
-      const hugeDiff = `@@ -0,0 +1 @@\n+${"y".repeat(80_000)}`;
+      const hunk1 = `@@ -1,0 +1,1 @@\n+${"a".repeat(30_000)}\n`;
+      const hunk2 = `@@ -5,0 +7,1 @@\n+${"b".repeat(30_000)}\n`;
+      const hugeDiff = `${hunk1}${hunk2}`;
       const tools: Record<string, Tool> = {
         file_edit_insert: createMockTool(
           "file_edit_insert",
@@ -995,10 +998,89 @@ describe("createCodeExecutionTool", () => {
       )) as PTCExecutionResult;
       expect(result.success).toBe(true);
       const record = result.toolCalls.find((r) => r.toolName === "file_edit_insert");
-      const diff = (record?.result as { diff?: string })?.diff;
-      expect(diff?.length).toBe(50_001);
-      expect(hugeDiff.startsWith(diff!)).toBe(true);
+      const retained = record?.result as { diff?: string; diffTruncated?: boolean };
+      // The first whole hunk is retained; the second (which would cross the
+      // cap) is dropped, and the truncation is flagged for the extractor.
+      expect(retained?.diff).toBe(hunk1);
+      expect(retained?.diffTruncated).toBe(true);
       await host.disposeScope("ws-oversized-diff");
+    });
+
+    it("preserves the edit path on a bounded-args marker", async () => {
+      // Inserting >2KiB of content bounds the record's ARGS to a
+      // __kernelBounded marker; without the merged-back path, extractors
+      // could not attribute the retained diff and would silently drop the
+      // successful edit from post-compaction context (round 8, P1).
+      using tmp = new DisposableTempDir("code-exec-bounded-edit-args");
+      const host = new SandboxHostService();
+      const tools: Record<string, Tool> = {
+        file_edit_insert: createMockTool(
+          "file_edit_insert",
+          z.object({ path: z.string(), content: z.string() }),
+          () => ({ success: true, diff: "@@ -1,0 +1,1 @@\n+hello\n" })
+        ),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(tools),
+        undefined,
+        persistentRunner(host, "ws-bounded-edit-args", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        {
+          code: 'mux.file_edit_insert({path: "/kept.ts", content: "x".repeat(5000)}); return true;',
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const record = result.toolCalls.find((r) => r.toolName === "file_edit_insert");
+      const args = record?.args as {
+        __kernelBounded?: boolean;
+        path?: string;
+        preview?: string;
+      };
+      expect(args.__kernelBounded).toBe(true);
+      expect(args.path).toBe("/kept.ts");
+      // The oversized content itself stays bounded to the marker preview.
+      expect(JSON.stringify(args).length).toBeLessThan(4 * 1024);
+      expect((record?.result as { diff?: string })?.diff).toContain("+hello");
+      await host.disposeScope("ws-bounded-edit-args");
+    });
+
+    it("budgets media containers at capture in classic (non-kernel) mode too", async () => {
+      // Exclusive PTC makes the bridge the only route to executable MCP
+      // tools even without RLM, and records/events persist into session
+      // history in every mode while request-time extraction rewrites only
+      // the provider copy — so the aggregate media budget must apply to
+      // ephemeral registrations as well (round 8).
+      const bigImage = "A".repeat(2 * 1024 * 1024);
+      const tools: Record<string, Tool> = {
+        mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
+          type: "content",
+          value: [
+            { type: "media", mediaType: "image/png", data: bigImage },
+            { type: "media", mediaType: "image/png", data: bigImage },
+          ],
+        })),
+      };
+      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge(tools));
+
+      const result = (await tool.execute!(
+        // The guest still receives the full container: only the RECORD is
+        // sanitized.
+        { code: "const r = mux.mcp__shots__take({}); return r.value[1].data.length;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      expect(result.result).toBe(bigImage.length);
+      const record = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
+      const value = (
+        record?.result as { value?: Array<{ type?: string; data?: string; text?: string }> }
+      )?.value;
+      expect(value?.[0]?.data).toBe(bigImage);
+      expect(value?.[1]?.type).toBe("text");
+      expect(value?.[1]?.text).toContain("aggregate media budget exceeded");
     });
 
     it("charges retained media against an aggregate budget", async () => {

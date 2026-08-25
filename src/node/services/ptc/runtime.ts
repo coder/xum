@@ -93,6 +93,20 @@ export interface IJSRuntime extends Disposable {
   setKernelRecordBounds(bounds: KernelRecordBounds | undefined): void;
 
   /**
+   * Sanitize results captured into records/events at CREATION time in ALL
+   * modes (classic + kernel). Unlike setKernelRecordBounds this never bounds
+   * ordinary results — the non-RLM inline-results contract keeps them inline —
+   * it exists for media containers, whose aggregate base64 must be budgeted
+   * before events/records persist into session history (request-time
+   * attachment extraction rewrites only the provider copy, never
+   * partial.json/chat.jsonl). The guest-visible value is never sanitized.
+   * Pass undefined to disable.
+   */
+  setCaptureResultSanitizer(
+    sanitizer: ((toolName: string, result: unknown) => unknown) | undefined
+  ): void;
+
+  /**
    * Route late guest-continuation execution through a host-provided gate.
    * When a fire-and-forget capability (registerPromiseFunction) settles after
    * its originating eval() returned, the runtime must run pending guest jobs —
@@ -148,6 +162,14 @@ export interface KernelRecordBounds {
    * result bounding. Args and errors stay bounded regardless.
    */
   captureRetained?: (toolName: string, result: unknown) => unknown;
+  /**
+   * Attribution fields merged onto a __kernelBounded ARGS marker when
+   * bounding replaces the args of a record (see
+   * retainPersistenceCriticalArgsFields): post-compaction extractors need the
+   * validated file path of an oversized file_edit_* call to attribute its
+   * retained diff. Marker fields win on key collisions.
+   */
+  captureArgsRetained?: (toolName: string, args: unknown) => Record<string, unknown> | undefined;
 }
 
 /**

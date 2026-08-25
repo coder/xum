@@ -20,7 +20,11 @@ import {
   isBridgeToolGranted,
   type CapabilityGrants,
 } from "@/common/types/capabilityGrants";
-import { retainExemptKernelRecordResult } from "./types";
+import {
+  retainExemptKernelRecordResult,
+  retainPersistenceCriticalArgsFields,
+  sanitizeMediaRecordCapture,
+} from "./types";
 
 /**
  * Result shape of an AI SDK Schema's optional custom validator
@@ -246,9 +250,17 @@ export class ToolBridge {
             argsCapBytes: KERNEL_COMPACT_ARGS_CAP_BYTES,
             resultCapBytes: RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES,
             captureRetained: retainExemptKernelRecordResult,
+            captureArgsRetained: retainPersistenceCriticalArgsFields,
           }
         : undefined
     );
+    // Media containers are budgeted at capture in BOTH modes: classic records
+    // keep full inline results by contract, but exclusive PTC makes the
+    // bridge the only route to executable MCP tools, and request-time
+    // attachment extraction rewrites only the provider copy — records/events
+    // persisted into partial.json/chat.jsonl need the budget regardless of
+    // kernel mode.
+    runtime.setCaptureResultSanitizer(sanitizeMediaRecordCapture);
     const xumObj: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
 
     // Grant-denied tools get an explicit stub: the guest sees a clear

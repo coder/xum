@@ -152,6 +152,34 @@ describe("nested PTC edit records (exclusive posture)", () => {
     expect(extractEditedFileDiffs(messages)).toHaveLength(1);
   });
 
+  it("propagates capture-time diff truncation to the combined diff", () => {
+    // A kernel-retained record whose oversized diff was hunk-bounded at
+    // capture (diffTruncated) makes every combined diff for that file
+    // incomplete — even when a later small edit combines cleanly, the result
+    // must not look like a complete original→final snapshot.
+    const laterDiff = makeDiff("/big.ts", "old", "new");
+    const messages: MuxMessage[] = [
+      createCodeExecutionMessage([
+        {
+          toolName: "file_edit_replace_string",
+          args: { path: "/big.ts" },
+          result: { success: true, diffTruncated: true },
+        },
+        {
+          toolName: "file_edit_replace_string",
+          args: { path: "/big.ts" },
+          result: { success: true, diff: laterDiff },
+        },
+      ]),
+    ];
+
+    expect(extractEditedFilePaths(messages)).toEqual(["/big.ts"]);
+    const diffs = extractEditedFileDiffs(messages);
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0].diff).toBe(laterDiff);
+    expect(diffs[0].truncated).toBe(true);
+  });
+
   it("kernel-compacted records surface the path but no diff", () => {
     // Current kernel compaction exempts file_edit_* records (results kept for
     // exactly this extractor), but result-less compact records still exist in
