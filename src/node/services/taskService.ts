@@ -4130,11 +4130,13 @@ export class TaskService {
           ownerResolutionPredictsTarget: ownerVouchesForTargetBase,
         });
         if (!validation.success) {
-          // Disposable workspaces are removed by the settlement's disposable cleanup, so
-          // only non-disposable workspaces are advertised as retryable.
+          // Disposable workspaces are removed by the settlement's disposable cleanup.
+          // That cleanup is best-effort (failures are logged and swallowed), so the
+          // wording must not assert completed removal; if cleanup fails the workspace
+          // stays owner-owned and a mode="existing" retry still passes ownership.
           agentValidationError =
             args.workspace?.disposable === true
-              ? `${validation.error} — no turn was dispatched; the disposable workspace (${targetWorkspaceId}) was cleaned up`
+              ? `${validation.error} — no turn was dispatched; automatic cleanup of the disposable workspace (${targetWorkspaceId}) was scheduled (if cleanup fails, it remains owned by this caller and retryable via workspace.mode="existing")`
               : `${validation.error} — no turn was dispatched; the created workspace (${targetWorkspaceId}) is owned by this caller and can be retried via workspace.mode="existing" once ready`;
         } else {
           agentDefinitionContext = {
@@ -4185,6 +4187,13 @@ export class TaskService {
         fallbacks: this.buildParentAiSettingsFallbacks(parentMeta, workspaceTurnAgentId),
         // Explicit agent overrides resolve the agent's own frontmatter `ai` defaults from the
         // checkout they were validated against (mirrors resolveTaskAISettings' definitionContext).
+        // Known tradeoff: these launch AI defaults are a snapshot — an init hook that later
+        // rewrites the agent's `ai` frontmatter does not retroactively change the model/thinking
+        // already selected here (waiting for init is not an option under the service-wide mutex).
+        // This is bounded to convenience defaults: callers wanting determinism pass explicit
+        // model/thinking, the send path re-clamps thinking and re-gates reasoning per model at
+        // request time, and the authoritative prompt/tool policy is always resolved at stream
+        // time (after init) with strictAgentResolution guarding agent identity.
         ...(agentDefinitionContext != null ? { definitionContext: agentDefinitionContext } : {}),
       });
       // Selected (not effective) values: sendMessage persists what it
