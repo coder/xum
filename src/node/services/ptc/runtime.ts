@@ -147,7 +147,7 @@ export interface KernelRecordBounds {
    * Returns the value to retain in the record, or undefined to apply normal
    * result bounding. Args and errors stay bounded regardless.
    */
-  captureRetained?: (toolName: string, result: unknown) => unknown | undefined;
+  captureRetained?: (toolName: string, result: unknown) => unknown;
 }
 
 /**

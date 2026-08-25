@@ -185,10 +185,6 @@ export function containsMediaContentPayload(result: unknown): boolean {
   if (container.type !== "content" || !Array.isArray(container.value)) return false;
   return container.value.some((item: unknown) => {
     const media = asMediaPart(item);
-    return (
-      media !== null &&
-      media.mediaType !== undefined &&
-      isSupportedAttachmentMediaType(media.mediaType)
-    );
+    return media?.mediaType !== undefined && isSupportedAttachmentMediaType(media.mediaType);
   });
 }
