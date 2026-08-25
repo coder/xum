@@ -409,6 +409,16 @@ export class ServiceContainer {
       createCoderArchiveHook({
         coderService: this.coderService,
         getArchiveBehavior,
+        // Model-driven archives probe the remote spawn-record layout before stopping a
+        // running Coder workspace: detached jobs surviving an unclean Xum exit live only in
+        // those records, which the host-local crash-orphan scans cannot see.
+        hasUnsettledRemoteBackgroundJobs: async (workspaceMetadata) => {
+          const runtime = createRuntimeForWorkspace(workspaceMetadata);
+          return await this.backgroundProcessManager.hasUnsettledRemoteSpawnRecords(
+            runtime,
+            workspaceMetadata.id
+          );
+        },
       })
     );
     workspaceLifecycleHooks.registerAfterUnarchive(

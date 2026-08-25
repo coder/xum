@@ -5,7 +5,10 @@ import assert from "@/common/utils/assert";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
 import { wouldRouteOpenAIThroughCodexOauth } from "@/common/utils/providers/codexOauthRouting";
 import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
-import { isCustomOpenAICompatibleProviderConfig } from "@/common/utils/providers/customProviders";
+import {
+  customProviderWireOrigin,
+  isCustomProviderConfig,
+} from "@/common/utils/providers/customProviders";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { getExplicitGatewayPrefix, normalizeToCanonical } from "./models";
 
@@ -39,10 +42,15 @@ export function supportsAnthropicCache(
   if (providersConfig?.anthropic?.disableBetaFeatures === true) {
     return false;
   }
-  if (
-    modelString.startsWith("coder:") &&
-    !isCustomOpenAICompatibleProviderConfig(providersConfig?.coder)
-  ) {
+  // Custom providers (including ones shadowing built-in ids) speak the wire
+  // their providerType selects; name normalization below cannot see that.
+  const colonIndex = modelString.indexOf(":");
+  const prefixEntry =
+    colonIndex > 0 ? providersConfig?.[modelString.slice(0, colonIndex)] : undefined;
+  if (isCustomProviderConfig(prefixEntry)) {
+    return customProviderWireOrigin(prefixEntry.providerType) === "anthropic";
+  }
+  if (modelString.startsWith("coder:") && !isCustomProviderConfig(providersConfig?.coder)) {
     const wire = resolveCoderWireCanonicalModel(
       modelString.slice("coder:".length),
       providersConfig?.coder

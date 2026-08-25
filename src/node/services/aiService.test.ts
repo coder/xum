@@ -4484,6 +4484,12 @@ describe("normalizeAnthropicBaseURL", () => {
     );
   });
 
+  it("appends /v1 to the path, not the query or fragment", () => {
+    expect(normalizeAnthropicBaseURL("https://proxy.example/anthropic?token=x")).toBe(
+      "https://proxy.example/anthropic/v1?token=x"
+    );
+  });
+
   it("handles URLs with ports", () => {
     expect(normalizeAnthropicBaseURL("http://localhost:8080")).toBe("http://localhost:8080/v1");
     expect(normalizeAnthropicBaseURL("http://localhost:8080/v1")).toBe("http://localhost:8080/v1");

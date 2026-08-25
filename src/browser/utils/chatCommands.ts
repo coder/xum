@@ -66,7 +66,7 @@ import { dispatchWorkspaceSwitch } from "./workspaceEvents";
 import { getRuntimeKey, copyWorkspaceStorage } from "@/common/constants/storage";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
-import { isCustomOpenAICompatibleProviderConfig } from "@/common/utils/providers/customProviders";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import { isValidProvider } from "@/common/constants/providers";
 import { openInEditor } from "@/browser/utils/openInEditor";
 import {
@@ -349,7 +349,7 @@ export async function processSlashCommand(
       }
 
       const providerConfig = providersConfig?.[provider];
-      if (!isValidProvider(provider) && !isCustomOpenAICompatibleProviderConfig(providerConfig)) {
+      if (!isValidProvider(provider) && !isCustomProviderConfig(providerConfig)) {
         setToast({
           id: Date.now().toString(),
           type: "error",

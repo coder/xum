@@ -28,6 +28,7 @@ tools:
     - task_retitle
     - task_stop
     - task_remove
+    - task_workspace_lifecycle
 ---
 
 You are in Explore mode (read-only).

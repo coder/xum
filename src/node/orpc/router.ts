@@ -13,6 +13,11 @@ import { Err, Ok } from "@/common/types/result";
 import { resolveProviderCredentials } from "@/node/utils/providerRequirements";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { isPathInsideDir, stripTrailingSlashes } from "@/node/utils/pathUtils";
+import {
+  CODE_WORKSPACE_EXTENSION,
+  managedRootsByProject,
+  syncProjectCodeWorkspace,
+} from "@/node/worktree/codeWorkspaceSync";
 import { generateWorkspaceIdentity } from "@/node/services/workspaceTitleGenerator";
 import {
   WorkspaceGoalChildWorkspaceError,
@@ -137,6 +142,7 @@ import {
   DEFAULT_WORKFLOW_AGENT_ID,
   WorkflowTaskServiceAdapter,
 } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
+import { acquireWorkflowArchiveAdmission } from "@/node/services/workflows/workflowArchiveAdmission";
 import { WorkflowArgsValidationError } from "@/node/services/workflows/workflowArgs";
 import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
 import { isProjectTrusted, isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
@@ -1984,6 +1990,12 @@ export const router = (authToken?: string) => {
         .input(schemas.workflows.resume.input)
         .output(schemas.workflows.resume.output)
         .handler(async ({ context, input }) => {
+          // Acquired before any await: resolveWorkflowContext suspends, and an
+          // interrupt_active archive entering during that window would see neither an
+          // admission nor a durable active run — it could destroy the delegated turns and
+          // archive the workspace before this request reaches the service-level admission.
+          // The service re-acquires its own admission; the counters stack.
+          using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
           const { service, projectTrusted } = await resolveWorkflowContext(
             context,
             input.workspaceId
@@ -2000,6 +2012,8 @@ export const router = (authToken?: string) => {
         .input(schemas.workflows.retryFromCheckpoint.input)
         .output(schemas.workflows.retryFromCheckpoint.output)
         .handler(async ({ context, input }) => {
+          // Entry-level admission; see workflows.resume above.
+          using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
           const { service, projectTrusted } = await resolveWorkflowContext(
             context,
             input.workspaceId,
@@ -2025,6 +2039,10 @@ export const router = (authToken?: string) => {
         .output(schemas.workflows.start.output)
         .handler(async ({ context, input, signal }) => {
           assertDynamicWorkflowsEnabled(context);
+          // Entry-level admission; see workflows.resume above. start additionally awaits
+          // workspace idleness and script resolution before reaching the service, widening
+          // the window an unguarded interrupt_active archive could slip through.
+          using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
           let invocationMessagePersisted: boolean | undefined;
           let resolveInvocationPersistence: (persisted: boolean) => void = () => undefined;
           const invocationPersistence = new Promise<boolean>((resolve) => {
@@ -2270,12 +2288,10 @@ export const router = (authToken?: string) => {
         .input(schemas.providers.getConfig.input)
         .output(schemas.providers.getConfig.output)
         .handler(({ context }) => context.providerService.getConfig()),
-      addCustomOpenAICompatibleProvider: t
-        .input(schemas.providers.addCustomOpenAICompatibleProvider.input)
-        .output(schemas.providers.addCustomOpenAICompatibleProvider.output)
-        .handler(({ context, input }) =>
-          context.providerService.addCustomOpenAICompatibleProvider(input)
-        ),
+      addCustomProvider: t
+        .input(schemas.providers.addCustomProvider.input)
+        .output(schemas.providers.addCustomProvider.output)
+        .handler(({ context, input }) => context.providerService.addCustomProvider(input)),
       removeCustomProvider: t
         .input(schemas.providers.removeCustomProvider.input)
         .output(schemas.providers.removeCustomProvider.output)
@@ -2819,10 +2835,44 @@ export const router = (authToken?: string) => {
         .input(schemas.general.openInEditor.input)
         .output(schemas.general.openInEditor.output)
         .handler(async ({ context, input }) => {
-          return context.editorService.openInEditor(
+          // Custom editors spawn detached and untrackable; record the open (refusing while
+          // the workspace is archiving) before launching. See recordExternalEditorOpen.
+          const recorded = await context.workspaceService.recordExternalEditorOpenForLaunch(
+            input.workspaceId
+          );
+          if (!recorded.success) {
+            return recorded;
+          }
+          const result = await context.editorService.openInEditor(
             input.workspaceId,
             input.targetPath,
             input.editorConfig
+          );
+          if (!result.success) {
+            // EditorService errors occur only before its detached spawn (missing/invalid
+            // command, unsupported runtime), so no editor launched — roll back a marker this
+            // call created, or it would stick and permanently refuse future model-driven
+            // snapshot/Coder-stop archives of the workspace.
+            await recorded.data.rollbackAfterFailedLaunch();
+          }
+          return result;
+        }),
+      recordEditorOpen: t
+        .input(schemas.general.recordEditorOpen.input)
+        .output(schemas.general.recordEditorOpen.output)
+        .handler(async ({ context, input }) => {
+          return context.workspaceService.recordExternalEditorOpen(
+            input.workspaceId,
+            input.launchToken
+          );
+        }),
+      rollbackEditorOpen: t
+        .input(schemas.general.rollbackEditorOpen.input)
+        .output(schemas.general.rollbackEditorOpen.output)
+        .handler(async ({ context, input }) => {
+          return context.workspaceService.rollbackRecordedEditorOpen(
+            input.workspaceId,
+            input.launchToken
           );
         }),
     },
@@ -3508,6 +3558,51 @@ export const router = (authToken?: string) => {
             return config;
           });
         }),
+      setCodeWorkspaceSyncPath: t
+        .input(schemas.projects.setCodeWorkspaceSyncPath.input)
+        .output(schemas.projects.setCodeWorkspaceSyncPath.output)
+        .handler(async ({ context, input }) => {
+          const normalizedPath = stripTrailingSlashes(input.projectPath);
+          const trimmed = input.codeWorkspaceSyncPath?.trim() ?? "";
+          if (trimmed && !trimmed.endsWith(CODE_WORKSPACE_EXTENSION)) {
+            // The sync read-modify-writes this file, so refuse arbitrary targets.
+            // ORPCError so the message reaches the UI instead of "Internal server error".
+            throw new ORPCError("BAD_REQUEST", {
+              message: `Path must end with ${CODE_WORKSPACE_EXTENSION}`,
+            });
+          }
+          let previousValue: string | undefined;
+          await context.config.editConfig((config) => {
+            const project = config.projects.get(normalizedPath);
+            if (!project) {
+              throw new Error(`Project not found: ${normalizedPath}`);
+            }
+            previousValue = project.codeWorkspaceSyncPath;
+            // Store undefined for blank input to keep config.json minimal.
+            project.codeWorkspaceSyncPath = trimmed ? trimmed : undefined;
+            return config;
+          });
+          // Sync immediately so enabling takes effect without waiting for the
+          // next workspace lifecycle event. Clearing or changing the path never
+          // deletes previously written files (they belong to the user).
+          if (trimmed) {
+            const result = await syncProjectCodeWorkspace(context.config, normalizedPath);
+            if (!result.ok) {
+              // Roll back so a broken integration is not retried on every
+              // later lifecycle event, and surface the reason to the user.
+              // Guarded: a concurrent save may have stored a newer value that
+              // this failing request must not discard.
+              await context.config.editConfig((config) => {
+                const project = config.projects.get(normalizedPath);
+                if (project?.codeWorkspaceSyncPath === trimmed) {
+                  project.codeWorkspaceSyncPath = previousValue;
+                }
+                return config;
+              });
+              throw new ORPCError("BAD_REQUEST", { message: result.error });
+            }
+          }
+        }),
       remove: t
         .input(schemas.projects.remove.input)
         .output(schemas.projects.remove.output)
@@ -3943,6 +4038,14 @@ export const router = (authToken?: string) => {
           .input(schemas.projects.subProjects.assignWorkspace.input)
           .output(schemas.projects.subProjects.assignWorkspace.output)
           .handler(async ({ context, input }) => {
+            // Reassignment moves the workspace between sub-project workspace
+            // files. Capture the previous assignment (and the managed roots
+            // the workspace contributed to it) before it changes: afterwards
+            // the old file could no longer remove the entry, for the same
+            // reason workspace removal captures managedRootsByProject.
+            const previousMetadata = (await context.config.getAllWorkspaceMetadata()).find(
+              (m) => m.id === input.workspaceId
+            );
             const result = await context.projectService.assignWorkspaceToSubProject(
               input.projectPath,
               input.workspaceId,
@@ -3950,6 +4053,28 @@ export const router = (authToken?: string) => {
             );
             if (result.success) {
               await context.workspaceService.refreshAndEmitMetadata(input.workspaceId);
+              // Best-effort (results logged inside): reconcile both sides of
+              // the reassignment so the old file drops the entry and the new
+              // one gains it without waiting for the next lifecycle event.
+              if (input.subProjectPath !== null) {
+                await syncProjectCodeWorkspace(context.config, input.subProjectPath);
+              }
+              const previousSubProjectPath =
+                previousMetadata?.subProjectPath != null
+                  ? stripTrailingSlashes(previousMetadata.subProjectPath)
+                  : null;
+              const newSubProjectPath =
+                input.subProjectPath !== null ? stripTrailingSlashes(input.subProjectPath) : null;
+              if (
+                previousMetadata &&
+                previousSubProjectPath !== null &&
+                previousSubProjectPath !== newSubProjectPath
+              ) {
+                await syncProjectCodeWorkspace(context.config, previousSubProjectPath, {
+                  extraManagedRootDirs:
+                    managedRootsByProject(previousMetadata).get(previousSubProjectPath),
+                });
+              }
             }
             return result;
           }),

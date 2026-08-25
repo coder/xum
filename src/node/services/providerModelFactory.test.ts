@@ -10,6 +10,7 @@ import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { CODEX_ENDPOINT, CODEX_OAUTH_ROUTED_HEADER } from "@/common/constants/codexOAuth";
 import { PROVIDER_REGISTRY } from "@/common/constants/providers";
+import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders";
 import { resolveProviderOptionsNamespaceKey } from "@/common/utils/ai/providerOptions";
 import { Ok } from "@/common/types/result";
 import {
@@ -376,6 +377,111 @@ describe("ProviderModelFactory.createModel", () => {
       }
 
       expect((unlistedModel.data as { provider?: unknown }).provider).toBe("local-vllm.chat");
+    });
+  });
+
+  it("creates a model with the selected custom provider adapter", async () => {
+    const expectedProviders = {
+      "openai-compatible": "local-vllm.chat",
+      "openai-responses": "openai.responses",
+      "anthropic-messages": "anthropic.messages",
+    } as const;
+
+    for (const providerType of CUSTOM_PROVIDER_TYPES) {
+      await withTempConfig(async (config, factory) => {
+        saveLocalVllmConfig(config, { providerType });
+
+        const result = await factory.createModel(`local-vllm:${LOCAL_VLLM_MODEL}`);
+        expect(result.success).toBe(true);
+        if (result.success) {
+          expect((result.data as { provider?: unknown }).provider).toBe(
+            expectedProviders[providerType]
+          );
+        }
+      });
+    }
+  });
+
+  it("keys the wire identity on the custom provider's API format", async () => {
+    const expectedWire = {
+      "openai-compatible": "local-vllm",
+      "openai-responses": "openai",
+      "anthropic-messages": "anthropic",
+    } as const;
+
+    for (const providerType of CUSTOM_PROVIDER_TYPES) {
+      await withTempConfig(async (config, factory) => {
+        saveLocalVllmConfig(config, { providerType });
+
+        const result = await factory.resolveAndCreateModel(`local-vllm:${LOCAL_VLLM_MODEL}`, "off");
+        expect(result.success).toBe(true);
+        if (result.success) {
+          // Message preparation and options namespaces key on the wire the
+          // request speaks, not the custom prefix.
+          expect(result.data.wireProviderName).toBe(expectedWire[providerType]);
+          // Custom adapters are direct routes: leaking the raw custom id as
+          // routeProvider would make namespace selection treat the request
+          // as a transforming gateway and drop provider options entirely.
+          expect(result.data.routeProvider).toBeUndefined();
+        }
+      });
+    }
+  });
+
+  it("keeps a custom provider shadowing mux-gateway off gateway attribution", async () => {
+    await withTempConfig(async (config, factory) => {
+      // The request goes directly to the custom endpoint, so gateway
+      // attribution and quota handling must not engage.
+      config.saveProvidersConfig({
+        "mux-gateway": {
+          providerType: "openai-compatible",
+          baseUrl: "http://localhost:8000/v1",
+          models: ["qwen3-coder"],
+        },
+      });
+
+      const result = await factory.resolveAndCreateModel("mux-gateway:qwen3-coder", "off");
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.routedThroughGateway).toBe(false);
+        expect(result.data.routeProvider).toBeUndefined();
+      }
+    });
+  });
+
+  it("merges backend OpenAI store policy for custom openai-responses providers", async () => {
+    await withTempConfig(async (config, factory) => {
+      // ZDR: providers.openai.store applies to every Responses-wire route,
+      // including custom Responses adapters.
+      saveLocalVllmConfig(config, { providerType: "openai-responses" });
+      config.saveProvidersConfig({
+        ...config.loadProvidersConfig(),
+        openai: { store: false },
+      } as Parameters<Config["saveProvidersConfig"]>[0]);
+
+      const muxOptions: MuxProviderOptions = {};
+      const result = await factory.createModel(`local-vllm:${LOCAL_VLLM_MODEL}`, muxOptions);
+      expect(result.success).toBe(true);
+      expect(muxOptions.openai?.store).toBe(false);
+    });
+  });
+
+  it("merges backend disableBetaFeatures for custom anthropic-messages providers", async () => {
+    await withTempConfig(async (config, factory) => {
+      // The providerType, not the provider name, classifies the request as
+      // Anthropic-wire: without it providers.anthropic.disableBetaFeatures
+      // never merges and cache_control is injected despite the user
+      // disabling beta features.
+      saveLocalVllmConfig(config, { providerType: "anthropic-messages" });
+      config.saveProvidersConfig({
+        ...config.loadProvidersConfig(),
+        anthropic: { disableBetaFeatures: true },
+      } as Parameters<Config["saveProvidersConfig"]>[0]);
+
+      const muxOptions: MuxProviderOptions = {};
+      const result = await factory.createModel(`local-vllm:${LOCAL_VLLM_MODEL}`, muxOptions);
+      expect(result.success).toBe(true);
+      expect(muxOptions.anthropic?.disableBetaFeatures).toBe(true);
     });
   });
 
@@ -2057,6 +2163,54 @@ describe("wrapFetchWithXAIServiceTier", () => {
 // Effort "xhigh" and thinking.display flow through the SDK directly as of
 // @ai-sdk/anthropic 4.0.11 (see buildProviderOptions), so the wrapper must NOT
 // rewrite reasoning fields — it only normalizes cache_control.
+describe("wrapFetchWithAnthropicCacheControl — ZDR stripping", () => {
+  it("strips existing cache markers when injection is disabled", async () => {
+    const { calls, fakeFetch } = createCapturingFetch();
+    const wrapped = wrapFetchWithAnthropicCacheControl(fakeFetch, undefined, {
+      injectCacheControl: false,
+    });
+
+    // Markers the request pipeline can serialize before the wrapper runs:
+    // eligibility checks read a policy-filtered view that can hide the
+    // global disableBetaFeatures flag, so the wire must strip them.
+    await wrapped("https://proxy.example/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        system: [{ type: "text", text: "cached system", cache_control: { type: "ephemeral" } }],
+        messages: [
+          {
+            role: "user",
+            content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }],
+            providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+          },
+        ],
+        tools: [{ name: "bash", cache_control: { type: "ephemeral" } }],
+      }),
+    });
+
+    expect(calls).toHaveLength(1);
+    const sent = JSON.stringify(parseSentBody(calls[0]));
+    expect(sent).not.toContain("cache_control");
+    expect(sent).not.toContain("cacheControl");
+  });
+
+  it("keeps markers when injection is enabled", async () => {
+    const { calls, fakeFetch } = createCapturingFetch();
+    const wrapped = wrapFetchWithAnthropicCacheControl(fakeFetch);
+
+    await wrapped("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        system: [{ type: "text", text: "cached system", cache_control: { type: "ephemeral" } }],
+        messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      }),
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(JSON.stringify(parseSentBody(calls[0]))).toContain("cache_control");
+  });
+});
+
 describe("wrapFetchWithAnthropicCacheControl — reasoning fields pass through unchanged", () => {
   it("passes native xhigh effort and summarized display through on the direct body", async () => {
     const { calls, fakeFetch } = createCapturingFetch();

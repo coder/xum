@@ -6,6 +6,9 @@ import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import * as fsPromises from "fs/promises";
 import assert from "@/common/utils/assert";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
+import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
+import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
+import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import {
@@ -131,6 +134,7 @@ import {
 import { isWorktreeRuntime } from "@/node/runtime/worktreeLifecycleHooks";
 import { expandTilde, expandTildeForSSH } from "@/node/runtime/tildeExpansion";
 import { removeManagedGitWorktree } from "@/node/worktree/removeManagedGitWorktree";
+import { managedRootsByProject, syncProjectCodeWorkspace } from "@/node/worktree/codeWorkspaceSync";
 
 import {
   copyStagedWorkspaceAttachments,
@@ -172,10 +176,12 @@ import { UIModeSchema, type UIMode } from "@/common/types/mode";
 import {
   createMuxMessage,
   getCompactionFollowUpContent,
+  parseWorkspaceTurnTaskCorrelation,
   pickPreservedSendOptions,
   type CompactionFollowUpRequest,
   type MuxMessageMetadata,
   type MuxMessage,
+  type WorkspaceTurnTaskCorrelation,
 } from "@/common/types/message";
 import { getFollowUpContentText } from "@/browser/utils/compaction/format";
 import { stripStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
@@ -186,6 +192,10 @@ import {
   type WorkflowRunStatus,
 } from "@/common/types/workflow";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
+import {
+  hasInProcessWorkflowWork,
+  setWorkflowArchiveAdmissionGuard,
+} from "@/node/services/workflows/workflowArchiveAdmission";
 import {
   WORKFLOW_RESULT_METADATA_TYPE,
   WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE,
@@ -200,7 +210,9 @@ import {
   getSrcBaseDir,
   isSSHRuntime,
   isDockerRuntime,
+  isDevcontainerRuntime,
 } from "@/common/types/runtime";
+import { BG_OUTPUT_SUBDIR } from "@/node/services/backgroundProcessExecutor";
 // Backend maintenance sends (goal continuations, idle compaction, heartbeats)
 // normalize persisted models with gateway-preserving normalizeSelectedModel:
 // normalizeToCanonical would rewrite cross-typed Coder selections
@@ -336,6 +348,9 @@ const MAX_WORKSPACE_NAME_COLLISION_RETRIES = 3;
  * for far longer and get reaped on a later startup.
  */
 const ORPHAN_SESSION_DIR_GRACE_MS = 24 * 60 * 60 * 1000;
+
+// Upper bound on startup .code-workspace reconciliation (see initialize()).
+const STARTUP_CODE_WORKSPACE_SYNC_TIMEOUT_MS = 10_000;
 
 /**
  * Base name used when /new auto-generates a branch name. Numbered suffixes
@@ -585,6 +600,53 @@ const POST_COMPACTION_METADATA_REFRESH_DEBOUNCE_MS = 100;
 
 const DESCENDANT_WORKSPACE_REMOVE_ERROR =
   "This workspace has descendant sub-agent workspaces. Remove those descendants deepest-first before removing their parent.";
+export interface ArchiveWorkspaceOptions {
+  /**
+   * Refuse to archive when the effective worktree archive behavior would delete the checkout
+   * ("delete"). Model-facing callers set this so a concurrent settings flip cannot turn an
+   * agent-driven archive into an unconfirmed checkout deletion; enforced against the same
+   * behavior read that drives the snapshot/deletion decisions.
+   */
+  forbidWorktreeCheckoutDeletion?: boolean;
+  /**
+   * Refuse to archive when live user activity exists at the sink (a stream, a send still in
+   * its pre-admission window, queued/preparing turns, terminal sessions, or a desktop
+   * session). Model-facing callers set this so an agent-driven archive fails closed instead
+   * of silently terminating user work that started after the caller's earlier activity check.
+   * Checked synchronously in the same block that marks the workspace as archiving, pairing
+   * with sendMessage's synchronous entry guards: whichever side runs first is observed by the
+   * other. Also holds the session's turn admission for the rest of the archive so a queued
+   * entry cannot dispatch through AgentSession's internal send path (which bypasses
+   * WorkspaceService.sendMessage) into the workspace mid-archive. The user-driven archive
+   * path intentionally omits this and keeps its stop-activity semantics.
+   */
+  refuseLiveUserActivity?: boolean;
+  /**
+   * Behavior snapshot read by the caller before it committed to the archive (e.g. before
+   * interrupting active turns). The sink uses it for every snapshot/deletion decision instead
+   * of re-reading config, so a concurrent settings flip cannot change archive eligibility
+   * between the caller's checks and the sink — e.g. flipping keep → snapshot after turns were
+   * interrupted would otherwise bounce with requires_confirmation, stranding destroyed work.
+   */
+  worktreeArchiveBehaviorOverride?: WorktreeArchiveBehavior;
+  /**
+   * Refuse to archive when the Coder workspace-on-archive policy would permanently delete a
+   * dedicated (mux-created) remote Coder workspace via the before-archive hook. Unarchive
+   * does not recreate deleted Coder workspaces, so a model-facing "reversible" archive must
+   * fail closed instead; route that policy through user-mediated archive.
+   */
+  forbidCoderWorkspaceDeletion?: boolean;
+  /**
+   * Coder archive-policy snapshot read by the caller before it committed to the archive (e.g.
+   * before deciding interrupt_active eligibility and interrupting turns). Mirrors
+   * worktreeArchiveBehaviorOverride: the sink's deletion guard and the before-archive hook honor
+   * this same read, so a keep → stop/delete settings flip after the caller's checks cannot make
+   * the sink run (or refuse on) a remote stop/deletion the caller never admitted — which would
+   * otherwise strand already-interrupted turns behind a failed archive.
+   */
+  coderWorkspaceArchiveBehaviorOverride?: CoderWorkspaceArchiveBehavior;
+}
+
 const ACTIVE_DESCENDANT_ARCHIVE_ERROR =
   "This workspace has active descendant sub-agents. Stop them before archiving their parent.";
 const MULTI_PROJECT_WORKSPACES_DISABLED_ERROR = "Multi-project workspaces experiment is disabled";
@@ -624,7 +686,11 @@ function buildArchiveLossyUntrackedFilesConfirmation(
   };
 }
 
-function areArchiveUntrackedPathListsEqual(
+// Exported so TaskService's pre-interruption archive preflight applies the exact
+// acknowledgement semantics enforced at the archive sink (getArchiveUntrackedFilesConfirmation):
+// a drifted acknowledged set — extra OR missing paths — must re-confirm before any
+// destructive interruption, not after.
+export function areArchiveUntrackedPathListsEqual(
   leftPaths: readonly string[],
   rightPaths: readonly string[]
 ): boolean {
@@ -2028,6 +2094,25 @@ export class WorkspaceService extends EventEmitter {
   // after that user row and enter the send's request as a trailing foreign
   // assistant row (see acquireIdleTurnExclusion).
   private readonly preflightSendCounts = new Map<string, number>();
+  // In-flight renderer executeBash requests per workspace. Incremented in the same
+  // synchronous block as executeBash's archivingWorkspaces check (mirroring
+  // preflightSendCounts) so archive admission and bash execution always observe each other:
+  // an exec admitted first holds the archive gate open for its full duration, and an exec
+  // entering after the gate armed is refused at entry.
+  private readonly preflightExecCounts = new Map<string, number>();
+  // Same pairing for renderer attachment staging (writes into the checkout an archive may
+  // capture/remove) and file-completion refreshes (run git through a runtime that could
+  // re-wake a stopped Coder workspace). See acquirePreflightAdmission.
+  private readonly preflightStagingCounts = new Map<string, number>();
+  private readonly preflightFileCompletionCounts = new Map<string, number>();
+  /**
+   * In-flight forks counted per SOURCE workspace. A fork clones the source checkout and (for
+   * SSH/Coder runtimes) shares its remote workspace, so a model-driven archive admitted
+   * mid-fork could stop or snapshot the environment under the clone. Pairs with the archive
+   * gates like the other preflight counters: a fork admitted first is visible to the sink
+   * and the pre-interruption hold; one entering later observes archivingWorkspaces.
+   */
+  private readonly preflightForkCounts = new Map<string, number>();
 
   // Tracks in-flight fork auto-title generations so only the first accepted continue
   // message can claim the workspace title.
@@ -2048,6 +2133,56 @@ export class WorkspaceService extends EventEmitter {
   // Why this lives here: archive/remove are the user-facing lifecycle operations that should
   // cancel any fire-and-forget init work to avoid orphaned processes (e.g., SSH sync, .xum/init).
   private readonly initAbortControllers = new Map<string, AbortController>();
+
+  /**
+   * Settlement promises of fire-and-forget background inits (create/createMulti/fork), kept
+   * so archive can wait for the init hook process to actually exit after aborting it: the
+   * abort only signals, and snapshot capture, checkout deletion, or a Coder stop under a
+   * still-writing init would race its writes. Entries self-clean on settlement; the stored
+   * promises never reject (init failures are reported through the init logger).
+   */
+  private readonly initSettlementPromises = new Map<string, Promise<void>>();
+
+  /**
+   * Registers a fire-and-forget background init started outside this service (TaskService
+   * starts inits for task workspaces after materializing their checkouts) with the same
+   * abort-and-settlement mechanism archive uses: archiveUnlocked aborts the registered
+   * controller when init state is still running, and always awaits the retained settlement
+   * before snapshot capture, checkout deletion, or Coder hooks can proceed. The controller
+   * entry self-cleans on settlement.
+   */
+  registerExternalBackgroundInit(
+    workspaceId: string,
+    abortController: AbortController,
+    settled: Promise<unknown>
+  ): void {
+    this.initAbortControllers.set(workspaceId, abortController);
+    this.retainInitSettlement(workspaceId, settled);
+    void settled
+      .then(
+        () => undefined,
+        () => undefined
+      )
+      .then(() => {
+        if (this.initAbortControllers.get(workspaceId) === abortController) {
+          this.initAbortControllers.delete(workspaceId);
+        }
+      });
+  }
+
+  /** See initSettlementPromises. */
+  private retainInitSettlement(workspaceId: string, settled: Promise<unknown>): void {
+    const swallowed = settled.then(
+      () => undefined,
+      () => undefined
+    );
+    this.initSettlementPromises.set(workspaceId, swallowed);
+    void swallowed.then(() => {
+      if (this.initSettlementPromises.get(workspaceId) === swallowed) {
+        this.initSettlementPromises.delete(workspaceId);
+      }
+    });
+  }
 
   // ExtensionMetadataService now serializes all mutations globally because every
   // workspace shares the same extensionMetadata.json file.
@@ -2086,6 +2221,26 @@ export class WorkspaceService extends EventEmitter {
     this.experimentsService = experimentsService;
     this.sessionTimingService = sessionTimingService;
     this.aiService.on("providers-config-changed", this.providerConfigChangedListener);
+    // Archive admission pairing for workflow starts/resumes: WorkflowService instances are
+    // per-request, so the guard is registered at module scope (see workflowArchiveAdmission).
+    // Entry points check it in the same synchronous block that counts their admission, so
+    // whichever of {archive gate, workflow admission} runs first is observed by the other.
+    setWorkflowArchiveAdmissionGuard((workspaceId) => {
+      if (this.archivingWorkspaces.has(workspaceId)) {
+        return `Workspace is being archived: ${workspaceId}. Unarchive it before starting or resuming workflows.`;
+      }
+      const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+      if (
+        workspaceEntry != null &&
+        isWorkspaceArchived(
+          workspaceEntry.workspace.archivedAt,
+          workspaceEntry.workspace.unarchivedAt
+        )
+      ) {
+        return `Workspace is archived: ${workspaceId}. Unarchive it before starting or resuming workflows.`;
+      }
+      return null;
+    });
     this.setupMetadataListeners();
     this.setupInitMetadataListeners();
     // r63 startup self-heal: reclaim removal tombstones left behind by a
@@ -3069,10 +3224,22 @@ export class WorkspaceService extends EventEmitter {
    */
   setTerminalService(terminalService: TerminalService): void {
     this.terminalService = terminalService;
+    // Archive admission pairing for terminal startups: create() checks this guard in the same
+    // synchronous block as its startup reservation, so whichever of {archive gate, terminal
+    // entry} runs first is observed by the other (see archiveUnlocked's refuseLiveUserActivity
+    // gate and TerminalService.create).
+    terminalService.setWorkspaceArchiveGuard((workspaceId) =>
+      this.archivingWorkspaces.has(workspaceId)
+    );
   }
 
   setDesktopSessionManager(manager: DesktopSessionManager): void {
     this.desktopSessionManager = manager;
+    // Archive admission pairing for desktop startups (mirrors setTerminalService above):
+    // ensureStarted checks this guard in the same synchronous block that registers its startup
+    // promise, so whichever of {archive gate, desktop startup entry} runs first is observed by
+    // the other.
+    manager.setWorkspaceArchiveGuard((workspaceId) => this.archivingWorkspaces.has(workspaceId));
   }
 
   private async closeDesktopSessionBestEffort(
@@ -3364,6 +3531,23 @@ export class WorkspaceService extends EventEmitter {
         this.startStartupRecovery(metadata.id);
         scheduledCount += 1;
       }
+
+      // Repair .code-workspace drift from lifecycle changes that happened while
+      // the app was not running. Each sync is internally bounded, but startup
+      // additionally caps the whole loop: many enabled projects on a stalled
+      // filesystem must never delay launch. Past the deadline the loop keeps
+      // running in the background; syncProjectCodeWorkspace never throws, so
+      // the orphaned promise cannot reject unhandled.
+      const codeWorkspaceSyncAll = (async () => {
+        for (const [projectPath, projectConfig] of this.config.loadConfigOrDefault().projects) {
+          if (projectConfig.codeWorkspaceSyncPath?.trim()) {
+            await syncProjectCodeWorkspace(this.config, projectPath);
+          }
+        }
+      })();
+      await raceWithAbortAndTimeout(codeWorkspaceSyncAll, {
+        timeoutMs: STARTUP_CODE_WORKSPACE_SYNC_TIMEOUT_MS,
+      });
 
       log.info("[startup] WorkspaceService.initialize completed", {
         totalMs: Date.now() - startupStartedAt,
@@ -4950,20 +5134,24 @@ export class WorkspaceService extends EventEmitter {
       // If the user cancelled creation while create() was still in flight, avoid spawning
       // additional background work for a workspace that's already being removed.
       if (!this.removingWorkspaces.has(workspaceId) && !initAbortController.signal.aborted) {
-        void runBackgroundInit(
-          runtime,
-          {
-            projectPath: owningProjectPath,
-            branchName: finalBranchName,
-            trunkBranch: normalizedTrunkBranch,
-            workspacePath: createResult!.workspacePath,
-            initLogger,
-            env: secrets,
-            abortSignal: initAbortController.signal,
-            trusted: projectConfig.trusted ?? false,
-          },
+        // Retained (not just fired) so archive can await the hook process's actual exit.
+        this.retainInitSettlement(
           workspaceId,
-          log
+          runBackgroundInit(
+            runtime,
+            {
+              projectPath: owningProjectPath,
+              branchName: finalBranchName,
+              trunkBranch: normalizedTrunkBranch,
+              workspacePath: createResult!.workspacePath,
+              initLogger,
+              env: secrets,
+              abortSignal: initAbortController.signal,
+              trusted: projectConfig.trusted ?? false,
+            },
+            workspaceId,
+            log
+          )
         );
       } else {
         initAbortController.abort();
@@ -4975,6 +5163,7 @@ export class WorkspaceService extends EventEmitter {
         session.emitMetadata(this.enrichFrontendMetadata(completeMetadata));
       }
 
+      await this.syncCodeWorkspaceFiles(completeMetadata);
       eventSpine.emit("workspace.created", { workspaceId });
       return Ok({ metadata: this.enrichFrontendMetadata(completeMetadata) });
     } catch (error) {
@@ -5311,77 +5500,81 @@ export class WorkspaceService extends EventEmitter {
       // Multi-project creation should mirror create(): return metadata immediately, but only mark init
       // complete after initialization work has run.
       if (!this.removingWorkspaces.has(workspaceId) && !initAbortController.signal.aborted) {
-        void (async () => {
-          let initFailed = false;
+        // Retained (not just fired) so archive can await the per-project init loop's exit.
+        this.retainInitSettlement(
+          workspaceId,
+          (async () => {
+            let initFailed = false;
 
-          for (const createdWorkspace of createdWorkspaces) {
-            if (this.removingWorkspaces.has(workspaceId) || initAbortController.signal.aborted) {
-              break;
-            }
+            for (const createdWorkspace of createdWorkspaces) {
+              if (this.removingWorkspaces.has(workspaceId) || initAbortController.signal.aborted) {
+                break;
+              }
 
-            const trusted =
-              configSnapshot.projects.get(
-                stripTrailingSlashes(createdWorkspace.project.projectPath)
-              )?.trusted ?? false;
+              const trusted =
+                configSnapshot.projects.get(
+                  stripTrailingSlashes(createdWorkspace.project.projectPath)
+                )?.trusted ?? false;
 
-            const projectInitLogger = {
-              ...initLogger,
-              // Each runtime's init path reports completion. Suppress per-project completion so
-              // multi-project workspaces only transition out of initializing after all runtimes finish.
-              logComplete: (_exitCode: number) => undefined,
-            };
+              const projectInitLogger = {
+                ...initLogger,
+                // Each runtime's init path reports completion. Suppress per-project completion so
+                // multi-project workspaces only transition out of initializing after all runtimes finish.
+                logComplete: (_exitCode: number) => undefined,
+              };
 
-            try {
-              const secrets = await secretsToRecord(
-                this.config.getEffectiveSecrets(createdWorkspace.project.projectPath)
-              );
+              try {
+                const secrets = await secretsToRecord(
+                  this.config.getEffectiveSecrets(createdWorkspace.project.projectPath)
+                );
 
-              const initResult = await runFullInit(createdWorkspace.runtime, {
-                projectPath: createdWorkspace.project.projectPath,
-                branchName,
-                trunkBranch: createdWorkspace.trunkBranch,
-                workspacePath: createdWorkspace.workspacePath,
-                initLogger: projectInitLogger,
-                env: secrets,
-                abortSignal: initAbortController.signal,
-                trusted,
-              });
+                const initResult = await runFullInit(createdWorkspace.runtime, {
+                  projectPath: createdWorkspace.project.projectPath,
+                  branchName,
+                  trunkBranch: createdWorkspace.trunkBranch,
+                  workspacePath: createdWorkspace.workspacePath,
+                  initLogger: projectInitLogger,
+                  env: secrets,
+                  abortSignal: initAbortController.signal,
+                  trusted,
+                });
 
-              if (!initResult.success) {
+                if (!initResult.success) {
+                  initFailed = true;
+                  log.error("Multi-project workspace init failed", {
+                    workspaceId,
+                    projectPath: createdWorkspace.project.projectPath,
+                    error: initResult.error ?? "Unknown initialization failure",
+                  });
+                }
+              } catch (error: unknown) {
                 initFailed = true;
+                const message = getErrorMessage(error);
                 log.error("Multi-project workspace init failed", {
                   workspaceId,
                   projectPath: createdWorkspace.project.projectPath,
-                  error: initResult.error ?? "Unknown initialization failure",
+                  error: message,
                 });
+                initLogger.logStderr(
+                  `Initialization failed for ${createdWorkspace.project.projectName}: ${message}`
+                );
               }
-            } catch (error: unknown) {
-              initFailed = true;
-              const message = getErrorMessage(error);
-              log.error("Multi-project workspace init failed", {
-                workspaceId,
-                projectPath: createdWorkspace.project.projectPath,
-                error: message,
-              });
-              initLogger.logStderr(
-                `Initialization failed for ${createdWorkspace.project.projectName}: ${message}`
-              );
             }
-          }
 
-          if (this.removingWorkspaces.has(workspaceId) || initAbortController.signal.aborted) {
-            initAbortController.abort();
-            this.initAbortControllers.delete(workspaceId);
+            if (this.removingWorkspaces.has(workspaceId) || initAbortController.signal.aborted) {
+              initAbortController.abort();
+              this.initAbortControllers.delete(workspaceId);
 
-            // Background init will never fully complete, so init-end won’t fire.
-            // Clear init state + re-emit fresh metadata so the sidebar doesn’t stay stuck on isInitializing.
-            this.initStateManager.clearInMemoryState(workspaceId);
-            session.emitMetadata(this.enrichFrontendMetadata(completeMetadata));
-            return;
-          }
+              // Background init will never fully complete, so init-end won’t fire.
+              // Clear init state + re-emit fresh metadata so the sidebar doesn’t stay stuck on isInitializing.
+              this.initStateManager.clearInMemoryState(workspaceId);
+              session.emitMetadata(this.enrichFrontendMetadata(completeMetadata));
+              return;
+            }
 
-          initLogger.logComplete(initFailed ? -1 : 0);
-        })();
+            initLogger.logComplete(initFailed ? -1 : 0);
+          })()
+        );
       } else {
         initAbortController.abort();
         this.initAbortControllers.delete(workspaceId);
@@ -5392,6 +5585,7 @@ export class WorkspaceService extends EventEmitter {
         session.emitMetadata(this.enrichFrontendMetadata(completeMetadata));
       }
 
+      await this.syncCodeWorkspaceFiles(completeMetadata);
       eventSpine.emit("workspace.created", { workspaceId });
       return Ok(enrichedMetadata);
     } catch (error) {
@@ -5416,7 +5610,11 @@ export class WorkspaceService extends EventEmitter {
     );
   }
 
-  /** Internal entry point for TaskService callers that already hold the task-tree lifecycle lock. */
+  /**
+   * Internal entry point for TaskService callers that already hold the task-tree lifecycle lock,
+   * or that must not acquire it for lock-ordering reasons (e.g. createWorkspaceTurn cleanup runs
+   * under TaskService's creation mutex, which the tree lock is ordered before).
+   */
   async removeWhileTaskTreeLocked(workspaceId: string, force = false): Promise<Result<void>> {
     return await this.removeUnlocked(workspaceId, force);
   }
@@ -6019,6 +6217,26 @@ export class WorkspaceService extends EventEmitter {
       this.terminalService?.closeWorkspaceSessions(workspaceId);
       await this.closeDesktopSessionBestEffort(workspaceId, "remove");
 
+      // Capture managed roots before the config entry disappears: a worktree
+      // under a custom/legacy srcBaseDir cannot be reconstructed afterwards,
+      // which would leave its folder entry in the .code-workspace file forever.
+      // Best-effort: removal must proceed even when the capture fails.
+      let removedMetadata: FrontendWorkspaceMetadata | undefined;
+      let removedWorkspaceRoots: Map<string, string[]> | undefined;
+      try {
+        removedMetadata = (await this.config.getAllWorkspaceMetadata()).find(
+          (m) => m.id === workspaceId
+        );
+        removedWorkspaceRoots = removedMetadata
+          ? managedRootsByProject(removedMetadata)
+          : undefined;
+      } catch (error) {
+        log.debug("Failed to capture removed workspace roots for .code-workspace sync", {
+          workspaceId,
+          error,
+        });
+      }
+
       // Remove from config
       try {
         await this.config.removeWorkspace(workspaceId);
@@ -6059,6 +6277,16 @@ export class WorkspaceService extends EventEmitter {
       removedFromConfig = true;
       this.autoTitlingWorkspaces.delete(workspaceId);
 
+      if (removedMetadata || persistedWorkspace) {
+        await this.syncCodeWorkspaceFiles(
+          removedMetadata ?? {
+            projectPath: persistedWorkspace!.projectPath,
+            projects: persistedWorkspace!.projects,
+          },
+          removedWorkspaceRoots
+        );
+      }
+
       this.emit("metadata", {
         workspaceId,
         metadata: null,
@@ -6076,6 +6304,37 @@ export class WorkspaceService extends EventEmitter {
       return Err(`Failed to remove workspace: ${message}`);
     } finally {
       this.removingWorkspaces.delete(workspaceId);
+    }
+  }
+
+  /**
+   * Best-effort .code-workspace reconcile for every project involved in a
+   * workspace lifecycle change (multi-project workspaces touch several).
+   * syncProjectCodeWorkspace never throws, so lifecycle ops cannot fail here.
+   */
+  private async syncCodeWorkspaceFiles(
+    workspace: {
+      projectPath: string;
+      projects?: ReadonlyArray<{ projectPath: string }>;
+      subProjectPath?: string;
+    },
+    extraManagedRootDirsByProject?: ReadonlyMap<string, string[]>
+  ): Promise<void> {
+    const involvedPaths = new Set([
+      workspace.projectPath,
+      // A registered sub-project's file lists workspaces assigned to it even
+      // though they live in the parent's bucket.
+      ...(workspace.subProjectPath != null ? [workspace.subProjectPath] : []),
+      ...(workspace.projects ?? []).map((ref) => ref.projectPath),
+    ]);
+    for (const involvedPath of involvedPaths) {
+      await syncProjectCodeWorkspace(this.config, involvedPath, {
+        // Extras are scoped per project so one project's file never gains
+        // removal rights under another project's root.
+        extraManagedRootDirs: extraManagedRootDirsByProject?.get(
+          stripTrailingSlashes(involvedPath)
+        ),
+      });
     }
   }
 
@@ -6989,6 +7248,8 @@ export class WorkspaceService extends EventEmitter {
         this.emit("metadata", { workspaceId, metadata: enrichedMetadata });
       }
 
+      await this.syncCodeWorkspaceFiles(updatedMetadata);
+
       return Ok({ newWorkspaceId: workspaceId });
     } catch (error) {
       const message = getErrorMessage(error);
@@ -7501,7 +7762,10 @@ export class WorkspaceService extends EventEmitter {
    * that snapshot cannot preserve). Returns a discriminated union the frontend uses to decide
    * whether to show a destructive confirmation dialog.
    */
-  async preflightArchive(workspaceId: string): Promise<Result<ArchivePreflightResult>> {
+  async preflightArchive(
+    workspaceId: string,
+    options?: { worktreeArchiveBehaviorOverride?: WorktreeArchiveBehavior }
+  ): Promise<Result<ArchivePreflightResult>> {
     try {
       if (this.taskService?.hasActiveDescendantAgentTasksForWorkspace(workspaceId) === true) {
         return Err(ACTIVE_DESCENDANT_ARCHIVE_ERROR);
@@ -7512,11 +7776,10 @@ export class WorkspaceService extends EventEmitter {
         return Err("Workspace not found");
       }
 
-      const worktreeArchiveBehavior = this.getWorktreeArchiveBehavior();
-      const snapshotBehaviorEnabled =
-        !this.isSharedTaskWorkspace(workspaceId) &&
-        worktreeArchiveBehavior === "snapshot" &&
-        this.worktreeArchiveSnapshotService != null;
+      const snapshotBehaviorEnabled = this.isSnapshotArchiveEligibilityMutationSensitive(
+        workspaceId,
+        options?.worktreeArchiveBehaviorOverride ?? this.getWorktreeArchiveBehavior()
+      );
 
       if (!snapshotBehaviorEnabled) {
         return Ok({ kind: "ready" as const });
@@ -7546,13 +7809,624 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
+  /**
+   * True when this workspace's archive eligibility depends on its live untracked-file set:
+   * snapshot-behavior archives require an exact acknowledgement of the current untracked
+   * paths, so any worktree write can flip the archive between proceeding and bouncing with
+   * requires_confirmation. Model-facing lifecycle paths consult this to refuse interrupting
+   * active turns — a turn interrupted for an archive that then bounces would strand the
+   * workspace with destroyed in-flight work and no archive.
+   */
+  isSnapshotArchiveEligibilityMutationSensitive(
+    workspaceId: string,
+    // Callers that pin one behavior read across an interrupt+archive operation pass it here so
+    // this check agrees with the pinned sink decision.
+    worktreeArchiveBehavior: WorktreeArchiveBehavior = this.getWorktreeArchiveBehavior(),
+    // When provided, mirrors the sink's snapshot-capture scoping: only single-project managed
+    // worktrees ever capture a snapshot, so other runtimes (SSH/Docker) and multi-project
+    // targets are never untracked-file sensitive and may be interrupted safely.
+    metadata?: WorkspaceMetadata
+  ): boolean {
+    if (
+      metadata != null &&
+      (!isWorktreeRuntime(metadata.runtimeConfig) ||
+        (Array.isArray(metadata.projects) && metadata.projects.length > 1))
+    ) {
+      return false;
+    }
+    return (
+      !this.isSharedTaskWorkspace(workspaceId) &&
+      worktreeArchiveBehavior === "snapshot" &&
+      this.worktreeArchiveSnapshotService != null
+    );
+  }
+
+  /**
+   * Workspaces an external editor (VS Code/Cursor/Zed deep link or a custom editor command)
+   * was opened for. Like native terminals, external editors are untrackable once open (deep
+   * links leave no process handle; custom commands spawn detached), so opens are recorded
+   * stickily in memory and as a durable per-workspace marker that survives app restarts.
+   */
+  private readonly externalEditorWorkspaces = new Set<string>();
+
+  /**
+   * Marker ancestry batches per workspace. A batch begins with a disk probe (did a durable
+   * marker exist before this batch wrote one?) and collects one launch-evidence token per
+   * recorded open; tokens are removed only by failed launches. When the last token of a
+   * batch is removed, every open in the batch failed, so the batch's marker is deleted
+   * unless it predated the batch (an earlier session's editor may still be running behind
+   * it). Deep-link opens recorded via recordExternalEditorOpen retain their token forever
+   * (they launch in the renderer immediately after recording and cannot report failures
+   * back), pinning the marker. Probing per batch — not per call — prevents a marker written
+   * by an earlier in-flight open of the same batch from masquerading as pre-existing
+   * evidence when every open in the batch fails.
+   */
+  private readonly externalEditorMarkerBatches = new Map<
+    string,
+    { markerPreexisted: boolean; tokens: Set<symbol> }
+  >();
+
+  /**
+   * Serializes marker writes against failed-launch rollbacks per workspace: an unserialized
+   * rollback's unlink could interleave with a concurrent open's write and delete the marker
+   * protecting that open's live editor.
+   */
+  private readonly externalEditorMarkerLocks = new MutexMap<string>();
+
+  /**
+   * Editor-open recordings currently in flight per workspace, counted synchronously at
+   * entry and released when the recording settles. An in-flight recording has already
+   * passed (or will synchronously fail) the admission checks and its launch follows without
+   * rechecking, so hasExternalEditorOpen counts these alongside durable evidence — a
+   * concurrent failed launch's rollback may collapse the shared marker and cache entry, and
+   * without this count that collapse would make a still-recording sibling invisible to an
+   * archive that then removes the environment beneath the launching editor.
+   */
+  private readonly pendingExternalEditorRecordings = new Map<string, number>();
+
+  private externalEditorMarkerPath(workspaceId: string): string {
+    return path.join(this.config.getSessionDir(workspaceId), "external-editor-opened");
+  }
+
+  /**
+   * Disk probe for the durable marker. "unknown" means the probe failed in a way that cannot
+   * prove absence (EACCES, EIO, ...).
+   */
+  private async probeExternalEditorMarkerOnDisk(
+    workspaceId: string
+  ): Promise<"present" | "absent" | "unknown"> {
+    try {
+      await fsPromises.access(this.externalEditorMarkerPath(workspaceId));
+      return "present";
+    } catch (error) {
+      return isErrnoWithCode(error, "ENOENT") ? "absent" : "unknown";
+    }
+  }
+
+  /**
+   * Rollback handles for renderer-recorded deep-link opens, keyed by the CLIENT-generated
+   * launch token (client-side so the renderer can still redeem it when the recording
+   * response is lost mid-connection — a backend-minted token would die with the response).
+   * The renderer redeems a token via rollbackRecordedEditorOpen only when its launch
+   * provably never happened (placeholder closed before navigation, or an ambiguous
+   * recording RPC whose launch was abandoned). Entries for successful launches are retained
+   * for the app session — they pin the batch token that keeps the durable marker protected.
+   * A (buggy) reused token overwrites its old entry, whose pinned launch evidence then only
+   * over-refuses (fail closed).
+   */
+  private readonly externalEditorLaunchRollbacks = new Map<
+    string,
+    { workspaceId: string; rollback: () => Promise<void> }
+  >();
+
+  /**
+   * Rollback requests that arrived before their recording committed, keyed by launch token.
+   * The renderer can observe a transport rejection of its recordEditorOpen RPC while the
+   * backend handler is still awaiting marker persistence; its immediate rollback would find
+   * no rollback entry, no-op, and the handler would then commit a durable marker for a
+   * launch the renderer already abandoned — a false marker that permanently refuses future
+   * model-driven archives. An unknown-token rollback therefore leaves a tombstone that the
+   * recording consumes at commit time (in the same synchronous block that would register
+   * the rollback entry), undoing its own admission instead of committing. Bounded FIFO:
+   * tombstones whose recording never reached the backend are unredeemable, and evicting one
+   * can at worst leave a sticky marker behind (over-refuses archives — fail closed).
+   */
+  private readonly externalEditorRollbackTombstones = new Map<string, string>();
+
+  private static readonly EXTERNAL_EDITOR_ROLLBACK_TOMBSTONE_CAP = 1024;
+
+  /**
+   * Record that the user is opening this workspace in an external editor. Refuses while an
+   * agent-driven archive is gating the workspace: the check shares the synchronous block with
+   * the in-memory recording (mirroring TerminalService.openNative), so an archive gate armed
+   * first refuses the open while an open recorded first is observed by the sink's
+   * untrackable-app check before snapshot capture.
+   */
+  async recordExternalEditorOpen(workspaceId: string, launchToken: string): Promise<Result<void>> {
+    const admitted = await this.recordExternalEditorOpenForLaunch(workspaceId);
+    if (!admitted.success) {
+      return admitted;
+    }
+    // A rollback for this token that raced ahead of the recording (the renderer saw the RPC
+    // reject while this handler was still persisting the marker) is consumed here, in the
+    // same synchronous block that would otherwise register the rollback entry: the renderer
+    // has already abandoned the launch, so undo the admission instead of committing a marker
+    // no editor will ever sit behind.
+    if (this.externalEditorRollbackTombstones.get(launchToken) === workspaceId) {
+      this.externalEditorRollbackTombstones.delete(launchToken);
+      await admitted.data.rollbackAfterFailedLaunch();
+      return Err(`Editor open for ${workspaceId} was rolled back before its recording finished.`);
+    }
+    // Deep-link opens launch in the renderer immediately after this returns; the rollback
+    // entry lets the renderer report a launch that provably never happened so the marker
+    // cannot outlive it (see externalEditorLaunchRollbacks for why the token is
+    // client-generated).
+    this.externalEditorLaunchRollbacks.set(launchToken, {
+      workspaceId,
+      rollback: admitted.data.rollbackAfterFailedLaunch,
+    });
+    return Ok(undefined);
+  }
+
+  /**
+   * Redeems a recordExternalEditorOpen launch token after the renderer's placeholder window
+   * was closed before navigation (no editor launched). Idempotent for the renderer: unknown
+   * or already redeemed tokens succeed without touching durable state (they only leave a
+   * tombstone for a possibly in-flight recording), so renderer retries are safe.
+   */
+  async rollbackRecordedEditorOpen(
+    workspaceId: string,
+    launchToken: string
+  ): Promise<Result<void>> {
+    const entry = this.externalEditorLaunchRollbacks.get(launchToken);
+    if (entry?.workspaceId !== workspaceId) {
+      // Unknown token: the recording may still be in flight (its RPC rejected at the
+      // transport while the handler awaits marker persistence). Tombstone the token so the
+      // commit rolls itself back instead of persisting a marker for an abandoned launch
+      // (see externalEditorRollbackTombstones). Already-redeemed or never-recorded tokens
+      // leave an unredeemable tombstone the FIFO cap eventually evicts.
+      this.externalEditorRollbackTombstones.set(launchToken, workspaceId);
+      if (
+        this.externalEditorRollbackTombstones.size >
+        WorkspaceService.EXTERNAL_EDITOR_ROLLBACK_TOMBSTONE_CAP
+      ) {
+        const oldest = this.externalEditorRollbackTombstones.keys().next().value;
+        if (oldest != null) {
+          this.externalEditorRollbackTombstones.delete(oldest);
+        }
+      }
+      return Ok(undefined);
+    }
+    this.externalEditorLaunchRollbacks.delete(launchToken);
+    await entry.rollback();
+    return Ok(undefined);
+  }
+
+  /**
+   * Like recordExternalEditorOpen, but for callers that launch the editor themselves and can
+   * observe deterministic launch failures (the custom-editor route: EditorService validates
+   * the command and spawns nothing on failure). A failed launch must call
+   * rollbackAfterFailedLaunch so a marker this call created cannot become a sticky false
+   * positive that permanently refuses future model-driven snapshot/Coder-stop archives.
+   */
+  async recordExternalEditorOpenForLaunch(
+    workspaceId: string
+  ): Promise<Result<{ rollbackAfterFailedLaunch: () => Promise<void> }>> {
+    // Pending-recording admission pairing (mirrors TerminalService.openNative): the count is
+    // registered before any await — including the marker-lock wait, where a concurrent
+    // failed launch's rollback may collapse the shared marker and cache entry — so
+    // hasExternalEditorOpen stays true for the whole in-flight window. Refused recordings
+    // record nothing durable; the count simply releases in the finally.
+    this.pendingExternalEditorRecordings.set(
+      workspaceId,
+      (this.pendingExternalEditorRecordings.get(workspaceId) ?? 0) + 1
+    );
+    try {
+      return await this.recordExternalEditorOpenAdmitted(workspaceId);
+    } finally {
+      const remaining = (this.pendingExternalEditorRecordings.get(workspaceId) ?? 1) - 1;
+      if (remaining <= 0) {
+        this.pendingExternalEditorRecordings.delete(workspaceId);
+      } else {
+        this.pendingExternalEditorRecordings.set(workspaceId, remaining);
+      }
+    }
+  }
+
+  /** Body of recordExternalEditorOpenForLaunch after pending-recording admission. */
+  private async recordExternalEditorOpenAdmitted(
+    workspaceId: string
+  ): Promise<Result<{ rollbackAfterFailedLaunch: () => Promise<void> }>> {
+    if (this.archivingWorkspaces.has(workspaceId)) {
+      return Err(
+        `Workspace is being archived: ${workspaceId}. Unarchive it before opening an editor.`
+      );
+    }
+    const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    if (workspaceEntry == null) {
+      // Also a path-safety boundary: the marker path joins the raw ID beneath the sessions
+      // directory, so an unknown (possibly traversal-crafted, e.g. "../../.ssh") ID must
+      // never reach the filesystem.
+      return Err(`Workspace not found: ${workspaceId}`);
+    }
+    // Persisted archived state (not just an in-progress archive): a stale renderer can request
+    // an editor for an already-archived workspace whose checkout may already be snapshot and
+    // removed (mirrors TerminalService.openNative and the send/PTY/desktop admissions).
+    // Checked before the durable marker write so a refused open cannot permanently gate
+    // future snapshot archives of this workspace.
+    if (
+      isWorkspaceArchived(
+        workspaceEntry.workspace.archivedAt,
+        workspaceEntry.workspace.unarchivedAt
+      )
+    ) {
+      return Err(`Workspace is archived: ${workspaceId}. Unarchive it before opening an editor.`);
+    }
+    // Durable marker: the editor can outlive Xum, so a restart must not forget the open.
+    // Persistence failure is fatal to the open (mirrors TerminalService.openNative): an
+    // editor opened without the marker would be invisible to archive gating after a restart,
+    // so refusing here is the only fail-closed option (the in-memory Set covers just this
+    // app session).
+    let admissionToken: symbol;
+    try {
+      admissionToken = await this.externalEditorMarkerLocks.withLock(workspaceId, async () => {
+        // Batch-scoped ancestry (see externalEditorMarkerBatches): the pre-existence probe
+        // runs once per batch, before the batch's first write, so a marker written by an
+        // earlier in-flight open of this same batch cannot masquerade as evidence of a real
+        // prior launch. "unknown" probes count as pre-existing (fail closed).
+        let batch = this.externalEditorMarkerBatches.get(workspaceId);
+        const createdBatch = batch == null;
+        if (batch == null) {
+          const preexisting = await this.probeExternalEditorMarkerOnDisk(workspaceId);
+          batch = { markerPreexisted: preexisting !== "absent", tokens: new Set() };
+          this.externalEditorMarkerBatches.set(workspaceId, batch);
+        }
+        const markerPath = this.externalEditorMarkerPath(workspaceId);
+        try {
+          await fsPromises.mkdir(path.dirname(markerPath), { recursive: true });
+          await fsPromises.writeFile(markerPath, new Date().toISOString());
+        } catch (error) {
+          // A newly created, still-empty batch must not outlive a failed persistence attempt:
+          // its probe (possibly a fail-closed "unknown" during the same filesystem hiccup)
+          // would become stale ancestry for a later retry, permanently preserving a marker
+          // that retry writes even when its launch fails. Discarding it makes the next
+          // attempt re-probe the recovered disk. A joined batch keeps its live tokens.
+          if (createdBatch && batch.tokens.size === 0) {
+            this.externalEditorMarkerBatches.delete(workspaceId);
+            // The failed write may still have created (or truncated) the marker file —
+            // ENOSPC and I/O errors can reject after the open. When this batch's probe
+            // proved absence, that artifact is ours and no launch backs it: left behind, it
+            // reads as durable launch evidence across restarts and classifies as
+            // pre-existing on retry. An "unknown" probe stays fail closed (never unlink
+            // what might predate us); unlink failure only over-refuses archives.
+            if (!batch.markerPreexisted) {
+              try {
+                await fsPromises.unlink(markerPath);
+              } catch {
+                // Best-effort (fail closed).
+              }
+            }
+          }
+          throw error;
+        }
+        // The sticky in-memory record is a cache of the just-written marker; before this
+        // point the pending-recording count already keeps archive gates closed.
+        this.externalEditorWorkspaces.add(workspaceId);
+        // Launch evidence is registered under the same lock as the write so a concurrent
+        // failed launch's rollback can never observe the marker without the token.
+        const token = Symbol("external-editor-launch");
+        batch.tokens.add(token);
+        return token;
+      });
+    } catch (error) {
+      log.error("Failed to persist external editor marker", { workspaceId, error });
+      return Err(
+        `Cannot open an editor for ${workspaceId}: persisting the editor-open marker failed (${getErrorMessage(error)}), and without it archive safety checks would forget the editor after a restart.`
+      );
+    }
+    return Ok({
+      rollbackAfterFailedLaunch: () =>
+        this.rollbackExternalEditorMarkerAfterFailedLaunch(workspaceId, admissionToken),
+    });
+  }
+
+  /**
+   * Undo a failed editor launch's durable marker. The marker is deleted only when its whole
+   * ancestry batch failed (no launch-evidence token remains, so no editor launched or can
+   * still launch under it) and it did not predate the batch (an earlier session's editor may
+   * still be running behind it). Serialized with marker writes so the unlink can never race
+   * a concurrent open's write; deletion failure keeps the sticky marker (fail closed).
+   */
+  private async rollbackExternalEditorMarkerAfterFailedLaunch(
+    workspaceId: string,
+    token: symbol
+  ): Promise<void> {
+    await this.externalEditorMarkerLocks.withLock(workspaceId, async () => {
+      const batch = this.externalEditorMarkerBatches.get(workspaceId);
+      if (batch == null) {
+        // Unknown batch (cannot happen: batches are only closed here): keep everything.
+        return;
+      }
+      batch.tokens.delete(token);
+      if (batch.tokens.size > 0) {
+        return;
+      }
+      // Every open in the batch failed: close it so the next open starts a fresh probe.
+      this.externalEditorMarkerBatches.delete(workspaceId);
+      if (batch.markerPreexisted) {
+        return;
+      }
+      try {
+        await fsPromises.unlink(this.externalEditorMarkerPath(workspaceId));
+      } catch (error) {
+        if (!isErrnoWithCode(error, "ENOENT")) {
+          // The marker may still exist, so the in-memory cache entry must stay to match it.
+          log.error("Failed to roll back external editor marker after a failed launch", {
+            workspaceId,
+            error,
+          });
+          return;
+        }
+      }
+      this.externalEditorWorkspaces.delete(workspaceId);
+    });
+  }
+
+  private async hasExternalEditorOpen(workspaceId: string): Promise<boolean> {
+    // Recordings still in flight count as open: see pendingExternalEditorRecordings.
+    if ((this.pendingExternalEditorRecordings.get(workspaceId) ?? 0) > 0) {
+      return true;
+    }
+    if (this.externalEditorWorkspaces.has(workspaceId)) {
+      return true;
+    }
+    const probe = await this.probeExternalEditorMarkerOnDisk(workspaceId);
+    if (probe === "present") {
+      this.externalEditorWorkspaces.add(workspaceId);
+      return true;
+    }
+    // An "unknown" probe (EACCES, EIO, ...) cannot prove the marker is absent, and a false
+    // "absent" would let a snapshot archive remove the checkout under a surviving editor —
+    // fail closed without caching (the marker may still prove readable later).
+    return probe !== "absent";
+  }
+
+  /**
+   * Whether an untrackable local app (native terminal or external editor) was ever opened for
+   * this workspace. Such apps are detached and daemonize, so their lifetime cannot be tracked;
+   * the model-facing lifecycle path refuses snapshot archives (which remove the checkout) for
+   * such workspaces instead of pulling the directory out from under a live shell or editor.
+   */
+  async hasUntrackableExternalAppOpen(workspaceId: string): Promise<boolean> {
+    if ((await this.terminalService?.hasOpenedNativeTerminal(workspaceId)) === true) {
+      return true;
+    }
+    return await this.hasExternalEditorOpen(workspaceId);
+  }
+
+  /**
+   * Fresh background-bash check: refreshes exit statuses first so a long-exited process cannot
+   * hold an archive refusal open. Pre-gates use this; the synchronous snapshot in
+   * listLiveWorkspaceActivity covers the sink's same-tick gate. Also consults the durable
+   * spawn records for crash orphans: nohup/setsid children survive an unclean app shutdown
+   * while the manager's in-memory map resets, so a purely in-memory answer would let a
+   * post-restart snapshot archive remove the checkout under a still-running process.
+   */
+  async hasRunningBackgroundBashProcesses(workspaceId: string): Promise<boolean> {
+    const processes = await this.backgroundProcessManager.list(workspaceId);
+    if (processes.some((process) => process.status === "running")) {
+      return true;
+    }
+    return await this.backgroundProcessManager.hasOrphanedRunningBackgroundProcesses(workspaceId, {
+      extraRecordDirs: this.extraBgRecordDirsForWorkspace(workspaceId),
+    });
+  }
+
+  /**
+   * Devcontainer background spawn records live inside the container under
+   * `<workspaceFolder>/.xum/tmp/mux-bashes/<workspaceId>` (DevcontainerRuntime.tempDir()),
+   * which the standard workspace bind mount makes host-visible at the same path beneath the
+   * checkout. The crash-orphan probe's default root covers only the host /tmp layout, so
+   * devcontainer workspaces pass this root as an extra record dir; PIDs recorded there are
+   * container-namespace, which the scan treats as unprobeable (running records fail closed).
+   */
+  private extraBgRecordDirsForWorkspace(workspaceId: string): string[] {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    const workspace = entry?.workspace;
+    if (workspace == null || !isDevcontainerRuntime(workspace.runtimeConfig)) return [];
+    if (workspace.path.trim().length === 0) return [];
+    return [path.join(workspace.path, ".xum", "tmp", BG_OUTPUT_SUBDIR, workspaceId)];
+  }
+
+  /**
+   * Live user-facing activity that archiveUnlocked would silently terminate via
+   * stopLiveWorkspaceActivityForArchive. Model-facing lifecycle paths consult this to refuse
+   * archiving instead of killing activity that has no delegated workspace-turn handle.
+   */
+  listLiveWorkspaceActivity(workspaceId: string): {
+    streaming: boolean;
+    /** Queued or dispatching (PREPARING) messages that would start a stream after archive. */
+    queuedMessages: boolean;
+    /**
+     * Detached background bash processes still running (sync snapshot; may briefly read
+     * stale-running until the next lazy refresh — callers wanting freshness should await
+     * hasRunningBackgroundBashProcesses first).
+     */
+    backgroundBashProcesses: boolean;
+    terminalSessions: boolean;
+    desktopSession: boolean;
+  } {
+    return {
+      streaming: this.aiService.isStreaming(workspaceId),
+      queuedMessages:
+        this.hasQueuedMessages(workspaceId) || this.hasPendingQueuedOrPreparingTurn(workspaceId),
+      backgroundBashProcesses:
+        this.backgroundProcessManager.hasRunningBackgroundProcesses(workspaceId),
+      terminalSessions: this.terminalService?.hasWorkspaceSessions(workspaceId) === true,
+      desktopSession: this.desktopSessionManager?.has(workspaceId) === true,
+    };
+  }
+
+  /**
+   * Arm the archive admission gate BEFORE a destructive pre-archive step (interrupt_active
+   * turn interruption) and validate that no live user activity is already in flight. The
+   * sink's refuseLiveUserActivity gate runs only inside archiveUnlocked — after the caller
+   * has already destroyed the delegated turns — so a renderer send, bash execution,
+   * attachment upload, file-completion refresh, workflow admission, or user queue entry
+   * admitted between the caller's earlier activity snapshot and the sink would refuse the
+   * archive with the turns already lost. This hold adds the workspace to
+   * archivingWorkspaces (refusing new admissions synchronously, exactly like the sink) and
+   * checks the same counters in the same synchronous block; the caller carries the returned
+   * hold through the sink call so nothing can be admitted in between. Turn-shaped activity
+   * (active streams, the delegated queue entries themselves) is intentionally NOT checked:
+   * the caller is about to interrupt those turns, and the sink's admission-hold recheck
+   * re-validates queue emptiness after interruption. Queue entries beyond
+   * queuedDelegatedTurnCount — or any entry already dispatching (PREPARING) — fail closed
+   * here instead.
+   *
+   * The sink adds/removes the same Set entry around its own gate; both operations are
+   * idempotent, and by the time the sink's finally removes it either archivedAt is
+   * persisted (admissions refuse durably) or the archive failed and re-admission is
+   * correct.
+   */
+  acquirePreInterruptionArchiveHold(
+    workspaceId: string,
+    options: {
+      queuedDelegatedTurnCount: number;
+      /**
+       * Correlations of the collected active (starting/running) delegated turns on this
+       * workspace. The workspace's one active stream is exempt only when its muxMetadata
+       * correlates to one of these turns; a stream without that exact correlation (a user
+       * stream that replaced an ended delegated stream, or one belonging to a different
+       * turn) refuses the hold so interruption cannot stopStream() user work.
+       */
+      expectedDelegatedTurnCorrelations: readonly WorkspaceTurnTaskCorrelation[];
+    }
+  ): Result<Disposable> {
+    assert(workspaceId.length > 0, "acquirePreInterruptionArchiveHold requires workspaceId");
+    assert(
+      Number.isInteger(options.queuedDelegatedTurnCount) && options.queuedDelegatedTurnCount >= 0,
+      "acquirePreInterruptionArchiveHold requires a non-negative queuedDelegatedTurnCount"
+    );
+    this.archivingWorkspaces.add(workspaceId);
+    const session = this.getOrCreateSession(workspaceId);
+    // Freeze queue dispatch for the hold's whole lifetime (through interruption and the
+    // sink): counting queued delegated entries below is not enough on its own, because an
+    // expected entry could leave the queue and enter PREPARING between this check and
+    // interruptWorkspaceTurn's targeted queue removal — the interrupt would then mark the
+    // handle interrupted without stopping the dispatch, and the sink would refuse on the
+    // pending turn work with the tasks already destroyed. Admission blocks stack, so the
+    // sink acquiring its own hold is fine.
+    const turnAdmissionHold = session.holdTurnAdmission();
+    const hold: Disposable = {
+      [Symbol.dispose]: () => {
+        this.archivingWorkspaces.delete(workspaceId);
+        turnAdmissionHold[Symbol.dispose]();
+      },
+    };
+    const activityLabels: string[] = [];
+    if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
+      activityLabels.push("a message send in progress");
+    }
+    // A user stream admitted after the caller's activity snapshot has already released its
+    // send preflight, so the counter above cannot see it — recheck streaming itself and
+    // bind the exemption to the collected delegated turns: the caller's earlier snapshot is
+    // stale by now, so only a stream whose correlation metadata names one of those turns is
+    // interruptible delegated work. Anything else (no stream info, no correlation, or a
+    // different turn) is treated as user work and refuses.
+    if (this.aiService.isStreaming(workspaceId)) {
+      const streamCorrelation = parseWorkspaceTurnTaskCorrelation(
+        this.aiService.getStreamInfo(workspaceId)?.muxMetadata
+      );
+      const streamIsExpectedDelegatedTurn =
+        streamCorrelation != null &&
+        options.expectedDelegatedTurnCorrelations.some(
+          (expected) =>
+            expected.taskHandleId === streamCorrelation.taskHandleId &&
+            expected.ownerWorkspaceId === streamCorrelation.ownerWorkspaceId &&
+            expected.turnId === streamCorrelation.turnId
+        );
+      if (!streamIsExpectedDelegatedTurn) {
+        activityLabels.push("an active stream not attributable to the delegated turns");
+      }
+    }
+    if ((this.preflightExecCounts.get(workspaceId) ?? 0) > 0) {
+      activityLabels.push("a bash command executing");
+    }
+    if ((this.preflightStagingCounts.get(workspaceId) ?? 0) > 0) {
+      activityLabels.push("an attachment transfer in progress");
+    }
+    if ((this.preflightFileCompletionCounts.get(workspaceId) ?? 0) > 0) {
+      activityLabels.push("a file completion refresh in progress");
+    }
+    if ((this.preflightForkCounts.get(workspaceId) ?? 0) > 0) {
+      activityLabels.push("a fork of this workspace in progress");
+    }
+    // In-flight native-terminal/editor opens passed their own archive guards before this
+    // hold armed and surface only through the pending-open counters until their durable
+    // markers persist; the sink's untrackable-app check would refuse on them after the
+    // turns were already destroyed.
+    if ((this.pendingExternalEditorRecordings.get(workspaceId) ?? 0) > 0) {
+      activityLabels.push("an external editor open in progress");
+    }
+    if (this.terminalService?.hasPendingNativeTerminalOpen(workspaceId) === true) {
+      activityLabels.push("a native terminal open in progress");
+    }
+    if (hasInProcessWorkflowWork(workspaceId)) {
+      activityLabels.push("a workflow run starting or running");
+    }
+    if (this.backgroundProcessManager.hasRunningBackgroundProcesses(workspaceId)) {
+      activityLabels.push("running background bash processes");
+    }
+    if (this.terminalService?.hasWorkspaceSessions(workspaceId) === true) {
+      activityLabels.push("open terminal sessions");
+    }
+    if (this.desktopSessionManager?.has(workspaceId) === true) {
+      activityLabels.push("a desktop session");
+    }
+    // Narrow PREPARING/auto-retry check, NOT hasPendingQueuedOrPreparingTurn: that predicate
+    // also reports plain queued messages, which would refuse every interrupt_active on a
+    // queued delegated turn before the entry-count comparison below could attribute it.
+    // (Queued entries cannot dispatch into PREPARING after this check: the turn-admission
+    // hold above freezes queue dispatch for the hold's lifetime.)
+    if (session.isPreparingTurn() || session.hasPendingAutoRetry()) {
+      // A dispatching (PREPARING) entry has left the queue but not yet registered a
+      // stream, so the queue comparison below cannot attribute it — fail closed.
+      activityLabels.push("a message dispatching");
+    } else if (session.queuedMessageEntryCount() > options.queuedDelegatedTurnCount) {
+      activityLabels.push("queued messages beyond the delegated turns");
+    }
+    if (activityLabels.length > 0) {
+      hold[Symbol.dispose]();
+      return Err(
+        `Workspace has live activity (${activityLabels.join(", ")}) that interrupting and archiving would destroy or terminate. Wait for it to finish or ask the user to archive manually.`
+      );
+    }
+    return Ok(hold);
+  }
+
   async archive(
     workspaceId: string,
-    acknowledgedUntrackedPaths?: string[]
+    acknowledgedUntrackedPaths?: string[],
+    options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
     return await this.withTaskTreeLifecycleLock(workspaceId, async () =>
-      this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths)
+      this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths, options)
     );
+  }
+
+  /**
+   * Internal entry point for TaskService callers that already hold the task-tree lifecycle
+   * lock. The model-facing workspace lifecycle path pre-acquires that lock before its own
+   * lifecycle locks to preserve the global lock order (task-tree → task-creation mutex →
+   * workspace lifecycle), so the sink must not re-acquire it.
+   */
+  async archiveWhileTaskTreeLocked(
+    workspaceId: string,
+    acknowledgedUntrackedPaths?: string[],
+    options?: ArchiveWorkspaceOptions
+  ): Promise<Result<ArchiveWorkspaceResult>> {
+    return await this.archiveUnlocked(workspaceId, acknowledgedUntrackedPaths, options);
   }
 
   /**
@@ -7567,11 +8441,95 @@ export class WorkspaceService extends EventEmitter {
    */
   private async archiveUnlocked(
     workspaceId: string,
-    acknowledgedUntrackedPaths?: string[]
+    acknowledgedUntrackedPaths?: string[],
+    options?: ArchiveWorkspaceOptions
   ): Promise<Result<ArchiveWorkspaceResult>> {
     this.archivingWorkspaces.add(workspaceId);
+    let admissionHold: Disposable | undefined;
 
     try {
+      // Fail-closed live-activity gate for model-facing callers. This check and the
+      // archivingWorkspaces.add above run in one synchronous block, pairing with the
+      // synchronous entry guards in sendMessage: a send whose entry block ran first is
+      // visible here (preflightSendCounts or a registered stream) and refuses the archive;
+      // a send entering later observes archivingWorkspaces and is refused instead.
+      if (options?.refuseLiveUserActivity === true) {
+        const liveActivity = this.listLiveWorkspaceActivity(workspaceId);
+        const activityLabels: string[] = [];
+        if (liveActivity.streaming) activityLabels.push("an active stream");
+        if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
+          activityLabels.push("a message send in progress");
+        }
+        if ((this.preflightExecCounts.get(workspaceId) ?? 0) > 0) {
+          activityLabels.push("a bash command executing");
+        }
+        if ((this.preflightStagingCounts.get(workspaceId) ?? 0) > 0) {
+          activityLabels.push("an attachment transfer in progress");
+        }
+        if ((this.preflightFileCompletionCounts.get(workspaceId) ?? 0) > 0) {
+          activityLabels.push("a file completion refresh in progress");
+        }
+        if ((this.preflightForkCounts.get(workspaceId) ?? 0) > 0) {
+          activityLabels.push("a fork of this workspace in progress");
+        }
+        if (liveActivity.queuedMessages) activityLabels.push("queued messages");
+        if (liveActivity.backgroundBashProcesses) {
+          activityLabels.push("running background bash processes");
+        }
+        if (liveActivity.terminalSessions) activityLabels.push("open terminal sessions");
+        if (liveActivity.desktopSession) activityLabels.push("a desktop session");
+        // Workflow admissions pair with this gate (see workflowArchiveAdmission): an admission
+        // whose synchronous entry ran first is counted here; one entering later observes the
+        // archivingWorkspaces guard registered in the constructor and refuses.
+        if (hasInProcessWorkflowWork(workspaceId)) {
+          activityLabels.push("a workflow run starting or running");
+        }
+        if (activityLabels.length > 0) {
+          return Err(
+            `Workspace has live activity (${activityLabels.join(", ")}) that archiving would terminate. Wait for it to finish or ask the user to archive manually.`
+          );
+        }
+        // Hold the session's turn admission for the remainder of the archive: queued entries
+        // dispatch through AgentSession's internal send path, which bypasses
+        // WorkspaceService.sendMessage's archived guard, so without the hold a message queued
+        // during this operation could start a hidden stream after archivedAt persists. Armed
+        // synchronously with the checks above and released in this function's finally; the
+        // post-arm recheck mirrors acquireContextMutationAdmissionGuard's pairing argument (a
+        // turn admitted first is observed here; a turn admitted later observes the block).
+        const session = this.getOrCreateSession(workspaceId);
+        admissionHold = session.holdTurnAdmission();
+        if (session.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId)) {
+          return Err(
+            "Workspace has pending turn work that archiving would terminate. Wait for it to finish or ask the user to archive manually."
+          );
+        }
+        // Post-arm workflow recheck: an admission that entered before archivingWorkspaces was
+        // armed either still holds its in-process admission (caught synchronously above) or
+        // released it only after a durably active run record existed (caught here); admissions
+        // entering later observe the armed guard and refuse. This closes the window between
+        // the caller's earlier active-run snapshot and this sink.
+        if (
+          (await this.taskService?.hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId)) === true
+        ) {
+          return Err(
+            "Workspace has active workflow runs that archiving would orphan. Wait for them to finish or ask the user to archive manually."
+          );
+        }
+        // Crash-orphan background processes: nohup/setsid children of a previous app session
+        // survive an unclean shutdown while the manager's in-memory map (checked in the
+        // synchronous gate above) resets. Orphans are static post-crash artifacts, not racing
+        // admissions, so this sink recheck is defense-in-depth against callers that skipped
+        // the fresh pre-gate.
+        if (
+          await this.backgroundProcessManager.hasOrphanedRunningBackgroundProcesses(workspaceId, {
+            extraRecordDirs: this.extraBgRecordDirsForWorkspace(workspaceId),
+          })
+        ) {
+          return Err(
+            "Workspace has background processes surviving from a previous app session that archiving could strand. Terminate them or ask the user to archive manually."
+          );
+        }
+      }
       const workspace = this.config.findWorkspace(workspaceId);
       if (!workspace) {
         return Err("Workspace not found");
@@ -7613,20 +8571,78 @@ export class WorkspaceService extends EventEmitter {
         }
       }
 
+      // The abort above only signals: the fire-and-forget init hook process (create/
+      // createMulti/fork) may still be writing to the checkout or reconnecting. Wait for its
+      // retained settlement — a deterministic exit signal, not a timer — before snapshot
+      // capture, checkout deletion, or Coder hooks can proceed under it. Checked outside the
+      // init-state branch because state may already be cleared while the process is exiting;
+      // the retained promise never rejects.
+      const initSettlement = this.initSettlementPromises.get(workspaceId);
+      if (initSettlement != null) {
+        await initSettlement;
+      }
+
       const { projectPath, workspacePath } = workspace;
-      const worktreeArchiveBehavior = this.getWorktreeArchiveBehavior();
+      // Prefer the caller's pinned behavior: model-facing callers make interruption and
+      // eligibility decisions against one read, and the sink honoring that same read keeps the
+      // whole operation coherent under concurrent settings flips.
+      const worktreeArchiveBehavior =
+        options?.worktreeArchiveBehaviorOverride ?? this.getWorktreeArchiveBehavior();
+      const forbidDeleteCheckNeeded =
+        options?.forbidWorktreeCheckoutDeletion === true && worktreeArchiveBehavior === "delete";
       const snapshotBehaviorEnabled =
         !this.isSharedTaskWorkspace(workspaceId) &&
         worktreeArchiveBehavior === "snapshot" &&
         this.worktreeArchiveSnapshotService != null;
 
       let beforeArchiveMetadata: WorkspaceMetadata | undefined;
-      if (this.workspaceLifecycleHooks || snapshotBehaviorEnabled) {
+      if (this.workspaceLifecycleHooks || snapshotBehaviorEnabled || forbidDeleteCheckNeeded) {
         const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
         if (!metadataResult.success) {
           return Err(metadataResult.error);
         }
         beforeArchiveMetadata = metadataResult.data;
+      }
+
+      // Enforced at the sink, not just in callers: this read is the same snapshot passed to the
+      // afterArchive worktree-deletion hook, so a concurrent settings flip cannot slip a
+      // checkout deletion past a caller that forbade it. Scoped to targets the worktree
+      // archive hook would actually delete (managed worktrees not shared via isolation:none);
+      // for other runtimes the delete policy cannot destroy a checkout, so it must not make
+      // reversible archive unavailable. Fails closed when metadata is unavailable.
+      if (forbidDeleteCheckNeeded) {
+        const runsManagedWorktreeDeletion =
+          beforeArchiveMetadata == null ||
+          (isWorktreeRuntime(beforeArchiveMetadata.runtimeConfig) &&
+            beforeArchiveMetadata.taskIsolation !== "none");
+        if (runsManagedWorktreeDeletion) {
+          return Err(
+            'Worktree archive behavior is set to "Delete checkout", which this caller forbids because it deletes the checkout without user confirmation.'
+          );
+        }
+      }
+
+      // Snapshot the Coder archive policy once: the before-archive hook receives this same
+      // value, so a settings flip cannot slip a remote deletion past the guard below. Callers
+      // that already pinned a read before committing to the archive (e.g. before interrupting
+      // turns) pass it as an override so the whole operation honors one policy.
+      const coderWorkspaceArchiveBehavior =
+        options?.coderWorkspaceArchiveBehaviorOverride ??
+        this.config.loadConfigOrDefault().coderWorkspaceArchiveBehavior ??
+        DEFAULT_CODER_ARCHIVE_BEHAVIOR;
+      const beforeArchiveRuntimeConfig = beforeArchiveMetadata?.runtimeConfig;
+      const isDedicatedCoderWorkspace =
+        beforeArchiveRuntimeConfig != null &&
+        isSSHRuntime(beforeArchiveRuntimeConfig) &&
+        beforeArchiveRuntimeConfig.coder != null &&
+        beforeArchiveRuntimeConfig.coder.existingWorkspace !== true &&
+        (beforeArchiveRuntimeConfig.coder.workspaceName?.trim() ?? "") !== "";
+      if (options?.forbidCoderWorkspaceDeletion === true) {
+        if (isDedicatedCoderWorkspace && coderWorkspaceArchiveBehavior === "delete") {
+          return Err(
+            'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior.'
+          );
+        }
       }
 
       const canSnapshotManagedWorktree =
@@ -7639,6 +8655,25 @@ export class WorkspaceService extends EventEmitter {
         Array.isArray(beforeArchiveMetadata.projects) &&
         beforeArchiveMetadata.projects.length > 1;
       const needsSnapshotCapture = canSnapshotManagedWorktree && !shouldSkipSnapshotCapture;
+
+      // Native terminals and external editors are detached and untrackable (see
+      // hasUntrackableExternalAppOpen): when this archive would capture a snapshot and remove
+      // the managed worktree — or stop a dedicated remote Coder workspace the user may still
+      // be connected to through such an app — a model-driven archive must not pull the
+      // environment out from under a user's live shell or editor. Mirrors the lifecycle
+      // caller's early refusal against the same pinned behavior reads. ("delete" for a
+      // dedicated Coder workspace is refused outright above, so non-"keep" here means stop.)
+      const stopsDedicatedCoderWorkspace =
+        isDedicatedCoderWorkspace && coderWorkspaceArchiveBehavior !== "keep";
+      if (
+        options?.refuseLiveUserActivity === true &&
+        (needsSnapshotCapture || stopsDedicatedCoderWorkspace) &&
+        (await this.hasUntrackableExternalAppOpen(workspaceId))
+      ) {
+        return Err(
+          "A native terminal or external editor was opened for this workspace and its lifetime cannot be tracked; the archive policy would remove the checkout or stop the dedicated remote Coder workspace under it. Ask the user to archive this workspace manually."
+        );
+      }
 
       if (needsSnapshotCapture && beforeArchiveMetadata) {
         const initialArchiveConfirmationResult = await this.getArchiveUntrackedFilesConfirmation({
@@ -7662,6 +8697,10 @@ export class WorkspaceService extends EventEmitter {
         const hookResult = await this.workspaceLifecycleHooks.runBeforeArchive({
           workspaceId,
           workspaceMetadata: beforeArchiveMetadata,
+          coderWorkspaceArchiveBehavior,
+          // Model-facing archives (refuseLiveUserActivity) must not stop a running remote
+          // workspace under a surviving detached job the host-local orphan scans cannot see.
+          refuseStopUnderUnverifiedRemoteJobs: options?.refuseLiveUserActivity === true,
         });
         if (!hookResult.success) {
           return Err(hookResult.error);
@@ -7792,6 +8831,9 @@ export class WorkspaceService extends EventEmitter {
           await this.workspaceLifecycleHooks.runAfterArchive({
             workspaceId,
             workspaceMetadata: hookMetadata,
+            // Same read that decided snapshot capture above; keeps the deletion decision
+            // consistent with the capture decision under concurrent settings changes.
+            worktreeArchiveBehavior,
           });
           await this.emitCurrentWorkspaceMetadata(workspaceId);
         }
@@ -7810,12 +8852,18 @@ export class WorkspaceService extends EventEmitter {
       // disposal here only frees runtimes and spine middleware. Never throws.
       await agentPluginHookService.disposeWorkspace(workspaceId);
 
+      await this.syncCodeWorkspaceFiles({
+        projectPath,
+        projects: beforeArchiveMetadata?.projects,
+        subProjectPath: beforeArchiveMetadata?.subProjectPath,
+      });
       eventSpine.emit("workspace.archived", { workspaceId });
       return Ok({ kind: "archived" as const });
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to archive workspace: ${message}`);
     } finally {
+      admissionHold?.[Symbol.dispose]();
       this.archivingWorkspaces.delete(workspaceId);
     }
   }
@@ -7824,6 +8872,25 @@ export class WorkspaceService extends EventEmitter {
    * Unarchive a workspace. Restores it to the main sidebar view.
    */
   async unarchive(workspaceId: string): Promise<Result<void>> {
+    // Serialize with archive under the same task-tree lifecycle lock: an unarchive admitted
+    // while an archive is still running its post-persist cleanup (e.g. worktree deletion after
+    // a snapshot) could restore a checkout the archive hook then removes, leaving a visible
+    // workspace with a missing checkout.
+    return await this.withTaskTreeLifecycleLock(workspaceId, async () =>
+      this.unarchiveUnlocked(workspaceId)
+    );
+  }
+
+  /**
+   * Internal entry point for TaskService callers that already hold the task-tree lifecycle
+   * lock (the model-facing unarchive path pre-acquires it for lock ordering; agent-task
+   * ancestry unarchive runs under the send path's tree lock).
+   */
+  async unarchiveWhileTaskTreeLocked(workspaceId: string): Promise<Result<void>> {
+    return await this.unarchiveUnlocked(workspaceId);
+  }
+
+  private async unarchiveUnlocked(workspaceId: string): Promise<Result<void>> {
     try {
       const workspace = this.config.findWorkspace(workspaceId);
       if (!workspace) {
@@ -7936,6 +9003,12 @@ export class WorkspaceService extends EventEmitter {
       if (this.workspaceLifecycleHooks || this.worktreeArchiveSnapshotService) {
         await this.emitCurrentWorkspaceMetadata(workspaceId);
       }
+
+      await this.syncCodeWorkspaceFiles({
+        projectPath,
+        projects: hookMetadata?.projects,
+        subProjectPath: hookMetadata?.subProjectPath,
+      });
 
       return Ok(undefined);
     } catch (error) {
@@ -8693,6 +9766,19 @@ export class WorkspaceService extends EventEmitter {
     sourceMessageId?: string,
     pendingAutoTitle?: boolean
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; projectPath: string }>> {
+    // Source-fork admission pairs with the model-facing archive gates (same synchronous
+    // block as the entry guards in sendMessage/executeBash): a fork admitted first is
+    // visible to the sink and the pre-interruption hold via preflightForkCounts and refuses
+    // the archive; a fork entering later observes archivingWorkspaces and refuses here.
+    // Without this pairing, a Coder-stop archive could stop the dedicated remote workspace
+    // mid-clone while the fork shares it, and the child's init could restart it afterwards.
+    if (this.archivingWorkspaces.has(sourceWorkspaceId)) {
+      return Err(`Workspace is being archived: ${sourceWorkspaceId}. Unarchive it before forking.`);
+    }
+    using _preflightFork = this.acquirePreflightAdmission(
+      this.preflightForkCounts,
+      sourceWorkspaceId
+    );
     try {
       const sourceMetadataResult = await this.aiService.getWorkspaceMetadata(sourceWorkspaceId);
       if (!sourceMetadataResult.success) {
@@ -8891,6 +9977,8 @@ export class WorkspaceService extends EventEmitter {
         newWorkspaceId,
         log
       );
+      // Also retained for archive: see initSettlementPromises.
+      this.retainInitSettlement(newWorkspaceId, initSettled);
 
       // Create a fresh source runtime handle because DockerRuntime.forkWorkspace() can
       // mutate the original runtime's container identity to target the new workspace.
@@ -9194,6 +10282,7 @@ export class WorkspaceService extends EventEmitter {
       const enrichedMetadata = this.enrichFrontendMetadata(metadata);
       session.emitMetadata(enrichedMetadata);
 
+      await this.syncCodeWorkspaceFiles(metadata);
       eventSpine.emit("workspace.created", { workspaceId: newWorkspaceId });
       return Ok({ metadata: enrichedMetadata, projectPath: foundProjectPath });
     } catch (error) {
@@ -9364,6 +10453,27 @@ export class WorkspaceService extends EventEmitter {
     return foundDecision && current;
   }
 
+  /**
+   * Increment a preflight admission counter in the caller's synchronous entry block and
+   * return a disposable releasing it. Pairs renderer-initiated workspace activity with the
+   * archive gate (see archiveUnlocked's refuseLiveUserActivity): an activity admitted first
+   * holds the gate open until it settles, and one entering after the gate armed observes
+   * archivingWorkspaces and refuses at entry.
+   */
+  private acquirePreflightAdmission(counts: Map<string, number>, workspaceId: string): Disposable {
+    counts.set(workspaceId, (counts.get(workspaceId) ?? 0) + 1);
+    return {
+      [Symbol.dispose]: () => {
+        const remaining = (counts.get(workspaceId) ?? 1) - 1;
+        if (remaining <= 0) {
+          counts.delete(workspaceId);
+        } else {
+          counts.set(workspaceId, remaining);
+        }
+      },
+    };
+  }
+
   async stageAttachment(input: {
     workspaceId: string;
     filename: string;
@@ -9371,9 +10481,22 @@ export class WorkspaceService extends EventEmitter {
     sizeBytes: number;
     dataBase64: string;
   }): Promise<Result<StagedWorkspaceAttachment, string>> {
+    // Archive admission pairing (same synchronous block, mirroring executeBash): staging
+    // writes into the checkout, so an archive must not capture/remove it mid-upload.
+    if (this.archivingWorkspaces.has(input.workspaceId)) {
+      return Err("Workspace is being archived. Unarchive it before attaching files.");
+    }
+    using _preflightStaging = this.acquirePreflightAdmission(
+      this.preflightStagingCounts,
+      input.workspaceId
+    );
+
     const metadata = await this.getInfo(input.workspaceId);
     if (metadata == null) {
       return Err("Workspace not found");
+    }
+    if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) {
+      return Err("Workspace is archived. Unarchive it before attaching files.");
     }
 
     // Deferred runtimes (Coder/SSH/devcontainer) return from create before
@@ -9396,9 +10519,26 @@ export class WorkspaceService extends EventEmitter {
     workspaceId: string;
     stagedPath: string;
   }): Promise<Result<DownloadedStagedWorkspaceAttachment, string>> {
+    // Archive admission pairing (same synchronous block, mirroring stageAttachment): the
+    // download reads from the checkout through the runtime, so an archive must not remove a
+    // snapshot-managed checkout mid-read — and on a dedicated Coder target the admitted
+    // read could reconnect and restart a workspace the archive just stopped. Downloads
+    // share the staging counter: both directions are attachment transfers the archive
+    // gates refuse on identically.
+    if (this.archivingWorkspaces.has(input.workspaceId)) {
+      return Err("Workspace is being archived. Unarchive it before downloading attachments.");
+    }
+    using _preflightDownload = this.acquirePreflightAdmission(
+      this.preflightStagingCounts,
+      input.workspaceId
+    );
+
     const metadata = await this.getInfo(input.workspaceId);
     if (metadata == null) {
       return Err("Workspace not found");
+    }
+    if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) {
+      return Err("Workspace is archived. Unarchive it before downloading attachments.");
     }
 
     const { runtime, workspacePath } = createRuntimeContextForWorkspace(metadata);
@@ -9494,6 +10634,35 @@ export class WorkspaceService extends EventEmitter {
           type: "unknown",
           raw: "Workspace is being deleted. Please wait and try again.",
         });
+      }
+
+      // Archive admission pairing (see archiveUnlocked's refuseLiveUserActivity gate): these
+      // checks run in the same synchronous block as the preflightSendCounts increment below,
+      // so a send and an archive always observe each other — whichever entry block runs first
+      // refuses the other side. Also refuses sends to already-archived workspaces so no stream
+      // can run hidden in a workspace the UI no longer surfaces.
+      if (this.archivingWorkspaces.has(workspaceId)) {
+        log.debug("sendMessage blocked: workspace is being archived", { workspaceId });
+        return Err({
+          type: "unknown",
+          raw: "Workspace is being archived. Unarchive it before sending messages.",
+        });
+      }
+      {
+        const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+        if (
+          workspaceEntry != null &&
+          isWorkspaceArchived(
+            workspaceEntry.workspace.archivedAt,
+            workspaceEntry.workspace.unarchivedAt
+          )
+        ) {
+          log.debug("sendMessage blocked: workspace is archived", { workspaceId });
+          return Err({
+            type: "unknown",
+            raw: "Workspace is archived. Unarchive it before sending messages.",
+          });
+        }
       }
 
       if (this.contextMutationWorkspaces.has(workspaceId)) {
@@ -9959,6 +11128,52 @@ export class WorkspaceService extends EventEmitter {
           raw: "Workspace is being deleted. Please wait and try again.",
         });
       }
+
+      // Archive admission pairing (see archiveUnlocked's refuseLiveUserActivity gate): resume
+      // is a stream-starting entry point just like sendMessage, so it shares the same
+      // synchronous guards — otherwise a resume admitted after the gate's activity snapshot
+      // could start a provider stream hidden in the archived workspace.
+      if (this.archivingWorkspaces.has(workspaceId)) {
+        log.debug("resumeStream blocked: workspace is being archived", { workspaceId });
+        return Err({
+          type: "unknown",
+          raw: "Workspace is being archived. Unarchive it before resuming.",
+        });
+      }
+      {
+        const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+        if (
+          workspaceEntry != null &&
+          isWorkspaceArchived(
+            workspaceEntry.workspace.archivedAt,
+            workspaceEntry.workspace.unarchivedAt
+          )
+        ) {
+          log.debug("resumeStream blocked: workspace is archived", { workspaceId });
+          return Err({
+            type: "unknown",
+            raw: "Workspace is archived. Unarchive it before resuming.",
+          });
+        }
+      }
+      // Count this resume as in-preflight in the same synchronous block as the checks above
+      // (mirrors sendMessage): the archive gate refuses while a resume that already passed
+      // these guards is still doing pre-admission work, so neither side can slip past the
+      // other's snapshot.
+      this.preflightSendCounts.set(
+        workspaceId,
+        (this.preflightSendCounts.get(workspaceId) ?? 0) + 1
+      );
+      using _preflightResume = {
+        [Symbol.dispose]: () => {
+          const remaining = (this.preflightSendCounts.get(workspaceId) ?? 1) - 1;
+          if (remaining <= 0) {
+            this.preflightSendCounts.delete(workspaceId);
+          } else {
+            this.preflightSendCounts.set(workspaceId, remaining);
+          }
+        },
+      };
 
       // Guard: avoid creating sessions for workspaces that don't exist anymore.
       if (!this.config.findWorkspace(workspaceId)) {
@@ -11721,8 +12936,22 @@ export class WorkspaceService extends EventEmitter {
 
     const resolvedLimit = Math.min(Math.max(1, Math.trunc(limit)), 50);
 
+    // Archive admission pairing (same synchronous block, mirroring executeBash): the refresh
+    // below runs git through the target runtime, which can re-wake a Coder workspace the
+    // archive hook just stopped. Completions degrade gracefully to empty instead of erroring.
+    if (this.archivingWorkspaces.has(workspaceId)) {
+      return { paths: [] };
+    }
+    using _preflightCompletions = this.acquirePreflightAdmission(
+      this.preflightFileCompletionCounts,
+      workspaceId
+    );
+
     const metadata = await this.getInfo(workspaceId);
     if (!metadata) {
+      return { paths: [] };
+    }
+    if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) {
       return { paths: [] };
     }
 
@@ -11739,6 +12968,13 @@ export class WorkspaceService extends EventEmitter {
 
     const isStale = cacheEntry.fetchedAt === 0 || now - cacheEntry.fetchedAt > CACHE_TTL_MS;
     if (isStale && !cacheEntry.refreshing) {
+      // The refresh can outlive this call, so it holds its own admission: acquired here
+      // while the outer admission is still held (no unguarded gap) and released when the
+      // refresh settles, keeping the archive gate closed for the runtime work's duration.
+      const refreshAdmission = this.acquirePreflightAdmission(
+        this.preflightFileCompletionCounts,
+        workspaceId
+      );
       cacheEntry.refreshing = (async () => {
         const previousIndex = cacheEntry.index;
 
@@ -11762,6 +12998,7 @@ export class WorkspaceService extends EventEmitter {
         }
       })().finally(() => {
         cacheEntry.refreshing = undefined;
+        refreshAdmission[Symbol.dispose]();
       });
     }
 
@@ -11806,6 +13043,24 @@ export class WorkspaceService extends EventEmitter {
     if (this.archivingWorkspaces.has(workspaceId)) {
       return Err(`Workspace ${workspaceId} is being archived; cannot execute bash`);
     }
+    // Archive admission pairing (same synchronous block as the guard above, mirroring
+    // sendMessage's preflightSendCounts): the metadata/init awaits below would otherwise
+    // hide this in-flight exec from the archive gate, letting an archive capture/remove the
+    // checkout (or stop a dedicated Coder workspace) while the admitted command resumes
+    // against it — on Coder even waking the workspace the archive hook just stopped. Held
+    // until the command settles; an archive arming later observes the count, and an exec
+    // entering after the gate armed is refused above.
+    this.preflightExecCounts.set(workspaceId, (this.preflightExecCounts.get(workspaceId) ?? 0) + 1);
+    using _preflightExec = {
+      [Symbol.dispose]: () => {
+        const remaining = (this.preflightExecCounts.get(workspaceId) ?? 1) - 1;
+        if (remaining <= 0) {
+          this.preflightExecCounts.delete(workspaceId);
+        } else {
+          this.preflightExecCounts.set(workspaceId, remaining);
+        }
+      },
+    };
 
     const metadataResult = await this.aiService.getWorkspaceMetadata(workspaceId);
     if (!metadataResult.success) {

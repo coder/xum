@@ -1,11 +1,25 @@
+import type { Dirent } from "node:fs";
+import * as fsPromises from "node:fs/promises";
+import * as nodePath from "node:path";
 import type { Runtime, BackgroundHandle } from "@/node/runtime/Runtime";
-import { spawnProcess } from "./backgroundProcessExecutor";
+import {
+  spawnProcess,
+  localBgWorkspaceDir,
+  spawnRecordsAreHostLocal,
+  quotePathForShell,
+  BG_META_FILENAME,
+  BG_EXIT_CODE_FILENAME,
+  BG_OUTPUT_SUBDIR,
+} from "./backgroundProcessExecutor";
+import { execBuffered } from "@/node/utils/runtime/helpers";
+import { Ok, Err, type Result } from "@/common/types/result";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "./log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import { BASH_MAX_LINE_BYTES } from "@/common/constants/toolLimits";
 import { stripAnsiControlChars } from "@/node/utils/ansi";
+import { isErrnoWithCode } from "@/node/utils/fs";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 
 const DEFAULT_BACKGROUND_BASH_TAIL_BYTES = 64_000;
@@ -29,6 +43,26 @@ export function computeTailStartOffset(fileSizeBytes: number, tailBytes: number)
   );
 
   return Math.max(0, fileSizeBytes - tailBytes);
+}
+
+/**
+ * Narrow a persisted meta.json spawn record to the fields the crash-orphan probe needs.
+ * Records are written by this app but can be truncated by a crash mid-write; anything
+ * malformed is treated as absent rather than trusted.
+ */
+export function parseSpawnRecordMeta(raw: string): { pid: number; status: string } | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  if (!("pid" in parsed) || !("status" in parsed)) return null;
+  const { pid, status } = parsed;
+  if (typeof pid !== "number" || !Number.isInteger(pid)) return null;
+  if (typeof status !== "string") return null;
+  return { pid, status };
 }
 
 import { EventEmitter } from "events";
@@ -231,6 +265,14 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   // All per-process state (read position, output lock) is stored in BackgroundProcess
   // so cleanup is automatic when the process is removed from this map.
   private processes = new Map<string, BackgroundProcess>();
+
+  // Process IDs claimed by in-flight spawns that have not yet registered in `processes`.
+  // Allocation must be race-free across the awaits between choosing an ID and registering
+  // the process: two concurrent same-name spawns sharing one directory would also share
+  // meta.json/exit_code, and the first exit would settle the record while the other process
+  // still writes — blinding the crash-orphan archive gates. Reserved synchronously when a
+  // candidate is chosen; released when the spawn registers or fails.
+  private readonly reservedProcessIds = new Set<string>();
 
   // Base directory for process output files
   private readonly bgOutputDir: string;
@@ -697,12 +739,38 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
     let processId = baseId;
     let suffix = 1;
-    while (this.processes.has(processId)) {
+    while (this.processes.has(processId) || this.reservedProcessIds.has(processId)) {
       processId = `${baseId} (${suffix})`;
       suffix++;
     }
 
     return processId;
+  }
+
+  /**
+   * Allocate a unique process ID and reserve it in the same synchronous step.
+   *
+   * Foreground-to-background migration awaits between choosing its ID and registering the
+   * migrated process; without a reservation, two concurrent same-name migrations would both
+   * be handed the same ID and share one output directory and manager entry — the first exit
+   * would then write the shared exit marker and settle the survivor's records, blinding
+   * archive gating after an unclean restart. Callers release on success only after the
+   * process is registered (the processes map then holds the name) and on failure only once
+   * the process's exit settles, so an unverifiable survivor keeps its name reserved for the
+   * session.
+   */
+  reserveUniqueProcessId(baseId: string): { processId: string; release: () => void } {
+    const processId = this.generateUniqueProcessId(baseId);
+    this.reservedProcessIds.add(processId);
+    let released = false;
+    return {
+      processId,
+      release: () => {
+        if (released) return;
+        released = true;
+        this.reservedProcessIds.delete(processId);
+      },
+    };
   }
 
   /**
@@ -738,7 +806,54 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   > {
     log.debug(`BackgroundProcessManager.spawn() called for workspace ${workspaceId}`);
 
-    const processId = this.generateUniqueProcessId(config.displayName);
+    let processId = this.generateUniqueProcessId(config.displayName);
+    // Reserved synchronously in the same tick each candidate is chosen (see
+    // reservedProcessIds): the awaits below would otherwise let a concurrent same-name spawn
+    // allocate the same directory. Released when this spawn registers or returns — the
+    // disposer reads the current processId, which the disk loop keeps in sync. Failed
+    // non-host-record spawns keep their reservation for the app session (see below).
+    this.reservedProcessIds.add(processId);
+    let retainReservationAfterFailure = false;
+    using _reservation = {
+      [Symbol.dispose]: () => {
+        if (!retainReservationAfterFailure) {
+          this.reservedProcessIds.delete(processId);
+        }
+      },
+    };
+    // Restart-unique directories: skip names whose durable directory may still belong to a
+    // surviving process from a previous session — see localSpawnDirMayHoldLiveProcess for
+    // why reuse would blind archive gating. Host-local records are probed on the local
+    // filesystem with host PID checks; all other layouts (SSH/Coder, Docker, devcontainer)
+    // live in the runtime's exec namespace and are probed through the runtime instead.
+    if (spawnRecordsAreHostLocal(runtime)) {
+      let suffix = 2;
+      while (await this.localSpawnDirMayHoldLiveProcess(workspaceId, processId)) {
+        this.reservedProcessIds.delete(processId);
+        do {
+          processId = `${config.displayName} (${suffix})`;
+          suffix++;
+        } while (this.processes.has(processId) || this.reservedProcessIds.has(processId));
+        this.reservedProcessIds.add(processId);
+      }
+    } else {
+      let suffix = 2;
+      for (;;) {
+        const probe = await this.runtimeSpawnDirMayHoldLiveProcess(runtime, workspaceId, processId);
+        if (probe === "free") break;
+        if (probe !== "held") {
+          // Unreachable/garbled probe: abort rather than loop forever against a dead host.
+          // Nothing was written under this name, so the reservation is safe to release.
+          return { success: false, error: probe.error };
+        }
+        this.reservedProcessIds.delete(processId);
+        do {
+          processId = `${config.displayName} (${suffix})`;
+          suffix++;
+        } while (this.processes.has(processId) || this.reservedProcessIds.has(processId));
+        this.reservedProcessIds.add(processId);
+      }
+    }
 
     // Spawn via executor with background infrastructure
     // spawnProcess uses runtime.tempDir() internally for output directory
@@ -751,6 +866,14 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
     if (!result.success) {
       log.debug(`BackgroundProcessManager: Failed to spawn: ${result.error}`);
+      // Non-host record layouts: a failed spawn may leave the record directory holding a
+      // live detached process (preserved ambiguous PID echo, post-dispatch transport throw,
+      // or a failed best-effort cleanup), and the local disk probe above cannot see those
+      // layouts for a same-session retry. Retain the name reservation for this app session
+      // so a retry of the same display name allocates a fresh directory instead of
+      // truncating the survivor's output and sharing its exit marker (fail closed — the
+      // only cost is a suffixed name).
+      retainReservationAfterFailure = !spawnRecordsAreHostLocal(runtime);
       return { success: false, error: result.error };
     }
 
@@ -766,7 +889,25 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       status: "running",
       displayName: config.displayName,
     };
-    await handle.writeMeta(JSON.stringify(meta, null, 2));
+    try {
+      await handle.writeMeta(JSON.stringify(meta, null, 2));
+    } catch (error) {
+      // The durable spawn record is what lets crash-orphan archive gating see this process
+      // after an unclean restart — a process that cannot be recorded must not run (fail
+      // closed). terminate() also writes the exit_code marker, so even this directory reads
+      // as exited to the unreadable-record probe; if termination fails too, the markerless
+      // directory keeps failing that probe closed.
+      await handle.terminate();
+      await handle.dispose();
+      // Same retention rationale as the spawn-failure path above: if the termination also
+      // failed (e.g. the same transport fault that broke writeMeta), a non-host record
+      // directory may still hold the live process.
+      retainReservationAfterFailure = !spawnRecordsAreHostLocal(runtime);
+      return {
+        success: false,
+        error: `Failed to persist the spawn record (meta.json): ${getErrorMessage(error)}`,
+      };
+    }
 
     const proc: BackgroundProcess = {
       id: processId,
@@ -1457,6 +1598,319 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       nextOffset: result.newOffset,
       truncatedStart,
     };
+  }
+
+  /**
+   * Synchronous snapshot: whether any tracked background (non-foreground) process for the
+   * workspace is still marked running. Statuses refresh lazily (see list()), so a just-exited
+   * process may briefly read as running; archive admission gates treat that as fail-safe
+   * over-refusal — callers wanting fresh statuses should await list() first.
+   */
+  hasRunningBackgroundProcesses(workspaceId: string): boolean {
+    assert(workspaceId.length > 0, "hasRunningBackgroundProcesses requires workspaceId");
+    return Array.from(this.processes.values()).some(
+      (p) => !p.isForeground && p.workspaceId === workspaceId && p.status === "running"
+    );
+  }
+
+  /**
+   * Crash-orphan probe: whether a durable spawn record shows a still-running process for this
+   * workspace that this manager does not track. Processes run under nohup/setsid, so they
+   * survive an unclean app shutdown while the in-memory map resets; without this probe the
+   * archive gates would report "no background processes" after a restart and a model-driven
+   * snapshot archive could remove the checkout while the surviving process still writes to it.
+   * The spawn layout persists per-process meta.json plus an exit_code file written by the
+   * wrapper's exit trap even when the app is gone, so orphans stay detectable: a record still
+   * marked running with no exit_code file and a live PID fails the gate closed.
+   *
+   * Host filesystem only: remote (SSH/Docker) spawn records live on the remote host, and the
+   * checkout-deletion hazard this guards is limited to local managed worktrees. Devcontainer
+   * records live inside the container under `<workspace>/.xum/tmp` — host-visible through the
+   * workspace bind mount — so callers pass that root via extraRecordDirs; its PIDs are
+   * container-namespace and cannot be probed from the host, so any running record there is
+   * treated as live. A recycled PID can cause a false positive, which errs on the safe side —
+   * the model-facing caller routes to user-mediated archive.
+   */
+  async hasOrphanedRunningBackgroundProcesses(
+    workspaceId: string,
+    options?: { extraRecordDirs?: string[] }
+  ): Promise<boolean> {
+    assert(workspaceId.length > 0, "hasOrphanedRunningBackgroundProcesses requires workspaceId");
+    const roots: Array<{ dir: string; pidsAreHostNamespace: boolean }> = [
+      { dir: localBgWorkspaceDir(workspaceId), pidsAreHostNamespace: true },
+      ...(options?.extraRecordDirs ?? []).map((dir) => ({ dir, pidsAreHostNamespace: false })),
+    ];
+    for (const root of roots) {
+      if (await this.recordRootHoldsOrphan(workspaceId, root.dir, root.pidsAreHostNamespace)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** One record root's scan for hasOrphanedRunningBackgroundProcesses. */
+  private async recordRootHoldsOrphan(
+    workspaceId: string,
+    workspaceDir: string,
+    pidsAreHostNamespace: boolean
+  ): Promise<boolean> {
+    let entries: Dirent[];
+    try {
+      entries = await fsPromises.readdir(workspaceDir, { withFileTypes: true });
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) {
+        // No spawn records under this root (never spawned there, or cleaned up).
+        return false;
+      }
+      // EACCES/EIO/...: the records exist but cannot be read, so absence of a surviving
+      // process is unprovable — fail closed (the model-facing caller routes to
+      // user-mediated archive).
+      return true;
+    }
+    const trackedPids = new Set<number>();
+    const trackedProcessIds = new Set<string>();
+    for (const proc of this.processes.values()) {
+      if (proc.workspaceId === workspaceId) {
+        trackedPids.add(proc.pid);
+        trackedProcessIds.add(proc.id);
+      }
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      // Tracked processes (directory name = process ID) are covered by the in-memory
+      // live-activity gates, whose statuses refresh via list(); this probe only reports
+      // processes nobody tracks. ID-based so migrated records (pid 0) are matched too.
+      if (trackedProcessIds.has(entry.name)) continue;
+      const processDir = nodePath.join(workspaceDir, entry.name);
+      let meta: { pid: number; status: string } | null = null;
+      try {
+        meta = parseSpawnRecordMeta(
+          await fsPromises.readFile(nodePath.join(processDir, BG_META_FILENAME), "utf-8")
+        );
+      } catch {
+        // Missing/unreadable record: handled with the parse-failure case below.
+      }
+      if (meta == null) {
+        // A record we cannot read or parse cannot prove its process exited: spawn aborts
+        // (and terminates the process, writing the exit marker) when the initial record
+        // fails to persist, and cleanly failed spawns remove their directory — ambiguous
+        // launches (spawn succeeded but the PID echo was garbled) intentionally keep
+        // theirs — so a markerless meta-less record is a crash artifact or untracked
+        // launch whose process may still be alive. Trust only the exit marker; otherwise
+        // fail closed (the model-facing caller routes to user-mediated archive).
+        try {
+          await fsPromises.access(nodePath.join(processDir, BG_EXIT_CODE_FILENAME));
+          continue;
+        } catch {
+          return true;
+        }
+      }
+      if (meta.status !== "running") continue;
+      try {
+        await fsPromises.access(nodePath.join(processDir, BG_EXIT_CODE_FILENAME));
+        continue; // The exit marker settles the record (wrapper trap or migrated handle).
+      } catch {
+        // No exit marker yet — fall through to the PID checks.
+      }
+      if (!pidsAreHostNamespace) {
+        // Container-namespace PID (devcontainer record): nothing on the host can probe it,
+        // and a host kill(pid, 0) would answer for an unrelated host process — treat the
+        // running record as a live orphan (fail closed; over-refusal routes to
+        // user-mediated archive).
+        return true;
+      }
+      if (meta.pid <= 1) {
+        // Migrated processes record pid 0 (exec streams expose no PID) and their exit
+        // marker is written by the in-process handle, not a detached trap. The child can
+        // outlive an unclean shutdown on Unix, and nothing can probe it afterwards — fail
+        // closed rather than skip. Clean shutdowns and natural exits rewrite the record
+        // (status via updateMetaFile, or the exit marker above), so only genuine
+        // unclean-exit survivors reach this branch.
+        return true;
+      }
+      if (trackedPids.has(meta.pid)) continue;
+      try {
+        process.kill(meta.pid, 0);
+        return true; // Alive and untracked: a crash orphan.
+      } catch (error) {
+        if (!isErrnoWithCode(error, "ESRCH")) {
+          // EPERM etc.: the PID exists but is not ours to signal — treat as alive (recycled
+          // PIDs over-refuse, never under-refuse).
+          return true;
+        }
+        // ESRCH: the process is gone (e.g. SIGKILL skipped the exit trap, or a reboot).
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Whether the local durable spawn directory for this process name may still belong to a
+   * live process from a previous app session. Used to keep process directories unique across
+   * restarts: the in-memory ID allocator resets with the app, and reusing a surviving crash
+   * orphan's directory would hand two live processes one meta.json/exit_code — the newer
+   * process's exit marker would then settle the survivor's record and blind the crash-orphan
+   * archive gate. Settled records (exit marker present, non-running status, or dead PID) are
+   * safe to reuse; anything unprovable is treated as live so the allocator picks a new name.
+   */
+  private async localSpawnDirMayHoldLiveProcess(
+    workspaceId: string,
+    processId: string
+  ): Promise<boolean> {
+    const processDir = nodePath.join(localBgWorkspaceDir(workspaceId), processId);
+    try {
+      await fsPromises.access(nodePath.join(processDir, BG_EXIT_CODE_FILENAME));
+      return false; // The exit trap ran: settled — spawn clears the stale marker on reuse.
+    } catch {
+      // No exit marker — consult the meta record.
+    }
+    let raw: string;
+    try {
+      raw = await fsPromises.readFile(nodePath.join(processDir, BG_META_FILENAME), "utf-8");
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) {
+        try {
+          await fsPromises.access(processDir);
+          // Metaless, markerless directory: a crash artifact the orphan probe fails closed
+          // on — leave it undisturbed rather than overwrite whatever evidence remains.
+          return true;
+        } catch {
+          return false; // Directory absent: the name is free.
+        }
+      }
+      return true; // Unreadable record: may belong to a live process.
+    }
+    const meta = parseSpawnRecordMeta(raw);
+    if (meta == null) return true; // Torn record without an exit marker: may be live.
+    if (meta.status !== "running") return false; // Settled.
+    if (meta.pid <= 1) return true; // Unprobeable pid recorded as running: do not reuse.
+    try {
+      process.kill(meta.pid, 0);
+      return true; // Alive.
+    } catch (error) {
+      // ESRCH: gone. Anything else (EPERM, ...): not provably dead — treat as live.
+      return !isErrnoWithCode(error, "ESRCH");
+    }
+  }
+
+  /**
+   * Counterpart of localSpawnDirMayHoldLiveProcess for runtimes whose spawn records are NOT
+   * host-local (SSH/Coder, Docker, devcontainer — see spawnRecordsAreHostLocal): the record
+   * layout lives in the runtime's exec namespace, so probe it through the runtime. Only the
+   * exit marker (or directory absence) proves the name safe to reuse — a markerless
+   * directory may belong to a live detached process from a previous session or a preserved
+   * ambiguous spawn, and reusing it would truncate its output and let either process's exit
+   * marker settle the other. No PID probe: recorded PIDs are only meaningful in the exec
+   * namespace and a stale-but-settled record merely costs a suffixed name (fail closed).
+   * Marker matching is substring-based because SSH login banners can prefix stdout (the same
+   * garbling that produces ambiguous PID echoes); a reply with neither marker or a failed
+   * exec is an error so callers abort instead of looping forever against a dead host.
+   */
+  private async runtimeSpawnDirMayHoldLiveProcess(
+    runtime: Runtime,
+    workspaceId: string,
+    processId: string
+  ): Promise<"free" | "held" | { error: string }> {
+    try {
+      const tempDir = await runtime.tempDir();
+      const processDir = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}/${processId}`;
+      const exitMarkerPath = `${processDir}/${BG_EXIT_CODE_FILENAME}`;
+      const script = `if [ ! -e ${quotePathForShell(processDir)} ] || [ -e ${quotePathForShell(
+        exitMarkerPath
+      )} ]; then echo __MUX_SPAWN_NAME_FREE__; else echo __MUX_SPAWN_NAME_HELD__; fi`;
+      const result = await execBuffered(runtime, script, { cwd: "/tmp", timeout: 10 });
+      if (result.exitCode === 0) {
+        if (result.stdout.includes("__MUX_SPAWN_NAME_FREE__")) return "free";
+        if (result.stdout.includes("__MUX_SPAWN_NAME_HELD__")) return "held";
+      }
+      return {
+        error: `Could not verify that background process name ${JSON.stringify(
+          processId
+        )} is free on the runtime (exit ${result.exitCode}): ${result.stderr || result.stdout}`,
+      };
+    } catch (error) {
+      return {
+        error: `Could not verify that background process name ${JSON.stringify(
+          processId
+        )} is free on the runtime: ${getErrorMessage(error)}`,
+      };
+    }
+  }
+
+  /**
+   * Remote counterpart of the crash-orphan probe for SSH/Coder targets, executed through the
+   * runtime because those spawn records live on the remote host. Called before a
+   * model-driven archive stops a running Coder workspace: stopping the VM would kill any
+   * detached job that survived an unclean Xum exit. Trusts only exit markers and
+   * remote-namespace liveness — a markerless meta-less record (a preserved ambiguous or
+   * transport-failure spawn) or a running-status record whose PID is alive (or unprobeable,
+   * including recycled-PID EPERM via /proc) reports Ok(true); a garbled or failed probe
+   * reports Err so the caller fails closed. Marker matching is substring-based because SSH
+   * login banners can prefix stdout.
+   */
+  async hasUnsettledRemoteSpawnRecords(
+    runtime: Runtime,
+    workspaceId: string
+  ): Promise<Result<boolean>> {
+    assert(workspaceId.length > 0, "hasUnsettledRemoteSpawnRecords requires workspaceId");
+    try {
+      const tempDir = await runtime.tempDir();
+      const root = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}`;
+      // One POSIX-shell pass over the per-process record dirs (see localSpawnDirMayHoldLiveProcess
+      // for the host-local equivalent of these rules):
+      // - exit marker present → settled; missing meta.json (or one without a "status" field,
+      //   i.e. torn/unreadable) → unsettled; non-"running" status → settled.
+      // - running status: dead PID means SIGKILL/reboot skipped the trap → settled; a live or
+      //   recycled PID (kill -0 success, or /proc entry on EPERM) → unsettled.
+      // Process IDs derive from display names, which may legally start with "." (only "." and
+      // ".." themselves are rejected), so also enumerate hidden record dirs — a bare "*/" glob
+      // would silently skip them and report CLEAR under a live dot-named job.
+      // Only a genuinely absent root proves no records: an existing root that is not a
+      // readable+searchable directory (ownership/permission change, or replaced by a file)
+      // would leave the glob unmatched and read as CLEAR while records may sit beneath it,
+      // so those cases emit UNREADABLE and fail the probe closed. `test -e` also returns
+      // false when an ancestor is unsearchable, so absence is only trusted when the parent
+      // directory itself is traversable.
+      const script = [
+        `root=${quotePathForShell(root)}`,
+        `if [ -d "$root" ]; then`,
+        `  if [ ! -r "$root" ] || [ ! -x "$root" ]; then echo __MUX_BG_REMOTE_UNREADABLE__; exit 0; fi`,
+        `elif [ -e "$root" ] || [ -L "$root" ]; then`,
+        `  echo __MUX_BG_REMOTE_UNREADABLE__; exit 0`,
+        `else`,
+        `  parent=$(dirname "$root")`,
+        `  if [ -d "$parent" ] && { [ ! -r "$parent" ] || [ ! -x "$parent" ]; }; then echo __MUX_BG_REMOTE_UNREADABLE__; exit 0; fi`,
+        `  echo __MUX_BG_REMOTE_CLEAR__; exit 0`,
+        `fi`,
+        `unsettled=0`,
+        `for p in "$root"/*/ "$root"/.*/; do`,
+        `  case "$p" in */./|*/../) continue ;; esac`,
+        `  [ -d "$p" ] || continue`,
+        `  [ -e "$p/${BG_EXIT_CODE_FILENAME}" ] && continue`,
+        `  if ! grep -q '"status"' "$p/${BG_META_FILENAME}" 2>/dev/null; then unsettled=1; break; fi`,
+        `  grep -q '"status"[[:space:]]*:[[:space:]]*"running"' "$p/${BG_META_FILENAME}" 2>/dev/null || continue`,
+        `  pid=$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p' "$p/${BG_META_FILENAME}" 2>/dev/null | head -n 1)`,
+        `  if [ -z "$pid" ] || [ "$pid" -le 1 ]; then unsettled=1; break; fi`,
+        `  if kill -0 "$pid" 2>/dev/null || [ -e "/proc/$pid" ]; then unsettled=1; break; fi`,
+        `done`,
+        `if [ "$unsettled" = 1 ]; then echo __MUX_BG_REMOTE_UNSETTLED__; else echo __MUX_BG_REMOTE_CLEAR__; fi`,
+      ].join("\n");
+      const result = await execBuffered(runtime, script, { cwd: "/tmp", timeout: 15 });
+      if (result.exitCode === 0) {
+        if (result.stdout.includes("__MUX_BG_REMOTE_UNREADABLE__")) {
+          return Err(
+            `remote spawn-record root ${root} exists but is not a readable directory; cannot verify background jobs are settled`
+          );
+        }
+        if (result.stdout.includes("__MUX_BG_REMOTE_UNSETTLED__")) return Ok(true);
+        if (result.stdout.includes("__MUX_BG_REMOTE_CLEAR__")) return Ok(false);
+      }
+      return Err(
+        `remote spawn-record probe failed (exit ${result.exitCode}): ${result.stderr || result.stdout}`
+      );
+    } catch (error) {
+      return Err(`remote spawn-record probe failed: ${getErrorMessage(error)}`);
+    }
   }
 
   /**

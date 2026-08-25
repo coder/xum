@@ -101,6 +101,10 @@ export interface ProjectContext {
     projectPath: string,
     customInstructions: string | null
   ) => Promise<Result<void>>;
+  updateCodeWorkspaceSyncPath: (
+    projectPath: string,
+    codeWorkspaceSyncPath: string | null
+  ) => Promise<Result<void>>;
 
   assignWorkspaceToSubProject: (
     projectPath: string,
@@ -621,6 +625,21 @@ export function ProjectProvider(props: { children: ReactNode }) {
       updateDisplayName,
       updateColor,
       updateCustomInstructions,
+      // Defined inline (not useCallback): the repo bans new manual useCallback
+      // memoization, and inlining keeps exhaustive-deps satisfied via `api`.
+      updateCodeWorkspaceSyncPath: async (
+        projectPath: string,
+        codeWorkspaceSyncPath: string | null
+      ): Promise<Result<void>> => {
+        if (!api) return { success: false, error: "API not connected" };
+        try {
+          await api.projects.setCodeWorkspaceSyncPath({ projectPath, codeWorkspaceSyncPath });
+          await refreshProjects();
+          return { success: true, data: undefined };
+        } catch (error) {
+          return { success: false, error: getErrorMessage(error) };
+        }
+      },
       assignWorkspaceToSubProject,
     }),
     [
@@ -647,6 +666,7 @@ export function ProjectProvider(props: { children: ReactNode }) {
       updateDisplayName,
       updateColor,
       updateCustomInstructions,
+      api,
       assignWorkspaceToSubProject,
     ]
   );

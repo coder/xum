@@ -74,6 +74,36 @@ describe("cacheStrategy", () => {
       expect(supportsAnthropicCache("coder:unknown-instance/model", config)).toBe(false);
     });
 
+    it("classifies custom providers by their API format", () => {
+      const config = {
+        zen: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          isCustom: true,
+          providerType: "anthropic-messages" as const,
+        },
+        zap: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          isCustom: true,
+          providerType: "openai-responses" as const,
+        },
+        zim: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          isCustom: true,
+          providerType: "openai-compatible" as const,
+        },
+      };
+
+      expect(supportsAnthropicCache("zen:claude-opus-4-5", config)).toBe(true);
+      expect(supportsAnthropicCache("zap:gpt-5", config)).toBe(false);
+      expect(supportsAnthropicCache("zim:claude-opus-4-5", config)).toBe(false);
+    });
+
     // ZDR: disableBetaFeatures must reject cache eligibility itself — the
     // provider fetch wrapper only skips injecting markers, it never strips
     // ones these helpers already serialized.

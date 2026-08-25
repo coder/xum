@@ -1,16 +1,20 @@
 import { Buffer } from "node:buffer";
 import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { Ok } from "@/common/types/result";
 import {
   BackgroundProcessManager,
   computeTailStartOffset,
+  parseSpawnRecordMeta,
   type BackgroundProcessMeta,
   type MonitorArmedPayload,
   type MonitorMatchPayload,
   type MonitorStoppedPayload,
   type OutputShownPayload,
 } from "./backgroundProcessManager";
+import { localBgWorkspaceDir } from "./backgroundProcessExecutor";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
-import type { Runtime } from "@/node/runtime/Runtime";
+import type { BackgroundHandle, Runtime } from "@/node/runtime/Runtime";
+import { spawnSync } from "node:child_process";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
@@ -18,6 +22,34 @@ import { createBashTool } from "@/node/services/tools/bash";
 import { createBashOutputTool } from "@/node/services/tools/bash_output";
 import { TestTempDir, createTestToolConfig } from "@/node/services/tools/testHelpers";
 import type { BashToolResult, BashOutputToolResult } from "@/common/types/tools";
+
+/**
+ * Delegates to a real LocalRuntime but is NOT an instanceof LocalBaseRuntime, so the
+ * manager treats it like a remote runtime (exec-based record-directory probing, name
+ * reservation retention on failure). Optionally throws on the spawn command itself to
+ * simulate a transport-level (SSH/Coder channel) error after dispatch.
+ */
+function createRemoteLikeRuntime(
+  base: LocalRuntime,
+  options?: { throwOnSpawn?: { value: boolean } }
+): Runtime {
+  return new Proxy({} as Runtime, {
+    get(_target, prop) {
+      if (prop === "exec") {
+        return (command: string, opts: never) => {
+          if (options?.throwOnSpawn?.value === true && command.includes("output.log")) {
+            throw new Error("SSH channel error after dispatch");
+          }
+          return base.exec(command, opts);
+        };
+      }
+      const value = (base as unknown as Record<PropertyKey, unknown>)[prop];
+      return typeof value === "function"
+        ? (value as (...args: unknown[]) => unknown).bind(base)
+        : value;
+    },
+  });
+}
 
 function waitForMonitorMatch(
   manager: BackgroundProcessManager,
@@ -151,6 +183,64 @@ describe("BackgroundProcessManager", () => {
         expect(meta.status).toBe("running");
         expect(meta.startTime).toBeGreaterThan(0);
       }
+    });
+
+    it("does not reuse a preserved record directory when retrying a failed remote spawn", async () => {
+      // A transport-level throw after dispatch preserves the remote record directory as
+      // fail-closed orphan evidence. A same-session retry of the same display name must not
+      // reuse that directory: truncating its output.log and sharing its exit_code would let
+      // either detached process settle the other and blind the Coder-stop archive gate.
+      const throwOnSpawn = { value: true };
+      const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), { throwOnSpawn });
+
+      const first = await manager.spawn(remote, testWorkspaceId, "echo hi", {
+        cwd: process.cwd(),
+        displayName: "retry-job",
+      });
+      expect(first.success).toBe(false);
+      await fs.access(`/tmp/mux-bashes/${testWorkspaceId}/retry-job/output.log`);
+
+      throwOnSpawn.value = false;
+      const second = await manager.spawn(remote, testWorkspaceId, "echo hi", {
+        cwd: process.cwd(),
+        displayName: "retry-job",
+      });
+      expect(second.success).toBe(true);
+      if (!second.success) return;
+      expect(second.processId).toBe("retry-job (1)");
+      // The preserved evidence stays untouched for crash-orphan gating.
+      await fs.access(`/tmp/mux-bashes/${testWorkspaceId}/retry-job/output.log`);
+    });
+
+    it("probes runtime record directories for non-host runtimes before reusing a name", async () => {
+      // A markerless record directory on the runtime (previous-session survivor or preserved
+      // ambiguous spawn) holds the name; an exit-marker-settled one frees it.
+      const heldDir = `/tmp/mux-bashes/${testWorkspaceId}/held-job`;
+      await fs.mkdir(heldDir, { recursive: true });
+      await fs.writeFile(path.join(heldDir, "output.log"), "previous session output");
+      const settledDir = `/tmp/mux-bashes/${testWorkspaceId}/settled-job`;
+      await fs.mkdir(settledDir, { recursive: true });
+      await fs.writeFile(path.join(settledDir, "exit_code"), "0");
+
+      const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()));
+      const held = await manager.spawn(remote, testWorkspaceId, "echo hi", {
+        cwd: process.cwd(),
+        displayName: "held-job",
+      });
+      expect(held.success).toBe(true);
+      if (!held.success) return;
+      expect(held.processId).toBe("held-job (2)");
+      expect(await fs.readFile(path.join(heldDir, "output.log"), "utf-8")).toBe(
+        "previous session output"
+      );
+
+      const settled = await manager.spawn(remote, testWorkspaceId, "echo hi", {
+        cwd: process.cwd(),
+        displayName: "settled-job",
+      });
+      expect(settled.success).toBe(true);
+      if (!settled.success) return;
+      expect(settled.processId).toBe("settled-job");
     });
   });
 
@@ -1904,6 +1994,371 @@ describe("BackgroundProcessManager", () => {
       const exitCodePath = path.join(result.outputDir, "exit_code");
       const exitCodeContent = await fs.readFile(exitCodePath, "utf-8");
       expect(exitCodeContent.trim()).toBe("42");
+    });
+  });
+
+  describe("hasOrphanedRunningBackgroundProcesses", () => {
+    // Unique per run: the probe scans the real durable spawn layout (/tmp/mux-bashes/<ws>),
+    // which is shared machine-wide, so collisions with other runs must be impossible.
+    const orphanWorkspaceId = `orphan-ws-${testRunId}-${process.pid}`;
+    const workspaceDir = localBgWorkspaceDir(orphanWorkspaceId);
+
+    afterEach(async () => {
+      await manager.cleanup(orphanWorkspaceId);
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    });
+
+    async function writeSpawnRecord(
+      processName: string,
+      meta: { pid: number; status: string } | string,
+      options?: { exitCode?: string }
+    ): Promise<void> {
+      const processDir = path.join(workspaceDir, processName);
+      await fs.mkdir(processDir, { recursive: true });
+      await fs.writeFile(
+        path.join(processDir, "meta.json"),
+        typeof meta === "string" ? meta : JSON.stringify(meta)
+      );
+      if (options?.exitCode != null) {
+        await fs.writeFile(path.join(processDir, "exit_code"), options.exitCode);
+      }
+    }
+
+    it("returns false when the workspace has no spawn records", async () => {
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("detects an untracked running record with a live PID", async () => {
+      // This test process itself is the "surviving child": alive and unknown to the manager,
+      // exactly what an unclean app restart leaves behind.
+      await writeSpawnRecord("survivor", { pid: process.pid, status: "running" });
+
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(true);
+    });
+
+    it("trusts the exit trap over the stale running status", async () => {
+      // A crash freezes meta.json at "running", but the wrapper's exit trap still writes
+      // exit_code when the process later exits — that must clear the gate even if the PID
+      // was recycled by another live process.
+      await writeSpawnRecord(
+        "exited-after-crash",
+        { pid: process.pid, status: "running" },
+        {
+          exitCode: "0",
+        }
+      );
+
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("ignores running records whose PID is dead", async () => {
+      // SIGKILL (or a reboot) skips the exit trap: no exit_code file, but the PID is gone.
+      const dead = spawnSync("true");
+      expect(dead.pid).toBeGreaterThan(1);
+      await writeSpawnRecord("killed-by-crash", { pid: dead.pid, status: "running" });
+
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("ignores non-running and marker-settled records", async () => {
+      await writeSpawnRecord("clean-exit", { pid: process.pid, status: "exited" });
+      // A migrated process (pid 0) whose in-process handle wrote the exit marker is settled.
+      await writeSpawnRecord("migrated-exited", { pid: 0, status: "running" }, { exitCode: "0" });
+
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("probes remote spawn records through the runtime before a Coder stop", async () => {
+      // The remote-like runtime executes the probe locally against the same /tmp layout the
+      // records were written to, so PID semantics match the probe's namespace.
+      const remote = createRemoteLikeRuntime(new LocalRuntime(process.cwd()));
+
+      // No records at all: clear.
+      expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
+        Ok(false)
+      );
+
+      // A markerless, meta-less directory (preserved ambiguous/transport-failure spawn)
+      // cannot prove its process exited: unsettled.
+      await fs.mkdir(path.join(workspaceDir, "ambiguous"), { recursive: true });
+      expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
+        Ok(true)
+      );
+      await fs.rm(path.join(workspaceDir, "ambiguous"), { recursive: true, force: true });
+
+      // Running record with a live PID (this test process): unsettled.
+      await writeSpawnRecord("remote-survivor", { pid: process.pid, status: "running" });
+      expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
+        Ok(true)
+      );
+
+      // The exit trap settles it even though the stale status still says running.
+      await fs.writeFile(path.join(workspaceDir, "remote-survivor", "exit_code"), "0");
+      expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
+        Ok(false)
+      );
+      await fs.rm(path.join(workspaceDir, "remote-survivor"), { recursive: true, force: true });
+
+      // Running record whose PID is dead (SIGKILL/reboot skipped the trap): settled.
+      const dead = spawnSync("true");
+      expect(dead.pid).toBeGreaterThan(1);
+      await writeSpawnRecord("remote-killed", { pid: dead.pid, status: "running" });
+      expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
+        Ok(false)
+      );
+
+      // Display names may legally start with "." (only "." and ".." are rejected), hiding the
+      // record dir from a bare "*/" glob — a live dot-named job must still report unsettled.
+      await writeSpawnRecord(".hidden-survivor", { pid: process.pid, status: "running" });
+      expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
+        Ok(true)
+      );
+      await fs.rm(path.join(workspaceDir, ".hidden-survivor"), { recursive: true, force: true });
+
+      // A root that exists but is not a directory (torn/replaced state) proves nothing about
+      // records beneath the expected layout: probe error, never CLEAR.
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+      await fs.writeFile(workspaceDir, "not a directory");
+      const nonDirProbe = await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId);
+      expect(nonDirProbe.success).toBe(false);
+      await fs.rm(workspaceDir, { force: true });
+      await fs.mkdir(workspaceDir, { recursive: true });
+
+      // An unreadable/unsearchable root would leave the shell glob unmatched and read as
+      // CLEAR while records may sit beneath it — must fail the probe closed instead.
+      // kill/access semantics differ for uid 0 (root reads anything), so skip there.
+      if (process.getuid?.() !== 0) {
+        await writeSpawnRecord("hidden-by-perms", { pid: process.pid, status: "running" });
+        await fs.chmod(workspaceDir, 0o000);
+        try {
+          const unreadableProbe = await manager.hasUnsettledRemoteSpawnRecords(
+            remote,
+            orphanWorkspaceId
+          );
+          expect(unreadableProbe.success).toBe(false);
+        } finally {
+          await fs.chmod(workspaceDir, 0o755);
+        }
+      }
+    });
+
+    it("treats running records under extra record dirs as live without host PID probes", async () => {
+      // Devcontainer records (passed via extraRecordDirs) carry container-namespace PIDs: a
+      // host ESRCH proves nothing about the container process, so a running record without
+      // an exit marker must fail closed instead of trusting the host PID probe.
+      const extraRoot = await fs.mkdtemp(path.join(os.tmpdir(), "bg-extra-root-"));
+      try {
+        const dead = spawnSync("true");
+        expect(dead.pid).toBeGreaterThan(1);
+        const processDir = path.join(extraRoot, "container-survivor");
+        await fs.mkdir(processDir, { recursive: true });
+        await fs.writeFile(
+          path.join(processDir, "meta.json"),
+          JSON.stringify({ pid: dead.pid, status: "running" })
+        );
+
+        // Host layout is empty, and the same record under the HOST root would read as dead.
+        expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+        expect(
+          await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId, {
+            extraRecordDirs: [extraRoot],
+          })
+        ).toBe(true);
+
+        // The exit trap still settles extra-root records.
+        await fs.writeFile(path.join(processDir, "exit_code"), "0");
+        expect(
+          await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId, {
+            extraRecordDirs: [extraRoot],
+          })
+        ).toBe(false);
+      } finally {
+        await fs.rm(extraRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("fails closed on untracked migrated records without an exit marker", async () => {
+      // Migrated processes record pid 0 (unprobeable) and their exit marker is written by
+      // the in-process handle: after an unclean shutdown the child may survive with nothing
+      // left to prove it exited, so the gate must refuse rather than skip.
+      await writeSpawnRecord("migrated-survivor", { pid: 0, status: "running" });
+
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(true);
+    });
+
+    it("skips migrated records the manager still tracks", async () => {
+      await writeSpawnRecord("migrated-live", { pid: 0, status: "running" });
+      // While Xum runs, the migrated process is tracked in-memory under the same ID (the
+      // record's directory name); the in-memory live-activity gates own it, so the probe
+      // must not double-report it as a crash orphan.
+      const stubHandle: BackgroundHandle = {
+        outputDir: path.join(workspaceDir, "migrated-live"),
+        getExitCode: () => Promise.resolve(null),
+        terminate: () => Promise.resolve(),
+        dispose: () => Promise.resolve(),
+        writeMeta: () => Promise.resolve(),
+        getOutputFileSize: () => Promise.resolve(0),
+        readOutput: () => Promise.resolve({ content: "", newOffset: 0 }),
+      };
+      manager.registerMigratedProcess(
+        stubHandle,
+        "migrated-live",
+        orphanWorkspaceId,
+        "echo hi",
+        path.join(workspaceDir, "migrated-live"),
+        "migrated-live"
+      );
+
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("fails closed on unreadable records without an exit marker", async () => {
+      // A crash mid-write can truncate meta.json while the detached process survives; an
+      // unreadable record cannot prove the process exited, so only the exit marker clears it.
+      await writeSpawnRecord("torn-write", '{"pid": 12');
+
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(true);
+
+      await fs.writeFile(path.join(workspaceDir, "torn-write", "exit_code"), "137");
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("aborts the spawn (and self-heals the record) when meta.json cannot be persisted", async () => {
+      // Fail exactly the meta.json heredoc write; every other exec (spawn, terminate)
+      // proceeds normally. Proxy keeps original-receiver calls so runtime internals work.
+      const proxyHandler: ProxyHandler<Runtime> = {
+        get(target, prop, receiver) {
+          if (prop === "exec") {
+            const failingExec: Runtime["exec"] = (command, options) => {
+              if (command.includes("METAEOF")) {
+                throw new Error("injected meta write failure");
+              }
+              return target.exec(command, options);
+            };
+            return failingExec;
+          }
+          const value: unknown = Reflect.get(target, prop, receiver);
+          if (typeof value === "function") {
+            return (value as (...args: unknown[]) => unknown).bind(target);
+          }
+          return value;
+        },
+      };
+      const failingRuntime = new Proxy(runtime, proxyHandler);
+
+      const result = await manager.spawn(failingRuntime, orphanWorkspaceId, "sleep 5", {
+        cwd: process.cwd(),
+        displayName: "unrecordable",
+      });
+
+      // Without a durable spawn record the crash-orphan gate could never see this process
+      // after a restart, so the spawn must fail closed instead of running unrecorded.
+      expect(result.success).toBe(false);
+      expect(await manager.getProcess("unrecordable")).toBeNull();
+      // The abort terminated the process, which wrote the exit marker — so the markerless
+      // unreadable-record probe reads the leftover directory as exited, not as an orphan.
+      const exitMarker = await fs.readFile(
+        path.join(workspaceDir, "unrecordable", "exit_code"),
+        "utf-8"
+      );
+      expect(exitMarker.length).toBeGreaterThan(0);
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("fails closed when the spawn-record directory is unreadable", async () => {
+      // chmod-based EACCES cannot be provoked when running as root (e.g. some CI containers).
+      if (process.getuid?.() === 0) return;
+      await writeSpawnRecord("settled", { pid: process.pid, status: "exited" });
+      await fs.chmod(workspaceDir, 0o000);
+      try {
+        // Records exist but cannot be read: absence of a surviving process is unprovable, so
+        // the gate must refuse rather than let a snapshot archive proceed blind.
+        expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(true);
+      } finally {
+        await fs.chmod(workspaceDir, 0o755);
+      }
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
+    });
+
+    it("allocates distinct directories for concurrent same-name spawns", async () => {
+      // Both spawns pass the in-memory allocator before either registers; the synchronous
+      // reservation must still keep their directories (and meta.json/exit_code) disjoint,
+      // or the first exit would settle the shared record under the other process.
+      const [a, b] = await Promise.all([
+        manager.spawn(runtime, orphanWorkspaceId, "sleep 2", {
+          cwd: process.cwd(),
+          displayName: "dup",
+        }),
+        manager.spawn(runtime, orphanWorkspaceId, "sleep 2", {
+          cwd: process.cwd(),
+          displayName: "dup",
+        }),
+      ]);
+      expect(a.success).toBe(true);
+      expect(b.success).toBe(true);
+      if (!a.success || !b.success) return;
+      expect(a.processId).not.toBe(b.processId);
+      expect(a.outputDir).not.toBe(b.outputDir);
+    });
+
+    it("does not reuse a surviving orphan's directory for a same-name spawn", async () => {
+      await writeSpawnRecord("survivor", { pid: process.pid, status: "running" });
+
+      const result = await manager.spawn(runtime, orphanWorkspaceId, "sleep 5", {
+        cwd: process.cwd(),
+        displayName: "survivor",
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      // The in-memory allocator resets across restarts, so the disk pass must skip the
+      // survivor's directory: sharing it would hand both processes one exit_code/meta.json
+      // and settle the survivor's record once the new process exits.
+      expect(result.processId).toBe("survivor (2)");
+      const survivorMeta = parseSpawnRecordMeta(
+        await fs.readFile(path.join(workspaceDir, "survivor", "meta.json"), "utf-8")
+      );
+      expect(survivorMeta?.pid).toBe(process.pid);
+      // The survivor still trips the crash-orphan gate even while the new process runs.
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(true);
+    });
+
+    it("clears a stale exit_code file when a restart reuses the process directory", async () => {
+      // Process IDs are display-name based and deduplicated only in memory, so after a
+      // restart a new spawn can land in a prior session's directory whose exit trap already
+      // wrote exit_code. That stale marker must not survive the new spawn: it would flip the
+      // live process to "exited" and let crash-orphan gating treat it as exited too.
+      const displayName = "reused-name";
+      const processDir = path.join(workspaceDir, displayName);
+      await fs.mkdir(processDir, { recursive: true });
+      await fs.writeFile(path.join(processDir, "exit_code"), "0");
+
+      const result = await manager.spawn(runtime, orphanWorkspaceId, "sleep 2", {
+        cwd: process.cwd(),
+        displayName,
+      });
+      expect(result.success).toBe(true);
+
+      let staleMarkerExists = true;
+      try {
+        await fs.access(path.join(processDir, "exit_code"));
+      } catch {
+        staleMarkerExists = false;
+      }
+      expect(staleMarkerExists).toBe(false);
+      const processes = await manager.list(orphanWorkspaceId);
+      expect(processes.find((p) => p.id === displayName)?.status).toBe("running");
+    });
+
+    it("skips processes the manager still tracks", async () => {
+      // A live tracked process writes the same durable "running" record an orphan would,
+      // but in-memory gates already cover it — the probe must not double-report it.
+      const result = await manager.spawn(runtime, orphanWorkspaceId, "sleep 5", {
+        cwd: process.cwd(),
+        displayName: "tracked",
+      });
+      expect(result.success).toBe(true);
+
+      expect(await manager.hasOrphanedRunningBackgroundProcesses(orphanWorkspaceId)).toBe(false);
     });
   });
 

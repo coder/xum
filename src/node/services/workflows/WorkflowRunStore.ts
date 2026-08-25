@@ -27,6 +27,7 @@ import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWor
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
+import { isErrnoWithCode } from "@/node/utils/fs";
 import { workflowRunStreamHub } from "@/node/services/workflows/workflowRunStreamHub";
 
 const WorkflowRunStatusSnapshotSchema = WorkflowRunRecordSchema.pick({
@@ -283,6 +284,30 @@ export class WorkflowRunStore {
     return runs
       .filter((run): run is WorkflowRunRecord => run != null)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  /**
+   * Like listRuns, but strict for archive-gating activity scans: only ENOENT/ENOTDIR mean
+   * "no runs" — any other directory read failure, and any unreadable run record, throws
+   * instead of being silently skipped. Archive gates must be able to prove the absence of
+   * active runs; assuming absence on a transient read failure would let a snapshot archive
+   * remove a checkout while a crash-recovered run later resumes into it.
+   */
+  async listRunsForActivityScan(): Promise<WorkflowRunRecord[]> {
+    let entries: Dirent[];
+    try {
+      entries = await fs.readdir(this.workflowsDir(), { withFileTypes: true });
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) {
+        return [];
+      }
+      throw error;
+    }
+
+    const runs = await Promise.all(
+      entries.filter((entry) => entry.isDirectory()).map((entry) => this.getRun(entry.name))
+    );
+    return runs.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
   async appendNextEvent(

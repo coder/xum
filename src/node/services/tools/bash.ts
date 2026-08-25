@@ -1399,9 +1399,14 @@ ${scriptWithEnv}`;
             const wall_duration_ms = Math.round(performance.now() - startTime);
 
             // Migrate to background tracking if manager is available
+            let migrationError = "background process manager unavailable";
             if (config.backgroundProcessManager && config.workspaceId) {
-              const processId =
-                config.backgroundProcessManager.generateUniqueProcessId(safeDisplayName);
+              // Allocate-and-reserve atomically: the migration awaits below would otherwise
+              // let a concurrent same-name migration receive the same ID and share this
+              // process's output directory and manager entry (see reserveUniqueProcessId).
+              const reservation =
+                config.backgroundProcessManager.reserveUniqueProcessId(safeDisplayName);
+              const processId = reservation.processId;
 
               // Create a synthetic ExecStream for the migration streams
               // The UI streams are still being consumed, migration streams continue to files
@@ -1435,6 +1440,8 @@ ${scriptWithEnv}`;
                   migrateResult.outputDir,
                   safeDisplayName
                 );
+                // The processes map now holds the name; the reservation has done its job.
+                reservation.release();
 
                 return withNotice({
                   success: true,
@@ -1445,14 +1452,30 @@ ${scriptWithEnv}`;
                   backgroundProcessId: processId,
                 });
               }
-              // Migration failed, fall through to simple return
+              // Migration failed, fall through to fail-closed termination below. Keep the
+              // name reserved until the aborted process's exit actually settles; if it never
+              // does, leaking the name for the session is the safe fail-closed behavior.
+              migrationError = migrateResult.error;
+              void execStream.exitCode.catch(() => undefined).finally(() => reservation.release());
             }
 
-            // Fallback: return without process ID (no manager or migration failed)
+            // Migration failure (e.g. ENOSPC/EACCES creating the output dir) leaves neither a
+            // manager entry nor a durable spawn record, so archive gates and crash-orphan scans
+            // could not see the surviving command — a snapshot archive could remove the checkout
+            // (or a Coder-stop archive stop the VM) under it. Fail closed: terminate the process
+            // instead of letting it run untracked. (Backgrounding requires the manager-backed
+            // foreground registration, so the manager-unavailable branch is defensive only.)
+            wrappedAbortController.abort();
+            stdoutForMigration.cancel().catch(() => {
+              /* ignore */ return;
+            });
+            stderrForMigration.cancel().catch(() => {
+              /* ignore */ return;
+            });
             return withNotice({
-              success: true,
-              output: `Process sent to background. It will continue running.\n\nOutput so far (${lines.length} lines):\n${lines.slice(-20).join("\n")}${lines.length > 20 ? "\n...(showing last 20 lines)" : ""}`,
-              exitCode: 0,
+              success: false,
+              error: `Failed to send process to background (${migrationError}); the process was terminated because it could not be tracked.\n\nOutput so far (${lines.length} lines):\n${lines.slice(-20).join("\n")}${lines.length > 20 ? "\n...(showing last 20 lines)" : ""}`,
+              exitCode: -1,
               wall_duration_ms,
             });
           }

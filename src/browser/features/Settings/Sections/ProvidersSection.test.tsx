@@ -3,12 +3,14 @@ import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/re
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { installDom } from "../../../../../tests/ui/dom";
+import { createSelectPrimitiveDouble } from "../../../../../tests/ui/selectPrimitiveDouble";
 import type { APIClient } from "@/browser/contexts/API";
+import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import * as SettingsContextModule from "@/browser/contexts/SettingsContext";
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import type * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import type {
-  AddCustomOpenAICompatibleProviderInput,
+  AddCustomProviderInput,
   ProviderConfigInfo,
   ProvidersConfigMap,
 } from "@/common/orpc/types";
@@ -28,6 +30,12 @@ function installTestDoubles() {
 
 let repairRemovedProviderMock = mock(
   (_provider: string, _workspaceIds: Iterable<string>) => undefined
+);
+
+// Radix Select portals its dropdown content, which happy-dom cannot render;
+// swap in the conditional-rendering double so option clicks work.
+void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () =>
+  createSelectPrimitiveDouble()
 );
 
 void mock.module("@/browser/utils/modelPreferenceRepair", () => ({
@@ -135,23 +143,21 @@ function emptyConfigChangeIterator(): AsyncIterator<void> & AsyncIterable<void> 
 
 function patchProviderMethods(client: APIClient, providersConfig: ProvidersConfigMap) {
   const getConfig = mock(() => Promise.resolve({ ...providersConfig }));
-  const addCustomOpenAICompatibleProvider = mock(
-    (input: AddCustomOpenAICompatibleProviderInput) => {
-      const providerInfo: ProviderConfigInfo = {
-        apiKeySet: input.apiKey != null,
-        isEnabled: true,
-        isConfigured: true,
-        apiKeyFile: input.apiKeyFile,
-        baseUrl: input.baseUrl,
-        displayName: input.displayName ?? input.provider,
-        isCustom: true,
-        providerType: "openai-compatible",
-        models: input.models,
-      };
-      providersConfig[input.provider] = providerInfo;
-      return Promise.resolve({ success: true as const, data: providerInfo });
-    }
-  );
+  const addCustomProvider = mock((input: AddCustomProviderInput) => {
+    const providerInfo: ProviderConfigInfo = {
+      apiKeySet: input.apiKey != null,
+      isEnabled: true,
+      isConfigured: true,
+      apiKeyFile: input.apiKeyFile,
+      baseUrl: input.baseUrl,
+      displayName: input.displayName ?? input.provider,
+      isCustom: true,
+      providerType: input.providerType ?? "openai-compatible",
+      models: input.models,
+    };
+    providersConfig[input.provider] = providerInfo;
+    return Promise.resolve({ success: true as const, data: providerInfo });
+  });
   const removeCustomProvider = mock<APIClient["providers"]["removeCustomProvider"]>((input) => {
     delete providersConfig[input.provider];
     return Promise.resolve({ success: true as const, data: undefined });
@@ -174,14 +180,14 @@ function patchProviderMethods(client: APIClient, providersConfig: ProvidersConfi
 
   Object.assign(client.providers, {
     getConfig,
-    addCustomOpenAICompatibleProvider,
+    addCustomProvider,
     removeCustomProvider,
     setProviderConfig,
     onConfigChanged,
   });
 
   return {
-    addCustomOpenAICompatibleProvider,
+    addCustomProvider,
     getConfig,
     removeCustomProvider,
     setProviderConfig,
@@ -216,6 +222,10 @@ describe("ProvidersSection", () => {
 
   beforeEach(() => {
     restoreDom = installDom();
+    // Re-register per test because afterEach restores the real module.
+    void mock.module("@/browser/components/SelectPrimitive/SelectPrimitive", () =>
+      createSelectPrimitiveDouble()
+    );
     installTestDoubles();
     repairRemovedProviderMock = mock(
       (_provider: string, _workspaceIds: Iterable<string>) => undefined
@@ -229,6 +239,12 @@ describe("ProvidersSection", () => {
   afterEach(() => {
     cleanup();
     mock.restore();
+    // mock.module registrations are global across files in one bun run;
+    // restore the real SelectPrimitive for other test files.
+    void mock.module(
+      "@/browser/components/SelectPrimitive/SelectPrimitive",
+      () => ActualSelectPrimitiveModule
+    );
     providersConfigMock = null;
     apiMock = null;
     restoreDom?.();
@@ -264,6 +280,88 @@ describe("ProvidersSection", () => {
     expect(within(customCard).getByText("Base URL")).toBeTruthy();
   });
 
+  test("persists API format changes for an existing custom provider", async () => {
+    const view = renderProvidersSection();
+    const customButton = await view.findByRole("button", { name: /Acme OpenAI/ });
+    fireEvent.click(customButton);
+
+    const customCard = getProviderCard(customButton);
+    fireEvent.pointerDown(within(customCard).getByRole("combobox", { name: "API format" }));
+    fireEvent.click(await within(customCard).findByRole("button", { name: "Anthropic Messages" }));
+
+    // The write is queued behind the per-provider chain (a microtask).
+    await waitFor(() => {
+      expect(view.setProviderConfig).toHaveBeenCalledWith({
+        provider: CUSTOM_PROVIDER_ID,
+        keyPath: ["providerType"],
+        value: "anthropic-messages",
+      });
+    });
+  });
+
+  test("resyncs from the backend when API format persistence fails", async () => {
+    const view = renderProvidersSection();
+    view.setProviderConfig.mockImplementationOnce(() =>
+      Promise.resolve({ success: false as const, error: "policy denied" })
+    );
+
+    const customButton = await view.findByRole("button", { name: /Acme OpenAI/ });
+    fireEvent.click(customButton);
+
+    const customCard = getProviderCard(customButton);
+    fireEvent.pointerDown(within(customCard).getByRole("combobox", { name: "API format" }));
+    fireEvent.click(await within(customCard).findByRole("button", { name: "Anthropic Messages" }));
+
+    // The optimistic format must not survive a failed persistence: the UI
+    // restores the previous value (refresh alone is best-effort and keeps
+    // optimistic state when the refetch fails) and refetches backend truth.
+    await waitFor(() => {
+      expect(updateOptimisticallyMock).toHaveBeenCalledWith(CUSTOM_PROVIDER_ID, {
+        providerType: "openai-compatible",
+      });
+      expect(providersRefreshMock).toHaveBeenCalled();
+    });
+  });
+
+  test("ignores a stale API-format failure after a newer selection", async () => {
+    const view = renderProvidersSection();
+    let rejectFirstWrite: ((error: Error) => void) | undefined;
+    view.setProviderConfig.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectFirstWrite = reject;
+        })
+    );
+
+    const customButton = await view.findByRole("button", { name: /Acme OpenAI/ });
+    fireEvent.click(customButton);
+    const customCard = getProviderCard(customButton);
+
+    // First selection: write held pending.
+    fireEvent.pointerDown(within(customCard).getByRole("combobox", { name: "API format" }));
+    fireEvent.click(await within(customCard).findByRole("button", { name: "Anthropic Messages" }));
+    // Second selection while the first write is still in flight.
+    fireEvent.pointerDown(within(customCard).getByRole("combobox", { name: "API format" }));
+    fireEvent.click(await within(customCard).findByRole("button", { name: "OpenAI Responses" }));
+
+    updateOptimisticallyMock.mockClear();
+    rejectFirstWrite?.(new Error("late failure"));
+
+    // The stale failure must not roll back the newer selection: the queued
+    // second write persists and no reconciliation fires.
+    await waitFor(() => {
+      expect(view.setProviderConfig).toHaveBeenCalledWith({
+        provider: CUSTOM_PROVIDER_ID,
+        keyPath: ["providerType"],
+        value: "openai-responses",
+      });
+    });
+    expect(updateOptimisticallyMock).not.toHaveBeenCalledWith(CUSTOM_PROVIDER_ID, {
+      providerType: "openai-compatible",
+    });
+    expect(providersRefreshMock).not.toHaveBeenCalled();
+  });
+
   test("validates custom provider IDs in the add form", async () => {
     const view = renderProvidersSection();
 
@@ -297,8 +395,9 @@ describe("ProvidersSection", () => {
     fireEvent.click(view.getByRole("button", { name: "Add custom provider" }));
 
     await waitFor(() => {
-      expect(view.addCustomOpenAICompatibleProvider).toHaveBeenCalledWith({
+      expect(view.addCustomProvider).toHaveBeenCalledWith({
         provider: "team-openai",
+        providerType: "openai-compatible",
         displayName: "Team OpenAI",
         baseUrl: "https://team.example/v1",
         apiKey: undefined,
@@ -327,7 +426,7 @@ describe("ProvidersSection", () => {
     fireEvent.click(view.getByRole("button", { name: "Add custom provider" }));
 
     await waitFor(() => {
-      expect(view.addCustomOpenAICompatibleProvider).toHaveBeenCalled();
+      expect(view.addCustomProvider).toHaveBeenCalled();
     });
     await waitFor(() => {
       expect(view.queryByRole("button", { name: "Add custom provider" })).toBeNull();
@@ -504,6 +603,42 @@ describe("ProvidersSection", () => {
     });
     expect(confirmMock).toHaveBeenCalledTimes(1);
     expect(repairRemovedProviderMock).toHaveBeenCalledWith(CUSTOM_PROVIDER_ID, expect.any(Set));
+  });
+
+  test("invalidates queued format writes when the provider is removed", async () => {
+    const view = renderProvidersSection();
+    window.confirm = mock(() => true);
+    let resolveFirstWrite: ((value: { success: true; data: undefined }) => void) | undefined;
+    view.setProviderConfig.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveFirstWrite = resolve;
+        })
+    );
+
+    const customButton = await view.findByRole("button", { name: /Acme OpenAI/ });
+    fireEvent.click(customButton);
+    const customCard = getProviderCard(customButton);
+
+    // First selection blocks in flight; second queues behind it.
+    fireEvent.pointerDown(within(customCard).getByRole("combobox", { name: "API format" }));
+    fireEvent.click(await within(customCard).findByRole("button", { name: "Anthropic Messages" }));
+    await waitFor(() => {
+      expect(view.setProviderConfig).toHaveBeenCalledTimes(1);
+    });
+    fireEvent.pointerDown(within(customCard).getByRole("combobox", { name: "API format" }));
+    fireEvent.click(await within(customCard).findByRole("button", { name: "OpenAI Responses" }));
+
+    // Removal invalidates the queue, then the in-flight write completes.
+    fireEvent.click(within(customCard).getByRole("button", { name: "Remove" }));
+    await waitFor(() => {
+      expect(view.removeCustomProvider).toHaveBeenCalledWith({ provider: CUSTOM_PROVIDER_ID });
+    });
+    resolveFirstWrite?.({ success: true, data: undefined });
+    await Promise.resolve();
+
+    // The queued write must never fire: it would recreate the removed entry.
+    expect(view.setProviderConfig).toHaveBeenCalledTimes(1);
   });
 
   test("startCoderLogin hint launches the Coder OAuth flow against the configured deployment", async () => {

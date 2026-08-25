@@ -25,8 +25,9 @@ import type { ServiceTier, XAIServiceTier } from "@/common/config/schemas/provid
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import {
+  customProviderWireOrigin,
   isBuiltInProvider,
-  isCustomOpenAICompatibleProviderConfig,
+  isCustomProviderConfig,
 } from "@/common/utils/providers/customProviders";
 import { isGatewayModelAccessibleFromAuthoritativeCatalog } from "@/common/utils/providers/gatewayModelCatalog";
 import {
@@ -401,6 +402,45 @@ export function countAnthropicCacheBreakpoints(requestBody: unknown): number {
 }
 
 /**
+ * Remove every cache marker the request pipeline may have serialized:
+ * `cache_control` on system/message/tool entries and nested content parts,
+ * plus gateway-style providerOptions.anthropic.cacheControl. ZDR enforcement
+ * happens HERE, at the wire, because upstream eligibility checks read a
+ * policy-filtered providers view that can hide the global anthropic
+ * disableBetaFeatures flag.
+ */
+function stripAnthropicCacheControlMarkers(json: Record<string, unknown>): void {
+  const stripEntry = (entry: unknown): void => {
+    if (entry == null || typeof entry !== "object" || Array.isArray(entry)) {
+      return;
+    }
+    const record = entry as Record<string, unknown>;
+    delete record.cache_control;
+    const providerOptions = record.providerOptions;
+    if (providerOptions != null && typeof providerOptions === "object") {
+      const anthropicOptions = (providerOptions as Record<string, unknown>).anthropic;
+      if (anthropicOptions != null && typeof anthropicOptions === "object") {
+        delete (anthropicOptions as Record<string, unknown>).cacheControl;
+      }
+    }
+    if (Array.isArray(record.content)) {
+      for (const part of record.content) {
+        stripEntry(part);
+      }
+    }
+  };
+
+  for (const key of ["system", "messages", "prompt", "tools"]) {
+    const value = json[key];
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        stripEntry(entry);
+      }
+    }
+  }
+}
+
+/**
  * Wrap fetch to normalize Anthropic cache_control directly on the final request body.
  *
  * This keeps routed Anthropic payloads aligned with Xum's manual cache markers
@@ -409,6 +449,9 @@ export function countAnthropicCacheBreakpoints(requestBody: unknown): number {
  * Injects cache_control on:
  * 1. Last tool (caches all tool definitions)
  * 2. Last message's last content part (caches entire conversation)
+ *
+ * When injectCacheControl is false (beta features disabled), existing markers
+ * are STRIPPED instead (see stripAnthropicCacheControlMarkers).
  */
 export function wrapFetchWithAnthropicCacheControl(
   baseFetch: typeof fetch,
@@ -427,6 +470,10 @@ export function wrapFetchWithAnthropicCacheControl(
 
     try {
       const json = JSON.parse(init.body) as Record<string, unknown>;
+
+      if (!injectCacheControl) {
+        stripAnthropicCacheControlMarkers(json);
+      }
 
       // Inject cache_control on the last tool if tools array exists.
       // If the SDK already populated cache_control, preserve it but override ttl
@@ -518,6 +565,38 @@ function wrapFetchWithMuxGatewayAutoLogout(
 }
 
 /**
+ * Custom adapters pass an explicit empty apiKey so the official SDKs cannot
+ * fall back to OPENAI_API_KEY/ANTHROPIC_API_KEY env credentials, but the SDKs
+ * then emit an empty auth header ("Authorization: Bearer" / "x-api-key: ").
+ * Keyless endpoints and auth proxies can reject a present malformed
+ * credential, so strip the empty header before the request leaves.
+ */
+function wrapFetchStrippingEmptyAuthHeaders(baseFetch: typeof fetch): typeof fetch {
+  const wrappedFetch = async (
+    input: Parameters<typeof fetch>[0],
+    init?: Parameters<typeof fetch>[1]
+  ): Promise<Response> => {
+    const headers = new Headers(init?.headers);
+    const authorization = headers.get("authorization");
+    if (
+      authorization != null &&
+      authorization
+        .trim()
+        .toLowerCase()
+        .replace(/^bearer$/, "") === ""
+    ) {
+      headers.delete("authorization");
+    }
+    const apiKeyHeader = headers.get("x-api-key");
+    if (apiKeyHeader != null && apiKeyHeader.trim() === "") {
+      headers.delete("x-api-key");
+    }
+    return baseFetch(input, { ...init, headers });
+  };
+  return Object.assign(wrappedFetch, baseFetch) as typeof fetch;
+}
+
+/**
  * Get fetch function for provider - use custom if provided, otherwise unlimited timeout default
  */
 function getProviderFetch(providerConfig: ProviderConfig): typeof fetch {
@@ -564,11 +643,22 @@ function getProviderFetch(providerConfig: ProviderConfig): typeof fetch {
  * @returns The base URL with /v1 suffix
  */
 export function normalizeAnthropicBaseURL(baseURL: string): string {
-  const trimmed = baseURL.replace(/\/+$/, ""); // Remove trailing slashes
-  if (trimmed.endsWith("/v1")) {
-    return trimmed;
+  // Append /v1 to the URL PATH: raw-string suffixing would push the version
+  // segment into a query or fragment (proxy.example/a?token=x -> ...?token=x/v1).
+  try {
+    const url = new URL(baseURL.trim());
+    // Compute on a local: the pathname setter normalizes "" back to "/".
+    const strippedPath = url.pathname.replace(/\/+$/, "");
+    url.pathname = strippedPath.endsWith("/v1") ? strippedPath : `${strippedPath}/v1`;
+    return url.toString();
+  } catch {
+    // Not an absolute URL; keep the legacy raw-string behavior.
+    const trimmed = baseURL.replace(/\/+$/, ""); // Remove trailing slashes
+    if (trimmed.endsWith("/v1")) {
+      return trimmed;
+    }
+    return `${trimmed}/v1`;
   }
-  return `${trimmed}/v1`;
 }
 
 export function normalizeOpenAICompatibleBaseURL(baseURL: string): string {
@@ -1143,19 +1233,21 @@ export class ProviderModelFactory {
       const providersConfig = opts?.providersConfig ?? this.config.loadProvidersConfig() ?? {};
       const providerConfigEntry = providersConfig[providerName];
       const providerIsBuiltIn = isBuiltInProvider(providerName);
-      const providerIsCustomOpenAICompatible =
-        providerConfigEntry != null && isCustomOpenAICompatibleProviderConfig(providerConfigEntry);
+      const customProviderType = isCustomProviderConfig(providerConfigEntry)
+        ? providerConfigEntry.providerType
+        : null;
+      const providerIsCustom = customProviderType !== null;
 
-      // Check if provider is supported. Explicit custom OpenAI-compatible config wins
+      // Check if provider is supported. Explicit custom provider config wins
       // even if a future release adds a built-in provider with the same id.
-      if (!providerIsCustomOpenAICompatible && providerIsBuiltIn) {
+      if (!providerIsCustom && providerIsBuiltIn) {
         if (!Object.hasOwn(PROVIDER_REGISTRY, providerName)) {
           return Err({
             type: "provider_not_supported",
             provider: providerName,
           });
         }
-      } else if (!providerIsCustomOpenAICompatible) {
+      } else if (!providerIsCustom) {
         return Err({
           type: "provider_not_supported",
           provider: providerName,
@@ -1189,7 +1281,7 @@ export class ProviderModelFactory {
       // disableBetaFeatures/cacheTtl, while a cross-typed canonical name
       // (coder:anthropic/x fronting an OpenAI-compatible upstream) must not.
       const isCoderGatewayModel =
-        providerName === "coder" && !isCustomOpenAICompatibleProviderConfig(providersConfig.coder);
+        providerName === "coder" && !isCustomProviderConfig(providersConfig.coder);
       const coderWire = isCoderGatewayModel
         ? resolveCoderWireCanonicalModel(
             modelId,
@@ -1200,7 +1292,9 @@ export class ProviderModelFactory {
         : null;
       const isAnthropicRoutedModel = isCoderGatewayModel
         ? coderWire?.origin === "anthropic"
-        : providerName === "anthropic" || modelId.startsWith("anthropic/");
+        : customProviderType === "anthropic-messages" ||
+          providerName === "anthropic" ||
+          modelId.startsWith("anthropic/");
 
       // Anthropic-specific: merge global disableBetaFeatures into muxProviderOptions.
       const configDisableBeta = providersConfig.anthropic?.disableBetaFeatures;
@@ -1228,7 +1322,9 @@ export class ProviderModelFactory {
       // while a cross-typed openai-named instance must not.
       const isOpenAIRoutedModel = isCoderGatewayModel
         ? coderWire?.providerType === "openai"
-        : providerName === "openai" || modelId.startsWith("openai/");
+        : customProviderType === "openai-responses" ||
+          providerName === "openai" ||
+          modelId.startsWith("openai/");
       const configOpenAIStore = providersConfig.openai?.store;
       if (isOpenAIRoutedModel && typeof configOpenAIStore === "boolean") {
         muxProviderOptions ??= {};
@@ -1269,7 +1365,7 @@ export class ProviderModelFactory {
         headers: buildAppAttributionHeaders(providerConfig.headers),
       };
 
-      if (providerIsCustomOpenAICompatible) {
+      if (customProviderType) {
         const credentials = resolveCustomProviderCredentials(providerName, providerConfig);
         if (!credentials.ok) {
           return Err(formatCustomProviderRequirementError(providerName, credentials.error));
@@ -1277,17 +1373,54 @@ export class ProviderModelFactory {
 
         const providerFetch = getProviderFetch(providerConfig);
         const muxAttributionHeaders = buildAppAttributionHeaders(providerConfig.headers);
+        // Custom adapters must not fall back to official-provider environment keys.
+        const isolatedApiKey = credentials.apiKey ?? "";
+        const customAdapterFetch =
+          credentials.apiKey == null
+            ? wrapFetchStrippingEmptyAuthHeaders(providerFetch)
+            : providerFetch;
 
-        // Pass only explicit OpenAI-compatible SDK settings so Xum-only config
-        // fields such as models, enabled, and providerType never reach the SDK.
-        const provider = createOpenAICompatible({
-          name: providerName,
-          baseURL: normalizeOpenAICompatibleBaseURL(credentials.baseURL),
-          ...(credentials.apiKey != null ? { apiKey: credentials.apiKey } : {}),
-          headers: { ...muxAttributionHeaders },
-          fetch: providerFetch,
-        });
-        return Ok(provider(modelId));
+        switch (customProviderType) {
+          case "openai-compatible": {
+            // Pass only explicit OpenAI-compatible SDK settings so Xum-only config
+            // fields such as models, enabled, and providerType never reach the SDK.
+            const provider = createOpenAICompatible({
+              name: providerName,
+              baseURL: normalizeOpenAICompatibleBaseURL(credentials.baseURL),
+              ...(credentials.apiKey != null ? { apiKey: credentials.apiKey } : {}),
+              headers: { ...muxAttributionHeaders },
+              fetch: providerFetch,
+            });
+            return Ok(provider(modelId));
+          }
+          case "openai-responses": {
+            const { createOpenAI } = await PROVIDER_REGISTRY.openai();
+            const provider = createOpenAI({
+              baseURL: normalizeOpenAICompatibleBaseURL(credentials.baseURL),
+              apiKey: isolatedApiKey,
+              headers: { ...muxAttributionHeaders },
+              fetch: customAdapterFetch,
+            });
+            return Ok(provider.responses(modelId));
+          }
+          case "anthropic-messages": {
+            const { createAnthropic } = await PROVIDER_REGISTRY.anthropic();
+            // Honor beta disablement like the built-in Anthropic path: strict
+            // ZDR proxies reject cache_control when beta features are off.
+            const disableBeta = muxProviderOptions?.anthropic?.disableBetaFeatures === true;
+            const provider = createAnthropic({
+              baseURL: normalizeAnthropicBaseURL(credentials.baseURL),
+              apiKey: isolatedApiKey,
+              headers: { ...muxAttributionHeaders },
+              fetch: wrapFetchWithAnthropicCacheControl(
+                customAdapterFetch,
+                effectiveAnthropicCacheTtl,
+                { injectCacheControl: !disableBeta }
+              ),
+            });
+            return Ok(provider(modelId));
+          }
+        }
       }
 
       // Handle Anthropic provider
@@ -2344,7 +2477,7 @@ export class ProviderModelFactory {
     const [rawProviderName] = parseModelString(modelString);
     const rawPrefixShadowedByCustomProvider =
       rawProviderName.length > 0 &&
-      isCustomOpenAICompatibleProviderConfig(providersConfigForShadowCheck[rawProviderName]);
+      isCustomProviderConfig(providersConfigForShadowCheck[rawProviderName]);
 
     const explicitGateway = rawPrefixShadowedByCustomProvider
       ? undefined
@@ -2480,10 +2613,17 @@ export class ProviderModelFactory {
       );
     }
 
+    // Custom providers own their canonical prefix (including shadowed
+    // built-in ids); their requests are always direct, never gateway-routed.
+    const canonicalCustomEntry = providersConfigForShadowCheck[canonicalProviderName];
+    const canonicalIsCustomProvider = isCustomProviderConfig(canonicalCustomEntry);
+
     // Stream result normalization currently only understands Xum gateway responses,
     // so keep this flag mux-gateway-specific until the downstream normalization path
-    // is generalized too.
-    const routedThroughGateway = effectiveModelString.startsWith("mux-gateway:");
+    // is generalized too. A custom provider shadowing the mux-gateway id is
+    // direct: gateway attribution/quota handling must not engage for it.
+    const routedThroughGateway =
+      !canonicalIsCustomProvider && effectiveModelString.startsWith("mux-gateway:");
     const [effectiveRouteProvider] = parseModelString(effectiveModelString);
     const routeProvider = Object.hasOwn(PROVIDER_REGISTRY, effectiveRouteProvider)
       ? (effectiveRouteProvider as ProviderName)
@@ -2507,7 +2647,7 @@ export class ProviderModelFactory {
       | undefined;
     if (
       effectiveRouteProvider === "coder" &&
-      !isCustomOpenAICompatibleProviderConfig(providersConfigForShadowCheck.coder)
+      !isCustomProviderConfig(providersConfigForShadowCheck.coder)
     ) {
       const wire = resolveCoderWireCanonicalModel(
         effectiveModelString.slice(effectiveModelString.indexOf(":") + 1),
@@ -2540,6 +2680,19 @@ export class ProviderModelFactory {
       const [seedOrigin] = parseModelString(normalizeToCanonical(routeSeedModelString));
       if (seedOrigin) {
         wireProviderName = seedOrigin;
+      }
+    }
+
+    // Custom providers speak the wire their providerType selects: an
+    // anthropic-messages provider sends Anthropic-shaped bytes, so Anthropic
+    // reasoning transforms and options namespaces must key on the wire, not
+    // the custom prefix (same rationale as the Coder-gateway remap above).
+    // Must mirror resolveOptionsCanonicalModel so the extras-merge namespace
+    // key matches what buildProviderOptions computes internally.
+    if (canonicalIsCustomProvider) {
+      const customWireOrigin = customProviderWireOrigin(canonicalCustomEntry.providerType);
+      if (customWireOrigin) {
+        wireProviderName = customWireOrigin;
       }
     }
 
@@ -2589,7 +2742,11 @@ export class ProviderModelFactory {
       coderWire,
       coderSelectedInstance,
       routedThroughGateway,
-      routeProvider,
+      // Custom adapters are direct routes: the raw custom id is not a
+      // ProviderName, and leaking it as routeProvider makes downstream
+      // namespace/format selection treat the request as a transforming
+      // gateway (empty provider options, suppressed Anthropic headers).
+      routeProvider: canonicalIsCustomProvider ? undefined : routeProvider,
     });
   }
 
@@ -2666,16 +2823,13 @@ export class ProviderModelFactory {
     const providersConfig = providersConfigSnapshot ?? this.config.loadProvidersConfig() ?? {};
 
     // Shadow check on the RAW prefix, BEFORE gateway canonicalization: a
-    // custom OpenAI-compatible provider can shadow a built-in gateway id
+    // custom provider can shadow a built-in gateway id
     // (an upgraded install may already have one named "coder"). Left to the
     // canonical check below, fromGatewayModelId would rewrite
     // coder:openai/foo to openai:foo first and silently route it through
     // the built-in machinery instead of the user's custom endpoint.
     const [rawProviderName] = parseModelString(modelString);
-    if (
-      rawProviderName &&
-      isCustomOpenAICompatibleProviderConfig(providersConfig[rawProviderName])
-    ) {
+    if (rawProviderName && isCustomProviderConfig(providersConfig[rawProviderName])) {
       return modelString;
     }
 
@@ -2691,7 +2845,7 @@ export class ProviderModelFactory {
       return canonicalModelString;
     }
 
-    if (isCustomOpenAICompatibleProviderConfig(providersConfig[originProviderName])) {
+    if (isCustomProviderConfig(providersConfig[originProviderName])) {
       // Manual providers.jsonc edits can shadow a built-in provider id. Custom providers
       // are direct-only, so keep the user's model pointed at the custom endpoint.
       return canonicalModelString;

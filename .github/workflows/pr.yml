@@ -239,18 +239,19 @@ jobs:
             done
           done
 
+          # Derive the exclusions from isolated_unit_tests so the two lists cannot
+          # drift. A hand-maintained duplicate list previously desynced: the QuickJS-heavy
+          # sandboxHostService.test.ts ran a second time inside this shared coverage
+          # process and segfaulted Bun mid-suite (merge-queue runs 32666269009 and
+          # 32667158072), kicking a fully green PR out of the queue.
+          find_excludes=()
+          for isolated_unit_test in "${isolated_unit_tests[@]}"; do
+            find_excludes+=(! -path "$isolated_unit_test")
+          done
+
           mapfile -d '' unit_files < <(
             find src -type f \( -name '*.test.ts' -o -name '*.test.tsx' \) \
-              ! -path 'src/node/orpc/router.test.ts' \
-              ! -path 'src/node/services/workflows/WorkflowRunner.test.ts' \
-              ! -path 'src/node/services/ptc/quickjsRuntime.test.ts' \
-              ! -path 'src/node/services/agentPlugins/hookService.test.ts' \
-              ! -path 'src/browser/components/WorkspaceHeartbeatModal/WorkspaceHeartbeatModal.test.tsx' \
-              ! -path 'src/browser/features/Messages/InlineSkillMarkdown.test.tsx' \
-              ! -path 'src/browser/hooks/useChatTranscriptFullWidth.test.tsx' \
-              ! -path 'src/browser/utils/commands/sources.test.ts' \
-              ! -path 'src/browser/components/CommandPalette/CommandPalette.prompt.test.tsx' \
-              ! -path 'src/browser/features/RightSidebar/Memory/MemoryTab.test.tsx' \
+              "${find_excludes[@]}" \
               -print0
           )
           bun test --max-concurrency=1 --coverage --coverage-reporter=lcov "${unit_files[@]}"
@@ -265,7 +266,13 @@ jobs:
     name: Test / Integration
     needs: [changes]
     if: ${{ (needs.changes.outputs.src == 'true' || needs.changes.outputs.config == 'true') && (github.event_name != 'push' || github.actor != 'github-merge-queue[bot]') }}
-    timeout-minutes: 10
+    # Healthy runs finish in ~4-5 min, but jest's integration testTimeout is 10 minutes,
+    # so a single hung test used to collide with a 10-minute job cap: the runner killed
+    # the job ("exceeded the maximum execution time of 10m0s") and destroyed all logs,
+    # repeatedly kicking green PRs from the merge queue (e.g. runs 32632804824,
+    # 32639270365, 32640298486). 20 minutes lets jest fail the hung test with real
+    # diagnostics and still bounds a wedged runner.
+    timeout-minutes: 20
     runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -279,9 +286,19 @@ jobs:
         run: | # zizmor: ignore[template-injection]
           set -euo pipefail
 
+          # No --maxWorkers override: jest.config.js sizes the pool via
+          # workerBudgetFor("jest") (scripts/lib/worker_budget.js), which accounts for
+          # per-fork peak memory (~4.7GiB) and live cgroup usage. The old CLI
+          # --maxWorkers=100% took precedence over that budget and forked 16 workers
+          # on the 16-core/64GB runner (~75GiB peak), thrashing memory. Under that
+          # load, wall clock inflated ~10-20x: suites that normally finish in seconds
+          # passed at 100-135s while tests with tight explicit timeouts (30-45s) died,
+          # which is what made focus/sendModeDropdown/anthropicCacheStrategy flake in
+          # the merge queue.
+
           # Manual override (workflow_dispatch input)
           if [[ -n "${{ github.event.inputs.test_filter }}" ]]; then
-            TEST_INTEGRATION=1 bun x jest --coverage --maxWorkers=100% --silent ${{ github.event.inputs.test_filter }}
+            TEST_INTEGRATION=1 bun x jest --coverage --silent ${{ github.event.inputs.test_filter }}
             exit 0
           fi
 
@@ -294,11 +311,11 @@ jobs:
           # Backend changed: run ALL integration tests (includes tests/ui)
           if [[ "$BACKEND" == "true" ]]; then
             echo "Backend changes detected - running all integration tests"
-            TEST_INTEGRATION=1 bun x jest --coverage --maxWorkers=100% --silent tests/
+            TEST_INTEGRATION=1 bun x jest --coverage --silent tests/
           else
             # Browser-only changes: run tests/ui
             echo "Browser changes detected - running tests/ui"
-            TEST_INTEGRATION=1 bun x jest --coverage --maxWorkers=100% --silent tests/ui/
+            TEST_INTEGRATION=1 bun x jest --coverage --silent tests/ui/
           fi
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

@@ -304,6 +304,10 @@ export const ProjectConfigSchema = z.object({
     description:
       "Custom system prompt appended for every workspace in this project (Settings → Instructions)",
   }),
+  codeWorkspaceSyncPath: z.string().optional().meta({
+    description:
+      "Path to a VS Code .code-workspace file kept in sync with this project's active worktrees (relative paths resolve against the project root). Unset = sync disabled.",
+  }),
 });
 
 export type WorktreeArchiveSnapshotProject = z.infer<typeof WorktreeArchiveSnapshotProjectSchema>;

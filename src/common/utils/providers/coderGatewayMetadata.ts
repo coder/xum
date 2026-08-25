@@ -1,5 +1,5 @@
 import { resolveCoderMetadataCanonicalModel } from "@/common/constants/coderOAuth";
-import { isCustomOpenAICompatibleProviderConfig } from "@/common/utils/providers/customProviders";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 
 /**
  * Capability/metadata identity for gateway-scoped Coder strings
@@ -11,7 +11,7 @@ import { isCustomOpenAICompatibleProviderConfig } from "@/common/utils/providers
  * over. Treat-as mappings must NOT confer runtime capabilities, which is why
  * runtime gates apply only this mapping and not resolveModelForMetadata.
  *
- * Returns null for non-coder strings, when a custom OpenAI-compatible
+ * Returns null for non-coder strings, when a custom
  * provider shadows the coder prefix (its model IDs are their own identity),
  * or when the upstream's catalog identity is unknowable (openai-compat).
  */
@@ -23,7 +23,7 @@ export function resolveCoderGatewayMetadataModel(
     return null;
   }
   const coderSection = providersConfig?.coder;
-  if (isCustomOpenAICompatibleProviderConfig(coderSection)) {
+  if (isCustomProviderConfig(coderSection)) {
     return null;
   }
   return resolveCoderMetadataCanonicalModel(
