@@ -1285,7 +1285,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         activeCount?: number;
         archivedCount?: number;
       },
-      buttonElement?: HTMLElement
+      // Callers pass precomputed coordinates because the triggering button may
+      // already be unmounted by the time an awaited removal/preflight settles.
+      anchor?: { top: number; left: number }
     ) => {
       let message: string;
       if (error.type === "workspace_blockers") {
@@ -1306,25 +1308,20 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         message = error.message ?? "Failed to remove project";
       }
 
-      let anchor: { top: number; left: number } | undefined;
-      if (buttonElement) {
-        const rect = buttonElement.getBoundingClientRect();
-        anchor = {
-          top: rect.top + window.scrollY,
-          left: rect.right + 10,
-        };
-      }
-
       projectRemoveError.showError(projectPath, message, anchor);
     },
     [projectRemoveError]
   );
 
   const removeProjectWithFeedback = useCallback(
-    async (projectPath: string, options?: { force?: boolean }, buttonElement?: HTMLElement) => {
+    async (
+      projectPath: string,
+      options?: { force?: boolean },
+      anchor?: { top: number; left: number }
+    ) => {
       const result = await onRemoveProject(projectPath, options);
       if (!result.success) {
-        showProjectRemoveError(projectPath, result.error, buttonElement);
+        showProjectRemoveError(projectPath, result.error, anchor);
       }
       return result;
     },
@@ -1495,6 +1492,16 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       }
 
       const projectName = projectConfig.displayName ?? getProjectNameFromPath(projectPath);
+      // Capture the anchor up front: the context menu closes (unmounting the
+      // button) while the preflight below is awaited, and a disconnected
+      // element would resolve to zero coordinates.
+      const anchor =
+        buttonElement != null
+          ? (() => {
+              const rect = buttonElement.getBoundingClientRect();
+              return { top: rect.top + window.scrollY, left: rect.right + 10 };
+            })()
+          : undefined;
       // projects.list excludes archived workspaces (read-side projection), so
       // blocker counts come from a read-only backend preflight instead of the
       // embedded workspace arrays. remove() is deliberately NOT used as the
@@ -1509,7 +1516,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
           showProjectRemoveError(
             projectPath,
             { type: "unknown", message: getErrorMessage(error) },
-            buttonElement
+            anchor
           );
         }
         return;
@@ -1527,7 +1534,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         return;
       }
 
-      void removeProjectWithFeedback(projectPath, undefined, buttonElement);
+      void removeProjectWithFeedback(projectPath, undefined, anchor);
     },
     [getRemovalBlockers, removeProjectWithFeedback, showProjectRemoveError, userProjects]
   );

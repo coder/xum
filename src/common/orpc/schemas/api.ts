@@ -35,6 +35,7 @@ import {
   GoalSetInputSchema,
 } from "./goal";
 import { ProjectConfigSchema } from "./project";
+import { ProjectWorkspaceCountsSchema } from "@/common/utils/projectRemoval";
 import {
   MemoryChangeEventSchema,
   MemoryConsolidationRecordSchema,
@@ -759,10 +760,7 @@ export const projects = {
   // longer embeds archived workspaces, so blocker counts come from the backend.
   getRemovalBlockers: {
     input: z.object({ projectPath: z.string() }),
-    output: z.object({
-      activeCount: z.number().int().nonnegative(),
-      archivedCount: z.number().int().nonnegative(),
-    }),
+    output: ProjectWorkspaceCountsSchema,
   },
   list: {
     input: z.void(),

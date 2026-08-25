@@ -354,16 +354,6 @@ export function ProjectProvider(props: { children: ReactNode }) {
     [api, refreshProjects]
   );
 
-  const getRemovalBlockers = useCallback(
-    async (path: string): Promise<ProjectWorkspaceCounts> => {
-      if (!api) {
-        throw new Error("API not connected");
-      }
-      return api.projects.getRemovalBlockers({ projectPath: path });
-    },
-    [api]
-  );
-
   const resolveProjectPath = useCallback(
     (query: ProjectQuery): string | null => {
       // The scratch sentinel is not a configured project until the first
@@ -622,7 +612,14 @@ export function ProjectProvider(props: { children: ReactNode }) {
       refreshProjects,
       addProject,
       removeProject,
-      getRemovalBlockers,
+      // Inline (not useCallback-wrapped): `api` is already a dependency of
+      // this provider value memo, mirroring the other inline actions below.
+      getRemovalBlockers: async (path: string): Promise<ProjectWorkspaceCounts> => {
+        if (!api) {
+          throw new Error("API not connected");
+        }
+        return api.projects.getRemovalBlockers({ projectPath: path });
+      },
       projectCreateInitialPath,
       isProjectCreateModalOpen,
       openProjectCreateModal: (options?: { initialPath?: string }) => {
@@ -672,7 +669,6 @@ export function ProjectProvider(props: { children: ReactNode }) {
       refreshProjects,
       addProject,
       removeProject,
-      getRemovalBlockers,
       projectCreateInitialPath,
       isProjectCreateModalOpen,
       workspaceModalState,
