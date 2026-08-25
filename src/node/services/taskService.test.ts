@@ -1079,19 +1079,11 @@ describe("TaskService", () => {
     expect(sendMessageCall[2]).toMatchObject({ agentId: "plan" });
   });
 
-  test("createWorkspaceTurn defers owner-side misses when a committed init hook could install agents", async () => {
+  test("createWorkspaceTurn owner-side misses are always advisory (target decides)", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["childworkspace", "turnhandle"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
     checkoutOwnerBranch(projectPath, "parent");
-    // A committed project init hook runs at target creation and may install the
-    // requested agent; the owner (initialized before the hook existed) legitimately
-    // lacks it, so an owner-side miss must not reject the launch pre-create.
-    const muxDir = path.join(projectPath, ".mux");
-    await fsPromises.mkdir(muxDir, { recursive: true });
-    // Executable: only hooks passing the init runner's test -x rule can ever run.
-    await fsPromises.writeFile(path.join(muxDir, "init"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-    commitOwnerAgentFiles(projectPath);
 
     const createWorkspace = mock(
       (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
@@ -1103,105 +1095,27 @@ describe("TaskService", () => {
       workspaceService: workspaceMocks.workspaceService,
     });
 
-    const result = await taskService.createWorkspaceTurn({
-      ownerWorkspaceId: parentId,
-      agentId: "hookinstalled",
-      prompt: "Should defer to the target",
-      title: "Hook-installed agent",
-      workspace: { mode: "new" },
-    });
-
-    // The miss defers to the created checkout, which is authoritative (validated
-    // post-create; here the hook did not actually install it, so the launch still
-    // fails — but only AFTER the target had its chance).
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error).toContain("no turn was dispatched");
-    }
-    expect(createWorkspace).toHaveBeenCalledTimes(1);
-    expect(sendMessage).not.toHaveBeenCalled();
-  });
-
-  test("createWorkspaceTurn keeps misses fatal when the committed init hook is not executable", async () => {
-    const config = await createTestConfig(rootDir);
-    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
-    checkoutOwnerBranch(projectPath, "parent");
-    // Only executable hooks can run (the init runner's test -x rule): a committed but
-    // non-executable init file cannot install agents, so the miss stays fatal and no
-    // unnecessary owned workspace is created.
-    const muxDir = path.join(projectPath, ".mux");
-    await fsPromises.mkdir(muxDir, { recursive: true });
-    await fsPromises.writeFile(path.join(muxDir, "init"), "#!/bin/sh\nexit 0\n", { mode: 0o644 });
-    commitOwnerAgentFiles(projectPath);
-
-    const createWorkspace = mock(
-      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
-        Promise.resolve(Ok({ metadata: createWorkspaceTurnMetadata(projectPath) }))
-    );
-    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
-    const { taskService } = createTaskServiceHarness(config, {
-      workspaceService: workspaceMocks.workspaceService,
-    });
-
+    // No owner-side equivalence proof is sound (fetched origin commits, existing
+    // branchName targets, submodules, init hooks): the created checkout is the only
+    // authoritative source, so a miss defers instead of rejecting pre-create.
     const result = await taskService.createWorkspaceTurn({
       ownerWorkspaceId: parentId,
       agentId: "doesnotexist",
-      prompt: "Should not run",
-      title: "Non-executable hook",
-      workspace: { mode: "new" },
-    });
-
-    expect(result.success).toBe(false);
-    if (!result.success) expect(result.error).toContain("unknown agentId");
-    expect(createWorkspace).not.toHaveBeenCalled();
-  });
-
-  test("createWorkspaceTurn defers owner-side misses when the owner is behind its origin ref", async () => {
-    const config = await createTestConfig(rootDir);
-    stubStableIds(config, ["childworkspace", "turnhandle"]);
-    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
-    checkoutOwnerBranch(projectPath, "parent");
-    // Worktree creation may branch from origin/<trunkBranch> when the local branch can
-    // fast-forward: an owner behind its origin cannot vouch for the base commit — an
-    // agent added only in the newer remote commit would be wrongly rejected pre-create.
-    const bareRemote = path.join(rootDir, "origin-behind.git");
-    execSync(`git init --bare -q '${bareRemote}'`, { cwd: rootDir, stdio: "ignore" });
-    execSync(`git remote add origin '${bareRemote}'`, { cwd: projectPath, stdio: "ignore" });
-    execSync("git commit -q --allow-empty -m newer", { cwd: projectPath, stdio: "ignore" });
-    execSync("git push -q origin parent", { cwd: projectPath, stdio: "ignore" });
-    execSync("git reset -q --hard HEAD~1", { cwd: projectPath, stdio: "ignore" });
-
-    const createWorkspace = mock(
-      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
-        Promise.resolve(Ok({ metadata: createWorkspaceTurnMetadata(projectPath) }))
-    );
-    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
-    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
-    const { taskService } = createTaskServiceHarness(config, {
-      workspaceService: workspaceMocks.workspaceService,
-    });
-
-    const result = await taskService.createWorkspaceTurn({
-      ownerWorkspaceId: parentId,
-      agentId: "remoteonly",
       prompt: "Should defer to the target",
-      title: "Owner behind origin",
+      title: "Advisory miss",
       workspace: { mode: "new" },
     });
 
-    // The miss defers to the created checkout (authoritative for the actual base
-    // commit); here the target lacks the agent too, so the launch still fails — but
-    // only after the target had its chance.
     expect(result.success).toBe(false);
     if (!result.success) {
+      expect(result.error).toContain("unknown agentId");
       expect(result.error).toContain("no turn was dispatched");
     }
     expect(createWorkspace).toHaveBeenCalledTimes(1);
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
-  test("createWorkspaceTurn rejects invalid, unknown, and internal agent ids before creating a workspace", async () => {
+  test("createWorkspaceTurn rejects bad agent ids without ever dispatching a turn", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
     checkoutOwnerBranch(projectPath, "parent");
@@ -1225,24 +1139,34 @@ describe("TaskService", () => {
         workspace: { mode: "new" },
       });
 
+    // Syntactically invalid ids are checkout-independent and fail before any
+    // workspace exists.
     const invalidSyntax = await attempt("Not A Valid Id!");
     expect(invalidSyntax.success).toBe(false);
     if (!invalidSyntax.success) expect(invalidSyntax.error).toContain("invalid agentId");
+    expect(createWorkspace).not.toHaveBeenCalled();
 
+    // Definition-dependent verdicts are decided by the created target checkout
+    // (owner-side prechecks are advisory): unknown and internal (ui.hidden) ids
+    // fail there, with the workspace retained as owned evidence and no dispatch.
     const unknown = await attempt("doesnotexist");
     expect(unknown.success).toBe(false);
-    if (!unknown.success) expect(unknown.error).toContain("unknown agentId");
+    if (!unknown.success) {
+      expect(unknown.error).toContain("unknown agentId");
+      expect(unknown.error).toContain("no turn was dispatched");
+    }
 
-    // Built-in internal agents (ui.hidden) must not be launchable as workspace turns.
     const internal = await attempt("compact");
     expect(internal.success).toBe(false);
-    if (!internal.success) expect(internal.error).toContain("not selectable");
+    if (!internal.success) {
+      expect(internal.error).toContain("not selectable");
+      expect(internal.error).toContain("no turn was dispatched");
+    }
 
-    expect(createWorkspace).not.toHaveBeenCalled();
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
-  test("createWorkspaceTurn rejects disabled agents before creating a workspace", async () => {
+  test("createWorkspaceTurn rejects disabled agents without dispatching a turn", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir, {
       agentAiDefaults: { custom: { enabled: false } },
@@ -1269,9 +1193,13 @@ describe("TaskService", () => {
       workspace: { mode: "new" },
     });
 
+    // Enablement is decided at the created target checkout (owner prechecks are
+    // advisory); the disabled verdict settles post-create with no dispatch.
     expect(result.success).toBe(false);
-    if (!result.success) expect(result.error).toContain("disabled");
-    expect(createWorkspace).not.toHaveBeenCalled();
+    if (!result.success) {
+      expect(result.error).toContain("disabled");
+      expect(result.error).toContain("no turn was dispatched");
+    }
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
@@ -1344,14 +1272,13 @@ describe("TaskService", () => {
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
-  test("createWorkspaceTurn unreachable target respects an owner project shadow of a built-in id", async () => {
+  test("createWorkspaceTurn respects a project shadow of a built-in id at the target", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["childworkspace", "turnhandle"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
     checkoutOwnerBranch(projectPath, "parent");
-    // Shadow the built-in plan agent with a hidden project-local override in the OWNER's
-    // checkout: eligibility for unreachable targets must consult the shadow, not just the
-    // embedded definition.
+    // Shadow the built-in plan agent with a hidden project-local override: target-side
+    // eligibility must consult the shadow, not just the embedded definition.
     const agentsDir = path.join(projectPath, ".mux", "agents");
     await fsPromises.mkdir(agentsDir, { recursive: true });
     await fsPromises.writeFile(
@@ -1391,8 +1318,10 @@ describe("TaskService", () => {
     });
 
     expect(result.success).toBe(false);
-    if (!result.success) expect(result.error).toContain("not selectable");
-    expect(createWorkspace).not.toHaveBeenCalled();
+    if (!result.success) {
+      expect(result.error).toContain("not selectable");
+      expect(result.error).toContain("no turn was dispatched");
+    }
     expect(sendMessage).not.toHaveBeenCalled();
   });
 

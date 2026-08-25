@@ -65,7 +65,6 @@ import {
   findWorkspaceEntry,
 } from "@/node/services/taskUtils";
 import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
-import { findInitHookRelativePath } from "@/node/runtime/initHook";
 import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
 import { getTaskGroupCount } from "@/common/utils/tools/taskGroups";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
@@ -4184,7 +4183,12 @@ export class TaskService {
                 effectiveTrunkBranch
               )
             : undefined;
+        // An explicit branchName can attach the worktree to an EXISTING branch of that
+        // name (WorktreeManager detects and reuses it), making the trunk comparison
+        // above meaningless for the actual base — never vouch in that case.
+        const requestedBranchName = coerceNonEmptyString(args.workspace?.branchName);
         ownerVouchesForTargetBase =
+          requestedBranchName == null &&
           ownerBranchMatchesTargetBase &&
           ownerAgentDirsClean === true &&
           ownerCommitMatchesOrigin === true;
@@ -4201,18 +4205,14 @@ export class TaskService {
           ...ownerContext,
         });
         if (!validation.success) {
-          // Fatal only when the owner provably equals the base AND target init cannot
-          // add definitions: an EXECUTABLE committed project init hook (the same
-          // findInitHookRelativePath rule the init runner uses — non-executable files
-          // never run) runs at target creation and may install the requested agent even
-          // though the owner (initialized before the hook existed, or with
-          // per-workspace conditions) legitimately lacks it.
-          const ownerInitHook = ownerVouchesForTargetBase
-            ? await findInitHookRelativePath(ownerContext.runtime, ownerContext.workspacePath)
-            : null;
-          if (ownerVouchesForTargetBase && ownerInitHook == null) {
-            return Err(validation.error);
-          }
+          // Owner-side misses are ALWAYS advisory: the created checkout is the only
+          // authoritative source of the target's agent definitions. No owner-side
+          // equivalence proof is sound here — worktree creation may fetch a newer
+          // origin commit, attach to an existing branchName, initialize submodules the
+          // owner never materialized, or run a committed init hook that installs the
+          // requested agent — so a pre-create rejection could deny a launch the real
+          // target would accept. Post-create validation (and, for anything it cannot
+          // see, the stream-time strict provenance pin) fails loudly instead.
           log.debug(
             "Task.createWorkspaceTurn: owner-side agent validation failed; deferring to the target checkout",
             { agentId: requestedAgentId, error: validation.error }
