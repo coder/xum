@@ -9673,28 +9673,6 @@ export class WorkspaceService extends EventEmitter {
     return this.updateAgentAISettings(workspaceId, mode, aiSettings);
   }
 
-  /**
-   * Model a selected-agent switch would make authoritative for backend
-   * dispatches (heartbeats, goal continuations): the target agent's stored
-   * workspace bucket, then the legacy shared workspace settings.
-   */
-  private getStoredWorkspaceAgentModel(workspaceId: string, agentId: string): string | undefined {
-    const found = this.config.findWorkspace(workspaceId);
-    if (!found) {
-      return undefined;
-    }
-    const normalizedAgentId = normalizeAgentId(agentId, "");
-    if (!normalizedAgentId) {
-      return undefined;
-    }
-    const entry = this.findFreshWorkspaceEntry(this.config.loadConfigOrDefault(), {
-      projectPath: found.projectPath,
-      workspaceId,
-      workspacePath: found.workspacePath,
-    });
-    return entry?.aiSettingsByAgent?.[normalizedAgentId]?.model ?? entry?.aiSettings?.model;
-  }
-
   async updateAgentAISettings(
     workspaceId: string,
     agentId: string,
@@ -9722,12 +9700,14 @@ export class WorkspaceService extends EventEmitter {
         // and budget enforcement quietly stops working.
         if (hasBudgetedResumableGoal(goal)) {
           // Agent-only switches (null aiSettings) still redirect heartbeat and
-          // goal-continuation dispatches to the target agent's stored settings,
-          // so gate on the model the switch would make authoritative.
+          // goal-continuation dispatches to the target agent, so gate on the
+          // same fully resolved model (bucket, configured/definition defaults,
+          // legacy fallback) that dispatch resolution would select.
           const gatedModel =
             normalizedSettings?.model ??
             (options?.persistSelectedAgentId === true
-              ? this.getStoredWorkspaceAgentModel(workspaceId, agentId)
+              ? (await this.resolveContinuationKickoffSendOptionsForAgent(workspaceId, agentId))
+                  ?.model
               : undefined);
           if (
             gatedModel != null &&
@@ -13482,6 +13462,21 @@ export class WorkspaceService extends EventEmitter {
       workspaceId.trim().length > 0,
       "getGoalContinuationKickoffSendOptions requires workspaceId"
     );
+    return this.resolveContinuationKickoffSendOptionsForAgent(workspaceId, null);
+  }
+
+  /**
+   * Send options a backend continuation dispatch (goal kickoff, heartbeat)
+   * would use for the given selected agent — or for the persisted selected
+   * agent when `overrideAgentId` is null. Also backs the budgeted-goal pricing
+   * gate for agent-only switches, which must gate the same fully resolved
+   * model (bucket, configured/definition defaults, legacy fallback) that this
+   * dispatch path would select.
+   */
+  private async resolveContinuationKickoffSendOptionsForAgent(
+    workspaceId: string,
+    overrideAgentId: string | null
+  ): Promise<SendMessageOptions | null> {
     const config = this.config.loadConfigOrDefault();
     const workspaceMatch = this.config.findWorkspace(workspaceId);
     if (!workspaceMatch) {
@@ -13496,7 +13491,10 @@ export class WorkspaceService extends EventEmitter {
     // sendMessage call runs, so resolve kickoff options from the persisted selected
     // agent instead of assuming the default exec agent. Plan/compact are UI modes,
     // not continuation-capable agents, so fall back to exec for the actual kickoff.
-    const persistedAgentId = normalizeAgentId(workspaceEntry?.agentId, WORKSPACE_DEFAULTS.agentId);
+    const persistedAgentId = normalizeAgentId(
+      overrideAgentId ?? workspaceEntry?.agentId,
+      WORKSPACE_DEFAULTS.agentId
+    );
     const agentId =
       persistedAgentId === "plan" || persistedAgentId === "compact"
         ? WORKSPACE_DEFAULTS.agentId

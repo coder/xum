@@ -9279,7 +9279,7 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
                 path: "/tmp/proj/ws",
                 name: "ws",
                 aiSettingsByAgent: {
-                  plan: { model: "openai:not-priced-model", thinkingLevel: "off" },
+                  reviewer: { model: "openai:not-priced-model", thinkingLevel: "off" },
                 },
               },
             ],
@@ -9288,7 +9288,32 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
       ]),
     }));
 
-    const result = await workspaceService.updateAgentAISettings("ws", "plan", null, {
+    const result = await workspaceService.updateAgentAISettings("ws", "reviewer", null, {
+      persistSelectedAgentId: true,
+    });
+
+    expect(result).toEqual({
+      success: false,
+      error: "Target model has no pricing data. Pick a priced model before switching.",
+    });
+  });
+
+  test("refuses agent-only switch when the configured agent default is unpriced", async () => {
+    workspaceService.setWorkspaceGoalService({
+      getGoal: mock(() => Promise.resolve({ status: "active", budgetCents: 500 })),
+    } as unknown as WorkspaceGoalService);
+    (
+      workspaceService as unknown as { config: { loadConfigOrDefault: () => unknown } }
+    ).config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        ["/tmp/proj", { workspaces: [{ id: "ws", path: "/tmp/proj/ws", name: "ws" }] }],
+      ]),
+      // No workspace bucket: continuation dispatch would resolve this
+      // configured default, so the switch must gate on it too.
+      agentAiDefaults: { reviewer: { modelString: "openai:not-priced-model" } },
+    }));
+
+    const result = await workspaceService.updateAgentAISettings("ws", "reviewer", null, {
       persistSelectedAgentId: true,
     });
 
@@ -9309,7 +9334,7 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
       }
     ).persistWorkspaceAISettingsForAgent = persistSpy;
 
-    const result = await workspaceService.updateAgentAISettings("ws", "plan", null, {
+    const result = await workspaceService.updateAgentAISettings("ws", "reviewer", null, {
       persistSelectedAgentId: true,
     });
 
