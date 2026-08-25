@@ -2343,16 +2343,18 @@ describe("WorkspaceGoalService", () => {
     // applying the discarded goal at the end of the NEXT stream (AgentSession
     // deliberately skips the stream-end drain for user aborts).
     await extensionMetadata.setStreaming(workspaceId, true);
+    const mutationAccess = service as unknown as { pendingGoalMutations: Map<string, unknown> };
     const stopPromises: Array<Promise<void>> = [];
     let fireStops = false;
     const originalGetSnapshot = extensionMetadata.getSnapshot.bind(extensionMetadata);
     spyOn(extensionMetadata, "getSnapshot").mockImplementation(async (id: string) => {
       const snapshot = await originalGetSnapshot(id);
-      if (fireStops) {
-        // Fire the abort's synchronous mutation delete at every await inside
-        // the queued-setGoal path, including the activity read inside
-        // publishPendingGoalSnapshot; the abort then queues on the goal file
-        // lock behind the setter.
+      if (fireStops && mutationAccess.pendingGoalMutations.get(workspaceId) != null) {
+        // Fire the abort's synchronous mutation delete during the activity
+        // read inside publishPendingGoalSnapshot — the only await with the
+        // mutation already installed (a stop during the pre-install awaits is
+        // rejected outright; see the span-a-user-stop test). The abort then
+        // queues on the goal file lock behind the setter.
         stopPromises.push(service.recordUserStoppedStream(workspaceId));
       }
       return snapshot;
@@ -2500,6 +2502,48 @@ describe("WorkspaceGoalService", () => {
     };
     expect(serviceAccess.pendingGoalMutations.get(workspaceId)).toBeUndefined();
     expect(await service.getGoal(workspaceId)).toMatchObject({ objective: "Late goal" });
+  });
+
+  test("goal setters that span a user stop are rejected", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cCH_H): if the user aborts while a setGoal is
+    // still in its pre-install awaits, recordUserStoppedStream finds no
+    // mutation to delete — the setter must detect the stop and reject instead
+    // of installing (stale streaming flag) or persisting directly, either of
+    // which would create and arm a goal from a turn the user just aborted.
+    await extensionMetadata.setStreaming(workspaceId, true);
+
+    // The setter captures the pre-stop state at entry; the stop's synchronous
+    // prefix runs while the setter is inside its pre-lock streaming check.
+    const setterPromise = service.setGoal({ workspaceId, objective: "Aborted turn goal" });
+    const stopPromise = service.recordUserStoppedStream(workspaceId);
+    const [setter] = await Promise.all([setterPromise, stopPromise]);
+
+    expect(setter.success).toBe(false);
+    if (!setter.success) {
+      expect(setter.error.type).toBe("invalid_transition");
+    }
+    const serviceAccess = service as unknown as { pendingGoalMutations: Map<string, unknown> };
+    expect(serviceAccess.pendingGoalMutations.get(workspaceId)).toBeUndefined();
+    expect(await service.getGoal(workspaceId)).toBeNull();
+  });
+
+  test("setters admitted after the drain settles persist directly", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cCH_L): a setter admitted after the drain's
+    // final empty-map check captures the already-bumped generation, and the
+    // streaming flag can still read stale-live — it must observe the settled
+    // state and persist directly instead of installing a mutation that stays
+    // non-durable until some unrelated later stream ends.
+    await extensionMetadata.setStreaming(workspaceId, true);
+    const drained = await service.applyPendingAfterStreamEnd(workspaceId);
+    expect(drained).toBeNull();
+
+    // Admitted strictly after the drain returned; streaming flag still true.
+    const setter = await service.setGoal({ workspaceId, objective: "Post-drain goal" });
+
+    expect(setter.success).toBe(true);
+    const serviceAccess = service as unknown as { pendingGoalMutations: Map<string, unknown> };
+    expect(serviceAccess.pendingGoalMutations.get(workspaceId)).toBeUndefined();
+    expect(await service.getGoal(workspaceId)).toMatchObject({ objective: "Post-drain goal" });
   });
 
   test("stream-end drain racing publication persists the publication stamp", async () => {

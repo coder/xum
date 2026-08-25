@@ -58,6 +58,8 @@ const GOAL_FILE = "goal.json";
 const GOAL_BOARD_FILE = "goal-board.json";
 const PENDING_GOAL_EDIT_MESSAGE =
   "Goal is still being saved. Wait for the current stream to finish before editing it.";
+const GOAL_SET_DISCARDED_BY_USER_STOP_MESSAGE =
+  "Goal change discarded: the stream was stopped while this change was in flight.";
 const REPLACE_GUARDED_STATUSES: ReadonlySet<GoalStatus> = new Set([
   "active",
   "budget_limited",
@@ -436,6 +438,15 @@ export class WorkspaceGoalService {
    * PRRT_kwDOPxxmWM6cBr9Q).
    */
   private readonly streamEndDrainGenerations = new Map<string, number>();
+  /**
+   * Workspaces whose last stream has ended and fully drained (or was user
+   * stopped, which skips the drain). The extension-metadata streaming flag
+   * clears asynchronously after stream end, so setters admitted after the
+   * drain's final empty-map check could otherwise still read a stale "live"
+   * flag and install a mutation nothing will drain (Codex P2
+   * PRRT_kwDOPxxmWM6cCH_L). Cleared when the next stream start is recorded.
+   */
+  private readonly drainSettledWorkspaces = new Set<string>();
   private nextGoalStreamStampSequence = 1;
   private goalContinuationBridge: GoalContinuationRuntimeBridge | null = null;
   private goalContinuationDispatcher: IdleDispatcher | null = null;
@@ -906,6 +917,9 @@ export class WorkspaceGoalService {
       await this.fileLocks.withLock(workspaceId, async () => {
         this.liveGoalPreviewSnapshots.delete(workspaceId);
         if (options.streamStartedAtMs != null) {
+          // A new stream is starting: queued mid-stream setGoal is meaningful
+          // again, so leave the settled fast-path (see drainSettledWorkspaces).
+          this.drainSettledWorkspaces.delete(workspaceId);
           this.recordedStreamStartedAtMsByWorkspace.set(workspaceId, options.streamStartedAtMs);
         }
         const current = await this.readGoalFile(workspaceId);
@@ -1164,6 +1178,11 @@ export class WorkspaceGoalService {
     assert(workspaceId.trim().length > 0, "recordUserStoppedStream requires workspaceId");
     assert(Number.isFinite(stoppedAtMs) && stoppedAtMs >= 0, "user stop timestamp must be valid");
     this.lastUserStopAtMsByWorkspace.set(workspaceId, stoppedAtMs);
+    // A user stop ends the stream WITHOUT a stream-end drain (AgentSession
+    // deliberately skips it), so treat the workspace as settled: setters
+    // admitted after this stop must persist directly instead of queueing a
+    // mutation nothing will drain (see drainSettledWorkspaces).
+    this.drainSettledWorkspaces.add(workspaceId);
     this.pendingContinuationCandidates.delete(workspaceId);
     this.pendingGoalSnapshots.delete(workspaceId);
     this.liveGoalPreviewSnapshots.delete(workspaceId);
@@ -2054,6 +2073,13 @@ export class WorkspaceGoalService {
     // hold a stale "live" long enough for a setter to queue a mutation the
     // drain has already stopped watching for.
     const drainGenerationAtEntry = this.streamEndDrainGenerations.get(input.workspaceId) ?? 0;
+    // Codex P1 (PRRT_kwDOPxxmWM6cCH_H): also captured synchronously at entry.
+    // A user stop landing while this setter is in flight means the stopped
+    // turn's goal change must be discarded — recordUserStoppedStream deletes
+    // only already-installed mutations, so a setter still in its pre-install
+    // awaits would otherwise install (or directly persist) a goal the abort
+    // meant to discard.
+    const userStopAtMsAtEntry = this.lastUserStopAtMsByWorkspace.get(input.workspaceId) ?? null;
 
     if (!objective && this.pendingGoalSnapshots.has(input.workspaceId)) {
       // Until stream-end persists the queued objective, status/budget-only edits
@@ -2073,17 +2099,29 @@ export class WorkspaceGoalService {
     // Without carrying this id into the drain, a transcript-persisted set_goal
     // result could point complete_goal at a throwaway pre-persistence id.
     // -----------------------------------------------------------------------
-    if (objective && (await this.isWorkspaceStreaming(input.workspaceId))) {
+    if (
+      objective &&
+      !this.drainSettledWorkspaces.has(input.workspaceId) &&
+      (await this.isWorkspaceStreaming(input.workspaceId))
+    ) {
       const deferredResult = await this.fileLocks.withLock(input.workspaceId, async () => {
+        if (this.userStopLandedSince(input.workspaceId, userStopAtMsAtEntry)) {
+          return Err({
+            type: "invalid_transition" as const,
+            message: GOAL_SET_DISCARDED_BY_USER_STOP_MESSAGE,
+          });
+        }
         if (
           !(await this.isWorkspaceStreaming(input.workspaceId)) ||
+          this.drainSettledWorkspaces.has(input.workspaceId) ||
           (this.streamEndDrainGenerations.get(input.workspaceId) ?? 0) !== drainGenerationAtEntry
         ) {
           // The stream can end while this caller waits for the goal file lock.
           // Persist immediately instead of queueing after stream-end already
-          // drained. The drain-generation check covers the stale-streaming
-          // window: the async streaming flag can still read "live" after the
-          // drain finished, and a mutation installed then would be stranded.
+          // drained. The drain-generation and settled checks cover the
+          // stale-streaming window: the async streaming flag can still read
+          // "live" after the drain finished, and a mutation installed then
+          // would be stranded.
           return null;
         }
         const current = await this.readGoalFile(input.workspaceId);
@@ -2133,8 +2171,15 @@ export class WorkspaceGoalService {
             message: UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
           });
         }
+        if (this.userStopLandedSince(input.workspaceId, userStopAtMsAtEntry)) {
+          return Err({
+            type: "invalid_transition" as const,
+            message: GOAL_SET_DISCARDED_BY_USER_STOP_MESSAGE,
+          });
+        }
         if (
           !(await this.isWorkspaceStreaming(input.workspaceId)) ||
+          this.drainSettledWorkspaces.has(input.workspaceId) ||
           (this.streamEndDrainGenerations.get(input.workspaceId) ?? 0) !== drainGenerationAtEntry
         ) {
           // Avoid queueing after the one stream-end drain has already observed no
@@ -2221,7 +2266,21 @@ export class WorkspaceGoalService {
       }
     }
 
+    if (this.userStopLandedSince(input.workspaceId, userStopAtMsAtEntry)) {
+      // Codex P1 (PRRT_kwDOPxxmWM6cCH_H): the abort can also land after the
+      // pre-lock admission read `streaming=false` — do not fall through to
+      // immediate persistence for a setter the stop meant to discard.
+      return Err({
+        type: "invalid_transition" as const,
+        message: GOAL_SET_DISCARDED_BY_USER_STOP_MESSAGE,
+      });
+    }
     return this.setGoalImmediately({ ...input, objective });
+  }
+
+  /** Whether a user stop was recorded after the caller captured `stopAtMsAtEntry`. */
+  private userStopLandedSince(workspaceId: string, stopAtMsAtEntry: number | null): boolean {
+    return (this.lastUserStopAtMsByWorkspace.get(workspaceId) ?? null) !== stopAtMsAtEntry;
   }
 
   private async canRunBudgetedGoalOnKickoffModel(
@@ -3215,6 +3274,13 @@ export class WorkspaceGoalService {
     // check therefore sees a changed generation and persists directly; one
     // whose recheck ran earlier installed a mutation the loop drained.
     this.bumpStreamEndDrainGeneration(workspaceId);
+    // Codex P2 (PRRT_kwDOPxxmWM6cCH_L): setters admitted AFTER this point
+    // capture the already-bumped generation, so the generation gate cannot
+    // help them — mark the workspace settled (also synchronously with the
+    // final empty-map check) so they observe a deterministic "no stream-end
+    // hook is coming" state and persist directly until the next stream start
+    // clears it.
+    this.drainSettledWorkspaces.add(workspaceId);
 
     // Stream-end deferred auto-promotion.
     //
