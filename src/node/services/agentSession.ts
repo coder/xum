@@ -4828,8 +4828,6 @@ export class AgentSession {
         source?: "idle-compaction" | "auto-compaction";
       }
     | undefined {
-    const streamIsCompaction = isCompactionRequestMetadata(options?.muxMetadata);
-
     for (let index = history.length - 1; index >= 0; index -= 1) {
       const message = history[index];
       if (message.role !== "user") {
@@ -4845,9 +4843,11 @@ export class AgentSession {
         };
       }
 
-      // Snapshot rows can follow a synthetic compaction request before stream startup.
-      // Skip only those rows when the current send options identify this stream as compaction.
-      if (!streamIsCompaction || message.metadata?.synthetic !== true) {
+      // Synthetic rows can follow a compaction request: prompt snapshots land before
+      // stream startup, and crash recovery can append a [CONTINUE] sentinel when the
+      // app restarts mid-compaction. Skip them regardless of what the current stream
+      // is, so the pending request stays correlated; stop at the first real user row.
+      if (message.metadata?.synthetic !== true) {
         return undefined;
       }
     }

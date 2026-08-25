@@ -176,6 +176,60 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     session.dispose();
   });
 
+  test("tracks a pending compaction request across a crash-recovery [CONTINUE] sentinel", async () => {
+    const model = "openai:gpt-4o";
+    const { session } = await createSessionHarness({
+      workspaceId: "ws-auto-compaction-request-continue-sentinel",
+    });
+    const compactionMetadata = {
+      type: "compaction-request" as const,
+      rawCommand: "/compact",
+      parsed: {},
+    };
+    const compactionRequest = createMuxMessage(
+      "compaction-request",
+      "user",
+      "Summarize the conversation",
+      {
+        synthetic: true,
+        muxMetadata: compactionMetadata,
+      }
+    );
+    // Crash mid-compaction persists an orphaned assistant row; recovery appends a
+    // synthetic [CONTINUE] sentinel after it. The resumed stream sends without
+    // compaction options but must still correlate with the pending request.
+    const orphanedAssistant = createMuxMessage("orphaned-summary", "assistant", "## Summary", {});
+    const continueSentinel = createMuxMessage("continue-sentinel", "user", "[CONTINUE]", {
+      synthetic: true,
+    });
+    const internals = session as unknown as {
+      resolveCompactionRequest: (
+        history: MuxMessage[],
+        modelString: string,
+        options?: SendMessageOptions
+      ) => { id: string } | undefined;
+    };
+
+    const request = internals.resolveCompactionRequest(
+      [compactionRequest, orphanedAssistant, continueSentinel],
+      model,
+      { model, agentId: "default" }
+    );
+
+    expect(request).toMatchObject({ id: compactionRequest.id });
+
+    // A real user message after the request must stop correlation.
+    const realUser = createMuxMessage("real-user", "user", "thanks", {});
+    const stopped = internals.resolveCompactionRequest(
+      [compactionRequest, orphanedAssistant, continueSentinel, realUser],
+      model,
+      { model, agentId: "default" }
+    );
+    expect(stopped).toBeUndefined();
+
+    session.dispose();
+  });
+
   test("does not materialize skill snapshots (or run their directives) on deferred on-send compaction turns", async () => {
     const workspaceId = "ws-auto-compaction-skill-snapshot-deferral";
 
