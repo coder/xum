@@ -460,7 +460,9 @@ class MuxAgent(BaseInstalledAgent):
                 # reported input total so cached legs are not understated;
                 # the per-bucket breakdown stays in mux-tokens.json.
                 context.n_input_tokens = (
-                    data.get("input", 0) + data.get("cache_read", 0) + data.get("cache_write", 0)
+                    data.get("input", 0)
+                    + data.get("cache_read", 0)
+                    + data.get("cache_write", 0)
                 )
                 context.n_output_tokens = data.get("output", 0)
                 # cost_usd is computed by mux CLI from model pricing
