@@ -9,6 +9,7 @@ import {
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
+import { toPersistedTaskExperiments } from "@/common/schemas/project";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
@@ -3444,7 +3445,7 @@ export class TaskService {
           taskModelString: plan.taskModelString,
           taskThinkingLevel: plan.effectiveThinkingLevel,
           taskOnRefusal: plan.onRefusal,
-          taskExperiments: plan.experiments,
+          taskExperiments: toPersistedTaskExperiments(plan.experiments),
           taskIsolation: plan.sharedWorkspacePath != null ? "none" : undefined,
           taskAttentionPolicy: plan.attentionPolicy,
           projects: plan.parentMeta.projects,
@@ -5217,7 +5218,7 @@ export class TaskService {
           taskModelString,
           taskThinkingLevel: effectiveThinkingLevel,
           taskOnRefusal: args.onRefusal,
-          taskExperiments: args.experiments,
+          taskExperiments: toPersistedTaskExperiments(args.experiments),
           taskIsolation: useSharedWorkspace ? "none" : undefined,
           taskAttentionPolicy: args.attentionPolicy,
           projects: parentMeta.projects,
@@ -5387,7 +5388,7 @@ export class TaskService {
         taskModelString,
         taskThinkingLevel: effectiveThinkingLevel,
         taskOnRefusal: args.onRefusal,
-        taskExperiments: args.experiments,
+        taskExperiments: toPersistedTaskExperiments(args.experiments),
         taskIsolation: useSharedWorkspace ? "none" : undefined,
         taskAttentionPolicy: args.attentionPolicy,
         projects: inheritedProjects,

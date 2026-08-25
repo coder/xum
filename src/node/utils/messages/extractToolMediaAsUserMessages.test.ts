@@ -219,6 +219,58 @@ describe("extractToolMediaAsUserMessages", () => {
     });
   });
 
+  it("replaces unsupported media (audio/blobs) with bounded placeholders", async () => {
+    // Unsupported media can be MiBs of base64 the model can never consume as
+    // an attachment; it must never ride into the provider request as JSON
+    // text (top-level here; nested records share the same helper).
+    const imageBase64 = (
+      await sharp({
+        create: { width: 10, height: 10, channels: 3, background: { r: 9, g: 9, b: 9 } },
+      })
+        .png()
+        .toBuffer()
+    ).toString("base64");
+    const audioBase64 = Buffer.from("wav bytes".repeat(100)).toString("base64");
+
+    const input: MuxMessage[] = [
+      {
+        id: "a-audio",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call1",
+            toolName: "mcp__rec__capture",
+            input: {},
+            state: "output-available",
+            output: {
+              type: "content",
+              value: [
+                { type: "media", mediaType: "image/png", data: imageBase64 },
+                { type: "media", mediaType: "audio/wav", data: audioBase64 },
+              ],
+            },
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    const toolPart = rewritten[0].parts[0];
+    if (toolPart.type !== "dynamic-tool" || toolPart.state !== "output-available") {
+      throw new Error("Expected an output-available dynamic-tool part");
+    }
+    const outputText = JSON.stringify(toolPart.output);
+    expect(outputText).not.toContain(audioBase64);
+    expect(outputText).toContain("[Media omitted from provider request: audio/wav");
+
+    // The supported image still becomes the single synthetic attachment.
+    const syntheticUser = rewritten[1];
+    const fileParts = syntheticUser.parts.filter((part) => part.type === "file");
+    expect(fileParts).toHaveLength(1);
+  });
+
   it("self-heals oversized raster tool attachments by downscaling them for provider requests", async () => {
     const oversizedPng = await sharp({
       create: {

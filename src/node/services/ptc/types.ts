@@ -6,6 +6,7 @@
  */
 
 import { FILE_EDIT_TOOL_NAMES } from "@/common/types/tools";
+import { isSupportedAttachmentMediaType } from "@/common/utils/attachments/supportedAttachmentMediaTypes";
 
 /**
  * Event emitted when a tool call starts within the sandbox.
@@ -122,7 +123,15 @@ export function isPersistenceCriticalRecordToolName(toolName: string): boolean {
   );
 }
 
-/** MCP-style content container ({ type: "content", value: [...] }) holding at least one media part. */
+/**
+ * MCP-style content container ({ type: "content", value: [...] }) holding at
+ * least one media part that request-time extraction will actually consume
+ * (supported attachment types: images/PDF/SVG). Unsupported media (audio,
+ * blobs — up to MiBs of base64 the model can never see as an attachment) does
+ * not justify exempting the record from kernel bounding; extraction replaces
+ * any unsupported parts that ride along in an exempted container with bounded
+ * placeholders at request time.
+ */
 export function containsMediaContentPayload(result: unknown): boolean {
   if (typeof result !== "object" || result === null) return false;
   const container = result as { type?: unknown; value?: unknown };
@@ -132,6 +141,8 @@ export function containsMediaContentPayload(result: unknown): boolean {
       typeof item === "object" &&
       item !== null &&
       (item as { type?: unknown }).type === "media" &&
-      typeof (item as { data?: unknown }).data === "string"
+      typeof (item as { data?: unknown }).data === "string" &&
+      typeof (item as { mediaType?: unknown }).mediaType === "string" &&
+      isSupportedAttachmentMediaType((item as { mediaType: string }).mediaType)
   );
 }

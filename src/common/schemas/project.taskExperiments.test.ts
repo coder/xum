@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { WorkspaceConfigSchema } from "./project";
+import { toPersistedTaskExperiments, WorkspaceConfigSchema } from "./project";
 
 describe("WorkspaceConfig taskExperiments", () => {
-  test("stale programmaticToolCallingExclusive entries parse cleanly and drop the key", () => {
-    // The exclusive experiment was removed (PTC is exclusive-only now).
+  test("legacy programmaticToolCallingExclusive entries parse cleanly and are retained", () => {
+    // The exclusive experiment was merged into PTC (exclusive-only now).
     // Workspaces stamped by older builds may still carry the flag on disk;
-    // it must be ignored, never rejected.
+    // it must parse cleanly and survive round-trips so a downgrade still
+    // sees it (downgrade-compat mirror).
     const parsed = WorkspaceConfigSchema.parse({
       path: "/tmp/ws",
       taskExperiments: {
@@ -16,9 +17,7 @@ describe("WorkspaceConfig taskExperiments", () => {
     });
     expect(parsed.taskExperiments?.programmaticToolCalling).toBe(true);
     expect(parsed.taskExperiments?.rlm).toBe(true);
-    expect(
-      parsed.taskExperiments && "programmaticToolCallingExclusive" in parsed.taskExperiments
-    ).toBe(false);
+    expect(parsed.taskExperiments?.programmaticToolCallingExclusive).toBe(true);
   });
 
   test("exclusive-only legacy tasks keep PTC (and therefore RLM) on resumption", () => {
@@ -36,7 +35,7 @@ describe("WorkspaceConfig taskExperiments", () => {
     expect(parsed.taskExperiments?.rlm).toBe(true);
   });
 
-  test("a legacy exclusive false is dropped without aliasing", () => {
+  test("a legacy exclusive false is not aliased onto PTC", () => {
     const parsed = WorkspaceConfigSchema.parse({
       path: "/tmp/ws",
       taskExperiments: {
@@ -44,5 +43,22 @@ describe("WorkspaceConfig taskExperiments", () => {
       },
     });
     expect(parsed.taskExperiments?.programmaticToolCalling).toBeUndefined();
+  });
+});
+
+describe("toPersistedTaskExperiments", () => {
+  test("mirrors an enabled PTC onto the legacy exclusive key for downgrades", () => {
+    expect(toPersistedTaskExperiments({ programmaticToolCalling: true, rlm: true })).toEqual({
+      programmaticToolCalling: true,
+      rlm: true,
+      programmaticToolCallingExclusive: true,
+    });
+  });
+
+  test("leaves PTC-off and undefined snapshots untouched", () => {
+    expect(toPersistedTaskExperiments({ programmaticToolCalling: false })).toEqual({
+      programmaticToolCalling: false,
+    });
+    expect(toPersistedTaskExperiments(undefined)).toBeUndefined();
   });
 });

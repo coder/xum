@@ -963,6 +963,36 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-exempt-bounds");
     });
 
+    it("does not exempt unsupported media (audio) from kernel record suppression", async () => {
+      // Request-time extraction only consumes supported attachment types
+      // (images/PDF); exempting audio/blob media would leave raw base64 in
+      // persisted records and provider requests with no attachment payoff.
+      using tmp = new DisposableTempDir("code-exec-audio-bounds");
+      const host = new SandboxHostService();
+      const tools: Record<string, Tool> = {
+        mcp__rec__capture: createMockTool("mcp__rec__capture", z.object({}), () => ({
+          type: "content",
+          value: [{ type: "media", mediaType: "audio/wav", data: "d2F2" }],
+        })),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(tools),
+        undefined,
+        persistentRunner(host, "ws-audio-bounds", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        { code: "mux.mcp__rec__capture({}); return true;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const record = result.toolCalls.find((r) => r.toolName === "mcp__rec__capture");
+      expect(record?.result).toBeUndefined();
+      expect(record?.ok).toBe(true);
+      await host.disposeScope("ws-audio-bounds");
+    });
+
     it("marks compact records not-ok when the tool resolved with success:false", async () => {
       // file_read-style tools resolve normally with {success:false} for
       // missing/oversized/directory paths — no thrown error. The compact

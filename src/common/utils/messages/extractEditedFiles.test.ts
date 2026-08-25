@@ -132,6 +132,26 @@ describe("nested PTC edit records (exclusive posture)", () => {
     expect(extractEditedFilePaths(messages)).toEqual(["/third.ts", "/second.ts", "/first.ts"]);
   });
 
+  it("skips malformed records (null or primitive result) instead of throwing", () => {
+    // History rows are untrusted persisted JSON; compaction preparation and
+    // post-compaction attachment tracking both run this extractor, so one
+    // corrupt nested result must not repeatedly fail those flows.
+    const messages: MuxMessage[] = [
+      createCodeExecutionMessage([
+        { toolName: "file_edit_insert", args: { path: "/null-result.ts" }, result: null },
+        { toolName: "file_edit_insert", args: { path: "/string-result.ts" }, result: "corrupt" },
+        {
+          toolName: "file_edit_insert",
+          args: { path: "/good.ts" },
+          result: { success: true, diff: makeDiff("/good.ts", "old", "new") },
+        },
+      ]),
+    ];
+
+    expect(extractEditedFilePaths(messages)).toEqual(["/good.ts"]);
+    expect(extractEditedFileDiffs(messages)).toHaveLength(1);
+  });
+
   it("kernel-compacted records surface the path but no diff", () => {
     // Current kernel compaction exempts file_edit_* records (results kept for
     // exactly this extractor), but result-less compact records still exist in

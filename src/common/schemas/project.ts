@@ -194,6 +194,11 @@ export const WorkspaceConfigSchema = z.object({
           : value,
       z.object({
         programmaticToolCalling: z.boolean().optional(),
+        // Downgrade-compat mirror (see toPersistedTaskExperiments): retained
+        // through parsing and stamped alongside programmaticToolCalling so a
+        // downgraded build resumes the task in its exclusive posture instead
+        // of reading bare PTC as the removed (~2x cost) supplement mode.
+        programmaticToolCallingExclusive: z.boolean().optional(),
         // RLM mode is stamped at spawn so child sessions keep RLM-gated features
         // (persistent sandbox kernel, family messaging tools) across app restarts
         // without depending on live frontend experiment state.
@@ -326,3 +331,19 @@ export const ProjectConfigSchema = z.object({
 
 export type WorktreeArchiveSnapshotProject = z.infer<typeof WorktreeArchiveSnapshotProjectSchema>;
 export type WorktreeArchiveSnapshot = z.infer<typeof WorktreeArchiveSnapshotSchema>;
+
+/**
+ * Project runtime experiment flags onto the persisted taskExperiments
+ * snapshot. A downgraded build interprets a bare `programmaticToolCalling:
+ * true` as the removed supplement mode (~2x token cost), so an enabled PTC
+ * also stamps the legacy exclusive flag — the same new-to-legacy mirror the
+ * backend applies to feature_flags.json and the renderer applies to
+ * localStorage. Read-side aliases (schema preprocess above + the runtime
+ * config loader) handle the opposite direction.
+ */
+export function toPersistedTaskExperiments<T extends { programmaticToolCalling?: boolean }>(
+  experiments: T | undefined
+): (T & { programmaticToolCallingExclusive?: boolean }) | undefined {
+  if (experiments?.programmaticToolCalling !== true) return experiments;
+  return { ...experiments, programmaticToolCallingExclusive: true };
+}

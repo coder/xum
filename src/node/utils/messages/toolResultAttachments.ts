@@ -94,6 +94,16 @@ function buildAttachmentPlaceholder(item: AISDKMediaPart): AISDKTextPart {
   };
 }
 
+function buildUnsupportedMediaPlaceholder(item: AISDKMediaPart): AISDKTextPart {
+  const normalizedMediaType = normalizeAttachmentMediaType(item.mediaType);
+  const filename = normalizeOptionalFilename(item.filename);
+  const label = filename != null ? `${filename} (${normalizedMediaType})` : normalizedMediaType;
+  return {
+    type: "text",
+    text: `[Media omitted from provider request: ${label} is not supported as a model attachment (base64 len=${item.data.length})]`,
+  };
+}
+
 function buildDisplayOnlyFilePlaceholder(item: DisplayOnlyFilePart): AISDKTextPart {
   const normalizedMediaType = normalizeAttachmentMediaType(item.mediaType);
   const filename = normalizeOptionalFilename(item.filename);
@@ -130,16 +140,25 @@ export function extractAttachmentsFromToolOutput(
   let didChange = false;
 
   for (const item of output.value) {
-    if (isMediaPart(item) && isSupportedAttachmentMediaType(item.mediaType)) {
+    if (isMediaPart(item)) {
+      if (isSupportedAttachmentMediaType(item.mediaType)) {
+        didChange = true;
+        attachments.push({
+          data: item.data,
+          mediaType: normalizeAttachmentMediaType(item.mediaType),
+          ...(normalizeOptionalFilename(item.filename)
+            ? { filename: normalizeOptionalFilename(item.filename) }
+            : {}),
+        });
+        newValue.push(buildAttachmentPlaceholder(item));
+        continue;
+      }
+
+      // Unsupported media (audio, blobs) can be MiBs of base64 the model can
+      // never consume as an attachment; sending it as tool-result JSON text
+      // would blow up the request, so replace it with a bounded placeholder.
       didChange = true;
-      attachments.push({
-        data: item.data,
-        mediaType: normalizeAttachmentMediaType(item.mediaType),
-        ...(normalizeOptionalFilename(item.filename)
-          ? { filename: normalizeOptionalFilename(item.filename) }
-          : {}),
-      });
-      newValue.push(buildAttachmentPlaceholder(item));
+      newValue.push(buildUnsupportedMediaPlaceholder(item));
       continue;
     }
 

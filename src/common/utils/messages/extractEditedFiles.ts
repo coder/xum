@@ -45,6 +45,16 @@ function collectNestedEditRecords(output: unknown): NestedEditRecord[] {
     }
     // Success = no error, and for kernel-compacted records ok !== false.
     if (record.error !== undefined || record.ok === false) continue;
+    // History rows are untrusted persisted JSON: a malformed record can carry
+    // null (or a primitive) here, and compaction preparation plus
+    // post-compaction attachment tracking both run this extractor — one
+    // corrupt row must degrade to a skip, never a repeated throw.
+    if (
+      record.result !== undefined &&
+      (record.result === null || typeof record.result !== "object")
+    ) {
+      continue;
+    }
     const result = record.result as FileEditToolOutput | undefined;
     // Classic records retain the full result: edits resolve with
     // {success: false} instead of throwing, so require an explicit success.
