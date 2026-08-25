@@ -773,6 +773,13 @@ export interface MuxMetadata {
   partial?: boolean; // Whether this message was interrupted and is incomplete
   synthetic?: boolean; // Whether this message was synthetically generated (e.g., [CONTINUE] sentinel)
   /**
+   * For queue-dispatched user turns: when the user last added to the queued
+   * entry. The row `timestamp` is stamped at dispatch (after the blocking turn
+   * ends), so goal safety needs this to durably tell messages typed before a
+   * mid-turn goal existed from genuine interventions against a visible goal.
+   */
+  enqueuedAtMs?: number;
+  /**
    * UI hint: show in the chat UI even when synthetic.
    *
    * Synthetic messages are hidden by default because most are for model context only.

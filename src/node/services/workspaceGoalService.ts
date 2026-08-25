@@ -208,6 +208,15 @@ interface ChatTailGoalModeResult {
    * freshly armed kickoff (see `applyChatTailGoalMode`).
    */
   pausedBy?: "pause_boundary" | "manual_user";
+  /**
+   * When `pausedBy === "manual_user"`: the moment the user authored the pausing
+   * row — its persisted enqueue time (queued sends) or the row timestamp.
+   * Reconciliation compares this against `goal.createdAtMs` to tell pre-goal
+   * rows (must not pause a never-driven goal) from genuine post-goal
+   * interventions (must pause even if the dispatch-time auto-pause was lost to
+   * a crash).
+   */
+  manualRowAuthoredAtMs?: number;
 }
 
 interface GoalContinuationEligibilityResult {
@@ -231,6 +240,13 @@ interface PendingGoalMutation {
   forceNewGoal?: boolean | null;
   /** Stable id for the optimistic record returned before the deferred write drains. */
   projectedGoalId?: string | null;
+  /**
+   * Creation time of the optimistic record. The drain re-creates the durable
+   * goal, but the user could already see (and react to) the projected goal
+   * mid-stream — a later stream-end `createdAtMs` would misclassify a queued
+   * intervention as pre-goal input (Codex P1).
+   */
+  projectedCreatedAtMs?: number | null;
   /**
    * Carries the caller's `editInPlace` intent across mid-stream deferral so
    * a queued rename preserves goalId + accounting when it drains.
@@ -506,7 +522,15 @@ export class WorkspaceGoalService {
       if (message.metadata?.synthetic === true) {
         continue;
       }
-      return { mode: "paused", pausedBy: "manual_user" };
+      // Queue-dispatched rows persist their authoring time separately: the row
+      // timestamp is stamped at dispatch, which can postdate a goal created at
+      // the blocking turn's stream end even though the user typed pre-goal.
+      const authoredAtMs = message.metadata?.enqueuedAtMs ?? message.metadata?.timestamp;
+      return {
+        mode: "paused",
+        pausedBy: "manual_user",
+        ...(authoredAtMs != null ? { manualRowAuthoredAtMs: authoredAtMs } : {}),
+      };
     }
 
     return { mode: null };
@@ -537,17 +561,26 @@ export class WorkspaceGoalService {
       chatTailMode.pausedBy === "manual_user"
     ) {
       // Durable kickoff window: a goal that has never fired a continuation has
-      // no goal_continuation row in history yet, so the chat tail necessarily
-      // still ends at a pre-goal manual user row. The in-memory candidate guard
+      // no goal_continuation row in history yet, so the chat tail still ends at
+      // a manual user row that predates the goal. The in-memory candidate guard
       // below covers the live process, but candidates are lost on restart and
       // can be evicted by unrelated paths — after which the very next getGoal
       // (heartbeat / wake-turn tool assembly, Goal panel reads, stream-end
       // hooks) would silently pause the goal before it ever ran (user report:
-      // scheduled heartbeats "pausing" fresh goals). Explicit pause paths are
-      // unaffected: they append a goal-pause-boundary row, which reconciles via
-      // the pause_boundary branch, and manual user turns still auto-pause at
-      // dispatch time via applyManualUserMessageGoalSafety.
-      if (goal.lastContinuationFiredAtMs == null) {
+      // scheduled heartbeats "pausing" fresh goals).
+      //
+      // Scoped to rows AUTHORED before the goal existed (persisted enqueue time
+      // for queued sends, row timestamp otherwise): a row the user authored
+      // after the goal became visible is a genuine intervention and must still
+      // pause even when the dispatch-time auto-pause was lost to a crash
+      // (Codex P2 — persisted state stays self-healing). Explicit pause paths
+      // are unaffected: they append a goal-pause-boundary row, which reconciles
+      // via the pause_boundary branch.
+      if (
+        goal.lastContinuationFiredAtMs == null &&
+        chatTailMode.manualRowAuthoredAtMs != null &&
+        chatTailMode.manualRowAuthoredAtMs <= goal.createdAtMs
+      ) {
         return goal;
       }
       const candidate = this.pendingContinuationCandidates.get(workspaceId);
@@ -681,8 +714,15 @@ export class WorkspaceGoalService {
     status?: GoalStatus | null;
     completionSummary?: string | null;
     goalId?: string | null;
+    /**
+     * Preserved creation time for goals projected mid-stream: the durable
+     * record must date from when the user could first see the goal, or queued
+     * interventions typed against the visible goal would be misread as
+     * pre-goal input by the goal-safety guards.
+     */
+    createdAtMs?: number | null;
   }): GoalRecordV1 {
-    const now = Date.now();
+    const now = input.createdAtMs ?? Date.now();
     const status = input.status ?? "active";
     const goal = GoalRecordV1Schema.parse({
       version: 1,
@@ -2075,6 +2115,7 @@ export class WorkspaceGoalService {
           ...(input.initiator != null ? { initiator: input.initiator } : {}),
           ...(input.forceNewGoal != null ? { forceNewGoal: input.forceNewGoal } : {}),
           projectedGoalId: projected.goalId,
+          projectedCreatedAtMs: projected.createdAtMs,
           // Forward `editInPlace` so an inline rename submitted while the
           // agent is streaming still takes the rename branch when the
           // pending mutation drains.
@@ -2111,7 +2152,7 @@ export class WorkspaceGoalService {
 
   private async setGoalImmediately(
     input: SetGoalInput & { objective?: string },
-    options?: { replacementGoalId?: string | null }
+    options?: { replacementGoalId?: string | null; replacementCreatedAtMs?: number | null }
   ): Promise<Result<GoalRecordV1, GoalSetError>> {
     const result = await this.fileLocks.withLock(input.workspaceId, async () => {
       const current = await this.readGoalFile(input.workspaceId);
@@ -2260,6 +2301,7 @@ export class WorkspaceGoalService {
         status: input.status,
         completionSummary: input.completionSummary,
         goalId: options?.replacementGoalId ?? null,
+        createdAtMs: options?.replacementCreatedAtMs ?? null,
       });
       if (
         (next.status === "active" || next.status === "budget_limited") &&
@@ -2709,16 +2751,18 @@ export class WorkspaceGoalService {
         return null;
       }
 
-      // Paused/complete goals only accrue cost from streams that are actually
-      // goal work racing the status change (an in-flight continuation or budget
+      // Non-running goals only accrue cost from streams that are actually goal
+      // work racing the status change (an in-flight continuation or budget
       // wrap-up). Maintenance streams — scheduled heartbeats ("user" origin,
       // no agentInitiated flag) and background wake turns ("other") — must not
       // charge turns/cost or bump updatedAtMs on a goal that is not running;
       // doing so made every heartbeat/wake look like it had just touched the
-      // paused goal. Mirrors attributeChildReport's paused/complete skip.
+      // goal. `budget_limited` is included so background activity while the
+      // wrap-up is pending cannot inflate the recorded overshoot. Mirrors
+      // attributeChildReport's paused/complete skip.
       const isGoalDrivenStream =
         originKind === "goal_continuation" || originKind === "goal_budget_limit";
-      if ((current.status === "paused" || current.status === "complete") && !isGoalDrivenStream) {
+      if (current.status !== "active" && !isGoalDrivenStream) {
         this.recordLastGoalStream(input.workspaceId, originKind, current.goalId);
         await this.pushSnapshot(input.workspaceId, current);
         return current;
@@ -2918,10 +2962,13 @@ export class WorkspaceGoalService {
       // be logged and swallowed so the stream-end pipeline stays alive.
       // The caller already treats null as "no apply happened".
       try {
-        const { projectedGoalId, ...pendingInput } = pending;
+        const { projectedGoalId, projectedCreatedAtMs, ...pendingInput } = pending;
         const result = await this.setGoalImmediately(
           { workspaceId, ...pendingInput },
-          { replacementGoalId: projectedGoalId ?? null }
+          {
+            replacementGoalId: projectedGoalId ?? null,
+            replacementCreatedAtMs: projectedCreatedAtMs ?? null,
+          }
         );
         drained = result.success ? result.data : null;
       } catch (error) {

@@ -3268,6 +3268,9 @@ export class AgentSession {
         muxMetadata: stampedMuxMetadata, // Pass through frontend metadata as black-box
         ...(acpPromptId != null ? { acpPromptId } : {}),
         ...(goalKind != null ? { kind: goalKind } : {}),
+        // Persist the queue-entry authoring time so goal-safety reconciliation
+        // can re-derive the pre-goal/post-goal distinction after a restart.
+        ...(internal?.enqueuedAtMs != null ? { enqueuedAtMs: internal.enqueuedAtMs } : {}),
         // Auto-resume and other system-generated messages are synthetic + UI-visible
         ...(internal?.synthetic && { synthetic: true, uiVisible: true }),
       },

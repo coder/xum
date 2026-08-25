@@ -427,16 +427,45 @@ describe("WorkspaceGoalService", () => {
 
   test("getGoal keeps a never-driven active goal active across candidate loss (durable kickoff window)", async () => {
     // A goal that has never fired a continuation only has pre-goal manual user
-    // rows in its chat tail. Reconciliation must not pause it — the in-memory
-    // kickoff candidate can be lost (restart, eviction), and the next getGoal
-    // (heartbeat/wake tool assembly) would otherwise silently pause the goal
-    // before it ever ran.
+    // rows in its chat tail (e.g. the request that made the model set it).
+    // Reconciliation must not pause it — the in-memory kickoff candidate can be
+    // lost (restart, eviction), and the next getGoal (heartbeat/wake tool
+    // assembly) would otherwise silently pause the goal before it ever ran.
+    await appendUserHistoryMessage(historyService, workspaceId, "Set yourself a goal");
     await setGoalOk(service, { workspaceId, objective: "Follow chat tail" });
-    await appendUserHistoryMessage(historyService, workspaceId, "Manual interruption");
 
     const reconciled = await service.getGoal(workspaceId);
 
     expect(reconciled).toMatchObject({ status: "active" });
+  });
+
+  test("getGoal keeps a never-driven goal active for queued rows authored before the goal", async () => {
+    // Queue race: the row is persisted at dispatch (after the goal-creating
+    // turn's stream end) so its timestamp postdates the goal, but the durable
+    // enqueuedAtMs proves the user typed before the goal existed.
+    const created = await setGoalOk(service, { workspaceId, objective: "Queue race" });
+    await appendUserHistoryMessage(historyService, workspaceId, "Typed mid-stream", {
+      timestamp: created.createdAtMs + 500,
+      enqueuedAtMs: created.createdAtMs - 500,
+    });
+
+    const reconciled = await service.getGoal(workspaceId);
+
+    expect(reconciled).toMatchObject({ status: "active" });
+  });
+
+  test("getGoal pauses a never-driven goal when a manual row was authored after the goal", async () => {
+    // Crash-recovery self-healing: if the dispatch-time auto-pause was lost
+    // (process exit between the user row persist and the pause write), the
+    // durable row authored after the goal must still pause it on restart.
+    const created = await setGoalOk(service, { workspaceId, objective: "Post-goal intervention" });
+    await appendUserHistoryMessage(historyService, workspaceId, "Stop this goal", {
+      timestamp: created.createdAtMs + 1_000,
+    });
+
+    const reconciled = await service.getGoal(workspaceId);
+
+    expect(reconciled).toMatchObject({ status: "paused" });
   });
 
   test("chat-tail reconciliation ignores synthetic maintenance user rows", async () => {
@@ -2221,6 +2250,24 @@ describe("WorkspaceGoalService", () => {
     });
   });
 
+  test("queued mid-stream goal creation preserves the projected creation time at drain time", async () => {
+    // The projected goal is visible in the Goal panel the moment set_goal runs
+    // mid-stream. The durable record must date from that moment — a stream-end
+    // createdAtMs would misclassify a user intervention queued against the
+    // visible goal as pre-goal input in the goal-safety guards.
+    await extensionMetadata.setStreaming(workspaceId, true);
+    const queued = await service.setGoal({ workspaceId, objective: "Projected mid-stream" });
+    expect(queued.success).toBe(true);
+    const projected = queued.success ? queued.data : null;
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await extensionMetadata.setStreaming(workspaceId, false);
+    const drained = await service.applyPendingAfterStreamEnd(workspaceId);
+
+    expect(drained?.goalId).toBe(projected?.goalId ?? "missing");
+    expect(drained?.createdAtMs).toBe(projected?.createdAtMs ?? -1);
+  });
+
   test("queued mid-stream goal replacement preserves expectedGoalId at drain time", async () => {
     const created = await setGoalOk(service, { workspaceId, objective: "Original" });
     await extensionMetadata.setStreaming(workspaceId, true);
@@ -2337,6 +2384,33 @@ describe("WorkspaceGoalService", () => {
     });
 
     expect(updated).toMatchObject({ costCents: 0, turnsUsed: 0, status: "paused" });
+  });
+
+  test("budget-limited goals ignore maintenance stream accounting", async () => {
+    // Background wakes/heartbeats running while the budget wrap-up is pending
+    // must not inflate the recorded overshoot; only goal-driven streams
+    // (continuation / wrap-up) may still charge a budget_limited goal.
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Budget exhausted",
+      budgetCents: 100,
+    });
+    const limited = await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1.25,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    expect(limited).toMatchObject({ status: "budget_limited", costCents: 125, turnsUsed: 1 });
+
+    const updated = await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 0.42,
+      streamStartedAtMs: created.createdAtMs + 2,
+      streamOriginKind: "other",
+    });
+
+    expect(updated).toMatchObject({ status: "budget_limited", costCents: 125, turnsUsed: 1 });
   });
 
   test("completed goals ignore later stream accounting", async () => {
