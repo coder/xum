@@ -408,6 +408,32 @@ function isCompactionRequestMetadata(meta: unknown): meta is CompactionRequestMe
   return true;
 }
 
+/**
+ * Synthetic user rows that may legitimately sit between a pending compaction
+ * request and its summary stream: file @-mention prompt snapshots, turn-start
+ * file-change notifications, and the crash-recovery [CONTINUE] sentinel.
+ *
+ * Any other user row stops backward correlation. A summary stream that fails
+ * validation (empty or raw-JSON output) commits no boundary, so its request
+ * stays in history; letting unrelated synthetic turns (goal continuations,
+ * task wakes) traverse past it would persist their responses as compaction
+ * boundaries and collapse valid history.
+ */
+function canFollowPendingCompactionRequest(message: MuxMessage): boolean {
+  if (message.metadata?.synthetic !== true) {
+    return false;
+  }
+  if (message.metadata?.fileAtMentionSnapshot != null) {
+    return true;
+  }
+  const text =
+    message.parts
+      ?.filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .join("\n") ?? "";
+  return text.startsWith("<system-file-update>") || text === "[CONTINUE]";
+}
+
 const AUTO_RETRY_PREFERENCE_FILE = "auto-retry-preference.json";
 
 /**
@@ -4843,11 +4869,11 @@ export class AgentSession {
         };
       }
 
-      // Synthetic rows can follow a compaction request: prompt snapshots land before
-      // stream startup, and crash recovery can append a [CONTINUE] sentinel when the
-      // app restarts mid-compaction. Skip them regardless of what the current stream
-      // is, so the pending request stays correlated; stop at the first real user row.
-      if (message.metadata?.synthetic !== true) {
+      // Only recognized synthetic rows may sit between a pending compaction
+      // request and its stream; anything else stops correlation so a stale
+      // request cannot claim an unrelated later turn (see
+      // canFollowPendingCompactionRequest).
+      if (!canFollowPendingCompactionRequest(message)) {
         return undefined;
       }
     }

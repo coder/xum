@@ -151,8 +151,9 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         muxMetadata: compactionMetadata,
       }
     );
-    const snapshot = createMuxMessage("file-change", "user", "<file-change />", {
+    const snapshot = createMuxMessage("file-snapshot", "user", "@foo.ts contents", {
       synthetic: true,
+      fileAtMentionSnapshot: ["t0"],
     });
     const internals = session as unknown as {
       resolveCompactionRequest: (
@@ -222,6 +223,50 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const realUser = createMuxMessage("real-user", "user", "thanks", {});
     const stopped = internals.resolveCompactionRequest(
       [compactionRequest, orphanedAssistant, continueSentinel, realUser],
+      model,
+      { model, agentId: "default" }
+    );
+    expect(stopped).toBeUndefined();
+
+    session.dispose();
+  });
+
+  test("does not correlate a stale compaction request past unrelated synthetic turns", async () => {
+    const model = "openai:gpt-4o";
+    const { session } = await createSessionHarness({
+      workspaceId: "ws-auto-compaction-stale-request-stop",
+    });
+    const compactionMetadata = {
+      type: "compaction-request" as const,
+      rawCommand: "/compact",
+      parsed: {},
+    };
+    // Failed summary: request stays in history with no boundary committed.
+    const staleRequest = createMuxMessage(
+      "stale-compaction-request",
+      "user",
+      "Summarize the conversation",
+      {
+        synthetic: true,
+        muxMetadata: compactionMetadata,
+      }
+    );
+    const orphanedAssistant = createMuxMessage("orphaned-summary", "assistant", "", {});
+    // An unrecognized synthetic turn (e.g. goal continuation) after the failed
+    // summary must stop correlation instead of claiming the stale request.
+    const goalContinuation = createMuxMessage("goal-wake", "user", "continue the goal", {
+      synthetic: true,
+    });
+    const internals = session as unknown as {
+      resolveCompactionRequest: (
+        history: MuxMessage[],
+        modelString: string,
+        options?: SendMessageOptions
+      ) => { id: string } | undefined;
+    };
+
+    const stopped = internals.resolveCompactionRequest(
+      [staleRequest, orphanedAssistant, goalContinuation],
       model,
       { model, agentId: "default" }
     );
