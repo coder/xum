@@ -47,6 +47,9 @@ describe("tokenizer", () => {
     // must not throw (ai-tokenizer's encode() disallows them by default).
     const count = await countTokens(openaiModel, "text with <|endoftext|> inside");
     expect(count).toBeGreaterThan(0);
+    // The spelling must tokenize as ordinary text (many tokens), not be
+    // interpreted as a single reserved token, or counts undercount.
+    expect(await countTokens(openaiModel, "<|endoftext|>")).toBeGreaterThan(1);
   });
 
   test("countTokensBatch matches individual calls", async () => {

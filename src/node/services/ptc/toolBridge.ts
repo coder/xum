@@ -22,7 +22,8 @@ import {
 } from "@/common/types/capabilityGrants";
 import { isToolContentResult } from "@/common/utils/tools/toolContentResult";
 import { isSupportedAttachmentMediaType } from "@/common/utils/attachments/supportedAttachmentMediaTypes";
-import { isMediaPart, type AISDKMediaPart } from "@/node/utils/messages/toolResultAttachments";
+import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
+import { isMediaPart, type ToolAttachmentPart } from "@/node/utils/messages/toolResultAttachments";
 
 /**
  * Sandbox-facing stand-in for stripped media payloads. Keeps the advertised
@@ -43,6 +44,9 @@ export const MEDIA_BUDGET_EXCEEDED_STUB =
 
 export const MEDIA_DATA_STUB =
   "[base64 omitted: media is delivered to the model as an attachment on this code_execution result]";
+
+export const DISPLAY_DATA_STUB =
+  "[base64 omitted: file is shown to the user on this code_execution result; its bytes are never sent to the model]";
 
 /**
  * Result shape of an AI SDK Schema's optional custom validator
@@ -174,11 +178,11 @@ export class ToolBridge {
    * authoritative host-side record of successful loads, immune to
    * model-visible record bounding (see drainNewlyLoadedVarsKeys). */
   private newlyLoadedVarsKeys: string[] = [];
-  /** Media parts stripped from bridged results, keyed per runtime so
-   * parallel code_execution calls sharing this bridge cannot claim each
-   * other's media (ephemeral runtimes are per-call; persistent mounts
-   * serialize evals under the scope lock). */
-  private readonly pendingAttachments = new WeakMap<IJSRuntime, AISDKMediaPart[]>();
+  /** Attachment parts (model media + display-only files) stripped from
+   * bridged results, keyed per runtime so parallel code_execution calls
+   * sharing this bridge cannot claim each other's parts (ephemeral runtimes
+   * are per-call; persistent mounts serialize evals under the scope lock). */
+  private readonly pendingAttachments = new WeakMap<IJSRuntime, ToolAttachmentPart[]>();
 
   constructor(tools: Record<string, Tool>, grants?: CapabilityGrants) {
     this.bridgeableTools = new Map();
@@ -446,52 +450,59 @@ export class ToolBridge {
   }
 
   /**
-   * Media parts inside bridged tool results (e.g. attach_file) are useless as
-   * sandbox values: guests cannot see pixels, and the base64 would bloat
-   * vars, result handles, and model-visible records. Strip them per-runtime
-   * so code_execution can re-attach the originals on its own result, where
-   * the request path lifts them into real model attachments
-   * (extractToolMediaAsUserMessages). Each stripped part keeps its declared
-   * shape with `data` swapped for MEDIA_DATA_STUB. display_file parts are
-   * deliberately NOT stripped: they exist for user preview, and the nested
-   * tool-call renderer reads them from the nested result.
+   * Attachment-carrying parts inside bridged tool results (e.g. attach_file)
+   * are useless as sandbox values: guests cannot see pixels, and the base64
+   * would bloat vars, result handles, model-visible records, and the
+   * host-side nested-call records/events (which sit outside QuickJS memory
+   * accounting). Strip them per-runtime so code_execution can re-attach the
+   * originals on its own result: the request path lifts media into real
+   * model attachments (extractToolMediaAsUserMessages) and the tool-call
+   * card renders both kinds from the carrier. Each stripped part keeps its
+   * declared shape with `data` swapped for a stub.
    */
   private stripAttachmentParts(runtime: IJSRuntime, serialized: unknown): unknown {
     if (!isToolContentResult(serialized)) {
       return serialized;
     }
-    const mediaParts: AISDKMediaPart[] = [];
+    const carriedParts: ToolAttachmentPart[] = [];
     const pending = this.pendingAttachments.get(runtime) ?? [];
     let pendingBytes = pending.reduce((sum, part) => sum + part.data.length, 0);
     let changed = false;
+    const carry = <T extends ToolAttachmentPart>(part: T, stub: string): T => {
+      if (pendingBytes + part.data.length > MAX_PENDING_ATTACHMENT_BYTES) {
+        return { ...part, data: MEDIA_BUDGET_EXCEEDED_STUB };
+      }
+      pendingBytes += part.data.length;
+      carriedParts.push(part);
+      return { ...part, data: stub };
+    };
     const newValue = serialized.value.map((item) => {
-      if (!isMediaPart(item) || !isSupportedAttachmentMediaType(item.mediaType)) {
-        return item;
+      if (isMediaPart(item) && isSupportedAttachmentMediaType(item.mediaType)) {
+        changed = true;
+        return carry(item, MEDIA_DATA_STUB);
       }
-      changed = true;
-      if (pendingBytes + item.data.length > MAX_PENDING_ATTACHMENT_BYTES) {
-        return { ...item, data: MEDIA_BUDGET_EXCEEDED_STUB };
+      if (isDisplayOnlyFilePart(item)) {
+        changed = true;
+        return carry(item, DISPLAY_DATA_STUB);
       }
-      pendingBytes += item.data.length;
-      mediaParts.push(item);
-      return { ...item, data: MEDIA_DATA_STUB };
+      return item;
     });
     if (!changed) {
       return serialized;
     }
-    if (mediaParts.length > 0) {
-      pending.push(...mediaParts);
+    if (carriedParts.length > 0) {
+      pending.push(...carriedParts);
       this.pendingAttachments.set(runtime, pending);
     }
     return { type: "content", value: newValue };
   }
 
   /**
-   * Drain media parts stripped from bridged results on this runtime.
+   * Drain attachment parts stripped from bridged results on this runtime.
    * register() clears stale entries before each eval, so a post-eval drain
    * yields exactly that eval's attachments.
    */
-  drainPendingAttachments(runtime: IJSRuntime): AISDKMediaPart[] {
+  drainPendingAttachments(runtime: IJSRuntime): ToolAttachmentPart[] {
     const pending = this.pendingAttachments.get(runtime) ?? [];
     this.pendingAttachments.delete(runtime);
     return pending;

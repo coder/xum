@@ -5,6 +5,7 @@
 import { describe, it, expect, mock } from "bun:test";
 import {
   ToolBridge,
+  DISPLAY_DATA_STUB,
   MAX_PENDING_ATTACHMENT_BYTES,
   MEDIA_BUDGET_EXCEEDED_STUB,
   MEDIA_DATA_STUB,
@@ -936,19 +937,17 @@ describe("attachment part stripping", () => {
     expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
   });
 
-  it("keeps display_file parts inline so nested UI previews survive", async () => {
+  it("strips display_file parts onto the carrier with a display stub", async () => {
+    const displayPart = {
+      type: "display_file" as const,
+      data: "RElTUExBWQ==",
+      mediaType: "text/markdown",
+      filename: "notes.md",
+      providerOptions: { mux: { displayOnly: true as const, size: 7 } },
+    };
     const displayResult = {
       type: "content",
-      value: [
-        { type: "text", text: "[File shown to user: notes.md]" },
-        {
-          type: "display_file",
-          data: "RElTUExBWQ==",
-          mediaType: "text/markdown",
-          filename: "notes.md",
-          providerOptions: { mux: { displayOnly: true, size: 7 } },
-        },
-      ],
+      value: [{ type: "text", text: "[File shown to user: notes.md]" }, displayPart],
     };
     const bridge = new ToolBridge({
       attach_file: createMockTool(
@@ -959,9 +958,51 @@ describe("attachment part stripping", () => {
     });
     const { captured, runtime } = registerCapturingXum(bridge);
 
-    // Display-only files are user-preview data, not model attachments: they
-    // pass through untouched and never ride the attachments carrier.
-    expect(await captured.xum.attach_file({ path: "/notes.md" })).toEqual(displayResult);
-    expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
+    // Display-only bytes are user-preview data, but leaving them inline lets
+    // guests grow host-side records without bound: they ride the carrier and
+    // render from the code_execution card instead of the nested result.
+    const sandboxValue = (await captured.xum.attach_file({ path: "/notes.md" })) as {
+      value: Array<{ type: string; data?: string; filename?: string }>;
+    };
+    expect(JSON.stringify(sandboxValue)).not.toContain("RElTUExBWQ==");
+    expect(sandboxValue.value[1].type).toBe("display_file");
+    expect(sandboxValue.value[1].data).toBe(DISPLAY_DATA_STUB);
+    expect(sandboxValue.value[1].filename).toBe("notes.md");
+
+    expect(bridge.drainPendingAttachments(runtime)).toEqual([displayPart]);
+  });
+
+  it("display_file bytes share the aggregate attachment budget", async () => {
+    const bigData = "a".repeat(MAX_PENDING_ATTACHMENT_BYTES - 16);
+    const bridge = new ToolBridge({
+      attach_file: createMockTool("attach_file", z.object({ path: z.string() }), (args) =>
+        (args as { path: string }).path === "/big.png"
+          ? { type: "content", value: [{ type: "media", data: bigData, mediaType: "image/png" }] }
+          : {
+              type: "content",
+              value: [
+                {
+                  type: "display_file",
+                  data: "b".repeat(64),
+                  mediaType: "text/markdown",
+                  providerOptions: { mux: { displayOnly: true, size: 48 } },
+                },
+              ],
+            }
+      ),
+    });
+    const { captured, runtime } = registerCapturingXum(bridge);
+
+    await captured.xum.attach_file({ path: "/big.png" });
+    // The media part above nearly exhausted the shared budget: the display
+    // part must be refused with the budget stub and not carried host-side.
+    const second = (await captured.xum.attach_file({ path: "/notes.md" })) as {
+      value: Array<{ data: string }>;
+    };
+    expect(second.value[0].data).toBe(MEDIA_BUDGET_EXCEEDED_STUB);
+
+    const drained = bridge.drainPendingAttachments(runtime);
+    expect(drained).toHaveLength(1);
+    expect(drained[0].type).toBe("media");
   });
 });

@@ -686,13 +686,14 @@ ${xumTypes}
             capKernelConsoleOutput(result);
           }
 
-          // Nested tools that produced model attachments (e.g. attach_file)
-          // had their media stripped from sandbox-visible values by the
-          // bridge; re-attach the originals on this result so the request
-          // path delivers them to the model as real attachments
-          // (extractToolMediaAsUserMessages). Drain even for failed evals:
-          // received media is still valid, and leaving it pending would let
-          // it leak into a later eval on this runtime.
+          // Nested tools that produced attachments (e.g. attach_file) had
+          // their media/display-file bytes stripped from sandbox-visible
+          // values by the bridge; re-attach the originals on this result so
+          // the request path delivers media to the model as real attachments
+          // (extractToolMediaAsUserMessages) and the UI renders both kinds
+          // from the carrier. Drain even for failed evals: received parts are
+          // still valid, and leaving them pending would let them leak into a
+          // later eval on this runtime.
           const attachmentParts = activeBridge.drainPendingAttachments(runtime);
           if (attachmentParts.length > 0) {
             result.attachments = attachmentParts;

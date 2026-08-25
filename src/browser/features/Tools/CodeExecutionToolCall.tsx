@@ -16,7 +16,9 @@ import type { CodeExecutionResult, NestedToolCall } from "./Shared/codeExecution
 import { cn } from "@/common/lib/utils";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { resolveCodeExecutionViewMode, type CodeExecutionViewMode } from "./codeExecutionViewMode";
-import { ToolResultImages } from "./Shared/ToolResultImages";
+import { ToolResultImages, sanitizeImageData, type MediaContent } from "./Shared/ToolResultImages";
+import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
+import { DisplayOnlyFile, MediaAttachmentDownloadCard } from "./Shared/AttachmentCards";
 
 interface CodeExecutionToolCallProps {
   args: { code: string };
@@ -107,12 +109,19 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
       : JSON.stringify(result.result, null, 2);
   }, [result]);
 
-  // Carrier media from nested tool results, wrapped into the content shape
-  // ToolResultImages consumes.
+  // Carrier attachments from nested tool results, split by kind: images
+  // render inline via ToolResultImages, media the gallery refuses (PDF, SVG)
+  // gets download cards, and display-only files get preview/download cards.
+  const attachmentParts = result?.attachments ?? [];
+  const mediaAttachments = attachmentParts.filter(
+    (part): part is MediaContent => part.type === "media"
+  );
+  const displayAttachments = attachmentParts.filter(isDisplayOnlyFilePart);
   const attachmentsResult =
-    result?.attachments && result.attachments.length > 0
-      ? { type: "content" as const, value: result.attachments }
-      : null;
+    mediaAttachments.length > 0 ? { type: "content" as const, value: mediaAttachments } : null;
+  const downloadOnlyMedia = mediaAttachments.filter(
+    (media) => sanitizeImageData(media.mediaType, media.data) === null
+  );
 
   // Determine result icon and variant
   const isInterrupted = status === "interrupted";
@@ -212,9 +221,26 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
           <div className="text-muted text-xs italic">Execution in progress...</div>
         ))}
 
-      {/* Media carried out of nested tool results (attach_file): the nested
-          result only holds a stub, so previews render from the carrier. */}
+      {/* Attachments carried out of nested tool results (attach_file): the
+          nested result only holds a stub, so previews render from the carrier. */}
       {attachmentsResult && <ToolResultImages result={attachmentsResult} />}
+      {downloadOnlyMedia.length > 0 && (
+        <div className="space-y-2">
+          {downloadOnlyMedia.map((media, index) => (
+            <MediaAttachmentDownloadCard
+              key={`${media.filename ?? media.mediaType}-${index}`}
+              media={media}
+            />
+          ))}
+        </div>
+      )}
+      {displayAttachments.length > 0 && (
+        <div className="space-y-2">
+          {displayAttachments.map((file, index) => (
+            <DisplayOnlyFile key={`${file.filename ?? file.mediaType}-${index}`} file={file} />
+          ))}
+        </div>
+      )}
     </fieldset>
   );
 };

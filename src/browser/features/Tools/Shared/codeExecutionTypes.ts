@@ -5,6 +5,8 @@
  * but are defined separately to avoid browser → node imports.
  */
 
+import type { DisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
+
 /** Console output record from code execution */
 export interface ConsoleRecord {
   level: "log" | "warn" | "error";
@@ -32,10 +34,13 @@ export interface CodeExecutionResult {
   toolCalls: ToolCallRecord[];
   consoleOutput: ConsoleRecord[];
   duration_ms: number;
-  /** Media parts re-attached from nested tool results (e.g. attach_file);
-   * delivered to the model as real attachments and rendered as previews on
-   * this card (nested results only carry a stub for the bytes). */
-  attachments?: Array<{ type: "media"; data: string; mediaType: string; filename?: string }>;
+  /** Attachment parts re-attached from nested tool results (e.g.
+   * attach_file). Media is delivered to the model as real attachments;
+   * display_file parts are user-preview-only. Both render on this card
+   * (nested results only carry a stub for the bytes). */
+  attachments?: Array<
+    { type: "media"; data: string; mediaType: string; filename?: string } | DisplayOnlyFilePart
+  >;
 }
 
 /** Nested tool call shape from streaming aggregator */

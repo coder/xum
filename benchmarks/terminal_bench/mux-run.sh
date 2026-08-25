@@ -79,9 +79,10 @@ log "trusting project ${project_path}"
 bun src/cli/trust.ts --dir "${project_path}" || fatal "failed to trust project ${project_path}"
 
 # Trust is needed only for sub-agent delegation. Dataset tasks control the
-# repo contents, so automatic repo hook execution (.xum/init, tool_env) must
-# stay off: hooks would run dataset code with provider credentials in env.
-export MUX_DISABLE_PROJECT_HOOKS=1
+# repo contents, so automatic repo-controlled automation (.xum/init, tool
+# hooks, project-local MCP servers) must stay off: it would run dataset code
+# with provider credentials in env.
+export MUX_DISABLE_PROJECT_AUTOMATION=1
 
 cmd=(bun src/cli/run.ts
   --dir "${project_path}"
@@ -187,9 +188,12 @@ for line in open(sys.argv[1]):
             msg_id = payload.get("messageId", "")
             # Prefer cumulativeUsage (running total across all steps in a message)
             # over usage (per-step delta). Keeping the latest cumulative per message
-            # gives the correct total when summed across messages.
+            # gives the correct total when summed across messages. Provider
+            # metadata rides along because Anthropic reports cache writes only
+            # there (anthropic.cacheCreationInputTokens), not in the usage shape.
             usage = payload.get("cumulativeUsage") or payload.get("usage") or {}
-            cumulative_by_msg[msg_id] = usage
+            meta = payload.get("cumulativeProviderMetadata") or {}
+            cumulative_by_msg[msg_id] = (usage, meta)
         elif payload.get("type") == "session-usage-delta":
             for model_usage in (payload.get("byModelDelta") or {}).values():
                 subagent_input += (model_usage.get("input") or {}).get("tokens", 0)
@@ -197,16 +201,22 @@ for line in open(sys.argv[1]):
     except Exception:
         pass
 # No run-complete found — aggregate the last usage-delta per message + sub-agent totals
-for usage in cumulative_by_msg.values():
+for usage, meta in cumulative_by_msg.values():
     input_tokens = usage.get("inputTokens", 0) or 0
-    cached = usage.get("cachedInputTokens", 0) or 0
-    # AI SDK inputTokens is inclusive of cached reads; split the buckets so
-    # consumers can sum input+cache_read without double counting (mirrors
-    # run-complete/createDisplayUsage semantics).
-    result["input"] += max(input_tokens - cached, 0)
+    details = usage.get("inputTokenDetails") or {}
+    cached = usage.get("cachedInputTokens")
+    if cached is None:
+        cached = details.get("cacheReadTokens", 0) or 0
+    cache_write = (meta.get("anthropic") or {}).get("cacheCreationInputTokens")
+    if cache_write is None:
+        cache_write = details.get("cacheWriteTokens", 0) or 0
+    # AI SDK inputTokens is inclusive of cache reads AND writes; split the
+    # buckets so consumers can sum input+cache_read+cache_write without
+    # double counting (mirrors run-complete/createDisplayUsage semantics).
+    result["input"] += max(input_tokens - cached - cache_write, 0)
     result["output"] += (usage.get("outputTokens", 0) or 0)
-    # AI SDK usage shape only exposes cache reads; cache writes stay 0 here.
     result["cache_read"] += cached
+    result["cache_write"] += cache_write
 result["input"] += subagent_input
 result["output"] += subagent_output
 print(json.dumps(result))

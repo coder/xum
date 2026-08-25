@@ -10,7 +10,7 @@ import {
   type MountRunner,
 } from "./code_execution";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
-import { ToolBridge, MEDIA_DATA_STUB } from "@/node/services/ptc/toolBridge";
+import { ToolBridge, DISPLAY_DATA_STUB, MEDIA_DATA_STUB } from "@/node/services/ptc/toolBridge";
 import type { Tool, ToolExecutionOptions } from "ai";
 import type { PTCEvent, PTCExecutionResult } from "@/node/services/ptc/types";
 import { z } from "zod";
@@ -2192,6 +2192,40 @@ describe("nested attachment delivery", () => {
     const returned = result.result as { value: Array<{ type: string; data?: string }> };
     expect(returned.value[1].type).toBe("media");
     expect(returned.value[1].data).toBe(MEDIA_DATA_STUB);
+  });
+
+  it("re-attaches display-only files stripped from nested tool results", async () => {
+    const displayPart = {
+      type: "display_file" as const,
+      data: "RElTUExBWQ==",
+      mediaType: "text/markdown",
+      filename: "notes.md",
+      providerOptions: { mux: { displayOnly: true as const, size: 7 } },
+    };
+    const tool = await createCodeExecutionTool(
+      runtimeFactory,
+      new ToolBridge({
+        attach_file: createMockTool("attach_file", z.object({ path: z.string() }), () => ({
+          type: "content",
+          value: [displayPart],
+        })),
+      })
+    );
+
+    const result = (await tool.execute!(
+      { code: 'return xum.attach_file({ path: "/notes.md" });', timeout_secs: null },
+      mockToolCallOptions
+    )) as PTCExecutionResult;
+
+    expect(result.success).toBe(true);
+    // Display bytes ride the carrier for UI rendering; sandbox-visible values
+    // only carry the stubbed shape so host-side records stay bounded.
+    expect(result.attachments).toEqual([displayPart]);
+    const sandboxVisible = JSON.stringify({ result: result.result, toolCalls: result.toolCalls });
+    expect(sandboxVisible).not.toContain(displayPart.data);
+    const returned = result.result as { value: Array<{ type: string; data?: string }> };
+    expect(returned.value[0].type).toBe("display_file");
+    expect(returned.value[0].data).toBe(DISPLAY_DATA_STUB);
   });
 
   it("omits attachments when no nested tool produced media", async () => {

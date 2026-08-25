@@ -145,7 +145,7 @@ export const Gallery: Story = {
           }}
         />
         <GallerySection
-          label="Completed (carrier media attachment)"
+          label="Completed (carrier attachments: image, PDF, display-only file)"
           cardProps={{
             args: { code: `await mux.attach_file({ path: "board.png" });` },
             result: {
@@ -158,6 +158,21 @@ export const Gallery: Story = {
               duration_ms: 30,
               attachments: [
                 { type: "media", data: RED_DOT_PNG, mediaType: "image/png", filename: "board.png" },
+                // PDF: the image gallery refuses it, so it must render as a
+                // download card instead of disappearing.
+                {
+                  type: "media",
+                  data: "JVBERi0xLjQK",
+                  mediaType: "application/pdf",
+                  filename: "report.pdf",
+                },
+                {
+                  type: "display_file",
+                  data: "IyBOb3RlcwoKQ2FycmllZCBkaXNwbGF5LW9ubHkgbWFya2Rvd24u",
+                  mediaType: "text/markdown",
+                  filename: "notes.md",
+                  providerOptions: { mux: { displayOnly: true, size: 38 } },
+                },
               ],
             },
             status: "completed",
