@@ -14346,6 +14346,76 @@ describe("TaskService", () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
+  test("sendAgentTreeMessage refuses sends escaping a hard-interrupt cascade after a user resume", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "branch-a", "branch-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "leaf-a", "leaf-a", {
+          parentWorkspaceId: "branch-a",
+          taskStatus: "running",
+        }),
+        // Cousin outside the interrupted subtree: the only thing keeping the stopping leaf from
+        // waking it mid-cascade is the descendant-set latch.
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    // Hard interrupt: markParentWorkspaceInterrupted's suppression entry is level-triggered and
+    // the user's next real send clears it (resetAutoResumeCount) while the descendant cascade
+    // may still be blocked in stopStream with taskStatus "running". The epoch bumps land before
+    // an entering send captures its baseline, so only the cascade latch can refuse it.
+    let markStopStarted: (() => void) | undefined;
+    const stopStarted = new Promise<void>((resolve) => {
+      markStopStarted = resolve;
+    });
+    let releaseStop: (() => void) | undefined;
+    const stopGate = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    const stopStream = mock(async (workspaceId: string) => {
+      if (workspaceId === "leaf-a") {
+        markStopStarted?.();
+        await stopGate;
+      }
+      return Ok(undefined);
+    });
+    const isStreaming = mock((workspaceId: string) => workspaceId === "leaf-a");
+    const { aiService } = createAIServiceMocks(config, { isStreaming, stopStream });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    taskService.markParentWorkspaceInterrupted("branch-a");
+    const terminating = taskService.terminateAllDescendantAgentTasks("branch-a");
+    await stopStarted;
+    // User resumes the interrupted workspace mid-cascade: suppression clears, but leaf-a is
+    // still being stopped.
+    taskService.resetAutoResumeCount("branch-a");
+
+    expect(await taskService.sendAgentTreeMessage("leaf-a", "sib-b", "escape the stop")).toEqual(
+      Err({
+        code: "refused",
+        reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
+      })
+    );
+
+    releaseStop?.();
+    expect(await terminating).toEqual(["leaf-a"]);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   test("sendAgentTreeMessage bounds peer message size, sender titles, and aggregate budgets", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
