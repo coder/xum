@@ -13,6 +13,11 @@ import {
   sanitizeMcpPromptRefs,
 } from "@/common/types/message";
 import type { StreamErrorType } from "@/common/types/errors";
+import {
+  getValidAgentPeerMessageMeta,
+  getValidAgentPeerTriggerMeta,
+  parseAgentMessageEnvelope,
+} from "@/common/utils/agentMessageEnvelope";
 import { GOAL_BUDGET_LIMIT_KIND, GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { getFollowUpContentText } from "@/browser/utils/compaction/format";
 import { getGoalClearedSummaryDisplayText } from "@/common/utils/goalClearedSummaryDisplay";
@@ -223,6 +228,37 @@ function getValidBashMonitorWakeRecords(
   return records.every(isValidRecord) ? records : undefined;
 }
 
+/**
+ * Same self-healing contract as getValidBashMonitorWakeRecords: peer metadata is persisted
+ * black-box data, so a corrupted row (e.g. object-valued fromTitle rendered as a React child)
+ * must fall back to normal user-message rendering instead of bricking the transcript.
+ *
+ * Authenticity mirrors the provider sanitizer: the row must carry synthetic provenance and its
+ * text must be a well-formed envelope whose sender fields MATCH the metadata. A partially
+ * corrupted row (valid-looking metadata on ordinary model output, or a metadata/envelope sender
+ * mismatch) renders as an ordinary assistant message instead of collapsing under another
+ * sender's attribution.
+ */
+function getValidAgentPeerMessage(
+  message: { metadata?: { muxMetadata?: MuxMessageMetadata; synthetic?: boolean } },
+  partText: string
+): NonNullable<Extract<DisplayedMessage, { type: "assistant" }>["agentPeerMessage"]> | undefined {
+  const meta = getValidAgentPeerMessageMeta(message.metadata?.muxMetadata);
+  if (meta == null || message.metadata?.synthetic !== true) {
+    return undefined;
+  }
+  const parsed = parseAgentMessageEnvelope(partText);
+  if (
+    parsed == null ||
+    parsed.from !== meta.fromWorkspaceId ||
+    parsed.relationship !== meta.relationship ||
+    parsed.fromTitle !== meta.fromTitle
+  ) {
+    return undefined;
+  }
+  return meta;
+}
+
 function getRawCommand(muxMetadata: unknown): string | undefined {
   if (!isPlainObject(muxMetadata) || typeof muxMetadata.type !== "string") {
     return undefined;
@@ -327,6 +363,21 @@ function buildUserDisplayedMessages(options: {
       compactionRequest,
       reviews: muxMeta?.reviews,
       bashMonitorWake: bashMonitorWakeRecords ? { records: bashMonitorWakeRecords } : undefined,
+      // The peer-message wake trigger is a synthetic machine row: mark it so prompt
+      // navigation skips it (the envelope payload itself is a separate assistant row). When the
+      // recipient is executing a delegated workspace turn, the trigger carries that turn's
+      // correlation metadata with the attribution nested on it. SECURITY/self-healing: require
+      // synthetic provenance AND validated attribution before collapsing the row — a corrupted
+      // human user row wearing peer metadata must fall back to ordinary rendering, not be
+      // disguised as a machine notification hidden from prompt navigation.
+      agentPeerMessageTrigger:
+        message.metadata?.synthetic === true &&
+        (muxMeta?.type === "agent-peer-message"
+          ? getValidAgentPeerMessageMeta(muxMeta) != null
+          : muxMeta?.type === "workspace-turn-task" &&
+            getValidAgentPeerTriggerMeta(muxMeta.agentPeerMessageTrigger) != null)
+          ? true
+          : undefined,
     },
   ];
 }
@@ -433,6 +484,9 @@ function appendAssistantTextRow(
     streamPresentation: options.isStreaming
       ? { source: options.streamIsReplay ? "replay" : "live" }
       : undefined,
+    // Backend-attached metadata (never model-authored text) gates the peer-message card, so a
+    // model-emitted lookalike envelope still renders as an ordinary assistant message.
+    agentPeerMessage: getValidAgentPeerMessage(message, part.text),
   });
 }
 

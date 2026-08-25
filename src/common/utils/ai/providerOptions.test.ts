@@ -2308,3 +2308,106 @@ describe("buildRequestHeaders", () => {
     expect(buildRequestHeaders("anthropic:claude-sonnet-4-5")).toBeUndefined();
   });
 });
+
+describe("custom provider wire origins", () => {
+  const customConfig = (
+    providerType: "openai-compatible" | "openai-responses" | "anthropic-messages"
+  ): ProvidersConfigMap => ({
+    zen: {
+      apiKeySet: true,
+      isEnabled: true,
+      isConfigured: true,
+      isCustom: true,
+      providerType,
+    },
+  });
+
+  test("anthropic-messages providers get Anthropic thinking options", () => {
+    const result = buildProviderOptions(
+      "zen:claude-sonnet-4-5",
+      "medium",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      customConfig("anthropic-messages")
+    );
+
+    expect(result).toEqual({
+      anthropic: {
+        disableParallelToolUse: false,
+        sendReasoning: true,
+        thinking: {
+          type: "enabled",
+          budgetTokens: 10000,
+        },
+      },
+    });
+  });
+
+  test("openai-responses providers get OpenAI reasoning options", () => {
+    const result = buildProviderOptions(
+      "zen:gpt-5",
+      "medium",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      customConfig("openai-responses")
+    );
+
+    const openai = "openai" in result ? result.openai : undefined;
+    expect(openai).toBeDefined();
+    expect(openai!.reasoningEffort).toBe("medium");
+    expect("anthropic" in result).toBe(false);
+  });
+
+  test("resolves mappedToModel aliases from the raw custom identity", () => {
+    const providersConfig: ProvidersConfigMap = {
+      zen: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        isCustom: true,
+        providerType: "anthropic-messages",
+        models: [{ id: "my-opus", mappedToModel: "anthropic:claude-opus-4-6-20260219" }],
+      },
+    };
+
+    const result = buildProviderOptions(
+      "zen:my-opus",
+      "high",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      providersConfig
+    );
+    const anthropic = (result as Record<string, unknown>).anthropic as Record<string, unknown>;
+
+    // The alias maps to an adaptive-thinking model; resolving metadata from
+    // the wire-remapped identity would miss the mapping and emit legacy
+    // budget-based thinking instead.
+    expect(anthropic.thinking).toEqual({ type: "adaptive" });
+    expect(anthropic.effort).toBe("high");
+  });
+
+  test("openai-compatible providers keep their own wire identity", () => {
+    const result = buildProviderOptions(
+      "zen:claude-sonnet-4-5",
+      "medium",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      customConfig("openai-compatible")
+    );
+
+    expect("anthropic" in result).toBe(false);
+    expect("openai" in result).toBe(false);
+  });
+});

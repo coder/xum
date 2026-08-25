@@ -67,20 +67,27 @@ import { getErrorMessage } from "@/common/utils/errors";
 
 import { repairLocalModelPreferencesForRemovedProvider } from "@/browser/utils/modelPreferenceRepair";
 import {
+  CUSTOM_PROVIDER_TYPES,
   formatProviderDisplayName,
   isBuiltInProvider,
-  isCustomOpenAICompatibleProviderConfig,
+  isCustomProviderConfig,
+  isCustomProviderType,
+  validateCustomProviderBaseUrl,
   validateCustomProviderId,
+  type CustomProviderType,
 } from "@/common/utils/providers/customProviders";
-import type {
-  AddCustomOpenAICompatibleProviderInput,
-  ProviderConfigInfo,
-} from "@/common/orpc/types";
+import type { AddCustomProviderInput, ProviderConfigInfo } from "@/common/orpc/types";
 import type { ServiceTier, XAIServiceTier } from "@/common/config/schemas/providersConfig";
 
 type MuxGatewayLoginStatus = "idle" | "starting" | "waiting" | "success" | "error";
 type CodexOauthFlowStatus = "idle" | "starting" | "waiting" | "error";
 type CopilotLoginStatus = "idle" | "starting" | "waiting" | "success" | "error";
+
+const CUSTOM_PROVIDER_TYPE_LABELS: Record<CustomProviderType, string> = {
+  "openai-compatible": "OpenAI Chat Completions",
+  "openai-responses": "OpenAI Responses",
+  "anthropic-messages": "Anthropic Messages",
+};
 
 const OPENAI_SERVICE_TIER_UNSET = "unset";
 
@@ -121,17 +128,13 @@ interface FieldConfig {
   optional?: boolean;
 }
 
-function isCustomOpenAICompatibleProviderInfo(
+function isCustomProviderInfo(
   providerInfo: ProviderConfigInfo | undefined
 ): providerInfo is ProviderConfigInfo & {
   isCustom: true;
-  providerType: "openai-compatible";
+  providerType: CustomProviderType;
 } {
-  return (
-    providerInfo?.isCustom === true &&
-    providerInfo.providerType === "openai-compatible" &&
-    isCustomOpenAICompatibleProviderConfig(providerInfo)
-  );
+  return providerInfo?.isCustom === true && isCustomProviderConfig(providerInfo);
 }
 
 /**
@@ -139,12 +142,12 @@ function isCustomOpenAICompatibleProviderInfo(
  * Most providers use API Key + Base URL, but some (like Bedrock) have different needs.
  */
 function getProviderFields(provider: string, providerInfo?: ProviderConfigInfo): FieldConfig[] {
-  if (isCustomOpenAICompatibleProviderInfo(providerInfo)) {
+  if (isCustomProviderInfo(providerInfo)) {
     return [
       {
         key: "displayName",
         label: "Display name",
-        placeholder: "My OpenAI-compatible provider",
+        placeholder: "My custom provider",
         type: "text",
       },
       {
@@ -217,7 +220,7 @@ function getProviderFields(provider: string, providerInfo?: ProviderConfigInfo):
   }
 
   // Guarded on isCustom: an upgraded install may carry a custom
-  // OpenAI-compatible provider named "coder" that intentionally shadows the
+  // custom provider named "coder" that intentionally shadows the
   // built-in (see detectAndLogShadowedProviders); it must keep its custom
   // API key/base URL fields instead of the built-in deployment field.
   if (provider === "coder" && providerInfo?.isCustom !== true) {
@@ -436,10 +439,7 @@ export function ProvidersSection() {
     const policyAllowedSet = new Set(visibleProviders);
 
     for (const provider of visibleProviders) {
-      if (
-        !isBuiltInProvider(provider) ||
-        isCustomOpenAICompatibleProviderInfo(config?.[provider])
-      ) {
+      if (!isBuiltInProvider(provider) || isCustomProviderInfo(config?.[provider])) {
         continue;
       }
 
@@ -447,7 +447,7 @@ export function ProvidersSection() {
     }
 
     for (const [provider, providerInfo] of Object.entries(config ?? {})) {
-      if (!policyAllowedSet.has(provider) || !isCustomOpenAICompatibleProviderInfo(providerInfo)) {
+      if (!policyAllowedSet.has(provider) || !isCustomProviderInfo(providerInfo)) {
         continue;
       }
 
@@ -1301,6 +1301,8 @@ export function ProvidersSection() {
 
   const [customProviderFormOpen, setCustomProviderFormOpen] = useState(false);
   const [customProviderId, setCustomProviderId] = useState("");
+  const [customProviderType, setCustomProviderType] =
+    useState<CustomProviderType>("openai-compatible");
   const [customProviderDisplayName, setCustomProviderDisplayName] = useState("");
   const [customProviderBaseUrl, setCustomProviderBaseUrl] = useState("");
   const [customProviderApiKey, setCustomProviderApiKey] = useState("");
@@ -1449,6 +1451,58 @@ export function ProvidersSection() {
     void api.providers.setProviderConfig({ provider, keyPath: [field], value: editValue });
   }, [api, editingField, editValue, updateOptimistically]);
 
+  // Per-provider write sequencing: rapid selections queue in click order and
+  // only the NEWEST write's failure reconciles shared state, so a stale
+  // completion cannot roll back or resurrect an older selection. Sequence
+  // numbers are globally monotonic so a queued write can never match a
+  // same-named provider re-added after removal.
+  const providerTypeWritesRef = useRef(new Map<string, { seq: number; chain: Promise<void> }>());
+  const providerTypeWriteSeqRef = useRef(0);
+
+  // Plain function: React Compiler handles memoization.
+  const handleCustomProviderTypeChange = (
+    provider: string,
+    next: CustomProviderType,
+    previous: CustomProviderType | undefined
+  ) => {
+    if (!api) return;
+
+    const writes = providerTypeWritesRef.current;
+    const entry = writes.get(provider) ?? { seq: 0, chain: Promise.resolve() };
+    const seq = ++providerTypeWriteSeqRef.current;
+    const chain = entry.chain.then(async () => {
+      if (writes.get(provider)?.seq !== seq) {
+        // Superseded by a newer selection, or the provider was removed while
+        // this write was queued; issuing it would resurrect the removed
+        // entry (setConfig creates absent provider sections).
+        return;
+      }
+      try {
+        const result = await api.providers.setProviderConfig({
+          provider,
+          keyPath: ["providerType"],
+          value: next,
+        });
+        if (!result.success) {
+          throw new Error(result.error);
+        }
+      } catch {
+        if (writes.get(provider)?.seq !== seq) {
+          return; // Stale: a newer selection owns the shared state.
+        }
+        // The format decides the request wire protocol, so an optimistic
+        // value that failed to persist (policy denial, lock/write failure)
+        // must not keep advertising an adapter the backend never adopted.
+        // Restore the previous value first: refresh() is best-effort and
+        // keeps the optimistic state when the refetch itself fails.
+        updateOptimistically(provider, { providerType: previous });
+        void refresh();
+      }
+    });
+    writes.set(provider, { seq, chain });
+    updateOptimistically(provider, { providerType: next });
+  };
+
   const handleClearField = useCallback(
     (provider: string, field: string) => {
       if (!api) return;
@@ -1577,13 +1631,12 @@ export function ProvidersSection() {
   const customProviderDisplayNameError =
     trimmedCustomProviderDisplayName.length === 0 ? "Display name is required." : null;
   const trimmedCustomProviderBaseUrl = customProviderBaseUrl.trim();
-  const customProviderBaseUrlError =
-    trimmedCustomProviderBaseUrl.length === 0
-      ? "Base URL is required."
-      : trimmedCustomProviderBaseUrl.startsWith("http://") ||
-          trimmedCustomProviderBaseUrl.startsWith("https://")
-        ? null
-        : "Base URL must start with http:// or https://.";
+  const customProviderBaseUrlValidation = validateCustomProviderBaseUrl(
+    trimmedCustomProviderBaseUrl
+  );
+  const customProviderBaseUrlError = customProviderBaseUrlValidation.ok
+    ? null
+    : customProviderBaseUrlValidation.reason;
   const showCustomProviderIdError =
     !customProviderIdValidation.ok &&
     (customProviderTouchedFields.providerId || customProviderSubmitAttempted);
@@ -1596,6 +1649,7 @@ export function ProvidersSection() {
 
   const clearCustomProviderForm = useCallback(() => {
     setCustomProviderId("");
+    setCustomProviderType("openai-compatible");
     setCustomProviderDisplayName("");
     setCustomProviderBaseUrl("");
     setCustomProviderApiKey("");
@@ -1636,18 +1690,16 @@ export function ProvidersSection() {
     if (
       !providerIdValidation.ok ||
       displayName.length === 0 ||
-      baseUrl.length === 0 ||
-      (!baseUrl.startsWith("http://") && !baseUrl.startsWith("https://"))
+      !validateCustomProviderBaseUrl(baseUrl).ok
     ) {
       setCustomProviderSubmitError(null);
       return;
     }
 
-    const models: AddCustomOpenAICompatibleProviderInput["models"] = initialModelId
-      ? [initialModelId]
-      : undefined;
-    const input: AddCustomOpenAICompatibleProviderInput = {
+    const models: AddCustomProviderInput["models"] = initialModelId ? [initialModelId] : undefined;
+    const input: AddCustomProviderInput = {
       provider,
+      providerType: customProviderType,
       displayName,
       baseUrl,
       apiKey: apiKey || undefined,
@@ -1659,7 +1711,7 @@ export function ProvidersSection() {
     setCustomProviderSubmitError(null);
     setCustomProviderNotice(null);
     try {
-      const result = await api.providers.addCustomOpenAICompatibleProvider(input);
+      const result = await api.providers.addCustomProvider(input);
       if (!result.success) {
         setCustomProviderSubmitError(result.error.message);
         return;
@@ -1690,6 +1742,7 @@ export function ProvidersSection() {
     customProviderApiKey,
     customProviderApiKeyFile,
     customProviderBaseUrl,
+    customProviderType,
     customProviderDisplayName,
     customProviderId,
     customProviderInitialModelId,
@@ -1723,6 +1776,10 @@ export function ProvidersSection() {
         return;
       }
 
+      // Invalidate queued format writes: a write draining after removal
+      // would recreate the entry (setConfig creates absent sections).
+      providerTypeWritesRef.current.delete(provider);
+
       const workspaceIds = new Set(workspaceMetadata.keys());
       if (selectedWorkspace) {
         workspaceIds.add(selectedWorkspace.workspaceId);
@@ -1738,6 +1795,10 @@ export function ProvidersSection() {
             ...prev,
             [provider]: result.error.message,
           }));
+          // The provider survives, but its queued format writes were already
+          // invalidated above; refetch backend truth so an unpersisted
+          // optimistic format cannot linger.
+          void refresh();
           return;
         }
         if (!result.success && result.error.code === "config_repair_failed") {
@@ -1769,6 +1830,8 @@ export function ProvidersSection() {
           ...prev,
           [provider]: "Failed to remove custom provider.",
         }));
+        // Same reconciliation as the structured-failure path above.
+        void refresh();
       } finally {
         setCustomProviderRemoving((prev) => (prev === provider ? null : prev));
       }
@@ -1843,7 +1906,7 @@ export function ProvidersSection() {
               const apiKeySource = providerInfo?.apiKeySource;
               const gatewayRouteTargets =
                 providerDefinition?.kind === "gateway" ? (providerDefinition.routes ?? []) : [];
-              const isCustomOpenAICompatible = isCustomOpenAICompatibleProviderInfo(providerInfo);
+              const isCustom = isCustomProviderInfo(providerInfo);
               const statusDotColor = !enabled
                 ? "bg-warning"
                 : configured
@@ -1893,7 +1956,7 @@ export function ProvidersSection() {
                   {/* Provider settings */}
                   {isExpanded && (
                     <div className="border-border-medium space-y-3 border-t px-4 py-3">
-                      {isBuiltInProvider(provider) && isCustomOpenAICompatible && (
+                      {isBuiltInProvider(provider) && isCustom && (
                         <div className="border-warning/40 bg-warning/10 text-warning rounded-md border px-3 py-2 text-xs">
                           This custom provider id now matches a built-in provider. Xum will keep
                           using your custom configuration.
@@ -2169,7 +2232,7 @@ export function ProvidersSection() {
                         const showOpenAIBaseUrlHint =
                           fieldConfig.key === "baseUrl" &&
                           provider === "openai" &&
-                          !isCustomOpenAICompatible &&
+                          !isCustom &&
                           // The hint's advice is already applied once Chat
                           // Completions is selected.
                           config?.openai?.wireFormat !== "chatCompletions" &&
@@ -2291,10 +2354,10 @@ export function ProvidersSection() {
                       })}
 
                       {/* Coder: OAuth login against the configured deployment.
-                          Hidden when a custom OpenAI-compatible provider named
+                          Hidden when a custom provider named
                           "coder" shadows the built-in — that entry keeps its
                           custom config and has no OAuth flow. */}
-                      {provider === "coder" && !isCustomOpenAICompatible && (
+                      {provider === "coder" && !isCustom && (
                         <div className="space-y-2">
                           <div>
                             <label className="text-foreground block text-xs font-medium">
@@ -3028,9 +3091,37 @@ export function ProvidersSection() {
                         </div>
                       )}
 
-                      {isCustomOpenAICompatible && (
-                        <div className="border-border-light space-y-2 border-t pt-3">
+                      {isCustom && (
+                        <div className="border-border-light space-y-3 border-t pt-3">
                           <div className="flex items-center justify-between gap-3">
+                            <label className="text-foreground block text-xs font-medium">
+                              API format
+                            </label>
+                            <Select
+                              value={providerInfo.providerType}
+                              onValueChange={(next) => {
+                                if (isCustomProviderType(next)) {
+                                  handleCustomProviderTypeChange(
+                                    provider,
+                                    next,
+                                    providerInfo.providerType
+                                  );
+                                }
+                              }}
+                            >
+                              <SelectTrigger className="w-56 max-w-full" aria-label="API format">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {CUSTOM_PROVIDER_TYPES.map((providerType) => (
+                                  <SelectItem key={providerType} value={providerType}>
+                                    {CUSTOM_PROVIDER_TYPE_LABELS[providerType]}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+                          <div className="border-border-light flex items-center justify-between gap-3 border-t pt-3">
                             <div>
                               <label className="text-foreground block text-xs font-medium">
                                 Remove custom provider
@@ -3066,11 +3157,10 @@ export function ProvidersSection() {
               <div className="border-border-medium bg-background-secondary/50 space-y-3 rounded-md border px-3 py-3">
                 <div className="flex items-center justify-between gap-3">
                   <div>
-                    <div className="text-foreground text-xs font-medium">
-                      OpenAI-compatible providers
-                    </div>
+                    <div className="text-foreground text-xs font-medium">Add a custom provider</div>
                     <div className="text-muted text-xs">
-                      Add providers that expose an OpenAI-compatible API.
+                      Add providers that use OpenAI Chat Completions, OpenAI Responses, or Anthropic
+                      Messages.
                     </div>
                   </div>
                   <Button
@@ -3140,6 +3230,29 @@ export function ProvidersSection() {
                           {customProviderDisplayNameError}
                         </span>
                       )}
+                    </label>
+
+                    <label className="block space-y-1">
+                      <span className="text-muted text-xs">API format</span>
+                      <Select
+                        value={customProviderType}
+                        onValueChange={(next) => {
+                          if (isCustomProviderType(next)) {
+                            setCustomProviderType(next);
+                          }
+                        }}
+                      >
+                        <SelectTrigger className="w-full" aria-label="API format">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {CUSTOM_PROVIDER_TYPES.map((providerType) => (
+                            <SelectItem key={providerType} value={providerType}>
+                              {CUSTOM_PROVIDER_TYPE_LABELS[providerType]}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
                     </label>
 
                     <label className="block space-y-1">

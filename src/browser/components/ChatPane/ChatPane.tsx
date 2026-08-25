@@ -763,8 +763,13 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const userMessageNavigationByHistoryId = useMemo(() => {
     const userHistoryIds: string[] = [];
     for (const message of deferredMessages) {
-      // Monitor wake events should not interrupt navigation between human prompts.
-      if (message.type === "user" && message.bashMonitorWake == null) {
+      // Monitor wakes and peer-message wake triggers are synthetic machine rows and should not
+      // interrupt navigation between human prompts (payloads themselves are assistant rows).
+      if (
+        message.type === "user" &&
+        message.bashMonitorWake == null &&
+        message.agentPeerMessageTrigger == null
+      ) {
         userHistoryIds.push(message.historyId);
       }
     }
@@ -995,7 +1000,12 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
   const handleCancelEdit = useCallback(() => {
     setEditingMessage(undefined);
-  }, [setEditingMessage]);
+    // handleEditLastUserMessage disabled auto-scroll to keep the view centered
+    // on the edited message. Dismissing the edit hands scroll ownership back to
+    // the transcript tail; without this the view stays scrolled up until the
+    // user manually returns to the bottom.
+    jumpToBottom();
+  }, [jumpToBottom, setEditingMessage]);
 
   const handleMessageSendStarted = useCallback(() => {
     // Re-arm and pin before the send request crosses the IPC boundary. Waiting for

@@ -443,6 +443,9 @@ export const KEYBINDS = {
   /** Reveal the selected timeline event in the transcript */
   REVEAL_TIMELINE_EVENT: { key: "Enter", ctrl: true, shift: true },
 
+  /** Open the timeline dialog on small viewports where the right sidebar is hidden */
+  OPEN_TIMELINE_DIALOG: { key: "t", shift: true },
+
   /** Reveal the last prompt in the transcript while its popup is open */
   REVEAL_LAST_PROMPT: { key: "Enter", ctrl: true, alt: true },
 

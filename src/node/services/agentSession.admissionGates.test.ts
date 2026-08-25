@@ -96,6 +96,88 @@ describe("AgentSession.sendMessage (admission gates)", () => {
     expect(history.success ? history.data : ["unexpected"]).toHaveLength(0);
   });
 
+  it("invokes the cancellation hook when the caller probe goes stale before acceptance", async () => {
+    const workspaceId = "ws-caller-stale-cancel";
+    const { session, historyService, streamMessage } = await createSessionHarness(workspaceId);
+    const appendMany = spyOn(historyService, "appendManyToHistory");
+    const canceled: string[] = [];
+
+    const result = await session.sendMessage(
+      "peer trigger",
+      { model: TEST_MODEL, agentId: "exec" },
+      {
+        synthetic: true,
+        preTurnMessages: [
+          createMuxMessage("peer-payload-stale", "assistant", "untrusted payload", {
+            timestamp: 1,
+            synthetic: true,
+          }),
+        ],
+        // Goes stale only once the pre-turn batch persisted: exercises the pre-horizon gate,
+        // which must roll the rows back AND surface the refusal through the cancellation hook —
+        // a queued peer send's caller already returned success and this hook carries its budget
+        // refund; without it the reservation would leak.
+        admissionStale: () => appendMany.mock.calls.length > 0,
+        onCanceled: (reason: string) => {
+          canceled.push(reason);
+        },
+      }
+    );
+
+    expect(result.success).toBe(false);
+    expect(canceled).toHaveLength(1);
+    expect(streamMessage).not.toHaveBeenCalled();
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success ? history.data : ["unexpected"]).toHaveLength(0);
+  });
+
+  it("keeps the charge when a stale send's rollback did not commit", async () => {
+    const workspaceId = "ws-caller-stale-rollback-failed";
+    const { session, historyService, streamMessage } = await createSessionHarness(workspaceId);
+    const appendMany = spyOn(historyService, "appendManyToHistory");
+    // Rollback deletion fails and the rows verifiably REMAIN: the cancellation hook must not
+    // fire — a refunded reservation with durable rows would let the payload enter provider
+    // context after a resume while no longer counting against the sender's budget.
+    const deleteSpy = spyOn(historyService, "deleteMessages").mockImplementation(() =>
+      Promise.resolve({ success: false as const, error: "sequence refresh failed" })
+    );
+    const canceled: string[] = [];
+    let preTurnRowsPersisted = 0;
+
+    const result = await session.sendMessage(
+      "peer trigger",
+      { model: TEST_MODEL, agentId: "exec" },
+      {
+        synthetic: true,
+        preTurnMessages: [
+          createMuxMessage("peer-payload-stuck", "assistant", "untrusted payload", {
+            timestamp: 1,
+            synthetic: true,
+          }),
+        ],
+        admissionStale: () => appendMany.mock.calls.length > 0,
+        onCanceled: (reason: string) => {
+          canceled.push(reason);
+        },
+        onPreTurnRowsPersisted: () => {
+          preTurnRowsPersisted += 1;
+        },
+      }
+    );
+    deleteSpy.mockRestore();
+
+    expect(result.success).toBe(false);
+    expect(canceled).toHaveLength(0);
+    // The failed rollback must be PROPAGATED as persistence: the Err still reaches the caller's
+    // outer refund paths (direct failure branch / queued onAcceptedPreStreamFailure), and only
+    // this marker keeps their payload-guarded refunds from releasing the charge on durable rows.
+    expect(preTurnRowsPersisted).toBe(1);
+    expect(streamMessage).not.toHaveBeenCalled();
+    // The rows stayed durable — consistent with the retained charge.
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success && history.data.length > 0).toBe(true);
+  });
+
   it("notifies accepted sends refused at the PREPARING gate and never streams", async () => {
     const workspaceId = "ws-epoch-preparing";
     const { session, streamMessage } = await createSessionHarness(workspaceId);

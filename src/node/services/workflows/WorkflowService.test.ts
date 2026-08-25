@@ -10,6 +10,12 @@ import { DisposableTempDir } from "@/node/services/tempDir";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { WorkflowRunStore } from "./WorkflowRunStore";
 import { WorkflowService } from "./WorkflowService";
+import {
+  acquireWorkflowArchiveAdmission,
+  hasInProcessWorkflowWork,
+  registerInProcessWorkflowRun,
+  setWorkflowArchiveAdmissionGuard,
+} from "./workflowArchiveAdmission";
 import type { ResolvedWorkflowScript } from "./workflowScriptResolver";
 
 function createScript(
@@ -25,6 +31,76 @@ function createScript(
     resolvedPath: "/workspace/workflows/demo.js",
     ...overrides,
   };
+}
+
+describe("WorkflowService archive admission", () => {
+  test("startWorkflow refuses admission while the workspace archive guard is armed", async () => {
+    using tmp = new DisposableTempDir("workflow-service-archive-admission");
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    const service = new WorkflowService({
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        async runAgent() {
+          throw new Error("No agent steps expected");
+        },
+      },
+      generateRunId: () => "wfr_admission_refused",
+      runnerId: "runner-admission",
+    });
+
+    setWorkflowArchiveAdmissionGuard((workspaceId) =>
+      workspaceId === "workspace-archiving" ? "Workspace is being archived: refuse" : null
+    );
+    try {
+      await expectStartRefused(service, "workspace-archiving");
+      // Background checkpoint retry is a run-starting entry point too: admission is acquired
+      // at method entry, before the run lookup, so the refusal fires even for eligible runs.
+      try {
+        await service.retryRunFromCheckpointInBackground({
+          workspaceId: "workspace-archiving",
+          runId: "wfr_any",
+          projectTrusted: true,
+        });
+        expect.unreachable("retryRunFromCheckpointInBackground must refuse while archiving");
+      } catch (error) {
+        expect(String(error)).toContain("being archived");
+      }
+      // No durable run may be created for a refused admission.
+      expect(await runStore.listRuns()).toEqual([]);
+      expect(hasInProcessWorkflowWork("workspace-archiving")).toBe(false);
+    } finally {
+      setWorkflowArchiveAdmissionGuard(() => null);
+    }
+  });
+
+  test("admissions and in-process runs release their workspace work when disposed", () => {
+    expect(hasInProcessWorkflowWork("workspace-admission")).toBe(false);
+    {
+      using _admission = acquireWorkflowArchiveAdmission("workspace-admission");
+      expect(hasInProcessWorkflowWork("workspace-admission")).toBe(true);
+      const release = registerInProcessWorkflowRun("workspace-admission");
+      release();
+      // Idempotent release must not free the still-held admission.
+      release();
+      expect(hasInProcessWorkflowWork("workspace-admission")).toBe(true);
+    }
+    expect(hasInProcessWorkflowWork("workspace-admission")).toBe(false);
+  });
+});
+
+async function expectStartRefused(service: WorkflowService, workspaceId: string): Promise<void> {
+  try {
+    await service.startWorkflow({
+      script: createScript("export default function workflow() { return {}; }\n"),
+      workspaceId,
+      projectTrusted: true,
+      args: {},
+    });
+    expect.unreachable("startWorkflow must refuse while the workspace is being archived");
+  } catch (error) {
+    expect(String(error)).toContain("being archived");
+  }
 }
 
 describe("WorkflowService", () => {

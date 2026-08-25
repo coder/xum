@@ -896,4 +896,252 @@ describe("task_list tool", () => {
       ],
     });
   });
+
+  function buildTreeTaskService() {
+    const listTaskTreeAgents = mock(() => ({
+      rootWorkspaceId: "tree-root",
+      rootTitle: "Root workspace",
+      rootRelationship: "ancestor" as const,
+      tasks: [
+        { ...buildAgentTask("task-self", "running", "tree-root"), relationship: "self" as const },
+        {
+          ...buildAgentTask("task-sib", "running", "tree-root"),
+          relationship: "sibling" as const,
+        },
+        {
+          ...buildAgentTask("task-done", "reported", "tree-root"),
+          relationship: "sibling" as const,
+        },
+      ],
+    }));
+    return {
+      listTaskTreeAgents,
+      taskService: { listTaskTreeAgents } as unknown as TaskService,
+    };
+  }
+
+  it("tree scope includes the root row by default and filters inactive rows", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-default");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+    const { listTaskTreeAgents, taskService } = buildTreeTaskService();
+
+    const tool = createTaskListTool({ ...baseConfig, taskService });
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ scope: "tree" }, mockToolCallOptions)
+    );
+
+    expect(listTaskTreeAgents).toHaveBeenCalledWith("task-self");
+    // Default statuses: the root "workspace" row plus active rows; reported rows stay hidden.
+    expect(taskIds(result)).toEqual(["tree-root", "task-self", "task-sib"]);
+    const parsed = result as {
+      tasks: Array<{
+        taskId: string;
+        status: string;
+        title?: string;
+        relationship?: string;
+        depth: number;
+      }>;
+      note?: string;
+    };
+    expect(parsed.tasks[0]).toEqual({
+      taskId: "tree-root",
+      status: "workspace",
+      title: "Root workspace",
+      relationship: "ancestor",
+      depth: 0,
+    });
+    expect(parsed.tasks[1].relationship).toBe("self");
+  });
+
+  it("tree scope does not advertise queued reawakenings on peer rows", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-reawakening");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+    const listTaskTreeAgents = mock(() => ({
+      rootWorkspaceId: "tree-root",
+      rootRelationship: "ancestor" as const,
+      tasks: [
+        { ...buildAgentTask("task-self", "running", "tree-root"), relationship: "self" as const },
+        // Sibling with a QUEUED reawakening: peer admission only accepts a running execution
+        // mirror, so the row must keep its stable terminal status (which the note marks
+        // unaddressable) instead of advertising an addressable-looking "queued".
+        {
+          ...buildAgentTask("task-sib-requeued", "reported", "tree-root"),
+          executionTaskId: "wtt-sib",
+          executionStatus: "queued" as const,
+          relationship: "sibling" as const,
+        },
+        // A RUNNING reawakened sibling stays overlaid: it genuinely accepts peer messages.
+        {
+          ...buildAgentTask("task-sib-live", "reported", "tree-root"),
+          executionTaskId: "wtt-live",
+          executionStatus: "running" as const,
+          relationship: "sibling" as const,
+        },
+      ],
+    }));
+    const tool = createTaskListTool({
+      ...baseConfig,
+      taskService: { listTaskTreeAgents } as unknown as TaskService,
+    });
+
+    const parsed = (await Promise.resolve(
+      tool.execute!(
+        { scope: "tree", statuses: ["workspace", "running", "queued", "reported"] },
+        mockToolCallOptions
+      )
+    )) as { tasks: Array<{ taskId: string; status: string }> };
+
+    const statusById = new Map(parsed.tasks.map((task) => [task.taskId, task.status]));
+    expect(statusById.get("task-sib-requeued")).toBe("reported");
+    expect(statusById.get("task-sib-live")).toBe("running");
+  });
+
+  it("tree scope hides initially queued peers that peer sends would refuse", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-initially-queued");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+    const listTaskTreeAgents = mock(() => ({
+      rootWorkspaceId: "tree-root",
+      rootRelationship: "ancestor" as const,
+      tasks: [
+        { ...buildAgentTask("task-self", "running", "tree-root"), relationship: "self" as const },
+        // Initially queued/starting siblings (launch capacity) carry a nonterminal STABLE
+        // status with no execution overlay, but sendAgentPeerMessage refuses those statuses
+        // outright — advertising them would break the note's addressability claim.
+        {
+          ...buildAgentTask("task-sib-queued", "queued", "tree-root"),
+          relationship: "sibling" as const,
+        },
+        {
+          ...buildAgentTask("task-sib-starting", "starting", "tree-root"),
+          relationship: "sibling" as const,
+        },
+        // Queued DESCENDANTS stay visible: parent guidance may target them.
+        {
+          ...buildAgentTask("task-child-queued", "queued", "task-self"),
+          relationship: "descendant" as const,
+        },
+      ],
+    }));
+    const tool = createTaskListTool({
+      ...baseConfig,
+      taskService: { listTaskTreeAgents } as unknown as TaskService,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!(
+        { scope: "tree", statuses: ["workspace", "running", "queued", "starting"] },
+        mockToolCallOptions
+      )
+    );
+    expect(taskIds(result)).toEqual(["tree-root", "task-self", "task-child-queued"]);
+  });
+
+  it("tree scope hides peers and swaps the note for restricted callers", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-restricted");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-cand-child" });
+    // A best-of candidate (or workflow-owned) caller cannot message the root or any peer:
+    // listTaskTreeAgents already omits those rows and flags the caller, and the tool must not
+    // advertise the root row or the standard addressability note.
+    const listTaskTreeAgents = mock(() => ({
+      rootWorkspaceId: "tree-root",
+      rootTitle: "Root workspace",
+      rootRelationship: "ancestor" as const,
+      callerPeerMessagingRestricted: true as const,
+      tasks: [
+        {
+          ...buildAgentTask("task-cand-child", "running", "task-cand"),
+          relationship: "self" as const,
+        },
+        {
+          ...buildAgentTask("task-cand-grandchild", "running", "task-cand-child"),
+          relationship: "descendant" as const,
+        },
+      ],
+    }));
+    const tool = createTaskListTool({
+      ...baseConfig,
+      taskService: { listTaskTreeAgents } as unknown as TaskService,
+    });
+
+    const result = (await Promise.resolve(
+      tool.execute!({ scope: "tree" }, mockToolCallOptions)
+    )) as { tasks: Array<{ taskId: string }>; note?: string };
+    expect(result.tasks.map((task) => task.taskId)).toEqual([
+      "task-cand-child",
+      "task-cand-grandchild",
+    ]);
+    expect(result.note).toContain("cannot send or receive peer messages");
+  });
+
+  it("tree scope omits an archived root from discovery", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-archived-root");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+    // Peer sends refuse archived targets, so an archived root must not be published as an
+    // addressable "workspace" row.
+    const listTaskTreeAgents = mock(() => ({
+      rootWorkspaceId: "tree-root",
+      rootTitle: "Root workspace",
+      rootRelationship: "ancestor" as const,
+      rootArchived: true as const,
+      tasks: [
+        { ...buildAgentTask("task-self", "running", "tree-root"), relationship: "self" as const },
+      ],
+    }));
+    const tool = createTaskListTool({
+      ...baseConfig,
+      taskService: { listTaskTreeAgents } as unknown as TaskService,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ scope: "tree" }, mockToolCallOptions)
+    );
+    expect(taskIds(result)).toEqual(["task-self"]);
+  });
+
+  it("tree scope omits a missing root from discovery", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-missing-root");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+    // A retained descendant whose parent chain ends at a removed/corrupted workspace: sends to
+    // that ID return not_found, so the root row must not be published as addressable.
+    const listTaskTreeAgents = mock(() => ({
+      rootWorkspaceId: "vanished-root",
+      rootRelationship: "ancestor" as const,
+      rootMissing: true as const,
+      tasks: [
+        {
+          ...buildAgentTask("task-self", "running", "vanished-root"),
+          relationship: "self" as const,
+        },
+      ],
+    }));
+    const tool = createTaskListTool({
+      ...baseConfig,
+      taskService: { listTaskTreeAgents } as unknown as TaskService,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ scope: "tree" }, mockToolCallOptions)
+    );
+    expect(taskIds(result)).toEqual(["task-self"]);
+  });
+
+  it("tree scope filters the root row like any other row when explicit statuses are passed", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-explicit");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+
+    const tool = createTaskListTool({
+      ...baseConfig,
+      taskService: buildTreeTaskService().taskService,
+    });
+
+    const withoutWorkspaceStatus: unknown = await Promise.resolve(
+      tool.execute!({ scope: "tree", statuses: ["running"] }, mockToolCallOptions)
+    );
+    expect(taskIds(withoutWorkspaceStatus)).toEqual(["task-self", "task-sib"]);
+
+    const withWorkspaceStatus: unknown = await Promise.resolve(
+      tool.execute!({ scope: "tree", statuses: ["workspace", "reported"] }, mockToolCallOptions)
+    );
+    expect(taskIds(withWorkspaceStatus)).toEqual(["tree-root", "task-done"]);
+  });
 });

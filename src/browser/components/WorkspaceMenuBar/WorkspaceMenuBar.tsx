@@ -16,7 +16,13 @@ import { WorkspaceMCPModal } from "../WorkspaceMCPModal/WorkspaceMCPModal";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { Popover, PopoverTrigger, PopoverContent } from "../Popover/Popover";
 import { Checkbox } from "../Checkbox/Checkbox";
-import { formatKeybind, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import {
+  formatKeybind,
+  isDialogOpen,
+  isEditableElement,
+  KEYBINDS,
+  matchesKeybind,
+} from "@/browser/utils/ui/keybinds";
 import { useRuntimeStatus, useRuntimeStatusStoreRaw } from "@/browser/stores/RuntimeStatusStore";
 import { useWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import { Button } from "@/browser/components/Button/Button";
@@ -48,7 +54,11 @@ import { forkWorkspace } from "@/browser/utils/chatCommands";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
-import { WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX } from "@/constants/layout";
+import {
+  NARROW_VIEWPORT_MAX_WIDTH_PX,
+  WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
+} from "@/constants/layout";
+import { TimelineDialog } from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
 import type { AgentSkillDescriptor, AgentSkillIssue } from "@/common/types/agentSkill";
 
 interface WorkspaceMenuBarProps {
@@ -91,6 +101,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const { preflightArchiveWorkspace, archiveWorkspace, setWorkspacePinned } = useWorkspaceActions();
   const { workspaceMetadata } = useWorkspaceContext();
   const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
+  const timelineExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.TIMELINE);
   const openTerminalPopout = useOpenTerminal();
   const openInEditor = useOpenInEditor();
   const runtimeStatus = useRuntimeStatus(workspaceId);
@@ -117,10 +128,20 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const [debugLlmRequestOpen, setDebugLlmRequestOpen] = useState(false);
   const [mcpModalOpen, setMcpModalOpen] = useState(false);
   const [heartbeatModalOpen, setHeartbeatModalOpen] = useState(false);
+  // Keyed by workspace so switching workspaces (e.g. the timeline's "Open child
+  // workspace" action) implicitly closes the dialog instead of covering the new view.
+  const [timelineDialogWorkspaceId, setTimelineDialogWorkspaceId] = useState<string | null>(null);
+  if (timelineDialogWorkspaceId !== null && timelineDialogWorkspaceId !== workspaceId) {
+    // Render-time adjustment (not an effect): leaving the dialog's workspace closes it
+    // for good; merely deriving open=false would reopen it when navigating back.
+    setTimelineDialogWorkspaceId(null);
+  }
+  const timelineDialogOpen = timelineDialogWorkspaceId === workspaceId;
   const [availableSkills, setAvailableSkills] = useState<AgentSkillDescriptor[]>([]);
   const [invalidSkills, setInvalidSkills] = useState<AgentSkillIssue[]>([]);
   const isSkillsMountedRef = useRef(true);
   const moreActionsButtonRef = useRef<HTMLButtonElement | null>(null);
+  const menuBarRef = useRef<HTMLDivElement | null>(null);
 
   const skillsRequestIdRef = useRef(0);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
@@ -175,6 +196,75 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const isTouchMobileScreen =
     typeof window !== "undefined" &&
     window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches;
+
+  // The right sidebar (home of the Timeline tab) is CSS-hidden by two independent
+  // rules: a viewport media query (<=768px, any pointer) and the workspace-shell
+  // container query (<=684px shell, e.g. a ~900px window with the left sidebar
+  // expanded). Read the sidebar's actual computed visibility so the timeline dialog
+  // gate matches the CSS truth; fall back to the media query when no shell is in
+  // the DOM (scratch pages, first render before refs attach, tests).
+  const isTimelineSidebarHidden = useCallback((): boolean => {
+    if (typeof window === "undefined") {
+      return false;
+    }
+    const sidebar = menuBarRef.current
+      ?.closest("[data-workspace-shell]")
+      ?.querySelector(".mobile-hide-right-sidebar");
+    if (sidebar instanceof HTMLElement) {
+      // Immersive review hides the sidebar on any viewport (marked aria-hidden);
+      // only a responsive hide should surface the dialog entry points.
+      if (sidebar.getAttribute("aria-hidden") === "true") {
+        return false;
+      }
+      return window.getComputedStyle(sidebar).display === "none";
+    }
+    return window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches;
+  }, []);
+
+  // Keep the gate reactive: resizing re-evaluates CSS instantly, but a render-time read
+  // would leave the More menu stale until an unrelated state update. The media-query
+  // listener covers viewport transitions and the ResizeObserver covers the shell
+  // container query (e.g. expanding the left sidebar squeezes the shell under 684px).
+  const [timelineSidebarHidden, setTimelineSidebarHidden] = useState(false);
+  useEffect(() => {
+    const compute = () => setTimelineSidebarHidden(isTimelineSidebarHidden());
+    compute();
+    const mql = window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+    mql.addEventListener("change", compute);
+    const shell = menuBarRef.current?.closest("[data-workspace-shell]");
+    let resizeObserver: ResizeObserver | undefined;
+    if (shell instanceof HTMLElement && typeof ResizeObserver !== "undefined") {
+      resizeObserver = new ResizeObserver(compute);
+      resizeObserver.observe(shell);
+    }
+    return () => {
+      mql.removeEventListener("change", compute);
+      resizeObserver?.disconnect();
+    };
+  }, [isTimelineSidebarHidden]);
+
+  // The dialog is the only timeline entry point while the sidebar is hidden, and every
+  // operation needs a keyboard shortcut. Evaluated at keydown time so the gate tracks
+  // live viewport/layout changes without a resize subscription.
+  useEffect(() => {
+    if (!timelineExperimentEnabled) {
+      return;
+    }
+    const handler = (e: KeyboardEvent) => {
+      if (
+        !matchesKeybind(e, KEYBINDS.OPEN_TIMELINE_DIALOG) ||
+        isDialogOpen() ||
+        isEditableElement(e.target) ||
+        !isTimelineSidebarHidden()
+      ) {
+        return;
+      }
+      e.preventDefault();
+      setTimelineDialogWorkspaceId(workspaceId);
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [timelineExperimentEnabled, isTimelineSidebarHidden, workspaceId]);
 
   const isDevcontainerWorkspace = isDevcontainerRuntime(runtimeConfig);
   const isRuntimeRunning = isDevcontainerWorkspace && runtimeStatus === "running";
@@ -488,6 +578,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
 
   return (
     <div
+      ref={menuBarRef}
       data-testid="workspace-menu-bar"
       className={cn(
         "bg-sidebar border-border-light flex items-center justify-between border-b px-2",
@@ -749,6 +840,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
               onEnterImmersiveReview={
                 hasRepository && !isTouchMobileScreen ? handleEnterImmersiveReview : null
               }
+              onOpenTimeline={
+                timelineExperimentEnabled && timelineSidebarHidden
+                  ? () => setTimelineDialogWorkspaceId(workspaceId)
+                  : null
+              }
               onStopRuntime={isRuntimeRunning ? () => void handleStopRuntime() : null}
               // Scratch chats have no repo: review events are ignored by
               // RightSidebar and fork is unsupported on the backend, so hide
@@ -796,6 +892,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
         projectPath={projectPath}
         open={mcpModalOpen}
         onOpenChange={setMcpModalOpen}
+      />
+      <TimelineDialog
+        workspaceId={workspaceId}
+        open={timelineDialogOpen}
+        onOpenChange={(open) => setTimelineDialogWorkspaceId(open ? workspaceId : null)}
       />
       <DebugLlmRequestModal
         workspaceId={workspaceId}

@@ -5,6 +5,7 @@
  */
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults, type GoalDefaults } from "@/constants/goals";
 import type { GoalBoardSnapshot } from "@/common/types/goal";
+import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
 import type {
   MemoryConsolidationRecordPayload,
   MemoryConsolidationStatusPayload,
@@ -176,6 +177,8 @@ export interface MockORPCClientOptions {
    * keyed by the workspace ID the story uses.
    */
   goalBoardSnapshots?: Map<string, GoalBoardSnapshot>;
+  /** Pre-seeded timeline events served to workspace.timeline.list/subscribe for every workspace. */
+  timelineEvents?: TimelineEvent[];
   /**
    * Pre-seeded memory files for memory.list (Memory tab / Settings → Memory
    * stories). read/save/delete/setPinned operate on this in-memory set.
@@ -408,6 +411,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     heartbeatDefaultIntervalMs: initialHeartbeatDefaultIntervalMs,
     goalDefaults: initialGoalDefaults,
     goalBoardSnapshots = new Map<string, GoalBoardSnapshot>(),
+    timelineEvents = [],
     memoryFiles = [],
     memoryConsolidationStatus,
     memoryFileContents = new Map<string, string>(),
@@ -1518,11 +1522,16 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         set: () => Promise.resolve({ success: true, data: undefined }),
       },
       timeline: {
-        list: () => Promise.resolve({ events: [], nextCursor: null, hasOlder: false }),
+        list: () => Promise.resolve({ events: timelineEvents, nextCursor: null, hasOlder: false }),
         subscribe: () =>
           Promise.resolve(
             (function* () {
-              yield { type: "snapshot" as const, events: [], nextCursor: null, hasOlder: false };
+              yield {
+                type: "snapshot" as const,
+                events: timelineEvents,
+                nextCursor: null,
+                hasOlder: false,
+              };
             })()
           ),
         preview: () => Promise.resolve(null),

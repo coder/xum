@@ -25,20 +25,25 @@ import {
 const describeOpenAICompatible = shouldRunIntegrationTests() ? describe : describe.skip;
 const MOCK_MODEL = "mock-model";
 
-type ChatRequestBody = {
+type MockRequestBody = Record<string, unknown> & {
   messages?: Array<{ role?: unknown; content?: unknown }>;
 };
 
 type MockHandler = (request: {
   path: string;
-  body: ChatRequestBody;
+  body: MockRequestBody;
+  headers: http.IncomingHttpHeaders;
   response: http.ServerResponse;
 }) => void;
 
 interface MockServer {
   origin: string;
   baseUrl: string;
-  requests: Array<{ path: string; body: ChatRequestBody }>;
+  requests: Array<{
+    path: string;
+    body: MockRequestBody;
+    headers: http.IncomingHttpHeaders;
+  }>;
   errors: Error[];
   close: () => Promise<void>;
 }
@@ -56,6 +61,107 @@ function writeCompletion(
     response.write(`data: ${JSON.stringify(chunk)}\n\n`);
   }
   response.end("data: [DONE]\n\n");
+}
+
+function writeResponsesCompletion(response: http.ServerResponse, text: string): void {
+  response.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+  // Minimal Responses SSE lifecycle: the SDK only emits text-start when the
+  // message output item is announced, so the delta must be preceded by
+  // response.output_item.added or the stream errors with a missing text part.
+  const events: Array<Record<string, unknown>> = [
+    {
+      type: "response.created",
+      response: { id: "resp-mock", created_at: 0, model: MOCK_MODEL },
+    },
+    {
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { type: "message", id: "msg-mock" },
+    },
+    {
+      type: "response.output_text.delta",
+      item_id: "msg-mock",
+      output_index: 0,
+      delta: text,
+    },
+    {
+      type: "response.output_item.done",
+      output_index: 0,
+      item: { type: "message", id: "msg-mock" },
+    },
+    {
+      type: "response.completed",
+      response: {
+        incomplete_details: null,
+        usage: { input_tokens: 1, output_tokens: 2 },
+      },
+    },
+  ];
+  for (const event of events) {
+    response.write(`data: ${JSON.stringify(event)}\n\n`);
+  }
+  response.end();
+}
+
+function writeAnthropicCompletion(response: http.ServerResponse, text: string): void {
+  response.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+  const events = [
+    {
+      event: "message_start",
+      data: {
+        type: "message_start",
+        message: {
+          id: "msg-mock",
+          model: MOCK_MODEL,
+          role: "assistant",
+          usage: { input_tokens: 1 },
+          content: [],
+          stop_reason: null,
+        },
+      },
+    },
+    {
+      event: "content_block_start",
+      data: {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "text", text: "" },
+      },
+    },
+    {
+      event: "content_block_delta",
+      data: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text },
+      },
+    },
+    {
+      event: "content_block_stop",
+      data: { type: "content_block_stop", index: 0 },
+    },
+    {
+      event: "message_delta",
+      data: {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
+        usage: { output_tokens: 2 },
+      },
+    },
+    { event: "message_stop", data: { type: "message_stop" } },
+  ];
+  for (const event of events) {
+    response.write(`event: ${event.event}\ndata: ${JSON.stringify(event.data)}\n\n`);
+  }
+  response.end();
 }
 
 function completionChunk(
@@ -81,18 +187,19 @@ async function createMockServer(handlers: MockHandler[]): Promise<MockServer> {
     request.on("data", (chunk: Buffer) => bodyChunks.push(chunk));
     request.on("end", () => {
       try {
-        const body = JSON.parse(Buffer.concat(bodyChunks).toString("utf8")) as ChatRequestBody;
-        const received = { path: request.url ?? "", body };
+        const body = JSON.parse(Buffer.concat(bodyChunks).toString("utf8")) as MockRequestBody;
+        const received = { path: request.url ?? "", body, headers: request.headers };
         requests.push(received);
 
-        if (request.method !== "POST" || received.path !== "/v1/chat/completions") {
+        if (request.method !== "POST") {
           response.writeHead(404).end();
           return;
         }
 
         const handler = handlerQueue.shift();
         if (!handler) {
-          throw new Error("Mock received more requests than expected");
+          response.writeHead(404).end();
+          return;
         }
         handler({ ...received, response });
       } catch (error) {
@@ -200,6 +307,120 @@ describeOpenAICompatible("custom OpenAI-compatible providers", () => {
       expect(mock.requests[0]?.path).toBe("/v1/chat/completions");
       expect(mock.errors).toEqual([]);
     } finally {
+      collector.stop();
+      await workspace.cleanup();
+      await mock.close();
+    }
+  }, 45000);
+
+  test("rejects custom provider base URLs carrying a query string", async () => {
+    // Every SDK adapter raw-appends endpoint paths onto the base URL
+    // (`${baseURL}/messages`), so a query string would swallow the endpoint.
+    // The IPC surface must reject it up front instead of misrouting requests.
+    const env = await createTestEnvironment();
+    try {
+      const result = await env.orpc.providers.addCustomProvider({
+        provider: "query-proxy",
+        displayName: "Query Proxy",
+        providerType: "anthropic-messages",
+        baseUrl: "https://proxy.example/anthropic?token=x",
+      });
+
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.code).toBe("invalid_base_url");
+        expect(result.error.message).toContain("query");
+      }
+      expect(await env.orpc.providers.list()).not.toContain("query-proxy");
+    } finally {
+      await cleanupTestEnvironment(env);
+    }
+  }, 30000);
+
+  test("streams a custom OpenAI Responses provider through /v1/responses", async () => {
+    const mock = await createMockServer([
+      ({ response }) => writeResponsesCompletion(response, "Hello from responses"),
+    ]);
+    const previousApiKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "must-not-leak";
+    const workspace = await createConfiguredWorkspace({
+      "local-responses": {
+        providerType: "openai-responses",
+        baseUrl: mock.origin,
+        models: [MOCK_MODEL],
+      },
+    });
+    const collector = createStreamCollector(workspace.env.orpc, workspace.workspaceId);
+    collector.start();
+
+    try {
+      await collector.waitForSubscription();
+      const result = await sendMessageWithModel(
+        workspace.env,
+        workspace.workspaceId,
+        "Say hello",
+        `local-responses:${MOCK_MODEL}`
+      );
+      expect(result.success).toBe(true);
+
+      expect(await collector.waitForEvent("stream-end", 30000)).toBeDefined();
+      assertStreamSuccess(collector);
+      expect(extractTextFromEvents(collector.getDeltas())).toContain("Hello from responses");
+      expect(mock.requests[0]?.path).toBe("/v1/responses");
+      // Keyless provider: no env-key fallback AND no empty auth header.
+      expect(mock.requests[0]?.headers.authorization).toBeUndefined();
+      expect(mock.errors).toEqual([]);
+    } finally {
+      if (previousApiKey === undefined) {
+        delete process.env.OPENAI_API_KEY;
+      } else {
+        process.env.OPENAI_API_KEY = previousApiKey;
+      }
+      collector.stop();
+      await workspace.cleanup();
+      await mock.close();
+    }
+  }, 45000);
+
+  test("streams a custom Anthropic Messages provider through /v1/messages", async () => {
+    const mock = await createMockServer([
+      ({ response }) => writeAnthropicCompletion(response, "Hello from Anthropic"),
+    ]);
+    const previousApiKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "must-not-leak";
+    const workspace = await createConfiguredWorkspace({
+      "local-anthropic": {
+        providerType: "anthropic-messages",
+        baseUrl: mock.origin,
+        models: [MOCK_MODEL],
+      },
+    });
+    const collector = createStreamCollector(workspace.env.orpc, workspace.workspaceId);
+    collector.start();
+
+    try {
+      await collector.waitForSubscription();
+      const result = await sendMessageWithModel(
+        workspace.env,
+        workspace.workspaceId,
+        "Say hello",
+        `local-anthropic:${MOCK_MODEL}`
+      );
+      expect(result.success).toBe(true);
+
+      expect(await collector.waitForEvent("stream-end", 30000)).toBeDefined();
+      assertStreamSuccess(collector);
+      expect(extractTextFromEvents(collector.getDeltas())).toContain("Hello from Anthropic");
+      expect(mock.requests[0]?.path).toBe("/v1/messages");
+      // Keyless provider: no env-key fallback AND no empty auth header.
+      expect(mock.requests[0]?.headers["x-api-key"]).toBeUndefined();
+      expect(mock.errors).toEqual([]);
+    } finally {
+      if (previousApiKey === undefined) {
+        delete process.env.ANTHROPIC_API_KEY;
+      } else {
+        process.env.ANTHROPIC_API_KEY = previousApiKey;
+      }
       collector.stop();
       await workspace.cleanup();
       await mock.close();

@@ -43,7 +43,10 @@ import {
   supports1MContext,
 } from "./models";
 import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
-import { isCustomOpenAICompatibleProviderConfig } from "@/common/utils/providers/customProviders";
+import {
+  customProviderWireOrigin,
+  isCustomProviderConfig,
+} from "@/common/utils/providers/customProviders";
 
 // Re-export for existing consumers (aiService, providerModelFactory, tests):
 // the implementations moved to browser-safe modules because this module
@@ -69,7 +72,7 @@ export { openaiProModeAvailable } from "./proMode";
  * emitting OpenAI options for an Anthropic-wire request. Metadata-aware wire
  * resolution must win over the name convention (which it still falls back to
  * for unknown instances). Mirrors resolveAndCreateModel's raw-prefix shadow
- * check: a custom OpenAI-compatible provider named "coder" owns the prefix,
+ * check: a custom provider named "coder" owns the prefix,
  * and its model IDs must not get gateway wire treatment.
  */
 function resolveOptionsCanonicalModel(
@@ -77,11 +80,21 @@ function resolveOptionsCanonicalModel(
   providersConfig?: ProvidersConfigMap | null
 ): string {
   const colonIndex = modelString.indexOf(":");
-  if (colonIndex === -1 || modelString.slice(0, colonIndex) !== "coder") {
+  if (colonIndex === -1) {
     return normalizeToCanonical(modelString);
   }
-  if (isCustomOpenAICompatibleProviderConfig(providersConfig?.coder)) {
-    return modelString; // custom-provider shadowing wins; already canonical
+  const prefix = modelString.slice(0, colonIndex);
+  const prefixEntry = providersConfig?.[prefix];
+  if (isCustomProviderConfig(prefixEntry)) {
+    // Custom providers (including ones shadowing built-in ids) speak the wire
+    // their providerType selects, so thinking/cache/header decisions must key
+    // on that origin. Generic chat-completions providers keep their own
+    // identity. Must mirror resolveAndCreateModel's wireProviderName remap.
+    const wireOrigin = customProviderWireOrigin(prefixEntry.providerType);
+    return wireOrigin ? `${wireOrigin}:${modelString.slice(colonIndex + 1)}` : modelString;
+  }
+  if (prefix !== "coder") {
+    return normalizeToCanonical(modelString);
   }
   const wire = resolveCoderWireCanonicalModel(
     modelString.slice(colonIndex + 1),
@@ -318,7 +331,14 @@ export function buildProviderOptions(
 
   // Resolve aliases to their base model for capability detection while keeping
   // the original modelString for provider routing and metadata lookups.
-  const capabilityModel = resolveModelForMetadata(normalizedModel, providersConfig ?? null);
+  // Custom-provider model entries (mappedToModel aliases) live under the raw
+  // custom prefix; the wire-remapped identity above is only for namespace and
+  // payload-format selection, so metadata must resolve from the raw identity.
+  const rawPrefixForMetadata = modelString.slice(0, Math.max(modelString.indexOf(":"), 0));
+  const metadataModel = isCustomProviderConfig(providersConfig?.[rawPrefixForMetadata])
+    ? modelString
+    : normalizedModel;
+  const capabilityModel = resolveModelForMetadata(metadataModel, providersConfig ?? null);
   const [, resolvedCapabilityModelName] = capabilityModel.split(":", 2);
   const capModelName = resolvedCapabilityModelName || modelName;
 

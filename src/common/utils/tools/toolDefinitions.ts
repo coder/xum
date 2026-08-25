@@ -952,21 +952,33 @@ export const TaskSendMessageToolArgsSchema = z
     task_id: z
       .string()
       .min(1)
-      .describe("Descendant sub-agent task ID returned by task or task_list."),
-    message: z.string().trim().min(1).describe("Updated guidance to send to the sub-agent."),
+      .describe(
+        'Tree target ID returned by task or task_list — a descendant sub-agent task ID or, for sibling/upward messages, a same-tree peer, ancestor, or root workspace ID (task_list scope:"tree").'
+      ),
+    message: z
+      .string()
+      .trim()
+      .min(1)
+      .describe(
+        `Plain-text message to deliver to the target. Sibling/upward sends are capped at ${TASK_FAMILY_MESSAGE_MAX_CHARS} characters and draw from shared per-pair/per-target session budgets; descendant guidance is uncapped.`
+      ),
     queue_dispatch_mode: z
       .enum(["tool-end", "turn-end"])
       .nullish()
       .describe(
-        'When the child is busy, dispatch the guidance at "tool-end" after its next tool call (default) or at "turn-end" after its current turn.'
+        'When the target is busy, dispatch at "tool-end" after its next tool call or at "turn-end" after its current turn. Defaults to "tool-end" for descendant and sibling targets and "turn-end" for ancestor targets (often human-driven; do not cut into their active turn).'
       ),
   })
   .strict();
+
+/** Target's relation to the sender, computed server-side; a sender cannot claim it. */
+const TaskSendMessageTargetRelationSchema = z.enum(["descendant", "sibling", "ancestor"]);
 
 const TaskSendMessageToolAcceptedResultSchema = z
   .object({
     status: z.literal("accepted"),
     taskId: z.string(),
+    targetRelation: TaskSendMessageTargetRelationSchema.optional(),
   })
   .strict();
 
@@ -975,6 +987,7 @@ const TaskSendMessageToolQueuedResultSchema = z
     status: z.literal("queued"),
     taskId: z.string(),
     queueDispatchMode: z.enum(["tool-end", "turn-end"]).optional(),
+    targetRelation: TaskSendMessageTargetRelationSchema.optional(),
   })
   .strict();
 
@@ -1024,6 +1037,23 @@ const TaskSendMessageToolErrorResultSchema = z
   })
   .strict();
 
+/** Peer/ancestor sends refused by a guard (workflow/best-of endpoints, duplicates, caps). */
+const TaskSendMessageToolRefusedResultSchema = z
+  .object({
+    status: z.literal("refused"),
+    taskId: z.string(),
+    reason: z.string(),
+  })
+  .strict();
+
+const TaskSendMessageToolRateLimitedResultSchema = z
+  .object({
+    status: z.literal("rate_limited"),
+    taskId: z.string(),
+    retryAfterMs: z.number().int().nonnegative().optional(),
+  })
+  .strict();
+
 export const TaskSendMessageToolResultSchema = z.discriminatedUnion("status", [
   TaskSendMessageToolAcceptedResultSchema,
   TaskSendMessageToolQueuedResultSchema,
@@ -1031,6 +1061,8 @@ export const TaskSendMessageToolResultSchema = z.discriminatedUnion("status", [
   TaskSendMessageToolNotFoundResultSchema,
   TaskSendMessageToolInvalidScopeResultSchema,
   TaskSendMessageToolNotActiveResultSchema,
+  TaskSendMessageToolRefusedResultSchema,
+  TaskSendMessageToolRateLimitedResultSchema,
   TaskSendMessageToolErrorResultSchema,
 ]);
 
@@ -1321,6 +1353,48 @@ export const TaskWorkspaceLifecycleToolArgsSchema = z
   })
   .strict();
 
+// Live model-facing input schema for the restored tool. Deliberately narrower than
+// TaskWorkspaceLifecycleToolArgsSchema (which is kept intact so historical transcripts
+// with delete_worktree/remove/force calls still parse and render): only the reversible
+// archive/unarchive verbs are model-invocable; task_remove stays the only irreversible verb.
+export const TaskWorkspaceLifecycleToolInputSchema = z
+  .object({
+    action: z
+      .enum(["archive", "unarchive"])
+      .describe(
+        'Reversible lifecycle action: "archive" hides and suspends the workspace without deleting state, "unarchive" restores it.'
+      ),
+    targets: z
+      .array(TaskWorkspaceLifecycleTargetSchema)
+      .min(1)
+      .describe(
+        'Workspace-turn targets this workspace created via task(kind="workspace"). Provide exactly one of taskId (wst_...) or workspaceId for each target.'
+      ),
+    interrupt_active: z
+      .boolean()
+      .nullish()
+      .describe(
+        "Archive only: when true, interrupt active workspace turns for the target before archiving. Ignored by unarchive, which never interrupts. Defaults to false."
+      ),
+    acknowledged_untracked_paths: z
+      .record(
+        z.string(),
+        z.array(
+          // The archive sink asserts trimmed non-empty paths when normalizing acknowledgements;
+          // reject blank entries at the boundary so a malformed acknowledgement fails this one
+          // call's validation instead of throwing inside the lifecycle service.
+          z
+            .string()
+            .refine((path) => path.trim().length > 0, "acknowledged paths must be non-empty")
+        )
+      )
+      .nullish()
+      .describe(
+        "Archive-only confirmations keyed by resolved workspaceId. Use only paths returned by a previous requires_confirmation result."
+      ),
+  })
+  .strict();
+
 const TaskWorkspaceLifecycleBaseResultSchema = z.object({
   action: TaskWorkspaceLifecycleActionSchema,
   taskId: z.string().optional(),
@@ -1369,6 +1443,7 @@ export const TaskWorkspaceLifecycleToolResultSchema = z
 // Agent tasks use queued/starting/running/awaiting_report/interrupted/reported; workflow runs
 // additionally use pending/backgrounded/failed/completed. The vocabularies share "running" and
 // "interrupted"; task IDs are self-describing (wfr_... = workflow run, bash:... = bash task).
+// "workspace" is emitted only for the scope:"tree" root row (a plain workspace, not a task).
 const TaskListStatusSchema = z.enum([
   "queued",
   "starting",
@@ -1380,6 +1455,7 @@ const TaskListStatusSchema = z.enum([
   "backgrounded",
   "failed",
   "completed",
+  "workspace",
 ]);
 export const TaskListToolArgsSchema = z
   .object({
@@ -1387,10 +1463,16 @@ export const TaskListToolArgsSchema = z
       .array(TaskListStatusSchema)
       .nullish()
       .describe(
-        "Task statuses to include. Defaults to unfinished tasks and workflow runs: queued, starting, running, awaiting_report, pending, backgrounded. " +
+        'Task statuses to include. Defaults to unfinished tasks and workflow runs: queued, starting, running, awaiting_report, pending, backgrounded (plus the root row under scope:"tree"). ' +
           "Persistent completed sub-agents are terminal `reported` tasks and are intentionally omitted by default; include `reported` (and `interrupted` when relevant) to rediscover inactive child workspaces after compaction or restart. " +
           "Omitting statuses is the safe recovery default after an uncertain workflow_run because it includes unfinished workflow runs. " +
           "Pass ['interrupted', 'failed'] to discover workflow runs that may be resumable via workflow_resume, but do not use only terminal/resumable statuses when checking for a still-running workflow."
+      ),
+    scope: z
+      .enum(["descendants", "tree"])
+      .nullish()
+      .describe(
+        'Listing scope. "descendants" (default) lists this workspace\'s own tasks, workflow runs, and bash processes. "tree" lists every agent workspace in this task tree — ancestors, siblings/cousins, descendants, and the root workspace row (status "workspace") — each tagged with its relationship to you; use it to discover task_send_message peer targets.'
       ),
     includeArchived: z
       .boolean()
@@ -1405,7 +1487,8 @@ export const TaskListToolTaskSchema = z
   .object({
     taskId: z.string(),
     status: TaskListStatusSchema,
-    parentWorkspaceId: z.string(),
+    // Absent only on the scope:"tree" root workspace row, which has no parent.
+    parentWorkspaceId: z.string().optional(),
     agentType: z.string().optional(),
     workspaceName: z.string().optional(),
     title: z.string().optional(),
@@ -1416,6 +1499,8 @@ export const TaskListToolTaskSchema = z
     thinkingLevel: TaskThinkingLevelSchema.optional(),
     bestOf: BestOfGroupSchema.optional(),
     workflowProgress: WorkflowProgressSummarySchema.optional(),
+    /** Present under scope:"tree": this row's relationship to the calling workspace. */
+    relationship: z.enum(["self", "ancestor", "sibling", "descendant"]).optional(),
     depth: z.number().int().min(0),
   })
   .strict();
@@ -2312,8 +2397,10 @@ export const TOOL_DEFINITIONS = {
   },
   task_send_message: {
     description:
-      "Send guidance to a descendant sub-agent. Queued/running work is interrupted or queued at the requested boundary so the child can incorporate the update. An inactive child is reawakened in the same persistent workspace under a fresh internal execution. " +
-      "The stable sub-agent task ID and durable role title remain unchanged, and the child's checkout is not refreshed automatically. Prefer reawakening an inactive child over spawning a replacement when its prior context or expertise is relevant. For repository-dependent work, reuse it only when the retained snapshot is appropriate or tell the child to verify and synchronize its checkout before acting; otherwise spawn a new child. If the new assignment changes the child's reusable responsibility, call task_retitle as well; do not retitle it for ordinary one-off assignments. Best-of children retain candidate metadata, so reawaken them only to continue that same candidate; use a standalone specialist for unrelated work. This tool does not target bash tasks, workflow runs, or workspace-turn handles.",
+      'Send a plain-text message to another agent workspace in this task tree: a descendant sub-agent, a sibling/cousin, or an ancestor (including the root workspace). The relationship is computed server-side from the tree — you can never claim parent authority you do not have. Discover addressable peers with task_list scope:"tree". ' +
+      "Descendant targets receive trusted guidance: queued/running work is interrupted or queued at the requested boundary, and an inactive child is reawakened in the same persistent workspace under a fresh internal execution. The stable sub-agent task ID and durable role title remain unchanged, and the child's checkout is not refreshed automatically. Prefer reawakening an inactive child over spawning a replacement when its prior context or expertise is relevant. For repository-dependent work, reuse it only when the retained snapshot is appropriate or tell the child to verify and synchronize its checkout before acting; otherwise spawn a new child. If the new assignment changes the child's reusable responsibility, call task_retitle as well; do not retitle it for ordinary one-off assignments. " +
+      "Sibling and ancestor targets receive your message wrapped in an untrusted <mux_agent_message> envelope carrying your ID (the reply address) and relationship; they must have a live turn/session (peers cannot reawaken inactive targets or edit queued launch prompts — that stays parent-only). Never ask a peer to do something your own constraints forbid; route such work back to the user. Peer sends are throttled (rate limits, duplicate suppression, queue and consecutive-wake caps) and refused for workflow-owned or best-of endpoints. " +
+      "This tool does not target bash tasks, workflow runs, workspace-turn handles, or workspaces outside this task tree.",
     schema: TaskSendMessageToolArgsSchema,
   },
   task_message_parent: {
@@ -2343,6 +2430,18 @@ export const TOOL_DEFINITIONS = {
       "Irreversibly remove inactive child task workspaces owned by the current workspace. Use it to prune completed grouped candidates after their results and artifacts are consumed, consolidate substantially overlapping standalone roles, restore the bounded reusable bench, honor an explicit user request, or discard clearly obsolete context. Do not use it for a blanket end-of-turn cleanup: retain a small bench of distinct useful roles. Removed sub-agents cannot be restored or reawakened. Active targets are rejected; descendants must be removed first, so nested batches are processed deepest-first.",
     schema: TaskRemoveToolArgsSchema,
   },
+  task_workspace_lifecycle: {
+    description:
+      'Reversibly archive or unarchive full workspaces that the current workspace created via task(kind="workspace"). ' +
+      "Scoped by durable workspace-turn ownership records: it cannot act on arbitrary user workspaces or sub-agent children (non-wst_ task IDs are invalid_scope). " +
+      'Use action="archive" when a peer workspace\'s work is complete; archived targets refuse task(kind="workspace", mode="existing") follow-ups until unarchived. ' +
+      "Active workspace turns involving the target (delegated to it, or owned by it for nested delegation) are refused unless interrupt_active is true (archive only; unarchive never interrupts). " +
+      "Live user activity in the target (a manual stream, terminal, or desktop session) also refuses archive and is never interrupted by this tool. " +
+      "Archive may return requires_confirmation with untracked paths when a snapshot would be lossy — the confirmation is checked before any interruption; re-call with acknowledged_untracked_paths to confirm. " +
+      'Archive of a managed-worktree target is refused while the "Delete checkout" worktree archive behavior is configured, because that policy deletes the checkout without user confirmation; targets the worktree policy cannot delete (SSH/Coder, Docker, project-dir local, or shared isolation-none checkouts) stay archivable. ' +
+      "For irreversible removal of inactive sub-agent children, use task_remove instead.",
+    schema: TaskWorkspaceLifecycleToolInputSchema,
+  },
   task_list: {
     description:
       "List descendant tasks for the current workspace, including status + metadata. " +
@@ -2350,6 +2449,7 @@ export const TOOL_DEFINITIONS = {
       "Use this after compaction, interruptions, workflow_run errors/aborts, or an app restart to rediscover active tasks, inactive persistent sub-agents, and resumable workflow runs. Sub-agent rows from grouped runs include `bestOf` metadata so they can be distinguished from the standalone reusable bench. The default statuses find unfinished work; request `reported` explicitly for completed persistent sub-agents. " +
       "When recovering an uncertain workflow_run, omit statuses first or include pending/running/backgrounded as well as interrupted/failed/completed; terminal-only filters can hide unfinished workflow runs. Pending runs may need workflow_resume because no runner may be active yet. " +
       "Workflow rows may include compact `workflowProgress` so callers can see the latest phase before deciding whether to await, resume, or leave the run alone. " +
+      'Pass scope:"tree" to list every agent workspace in this task tree instead — ancestors, siblings/cousins, descendants, and the root workspace row (status "workspace") — each tagged with its relationship to you. Tree rows are addressable via task_send_message except your own "self" row, best-of candidate rows (`bestOf` metadata, refused to keep candidates independent), and non-descendant rows in terminal states (peers cannot reactivate an inactive task — only its parent can); the root row is included by default and filtered like any other row when explicit statuses are passed. ' +
       "The legacy includeArchived option only affects archived workspace-turn and bash records; sub-agents remain one inactive/active task identity. " +
       "This is a discovery tool, NOT a waiting mechanism. If the current request actually depends on a task's output, call task_await with the specific task IDs you need; do not await all active tasks just because they appear here.",
     schema: TaskListToolArgsSchema,
@@ -3273,6 +3373,7 @@ export type BridgeableToolName =
   | "task_retitle"
   | "task_stop"
   | "task_remove"
+  | "task_workspace_lifecycle"
   | "heartbeat"
   | "memory"
   | "mcp_prompt_get";
@@ -3305,6 +3406,7 @@ export const RESULT_SCHEMAS: Record<BridgeableToolName, z.ZodType> = {
   task_retitle: TaskRetitleToolResultSchema,
   task_stop: TaskStopToolResultSchema,
   task_remove: TaskRemoveToolResultSchema,
+  task_workspace_lifecycle: TaskWorkspaceLifecycleToolResultSchema,
   heartbeat: HeartbeatToolResultSchema,
   memory: MemoryToolResultSchema,
   mcp_prompt_get: MCPPromptGetToolResultSchema,
@@ -3433,6 +3535,7 @@ export function getAvailableTools(
     "task_retitle",
     "task_stop",
     "task_remove",
+    "task_workspace_lifecycle",
     "task_list",
     ...(enableDynamicWorkflows ? ["workflow_run", "workflow_resume"] : []),
     ...(enableAgentReport ? ["agent_report"] : []),

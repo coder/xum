@@ -1,5 +1,6 @@
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn, type Mock } from "bun:test";
 import { WorkspaceService, generateForkBranchName, generateForkTitle } from "./workspaceService";
+import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
 import type { IdleCompactionOutcome } from "./idleCompactionService";
 import type { AgentSession } from "./agentSession";
 import { createAgentSessionHarness } from "./agentSession.testHarness";
@@ -49,7 +50,7 @@ import type { TerminalService } from "@/node/services/terminalService";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { WorktreeArchiveSnapshot } from "@/common/schemas/project";
 import type { BashToolResult } from "@/common/types/tools";
-import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
 import { createMuxMessage } from "@/common/types/message";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import {
@@ -161,6 +162,8 @@ const mockExtensionMetadataService: Partial<ExtensionMetadataService> = {
 };
 const mockBackgroundProcessManager: Partial<BackgroundProcessManager> = {
   cleanup: mock(() => Promise.resolve()),
+  hasRunningBackgroundProcesses: mock(() => false),
+  hasOrphanedRunningBackgroundProcesses: mock(() => Promise.resolve(false)),
 };
 
 type WorkspaceServiceArgs = ConstructorParameters<typeof WorkspaceService>;
@@ -8215,6 +8218,123 @@ describe("WorkspaceService executeBash archive guards", () => {
     expect(waitForInitMock).toHaveBeenCalledTimes(0);
     expect(getWorkspaceMetadataMock).toHaveBeenCalledTimes(0);
   });
+
+  test("in-flight executeBash holds the archive gate until it settles", async () => {
+    const workspaceId = "ws-exec-pairing";
+
+    // Park executeBash at its first await (metadata fetch): the admission was counted in its
+    // synchronous entry block, so the archive gate must observe it with no timing games.
+    let releaseMetadata: () => void = () => undefined;
+    const metadataGate = new Promise<{ success: false; error: string }>((resolve) => {
+      releaseMetadata = () => resolve({ success: false, error: "metadata unavailable (test)" });
+    });
+    getWorkspaceMetadataMock.mockReturnValue(metadataGate);
+
+    const execPromise = workspaceService.executeBash(workspaceId, "echo hello");
+
+    const archiveResult = await workspaceService.archive(workspaceId, undefined, {
+      refuseLiveUserActivity: true,
+    });
+    expect(archiveResult.success).toBe(false);
+    if (!archiveResult.success) {
+      expect(archiveResult.error).toContain("bash command");
+    }
+
+    releaseMetadata();
+    const execResult = await execPromise;
+    expect(execResult.success).toBe(false);
+
+    // Once the exec settled, its admission is released and the gate no longer reports it.
+    const archiveAfter = await workspaceService.archive(workspaceId, undefined, {
+      refuseLiveUserActivity: true,
+    });
+    if (!archiveAfter.success) {
+      expect(archiveAfter.error).not.toContain("bash command");
+    }
+  });
+
+  test("stageAttachment refuses while the workspace is being archived", async () => {
+    addToArchivingWorkspaces(workspaceService, "ws-staging");
+
+    const result = await workspaceService.stageAttachment({
+      workspaceId: "ws-staging",
+      filename: "notes.txt",
+      sizeBytes: 1,
+      dataBase64: Buffer.from("x").toString("base64"),
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("being archived");
+    }
+  });
+
+  test("downloadStagedAttachment refuses while the workspace is being archived", async () => {
+    // Downloads read from the checkout through the runtime (and can restart a stopped Coder
+    // workspace), so they pair with the archive gates exactly like staging.
+    addToArchivingWorkspaces(workspaceService, "ws-download");
+
+    const result = await workspaceService.downloadStagedAttachment({
+      workspaceId: "ws-download",
+      stagedPath: ".xum/user-attachments/notes.txt",
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("being archived");
+    }
+  });
+
+  test("getFileCompletions returns empty without touching the workspace while archiving", async () => {
+    addToArchivingWorkspaces(workspaceService, "ws-completions");
+
+    // The sync entry guard must return before getInfo: this fixture's config has no
+    // getAllWorkspaceMetadata, so reaching metadata/runtime work would throw.
+    const result = await workspaceService.getFileCompletions("ws-completions", "src");
+
+    expect(result.paths).toEqual([]);
+  });
+
+  test("in-flight staging and completion refreshes hold the archive gate", async () => {
+    // Park both requests at getInfo: their admissions were counted in the synchronous entry
+    // blocks, so the archive gate observes them with no timing assumptions.
+    let releaseMetadata: () => void = () => undefined;
+    const metadataGate = new Promise<never[]>((resolve) => {
+      releaseMetadata = () => resolve([]);
+    });
+    const service = createWorkspaceServiceForTest({
+      config: {
+        srcDir: "/tmp/test",
+        getSessionDir: mock(() => "/tmp/test/sessions"),
+        loadConfigOrDefault: mock(() => ({ projects: new Map() })),
+        getAllWorkspaceMetadata: mock(() => metadataGate),
+      } as unknown as Config,
+      historyService,
+    });
+
+    const stagePromise = service.stageAttachment({
+      workspaceId: "ws-gate",
+      filename: "notes.txt",
+      sizeBytes: 1,
+      dataBase64: Buffer.from("x").toString("base64"),
+    });
+    const completionsPromise = service.getFileCompletions("ws-gate", "src");
+
+    const archiveResult = await service.archive("ws-gate", undefined, {
+      refuseLiveUserActivity: true,
+    });
+    expect(archiveResult.success).toBe(false);
+    if (!archiveResult.success) {
+      expect(archiveResult.error).toContain("an attachment transfer in progress");
+      expect(archiveResult.error).toContain("a file completion refresh in progress");
+    }
+
+    releaseMetadata();
+    const staged = await stagePromise;
+    expect(staged.success).toBe(false); // Workspace not found in the empty metadata list.
+    const completions = await completionsPromise;
+    expect(completions.paths).toEqual([]);
+  });
 });
 
 describe("WorkspaceService executeBash workspace path resolution", () => {
@@ -10104,6 +10224,7 @@ describe("WorkspaceService remove desktop session cleanup", () => {
     const close = mock(() => Promise.resolve(undefined));
     const desktopSessionManager = {
       close,
+      setWorkspaceArchiveGuard: () => undefined,
     } as unknown as DesktopSessionManager;
     workspaceService.setDesktopSessionManager(desktopSessionManager);
 
@@ -10158,6 +10279,7 @@ describe("WorkspaceService remove desktop session cleanup", () => {
     const close = mock(() => Promise.reject(new Error("close failed")));
     const desktopSessionManager = {
       close,
+      setWorkspaceArchiveGuard: () => undefined,
     } as unknown as DesktopSessionManager;
     workspaceService.setDesktopSessionManager(desktopSessionManager);
 
@@ -10846,6 +10968,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     });
     const terminalService = {
       closeWorkspaceSessions,
+      setWorkspaceArchiveGuard: () => undefined,
     } as unknown as TerminalService;
     workspaceService.setTerminalService(terminalService);
 
@@ -10860,6 +10983,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const closeWorkspaceSessions = mock(() => undefined);
     const terminalService = {
       closeWorkspaceSessions,
+      setWorkspaceArchiveGuard: () => undefined,
     } as unknown as TerminalService;
     workspaceService.setTerminalService(terminalService);
 
@@ -10878,6 +11002,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const closeWorkspaceSessions = mock(() => undefined);
     const terminalService = {
       closeWorkspaceSessions,
+      setWorkspaceArchiveGuard: () => undefined,
     } as unknown as TerminalService;
     workspaceService.setTerminalService(terminalService);
 
@@ -10891,6 +11016,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const close = mock(() => Promise.resolve(undefined));
     const desktopSessionManager = {
       close,
+      setWorkspaceArchiveGuard: () => undefined,
     } as unknown as DesktopSessionManager;
     workspaceService.setDesktopSessionManager(desktopSessionManager);
 
@@ -10909,6 +11035,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const close = mock(() => Promise.resolve(undefined));
     const desktopSessionManager = {
       close,
+      setWorkspaceArchiveGuard: () => undefined,
     } as unknown as DesktopSessionManager;
     workspaceService.setDesktopSessionManager(desktopSessionManager);
 
@@ -10994,6 +11121,566 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     expect(cleanupReportedDescendantsAfterArchive).not.toHaveBeenCalled();
     const entry = configState.projects.get(projectPath)?.workspaces[0];
     expect(entry?.archivedAt).toBeTruthy();
+  });
+
+  test("archive() honors the caller's pinned Coder policy over a flipped config read", async () => {
+    // Dedicated (mux-created) Coder workspace: the remote-deletion guard only applies to these.
+    (mockAIService.getWorkspaceMetadata as ReturnType<typeof mock>).mockReturnValue(
+      Promise.resolve(
+        Ok({
+          ...workspaceMetadata,
+          runtimeConfig: {
+            type: "ssh",
+            host: "coder.example",
+            srcBaseDir: "/home/coder/src",
+            coder: { workspaceName: "mux-child", existingWorkspace: false },
+          },
+        })
+      )
+    );
+    // Simulate a keep → delete settings flip landing AFTER the caller read "keep" and committed
+    // to the archive (e.g. by interrupting turns based on that read).
+    configState.coderWorkspaceArchiveBehavior = "delete";
+
+    const hooks = new WorkspaceLifecycleHooks();
+    let hookBehavior: string | undefined;
+    hooks.registerBeforeArchive((args) => {
+      hookBehavior = args.coderWorkspaceArchiveBehavior;
+      return Promise.resolve(Ok(undefined));
+    });
+    workspaceService.setWorkspaceLifecycleHooks(hooks);
+
+    // Without a pinned read, the sink's fresh config read refuses under the flipped policy.
+    const unpinned = await workspaceService.archive(workspaceId, undefined, {
+      forbidCoderWorkspaceDeletion: true,
+    });
+    expect(unpinned.success).toBe(false);
+    if (!unpinned.success) {
+      expect(unpinned.error).toContain("Coder workspace archive behavior");
+    }
+
+    // With the caller's pinned read, the same flipped config cannot change the operation: the
+    // guard passes and the before-archive hook receives the pinned value.
+    const pinned = await workspaceService.archive(workspaceId, undefined, {
+      forbidCoderWorkspaceDeletion: true,
+      coderWorkspaceArchiveBehaviorOverride: "keep",
+    });
+    expect(pinned).toEqual(Ok({ kind: "archived" }));
+    expect(hookBehavior).toBe("keep");
+  });
+
+  test("archive() refuses while in-process workflow work exists under refuseLiveUserActivity", async () => {
+    // Simulates a workflow admission/runner that entered before the archive gate armed: the
+    // sink's synchronous gate must observe it and refuse instead of orphaning the run.
+    const release = registerInProcessWorkflowRun(workspaceId);
+    try {
+      const refused = await workspaceService.archive(workspaceId, undefined, {
+        refuseLiveUserActivity: true,
+      });
+      expect(refused.success).toBe(false);
+      if (!refused.success) {
+        expect(refused.error).toContain("workflow run starting or running");
+      }
+    } finally {
+      release();
+    }
+
+    const archived = await workspaceService.archive(workspaceId, undefined, {
+      refuseLiveUserActivity: true,
+    });
+    expect(archived).toEqual(Ok({ kind: "archived" }));
+  });
+
+  test("acquirePreInterruptionArchiveHold validates and arms the gate before turn interruption", async () => {
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+
+    // In-flight user activity must refuse BEFORE the caller destroys delegated turns: the
+    // sink's own gate runs only after interruption, when the turns are already lost.
+    const release = registerInProcessWorkflowRun(workspaceId);
+    let refused: ReturnType<typeof workspaceService.acquirePreInterruptionArchiveHold>;
+    try {
+      refused = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+        queuedDelegatedTurnCount: 0,
+        expectedDelegatedTurnCorrelations: [],
+      });
+    } finally {
+      release();
+    }
+    expect(refused.success).toBe(false);
+    if (!refused.success) {
+      expect(refused.error).toContain("workflow run");
+    }
+
+    // In-flight editor/terminal opens are visible only through the pending-open counters
+    // until their durable markers persist; the hold must refuse on them before the caller
+    // interrupts anything (the sink's untrackable-app check would refuse only afterwards).
+    const pendingOpen = workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
+    const refusedByOpen = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [],
+    });
+    expect(refusedByOpen.success).toBe(false);
+    if (!refusedByOpen.success) {
+      expect(refusedByOpen.error).toContain("external editor open in progress");
+    }
+    const admittedOpen = await pendingOpen;
+    expect(admittedOpen.success).toBe(true);
+    if (admittedOpen.success) {
+      await admittedOpen.data.rollbackAfterFailedLaunch();
+    }
+
+    // A refused hold releases the gate; a granted one arms it for the caller to carry
+    // through the sink, refusing new user admissions exactly like the sink's own gate.
+    const hold = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [],
+    });
+    expect(hold.success).toBe(true);
+    if (!hold.success) return;
+    try {
+      const refusedOpen = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-hold");
+      expect(refusedOpen.success).toBe(false);
+      if (!refusedOpen.success) {
+        expect(refusedOpen.error).toContain("being archived");
+      }
+    } finally {
+      hold.data[Symbol.dispose]();
+    }
+
+    // Released (e.g. the archive failed): admissions flow again.
+    const allowed = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-hold-2");
+    expect(allowed.success).toBe(true);
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+  });
+
+  test("acquirePreInterruptionArchiveHold binds the stream exemption to the delegated turns", () => {
+    const delegated = { taskHandleId: "wt-1", ownerWorkspaceId: "owner-1", turnId: "turn-1" };
+    const streamMeta: Record<string, unknown> = { type: "workspace-turn-task", ...delegated };
+    Object.assign(mockAIService, {
+      isStreaming: mock(() => true),
+      getStreamInfo: mock(() => ({ muxMetadata: streamMeta })),
+    });
+
+    // The active stream carries the collected turn's exact correlation: interruptible
+    // delegated work, so the hold is granted.
+    const held = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [delegated],
+    });
+    expect(held.success).toBe(true);
+    if (held.success) held.data[Symbol.dispose]();
+
+    // A stream correlated to a DIFFERENT turn (the collected turn ended and something else
+    // took the workspace's stream slot) must refuse — interruption would stopStream() it.
+    streamMeta.turnId = "turn-2";
+    const refusedMismatch = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [delegated],
+    });
+    expect(refusedMismatch.success).toBe(false);
+    if (!refusedMismatch.success) {
+      expect(refusedMismatch.error).toContain("not attributable to the delegated turns");
+    }
+
+    // A stream with no correlation metadata (a plain user stream that replaced the ended
+    // delegated stream) also refuses, even though a running delegated turn was collected —
+    // the stale collection must not exempt whichever stream happens to be active now.
+    Object.assign(mockAIService, {
+      getStreamInfo: mock(() => ({ muxMetadata: undefined })),
+    });
+    const refusedPlain = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [delegated],
+    });
+    expect(refusedPlain.success).toBe(false);
+    if (!refusedPlain.success) {
+      expect(refusedPlain.error).toContain("not attributable to the delegated turns");
+    }
+  });
+
+  test("acquirePreInterruptionArchiveHold freezes queue dispatch for the hold's lifetime", () => {
+    // A queued delegated entry that dispatched into PREPARING between the hold and turn
+    // interruption would evade the interrupt's targeted queue removal, so the hold must
+    // acquire the session's turn-admission block when it arms and release it on dispose.
+    const session = workspaceService.getOrCreateSession(workspaceId);
+    const realHoldTurnAdmission = session.holdTurnAdmission.bind(session);
+    let releases = 0;
+    const holdTurnAdmissionSpy = mock(() => {
+      const inner = realHoldTurnAdmission();
+      return {
+        [Symbol.dispose]: () => {
+          releases += 1;
+          inner[Symbol.dispose]();
+        },
+      };
+    });
+    session.holdTurnAdmission = holdTurnAdmissionSpy;
+
+    const held = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [],
+    });
+    expect(held.success).toBe(true);
+    expect(holdTurnAdmissionSpy).toHaveBeenCalledTimes(1);
+    if (!held.success) return;
+    // Held across interruption and the sink — not released before the caller disposes.
+    expect(releases).toBe(0);
+    held.data[Symbol.dispose]();
+    expect(releases).toBe(1);
+
+    // A refused hold must not leak the admission block either.
+    Object.assign(mockAIService, {
+      isStreaming: mock(() => true),
+      getStreamInfo: mock(() => undefined),
+    });
+    const refused = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [],
+    });
+    expect(refused.success).toBe(false);
+    expect(releases).toBe(2);
+  });
+
+  test("fork() refuses while the source workspace is being archived", async () => {
+    // Source-fork admission pairs with the archive gates: a Coder-stop archive must not stop
+    // the dedicated remote workspace mid-clone while a fork shares it.
+    addToArchivingWorkspaces(workspaceService, workspaceId);
+
+    const result = await workspaceService.fork(workspaceId);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("being archived");
+    }
+  });
+
+  test("archive() rechecks durably active workflow runs after arming the admission gate", async () => {
+    workspaceService.setTaskService({
+      hasActiveDescendantAgentTasksForWorkspace: mock(() => false),
+      hasActiveTopLevelWorkflowRunsForWorkspace: mock(() => Promise.resolve(true)),
+      withTaskTreeLifecycleLock: mock(
+        <T>(_: string, operation: () => Promise<T>): Promise<T> => operation()
+      ),
+    } as unknown as TaskService);
+
+    const result = await workspaceService.archive(workspaceId, undefined, {
+      refuseLiveUserActivity: true,
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("active workflow runs");
+    }
+  });
+
+  test("archive() refuses when durable spawn records show crash-orphaned background processes", async () => {
+    // Simulates the post-unclean-restart state: the manager's in-memory map is empty but a
+    // durable spawn record still points at a live nohup/setsid child (probe behavior itself
+    // is covered in backgroundProcessManager.test.ts).
+    (
+      mockBackgroundProcessManager.hasOrphanedRunningBackgroundProcesses as Mock<
+        (workspaceId: string) => Promise<boolean>
+      >
+    ).mockImplementationOnce(() => Promise.resolve(true));
+
+    const result = await workspaceService.archive(workspaceId, undefined, {
+      refuseLiveUserActivity: true,
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("previous app session");
+    }
+  });
+
+  test("recordExternalEditorOpen refuses while the workspace is being archived", async () => {
+    // A crashed prior run may have leaked the shared-session-dir marker; clear it first.
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    addToArchivingWorkspaces(workspaceService, workspaceId);
+
+    const result = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-refused");
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("being archived");
+    }
+    // The refused open launched nothing, so its reservation rolls back: a sticky entry would
+    // permanently refuse model-driven snapshot/Coder-stop archives after unarchive.
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
+  });
+
+  test("recordExternalEditorOpen rejects workspace IDs without a config entry", async () => {
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+
+    // Unknown IDs never reach the marker path (which joins the raw ID beneath the sessions
+    // directory), closing both stale-ID requests and traversal-crafted IDs.
+    const result = await workspaceService.recordExternalEditorOpen("../../etc-trap", "tok-trap");
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("not found");
+    }
+    let markerExists = true;
+    try {
+      await fsPromises.access("/tmp/test/sessions/external-editor-opened");
+    } catch {
+      markerExists = false;
+    }
+    expect(markerExists).toBe(false);
+    // The rejected reservation rolled back too.
+    expect(await workspaceService.hasUntrackableExternalAppOpen("../../etc-trap")).toBe(false);
+  });
+
+  test("recordExternalEditorOpen marks the workspace as having an untrackable app open", async () => {
+    // A crashed prior run may have leaked the shared-session-dir marker; clear it first.
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
+
+    const result = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-marks");
+    expect(result.success).toBe(true);
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
+
+    // The durable marker outlives this test run; remove it so "not yet opened" assertions in
+    // future runs (this fixture shares one session dir) stay deterministic.
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+  });
+
+  test("recordExternalEditorOpenForLaunch rolls back a freshly created marker after a failed launch", async () => {
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+
+    const admitted = await workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
+    expect(admitted.success).toBe(true);
+    if (!admitted.success) return;
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
+
+    // EditorService failures occur only before its detached spawn (missing executable,
+    // unsupported runtime), so nothing launched: the marker this recording created must not
+    // permanently refuse future model-driven snapshot/Coder-stop archives.
+    await admitted.data.rollbackAfterFailedLaunch();
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
+  });
+
+  test("rollbackAfterFailedLaunch removes the marker when every open in a concurrent batch fails", async () => {
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+
+    // Two first-time recordings overlap in flight: the second sees the marker written by the
+    // first, but that in-flight marker must not masquerade as evidence of a real prior
+    // launch — when both launches fail, the whole batch failed and the marker must go.
+    const [first, second] = await Promise.all([
+      workspaceService.recordExternalEditorOpenForLaunch(workspaceId),
+      workspaceService.recordExternalEditorOpenForLaunch(workspaceId),
+    ]);
+    expect(first.success).toBe(true);
+    expect(second.success).toBe(true);
+    if (!first.success || !second.success) return;
+
+    await first.data.rollbackAfterFailedLaunch();
+    // One failed launch alone must not delete the marker (the other may still launch).
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
+    await second.data.rollbackAfterFailedLaunch();
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
+  });
+
+  test("rollbackRecordedEditorOpen redeems a renderer launch token", async () => {
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+
+    // Client-generated token: the renderer knows it even when the recording response is
+    // lost, so an ambiguous outcome can still be reconciled.
+    const recorded = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-redeem");
+    expect(recorded.success).toBe(true);
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
+
+    // The renderer's placeholder window was closed before navigation: the deep link provably
+    // never launched, so redeeming the token must roll the durable marker back.
+    const rolledBack = await workspaceService.rollbackRecordedEditorOpen(workspaceId, "tok-redeem");
+    expect(rolledBack.success).toBe(true);
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
+
+    // Idempotent: redeeming again (or redeeming a token that was never committed) is a
+    // safe no-op.
+    expect(
+      (await workspaceService.rollbackRecordedEditorOpen(workspaceId, "tok-redeem")).success
+    ).toBe(true);
+    expect(
+      (await workspaceService.rollbackRecordedEditorOpen(workspaceId, "tok-never-committed"))
+        .success
+    ).toBe(true);
+  });
+
+  test("rollbackRecordedEditorOpen tombstones a token whose recording is still in flight", async () => {
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+
+    // The renderer saw its recording RPC reject at the transport while the backend handler
+    // was still persisting the marker, and rolled back immediately. The not-yet-registered
+    // token must not no-op: the handler would then commit a durable marker for a launch the
+    // renderer already abandoned, permanently refusing future model-driven archives.
+    const pending = workspaceService.recordExternalEditorOpen(workspaceId, "tok-inflight");
+    const rolledBack = await workspaceService.rollbackRecordedEditorOpen(
+      workspaceId,
+      "tok-inflight"
+    );
+    expect(rolledBack.success).toBe(true);
+
+    const recorded = await pending;
+    expect(recorded.success).toBe(false);
+    if (!recorded.success) {
+      expect(recorded.error).toContain("rolled back");
+    }
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
+  });
+
+  test("a failed marker persistence does not leave stale ancestry for the next attempt", async () => {
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+
+    // Same filesystem hiccup hits both the probe (EACCES -> fail-closed "unknown", so the
+    // batch records markerPreexisted: true) and the write. The failed attempt must discard
+    // that batch; otherwise the retry below would join it and its rollback would preserve a
+    // marker no launch ever backed.
+    const accessSpy = spyOn(fsPromises, "access").mockImplementationOnce(() =>
+      Promise.reject(Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" }))
+    );
+    const writeSpy = spyOn(fsPromises, "writeFile").mockImplementationOnce(() =>
+      Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
+    );
+    try {
+      const failed = await workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
+      expect(failed.success).toBe(false);
+
+      const retried = await workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
+      expect(retried.success).toBe(true);
+      if (!retried.success) return;
+      await retried.data.rollbackAfterFailedLaunch();
+      expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
+    } finally {
+      accessSpy.mockRestore();
+      writeSpy.mockRestore();
+    }
+  });
+
+  test("archive gating stays closed while an editor recording is in flight", async () => {
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+
+    // Freeze the recording at its marker write: the pending-recording count must keep the
+    // untrackable-app probe true for the whole in-flight window even though no durable
+    // marker or cache entry exists yet (a concurrent rollback may have collapsed them).
+    let releaseWrite!: () => void;
+    const writeGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    const writeSpy = spyOn(fsPromises, "writeFile").mockImplementationOnce(async () => {
+      await writeGate;
+    });
+    try {
+      const pending = workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
+      expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
+
+      releaseWrite();
+      const admitted = await pending;
+      expect(admitted.success).toBe(true);
+      if (!admitted.success) return;
+      // Clean up: the gated write never created a real marker, so a failed-launch rollback
+      // clears the in-memory record.
+      await admitted.data.rollbackAfterFailedLaunch();
+      expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(false);
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
+
+  test("rollbackAfterFailedLaunch preserves a marker that predates the recording", async () => {
+    // An earlier session's editor may still be running behind a pre-existing marker; a later
+    // failed launch must not delete the evidence protecting it.
+    await fsPromises.mkdir("/tmp/test/sessions", { recursive: true });
+    await fsPromises.writeFile("/tmp/test/sessions/external-editor-opened", "earlier session");
+
+    const admitted = await workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
+    expect(admitted.success).toBe(true);
+    if (!admitted.success) return;
+    await admitted.data.rollbackAfterFailedLaunch();
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
+
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+  });
+
+  test("rollbackAfterFailedLaunch preserves the marker while another open holds launch evidence", async () => {
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+
+    const failing = await workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
+    expect(failing.success).toBe(true);
+    // A deep-link open recorded meanwhile launches in the renderer unconditionally; its
+    // evidence must keep protecting the marker when the custom-editor launch fails.
+    const deepLink = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-deep-link");
+    expect(deepLink.success).toBe(true);
+    if (!failing.success) return;
+
+    await failing.data.rollbackAfterFailedLaunch();
+    expect(await workspaceService.hasUntrackableExternalAppOpen(workspaceId)).toBe(true);
+
+    await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+  });
+
+  test("archive waits for a retained background-init settlement before proceeding", async () => {
+    // Aborting init only signals: the fire-and-forget init hook process settles later, and
+    // snapshot capture / checkout deletion / Coder hooks must not run under its writes.
+    let releaseInit!: () => void;
+    const settlement = new Promise<void>((resolve) => {
+      releaseInit = resolve;
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call
+    (workspaceService as any).initSettlementPromises.set(workspaceId, settlement);
+
+    let archiveSettled = false;
+    const archivePromise = workspaceService.archive(workspaceId).then((result) => {
+      archiveSettled = true;
+      return result;
+    });
+    // Generous scheduling room: without the settlement await, this mock-backed archive
+    // completes within these turns and the assertion below goes red.
+    for (let i = 0; i < 50; i++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(archiveSettled).toBe(false);
+
+    releaseInit();
+    expect(await archivePromise).toEqual(Ok({ kind: "archived" }));
+  });
+
+  test("resumeStream refuses while the workspace is being archived", async () => {
+    addToArchivingWorkspaces(workspaceService, workspaceId);
+
+    const result = await workspaceService.resumeStream(workspaceId, {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    } satisfies SendMessageOptions);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.type).toBe("unknown");
+      if (result.error.type === "unknown") {
+        expect(result.error.raw).toContain("being archived");
+      }
+    }
+  });
+
+  test("resumeStream refuses archived workspaces", async () => {
+    const entry = configState.projects.get(projectPath)?.workspaces[0];
+    expect(entry).toBeDefined();
+    if (entry) {
+      entry.archivedAt = "2026-01-01T00:00:00.000Z";
+    }
+
+    const result = await workspaceService.resumeStream(workspaceId, {
+      model: "openai:gpt-4o-mini",
+      agentId: "exec",
+    } satisfies SendMessageOptions);
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.type).toBe("unknown");
+      if (result.error.type === "unknown") {
+        expect(result.error.raw).toContain("archived");
+      }
+    }
   });
 });
 
@@ -11413,11 +12100,13 @@ describe("WorkspaceService archive snapshots", () => {
     const closeWorkspaceSessions = mock(() => undefined);
     workspaceService.setTerminalService({
       closeWorkspaceSessions,
+      setWorkspaceArchiveGuard: () => undefined,
     } as unknown as TerminalService);
 
     const closeDesktopSession = mock(() => Promise.resolve(undefined));
     workspaceService.setDesktopSessionManager({
       close: closeDesktopSession,
+      setWorkspaceArchiveGuard: () => undefined,
     } as unknown as DesktopSessionManager);
 
     const captureSnapshotForArchive = mock(() => Promise.resolve(Err("should not run")));

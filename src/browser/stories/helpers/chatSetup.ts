@@ -9,6 +9,7 @@ import type { MuxMessage } from "@/common/types/message";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { BackgroundProcessInfo } from "@/common/orpc/schemas/api";
+import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { APIClient } from "@/browser/contexts/API";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
@@ -93,6 +94,8 @@ export interface SimpleChatSetupOptions {
   clearLogsResult?: { success: boolean; error?: string | null };
   /** Full-width transcript preference returned by the mock config API. */
   chatTranscriptFullWidth?: boolean;
+  /** Timeline events served by the mock workspace.timeline endpoints. */
+  timelineEvents?: TimelineEvent[];
 }
 
 /**
@@ -184,6 +187,7 @@ export function setupSimpleChatStory(opts: SimpleChatSetupOptions): APIClient {
     logEntries: opts.logEntries,
     clearLogsResult: opts.clearLogsResult,
     chatTranscriptFullWidth: opts.chatTranscriptFullWidth,
+    timelineEvents: opts.timelineEvents,
   });
 }
 
