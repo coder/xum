@@ -141,6 +141,7 @@ const mockInitStateManager: Partial<InitStateManager> = {
   clearInMemoryState: mock(() => undefined),
 };
 const mockExtensionMetadataService: Partial<ExtensionMetadataService> = {
+  getSnapshot: mock(() => Promise.resolve(null)),
   setStreaming: mock(() =>
     Promise.resolve({
       recency: Date.now(),
@@ -9353,6 +9354,39 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
     }));
 
     const result = await workspaceService.updateAgentAISettings("ws", "plan", null, {
+      persistSelectedAgentId: true,
+    });
+
+    expect(result).toEqual({
+      success: false,
+      error: "Target model has no pricing data. Pick a priced model before switching.",
+    });
+  });
+
+  test("refuses agent-only switch when only the activity snapshot model is unpriced", async () => {
+    workspaceService.setWorkspaceGoalService({
+      getGoal: mock(() => Promise.resolve({ status: "active", budgetCents: 500 })),
+    } as unknown as WorkspaceGoalService);
+    // No bucket, configured default, or legacy settings for the target agent:
+    // heartbeats then fall back to the activity snapshot's last-used model,
+    // so the gate must reject when that fallback is unpriced.
+    (
+      workspaceService as unknown as {
+        extensionMetadata: Pick<ExtensionMetadataService, "getSnapshot">;
+      }
+    ).extensionMetadata = {
+      getSnapshot: mock(() =>
+        Promise.resolve({
+          recency: Date.now(),
+          streaming: false,
+          lastModel: "openai:not-priced-model",
+          lastThinkingLevel: null,
+          agentStatus: null,
+        })
+      ),
+    } as unknown as ExtensionMetadataService;
+
+    const result = await workspaceService.updateAgentAISettings("ws", "reviewer", null, {
       persistSelectedAgentId: true,
     });
 

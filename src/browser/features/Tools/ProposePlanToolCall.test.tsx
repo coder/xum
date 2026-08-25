@@ -260,6 +260,7 @@ function createMockApi(
     getPlanContent?: MockApi["workspace"]["getPlanContent"];
     replaceChatHistory?: MockApi["workspace"]["replaceChatHistory"];
     sendMessage?: MockApi["workspace"]["sendMessage"];
+    updateAgentAISettings?: MockApi["workspace"]["updateAgentAISettings"];
   } = {}
 ): MockApi {
   return {
@@ -278,7 +279,9 @@ function createMockApi(
         overrides.sendMessage ?? (() => Promise.resolve({ success: true, data: undefined })),
       updateAgentAISettings: (args) => {
         updateAgentAISettingsCalls.push(args);
-        return Promise.resolve({ success: true });
+        return overrides.updateAgentAISettings
+          ? overrides.updateAgentAISettings(args)
+          : Promise.resolve({ success: true });
       },
     },
   };
@@ -580,6 +583,51 @@ describe("ProposePlanToolCall", () => {
     );
     // No explicit persistence for a switch whose send never went through.
     expect(updateAgentAISettingsCalls).toHaveLength(0);
+    // The optimistic switch rolls back to the pre-transition state.
+    await waitFor(() =>
+      expect(JSON.parse(window.localStorage.getItem(getAgentIdKey(WORKSPACE_ID))!)).toBe("plan")
+    );
+    expect(JSON.parse(window.localStorage.getItem(getModelKey(WORKSPACE_ID))!)).toBe(
+      "anthropic:claude-sonnet-4-5"
+    );
+    expect(JSON.parse(window.localStorage.getItem(getThinkingLevelKey(WORKSPACE_ID))!)).toBe(
+      "high"
+    );
+  });
+
+  test("rolls back the optimistic switch when explicit selection persistence fails", async () => {
+    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
+
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({
+      sendMessage: recordSendMessage(sendMessageCalls),
+      // Both the send-side best-effort write and this authoritative retry can
+      // fail (e.g. unwritable config); the returned Result must be honored.
+      updateAgentAISettings: () => Promise.resolve({ success: false, error: "unwritable config" }),
+    });
+
+    const view = renderCompletedPlan();
+
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+    await waitFor(() => expect(updateAgentAISettingsCalls).toHaveLength(1));
+
+    // The backend kept the previous agent, so the local switch (and the
+    // target-agent settings applied with it) must roll back to plan.
+    await waitFor(() =>
+      expect(JSON.parse(window.localStorage.getItem(getAgentIdKey(WORKSPACE_ID))!)).toBe("plan")
+    );
+    expect(JSON.parse(window.localStorage.getItem(getModelKey(WORKSPACE_ID))!)).toBe(
+      "anthropic:claude-sonnet-4-5"
+    );
+    expect(JSON.parse(window.localStorage.getItem(getThinkingLevelKey(WORKSPACE_ID))!)).toBe(
+      "high"
+    );
+    // Guard released after the persistence attempt settles.
+    await waitFor(() =>
+      expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true)
+    );
   });
 
   test("uses workspace-by-agent override for Implement when exec defaults inherit", async () => {

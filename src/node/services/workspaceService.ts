@@ -9702,7 +9702,8 @@ export class WorkspaceService extends EventEmitter {
           // Agent-only switches (null aiSettings) still redirect backend
           // dispatches to the target agent, so gate every dispatch surface's
           // fully resolved model: goal continuations remap plan/compact to
-          // exec, while heartbeats resolve the persisted agent as-is.
+          // exec, while heartbeats resolve the persisted agent as-is and add
+          // the activity snapshot's last-used model as a fallback layer.
           const gatedModels: string[] = [];
           if (normalizedSettings != null) {
             gatedModels.push(normalizedSettings.model);
@@ -9714,13 +9715,9 @@ export class WorkspaceService extends EventEmitter {
             if (kickoff?.model != null) {
               gatedModels.push(kickoff.model);
             }
-            const heartbeat = await this.resolveContinuationKickoffSendOptionsForAgent(
-              workspaceId,
-              agentId,
-              { remapUiModes: false }
-            );
-            if (heartbeat?.model != null && heartbeat.model !== kickoff?.model) {
-              gatedModels.push(heartbeat.model);
+            const heartbeat = await this.resolveHeartbeatAiSettings(workspaceId, agentId);
+            if (heartbeat.resolved.selected.model !== kickoff?.model) {
+              gatedModels.push(heartbeat.resolved.selected.model);
             }
           }
           const providersConfig =
@@ -13481,14 +13478,13 @@ export class WorkspaceService extends EventEmitter {
    * null. Also backs the budgeted-goal pricing gate for agent-only switches,
    * which must gate the same fully resolved model (bucket,
    * configured/definition defaults, legacy fallback) that dispatch selects.
-   * Heartbeats resolve the persisted agent WITHOUT the plan/compact→exec
-   * remap (buildHeartbeatSendOptions), so the gate probes that surface with
-   * `remapUiModes: false`.
+   * Heartbeats resolve differently (no plan/compact→exec remap plus an
+   * activity-snapshot fallback), so the gate probes that surface via
+   * resolveHeartbeatAiSettings instead.
    */
   private async resolveContinuationKickoffSendOptionsForAgent(
     workspaceId: string,
-    overrideAgentId: string | null,
-    opts?: { remapUiModes?: boolean }
+    overrideAgentId: string | null
   ): Promise<SendMessageOptions | null> {
     const config = this.config.loadConfigOrDefault();
     const workspaceMatch = this.config.findWorkspace(workspaceId);
@@ -13509,8 +13505,7 @@ export class WorkspaceService extends EventEmitter {
       WORKSPACE_DEFAULTS.agentId
     );
     const agentId =
-      (opts?.remapUiModes ?? true) &&
-      (persistedAgentId === "plan" || persistedAgentId === "compact")
+      persistedAgentId === "plan" || persistedAgentId === "compact"
         ? WORKSPACE_DEFAULTS.agentId
         : persistedAgentId;
     const selectedAgentSettings = workspaceEntry?.aiSettingsByAgent?.[agentId];
@@ -14066,12 +14061,20 @@ export class WorkspaceService extends EventEmitter {
       : String(error);
   }
 
-  private async buildHeartbeatSendOptions(workspaceId: string): Promise<{
-    sendOptions: SendMessageOptions;
-    heartbeatMessage: string | undefined;
-    contextMode: HeartbeatContextMode;
-    schedulePolicy: HeartbeatSchedulePolicy;
-    intervalMs: number;
+  /**
+   * Heartbeat-surface AI settings for the given selected agent — or for the
+   * persisted selected agent when `overrideAgentId` is null. Unlike goal
+   * continuations, heartbeats keep plan/compact as-is and fall back to the
+   * activity snapshot's last-used model. The budgeted-goal pricing gate for
+   * agent-only switches probes this exact resolution so gated models cannot
+   * drift from what heartbeats actually dispatch.
+   */
+  private async resolveHeartbeatAiSettings(
+    workspaceId: string,
+    overrideAgentId: string | null
+  ): Promise<{
+    agentId: string;
+    resolved: Awaited<ReturnType<typeof resolveNodeAgentAiSettings>>;
   }> {
     const config = this.config.loadConfigOrDefault();
     const workspaceMatch = this.config.findWorkspace(workspaceId);
@@ -14088,13 +14091,15 @@ export class WorkspaceService extends EventEmitter {
 
     const activity = await this.extensionMetadata.getSnapshot(workspaceId);
 
-    const rawAgentId = workspaceEntry?.agentId;
-    const agentId = normalizeAgentId(rawAgentId, WORKSPACE_DEFAULTS.agentId);
+    const agentId = normalizeAgentId(
+      overrideAgentId ?? workspaceEntry?.agentId,
+      WORKSPACE_DEFAULTS.agentId
+    );
     const agentSettings = workspaceEntry?.aiSettingsByAgent?.[agentId];
 
-    // Unified interactive resolution for the workspace's selected agent: its
-    // bucket, configured/definition defaults and the declared base chain, then
-    // the legacy workspace settings and activity snapshot as fallback layers.
+    // Unified interactive resolution for the selected agent: its bucket,
+    // configured/definition defaults and the declared base chain, then the
+    // legacy workspace settings and activity snapshot as fallback layers.
     const resolved = await resolveNodeAgentAiSettings({
       agentId,
       profile: "interactive",
@@ -14122,6 +14127,31 @@ export class WorkspaceService extends EventEmitter {
       defaultModel: WORKSPACE_DEFAULTS.model,
       definitionContext: await this.getAgentDefinitionContext(workspaceId),
     });
+
+    return { agentId, resolved };
+  }
+
+  private async buildHeartbeatSendOptions(workspaceId: string): Promise<{
+    sendOptions: SendMessageOptions;
+    heartbeatMessage: string | undefined;
+    contextMode: HeartbeatContextMode;
+    schedulePolicy: HeartbeatSchedulePolicy;
+    intervalMs: number;
+  }> {
+    const config = this.config.loadConfigOrDefault();
+    const workspaceMatch = this.config.findWorkspace(workspaceId);
+
+    const workspaceEntry = workspaceMatch
+      ? (() => {
+          const project = config.projects.get(workspaceMatch.projectPath);
+          return (
+            project?.workspaces.find((workspace) => workspace.id === workspaceId) ??
+            project?.workspaces.find((workspace) => workspace.path === workspaceMatch.workspacePath)
+          );
+        })()
+      : undefined;
+
+    const { agentId, resolved } = await this.resolveHeartbeatAiSettings(workspaceId, null);
 
     return {
       sendOptions: {

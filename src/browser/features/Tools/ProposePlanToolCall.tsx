@@ -137,6 +137,32 @@ function isLegacyProposePlanArgs(args: unknown): args is LegacyProposePlanToolAr
   return args !== null && typeof args === "object" && "title" in args && "plan" in args;
 }
 
+interface TargetAgentSwitchSnapshot {
+  previousAgentId: string;
+  model: string;
+  thinkingLevel: ThinkingLevel;
+  reasoningMode: OpenAIReasoningMode;
+}
+
+// A failed plan→exec/auto transition (send failure, or rejected/failed
+// selection persistence) leaves the backend on the previous agent. Restore
+// the optimistic local switch — settings first, then the agent id — unless
+// the user already moved on to another agent meanwhile.
+function rollbackTargetAgentSwitch(
+  workspaceId: string,
+  targetAgentId: string,
+  snapshot: TargetAgentSwitchSnapshot
+): void {
+  const agentKey = getAgentIdKey(workspaceId);
+  if (readPersistedState<string | null>(agentKey, null) !== targetAgentId) {
+    return;
+  }
+  setWorkspaceModelWithOrigin(workspaceId, snapshot.model, "sync");
+  updatePersistedState(getThinkingLevelKey(workspaceId), snapshot.thinkingLevel);
+  updatePersistedState(getReasoningModeKey(workspaceId), snapshot.reasoningMode);
+  updatePersistedState(agentKey, snapshot.previousAgentId);
+}
+
 interface ProposePlanToolCallProps {
   args: Record<string, unknown>;
   result?: unknown;
@@ -479,7 +505,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const resolveAndPersistTargetAgentSettings = (args: {
     workspaceId: string;
     targetAgentId: "auto" | "exec";
-  }): { resolvedModel: string; resolvedThinking: ThinkingLevel } => {
+  }): {
+    resolvedModel: string;
+    resolvedThinking: ThinkingLevel;
+    snapshot: TargetAgentSwitchSnapshot;
+  } => {
     const modelKey = getModelKey(args.workspaceId);
     const thinkingKey = getThinkingLevelKey(args.workspaceId);
     const reasoningKey = getReasoningModeKey(args.workspaceId);
@@ -509,6 +539,10 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
       });
 
+    // propose_plan renders in plan mode, so an unset key means plan.
+    const previousAgentId =
+      readPersistedState<string | null>(getAgentIdKey(args.workspaceId), null) ?? "plan";
+
     // The follow-up send persists this switch to the backend; guard the interim
     // against stale metadata broadcasts re-seeding the previous agent.
     markPendingWorkspaceAgentId(args.workspaceId, args.targetAgentId);
@@ -525,7 +559,16 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       updatePersistedState(reasoningKey, resolvedReasoningMode);
     }
 
-    return { resolvedModel, resolvedThinking };
+    return {
+      resolvedModel,
+      resolvedThinking,
+      snapshot: {
+        previousAgentId,
+        model: existingModel,
+        thinkingLevel: existingThinking,
+        reasoningMode: existingReasoning,
+      },
+    };
   };
 
   const handleImplement = async () => {
@@ -537,6 +580,8 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       setIsImplementing(true);
     }
 
+    const targetAgentId = "exec";
+    let switchSnapshot: TargetAgentSwitchSnapshot | null = null;
     try {
       let shouldReplaceChatHistory = false;
 
@@ -555,11 +600,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         });
       }
 
-      const targetAgentId = "exec";
-      const { resolvedModel, resolvedThinking } = resolveAndPersistTargetAgentSettings({
+      const { resolvedModel, resolvedThinking, snapshot } = resolveAndPersistTargetAgentSettings({
         workspaceId,
         targetAgentId,
       });
+      switchSnapshot = snapshot;
       const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
 
       const sendResult = await api.workspace.sendMessage({
@@ -577,25 +622,36 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         // settings persistence is best-effort (failures only log). Persist the
         // selection explicitly, then release the guard either way — backend
         // echoes carry the authoritative agent, and a successful no-op write
-        // emits no echo to release it for us.
+        // emits no echo to release it for us. A failed or rejected persistence
+        // leaves the backend on the previous agent, so restore the optimistic
+        // local switch instead of silently diverging.
         try {
-          await api.workspace.updateAgentAISettings({
+          const persistResult = await api.workspace.updateAgentAISettings({
             workspaceId,
             agentId: targetAgentId,
             aiSettings: null,
             persistSelectedAgentId: true,
           });
+          if (!persistResult.success) {
+            rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
+          }
+        } catch {
+          rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
         } finally {
           clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
         }
       } else {
-        // Failed send: nothing will echo, and a stuck guard would block
-        // backend agent seeds indefinitely.
+        // Failed send: the switch never reached the backend, nothing will
+        // echo, and a stuck guard would block backend agent seeds indefinitely.
+        rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
         clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
       }
     } catch {
       // Best-effort: user can retry manually if sending fails.
-      clearPendingWorkspaceAgentId(workspaceId, "exec");
+      if (switchSnapshot != null) {
+        rollbackTargetAgentSwitch(workspaceId, targetAgentId, switchSnapshot);
+      }
+      clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
     } finally {
       isImplementingRef.current = false;
       if (isMountedRef.current) {
@@ -612,6 +668,8 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       setIsContinuingInAuto(true);
     }
 
+    const targetAgentId = "auto";
+    let switchSnapshot: TargetAgentSwitchSnapshot | null = null;
     try {
       let shouldReplaceChatHistory = false;
 
@@ -630,11 +688,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         });
       }
 
-      const targetAgentId = "auto";
-      const { resolvedModel, resolvedThinking } = resolveAndPersistTargetAgentSettings({
+      const { resolvedModel, resolvedThinking, snapshot } = resolveAndPersistTargetAgentSettings({
         workspaceId,
         targetAgentId,
       });
+      switchSnapshot = snapshot;
       const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
 
       const sendResult = await api.workspace.sendMessage({
@@ -648,24 +706,34 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         },
       });
       // See handleImplement: persist the selection explicitly (send-side
-      // persistence is best-effort), then release the guard.
+      // persistence is best-effort), roll the optimistic switch back when the
+      // transition fails, then release the guard.
       if (sendResult.success) {
         try {
-          await api.workspace.updateAgentAISettings({
+          const persistResult = await api.workspace.updateAgentAISettings({
             workspaceId,
             agentId: targetAgentId,
             aiSettings: null,
             persistSelectedAgentId: true,
           });
+          if (!persistResult.success) {
+            rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
+          }
+        } catch {
+          rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
         } finally {
           clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
         }
       } else {
+        rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
         clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
       }
     } catch {
       // Best-effort: user can retry manually if sending fails.
-      clearPendingWorkspaceAgentId(workspaceId, "auto");
+      if (switchSnapshot != null) {
+        rollbackTargetAgentSwitch(workspaceId, targetAgentId, switchSnapshot);
+      }
+      clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
     } finally {
       isContinuingInAutoRef.current = false;
       if (isMountedRef.current) {

@@ -8,7 +8,13 @@ import { GlobalWindow } from "happy-dom";
 
 import { useWorkspaceStoreRaw as getWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
-import { GLOBAL_SCOPE_ID, getAgentIdKey, getProjectScopeId } from "@/common/constants/storage";
+import {
+  GLOBAL_SCOPE_ID,
+  getAgentIdKey,
+  getModelKey,
+  getProjectScopeId,
+  getThinkingLevelKey,
+} from "@/common/constants/storage";
 import { requireTestModule } from "@/browser/testUtils";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -458,6 +464,57 @@ describe("AgentContext", () => {
     await waitFor(() => {
       expect(contextValue?.agentId).toBe("exec");
     });
+  });
+
+  test("failed persistence restores the pre-switch model settings with the agent", async () => {
+    const projectPath = "/tmp/project";
+    const workspaceId = "main-workspace";
+    mockAgentDefinitions = [EXEC_AGENT, PLAN_AGENT];
+    mockWorkspaceMetadata.set(workspaceId, {});
+    window.localStorage.setItem(getAgentIdKey(workspaceId), JSON.stringify("exec"));
+    window.localStorage.setItem(getModelKey(workspaceId), JSON.stringify("openai:exec-model"));
+    window.localStorage.setItem(getThinkingLevelKey(workspaceId), JSON.stringify("high"));
+    deferUpdateAgentAISettings = true;
+
+    let contextValue: AgentContextValue | undefined;
+
+    renderAgentHarness({
+      workspaceId,
+      projectPath,
+      onChange: (value) => (contextValue = value),
+    });
+
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("exec");
+    });
+
+    contextValue?.setAgentId("plan");
+
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("plan");
+    });
+
+    // WorkspaceModeAISync reacts to the optimistic switch by applying the
+    // target agent's settings before the backend write settles.
+    window.localStorage.setItem(getModelKey(workspaceId), JSON.stringify("openai:plan-model"));
+    window.localStorage.setItem(getThinkingLevelKey(workspaceId), JSON.stringify("off"));
+
+    await waitFor(() => {
+      expect(resolveUpdateAgentAISettings).not.toBeNull();
+    });
+    resolveUpdateAgentAISettings?.({ success: false, error: "offline" });
+
+    // Rollback restores the previous agent AND its resolved settings, so the
+    // sync effect's fallback cannot leave exec on plan's just-applied model.
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("exec");
+    });
+    expect(window.localStorage.getItem(getModelKey(workspaceId))).toBe(
+      JSON.stringify("openai:exec-model")
+    );
+    expect(window.localStorage.getItem(getThinkingLevelKey(workspaceId))).toBe(
+      JSON.stringify("high")
+    );
   });
 
   test("shortcut actions do not override a locked workspace agent", async () => {

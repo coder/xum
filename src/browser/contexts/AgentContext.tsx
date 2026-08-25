@@ -13,15 +13,25 @@ import {
 
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  readPersistedState,
+  updatePersistedState,
+  usePersistedState,
+} from "@/browser/hooks/usePersistedState";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { matchesKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
   getAgentIdKey,
+  getModelKey,
   getProjectScopeId,
   getDisableWorkspaceAgentsKey,
+  getReasoningModeKey,
+  getThinkingLevelKey,
   GLOBAL_SCOPE_ID,
 } from "@/common/constants/storage";
+import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
+import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
+import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { sortAgentsStable } from "@/browser/utils/agents";
 import { normalizeAgentId, resolveRemovedBuiltinAgentId } from "@/common/utils/agentIds";
@@ -151,14 +161,37 @@ function AgentProviderWithState(props: {
       const nextAgentId: string = next;
       const previousAgentId: string | null = previous;
 
+      // Snapshot the resolved settings before WorkspaceModeAISync reacts to
+      // the optimistic switch: it replaces model/thinking/reasoning for the
+      // target agent, and on rollback its fallback for a previous agent with
+      // no bucket or configured defaults would be the target agent's newly
+      // applied settings rather than these.
+      const modelKey = getModelKey(workspaceId);
+      const thinkingKey = getThinkingLevelKey(workspaceId);
+      const reasoningKey = getReasoningModeKey(workspaceId);
+      const previousModel = readPersistedState<string>(modelKey, getDefaultModel());
+      const previousThinking = readPersistedState<ThinkingLevel>(thinkingKey, "off");
+      const previousReasoning = readPersistedState<OpenAIReasoningMode>(reasoningKey, "standard");
+
       // Optimistic local update above; on persistence failure roll the local
       // selection back (unless it changed again meanwhile) so this client
       // cannot silently diverge from the backend-authoritative agent.
       const rollback = () => {
         clearPendingWorkspaceAgentId(workspaceId, nextAgentId);
-        if (previousAgentId != null) {
-          setAgentIdRaw((current) => (current === nextAgentId ? previousAgentId : current));
+        if (previousAgentId == null) {
+          return;
         }
+        // scopeId === workspaceId here: persistence only runs workspace-scoped.
+        const current = readPersistedState<string | null>(getAgentIdKey(workspaceId), null);
+        if (current !== nextAgentId) {
+          return;
+        }
+        // Restore settings before the agent id so the sync effect's rollback
+        // run reads them as the existing (fallback) values.
+        setWorkspaceModelWithOrigin(workspaceId, previousModel, "sync");
+        updatePersistedState(thinkingKey, previousThinking);
+        updatePersistedState(reasoningKey, previousReasoning);
+        setAgentIdRaw(previousAgentId);
       };
 
       markPendingWorkspaceAgentId(workspaceId, nextAgentId);
