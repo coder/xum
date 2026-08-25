@@ -199,6 +199,16 @@ interface PendingGoalContinuationCandidate {
   sendOptions: SendMessageOptions;
 }
 
+/**
+ * Defensive validation for persisted timestamps: chat.jsonl rows are unchecked
+ * JSON, so metadata numbers can arrive malformed (negative, NaN, or a string
+ * masquerading through a cast). Only finite non-negative numbers participate
+ * in goal-safety comparisons; everything else is treated as absent.
+ */
+function toValidEpochMs(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
 interface ChatTailGoalModeResult {
   mode: "active" | "paused" | null;
   /**
@@ -525,7 +535,14 @@ export class WorkspaceGoalService {
       // Queue-dispatched rows persist their authoring time separately: the row
       // timestamp is stamped at dispatch, which can postdate a goal created at
       // the blocking turn's stream end even though the user typed pre-goal.
-      const authoredAtMs = message.metadata?.enqueuedAtMs ?? message.metadata?.timestamp;
+      // Codex P2 (PRRT_kwDOPxxmWM6b_1_J): chat.jsonl rows are unchecked JSON,
+      // so validate each candidate before comparing — a malformed enqueuedAtMs
+      // (negative, NaN, or a string) must fall back to the row timestamp
+      // instead of silently misclassifying a post-goal intervention as
+      // pre-goal and leaving the goal running.
+      const authoredAtMs =
+        toValidEpochMs(message.metadata?.enqueuedAtMs) ??
+        toValidEpochMs(message.metadata?.timestamp);
       return {
         mode: "paused",
         pausedBy: "manual_user",

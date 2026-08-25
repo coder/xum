@@ -468,6 +468,22 @@ describe("WorkspaceGoalService", () => {
     expect(reconciled).toMatchObject({ status: "paused" });
   });
 
+  test("getGoal ignores malformed persisted enqueuedAtMs and pauses on the row timestamp", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6b_1_J): chat.jsonl is unchecked JSON — a
+    // malformed enqueuedAtMs (negative here) must not beat a valid row
+    // timestamp, or a genuine post-goal intervention would be misread as
+    // pre-goal after a restart and the goal would keep running.
+    const created = await setGoalOk(service, { workspaceId, objective: "Malformed metadata" });
+    await appendUserHistoryMessage(historyService, workspaceId, "Stop this goal", {
+      timestamp: created.createdAtMs + 1_000,
+      enqueuedAtMs: -1,
+    });
+
+    const reconciled = await service.getGoal(workspaceId);
+
+    expect(reconciled).toMatchObject({ status: "paused" });
+  });
+
   test("chat-tail reconciliation ignores synthetic maintenance user rows", async () => {
     await setGoalOk(service, { workspaceId, objective: "Ignore maintenance rows" });
     // Drive a real continuation first so the goal is past its kickoff window
