@@ -16325,10 +16325,77 @@ describe("TaskService", () => {
     // child's execution (here an explicit turn interrupt persisting the terminal mirror) must
     // free it — otherwise the child stays barred from peer messaging until restart even after
     // every admission-visible marker refuses on its own.
-    const internals = taskService as unknown as { workspaceStopsInProgress: Map<string, number> };
+    const internals = taskService as unknown as {
+      workspaceStopsInProgress: Map<string, number>;
+      taskHandleStore: {
+        upsertWorkspaceTurn: (record: Record<string, unknown>) => Promise<void>;
+      };
+    };
     expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(true);
+
+    // A STALE handle settling for the same workspace is NOT settlement for the live execution:
+    // the mirror still points at wst_leaf, so releasing here would let the still-running child
+    // resume peer messaging with nothing admission-visible refusing it.
+    await internals.taskHandleStore.upsertWorkspaceTurn({
+      kind: "workspace_turn",
+      handleId: "wst_stale",
+      ownerWorkspaceId: "tree-root",
+      workspaceId: "leaf-a",
+      turnId: "wst_stale-turn",
+      status: "running",
+      createdAt: "2026-08-24T00:00:00.000Z",
+      updatedAt: "2026-08-24T00:00:00.000Z",
+      createdWorkspace: false,
+      disposableWorkspace: false,
+    });
+    const staleInterrupt = await taskService.interruptWorkspaceTurn("tree-root", "wst_stale");
+    expect(staleInterrupt.success).toBe(true);
+    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(true);
+
     const interrupted = await taskService.interruptWorkspaceTurn("tree-root", "wst_leaf");
     expect(interrupted.success).toBe(true);
+    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
+  });
+
+  test("park-after-settlement race releases the latch on already-settled evidence", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "branch-a", "branch-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        // Mid-settlement snapshot: a racing settlement already persisted the terminal mirror
+        // (and ran its retained-latch release) but has not yet deleted the live handle entry.
+        // The cascade's park lands AFTER the only settlement callback — without the post-park
+        // recheck the latch would hold until restart even though the persisted mirror already
+        // refuses peer sends on its own.
+        projectWorkspace(projectPath, "leaf-a", "leaf-a", {
+          parentWorkspaceId: "branch-a",
+          taskStatus: "reported",
+          taskExecutionId: "wst_leaf",
+          taskExecutionStatus: "interrupted",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService } = createWorkspaceServiceMocks();
+    const { aiService } = createAIServiceMocks(config, {
+      stopStream: mock((): Promise<Result<void>> => Promise.resolve(Err("cancel failed"))),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
+    await registerLiveWorkspaceTurnHandle(taskService, "leaf-a", "wst_leaf");
+
+    taskService.markParentWorkspaceInterrupted("branch-a");
+    await taskService.terminateAllDescendantAgentTasks("branch-a");
+
+    const internals = taskService as unknown as { workspaceStopsInProgress: Map<string, number> };
     expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
   });
 

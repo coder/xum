@@ -1899,6 +1899,32 @@ export class TaskService {
     }
   }
 
+  /**
+   * True when persisted evidence alone already refuses this workspace's peer sends, making a
+   * retained stop latch redundant: the workspace is missing, or its stable status is terminal
+   * with no live accepted running execution to rescue it. Active stable statuses return false —
+   * for a running child only the latch refuses, so it must be retained. Used to close the
+   * park-after-settlement race: settlement persists its terminal mirror BEFORE releasing
+   * retained latches, so a recheck that still sees a live execution is ordered before the
+   * settlement's release, which will then find the freshly parked latch.
+   */
+  private isStopSettledForAdmission(workspaceId: string): boolean {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    if (entry == null) return true;
+    const workspace = entry.workspace;
+    if (ACTIVE_AGENT_TASK_STATUSES.has(workspace.taskStatus ?? "running")) return false;
+    // Mirror of sendAgentPeerMessage's hasLiveRunningExecution: terminal-status senders are
+    // admitted only through a running mirror backed by a matching ACCEPTED live registration.
+    const live = this.activeWorkspaceTurnHandleByWorkspaceId.get(workspaceId);
+    const liveRunningExecution =
+      workspace.taskExecutionStatus === "running" &&
+      workspace.taskExecutionId != null &&
+      live != null &&
+      live.handleId === workspace.taskExecutionId &&
+      live.accepted;
+    return !liveRunningExecution;
+  }
+
   private recordTaskInterrupted(taskId: string, parentWorkspaceId: string | undefined): void {
     // Latch the stop for in-flight peer-send admission even when there is no parent to notify.
     this.bumpWorkspaceStopEpoch(taskId);
@@ -6593,10 +6619,18 @@ export class TaskService {
               ) {
                 releaseById.delete(id);
                 this.retainStopLatchUntilSettlement(id, release);
-                log.error(
-                  "terminateAllDescendantAgentTasks: unconfirmed stream stop for completed descendant with live execution; retaining stop latch",
-                  { taskId: id }
-                );
+                // Park-then-recheck: a settlement racing this cascade may have persisted the
+                // terminal mirror and run ITS release before the park above. If persisted
+                // evidence now refuses on its own, free the latch immediately — no later
+                // settlement callback will.
+                if (this.isStopSettledForAdmission(id)) {
+                  this.releaseRetainedStopLatches(id);
+                } else {
+                  log.error(
+                    "terminateAllDescendantAgentTasks: unconfirmed stream stop for completed descendant with live execution; retaining stop latch",
+                    { taskId: id }
+                  );
+                }
               }
               log.debug(
                 "terminateAllDescendantAgentTasks: preserving completed descendant report",
@@ -6621,11 +6655,17 @@ export class TaskService {
           } catch (error: unknown) {
             // Retain this descendant's latch as the stop marker (see comment above) and keep
             // processing the remaining descendants instead of aborting the whole cascade;
-            // authoritative settlement (releaseRetainedStopLatches) frees it later.
+            // authoritative settlement (releaseRetainedStopLatches) frees it later. The same
+            // park-then-recheck as the preserved-completed branch closes the race with a
+            // settlement whose release ran before this park (running children recheck false and
+            // stay latched).
             const release = releaseById.get(id);
             if (release != null) {
               releaseById.delete(id);
               this.retainStopLatchUntilSettlement(id, release);
+              if (this.isStopSettledForAdmission(id)) {
+                this.releaseRetainedStopLatches(id);
+              }
             }
             log.error(
               "terminateAllDescendantAgentTasks: interrupt processing failed; retaining stop latch",
@@ -7815,6 +7855,10 @@ export class TaskService {
     handleId: string,
     status: WorkspaceTurnTaskStatus | null
   ): Promise<void> {
+    // editWorkspaceEntry reports `updated` for a mere existing workspace, so a queued/stale
+    // handle B settling must not count as settlement for the DIFFERENT live handle A the mirror
+    // points at — track whether the matching mirror was actually mutated.
+    let settledMatchingMirror = false;
     const updated = await this.editWorkspaceEntry(
       workspaceId,
       (workspace) => {
@@ -7822,6 +7866,7 @@ export class TaskService {
           if (workspace.taskExecutionId === handleId) {
             delete workspace.taskExecutionId;
             delete workspace.taskExecutionStatus;
+            settledMatchingMirror = true;
           }
           return;
         }
@@ -7832,16 +7877,19 @@ export class TaskService {
         }
         if (workspace.taskExecutionId === handleId) {
           workspace.taskExecutionStatus = status;
+          settledMatchingMirror = true;
         }
       },
       { allowMissing: true }
     );
     if (updated) {
-      // A persisted terminal (or cleared) execution mirror is authoritative settlement: peer
-      // admission's live-execution rescue now refuses on its own, so any stop latch retained for
-      // an unconfirmed stop of this workspace has been superseded and must be released — holding
-      // it past settlement would bar the workspace from peer messaging until restart.
-      if (status == null || !isActiveWorkspaceTurnTaskStatus(status)) {
+      // A persisted terminal (or cleared) execution mirror for the MATCHING handle is
+      // authoritative settlement: peer admission's live-execution rescue now refuses on its
+      // own, so any stop latch retained for an unconfirmed stop of this workspace has been
+      // superseded and must be released — holding it past settlement would bar the workspace
+      // from peer messaging until restart. A non-matching handle settling leaves the live
+      // execution unrefuted, so its latch must stay.
+      if (settledMatchingMirror) {
         this.releaseRetainedStopLatches(workspaceId);
       }
       await this.emitWorkspaceMetadata(workspaceId);
