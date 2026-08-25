@@ -10860,8 +10860,14 @@ export class WorkspaceService extends EventEmitter {
       );
       if (!pricingGate.success) {
         if (internal?.synthetic !== true) {
-          sessionInvisiblePreflight.release();
-          return session.sendMessage(message, normalizedOptions, {
+          // Codex P1 (PRRT_kwDOPxxmWM6cSCjs): unlike the accepted handoffs
+          // below, this rejected send never streams and cannot produce its own
+          // compaction follow-up, so the handoff release does not apply. Hold
+          // the reservation (released by `using` disposal after the await
+          // settles) so a completing goal-scoped follow-up cannot be admitted
+          // ahead of the user's intervention while the fallback persists the
+          // rejected row and applies goal safety.
+          return await session.sendMessage(message, normalizedOptions, {
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
             goalKind: internal?.goalKind,

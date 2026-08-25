@@ -6386,6 +6386,51 @@ describe("WorkspaceService sendMessage status clearing", () => {
     }
   });
 
+  test("holds the preflight reservation through the rejected-send fallback", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cSCjs): a manual send rejected by the pricing
+    // gate delegates into AgentSession to persist the user row and apply goal
+    // safety, but it never streams and cannot produce its own compaction
+    // follow-up. Releasing the reservation before that fallback let a
+    // completing goal-scoped follow-up be admitted ahead of the user's
+    // intervention; the reservation must survive until the fallback settles.
+    fakeSession.isBusy.mockReturnValue(false);
+    const realSession = (
+      workspaceService as unknown as { createSession: (workspaceId: string) => AgentSession }
+    ).createSession("test-workspace");
+    // The shared fixture aiService omits stopStream; disposal needs it.
+    (
+      realSession as unknown as { aiService: { stopStream?: () => Promise<unknown> } }
+    ).aiService.stopStream = () => Promise.resolve(Ok(undefined));
+    const probe = (realSession as unknown as { hasExternalSendPreflight?: () => boolean })
+      .hasExternalSendPreflight;
+    expect(probe).toBeDefined();
+    try {
+      const pricingError: SendMessageError = { type: "unknown", raw: "unpriced model" };
+      workspaceService.setWorkspaceGoalService({
+        assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Err(pricingError))),
+        getPendingGoalSnapshot: mock(() => null),
+      } as unknown as WorkspaceGoalService);
+      const probeDuringFallback: { value: boolean | null } = { value: null };
+      fakeSession.sendMessage.mockImplementationOnce(() => {
+        probeDuringFallback.value = probe!();
+        return Promise.resolve(Err(pricingError));
+      });
+
+      const result = await workspaceService.sendMessage("test-workspace", "please stop", {
+        model: "custom:unpriced-model",
+        agentId: "exec",
+      });
+      expect(result.success).toBe(false);
+      // The fallback persists the rejected row and applies goal safety while
+      // other dispatchers may probe idleness — it must still see this send.
+      expect(probeDuringFallback.value).toBe(true);
+      // Fully settled: no residual reservation leaks.
+      expect(probe!()).toBe(false);
+    } finally {
+      realSession.dispose();
+    }
+  });
+
   test("does not clear persisted agent status directly for non-synthetic sends", async () => {
     const updateAgentStatus = spyOn(
       workspaceService as unknown as {
