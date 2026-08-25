@@ -58,6 +58,7 @@ type PreservedSendOptions = Pick<
   | "providerOptions"
   | "experiments"
   | "disableWorkspaceAgents"
+  | "strictAgentResolution"
   | "allowAgentSetGoal"
   | "skipAiSettingsPersistence"
 >;
@@ -74,6 +75,10 @@ export function pickPreservedSendOptions(options: SendMessageOptions): Preserved
     providerOptions: options.providerOptions,
     experiments: options.experiments,
     disableWorkspaceAgents: options.disableWorkspaceAgents,
+    // Delegated turns with explicit agent overrides must stay loud across the
+    // compaction replay too — dropping this would let the follow-up silently
+    // fall back to exec if the agent vanished in the meantime.
+    strictAgentResolution: options.strictAgentResolution,
     allowAgentSetGoal: options.allowAgentSetGoal,
     skipAiSettingsPersistence: options.skipAiSettingsPersistence,
   };
@@ -91,6 +96,7 @@ export type StartupRetrySendOptions = Pick<
   | "providerOptions"
   | "experiments"
   | "disableWorkspaceAgents"
+  | "strictAgentResolution"
   | "allowAgentSetGoal"
 > & {
   /** Correlation for a delegated workspace turn that must survive restart recovery. */
@@ -124,6 +130,8 @@ export function pickStartupRetrySendOptions(
     providerOptions: options.providerOptions,
     experiments: options.experiments,
     disableWorkspaceAgents: options.disableWorkspaceAgents,
+    // Keep explicit-agent turns loud across restart recovery (see pickPreservedSendOptions).
+    strictAgentResolution: options.strictAgentResolution,
     allowAgentSetGoal: options.allowAgentSetGoal,
     ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     ...(agentInitiated === true ? { agentInitiated: true } : {}),

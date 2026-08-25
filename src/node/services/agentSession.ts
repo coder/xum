@@ -1900,6 +1900,11 @@ export class AgentSession {
     if (typeof persistedDisableWorkspaceAgents === "boolean") {
       retryRequest.disableWorkspaceAgents = persistedDisableWorkspaceAgents;
     }
+    // Explicit-agent delegated turns must stay loud across restart recovery: without
+    // this, a replay after the agent was removed/disabled would silently run exec.
+    if (persistedRetrySendOptions?.strictAgentResolution === true) {
+      retryRequest.strictAgentResolution = true;
+    }
 
     if (persistedRetrySendOptions?.agentInitiated === true) {
       retryRequest.agentInitiated = true;
