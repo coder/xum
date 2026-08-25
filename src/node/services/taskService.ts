@@ -91,6 +91,7 @@ import {
 import type { ProjectRef, WorkspaceMetadata } from "@/common/types/workspace";
 import { getRuntimeType } from "@/node/runtime/initHook";
 import { AgentIdSchema } from "@/common/orpc/schemas";
+import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
 import {
   normalizeAgentId,
   resolvePersistedAgentId,
@@ -3695,8 +3696,28 @@ export class TaskService {
     runtime: Runtime;
     workspacePath: string;
     includeAgentPlugins: boolean;
-  }): Promise<Result<void, string>> {
+  }): Promise<Result<{ scope: AgentDefinitionScope }, string>> {
     assert(params.agentId.length > 0, "validateWorkspaceTurnAgentId: agentId must be non-empty");
+    const parsedAgentId = AgentIdSchema.safeParse(params.agentId);
+    if (!parsedAgentId.success) {
+      return Err(`Task.createWorkspaceTurn: invalid agentId (${params.agentId})`);
+    }
+    // The winning definition's scope is captured so the dispatched turn can pin the
+    // validated provenance at stream time (strictAgentResolution.expectedScope): a
+    // validated shadow vanishing must not let a lower-priority definition with the
+    // same id run under a strict send.
+    let scope: AgentDefinitionScope;
+    try {
+      const definition = await readAgentDefinition(
+        params.runtime,
+        params.workspacePath,
+        parsedAgentId.data,
+        { includeAgentPlugins: params.includeAgentPlugins }
+      );
+      scope = definition.scope;
+    } catch {
+      return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
+    }
     let frontmatter: Awaited<ReturnType<typeof resolveAgentFrontmatter>>;
     try {
       frontmatter = await resolveAgentFrontmatter(
@@ -3722,7 +3743,7 @@ export class TaskService {
     ) {
       return Err(`Task.createWorkspaceTurn: agentId is disabled (${params.agentId})`);
     }
-    return Ok(undefined);
+    return Ok({ scope });
   }
 
   /**
@@ -3766,7 +3787,9 @@ export class TaskService {
      * owner-side resolution.
      */
     ownerResolutionPredictsTarget: boolean;
-  }): Promise<Result<{ validatedContext: WorkspaceTurnAgentContext }, string>> {
+  }): Promise<
+    Result<{ validatedContext: WorkspaceTurnAgentContext; scope: AgentDefinitionScope }, string>
+  > {
     const reachable = await runtimePathExists(params.target.runtime, params.target.workspacePath);
     if (reachable) {
       const validation = await this.validateWorkspaceTurnAgentId({
@@ -3775,7 +3798,7 @@ export class TaskService {
         ...params.target,
       });
       if (validation.success) {
-        return Ok({ validatedContext: params.target });
+        return Ok({ validatedContext: params.target, scope: validation.data.scope });
       }
       if (params.targetInitPending) {
         return Err(
@@ -3798,7 +3821,7 @@ export class TaskService {
     if (!parsedAgentId.success) {
       return Err(`Task.createWorkspaceTurn: invalid agentId (${params.agentId})`);
     }
-    let resolvedScope: string;
+    let resolvedScope: AgentDefinitionScope;
     try {
       const definition = await readAgentDefinition(
         params.owner.runtime,
@@ -3820,7 +3843,9 @@ export class TaskService {
       agentId: params.agentId,
       ...params.owner,
     });
-    return validation.success ? Ok({ validatedContext: params.owner }) : validation;
+    return validation.success
+      ? Ok({ validatedContext: params.owner, scope: validation.data.scope })
+      : validation;
   }
 
   async createWorkspaceTurn(
@@ -3907,6 +3932,10 @@ export class TaskService {
     // agent-authored frontmatter `ai` defaults participate in AI-settings resolution
     // (mirrors the sub-agent creation path). Left unset for default exec/resume turns.
     let agentDefinitionContext: NodeAgentDefinitionContext | undefined;
+    // Scope of the definition that authorized the dispatch; pinned at stream time via
+    // strictAgentResolution.expectedScope so a vanished shadow cannot silently hand the
+    // id to a lower-priority definition.
+    let validatedAgentScope: AgentDefinitionScope | undefined;
     // Post-create target validation failure. Deferred (not returned immediately) so the
     // workspace-turn record is still written first: the record marks the created workspace
     // as owner-owned and retryable via mode="existing", and the failure settles through the
@@ -4007,6 +4036,7 @@ export class TaskService {
         });
         if (!validation.success) return Err(validation.error);
         workspaceTurnAgentId = requestedAgentId;
+        validatedAgentScope = validation.data.scope;
         agentDefinitionContext = {
           ...validation.data.validatedContext,
           workspaceId: targetWorkspaceId,
@@ -4139,6 +4169,7 @@ export class TaskService {
               ? `${validation.error} — no turn was dispatched; automatic cleanup of the disposable workspace (${targetWorkspaceId}) was scheduled (if cleanup fails, it remains owned by this caller and retryable via workspace.mode="existing")`
               : `${validation.error} — no turn was dispatched; the created workspace (${targetWorkspaceId}) is owned by this caller and can be retried via workspace.mode="existing" once ready`;
         } else {
+          validatedAgentScope = validation.data.scope;
           agentDefinitionContext = {
             ...validation.data.validatedContext,
             workspaceId: targetWorkspaceId,
@@ -4320,8 +4351,15 @@ export class TaskService {
           : {}),
         // Explicit overrides were validated pre-dispatch, but that validation races init
         // hooks and later edits; stream-time resolution runs after initialization and must
-        // fail loudly rather than silently swap in exec (see strictAgentResolution docs).
-        ...(requestedAgentId != null ? { strictAgentResolution: true } : {}),
+        // fail loudly rather than silently swap in exec — and, when the validated scope is
+        // known, must not run a different-provenance definition for the same id (see
+        // strictAgentResolution docs).
+        ...(requestedAgentId != null
+          ? {
+              strictAgentResolution:
+                validatedAgentScope != null ? { expectedScope: validatedAgentScope } : true,
+            }
+          : {}),
       },
       {
         startStreamInBackground: true,

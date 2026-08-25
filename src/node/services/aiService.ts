@@ -294,7 +294,7 @@ export interface StreamMessageOptions {
   agentInitiated?: boolean;
   agentId?: string;
   /** See SendMessageOptionsSchema.strictAgentResolution: explicit-agent sends fail loudly instead of falling back to exec. */
-  strictAgentResolution?: boolean;
+  strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
   /** ACP prompt correlation id used to match stream events to a specific request. */
   acpPromptId?: string;
   /** Tool names that should be delegated back to ACP clients for this request. */
@@ -1955,7 +1955,7 @@ export class AIService extends EventEmitter {
         runtime,
         workspacePath,
         requestedAgentId: agentId,
-        strictAgentResolution: strictAgentResolution ?? false,
+        strictAgentResolution,
         disableWorkspaceAgents: disableWorkspaceAgents ?? false,
         callerToolPolicy: toolPolicy,
         cfg,

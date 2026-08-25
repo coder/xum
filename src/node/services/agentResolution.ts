@@ -14,6 +14,7 @@
 import { resolveAdvisorEnabledForAgent } from "@/common/constants/advisor";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import type { SendMessageError } from "@/common/types/errors";
+import type { SendMessageOptions } from "@/common/orpc/types";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import type { ErrorEvent } from "@/common/types/stream";
@@ -51,14 +52,16 @@ export interface ResolveAgentOptions {
   /** When true, skip workspace-specific agents (for "unbricking" broken agent files). */
   disableWorkspaceAgents: boolean;
   /**
-   * When true, a top-level requested agent that cannot be resolved (or is
-   * disabled) fails the stream loudly instead of silently falling back to exec.
-   * Set by workspace-turn launches with explicit agent overrides: their
+   * When truthy, a top-level requested agent that cannot be resolved (or is
+   * hidden or disabled) fails the stream loudly instead of silently falling back
+   * to exec. Set by workspace-turn launches with explicit agent overrides: their
    * pre-dispatch validation races init hooks and user edits, so this post-init
    * resolution is the last sound gate against running a different agent than
-   * the caller asked for. Sub-agent workspaces already fail loudly.
+   * the caller asked for. The object form additionally pins the validated
+   * definition's provenance (scope) — see SendMessageOptionsSchema. Sub-agent
+   * workspaces already fail loudly.
    */
-  strictAgentResolution?: boolean;
+  strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
   /** Caller-supplied tool policy (applied AFTER agent policy for further restriction). */
   callerToolPolicy: ToolPolicy | undefined;
   /** Loaded config from Config.loadConfigOrDefault(). */
@@ -234,7 +237,10 @@ export async function resolveAgentForStream(
   const isSubagentWorkspace = Boolean(metadata.parentWorkspaceId);
   // Strict explicit-agent gating applies only to top-level sends: sub-agent workspaces
   // already fail loudly and legitimately run hidden agents (explore, compact).
-  const strictTopLevel = strictAgentResolution === true && !isSubagentWorkspace;
+  const strictTopLevel =
+    strictAgentResolution != null && strictAgentResolution !== false && !isSubagentWorkspace;
+  const strictExpectedScope =
+    typeof strictAgentResolution === "object" ? strictAgentResolution.expectedScope : undefined;
 
   // --- Load agent definition (with fallback to exec) ---
   let agentDefinition: Awaited<ReturnType<typeof readAgentDefinition>> | undefined;
@@ -298,6 +304,27 @@ export async function resolveAgentForStream(
     agentDefinition = await readAgentDefinition(agentDiscoveryRuntime, agentDiscoveryPath, "exec", {
       includeAgentPlugins,
     });
+  }
+
+  // Strict provenance pin: launch validation approved a specific definition, not just
+  // an id. If that definition vanished (e.g. an init hook or edit deleted a validated
+  // project shadow) and a lower-priority scope now resolves the same id, the turn
+  // would run a different prompt/tool policy with AI settings derived from the
+  // validated one — fail instead.
+  if (
+    strictTopLevel &&
+    strictExpectedScope != null &&
+    agentDefinition.scope !== strictExpectedScope
+  ) {
+    const errorMessage = `Agent '${requestedAgentId}' now resolves from a different scope than launch validation saw (expected ${strictExpectedScope}, found ${agentDefinition.scope}); refusing to stream an explicit agent request.`;
+    emitError(
+      createErrorEvent(workspaceId, {
+        messageId: createAssistantMessageId(),
+        error: errorMessage,
+        errorType: "unknown",
+      })
+    );
+    return Err({ type: "unknown", raw: errorMessage });
   }
 
   // Keep agent ID aligned with the actual definition used (may fall back to exec).

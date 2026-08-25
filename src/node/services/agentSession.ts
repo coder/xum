@@ -1902,8 +1902,10 @@ export class AgentSession {
     }
     // Explicit-agent delegated turns must stay loud across restart recovery: without
     // this, a replay after the agent was removed/disabled would silently run exec.
-    if (persistedRetrySendOptions?.strictAgentResolution === true) {
-      retryRequest.strictAgentResolution = true;
+    // Copied verbatim so the object form keeps its provenance pin (expectedScope).
+    const persistedStrictAgentResolution = persistedRetrySendOptions?.strictAgentResolution;
+    if (persistedStrictAgentResolution != null && persistedStrictAgentResolution !== false) {
+      retryRequest.strictAgentResolution = persistedStrictAgentResolution;
     }
 
     if (persistedRetrySendOptions?.agentInitiated === true) {

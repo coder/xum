@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { AgentIdSchema } from "./agentDefinition";
+import { AgentDefinitionScopeSchema, AgentIdSchema } from "./agentDefinition";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 import { AgentModeSchema } from "../../types/mode";
 import { ChatUsageDisplaySchema } from "./chatStats";
@@ -801,14 +801,21 @@ export const SendMessageOptionsSchema = z.object({
    */
   disableWorkspaceAgents: z.boolean().optional(),
   /**
-   * When true, a top-level send whose agentId cannot be resolved (or is disabled)
-   * at stream time fails loudly instead of silently falling back to exec.
+   * When truthy, a top-level send whose agentId cannot be resolved (or is hidden or
+   * disabled) at stream time fails loudly instead of silently falling back to exec.
    * Workspace-turn launches with explicit agent overrides set this: pre-dispatch
    * validation races init hooks and user edits, so stream-time resolution — which
    * runs after initialization completes — is the last sound gate against running
-   * a different agent than the caller asked for.
+   * a different agent than the caller asked for. The object form additionally pins
+   * the validated definition's provenance: if the id resolves from a different
+   * scope than launch validation saw (e.g. a validated project shadow vanished and
+   * a global/built-in definition with the same id took over), the send fails
+   * instead of running a different prompt/tool policy. A single field (rather than
+   * a sibling flag) so every option-preservation path copies it verbatim.
    */
-  strictAgentResolution: z.boolean().optional(),
+  strictAgentResolution: z
+    .union([z.boolean(), z.object({ expectedScope: AgentDefinitionScopeSchema })])
+    .optional(),
   /**
    * Desktop/app-only capability: expose set_goal so an agent can create a
    * continuation-backed goal for its current parent workspace. Headless callers

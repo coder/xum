@@ -1005,10 +1005,14 @@ describe("TaskService", () => {
     expect(sendMessage).toHaveBeenCalledTimes(1);
     const sendMessageCall = sendMessage.mock.calls[0] as unknown[];
     expect(sendMessageCall[0]).toBe("childworkspace");
-    // Explicit overrides also arm stream-time strict resolution: pre-dispatch validation
-    // races init hooks/user edits, so the stream must fail loudly instead of silently
-    // swapping in exec if the agent cannot be resolved post-init.
-    expect(sendMessageCall[2]).toMatchObject({ agentId: "plan", strictAgentResolution: true });
+    // Explicit overrides also arm stream-time strict resolution, pinning the validated
+    // definition's provenance: pre-dispatch validation races init hooks/user edits, so
+    // the stream must fail loudly instead of silently swapping in exec (or running a
+    // different-scope definition for the same id) post-init.
+    expect(sendMessageCall[2]).toMatchObject({
+      agentId: "plan",
+      strictAgentResolution: { expectedScope: "built-in" },
+    });
   });
 
   test("createWorkspaceTurn rejects invalid, unknown, and internal agent ids before creating a workspace", async () => {

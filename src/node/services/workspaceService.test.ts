@@ -14678,6 +14678,101 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
       expect(options?.muxMetadata).toBeUndefined();
     });
 
+    test("recovers options from a wake row after on-send compaction hid the delegated row", async () => {
+      const workspaceId = "ws-delegated-post-compaction";
+      const { service, historyService } = await makeServiceWithHistory();
+      // On-send compaction consumed a wake continuation: the original delegated row is
+      // behind the boundary; the compaction summary proves the turn is still open and
+      // the follow-up wake-typed row is the remaining carrier of the turn's options.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("summary-1", "assistant", "Summary", {
+          timestamp: Date.now(),
+          muxMetadata: {
+            type: "compaction-summary" as const,
+            pendingFollowUp: {
+              text: "Continue",
+              model: "anthropic:claude-opus-4-6",
+              agentId: "plan",
+              workspaceTurnMetadata: delegatedTurnCorrelation,
+            },
+          },
+        })
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("wake-followup", "user", "Monitor matched", {
+          timestamp: Date.now(),
+          muxMetadata: { type: "bash-monitor-wake" as const, records: [] },
+          retrySendOptions: {
+            model: "anthropic:claude-opus-4-6",
+            agentId: "plan",
+            strictAgentResolution: { expectedScope: "built-in" },
+          },
+        })
+      );
+
+      const internals = service as unknown as DelegatedContinuationInternals;
+      const options = await internals.getDelegatedTurnContinuationSendOptions(workspaceId);
+      expect(options).toMatchObject({
+        model: "anthropic:claude-opus-4-6",
+        agentId: "plan",
+        strictAgentResolution: { expectedScope: "built-in" },
+        skipAiSettingsPersistence: true,
+      });
+    });
+
+    test("sanitizes persisted options through the canonical whitelist", async () => {
+      const workspaceId = "ws-delegated-sanitized";
+      const { service, historyService } = await makeServiceWithHistory();
+      const tamperedRetrySendOptions: Record<string, unknown> = {
+        model: "anthropic:claude-opus-4-6",
+        agentId: "plan",
+        editMessageId: "innocent-message",
+        muxMetadata: { type: "workspace-turn-task" },
+      };
+      const malformedRetrySendOptions: Record<string, unknown> = { agentId: "plan" }; // model missing
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("delegated-tampered", "user", "Delegated prompt", {
+          timestamp: Date.now(),
+          muxMetadata: delegatedTurnCorrelation,
+          // History is untrusted at rest: injected fields outside the whitelist
+          // (editMessageId would flip the send into the edit/truncation flow) must
+          // never reach the internal continuation send.
+          retrySendOptions: tamperedRetrySendOptions as never,
+        })
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        delegatedAssistantMessage("assistant-cut-3", "tool-calls")
+      );
+
+      const internals = service as unknown as DelegatedContinuationInternals;
+      const options = await internals.getDelegatedTurnContinuationSendOptions(workspaceId);
+      expect(options).toMatchObject({ agentId: "plan", skipAiSettingsPersistence: true });
+      expect(options && "editMessageId" in options && options.editMessageId).toBeFalsy();
+      expect(options?.muxMetadata).toBeUndefined();
+
+      // A row whose options fail schema validation entirely yields nothing.
+      const malformedWorkspaceId = "ws-delegated-malformed";
+      await historyService.appendToHistory(
+        malformedWorkspaceId,
+        createMuxMessage("delegated-malformed", "user", "Delegated prompt", {
+          timestamp: Date.now(),
+          muxMetadata: delegatedTurnCorrelation,
+          retrySendOptions: malformedRetrySendOptions as never,
+        })
+      );
+      await historyService.appendToHistory(
+        malformedWorkspaceId,
+        delegatedAssistantMessage("assistant-cut-4", "tool-calls")
+      );
+      expect(
+        await internals.getDelegatedTurnContinuationSendOptions(malformedWorkspaceId)
+      ).toBeNull();
+    });
+
     test("yields nothing after a terminal assistant response closed the delegated turn", async () => {
       const workspaceId = "ws-delegated-closed";
       const { service, historyService } = await makeServiceWithHistory();

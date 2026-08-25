@@ -258,6 +258,7 @@ import type {
   WorkspaceGoalDefaultsOverrideSchema,
   WorkspaceHeartbeatSettingsSchema,
 } from "@/common/orpc/schemas";
+import { SendMessageOptionsSchema } from "@/common/orpc/schemas";
 import type {
   ArchiveLossyUntrackedFilesConfirmation,
   ArchivePreflightResult,
@@ -1756,6 +1757,29 @@ function extractUserPromptText(message: MuxMessage): string {
 
   return stripStagedAttachmentNotice(partsText).trim();
 }
+
+/**
+ * Canonical whitelist for options replayed from a persisted delegated-turn row
+ * (see getDelegatedTurnContinuationSendOptions). History metadata stores
+ * retrySendOptions as an untyped blob, so a malformed or tampered row must be
+ * rejected (parse failure) or stripped to exactly these fields — never spread
+ * verbatim into an internal send where extras like editMessageId would trigger
+ * the edit/truncation flow.
+ */
+const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick({
+  model: true,
+  agentId: true,
+  thinkingLevel: true,
+  reasoningMode: true,
+  toolPolicy: true,
+  additionalSystemInstructions: true,
+  maxOutputTokens: true,
+  providerOptions: true,
+  experiments: true,
+  disableWorkspaceAgents: true,
+  strictAgentResolution: true,
+  allowAgentSetGoal: true,
+});
 
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
 export class WorkspaceService extends EventEmitter {
@@ -12191,7 +12215,16 @@ export class WorkspaceService extends EventEmitter {
    * response closed the turn (or any other user send took over the conversation),
    * a late monitor match is a NEW synthetic turn and resolves from the target's
    * persisted defaults instead of resurrecting stale per-turn overrides.
-   * Continuations never persist these options as workspace defaults.
+   *
+   * Carrier rows for the open turn's options, newest first: the correlated
+   * workspace-turn user row itself, and this mechanism's own wake continuations
+   * (their sends were dispatched with the delegated options and re-stamped them) —
+   * after an on-send compaction consumed a wake, the follow-up wake-typed row is
+   * the only carrier left inside the boundary while the summary still proves the
+   * turn is open. Persisted options are rebuilt through a canonical schema
+   * whitelist (history is untrusted at rest; a tampered row must not inject fields
+   * like editMessageId into an internal send). Continuations never persist these
+   * options as workspace defaults.
    */
   private async getDelegatedTurnContinuationSendOptions(
     workspaceId: string
@@ -12215,28 +12248,30 @@ export class WorkspaceService extends EventEmitter {
         continue;
       }
       const muxMetadata = message.metadata?.muxMetadata;
-      if (
-        muxMetadata?.type !== "workspace-turn-task" ||
-        muxMetadata.taskHandleId !== openTurn.taskHandleId ||
-        muxMetadata.turnId !== openTurn.turnId
-      ) {
+      const isOpenTurnRow =
+        muxMetadata?.type === "workspace-turn-task" &&
+        muxMetadata.taskHandleId === openTurn.taskHandleId &&
+        muxMetadata.turnId === openTurn.turnId;
+      const isWakeContinuationRow = muxMetadata?.type === "bash-monitor-wake";
+      if (!isOpenTurnRow && !isWakeContinuationRow) {
         continue;
       }
-      const retrySendOptions = message.metadata?.retrySendOptions;
-      if (retrySendOptions == null) {
+      const parsed = DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA.safeParse(
+        message.metadata?.retrySendOptions
+      );
+      if (parsed.success) {
+        return {
+          ...parsed.data,
+          // Per-turn continuation settings must not become workspace defaults.
+          skipAiSettingsPersistence: true,
+        };
+      }
+      if (isOpenTurnRow) {
+        // The anchor row itself has no usable options; nothing older can be more
+        // authoritative for this turn.
         return null;
       }
-      const {
-        muxMetadata: _turnCorrelation,
-        agentInitiated: _agentInitiated,
-        goalKind: _goalKind,
-        ...sendOptions
-      } = retrySendOptions;
-      return {
-        ...sendOptions,
-        // Per-turn continuation settings must not become workspace defaults.
-        skipAiSettingsPersistence: true,
-      };
+      // A wake row without valid options: keep walking toward the anchor row.
     }
     return null;
   }

@@ -486,7 +486,7 @@ describe("resolveAgentForStream strict resolution", () => {
   async function resolveTopLevel(params: {
     projectPath: string;
     agentId: string;
-    strictAgentResolution: boolean;
+    strictAgentResolution: boolean | { expectedScope: "project" | "global" | "built-in" };
     agentAiDefaults?: ProjectsConfig["agentAiDefaults"];
   }) {
     const cfg: ProjectsConfig = {
@@ -607,6 +607,36 @@ describe("resolveAgentForStream strict resolution", () => {
     } else {
       expect(strict.success === false && strict.error.type).toBe("unknown");
     }
+  });
+
+  test("strict mode rejects a definition resolving from a different scope than validated", async () => {
+    using tempDir = new DisposableTempDir("agent-resolution-strict-provenance");
+    const projectPath = path.join(tempDir.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    // Launch validation saw a project shadow that has since vanished (init hook or
+    // concurrent edit): the same id now resolves from the built-in scope. The strict
+    // provenance pin must fail the send instead of running the different definition.
+    const strict = await resolveTopLevel({
+      projectPath,
+      agentId: "plan",
+      strictAgentResolution: { expectedScope: "project" },
+    });
+    expect(strict.success).toBe(false);
+    if (!strict.success && strict.error.type === "unknown") {
+      expect(strict.error.raw).toContain("different scope");
+    } else {
+      expect(strict.success === false && strict.error.type).toBe("unknown");
+    }
+
+    // A matching scope streams normally.
+    const matching = await resolveTopLevel({
+      projectPath,
+      agentId: "plan",
+      strictAgentResolution: { expectedScope: "built-in" },
+    });
+    expect(matching.success).toBe(true);
+    if (matching.success) expect(matching.data.effectiveAgentId).toBe("plan");
   });
 
   test("strict mode fails closed when eligibility resolution throws", async () => {
