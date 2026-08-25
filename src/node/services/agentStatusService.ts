@@ -68,8 +68,17 @@ interface State {
    * `runForWorkspace`.
    *
    * null if we have never settled on a transcript for this workspace.
+   * On the first run after process start it is seeded from the hash
+   * persisted next to the sidebar status (see persistedHashChecked).
    */
   lastInputHash: string | null;
+  /**
+   * Whether we already tried seeding lastInputHash from the hash persisted
+   * alongside the sidebar status (ExtensionMetadataService). Done lazily on
+   * the first runForWorkspace per process so a server restart doesn't
+   * regenerate statuses for chats whose transcript hasn't changed.
+   */
+  persistedHashChecked: boolean;
   /**
    * Hash of the transcript the scheduler last examined, even if that input
    * did not settle into a sidebar status (for example, a pre-provider config
@@ -269,6 +278,15 @@ export class AgentStatusService {
       // chat pivoted again.
       const state = this.ensureState(workspaceId);
 
+      // First look at this workspace since process start: seed the dedup
+      // hash persisted alongside the sidebar status so a restart doesn't
+      // regenerate every idle chat. A stale or missing persisted hash simply
+      // misses the dedup branch below and regenerates as before.
+      if (!state.persistedHashChecked) {
+        state.persistedHashChecked = true;
+        state.lastInputHash ??= await this.extensionMetadata.getSidebarStatusInputHash(workspaceId);
+      }
+
       const markRecencyObserved = () => {
         if (observedRecency !== null) {
           state.lastObservedRecency = observedRecency;
@@ -443,7 +461,9 @@ export class AgentStatusService {
         const snapshot = await this.extensionMetadata.setSidebarStatus(
           workspaceId,
           result.data.status,
-          { skipIfRecencyAdvancedSince: observedRecency }
+          // inputHash persists atomically with the status so a restarted
+          // process can skip regenerating this exact input.
+          { inputHash: dedupHash, skipIfRecencyAdvancedSince: observedRecency }
         );
         if (this.stopped) return;
         if (!snapshot) {
@@ -480,6 +500,7 @@ export class AgentStatusService {
       state = {
         lastRanAt: 0,
         lastInputHash: null,
+        persistedHashChecked: false,
         lastSeenInputHash: null,
         lastObservedRecency: null,
         lastProviderFailureHash: null,
