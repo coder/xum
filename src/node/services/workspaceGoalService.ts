@@ -233,8 +233,12 @@ function toValidEpochMs(value: unknown): number | null {
  * `!== currentGoalId` mismatch test (it is not evidence the row belongs to a
  * DIFFERENT goal) — skipping a pause boundary on corrupt data would let the
  * scan reach an older continuation row and reactivate a durably paused goal
- * after restart. Invalid values degrade to `null`, i.e. legacy unscoped
- * semantics.
+ * after restart.
+ *
+ * Callers treat a present-but-invalid ID by failure direction (Codex P2
+ * PRRT_kwDOPxxmWM6cOHpI): a pause BOUNDARY degrades to legacy unscoped
+ * semantics (conservative paused, never scoped), while a CONTINUATION row is
+ * skipped outright — corrupt data must not manufacture activity evidence.
  */
 function toValidGoalId(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
@@ -723,9 +727,17 @@ export class WorkspaceGoalService {
         // continuation row and silently reactivate B. Rows scoped to a
         // different goal are invisible here, mirroring the boundary skip;
         // legacy rows without a goalId keep the old any-goal semantics.
-        // Validated before comparison: a malformed ID is not a different goal
-        // (see toValidGoalId).
-        const rowGoalId = toValidGoalId(message.metadata.goalId);
+        // Codex P2 (PRRT_kwDOPxxmWM6cOHpI): legacy any-goal semantics apply
+        // only when the scoping ID is genuinely absent. A present-but-
+        // malformed ID (object, number, empty string) is not trustworthy
+        // ACTIVITY evidence — degrading it to legacy-active could reactivate
+        // a durably paused goal off corrupt data. Skip the row entirely: it
+        // neither proves activity nor marks other-goal history.
+        const rawRowGoalId: unknown = message.metadata.goalId;
+        const rowGoalId = toValidGoalId(rawRowGoalId);
+        if (rawRowGoalId != null && rowGoalId == null) {
+          continue;
+        }
         if (currentGoalId != null && rowGoalId != null && rowGoalId !== currentGoalId) {
           crossedOtherGoalHistory = true;
           continue;
@@ -2869,6 +2881,15 @@ export class WorkspaceGoalService {
         }
         await this.pushSnapshot(input.workspaceId, withEdits);
         await this.pushLiveGoalPreviewOverlay(input.workspaceId, withEdits);
+        // Codex P1 (PRRT_kwDOPxxmWM6cOHpB): same publication-await window as
+        // the same-objective branch — keep the veto active through the final
+        // awaited publication step.
+        const stoppedDuringEditPublication = discardIfUserStopLanded();
+        if (stoppedDuringEditPublication) {
+          await this.writeGoal(input.workspaceId, current);
+          await this.pushSnapshot(input.workspaceId, current);
+          return stoppedDuringEditPublication;
+        }
         this.emitBudgetChanged(current, withEdits, input);
         this.emitBudgetLimited(input.workspaceId, withEdits, previousStatus);
         this.emitStatusLifecycle(withEdits, previousStatus, input.initiator ?? "user");
@@ -2944,6 +2965,19 @@ export class WorkspaceGoalService {
           }
           await this.pushSnapshot(input.workspaceId, updated);
           await this.pushLiveGoalPreviewOverlay(input.workspaceId, updated);
+          // Codex P1 (PRRT_kwDOPxxmWM6cOHpB): the publication awaits above run
+          // inside the same lock tenure AFTER the post-write sample — a Stop
+          // landing during them would leave the aborted turn's mutation (e.g.
+          // a model complete_goal) durable with nothing left to discard it.
+          // Keep the veto active through the final awaited publication step;
+          // the restore also re-publishes the prior snapshot, superseding the
+          // transiently published mutation.
+          const stoppedDuringPublication = discardIfUserStopLanded();
+          if (stoppedDuringPublication) {
+            await this.writeGoal(input.workspaceId, current);
+            await this.pushSnapshot(input.workspaceId, current);
+            return stoppedDuringPublication;
+          }
           this.emitBudgetChanged(current, updated, input);
           this.emitBudgetLimited(input.workspaceId, updated, previousStatus);
           this.emitStatusLifecycle(updated, previousStatus, input.initiator ?? "user");
@@ -3046,6 +3080,20 @@ export class WorkspaceGoalService {
         return stoppedDuringCreateWrite;
       }
       await this.pushSnapshot(input.workspaceId, next);
+      // Codex P1 (PRRT_kwDOPxxmWM6cOHpB): the snapshot publication also runs
+      // inside this tenure after the post-write sample — keep the veto active
+      // through it (same restore as the post-write branch above).
+      const stoppedDuringCreatePublication = discardIfUserStopLanded();
+      if (stoppedDuringCreatePublication) {
+        if (current) {
+          await this.writeGoal(input.workspaceId, current);
+          await this.pushSnapshot(input.workspaceId, current);
+        } else {
+          await fs.rm(this.getFilePath(input.workspaceId), { force: true });
+          await this.pushSnapshot(input.workspaceId, null);
+        }
+        return stoppedDuringCreatePublication;
+      }
       this.emitBudgetChanged(current, next, input);
       this.emitLifecycle(current ? "goal_replaced" : "goal_created", {
         sameObjective: current?.objective === objective,

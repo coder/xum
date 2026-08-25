@@ -2998,6 +2998,84 @@ describe("WorkspaceGoalService", () => {
     });
   });
 
+  test("a malformed continuation goalId is not legacy activity evidence", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cOHpI): legacy any-goal semantics apply only
+    // when the scoping ID is genuinely absent. A present-but-malformed ID on
+    // a continuation row must be skipped, not accepted as legacy-active — at
+    // the tail it would otherwise reactivate a durably paused goal.
+    const created = await setGoalOk(service, { workspaceId, objective: "Corrupt continuation" });
+    await appendUserHistoryMessage(historyService, workspaceId, "Continue working on the goal.", {
+      timestamp: Date.now(),
+      synthetic: true,
+      kind: "goal_continuation",
+      goalId: 42 as unknown as string,
+    });
+    // Durable pause written directly (no boundary, no in-memory bookkeeping)
+    // — models the post-restart state where only persisted artifacts remain.
+    await (
+      service as unknown as { writeGoal: (id: string, goal: GoalRecordV1) => Promise<void> }
+    ).writeGoal(workspaceId, { ...created, status: "paused", updatedAtMs: Date.now() });
+
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: created.goalId,
+      status: "paused",
+    });
+  });
+
+  test("a stop landing during post-write publication restores the prior record", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cOHpB): the post-write recheck samples the
+    // stop generation, but pushSnapshot/pushLiveGoalPreviewOverlay still
+    // await inside the same lock tenure. A Stop landing there left the
+    // aborted turn's complete_goal durable — the veto must stay active
+    // through the final awaited publication step.
+    const created = await setGoalOk(service, { workspaceId, objective: "Abort mid-publication" });
+    await extensionMetadata.setStreaming(workspaceId, true);
+
+    const serviceAccess = service as unknown as {
+      pushSnapshot: (id: string, goal: GoalRecordV1 | null) => Promise<unknown>;
+    };
+    const realPush = serviceAccess.pushSnapshot.bind(service);
+    let releasePush!: () => void;
+    const pushGate = new Promise<void>((resolve) => {
+      releasePush = resolve;
+    });
+    let pushStarted = false;
+    const pushSpy = spyOn(serviceAccess, "pushSnapshot").mockImplementationOnce(
+      async (id: string, goal: GoalRecordV1 | null) => {
+        pushStarted = true;
+        await pushGate;
+        return realPush(id, goal);
+      }
+    );
+
+    const completePromise = service.setGoal({
+      workspaceId,
+      status: "complete",
+      completionSummary: "Done before the user could stop it",
+      initiator: "model",
+    });
+    await waitForCondition(() => pushStarted, { timeoutMs: 5_000 });
+    // Stop lands during the publication await, after the post-write sample.
+    const stopPromise = service.recordUserStoppedStream(workspaceId);
+    releasePush();
+
+    const completed = await completePromise;
+    expect(completed.success).toBe(false);
+    if (!completed.success) {
+      expect(completed.error.type).toBe("invalid_transition");
+    }
+    await stopPromise;
+    pushSpy.mockRestore();
+
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: created.goalId,
+      status: "active",
+    });
+    expect(typeof (await service.getGoal(workspaceId))?.requireUserAcknowledgmentSinceMs).toBe(
+      "number"
+    );
+  });
+
   test("continuation rows for a replaced goal do not reconcile the newer goal to active", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cH3kV): goal A fired a continuation and was
     // paused, then replaced with goal B which the user pauses. When B's pause
