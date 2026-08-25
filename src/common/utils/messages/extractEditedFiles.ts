@@ -15,6 +15,53 @@ interface FileEditToolOutput {
 }
 
 /**
+ * One successful nested edit found inside a code_execution output. `diff` is
+ * present only for classic (non-kernel) PTC records, which retain the full
+ * tool result; kernel-compacted records keep args (so the path survives) but
+ * drop result contents, leaving nothing to rebuild a diff from.
+ */
+interface NestedEditRecord {
+  filePath: string;
+  diff?: string;
+}
+
+/**
+ * Nested edit calls inside a code_execution part (exclusive PTC): file edits
+ * happen as nested xum.file_edit_* calls, so the outer part is named
+ * "code_execution" and the edits live in its output's toolCalls records.
+ * Mirrors collectNestedReadPaths in extractReadFiles.ts. Records are returned
+ * in chronological (execution) order.
+ */
+function collectNestedEditRecords(output: unknown): NestedEditRecord[] {
+  if (typeof output !== "object" || output === null) return [];
+  const toolCalls = (output as { toolCalls?: unknown }).toolCalls;
+  if (!Array.isArray(toolCalls)) return [];
+
+  const records: NestedEditRecord[] = [];
+  for (const record of toolCalls as Array<Record<string, unknown>>) {
+    if (typeof record !== "object" || record === null) continue;
+    if (!FILE_EDIT_TOOL_NAMES.includes(record.toolName as (typeof FILE_EDIT_TOOL_NAMES)[number])) {
+      continue;
+    }
+    // Success = no error, and for kernel-compacted records ok !== false.
+    if (record.error !== undefined || record.ok === false) continue;
+    const result = record.result as FileEditToolOutput | undefined;
+    // Classic records retain the full result: edits resolve with
+    // {success: false} instead of throwing, so require an explicit success.
+    // Kernel-compacted records carry no result; their ok bit above decides.
+    if (result !== undefined && result.success !== true) continue;
+    const filePath = extractToolFilePath(record.args);
+    if (!filePath) continue;
+    const diff =
+      result !== undefined
+        ? (getToolOutputUiOnly(result)?.file_edit?.diff ?? result.diff)
+        : undefined;
+    records.push({ filePath, ...(diff !== undefined ? { diff } : {}) });
+  }
+  return records;
+}
+
+/**
  * Represents a file and its combined diff from all edits.
  */
 export interface FileEditDiff {
@@ -42,11 +89,21 @@ export function extractEditedFilePaths(messages: MuxMessage[]): string[] {
 
     for (const part of message.parts) {
       if (part.type !== "dynamic-tool") continue;
+      if (part.state !== "output-available") continue;
+
+      if (part.toolName === "code_execution") {
+        // Nested edits that completed before a later failure still landed.
+        for (const record of collectNestedEditRecords(part.output)) {
+          if (!seen.has(record.filePath)) {
+            seen.add(record.filePath);
+            editedFiles.push(record.filePath);
+          }
+        }
+        continue;
+      }
+
       if (!FILE_EDIT_TOOL_NAMES.includes(part.toolName as (typeof FILE_EDIT_TOOL_NAMES)[number]))
         continue;
-
-      // Only count successful edits (output-available with success)
-      if (part.state !== "output-available") continue;
 
       // Check if the tool result indicates success
       const output = part.output as { success?: boolean } | undefined;
@@ -181,14 +238,39 @@ export function extractEditedFileDiffs(messages: MuxMessage[]): FileEditDiff[] {
   const diffsByPath = new Map<string, string[]>();
   const editOrder: string[] = []; // Track order of last edit per file
 
+  const addDiff = (filePath: string, diff: string): void => {
+    if (!diffsByPath.has(filePath)) {
+      diffsByPath.set(filePath, []);
+    }
+    diffsByPath.get(filePath)!.push(diff);
+
+    // Update edit order (move to end if already exists)
+    const idx = editOrder.indexOf(filePath);
+    if (idx !== -1) editOrder.splice(idx, 1);
+    editOrder.push(filePath);
+  };
+
   for (const message of messages) {
     if (message.role !== "assistant") continue;
 
     for (const part of message.parts) {
       if (part.type !== "dynamic-tool") continue;
+      if (part.state !== "output-available") continue;
+
+      if (part.toolName === "code_execution") {
+        // Classic PTC records retain the full nested result (including the
+        // diff); kernel-compacted records surface path-only edits and are
+        // skipped here (no diff contents survive compaction of the record).
+        for (const record of collectNestedEditRecords(part.output)) {
+          if (record.diff !== undefined && record.diff.length > 0) {
+            addDiff(record.filePath, record.diff);
+          }
+        }
+        continue;
+      }
+
       if (!FILE_EDIT_TOOL_NAMES.includes(part.toolName as (typeof FILE_EDIT_TOOL_NAMES)[number]))
         continue;
-      if (part.state !== "output-available") continue;
 
       const output = part.output as FileEditToolOutput | undefined;
       if (!output?.success) continue;
@@ -200,16 +282,7 @@ export function extractEditedFileDiffs(messages: MuxMessage[]): FileEditDiff[] {
       const filePath = extractToolFilePath(part.input);
       if (!filePath) continue;
 
-      // Add diff to this file's list
-      if (!diffsByPath.has(filePath)) {
-        diffsByPath.set(filePath, []);
-      }
-      diffsByPath.get(filePath)!.push(diff);
-
-      // Update edit order (move to end if already exists)
-      const idx = editOrder.indexOf(filePath);
-      if (idx !== -1) editOrder.splice(idx, 1);
-      editOrder.push(filePath);
+      addDiff(filePath, diff);
     }
   }
 

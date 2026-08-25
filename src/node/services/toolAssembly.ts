@@ -18,7 +18,11 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 /** Renderer-sent experiment flags (SendMessageOptions.experiments). */
 type SendMessageExperiments = SendMessageOptions["experiments"];
 
-import { applyToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import {
+  applyToolPolicy,
+  buildRequiredToolPatterns,
+  type ToolPolicy,
+} from "@/common/utils/tools/toolPolicy";
 import { applyCapabilityGrants } from "@/common/utils/tools/capabilityGrants";
 import type { CapabilityGrants } from "@/common/types/capabilityGrants";
 // PTC types only — modules lazy-loaded to avoid loading typescript/prettier at startup
@@ -194,7 +198,14 @@ export async function applyToolPolicyAndExperiments(
   // RLM rides the PTC parent flag: this flag is only read inside the PTC
   // branch below, so RLM alone (PTC off) is inert by construction.
   const rlmActive = experiments?.rlm === true;
-  if (experiments?.programmaticToolCalling) {
+  // A policy that disables EVERY tool (e.g. auto-compaction's `.*` disable
+  // rule, inherited alongside the original send's experiment flags) is a
+  // no-tools contract: synthesizing code_execution anyway would hand that
+  // flow a tool it explicitly forbade. Checked on the PRE-grant policy
+  // result so a least-privilege grants ceiling (which stubs, not disables)
+  // keeps code_execution as the mandatory bridge entry point.
+  const policyLeavesNoTools = Object.keys(policyFilteredPreGrant).length === 0;
+  if (experiments?.programmaticToolCalling && !policyLeavesNoTools) {
     try {
       // Lazy-load PTC modules only when experiments are enabled
       const ptc = await getPTCModules();
@@ -263,8 +274,21 @@ export async function applyToolPolicyAndExperiments(
       // Keep mcp_prompt_get direct because sandbox declarations omit its
       // multiline prompt catalog.
       const promptGet = policyFilteredTools.mcp_prompt_get;
+      // Policy-REQUIRED tools stay model-visible: "require" gates run
+      // completion on a top-level toolResult for that name
+      // (StreamManager.createStopWhenCondition), which a nested xum.* call
+      // inside a code_execution record never satisfies. Sourced from the
+      // grant-and-policy-filtered record so both ceilings still apply; the
+      // tool also stays bridged, which is harmless duplication.
+      const requiredPatterns = buildRequiredToolPatterns(effectiveToolPolicy);
+      const requiredTools = Object.fromEntries(
+        Object.entries(policyFilteredTools).filter(([name]) =>
+          requiredPatterns.some((pattern) => pattern.test(name))
+        )
+      );
       toolsForModel = {
         ...nonBridgeable,
+        ...requiredTools,
         ...(promptGet !== undefined ? { mcp_prompt_get: promptGet } : {}),
         code_execution: codeExecutionTool,
       };
@@ -292,20 +316,16 @@ export async function applyToolPolicyAndExperiments(
         toolsForModel = { ...toolsForModel, ...rollback };
       }
     } catch (error) {
-      // RLM fails CLOSED (r49): silently degrading to the complete flat
-      // toolset would drop the exclusive persistent kernel and its
-      // nested-result context isolation while the run is still recorded as
-      // RLM — bulk tool results would leak into model context and corrupt
-      // RLM evaluations. Surfacing the failure lets the send fail visibly
-      // and the user retry once the cause (e.g. QuickJS WASM load) clears.
-      if (rlmActive) {
-        throw new Error(
-          `RLM kernel assembly failed and RLM must not silently fall back to flat tools: ${getErrorMessage(error)}`
-        );
-      }
-      // Non-RLM PTC keeps the legacy behavior: fall back to policy-filtered
-      // tools if code_execution creation fails.
-      log.error("Failed to create code_execution tool, falling back to base tools", { error });
+      // PTC fails CLOSED (r49): the experiment is exclusive-only, so silently
+      // degrading to the complete flat toolset would change user-visible
+      // semantics while the run is still recorded as PTC (corrupting
+      // experiment results) — and for RLM would additionally drop the
+      // persistent kernel's nested-result context isolation. Surfacing the
+      // failure lets the send fail visibly and the user retry once the cause
+      // (e.g. QuickJS WASM load) clears.
+      throw new Error(
+        `PTC exclusive assembly failed and must not silently fall back to flat tools: ${getErrorMessage(error)}`
+      );
     }
   }
 

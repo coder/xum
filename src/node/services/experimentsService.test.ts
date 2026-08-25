@@ -148,19 +148,17 @@ describe("ExperimentsService", () => {
     expect(service.isExperimentEnabled(EXPERIMENT_IDS.TOOL_SEARCH)).toBe(false);
   });
 
-  test("stale overrides for removed experiments are ignored, never rejected", async () => {
-    // "programmatic-tool-calling-exclusive" was a real experiment ID before
-    // PTC became exclusive-only. Users upgrading with the old key persisted
-    // must load cleanly with the stale entry filtered out.
+  test("legacy exclusive-only override keeps PTC enabled after upgrade", async () => {
+    // "programmatic-tool-calling-exclusive" was a separate experiment before
+    // PTC became exclusive-only. A user who had ONLY that toggle enabled opted
+    // into exactly the posture the merged PTC experiment activates, so the
+    // alias must keep PTC on instead of silently disabling it.
     await fs.writeFile(
       path.join(tempDir, OVERRIDES_FILE),
       JSON.stringify({
         version: 1,
         experiments: {},
-        overrides: {
-          "programmatic-tool-calling-exclusive": true,
-          [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: true,
-        },
+        overrides: { "programmatic-tool-calling-exclusive": true },
       }),
       "utf-8"
     );
@@ -173,6 +171,42 @@ describe("ExperimentsService", () => {
     expect(await service.getOverrides()).toEqual({
       [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: true,
     });
+  });
+
+  test("a disabled legacy exclusive override stays ignored", async () => {
+    await fs.writeFile(
+      path.join(tempDir, OVERRIDES_FILE),
+      JSON.stringify({
+        version: 1,
+        experiments: {},
+        overrides: { "programmatic-tool-calling-exclusive": false },
+      }),
+      "utf-8"
+    );
+
+    const { telemetryService } = createTelemetryService();
+    const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    await service.initialize();
+
+    expect(service.isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING)).toBe(false);
+    expect(await service.getOverrides()).toEqual({});
+  });
+
+  test("enabled PTC writes the legacy exclusive key for downgrade compatibility", async () => {
+    // A downgraded build reads a bare ptc:true as the removed (~2x cost)
+    // supplement mode; mirroring the legacy exclusive key preserves the
+    // exclusive posture across downgrade. Disabling PTC drops both keys.
+    const { telemetryService } = createTelemetryService();
+    const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    await service.setOverride(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING, true);
+
+    expect((await readOverridesFile()).overrides).toEqual({
+      [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: true,
+      "programmatic-tool-calling-exclusive": true,
+    });
+
+    await service.setOverride(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING, null);
+    expect((await readOverridesFile()).overrides).toEqual({});
   });
 
   test("a client with empty local state does not clear overrides it never knew about", async () => {

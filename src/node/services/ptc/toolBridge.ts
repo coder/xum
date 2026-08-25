@@ -134,6 +134,18 @@ const EXCLUDED_TOOLS = new Set([
   "todo_read", // UI-specific
   "status_set", // UI-specific
   "agent_report", // Must be top-level for taskService to read args from history
+  // Context-coupled tools: AIService keys system-prompt context off their
+  // top-level presence (memory index / hot-set block for `memory`, proactive
+  // guidance for `advisor`). Bridging them would silently drop that context
+  // in the exclusive posture.
+  "memory",
+  "advisor",
+  // Media-producing tools: their content-container outputs are converted into
+  // model-visible multimodal parts by extractToolMediaAsUserMessages, which
+  // only sees TOP-LEVEL tool outputs — nested inside a code_execution record
+  // the attachment would stay as base64 JSON text (context blowup, no image).
+  "attach_file",
+  "desktop_screenshot",
 ]);
 
 /**
@@ -481,9 +493,37 @@ export class ToolBridge {
   private serializeResult(result: unknown): unknown {
     try {
       // Round-trip through JSON to ensure QuickJS can handle the value
-      return JSON.parse(JSON.stringify(result));
+      return JSON.parse(JSON.stringify(elideContentMediaPayloads(result)));
     } catch {
       return { error: "Result not JSON-serializable" };
     }
   }
+}
+
+/**
+ * Replace base64 media items inside MCP-style content-container results
+ * ({ type: "content", value: [...] }) with small text placeholders before the
+ * result enters the sandbox and its model-visible record. Known
+ * media-producing built-ins are non-bridgeable (EXCLUDED_TOOLS), but any
+ * bridged MCP tool may return media: nested records bypass
+ * extractToolMediaAsUserMessages, so the raw payload would otherwise ride as
+ * JSON text into guest vars and provider context.
+ */
+function elideContentMediaPayloads(result: unknown): unknown {
+  if (typeof result !== "object" || result === null) return result;
+  const container = result as { type?: unknown; value?: unknown };
+  if (container.type !== "content" || !Array.isArray(container.value)) return result;
+
+  let changed = false;
+  const value = container.value.map((item: unknown) => {
+    if (typeof item !== "object" || item === null) return item;
+    const media = item as { type?: unknown; data?: unknown; mediaType?: unknown };
+    if (media.type !== "media" || typeof media.data !== "string") return item;
+    changed = true;
+    return {
+      type: "text",
+      text: `[media elided: ${typeof media.mediaType === "string" ? media.mediaType : "unknown"}, ${media.data.length} base64 chars — media returned by bridged tools is not model-visible inside code_execution; call a top-level tool to attach it]`,
+    };
+  });
+  return changed ? { ...result, value } : result;
 }

@@ -40,6 +40,61 @@ describe("applyToolPolicyAndExperiments", () => {
     expect(result.mcp_prompt_get.description).toContain("mcp__s__p");
   });
 
+  test("context-coupled and media tools stay model-visible under PTC", async () => {
+    // memory/advisor: AIService keys system-prompt context (memory index /
+    // hot set, advisor guidance) off their top-level presence. attach_file /
+    // desktop_screenshot: extractToolMediaAsUserMessages only converts
+    // TOP-LEVEL media outputs into model-visible multimodal parts.
+    const result = await applyToolPolicyAndExperiments({
+      allTools: {
+        bash: executableTool("Run a command"),
+        memory: executableTool("Memory"),
+        advisor: executableTool("Advisor"),
+        attach_file: executableTool("Attach"),
+        desktop_screenshot: executableTool("Screenshot"),
+      },
+      effectiveToolPolicy: undefined,
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(Object.keys(result).sort()).toEqual([
+      "advisor",
+      "attach_file",
+      "code_execution",
+      "desktop_screenshot",
+      "memory",
+    ]);
+  });
+
+  test("a disable-all policy yields no tools at all (no code_execution)", async () => {
+    // Auto-compaction inherits the original send's experiment flags and sets a
+    // `.*` disable policy: that no-tools contract must win over the exclusive
+    // posture's otherwise-mandatory code_execution.
+    const result = await applyToolPolicyAndExperiments({
+      allTools: { bash: executableTool("Run a command"), todo_write: executableTool("Todos") },
+      effectiveToolPolicy: [{ regex_match: ".*", action: "disable" }],
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(Object.keys(result)).toEqual([]);
+  });
+
+  test("policy-required bridgeable tools stay model-visible in the exclusive set", async () => {
+    // "require" gates run completion on a TOP-LEVEL toolResult for that name
+    // (StreamManager.createStopWhenCondition); a nested xum.* call never
+    // satisfies it, so the required tool must not be bridged away.
+    const result = await applyToolPolicyAndExperiments({
+      allTools: {
+        bash: executableTool("Run a command"),
+        file_read: executableTool("Read a file"),
+      },
+      effectiveToolPolicy: [{ regex_match: "bash", action: "require" }],
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(Object.keys(result).sort()).toEqual(["bash", "code_execution"]);
+  });
+
   test("grant-denied tools are hidden from the model but stubbed in the sandbox", async () => {
     const result = await applyToolPolicyAndExperiments({
       allTools: {

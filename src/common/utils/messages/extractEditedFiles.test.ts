@@ -50,6 +50,72 @@ function makeDiff(filePath: string, oldContent: string, newContent: string): str
   return createPatch(filePath, oldContent, newContent, "", "", { context: 3 });
 }
 
+/**
+ * Helper to create an assistant message with one code_execution part whose
+ * output carries nested PTC tool-call records (exclusive posture).
+ */
+function createCodeExecutionMessage(toolCalls: unknown[]): MuxMessage {
+  return {
+    id: `msg-${Math.random().toString(36).slice(2)}`,
+    role: "assistant",
+    parts: [
+      {
+        type: "dynamic-tool" as const,
+        toolCallId: `tc-${Math.random().toString(36).slice(2)}`,
+        toolName: "code_execution",
+        state: "output-available" as const,
+        input: { code: "..." },
+        output: { success: true, toolCalls },
+      },
+    ],
+  };
+}
+
+describe("nested PTC edit records (exclusive posture)", () => {
+  it("extracts paths and diffs from successful nested file_edit_* records", () => {
+    const nestedDiff = makeDiff("/nested.ts", "old", "new");
+    const messages: MuxMessage[] = [
+      createCodeExecutionMessage([
+        {
+          toolName: "file_edit_replace_string",
+          args: { path: "/nested.ts" },
+          result: { success: true, diff: nestedDiff },
+        },
+        // Failed nested edits (bridge error, resolved failure, kernel ok bit)
+        // are all skipped.
+        { toolName: "file_edit_insert", args: { path: "/errored.ts" }, error: "denied" },
+        {
+          toolName: "file_edit_replace_string",
+          args: { path: "/resolved-failed.ts" },
+          result: { success: false },
+        },
+        { toolName: "file_edit_insert", args: { path: "/kernel-failed.ts" }, ok: false },
+        // Non-edit nested calls are ignored.
+        { toolName: "bash", args: { script: "true" }, result: { success: true } },
+      ]),
+    ];
+
+    expect(extractEditedFilePaths(messages)).toEqual(["/nested.ts"]);
+    const diffs = extractEditedFileDiffs(messages);
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0].path).toBe("/nested.ts");
+    expect(diffs[0].diff).toBe(nestedDiff);
+  });
+
+  it("kernel-compacted records surface the path but no diff", () => {
+    // Kernel record compaction drops result contents (ok bit only): the edit
+    // is still tracked by path, but no diff content survives to preserve.
+    const messages: MuxMessage[] = [
+      createCodeExecutionMessage([
+        { toolName: "file_edit_replace_string", args: { path: "/kernel.ts" }, ok: true, bytes: 9 },
+      ]),
+    ];
+
+    expect(extractEditedFilePaths(messages)).toEqual(["/kernel.ts"]);
+    expect(extractEditedFileDiffs(messages)).toEqual([]);
+  });
+});
+
 describe("extractEditedFilePaths", () => {
   it("should extract file paths from successful edits", () => {
     const messages: MuxMessage[] = [

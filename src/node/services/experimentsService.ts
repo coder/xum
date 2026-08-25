@@ -1,5 +1,6 @@
 import assert from "@/common/utils/assert";
 import {
+  EXPERIMENT_IDS,
   EXPERIMENTS,
   isExperimentSupportedOnPlatform,
   type ExperimentId,
@@ -24,6 +25,16 @@ interface ExperimentsFile {
 
 const OVERRIDES_FILE_NAME = "feature_flags.json";
 const OVERRIDES_FILE_VERSION = 1;
+
+/**
+ * Pre-merge experiment ID: "PTC Exclusive Mode" was a separate experiment
+ * before Programmatic Tool Calling became exclusive-only. Reads alias a
+ * persisted `true` onto the merged PTC key (a user who opted into exclusive
+ * opted into exactly the posture PTC now activates), and writes mirror an
+ * enabled PTC back onto this key so a downgraded build runs its exclusive
+ * posture instead of the removed (~2x cost) supplement mode.
+ */
+const LEGACY_PTC_EXCLUSIVE_ID = "programmatic-tool-calling-exclusive";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -51,6 +62,15 @@ async function readOverridesFile(filePath: string): Promise<Map<ExperimentId, bo
       }
 
       overrides.set(key as ExperimentId, value);
+    }
+
+    // Legacy alias (see LEGACY_PTC_EXCLUSIVE_ID): an enabled exclusive toggle
+    // must keep PTC on after upgrade — filtering it like an ordinary unknown
+    // key would silently turn the user's PTC posture off. `true` wins over an
+    // explicit ptc:false because the old build's exclusive flag activated the
+    // exclusive posture regardless of the supplement flag.
+    if (persisted[LEGACY_PTC_EXCLUSIVE_ID] === true) {
+      overrides.set(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING, true);
     }
   } catch {
     // Ignore missing/corrupt overrides
@@ -202,6 +222,12 @@ export class ExperimentsService {
       const overrides: NonNullable<ExperimentsFile["overrides"]> = {};
       for (const [experimentId, enabled] of this.overrides) {
         overrides[experimentId] = enabled;
+      }
+      // Downgrade sync (see LEGACY_PTC_EXCLUSIVE_ID): mirror an enabled PTC
+      // onto the pre-merge exclusive key so an older build keeps the exclusive
+      // posture instead of interpreting a bare ptc:true as supplement mode.
+      if (overrides[EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING] === true) {
+        overrides[LEGACY_PTC_EXCLUSIVE_ID] = true;
       }
 
       const payload: ExperimentsFile = {
