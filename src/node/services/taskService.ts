@@ -58,13 +58,11 @@ import type { InitLogger, Runtime } from "@/node/runtime/Runtime";
 import { readPlanFile } from "@/node/utils/runtime/helpers";
 import {
   coerceNonEmptyString,
+  tryReadGitCurrentBranch,
   tryReadGitHeadCommitSha,
   findWorkspaceEntry,
 } from "@/node/services/taskUtils";
-import {
-  sanitizeBranchNameForWorkspace,
-  validateWorkspaceName,
-} from "@/common/utils/validation/workspaceValidation";
+import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
 import { getTaskGroupCount } from "@/common/utils/tools/taskGroups";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { Ok, Err, type Result } from "@/common/types/result";
@@ -85,7 +83,11 @@ import { defaultModel, normalizeSelectedModel } from "@/common/utils/ai/models";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
-import { runtimeModeSupportsSharedTaskWorkspace, type RuntimeConfig } from "@/common/types/runtime";
+import {
+  RUNTIME_MODE,
+  runtimeModeSupportsSharedTaskWorkspace,
+  type RuntimeConfig,
+} from "@/common/types/runtime";
 import type { ProjectRef, WorkspaceMetadata } from "@/common/types/workspace";
 import { getRuntimeType } from "@/node/runtime/initHook";
 import { AgentIdSchema } from "@/common/orpc/schemas";
@@ -526,6 +528,31 @@ interface WorkspaceTurnAgentContext {
   runtime: Runtime;
   workspacePath: string;
   includeAgentPlugins: boolean;
+  /** Source config, kept so owner/target contexts can be compared for host identity. */
+  runtimeConfig: RuntimeConfig;
+}
+
+/**
+ * Whether agent discovery for both runtime configs reads the same host filesystem,
+ * i.e. the owner's global/plugin agent roots are literally the target's roots.
+ * Local-family runtimes (local/worktree) share the local machine. Plain SSH shares
+ * the remote home only for an identical host/port with no Coder indirection —
+ * CoderSSHRuntime.finalizeConfig derives a distinct per-workspace host, so a Coder
+ * owner's ~/.xum/agents says nothing about the child's. Docker/devcontainer get
+ * per-workspace containers and never share.
+ */
+function runtimeConfigsShareAgentHost(a: RuntimeConfig, b: RuntimeConfig): boolean {
+  const isLocalFamily = (rc: RuntimeConfig): boolean =>
+    rc.type === RUNTIME_MODE.LOCAL || rc.type === RUNTIME_MODE.WORKTREE;
+  if (isLocalFamily(a) && isLocalFamily(b)) {
+    return true;
+  }
+  if (a.type === RUNTIME_MODE.SSH && b.type === RUNTIME_MODE.SSH) {
+    return (
+      a.coder == null && b.coder == null && a.host === b.host && (a.port ?? 22) === (b.port ?? 22)
+    );
+  }
+  return false;
 }
 
 export interface WorkspaceTurnCreateArgs {
@@ -3648,6 +3675,7 @@ export class TaskService {
     return {
       ...context,
       includeAgentPlugins: this.workspaceService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS),
+      runtimeConfig: params.runtimeConfig,
     };
   }
 
@@ -3701,30 +3729,41 @@ export class TaskService {
    * Validate an explicit agentId against the TARGET workspace's checkout, tolerating
    * targets that are not reachable yet (deferred provisioning, stopped containers)
    * without permitting a silent exec fallback later:
-   * - reachable checkout: strict validation against the target;
-   * - unreachable checkout: resolve the definition via the OWNER's context (same
-   *   project and runtime host, so project shadows and host-side global roots are
-   *   visible). If the winning definition is checkout-dependent (project scope),
-   *   fail with a reachability error — it cannot be verified in the target and
-   *   dispatching anyway would let resolveAgentForStream silently fall back to
-   *   exec (wrong prompt/tool policy). Host-side definitions (built-in, global,
-   *   plugin) resolve independently of the target checkout, so eligibility is
-   *   validated against the owner context and the launch proceeds.
-   * Waiting for provisioning here is not an option: createWorkspaceTurn holds the
-   * service-wide task mutex for its whole body.
+   * - reachable checkout: strict validation against the target. If that fails while
+   *   the target's init hook is still running, the verdict is not trustworthy (the
+   *   hook may still be installing/rewriting agent definitions), so the launch fails
+   *   with an explicitly transient error instead of a definitive "unknown agentId";
+   * - unreachable checkout: resolve the definition via the OWNER's context, but only
+   *   when the owner and target run agent discovery on the same host filesystem
+   *   (runtimeConfigsShareAgentHost) — cross-host (Coder per-workspace hosts, per-
+   *   workspace containers), the owner's global roots say nothing about the target's,
+   *   and even a built-in could be shadowed by a target-host global definition, so
+   *   everything fails closed. Same-host, project shadows and global roots are
+   *   visible through the owner: a checkout-dependent (project-scope) winner still
+   *   fails with a reachability error — it cannot be verified in the target and
+   *   dispatching anyway would let resolveAgentForStream silently fall back to exec
+   *   (wrong prompt/tool policy) — while host-side definitions (built-in, global,
+   *   plugin) are validated against the owner context and the launch proceeds.
+   * Waiting for provisioning/init here is not an option: createWorkspaceTurn holds
+   * the service-wide task mutex for its whole body. Failures in these windows settle
+   * as retryable errors (mode="existing" once the target is ready) rather than
+   * dispatching an unverified id.
    */
   private async validateWorkspaceTurnAgentIdForTarget(params: {
     cfg: ReturnType<Config["loadConfigOrDefault"]>;
     agentId: string;
     target: WorkspaceTurnAgentContext;
     owner: WorkspaceTurnAgentContext;
+    /** Whether the target workspace's init hook is still running (see doc above). */
+    targetInitPending: boolean;
     /**
      * Whether the owner's checkout is a sound predictor of the target's agent
-     * definitions. Only true for workspaces this call just created from the owner's
-     * own branch. False for existing targets (their checkout has unknown provenance —
-     * any branch, uncommitted shadows) and for new workspaces created from a different
-     * base branch (which can shadow ANY id, including built-ins). When false,
-     * unreachable targets fail closed instead of trusting owner-side resolution.
+     * definitions. Only true for workspaces this call just created from the branch
+     * verified (via git) to be checked out in the owner right now. False for existing
+     * targets (their checkout has unknown provenance — any branch, uncommitted shadows)
+     * and for new workspaces whose base branch differs from or cannot be proven equal
+     * to the owner's. When false, unreachable targets fail closed instead of trusting
+     * owner-side resolution.
      */
     ownerResolutionPredictsTarget: boolean;
   }): Promise<Result<{ validatedContext: WorkspaceTurnAgentContext }, string>> {
@@ -3735,11 +3774,24 @@ export class TaskService {
         agentId: params.agentId,
         ...params.target,
       });
-      return validation.success ? Ok({ validatedContext: params.target }) : validation;
+      if (validation.success) {
+        return Ok({ validatedContext: params.target });
+      }
+      if (params.targetInitPending) {
+        return Err(
+          `Task.createWorkspaceTurn: the target workspace is still initializing, so agentId (${params.agentId}) could not be verified yet (${validation.error})`
+        );
+      }
+      return validation;
     }
     if (!params.ownerResolutionPredictsTarget) {
       return Err(
         `Task.createWorkspaceTurn: target checkout is not reachable (provisioning, stopped runtime, or unknown checkout state), so agentId (${params.agentId}) cannot be verified there`
+      );
+    }
+    if (!runtimeConfigsShareAgentHost(params.owner.runtimeConfig, params.target.runtimeConfig)) {
+      return Err(
+        `Task.createWorkspaceTurn: target checkout is not reachable and runs on a different host than the owner, so agentId (${params.agentId}) cannot be verified there`
       );
     }
     const parsedAgentId = AgentIdSchema.safeParse(params.agentId);
@@ -3946,6 +3998,8 @@ export class TaskService {
           agentId: requestedAgentId,
           target: targetContext,
           owner: ownerContext,
+          targetInitPending:
+            this.initStateManager.getInitState(existingWorkspaceId)?.status === "running",
           // Existing targets have unknown checkout provenance (any branch, uncommitted
           // shadows), so an unreachable checkout fails closed rather than trusting the
           // owner's resolution. Omitting agentId still works (default identity).
@@ -3977,20 +4031,19 @@ export class TaskService {
       }
     } else {
       let ownerContext: WorkspaceTurnAgentContext | undefined;
-      // A different base branch means owner-side agent resolution predicts nothing about
-      // the target checkout: agents may exist only on the target branch (so an owner-side
-      // miss must not fail-fast) and the target branch may shadow ANY id (so unreachable
-      // targets fail closed in validateWorkspaceTurnAgentIdForTarget). Compare via the
-      // branch→workspace-name sanitization: parentMeta.name is a workspace name, so a raw
-      // branch like feature/foo must not look divergent from its own workspace feature-foo.
+      // Owner-side vouching for the created checkout's agent definitions requires proof
+      // that the target's base IS the branch actually checked out in the owner. The
+      // workspace name cannot prove it: branch→name sanitization is not injective
+      // (feature/foo and feature-foo both map to feature-foo) in BOTH directions — a
+      // request naming the owner's workspace name may be a distinct colliding branch, and
+      // the omitted-arg default (parentMeta.name, passed as trunkBranch to create below)
+      // may itself differ from a slash-branch owner's real branch. A different/unproven
+      // base means agents may exist only on the target branch (owner-side misses must not
+      // fail-fast) and the target branch may shadow ANY id (unreachable targets fail
+      // closed in validateWorkspaceTurnAgentIdForTarget).
       const requestedTrunkBranch = coerceNonEmptyString(args.workspace?.trunkBranch);
-      const targetBaseDivergesFromOwner =
-        requestedTrunkBranch != null &&
-        sanitizeBranchNameForWorkspace(requestedTrunkBranch) !== parentMeta.name;
+      let ownerVouchesForTargetBase = false;
       if (requestedAgentId != null) {
-        // Pre-create stage: catch obviously bad ids (unknown/hidden/disabled) against the
-        // OWNER's checkout before creating any workspace. Advisory when the requested base
-        // branch diverges — the target checkout is authoritative in that case.
         ownerContext = this.buildWorkspaceTurnAgentContext({
           runtimeConfig: parentMeta.runtimeConfig,
           projectPath: parentMeta.projectPath,
@@ -3998,13 +4051,26 @@ export class TaskService {
           persistedWorkspacePath: parentEntry?.workspace.path,
           subProjectPath: parentMeta.subProjectPath,
         });
+        const effectiveTrunkBranch = requestedTrunkBranch ?? parentMeta.name;
+        const ownerBranch = await tryReadGitCurrentBranch(
+          ownerContext.runtime,
+          ownerContext.workspacePath
+        );
+        ownerVouchesForTargetBase = ownerBranch != null && ownerBranch === effectiveTrunkBranch;
+        // Pre-create stage: catch obviously bad ids (unknown/hidden/disabled) against the
+        // OWNER's checkout before creating any workspace. Strict for an omitted
+        // trunkBranch (the child is created from the owner's own workspace line) or a
+        // verified same-branch request; advisory when the requested base may diverge —
+        // the target checkout is authoritative in that case.
         const validation = await this.validateWorkspaceTurnAgentId({
           cfg,
           agentId: requestedAgentId,
           ...ownerContext,
         });
         if (!validation.success) {
-          if (!targetBaseDivergesFromOwner) return Err(validation.error);
+          if (requestedTrunkBranch == null || ownerVouchesForTargetBase) {
+            return Err(validation.error);
+          }
           log.debug(
             "Task.createWorkspaceTurn: owner-side agent validation failed; deferring to the target branch checkout",
             { agentId: requestedAgentId, error: validation.error }
@@ -4056,7 +4122,11 @@ export class TaskService {
           agentId: requestedAgentId,
           target: targetContext,
           owner: ownerContext,
-          ownerResolutionPredictsTarget: !targetBaseDivergesFromOwner,
+          // create() starts runBackgroundInit asynchronously; a reachable checkout whose
+          // init hook is still running may not have its final agent definitions yet.
+          targetInitPending:
+            this.initStateManager.getInitState(targetWorkspaceId)?.status === "running",
+          ownerResolutionPredictsTarget: ownerVouchesForTargetBase,
         });
         if (!validation.success) {
           // Disposable workspaces are removed by the settlement's disposable cleanup, so
@@ -4144,7 +4214,13 @@ export class TaskService {
       prompt,
       modelString: model,
       ...(thinkingLevel != null ? { thinkingLevel } : {}),
-      ...(args.attentionPolicy != null ? { attentionPolicy: args.attentionPolicy } : {}),
+      // Synchronous validation failure below returns the error directly to the caller, so
+      // never persist notify_on_terminal for it: settleWorkspaceTurn derives the terminal
+      // wake from the PERSISTED record's attentionPolicy, which would enqueue a duplicate
+      // notification on top of the synchronous Err.
+      ...(args.attentionPolicy != null && agentValidationError == null
+        ? { attentionPolicy: args.attentionPolicy }
+        : {}),
     };
     await this.taskHandleStore.upsertWorkspaceTurn(record);
     if (targetIsAgentWorkspace) {
@@ -4160,12 +4236,11 @@ export class TaskService {
     if (agentValidationError != null) {
       // Deferred post-create validation failure: the record above keeps the created
       // workspace owner-owned (retryable via mode="existing"); settle the handle as a
-      // normal error instead of dispatching the turn. The error is returned synchronously
-      // to the caller below, so strip attentionPolicy from the settled record — keeping
-      // notify_on_terminal would enqueue a second, duplicate terminal wake for the owner.
-      const { attentionPolicy: _droppedAttentionPolicy, ...recordWithoutAttention } = record;
+      // normal error instead of dispatching the turn. The record was persisted without
+      // attentionPolicy (see above), so settlement cannot enqueue a terminal wake on
+      // top of the synchronous Err returned below.
       const next: WorkspaceTurnTaskHandleRecord = {
-        ...recordWithoutAttention,
+        ...record,
         status: "error",
         updatedAt: getIsoNow(),
         error: agentValidationError,

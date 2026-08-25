@@ -37,6 +37,38 @@ export async function tryReadGitHeadCommitSha(
 }
 
 /**
+ * Branch currently checked out in the workspace, or undefined when it cannot be
+ * determined (no git, detached HEAD, unreachable runtime). Callers use this as
+ * proof of a checkout's base branch, so "unknown" must stay distinguishable
+ * from any real branch name.
+ */
+export async function tryReadGitCurrentBranch(
+  runtime: Runtime,
+  workspacePath: string
+): Promise<string | undefined> {
+  assert(workspacePath.length > 0, "tryReadGitCurrentBranch: workspacePath must be non-empty");
+
+  try {
+    const result = await execBuffered(runtime, "git rev-parse --abbrev-ref HEAD", {
+      cwd: workspacePath,
+      timeout: 10,
+    });
+    if (result.exitCode !== 0) {
+      return undefined;
+    }
+
+    const branch = result.stdout.trim();
+    // Detached HEAD reports the literal string "HEAD" — not a branch identity.
+    if (branch.length === 0 || branch === "HEAD") {
+      return undefined;
+    }
+    return branch;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Resolve the effective refusal-fallback chain for a workspace's turn.
  * Task children can opt out via taskOnRefusal: "fail" (e.g. workflow verifier
  * steps that demand an honest terminal failure instead of a silent model

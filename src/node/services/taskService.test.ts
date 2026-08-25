@@ -279,6 +279,7 @@ async function saveLocalParentWorkspace(
     agentAiDefaults?: AgentAiDefaults;
     subagentAiDefaults?: Record<string, AgentAiSubagentProfile>;
     parentAiSettings?: { model: string; thinkingLevel: ThinkingLevel };
+    workspaceName?: string;
   }
 ): Promise<{ parentId: string; projectPath: string }> {
   const projectPath = await createTestProject(rootDir, "repo", { initGit: false });
@@ -290,7 +291,7 @@ async function saveLocalParentWorkspace(
       {
         path: projectPath,
         id: parentId,
-        name: "parent",
+        name: options?.workspaceName ?? "parent",
         createdAt: new Date().toISOString(),
         runtimeConfig: { type: "local" },
         aiSettings: options?.parentAiSettings ?? {
@@ -1101,6 +1102,10 @@ describe("TaskService", () => {
       prompt: "Should not dispatch",
       title: "Diverged agent",
       workspace: { mode: "new" },
+      // Background launch: on this synchronous failure the policy must NOT be persisted —
+      // settleWorkspaceTurn derives the terminal wake from the persisted record, which
+      // would duplicate the Err returned directly to the caller.
+      attentionPolicy: "notify_on_terminal",
     });
 
     expect(result.success).toBe(false);
@@ -1114,11 +1119,14 @@ describe("TaskService", () => {
     // owner-owned: a mode="existing" retry must pass the ownership check (not invalid_scope).
     const turns = await (
       taskService as unknown as {
-        taskHandleStore: { listAllWorkspaceTurns: () => Promise<Array<{ status: string }>> };
+        taskHandleStore: {
+          listAllWorkspaceTurns: () => Promise<Array<{ status: string; attentionPolicy?: string }>>;
+        };
       }
     ).taskHandleStore.listAllWorkspaceTurns();
     expect(turns).toHaveLength(1);
     expect(turns[0]).toMatchObject({ status: "error", createdWorkspace: true });
+    expect(turns[0]?.attentionPolicy).toBeUndefined();
 
     const retry = await taskService.createWorkspaceTurn({
       ownerWorkspaceId: parentId,
@@ -1276,6 +1284,10 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["childworkspace", "turnhandle"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    // Owner vouching for an unreachable target requires git proof that the owner is
+    // actually checked out on the base branch the child is created from.
+    initGitRepo(projectPath);
+    execSync("git checkout -b parent", { cwd: projectPath, stdio: "ignore" });
     await writeCustomAgentDefinition(projectPath);
     // Deferred-provisioning runtimes return from create before the checkout is reachable.
     const unreachableCheckout = path.join(rootDir, "not-provisioned-yet");
@@ -1325,6 +1337,157 @@ describe("TaskService", () => {
     expect(sendMessage).toHaveBeenCalledTimes(1);
     const sendMessageCall = sendMessage.mock.calls[0];
     expect(sendMessageCall?.[2]).toMatchObject({ agentId: "plan" });
+  });
+
+  test("createWorkspaceTurn treats sanitized branch-name collisions as unproven bases", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    // Owner is checked out on feature/foo, whose workspace name sanitizes to feature-foo.
+    // A request for the DISTINCT branch feature-foo collides with that name, so the owner
+    // must not vouch for the unreachable target: even a built-in id fails closed (the
+    // colliding branch could shadow it).
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir, {
+      workspaceName: "feature-foo",
+    });
+    initGitRepo(projectPath);
+    execSync("git checkout -b feature/foo", { cwd: projectPath, stdio: "ignore" });
+
+    const unreachableMetadata: WorkspaceMetadata & { namedWorkspacePath: string } = {
+      ...createWorkspaceTurnMetadata(projectPath),
+      runtimeConfig: { type: "worktree", srcBaseDir: path.join(rootDir, "wt") },
+      namedWorkspacePath: path.join(rootDir, "not-provisioned-collision"),
+    };
+    const createWorkspace = mock(
+      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
+        Promise.resolve(Ok({ metadata: unreachableMetadata }))
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "plan",
+      prompt: "Should not dispatch",
+      title: "Colliding branch",
+      workspace: { mode: "new", trunkBranch: "feature-foo" },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("not reachable");
+      expect(result.error).toContain("no turn was dispatched");
+    }
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    // The owner's real branch, by contrast, is a proven base: the same launch succeeds.
+    const sameBranch = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "plan",
+      prompt: "Plan from the owner's own branch",
+      title: "Same branch",
+      workspace: { mode: "new", trunkBranch: "feature/foo" },
+    });
+    expect(sameBranch.success).toBe(true);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  test("createWorkspaceTurn unreachable cross-host target fails closed even for built-ins", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    initGitRepo(projectPath);
+    execSync("git checkout -b parent", { cwd: projectPath, stdio: "ignore" });
+
+    // The created target lives on a remote host (per-workspace containers, Coder-style
+    // per-workspace hosts). The owner's global agent roots say nothing about that host —
+    // even a built-in could be shadowed by a target-host global definition — so
+    // owner-side resolution must not vouch while the checkout is unreachable.
+    const remoteMetadata: WorkspaceMetadata & { namedWorkspacePath: string } = {
+      ...createWorkspaceTurnMetadata(projectPath),
+      runtimeConfig: { type: "docker", image: "node:20" },
+      namedWorkspacePath: "/workspace/repo",
+    };
+    const createWorkspace = mock(
+      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
+        Promise.resolve(Ok({ metadata: remoteMetadata }))
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "plan",
+      prompt: "Should not dispatch",
+      title: "Cross-host unreachable",
+      workspace: { mode: "new" },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("different host");
+      expect(result.error).toContain("no turn was dispatched");
+    }
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("createWorkspaceTurn does not verify agents while the created workspace is still initializing", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await writeCustomAgentDefinition(projectPath);
+    // Reachable checkout whose init hook is still running: the hook may still be
+    // installing/rewriting agent definitions, so a strict-validation miss is not a
+    // trustworthy "unknown agentId" verdict — the launch must fail with a transient
+    // error instead of a definitive one (and never dispatch an unverified id).
+    const initializingCheckout = path.join(rootDir, "initializing-checkout");
+    await fsPromises.mkdir(initializingCheckout, { recursive: true });
+
+    const initializingMetadata: WorkspaceMetadata & { namedWorkspacePath: string } = {
+      ...createWorkspaceTurnMetadata(projectPath),
+      runtimeConfig: { type: "worktree", srcBaseDir: path.join(rootDir, "wt") },
+      namedWorkspacePath: initializingCheckout,
+    };
+    const createWorkspace = mock(
+      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
+        Promise.resolve(Ok({ metadata: initializingMetadata }))
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const initStateManager = {
+      startInit: mock(() => undefined),
+      enterHookPhase: mock(() => undefined),
+      appendOutput: mock(() => undefined),
+      endInit: mock(() => Promise.resolve()),
+      getInitState: mock((workspaceId: string) =>
+        workspaceId === "childworkspace" ? { status: "running" } : undefined
+      ),
+      readInitStatus: mock(() => Promise.resolve(null)),
+    } as unknown as InitStateManager;
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+      initStateManager,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "custom",
+      prompt: "Should not dispatch",
+      title: "Initializing target",
+      workspace: { mode: "new" },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("still initializing");
+      expect(result.error).toContain("no turn was dispatched");
+    }
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 
   test("createWorkspaceTurn unreachable existing target: explicit overrides fail closed, default identity works", async () => {
