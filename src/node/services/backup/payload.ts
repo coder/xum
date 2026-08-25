@@ -1615,6 +1615,20 @@ function parseManifest(raw: string, portable: boolean): BackupManifest {
   return manifest as BackupManifest;
 }
 
+/**
+ * True when the bytes parse as a portable backup manifest. Managed-path selection probes
+ * with this rather than mere existence: `manifest.json` is a generic filename, so an
+ * unrelated or corrupt file under one spelling must not beat a valid backup under another.
+ */
+export function isParseableBackupManifest(raw: string): boolean {
+  try {
+    parseManifest(raw, true);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function backupPayloadExists(sourceDir: string): Promise<boolean> {
   return await fileExists(path.join(sourceDir, BACKUP_MANIFEST_FILE));
 }

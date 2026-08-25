@@ -17,6 +17,7 @@ import {
   assertBackupPathComplexity,
   BACKUP_MANIFEST_FILE,
   BackupInvalidPayloadError,
+  isParseableBackupManifest,
   MAX_BACKUP_FILE_BYTES,
   MAX_BACKUP_FILE_COUNT,
   MAX_BACKUP_TOTAL_BYTES,
@@ -1064,23 +1065,30 @@ export class BackupRepoCache {
     const [configured, ...legacySpellings] = listBackupManagedPathSpellings(
       this.options.managedPath
     );
-    if (remoteCommit === null) return configured;
-    if (await this.treeHasBackupManifest(remoteCommit, safeRelativePath(configured))) {
+    if (remoteCommit === null || legacySpellings.length === 0) return configured;
+    if (await this.treeHasReadableBackupManifest(remoteCommit, safeRelativePath(configured))) {
       return configured;
     }
     for (const legacy of legacySpellings) {
-      if (await this.treeHasBackupManifest(remoteCommit, safeRelativePath(legacy))) return legacy;
+      if (await this.treeHasReadableBackupManifest(remoteCommit, safeRelativePath(legacy))) {
+        return legacy;
+      }
     }
     return configured;
   }
 
   /**
-   * True only when `<readPath>/manifest.json` is a blob at the given commit. Deliberately
-   * non-recursive: a directory spelled like the manifest is then a single `tree` record the
-   * type check rejects, rather than an unbounded listing of its descendants. Reads only
-   * tree objects, which a blob-filtered fetch always transfers.
+   * True only when `<readPath>/manifest.json` is a blob at the given commit that parses as
+   * a backup manifest. Deliberately non-recursive: a directory spelled like the manifest is
+   * then a single `tree` record the type check rejects, rather than an unbounded listing of
+   * its descendants. Parsing matters because `manifest.json` is a generic filename: an
+   * unrelated or corrupt file under the configured spelling must not win the selection over
+   * a valid legacy backup that would then never be consulted.
    */
-  private async treeHasBackupManifest(remoteCommit: string, readPath: string): Promise<boolean> {
+  private async treeHasReadableBackupManifest(
+    remoteCommit: string,
+    readPath: string
+  ): Promise<boolean> {
     const { stdout } = await this.localGit(
       ["ls-tree", "-z", remoteCommit, "--", `:(top,literal)${readPath}/${BACKUP_MANIFEST_FILE}`],
       { env: { GIT_NO_LAZY_FETCH: "1" }, maxOutputBytes: MANIFEST_LOOKUP_MAX_OUTPUT_BYTES }
@@ -1088,7 +1096,49 @@ export class BackupRepoCache {
     const record = stdout.split("\0")[0] ?? "";
     const separator = record.indexOf("\t");
     if (separator < 0) return false;
-    return record.slice(0, separator).trim().split(/\s+/)[1] === "blob";
+    const [, objectType, objectId] = record.slice(0, separator).trim().split(/\s+/);
+    if (objectType !== "blob" || objectId === undefined || !/^[0-9a-f]{40,64}$/.test(objectId)) {
+      return false;
+    }
+    const manifest = await this.readProbedBlob(objectId);
+    return manifest !== null && isParseableBackupManifest(manifest);
+  }
+
+  /**
+   * Reads a probed blob's bytes, fetching it once through the credential ladder when the
+   * blob-filtered clone has only promised it. Returns null for a blob that still cannot be
+   * read afterwards (including one larger than any legitimate payload), so the probe treats
+   * it as "not a usable manifest" rather than failing the whole preparation.
+   */
+  private async readProbedBlob(objectId: string): Promise<string | null> {
+    const read = () =>
+      this.localGit(["cat-file", "blob", objectId], {
+        env: { GIT_NO_LAZY_FETCH: "1" },
+        maxOutputBytes: MAX_BACKUP_TOTAL_BYTES,
+      });
+    try {
+      return (await read()).stdout;
+    } catch {
+      // The blob is missing from the partial clone; fetch exactly it, like the
+      // pre-checkout size validation does for payload blobs.
+      await this.networkGit([
+        "-C",
+        this.cachePath,
+        "fetch",
+        "--refetch",
+        "--no-tags",
+        "--no-write-fetch-head",
+        ...localUploadPackArgs(this.repoUrl),
+        "origin",
+        objectId,
+      ]);
+      await this.assertObjectStoreWithinBudget();
+    }
+    try {
+      return (await read()).stdout;
+    } catch {
+      return null;
+    }
   }
 
   private async listManagedBlobs(

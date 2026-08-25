@@ -775,6 +775,51 @@ describe("backup adapters", () => {
     );
   });
 
+  it("selects a legacy mux/ backup when the canonical manifest is not a real backup", async () => {
+    // A valid mux-era backup.
+    await writeFixtureFile(muxRoot, "AGENTS.md", "legacy instructions\n");
+    const gitRepo = createBackupGitRepo({ cacheRoot });
+    const payload = createBackupPayloadStore({ config });
+    const legacy = await gitRepo.prepare({ ...settings, path: "mux/" });
+    await payload.exportTo({ repositoryRoot: legacy.rootDir, managedPath: legacy.managedPath });
+    await gitRepo.commitAndPush(legacy, {
+      message: "Back up Mux settings",
+      expectedRemoteCommit: legacy.remoteCommit,
+    });
+
+    // xum/manifest.json exists as a blob but is not a Xum backup manifest — a generic
+    // filename another tool plausibly owns. Presence alone must not win the selection.
+    const seed = path.join(tempDir, "unrelated-seed");
+    await runGit(["clone", "--quiet", originPath, seed]);
+    await writeFixtureFile(seed, "xum/manifest.json", '{ "name": "some other tool" }\n');
+    await runGit(["-C", seed, "add", "."]);
+    await runGit([
+      "-C",
+      seed,
+      "-c",
+      "user.email=other@example.com",
+      "-c",
+      "user.name=Other",
+      "commit",
+      "--quiet",
+      "-m",
+      "unrelated manifest",
+    ]);
+    await runGit(["-C", seed, "push", "--quiet", "origin", "main"]);
+
+    await writeFixtureFile(muxRoot, "AGENTS.md", "local edit\n");
+    const prepared = await gitRepo.prepare({ ...settings, path: "xum/" });
+    expect(prepared.managedPath).toBe("mux/");
+    const restored = await payload.restore({
+      repositoryRoot: prepared.rootDir,
+      managedPath: prepared.managedPath,
+    });
+    expect(restored.changedFiles).toEqual(["AGENTS.md"]);
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "legacy instructions\n"
+    );
+  });
+
   it("reports preferences as changed only when the merge would change them", async () => {
     config.state = { projects: new Map(), userPreferences: { appearance: { theme: "dark" } } };
     const gitRepo = createBackupGitRepo({ cacheRoot });
