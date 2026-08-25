@@ -2094,6 +2094,38 @@ export class WorkspaceService extends EventEmitter {
   // after that user row and enter the send's request as a trailing foreign
   // assistant row (see acquireIdleTurnExclusion).
   private readonly preflightSendCounts = new Map<string, number>();
+  /**
+   * Codex P1 (PRRT_kwDOPxxmWM6cRi_J): sends the SESSION cannot observe yet —
+   * counted from service entry until the queue/session handoff, then released.
+   * Unlike preflightSendCounts (held for the whole service call for archive
+   * and refine interlocks), this feeds the session's follow-up idle probes:
+   * a follow-up redispatched from within the originating send's own turn
+   * (e.g. its on-send compaction completing) must not veto itself, and once
+   * handed off the session's own queue/turn-phase state governs visibility.
+   */
+  private readonly sessionInvisiblePreflightCounts = new Map<string, number>();
+
+  /** See sessionInvisiblePreflightCounts. Release is idempotent. */
+  private armSessionInvisiblePreflight(workspaceId: string): { release: () => void } & Disposable {
+    this.sessionInvisiblePreflightCounts.set(
+      workspaceId,
+      (this.sessionInvisiblePreflightCounts.get(workspaceId) ?? 0) + 1
+    );
+    let released = false;
+    const release = () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      const remaining = (this.sessionInvisiblePreflightCounts.get(workspaceId) ?? 1) - 1;
+      if (remaining <= 0) {
+        this.sessionInvisiblePreflightCounts.delete(workspaceId);
+      } else {
+        this.sessionInvisiblePreflightCounts.set(workspaceId, remaining);
+      }
+    };
+    return { release, [Symbol.dispose]: release };
+  }
   // In-flight renderer executeBash requests per workspace. Incremented in the same
   // synchronous block as executeBash's archivingWorkspaces check (mirroring
   // preflightSendCounts) so archive admission and bash execution always observe each other:
@@ -4219,10 +4251,14 @@ export class WorkspaceService extends EventEmitter {
         this.schedulePostCompactionMetadataRefresh(workspaceId);
       },
       // Codex P1 (PRRT_kwDOPxxmWM6cRJD-): expose service-level send
-      // preflights (manual sends counted below but not yet queued or busy) to
-      // the session's follow-up idle probes so redispatched synthetic turns
-      // yield to them.
-      hasExternalSendPreflight: () => (this.preflightSendCounts.get(workspaceId) ?? 0) > 0,
+      // preflights (manual sends counted but not yet queued or busy) to the
+      // session's follow-up idle probes so redispatched synthetic turns yield
+      // to them. Codex P1 (PRRT_kwDOPxxmWM6cRi_J): reads the session-invisible
+      // counter, not preflightSendCounts — the originating send's reservation
+      // is released at its queue/session handoff so a follow-up dispatched
+      // from within that turn does not veto itself.
+      hasExternalSendPreflight: () =>
+        (this.sessionInvisiblePreflightCounts.get(workspaceId) ?? 0) > 0,
     });
   }
 
@@ -10715,6 +10751,7 @@ export class WorkspaceService extends EventEmitter {
           }
         },
       };
+      using sessionInvisiblePreflight = this.armSessionInvisiblePreflight(workspaceId);
 
       // Guard: avoid creating sessions for workspaces that don't exist anymore.
       const workspaceConfig = this.config.findWorkspace(workspaceId);
@@ -10823,6 +10860,7 @@ export class WorkspaceService extends EventEmitter {
       );
       if (!pricingGate.success) {
         if (internal?.synthetic !== true) {
+          sessionInvisiblePreflight.release();
           return session.sendMessage(message, normalizedOptions, {
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
@@ -10963,6 +11001,7 @@ export class WorkspaceService extends EventEmitter {
         // we must not cancel foreground waits. Use the queue's effective dispatch mode
         // (not incoming options) because MessageQueue makes tool-end sticky.
         const continuationSendState = getContinuationSendState();
+        sessionInvisiblePreflight.release();
         const effectiveQueueDispatchMode = session.queueMessage(
           message,
           continuationSendState.options,
@@ -11068,6 +11107,10 @@ export class WorkspaceService extends EventEmitter {
         claimedAutoTitle = true;
       }
 
+      // Handoff: from here the send is the session's own admission problem —
+      // release the probe reservation so a follow-up redispatched from within
+      // this very turn (on-send compaction completion) does not veto itself.
+      sessionInvisiblePreflight.release();
       const result = await session.sendMessage(message, continuationSendState.options, {
         synthetic: internal?.synthetic,
         agentInitiated: internal?.agentInitiated,
@@ -11236,6 +11279,7 @@ export class WorkspaceService extends EventEmitter {
           }
         },
       };
+      using sessionInvisiblePreflight = this.armSessionInvisiblePreflight(workspaceId);
 
       // Guard: avoid creating sessions for workspaces that don't exist anymore.
       if (!this.config.findWorkspace(workspaceId)) {
@@ -11312,6 +11356,7 @@ export class WorkspaceService extends EventEmitter {
         });
       }
 
+      sessionInvisiblePreflight.release();
       const result = await session.resumeStream(normalizedOptions, {
         agentInitiated: internal?.agentInitiated,
       });

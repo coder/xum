@@ -281,6 +281,33 @@ describe("AgentSession continue-message agentId fallback", () => {
     expect(historyResult.data.map((message) => message.id)).toEqual(["before-reset"]);
   });
 
+  test("dispatchPendingFollowUp rolls back heartbeat boundaries when a service send is in preflight", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cRi_N): a manual service-level send still in
+    // preflight is user contention too — the heartbeat reset boundary must be
+    // rolled back (as for queued input), not left in history with the
+    // follow-up silently cleared.
+    const earlierMessage = createMuxMessage("before-reset", "assistant", "Earlier context");
+    const { session, historyService, internals } = await createSession([
+      earlierMessage,
+      heartbeatBoundaryMessage(),
+    ]);
+    internals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    (session as unknown as { hasExternalSendPreflight?: () => boolean }).hasExternalSendPreflight =
+      () => true;
+
+    const dispatched = await internals.dispatchPendingFollowUp();
+
+    expect(dispatched).toBe(false);
+    expect(internals.sendMessage).not.toHaveBeenCalled();
+
+    const historyResult = await historyService.getLastMessages("ws", 10);
+    expect(historyResult.success).toBe(true);
+    if (!historyResult.success) {
+      throw new Error(`Expected history read to succeed: ${historyResult.error}`);
+    }
+    expect(historyResult.data.map((message) => message.id)).toEqual(["before-reset"]);
+  });
+
   test("dispatchPendingFollowUp skips idle-only follow-ups when a new turn is already active", async () => {
     const { historyService, internals } = await createSession([
       compactionSummaryMessage("summary-active-turn", idleFollowUp()),

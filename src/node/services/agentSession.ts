@@ -6951,7 +6951,11 @@ export class AgentSession {
         hasQueuedMessages,
         turnPhase: this.turnPhase,
       });
-      await this.skipIdleRuleFollowUp(lastMessage, hasQueuedMessages, hasActiveNonCompletingTurn);
+      await this.skipIdleRuleFollowUp(
+        lastMessage,
+        hasQueuedMessages || hasExternalPreflightSend,
+        hasActiveNonCompletingTurn
+      );
       return false;
     }
 
@@ -7093,7 +7097,7 @@ export class AgentSession {
         });
         await this.skipIdleRuleFollowUp(
           lastMessage,
-          this.hasPendingManualFollowUp(),
+          this.hasPendingManualFollowUp() || this.hasExternalSendPreflight?.() === true,
           this.isBusy() && this.turnPhase !== TurnPhase.COMPLETING
         );
         return false;
@@ -7128,17 +7132,22 @@ export class AgentSession {
   /**
    * Shared skip path for a pending follow-up vetoed by the idle rule (or a
    * stale goal admission): heartbeat reset boundaries are rolled back so the
-   * queued user turn sees pre-reset context; every other summary just drops
-   * its pending follow-up so it cannot re-fire on a later recovery pass.
+   * user turn sees pre-reset context; every other summary just drops its
+   * pending follow-up so it cannot re-fire on a later recovery pass.
+   *
+   * `hasUserContention` covers queued manual input AND a service-level send
+   * still in preflight (Codex P2 PRRT_kwDOPxxmWM6cRi_N): when user input is
+   * the reason the heartbeat continuation was vetoed, the reset boundary must
+   * be rolled back even though the message has not reached the queue yet.
    */
   private async skipIdleRuleFollowUp(
     summaryMessage: MuxMessage,
-    hasQueuedMessages: boolean,
+    hasUserContention: boolean,
     hasActiveNonCompletingTurn: boolean
   ): Promise<void> {
     if (
       summaryMessage.metadata?.compacted === "heartbeat" &&
-      hasQueuedMessages &&
+      hasUserContention &&
       !hasActiveNonCompletingTurn
     ) {
       const rollbackResult =

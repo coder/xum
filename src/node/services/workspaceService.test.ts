@@ -6324,6 +6324,68 @@ describe("WorkspaceService sendMessage status clearing", () => {
     );
   });
 
+  test("the follow-up idle probe excludes the originating send after its session handoff", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cRi_J): preflightSendCounts stays positive
+    // until the outer service call returns, so a probe reading it would let a
+    // continuation's on-send compaction completion veto the continuation's
+    // OWN saved follow-up. The probe must see unrelated preflights (round-37
+    // semantics) but release the originating send at its session handoff.
+    fakeSession.isBusy.mockReturnValue(false);
+    const realSession = (
+      workspaceService as unknown as { createSession: (workspaceId: string) => AgentSession }
+    ).createSession("test-workspace");
+    // The shared fixture aiService omits stopStream; disposal needs it.
+    (
+      realSession as unknown as { aiService: { stopStream?: () => Promise<unknown> } }
+    ).aiService.stopStream = () => Promise.resolve(Ok(undefined));
+    const probe = (realSession as unknown as { hasExternalSendPreflight?: () => boolean })
+      .hasExternalSendPreflight;
+    expect(probe).toBeDefined();
+    try {
+      expect(probe!()).toBe(false);
+
+      // A send stalled in its pricing preflight is visible to the probe.
+      let releasePricing!: () => void;
+      const pricingGate = new Promise<void>((resolve) => {
+        releasePricing = resolve;
+      });
+      let pricingStarted = false;
+      workspaceService.setWorkspaceGoalService({
+        assertPricedModelForBudgetedGoal: mock(async () => {
+          pricingStarted = true;
+          await pricingGate;
+          return Ok(undefined);
+        }),
+        getPendingGoalSnapshot: mock(() => null),
+      } as unknown as WorkspaceGoalService);
+      // Ref object: closure assignments to a `let` are invisible to TS
+      // control-flow narrowing at the later assertion site.
+      const probeDuringSessionSend: { value: boolean | null } = { value: null };
+      fakeSession.sendMessage.mockImplementationOnce(() => {
+        probeDuringSessionSend.value = probe!();
+        return Promise.resolve(Ok(undefined));
+      });
+
+      const sendPromise = workspaceService.sendMessage("test-workspace", "manual message", {
+        model: "openai:gpt-4o-mini",
+        agentId: "exec",
+      });
+      await waitForCondition(() => pricingStarted);
+      expect(probe!()).toBe(true);
+
+      // Once the send reaches the session handoff its reservation releases:
+      // a follow-up redispatched from within that turn must not see it.
+      releasePricing();
+      const result = await sendPromise;
+      expect(result.success).toBe(true);
+      expect(probeDuringSessionSend.value).toBe(false);
+      // Fully settled: no residual reservation leaks.
+      expect(probe!()).toBe(false);
+    } finally {
+      realSession.dispose();
+    }
+  });
+
   test("does not clear persisted agent status directly for non-synthetic sends", async () => {
     const updateAgentStatus = spyOn(
       workspaceService as unknown as {
