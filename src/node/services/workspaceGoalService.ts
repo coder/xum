@@ -3034,17 +3034,28 @@ export class WorkspaceGoalService {
       // createdAtMs. Taking the mutation here without the locked handoff would
       // drain the pre-publication construction stamp, and a message authored
       // during the publication await would then be misclassified as a
-      // post-goal intervention. Wait for the lock to flush the setter, then
-      // re-read: the mutation may also have been legitimately discarded in
-      // that window (user abort / clearGoal).
-      await this.fileLocks.withLock(workspaceId, () => Promise.resolve());
-      pending = this.pendingGoalMutations.get(workspaceId);
+      // post-goal intervention.
+      //
+      // Codex P2 (PRRT_kwDOPxxmWM6cANQH): the claim (read + delete) must
+      // happen INSIDE one lock tenure. Setters install/replace mutations only
+      // while holding this lock, so an unlocked reread-then-delete after a
+      // bare barrier could interleave with a setter that queued behind the
+      // barrier: the drain would persist the older mutation and strand the
+      // setter's newer one with no remaining stream-end hook. The claim also
+      // honors discards that landed in the window (user abort / clearGoal),
+      // which delete the mutation before the claim runs.
+      pending = await this.fileLocks.withLock(workspaceId, () => {
+        const claimed = this.pendingGoalMutations.get(workspaceId);
+        if (claimed != null) {
+          this.pendingGoalMutations.delete(workspaceId);
+          this.pendingGoalSnapshots.delete(workspaceId);
+        }
+        return Promise.resolve(claimed);
+      });
     }
     let drained: GoalRecordV1 | null = null;
 
     if (pending) {
-      this.pendingGoalMutations.delete(workspaceId);
-      this.pendingGoalSnapshots.delete(workspaceId);
       // Mirror the `setGoal` wrapper here: invalid queued transitions must
       // be logged and swallowed so the stream-end pipeline stays alive.
       // The caller already treats null as "no apply happened".
