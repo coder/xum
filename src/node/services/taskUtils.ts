@@ -15,26 +15,49 @@ export function coerceNonEmptyString(value: unknown): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+/**
+ * Upper bound for the short read-only git queries below. They are all
+ * single-shot metadata reads, so an unresponsive runtime should degrade to
+ * "unknown" quickly instead of stalling task bookkeeping.
+ */
+const GIT_QUERY_TIMEOUT_SECONDS = 10;
+
+/**
+ * Run a short read-only git query in a workspace checkout and return its exit
+ * code plus trimmed stdout.
+ *
+ * Returns undefined only when the command could not be run at all (no git,
+ * unreachable runtime). A non-zero exit is reported via `exitCode` rather than
+ * folded into undefined, because the callers below build base-commit proofs
+ * where "git answered no" and "we could not ask" must stay distinguishable.
+ */
+async function tryRunGitQuery(
+  runtime: Runtime,
+  workspacePath: string,
+  command: string
+): Promise<{ exitCode: number; stdout: string } | undefined> {
+  try {
+    const result = await execBuffered(runtime, command, {
+      cwd: workspacePath,
+      timeout: GIT_QUERY_TIMEOUT_SECONDS,
+    });
+    return { exitCode: result.exitCode, stdout: result.stdout.trim() };
+  } catch {
+    return undefined;
+  }
+}
+
 export async function tryReadGitHeadCommitSha(
   runtime: Runtime,
   workspacePath: string
 ): Promise<string | undefined> {
   assert(workspacePath.length > 0, "tryReadGitHeadCommitSha: workspacePath must be non-empty");
 
-  try {
-    const result = await execBuffered(runtime, "git rev-parse HEAD", {
-      cwd: workspacePath,
-      timeout: 10,
-    });
-    if (result.exitCode !== 0) {
-      return undefined;
-    }
-
-    const sha = result.stdout.trim();
-    return sha.length > 0 ? sha : undefined;
-  } catch {
+  const result = await tryRunGitQuery(runtime, workspacePath, "git rev-parse HEAD");
+  if (result?.exitCode !== 0) {
     return undefined;
   }
+  return result.stdout.length > 0 ? result.stdout : undefined;
 }
 
 /**
@@ -49,24 +72,17 @@ export async function tryReadGitCurrentBranch(
 ): Promise<string | undefined> {
   assert(workspacePath.length > 0, "tryReadGitCurrentBranch: workspacePath must be non-empty");
 
-  try {
-    const result = await execBuffered(runtime, "git rev-parse --abbrev-ref HEAD", {
-      cwd: workspacePath,
-      timeout: 10,
-    });
-    if (result.exitCode !== 0) {
-      return undefined;
-    }
-
-    const branch = result.stdout.trim();
-    // Detached HEAD reports the literal string "HEAD" — not a branch identity.
-    if (branch.length === 0 || branch === "HEAD") {
-      return undefined;
-    }
-    return branch;
-  } catch {
+  const result = await tryRunGitQuery(runtime, workspacePath, "git rev-parse --abbrev-ref HEAD");
+  if (result?.exitCode !== 0) {
     return undefined;
   }
+
+  const branch = result.stdout;
+  // Detached HEAD reports the literal string "HEAD" — not a branch identity.
+  if (branch.length === 0 || branch === "HEAD") {
+    return undefined;
+  }
+  return branch;
 }
 
 /**
@@ -92,22 +108,22 @@ export async function tryReadGitBranchMatchesOrigin(
   if (headSha == null) {
     return undefined;
   }
-  try {
-    // SECURITY: branch names are repo-controlled input (a git-valid branch can contain
-    // quotes); the full revision argument must be shell-quoted before interpolation.
-    const revision = shellQuote(`origin/${branch}^{commit}`);
-    const result = await execBuffered(runtime, `git rev-parse --verify --quiet ${revision}`, {
-      cwd: workspacePath,
-      timeout: 10,
-    });
-    if (result.exitCode !== 0) {
-      // No origin ref for this branch: the local commit is the only candidate base.
-      return true;
-    }
-    return result.stdout.trim() === headSha;
-  } catch {
+  // SECURITY: branch names are repo-controlled input (a git-valid branch can contain
+  // quotes); the full revision argument must be shell-quoted before interpolation.
+  const revision = shellQuote(`origin/${branch}^{commit}`);
+  const result = await tryRunGitQuery(
+    runtime,
+    workspacePath,
+    `git rev-parse --verify --quiet ${revision}`
+  );
+  if (result == null) {
     return undefined;
   }
+  if (result.exitCode !== 0) {
+    // No origin ref for this branch: the local commit is the only candidate base.
+    return true;
+  }
+  return result.stdout === headSha;
 }
 
 /**
@@ -126,19 +142,16 @@ export async function tryReadGitPathsClean(
   assert(workspacePath.length > 0, "tryReadGitPathsClean: workspacePath must be non-empty");
   assert(pathspecs.length > 0, "tryReadGitPathsClean: pathspecs must be non-empty");
 
-  try {
-    const quoted = pathspecs.map((pathspec) => shellQuote(pathspec)).join(" ");
-    const result = await execBuffered(runtime, `git status --porcelain --ignored -- ${quoted}`, {
-      cwd: workspacePath,
-      timeout: 10,
-    });
-    if (result.exitCode !== 0) {
-      return undefined;
-    }
-    return result.stdout.trim().length === 0;
-  } catch {
+  const quoted = pathspecs.map((pathspec) => shellQuote(pathspec)).join(" ");
+  const result = await tryRunGitQuery(
+    runtime,
+    workspacePath,
+    `git status --porcelain --ignored -- ${quoted}`
+  );
+  if (result?.exitCode !== 0) {
     return undefined;
   }
+  return result.stdout.length === 0;
 }
 
 /**
