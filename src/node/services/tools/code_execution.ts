@@ -32,7 +32,7 @@ import {
 } from "@/constants/resultHandles";
 import { KERNEL_COMPACT_ARGS_CAP_BYTES, KERNEL_CONSOLE_CAP_BYTES } from "@/constants/kernelOutput";
 import { sliceUtf8Bytes } from "@/common/utils/sliceUtf8Bytes";
-import { FILE_EDIT_TOOL_NAMES } from "@/common/types/tools";
+import { isKernelRecordResultExempt } from "@/node/services/ptc/types";
 
 // Default limits
 const DEFAULT_MEMORY_BYTES = 64 * 1024 * 1024; // 64MB
@@ -281,9 +281,9 @@ async function offloadOversizedReturnValue(
  * When the kernel load is inactive, a bridged tool that happens to be named
  * "load" gets no exception (its records are ordinary and must not leak).
  *
- * Exception: agent_skill_read and file_edit_* records keep their result —
- * post-compaction persistence extractors depend on it (see the inline
- * comment below).
+ * Exception: exempt records (agent_skill_read, file_edit_*, media-bearing
+ * results — see isKernelRecordResultExempt) keep their result for
+ * post-compaction persistence extractors and request-time media extraction.
  */
 function compactKernelToolCallRecords(result: PTCExecutionResult, loadActive: boolean): void {
   result.toolCalls = result.toolCalls.map((record) => {
@@ -302,19 +302,14 @@ function compactKernelToolCallRecords(result: PTCExecutionResult, loadActive: bo
         ...(record.error !== undefined ? { error: boundCompactRecordError(record.error) } : {}),
       };
     }
-    // Persistence-critical records also keep their result: compaction mines
-    // successful nested file_edit_* diffs (extractEditedFileDiffs /
-    // extractEditedFilePaths) and agent_skill_read snapshots
-    // (loadedSkillSnapshots) out of history, so suppressing these like
-    // ordinary kernel records would silently lose edited-file diffs and
-    // loaded-skill gating context after compaction in RLM mode. Their results
-    // are repo-controlled (unified diffs / SKILL.md snapshots) — the same
-    // trust and size class classic-mode records already expose — and
-    // creation-time kernel record bounds still stub oversized values.
-    if (
-      record.toolName === "agent_skill_read" ||
-      FILE_EDIT_TOOL_NAMES.includes(record.toolName as (typeof FILE_EDIT_TOOL_NAMES)[number])
-    ) {
+    // Exempt records also keep their result (see isKernelRecordResultExempt;
+    // creation-time capture bounding applies the same predicate, so the full
+    // payload actually reaches this point): persistence extractors mine
+    // nested file_edit_* diffs and agent_skill_read snapshots out of history
+    // after compaction, and media containers from bridged MCP tools must
+    // reach request-time attachment extraction or RLM users could never see
+    // bridged screenshots/images.
+    if (isKernelRecordResultExempt(record.toolName, record.result)) {
       return {
         ...record,
         args: boundCompactRecordArgs(record.args),

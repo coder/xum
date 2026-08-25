@@ -102,6 +102,21 @@ describe("nested PTC edit records (exclusive posture)", () => {
     expect(diffs[0].diff).toBe(nestedDiff);
   });
 
+  it("returns edits from the newest code_execution part first when one message has several", () => {
+    // Successive SDK steps append separate code_execution parts to one
+    // assistant message; the later execution's edits must fill the
+    // MAX_EDITED_FILES cap first.
+    const older = createCodeExecutionMessage([
+      { toolName: "file_edit_insert", args: { path: "/older.ts" }, ok: true },
+    ]);
+    const newer = createCodeExecutionMessage([
+      { toolName: "file_edit_insert", args: { path: "/newer.ts" }, ok: true },
+    ]);
+    const combined: MuxMessage = { ...older, parts: [...older.parts, ...newer.parts] };
+
+    expect(extractEditedFilePaths([combined])).toEqual(["/newer.ts", "/older.ts"]);
+  });
+
   it("returns nested batch paths newest-first", () => {
     // The surrounding scan walks history backward to keep the LATEST edits
     // under MAX_EDITED_FILES; nested records are chronological, so a batch

@@ -5,6 +5,8 @@
  * multi-tool workflows via code execution.
  */
 
+import { FILE_EDIT_TOOL_NAMES } from "@/common/types/tools";
+
 /**
  * Event emitted when a tool call starts within the sandbox.
  */
@@ -88,4 +90,48 @@ export interface PTCExecutionResult {
   consoleOutput: PTCConsoleRecord[];
   /** Total execution time in milliseconds */
   duration_ms: number;
+}
+
+/**
+ * Nested records whose FULL result must survive kernel-mode capture bounding
+ * and post-eval compaction (both consult this predicate):
+ *
+ * - Persistence-critical tools: post-compaction extractors mine successful
+ *   nested file_edit_* diffs (extractEditedFileDiffs) and agent_skill_read
+ *   snapshots (loadedSkillSnapshots) out of history. Their results are
+ *   repo-controlled and tool-side bounded (~50k-char diff/snapshot caps), so
+ *   retaining them matches what classic-mode records already expose.
+ * - Media-bearing results: any bridged MCP tool may return a content
+ *   container carrying base64 media. Request-time extraction
+ *   (extractToolMediaAsUserMessages) turns nested media into model-visible
+ *   multimodal attachments — impossible if capture bounding or compaction
+ *   already dropped the payload, which would leave RLM users unable to see
+ *   bridged screenshots/images at all. Media size is host-tool-produced (the
+ *   same trust class as classic-mode records) and rasters are resized at
+ *   request time.
+ */
+export function isKernelRecordResultExempt(toolName: string, result: unknown): boolean {
+  return isPersistenceCriticalRecordToolName(toolName) || containsMediaContentPayload(result);
+}
+
+/** See isKernelRecordResultExempt (persistence-critical branch). */
+export function isPersistenceCriticalRecordToolName(toolName: string): boolean {
+  return (
+    toolName === "agent_skill_read" ||
+    FILE_EDIT_TOOL_NAMES.includes(toolName as (typeof FILE_EDIT_TOOL_NAMES)[number])
+  );
+}
+
+/** MCP-style content container ({ type: "content", value: [...] }) holding at least one media part. */
+export function containsMediaContentPayload(result: unknown): boolean {
+  if (typeof result !== "object" || result === null) return false;
+  const container = result as { type?: unknown; value?: unknown };
+  if (container.type !== "content" || !Array.isArray(container.value)) return false;
+  return container.value.some(
+    (item: unknown) =>
+      typeof item === "object" &&
+      item !== null &&
+      (item as { type?: unknown }).type === "media" &&
+      typeof (item as { data?: unknown }).data === "string"
+  );
 }

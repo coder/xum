@@ -87,7 +87,12 @@ export function extractEditedFilePaths(messages: MuxMessage[]): string[] {
     const message = messages[i];
     if (message.role !== "assistant") continue;
 
-    for (const part of message.parts) {
+    // Parts are chronological too (successive SDK steps can each add a
+    // code_execution batch): walk them backward so a later execution's edits
+    // fill the MAX_EDITED_FILES cap before an earlier one's (mirrors
+    // extractReadFilePaths).
+    for (let partIndex = message.parts.length - 1; partIndex >= 0; partIndex--) {
+      const part = message.parts[partIndex];
       if (part.type !== "dynamic-tool") continue;
       if (part.state !== "output-available") continue;
 

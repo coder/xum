@@ -312,7 +312,7 @@ export class QuickJSRuntime implements IJSRuntime {
         const result = await fn(...args);
         const endTime = Date.now();
         const duration_ms = endTime - startTime;
-        const recordResult = this.boundCaptureResult(result);
+        const recordResult = this.boundCaptureResult(result, name);
 
         // Record tool call
         this.toolCalls.push({
@@ -478,7 +478,7 @@ export class QuickJSRuntime implements IJSRuntime {
           const endTime = Date.now();
           // Same creation-time bounding as synchronous bridges (kernel mode).
           const recordArgs = this.boundCaptureArgs(args[0]);
-          const recordResult = this.boundCaptureResult(result);
+          const recordResult = this.boundCaptureResult(result, name);
           toolCalls.push({
             toolName: name,
             args: recordArgs,
@@ -617,10 +617,13 @@ export class QuickJSRuntime implements IJSRuntime {
     return `${sliceUtf8Bytes(errorStr, capBytes)}…[${bytes} bytes total; truncated]`;
   }
 
-  private boundCaptureResult(value: unknown): unknown {
-    return this.kernelRecordBounds === undefined
-      ? value
-      : this.boundCapture(value, this.kernelRecordBounds.resultCapBytes);
+  private boundCaptureResult(value: unknown, toolName: string): unknown {
+    if (this.kernelRecordBounds === undefined) return value;
+    // Exempt records (persistence-critical tools, media containers) keep the
+    // full result: compaction and request-time extractors reconstruct
+    // context from them, so a bounded preview would silently lose it.
+    if (this.kernelRecordBounds.resultExempt?.(toolName, value) === true) return value;
+    return this.boundCapture(value, this.kernelRecordBounds.resultCapBytes);
   }
 
   setPendingJobGate(gate: (run: () => void) => void): void {
@@ -800,7 +803,7 @@ export class QuickJSRuntime implements IJSRuntime {
           const result = await fn(...args);
           const endTime = Date.now();
           const duration_ms = endTime - startTime;
-          const recordResult = this.boundCaptureResult(result);
+          const recordResult = this.boundCaptureResult(result, methodName);
 
           // Record tool call
           this.toolCalls.push({

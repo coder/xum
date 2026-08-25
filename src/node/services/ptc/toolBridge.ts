@@ -20,6 +20,7 @@ import {
   isBridgeToolGranted,
   type CapabilityGrants,
 } from "@/common/types/capabilityGrants";
+import { isKernelRecordResultExempt } from "./types";
 
 /**
  * Result shape of an AI SDK Schema's optional custom validator
@@ -140,11 +141,13 @@ const EXCLUDED_TOOLS = new Set([
   // in the exclusive posture.
   "memory",
   "advisor",
-  // Media-producing tools: these exist solely to put media in front of the
-  // model. Nested media is recovered at request time only from classic
-  // (non-RLM) records — kernel-compacted records drop result contents — so
-  // keep them top-level, where extractToolMediaAsUserMessages guarantees the
-  // attachment becomes model-visible in both modes.
+  // Media-producing built-ins: these exist solely to put media in front of
+  // the model, so keep them top-level where their content-container output
+  // feeds extractToolMediaAsUserMessages directly. Bridged MCP tools that
+  // return media are still covered without this static list: kernel capture
+  // bounding and compaction exempt media containers (see
+  // isKernelRecordResultExempt), so nested media survives to request-time
+  // extraction in classic AND kernel modes.
   "attach_file",
   "desktop_screenshot",
 ]);
@@ -234,12 +237,15 @@ export class ToolBridge {
     // Kernel mode bounds record/event capture at creation (host memory and
     // streamed-to-history events); ephemeral registrations keep full records
     // (the non-RLM inline-results contract). Post-eval compaction still
-    // bounds the model-visible set.
+    // bounds the model-visible set. Exempt records (persistence-critical
+    // tools, media containers) keep full results through BOTH stages — see
+    // isKernelRecordResultExempt.
     runtime.setKernelRecordBounds(
       kernel !== undefined
         ? {
             argsCapBytes: KERNEL_COMPACT_ARGS_CAP_BYTES,
             resultCapBytes: RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES,
+            resultExempt: isKernelRecordResultExempt,
           }
         : undefined
     );

@@ -915,6 +915,54 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-persist-records");
     });
 
+    it("keeps oversized persistence results and media containers through capture bounding", async () => {
+      // Creation-time bounding replaces results over the 16KB threshold with
+      // a __kernelBounded marker BEFORE compaction runs, so the compaction
+      // exemption alone cannot save an oversized diff (repo caps allow up to
+      // ~50k chars) — and media containers must survive both stages or RLM
+      // users never see bridged MCP screenshots as attachments.
+      using tmp = new DisposableTempDir("code-exec-exempt-bounds");
+      const host = new SandboxHostService();
+      const bigDiff = `@@ -0,0 +1 @@\n+${"x".repeat(20_000)}`;
+      const mediaData = "aGVsbG8=";
+      const tools: Record<string, Tool> = {
+        file_edit_replace_string: createMockTool(
+          "file_edit_replace_string",
+          z.object({ path: z.string() }),
+          () => ({ success: true, diff: bigDiff })
+        ),
+        mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
+          type: "content",
+          value: [
+            { type: "text", text: "took a screenshot" },
+            { type: "media", mediaType: "image/png", data: mediaData },
+          ],
+        })),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(tools),
+        undefined,
+        persistentRunner(host, "ws-exempt-bounds", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        {
+          code: 'mux.file_edit_replace_string({path: "/big.ts"}); mux.mcp__shots__take({}); return true;',
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+
+      const editRecord = result.toolCalls.find((r) => r.toolName === "file_edit_replace_string");
+      expect((editRecord?.result as { diff?: string })?.diff).toBe(bigDiff);
+
+      const shotRecord = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
+      const shotValue = (shotRecord?.result as { value?: Array<{ data?: string }> })?.value;
+      expect(shotValue?.[1]?.data).toBe(mediaData);
+      await host.disposeScope("ws-exempt-bounds");
+    });
+
     it("marks compact records not-ok when the tool resolved with success:false", async () => {
       // file_read-style tools resolve normally with {success:false} for
       // missing/oversized/directory paths — no thrown error. The compact
