@@ -209,6 +209,75 @@ export GIT_ASKPASS=echo
 export SSH_ASKPASS=echo
 export GIT_SSH_COMMAND="\${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
 
+# One-time heal for repos that previous versions of this script converted
+# into promisor/partial clones. --no-filter (used below) stops the damage but
+# does not remove the persisted promisor config, nor backfill the blobs that
+# earlier filtered fetches omitted. Left unhealed, "git worktree add"
+# (workspace creation) lazy-fetches those old blobs mid-checkout and fails on
+# transient network errors. Only repos whose filter is exactly the
+# "blob:none" this script used to write are healed. This block runs before
+# any ls-remote/primary-branch gating on purpose: a stale origin/HEAD (e.g.
+# default branch renamed upstream) makes the checks below exit early, which
+# must not leave the repo poisoned forever.
+if [ "$(git config --local --get remote.origin.partialclonefilter 2>/dev/null)" = "blob:none" ]; then
+  COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+  NOW=$(date +%s)
+  # A refetch can succeed while objects stay missing (see the completeness
+  # check below); that outcome may never improve, so retry it at most daily
+  # instead of hammering the network with a full refetch every poll.
+  LAST_INCOMPLETE=$(git config --local --get xum.promisorHealIncompleteAt 2>/dev/null || echo 0)
+  [ -n "$LAST_INCOMPLETE" ] || LAST_INCOMPLETE=0
+  if [ -n "$COMMON_DIR" ] && [ $((NOW - LAST_INCOMPLETE)) -ge 86400 ]; then
+    # mkdir is the atomic claim: sibling worktrees share repo config, so this
+    # keeps them from starting concurrent full refetches. Staleness comes
+    # from a timestamp file inside the lock (portable, unlike find/stat
+    # mtime probing): a lock left behind by a killed heal expires after an
+    # hour, which also rate-limits retries after a failed refetch (the
+    # failure path below keeps the lock in place for that reason).
+    HEAL_LOCK="$COMMON_DIR/xum-promisor-heal.lock"
+    LOCK_TS=$(cat "$HEAL_LOCK/started" 2>/dev/null || echo 0)
+    [ -n "$LOCK_TS" ] || LOCK_TS=0
+    if [ -d "$HEAL_LOCK" ] && [ $((NOW - LOCK_TS)) -gt 3600 ]; then
+      rm -rf "$HEAL_LOCK"
+    fi
+    if mkdir "$HEAL_LOCK" 2>/dev/null; then
+      echo "$NOW" > "$HEAL_LOCK/started"
+      echo "HEAL: backfilling promisor partial clone"
+      # --refetch (git >= 2.36) negotiates as if the repo had nothing, so the
+      # server re-sends every object reachable from the fetch refspec,
+      # including previously filtered-out blobs.
+      if git -c protocol.version=2 \\
+          fetch origin \\
+          --refetch \\
+          --no-filter \\
+          --prune \\
+          --no-tags \\
+          --no-recurse-submodules \\
+          --no-write-fetch-head \\
+          2>&1; then
+        # A successful refetch is not proof of completeness: it only re-sends
+        # objects reachable from the *remote's current refs*. Blobs referenced
+        # only by local refs into upstream-deleted branches can remain
+        # missing, and unsetting the promisor config then would turn a
+        # recoverable partial clone into a repo whose checkouts hard-fail
+        # ("unable to read sha1 file") with no lazy-fetch fallback. Only
+        # unset once every locally reachable object is actually present.
+        if git rev-list --objects --missing=print --all 2>/dev/null | grep -q '^?'; then
+          echo "HEAL: objects still missing after refetch; keeping promisor config"
+          git config --local xum.promisorHealIncompleteAt "$NOW" 2>/dev/null
+        else
+${PROMISOR_CONFIG_KEYS.map((key) => `          git config --local --unset-all ${key} 2>/dev/null`).join("\n")}
+          git config --local --unset-all xum.promisorHealIncompleteAt 2>/dev/null
+        fi
+        rm -rf "$HEAL_LOCK"
+      fi
+      # On refetch failure the lock (with its timestamp) stays in place so the
+      # next attempt waits out the 1h staleness window instead of re-running a
+      # full refetch on every status poll.
+    fi
+  fi
+fi
+
 # Get primary branch name
 PRIMARY_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
 if [ -z "$PRIMARY_BRANCH" ]; then
@@ -223,46 +292,6 @@ REMOTE_SHA=$(git ls-remote origin "refs/heads/$PRIMARY_BRANCH" 2>/dev/null | cut
 if [ -z "$REMOTE_SHA" ]; then
   echo "SKIP: Could not get remote SHA"
   exit 0
-fi
-
-# One-time heal for repos that previous versions of this script converted
-# into promisor/partial clones. --no-filter (used below) stops the damage but
-# does not remove the persisted promisor config, nor backfill the blobs that
-# earlier filtered fetches omitted, and up-to-date repos would skip the fetch
-# entirely via the early-exit below. Left unhealed, "git worktree add"
-# (workspace creation) lazy-fetches those old blobs mid-checkout and fails on
-# transient network errors. Only repos whose filter is exactly the
-# "blob:none" this script used to write are healed.
-if [ "$(git config --local --get remote.origin.partialclonefilter 2>/dev/null)" = "blob:none" ]; then
-  # Lock in the shared git dir: sibling worktrees share repo config, so this
-  # keeps them from starting concurrent full refetches. A stale lock (killed
-  # heal) expires after an hour, which also rate-limits retries when the
-  # refetch keeps failing (e.g. huge repo on a slow link).
-  COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
-  HEAL_LOCK="$COMMON_DIR/xum-promisor-heal.lock"
-  if [ -n "$COMMON_DIR" ] && [ -n "$(find "$HEAL_LOCK" -maxdepth 0 -type d -mmin +60 2>/dev/null)" ]; then
-    rmdir "$HEAL_LOCK" 2>/dev/null
-  fi
-  if [ -n "$COMMON_DIR" ] && mkdir "$HEAL_LOCK" 2>/dev/null; then
-    echo "HEAL: backfilling promisor partial clone"
-    # --refetch (git >= 2.36) negotiates as if the repo had nothing, so the
-    # server re-sends every object including previously filtered-out blobs.
-    # Unset the promisor config only after a successful refetch: stripping
-    # first would leave missing blobs with no lazy-fetch fallback, breaking
-    # checkouts outright instead of healing them.
-    if git -c protocol.version=2 \\
-        fetch origin \\
-        --refetch \\
-        --no-filter \\
-        --prune \\
-        --no-tags \\
-        --no-recurse-submodules \\
-        --no-write-fetch-head \\
-        2>&1; then
-${PROMISOR_CONFIG_KEYS.map((key) => `      git config --local --unset-all ${key} 2>/dev/null`).join("\n")}
-    fi
-    rmdir "$HEAL_LOCK" 2>/dev/null
-  fi
 fi
 
 # Check current local remote-tracking ref (no lock)

@@ -140,4 +140,71 @@ describe("GIT_FETCH_SCRIPT", () => {
       await rm(tempDir, { recursive: true, force: true });
     }
   }, 20000);
+
+  test("keeps promisor config when refetch cannot restore locally referenced blobs", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "mux-git-heal-incomplete-"));
+    const originDir = path.join(tempDir, "origin.git");
+    const seedDir = path.join(tempDir, "seed");
+    const workspaceDir = path.join(tempDir, "workspace");
+
+    const run = (cmd: string, cwd?: string) =>
+      execSync(cmd, { cwd, stdio: "pipe" }).toString().trim();
+    const configureIdentity = (cwd: string) => {
+      run('git config user.email "test@example.com"', cwd);
+      run('git config user.name "Test User"', cwd);
+      run("git config commit.gpgsign false", cwd);
+    };
+
+    try {
+      run(`git init --bare ${originDir}`);
+      run(`git -C ${originDir} config uploadpack.allowFilter true`);
+
+      run(`git clone ${originDir} ${seedDir}`);
+      configureIdentity(seedDir);
+      await writeFile(path.join(seedDir, "README.md"), "init\n");
+      run("git add README.md", seedDir);
+      run('git commit -m "init"', seedDir);
+      run("git branch -M main", seedDir);
+      run("git push -u origin main", seedDir);
+      run("git symbolic-ref HEAD refs/heads/main", originDir);
+
+      run(`git clone ${originDir} ${workspaceDir}`);
+      configureIdentity(workspaceDir);
+
+      // Push a feature branch whose blob the workspace will only ever see
+      // through a filtered fetch.
+      run("git checkout -b feature", seedDir);
+      await writeFile(path.join(seedDir, "orphan.txt"), "blob that will be orphaned upstream\n");
+      run("git add orphan.txt", seedDir);
+      run('git commit -m "orphan"', seedDir);
+      run("git push origin feature", seedDir);
+
+      // Poison the workspace and pin the blobless commit with a local branch.
+      run("git fetch origin --filter=blob:none", workspaceDir);
+      run("git branch keep origin/feature", workspaceDir);
+
+      // Delete the branch upstream: --refetch can no longer re-send its blob.
+      run("git push origin :feature", seedDir);
+
+      const output = run(GIT_FETCH_SCRIPT, workspaceDir);
+      expect(output).toContain(
+        "HEAL: objects still missing after refetch; keeping promisor config"
+      );
+
+      // Promisor config retained so the lazy-fetch fallback keeps working.
+      expect(run("git config --local --get remote.origin.partialclonefilter", workspaceDir)).toBe(
+        "blob:none"
+      );
+      // Incomplete-heal marker set: retries are throttled to daily.
+      expect(
+        Number(run("git config --local --get xum.promisorHealIncompleteAt", workspaceDir))
+      ).toBeGreaterThan(0);
+
+      // Within the daily window a second run must not attempt another refetch.
+      const secondOutput = run(GIT_FETCH_SCRIPT, workspaceDir);
+      expect(secondOutput).not.toContain("HEAL:");
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  }, 20000);
 });
