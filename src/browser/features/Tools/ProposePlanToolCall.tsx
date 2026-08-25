@@ -581,6 +581,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     snapshot: TargetAgentSwitchSnapshot
   ) => {
     if (!workspaceId || !api) return;
+    // A newer pick made while the send was in flight is authoritative:
+    // restoring the pre-send agent (locally or backend-side) would clobber it.
+    if (readPersistedState<string | null>(getAgentIdKey(workspaceId), null) !== targetAgentId) {
+      return;
+    }
     try {
       await api.workspace.updateAgentAISettings({
         workspaceId,
@@ -592,6 +597,37 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       // Best-effort restore only.
     }
     rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
+  };
+
+  // A successful send does not guarantee the switch is durable: its settings
+  // persistence is best-effort (failures only log). Persist the selection
+  // explicitly — unless the user already picked another agent mid-send, in
+  // which case that newer write is authoritative and persisting this action's
+  // target would overwrite it (and its metadata echo would flip the UI back).
+  // A failed or rejected persistence leaves the backend on the previous
+  // agent, so restore the optimistic local switch instead of silently
+  // diverging.
+  const persistTargetAgentSwitchAfterSend = async (
+    targetAgentId: string,
+    snapshot: TargetAgentSwitchSnapshot
+  ) => {
+    if (!workspaceId || !api) return;
+    if (readPersistedState<string | null>(getAgentIdKey(workspaceId), null) !== targetAgentId) {
+      return;
+    }
+    try {
+      const persistResult = await api.workspace.updateAgentAISettings({
+        workspaceId,
+        agentId: targetAgentId,
+        aiSettings: null,
+        persistSelectedAgentId: true,
+      });
+      if (!persistResult.success) {
+        rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
+      }
+    } catch {
+      rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
+    }
   };
 
   const handleImplement = async () => {
@@ -641,28 +677,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         },
       });
       if (sendResult.success) {
-        // A successful send does not guarantee the switch is durable: its
-        // settings persistence is best-effort (failures only log). Persist the
-        // selection explicitly, then release the guard either way — backend
-        // echoes carry the authoritative agent, and a successful no-op write
-        // emits no echo to release it for us. A failed or rejected persistence
-        // leaves the backend on the previous agent, so restore the optimistic
-        // local switch instead of silently diverging.
-        try {
-          const persistResult = await api.workspace.updateAgentAISettings({
-            workspaceId,
-            agentId: targetAgentId,
-            aiSettings: null,
-            persistSelectedAgentId: true,
-          });
-          if (!persistResult.success) {
-            rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
-          }
-        } catch {
-          rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
-        } finally {
-          clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
-        }
+        // Release the guard either way — backend echoes carry the
+        // authoritative agent, and a successful no-op write emits no echo to
+        // release it for us.
+        await persistTargetAgentSwitchAfterSend(targetAgentId, snapshot);
+        clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
       } else {
         // Failed send: nothing will echo and a stuck guard would block
         // backend agent seeds indefinitely.
@@ -728,25 +747,10 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
           thinkingLevel: resolvedThinking,
         },
       });
-      // See handleImplement: persist the selection explicitly (send-side
-      // persistence is best-effort), roll the optimistic switch back when the
-      // transition fails, then release the guard.
+      // See handleImplement: persist explicitly, then release the guard.
       if (sendResult.success) {
-        try {
-          const persistResult = await api.workspace.updateAgentAISettings({
-            workspaceId,
-            agentId: targetAgentId,
-            aiSettings: null,
-            persistSelectedAgentId: true,
-          });
-          if (!persistResult.success) {
-            rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
-          }
-        } catch {
-          rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
-        } finally {
-          clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
-        }
+        await persistTargetAgentSwitchAfterSend(targetAgentId, snapshot);
+        clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
       } else {
         await rollbackFailedSendAgentSwitch(targetAgentId, snapshot);
         clearPendingWorkspaceAgentId(workspaceId, targetAgentId);

@@ -53,6 +53,7 @@ function createHarness(
   initial: WorkspaceState,
   options?: {
     agents?: AgentDescriptor[];
+    parentWorkspaceId?: string;
   }
 ): {
   client: ORPCClient;
@@ -102,6 +103,9 @@ function createHarness(
         agentId: workspaceState.agentId,
         aiSettings: workspaceState.aiSettings,
         aiSettingsByAgent: workspaceState.aiSettingsByAgent,
+        ...(options?.parentWorkspaceId != null
+          ? { parentWorkspaceId: options.parentWorkspaceId }
+          : {}),
       }),
       updateModeAISettings: async (input: {
         workspaceId: string;
@@ -292,6 +296,32 @@ describe("ACP config options", () => {
     expect(harness.updateAgentCalls).toHaveLength(1);
     expect(harness.updateAgentCalls[0]?.agentId).toBe("exec");
     expect(harness.updateAgentCalls[0]?.persistSelectedAgentId).toBe(true);
+  });
+
+  it("keeps mode changes session-local for child workspaces", async () => {
+    const harness = createHarness(
+      {
+        agentId: "plan",
+        aiSettings: { model: "anthropic:claude-opus-4-6", thinkingLevel: "high" },
+        aiSettingsByAgent: {
+          plan: { model: "anthropic:claude-opus-4-6", thinkingLevel: "high" },
+          exec: { model: "openai:gpt-5.2", thinkingLevel: "low" },
+        },
+      },
+      { parentWorkspaceId: "ws-parent" }
+    );
+
+    await handleSetConfigOption(harness.client, "ws-1", AGENT_MODE_CONFIG_ID, "exec", {
+      activeAgentId: "plan",
+    });
+
+    // A child's creation-time agent is its locked identity and backend
+    // scheduled dispatch reads the persisted agentId directly, so the switch
+    // must stay session-local: settings-only writes, no selected-agent
+    // persistence.
+    expect(harness.updateModeCalls).toHaveLength(1);
+    expect(harness.updateModeCalls[0]?.mode).toBe("exec");
+    expect(harness.updateAgentCalls).toHaveLength(0);
   });
 
   it("preserves pro reasoning mode across model and thinking level changes", async () => {

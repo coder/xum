@@ -602,6 +602,62 @@ describe("ProposePlanToolCall", () => {
     );
   });
 
+  test("keeps a newer agent pick when the Implement send fails", async () => {
+    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
+
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({
+      sendMessage: (args) => {
+        sendMessageCalls.push(args);
+        // The user picks another agent while the send is in flight; the
+        // failure compensation must not clobber that newer choice.
+        updatePersistedState(getAgentIdKey(WORKSPACE_ID), "reviewer");
+        return Promise.resolve({ success: false as const, error: "send rejected" });
+      },
+    });
+
+    const view = renderCompletedPlan();
+
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+    // Guard release still happens for this action's target.
+    await waitFor(() =>
+      expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true)
+    );
+    // No compensating backend restore and no local rollback: the newer pick wins.
+    expect(updateAgentAISettingsCalls).toHaveLength(0);
+    expect(JSON.parse(window.localStorage.getItem(getAgentIdKey(WORKSPACE_ID))!)).toBe("reviewer");
+  });
+
+  test("skips explicit selection persistence when the user switched agents mid-send", async () => {
+    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
+
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({
+      sendMessage: (args) => {
+        sendMessageCalls.push(args);
+        // A newer pick lands while the send is in flight: persisting this
+        // action's exec target afterwards would overwrite it on the backend
+        // and echo the UI back to exec.
+        updatePersistedState(getAgentIdKey(WORKSPACE_ID), "reviewer");
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
+    });
+
+    const view = renderCompletedPlan();
+
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+    // Guard released without any write for this action's target.
+    await waitFor(() =>
+      expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true)
+    );
+    expect(updateAgentAISettingsCalls).toHaveLength(0);
+    expect(JSON.parse(window.localStorage.getItem(getAgentIdKey(WORKSPACE_ID))!)).toBe("reviewer");
+  });
+
   test("rolls back the optimistic switch when explicit selection persistence fails", async () => {
     startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
 

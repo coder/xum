@@ -397,8 +397,13 @@ export async function handleSetConfigOption(
         : {}),
     };
 
+    // Child workspaces keep their creation-time agent as their locked
+    // identity, and backend continuation/heartbeat dispatch resolves the
+    // persisted workspaceEntry.agentId directly — persisting a session-local
+    // ACP mode change there would redirect later scheduled work to the wrong
+    // agent. Keep mode changes session-local (settings only) for children.
     await persistAgentAiSettings(client, trimmedWorkspaceId, nextAgentId, normalizedAiSettings, {
-      persistSelectedAgentId: true,
+      persistSelectedAgentId: workspace.parentWorkspaceId == null,
     });
     if (args?.onAgentModeChanged != null) {
       await args.onAgentModeChanged(nextAgentId, normalizedAiSettings);

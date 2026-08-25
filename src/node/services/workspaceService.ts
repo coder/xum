@@ -9699,24 +9699,40 @@ export class WorkspaceService extends EventEmitter {
         // model in the meantime silently records 0 cost on the next stream
         // and budget enforcement quietly stops working.
         if (hasBudgetedResumableGoal(goal)) {
-          // Agent-only switches (null aiSettings) still redirect backend
-          // dispatches to the target agent, so gate every dispatch surface's
-          // fully resolved model: goal continuations remap plan/compact to
-          // exec, while heartbeats resolve the persisted agent as-is and add
-          // the activity snapshot's last-used model as a fallback layer.
+          // Selected-agent changes redirect backend dispatches even when
+          // settings are supplied (ACP mode switches), so gate every dispatch
+          // surface's fully resolved model: goal continuations remap
+          // plan/compact to exec — a bucket the submitted settings do not
+          // cover — while heartbeats resolve the persisted agent as-is and
+          // add the activity snapshot's last-used model as a fallback layer.
+          // Overlay the about-to-be-written bucket so a priced submission is
+          // not rejected against its own stale stored bucket.
           const gatedModels: string[] = [];
           if (normalizedSettings != null) {
             gatedModels.push(normalizedSettings.model);
-          } else if (options?.persistSelectedAgentId === true) {
+          }
+          if (options?.persistSelectedAgentId === true) {
+            const pendingBucket =
+              normalizedSettings != null
+                ? {
+                    agentId: normalizeAgentId(agentId, WORKSPACE_DEFAULTS.agentId),
+                    settings: normalizedSettings,
+                  }
+                : null;
             const kickoff = await this.resolveContinuationKickoffSendOptionsForAgent(
               workspaceId,
-              agentId
+              agentId,
+              pendingBucket
             );
-            if (kickoff?.model != null) {
+            if (kickoff?.model != null && !gatedModels.includes(kickoff.model)) {
               gatedModels.push(kickoff.model);
             }
-            const heartbeat = await this.resolveHeartbeatAiSettings(workspaceId, agentId);
-            if (heartbeat.resolved.selected.model !== kickoff?.model) {
+            const heartbeat = await this.resolveHeartbeatAiSettings(
+              workspaceId,
+              agentId,
+              pendingBucket
+            );
+            if (!gatedModels.includes(heartbeat.resolved.selected.model)) {
               gatedModels.push(heartbeat.resolved.selected.model);
             }
           }
@@ -13484,7 +13500,10 @@ export class WorkspaceService extends EventEmitter {
    */
   private async resolveContinuationKickoffSendOptionsForAgent(
     workspaceId: string,
-    overrideAgentId: string | null
+    overrideAgentId: string | null,
+    // Bucket an in-flight updateAgentAISettings is about to write: the
+    // pricing gate passes it so resolution reflects post-write state.
+    pendingBucket?: { agentId: string; settings: WorkspaceAISettings } | null
   ): Promise<SendMessageOptions | null> {
     const config = this.config.loadConfigOrDefault();
     const workspaceMatch = this.config.findWorkspace(workspaceId);
@@ -13508,7 +13527,10 @@ export class WorkspaceService extends EventEmitter {
       persistedAgentId === "plan" || persistedAgentId === "compact"
         ? WORKSPACE_DEFAULTS.agentId
         : persistedAgentId;
-    const selectedAgentSettings = workspaceEntry?.aiSettingsByAgent?.[agentId];
+    const selectedAgentSettings =
+      pendingBucket?.agentId === agentId
+        ? pendingBucket.settings
+        : workspaceEntry?.aiSettingsByAgent?.[agentId];
 
     // Unified interactive resolution: the workspace's own bucket, then
     // configured/definition defaults and the declared base chain, then the
@@ -14071,7 +14093,10 @@ export class WorkspaceService extends EventEmitter {
    */
   private async resolveHeartbeatAiSettings(
     workspaceId: string,
-    overrideAgentId: string | null
+    overrideAgentId: string | null,
+    // Bucket an in-flight updateAgentAISettings is about to write: the
+    // pricing gate passes it so resolution reflects post-write state.
+    pendingBucket?: { agentId: string; settings: WorkspaceAISettings } | null
   ): Promise<{
     agentId: string;
     resolved: Awaited<ReturnType<typeof resolveNodeAgentAiSettings>>;
@@ -14095,7 +14120,10 @@ export class WorkspaceService extends EventEmitter {
       overrideAgentId ?? workspaceEntry?.agentId,
       WORKSPACE_DEFAULTS.agentId
     );
-    const agentSettings = workspaceEntry?.aiSettingsByAgent?.[agentId];
+    const agentSettings =
+      pendingBucket?.agentId === agentId
+        ? pendingBucket.settings
+        : workspaceEntry?.aiSettingsByAgent?.[agentId];
 
     // Unified interactive resolution for the selected agent: its bucket,
     // configured/definition defaults and the declared base chain, then the
