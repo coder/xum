@@ -7,6 +7,7 @@ import {
   formatWorkflowTimeAgo,
   formatWorkflowTokens,
   hasDisplayableWorkflowReport,
+  shouldAutoActivateWorkflowsTab,
   workflowStructuredOutputEntries,
 } from "./workflowDisplay";
 
@@ -97,5 +98,20 @@ describe("workflowStructuredOutputEntries", () => {
     expect(workflowStructuredOutputEntries(null)).toEqual([]);
     expect(workflowStructuredOutputEntries([1, 2])).toEqual([]);
     expect(workflowStructuredOutputEntries("nope")).toEqual([]);
+  });
+});
+
+describe("shouldAutoActivateWorkflowsTab", () => {
+  test("activates only on a mounted zero-to-active transition", () => {
+    expect(shouldAutoActivateWorkflowsTab(0, 1)).toBe(true);
+    expect(shouldAutoActivateWorkflowsTab(0, 3)).toBe(true);
+  });
+  test("first observation never activates, so opening a workspace mid-run keeps the persisted tab", () => {
+    expect(shouldAutoActivateWorkflowsTab(null, 2)).toBe(false);
+  });
+  test("additional concurrent runs and run completion do not re-activate", () => {
+    expect(shouldAutoActivateWorkflowsTab(1, 2)).toBe(false);
+    expect(shouldAutoActivateWorkflowsTab(2, 0)).toBe(false);
+    expect(shouldAutoActivateWorkflowsTab(0, 0)).toBe(false);
   });
 });

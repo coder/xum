@@ -83,6 +83,20 @@ export function formatWorkflowCost(costUsd: number | null | undefined): string {
   return `$${costUsd.toFixed(2)}`;
 }
 
+/**
+ * Auto-surface gate for the Workflows tab: activate only when a mounted
+ * workspace transitions from zero to some active runs. A `null` previous count
+ * means "first observation" (workspace open / remount) — activating there
+ * would steal the user's persisted tab choice every time they visit a
+ * workspace with a run already in flight.
+ */
+export function shouldAutoActivateWorkflowsTab(
+  previousActiveRunCount: number | null,
+  activeRunCount: number
+): boolean {
+  return previousActiveRunCount === 0 && activeRunCount > 0;
+}
+
 /** Coarse relative time for run-history rows ("just now" / "5m ago" / "3h ago" / "2d ago"). */
 export function formatWorkflowTimeAgo(iso: string, now: number = Date.now()): string {
   const then = Date.parse(iso);
