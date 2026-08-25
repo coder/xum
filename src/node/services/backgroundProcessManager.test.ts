@@ -2113,6 +2113,33 @@ describe("BackgroundProcessManager", () => {
       expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
         Ok(true)
       );
+      await fs.rm(path.join(workspaceDir, ".hidden-survivor"), { recursive: true, force: true });
+
+      // A root that exists but is not a directory (torn/replaced state) proves nothing about
+      // records beneath the expected layout: probe error, never CLEAR.
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+      await fs.writeFile(workspaceDir, "not a directory");
+      const nonDirProbe = await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId);
+      expect(nonDirProbe.success).toBe(false);
+      await fs.rm(workspaceDir, { force: true });
+      await fs.mkdir(workspaceDir, { recursive: true });
+
+      // An unreadable/unsearchable root would leave the shell glob unmatched and read as
+      // CLEAR while records may sit beneath it — must fail the probe closed instead.
+      // kill/access semantics differ for uid 0 (root reads anything), so skip there.
+      if (process.getuid?.() !== 0) {
+        await writeSpawnRecord("hidden-by-perms", { pid: process.pid, status: "running" });
+        await fs.chmod(workspaceDir, 0o000);
+        try {
+          const unreadableProbe = await manager.hasUnsettledRemoteSpawnRecords(
+            remote,
+            orphanWorkspaceId
+          );
+          expect(unreadableProbe.success).toBe(false);
+        } finally {
+          await fs.chmod(workspaceDir, 0o755);
+        }
+      }
     });
 
     it("treats running records under extra record dirs as live without host PID probes", async () => {

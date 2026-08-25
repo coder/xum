@@ -11201,7 +11201,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     try {
       refused = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
         queuedDelegatedTurnCount: 0,
-        expectRunningDelegatedStream: false,
+        expectedDelegatedTurnCorrelations: [],
       });
     } finally {
       release();
@@ -11217,7 +11217,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const pendingOpen = workspaceService.recordExternalEditorOpenForLaunch(workspaceId);
     const refusedByOpen = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
       queuedDelegatedTurnCount: 0,
-      expectRunningDelegatedStream: false,
+      expectedDelegatedTurnCorrelations: [],
     });
     expect(refusedByOpen.success).toBe(false);
     if (!refusedByOpen.success) {
@@ -11233,7 +11233,7 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     // through the sink, refusing new user admissions exactly like the sink's own gate.
     const hold = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
       queuedDelegatedTurnCount: 0,
-      expectRunningDelegatedStream: false,
+      expectedDelegatedTurnCorrelations: [],
     });
     expect(hold.success).toBe(true);
     if (!hold.success) return;
@@ -11251,6 +11251,94 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const allowed = await workspaceService.recordExternalEditorOpen(workspaceId, "tok-hold-2");
     expect(allowed.success).toBe(true);
     await fsPromises.rm("/tmp/test/sessions/external-editor-opened", { force: true });
+  });
+
+  test("acquirePreInterruptionArchiveHold binds the stream exemption to the delegated turns", () => {
+    const delegated = { taskHandleId: "wt-1", ownerWorkspaceId: "owner-1", turnId: "turn-1" };
+    const streamMeta: Record<string, unknown> = { type: "workspace-turn-task", ...delegated };
+    Object.assign(mockAIService, {
+      isStreaming: mock(() => true),
+      getStreamInfo: mock(() => ({ muxMetadata: streamMeta })),
+    });
+
+    // The active stream carries the collected turn's exact correlation: interruptible
+    // delegated work, so the hold is granted.
+    const held = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [delegated],
+    });
+    expect(held.success).toBe(true);
+    if (held.success) held.data[Symbol.dispose]();
+
+    // A stream correlated to a DIFFERENT turn (the collected turn ended and something else
+    // took the workspace's stream slot) must refuse — interruption would stopStream() it.
+    streamMeta.turnId = "turn-2";
+    const refusedMismatch = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [delegated],
+    });
+    expect(refusedMismatch.success).toBe(false);
+    if (!refusedMismatch.success) {
+      expect(refusedMismatch.error).toContain("not attributable to the delegated turns");
+    }
+
+    // A stream with no correlation metadata (a plain user stream that replaced the ended
+    // delegated stream) also refuses, even though a running delegated turn was collected —
+    // the stale collection must not exempt whichever stream happens to be active now.
+    Object.assign(mockAIService, {
+      getStreamInfo: mock(() => ({ muxMetadata: undefined })),
+    });
+    const refusedPlain = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [delegated],
+    });
+    expect(refusedPlain.success).toBe(false);
+    if (!refusedPlain.success) {
+      expect(refusedPlain.error).toContain("not attributable to the delegated turns");
+    }
+  });
+
+  test("acquirePreInterruptionArchiveHold freezes queue dispatch for the hold's lifetime", () => {
+    // A queued delegated entry that dispatched into PREPARING between the hold and turn
+    // interruption would evade the interrupt's targeted queue removal, so the hold must
+    // acquire the session's turn-admission block when it arms and release it on dispose.
+    const session = workspaceService.getOrCreateSession(workspaceId);
+    const realHoldTurnAdmission = session.holdTurnAdmission.bind(session);
+    let releases = 0;
+    const holdTurnAdmissionSpy = mock(() => {
+      const inner = realHoldTurnAdmission();
+      return {
+        [Symbol.dispose]: () => {
+          releases += 1;
+          inner[Symbol.dispose]();
+        },
+      };
+    });
+    session.holdTurnAdmission = holdTurnAdmissionSpy;
+
+    const held = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [],
+    });
+    expect(held.success).toBe(true);
+    expect(holdTurnAdmissionSpy).toHaveBeenCalledTimes(1);
+    if (!held.success) return;
+    // Held across interruption and the sink — not released before the caller disposes.
+    expect(releases).toBe(0);
+    held.data[Symbol.dispose]();
+    expect(releases).toBe(1);
+
+    // A refused hold must not leak the admission block either.
+    Object.assign(mockAIService, {
+      isStreaming: mock(() => true),
+      getStreamInfo: mock(() => undefined),
+    });
+    const refused = workspaceService.acquirePreInterruptionArchiveHold(workspaceId, {
+      queuedDelegatedTurnCount: 0,
+      expectedDelegatedTurnCorrelations: [],
+    });
+    expect(refused.success).toBe(false);
+    expect(releases).toBe(2);
   });
 
   test("fork() refuses while the source workspace is being archived", async () => {

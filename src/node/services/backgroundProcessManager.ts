@@ -748,6 +748,32 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   }
 
   /**
+   * Allocate a unique process ID and reserve it in the same synchronous step.
+   *
+   * Foreground-to-background migration awaits between choosing its ID and registering the
+   * migrated process; without a reservation, two concurrent same-name migrations would both
+   * be handed the same ID and share one output directory and manager entry — the first exit
+   * would then write the shared exit marker and settle the survivor's records, blinding
+   * archive gating after an unclean restart. Callers release on success only after the
+   * process is registered (the processes map then holds the name) and on failure only once
+   * the process's exit settles, so an unverifiable survivor keeps its name reserved for the
+   * session.
+   */
+  reserveUniqueProcessId(baseId: string): { processId: string; release: () => void } {
+    const processId = this.generateUniqueProcessId(baseId);
+    this.reservedProcessIds.add(processId);
+    let released = false;
+    return {
+      processId,
+      release: () => {
+        if (released) return;
+        released = true;
+        this.reservedProcessIds.delete(processId);
+      },
+    };
+  }
+
+  /**
    * Spawn a new process with background-style infrastructure.
    *
    * All processes are spawned with nohup/setsid and file-based output,
@@ -1839,9 +1865,23 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // Process IDs derive from display names, which may legally start with "." (only "." and
       // ".." themselves are rejected), so also enumerate hidden record dirs — a bare "*/" glob
       // would silently skip them and report CLEAR under a live dot-named job.
+      // Only a genuinely absent root proves no records: an existing root that is not a
+      // readable+searchable directory (ownership/permission change, or replaced by a file)
+      // would leave the glob unmatched and read as CLEAR while records may sit beneath it,
+      // so those cases emit UNREADABLE and fail the probe closed. `test -e` also returns
+      // false when an ancestor is unsearchable, so absence is only trusted when the parent
+      // directory itself is traversable.
       const script = [
         `root=${quotePathForShell(root)}`,
-        `if [ ! -e "$root" ]; then echo __MUX_BG_REMOTE_CLEAR__; exit 0; fi`,
+        `if [ -d "$root" ]; then`,
+        `  if [ ! -r "$root" ] || [ ! -x "$root" ]; then echo __MUX_BG_REMOTE_UNREADABLE__; exit 0; fi`,
+        `elif [ -e "$root" ] || [ -L "$root" ]; then`,
+        `  echo __MUX_BG_REMOTE_UNREADABLE__; exit 0`,
+        `else`,
+        `  parent=$(dirname "$root")`,
+        `  if [ -d "$parent" ] && { [ ! -r "$parent" ] || [ ! -x "$parent" ]; }; then echo __MUX_BG_REMOTE_UNREADABLE__; exit 0; fi`,
+        `  echo __MUX_BG_REMOTE_CLEAR__; exit 0`,
+        `fi`,
         `unsettled=0`,
         `for p in "$root"/*/ "$root"/.*/; do`,
         `  case "$p" in */./|*/../) continue ;; esac`,
@@ -1857,6 +1897,11 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       ].join("\n");
       const result = await execBuffered(runtime, script, { cwd: "/tmp", timeout: 15 });
       if (result.exitCode === 0) {
+        if (result.stdout.includes("__MUX_BG_REMOTE_UNREADABLE__")) {
+          return Err(
+            `remote spawn-record root ${root} exists but is not a readable directory; cannot verify background jobs are settled`
+          );
+        }
         if (result.stdout.includes("__MUX_BG_REMOTE_UNSETTLED__")) return Ok(true);
         if (result.stdout.includes("__MUX_BG_REMOTE_CLEAR__")) return Ok(false);
       }

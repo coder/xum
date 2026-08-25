@@ -1650,22 +1650,23 @@ describe("TaskService", () => {
     );
     expect(archive).not.toHaveBeenCalled();
 
-    const interrupted = await taskService.archiveOwnedWorkspaceTurnWorkspace(
+    // interrupt_active does not cascade into turns running in OTHER workspaces: the nested
+    // workspace never gets the activity checks and admission holds the target does, so
+    // interruption (and any disposable cleanup) there could destroy user work unseen.
+    const refusedNested = await taskService.archiveOwnedWorkspaceTurnWorkspace(
       parentId,
       { workspaceId: "childworkspace" },
       { interruptActive: true }
     );
 
-    expect(interrupted).toEqual(
-      Ok({
-        status: "archived",
-        action: "archive",
-        workspaceId: "childworkspace",
-        displayName: "Child workspace",
-      })
-    );
+    expect(refusedNested.success).toBe(true);
+    if (refusedNested.success) {
+      expect(refusedNested.data.status).toBe("active");
+      expect(refusedNested.data.note).toContain("nested workspaces (grandchildworkspace)");
+    }
+    expect(archive).not.toHaveBeenCalled();
     const nested = await taskHandleStore.getWorkspaceTurn("childworkspace", "wst_nested");
-    expect(nested?.status).toBe("interrupted");
+    expect(nested?.status).toBe("running");
   });
 
   test("workspace lifecycle preflights lossy confirmation before interrupting active turns", async () => {
@@ -2302,7 +2303,7 @@ describe("TaskService", () => {
     expect(harness.archive).not.toHaveBeenCalled();
   });
 
-  test("workspace lifecycle defers nested disposable cleanup until after the archive", async () => {
+  test("workspace lifecycle refuses interrupt_active for nested disposable turn workspaces", async () => {
     const harness = await createWorkspaceLifecycleHarness();
     await harness.config.editConfig((cfg) => {
       for (const [, project] of cfg.projects) {
@@ -2319,9 +2320,12 @@ describe("TaskService", () => {
       }
       return cfg;
     });
-    // Nested turn OWNED BY the archive target, running in its own disposable workspace: its
-    // normal auto-removal must still happen (the archived owner could never clean it up via
-    // the lifecycle API), just deferred until the archive released its locks.
+    // Nested turn OWNED BY the archive target, running in its own disposable workspace:
+    // interrupting it would trigger that workspace's disposable force-removal without any of
+    // the activity checks or admission holds the target gets — user terminals/editors/queued
+    // work there would be destroyed unseen. interrupt_active must refuse instead of
+    // cascading; the caller stops the turn explicitly (task_stop), which runs the same
+    // user-visible cleanup as normal settlement.
     await harness.taskHandleStore.upsertWorkspaceTurn({
       kind: "workspace_turn",
       handleId: "wst_nested",
@@ -2347,20 +2351,20 @@ describe("TaskService", () => {
       { interruptActive: true }
     );
 
-    expect(result).toEqual(
-      Ok({
-        status: "archived",
-        action: "archive",
-        workspaceId: "childworkspace",
-        displayName: "Child workspace",
-      })
-    );
-    expect(harness.remove).toHaveBeenCalledWith("grandchildworkspace", true);
-    const interrupted = await harness.taskHandleStore.getWorkspaceTurn(
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.status).toBe("active");
+      expect(result.data.activeTaskIds).toEqual(["wst_nested"]);
+      expect(result.data.note).toContain("nested workspaces (grandchildworkspace)");
+    }
+    expect(harness.archive).not.toHaveBeenCalled();
+    // Nothing was interrupted or removed: the nested turn and its workspace are untouched.
+    expect(harness.remove).not.toHaveBeenCalled();
+    const nestedRecord = await harness.taskHandleStore.getWorkspaceTurn(
       "childworkspace",
       "wst_nested"
     );
-    expect(interrupted?.status).toBe("interrupted");
+    expect(nestedRecord?.status).toBe("running");
   });
 
   test("workspace lifecycle refuses archive while background bash processes are running", async () => {

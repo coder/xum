@@ -175,10 +175,12 @@ import { UIModeSchema, type UIMode } from "@/common/types/mode";
 import {
   createMuxMessage,
   getCompactionFollowUpContent,
+  parseWorkspaceTurnTaskCorrelation,
   pickPreservedSendOptions,
   type CompactionFollowUpRequest,
   type MuxMessageMetadata,
   type MuxMessage,
+  type WorkspaceTurnTaskCorrelation,
 } from "@/common/types/message";
 import { getFollowUpContentText } from "@/browser/utils/compaction/format";
 import { stripStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
@@ -8192,7 +8194,17 @@ export class WorkspaceService extends EventEmitter {
    */
   acquirePreInterruptionArchiveHold(
     workspaceId: string,
-    options: { queuedDelegatedTurnCount: number; expectRunningDelegatedStream: boolean }
+    options: {
+      queuedDelegatedTurnCount: number;
+      /**
+       * Correlations of the collected active (starting/running) delegated turns on this
+       * workspace. The workspace's one active stream is exempt only when its muxMetadata
+       * correlates to one of these turns; a stream without that exact correlation (a user
+       * stream that replaced an ended delegated stream, or one belonging to a different
+       * turn) refuses the hold so interruption cannot stopStream() user work.
+       */
+      expectedDelegatedTurnCorrelations: readonly WorkspaceTurnTaskCorrelation[];
+    }
   ): Result<Disposable> {
     assert(workspaceId.length > 0, "acquirePreInterruptionArchiveHold requires workspaceId");
     assert(
@@ -8200,9 +8212,19 @@ export class WorkspaceService extends EventEmitter {
       "acquirePreInterruptionArchiveHold requires a non-negative queuedDelegatedTurnCount"
     );
     this.archivingWorkspaces.add(workspaceId);
+    const session = this.getOrCreateSession(workspaceId);
+    // Freeze queue dispatch for the hold's whole lifetime (through interruption and the
+    // sink): counting queued delegated entries below is not enough on its own, because an
+    // expected entry could leave the queue and enter PREPARING between this check and
+    // interruptWorkspaceTurn's targeted queue removal — the interrupt would then mark the
+    // handle interrupted without stopping the dispatch, and the sink would refuse on the
+    // pending turn work with the tasks already destroyed. Admission blocks stack, so the
+    // sink acquiring its own hold is fine.
+    const turnAdmissionHold = session.holdTurnAdmission();
     const hold: Disposable = {
       [Symbol.dispose]: () => {
         this.archivingWorkspaces.delete(workspaceId);
+        turnAdmissionHold[Symbol.dispose]();
       },
     };
     const activityLabels: string[] = [];
@@ -8210,11 +8232,26 @@ export class WorkspaceService extends EventEmitter {
       activityLabels.push("a message send in progress");
     }
     // A user stream admitted after the caller's activity snapshot has already released its
-    // send preflight, so the counter above cannot see it — recheck streaming itself. The one
-    // stream a workspace can run is expected only when the caller collected a delegated turn
-    // RUNNING on this workspace; anything else is user work the sink would refuse on.
-    if (!options.expectRunningDelegatedStream && this.aiService.isStreaming(workspaceId)) {
-      activityLabels.push("an active stream");
+    // send preflight, so the counter above cannot see it — recheck streaming itself and
+    // bind the exemption to the collected delegated turns: the caller's earlier snapshot is
+    // stale by now, so only a stream whose correlation metadata names one of those turns is
+    // interruptible delegated work. Anything else (no stream info, no correlation, or a
+    // different turn) is treated as user work and refuses.
+    if (this.aiService.isStreaming(workspaceId)) {
+      const streamCorrelation = parseWorkspaceTurnTaskCorrelation(
+        this.aiService.getStreamInfo(workspaceId)?.muxMetadata
+      );
+      const streamIsExpectedDelegatedTurn =
+        streamCorrelation != null &&
+        options.expectedDelegatedTurnCorrelations.some(
+          (expected) =>
+            expected.taskHandleId === streamCorrelation.taskHandleId &&
+            expected.ownerWorkspaceId === streamCorrelation.ownerWorkspaceId &&
+            expected.turnId === streamCorrelation.turnId
+        );
+      if (!streamIsExpectedDelegatedTurn) {
+        activityLabels.push("an active stream not attributable to the delegated turns");
+      }
     }
     if ((this.preflightExecCounts.get(workspaceId) ?? 0) > 0) {
       activityLabels.push("a bash command executing");
@@ -8250,10 +8287,11 @@ export class WorkspaceService extends EventEmitter {
     if (this.desktopSessionManager?.has(workspaceId) === true) {
       activityLabels.push("a desktop session");
     }
-    const session = this.getOrCreateSession(workspaceId);
     // Narrow PREPARING/auto-retry check, NOT hasPendingQueuedOrPreparingTurn: that predicate
     // also reports plain queued messages, which would refuse every interrupt_active on a
     // queued delegated turn before the entry-count comparison below could attribute it.
+    // (Queued entries cannot dispatch into PREPARING after this check: the turn-admission
+    // hold above freezes queue dispatch for the hold's lifetime.)
     if (session.isPreparingTurn() || session.hasPendingAutoRetry()) {
       // A dispatching (PREPARING) entry has left the queue but not yet registered a
       // stream, so the queue comparison below cannot attribute it — fail closed.

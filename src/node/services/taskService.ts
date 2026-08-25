@@ -71,7 +71,12 @@ import {
   type BackgroundWorkAttentionPolicy,
 } from "@/common/types/backgroundWorkAttention";
 
-import { createMuxMessage, type MuxMessage, type MuxMessageMetadata } from "@/common/types/message";
+import {
+  createMuxMessage,
+  parseWorkspaceTurnTaskCorrelation,
+  type MuxMessage,
+  type MuxMessageMetadata,
+} from "@/common/types/message";
 import {
   createCompactionSummaryMessageId,
   createTaskFailureMessageId,
@@ -9330,10 +9335,6 @@ export class TaskService {
     );
     if ("status" in resolved) return Ok(resolved);
 
-    // Nested disposable workspace-turn workspaces interrupted for this archive: their normal
-    // auto-removal must not run while the archive holds its locks (removal acquires the nested
-    // child's own task-tree lock), so it is deferred until after the locks release.
-    const deferredDisposableCleanups: WorkspaceTurnTaskHandleRecord[] = [];
     // Global lock order: task-tree → task-creation mutex → workspace lifecycle (see the
     // workspaceLifecycleLocks declaration). Pre-acquire the target's task-tree lock here and
     // call the *WhileTaskTreeLocked archive sink so no path holds a lifecycle lock while
@@ -9542,6 +9543,31 @@ export class TaskService {
                   activeTaskIds: activeTurns.map((turn) => turn.handleId),
                 });
               }
+              // interrupt_active does not cascade into turns running in OTHER workspaces
+              // (the target's own nested workspace turns): interrupting one triggers the
+              // nested disposable workspace's force-removal, which would terminate any user
+              // terminals/editors/queued work there and delete its checkout without the
+              // activity checks and admission holds the target itself gets. Refuse instead;
+              // the caller stops those turns explicitly (task_stop), which is the same
+              // user-visible cleanup path as normal turn settlement.
+              const nestedTurnWorkspaceIds = [
+                ...new Set(
+                  activeTurns
+                    .filter((turn) => turn.workspaceId !== resolved.workspaceId)
+                    .map((turn) => turn.workspaceId)
+                ),
+              ];
+              if (nestedTurnWorkspaceIds.length > 0) {
+                return Ok({
+                  status: "active",
+                  action: "archive",
+                  ...this.lifecycleTargetFields(resolved),
+                  activeTaskIds: activeTurns.map((turn) => turn.handleId),
+                  note: `interrupt_active was not honored: some active turns run in nested workspaces (${nestedTurnWorkspaceIds.join(
+                    ", "
+                  )}) whose cleanup cannot be safely combined with this archive. Stop the listed turns (task_stop) or wait for them to finish, then archive again.`,
+                });
+              }
               // Snapshot-behavior archives are eligibility-mutation-sensitive: the running turns
               // being interrupted can create/remove untracked files between any preflight scan and
               // the sink's exact-acknowledgement recheck, so interruption could destroy in-flight
@@ -9632,11 +9658,19 @@ export class TaskService {
                     (turn) => turn.workspaceId === resolved.workspaceId && turn.status === "queued"
                   ).length,
                   // The workspace's one active stream is expected (and interruptible) only
-                  // when a collected delegated turn is RUNNING on the target itself; any
-                  // other stream is user work the hold must refuse on.
-                  expectRunningDelegatedStream: activeTurns.some(
-                    (turn) => turn.workspaceId === resolved.workspaceId && turn.status === "running"
-                  ),
+                  // when it correlates to a collected delegated turn active on the target
+                  // itself; any other stream (e.g. a user stream that replaced an ended
+                  // delegated stream since collection) is user work the hold must refuse on.
+                  expectedDelegatedTurnCorrelations: activeTurns
+                    .filter(
+                      (turn) =>
+                        turn.workspaceId === resolved.workspaceId && turn.status !== "queued"
+                    )
+                    .map((turn) => ({
+                      taskHandleId: turn.handleId,
+                      ownerWorkspaceId: turn.ownerWorkspaceId,
+                      turnId: turn.turnId,
+                    })),
                 }
               );
               if (!holdResult.success) {
@@ -9651,8 +9685,7 @@ export class TaskService {
               preInterruptionHold = holdResult.data;
               const interruptFailure = await this.interruptActiveWorkspaceLifecycleTurns(
                 resolved,
-                activeTurns,
-                deferredDisposableCleanups
+                activeTurns
               );
               if (interruptFailure != null) return Ok(interruptFailure);
             }
@@ -9701,12 +9734,6 @@ export class TaskService {
           }
         })
       );
-    // Locks are released: run the deferred disposable cleanup for nested turn workspaces whose
-    // auto-removal was suppressed during interruption. The archived target itself is never in
-    // this list (its records target resolved.workspaceId, which archive retains).
-    for (const record of deferredDisposableCleanups) {
-      await this.cleanupDisposableWorkspaceTurn(record);
-    }
     return lifecycleResult;
   }
 
@@ -9917,6 +9944,7 @@ export class TaskService {
       ownerWorkspaceId: string;
       handleId: string;
       workspaceId: string;
+      turnId: string;
       status: WorkspaceTurnTaskStatus;
     }>
   > {
@@ -9929,37 +9957,29 @@ export class TaskService {
       ownerWorkspaceId: record.ownerWorkspaceId,
       handleId: record.handleId,
       workspaceId: record.workspaceId,
+      turnId: record.turnId,
       status: record.status,
     }));
   }
 
   private async interruptActiveWorkspaceLifecycleTurns(
     resolved: ResolvedWorkspaceLifecycleTarget,
-    activeTurns: ReadonlyArray<{ ownerWorkspaceId: string; handleId: string; workspaceId: string }>,
-    // Receives interrupted nested disposable records (workspaceId !== the archived target)
-    // whose auto-removal was suppressed for lock ordering; the caller cleans them up after
-    // releasing the archive locks so they are not leaked unmanageable under an archived owner.
-    deferredDisposableCleanups: WorkspaceTurnTaskHandleRecord[]
+    activeTurns: ReadonlyArray<{ ownerWorkspaceId: string; handleId: string; workspaceId: string }>
   ): Promise<WorkspaceLifecycleResult | null> {
     for (const turn of activeTurns) {
-      // suppressDisposableCleanup: for turns targeting the archived workspace itself, the
-      // disposable auto-removal must not delete the checkout the archive is about to keep.
-      // For nested turns it must not run while the lifecycle path holds its locks (removal
-      // acquires the nested child's task-tree lock), so it is deferred instead of dropped.
+      // Every turn reaching this loop targets the archived workspace itself (nested turn
+      // workspaces refuse interrupt_active earlier), so suppressDisposableCleanup only has
+      // to protect the target's checkout: the disposable auto-removal that normally follows
+      // interruption must not delete the checkout the archive is about to keep.
+      assert(
+        turn.workspaceId === resolved.workspaceId,
+        "interruptActiveWorkspaceLifecycleTurns requires turns targeting the archived workspace"
+      );
       const interruptResult = await this.interruptWorkspaceTurn(
         turn.ownerWorkspaceId,
         turn.handleId,
         { suppressDisposableCleanup: true }
       );
-      if (interruptResult.success && turn.workspaceId !== resolved.workspaceId) {
-        const record = await this.taskHandleStore.getWorkspaceTurn(
-          turn.ownerWorkspaceId,
-          turn.handleId
-        );
-        if (record?.disposableWorkspace === true) {
-          deferredDisposableCleanups.push(record);
-        }
-      }
       if (!interruptResult.success) {
         // Turns can settle between collection and interruption (e.g. during the archive
         // preflight). A now-terminal handle needs no interruption and must not abort the
@@ -11682,20 +11702,7 @@ export class TaskService {
   private getWorkspaceTurnMetadataFromValue(
     muxMetadata: unknown
   ): { taskHandleId: string; ownerWorkspaceId: string; turnId: string } | null {
-    if (typeof muxMetadata !== "object" || muxMetadata == null || Array.isArray(muxMetadata)) {
-      return null;
-    }
-    const data = muxMetadata as Record<string, unknown>;
-    if (data.type !== "workspace-turn-task") {
-      return null;
-    }
-    const taskHandleId = coerceNonEmptyString(data.taskHandleId);
-    const ownerWorkspaceId = coerceNonEmptyString(data.ownerWorkspaceId);
-    const turnId = coerceNonEmptyString(data.turnId);
-    if (!taskHandleId || !ownerWorkspaceId || !turnId) {
-      return null;
-    }
-    return { taskHandleId, ownerWorkspaceId, turnId };
+    return parseWorkspaceTurnTaskCorrelation(muxMetadata);
   }
 
   private getWorkspaceTurnMetadata(

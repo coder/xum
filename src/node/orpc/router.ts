@@ -137,6 +137,7 @@ import {
   DEFAULT_WORKFLOW_AGENT_ID,
   WorkflowTaskServiceAdapter,
 } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
+import { acquireWorkflowArchiveAdmission } from "@/node/services/workflows/workflowArchiveAdmission";
 import { WorkflowArgsValidationError } from "@/node/services/workflows/workflowArgs";
 import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
 import { isProjectTrusted, isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
@@ -1984,6 +1985,12 @@ export const router = (authToken?: string) => {
         .input(schemas.workflows.resume.input)
         .output(schemas.workflows.resume.output)
         .handler(async ({ context, input }) => {
+          // Acquired before any await: resolveWorkflowContext suspends, and an
+          // interrupt_active archive entering during that window would see neither an
+          // admission nor a durable active run — it could destroy the delegated turns and
+          // archive the workspace before this request reaches the service-level admission.
+          // The service re-acquires its own admission; the counters stack.
+          using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
           const { service, projectTrusted } = await resolveWorkflowContext(
             context,
             input.workspaceId
@@ -2000,6 +2007,8 @@ export const router = (authToken?: string) => {
         .input(schemas.workflows.retryFromCheckpoint.input)
         .output(schemas.workflows.retryFromCheckpoint.output)
         .handler(async ({ context, input }) => {
+          // Entry-level admission; see workflows.resume above.
+          using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
           const { service, projectTrusted } = await resolveWorkflowContext(
             context,
             input.workspaceId,
@@ -2025,6 +2034,10 @@ export const router = (authToken?: string) => {
         .output(schemas.workflows.start.output)
         .handler(async ({ context, input, signal }) => {
           assertDynamicWorkflowsEnabled(context);
+          // Entry-level admission; see workflows.resume above. start additionally awaits
+          // workspace idleness and script resolution before reaching the service, widening
+          // the window an unguarded interrupt_active archive could slip through.
+          using _archiveAdmission = acquireWorkflowArchiveAdmission(input.workspaceId);
           let invocationMessagePersisted: boolean | undefined;
           let resolveInvocationPersistence: (persisted: boolean) => void = () => undefined;
           const invocationPersistence = new Promise<boolean>((resolve) => {

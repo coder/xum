@@ -1401,8 +1401,12 @@ ${scriptWithEnv}`;
             // Migrate to background tracking if manager is available
             let migrationError = "background process manager unavailable";
             if (config.backgroundProcessManager && config.workspaceId) {
-              const processId =
-                config.backgroundProcessManager.generateUniqueProcessId(safeDisplayName);
+              // Allocate-and-reserve atomically: the migration awaits below would otherwise
+              // let a concurrent same-name migration receive the same ID and share this
+              // process's output directory and manager entry (see reserveUniqueProcessId).
+              const reservation =
+                config.backgroundProcessManager.reserveUniqueProcessId(safeDisplayName);
+              const processId = reservation.processId;
 
               // Create a synthetic ExecStream for the migration streams
               // The UI streams are still being consumed, migration streams continue to files
@@ -1436,6 +1440,8 @@ ${scriptWithEnv}`;
                   migrateResult.outputDir,
                   safeDisplayName
                 );
+                // The processes map now holds the name; the reservation has done its job.
+                reservation.release();
 
                 return withNotice({
                   success: true,
@@ -1446,8 +1452,11 @@ ${scriptWithEnv}`;
                   backgroundProcessId: processId,
                 });
               }
-              // Migration failed, fall through to fail-closed termination below.
+              // Migration failed, fall through to fail-closed termination below. Keep the
+              // name reserved until the aborted process's exit actually settles; if it never
+              // does, leaking the name for the session is the safe fail-closed behavior.
               migrationError = migrateResult.error;
+              void execStream.exitCode.catch(() => undefined).finally(() => reservation.release());
             }
 
             // Migration failure (e.g. ENOSPC/EACCES creating the output dir) leaves neither a

@@ -675,6 +675,40 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
       }
   );
 
+/** Correlation identifying which delegated workspace turn a stream belongs to. */
+export interface WorkspaceTurnTaskCorrelation {
+  taskHandleId: string;
+  ownerWorkspaceId: string;
+  turnId: string;
+}
+
+/**
+ * Parse untyped muxMetadata (from persisted history or live stream info) into a
+ * workspace-turn correlation. Returns null unless the value is a well-formed
+ * "workspace-turn-task" marker — callers use this to attribute a workspace's active
+ * stream to a specific delegated turn (e.g. archive interruption must not stop a user
+ * stream that replaced an ended delegated stream).
+ */
+export function parseWorkspaceTurnTaskCorrelation(
+  muxMetadata: unknown
+): WorkspaceTurnTaskCorrelation | null {
+  if (typeof muxMetadata !== "object" || muxMetadata == null || Array.isArray(muxMetadata)) {
+    return null;
+  }
+  const data = muxMetadata as Record<string, unknown>;
+  if (data.type !== "workspace-turn-task") {
+    return null;
+  }
+  const taskHandleId = typeof data.taskHandleId === "string" ? data.taskHandleId.trim() : "";
+  const ownerWorkspaceId =
+    typeof data.ownerWorkspaceId === "string" ? data.ownerWorkspaceId.trim() : "";
+  const turnId = typeof data.turnId === "string" ? data.turnId.trim() : "";
+  if (taskHandleId.length === 0 || ownerWorkspaceId.length === 0 || turnId.length === 0) {
+    return null;
+  }
+  return { taskHandleId, ownerWorkspaceId, turnId };
+}
+
 export function getCompactionFollowUpContent(
   metadata?: MuxMessageMetadata
 ): CompactionRequestData["followUpContent"] | undefined {
