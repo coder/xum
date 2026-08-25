@@ -129,6 +129,20 @@ describe("ExtensionMetadataService", () => {
     expect(await service.getSidebarStatusInputHash("ws-hash")).toBeNull();
   });
 
+  test("a todo-path clear orphans the hash and the reader treats it as absent", async () => {
+    await service.setSidebarStatus(
+      "ws-hash",
+      { emoji: "🛠️", message: "Editing source" },
+      { inputHash: "hash-1" }
+    );
+    expect(await service.getSidebarStatusInputHash("ws-hash")).toBe("hash-1");
+
+    // setTodoStatus clears the shared todoStatus slot without touching the
+    // hash; the reader must not hand back a hash with no status behind it.
+    await service.setTodoStatus("ws-hash", null, false);
+    expect(await service.getSidebarStatusInputHash("ws-hash")).toBeNull();
+  });
+
   test("sidebar status input hash survives unrelated metadata mutations", async () => {
     // Mutators round-trip entries through coerceExtensionMetadata; dropping
     // the hash there would silently reintroduce regenerate-on-restart after

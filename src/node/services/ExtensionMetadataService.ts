@@ -311,7 +311,14 @@ export class ExtensionMetadataService {
    */
   async getSidebarStatusInputHash(workspaceId: string): Promise<string | null> {
     const data = await this.load();
-    return coerceExtensionMetadata(data.workspaces[workspaceId])?.sidebarStatusInputHash ?? null;
+    const entry = coerceExtensionMetadata(data.workspaces[workspaceId]);
+    // Codex review: other writers (setTodoStatus, setStreaming) clear or
+    // replace the shared todoStatus slot without touching the hash. A hash
+    // with no live status behind it is orphaned and must read as absent —
+    // otherwise a restart would dedup an unchanged transcript against a
+    // cleared slot and leave the sidebar blank until the transcript changed.
+    if (!entry?.todoStatus) return null;
+    return entry.sidebarStatusInputHash ?? null;
   }
 
   /**

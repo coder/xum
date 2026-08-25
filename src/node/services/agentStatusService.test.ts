@@ -1057,6 +1057,28 @@ describe("AgentStatusService", () => {
     });
   });
 
+  test("restart: does not dedup against a hash orphaned by a todo-path clear", async () => {
+    // Codex review: setTodoStatus(null) clears the shared todoStatus slot
+    // without touching the persisted hash. The orphaned hash must not
+    // suppress regeneration after a restart, or the sidebar stays blank
+    // until the transcript changes.
+    await historyHandle.historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("u1", "user", "Idle workspace")
+    );
+
+    await withRestartableMetadata(async ({ newInstance }) => {
+      await newInstance().runForWorkspace(workspaceId);
+      expect(generateSpy).toHaveBeenCalledTimes(1);
+
+      // Todo path clears the slot (e.g. stream stopped with an empty todo list).
+      await mockExtensionMetadata.setTodoStatus(workspaceId, null, false);
+
+      await newInstance().runForWorkspace(workspaceId, 0);
+      expect(generateSpy).toHaveBeenCalledTimes(2);
+    });
+  });
+
   test("restart: persisted hash folds the streaming bit so an idle restart regenerates", async () => {
     await historyHandle.historyService.appendToHistory(
       workspaceId,
