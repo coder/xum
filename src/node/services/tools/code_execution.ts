@@ -302,6 +302,17 @@ function compactKernelToolCallRecords(result: PTCExecutionResult, loadActive: bo
         ...(record.error !== undefined ? { error: boundCompactRecordError(record.error) } : {}),
       };
     }
+    // A result already replaced by a __kernelBounded marker at capture
+    // (execution-wide retained budget exhausted) carries no extractable
+    // payload: the name-based persistence exemption below would keep the
+    // marker as the record's result, and edit extractors would then see a
+    // result without success:true and drop the record's PATH attribution
+    // too. Compact it normally instead — the result-less {ok, bytes} summary
+    // keeps crash-safe edited-file tracking and reports the honest size.
+    const captureBounded =
+      typeof record.result === "object" &&
+      record.result !== null &&
+      (record.result as { __kernelBounded?: boolean }).__kernelBounded === true;
     // Exempt records also keep their result (see isKernelRecordResultExempt;
     // creation-time capture bounding applies the same predicate, so the full
     // payload actually reaches this point): persistence extractors mine
@@ -309,7 +320,7 @@ function compactKernelToolCallRecords(result: PTCExecutionResult, loadActive: bo
     // after compaction, and media containers from bridged MCP tools must
     // reach request-time attachment extraction or RLM users could never see
     // bridged screenshots/images.
-    if (isKernelRecordResultExempt(record.toolName, record.result)) {
+    if (!captureBounded && isKernelRecordResultExempt(record.toolName, record.result)) {
       return {
         ...record,
         args: boundCompactRecordArgs(record.args),

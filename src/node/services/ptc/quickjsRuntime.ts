@@ -679,8 +679,23 @@ export class QuickJSRuntime implements IJSRuntime {
         budget.remainingBytes -= size;
         return retained;
       }
-      // Budget exhausted: fall through to normal bounding — oversized
-      // results become honest-size markers, small results still pass inline.
+      // Budget exhausted: fall back to normal bounding — oversized results
+      // become honest-size markers, small results still pass inline. A
+      // boolean success bit is preserved onto the marker: compaction folds
+      // result.success===false into the compact ok bit, and a FAILED edit
+      // misattributed as ok:true would advertise a never-applied path in
+      // crash-safe edited-file tracking.
+      const bounded = this.boundCapture(sanitized, this.kernelRecordBounds.resultCapBytes);
+      const success = (retained as { success?: unknown }).success;
+      if (
+        typeof success === "boolean" &&
+        typeof bounded === "object" &&
+        bounded !== null &&
+        (bounded as { __kernelBounded?: boolean }).__kernelBounded === true
+      ) {
+        return { ...bounded, success };
+      }
+      return bounded;
     }
     return this.boundCapture(sanitized, this.kernelRecordBounds.resultCapBytes);
   }

@@ -1092,11 +1092,25 @@ describe("createCodeExecutionTool", () => {
       using tmp = new DisposableTempDir("code-exec-exec-budget");
       const host = new SandboxHostService();
       const imageData = "A".repeat(KERNEL_RETAINED_MEDIA_BUDGET_BYTES - 1024);
+      const bigDiff = `@@ -1,0 +1,1 @@\n+${"d".repeat(30_000)}\n@@ -9,0 +10,1 @@\n+${"e".repeat(30_000)}\n`;
       const tools: Record<string, Tool> = {
         mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
           type: "content",
           value: [{ type: "media", mediaType: "image/png", data: imageData }],
         })),
+        file_edit_insert: createMockTool(
+          "file_edit_insert",
+          z.object({ path: z.string() }),
+          () => ({
+            success: true,
+            diff: bigDiff,
+          })
+        ),
+        file_edit_replace_string: createMockTool(
+          "file_edit_replace_string",
+          z.object({ path: z.string() }),
+          () => ({ success: false, diff: bigDiff })
+        ),
       };
       const tool = await createCodeExecutionTool(
         runtimeFactory,
@@ -1106,7 +1120,12 @@ describe("createCodeExecutionTool", () => {
       );
 
       const result = (await tool.execute!(
-        { code: "for (let i = 0; i < 5; i++) { mux.mcp__shots__take({}); } return true;" },
+        {
+          code:
+            "for (let i = 0; i < 5; i++) { mux.mcp__shots__take({}); } " +
+            'mux.file_edit_insert({path: "/after-budget.ts"}); ' +
+            'mux.file_edit_replace_string({path: "/after-budget-failed.ts"}); return true;',
+        },
         mockToolCallOptions
       )) as PTCExecutionResult;
       expect(result.success).toBe(true);
@@ -1123,6 +1142,19 @@ describe("createCodeExecutionTool", () => {
       expect(overflow.result).toBeUndefined();
       expect(overflow.ok).toBe(true);
       expect(overflow.bytes).toBeGreaterThan(3_000_000);
+
+      // Persistence-critical records after overflow: the name-based
+      // exemption must not preserve the __kernelBounded marker as a result —
+      // compaction emits the normal {ok, bytes} summary so edit extractors
+      // keep PATH attribution (round 12), and a FAILED edit's success bit
+      // survives through the marker instead of misreporting ok:true.
+      const editOk = result.toolCalls.find((r) => r.toolName === "file_edit_insert");
+      expect(editOk?.result).toBeUndefined();
+      expect(editOk?.ok).toBe(true);
+      expect((editOk?.args as { path?: string })?.path).toBe("/after-budget.ts");
+      const editFailed = result.toolCalls.find((r) => r.toolName === "file_edit_replace_string");
+      expect(editFailed?.result).toBeUndefined();
+      expect(editFailed?.ok).toBe(false);
       await host.disposeScope("ws-exec-budget");
     });
 

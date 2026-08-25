@@ -130,11 +130,27 @@ function buildDisplayOnlyFilePlaceholder(item: DisplayOnlyFilePart): AISDKTextPa
   };
 }
 
+/**
+ * Depth bound for the mutual recursion between extractAttachmentsFromToolOutput
+ * and extractAttachmentsFromNestedToolCalls (json wrappers count too). History
+ * rows are untrusted persisted JSON: a syntactically valid row nesting
+ * {toolCalls:[{result: …}]} chains deep enough would overflow the stack while
+ * preparing provider messages, and since extraction runs on EVERY request,
+ * one malformed row would brick the workspace (self-healing rule). Real
+ * nesting is 1–2 levels (code_execution → bridged tool results); over-deep
+ * values are left unrewritten instead of recursed into.
+ */
+const MAX_NESTED_TOOL_EXTRACTION_DEPTH = 64;
+
 export function extractAttachmentsFromToolOutput(
-  output: unknown
+  output: unknown,
+  depth = 0
 ): { newOutput: unknown; attachments: ExtractedToolAttachment[] } | null {
+  if (depth > MAX_NESTED_TOOL_EXTRACTION_DEPTH) {
+    return null;
+  }
   if (isJsonContainer(output)) {
-    const extracted = extractAttachmentsFromToolOutput(output.value);
+    const extracted = extractAttachmentsFromToolOutput(output.value, depth + 1);
     if (extracted == null) {
       return null;
     }
@@ -146,7 +162,7 @@ export function extractAttachmentsFromToolOutput(
   }
 
   if (!isContentContainer(output)) {
-    return extractAttachmentsFromNestedToolCalls(output);
+    return extractAttachmentsFromNestedToolCalls(output, depth + 1);
   }
 
   const attachments: ExtractedToolAttachment[] = [];
@@ -211,7 +227,8 @@ export function extractAttachmentsFromToolOutput(
  * places is deduplicated into a single attachment.
  */
 function extractAttachmentsFromNestedToolCalls(
-  output: unknown
+  output: unknown,
+  depth: number
 ): { newOutput: unknown; attachments: ExtractedToolAttachment[] } | null {
   if (typeof output !== "object" || output === null) {
     return null;
@@ -238,7 +255,10 @@ function extractAttachmentsFromNestedToolCalls(
     if (typeof record !== "object" || record === null) {
       return record;
     }
-    const extracted = extractAttachmentsFromToolOutput((record as { result?: unknown }).result);
+    const extracted = extractAttachmentsFromToolOutput(
+      (record as { result?: unknown }).result,
+      depth + 1
+    );
     if (extracted == null) {
       return record;
     }
@@ -248,7 +268,7 @@ function extractAttachmentsFromNestedToolCalls(
   });
 
   const outerResult = (output as { result?: unknown }).result;
-  const extractedOuter = extractAttachmentsFromToolOutput(outerResult);
+  const extractedOuter = extractAttachmentsFromToolOutput(outerResult, depth + 1);
   if (extractedOuter != null) {
     didChange = true;
     pushUnique(extractedOuter.attachments);
@@ -272,7 +292,7 @@ function extractAttachmentsFromNestedToolCalls(
       }
       let argsChanged = false;
       const newArgs = args.map((arg: unknown) => {
-        const extracted = extractAttachmentsFromToolOutput(arg);
+        const extracted = extractAttachmentsFromToolOutput(arg, depth + 1);
         if (extracted == null) {
           return arg;
         }

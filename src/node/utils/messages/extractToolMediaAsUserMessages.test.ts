@@ -372,6 +372,45 @@ describe("extractToolMediaAsUserMessages", () => {
     expect(rewritten).toHaveLength(1);
   });
 
+  it("bounds recursion through corrupt deeply-nested tool records instead of overflowing the stack", async () => {
+    // History rows are untrusted persisted JSON (self-healing rule): a
+    // syntactically valid row nesting {toolCalls:[{result: …}]} deep enough
+    // would otherwise stack-overflow while preparing provider messages —
+    // and extraction runs on EVERY request, so one corrupt row would brick
+    // the workspace. Over-deep values must degrade to no extraction.
+    let deep: Record<string, unknown> = { toolCalls: [] };
+    for (let i = 0; i < 50_000; i++) {
+      deep = { toolCalls: [{ toolName: "bash", result: deep }] };
+    }
+
+    const input: MuxMessage[] = [
+      {
+        id: "a-deep",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call1",
+            toolName: "code_execution",
+            input: { code: "..." },
+            state: "output-available",
+            output: deep,
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    // No throw, no synthetic attachments — the row passes through unrewritten.
+    expect(rewritten).toHaveLength(1);
+    const toolPart = rewritten[0].parts[0];
+    if (toolPart.type !== "dynamic-tool" || toolPart.state !== "output-available") {
+      throw new Error("Expected an output-available dynamic-tool part");
+    }
+    expect(toolPart.output).toBe(deep);
+  });
+
   it("self-heals oversized raster tool attachments by downscaling them for provider requests", async () => {
     const oversizedPng = await sharp({
       create: {
