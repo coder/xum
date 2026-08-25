@@ -9965,45 +9965,48 @@ export class TaskService {
     let shouldClearQueuedPrompt = false;
     let shouldStopStream = false;
     let interruptedRecord: WorkspaceTurnTaskHandleRecord | undefined;
+    let releaseStopLatch: (() => void) | undefined;
 
-    const result = await this.workspaceTurnSettlementLocks.withLock(handleId, async () => {
-      const record = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
-      if (record == null) {
-        return Err("Workspace turn not found or out of scope");
-      }
-      if (record.status === "completed" || record.status === "error") {
-        return Err(`Workspace turn is already ${record.status} and cannot be interrupted.`);
-      }
-      // Already-settled interrupts (explicit stop, restart recovery, queue-cut
-      // supersede) have nothing left to stop: proceeding would stopStream the
-      // target workspace's *current* stream — e.g. the manual message or
-      // /compact that superseded the delegated turn. Idempotent no-op instead.
-      if (record.status === "interrupted") {
-        return Ok({ workspaceId: record.workspaceId });
-      }
+    try {
+      const result = await this.workspaceTurnSettlementLocks.withLock(handleId, async () => {
+        const record = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
+        if (record == null) {
+          return Err("Workspace turn not found or out of scope");
+        }
+        if (record.status === "completed" || record.status === "error") {
+          return Err(`Workspace turn is already ${record.status} and cannot be interrupted.`);
+        }
+        // Already-settled interrupts (explicit stop, restart recovery, queue-cut
+        // supersede) have nothing left to stop: proceeding would stopStream the
+        // target workspace's *current* stream — e.g. the manual message or
+        // /compact that superseded the delegated turn. Idempotent no-op instead.
+        if (record.status === "interrupted") {
+          return Ok({ workspaceId: record.workspaceId });
+        }
 
-      workspaceId = record.workspaceId;
-      shouldClearQueuedPrompt =
-        record.status === "queued" &&
-        this.workspaceService.hasQueuedWorkspaceTurn(record.workspaceId, record.handleId);
-      shouldStopStream = record.status !== "queued";
+        workspaceId = record.workspaceId;
+        shouldClearQueuedPrompt =
+          record.status === "queued" &&
+          this.workspaceService.hasQueuedWorkspaceTurn(record.workspaceId, record.handleId);
+        shouldStopStream = record.status !== "queued";
 
-      const next: WorkspaceTurnTaskHandleRecord = {
-        ...record,
-        status: "interrupted",
-        updatedAt: getIsoNow(),
-      };
-      await this.taskHandleStore.upsertWorkspaceTurn(next);
-      interruptedRecord = next;
-      // Latch the stop synchronously inside the settlement boundary: in-flight peer-send
-      // admission observes this generation immediately, without waiting for the async config
-      // mirror below to persist. The level latch covers sends ENTERING after the bump but
-      // before the mirror persists/the live handle is deregistered — those would otherwise
-      // capture the bumped generation as their clean baseline while hasLiveRunningExecution
-      // still reads active.
-      this.bumpWorkspaceStopEpoch(record.workspaceId);
-      const releaseStopLatch = this.latchWorkspaceStopsInProgress([record.workspaceId]);
-      try {
+        const next: WorkspaceTurnTaskHandleRecord = {
+          ...record,
+          status: "interrupted",
+          updatedAt: getIsoNow(),
+        };
+        await this.taskHandleStore.upsertWorkspaceTurn(next);
+        interruptedRecord = next;
+        // Latch the stop synchronously inside the settlement boundary: in-flight peer-send
+        // admission observes this generation immediately, without waiting for the async config
+        // mirror below to persist. The level latch covers sends ENTERING after the bump — those
+        // would otherwise capture the bumped generation as their clean baseline. Held through the
+        // stopStream await below (released in the method-level finally), not just mirror
+        // persistence: ROOT targets have no task lifecycle status to refuse on, so a send
+        // admitted during the wind-down would queue behind the dying stream and auto-dispatch
+        // when it ends, defeating the stop.
+        this.bumpWorkspaceStopEpoch(record.workspaceId);
+        releaseStopLatch = this.latchWorkspaceStopsInProgress([record.workspaceId]);
         // Persist the execution mirror terminal within the same settlement boundary as the
         // handle transition, so config readers (peer admission, task_list) never observe an
         // interrupted handle with a still-running mirror.
@@ -10020,43 +10023,47 @@ export class TaskService {
         ) {
           this.activeWorkspaceTurnHandleByWorkspaceId.delete(record.workspaceId);
         }
-      } finally {
-        releaseStopLatch();
-      }
-      this.settleWorkspaceTurnWaiters(record.handleId, {
-        status: "error",
-        error: new Error("Workspace turn interrupted"),
+        this.settleWorkspaceTurnWaiters(record.handleId, {
+          status: "error",
+          error: new Error("Workspace turn interrupted"),
+        });
+        this.markTaskForegroundRelevant(record.handleId);
+        return Ok({ workspaceId: record.workspaceId });
       });
-      this.markTaskForegroundRelevant(record.handleId);
-      return Ok({ workspaceId: record.workspaceId });
-    });
 
-    if (!result.success) {
+      if (!result.success) {
+        return result;
+      }
+
+      if (shouldClearQueuedPrompt && workspaceId != null) {
+        // Targeted removal: the queue can hold unrelated user messages before/behind
+        // this turn's entry, so clearing the whole queue would drop real input.
+        const removeResult = this.workspaceService.removeQueuedWorkspaceTurn(
+          workspaceId,
+          handleId,
+          {
+            cancelReason: "Workspace turn interrupted",
+          }
+        );
+        if (!removeResult.success) {
+          return Err(`Failed to clear queued workspace turn: ${removeResult.error}`);
+        }
+      }
+      if (shouldStopStream && workspaceId != null) {
+        try {
+          await this.aiService.stopStream(workspaceId, { abandonPartial: false });
+        } catch (error: unknown) {
+          log.debug("interruptWorkspaceTurn: stopStream threw", { handleId, error });
+        }
+      }
+      if (interruptedRecord != null) {
+        await this.cleanupDisposableWorkspaceTurn(interruptedRecord);
+      }
+      this.scheduleMaybeStartQueuedTasks();
       return result;
+    } finally {
+      releaseStopLatch?.();
     }
-
-    if (shouldClearQueuedPrompt && workspaceId != null) {
-      // Targeted removal: the queue can hold unrelated user messages before/behind
-      // this turn's entry, so clearing the whole queue would drop real input.
-      const removeResult = this.workspaceService.removeQueuedWorkspaceTurn(workspaceId, handleId, {
-        cancelReason: "Workspace turn interrupted",
-      });
-      if (!removeResult.success) {
-        return Err(`Failed to clear queued workspace turn: ${removeResult.error}`);
-      }
-    }
-    if (shouldStopStream && workspaceId != null) {
-      try {
-        await this.aiService.stopStream(workspaceId, { abandonPartial: false });
-      } catch (error: unknown) {
-        log.debug("interruptWorkspaceTurn: stopStream threw", { handleId, error });
-      }
-    }
-    if (interruptedRecord != null) {
-      await this.cleanupDisposableWorkspaceTurn(interruptedRecord);
-    }
-    this.scheduleMaybeStartQueuedTasks();
-    return result;
   }
 
   private async unarchiveAgentTaskAncestry(

@@ -266,6 +266,17 @@ async function executeTreeScope(
     if (executionStatus != null && !hideUnadmittedReawakening) {
       status = taskListStatusFromExecution(executionStatus);
     }
+    // Initially queued/starting peers (waiting for launch capacity — no execution overlay, the
+    // STABLE status is nonterminal) are also unaddressable: sendAgentPeerMessage refuses those
+    // statuses outright because only the parent may edit a queued launch prompt. Hide the row
+    // so the note's "nonterminal ⇒ addressable" claim stays true; descendant/self rows keep
+    // every state (guidance may target them).
+    if (
+      (task.relationship === "sibling" || task.relationship === "ancestor") &&
+      (status === "queued" || status === "starting")
+    ) {
+      continue;
+    }
     if (!statusFilter.has(status)) {
       continue;
     }

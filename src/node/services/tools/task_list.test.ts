@@ -996,6 +996,46 @@ describe("task_list tool", () => {
     expect(statusById.get("task-sib-live")).toBe("running");
   });
 
+  it("tree scope hides initially queued peers that peer sends would refuse", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-initially-queued");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+    const listTaskTreeAgents = mock(() => ({
+      rootWorkspaceId: "tree-root",
+      rootRelationship: "ancestor" as const,
+      tasks: [
+        { ...buildAgentTask("task-self", "running", "tree-root"), relationship: "self" as const },
+        // Initially queued/starting siblings (launch capacity) carry a nonterminal STABLE
+        // status with no execution overlay, but sendAgentPeerMessage refuses those statuses
+        // outright — advertising them would break the note's addressability claim.
+        {
+          ...buildAgentTask("task-sib-queued", "queued", "tree-root"),
+          relationship: "sibling" as const,
+        },
+        {
+          ...buildAgentTask("task-sib-starting", "starting", "tree-root"),
+          relationship: "sibling" as const,
+        },
+        // Queued DESCENDANTS stay visible: parent guidance may target them.
+        {
+          ...buildAgentTask("task-child-queued", "queued", "task-self"),
+          relationship: "descendant" as const,
+        },
+      ],
+    }));
+    const tool = createTaskListTool({
+      ...baseConfig,
+      taskService: { listTaskTreeAgents } as unknown as TaskService,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!(
+        { scope: "tree", statuses: ["workspace", "running", "queued", "starting"] },
+        mockToolCallOptions
+      )
+    );
+    expect(taskIds(result)).toEqual(["tree-root", "task-self", "task-child-queued"]);
+  });
+
   it("tree scope omits an archived root from discovery", async () => {
     using tempDir = new TestTempDir("test-task-list-tree-archived-root");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });

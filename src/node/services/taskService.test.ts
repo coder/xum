@@ -14604,6 +14604,70 @@ describe("TaskService", () => {
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
+  test("sendAgentTreeMessage refuses root sends while an interrupted workspace turn winds down", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "child-a", "child-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    // task_stop on a delegated workspace turn whose target is the tree ROOT: the root has no
+    // task lifecycle status to refuse on, so during the stopStream wind-down only the held
+    // latch keeps an upward send from queueing behind the dying stream and auto-dispatching
+    // when it ends — which would defeat the stop.
+    let markStopStarted: (() => void) | undefined;
+    const stopStarted = new Promise<void>((resolve) => {
+      markStopStarted = resolve;
+    });
+    let releaseStop: (() => void) | undefined;
+    const stopGate = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    const stopStream = mock(async (workspaceId: string) => {
+      if (workspaceId === "tree-root") {
+        markStopStarted?.();
+        await stopGate;
+      }
+      return Ok(undefined);
+    });
+    const { aiService } = createAIServiceMocks(config, { stopStream });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+    await registerLiveWorkspaceTurnHandle(taskService, "tree-root", "wst_root_turn", "owner-ws");
+
+    const interrupting = taskService.interruptWorkspaceTurn("owner-ws", "wst_root_turn");
+    await stopStarted;
+
+    expect(await taskService.sendAgentTreeMessage("child-a", "tree-root", "wake the root")).toEqual(
+      Err({
+        code: "refused",
+        reason:
+          "Target was interrupted by the user and will not accept agent messages until the user resumes it.",
+      })
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    releaseStop?.();
+    expect(await interrupting).toEqual(Ok({ workspaceId: "tree-root" }));
+    // Once the stop settles, the idle root accepts peer messages again (fresh turn on delivery).
+    expect(
+      await taskService.sendAgentTreeMessage("child-a", "tree-root", "after the stop")
+    ).toEqual(
+      Ok({ delivery: "queued", relation: "target_ancestor", queueDispatchMode: "turn-end" })
+    );
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
   test("listTaskTreeAgents tags relationships relative to the caller and excludes workflow subtrees", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
