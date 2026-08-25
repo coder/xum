@@ -391,4 +391,142 @@ describe("extractToolMediaAsUserMessages", () => {
     const rewritten = await extractToolMediaAsUserMessages(input);
     expect(rewritten).toBe(input);
   });
+
+  it("lifts media from tool outputs carrying a top-level attachments array", async () => {
+    const base64 = (
+      await sharp({
+        create: {
+          width: 8,
+          height: 8,
+          channels: 3,
+          background: { r: 0, g: 128, b: 255 },
+        },
+      })
+        .png()
+        .toBuffer()
+    ).toString("base64");
+
+    const input: MuxMessage[] = [
+      {
+        id: "a-ce",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call-ce",
+            toolName: "code_execution",
+            input: { code: 'return xum.attach_file({ path: "/board.png" });' },
+            state: "output-available",
+            output: {
+              success: true,
+              result: {
+                type: "content",
+                value: [{ type: "text", text: "[Attachment prepared: board.png]" }],
+              },
+              toolCalls: [],
+              consoleOutput: [],
+              duration_ms: 5,
+              attachments: [
+                { type: "media", mediaType: "image/png", data: base64, filename: "board.png" },
+              ],
+            },
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    expect(rewritten).toHaveLength(2);
+
+    const toolPart = rewritten[0].parts[0];
+    expect(toolPart.type).toBe("dynamic-tool");
+    if (toolPart.type === "dynamic-tool" && toolPart.state === "output-available") {
+      const output = toolPart.output as { success: boolean; attachments: unknown[] };
+      // Non-attachment fields survive the rewrite; media becomes a placeholder
+      expect(output.success).toBe(true);
+      expect(output.attachments).toHaveLength(1);
+      const outputText = JSON.stringify(output);
+      expect(outputText).toContain("[Attachment attached:");
+      expect(outputText).not.toContain(base64.slice(0, 100));
+    }
+
+    const syntheticUser = rewritten[1];
+    expect(syntheticUser.role).toBe("user");
+    expect(syntheticUser.metadata?.synthetic).toBe(true);
+    const filePart = syntheticUser.parts.find((part) => part.type === "file");
+    expect(filePart).toBeDefined();
+    if (filePart?.type === "file") {
+      expect(filePart.mediaType).toBe("image/png");
+      expect(filePart.filename).toBe("board.png");
+      expect(filePart.url.startsWith("data:image/png;base64,")).toBe(true);
+    }
+  });
+
+  it("delivers carrier media to the provider identically to native attach_file media", async () => {
+    const base64 = (
+      await sharp({
+        create: {
+          width: 8,
+          height: 8,
+          channels: 3,
+          background: { r: 200, g: 10, b: 10 },
+        },
+      })
+        .png()
+        .toBuffer()
+    ).toString("base64");
+
+    const mediaPart = {
+      type: "media",
+      mediaType: "image/png",
+      data: base64,
+      filename: "board.png",
+    };
+    const makeAssistant = (toolName: string, output: unknown): MuxMessage => ({
+      id: `a-${toolName}`,
+      role: "assistant",
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: `call-${toolName}`,
+          toolName,
+          input: {},
+          state: "output-available",
+          output,
+        },
+      ],
+      metadata: { timestamp: 1 },
+    });
+
+    // Native attach_file shape (proven end-to-end against providers) vs the
+    // code_execution carrier shape introduced for PTC/RLM media delivery.
+    const nativeMessages = await extractToolMediaAsUserMessages([
+      makeAssistant("attach_file", {
+        type: "content",
+        value: [{ type: "text", text: "[Attachment prepared: board.png]" }, mediaPart],
+      }),
+    ]);
+    const carrierMessages = await extractToolMediaAsUserMessages([
+      makeAssistant("code_execution", {
+        success: true,
+        result: "ok",
+        toolCalls: [],
+        consoleOutput: [],
+        duration_ms: 3,
+        attachments: [mediaPart],
+      }),
+    ]);
+
+    const syntheticOf = (messages: MuxMessage[]) => {
+      const synthetic = messages.find((m) => m.role === "user" && m.metadata?.synthetic);
+      expect(synthetic).toBeDefined();
+      return synthetic!.parts;
+    };
+
+    // The synthetic user message must be part-for-part identical: whatever the
+    // provider pipeline does for native attach_file media, it now does for
+    // media that traveled through the code_execution sandbox.
+    expect(syntheticOf(carrierMessages)).toEqual(syntheticOf(nativeMessages));
+  });
 });

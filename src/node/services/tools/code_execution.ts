@@ -686,6 +686,18 @@ ${xumTypes}
             capKernelConsoleOutput(result);
           }
 
+          // Nested tools that produced model attachments (e.g. attach_file)
+          // had their media stripped from sandbox-visible values by the
+          // bridge; re-attach the originals on this result so the request
+          // path delivers them to the model as real attachments
+          // (extractToolMediaAsUserMessages). Drain even for failed evals:
+          // received media is still valid, and leaving it pending would let
+          // it leak into a later eval on this runtime.
+          const attachmentParts = activeBridge.drainPendingAttachments(runtime);
+          if (attachmentParts.length > 0) {
+            result.attachments = attachmentParts;
+          }
+
           // RLM return-value offloading BEFORE the vars snapshot below, so the
           // handle vars land in the same durable snapshot the model's
           // {handle, preview, size} record relies on.

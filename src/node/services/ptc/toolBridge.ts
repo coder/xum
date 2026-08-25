@@ -18,6 +18,11 @@ import {
   isBridgeToolGranted,
   type CapabilityGrants,
 } from "@/common/types/capabilityGrants";
+import { isToolContentResult } from "@/common/utils/tools/toolContentResult";
+import {
+  splitAttachmentPartsFromValueArray,
+  type ToolAttachmentPart,
+} from "@/node/utils/messages/toolResultAttachments";
 
 /**
  * RLM kernel extras for register(): host bindings that only exist on
@@ -143,6 +148,11 @@ export class ToolBridge {
    * authoritative host-side record of successful loads, immune to
    * model-visible record bounding (see drainNewlyLoadedVarsKeys). */
   private newlyLoadedVarsKeys: string[] = [];
+  /** Attachment parts stripped from bridged results, keyed per runtime so
+   * parallel code_execution calls sharing this bridge cannot claim each
+   * other's media (ephemeral runtimes are per-call; persistent mounts
+   * serialize evals under the scope lock). */
+  private readonly pendingAttachments = new WeakMap<IJSRuntime, ToolAttachmentPart[]>();
 
   constructor(tools: Record<string, Tool>, grants?: CapabilityGrants) {
     this.bridgeableTools = new Map();
@@ -210,6 +220,10 @@ export class ToolBridge {
    * not just when the parent stream is cancelled.
    */
   register(runtime: IJSRuntime, kernel?: KernelBridgeOptions): void {
+    // Every execution re-registers before eval, so this is the per-eval reset
+    // point: stale attachments from a crashed/aborted prior eval on this
+    // runtime must not leak into the next eval's drain.
+    this.pendingAttachments.delete(runtime);
     // Kernel mode bounds record/event capture at creation (host memory and
     // streamed-to-history events); ephemeral registrations keep full records
     // (the byte-identical supplement contract). Post-eval compaction still
@@ -264,7 +278,7 @@ export class ToolBridge {
         });
 
         // Ensure result is JSON-serializable
-        return this.serializeResult(result);
+        return this.stripAttachmentParts(runtime, this.serializeResult(result));
       };
     }
 
@@ -389,6 +403,39 @@ export class ToolBridge {
       : () => {
           throw new Error("Capability denied: mux.events is not granted for this sandbox");
         };
+  }
+
+  /**
+   * Media/display-file parts inside bridged tool results (e.g. attach_file)
+   * are useless as sandbox values: guests cannot see pixels, and the base64
+   * would bloat vars, result handles, and model-visible records. Split them
+   * out per-runtime so code_execution can re-attach the originals on its own
+   * result, where the request path lifts them into real model attachments
+   * (extractToolMediaAsUserMessages). The sandbox sees text placeholders.
+   */
+  private stripAttachmentParts(runtime: IJSRuntime, serialized: unknown): unknown {
+    if (!isToolContentResult(serialized)) {
+      return serialized;
+    }
+    const split = splitAttachmentPartsFromValueArray(serialized.value);
+    if (!split.didChange) {
+      return serialized;
+    }
+    const pending = this.pendingAttachments.get(runtime) ?? [];
+    pending.push(...split.mediaParts, ...split.displayParts);
+    this.pendingAttachments.set(runtime, pending);
+    return { type: "content", value: split.newItems };
+  }
+
+  /**
+   * Drain attachment parts stripped from bridged results on this runtime.
+   * register() clears stale entries before each eval, so a post-eval drain
+   * yields exactly that eval's attachments.
+   */
+  drainPendingAttachments(runtime: IJSRuntime): ToolAttachmentPart[] {
+    const pending = this.pendingAttachments.get(runtime) ?? [];
+    this.pendingAttachments.delete(runtime);
+    return pending;
   }
 
   private hasExecute(tool: Tool): tool is Tool & { execute: NonNullable<Tool["execute"]> } {

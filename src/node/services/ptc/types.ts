@@ -5,6 +5,8 @@
  * multi-tool workflows via code execution.
  */
 
+import type { ToolAttachmentPart } from "@/node/utils/messages/toolResultAttachments";
+
 /**
  * Event emitted when a tool call starts within the sandbox.
  */
@@ -88,4 +90,12 @@ export interface PTCExecutionResult {
   consoleOutput: PTCConsoleRecord[];
   /** Total execution time in milliseconds */
   duration_ms: number;
+  /**
+   * Original media/display-file parts from nested tool results (e.g.
+   * attach_file). The ToolBridge strips these out of sandbox-visible values
+   * (guests cannot use pixels, and base64 would bloat vars/records) and
+   * code_execution re-attaches them here so the request path can deliver
+   * them to the model as real attachments (extractToolMediaAsUserMessages).
+   */
+  attachments?: ToolAttachmentPart[];
 }

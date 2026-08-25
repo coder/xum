@@ -601,3 +601,114 @@ describe("ToolBridge", () => {
     });
   });
 });
+
+describe("attachment part stripping", () => {
+  const mediaPart = {
+    type: "media" as const,
+    data: "BASE64DATA",
+    mediaType: "image/png",
+    filename: "board.png",
+  };
+  const contentResult = {
+    type: "content",
+    value: [{ type: "text", text: "[Attachment prepared: board.png]" }, mediaPart],
+  };
+
+  function registerCapturingXum(bridge: ToolBridge) {
+    const captured: { xum: Record<string, (...args: unknown[]) => Promise<unknown>> } = { xum: {} };
+    const runtime = createMockRuntime({
+      registerObject: (
+        name: string,
+        obj: Record<string, (...args: unknown[]) => Promise<unknown>>
+      ) => {
+        if (name === "xum") {
+          captured.xum = obj;
+        }
+      },
+    });
+    bridge.register(runtime);
+    return { captured, runtime };
+  }
+
+  it("strips media from bridged content results and drains it per runtime", async () => {
+    const bridge = new ToolBridge({
+      attach_file: createMockTool(
+        "attach_file",
+        z.object({ path: z.string() }),
+        () => contentResult
+      ),
+    });
+    const { captured, runtime } = registerCapturingXum(bridge);
+
+    const sandboxValue = (await captured.xum.attach_file({ path: "/board.png" })) as {
+      type: string;
+      value: Array<{ type: string }>;
+    };
+    // Media replaced by a text placeholder; leading text part preserved
+    expect(JSON.stringify(sandboxValue)).not.toContain("BASE64DATA");
+    expect(sandboxValue.type).toBe("content");
+    expect(sandboxValue.value).toHaveLength(2);
+    expect(sandboxValue.value[1].type).toBe("text");
+
+    expect(bridge.drainPendingAttachments(runtime)).toEqual([mediaPart]);
+    // Drain empties the pending set
+    expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
+  });
+
+  it("attributes stripped media to the invoking runtime", async () => {
+    const bridge = new ToolBridge({
+      attach_file: createMockTool(
+        "attach_file",
+        z.object({ path: z.string() }),
+        () => contentResult
+      ),
+    });
+    const a = registerCapturingXum(bridge);
+    const b = registerCapturingXum(bridge);
+
+    await a.captured.xum.attach_file({ path: "/a.png" });
+    expect(bridge.drainPendingAttachments(b.runtime)).toEqual([]);
+    expect(bridge.drainPendingAttachments(a.runtime)).toEqual([mediaPart]);
+
+    await b.captured.xum.attach_file({ path: "/b.png" });
+    expect(bridge.drainPendingAttachments(b.runtime)).toEqual([mediaPart]);
+  });
+
+  it("register clears stale pending attachments for that runtime", async () => {
+    const bridge = new ToolBridge({
+      attach_file: createMockTool(
+        "attach_file",
+        z.object({ path: z.string() }),
+        () => contentResult
+      ),
+    });
+    const { captured, runtime } = registerCapturingXum(bridge);
+    await captured.xum.attach_file({ path: "/board.png" });
+
+    // Re-register simulates the next execution's setup: stale media from a
+    // crashed prior eval must not leak into the new eval's drain.
+    bridge.register(runtime);
+    expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
+  });
+
+  it("leaves non-content results and unsupported media untouched", async () => {
+    const bashResult = { success: true, output: "plain output" };
+    const unsupportedMedia = {
+      type: "content",
+      value: [{ type: "media", data: "RAWBYTES", mediaType: "application/x-custom" }],
+    };
+    const bridge = new ToolBridge({
+      bash: createMockTool("bash", z.object({ script: z.string() }), () => bashResult),
+      attach_file: createMockTool(
+        "attach_file",
+        z.object({ path: z.string() }),
+        () => unsupportedMedia
+      ),
+    });
+    const { captured, runtime } = registerCapturingXum(bridge);
+
+    expect(await captured.xum.bash({ script: "true" })).toEqual(bashResult);
+    expect(await captured.xum.attach_file({ path: "/x.bin" })).toEqual(unsupportedMedia);
+    expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
+  });
+});

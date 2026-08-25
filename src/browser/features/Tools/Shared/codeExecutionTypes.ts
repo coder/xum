@@ -32,6 +32,9 @@ export interface CodeExecutionResult {
   toolCalls: ToolCallRecord[];
   consoleOutput: ConsoleRecord[];
   duration_ms: number;
+  /** Media/display-file parts re-attached from nested tool results
+   * (e.g. attach_file); delivered to the model as real attachments. */
+  attachments?: unknown[];
 }
 
 /** Nested tool call shape from streaming aggregator */

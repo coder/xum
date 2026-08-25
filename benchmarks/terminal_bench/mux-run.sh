@@ -71,6 +71,13 @@ project_path=$(resolve_project_path)
 log "starting mux agent session for ${project_path}"
 cd "${MUX_APP_ROOT}"
 
+# Grant project trust before the agent starts: sub-agent workspace creation
+# (task/task_spawn) is hard-gated on trust, and an untrusted benchmark project
+# silently strips delegation from every trial. Fatal on failure so a broken
+# config root surfaces as an infra error instead of an invisible handicap.
+log "trusting project ${project_path}"
+bun src/cli/trust.ts --dir "${project_path}" || fatal "failed to trust project ${project_path}"
+
 cmd=(bun src/cli/run.ts
   --dir "${project_path}"
   --model "${MUX_MODEL}"

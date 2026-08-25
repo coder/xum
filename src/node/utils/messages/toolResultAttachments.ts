@@ -19,12 +19,19 @@ export interface ExtractedToolAttachment {
   filename?: string;
 }
 
-interface AISDKMediaPart {
+export interface AISDKMediaPart {
   type: "media";
   data: string;
   mediaType: string;
   filename?: string;
 }
+
+/**
+ * Original attachment-carrying parts a tool result can produce: model
+ * attachments (media) and user-preview-only files (display_file). Shared with
+ * the PTC ToolBridge, which strips these out of sandbox-visible values.
+ */
+export type ToolAttachmentPart = AISDKMediaPart | DisplayOnlyFilePart;
 
 interface AISDKTextPart {
   type: "text";
@@ -106,6 +113,67 @@ function buildDisplayOnlyFilePlaceholder(item: DisplayOnlyFilePart): AISDKTextPa
   };
 }
 
+/**
+ * Split media/display-file parts out of a tool-result value array, replacing
+ * each with a small text placeholder. Returns the original parts so callers
+ * can route them (provider extraction, PTC bridge stripping).
+ */
+export function splitAttachmentPartsFromValueArray(items: unknown[]): {
+  newItems: AISDKContent[];
+  mediaParts: AISDKMediaPart[];
+  displayParts: DisplayOnlyFilePart[];
+  didChange: boolean;
+} {
+  const newItems: AISDKContent[] = [];
+  const mediaParts: AISDKMediaPart[] = [];
+  const displayParts: DisplayOnlyFilePart[] = [];
+  let didChange = false;
+
+  for (const item of items) {
+    if (isMediaPart(item) && isSupportedAttachmentMediaType(item.mediaType)) {
+      didChange = true;
+      mediaParts.push(item);
+      newItems.push(buildAttachmentPlaceholder(item));
+      continue;
+    }
+
+    if (isDisplayOnlyFilePart(item)) {
+      didChange = true;
+      displayParts.push(item);
+      newItems.push(buildDisplayOnlyFilePlaceholder(item));
+      continue;
+    }
+
+    newItems.push(item as AISDKContent);
+  }
+
+  return { newItems, mediaParts, displayParts, didChange };
+}
+
+function toExtractedToolAttachment(item: AISDKMediaPart): ExtractedToolAttachment {
+  return {
+    data: item.data,
+    mediaType: normalizeAttachmentMediaType(item.mediaType),
+    ...(normalizeOptionalFilename(item.filename)
+      ? { filename: normalizeOptionalFilename(item.filename) }
+      : {}),
+  };
+}
+
+/**
+ * Tool outputs that carry attachment parts in a top-level `attachments` array
+ * (e.g. code_execution re-attaching media produced by nested attach_file
+ * calls). Any tool output using this shape gets its media lifted to real
+ * model attachments by extractToolMediaAsUserMessages.
+ */
+function isAttachmentsCarrier(value: unknown): value is { attachments: unknown[] } {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    Array.isArray((value as Record<string, unknown>).attachments)
+  );
+}
+
 export function extractAttachmentsFromToolOutput(
   output: unknown
 ): { newOutput: unknown; attachments: ExtractedToolAttachment[] } | null {
@@ -121,45 +189,31 @@ export function extractAttachmentsFromToolOutput(
     };
   }
 
-  if (!isContentContainer(output)) {
-    return null;
-  }
-
-  const attachments: ExtractedToolAttachment[] = [];
-  const newValue: AISDKContent[] = [];
-  let didChange = false;
-
-  for (const item of output.value) {
-    if (isMediaPart(item) && isSupportedAttachmentMediaType(item.mediaType)) {
-      didChange = true;
-      attachments.push({
-        data: item.data,
-        mediaType: normalizeAttachmentMediaType(item.mediaType),
-        ...(normalizeOptionalFilename(item.filename)
-          ? { filename: normalizeOptionalFilename(item.filename) }
-          : {}),
-      });
-      newValue.push(buildAttachmentPlaceholder(item));
-      continue;
+  if (isContentContainer(output)) {
+    const split = splitAttachmentPartsFromValueArray(output.value);
+    if (!split.didChange) {
+      return null;
     }
 
-    if (isDisplayOnlyFilePart(item)) {
-      didChange = true;
-      newValue.push(buildDisplayOnlyFilePlaceholder(item));
-      continue;
+    return {
+      newOutput: { type: "content", value: split.newItems },
+      attachments: split.mediaParts.map(toExtractedToolAttachment),
+    };
+  }
+
+  if (isAttachmentsCarrier(output)) {
+    const split = splitAttachmentPartsFromValueArray(output.attachments);
+    if (!split.didChange) {
+      return null;
     }
 
-    newValue.push(item);
+    return {
+      newOutput: { ...output, attachments: split.newItems },
+      attachments: split.mediaParts.map(toExtractedToolAttachment),
+    };
   }
 
-  if (!didChange) {
-    return null;
-  }
-
-  return {
-    newOutput: { type: "content", value: newValue },
-    attachments,
-  };
+  return null;
 }
 
 type ProviderReadyToolAttachment =

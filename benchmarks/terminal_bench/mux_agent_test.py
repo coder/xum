@@ -67,6 +67,10 @@ def _run_mux_runner_smoke(
         fake_bin / "bun",
         """#!/usr/bin/env bash
 set -euo pipefail
+if [[ "${1:-}" == "src/cli/trust.ts" ]]; then
+  printf '%s\n' "$*" >"${FAKE_BUN_ARGS_FILE}.trust"
+  exit 0
+fi
 printf '%s\n' "$*" >"${FAKE_BUN_ARGS_FILE}"
 cat >/dev/null
 printf '{"type":"run-complete","usage":{"inputTokens":7,"outputTokens":11,"cachedTokens":5,"cacheCreateTokens":3},"cost_usd":0.42}\n'
@@ -195,6 +199,11 @@ def test_mux_runner_scores_goal_mode_incomplete_exit(tmp_path: Path) -> None:
     args = result.args_file.read_text()
     assert "--goal" in args
     assert "solve it" in args
+    # Trust must be granted (against the resolved project dir) before the
+    # agent starts, or sub-agent spawns fail the trust gate inside the run.
+    trust_args = Path(f"{result.args_file}.trust").read_text()
+    assert "src/cli/trust.ts" in trust_args
+    assert str(tmp_path / "project") in trust_args
     assert json.loads(result.token_file.read_text()) == {
         "input": 7,
         "output": 11,

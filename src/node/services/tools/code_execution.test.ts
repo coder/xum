@@ -2154,3 +2154,59 @@ describe("createCodeExecutionTool", () => {
     });
   });
 });
+
+describe("nested attachment delivery", () => {
+  const runtimeFactory = new QuickJSRuntimeFactory();
+  const mediaPart = {
+    type: "media" as const,
+    data: "QkFTRTY0REFUQQ==",
+    mediaType: "image/png",
+    filename: "board.png",
+  };
+
+  function attachFileTool(): Tool {
+    return createMockTool("attach_file", z.object({ path: z.string() }), () => ({
+      type: "content",
+      value: [{ type: "text", text: "[Attachment prepared: board.png]" }, mediaPart],
+    }));
+  }
+
+  it("re-attaches media stripped from nested tool results onto the execution result", async () => {
+    const tool = await createCodeExecutionTool(
+      runtimeFactory,
+      new ToolBridge({ attach_file: attachFileTool() })
+    );
+
+    const result = (await tool.execute!(
+      { code: 'return xum.attach_file({ path: "/board.png" });', timeout_secs: null },
+      mockToolCallOptions
+    )) as PTCExecutionResult;
+
+    expect(result.success).toBe(true);
+    // Original media rides the top-level result for the request-path lift
+    expect(result.attachments).toEqual([mediaPart]);
+    // Sandbox-visible values (return value + nested record) carry only placeholders
+    const sandboxVisible = JSON.stringify({ result: result.result, toolCalls: result.toolCalls });
+    expect(sandboxVisible).not.toContain(mediaPart.data);
+  });
+
+  it("omits attachments when no nested tool produced media", async () => {
+    const tool = await createCodeExecutionTool(
+      runtimeFactory,
+      new ToolBridge({
+        bash: createMockTool("bash", z.object({ script: z.string() }), () => ({
+          success: true,
+          output: "ok",
+        })),
+      })
+    );
+
+    const result = (await tool.execute!(
+      { code: 'return xum.bash({ script: "true" });', timeout_secs: null },
+      mockToolCallOptions
+    )) as PTCExecutionResult;
+
+    expect(result.success).toBe(true);
+    expect(result.attachments).toBeUndefined();
+  });
+});
