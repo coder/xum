@@ -573,6 +573,48 @@ describe("MessageQueue", () => {
       expect(second.internal?.onAcceptedPreStreamFailure).toBeUndefined();
     });
 
+    it("should keep peer trigger identity and refund hook when correlation is stripped", () => {
+      const onCanceled = () => undefined;
+      const onAcceptedPreStreamFailure = () => undefined;
+      queue.add(
+        "Peer trigger",
+        {
+          model: "gpt-4",
+          agentId: "exec",
+          muxMetadata: {
+            ...metadata,
+            agentPeerMessageTrigger: { fromWorkspaceId: "sib-a", relationship: "sibling" },
+          },
+        },
+        {
+          synthetic: true,
+          agentInitiated: true,
+          workspaceTurnContinuation: true,
+          onCanceled,
+          onAcceptedPreStreamFailure,
+        }
+      );
+      queue.add("User send now", { model: "gpt-4", agentId: "exec" });
+
+      expect(queue.setVisibleQueueDispatchMode("tool-end")).toBe(true);
+
+      const first = queue.dequeueNext();
+      expect(first.message).toBe("User send now");
+
+      // The superseded correlation is stripped, but a peer trigger keeps its
+      // machine-notification identity (downgraded to plain peer attribution) and its
+      // onCanceled — the sender's budget refund, tied to this entry rather than the
+      // superseded owner handle. The owner's pre-stream-failure callback is still dropped.
+      const second = queue.dequeueNext();
+      expect(second.options?.muxMetadata).toEqual({
+        type: "agent-peer-message",
+        fromWorkspaceId: "sib-a",
+        relationship: "sibling",
+      });
+      expect(second.internal?.onCanceled).toBe(onCanceled);
+      expect(second.internal?.onAcceptedPreStreamFailure).toBeUndefined();
+    });
+
     it("should preserve an original queued workspace-turn prompt during reordering", () => {
       const onAccepted = () => undefined;
       const onCanceled = () => undefined;

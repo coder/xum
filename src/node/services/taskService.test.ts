@@ -14542,6 +14542,111 @@ describe("TaskService", () => {
     );
   });
 
+  test("sendAgentTreeMessage refunds queued sends canceled before dispatch", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "sib-a", "sib-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    // One aggregate slot left: a queued-then-canceled send that never refunds would consume it
+    // permanently and refuse the follow-up.
+    const internals = taskService as unknown as {
+      familyMessageTargetTotals: Map<string, { count: number; chars: number }>;
+    };
+    internals.familyMessageTargetTotals.set("sib-b", {
+      count: TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1,
+      chars: 0,
+    });
+
+    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "queued send")).toEqual(
+      Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
+    );
+    // A busy target queued the entry; a user interrupt clears the queue before dispatch —
+    // AgentSession invokes the entry's onCanceled, which must release the reservation.
+    const [, , , internalArg] = sendMessage.mock.calls[0] as [
+      string,
+      string,
+      unknown,
+      { onCanceled?: (reason: string) => void },
+    ];
+    expect(internalArg.onCanceled).toBeDefined();
+    internalArg.onCanceled?.("Queue cleared before dispatch");
+
+    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "after cancel")).toEqual(
+      Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
+    );
+  });
+
+  test("failed hard-interrupt cascade persistence retains the descendant's stop latch", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "branch-a", "branch-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "leaf-a", "leaf-a", {
+          parentWorkspaceId: "branch-a",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    taskService.markParentWorkspaceInterrupted("branch-a");
+    // Persistence of leaf-a's interrupted status fails: interruptStream's outer catch
+    // suppresses the error and reports success, so without fail-closed latch retention the
+    // still-running descendant would resume peer sends right after the failed cascade.
+    const editSpy = spyOn(config, "editConfig").mockImplementationOnce(() =>
+      Promise.reject(new Error("read-only config"))
+    );
+    expect(await taskService.terminateAllDescendantAgentTasks("branch-a")).toEqual([]);
+    editSpy.mockRestore();
+    expect(findWorkspaceInConfig(config, "leaf-a")?.taskStatus).toBe("running");
+
+    // User resume clears the level-triggered suppression; only the retained latch refuses.
+    taskService.resetAutoResumeCount("branch-a");
+    expect(
+      await taskService.sendAgentTreeMessage("leaf-a", "sib-b", "escape the failed stop")
+    ).toEqual(
+      Err({
+        code: "refused",
+        reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
+      })
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   test("sendAgentTreeMessage refuses sends latched at the hard-stop request boundary", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");

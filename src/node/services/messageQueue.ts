@@ -1,5 +1,6 @@
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
 import { AGENT_PEER_MESSAGE_DEDUPE_PREFIX } from "@/constants/agentMessaging";
+import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelope";
 import type { SendMessageError } from "@/common/types/errors";
 import type { MuxMessage } from "@/common/types/message";
 import type { ReviewNoteData } from "@/common/types/review";
@@ -53,6 +54,8 @@ interface WorkspaceTurnMetadata {
   taskHandleId: string;
   ownerWorkspaceId: string;
   turnId: string;
+  /** Peer attribution nested on correlated peer triggers (see MuxMessageMetadata). */
+  agentPeerMessageTrigger?: unknown;
 }
 
 function isWorkspaceTurnMetadata(meta: unknown): meta is WorkspaceTurnMetadata {
@@ -331,8 +334,17 @@ export class MessageQueue {
       } else if (!matchesPriorCorrelation) {
         hasUnrelatedPredecessor = true;
         if (entry.workspaceTurnContinuation) {
-          entry.muxMetadata = undefined;
-          entry.onCanceled = undefined;
+          // Mirror WorkspaceService.stripWorkspaceTurnCorrelation for entries whose correlation
+          // goes stale while QUEUED: a peer trigger keeps its machine-notification identity
+          // (downgraded to plain peer attribution) and its onCanceled — that callback is the
+          // sender's budget refund, tied to this entry rather than the superseded owner handle.
+          // Owner handle-settling callbacks are still dropped.
+          const peerTrigger = getValidAgentPeerTriggerMeta(metadata.agentPeerMessageTrigger);
+          entry.muxMetadata =
+            peerTrigger != null ? { type: "agent-peer-message", ...peerTrigger } : undefined;
+          if (peerTrigger == null) {
+            entry.onCanceled = undefined;
+          }
           entry.onAcceptedPreStreamFailure = undefined;
         }
       } else {

@@ -5644,6 +5644,17 @@ export class TaskService {
           onAccepted: () => {
             accepted = true;
           },
+          // A busy target queues this send AFTER sendAgentPeerMessage returned success, so
+          // neither the returned-failure branch nor the catch can refund it. A user interrupt
+          // clearing the queue before dispatch means neither payload nor trigger ever reached
+          // history — release the reservation (the refund closure is idempotent), or repeated
+          // canceled queues would exhaust the pair/target budgets and refuse valid sends until
+          // restart.
+          onCanceled: () => {
+            if (!payloadPersisted) {
+              refundBudget();
+            }
+          },
         });
         if (!sendResult.success) {
           // Refund only when nothing landed in the target transcript: pre-horizon failures roll
@@ -6323,81 +6334,109 @@ export class TaskService {
       // can happen while a descendant is still blocked in stopStream with taskStatus "running" —
       // a peer send entering then would capture the already-bumped ancestor epoch as its clean
       // baseline and could wake a cousin or the root after Stop. The latch holds until every
-      // descendant's terminal status persists.
+      // descendant's terminal status persists — and is RETAINED (fail closed) for descendants
+      // whose interrupt processing throws: interruptStream's outer catch suppresses the error
+      // and reports success, so without an admission-visible stop marker a still-running
+      // descendant would resume peer sends right after the failed cascade. The retained latch
+      // refuses admission until the process restarts (which also kills the descendant's
+      // stream) or a later cascade completes.
       for (const id of descendants) {
         this.bumpWorkspaceStopEpoch(id);
       }
-      const releaseStopLatch = this.latchWorkspaceStopsInProgress(descendants);
+      const releaseById = new Map(
+        descendants.map((id) => [id, this.latchWorkspaceStopsInProgress([id])] as const)
+      );
       try {
         for (const id of descendants) {
-          // Best-effort: clear queue first. AgentSession stream-end cleanup auto-flushes
-          // queued messages, so descendants must not keep pending input after a hard interrupt.
           try {
-            const clearQueueResult = this.workspaceService.clearQueue(id);
-            if (!clearQueueResult.success) {
-              log.debug("terminateAllDescendantAgentTasks: clearQueue failed", {
+            // Best-effort: clear queue first. AgentSession stream-end cleanup auto-flushes
+            // queued messages, so descendants must not keep pending input after a hard interrupt.
+            try {
+              const clearQueueResult = this.workspaceService.clearQueue(id);
+              if (!clearQueueResult.success) {
+                log.debug("terminateAllDescendantAgentTasks: clearQueue failed", {
+                  taskId: id,
+                  error: clearQueueResult.error,
+                });
+              }
+            } catch (error: unknown) {
+              log.debug("terminateAllDescendantAgentTasks: clearQueue threw", {
                 taskId: id,
-                error: clearQueueResult.error,
+                error,
               });
             }
-          } catch (error: unknown) {
-            log.debug("terminateAllDescendantAgentTasks: clearQueue threw", { taskId: id, error });
-          }
 
-          // Best-effort: stop any active stream immediately to avoid further token usage
-          // while preserving commit-worthy partial progress for inspection/resume.
-          try {
-            const stopResult = await this.aiService.stopStream(id, { abandonPartial: false });
-            if (!stopResult.success) {
-              log.debug("terminateAllDescendantAgentTasks: stopStream failed", { taskId: id });
+            // Best-effort: stop any active stream immediately to avoid further token usage
+            // while preserving commit-worthy partial progress for inspection/resume.
+            try {
+              const stopResult = await this.aiService.stopStream(id, { abandonPartial: false });
+              if (!stopResult.success) {
+                log.debug("terminateAllDescendantAgentTasks: stopStream failed", { taskId: id });
+              }
+            } catch (error: unknown) {
+              log.debug("terminateAllDescendantAgentTasks: stopStream threw", {
+                taskId: id,
+                error,
+              });
             }
-          } catch (error: unknown) {
-            log.debug("terminateAllDescendantAgentTasks: stopStream threw", { taskId: id, error });
-          }
 
-          let preservedCompletedDescendant = false;
-          let transitionedToInterrupted = false;
-          let parentWorkspaceId: string | undefined;
-          const updated = await this.editWorkspaceEntry(
-            id,
-            (ws) => {
-              const previousStatus = ws.taskStatus;
-              parentWorkspaceId = ws.parentWorkspaceId;
-              preservedCompletedDescendant =
-                this.applyInterruptedTaskStatus(ws) === "preserved-completed-report";
-              transitionedToInterrupted =
-                !preservedCompletedDescendant && previousStatus !== "interrupted";
-            },
-            { allowMissing: true }
-          );
-          if (!updated) {
-            // Missing descendants should still reject prompt waiters promptly so task_await does
-            // not hang until timeout after a parent hard interrupt races with external cleanup.
+            let preservedCompletedDescendant = false;
+            let transitionedToInterrupted = false;
+            let parentWorkspaceId: string | undefined;
+            const updated = await this.editWorkspaceEntry(
+              id,
+              (ws) => {
+                const previousStatus = ws.taskStatus;
+                parentWorkspaceId = ws.parentWorkspaceId;
+                preservedCompletedDescendant =
+                  this.applyInterruptedTaskStatus(ws) === "preserved-completed-report";
+                transitionedToInterrupted =
+                  !preservedCompletedDescendant && previousStatus !== "interrupted";
+              },
+              { allowMissing: true }
+            );
+            if (!updated) {
+              // Missing descendants should still reject prompt waiters promptly so task_await does
+              // not hang until timeout after a parent hard interrupt races with external cleanup.
+              this.rejectWaiters(id, interruptionError);
+              log.debug("terminateAllDescendantAgentTasks: descendant workspace missing", {
+                taskId: id,
+              });
+              continue;
+            }
+
+            if (preservedCompletedDescendant) {
+              log.debug(
+                "terminateAllDescendantAgentTasks: preserving completed descendant report",
+                {
+                  taskId: id,
+                }
+              );
+              continue;
+            }
+
+            if (transitionedToInterrupted) {
+              this.recordTaskInterrupted(id, parentWorkspaceId);
+            }
+
+            // Report monotonicity: descendants that did not complete a report must reject waiters
+            // once the interrupt status transition is persisted.
             this.rejectWaiters(id, interruptionError);
-            log.debug("terminateAllDescendantAgentTasks: descendant workspace missing", {
-              taskId: id,
-            });
-            continue;
+            interruptedTaskIds.push(id);
+          } catch (error: unknown) {
+            // Retain this descendant's latch as the stop marker (see comment above) and keep
+            // processing the remaining descendants instead of aborting the whole cascade.
+            releaseById.delete(id);
+            log.error(
+              "terminateAllDescendantAgentTasks: interrupt processing failed; retaining stop latch",
+              { taskId: id, error }
+            );
           }
-
-          if (preservedCompletedDescendant) {
-            log.debug("terminateAllDescendantAgentTasks: preserving completed descendant report", {
-              taskId: id,
-            });
-            continue;
-          }
-
-          if (transitionedToInterrupted) {
-            this.recordTaskInterrupted(id, parentWorkspaceId);
-          }
-
-          // Report monotonicity: descendants that did not complete a report must reject waiters
-          // once the interrupt status transition is persisted.
-          this.rejectWaiters(id, interruptionError);
-          interruptedTaskIds.push(id);
         }
       } finally {
-        releaseStopLatch();
+        for (const release of releaseById.values()) {
+          release();
+        }
       }
     }
 

@@ -96,6 +96,41 @@ describe("AgentSession.sendMessage (admission gates)", () => {
     expect(history.success ? history.data : ["unexpected"]).toHaveLength(0);
   });
 
+  it("invokes the cancellation hook when the caller probe goes stale before acceptance", async () => {
+    const workspaceId = "ws-caller-stale-cancel";
+    const { session, historyService, streamMessage } = await createSessionHarness(workspaceId);
+    const appendMany = spyOn(historyService, "appendManyToHistory");
+    const canceled: string[] = [];
+
+    const result = await session.sendMessage(
+      "peer trigger",
+      { model: TEST_MODEL, agentId: "exec" },
+      {
+        synthetic: true,
+        preTurnMessages: [
+          createMuxMessage("peer-payload-stale", "assistant", "untrusted payload", {
+            timestamp: 1,
+            synthetic: true,
+          }),
+        ],
+        // Goes stale only once the pre-turn batch persisted: exercises the pre-horizon gate,
+        // which must roll the rows back AND surface the refusal through the cancellation hook —
+        // a queued peer send's caller already returned success and this hook carries its budget
+        // refund; without it the reservation would leak.
+        admissionStale: () => appendMany.mock.calls.length > 0,
+        onCanceled: (reason: string) => {
+          canceled.push(reason);
+        },
+      }
+    );
+
+    expect(result.success).toBe(false);
+    expect(canceled).toHaveLength(1);
+    expect(streamMessage).not.toHaveBeenCalled();
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success ? history.data : ["unexpected"]).toHaveLength(0);
+  });
+
   it("notifies accepted sends refused at the PREPARING gate and never streams", async () => {
     const workspaceId = "ws-epoch-preparing";
     const { session, streamMessage } = await createSessionHarness(workspaceId);

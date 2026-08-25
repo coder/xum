@@ -3563,6 +3563,12 @@ export class AgentSession {
     // the remaining pre-stream awaits refuses the turn at the PREPARING gate with rows retained.
     if (internal?.admissionStale?.() === true) {
       await rollbackPersistedTurnRows();
+      // Probe-carrying sends are peer messages whose caller already returned success when the
+      // entry was queued — the cancellation hook is their only way to observe this refusal and
+      // release the budget reservation (nothing persisted; the refund closure is idempotent).
+      await internal?.onCanceled?.(
+        "Send refused: the caller's admission became stale before the turn was accepted."
+      );
       return Err(
         createUnknownSendMessageError(
           "Send refused: the caller's admission became stale before the turn was accepted."

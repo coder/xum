@@ -9614,11 +9614,16 @@ export class WorkspaceService extends EventEmitter {
         const preserveCorrelation =
           !isWorkspaceTurnContinuation ||
           !session.hasQueuedOrDispatchingEntry(workspaceTurnContinuationMetadata);
+        // Dropping callbacks on a superseded correlation protects the delegated-turn OWNER
+        // (its onCanceled settles the owner's handle, which the superseded entry no longer
+        // represents) — but a peer trigger's onCanceled is the sender's budget refund, tied to
+        // this entry rather than the foreign handle, so it survives the downgrade.
+        const isPeerTrigger = workspaceTurnContinuationMetadata?.agentPeerMessageTrigger != null;
         return {
           options: preserveCorrelation
             ? normalizedOptions
             : stripWorkspaceTurnCorrelation(normalizedOptions),
-          onCanceled: preserveCorrelation ? internal?.onCanceled : undefined,
+          onCanceled: preserveCorrelation || isPeerTrigger ? internal?.onCanceled : undefined,
           onAcceptedPreStreamFailure: preserveCorrelation
             ? internal?.onAcceptedPreStreamFailure
             : undefined,
