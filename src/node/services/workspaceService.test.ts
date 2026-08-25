@@ -8269,6 +8269,22 @@ describe("WorkspaceService executeBash archive guards", () => {
     }
   });
 
+  test("downloadStagedAttachment refuses while the workspace is being archived", async () => {
+    // Downloads read from the checkout through the runtime (and can restart a stopped Coder
+    // workspace), so they pair with the archive gates exactly like staging.
+    addToArchivingWorkspaces(workspaceService, "ws-download");
+
+    const result = await workspaceService.downloadStagedAttachment({
+      workspaceId: "ws-download",
+      stagedPath: ".xum/user-attachments/notes.txt",
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("being archived");
+    }
+  });
+
   test("getFileCompletions returns empty without touching the workspace while archiving", async () => {
     addToArchivingWorkspaces(workspaceService, "ws-completions");
 
@@ -8309,7 +8325,7 @@ describe("WorkspaceService executeBash archive guards", () => {
     });
     expect(archiveResult.success).toBe(false);
     if (!archiveResult.success) {
-      expect(archiveResult.error).toContain("an attachment upload in progress");
+      expect(archiveResult.error).toContain("an attachment transfer in progress");
       expect(archiveResult.error).toContain("a file completion refresh in progress");
     }
 

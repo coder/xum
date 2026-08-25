@@ -8220,7 +8220,7 @@ export class WorkspaceService extends EventEmitter {
       activityLabels.push("a bash command executing");
     }
     if ((this.preflightStagingCounts.get(workspaceId) ?? 0) > 0) {
-      activityLabels.push("an attachment upload in progress");
+      activityLabels.push("an attachment transfer in progress");
     }
     if ((this.preflightFileCompletionCounts.get(workspaceId) ?? 0) > 0) {
       activityLabels.push("a file completion refresh in progress");
@@ -8329,7 +8329,7 @@ export class WorkspaceService extends EventEmitter {
           activityLabels.push("a bash command executing");
         }
         if ((this.preflightStagingCounts.get(workspaceId) ?? 0) > 0) {
-          activityLabels.push("an attachment upload in progress");
+          activityLabels.push("an attachment transfer in progress");
         }
         if ((this.preflightFileCompletionCounts.get(workspaceId) ?? 0) > 0) {
           activityLabels.push("a file completion refresh in progress");
@@ -10372,9 +10372,26 @@ export class WorkspaceService extends EventEmitter {
     workspaceId: string;
     stagedPath: string;
   }): Promise<Result<DownloadedStagedWorkspaceAttachment, string>> {
+    // Archive admission pairing (same synchronous block, mirroring stageAttachment): the
+    // download reads from the checkout through the runtime, so an archive must not remove a
+    // snapshot-managed checkout mid-read — and on a dedicated Coder target the admitted
+    // read could reconnect and restart a workspace the archive just stopped. Downloads
+    // share the staging counter: both directions are attachment transfers the archive
+    // gates refuse on identically.
+    if (this.archivingWorkspaces.has(input.workspaceId)) {
+      return Err("Workspace is being archived. Unarchive it before downloading attachments.");
+    }
+    using _preflightDownload = this.acquirePreflightAdmission(
+      this.preflightStagingCounts,
+      input.workspaceId
+    );
+
     const metadata = await this.getInfo(input.workspaceId);
     if (metadata == null) {
       return Err("Workspace not found");
+    }
+    if (isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt)) {
+      return Err("Workspace is archived. Unarchive it before downloading attachments.");
     }
 
     const { runtime, workspacePath } = createRuntimeContextForWorkspace(metadata);
