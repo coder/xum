@@ -61,7 +61,10 @@ import {
   tryReadGitHeadCommitSha,
   findWorkspaceEntry,
 } from "@/node/services/taskUtils";
-import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
+import {
+  sanitizeBranchNameForWorkspace,
+  validateWorkspaceName,
+} from "@/common/utils/validation/workspaceValidation";
 import { getTaskGroupCount } from "@/common/utils/tools/taskGroups";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { Ok, Err, type Result } from "@/common/types/result";
@@ -3716,11 +3719,14 @@ export class TaskService {
     target: WorkspaceTurnAgentContext;
     owner: WorkspaceTurnAgentContext;
     /**
-     * The target checkout was created from a base branch different from the owner's.
-     * Owner-side resolution then predicts nothing about the target (the target branch
-     * can shadow ANY id, including built-ins), so unreachable targets fail closed.
+     * Whether the owner's checkout is a sound predictor of the target's agent
+     * definitions. Only true for workspaces this call just created from the owner's
+     * own branch. False for existing targets (their checkout has unknown provenance —
+     * any branch, uncommitted shadows) and for new workspaces created from a different
+     * base branch (which can shadow ANY id, including built-ins). When false,
+     * unreachable targets fail closed instead of trusting owner-side resolution.
      */
-    targetBaseDivergesFromOwner?: boolean;
+    ownerResolutionPredictsTarget: boolean;
   }): Promise<Result<{ validatedContext: WorkspaceTurnAgentContext }, string>> {
     const reachable = await runtimePathExists(params.target.runtime, params.target.workspacePath);
     if (reachable) {
@@ -3731,9 +3737,9 @@ export class TaskService {
       });
       return validation.success ? Ok({ validatedContext: params.target }) : validation;
     }
-    if (params.targetBaseDivergesFromOwner === true) {
+    if (!params.ownerResolutionPredictsTarget) {
       return Err(
-        `Task.createWorkspaceTurn: target checkout is not reachable yet and was created from a different base branch, so agentId (${params.agentId}) cannot be verified there`
+        `Task.createWorkspaceTurn: target checkout is not reachable (provisioning, stopped runtime, or unknown checkout state), so agentId (${params.agentId}) cannot be verified there`
       );
     }
     const parsedAgentId = AgentIdSchema.safeParse(params.agentId);
@@ -3940,6 +3946,10 @@ export class TaskService {
           agentId: requestedAgentId,
           target: targetContext,
           owner: ownerContext,
+          // Existing targets have unknown checkout provenance (any branch, uncommitted
+          // shadows), so an unreachable checkout fails closed rather than trusting the
+          // owner's resolution. Omitting agentId still works (default identity).
+          ownerResolutionPredictsTarget: false,
         });
         if (!validation.success) return Err(validation.error);
         workspaceTurnAgentId = requestedAgentId;
@@ -3970,10 +3980,13 @@ export class TaskService {
       // A different base branch means owner-side agent resolution predicts nothing about
       // the target checkout: agents may exist only on the target branch (so an owner-side
       // miss must not fail-fast) and the target branch may shadow ANY id (so unreachable
-      // targets fail closed in validateWorkspaceTurnAgentIdForTarget).
+      // targets fail closed in validateWorkspaceTurnAgentIdForTarget). Compare via the
+      // branch→workspace-name sanitization: parentMeta.name is a workspace name, so a raw
+      // branch like feature/foo must not look divergent from its own workspace feature-foo.
+      const requestedTrunkBranch = coerceNonEmptyString(args.workspace?.trunkBranch);
       const targetBaseDivergesFromOwner =
-        coerceNonEmptyString(args.workspace?.trunkBranch) != null &&
-        args.workspace?.trunkBranch !== parentMeta.name;
+        requestedTrunkBranch != null &&
+        sanitizeBranchNameForWorkspace(requestedTrunkBranch) !== parentMeta.name;
       if (requestedAgentId != null) {
         // Pre-create stage: catch obviously bad ids (unknown/hidden/disabled) against the
         // OWNER's checkout before creating any workspace. Advisory when the requested base
@@ -4043,7 +4056,7 @@ export class TaskService {
           agentId: requestedAgentId,
           target: targetContext,
           owner: ownerContext,
-          targetBaseDivergesFromOwner,
+          ownerResolutionPredictsTarget: !targetBaseDivergesFromOwner,
         });
         if (!validation.success) {
           // Disposable workspaces are removed by the settlement's disposable cleanup, so
@@ -4147,9 +4160,12 @@ export class TaskService {
     if (agentValidationError != null) {
       // Deferred post-create validation failure: the record above keeps the created
       // workspace owner-owned (retryable via mode="existing"); settle the handle as a
-      // normal error instead of dispatching the turn.
+      // normal error instead of dispatching the turn. The error is returned synchronously
+      // to the caller below, so strip attentionPolicy from the settled record — keeping
+      // notify_on_terminal would enqueue a second, duplicate terminal wake for the owner.
+      const { attentionPolicy: _droppedAttentionPolicy, ...recordWithoutAttention } = record;
       const next: WorkspaceTurnTaskHandleRecord = {
-        ...record,
+        ...recordWithoutAttention,
         status: "error",
         updatedAt: getIsoNow(),
         error: agentValidationError,

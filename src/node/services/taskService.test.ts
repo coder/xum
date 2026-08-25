@@ -1266,7 +1266,7 @@ describe("TaskService", () => {
 
     expect(result.success).toBe(false);
     if (!result.success) {
-      expect(result.error).toContain("different base branch");
+      expect(result.error).toContain("not reachable");
       expect(result.error).toContain("no turn was dispatched");
     }
     expect(sendMessage).not.toHaveBeenCalled();
@@ -1327,7 +1327,7 @@ describe("TaskService", () => {
     expect(sendMessageCall?.[2]).toMatchObject({ agentId: "plan" });
   });
 
-  test("createWorkspaceTurn unreachable existing target: built-in override works, custom fails with reachability error", async () => {
+  test("createWorkspaceTurn unreachable existing target: explicit overrides fail closed, default identity works", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, [
       "childworkspace",
@@ -1379,30 +1379,36 @@ describe("TaskService", () => {
       workspace: { mode: "new" },
     });
     expect(first.success).toBe(true);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
 
-    // Built-ins are embedded, so the override is verifiable even when the target is unreachable.
-    const builtIn = await taskService.createWorkspaceTurn({
-      ownerWorkspaceId: parentId,
-      agentId: "plan",
-      prompt: "Plan follow-up",
-      title: "Plan follow-up",
-      workspace: { mode: "existing", workspaceId: "childworkspace" },
-    });
-    expect(builtIn.success).toBe(true);
-
-    // Custom agents get an honest reachability error, not a misleading "unknown agentId".
-    const custom = await taskService.createWorkspaceTurn({
-      ownerWorkspaceId: parentId,
-      agentId: "custom",
-      prompt: "Custom follow-up",
-      title: "Custom follow-up",
-      workspace: { mode: "existing", workspaceId: "childworkspace" },
-    });
-    expect(custom.success).toBe(false);
-    if (!custom.success) {
-      expect(custom.error).toContain("not reachable");
-      expect(custom.error).not.toContain("unknown agentId");
+    // Existing targets have unknown checkout provenance (any branch, uncommitted shadows),
+    // so ALL explicit overrides fail closed while the checkout is unreachable — even
+    // built-ins, whose id could be shadowed by a project definition on the target.
+    for (const agentId of ["plan", "custom"]) {
+      const overridden = await taskService.createWorkspaceTurn({
+        ownerWorkspaceId: parentId,
+        agentId,
+        prompt: `${agentId} follow-up`,
+        title: `${agentId} follow-up`,
+        workspace: { mode: "existing", workspaceId: "childworkspace" },
+      });
+      expect(overridden.success).toBe(false);
+      if (!overridden.success) {
+        expect(overridden.error).toContain("not reachable");
+        expect(overridden.error).not.toContain("unknown agentId");
+      }
     }
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+
+    // Omitting agentId keeps working: the default identity needs no verification.
+    const withoutOverride = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      prompt: "Default follow-up",
+      title: "Default follow-up",
+      workspace: { mode: "existing", workspaceId: "childworkspace" },
+    });
+    expect(withoutOverride.success).toBe(true);
+    expect(sendMessage).toHaveBeenCalledTimes(2);
   });
 
   test("createWorkspaceTurn rejects explicit agentId for descendant agent workspace targets", async () => {
