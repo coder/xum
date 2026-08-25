@@ -61,6 +61,19 @@ export const KERNEL_RETAINED_MEDIA_BUDGET_BYTES = 3 * 1024 * 1024;
 export const KERNEL_RETAINED_CONTAINER_MAX_PARTS = 64;
 
 /**
+ * Execution-wide byte budget for RETAINED kernel record results (see
+ * QuickJSRuntime.boundCaptureResult). Retained results (persistence-critical
+ * diffs/skills, media containers) legitimately bypass the per-record 16KiB
+ * kernel bound, but each is only individually capped (~50k chars / 3MiB
+ * media) — a loop of retained calls would otherwise append megabytes per
+ * call to toolCalls and streamed history without limit. This bounds their
+ * SUM per execution; on exhaustion, further oversized results fall back to
+ * normal bounding (honest-size markers) while small results pass unaffected.
+ * Sized for several full media containers plus hundreds of bounded diffs.
+ */
+export const KERNEL_RETAINED_EXECUTION_BUDGET_BYTES = 4 * KERNEL_RETAINED_MEDIA_BUDGET_BYTES;
+
+/**
  * Max chars of a validated tool-arg file path preserved on a __kernelBounded
  * args marker (see retainPersistenceCriticalArgsFields). Covers Linux
  * PATH_MAX (4096); longer strings cannot be real paths of successful edits,

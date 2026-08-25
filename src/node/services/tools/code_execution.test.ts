@@ -1083,6 +1083,49 @@ describe("createCodeExecutionTool", () => {
       expect(value?.[1]?.text).toContain("aggregate media budget exceeded");
     });
 
+    it("charges retained results against one execution-wide budget", async () => {
+      // Retention bypasses the per-record 16KiB kernel cap by design, but a
+      // loop of retained calls (each up to ~3MiB of media) must not grow
+      // toolCalls and streamed history without limit (round 10): once the
+      // execution-wide budget is exhausted, further oversized results fall
+      // back to normal bounding and compaction drops them with honest sizes.
+      using tmp = new DisposableTempDir("code-exec-exec-budget");
+      const host = new SandboxHostService();
+      const imageData = "A".repeat(KERNEL_RETAINED_MEDIA_BUDGET_BYTES - 1024);
+      const tools: Record<string, Tool> = {
+        mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
+          type: "content",
+          value: [{ type: "media", mediaType: "image/png", data: imageData }],
+        })),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(tools),
+        undefined,
+        persistentRunner(host, "ws-exec-budget", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        { code: "for (let i = 0; i < 5; i++) { mux.mcp__shots__take({}); } return true;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const records = result.toolCalls.filter((r) => r.toolName === "mcp__shots__take");
+      expect(records).toHaveLength(5);
+      // First four ~3MiB containers fit the 12MiB execution budget and are
+      // retained; the fifth exceeds it, gets normally bounded at capture, and
+      // compaction drops the non-exempt marker while reporting the true size.
+      for (const record of records.slice(0, 4)) {
+        const value = (record.result as { value?: Array<{ data?: string }> })?.value;
+        expect(value?.[0]?.data).toBe(imageData);
+      }
+      const overflow = records[4];
+      expect(overflow.result).toBeUndefined();
+      expect(overflow.ok).toBe(true);
+      expect(overflow.bytes).toBeGreaterThan(3_000_000);
+      await host.disposeScope("ws-exec-budget");
+    });
+
     it("sanitizes returned and console-logged media containers in classic mode", async () => {
       // Classic executions have no offload stage: `return xum.<mediaTool>()`
       // assigns the guest value directly to the outer PTCExecutionResult
@@ -1111,15 +1154,19 @@ describe("createCodeExecutionTool", () => {
 
       const result = (await tool.execute!(
         {
-          code: "const r = mux.mcp__shots__take({}); console.log(mux.mcp__rec__capture({})); return r;",
+          // Wrapped, not returned at the root: the sanitizer must walk the
+          // whole value graph (round 10), a root-only check would miss this.
+          code: "const r = mux.mcp__shots__take({}); console.log(mux.mcp__rec__capture({})); return { wrapped: r };",
         },
         mockToolCallOptions
       )) as PTCExecutionResult;
       expect(result.success).toBe(true);
 
       const outer = (
-        result.result as { value?: Array<{ type?: string; data?: string; text?: string }> }
-      )?.value;
+        result.result as {
+          wrapped?: { value?: Array<{ type?: string; data?: string; text?: string }> };
+        }
+      )?.wrapped?.value;
       expect(outer?.[0]?.data).toBe(bigImage);
       expect(outer?.[1]?.type).toBe("text");
       expect(outer?.[1]?.text).toContain("aggregate media budget exceeded");

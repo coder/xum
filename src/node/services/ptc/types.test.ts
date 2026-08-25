@@ -9,6 +9,7 @@ import {
 import {
   retainExemptKernelRecordResult,
   retainPersistenceCriticalArgsFields,
+  sanitizeCapturedMediaValue,
   sanitizeMediaRecordCapture,
 } from "./types";
 
@@ -151,6 +152,55 @@ describe("sanitizeMediaRecordCapture", () => {
   it("passes non-container results through untouched (non-RLM inline-results contract)", () => {
     const result = { success: true, output: "x".repeat(100_000) };
     expect(sanitizeMediaRecordCapture("bash", result)).toBe(result);
+  });
+
+  it("sanitizes containers wrapped inside return values", () => {
+    // Guests can wrap bridged results (`return { image: xum.mcp(...) }`);
+    // a root-only check would pass the wrapper through raw and persist
+    // unbudgeted base64 (round 10).
+    const audio = { type: "media", mediaType: "audio/wav", data: "d2F2".repeat(50) };
+    const wrapped = { image: { type: "content", value: [audio] }, note: "kept" };
+    const sanitized = sanitizeCapturedMediaValue(wrapped) as {
+      image: RetainedContainer;
+      note: string;
+    };
+    expect(sanitized.note).toBe("kept");
+    expect(sanitized.image.value[0]?.type).toBe("text");
+    expect(sanitized.image.value[0]?.text).toContain("not supported as a model attachment");
+  });
+
+  it("shares one aggregate budget across all containers in a value", () => {
+    // Wrapping N containers must not multiply the bound: two ~2MiB images in
+    // separate wrapped containers exceed one shared 3MiB budget.
+    const bigImage = "A".repeat(2 * 1024 * 1024);
+    const container = () => ({
+      type: "content",
+      value: [{ type: "media", mediaType: "image/png", data: bigImage }],
+    });
+    const sanitized = sanitizeCapturedMediaValue({ a: container(), b: container() }) as {
+      a: RetainedContainer;
+      b: RetainedContainer;
+    };
+    expect(sanitized.a.value[0]?.data).toBe(bigImage);
+    expect(sanitized.b.value[0]?.type).toBe("text");
+    expect(sanitized.b.value[0]?.text).toContain("aggregate media budget exceeded");
+  });
+
+  it("bounds cyclic and overly deep values instead of hanging or leaking", () => {
+    const audio = { type: "media", mediaType: "audio/wav", data: "d2F2" };
+    const cyclic: Record<string, unknown> = { container: { type: "content", value: [audio] } };
+    cyclic.self = cyclic;
+    const sanitizedCycle = sanitizeCapturedMediaValue(cyclic) as Record<string, unknown>;
+    expect(sanitizedCycle.self).toBe("[cyclic value bounded at capture]");
+    expect((sanitizedCycle.container as RetainedContainer).value[0]?.type).toBe("text");
+
+    // A media container buried past the depth cap must fail CLOSED: the
+    // subtree becomes a placeholder rather than passing through unsanitized.
+    let deep: unknown = { type: "content", value: [audio] };
+    for (let i = 0; i < 300; i++) deep = { next: deep };
+    const sanitizedDeep = JSON.stringify(sanitizeCapturedMediaValue(deep));
+    expect(sanitizedDeep).toContain("nesting depth limit exceeded");
+    expect(sanitizedDeep).not.toContain("d2F2");
   });
 
   it("bounds containers holding only unsupported media", () => {

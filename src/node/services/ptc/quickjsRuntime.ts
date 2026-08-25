@@ -14,7 +14,10 @@ import { QuickJSAsyncFFI } from "@jitl/quickjs-wasmfile-release-asyncify/ffi";
 import crypto from "crypto";
 import type { IJSRuntime, IJSRuntimeFactory, KernelRecordBounds, RuntimeLimits } from "./runtime";
 import type { PTCEvent, PTCExecutionResult, PTCToolCallRecord, PTCConsoleRecord } from "./types";
-import { CONSOLE_CAPTURE_BUDGET_BYTES } from "@/constants/kernelOutput";
+import {
+  CONSOLE_CAPTURE_BUDGET_BYTES,
+  KERNEL_RETAINED_EXECUTION_BUDGET_BYTES,
+} from "@/constants/kernelOutput";
 import { sliceUtf8Bytes } from "@/common/utils/sliceUtf8Bytes";
 
 /** Capture-time console retention accounting for one eval (see setupConsole). */
@@ -184,6 +187,15 @@ export class QuickJSRuntime implements IJSRuntime {
   private kernelRecordBounds?: KernelRecordBounds;
   /** Mode-independent record sanitizer; see IJSRuntime.setCaptureResultSanitizer. */
   private captureResultSanitizer?: (toolName: string, result: unknown) => unknown;
+  /** Per-execution byte budgets for RETAINED record results, keyed by the
+   * attribution's record array like consoleBudgets (fresh array per eval;
+   * late fire-and-forget settlements share their originating eval's budget).
+   * Retained results bypass the per-record kernel bound by design, so their
+   * SUM must be bounded here (see boundCaptureResult). */
+  private readonly retainedResultBudgets = new WeakMap<
+    PTCToolCallRecord[],
+    { remainingBytes: number }
+  >();
   /** Monotonic eval counter + the generation currently inside eval() (null
    * between evals). Distinguishes settlements arriving mid-eval (queued for
    * the eval's own drain points) from truly-late ones between evals (gated).
@@ -314,7 +326,7 @@ export class QuickJSRuntime implements IJSRuntime {
         const result = await fn(...args);
         const endTime = Date.now();
         const duration_ms = endTime - startTime;
-        const recordResult = this.boundCaptureResult(result, name);
+        const recordResult = this.boundCaptureResult(result, name, this.toolCalls);
 
         // Record tool call
         this.toolCalls.push({
@@ -480,7 +492,7 @@ export class QuickJSRuntime implements IJSRuntime {
           const endTime = Date.now();
           // Same creation-time bounding as synchronous bridges (kernel mode).
           const recordArgs = this.boundCaptureArgs(args[0], name);
-          const recordResult = this.boundCaptureResult(result, name);
+          const recordResult = this.boundCaptureResult(result, name, toolCalls);
           toolCalls.push({
             toolName: name,
             args: recordArgs,
@@ -631,7 +643,11 @@ export class QuickJSRuntime implements IJSRuntime {
     return `${sliceUtf8Bytes(errorStr, capBytes)}…[${bytes} bytes total; truncated]`;
   }
 
-  private boundCaptureResult(value: unknown, toolName: string): unknown {
+  private boundCaptureResult(
+    value: unknown,
+    toolName: string,
+    toolCalls: PTCToolCallRecord[]
+  ): unknown {
     // The mode-independent sanitizer runs first (both classic and kernel
     // mode): media containers are budgeted at capture because records/events
     // persist into session history in every mode, and request-time
@@ -646,8 +662,38 @@ export class QuickJSRuntime implements IJSRuntime {
     // reconstruct context from them, so a bounded preview would silently
     // lose it.
     const retained = this.kernelRecordBounds.captureRetained?.(toolName, sanitized);
-    if (retained !== undefined) return retained;
+    if (retained !== undefined) {
+      // Execution-wide budget on retained results: each is individually
+      // bounded, but retention bypasses the per-record kernel cap by design,
+      // so a loop of retained calls would otherwise append ~3MiB containers
+      // or 50k-char persistence records without limit. Unserializable
+      // values count as overflow — never retain for free.
+      let size: number;
+      try {
+        size = Buffer.byteLength(JSON.stringify(retained) ?? "", "utf8");
+      } catch {
+        size = Number.POSITIVE_INFINITY;
+      }
+      const budget = this.retainedBudgetFor(toolCalls);
+      if (size <= budget.remainingBytes) {
+        budget.remainingBytes -= size;
+        return retained;
+      }
+      // Budget exhausted: fall through to normal bounding — oversized
+      // results become honest-size markers, small results still pass inline.
+    }
     return this.boundCapture(sanitized, this.kernelRecordBounds.resultCapBytes);
+  }
+
+  /** Get-or-create the retained-result budget for one attribution's record
+   * array (keying mirrors consoleBudgetFor). */
+  private retainedBudgetFor(toolCalls: PTCToolCallRecord[]): { remainingBytes: number } {
+    let budget = this.retainedResultBudgets.get(toolCalls);
+    if (!budget) {
+      budget = { remainingBytes: KERNEL_RETAINED_EXECUTION_BUDGET_BYTES };
+      this.retainedResultBudgets.set(toolCalls, budget);
+    }
+    return budget;
   }
 
   setPendingJobGate(gate: (run: () => void) => void): void {
@@ -827,7 +873,7 @@ export class QuickJSRuntime implements IJSRuntime {
           const result = await fn(...args);
           const endTime = Date.now();
           const duration_ms = endTime - startTime;
-          const recordResult = this.boundCaptureResult(result, methodName);
+          const recordResult = this.boundCaptureResult(result, methodName, this.toolCalls);
 
           // Record tool call
           this.toolCalls.push({

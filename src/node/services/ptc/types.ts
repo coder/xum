@@ -321,11 +321,13 @@ function boundedMediaTypeLabel(mediaType: string | undefined): string {
  * cannot grow without bound either. Idempotent: placeholders are small text
  * parts that re-charge identically on a second pass.
  */
-function sanitizeRetainedMediaContainer(result: unknown): unknown {
+function sanitizeRetainedMediaContainer(
+  result: unknown,
+  budget: { remainingBytes: number } = { remainingBytes: KERNEL_RETAINED_MEDIA_BUDGET_BYTES }
+): unknown {
   const container = result as { type: "content"; value: unknown[] };
   const parts = container.value.slice(0, KERNEL_RETAINED_CONTAINER_MAX_PARTS);
   let changed = parts.length < container.value.length;
-  let retainedBytes = 0;
   const value: unknown[] = parts.map((item) => {
     const media = asMediaPart(item);
     if (
@@ -339,11 +341,8 @@ function sanitizeRetainedMediaContainer(result: unknown): unknown {
       };
     }
     const serialized = serializedJsonByteLength(item);
-    if (
-      serialized !== undefined &&
-      retainedBytes + serialized <= KERNEL_RETAINED_MEDIA_BUDGET_BYTES
-    ) {
-      retainedBytes += serialized;
+    if (serialized !== undefined && serialized <= budget.remainingBytes) {
+      budget.remainingBytes -= serialized;
       return item;
     }
     changed = true;
@@ -382,14 +381,70 @@ export function sanitizeMediaRecordCapture(_toolName: string, result: unknown): 
 }
 
 /**
+ * Recursion depth cap for the media value-graph walk. JSON persistence
+ * tolerates deeper nesting, but a guest-built ladder past this depth is not a
+ * plausible legitimate return shape — fail CLOSED (bounded placeholder) so
+ * depth can never be used to smuggle an unsanitized container past the walk.
+ */
+const MAX_MEDIA_SANITIZE_DEPTH = 256;
+
+/**
  * Tool-name-free form of sanitizeMediaRecordCapture for values that are not
  * nested tool records: the classic execution's outer return value and console
  * args also persist into the code_execution history row (see
  * createCodeExecutionTool), and `return xum.<mediaTool>(...)` /
  * `console.log(...)` would otherwise carry the raw unbudgeted container.
+ *
+ * Walks the ENTIRE value graph, not just the root: guests can wrap bridged
+ * results arbitrarily (`return { image: xum.mcp__shots__take({}) }`), and a
+ * root-only check would pass the wrapper through raw. All containers found in
+ * one value share a single aggregate budget, so wrapping N containers cannot
+ * multiply the bound. Object identity is memoized (shared subtrees stay
+ * linear; cycle back-edges resolve to a bounded placeholder — cyclic values
+ * cannot JSON-persist anyway).
  */
 export function sanitizeCapturedMediaValue(value: unknown): unknown {
-  return isMediaContentContainer(value) ? sanitizeRetainedMediaContainer(value) : value;
+  const budget = { remainingBytes: KERNEL_RETAINED_MEDIA_BUDGET_BYTES };
+  return sanitizeMediaValueGraph(value, budget, new Map<object, unknown>(), 0);
+}
+
+function sanitizeMediaValueGraph(
+  value: unknown,
+  budget: { remainingBytes: number },
+  memo: Map<object, unknown>,
+  depth: number
+): unknown {
+  if (typeof value !== "object" || value === null) return value;
+  const existing = memo.get(value);
+  if (existing !== undefined) return existing;
+  if (depth >= MAX_MEDIA_SANITIZE_DEPTH) {
+    return "[value bounded at capture: nesting depth limit exceeded]";
+  }
+  // Pre-seed so a cycle back-edge encountered while this node is still being
+  // processed resolves to a placeholder instead of recursing forever.
+  memo.set(value, "[cyclic value bounded at capture]");
+
+  let result: unknown;
+  if (isMediaContentContainer(value)) {
+    // Container parts are charged their FULL serialized size (nested payloads
+    // included), so there is no need to descend into a sanitized container.
+    result = sanitizeRetainedMediaContainer(value, budget);
+  } else if (Array.isArray(value)) {
+    const mapped = value.map((item) => sanitizeMediaValueGraph(item, budget, memo, depth + 1));
+    result = mapped.some((item, index) => item !== value[index]) ? mapped : value;
+  } else {
+    const record = value as Record<string, unknown>;
+    let changed = false;
+    const mapped: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(record)) {
+      const sanitized = sanitizeMediaValueGraph(item, budget, memo, depth + 1);
+      mapped[key] = sanitized;
+      if (sanitized !== item) changed = true;
+    }
+    result = changed ? mapped : value;
+  }
+  memo.set(value, result);
+  return result;
 }
 
 /**

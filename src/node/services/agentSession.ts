@@ -7130,7 +7130,13 @@ export class AgentSession {
       reasoningMode: followUp.reasoningMode,
       additionalSystemInstructions: followUp.additionalSystemInstructions,
       providerOptions: followUp.providerOptions,
-      experiments: followUp.experiments,
+      // Raw JSON boundary (same as the startup-retry snapshot read above): an
+      // older build may have persisted {programmaticToolCalling: false,
+      // programmaticToolCallingExclusive: true}, and the explicit false would
+      // otherwise win over backend overrides while the removed legacy field
+      // is ignored — silently downgrading the crash-safe follow-up to
+      // PTC-off (and making its rlm flag inert).
+      experiments: aliasLegacyPtcExclusive(followUp.experiments),
       allowAgentSetGoal: followUp.allowAgentSetGoal,
       disableWorkspaceAgents: followUp.disableWorkspaceAgents,
       // Explicit-agent turns stay loud on the resumed turn too: the requested agent
