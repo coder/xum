@@ -3260,7 +3260,22 @@ export class WorkspaceGoalService {
     );
     return this.fileLocks.withLock(workspaceId, async () => {
       const current = await this.readGoalFile(workspaceId);
-      if (current?.status !== "budget_limited" || current.budgetLimitOriginKind === "user") {
+      if (current?.status !== "budget_limited") {
+        return;
+      }
+      // Codex P2 (PRRT_kwDOPxxmWM6cKkGL): the durable stamp below only
+      // protects restarts. The LIVE stream stamp stays goal-attributable
+      // through the manual turn's own accounting (recordStreamAccounting
+      // preserves budget_limited stamps), so the manual turn's stream-end
+      // would arm a fresh candidate that wrap-up eligibility accepts —
+      // dispatching the autonomous wrap-up right after the user's
+      // intervention. Re-mark the live stamp user-origin so eligibility
+      // rejects it in-process too.
+      const liveStamp = this.lastGoalStreamStamps.get(workspaceId);
+      if (liveStamp?.goalId === current.goalId && liveStamp.originKind !== "user") {
+        this.lastGoalStreamStamps.set(workspaceId, { ...liveStamp, originKind: "user" });
+      }
+      if (current.budgetLimitOriginKind === "user") {
         return;
       }
       const next = GoalRecordV1Schema.parse({

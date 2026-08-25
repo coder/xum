@@ -2692,6 +2692,17 @@ describe("WorkspaceGoalService", () => {
     const serviceAccess = service as unknown as {
       fileLocks: { withLock: <T>(key: string, fn: () => Promise<T>) => Promise<T> };
     };
+    // Codex P2 (PRRT_kwDOPxxmWM6cKkGV): count lock admissions instead of
+    // sleeping — on a loaded worker a fixed delay cannot guarantee the setter
+    // captured the pre-stop generation and queued behind the gate before the
+    // stop runs; the stop would then come first and the setter would
+    // legitimately persist, failing the test despite correct behavior.
+    let lockCalls = 0;
+    const originalWithLock = serviceAccess.fileLocks.withLock.bind(serviceAccess.fileLocks);
+    serviceAccess.fileLocks.withLock = <T>(key: string, fn: () => Promise<T>): Promise<T> => {
+      lockCalls += 1;
+      return originalWithLock(key, fn);
+    };
     let releaseGate!: () => void;
     const gate = new Promise<void>((resolve) => {
       releaseGate = resolve;
@@ -2701,7 +2712,8 @@ describe("WorkspaceGoalService", () => {
     // Direct path (no live stream): the setter passes its pre-lock stop check
     // and queues behind the gate.
     const setterPromise = service.setGoal({ workspaceId, objective: "Aborted direct goal" });
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    // Deterministic admission signal: gate (1), setter's persistence tenure (2).
+    await waitForCondition(() => lockCalls >= 2, { timeoutMs: 5_000 });
     // The stop bumps the stop generation synchronously; its own locked section
     // queues behind the setter's tenure.
     const stopPromise = service.recordUserStoppedStream(workspaceId);
@@ -2998,6 +3010,39 @@ describe("WorkspaceGoalService", () => {
       status: "budget_limited",
       budgetLimitOriginKind: "user",
     });
+
+    // Codex P2 (PRRT_kwDOPxxmWM6cKkGL): the suppression must also neutralize
+    // the LIVE eligibility state — without touching the in-memory stream
+    // stamp, the manual turn's accounting preserves the goal-attributable
+    // stamp and its stream-end arms a candidate that dispatches the wrap-up
+    // immediately, no restart required.
+    const liveDispatcher = new IdleDispatcher();
+    const liveExecuted: Array<{ kind: string | undefined }> = [];
+    service.registerGoalContinuationConsumer(liveDispatcher, {
+      hasActiveDescendantTasks: () => false,
+      getRuntimeState: () => ({ isRuntimeCompatible: true }),
+      executeGoalContinuation: (input) => {
+        liveExecuted.push({ kind: input.kind });
+        return Promise.resolve(true);
+      },
+      getKickoffSendOptions: () => Promise.resolve({ model: "openai:gpt-4o", agentId: "exec" }),
+    });
+    // The manual turn's own accounting preserves the existing budget_limited
+    // stamp rather than overwriting it; its stream-end then requests a
+    // continuation.
+    await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 0.01,
+      streamStartedAtMs: created.createdAtMs + 2,
+      streamOriginKind: "user",
+    });
+    await service.requestContinuationAfterStreamEnd({
+      workspaceId,
+      sendOptions: { model: "openai:gpt-4o", agentId: "exec" },
+      streamEndedAtMs: created.createdAtMs + 3,
+    });
+    await drainPendingDispatches();
+    expect(liveExecuted).toHaveLength(0);
 
     // Simulate restart: recovery must honor the durable suppression.
     const restartedService = new WorkspaceGoalService(
