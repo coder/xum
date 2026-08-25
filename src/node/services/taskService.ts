@@ -45,7 +45,6 @@ import {
   resolveAgentFrontmatter,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
-import { getBuiltInAgentDefinitions } from "@/node/services/agentDefinitions/builtInAgentDefinitions";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
@@ -3691,14 +3690,14 @@ export class TaskService {
    * targets that are not reachable yet (deferred provisioning, stopped containers)
    * without permitting a silent exec fallback later:
    * - reachable checkout: strict validation against the target;
-   * - unreachable + built-in agent id: validate against the OWNER's checkout — same
-   *   project, so a project-local shadow of the built-in id (and its ui/disabled
-   *   state) is visible there, while the embedded definition guarantees the id
-   *   resolves in the target even if the shadow is absent;
-   * - unreachable + custom agent id: fail with a reachability error instead of a
-   *   misleading "unknown agentId". Dispatching anyway would let
-   *   resolveAgentForStream silently fall back to exec if the definition turns out
-   *   to be absent after provisioning (wrong prompt/tool policy).
+   * - unreachable checkout: resolve the definition via the OWNER's context (same
+   *   project and runtime host, so project shadows and host-side global roots are
+   *   visible). If the winning definition is checkout-dependent (project scope),
+   *   fail with a reachability error — it cannot be verified in the target and
+   *   dispatching anyway would let resolveAgentForStream silently fall back to
+   *   exec (wrong prompt/tool policy). Host-side definitions (built-in, global,
+   *   plugin) resolve independently of the target checkout, so eligibility is
+   *   validated against the owner context and the launch proceeds.
    * Waiting for provisioning here is not an option: createWorkspaceTurn holds the
    * service-wide task mutex for its whole body.
    */
@@ -3717,9 +3716,29 @@ export class TaskService {
       });
       return validation.success ? Ok({ validatedContext: params.target }) : validation;
     }
-    if (!getBuiltInAgentDefinitions().some((definition) => definition.id === params.agentId)) {
+    const parsedAgentId = AgentIdSchema.safeParse(params.agentId);
+    if (!parsedAgentId.success) {
+      return Err(`Task.createWorkspaceTurn: invalid agentId (${params.agentId})`);
+    }
+    let resolvedScope: string;
+    try {
+      const definition = await readAgentDefinition(
+        params.owner.runtime,
+        params.owner.workspacePath,
+        parsedAgentId.data,
+        {
+          includeAgentPlugins: this.workspaceService.isExperimentEnabled(
+            EXPERIMENT_IDS.AGENT_PLUGINS
+          ),
+        }
+      );
+      resolvedScope = definition.scope;
+    } catch {
+      return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
+    }
+    if (resolvedScope === "project") {
       return Err(
-        `Task.createWorkspaceTurn: target checkout is not reachable yet (provisioning or stopped runtime), so non-built-in agentId (${params.agentId}) cannot be verified`
+        `Task.createWorkspaceTurn: target checkout is not reachable yet (provisioning or stopped runtime), so project-local agentId (${params.agentId}) cannot be verified there`
       );
     }
     const validation = await this.validateWorkspaceTurnAgentId({
