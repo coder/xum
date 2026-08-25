@@ -14617,15 +14617,17 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
       ) => Promise<SendMessageOptions | null>;
     }
 
+    const delegatedTurnCorrelation = {
+      type: "workspace-turn-task" as const,
+      taskHandleId: "wst_handle",
+      ownerWorkspaceId: "owner-ws",
+      turnId: "turn-1",
+    };
+
     const delegatedTurnMessage = (id: string) =>
       createMuxMessage(id, "user", "Delegated prompt", {
         timestamp: Date.now(),
-        muxMetadata: {
-          type: "workspace-turn-task" as const,
-          taskHandleId: "wst_handle",
-          ownerWorkspaceId: "owner-ws",
-          turnId: "turn-1",
-        },
+        muxMetadata: delegatedTurnCorrelation,
         retrySendOptions: {
           model: "anthropic:claude-opus-4-6",
           agentId: "plan",
@@ -14634,10 +14636,23 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
         },
       });
 
-    test("continues an in-flight delegated turn under its own per-turn options", async () => {
+    /** Correlated assistant response; "tool-calls" is the queue-dispatch cut that leaves the turn open. */
+    const delegatedAssistantMessage = (id: string, finishReason: "tool-calls" | "stop") =>
+      createMuxMessage(id, "assistant", "Working…", {
+        timestamp: Date.now(),
+        partial: false,
+        finishReason,
+        muxMetadata: delegatedTurnCorrelation,
+      });
+
+    test("continues a still-open delegated turn under its own per-turn options", async () => {
       const workspaceId = "ws-delegated-continuation";
       const { service, historyService } = await makeServiceWithHistory();
       await historyService.appendToHistory(workspaceId, delegatedTurnMessage("delegated-1"));
+      await historyService.appendToHistory(
+        workspaceId,
+        delegatedAssistantMessage("assistant-cut", "tool-calls")
+      );
       // A previous wake continuation must not hide the delegated turn's options.
       await historyService.appendToHistory(
         workspaceId,
@@ -14663,10 +14678,29 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
       expect(options?.muxMetadata).toBeUndefined();
     });
 
+    test("yields nothing after a terminal assistant response closed the delegated turn", async () => {
+      const workspaceId = "ws-delegated-closed";
+      const { service, historyService } = await makeServiceWithHistory();
+      await historyService.appendToHistory(workspaceId, delegatedTurnMessage("delegated-2"));
+      // finishReason "stop" ends the delegated turn: a later monitor match is a NEW
+      // synthetic turn and must resolve from persisted defaults, not stale overrides.
+      await historyService.appendToHistory(
+        workspaceId,
+        delegatedAssistantMessage("assistant-final", "stop")
+      );
+
+      const internals = service as unknown as DelegatedContinuationInternals;
+      expect(await internals.getDelegatedTurnContinuationSendOptions(workspaceId)).toBeNull();
+    });
+
     test("yields nothing once another user send follows the delegated prompt", async () => {
       const workspaceId = "ws-delegated-superseded";
       const { service, historyService } = await makeServiceWithHistory();
-      await historyService.appendToHistory(workspaceId, delegatedTurnMessage("delegated-2"));
+      await historyService.appendToHistory(workspaceId, delegatedTurnMessage("delegated-3"));
+      await historyService.appendToHistory(
+        workspaceId,
+        delegatedAssistantMessage("assistant-cut-2", "tool-calls")
+      );
       await historyService.appendToHistory(
         workspaceId,
         createMuxMessage("manual-1", "user", "Manual user message", { timestamp: Date.now() })

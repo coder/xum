@@ -31,6 +31,7 @@ import {
   AgentSession,
   clearProviderConfigFixableAbandonMarkers,
   CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE,
+  inheritOpenWorkspaceTurnMetadata,
   type StreamErrorRecoveryOutcome,
 } from "@/node/services/agentSession";
 import type { HistoryService } from "@/node/services/historyService";
@@ -12178,15 +12179,18 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * Send options for continuing an in-flight delegated workspace turn (bash-monitor
+   * Send options for continuing a STILL-OPEN delegated workspace turn (bash-monitor
    * wakes cut turns at tool boundaries). The delegated prompt's persisted
    * retrySendOptions carry the turn's own settings — including per-turn overrides
    * (agentId, model, strictAgentResolution) that are deliberately NOT in the
    * workspace's persisted defaults when the launch used skipAiSettingsPersistence —
    * so resolving from workspace defaults would continue the turn under the wrong
-   * agent. Walks user messages backwards, skipping this mechanism's own wake
-   * continuations, and yields nothing once any other user send follows the delegated
-   * prompt (the delegated turn is no longer the active conversation context).
+   * agent. Openness is decided by the same rule as workspace-turn correlation
+   * (inheritOpenWorkspaceTurnMetadata): only a correlated assistant cut with
+   * finishReason "tool-calls" leaves the turn open. Once a terminal assistant
+   * response closed the turn (or any other user send took over the conversation),
+   * a late monitor match is a NEW synthetic turn and resolves from the target's
+   * persisted defaults instead of resurrecting stale per-turn overrides.
    * Continuations never persist these options as workspace defaults.
    */
   private async getDelegatedTurnContinuationSendOptions(
@@ -12201,17 +12205,22 @@ export class WorkspaceService extends EventEmitter {
     if (!history.success) {
       return null;
     }
+    const openTurn = inheritOpenWorkspaceTurnMetadata(history.data);
+    if (openTurn == null) {
+      return null;
+    }
     for (let i = history.data.length - 1; i >= 0; i--) {
       const message = history.data[i];
       if (message.role !== "user") {
         continue;
       }
       const muxMetadata = message.metadata?.muxMetadata;
-      if (muxMetadata?.type === "bash-monitor-wake") {
+      if (
+        muxMetadata?.type !== "workspace-turn-task" ||
+        muxMetadata.taskHandleId !== openTurn.taskHandleId ||
+        muxMetadata.turnId !== openTurn.turnId
+      ) {
         continue;
-      }
-      if (muxMetadata?.type !== "workspace-turn-task") {
-        return null;
       }
       const retrySendOptions = message.metadata?.retrySendOptions;
       if (retrySendOptions == null) {
