@@ -13,11 +13,7 @@ import {
 
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
-import {
-  readPersistedState,
-  updatePersistedState,
-  usePersistedState,
-} from "@/browser/hooks/usePersistedState";
+import { readPersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { matchesKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
@@ -32,7 +28,6 @@ import {
   GLOBAL_SCOPE_ID,
 } from "@/common/constants/storage";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
-import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import {
   resolveWorkspaceAiSettingsForAgent,
   type WorkspaceAISettingsCache,
@@ -174,13 +169,10 @@ function AgentProviderWithState(props: {
         return;
       }
       const nextAgentId: string = next;
-      const previousAgentId: string | null = previous;
 
-      // Snapshot the resolved settings before WorkspaceModeAISync reacts to
-      // the optimistic switch: it replaces model/thinking/reasoning for the
-      // target agent, and on rollback its fallback for a previous agent with
-      // no bucket or configured defaults would be the target agent's newly
-      // applied settings rather than these.
+      // Read the carried-over settings before WorkspaceModeAISync reacts to
+      // the optimistic switch; they seed the resolver as the previously
+      // active values.
       const modelKey = getModelKey(workspaceId);
       const thinkingKey = getThinkingLevelKey(workspaceId);
       const reasoningKey = getReasoningModeKey(workspaceId);
@@ -211,29 +203,14 @@ function AgentProviderWithState(props: {
           agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
         });
 
-      // Optimistic local update above; on persistence failure roll the local
-      // selection back (unless it changed again meanwhile) so this client
-      // cannot silently diverge from the backend-authoritative agent.
-      const rollback = () => {
-        clearPendingWorkspaceAgentId(workspaceId, nextAgentId);
-        if (previousAgentId == null) {
-          return;
-        }
-        // scopeId === workspaceId here: persistence only runs workspace-scoped.
-        const current = readPersistedState<string | null>(getAgentIdKey(workspaceId), null);
-        if (current !== nextAgentId) {
-          return;
-        }
-        // Restore settings before the agent id so the sync effect's rollback
-        // run reads them as the existing (fallback) values.
-        setWorkspaceModelWithOrigin(workspaceId, previousModel, "sync");
-        updatePersistedState(thinkingKey, previousThinking);
-        updatePersistedState(reasoningKey, previousReasoning);
-        setAgentIdRaw(previousAgentId);
-      };
+      // The local update above is authoritative for this client and the write
+      // below is best-effort: every send carries the selection and re-persists
+      // it backend-side (maybePersistAISettingsFromOptions), so a failed or
+      // rejected write self-heals on the next send instead of triggering a
+      // local rollback.
 
       // The picker closes on selection, so a rejected switch would otherwise
-      // just snap back with no explanation (e.g. budgeted-goal pricing gate).
+      // be silent (e.g. budgeted-goal pricing gate).
       const notifySwitchRejected = (message: string) => {
         window.dispatchEvent(
           createCustomEvent(CUSTOM_EVENTS.AGENT_SWITCH_ERROR_TOAST, {
@@ -257,20 +234,19 @@ function AgentProviderWithState(props: {
           persistSelectedAgentId: true,
         })
         .then((result) => {
-          if (result.success) {
-            // A no-op write (backend already on this agent) emits no metadata
-            // echo, so release the guard deterministically. For changed writes
-            // the echo is ordered after any stale broadcast, so releasing on
-            // the response cannot strand a stale value.
-            clearPendingWorkspaceAgentId(workspaceId, nextAgentId);
-            return;
+          if (!result.success) {
+            notifySwitchRejected(typeof result.error === "string" ? result.error : "");
           }
-          notifySwitchRejected(typeof result.error === "string" ? result.error : "");
-          rollback();
+          // Release the guard on every settled write: no-op writes (backend
+          // already on this agent) and failed writes emit no metadata echo,
+          // and a stuck guard would block future backend agent seeds. For
+          // changed writes the echo is ordered after any stale broadcast, so
+          // releasing on the response cannot strand a stale value.
+          clearPendingWorkspaceAgentId(workspaceId, nextAgentId);
         })
         .catch((error) => {
           notifySwitchRejected(getErrorMessage(error));
-          rollback();
+          clearPendingWorkspaceAgentId(workspaceId, nextAgentId);
         });
     },
     [
