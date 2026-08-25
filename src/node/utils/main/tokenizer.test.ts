@@ -42,6 +42,13 @@ describe("tokenizer", () => {
     expect(second).toBe(first);
   });
 
+  test("countTokens tolerates special-token strings in ordinary text", async () => {
+    // GPT-2/BPE task content can contain literal special tokens; counting
+    // must not throw (ai-tokenizer's encode() disallows them by default).
+    const count = await countTokens(openaiModel, "text with <|endoftext|> inside");
+    expect(count).toBeGreaterThan(0);
+  });
+
   test("countTokensBatch matches individual calls", async () => {
     const texts = ["alpha", "beta", "gamma"];
     const batch = await countTokensBatch(openaiModel, texts);
