@@ -219,6 +219,72 @@ describe("extractToolMediaAsUserMessages", () => {
     });
   });
 
+  it("rewrites media containers wrapped inside outer results and console args", async () => {
+    // `return { image: xum.mcp(...) }` wraps the container in a plain object:
+    // capture-time sanitization intentionally retains supported containers
+    // under its budget, so the provider copy must deep-walk arbitrary
+    // wrappers — a root-only outer check would ship the screenshot as BOTH an
+    // attachment (from the nested record) and raw JSON on every later
+    // request (round 15).
+    const base64 = (
+      await sharp({
+        create: {
+          width: 10,
+          height: 10,
+          channels: 3,
+          background: { r: 0, g: 0, b: 255 },
+        },
+      })
+        .png()
+        .toBuffer()
+    ).toString("base64");
+
+    const mediaContainer = {
+      type: "content",
+      value: [{ type: "media", mediaType: "image/png", data: base64 }],
+    };
+    const input: MuxMessage[] = [
+      {
+        id: "ce-wrapped",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call1",
+            toolName: "code_execution",
+            input: { code: "const r = xum.mcp__shots__take({}); return { image: r };" },
+            state: "output-available",
+            output: {
+              success: true,
+              result: { image: mediaContainer, note: "kept" },
+              toolCalls: [{ toolName: "mcp__shots__take", args: {}, result: mediaContainer }],
+              consoleOutput: [{ level: "log", args: [{ wrapped: mediaContainer }], timestamp: 1 }],
+            },
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    expect(rewritten).toHaveLength(2);
+
+    const toolPart = rewritten[0].parts[0];
+    if (toolPart.type !== "dynamic-tool" || toolPart.state !== "output-available") {
+      throw new Error("Expected an output-available dynamic-tool part");
+    }
+    const outputText = JSON.stringify(toolPart.output);
+    // All three copies (record, wrapped outer result, wrapped console arg)
+    // are replaced; sibling wrapper fields survive untouched.
+    expect(outputText).not.toContain(base64);
+    expect(outputText).toContain('"note":"kept"');
+
+    // Identical media across all copies dedupes into ONE attachment.
+    const syntheticUser = rewritten[1];
+    const fileParts = syntheticUser.parts.filter((part) => part.type === "file");
+    expect(fileParts).toHaveLength(1);
+  });
+
   it("redacts media containers copied into code_execution console output", async () => {
     // `const image = xum.<mediaTool>(...); console.log(image)` copies the
     // container into consoleOutput args (classic console budget ~1MiB);

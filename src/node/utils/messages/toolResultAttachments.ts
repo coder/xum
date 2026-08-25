@@ -171,7 +171,11 @@ export function extractAttachmentsFromToolOutput(
   }
 
   if (!isContentContainer(output)) {
-    return extractAttachmentsFromNestedToolCalls(output, depth + 1);
+    const nested = extractAttachmentsFromNestedToolCalls(output, depth + 1);
+    if (nested != null) {
+      return nested;
+    }
+    return extractAttachmentsFromWrapperValue(output, depth + 1);
   }
 
   const attachments: ExtractedToolAttachment[] = [];
@@ -334,6 +338,45 @@ function extractAttachmentsFromNestedToolCalls(
     },
     attachments,
   };
+}
+
+/**
+ * Deep-walk arbitrary wrapper objects/arrays for media content containers.
+ * Sandbox code can wrap bridged results (`return { image: xum.mcp(...) }`),
+ * and capture-time sanitization intentionally RETAINS supported containers
+ * under its budget — so the provider copy must rewrite them into
+ * attachments/placeholders wherever they sit, or a normal screenshot ships as
+ * both an attachment (from the duplicate nested record) and megabytes of raw
+ * JSON (from the wrapped outer result) on every later request. Children route
+ * back through extractAttachmentsFromToolOutput, so the shared depth cap
+ * bounds the stack (cycles terminate because depth grows on each revisit) and
+ * over-deep subtrees degrade to the bounded placeholder.
+ */
+function extractAttachmentsFromWrapperValue(
+  value: unknown,
+  depth: number
+): { newOutput: unknown; attachments: ExtractedToolAttachment[] } | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+  const attachments: ExtractedToolAttachment[] = [];
+  let didChange = false;
+  const rewrite = (item: unknown): unknown => {
+    const extracted = extractAttachmentsFromToolOutput(item, depth + 1);
+    if (extracted == null) {
+      return item;
+    }
+    didChange = true;
+    attachments.push(...extracted.attachments);
+    return extracted.newOutput;
+  };
+  const newValue = Array.isArray(value)
+    ? value.map(rewrite)
+    : Object.fromEntries(Object.entries(value).map(([key, item]) => [key, rewrite(item)]));
+  if (!didChange) {
+    return null;
+  }
+  return { newOutput: newValue, attachments };
 }
 
 type ProviderReadyToolAttachment =
