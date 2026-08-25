@@ -93,7 +93,7 @@ import {
   normalizeUsageModelKey,
   resolveModelForMetadata,
 } from "@/common/utils/providers/modelEntries";
-import { getErrorMessage } from "@/common/utils/errors";
+import { clampErrorMessage, getErrorMessage } from "@/common/utils/errors";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { shellQuote } from "@/common/utils/shell";
 import { classify429Capacity } from "@/common/utils/errors/classify429Capacity";
@@ -3846,7 +3846,11 @@ export class StreamManager extends EventEmitter {
 
     return {
       messageId: streamInfo.messageId,
-      error: errorMessage,
+      // Clamp AFTER categorization/enhancement: some SDK errors embed the
+      // entire serialized prompt in their message (AI_TypeValidationError via
+      // the cause walk), and an unbounded message would be persisted to
+      // history metadata, shipped over IPC, and rendered in the chat.
+      error: clampErrorMessage(errorMessage),
       errorType,
       acpPromptId: streamInfo.initialMetadata?.acpPromptId,
     };

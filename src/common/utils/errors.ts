@@ -49,3 +49,30 @@ export function getErrorMessage(error: unknown): string {
   }
   return msg;
 }
+
+/**
+ * Default bound for clampErrorMessage. Generous for real provider errors,
+ * tiny compared to the pathological cases it defends against.
+ */
+export const ERROR_MESSAGE_CLAMP_MAX_CHARS = 8_000;
+
+/**
+ * Clamp a pathologically long error message before it is persisted, sent over
+ * IPC, or rendered. Some AI SDK errors embed entire request payloads in their
+ * message — AI_TypeValidationError (surfaced via getErrorMessage's cause walk)
+ * includes the full JSON-serialized prompt, easily hundreds of KB. Keeps the
+ * head (error type + summary) and the tail (the actionable validation detail
+ * usually trails the payload dump).
+ */
+export function clampErrorMessage(
+  message: string,
+  maxChars: number = ERROR_MESSAGE_CLAMP_MAX_CHARS
+): string {
+  if (message.length <= maxChars) {
+    return message;
+  }
+  const tailChars = Math.floor(maxChars / 4);
+  const headChars = maxChars - tailChars;
+  const omitted = message.length - headChars - tailChars;
+  return `${message.slice(0, headChars)}\n… [${omitted} chars omitted] …\n${message.slice(message.length - tailChars)}`;
+}

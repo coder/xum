@@ -353,6 +353,29 @@ describe("createCodeExecutionTool", () => {
       expect(result.result).toBe(3);
     });
 
+    it("normalizes non-JSON guest values so the output survives strict JSONValue validation", async () => {
+      // Regression: console.log(undefined) / returned undefined fields used to
+      // reach the AI SDK verbatim, failing ModelMessage validation on the next
+      // step and killing the live stream (AI_InvalidPromptError) — while the
+      // retry, rebuilt from JSON-rehydrated history, succeeded.
+      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge({}));
+
+      const result = (await tool.execute!(
+        {
+          code: "console.log(undefined); return { a: undefined, arr: [undefined, 1], nan: NaN };",
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+
+      expect(result.success).toBe(true);
+      // The live object must equal its own JSON round-trip (what a reloaded
+      // history would contain), so first-run and retry behavior are identical.
+      const roundTripped = JSON.parse(JSON.stringify(result)) as PTCExecutionResult;
+      expect(result).toEqual(roundTripped);
+      expect(result.result).toEqual({ arr: [null, 1], nan: null });
+      expect(result.consoleOutput[0]?.args).toEqual([null]);
+    });
+
     it("captures console.log output", async () => {
       const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge({}));
 
