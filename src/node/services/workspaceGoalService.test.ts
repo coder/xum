@@ -2318,6 +2318,44 @@ describe("WorkspaceGoalService", () => {
     expect(projected?.createdAtMs ?? -1).toBeGreaterThanOrEqual(lastActivityReadMs);
   });
 
+  test("user abort during pending-goal publication discards the queued mutation", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6b-orH): recordUserStoppedStream deletes queued
+    // goal mutations synchronously before taking the goal file lock. If the
+    // mutation were installed only after the publication await, an abort
+    // landing during publication would find nothing to delete, block on the
+    // lock, and the setter would then install the mutation anyway — silently
+    // applying the discarded goal at the end of the NEXT stream (AgentSession
+    // deliberately skips the stream-end drain for user aborts).
+    await extensionMetadata.setStreaming(workspaceId, true);
+    const stopPromises: Array<Promise<void>> = [];
+    let fireStops = false;
+    const originalGetSnapshot = extensionMetadata.getSnapshot.bind(extensionMetadata);
+    spyOn(extensionMetadata, "getSnapshot").mockImplementation(async (id: string) => {
+      const snapshot = await originalGetSnapshot(id);
+      if (fireStops) {
+        // Fire the abort's synchronous mutation delete at every await inside
+        // the queued-setGoal path, including the activity read inside
+        // publishPendingGoalSnapshot; the abort then queues on the goal file
+        // lock behind the setter.
+        stopPromises.push(service.recordUserStoppedStream(workspaceId));
+      }
+      return snapshot;
+    });
+
+    fireStops = true;
+    const queued = await service.setGoal({ workspaceId, objective: "Aborted goal" });
+    fireStops = false;
+    expect(queued.success).toBe(true);
+    expect(stopPromises.length).toBeGreaterThan(0);
+    await Promise.all(stopPromises);
+
+    await extensionMetadata.setStreaming(workspaceId, false);
+    // Simulate the NEXT stream's end: the drain must find nothing to apply.
+    const drained = await service.applyPendingAfterStreamEnd(workspaceId);
+    expect(drained).toBeNull();
+    expect(await service.getGoal(workspaceId)).toBeNull();
+  });
+
   test("queued mid-stream goal replacement preserves expectedGoalId at drain time", async () => {
     const created = await setGoalOk(service, { workspaceId, objective: "Original" });
     await extensionMetadata.setStreaming(workspaceId, true);

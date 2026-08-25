@@ -6063,6 +6063,8 @@ export class AgentSession {
     internal?: {
       synthetic?: boolean;
       agentInitiated?: boolean;
+      /** Request-entry authoring time captured before send preflight awaits (see MessageQueue). */
+      authoredAtMs?: number;
       /** True only for a report that continues an existing workspace turn. */
       workspaceTurnContinuation?: boolean;
       /** Coalescing: drop the message when an entry with the same key is already queued. */

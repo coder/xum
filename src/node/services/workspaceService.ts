@@ -9455,6 +9455,13 @@ export class WorkspaceService extends EventEmitter {
       agentId: options?.agentId,
       options,
     });
+    // Codex P2 (PRRT_kwDOPxxmWM6b-orA): capture authoring time at request
+    // entry, before the preflight awaits below (pricing gate, AI-settings
+    // persistence). Goal safety compares this against goal creation, so
+    // sampling later — at enqueue or dispatch — would misclassify a message
+    // the user authored before a goal became visible as an intervention
+    // against it, pausing the fresh goal.
+    const authoredAtMs = Date.now();
 
     let resumedInterruptedTask = false;
     let claimedAutoTitle = false;
@@ -9616,6 +9623,10 @@ export class WorkspaceService extends EventEmitter {
             startStreamInBackground: internal?.startStreamInBackground,
             goalContinuation: internal?.goalContinuation,
             admissionEpochStale,
+            // The rejected manual send still persists the user row; carry the
+            // authoring time so goal safety and restart reconciliation can
+            // prove it predates any goal published during the pricing await.
+            enqueuedAtMs: authoredAtMs,
           });
         }
         return Err(pricingGate.error);
@@ -9702,6 +9713,7 @@ export class WorkspaceService extends EventEmitter {
           {
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
+            authoredAtMs,
             workspaceTurnContinuation: internal?.workspaceTurnContinuation,
             dedupeKey: internal?.queueDedupeKey,
             removableDedupeKey: internal?.removableQueueDedupeKey,
@@ -9789,6 +9801,10 @@ export class WorkspaceService extends EventEmitter {
         startStreamInBackground: internal?.startStreamInBackground,
         cancelState: internal?.cancelState,
         cancelSignal: internal?.cancelSignal,
+        // Same authoring-time race as the queued path: the goal-creating
+        // stream can end during the preflight awaits above, making a fresh
+        // goal visible after the user hit enter but before this dispatch.
+        enqueuedAtMs: authoredAtMs,
         onCanceled: continuationSendState.onCanceled,
         onAccepted: internal?.onAccepted,
         onAcceptedPreStreamFailure,

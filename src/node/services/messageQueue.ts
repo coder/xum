@@ -84,6 +84,14 @@ type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMode"]>;
 interface QueuedMessageInternalOptions {
   synthetic?: boolean;
   agentInitiated?: boolean;
+  /**
+   * When the sender authored this message (request entry), before any send
+   * preflight awaits (pricing gate, settings persistence). Goal safety
+   * compares the authoring time against goal creation, so sampling at
+   * enqueue time would misclassify a message authored before a goal became
+   * visible as an intervention against it (Codex P2 PRRT_kwDOPxxmWM6b-orA).
+   */
+  authoredAtMs?: number;
   /** True only for a report that continues an existing workspace turn. */
   workspaceTurnContinuation?: boolean;
   /** Keep this queued add isolated so its dedupe key can be removed without affecting siblings. */
@@ -531,7 +539,7 @@ export class MessageQueue {
     }
 
     entry.addCount += 1;
-    entry.lastAddedAtMs = Date.now();
+    entry.lastAddedAtMs = internal?.authoredAtMs ?? Date.now();
     if (internal?.synthetic === true) {
       entry.syntheticCount += 1;
     }

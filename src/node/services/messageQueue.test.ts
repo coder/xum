@@ -10,6 +10,29 @@ describe("MessageQueue", () => {
     queue = new MessageQueue();
   });
 
+  describe("authoredAtMs", () => {
+    it("returns the request-entry authoring time from dequeueNext when provided", () => {
+      // Codex P2 (PRRT_kwDOPxxmWM6b-orA): the sender captures authoring time
+      // before its preflight awaits (pricing gate, settings persistence);
+      // sampling Date.now() at enqueue instead would postdate a goal that
+      // became visible during those awaits and misclassify the message as an
+      // intervention against a goal the user had not seen.
+      const authoredAtMs = Date.now() - 5_000;
+      queue.add("typed before preflight", undefined, { authoredAtMs });
+
+      const { enqueuedAtMs } = queue.dequeueNext();
+      expect(enqueuedAtMs).toBe(authoredAtMs);
+    });
+
+    it("falls back to enqueue-time sampling when authoring time is absent", () => {
+      const before = Date.now();
+      queue.add("plain add");
+
+      const { enqueuedAtMs } = queue.dequeueNext();
+      expect(enqueuedAtMs).toBeGreaterThanOrEqual(before);
+    });
+  });
+
   describe("getDisplayText", () => {
     it("should return joined messages for normal messages", () => {
       queue.add("First message");
