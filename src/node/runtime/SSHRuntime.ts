@@ -152,7 +152,11 @@ function isUnresolvedDeltaPushFailure(errorMsg: string): boolean {
 }
 
 function isMissingObjectCheckoutFailure(message: string): boolean {
-  return /unable to read sha1 file|Could not reset index file|missing (blob|tree|commit)|bad object|unable to read tree|object file .* is empty|loose object .* is corrupt/i.test(
+  // "could not fetch ... from promisor remote": the checkout needed objects the
+  // repo does not have and a lazy fetch from upstream failed (e.g. transient
+  // network drop). The objects are still missing locally, so the same
+  // repair-from-local path applies.
+  return /unable to read sha1 file|Could not reset index file|missing (blob|tree|commit)|bad object|unable to read tree|object file .* is empty|loose object .* is corrupt|could not fetch .* from promisor remote/i.test(
     message
   );
 }
@@ -2657,6 +2661,18 @@ export class SSHRuntime extends RemoteRuntime {
       // path where ensureBaseRepo() has retry/error handling instead of risking
       // materializing a worktree from still-poisoned shared config.
       `git --git-dir=${baseRepoPathArg} symbolic-ref HEAD ${baseRepoUnbornHeadArg} 2>/dev/null || { echo WARM_MISS:base-head-normalization-failed; exit 0; }`,
+      // Best-effort promisor strip, mirroring ensureBaseRepo()'s epilogue. The
+      // warm path skips ensureBaseRepo(), and background status fetches that
+      // ran `git fetch --filter=blob:none` inside sibling worktrees register
+      // the shared base repo as a promisor remote (remote.origin.promisor +
+      // partialclonefilter). Left in place, `git worktree add` below would
+      // lazy-fetch missing blobs from upstream mid-checkout, so a transient
+      // network drop aborts workspace creation with "could not fetch <oid>
+      // from promisor remote" instead of the repairable missing-objects path.
+      ...BASE_REPO_PROMISOR_CONFIG_KEYS.map(
+        (key) =>
+          `git --git-dir=${baseRepoPathArg} config --local --unset-all ${shescape.quote(key)} 2>/dev/null || true`
+      ),
     ];
 
     const originPreamble = originUrlArg
@@ -2706,7 +2722,7 @@ export class SSHRuntime extends RemoteRuntime {
       "wt_status=$?",
       'if [ "$wt_status" -ne 0 ]; then',
       '  case "$wt_output" in',
-      '    *"unable to read sha1 file"*|*"Could not reset index file"*|*"missing blob"*|*"missing tree"*|*"missing commit"*|*"bad object"*|*"unable to read tree"*) wt_reason=missing-objects ;;',
+      '    *"unable to read sha1 file"*|*"Could not reset index file"*|*"missing blob"*|*"missing tree"*|*"missing commit"*|*"bad object"*|*"unable to read tree"*|*"from promisor remote"*) wt_reason=missing-objects ;;',
       "    *) wt_reason=worktree-add-failed ;;",
       "  esac",
       `  git -C ${baseRepoPathArg} worktree remove --force ${workspacePathArg} >/dev/null 2>&1 || rm -rf ${workspacePathArg}`,

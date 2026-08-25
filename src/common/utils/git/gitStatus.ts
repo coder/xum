@@ -222,6 +222,17 @@ if [ "$LOCAL_SHA" = "$REMOTE_SHA" ]; then
 fi
 
 # Remote has new commits or ref moved - fetch updates
+#
+# --no-filter (NOT --filter=blob:none): a filtered fetch permanently converts
+# the repo into a promisor/partial clone (git writes remote.origin.promisor +
+# remote.origin.partialclonefilter on the first filtered fetch, and the
+# configured filter then applies to every subsequent plain fetch). That leaves
+# every commit fetched by this background loop without its blobs, so a later
+# "git worktree add" (workspace creation) must lazy-fetch blobs from the
+# remote mid-checkout and any transient network failure aborts it with
+# "fatal: could not fetch <oid> from promisor remote". --no-filter both avoids
+# poisoning healthy repos and overrides the persisted filter config in repos
+# that were already converted, so they heal going forward.
 git -c protocol.version=2 \\
     -c fetch.negotiationAlgorithm=skipping \\
     fetch origin \\
@@ -229,6 +240,6 @@ git -c protocol.version=2 \\
     --no-tags \\
     --no-recurse-submodules \\
     --no-write-fetch-head \\
-    --filter=blob:none \\
+    --no-filter \\
     2>&1
 `;
