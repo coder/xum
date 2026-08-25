@@ -65,9 +65,12 @@ function collectNestedEditRecords(output: unknown): NestedEditRecord[] {
       continue;
     }
     const result = record.result as FileEditToolOutput | undefined;
-    // Classic records retain the full result: edits resolve with
-    // {success: false} instead of throwing, so require an explicit success.
-    // Kernel-compacted records carry no result; their ok bit above decides.
+    // Success must be POSITIVE, never inferred from absence: classic records
+    // retain the full result (edits resolve with {success: false} instead of
+    // throwing), and kernel-compacted result-less records always carry an
+    // explicit boolean ok — a malformed row with neither must not be
+    // reported by crash-safe tracking as a completed edit.
+    if (result === undefined && record.ok !== true) continue;
     if (result !== undefined && result.success !== true) continue;
     const filePath = extractToolFilePath(record.args);
     if (!filePath) continue;

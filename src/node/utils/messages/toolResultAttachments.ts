@@ -139,12 +139,15 @@ function buildDisplayOnlyFilePlaceholder(item: DisplayOnlyFilePart): AISDKTextPa
  * one malformed row would brick the workspace (self-healing rule). Real
  * nesting is 1–2 levels (code_execution → bridged tool results).
  *
- * Over-deep subtrees are REPLACED with a bounded placeholder in the provider
- * copy, not retained: descent only follows tool-output-shaped wrappers, so
- * anything past the cap is malformed by construction, and retaining it would
- * keep shipping whatever payload hides at the leaf (e.g. raw base64) on every
- * later request — trading the stack overflow for context-limit failures.
- * Persisted history itself is never mutated.
+ * Over-deep TOOL-OUTPUT-SHAPED subtrees (json wrappers, toolCalls record
+ * chains) are REPLACED with a bounded placeholder in the provider copy, not
+ * retained: those shapes are malformed by construction past the cap, and
+ * retaining them would keep shipping whatever payload hides at the leaf
+ * (e.g. raw base64) on every later request — trading the stack overflow for
+ * context-limit failures. GENERIC wrapper descent instead stops at the cap
+ * and leaves the subtree unchanged (see extractAttachmentsFromWrapperValue):
+ * media-free deep JSON is plausibly legitimate output and must not be
+ * silently truncated. Persisted history itself is never mutated.
  */
 const MAX_NESTED_TOOL_EXTRACTION_DEPTH = 64;
 
@@ -357,6 +360,16 @@ function extractAttachmentsFromWrapperValue(
   depth: number
 ): { newOutput: unknown; attachments: ExtractedToolAttachment[] } | null {
   if (typeof value !== "object" || value === null) {
+    return null;
+  }
+  // Generic wrappers past the cap are plausibly LEGITIMATE deep JSON (a
+  // media-free API tree), unlike tool-output-shaped chains: stop descending
+  // and leave the subtree unchanged instead of substituting the placeholder.
+  // The stack stays bounded because no recursion continues from here, and
+  // children below are invoked at depth + 1 ≤ cap, so the placeholder branch
+  // in extractAttachmentsFromToolOutput is reachable only through
+  // json/toolCalls edges that add further depth.
+  if (depth >= MAX_NESTED_TOOL_EXTRACTION_DEPTH) {
     return null;
   }
   const attachments: ExtractedToolAttachment[] = [];

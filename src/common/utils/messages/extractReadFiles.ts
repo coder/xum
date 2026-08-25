@@ -40,6 +40,11 @@ function collectNestedReadPaths(output: unknown): string[] {
     // instead of throwing, so a missing error does not mean the read
     // succeeded. (Kernel-compacted records fold this into the ok bit.)
     const result = (record as { result?: unknown }).result;
+    // Same positive-success rule as collectNestedEditRecords: a result-less
+    // record must carry an explicit ok === true (all kernel-compacted records
+    // do) — a malformed row with neither result nor ok must not advertise a
+    // never-read path.
+    if (result === undefined && record.ok !== true) continue;
     if (
       typeof result === "object" &&
       result !== null &&

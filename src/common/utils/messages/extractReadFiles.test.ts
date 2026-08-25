@@ -97,8 +97,17 @@ describe("extractReadFilePaths", () => {
             success: true,
             toolCalls: [
               { toolName: "file_read", args: { path: "/nested-read.ts" }, ok: true, bytes: 10 },
-              { toolName: "load", args: { path: "/loaded.jsonl", key: "data" } },
+              // loadActive compaction keeps the load result (no ok bit).
+              {
+                toolName: "load",
+                args: { path: "/loaded.jsonl", key: "data" },
+                result: { key: "data", bytes: 9, lines: 1 },
+              },
               // Failures and non-read nested calls are ignored.
+              // A malformed row with neither result nor ok must not be
+              // advertised as read (round 16): success is never inferred
+              // from absence.
+              { toolName: "file_read", args: { path: "/never-read.ts" } },
               { toolName: "file_read", args: { path: "/nested-failed.ts" }, error: "denied" },
               { toolName: "load", args: { path: "/load-failed.txt", key: "x" }, error: "missing" },
               { toolName: "bash", args: { path: "/not-a-read.sh" }, ok: true },

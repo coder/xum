@@ -488,6 +488,42 @@ describe("extractToolMediaAsUserMessages", () => {
     expect(outputText).not.toContain(leafPayload);
   });
 
+  it("leaves media-free deep JSON outputs untouched", async () => {
+    // The wrapper walk visits arbitrary objects; legitimate deep JSON with no
+    // media or tool-record shapes must pass through unchanged — only
+    // tool-output-shaped chains earn the over-depth placeholder (round 16).
+    let deep: Record<string, unknown> = { leaf: "value" };
+    for (let i = 0; i < 200; i++) {
+      deep = { next: deep };
+    }
+
+    const input: MuxMessage[] = [
+      {
+        id: "a-deep-json",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call1",
+            toolName: "mcp__api__query",
+            input: {},
+            state: "output-available",
+            output: deep,
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    expect(rewritten).toHaveLength(1);
+    const toolPart = rewritten[0].parts[0];
+    if (toolPart.type !== "dynamic-tool" || toolPart.state !== "output-available") {
+      throw new Error("Expected an output-available dynamic-tool part");
+    }
+    expect(toolPart.output).toBe(deep);
+  });
+
   it("self-heals oversized raster tool attachments by downscaling them for provider requests", async () => {
     const oversizedPng = await sharp({
       create: {

@@ -225,6 +225,21 @@ describe("nested PTC edit records (exclusive posture)", () => {
     expect(diffs[0].path).toBe("/good.ts");
   });
 
+  it("does not report records lacking both a result and an ok bit as edits", () => {
+    // Success must be positive: kernel-compacted records always carry an
+    // explicit boolean ok and classic records carry a result, so a malformed
+    // row with neither must not be reported by crash-safe tracking as a
+    // completed edit (round 16).
+    const messages: MuxMessage[] = [
+      createCodeExecutionMessage([
+        { toolName: "file_edit_insert", args: { path: "/unmodified.ts" } },
+        { toolName: "file_edit_insert", args: { path: "/kernel-ok.ts" }, ok: true },
+      ]),
+    ];
+
+    expect(extractEditedFilePaths(messages)).toEqual(["/kernel-ok.ts"]);
+  });
+
   it("kernel-compacted records surface the path but no diff", () => {
     // Current kernel compaction exempts file_edit_* records (results kept for
     // exactly this extractor), but result-less compact records still exist in
