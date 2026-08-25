@@ -7881,13 +7881,24 @@ export class TaskService {
       { allowMissing: true }
     );
     if (updated) {
-      // A persisted terminal (or cleared) execution mirror for the MATCHING handle is
-      // authoritative settlement: peer admission's live-execution rescue now refuses on its
-      // own, so any stop latch retained for an unconfirmed stop of this workspace has been
-      // superseded and must be released — holding it past settlement would bar the workspace
-      // from peer messaging until restart. A non-matching handle settling leaves the live
-      // execution unrefuted, so its latch must stay.
+      // A settled MATCHING execution mirror is authoritative settlement: any stop latch
+      // retained for an unconfirmed stop of this workspace has been superseded and must be
+      // released — holding it past settlement would bar the workspace from peer messaging
+      // until restart. A non-matching handle settling leaves the live execution unrefuted, so
+      // its latch must stay.
+      //
+      // Remove the matching live registration BEFORE releasing (synchronously, in the same
+      // tick): Config.saveConfig swallows write failures, so `updated` does not prove the
+      // terminal mirror reached disk — a peer admission probe reading a stale running mirror
+      // between this release and the caller's own guarded registration delete would otherwise
+      // still find an accepted live handle and escape the stop. Without the registration,
+      // hasLiveRunningExecution refuses regardless of what the on-disk mirror claims. Callers'
+      // later guarded deletes simply no-op.
       if (settledMatchingMirror) {
+        const live = this.activeWorkspaceTurnHandleByWorkspaceId.get(workspaceId);
+        if (live?.handleId === handleId) {
+          this.activeWorkspaceTurnHandleByWorkspaceId.delete(workspaceId);
+        }
         this.releaseRetainedStopLatches(workspaceId);
       }
       await this.emitWorkspaceMetadata(workspaceId);

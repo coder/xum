@@ -16418,6 +16418,81 @@ describe("TaskService", () => {
     expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
   });
 
+  test("settlement with a swallowed mirror write still refuses peer sends via registration removal", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "branch-a", "branch-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "leaf-a", "leaf-a", {
+          parentWorkspaceId: "branch-a",
+          taskStatus: "reported",
+          taskExecutionId: "wst_leaf",
+          taskExecutionStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    await registerLiveWorkspaceTurnHandle(taskService, "leaf-a", "wst_leaf");
+
+    // Establish a retained latch (accepted-but-unsettled live execution under a hard stop).
+    taskService.markParentWorkspaceInterrupted("branch-a");
+    await taskService.terminateAllDescendantAgentTasks("branch-a");
+    const internals = taskService as unknown as {
+      workspaceStopsInProgress: Map<string, number>;
+      activeWorkspaceTurnHandleByWorkspaceId: Map<string, { handleId: string }>;
+      updateAgentTaskExecutionState: (
+        workspaceId: string,
+        handleId: string,
+        status: "interrupted"
+      ) => Promise<void>;
+    };
+    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(true);
+
+    // Settlement's terminal mirror write is SWALLOWED (Config.saveConfig logs and drops write
+    // errors), so the on-disk mirror keeps claiming "running". Releasing the latch on the
+    // unverified write must therefore be accompanied by removing the live registration in the
+    // same tick — otherwise a peer admission probe in the pre-caller-delete window sees the
+    // stale running mirror plus the accepted handle and escapes the stop.
+    const saveSpy = spyOn(
+      config as unknown as { saveConfig: (config: unknown) => Promise<void> },
+      "saveConfig"
+    ).mockImplementation(() => Promise.resolve());
+    await internals.updateAgentTaskExecutionState("leaf-a", "wst_leaf", "interrupted");
+    saveSpy.mockRestore();
+
+    // The stale mirror really is still on disk...
+    expect(findWorkspaceInConfig(config, "leaf-a")?.taskExecutionStatus).toBe("running");
+    // ...but the registration is gone and the latch released: admission refuses on its own.
+    expect(internals.activeWorkspaceTurnHandleByWorkspaceId.has("leaf-a")).toBe(false);
+    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
+
+    taskService.resetAutoResumeCount("branch-a");
+    expect(
+      await taskService.sendAgentTreeMessage("leaf-a", "sib-b", "escape via stale mirror")
+    ).toEqual(
+      Err({
+        code: "refused",
+        reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
+      })
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   test("park-after-settlement race releases the latch on already-settled evidence", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
