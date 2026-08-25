@@ -547,6 +547,43 @@ describe("resolveAgentForStream strict resolution", () => {
     }
   });
 
+  test("hidden explicit agent fails loudly in strict mode for top-level workspaces", async () => {
+    using tempDir = new DisposableTempDir("agent-resolution-strict-hidden");
+    const projectPath = path.join(tempDir.path, "project");
+    const agentsDir = path.join(projectPath, ".mux", "agents");
+    await fs.mkdir(agentsDir, { recursive: true });
+    // A definition hidden between launch-time validation and streaming (init hook or
+    // concurrent edit): strict sends must uphold the workspace-task contract that
+    // internal agents are ineligible instead of running the hidden policy.
+    await fs.writeFile(
+      path.join(agentsDir, "custom.md"),
+      ["---", "name: Custom", "base: exec", "ui:", "  hidden: true", "---", "Hidden agent."].join(
+        "\n"
+      )
+    );
+
+    const strict = await resolveTopLevel({
+      projectPath,
+      agentId: "custom",
+      strictAgentResolution: true,
+    });
+    expect(strict.success).toBe(false);
+    if (!strict.success && strict.error.type === "unknown") {
+      expect(strict.error.raw).toContain("not selectable");
+    } else {
+      expect(strict.success === false && strict.error.type).toBe("unknown");
+    }
+
+    // Lenient top-level sends keep today's behavior (no visibility gate).
+    const lenient = await resolveTopLevel({
+      projectPath,
+      agentId: "custom",
+      strictAgentResolution: false,
+    });
+    expect(lenient.success).toBe(true);
+    if (lenient.success) expect(lenient.data.effectiveAgentId).toBe("custom");
+  });
+
   test("disabled explicit agent fails loudly in strict mode for top-level workspaces", async () => {
     using tempDir = new DisposableTempDir("agent-resolution-strict-disabled");
     const projectPath = path.join(tempDir.path, "project");

@@ -32,6 +32,7 @@ import {
   resolveAgentFrontmatter,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
+import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { resolveToolPolicyForAgent } from "@/node/services/agentDefinitions/resolveToolPolicy";
 import { log } from "./log";
@@ -314,6 +315,27 @@ export async function resolveAgentForStream(
           skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
         }
       );
+
+      // Strict explicit-agent sends must also reject definitions that are no longer
+      // selectable: the workspace-task contract excludes internal (ui.hidden) agents,
+      // and an init hook or concurrent edit could hide the definition between
+      // launch-time validation and this stream. Sub-agent workspaces legitimately run
+      // hidden agents (explore, compact), so only strict top-level sends are gated.
+      if (
+        strictAgentResolution &&
+        !isSubagentWorkspace &&
+        !resolveAgentVisibility(resolvedFrontmatter.ui).selectable
+      ) {
+        const errorMessage = `Agent '${agentDefinition.id}' is not selectable for explicit agent requests.`;
+        emitError(
+          createErrorEvent(workspaceId, {
+            messageId: createAssistantMessageId(),
+            error: errorMessage,
+            errorType: "unknown",
+          })
+        );
+        return Err({ type: "unknown", raw: errorMessage });
+      }
 
       const effectivelyDisabled = isAgentEffectivelyDisabled({
         cfg,
