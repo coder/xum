@@ -1,4 +1,4 @@
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   getEditorDeepLink,
   getDockerDeepLink,
@@ -23,6 +23,8 @@ export interface OpenInEditorResult {
 
 // Browser mode: window.api is not set (only exists in Electron via preload)
 const isBrowserMode = typeof window !== "undefined" && !window.api;
+
+const VS_CODE_EXTENSION_INSTALL_ATTEMPTED_KEY = "vsCodeExtensionInstallAttempted";
 
 // Helper for opening URLs - allows testing in Node environment
 function openUrl(url: string): void {
@@ -100,6 +102,37 @@ export async function openInEditor(args: {
   const editorConfig = normalizeEditorConfig(
     readPersistedState<EditorConfig>(EDITOR_CONFIG_KEY, DEFAULT_EDITOR_CONFIG)
   );
+
+  const extensionEditor =
+    editorConfig.editor === "vscode" || editorConfig.editor === "cursor"
+      ? editorConfig.editor
+      : null;
+
+  // Browser mode runs RPCs on the remote Mux host, so extension installation cannot
+  // satisfy local editor requirements there.
+  if (!isBrowserMode && extensionEditor) {
+    const extensionInstallAttemptedKey = `${VS_CODE_EXTENSION_INSTALL_ATTEMPTED_KEY}:${extensionEditor}`;
+
+    if (!readPersistedState(extensionInstallAttemptedKey, false)) {
+      // Only attempt (and mark as attempted) when the API is actually available.
+      // If api is null (startup/reconnect), skip so the next open can retry.
+      if (args.api) {
+        // Mark as attempted immediately to prevent duplicate install RPCs from rapid opens.
+        updatePersistedState(extensionInstallAttemptedKey, true);
+
+        // Install once in the background so the existing open flow stays non-blocking.
+        // In tests we often pass partial API mocks, so this must never throw even when
+        // installVsCodeExtension is missing.
+        try {
+          args.api.general.installVsCodeExtension({ editor: extensionEditor }).catch(() => {
+            /* silently ignore background install errors */
+          });
+        } catch {
+          // Silently ignore — partial API objects may not expose this method.
+        }
+      }
+    }
+  }
 
   const isSSH = isSSHRuntime(args.runtimeConfig);
   const isDocker = isDockerRuntime(args.runtimeConfig);

@@ -1,10 +1,13 @@
-import { spawn, spawnSync } from "child_process";
+import { exec as childProcessExec, spawn, spawnSync } from "child_process";
 import * as fsPromises from "fs/promises";
+import { promisify } from "util";
 import type { Config } from "@/node/config";
 import { isDockerRuntime, isSSHRuntime, isDevcontainerRuntime } from "@/common/types/runtime";
 import { log } from "@/node/services/log";
 import { sanitizeXumChildEnv } from "@/node/runtime/childProcessEnv";
 import { getErrorMessage } from "@/common/utils/errors";
+
+const execAsync = promisify(childProcessExec);
 
 /**
  * Quote a string for safe use in shell commands.
@@ -149,6 +152,45 @@ export class EditorService {
       const message = getErrorMessage(err);
       log.error(`Failed to open in editor: ${message}`);
       return { success: false, error: message };
+    }
+  }
+
+  async installVsCodeExtension(
+    editor: "vscode" | "cursor"
+  ): Promise<{ installed: boolean; alreadyInstalled: boolean; error?: string }> {
+    try {
+      const cli = editor === "cursor" ? "cursor" : "code";
+      const extensionId = "coder.mux";
+
+      const { stdout } = await execAsync(`${cli} --list-extensions`, {
+        timeout: 10_000,
+        windowsHide: true,
+      });
+      const extensionListOutput = String(stdout);
+      const alreadyInstalled = extensionListOutput
+        .split(/\r?\n/)
+        .some((line) => line.trim().toLowerCase() === extensionId);
+
+      if (alreadyInstalled) {
+        return { installed: true, alreadyInstalled: true };
+      }
+
+      await execAsync(`${cli} --install-extension ${extensionId}`, {
+        timeout: 30_000,
+        windowsHide: true,
+      });
+
+      return { installed: true, alreadyInstalled: false };
+    } catch (error) {
+      log.debug("Failed to install VS Code extension", {
+        editor,
+        error: String(error),
+      });
+      return {
+        installed: false,
+        alreadyInstalled: false,
+        error: String(error),
+      };
     }
   }
 
