@@ -963,6 +963,46 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-exempt-bounds");
     });
 
+    it("bounds unsupported parts of mixed media containers at capture", async () => {
+      // A mixed container (image + audio) is retained for request-time image
+      // extraction, but the unsupported audio payload (up to 8 MiB per part)
+      // must not persist raw into the record/chat.jsonl — it is replaced with
+      // a bounded placeholder BEFORE retention.
+      using tmp = new DisposableTempDir("code-exec-mixed-media");
+      const host = new SandboxHostService();
+      const audioData = "d2F2".repeat(50);
+      const tools: Record<string, Tool> = {
+        mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
+          type: "content",
+          value: [
+            { type: "media", mediaType: "image/png", data: "aGVsbG8=" },
+            { type: "media", mediaType: "audio/wav", data: audioData },
+          ],
+        })),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(tools),
+        undefined,
+        persistentRunner(host, "ws-mixed-media", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        { code: "mux.mcp__shots__take({}); return true;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const record = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
+      const value = (
+        record?.result as { value?: Array<{ type?: string; data?: string; text?: string }> }
+      )?.value;
+      expect(value?.[0]?.data).toBe("aGVsbG8=");
+      expect(value?.[1]?.type).toBe("text");
+      expect(value?.[1]?.text).toContain("media bounded at capture: audio/wav");
+      expect(JSON.stringify(record)).not.toContain(audioData);
+      await host.disposeScope("ws-mixed-media");
+    });
+
     it("does not exempt unsupported media (audio) from kernel record suppression", async () => {
       // Request-time extraction only consumes supported attachment types
       // (images/PDF); exempting audio/blob media would leave raw base64 in

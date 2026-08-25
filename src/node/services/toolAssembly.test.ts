@@ -90,6 +90,22 @@ describe("applyToolPolicyAndExperiments", () => {
     expect(Object.keys(result)).toEqual([]);
   });
 
+  test("an allowlist that re-enables code_execution keeps the exclusive entry point", async () => {
+    // [disable .*, enable code_execution] empties the base-tool record, but
+    // the last matching rule explicitly enables the synthesized entry point —
+    // it must not be misread as a no-tools contract.
+    const result = await applyToolPolicyAndExperiments({
+      allTools: { bash: executableTool("Run a command") },
+      effectiveToolPolicy: [
+        { regex_match: ".*", action: "disable" },
+        { regex_match: "code_execution", action: "enable" },
+      ],
+      experiments: { programmaticToolCalling: true },
+      emitNestedToolEvent: () => undefined,
+    });
+    expect(Object.keys(result)).toEqual(["code_execution"]);
+  });
+
   test("policy-required bridgeable tools stay model-visible in the exclusive set", async () => {
     // "require" gates run completion on a TOP-LEVEL toolResult for that name
     // (StreamManager.createStopWhenCondition); a nested xum.* call never

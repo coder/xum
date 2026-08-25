@@ -219,6 +219,60 @@ describe("extractToolMediaAsUserMessages", () => {
     });
   });
 
+  it("redacts media containers copied into code_execution console output", async () => {
+    // `const image = xum.<mediaTool>(...); console.log(image)` copies the
+    // container into consoleOutput args (classic console budget ~1MiB);
+    // request-time extraction must rewrite that copy too and dedupe it
+    // against the record's attachment.
+    const base64 = (
+      await sharp({
+        create: { width: 10, height: 10, channels: 3, background: { r: 1, g: 2, b: 3 } },
+      })
+        .png()
+        .toBuffer()
+    ).toString("base64");
+    const mediaContainer = {
+      type: "content",
+      value: [{ type: "media", mediaType: "image/png", data: base64 }],
+    };
+
+    const input: MuxMessage[] = [
+      {
+        id: "ce-console",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call1",
+            toolName: "code_execution",
+            input: { code: "const image = xum.mcp__shots__take({}); console.log(image);" },
+            state: "output-available",
+            output: {
+              success: true,
+              toolCalls: [{ toolName: "mcp__shots__take", args: {}, result: mediaContainer }],
+              consoleOutput: [{ level: "log", args: [mediaContainer], timestamp: 1 }],
+            },
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    expect(rewritten).toHaveLength(2);
+
+    const toolPart = rewritten[0].parts[0];
+    if (toolPart.type !== "dynamic-tool" || toolPart.state !== "output-available") {
+      throw new Error("Expected an output-available dynamic-tool part");
+    }
+    expect(JSON.stringify(toolPart.output)).not.toContain(base64);
+
+    // Record copy + console copy dedupe into a single attachment.
+    const syntheticUser = rewritten[1];
+    const fileParts = syntheticUser.parts.filter((part) => part.type === "file");
+    expect(fileParts).toHaveLength(1);
+  });
+
   it("replaces unsupported media (audio/blobs) with bounded placeholders", async () => {
     // Unsupported media can be MiBs of base64 the model can never consume as
     // an attachment; it must never ride into the provider request as JSON

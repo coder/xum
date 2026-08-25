@@ -80,7 +80,10 @@ import { createRuntime, runFullInit } from "../node/runtime/runtimeFactory";
 import type { Runtime } from "../node/runtime/Runtime";
 import { execSync } from "child_process";
 import { getParseOptions } from "./argv";
-import { EXPERIMENT_IDS } from "../common/constants/experiments";
+import {
+  EXPERIMENT_IDS,
+  LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID,
+} from "../common/constants/experiments";
 import { getErrorMessage } from "@/common/utils/errors";
 import { describeCliGoalStop, driveCliGoalUntilTerminal } from "./goalRunDriver";
 import {
@@ -267,7 +270,13 @@ function renderUnknown(value: unknown): string {
 const VALID_EXPERIMENT_IDS = new Set<string>(Object.values(EXPERIMENT_IDS));
 
 function collectExperiments(value: string, previous: string[]): string[] {
-  const experimentId = value.trim().toLowerCase();
+  let experimentId = value.trim().toLowerCase();
+  // Hidden compat alias: "PTC Exclusive Mode" merged into PTC, and the merged
+  // flag activates exactly the old exclusive posture — keep existing
+  // automation that passes the removed ID working instead of erroring.
+  if (experimentId === LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID) {
+    experimentId = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
+  }
   if (!VALID_EXPERIMENT_IDS.has(experimentId)) {
     throw new Error(
       `Unknown experiment "${value}". Valid experiments: ${[...VALID_EXPERIMENT_IDS].join(", ")}`

@@ -619,10 +619,12 @@ export class QuickJSRuntime implements IJSRuntime {
 
   private boundCaptureResult(value: unknown, toolName: string): unknown {
     if (this.kernelRecordBounds === undefined) return value;
-    // Exempt records (persistence-critical tools, media containers) keep the
-    // full result: compaction and request-time extractors reconstruct
-    // context from them, so a bounded preview would silently lose it.
-    if (this.kernelRecordBounds.resultExempt?.(toolName, value) === true) return value;
+    // Retained records (persistence-critical tools, media containers) keep a
+    // possibly sanitized full result: compaction and request-time extractors
+    // reconstruct context from them, so a bounded preview would silently
+    // lose it.
+    const retained = this.kernelRecordBounds.captureRetained?.(toolName, value);
+    if (retained !== undefined) return retained;
     return this.boundCapture(value, this.kernelRecordBounds.resultCapBytes);
   }
 

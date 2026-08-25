@@ -115,6 +115,53 @@ export function isKernelRecordResultExempt(toolName: string, result: unknown): b
   return isPersistenceCriticalRecordToolName(toolName) || containsMediaContentPayload(result);
 }
 
+/**
+ * Capture-time counterpart of isKernelRecordResultExempt (see
+ * KernelRecordBounds.captureRetained): returns the value the record should
+ * retain, or undefined to apply normal result bounding. Media containers are
+ * retained in SANITIZED form — unsupported media parts (audio/blobs, up to
+ * 8 MiB each with no aggregate cap) are replaced with bounded text
+ * placeholders BEFORE the record is retained and persisted, so a mixed
+ * container (image + audio) keeps only its extractable payload.
+ */
+export function retainExemptKernelRecordResult(toolName: string, result: unknown): unknown {
+  if (isPersistenceCriticalRecordToolName(toolName)) return result;
+  if (!containsMediaContentPayload(result)) return undefined;
+  return boundUnsupportedMediaPartsAtCapture(result);
+}
+
+/** Media-part shape check shared by the container predicates below. */
+function asMediaPart(item: unknown): { data: string; mediaType?: string } | null {
+  if (typeof item !== "object" || item === null) return null;
+  const record = item as { type?: unknown; data?: unknown; mediaType?: unknown };
+  if (record.type !== "media" || typeof record.data !== "string") return null;
+  return {
+    data: record.data,
+    ...(typeof record.mediaType === "string" ? { mediaType: record.mediaType } : {}),
+  };
+}
+
+/** See retainExemptKernelRecordResult: bound unsupported media parts inside an otherwise-retained container. */
+function boundUnsupportedMediaPartsAtCapture(result: unknown): unknown {
+  const container = result as { type: "content"; value: unknown[] };
+  let changed = false;
+  const value = container.value.map((item) => {
+    const media = asMediaPart(item);
+    if (
+      media === null ||
+      (media.mediaType !== undefined && isSupportedAttachmentMediaType(media.mediaType))
+    ) {
+      return item;
+    }
+    changed = true;
+    return {
+      type: "text",
+      text: `[media bounded at capture: ${media.mediaType ?? "unknown"}, ${media.data.length} base64 chars — not supported as a model attachment]`,
+    };
+  });
+  return changed ? { ...container, value } : result;
+}
+
 /** See isKernelRecordResultExempt (persistence-critical branch). */
 export function isPersistenceCriticalRecordToolName(toolName: string): boolean {
   return (
@@ -136,13 +183,12 @@ export function containsMediaContentPayload(result: unknown): boolean {
   if (typeof result !== "object" || result === null) return false;
   const container = result as { type?: unknown; value?: unknown };
   if (container.type !== "content" || !Array.isArray(container.value)) return false;
-  return container.value.some(
-    (item: unknown) =>
-      typeof item === "object" &&
-      item !== null &&
-      (item as { type?: unknown }).type === "media" &&
-      typeof (item as { data?: unknown }).data === "string" &&
-      typeof (item as { mediaType?: unknown }).mediaType === "string" &&
-      isSupportedAttachmentMediaType((item as { mediaType: string }).mediaType)
-  );
+  return container.value.some((item: unknown) => {
+    const media = asMediaPart(item);
+    return (
+      media !== null &&
+      media.mediaType !== undefined &&
+      isSupportedAttachmentMediaType(media.mediaType)
+    );
+  });
 }

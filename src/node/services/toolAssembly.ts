@@ -20,6 +20,7 @@ type SendMessageExperiments = SendMessageOptions["experiments"];
 
 import {
   applyToolPolicy,
+  applyToolPolicyToNames,
   buildRequiredToolPatterns,
   type ToolPolicy,
 } from "@/common/utils/tools/toolPolicy";
@@ -203,8 +204,13 @@ export async function applyToolPolicyAndExperiments(
   // no-tools contract: synthesizing code_execution anyway would hand that
   // flow a tool it explicitly forbade. Checked on the PRE-grant policy
   // result so a least-privilege grants ceiling (which stubs, not disables)
-  // keeps code_execution as the mandatory bridge entry point.
-  const policyLeavesNoTools = Object.keys(policyFilteredPreGrant).length === 0;
+  // keeps code_execution as the mandatory bridge entry point. The synthesized
+  // name is probed explicitly: an allowlist like [disable .*, enable
+  // code_execution] empties the base record yet clearly intends the exclusive
+  // entry point to exist, so the base-tool record alone cannot decide.
+  const policyLeavesNoTools =
+    Object.keys(policyFilteredPreGrant).length === 0 &&
+    applyToolPolicyToNames(["code_execution"], effectiveToolPolicy).length === 0;
   if (experiments?.programmaticToolCalling && !policyLeavesNoTools) {
     try {
       // Lazy-load PTC modules only when experiments are enabled

@@ -140,13 +140,14 @@ export interface KernelRecordBounds {
   /** Max serialized bytes of `result` kept in a record/event. */
   resultCapBytes: number;
   /**
-   * Skip RESULT bounding for records that must retain their full payload
-   * through capture (persistence-critical tools, media containers — see
-   * isKernelRecordResultExempt): post-eval compaction and request-time
-   * extractors need the original value. Args and errors stay bounded
-   * regardless.
+   * Capture-time retain override for records that must keep (a possibly
+   * sanitized form of) their full result — persistence-critical tools and
+   * extractable media containers (see retainExemptKernelRecordResult):
+   * post-eval compaction and request-time extractors need the payload.
+   * Returns the value to retain in the record, or undefined to apply normal
+   * result bounding. Args and errors stay bounded regardless.
    */
-  resultExempt?: (toolName: string, result: unknown) => boolean;
+  captureRetained?: (toolName: string, result: unknown) => unknown | undefined;
 }
 
 /**

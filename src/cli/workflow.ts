@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 import { Command } from "commander";
 
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS, LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID } from "@/common/constants/experiments";
 import type { ProjectConfig } from "@/common/types/project";
 import { parseRuntimeModeAndHost, RUNTIME_MODE, type RuntimeConfig } from "@/common/types/runtime";
 import {
@@ -165,7 +165,13 @@ async function gatherStdin(): Promise<string> {
 }
 
 function collectExperiments(value: string, previous: string[]): string[] {
-  const experimentId = value.trim().toLowerCase();
+  let experimentId = value.trim().toLowerCase();
+  // Hidden compat alias: "PTC Exclusive Mode" merged into PTC, and the merged
+  // flag activates exactly the old exclusive posture — keep existing
+  // automation that passes the removed ID working instead of erroring.
+  if (experimentId === LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID) {
+    experimentId = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
+  }
   if (!VALID_EXPERIMENT_IDS.has(experimentId)) {
     throw new Error(
       `Unknown experiment "${value}". Valid experiments: ${[...VALID_EXPERIMENT_IDS].join(", ")}`

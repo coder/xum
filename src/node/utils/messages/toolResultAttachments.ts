@@ -240,6 +240,44 @@ function extractAttachmentsFromNestedToolCalls(
     pushUnique(extractedOuter.attachments);
   }
 
+  // Console output too: `const image = xum.<mediaTool>(...); console.log(image)`
+  // copies the media container into consoleOutput args, which would otherwise
+  // carry up to the classic console budget (~1MiB) of base64 into the next
+  // request as JSON despite the record/result rewrites above.
+  const consoleOutput = (output as { consoleOutput?: unknown }).consoleOutput;
+  let newConsoleOutput = consoleOutput;
+  if (Array.isArray(consoleOutput)) {
+    let consoleChanged = false;
+    const mapped = consoleOutput.map((record: unknown) => {
+      if (typeof record !== "object" || record === null) {
+        return record;
+      }
+      const args = (record as { args?: unknown }).args;
+      if (!Array.isArray(args)) {
+        return record;
+      }
+      let argsChanged = false;
+      const newArgs = args.map((arg: unknown) => {
+        const extracted = extractAttachmentsFromToolOutput(arg);
+        if (extracted == null) {
+          return arg;
+        }
+        argsChanged = true;
+        pushUnique(extracted.attachments);
+        return extracted.newOutput;
+      });
+      if (!argsChanged) {
+        return record;
+      }
+      consoleChanged = true;
+      return { ...record, args: newArgs };
+    });
+    if (consoleChanged) {
+      didChange = true;
+      newConsoleOutput = mapped;
+    }
+  }
+
   if (!didChange) {
     return null;
   }
@@ -249,6 +287,7 @@ function extractAttachmentsFromNestedToolCalls(
       ...output,
       toolCalls: newToolCalls,
       ...(extractedOuter != null ? { result: extractedOuter.newOutput } : {}),
+      ...(newConsoleOutput !== consoleOutput ? { consoleOutput: newConsoleOutput } : {}),
     },
     attachments,
   };

@@ -20,7 +20,7 @@ import {
   isBridgeToolGranted,
   type CapabilityGrants,
 } from "@/common/types/capabilityGrants";
-import { isKernelRecordResultExempt } from "./types";
+import { retainExemptKernelRecordResult } from "./types";
 
 /**
  * Result shape of an AI SDK Schema's optional custom validator
@@ -245,7 +245,7 @@ export class ToolBridge {
         ? {
             argsCapBytes: KERNEL_COMPACT_ARGS_CAP_BYTES,
             resultCapBytes: RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES,
-            resultExempt: isKernelRecordResultExempt,
+            captureRetained: retainExemptKernelRecordResult,
           }
         : undefined
     );
