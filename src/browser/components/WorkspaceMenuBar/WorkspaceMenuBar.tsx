@@ -18,6 +18,7 @@ import { Popover, PopoverTrigger, PopoverContent } from "../Popover/Popover";
 import { Checkbox } from "../Checkbox/Checkbox";
 import {
   formatKeybind,
+  isDialogOpen,
   isEditableElement,
   KEYBINDS,
   matchesKeybind,
@@ -127,7 +128,10 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
   const [debugLlmRequestOpen, setDebugLlmRequestOpen] = useState(false);
   const [mcpModalOpen, setMcpModalOpen] = useState(false);
   const [heartbeatModalOpen, setHeartbeatModalOpen] = useState(false);
-  const [timelineDialogOpen, setTimelineDialogOpen] = useState(false);
+  // Keyed by workspace so switching workspaces (e.g. the timeline's "Open child
+  // workspace" action) implicitly closes the dialog instead of covering the new view.
+  const [timelineDialogWorkspaceId, setTimelineDialogWorkspaceId] = useState<string | null>(null);
+  const timelineDialogOpen = timelineDialogWorkspaceId === workspaceId;
   const [availableSkills, setAvailableSkills] = useState<AgentSkillDescriptor[]>([]);
   const [invalidSkills, setInvalidSkills] = useState<AgentSkillIssue[]>([]);
   const isSkillsMountedRef = useRef(true);
@@ -202,6 +206,11 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       ?.closest("[data-workspace-shell]")
       ?.querySelector(".mobile-hide-right-sidebar");
     if (sidebar instanceof HTMLElement) {
+      // Immersive review hides the sidebar on any viewport (marked aria-hidden);
+      // only a responsive hide should surface the dialog entry points.
+      if (sidebar.getAttribute("aria-hidden") === "true") {
+        return false;
+      }
       return window.getComputedStyle(sidebar).display === "none";
     }
     return window.matchMedia(`(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`).matches;
@@ -239,17 +248,18 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
     const handler = (e: KeyboardEvent) => {
       if (
         !matchesKeybind(e, KEYBINDS.OPEN_TIMELINE_DIALOG) ||
+        isDialogOpen() ||
         isEditableElement(e.target) ||
         !isTimelineSidebarHidden()
       ) {
         return;
       }
       e.preventDefault();
-      setTimelineDialogOpen(true);
+      setTimelineDialogWorkspaceId(workspaceId);
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [timelineExperimentEnabled, isTimelineSidebarHidden]);
+  }, [timelineExperimentEnabled, isTimelineSidebarHidden, workspaceId]);
 
   const isDevcontainerWorkspace = isDevcontainerRuntime(runtimeConfig);
   const isRuntimeRunning = isDevcontainerWorkspace && runtimeStatus === "running";
@@ -827,7 +837,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
               }
               onOpenTimeline={
                 timelineExperimentEnabled && timelineSidebarHidden
-                  ? () => setTimelineDialogOpen(true)
+                  ? () => setTimelineDialogWorkspaceId(workspaceId)
                   : null
               }
               onStopRuntime={isRuntimeRunning ? () => void handleStopRuntime() : null}
@@ -881,7 +891,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
       <TimelineDialog
         workspaceId={workspaceId}
         open={timelineDialogOpen}
-        onOpenChange={setTimelineDialogOpen}
+        onOpenChange={(open) => setTimelineDialogWorkspaceId(open ? workspaceId : null)}
       />
       <DebugLlmRequestModal
         workspaceId={workspaceId}

@@ -529,6 +529,71 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(getLastTimelineDialogProps()?.open).toBe(false);
   });
 
+  it("ignores the timeline shortcut while another modal is open", () => {
+    mockTimelineExperimentEnabled = true;
+    stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+
+    const modal = document.createElement("div");
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    document.body.appendChild(modal);
+
+    render(<WorkspaceMenuBar {...defaultProps} />);
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "T", shiftKey: true });
+    });
+
+    expect(getLastTimelineDialogProps()?.open).toBe(false);
+    modal.remove();
+  });
+
+  it("closes the timeline dialog when switching workspaces", () => {
+    mockTimelineExperimentEnabled = true;
+    stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
+
+    const view = render(<WorkspaceMenuBar {...defaultProps} />);
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "T", shiftKey: true });
+    });
+    expect(getLastTimelineDialogProps()?.open).toBe(true);
+
+    // The timeline's "Open child workspace" action swaps the selected workspace while
+    // App reuses this menu bar instance; the dialog must not cover the new workspace.
+    view.rerender(<WorkspaceMenuBar {...defaultProps} workspaceId="workspace-2" />);
+
+    expect(getLastTimelineDialogProps()?.open).toBe(false);
+  });
+
+  it("keeps the Timeline action hidden when immersive review hides the sidebar", () => {
+    mockTimelineExperimentEnabled = true;
+    stubMatchMedia(() => false);
+
+    // Immersive review hides the sidebar via the same display:none but marks it
+    // aria-hidden; the gate must not treat that as a responsive (narrow) layout.
+    const shell = document.createElement("div");
+    shell.setAttribute("data-workspace-shell", "");
+    document.body.appendChild(shell);
+    const sidebar = document.createElement("div");
+    sidebar.className = "mobile-hide-right-sidebar";
+    sidebar.style.display = "none";
+    sidebar.setAttribute("aria-hidden", "true");
+    shell.appendChild(sidebar);
+    const mount = document.createElement("div");
+    shell.appendChild(mount);
+
+    render(<WorkspaceMenuBar {...defaultProps} />, { container: mount });
+
+    expect(getLastMenuContentProps()?.onOpenTimeline).toBeNull();
+
+    act(() => {
+      fireEvent.keyDown(window, { key: "T", shiftKey: true });
+    });
+    expect(getLastTimelineDialogProps()?.open).toBe(false);
+    shell.remove();
+  });
+
   it("applies the collapsed-left-sidebar inset immediately from props", () => {
     const view = render(<WorkspaceMenuBar {...defaultProps} leftSidebarCollapsed />);
 
