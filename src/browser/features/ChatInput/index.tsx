@@ -2177,6 +2177,25 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       window.removeEventListener(CUSTOM_EVENTS.GOAL_CHILD_BUDGET_TOAST, handler as EventListener);
   }, [variant, workspaceId, pushToast]);
 
+  // Surface rejected agent switches (e.g. budgeted-goal pricing gate): the
+  // mode picker closes immediately, so the snap-back needs an explanation.
+  useEffect(() => {
+    if (variant !== "workspace") return;
+
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<{ workspaceId: string; message: string }>).detail;
+      if (detail?.workspaceId !== workspaceId || !detail.message) {
+        return;
+      }
+
+      pushToast({ type: "error", message: detail.message });
+    };
+
+    window.addEventListener(CUSTOM_EVENTS.AGENT_SWITCH_ERROR_TOAST, handler as EventListener);
+    return () =>
+      window.removeEventListener(CUSTOM_EVENTS.AGENT_SWITCH_ERROR_TOAST, handler as EventListener);
+  }, [variant, workspaceId, pushToast]);
+
   // Show toast feedback for analytics rebuild command palette action.
   useEffect(() => {
     const handler = (event: Event) => {

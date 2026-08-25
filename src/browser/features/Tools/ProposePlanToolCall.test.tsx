@@ -581,8 +581,15 @@ describe("ProposePlanToolCall", () => {
     await waitFor(() =>
       expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true)
     );
-    // No explicit persistence for a switch whose send never went through.
-    expect(updateAgentAISettingsCalls).toHaveLength(0);
+    // The send persists the target agent pre-dispatch, so the failed send
+    // restores the prior selection backend-side instead of persisting exec.
+    await waitFor(() => expect(updateAgentAISettingsCalls).toHaveLength(1));
+    expect(updateAgentAISettingsCalls[0]).toEqual({
+      workspaceId: WORKSPACE_ID,
+      agentId: "plan",
+      aiSettings: null,
+      persistSelectedAgentId: true,
+    });
     // The optimistic switch rolls back to the pre-transition state.
     await waitFor(() =>
       expect(JSON.parse(window.localStorage.getItem(getAgentIdKey(WORKSPACE_ID))!)).toBe("plan")

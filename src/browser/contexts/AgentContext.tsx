@@ -32,6 +32,7 @@ import {
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
+import { getErrorMessage } from "@/common/utils/errors";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { sortAgentsStable } from "@/browser/utils/agents";
 import { normalizeAgentId, resolveRemovedBuiltinAgentId } from "@/common/utils/agentIds";
@@ -194,6 +195,18 @@ function AgentProviderWithState(props: {
         setAgentIdRaw(previousAgentId);
       };
 
+      // The picker closes on selection, so a rejected switch would otherwise
+      // just snap back with no explanation (e.g. budgeted-goal pricing gate).
+      const notifySwitchRejected = (message: string) => {
+        window.dispatchEvent(
+          createCustomEvent(CUSTOM_EVENTS.AGENT_SWITCH_ERROR_TOAST, {
+            workspaceId,
+            message:
+              message.trim().length > 0 ? message : `Failed to switch to the ${nextAgentId} agent.`,
+          })
+        );
+      };
+
       markPendingWorkspaceAgentId(workspaceId, nextAgentId);
       api.workspace
         .updateAgentAISettings({
@@ -211,9 +224,13 @@ function AgentProviderWithState(props: {
             clearPendingWorkspaceAgentId(workspaceId, nextAgentId);
             return;
           }
+          notifySwitchRejected(typeof result.error === "string" ? result.error : "");
           rollback();
         })
-        .catch(rollback);
+        .catch((error) => {
+          notifySwitchRejected(getErrorMessage(error));
+          rollback();
+        });
     },
     [api, globalDefaultAgentId, isCurrentAgentLocked, isProjectScope, setAgentIdRaw, workspaceId]
   );

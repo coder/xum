@@ -129,6 +129,13 @@ export const CUSTOM_EVENTS = {
    */
   GOAL_CHILD_BUDGET_TOAST: "mux:goalChildBudgetToast",
 
+  /**
+   * Event to show a toast when a workspace agent switch is rejected by the
+   * backend (e.g. budgeted-goal pricing gate or an unwritable config).
+   * Detail: { workspaceId: string, message: string }
+   */
+  AGENT_SWITCH_ERROR_TOAST: "mux:agentSwitchErrorToast",
+
   REVEAL_TIMELINE_ANCHOR: "mux:revealTimelineAnchor",
 
   /**
@@ -202,6 +209,10 @@ export interface CustomEventPayloads {
     openCompleteInput?: boolean;
   };
   [CUSTOM_EVENTS.GOAL_CHILD_BUDGET_TOAST]: {
+    workspaceId: string;
+    message: string;
+  };
+  [CUSTOM_EVENTS.AGENT_SWITCH_ERROR_TOAST]: {
     workspaceId: string;
     message: string;
   };

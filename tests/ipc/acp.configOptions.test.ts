@@ -66,6 +66,7 @@ function createHarness(
     workspaceId: string;
     agentId: string;
     aiSettings: WorkspaceAiSettings;
+    persistSelectedAgentId?: boolean;
   }>;
 } {
   let workspaceState: WorkspaceState = {
@@ -83,6 +84,7 @@ function createHarness(
     workspaceId: string;
     agentId: string;
     aiSettings: WorkspaceAiSettings;
+    persistSelectedAgentId?: boolean;
   }> = [];
 
   const availableAgents = options?.agents ?? DEFAULT_AGENT_DESCRIPTORS;
@@ -124,6 +126,7 @@ function createHarness(
         workspaceId: string;
         agentId: string;
         aiSettings: WorkspaceAiSettings;
+        persistSelectedAgentId?: boolean;
       }) => {
         updateAgentCalls.push(input);
 
@@ -263,8 +266,32 @@ describe("ACP config options", () => {
       activeAgentId: "plan",
     });
 
-    expect(harness.updateModeCalls).toHaveLength(1);
-    expect(harness.updateModeCalls[0]?.aiSettings.reasoningMode).toBe("pro");
+    // Mode switches persist through updateAgentAISettings so the selected
+    // agent is recorded alongside its settings.
+    expect(harness.updateAgentCalls).toHaveLength(1);
+    expect(harness.updateAgentCalls[0]?.aiSettings.reasoningMode).toBe("pro");
+  });
+
+  it("persists the selected agent when switching modes", async () => {
+    const harness = createHarness({
+      agentId: "plan",
+      aiSettings: { model: "anthropic:claude-opus-4-6", thinkingLevel: "high" },
+      aiSettingsByAgent: {
+        plan: { model: "anthropic:claude-opus-4-6", thinkingLevel: "high" },
+        exec: { model: "openai:gpt-5.2", thinkingLevel: "low" },
+      },
+    });
+
+    await handleSetConfigOption(harness.client, "ws-1", AGENT_MODE_CONFIG_ID, "exec", {
+      activeAgentId: "plan",
+    });
+
+    // The selected agent must be persisted (not just the mode's settings) so
+    // reconnects and other clients hydrate the new mode.
+    expect(harness.updateModeCalls).toHaveLength(0);
+    expect(harness.updateAgentCalls).toHaveLength(1);
+    expect(harness.updateAgentCalls[0]?.agentId).toBe("exec");
+    expect(harness.updateAgentCalls[0]?.persistSelectedAgentId).toBe(true);
   });
 
   it("preserves pro reasoning mode across model and thinking level changes", async () => {

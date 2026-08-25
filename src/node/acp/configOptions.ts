@@ -243,8 +243,23 @@ async function persistAgentAiSettings(
   client: ORPCClient,
   workspaceId: string,
   agentId: string,
-  aiSettings: ResolvedAiSettings
+  aiSettings: ResolvedAiSettings,
+  options?: { persistSelectedAgentId?: boolean }
 ): Promise<void> {
+  // Selected-agent persistence must go through updateAgentAISettings: the
+  // mode variant cannot record the workspace's selected agent, which ACP mode
+  // switches need so reconnects and other clients hydrate the new mode.
+  if (options?.persistSelectedAgentId === true) {
+    const updateResult = await client.workspace.updateAgentAISettings({
+      workspaceId,
+      agentId,
+      aiSettings,
+      persistSelectedAgentId: true,
+    });
+    ensureUpdateSucceeded(updateResult, "workspace.updateAgentAISettings");
+    return;
+  }
+
   if (isModeAgentId(agentId)) {
     const updateModeResult = await client.workspace.updateModeAISettings({
       workspaceId,
@@ -382,7 +397,9 @@ export async function handleSetConfigOption(
         : {}),
     };
 
-    await persistAgentAiSettings(client, trimmedWorkspaceId, nextAgentId, normalizedAiSettings);
+    await persistAgentAiSettings(client, trimmedWorkspaceId, nextAgentId, normalizedAiSettings, {
+      persistSelectedAgentId: true,
+    });
     if (args?.onAgentModeChanged != null) {
       await args.onAgentModeChanged(nextAgentId, normalizedAiSettings);
     }

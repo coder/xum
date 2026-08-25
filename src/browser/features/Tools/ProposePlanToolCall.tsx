@@ -571,6 +571,29 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     };
   };
 
+  // A send can fail after WorkspaceService already persisted the target agent
+  // pre-dispatch (admission/startup failures), leaving the backend on the
+  // target while nothing echoes. Restore the prior selection backend-side too
+  // (best-effort — the authoritative metadata echo reconciles clients if this
+  // write fails) before rolling the local switch back.
+  const rollbackFailedSendAgentSwitch = async (
+    targetAgentId: string,
+    snapshot: TargetAgentSwitchSnapshot
+  ) => {
+    if (!workspaceId || !api) return;
+    try {
+      await api.workspace.updateAgentAISettings({
+        workspaceId,
+        agentId: snapshot.previousAgentId,
+        aiSettings: null,
+        persistSelectedAgentId: true,
+      });
+    } catch {
+      // Best-effort restore only.
+    }
+    rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
+  };
+
   const handleImplement = async () => {
     if (!workspaceId || !api) return;
     if (isImplementingRef.current) return;
@@ -641,15 +664,15 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
           clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
         }
       } else {
-        // Failed send: the switch never reached the backend, nothing will
-        // echo, and a stuck guard would block backend agent seeds indefinitely.
-        rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
+        // Failed send: nothing will echo and a stuck guard would block
+        // backend agent seeds indefinitely.
+        await rollbackFailedSendAgentSwitch(targetAgentId, snapshot);
         clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
       }
     } catch {
       // Best-effort: user can retry manually if sending fails.
       if (switchSnapshot != null) {
-        rollbackTargetAgentSwitch(workspaceId, targetAgentId, switchSnapshot);
+        await rollbackFailedSendAgentSwitch(targetAgentId, switchSnapshot);
       }
       clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
     } finally {
@@ -725,13 +748,13 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
           clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
         }
       } else {
-        rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
+        await rollbackFailedSendAgentSwitch(targetAgentId, snapshot);
         clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
       }
     } catch {
       // Best-effort: user can retry manually if sending fails.
       if (switchSnapshot != null) {
-        rollbackTargetAgentSwitch(workspaceId, targetAgentId, switchSnapshot);
+        await rollbackFailedSendAgentSwitch(targetAgentId, switchSnapshot);
       }
       clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
     } finally {

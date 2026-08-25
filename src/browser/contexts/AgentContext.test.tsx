@@ -448,22 +448,33 @@ describe("AgentContext", () => {
       expect(contextValue?.agentId).toBe("exec");
     });
 
-    contextValue?.setAgentId("plan");
+    const toasts: Array<{ workspaceId: string; message: string }> = [];
+    const toastListener = (event: Event) =>
+      toasts.push((event as CustomEvent<{ workspaceId: string; message: string }>).detail);
+    window.addEventListener(CUSTOM_EVENTS.AGENT_SWITCH_ERROR_TOAST, toastListener);
 
-    // Optimistic switch happens immediately...
-    await waitFor(() => {
-      expect(contextValue?.agentId).toBe("plan");
-    });
-    await waitFor(() => {
-      expect(resolveUpdateAgentAISettings).not.toBeNull();
-    });
+    try {
+      contextValue?.setAgentId("plan");
 
-    // ...then the backend rejects the write and the selection rolls back.
-    resolveUpdateAgentAISettings?.({ success: false, error: "offline" });
+      // Optimistic switch happens immediately...
+      await waitFor(() => {
+        expect(contextValue?.agentId).toBe("plan");
+      });
+      await waitFor(() => {
+        expect(resolveUpdateAgentAISettings).not.toBeNull();
+      });
 
-    await waitFor(() => {
-      expect(contextValue?.agentId).toBe("exec");
-    });
+      // ...then the backend rejects the write and the selection rolls back.
+      resolveUpdateAgentAISettings?.({ success: false, error: "offline" });
+
+      await waitFor(() => {
+        expect(contextValue?.agentId).toBe("exec");
+      });
+      // The rejection surfaces to the user instead of silently snapping back.
+      expect(toasts).toEqual([{ workspaceId, message: "offline" }]);
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.AGENT_SWITCH_ERROR_TOAST, toastListener);
+    }
   });
 
   test("failed persistence restores the pre-switch model settings with the agent", async () => {
