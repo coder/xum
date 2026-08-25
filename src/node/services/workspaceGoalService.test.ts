@@ -2372,6 +2372,42 @@ describe("WorkspaceGoalService", () => {
     expect(await service.getGoal(workspaceId)).toBeNull();
   });
 
+  test("skipped maintenance streams preserve the budget wrap-up stamp", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cBACb): once a goal-driven stream flips the
+    // goal to budget_limited, its stamp keeps the pending budget wrap-up
+    // eligible. A scheduled heartbeat ending before the wrap-up dispatches
+    // must not replace that stamp with a user-origin one, or the wrap-up is
+    // classified budget_wrapup_suppressed and the goal strands without its
+    // final turn.
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Budget-limited goal",
+      budgetCents: 100,
+    });
+    await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 2,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    expect(await service.getGoal(workspaceId)).toMatchObject({ status: "budget_limited" });
+
+    // Scheduled heartbeat stream ends while the wrap-up is still pending.
+    await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 0.01,
+      streamStartedAtMs: created.createdAtMs + 2,
+      streamOriginKind: "user",
+    });
+
+    const stamps = (
+      service as unknown as {
+        lastGoalStreamStamps: Map<string, { originKind: string; goalId: string | null }>;
+      }
+    ).lastGoalStreamStamps;
+    expect(stamps.get(workspaceId)?.originKind).toBe("goal_continuation");
+  });
+
   test("stream-end drain racing publication persists the publication stamp", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6b_KgE): the stream can end while the queued
     // setter is still inside its publication await. The drain used to take the
@@ -2424,8 +2460,7 @@ describe("WorkspaceGoalService", () => {
     // come. The drain must loop so the replacement is persisted too — a
     // single-pass drain persists the older mutation and strands the newer one.
     await extensionMetadata.setStreaming(workspaceId, true);
-    const first = await service.setGoal({ workspaceId, objective: "First goal" });
-    expect(first.success).toBe(true);
+    const first = await setGoalOk(service, { workspaceId, objective: "First goal" });
 
     const serviceAccess = service as unknown as {
       fileLocks: { withLock: <T>(key: string, fn: () => Promise<T>) => Promise<T> };
@@ -2448,6 +2483,12 @@ describe("WorkspaceGoalService", () => {
       workspaceId,
       objective: "Replacement goal",
       forceNewGoal: true,
+      // Codex P2 (PRRT_kwDOPxxmWM6cBACj): the replacement targets the goal
+      // the user sees — the first mutation's projected id. Because each drain
+      // pass claims AND persists in one lock tenure, that id is already
+      // durable when this setter validates, and the accepted guard stays
+      // coherent when the drain replays this mutation on the next pass.
+      expectedGoalId: first.goalId,
     });
     // Let the replacement setter finish its pre-lock streaming check and
     // queue on the lock before the gate opens.

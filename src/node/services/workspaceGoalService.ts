@@ -2217,7 +2217,25 @@ export class WorkspaceGoalService {
     input: SetGoalInput & { objective?: string },
     options?: { replacementGoalId?: string | null; replacementCreatedAtMs?: number | null }
   ): Promise<Result<GoalRecordV1, GoalSetError>> {
-    const result = await this.fileLocks.withLock(input.workspaceId, async () => {
+    const result = await this.fileLocks.withLock(input.workspaceId, () =>
+      this.persistGoalMutationLocked(input, options)
+    );
+    return this.finalizeGoalPersistence(input, result);
+  }
+
+  /**
+   * Locked core of `setGoalImmediately`: validates guards against the durable
+   * record and persists. Callers MUST hold the goal file lock. The stream-end
+   * drain calls this inside its claim tenure (Codex P2 PRRT_kwDOPxxmWM6cBACj)
+   * so no setter can interleave between claiming a pending mutation and
+   * persisting it — every later setter therefore validates its guards against
+   * durable state that already includes the drained mutation.
+   */
+  private async persistGoalMutationLocked(
+    input: SetGoalInput & { objective?: string },
+    options?: { replacementGoalId?: string | null; replacementCreatedAtMs?: number | null }
+  ): Promise<Result<GoalRecordV1, GoalSetError>> {
+    {
       const current = await this.readGoalFile(input.workspaceId);
       const conflict =
         this.conflictForExpectedGoalId(current, input.expectedGoalId) ??
@@ -2398,8 +2416,18 @@ export class WorkspaceGoalService {
         hasTurnCap: next.turnCap != null,
       });
       return Ok(next);
-    });
+    }
+  }
 
+  /**
+   * Post-lock finalization shared by `setGoalImmediately` and the stream-end
+   * drain: lifecycle/timeline side effects, pause-boundary handling, kickoff
+   * arming, and chat-tail syncs. Runs outside the goal file lock.
+   */
+  private async finalizeGoalPersistence(
+    input: SetGoalInput & { objective?: string },
+    result: Result<GoalRecordV1, GoalSetError>
+  ): Promise<Result<GoalRecordV1, GoalSetError>> {
     if (!result.success) {
       return result;
     }
@@ -2837,7 +2865,20 @@ export class WorkspaceGoalService {
       const isGoalDrivenStream =
         originKind === "goal_continuation" || originKind === "goal_budget_limit";
       if (current.status !== "active" && !isGoalDrivenStream) {
-        this.recordLastGoalStream(input.workspaceId, originKind, current.goalId);
+        // Codex P2 (PRRT_kwDOPxxmWM6cBACb): a skipped maintenance stream on a
+        // budget_limited goal must not overwrite the goal-driven stamp that
+        // keeps the pending budget wrap-up eligible — replacing it with a
+        // user/other stamp would make checkGoalContinuationEligibility
+        // classify the wrap-up as budget_wrapup_suppressed and delete its
+        // candidate, stranding the goal without its final wrap-up turn.
+        const existingStamp = this.lastGoalStreamStamps.get(input.workspaceId);
+        const preservesWrapupEligibility =
+          current.status === "budget_limited" &&
+          existingStamp?.goalId === current.goalId &&
+          this.isBudgetWrapupEligibleOrigin(existingStamp.originKind);
+        if (!preservesWrapupEligibility) {
+          this.recordLastGoalStream(input.workspaceId, originKind, current.goalId);
+        }
         await this.pushSnapshot(input.workspaceId, current);
         return current;
       }
@@ -3043,56 +3084,70 @@ export class WorkspaceGoalService {
     // in the window (user abort / clearGoal), which delete the mutation
     // before the claim runs.
     //
-    // Codex P2 (PRRT_kwDOPxxmWM6cAl6e): persistence (setGoalImmediately) is a
-    // separate lock tenure, and the async streaming=false metadata update can
-    // still report the ended stream as live — a setter interleaving between
-    // claim and persistence can therefore install a NEWER mutation expecting
-    // a stream-end drain that would otherwise never come (this is the last
-    // one). Loop until no pending mutation remains so any replacement is
-    // deterministically drained; the newest mutation persists last and wins.
-    // The pass cap is defensive — installs require a live-looking stream, so
-    // replacements cannot arrive indefinitely after stream end.
-    for (let pass = 0; pass < 10; pass += 1) {
+    // Codex P2 (PRRT_kwDOPxxmWM6cAl6e, PRRT_kwDOPxxmWM6cANQH,
+    // PRRT_kwDOPxxmWM6cBACj): each pass claims AND persists inside ONE lock
+    // tenure via `persistGoalMutationLocked`. Setters install/replace
+    // mutations only while holding this lock, so nothing can interleave
+    // between the claim and its persistence — a later setter always validates
+    // its expectedGoalId/replacement guard against durable state that already
+    // includes every drained pass, keeping accepted guards coherent on
+    // replay.
+    //
+    // Codex P2 (PRRT_kwDOPxxmWM6cBACH): loop until a locked claim observes no
+    // mutation instead of a fixed pass cap — a cap exit could strand the
+    // newest mutation with no remaining stream-end hook. Termination: nothing
+    // can install while we hold the lock, each iteration consumes the single
+    // mutation slot, and new installs require a setter that still observes
+    // the (stale) live-stream flag, which closes shortly after stream end.
+    while (true) {
       // Unlocked fast path: setters install before publication, so a setter
       // mid-publication always has a visible mutation here; an empty map means
       // there is nothing to hand off (the common no-mutation stream end).
       if (this.pendingGoalMutations.get(workspaceId) == null) {
         break;
       }
-      const pending = await this.fileLocks.withLock(workspaceId, () => {
-        const claimed = this.pendingGoalMutations.get(workspaceId);
-        if (claimed != null) {
-          this.pendingGoalMutations.delete(workspaceId);
-          this.pendingGoalSnapshots.delete(workspaceId);
-        }
-        return Promise.resolve(claimed);
-      });
-      if (pending == null) {
-        break;
-      }
-
       // Mirror the `setGoal` wrapper here: invalid queued transitions must
       // be logged and swallowed so the stream-end pipeline stays alive.
       // The caller already treats null as "no apply happened".
+      let claimedMutation = false;
       try {
-        const { projectedGoalId, projectedCreatedAtMs, ...pendingInput } = pending;
-        const result = await this.setGoalImmediately(
-          { workspaceId, ...pendingInput },
-          {
-            replacementGoalId: projectedGoalId ?? null,
-            replacementCreatedAtMs: projectedCreatedAtMs ?? null,
+        const tenure = await this.fileLocks.withLock(workspaceId, async () => {
+          const claimed = this.pendingGoalMutations.get(workspaceId);
+          if (claimed == null) {
+            // Discarded (user abort / clearGoal) between the fast path and
+            // the claim.
+            return null;
           }
-        );
-        drained = result.success ? result.data : drained;
+          claimedMutation = true;
+          this.pendingGoalMutations.delete(workspaceId);
+          this.pendingGoalSnapshots.delete(workspaceId);
+          const { projectedGoalId, projectedCreatedAtMs, ...pendingInput } = claimed;
+          const input = { workspaceId, ...pendingInput };
+          return {
+            input,
+            result: await this.persistGoalMutationLocked(input, {
+              replacementGoalId: projectedGoalId ?? null,
+              replacementCreatedAtMs: projectedCreatedAtMs ?? null,
+            }),
+          };
+        });
+        if (tenure == null) {
+          break;
+        }
+        const finalized = await this.finalizeGoalPersistence(tenure.input, tenure.result);
+        drained = finalized.success ? finalized.data : drained;
       } catch (error) {
         log.warn("applyPendingAfterStreamEnd: dropped invalid queued goal mutation", {
           workspaceId,
           error: error instanceof Error ? error.message : String(error),
         });
       } finally {
-        // Always re-read the durable record: queued snapshots are optimistic, and
-        // drains can succeed as persistence no-ops, reject, or throw.
-        await this.restorePersistedGoalSnapshot(workspaceId);
+        // Always re-read the durable record after a claim: queued snapshots
+        // are optimistic, and drains can succeed as persistence no-ops,
+        // reject, or throw.
+        if (claimedMutation) {
+          await this.restorePersistedGoalSnapshot(workspaceId);
+        }
       }
     }
 
