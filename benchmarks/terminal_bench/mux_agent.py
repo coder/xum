@@ -53,6 +53,9 @@ class MuxAgent(BaseInstalledAgent):
         "src",
         "dist",
         "scripts/postinstall.sh",
+        # bun install applies package.json patchedDependencies; without the patch
+        # files the in-sandbox install fails outright.
+        "patches",
     )
 
     _PROVIDER_ENV_KEYS: Sequence[str] = (
