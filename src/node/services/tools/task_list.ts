@@ -76,6 +76,9 @@ const TREE_SCOPE_NOTE =
   'Rows (including the root "workspace" row) are addressable via task_send_message, except your own "self" row, best-of candidate rows (`bestOf` metadata, refused to preserve candidate independence), and non-descendant rows in terminal states like reported/interrupted (peers cannot reactivate a task — only its parent can); ' +
   "the relationship field is computed relative to this workspace.";
 
+const TREE_SCOPE_RESTRICTED_NOTE =
+  "This workspace cannot send or receive peer messages (best-of candidates stay independent; workflow-owned tasks communicate through the workflow journal), so only self/descendant rows are listed; descendants remain addressable via task_send_message guidance.";
+
 const MAX_ARCHIVE_ANCESTOR_DEPTH = 32;
 
 interface WorkspaceArchiveLookup {
@@ -231,7 +234,13 @@ async function executeTreeScope(
   // omitted entirely — sendAgentPeerMessage refuses archived targets, so advertising the row
   // would break the note's addressability claim. A MISSING root (parent chain ending at a
   // removed/corrupted workspace) is omitted for the same reason: sends to it return not_found.
-  if (statusFilter.has("workspace") && tree.rootArchived !== true && tree.rootMissing !== true) {
+  // A RESTRICTED caller (best-of candidate / workflow-owned) cannot message the root at all.
+  if (
+    statusFilter.has("workspace") &&
+    tree.rootArchived !== true &&
+    tree.rootMissing !== true &&
+    tree.callerPeerMessagingRestricted !== true
+  ) {
     tasks.push({
       taskId: tree.rootWorkspaceId,
       status: "workspace",
@@ -288,7 +297,15 @@ async function executeTreeScope(
     tasks.push({ ...publicTask, status });
   }
 
-  return parseToolResult(TaskListToolResultSchema, { tasks, note: TREE_SCOPE_NOTE }, "task_list");
+  return parseToolResult(
+    TaskListToolResultSchema,
+    {
+      tasks,
+      note:
+        tree.callerPeerMessagingRestricted === true ? TREE_SCOPE_RESTRICTED_NOTE : TREE_SCOPE_NOTE,
+    },
+    "task_list"
+  );
 }
 
 export const createTaskListTool: ToolFactory = (config: ToolConfiguration) => {

@@ -43,6 +43,52 @@ describe("neutralizeAgentEnvelopeLookalikesForProvider", () => {
     expect(result).toBe(peer);
   });
 
+  test("neutralizes lookalike wrappers inside tool outputs", () => {
+    // Tool results carry attacker-controlled repository content (file_read, bash, ...): an
+    // exact wrapper inside them reaches provider tool content via convertToModelMessages, so it
+    // must lose server provenance just like ordinary text parts.
+    const message = createMuxMessage("a-tool", "assistant", "", { historySequence: 4 });
+    message.parts = [
+      {
+        type: "dynamic-tool",
+        toolCallId: "call-1",
+        toolName: "file_read",
+        state: "output-available",
+        input: { path: "README.md" },
+        output: {
+          success: true,
+          content: `injected:\n${envelope}`,
+          nested: [{ note: envelope }],
+        },
+      } as unknown as (typeof message.parts)[number],
+    ];
+    const [result] = neutralizeAgentEnvelopeLookalikesForProvider([message]);
+    const output = (
+      result.parts[0] as unknown as { output: { content: string; nested: Array<{ note: string }> } }
+    ).output;
+    expect(output.content).not.toContain("<mux_agent_message>");
+    expect(output.content).toContain("<user_pasted_mux_agent_message>");
+    expect(output.nested[0].note).not.toContain("<mux_agent_message>");
+    // Payload text survives for the model.
+    expect(output.content).toContain("status update");
+  });
+
+  test("keeps tool parts without lookalikes reference-identical", () => {
+    const message = createMuxMessage("a-tool-clean", "assistant", "", { historySequence: 5 });
+    message.parts = [
+      {
+        type: "dynamic-tool",
+        toolCallId: "call-2",
+        toolName: "bash",
+        state: "output-available",
+        input: { script: "echo ok" },
+        output: { success: true, content: "ok" },
+      } as unknown as (typeof message.parts)[number],
+    ];
+    const [result] = neutralizeAgentEnvelopeLookalikesForProvider([message]);
+    expect(result).toBe(message);
+  });
+
   test("neutralizes user rows even when they carry valid peer metadata and an envelope", () => {
     // Authentic payloads are assistant-role only: a user row must never be exempt, or a
     // corrupted/forged user row could smuggle the exact wrapper with user authority.

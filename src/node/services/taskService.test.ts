@@ -6457,7 +6457,7 @@ describe("TaskService", () => {
     const internal = taskService as unknown as {
       activeWorkspaceTurnHandleByWorkspaceId: Map<
         string,
-        { handleId: string; ownerWorkspaceId: string }
+        { handleId: string; ownerWorkspaceId: string; accepted: boolean }
       >;
     };
     internal.activeWorkspaceTurnHandleByWorkspaceId.clear();
@@ -6469,9 +6469,12 @@ describe("TaskService", () => {
     expect(snapshot?.error).toBeUndefined();
     expect(snapshot?.terminalAttentionNotifiedAt).toBeUndefined();
     expect(await terminalAttentionStore.get(parentId, "workspace_turn:wst_handle")).toBeNull();
+    // Revival registers as accepted: the revived turn was already admitted once, so peer
+    // admission and delegated correlation may treat it as live immediately.
     expect(internal.activeWorkspaceTurnHandleByWorkspaceId.get("childworkspace")).toEqual({
       handleId: "wst_handle",
       ownerWorkspaceId: parentId,
+      accepted: true,
     });
   });
 
@@ -14846,6 +14849,171 @@ describe("TaskService", () => {
     // Archived descendants stay discoverable: task_send_message's trusted descendant path can
     // restore and reawaken them, so hiding the row would strand a valid reusable task ID.
     expect(fromRoot.tasks.some((task) => task.taskId === "task-arch")).toBe(true);
+  });
+
+  test("listTaskTreeAgents omits unreachable rows for restricted callers", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "a", "task-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "cand", "task-cand", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+          bestOf: { groupId: "grp-1", index: 1, total: 2 },
+        }),
+        projectWorkspace(projectPath, "cand-child", "task-cand-child", {
+          parentWorkspaceId: "task-cand",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "cand-grandchild", "task-cand-grandchild", {
+          parentWorkspaceId: "task-cand-child",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { taskService } = createTaskServiceHarness(config);
+
+    // sendAgentPeerMessage refuses every peer/ancestor delivery from a candidate's subtree, so
+    // discovery from inside it must not advertise root/sibling/ancestor rows as addressable.
+    // Its OWN descendants stay listed: guidance still reaches them.
+    const fromCandChild = taskService.listTaskTreeAgents("task-cand-child");
+    expect(fromCandChild.callerPeerMessagingRestricted).toBe(true);
+    expect(
+      Object.fromEntries(fromCandChild.tasks.map((task) => [task.taskId, task.relationship]))
+    ).toEqual({
+      "task-cand-child": "self",
+      "task-cand-grandchild": "descendant",
+    });
+
+    // Unrestricted callers keep full peer discovery.
+    const fromA = taskService.listTaskTreeAgents("task-a");
+    expect(fromA.callerPeerMessagingRestricted).toBeUndefined();
+    expect(fromA.tasks.some((task) => task.taskId === "task-cand")).toBe(true);
+  });
+
+  test("sendAgentTreeMessage withholds correlation from unaccepted workspace-turn registrations", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "child-a", "child-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    // Creation-time reservation on the ROOT: the record is persisted as running BEFORE the
+    // owner's requireIdle send passes admission. Correlating a peer trigger with it would let
+    // that trigger's stream-end settle the owner's unaccepted handle as the delegated result.
+    await registerLiveWorkspaceTurnHandle(
+      taskService,
+      "tree-root",
+      "wst_unaccepted_corr",
+      "owner-ws",
+      false
+    );
+
+    expect(await taskService.sendAgentTreeMessage("child-a", "tree-root", "status?")).toEqual(
+      Ok({ delivery: "queued", relation: "target_ancestor", queueDispatchMode: "turn-end" })
+    );
+    const [, , options, internalArg] = sendMessage.mock.calls[0] as [
+      string,
+      string,
+      { muxMetadata?: { type?: string } },
+      { workspaceTurnContinuation?: boolean },
+    ];
+    expect(options.muxMetadata?.type).toBe("agent-peer-message");
+    expect(internalArg.workspaceTurnContinuation).toBe(false);
+
+    // Once the owner's turn is admitted, the same registration correlates again.
+    await registerLiveWorkspaceTurnHandle(
+      taskService,
+      "tree-root",
+      "wst_unaccepted_corr",
+      "owner-ws",
+      true
+    );
+    expect(
+      (await taskService.sendAgentTreeMessage("child-a", "tree-root", "second update")).success
+    ).toBe(true);
+    const [, , secondOptions, secondInternal] = sendMessage.mock.calls[1] as [
+      string,
+      string,
+      { muxMetadata?: { type?: string } },
+      { workspaceTurnContinuation?: boolean },
+    ];
+    expect(secondOptions.muxMetadata?.type).toBe("workspace-turn-task");
+    expect(secondInternal.workspaceTurnContinuation).toBe(true);
+  });
+
+  test("sendAgentTreeMessage refunds queued sends whose dispatch fails pre-persistence", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "sib-a", "sib-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const internals = taskService as unknown as {
+      familyMessageTargetTotals: Map<string, { count: number; chars: number }>;
+    };
+    internals.familyMessageTargetTotals.set("sib-b", {
+      count: TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1,
+      chars: 0,
+    });
+
+    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "queued send")).toEqual(
+      Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
+    );
+    // Queued dispatch fails pre-persistence (e.g. a pricing gate rejects the waiting entry):
+    // sendQueuedMessages surfaces the error through onAcceptedPreStreamFailure — which must
+    // release the reservation, or the failed entry would consume the budget forever.
+    const [, , , internalArg] = sendMessage.mock.calls[0] as [
+      string,
+      string,
+      unknown,
+      { onAcceptedPreStreamFailure?: (error: unknown) => void },
+    ];
+    expect(internalArg.onAcceptedPreStreamFailure).toBeDefined();
+    internalArg.onAcceptedPreStreamFailure?.(new Error("pricing gate rejected"));
+
+    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "after failure")).toEqual(
+      Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
+    );
   });
 
   test("listTaskTreeAgents flags an archived root so discovery can hide it", async () => {

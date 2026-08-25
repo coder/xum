@@ -1036,6 +1036,43 @@ describe("task_list tool", () => {
     expect(taskIds(result)).toEqual(["tree-root", "task-self", "task-child-queued"]);
   });
 
+  it("tree scope hides peers and swaps the note for restricted callers", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-restricted");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-cand-child" });
+    // A best-of candidate (or workflow-owned) caller cannot message the root or any peer:
+    // listTaskTreeAgents already omits those rows and flags the caller, and the tool must not
+    // advertise the root row or the standard addressability note.
+    const listTaskTreeAgents = mock(() => ({
+      rootWorkspaceId: "tree-root",
+      rootTitle: "Root workspace",
+      rootRelationship: "ancestor" as const,
+      callerPeerMessagingRestricted: true as const,
+      tasks: [
+        {
+          ...buildAgentTask("task-cand-child", "running", "task-cand"),
+          relationship: "self" as const,
+        },
+        {
+          ...buildAgentTask("task-cand-grandchild", "running", "task-cand-child"),
+          relationship: "descendant" as const,
+        },
+      ],
+    }));
+    const tool = createTaskListTool({
+      ...baseConfig,
+      taskService: { listTaskTreeAgents } as unknown as TaskService,
+    });
+
+    const result = (await Promise.resolve(
+      tool.execute!({ scope: "tree" }, mockToolCallOptions)
+    )) as { tasks: Array<{ taskId: string }>; note?: string };
+    expect(result.tasks.map((task) => task.taskId)).toEqual([
+      "task-cand-child",
+      "task-cand-grandchild",
+    ]);
+    expect(result.note).toContain("cannot send or receive peer messages");
+  });
+
   it("tree scope omits an archived root from discovery", async () => {
     using tempDir = new TestTempDir("test-task-list-tree-archived-root");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });

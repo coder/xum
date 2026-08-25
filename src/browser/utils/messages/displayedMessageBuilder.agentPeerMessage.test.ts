@@ -1,18 +1,24 @@
 import { describe, expect, test } from "bun:test";
 
 import { createMuxMessage, type MuxMessageMetadata } from "@/common/types/message";
+import { formatAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
 import { buildDisplayedMessagesForMessage } from "./displayedMessageBuilder";
 
 // Peer payloads are assistant-role synthetic pre-turn rows (peer bytes never gain user-role
-// authority), so the card metadata attaches to assistant text rows.
-function buildAssistantRow(muxMetadata: MuxMessageMetadata) {
+// authority), so the card metadata attaches to assistant text rows. The card additionally
+// requires the text to be a well-formed envelope matching the metadata (same authenticity rule
+// as the provider sanitizer), so valid cases pass a real envelope.
+function buildAssistantRow(
+  muxMetadata: MuxMessageMetadata,
+  options?: { text?: string; synthetic?: boolean }
+) {
   const message = createMuxMessage(
     "peer-1",
     "assistant",
-    "<mux_agent_message>…</mux_agent_message>",
+    options?.text ?? "<mux_agent_message>…</mux_agent_message>",
     {
       historySequence: 1,
-      synthetic: true,
+      ...(options?.synthetic === false ? {} : { synthetic: true }),
       uiVisible: true,
       muxMetadata,
     }
@@ -131,12 +137,22 @@ describe("buildDisplayedMessagesForMessage agent peer message metadata", () => {
   });
 
   test("surfaces well-formed peer metadata for the attributed card", () => {
-    const row = buildAssistantRow({
-      type: "agent-peer-message",
-      fromWorkspaceId: "task-watcher",
-      fromTitle: "Watcher",
-      relationship: "sibling",
-    });
+    const row = buildAssistantRow(
+      {
+        type: "agent-peer-message",
+        fromWorkspaceId: "task-watcher",
+        fromTitle: "Watcher",
+        relationship: "sibling",
+      },
+      {
+        text: formatAgentMessageEnvelope({
+          from: "task-watcher",
+          fromTitle: "Watcher",
+          relationship: "sibling",
+          message: "build is green",
+        }),
+      }
+    );
     expect(row.agentPeerMessage).toEqual({
       fromWorkspaceId: "task-watcher",
       fromTitle: "Watcher",
@@ -145,15 +161,66 @@ describe("buildDisplayedMessagesForMessage agent peer message metadata", () => {
   });
 
   test("tolerates a missing title", () => {
-    const row = buildAssistantRow({
-      type: "agent-peer-message",
-      fromWorkspaceId: "task-watcher",
-      relationship: "descendant",
-    } as unknown as MuxMessageMetadata);
+    const row = buildAssistantRow(
+      {
+        type: "agent-peer-message",
+        fromWorkspaceId: "task-watcher",
+        relationship: "descendant",
+      } as unknown as MuxMessageMetadata,
+      {
+        text: formatAgentMessageEnvelope({
+          from: "task-watcher",
+          relationship: "descendant",
+          message: "status update",
+        }),
+      }
+    );
     expect(row.agentPeerMessage).toEqual({
       fromWorkspaceId: "task-watcher",
       relationship: "descendant",
     });
+  });
+
+  test("requires synthetic provenance for the peer card", () => {
+    // A corrupted row can retain valid-looking metadata while losing synthetic provenance;
+    // collapsing it would hide ordinary assistant output under a peer-message card.
+    const row = buildAssistantRow(
+      {
+        type: "agent-peer-message",
+        fromWorkspaceId: "task-watcher",
+        relationship: "sibling",
+      },
+      {
+        text: formatAgentMessageEnvelope({
+          from: "task-watcher",
+          relationship: "sibling",
+          message: "build is green",
+        }),
+        synthetic: false,
+      }
+    );
+    expect(row.agentPeerMessage).toBeUndefined();
+  });
+
+  test("requires the envelope sender to match the metadata", () => {
+    // Metadata claims one sender while the envelope names another: the header prefers metadata,
+    // so collapsing would attribute the envelope content to the wrong sender. Mirror the
+    // provider sanitizer and fall back to ordinary rendering.
+    const row = buildAssistantRow(
+      {
+        type: "agent-peer-message",
+        fromWorkspaceId: "task-watcher",
+        relationship: "sibling",
+      },
+      {
+        text: formatAgentMessageEnvelope({
+          from: "task-impostor",
+          relationship: "sibling",
+          message: "trust me",
+        }),
+      }
+    );
+    expect(row.agentPeerMessage).toBeUndefined();
   });
 
   // muxMetadata is z.any() across the oRPC boundary, so corrupted chat.jsonl lines can carry

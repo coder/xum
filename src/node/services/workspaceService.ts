@@ -9624,9 +9624,8 @@ export class WorkspaceService extends EventEmitter {
             ? normalizedOptions
             : stripWorkspaceTurnCorrelation(normalizedOptions),
           onCanceled: preserveCorrelation || isPeerTrigger ? internal?.onCanceled : undefined,
-          onAcceptedPreStreamFailure: preserveCorrelation
-            ? internal?.onAcceptedPreStreamFailure
-            : undefined,
+          onAcceptedPreStreamFailure:
+            preserveCorrelation || isPeerTrigger ? internal?.onAcceptedPreStreamFailure : undefined,
         };
       };
 

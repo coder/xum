@@ -705,6 +705,11 @@ export interface TaskTreeAgentsResult {
    * corrupted workspace): peer sends return not_found for it, so discovery hides the row.
    */
   rootMissing?: true;
+  /**
+   * True when the CALLER cannot send peer messages at all (best-of candidate or workflow-owned
+   * chain): non-descendant rows are omitted so discovery never advertises unreachable targets.
+   */
+  callerPeerMessagingRestricted?: true;
   tasks: TreeAgentTaskInfo[];
 }
 
@@ -5478,8 +5483,10 @@ export class TaskService {
         // stream end settles the owner's delegated turn as interrupted/superseded. Peer
         // attribution stays on the assistant payload row, so no provenance is lost; the queue
         // still counts these entries by their dedupe-key prefix.
-        const workspaceTurnMuxMetadata =
-          await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(targetId);
+        const workspaceTurnMuxMetadata = await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(
+          targetId,
+          { requireAcceptedRegistration: true }
+        );
         // Keep the explicit trigger marker alongside the correlation: displayedMessageBuilder
         // renders machine notifications from metadata, so a bare workspace-turn replacement would
         // present the backend trigger as a human prompt (and re-enter prompt navigation).
@@ -5651,6 +5658,15 @@ export class TaskService {
           // canceled queues would exhaust the pair/target budgets and refuse valid sends until
           // restart.
           onCanceled: () => {
+            if (!payloadPersisted) {
+              refundBudget();
+            }
+          },
+          // Queued dispatch can also FAIL pre-persistence (e.g. a pricing gate rejecting the
+          // entry while it waited): sendQueuedMessages surfaces those errors through this
+          // callback, not onCanceled, so the same guarded refund rides here. Post-persistence
+          // failures keep the charge (payloadPersisted flips first).
+          onAcceptedPreStreamFailure: () => {
             if (!payloadPersisted) {
               refundBudget();
             }
@@ -10675,6 +10691,13 @@ export class TaskService {
 
     const cfg = this.config.loadConfigOrDefault();
     const index = this.buildAgentTaskIndex(cfg);
+    // sendAgentPeerMessage refuses EVERY peer/ancestor delivery from a best-of candidate
+    // (independence) or a workflow-owned task (journal determinism) based on the sender's own
+    // chain — advertising root/sibling/ancestor rows to such a caller would direct it at
+    // targets it can never message. Descendant guidance stays valid, so those rows survive.
+    const callerRestricted =
+      this.isBestOfChainUsingIndex(index, workspaceId) ||
+      this.isWorkflowOwnedTaskUsingIndex(index, workspaceId);
     const rootWorkspaceId = this.resolveRootWorkspaceIdUsingParentById(
       index.parentById,
       workspaceId
@@ -10742,6 +10765,9 @@ export class TaskService {
         if (task.relationship === "descendant" || task.relationship === "self") {
           return true;
         }
+        if (callerRestricted) {
+          return false;
+        }
         const entry = index.byId.get(task.taskId);
         return entry == null || !isWorkspaceArchived(entry.archivedAt, entry.unarchivedAt);
       });
@@ -10761,6 +10787,7 @@ export class TaskService {
       // ends at a workspace that no longer exists; sendAgentTreeMessage returns not_found for
       // that ID, so discovery must say so instead of advertising an addressable root row.
       ...(rootEntry == null ? { rootMissing: true as const } : {}),
+      ...(callerRestricted ? { callerPeerMessagingRestricted: true as const } : {}),
       tasks,
     };
   }
@@ -12881,7 +12908,8 @@ export class TaskService {
   }
 
   private async getActiveWorkspaceTurnMuxMetadataForWorkspace(
-    workspaceId: string
+    workspaceId: string,
+    options?: { requireAcceptedRegistration?: boolean }
   ): Promise<WorkspaceTurnMuxMetadata | undefined> {
     const candidate = await this.getActiveWorkspaceTurnRecordForWorkspace(workspaceId);
     if (candidate == null) {
@@ -12905,6 +12933,22 @@ export class TaskService {
           this.activeWorkspaceTurnHandleByWorkspaceId.delete(workspaceId);
         }
         return undefined;
+      }
+
+      // Peer sends must not correlate with a turn whose send has not passed admission (a
+      // creation-time reservation's requireIdle send can still fail) or with a stale persisted
+      // record left by failed startup reconciliation: an attached correlation makes the peer
+      // trigger's stream-end settle that unaccepted/stale owner handle as if the peer response
+      // were the delegated task result. Family wakes keep the legacy behavior (correlating a
+      // recovered delegated turn is how child reports continue it after restart).
+      if (options?.requireAcceptedRegistration === true) {
+        if (
+          active?.handleId !== candidate.handleId ||
+          active.ownerWorkspaceId !== candidate.ownerWorkspaceId ||
+          !active.accepted
+        ) {
+          return undefined;
+        }
       }
 
       return this.buildWorkspaceTurnMuxMetadata(current);

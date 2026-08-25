@@ -131,6 +131,45 @@ describe("AgentSession.sendMessage (admission gates)", () => {
     expect(history.success ? history.data : ["unexpected"]).toHaveLength(0);
   });
 
+  it("keeps the charge when a stale send's rollback did not commit", async () => {
+    const workspaceId = "ws-caller-stale-rollback-failed";
+    const { session, historyService, streamMessage } = await createSessionHarness(workspaceId);
+    const appendMany = spyOn(historyService, "appendManyToHistory");
+    // Rollback deletion fails and the rows verifiably REMAIN: the cancellation hook must not
+    // fire — a refunded reservation with durable rows would let the payload enter provider
+    // context after a resume while no longer counting against the sender's budget.
+    const deleteSpy = spyOn(historyService, "deleteMessages").mockImplementation(() =>
+      Promise.resolve({ success: false as const, error: "sequence refresh failed" })
+    );
+    const canceled: string[] = [];
+
+    const result = await session.sendMessage(
+      "peer trigger",
+      { model: TEST_MODEL, agentId: "exec" },
+      {
+        synthetic: true,
+        preTurnMessages: [
+          createMuxMessage("peer-payload-stuck", "assistant", "untrusted payload", {
+            timestamp: 1,
+            synthetic: true,
+          }),
+        ],
+        admissionStale: () => appendMany.mock.calls.length > 0,
+        onCanceled: (reason: string) => {
+          canceled.push(reason);
+        },
+      }
+    );
+    deleteSpy.mockRestore();
+
+    expect(result.success).toBe(false);
+    expect(canceled).toHaveLength(0);
+    expect(streamMessage).not.toHaveBeenCalled();
+    // The rows stayed durable — consistent with the retained charge.
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success && history.data.length > 0).toBe(true);
+  });
+
   it("notifies accepted sends refused at the PREPARING gate and never streams", async () => {
     const workspaceId = "ws-epoch-preparing";
     const { session, streamMessage } = await createSessionHarness(workspaceId);

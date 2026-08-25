@@ -602,9 +602,9 @@ describe("MessageQueue", () => {
       expect(first.message).toBe("User send now");
 
       // The superseded correlation is stripped, but a peer trigger keeps its
-      // machine-notification identity (downgraded to plain peer attribution) and its
-      // onCanceled — the sender's budget refund, tied to this entry rather than the
-      // superseded owner handle. The owner's pre-stream-failure callback is still dropped.
+      // machine-notification identity (downgraded to plain peer attribution) plus both refund
+      // hooks — onCanceled and onAcceptedPreStreamFailure carry the sender's budget refund,
+      // tied to this entry rather than the superseded owner handle.
       const second = queue.dequeueNext();
       expect(second.options?.muxMetadata).toEqual({
         type: "agent-peer-message",
@@ -612,7 +612,7 @@ describe("MessageQueue", () => {
         relationship: "sibling",
       });
       expect(second.internal?.onCanceled).toBe(onCanceled);
-      expect(second.internal?.onAcceptedPreStreamFailure).toBeUndefined();
+      expect(second.internal?.onAcceptedPreStreamFailure).toBe(onAcceptedPreStreamFailure);
     });
 
     it("should preserve an original queued workspace-turn prompt during reordering", () => {

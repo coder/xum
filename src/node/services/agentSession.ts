@@ -2771,18 +2771,33 @@ export class AgentSession {
     const persistedCancelableMessageIds: string[] = [];
     // Roll back synthetic snapshots if the invoking user row fails to persist, or
     // later provider requests could consume orphaned context.
-    const rollbackPersistedTurnRows = async (): Promise<void> => {
-      if (persistedCancelableMessageIds.length === 0) return;
+    /**
+     * Returns whether the rows are verifiably gone. deleteMessages can fail AFTER its atomic
+     * rewrite committed, so a reported failure re-reads the durable history before concluding —
+     * callers that couple side effects to the rollback (peer budget refunds) must only act when
+     * deletion actually committed, or a "canceled" payload would stay durable while no longer
+     * counting against the sender's budget.
+     */
+    const rollbackPersistedTurnRows = async (): Promise<boolean> => {
+      if (persistedCancelableMessageIds.length === 0) return true;
       const rollbackResult = await this.historyService.deleteMessages(
         this.workspaceId,
         persistedCancelableMessageIds
       );
-      if (!rollbackResult.success) {
-        log.error("Failed to roll back partially persisted turn rows", {
-          workspaceId: this.workspaceId,
-          error: rollbackResult.error,
-        });
-      }
+      if (rollbackResult.success) return true;
+      log.error("Failed to roll back partially persisted turn rows", {
+        workspaceId: this.workspaceId,
+        error: rollbackResult.error,
+      });
+      const historyResult = await this.historyService.getHistoryFromLatestBoundary(
+        this.workspaceId
+      );
+      return (
+        historyResult.success &&
+        persistedCancelableMessageIds.every(
+          (messageId) => !historyResult.data.some((message) => message.id === messageId)
+        )
+      );
     };
     let cancellationHandled = false;
     let cancellationDisabled = false;
@@ -3562,13 +3577,17 @@ export class AgentSession {
     // rollback is forbidden by design (goal sync observes the durable row), so a Stop landing in
     // the remaining pre-stream awaits refuses the turn at the PREPARING gate with rows retained.
     if (internal?.admissionStale?.() === true) {
-      await rollbackPersistedTurnRows();
+      const rolledBack = await rollbackPersistedTurnRows();
       // Probe-carrying sends are peer messages whose caller already returned success when the
       // entry was queued — the cancellation hook is their only way to observe this refusal and
-      // release the budget reservation (nothing persisted; the refund closure is idempotent).
-      await internal?.onCanceled?.(
-        "Send refused: the caller's admission became stale before the turn was accepted."
-      );
+      // release the budget reservation (the refund closure is idempotent). Fire it ONLY when the
+      // rollback verifiably committed: rows that remain durable can enter provider context after
+      // a resume, so their charge must stand (budget charged ⇔ rows durable).
+      if (rolledBack) {
+        await internal?.onCanceled?.(
+          "Send refused: the caller's admission became stale before the turn was accepted."
+        );
+      }
       return Err(
         createUnknownSendMessageError(
           "Send refused: the caller's admission became stale before the turn was accepted."
