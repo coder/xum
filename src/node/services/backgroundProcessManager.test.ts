@@ -2106,6 +2106,13 @@ describe("BackgroundProcessManager", () => {
       expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
         Ok(false)
       );
+
+      // Display names may legally start with "." (only "." and ".." are rejected), hiding the
+      // record dir from a bare "*/" glob — a live dot-named job must still report unsettled.
+      await writeSpawnRecord(".hidden-survivor", { pid: process.pid, status: "running" });
+      expect(await manager.hasUnsettledRemoteSpawnRecords(remote, orphanWorkspaceId)).toEqual(
+        Ok(true)
+      );
     });
 
     it("treats running records under extra record dirs as live without host PID probes", async () => {

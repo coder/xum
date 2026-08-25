@@ -1836,11 +1836,15 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       //   i.e. torn/unreadable) → unsettled; non-"running" status → settled.
       // - running status: dead PID means SIGKILL/reboot skipped the trap → settled; a live or
       //   recycled PID (kill -0 success, or /proc entry on EPERM) → unsettled.
+      // Process IDs derive from display names, which may legally start with "." (only "." and
+      // ".." themselves are rejected), so also enumerate hidden record dirs — a bare "*/" glob
+      // would silently skip them and report CLEAR under a live dot-named job.
       const script = [
         `root=${quotePathForShell(root)}`,
         `if [ ! -e "$root" ]; then echo __MUX_BG_REMOTE_CLEAR__; exit 0; fi`,
         `unsettled=0`,
-        `for p in "$root"/*/; do`,
+        `for p in "$root"/*/ "$root"/.*/; do`,
+        `  case "$p" in */./|*/../) continue ;; esac`,
         `  [ -d "$p" ] || continue`,
         `  [ -e "$p/${BG_EXIT_CODE_FILENAME}" ] && continue`,
         `  if ! grep -q '"status"' "$p/${BG_META_FILENAME}" 2>/dev/null; then unsettled=1; break; fi`,

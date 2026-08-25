@@ -1399,6 +1399,7 @@ ${scriptWithEnv}`;
             const wall_duration_ms = Math.round(performance.now() - startTime);
 
             // Migrate to background tracking if manager is available
+            let migrationError = "background process manager unavailable";
             if (config.backgroundProcessManager && config.workspaceId) {
               const processId =
                 config.backgroundProcessManager.generateUniqueProcessId(safeDisplayName);
@@ -1445,14 +1446,27 @@ ${scriptWithEnv}`;
                   backgroundProcessId: processId,
                 });
               }
-              // Migration failed, fall through to simple return
+              // Migration failed, fall through to fail-closed termination below.
+              migrationError = migrateResult.error;
             }
 
-            // Fallback: return without process ID (no manager or migration failed)
+            // Migration failure (e.g. ENOSPC/EACCES creating the output dir) leaves neither a
+            // manager entry nor a durable spawn record, so archive gates and crash-orphan scans
+            // could not see the surviving command — a snapshot archive could remove the checkout
+            // (or a Coder-stop archive stop the VM) under it. Fail closed: terminate the process
+            // instead of letting it run untracked. (Backgrounding requires the manager-backed
+            // foreground registration, so the manager-unavailable branch is defensive only.)
+            wrappedAbortController.abort();
+            stdoutForMigration.cancel().catch(() => {
+              /* ignore */ return;
+            });
+            stderrForMigration.cancel().catch(() => {
+              /* ignore */ return;
+            });
             return withNotice({
-              success: true,
-              output: `Process sent to background. It will continue running.\n\nOutput so far (${lines.length} lines):\n${lines.slice(-20).join("\n")}${lines.length > 20 ? "\n...(showing last 20 lines)" : ""}`,
-              exitCode: 0,
+              success: false,
+              error: `Failed to send process to background (${migrationError}); the process was terminated because it could not be tracked.\n\nOutput so far (${lines.length} lines):\n${lines.slice(-20).join("\n")}${lines.length > 20 ? "\n...(showing last 20 lines)" : ""}`,
+              exitCode: -1,
               wall_duration_ms,
             });
           }

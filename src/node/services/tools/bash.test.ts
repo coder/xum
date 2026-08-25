@@ -1940,6 +1940,66 @@ describe("bash tool - background execution", () => {
     tempDir[Symbol.dispose]();
   });
 
+  it("terminates the process and fails when foreground-to-background migration fails", async () => {
+    const tempDir = new TestTempDir("test-bash-migrate-fail");
+    // Point the manager's output root at a regular FILE so migrateToBackground's mkdir
+    // fails deterministically (stand-in for ENOSPC/EACCES-style failures).
+    const blockedRoot = path.join(tempDir.path, "bg-root-blocked");
+    fs.writeFileSync(blockedRoot, "not a directory");
+    const manager = new BackgroundProcessManager(blockedRoot);
+
+    const config = createTestToolConfig(process.cwd());
+    config.runtimeTempDir = tempDir.path;
+    config.backgroundProcessManager = manager;
+
+    const tool = createBashTool(config);
+    const pidFile = path.join(tempDir.path, "migrate-fail.pid");
+    const resultPromise = tool.execute!(
+      {
+        script: `echo $$ > "${pidFile}"; sleep 30`,
+        timeout_secs: 60,
+        run_in_background: false,
+        display_name: "migrate-fail",
+      },
+      mockToolCallOptions
+    ) as Promise<BashToolResult>;
+
+    // Wait for the script to be running before clicking "send to background".
+    const startDeadline = Date.now() + 5000;
+    while (!fs.existsSync(pidFile) && Date.now() < startDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(fs.existsSync(pidFile)).toBe(true);
+
+    const sendResult = manager.sendToBackground(mockToolCallOptions.toolCallId);
+    expect(sendResult.success).toBe(true);
+
+    // An untracked live process would be invisible to archive gates and crash-orphan scans,
+    // so a failed migration must terminate the process and report failure instead of
+    // claiming the process will continue running.
+    const result = await resultPromise;
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("terminated because it could not be tracked");
+    }
+
+    const pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+    expect(pid).toBeGreaterThan(1);
+    const killDeadline = Date.now() + 5000;
+    let alive = true;
+    while (alive && Date.now() < killDeadline) {
+      try {
+        process.kill(pid, 0);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      } catch {
+        alive = false;
+      }
+    }
+    expect(alive).toBe(false);
+
+    tempDir[Symbol.dispose]();
+  }, 15000);
+
   it("should arm monitor for background mode and echo monitor config", async () => {
     const manager = new BackgroundProcessManager("/tmp/mux-test-bg");
 
