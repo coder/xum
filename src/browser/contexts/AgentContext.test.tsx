@@ -31,7 +31,7 @@ let mockWorkspaceMetadata = new Map<string, { parentWorkspaceId?: string; agentI
 let updateAgentAISettingsCalls: Array<{
   workspaceId: string;
   agentId: string;
-  aiSettings: { model: string } | null;
+  aiSettings: { model: string; thinkingLevel?: string; reasoningMode?: string } | null;
   persistSelectedAgentId?: boolean | null;
 }> = [];
 interface UpdateAgentAISettingsResult {
@@ -419,9 +419,16 @@ describe("AgentContext", () => {
     await waitFor(() => {
       expect(contextValue?.agentId).toBe("plan");
     });
-    expect(updateAgentAISettingsCalls).toEqual([
-      { workspaceId, agentId: "plan", aiSettings: null, persistSelectedAgentId: true },
-    ]);
+    expect(updateAgentAISettingsCalls).toHaveLength(1);
+    expect(updateAgentAISettingsCalls[0]).toMatchObject({
+      workspaceId,
+      agentId: "plan",
+      persistSelectedAgentId: true,
+    });
+    // The switch persists its resolved settings alongside the selection so a
+    // fresh client can hydrate the bucket even when the target agent had none.
+    expect(typeof updateAgentAISettingsCalls[0]?.aiSettings?.model).toBe("string");
+    expect(updateAgentAISettingsCalls[0]?.aiSettings?.thinkingLevel).toBeDefined();
 
     // Re-selecting the current agent is a no-op and must not hit the backend.
     contextValue?.setAgentId("plan");

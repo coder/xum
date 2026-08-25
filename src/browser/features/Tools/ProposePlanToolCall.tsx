@@ -572,10 +572,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   };
 
   // A send can fail after WorkspaceService already persisted the target agent
-  // pre-dispatch (admission/startup failures), leaving the backend on the
-  // target while nothing echoes. Restore the prior selection backend-side too
-  // (best-effort — the authoritative metadata echo reconciles clients if this
-  // write fails) before rolling the local switch back.
+  // pre-dispatch (admission/startup failures) — or before it did (send-time
+  // pricing gate, best-effort settings write) — while nothing echoes. Restore
+  // the prior selection backend-side; when that restore is refused, reconcile
+  // with the authoritative backend agent instead of guessing which side the
+  // failed send left the backend on.
   const rollbackFailedSendAgentSwitch = async (
     targetAgentId: string,
     snapshot: TargetAgentSwitchSnapshot
@@ -593,11 +594,8 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         aiSettings: null,
         persistSelectedAgentId: true,
       });
-      if (!restoreResult.success) {
-        // The backend refused the restore (e.g. the prior agent now fails the
-        // budgeted-goal pricing gate) and stays on the target agent with no
-        // echo coming — keep the local switch so local and backend state stay
-        // converged.
+      if (restoreResult.success) {
+        rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
         return;
       }
     } catch {
@@ -606,7 +604,18 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       // next metadata delivery re-seeds the authoritative backend agent.
       return;
     }
-    rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
+    // The backend refused the restore (e.g. the prior agent now fails the
+    // budgeted-goal pricing gate). Only roll back if the backend is actually
+    // elsewhere than the target — keeping local state converged with whichever
+    // agent the failed send left persisted.
+    try {
+      const info = await api.workspace.getInfo({ workspaceId });
+      if (info?.agentId != null && info.agentId !== targetAgentId) {
+        rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
+      }
+    } catch {
+      // Keep the local switch; the next metadata delivery reconciles.
+    }
   };
 
   // A successful send does not guarantee the switch is durable: its settings

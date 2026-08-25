@@ -21,16 +21,23 @@ import {
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { matchesKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
+  AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
   getModelKey,
   getProjectScopeId,
   getDisableWorkspaceAgentsKey,
   getReasoningModeKey,
   getThinkingLevelKey,
+  getWorkspaceAISettingsByAgentKey,
   GLOBAL_SCOPE_ID,
 } from "@/common/constants/storage";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
+import {
+  resolveWorkspaceAiSettingsForAgent,
+  type WorkspaceAISettingsCache,
+} from "@/browser/utils/workspaceModeAi";
+import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
@@ -140,6 +147,13 @@ function AgentProviderWithState(props: {
   const isCurrentAgentLocked = currentMeta?.parentWorkspaceId != null;
 
   const workspaceId = props.workspaceId;
+
+  // Declared before setAgentId: switches resolve the target agent's settings
+  // (base-chain aware) to persist them with the selection.
+  const [agents, setAgents] = useState<AgentDefinitionDescriptor[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
+
   const setAgentId: Dispatch<SetStateAction<string>> = useCallback(
     (value) => {
       // usePersistedState runs the updater synchronously, so `next` is
@@ -173,6 +187,29 @@ function AgentProviderWithState(props: {
       const previousModel = readPersistedState<string>(modelKey, getDefaultModel());
       const previousThinking = readPersistedState<ThinkingLevel>(thinkingKey, "off");
       const previousReasoning = readPersistedState<OpenAIReasoningMode>(reasoningKey, "standard");
+
+      // Resolve the switch's effective settings exactly as WorkspaceModeAISync
+      // will apply them locally, and persist them with the selection: an
+      // agent-only write leaves a fresh client with nothing to hydrate when
+      // the target agent has no bucket or configured default, diverging from
+      // the originating client's carried-over model until the next send.
+      const agentAiDefaults = readPersistedState<AgentAiDefaults>(AGENT_AI_DEFAULTS_KEY, {});
+      const workspaceByAgent = readPersistedState<WorkspaceAISettingsCache>(
+        getWorkspaceAISettingsByAgentKey(workspaceId),
+        {}
+      );
+      const { resolvedModel, resolvedThinking, resolvedReasoningMode } =
+        resolveWorkspaceAiSettingsForAgent({
+          agentId: nextAgentId,
+          agentAiDefaults,
+          workspaceByAgent,
+          useWorkspaceByAgentFallback: true,
+          fallbackModel: getDefaultModel(),
+          existingModel: previousModel,
+          existingThinking: previousThinking,
+          existingReasoningMode: previousReasoning,
+          agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
+        });
 
       // Optimistic local update above; on persistence failure roll the local
       // selection back (unless it changed again meanwhile) so this client
@@ -212,7 +249,11 @@ function AgentProviderWithState(props: {
         .updateAgentAISettings({
           workspaceId,
           agentId: nextAgentId,
-          aiSettings: null,
+          aiSettings: {
+            model: resolvedModel,
+            thinkingLevel: resolvedThinking,
+            ...(resolvedReasoningMode != null ? { reasoningMode: resolvedReasoningMode } : {}),
+          },
           persistSelectedAgentId: true,
         })
         .then((result) => {
@@ -232,12 +273,16 @@ function AgentProviderWithState(props: {
           rollback();
         });
     },
-    [api, globalDefaultAgentId, isCurrentAgentLocked, isProjectScope, setAgentIdRaw, workspaceId]
+    [
+      agents,
+      api,
+      globalDefaultAgentId,
+      isCurrentAgentLocked,
+      isProjectScope,
+      setAgentIdRaw,
+      workspaceId,
+    ]
   );
-
-  const [agents, setAgents] = useState<AgentDefinitionDescriptor[]>([]);
-  const [loaded, setLoaded] = useState(false);
-  const [loadFailed, setLoadFailed] = useState(false);
 
   const isMountedRef = useRef(true);
 

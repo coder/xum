@@ -69,6 +69,7 @@ interface MockApi {
       aiSettings: null;
       persistSelectedAgentId?: boolean;
     }) => Promise<{ success: boolean; error?: string }>;
+    getInfo: (args: { workspaceId: string }) => Promise<{ agentId?: string | null } | null>;
   };
 }
 
@@ -261,6 +262,7 @@ function createMockApi(
     replaceChatHistory?: MockApi["workspace"]["replaceChatHistory"];
     sendMessage?: MockApi["workspace"]["sendMessage"];
     updateAgentAISettings?: MockApi["workspace"]["updateAgentAISettings"];
+    getInfo?: MockApi["workspace"]["getInfo"];
   } = {}
 ): MockApi {
   return {
@@ -283,6 +285,7 @@ function createMockApi(
           ? overrides.updateAgentAISettings(args)
           : Promise.resolve({ success: true });
       },
+      getInfo: overrides.getInfo ?? (() => Promise.resolve(null)),
     },
   };
 }
@@ -612,9 +615,10 @@ describe("ProposePlanToolCall", () => {
         return Promise.resolve({ success: false as const, error: "send rejected" });
       },
       // The restore itself is refused (e.g. the prior agent now fails the
-      // budgeted-goal pricing gate): the backend stays on exec with no echo
-      // coming, so the local switch must not roll back and silently diverge.
+      // budgeted-goal pricing gate) while the backend holds the target exec:
+      // the local switch must not roll back and silently diverge.
       updateAgentAISettings: () => Promise.resolve({ success: false, error: "unpriced model" }),
+      getInfo: () => Promise.resolve({ agentId: "exec" }),
     });
 
     const view = renderCompletedPlan();
@@ -629,6 +633,39 @@ describe("ProposePlanToolCall", () => {
       expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true)
     );
     expect(JSON.parse(window.localStorage.getItem(getAgentIdKey(WORKSPACE_ID))!)).toBe("exec");
+  });
+
+  test("rolls back when the rejected restore reveals the target was never persisted", async () => {
+    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
+
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({
+      sendMessage: (args) => {
+        sendMessageCalls.push(args);
+        return Promise.resolve({ success: false as const, error: "send rejected" });
+      },
+      // Restore refused while the backend still holds plan (the send failed
+      // before persisting exec): local state must reconcile back to plan
+      // instead of keeping an exec the backend never had.
+      updateAgentAISettings: () => Promise.resolve({ success: false, error: "unwritable config" }),
+      getInfo: () => Promise.resolve({ agentId: "plan" }),
+    });
+
+    const view = renderCompletedPlan();
+
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+    await waitFor(() => expect(updateAgentAISettingsCalls).toHaveLength(1));
+    await waitFor(() =>
+      expect(JSON.parse(window.localStorage.getItem(getAgentIdKey(WORKSPACE_ID))!)).toBe("plan")
+    );
+    expect(JSON.parse(window.localStorage.getItem(getModelKey(WORKSPACE_ID))!)).toBe(
+      "anthropic:claude-sonnet-4-5"
+    );
+    await waitFor(() =>
+      expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true)
+    );
   });
 
   test("keeps a newer agent pick when the Implement send fails", async () => {
