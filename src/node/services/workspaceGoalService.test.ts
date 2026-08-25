@@ -3076,6 +3076,150 @@ describe("WorkspaceGoalService", () => {
     );
   });
 
+  test("the continuation dispatch admission probe goes stale when an explicit pause commits", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cOgXR): an explicit Pause completing while
+    // the dispatched continuation's send runs its unlocked preflight must
+    // refuse the captured send — otherwise its synthetic row lands after the
+    // pause boundary as fresh active evidence and reactivates the goal. The
+    // dispatch passes an admissionStale probe that flips when the candidate
+    // is deleted or the explicit-pause generation moves.
+    const dispatcher = new IdleDispatcher();
+    let capturedProbe: (() => boolean) | undefined;
+    service.registerGoalContinuationConsumer(dispatcher, {
+      hasActiveDescendantTasks: () => false,
+      getRuntimeState: () => ({ isRuntimeCompatible: true }),
+      executeGoalContinuation: (input) => {
+        capturedProbe = input.admissionStale;
+        // Model a send parked in preflight: never accept.
+        return Promise.resolve(false);
+      },
+      getKickoffSendOptions: () => Promise.resolve({ model: "openai:gpt-4o", agentId: "exec" }),
+    });
+    await setGoalOk(service, { workspaceId, objective: "Pause races dispatch" });
+    await drainPendingDispatches();
+    await waitForCondition(() => capturedProbe != null, { timeoutMs: 5_000 });
+
+    // Mid-preflight, before any pause: not stale.
+    expect(capturedProbe!()).toBe(false);
+    // Explicit pause commits during the preflight: deletes the candidate and
+    // bumps the explicit-pause generation — the probe must flip stale.
+    await setGoalOk(service, { workspaceId, status: "paused" });
+    expect(capturedProbe!()).toBe(true);
+  });
+
+  test("a stop landing during auto-promotion reads restores the completed goal", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cOgXV): maybeAutoPromoteOnComplete awaits
+    // board/streaming/pricing reads after the caller's publication sample. A
+    // Stop landing there must neither leave the aborted completion durable
+    // nor promote the next upcoming goal from the aborted turn.
+    const created = await setGoalOk(service, { workspaceId, objective: "Abort mid-promotion" });
+    const queued = await service.addUpcomingGoal({ workspaceId, objective: "Next in queue" });
+
+    const serviceAccess = service as unknown as {
+      readBoard: (id: string) => Promise<unknown>;
+    };
+    const realReadBoard = serviceAccess.readBoard.bind(service);
+    let releaseBoard!: () => void;
+    const boardGate = new Promise<void>((resolve) => {
+      releaseBoard = resolve;
+    });
+    let boardReadStarted = false;
+    const boardSpy = spyOn(serviceAccess, "readBoard").mockImplementationOnce(
+      async (id: string) => {
+        boardReadStarted = true;
+        await boardGate;
+        return realReadBoard(id);
+      }
+    );
+
+    const completePromise = service.setGoal({
+      workspaceId,
+      status: "complete",
+      completionSummary: "Done before the user could stop it",
+      initiator: "model",
+    });
+    await waitForCondition(() => boardReadStarted, { timeoutMs: 5_000 });
+    // Stop lands during the auto-promotion's board read.
+    const stopPromise = service.recordUserStoppedStream(workspaceId);
+    releaseBoard();
+
+    const completed = await completePromise;
+    expect(completed.success).toBe(false);
+    if (!completed.success) {
+      expect(completed.error.type).toBe("invalid_transition");
+    }
+    await stopPromise;
+    boardSpy.mockRestore();
+
+    // The prior goal is restored (not completed, not promoted) and gated.
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: created.goalId,
+      status: "active",
+    });
+    expect(typeof (await service.getGoal(workspaceId))?.requireUserAcknowledgmentSinceMs).toBe(
+      "number"
+    );
+    // The upcoming goal was not consumed by the aborted promotion.
+    const board = await service.getGoalBoard(workspaceId);
+    const upcomingEntry = board.entries.find((e) => e.section === "upcoming");
+    expect(upcomingEntry?.goal.goalId).toBe(queued.goalId);
+  });
+
+  test("a failed preview reset publication is retried on the next usage delta", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cOgXY): the reset deleted the cached live
+    // preview BEFORE publishing the durable snapshot. A failed publication
+    // then left no cached preview for later deltas to observe, so the reset
+    // never retried and the Goal UI kept the stale cost. Publish first;
+    // clear only after success.
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Preview reset retry",
+      budgetCents: 500,
+    });
+    await service.previewStreamAccounting({
+      workspaceId,
+      costUsd: 0.5,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "other",
+    });
+    const previews = (service as unknown as { liveGoalPreviewSnapshots: Map<string, unknown> })
+      .liveGoalPreviewSnapshots;
+    expect(previews.has(workspaceId)).toBe(true);
+    // Mid-stream pause makes the next delta ineligible.
+    await setGoalOk(service, { workspaceId, status: "paused" });
+
+    const serviceAccess = service as unknown as {
+      pushSnapshot: (id: string, goal: GoalRecordV1 | null) => Promise<unknown>;
+    };
+    const pushSpy = spyOn(serviceAccess, "pushSnapshot").mockImplementationOnce(() =>
+      Promise.reject(new Error("injected: snapshot publish lost"))
+    );
+    let threw = false;
+    try {
+      await service.previewStreamAccounting({
+        workspaceId,
+        costUsd: 0.6,
+        streamStartedAtMs: created.createdAtMs + 1,
+        streamOriginKind: "other",
+      });
+    } catch {
+      threw = true;
+    }
+    pushSpy.mockRestore();
+    expect(threw).toBe(true);
+    // The cache survives the failed publication so a later delta retries.
+    expect(previews.has(workspaceId)).toBe(true);
+
+    // The next delta completes the reset.
+    await service.previewStreamAccounting({
+      workspaceId,
+      costUsd: 0.7,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "other",
+    });
+    expect(previews.has(workspaceId)).toBe(false);
+  });
+
   test("continuation rows for a replaced goal do not reconcile the newer goal to active", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cH3kV): goal A fired a continuation and was
     // paused, then replaced with goal B which the user pauses. When B's pause

@@ -13573,6 +13573,7 @@ export class WorkspaceService extends EventEmitter {
     kind?: GoalSyntheticMessageKind;
     goalId?: string;
     options: SendMessageOptions;
+    admissionStale?: () => boolean;
   }): Promise<boolean> {
     assert(input.workspaceId.trim().length > 0, "executeGoalContinuation requires workspaceId");
     assert(input.message.trim().length > 0, "executeGoalContinuation requires message");
@@ -13600,6 +13601,9 @@ export class WorkspaceService extends EventEmitter {
         goalKind,
         goalId: input.goalId,
         goalContinuation: true,
+        // Composed with the requireIdle preflight probe (see the requireIdle
+        // admission section in sendMessage).
+        admissionStale: input.admissionStale,
       }
     );
 

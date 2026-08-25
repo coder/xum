@@ -184,6 +184,15 @@ export interface GoalContinuationRuntimeBridge {
     kind?: GoalSyntheticMessageKind;
     /** Stamped on the synthetic user row so chat-tail reconciliation can scope it to this goal. */
     goalId?: string;
+    /**
+     * Codex P1 (PRRT_kwDOPxxmWM6cOgXR): re-evaluated through the send's
+     * admission gates up to the last gate before the pre-turn batch becomes
+     * irrevocable. An explicit Pause completing during the send preflight
+     * (pricing/settings/history awaits) flips this stale, refusing the
+     * captured continuation instead of landing its row after the pause
+     * boundary as fresh active evidence.
+     */
+    admissionStale?: () => boolean;
   }): Promise<boolean>;
   /**
    * Build default SendMessageOptions for a kickoff continuation that is armed
@@ -1688,6 +1697,16 @@ export class WorkspaceGoalService {
     const message = buildGoalContinuationMessage(continuationGoal);
     return {
       dispatch: async () => {
+        // Codex P1 (PRRT_kwDOPxxmWM6cOgXR): an explicit Pause completing
+        // while the send below runs its unlocked preflight would otherwise go
+        // unobserved — requireIdle still admits (Pause does not make the
+        // session busy) and the continuation row would land after the pause
+        // boundary as fresh active evidence. Every explicit pause path
+        // deletes the candidate and bumps the explicit-pause generation, so
+        // the probe flips stale and the send is refused before its pre-turn
+        // batch becomes irrevocable. Reconciliation pauses do neither, so the
+        // kickoff-window recovery dispatch still proceeds.
+        const pauseGenerationAtDispatch = this.explicitPauseGenerations.get(workspaceId) ?? 0;
         const accepted = await this.goalContinuationBridge?.executeGoalContinuation({
           workspaceId,
           message,
@@ -1695,6 +1714,9 @@ export class WorkspaceGoalService {
           startStreamInBackground: candidate.source === "kickoff",
           kind: GOAL_CONTINUATION_KIND,
           goalId: goal.goalId,
+          admissionStale: () =>
+            this.pendingContinuationCandidates.get(workspaceId) !== candidate ||
+            (this.explicitPauseGenerations.get(workspaceId) ?? 0) !== pauseGenerationAtDispatch,
         });
         if (accepted !== true) {
           this.scheduleContinuationReRequest(workspaceId, Date.now() + 1_000);
@@ -2905,7 +2927,20 @@ export class WorkspaceGoalService {
           hasTurnCap: withEdits.turnCap != null,
           editInPlace: true,
         });
-        await this.maybeAutoPromoteOnComplete(input.workspaceId, withEdits, previousStatus);
+        await this.maybeAutoPromoteOnComplete(input.workspaceId, withEdits, previousStatus, {
+          stopVeto: () => discardIfUserStopLanded() != null,
+        });
+        // Codex P1 (PRRT_kwDOPxxmWM6cOgXV): same conditional restore as the
+        // same-objective branch (see comment there).
+        const stoppedDuringEditPromotion = discardIfUserStopLanded();
+        if (stoppedDuringEditPromotion) {
+          const durableNow = await this.readGoalFile(input.workspaceId);
+          if (durableNow?.goalId === withEdits.goalId) {
+            await this.writeGoal(input.workspaceId, current);
+            await this.pushSnapshot(input.workspaceId, current);
+            return stoppedDuringEditPromotion;
+          }
+        }
         return Ok(withEdits);
       }
 
@@ -2981,7 +3016,25 @@ export class WorkspaceGoalService {
           this.emitBudgetChanged(current, updated, input);
           this.emitBudgetLimited(input.workspaceId, updated, previousStatus);
           this.emitStatusLifecycle(updated, previousStatus, input.initiator ?? "user");
-          await this.maybeAutoPromoteOnComplete(input.workspaceId, updated, previousStatus);
+          await this.maybeAutoPromoteOnComplete(input.workspaceId, updated, previousStatus, {
+            stopVeto: () => discardIfUserStopLanded() != null,
+          });
+          // Codex P1 (PRRT_kwDOPxxmWM6cOgXV): auto-promotion awaits board/
+          // streaming/pricing reads after the publication sample. The vetoes
+          // inside it prevent promotion writes once a stop lands, so if the
+          // durable record is still this turn's completion, restore the prior
+          // record; if a promotion already replaced goal.json (stop landed
+          // inside the promotion writes), leave it — the stop's queued
+          // section gates the promoted active goal instead.
+          const stoppedDuringPromotion = discardIfUserStopLanded();
+          if (stoppedDuringPromotion) {
+            const durableNow = await this.readGoalFile(input.workspaceId);
+            if (durableNow?.goalId === updated.goalId) {
+              await this.writeGoal(input.workspaceId, current);
+              await this.pushSnapshot(input.workspaceId, current);
+              return stoppedDuringPromotion;
+            }
+          }
         }
         if (input.objective != null) {
           this.emitLifecycle("goal_replaced", {
@@ -3600,9 +3653,16 @@ export class WorkspaceGoalService {
     workspaceId: string,
     current: GoalRecordV1
   ): Promise<GoalSnapshot | null> {
-    const hadPreview = this.liveGoalPreviewSnapshots.delete(workspaceId);
-    if (hadPreview) {
-      return this.pushSnapshot(workspaceId, current);
+    if (this.liveGoalPreviewSnapshots.has(workspaceId)) {
+      // Codex P2 (PRRT_kwDOPxxmWM6cOgXY): publish BEFORE clearing the cache.
+      // Deleting first meant a failed publication left no cached preview for
+      // later deltas to observe, so the reset was never retried and the Goal
+      // UI kept the stale cost until an unrelated snapshot happened to
+      // succeed. If the push throws, the cache stays intact and the next
+      // usage delta retries the reset.
+      const snapshot = await this.pushSnapshot(workspaceId, current);
+      this.liveGoalPreviewSnapshots.delete(workspaceId);
+      return snapshot;
     }
     return toGoalSnapshot(current);
   }
@@ -4765,7 +4825,8 @@ export class WorkspaceGoalService {
   private async maybeAutoPromoteOnComplete(
     workspaceId: string,
     completedGoal: GoalRecordV1,
-    previousStatus: GoalStatus
+    previousStatus: GoalStatus,
+    options?: { stopVeto?: () => boolean }
   ): Promise<void> {
     if (completedGoal.status !== "complete" || previousStatus === "complete") {
       return;
@@ -4799,12 +4860,20 @@ export class WorkspaceGoalService {
       );
       return;
     }
+    // Codex P1 (PRRT_kwDOPxxmWM6cOgXV): the board/streaming/pricing reads
+    // above await after the caller's last stop sample. Re-sample before the
+    // first durable write so an abort landing during those reads neither
+    // archives the aborted completion nor promotes the next goal; the caller
+    // re-checks after we return and restores the prior record.
+    if (options?.stopVeto?.() === true) {
+      return;
+    }
     // Move the completed goal into history before overwriting goal.json
     // with the promoted goal. The board's Completed section reads from
     // history, so this is what makes the just-completed goal visible
     // there.
     await this.appendGoalHistoryEntry(workspaceId, completedGoal, "completed");
-    await this.promoteNextUpcomingUnlocked(workspaceId);
+    await this.promoteNextUpcomingUnlocked(workspaceId, options);
   }
 
   /**
@@ -4818,7 +4887,10 @@ export class WorkspaceGoalService {
    * Caller must hold the workspace file lock. Returns the new active
    * record if a promotion happened, null otherwise.
    */
-  private async promoteNextUpcomingUnlocked(workspaceId: string): Promise<GoalRecordV1 | null> {
+  private async promoteNextUpcomingUnlocked(
+    workspaceId: string,
+    options?: { stopVeto?: () => boolean }
+  ): Promise<GoalRecordV1 | null> {
     const board = await this.readBoard(workspaceId);
     if (board.upcoming.length === 0) return null;
     // same mid-stream guard as `promoteUpcomingGoal`.
@@ -4868,6 +4940,15 @@ export class WorkspaceGoalService {
         "Auto-promote on complete skipped: queued goal is budgeted but kickoff model is unpriced",
         { workspaceId, goalId: head.goalId }
       );
+      return null;
+    }
+    // Codex P1 (PRRT_kwDOPxxmWM6cOgXV): last stop sample before the promotion
+    // writes — an abort landing during this helper's own board/streaming/
+    // pricing reads must not promote a goal from the aborted turn. (A stop
+    // landing inside the writes below leaves the promoted goal active; the
+    // stop's queued locked section then installs its acknowledgment gate on
+    // it, halting autonomy.)
+    if (options?.stopVeto?.() === true) {
       return null;
     }
     await this.writeBoard(workspaceId, { ...board, upcoming: rest });
