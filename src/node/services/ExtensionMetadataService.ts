@@ -386,6 +386,45 @@ export class ExtensionMetadataService {
   }
 
   /**
+   * Remove entries whose workspace no longer exists. Removed workspaces and
+   * sub-agents were historically never pruned here, so long-lived deployments
+   * accumulate thousands of stale entries that inflate every read and rewrite
+   * of this file (issue #3959 measured 13,895 entries for 1,513 known
+   * workspaces). Called once per process; `deleteWorkspace` keeps the file
+   * bounded afterwards.
+   *
+   * Loss safety: `getKnownWorkspaceIds` is invoked INSIDE the serialized
+   * mutation, before the file is loaded. All in-process writers go through the
+   * same mutation queue, so any entry visible in the loaded file was written
+   * by a mutation that completed before this one started — and a workspace is
+   * registered in config before its first metadata write, so a live
+   * workspace's id is always present in the fetched set.
+   *
+   * Upgrade↔downgrade safety: surviving entries are round-tripped verbatim
+   * (no coercion), so fields written by other builds are preserved and the
+   * on-disk format is unchanged.
+   */
+  async pruneMissingWorkspaces(
+    getKnownWorkspaceIds: () => Promise<ReadonlySet<string>>
+  ): Promise<number> {
+    return this.withSerializedMutation(async () => {
+      const knownWorkspaceIds = await getKnownWorkspaceIds();
+      const data = await this.load();
+      let prunedCount = 0;
+      for (const workspaceId of Object.keys(data.workspaces)) {
+        if (!knownWorkspaceIds.has(workspaceId)) {
+          delete data.workspaces[workspaceId];
+          prunedCount++;
+        }
+      }
+      if (prunedCount > 0) {
+        await this.save(data);
+      }
+      return prunedCount;
+    });
+  }
+
+  /**
    * Clear all streaming flags.
    * Call this on app startup to clean up stale streaming states from crashes.
    */

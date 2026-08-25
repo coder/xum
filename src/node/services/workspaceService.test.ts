@@ -1398,6 +1398,16 @@ describe("WorkspaceService bash monitor wakes", () => {
     const { config, cleanup } = await createTestHistoryService();
     try {
       const workspaceId = "bash-monitor-tombstone-failed-clear";
+      // getActivityList only emits entries for config-known workspaces; the
+      // tombstone contract below is scoped to known ids.
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
       let activeMonitorCount = 1;
       const backgroundProcessManager = Object.assign(new EventEmitter(), {
         cleanup: mock(() => Promise.resolve()),
@@ -1451,6 +1461,16 @@ describe("WorkspaceService bash monitor wakes", () => {
     const { config, cleanup } = await createTestHistoryService();
     try {
       const workspaceId = "bash-monitor-tombstone";
+      // getActivityList only emits entries for config-known workspaces; the
+      // tombstone contract below is scoped to known ids.
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
       let activeMonitorCount = 1;
       const backgroundProcessManager = Object.assign(new EventEmitter(), {
         cleanup: mock(() => Promise.resolve()),
@@ -3014,6 +3034,15 @@ describe("WorkspaceService workflow activity", () => {
 
     try {
       const workspaceId = "workflow-activity-race";
+      // getActivityList only emits entries for config-known workspaces.
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
       const workspaceService = createWorkspaceServiceForTest({
         config,
         historyService,
@@ -3065,6 +3094,17 @@ describe("WorkspaceService workflow activity", () => {
 
     try {
       const workspaceId = "workflow-activity-overlap";
+      // getActivityList only emits entries for config-known workspaces; keep
+      // this workspace known so the zero-count assertion below exercises the
+      // tombstone path rather than trivially missing the entry.
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
       const workspaceService = createWorkspaceServiceForTest({
         config,
         historyService,
@@ -3119,6 +3159,126 @@ describe("WorkspaceService workflow activity", () => {
     } finally {
       getSnapshotSpy.mockRestore();
       releaseFirstSnapshot.resolve();
+      await cleanup();
+    }
+  });
+});
+
+describe("WorkspaceService activity list scoping", () => {
+  test("drops stale extension metadata entries and lazily prunes them once", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "activity-scoping-known";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency(workspaceId, 100);
+      // Simulates the leaked entry of a removed workspace/sub-agent.
+      await extensionMetadata.updateRecency("removed-workspace", 200);
+      const pruneSpy = spyOn(extensionMetadata, "pruneMissingWorkspaces");
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+
+      const activityList = await workspaceService.getActivityList();
+      expect(activityList[workspaceId]?.recency).toBe(100);
+      expect(activityList["removed-workspace"]).toBeUndefined();
+
+      // The one-time lazy cleanup dropped the stale entry from disk while
+      // keeping the still-existing workspace's entry.
+      const snapshots = await extensionMetadata.getAllSnapshots();
+      expect(snapshots.has("removed-workspace")).toBe(false);
+      expect(snapshots.get(workspaceId)?.recency).toBe(100);
+
+      // One-time: a second bootstrap must not re-run the cleanup scan.
+      await workspaceService.getActivityList();
+      expect(pruneSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("falls back to the unscoped union when config workspaces cannot be listed", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency("possibly-live", 100);
+      const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(() =>
+        Promise.reject(new Error("config unavailable"))
+      );
+      try {
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+        // Fail open: without the config view, stale ids cannot be told apart
+        // from live ones, so nothing may be dropped from the list or pruned
+        // from disk.
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList["possibly-live"]?.recency).toBe(100);
+        expect((await extensionMetadata.getAllSnapshots()).has("possibly-live")).toBe(true);
+      } finally {
+        metadataSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("prunes the extension metadata entry after a workspace is removed", async () => {
+    const { historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "remove-prunes-metadata";
+    const tempRoot = await fsPromises.mkdtemp(path.join(tmpdir(), "mux-remove-metadata-"));
+    try {
+      const sessionRoot = path.join(tempRoot, "sessions");
+      await fsPromises.mkdir(path.join(sessionRoot, workspaceId), { recursive: true });
+
+      const deleteWorkspace = mock(() => Promise.resolve());
+      const extensionMetadata = {
+        ...mockExtensionMetadataService,
+        deleteWorkspace,
+      } as unknown as ExtensionMetadataService;
+      const mockConfig: Partial<Config> = {
+        rootDir: path.join(tempRoot, "root"),
+        srcDir: "/tmp/src",
+        getSessionDir: mock((id: string) => path.join(sessionRoot, id)),
+        removeWorkspace: mock(() => Promise.resolve()),
+        findWorkspace: mock(() => null),
+        loadConfigOrDefault: mock(() => ({ projects: new Map() })),
+      };
+      const workspaceService = createWorkspaceServiceForTest({
+        config: mockConfig,
+        historyService,
+        extensionMetadata,
+        aiService: createMockAIService({
+          isStreaming: mock(() => false),
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+          getWorkspaceMetadata: mock(() =>
+            Promise.resolve(
+              Ok(createFrontendWorkspaceMetadata({ id: workspaceId, name: workspaceId }))
+            )
+          ),
+        }),
+      });
+
+      const removeResult = await workspaceService.remove(workspaceId, true);
+      expect(removeResult.success).toBe(true);
+      expect(deleteWorkspace).toHaveBeenCalledWith(workspaceId);
+    } finally {
+      await fsPromises.rm(tempRoot, { recursive: true, force: true });
       await cleanup();
     }
   });

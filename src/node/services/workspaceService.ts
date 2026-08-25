@@ -6347,6 +6347,20 @@ export class WorkspaceService extends EventEmitter {
       removedFromConfig = true;
       this.autoTitlingWorkspaces.delete(workspaceId);
 
+      // Deregistration succeeded: drop the workspace's activity/status entry
+      // so extensionMetadata.json stays bounded (stale entries were
+      // historically never pruned and grew monotonically, issue #3959).
+      // Best-effort: a missed delete is reclaimed by the one-time
+      // pruneStaleExtensionMetadataOnce pass on a later process start.
+      try {
+        await this.extensionMetadata.deleteWorkspace(workspaceId);
+      } catch (error) {
+        log.debug("Failed to prune extension metadata after workspace removal", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
+
       if (removedMetadata || persistedWorkspace) {
         await this.syncCodeWorkspaceFiles(
           removedMetadata ?? {
@@ -12748,22 +12762,68 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
+  /**
+   * One-time lazy cleanup for pre-existing deployments: drop
+   * extensionMetadata.json entries whose workspace no longer exists in
+   * config. remove() prunes going forward, but entries that leaked before
+   * that hook existed (issue #3959) would otherwise bloat the file — and
+   * every serialized rewrite of it — forever. Runs at most once per process
+   * from the activity bootstrap path; never a per-read scan.
+   */
+  private prunedStaleExtensionMetadata = false;
+  private async pruneStaleExtensionMetadataOnce(): Promise<void> {
+    if (this.prunedStaleExtensionMetadata) {
+      return;
+    }
+    // Latch before awaiting so concurrent bootstraps don't queue redundant
+    // prunes; a failed attempt is retried on the next process start rather
+    // than on every read.
+    this.prunedStaleExtensionMetadata = true;
+    try {
+      const prunedCount = await this.extensionMetadata.pruneMissingWorkspaces(async () => {
+        // Fetched inside the file's serialized mutation (see
+        // pruneMissingWorkspaces) so a concurrently created workspace cannot
+        // lose its just-written entry.
+        const allMetadata = await this.config.getAllWorkspaceMetadata();
+        return new Set(allMetadata.map((metadata) => metadata.id));
+      });
+      if (prunedCount > 0) {
+        log.info(`Pruned ${prunedCount} stale extension metadata entries`);
+      }
+    } catch (error) {
+      log.debug("Failed to prune stale extension metadata entries", { error });
+    }
+  }
+
   async getActivityList(): Promise<Record<string, WorkspaceActivitySnapshot>> {
     try {
+      await this.pruneStaleExtensionMetadataOnce();
       const snapshots = await this.extensionMetadata.getAllSnapshots();
-      const workspaceIds = new Set(snapshots.keys());
-      for (const workspaceId of this.activeWorkflowRunIdsByWorkspace.keys()) {
-        workspaceIds.add(workspaceId);
-      }
-      for (const workspaceId of this.bashMonitorSeenWorkspaces) {
-        workspaceIds.add(workspaceId);
-      }
+      // Scope the list to config-known workspaces. extensionMetadata.json was
+      // historically never pruned, so long-lived deployments accumulate stale
+      // entries for removed workspaces/sub-agents by the thousands (issue
+      // #3959: 13,901 entries / 2.89 MB / ~59 s per bootstrap while the
+      // sidebar needed ~246). Stale ids must neither inflate the payload nor
+      // trigger the per-id workflow-run bootstrap disk probe below. Known ids
+      // WITHOUT a snapshot still flow through the tombstone logic below —
+      // scoping only drops ids that are not in config at all.
+      let workspaceIds: Set<string>;
       try {
-        for (const metadata of await this.config.getAllWorkspaceMetadata()) {
-          workspaceIds.add(metadata.id);
-        }
+        workspaceIds = new Set(
+          (await this.config.getAllWorkspaceMetadata()).map((metadata) => metadata.id)
+        );
       } catch (error) {
-        log.debug("Failed to include all workspaces while listing activity", { error });
+        // Fail open: without the config view, stale ids cannot be told apart
+        // from live ones, and dropping live entries would strand renderer
+        // activity state. Fall back to the legacy unscoped union.
+        log.debug("Failed to scope activity list to known workspaces", { error });
+        workspaceIds = new Set(snapshots.keys());
+        for (const workspaceId of this.activeWorkflowRunIdsByWorkspace.keys()) {
+          workspaceIds.add(workspaceId);
+        }
+        for (const workspaceId of this.bashMonitorSeenWorkspaces) {
+          workspaceIds.add(workspaceId);
+        }
       }
 
       const entries = await Promise.all(

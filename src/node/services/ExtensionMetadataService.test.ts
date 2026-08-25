@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdtemp, rm, writeFile } from "fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import * as path from "path";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
@@ -376,5 +376,71 @@ describe("ExtensionMetadataService", () => {
 
     const snapshots = await service.getAllSnapshots();
     expect(snapshots.get("workspace-2")).toEqual(cleared);
+  });
+
+  test("pruneMissingWorkspaces drops unknown entries and keeps known ones", async () => {
+    await service.updateRecency("known-workspace", 100);
+    await service.updateRecency("stale-workspace", 200);
+    await service.updateRecency("another-stale", 300);
+
+    const prunedCount = await service.pruneMissingWorkspaces(() =>
+      Promise.resolve(new Set(["known-workspace"]))
+    );
+    expect(prunedCount).toBe(2);
+
+    const snapshots = await service.getAllSnapshots();
+    expect(snapshots.get("known-workspace")?.recency).toBe(100);
+    expect(snapshots.has("stale-workspace")).toBe(false);
+    expect(snapshots.has("another-stale")).toBe(false);
+  });
+
+  test("pruneMissingWorkspaces preserves unrecognized fields on surviving entries", async () => {
+    // Upgrade↔downgrade: a newer build may persist fields this build does not
+    // know about; pruning stale siblings must not strip them.
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        workspaces: {
+          "known-workspace": {
+            recency: 100,
+            streaming: false,
+            lastModel: null,
+            lastThinkingLevel: null,
+            agentStatus: null,
+            fieldFromNewerBuild: { nested: true },
+          },
+          "stale-workspace": { recency: 200, streaming: false },
+        },
+      })
+    );
+
+    expect(
+      await service.pruneMissingWorkspaces(() => Promise.resolve(new Set(["known-workspace"])))
+    ).toBe(1);
+
+    const persisted = JSON.parse(await readFile(filePath, "utf-8")) as ExtensionMetadataFile;
+    expect(Object.keys(persisted.workspaces)).toEqual(["known-workspace"]);
+    expect(
+      (persisted.workspaces["known-workspace"] as { fieldFromNewerBuild?: unknown })
+        .fieldFromNewerBuild
+    ).toEqual({ nested: true });
+  });
+
+  test("pruneMissingWorkspaces does not rewrite the file when nothing is stale", async () => {
+    // Compact (non-pretty) serialization: any rewrite through save() would
+    // change the raw bytes, so byte-equality proves no write happened.
+    const rawContent = JSON.stringify({
+      version: 1,
+      workspaces: {
+        "known-workspace": { recency: 100, streaming: false },
+      },
+    });
+    await writeFile(filePath, rawContent);
+
+    expect(
+      await service.pruneMissingWorkspaces(() => Promise.resolve(new Set(["known-workspace"])))
+    ).toBe(0);
+    expect(await readFile(filePath, "utf-8")).toBe(rawContent);
   });
 });
