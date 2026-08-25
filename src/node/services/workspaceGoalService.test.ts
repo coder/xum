@@ -2950,6 +2950,13 @@ describe("WorkspaceGoalService", () => {
     });
     expect(afterStale?.requireUserAcknowledgmentSinceMs).not.toBeNull();
 
+    // Codex P1 (PRRT_kwDOPxxmWM6cHJVn): same-millisecond authoring cannot
+    // prove the send was admitted after the Stop — equality keeps the gate.
+    const afterEqual = await service.acknowledgeUser(workspaceId, {
+      authoredAtMs: created.createdAtMs + 5_000,
+    });
+    expect(afterEqual?.requireUserAcknowledgmentSinceMs).not.toBeNull();
+
     // Authored after the stop: an informed user action clears the gate.
     const afterFresh = await service.acknowledgeUser(workspaceId, {
       authoredAtMs: created.createdAtMs + 6_000,

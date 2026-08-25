@@ -3112,9 +3112,12 @@ export class WorkspaceGoalService {
       // timestamp) recovery re-arms the goal despite the newer Stop. Callers
       // acting for an explicit fresh user action (slash workflows, direct
       // sends carrying their request-entry authoring time) postdate the gate
-      // and clear it as before.
+      // and clear it as before. Equality is treated as stale (Codex P1
+      // PRRT_kwDOPxxmWM6cHJVn): a same-millisecond timestamp cannot prove the
+      // send was admitted after the Stop, and keeping the gate is the safe
+      // failure mode — the user can always acknowledge with a later message.
       const authoredAtMs = toValidEpochMs(options?.authoredAtMs);
-      if (authoredAtMs != null && authoredAtMs < current.requireUserAcknowledgmentSinceMs) {
+      if (authoredAtMs != null && authoredAtMs <= current.requireUserAcknowledgmentSinceMs) {
         await this.pushSnapshot(workspaceId, current);
         return current;
       }
