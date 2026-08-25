@@ -45,6 +45,7 @@ import {
   resolveAgentFrontmatter,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
+import { getBuiltInAgentDefinitions } from "@/node/services/agentDefinitions/builtInAgentDefinitions";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
@@ -3685,6 +3686,40 @@ export class TaskService {
     return Ok(undefined);
   }
 
+  /**
+   * Validate an explicit agentId against the TARGET workspace's checkout, tolerating
+   * targets that are not reachable yet (deferred provisioning, stopped containers)
+   * without permitting a silent exec fallback later:
+   * - reachable checkout: strict validation;
+   * - unreachable + built-in agent: validate against the embedded definitions —
+   *   built-ins exist in every checkout, so the launch is provably safe;
+   * - unreachable + custom agent: fail with a reachability error instead of a
+   *   misleading "unknown agentId". Dispatching anyway would let
+   *   resolveAgentForStream silently fall back to exec if the definition turns out
+   *   to be absent after provisioning (wrong prompt/tool policy).
+   * Waiting for provisioning here is not an option: createWorkspaceTurn holds the
+   * service-wide task mutex for its whole body.
+   */
+  private async validateWorkspaceTurnAgentIdForTarget(params: {
+    cfg: ReturnType<Config["loadConfigOrDefault"]>;
+    agentId: string;
+    runtime: Runtime;
+    workspacePath: string;
+  }): Promise<Result<void, string>> {
+    const reachable = await runtimePathExists(params.runtime, params.workspacePath);
+    if (
+      !reachable &&
+      !getBuiltInAgentDefinitions().some((definition) => definition.id === params.agentId)
+    ) {
+      return Err(
+        `Task.createWorkspaceTurn: target checkout is not reachable yet (provisioning or stopped runtime), so non-built-in agentId (${params.agentId}) cannot be verified — omit agentId or retry once the workspace is ready`
+      );
+    }
+    // Built-in agents resolve from embedded definitions even when the runtime is
+    // unreachable: per-root discovery failures are swallowed by the scanner.
+    return await this.validateWorkspaceTurnAgentId(params);
+  }
+
   async createWorkspaceTurn(
     args: WorkspaceTurnCreateArgs
   ): Promise<Result<WorkspaceTurnCreateResult, string>> {
@@ -3848,7 +3883,7 @@ export class TaskService {
                 persistedWorkspacePath: parentEntry?.workspace.path,
               }
         );
-        const validation = await this.validateWorkspaceTurnAgentId({
+        const validation = await this.validateWorkspaceTurnAgentIdForTarget({
           cfg,
           agentId: requestedAgentId,
           ...targetContext,
@@ -3926,28 +3961,19 @@ export class TaskService {
           workspaceName: createdMeta.name,
           persistedWorkspacePath: createdMeta.namedWorkspacePath,
         });
-        // Deferred-provisioning runtimes (Coder, devcontainer, Docker) can return from create
-        // while the checkout is not reachable yet; strict re-validation there would strand every
-        // valid launch. Owner-side validation already gated obviously-bad ids, and stream-time
-        // resolution handles the rest, so only re-validate when the checkout is reachable.
-        if (await runtimePathExists(targetContext.runtime, targetContext.workspacePath)) {
-          const validation = await this.validateWorkspaceTurnAgentId({
-            cfg,
-            agentId: requestedAgentId,
-            ...targetContext,
-          });
-          if (!validation.success) {
-            return Err(
-              `${validation.error} — agent unavailable in the created workspace (${targetWorkspaceId}); no turn was dispatched`
-            );
-          }
-          agentDefinitionContext = { ...targetContext, workspaceId: targetWorkspaceId };
-        } else {
-          log.debug(
-            "Task.createWorkspaceTurn: target checkout not reachable yet; skipping post-create agent re-validation",
-            { targetWorkspaceId, agentId: requestedAgentId }
+        const validation = await this.validateWorkspaceTurnAgentIdForTarget({
+          cfg,
+          agentId: requestedAgentId,
+          ...targetContext,
+        });
+        if (!validation.success) {
+          // The created workspace is left behind as failed evidence (no safe
+          // pre-record cleanup path exists); the error names it.
+          return Err(
+            `${validation.error} — no turn was dispatched to the created workspace (${targetWorkspaceId})`
           );
         }
+        agentDefinitionContext = { ...targetContext, workspaceId: targetWorkspaceId };
       }
       workspaceTurnAgentId = requestedAgentId ?? workspaceTurnAgentId;
     }

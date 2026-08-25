@@ -1111,7 +1111,7 @@ describe("TaskService", () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
-  test("createWorkspaceTurn skips post-create re-validation while the target checkout is unreachable", async () => {
+  test("createWorkspaceTurn unreachable created checkout: built-ins launch, custom agents fail with a reachability error", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["childworkspace", "turnhandle"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
@@ -1128,25 +1128,120 @@ describe("TaskService", () => {
       (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
         Promise.resolve(Ok({ metadata: deferredMetadata }))
     );
-    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
     const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
     const { taskService } = createTaskServiceHarness(config, {
       workspaceService: workspaceMocks.workspaceService,
     });
 
-    const result = await taskService.createWorkspaceTurn({
+    // Custom agents cannot be verified in an unreachable checkout; dispatching anyway
+    // would risk a silent exec fallback at stream time, so the launch must fail loudly.
+    const custom = await taskService.createWorkspaceTurn({
       ownerWorkspaceId: parentId,
       agentId: "custom",
       prompt: "Launch despite pending provisioning",
       title: "Deferred runtime",
       workspace: { mode: "new" },
     });
+    expect(custom.success).toBe(false);
+    if (!custom.success) {
+      expect(custom.error).toContain("not reachable");
+      expect(custom.error).toContain("no turn was dispatched");
+    }
+    expect(sendMessage).not.toHaveBeenCalled();
 
-    // Owner-side validation passed; strict target re-validation must not strand the launch.
-    expect(result.success).toBe(true);
+    // Built-in agents are embedded in every checkout, so the launch is provably safe.
+    const builtIn = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "plan",
+      prompt: "Plan despite pending provisioning",
+      title: "Deferred runtime plan",
+      workspace: { mode: "new" },
+    });
+    expect(builtIn.success).toBe(true);
     expect(sendMessage).toHaveBeenCalledTimes(1);
-    const sendMessageCall = sendMessage.mock.calls[0] as unknown[];
-    expect(sendMessageCall[2]).toMatchObject({ agentId: "custom" });
+    const sendMessageCall = sendMessage.mock.calls[0];
+    expect(sendMessageCall?.[2]).toMatchObject({ agentId: "plan" });
+  });
+
+  test("createWorkspaceTurn unreachable existing target: built-in override works, custom fails with reachability error", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, [
+      "childworkspace",
+      "firstturn",
+      "planhandle",
+      "planturn",
+      "customhandle",
+    ]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    await writeCustomAgentDefinition(projectPath);
+    // Simulates a stopped-container/deferred target: entry exists, checkout unreachable.
+    const unreachableCheckout = path.join(rootDir, "stopped-target");
+
+    const createWorkspace = mock(async (): Promise<Result<{ metadata: WorkspaceMetadata }>> => {
+      await config.editConfig((cfg) => {
+        const project = cfg.projects.get(projectPath);
+        assert(project, "test project must exist");
+        project.workspaces.push({
+          path: unreachableCheckout,
+          id: "childworkspace",
+          name: "workspace-turn",
+          title: "Workspace turn",
+          createdAt: "2026-06-19T00:00:00.000Z",
+          runtimeConfig: { type: "worktree", srcBaseDir: path.join(rootDir, "wt") },
+        });
+        return cfg;
+      });
+      return Ok({
+        metadata: {
+          ...createWorkspaceTurnMetadata(projectPath),
+          runtimeConfig: { type: "worktree", srcBaseDir: path.join(rootDir, "wt") },
+        },
+      });
+    });
+    const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
+      const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
+      await internal?.onAccepted?.();
+      return Ok(undefined);
+    });
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const first = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      prompt: "Initial turn",
+      title: "Workspace turn",
+      workspace: { mode: "new" },
+    });
+    expect(first.success).toBe(true);
+
+    // Built-ins are embedded, so the override is verifiable even when the target is unreachable.
+    const builtIn = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "plan",
+      prompt: "Plan follow-up",
+      title: "Plan follow-up",
+      workspace: { mode: "existing", workspaceId: "childworkspace" },
+    });
+    expect(builtIn.success).toBe(true);
+
+    // Custom agents get an honest reachability error, not a misleading "unknown agentId".
+    const custom = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "custom",
+      prompt: "Custom follow-up",
+      title: "Custom follow-up",
+      workspace: { mode: "existing", workspaceId: "childworkspace" },
+    });
+    expect(custom.success).toBe(false);
+    if (!custom.success) {
+      expect(custom.error).toContain("not reachable");
+      expect(custom.error).not.toContain("unknown agentId");
+    }
   });
 
   test("createWorkspaceTurn rejects explicit agentId for descendant agent workspace targets", async () => {
