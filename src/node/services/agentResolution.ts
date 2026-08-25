@@ -291,7 +291,7 @@ export async function resolveAgentForStream(
         createErrorEvent(workspaceId, {
           messageId: createAssistantMessageId(),
           error: errorMessage,
-          errorType: "unknown",
+          errorType: "agent_resolution",
         })
       );
       return Err({ type: "unknown", raw: errorMessage });
@@ -324,7 +324,7 @@ export async function resolveAgentForStream(
         createErrorEvent(workspaceId, {
           messageId: createAssistantMessageId(),
           error: errorMessage,
-          errorType: "unknown",
+          errorType: "agent_resolution",
         })
       );
       return Err({ type: "unknown", raw: errorMessage });
@@ -363,7 +363,7 @@ export async function resolveAgentForStream(
           createErrorEvent(workspaceId, {
             messageId: createAssistantMessageId(),
             error: errorMessage,
-            errorType: "unknown",
+            errorType: "agent_resolution",
           })
         );
         return Err({ type: "unknown", raw: errorMessage });
@@ -384,7 +384,7 @@ export async function resolveAgentForStream(
             createErrorEvent(workspaceId, {
               messageId: errorMessageId,
               error: errorMessage,
-              errorType: "unknown",
+              errorType: strictTopLevel ? "agent_resolution" : "unknown",
             })
           );
           return Err({ type: "unknown", raw: errorMessage });
@@ -412,7 +412,7 @@ export async function resolveAgentForStream(
           createErrorEvent(workspaceId, {
             messageId: createAssistantMessageId(),
             error: errorMessage,
-            errorType: "unknown",
+            errorType: "agent_resolution",
           })
         );
         return Err({ type: "unknown", raw: errorMessage });
@@ -467,7 +467,7 @@ export async function resolveAgentForStream(
         createErrorEvent(workspaceId, {
           messageId: createAssistantMessageId(),
           error: errorMessage,
-          errorType: "unknown",
+          errorType: "agent_resolution",
         })
       );
       return Err({ type: "unknown", raw: errorMessage });

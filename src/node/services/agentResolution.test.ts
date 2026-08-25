@@ -498,6 +498,7 @@ describe("resolveAgentForStream strict resolution", () => {
           }>;
         };
     agentAiDefaults?: ProjectsConfig["agentAiDefaults"];
+    onError?: (event: { errorType?: string }) => void;
   }) {
     const cfg: ProjectsConfig = {
       projects: new Map([
@@ -523,7 +524,7 @@ describe("resolveAgentForStream strict resolution", () => {
       strictAgentResolution: params.strictAgentResolution,
       callerToolPolicy: undefined,
       cfg,
-      emitError: () => undefined,
+      emitError: (event) => params.onError?.(event),
       isAdvisorExperimentEnabled: false,
     });
   }
@@ -543,11 +544,15 @@ describe("resolveAgentForStream strict resolution", () => {
     if (lenient.success) expect(lenient.data.effectiveAgentId).toBe("exec");
 
     // Strict mode (explicit workspace-turn overrides): running a different agent
-    // than requested must fail the stream, not silently swap in exec.
+    // than requested must fail the stream, not silently swap in exec — and the
+    // failure is deterministic, so it must be classified non-retryable
+    // (agent_resolution) instead of the retryable catch-all.
+    const emittedErrorTypes: Array<string | undefined> = [];
     const strict = await resolveTopLevel({
       projectPath,
       agentId: "doesnotexist",
       strictAgentResolution: true,
+      onError: (event) => emittedErrorTypes.push(event.errorType),
     });
     expect(strict.success).toBe(false);
     if (!strict.success && strict.error.type === "unknown") {
@@ -555,6 +560,7 @@ describe("resolveAgentForStream strict resolution", () => {
     } else {
       expect(strict.success === false && strict.error.type).toBe("unknown");
     }
+    expect(emittedErrorTypes).toEqual(["agent_resolution"]);
   });
 
   test("hidden explicit agent fails loudly in strict mode for top-level workspaces", async () => {
