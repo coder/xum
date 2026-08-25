@@ -75,6 +75,11 @@ export async function findGitRoot(cwd: string): Promise<string | null> {
  * For a linked git worktree, returns the main repository working directory (the
  * parent of the common `.git` dir). Returns null for the main checkout itself,
  * bare repos, and non-git directories.
+ *
+ * The common dir alone is spoofable: a crafted `.git` *file* can point gitdir
+ * at an arbitrary repository's .git, which would let an unregistered checkout
+ * inherit that repository's trust (and run its .xum automation). Only
+ * checkouts the main repository itself registers (git worktree list) count.
  */
 export async function findMainRepoDir(projectDir: string): Promise<string | null> {
   try {
@@ -92,9 +97,39 @@ export async function findMainRepoDir(projectDir: string): Promise<string | null
       return null;
     }
     const mainRepoDir = path.dirname(absoluteCommonDir);
-    return mainRepoDir === projectDir ? null : mainRepoDir;
+    if (mainRepoDir === projectDir) {
+      return null;
+    }
+    return (await isRegisteredWorktreeOf(mainRepoDir, projectDir)) ? mainRepoDir : null;
   } catch {
     return null;
+  }
+}
+
+async function isRegisteredWorktreeOf(mainRepoDir: string, projectDir: string): Promise<boolean> {
+  const { stdout } = await execFileAsync("git", ["worktree", "list", "--porcelain"], {
+    cwd: mainRepoDir,
+  });
+  const projectReal = await realpathOrResolve(projectDir);
+  for (const line of stdout.split("\n")) {
+    if (!line.startsWith("worktree ")) {
+      continue;
+    }
+    const listed = line.slice("worktree ".length).trim();
+    if ((await realpathOrResolve(listed)) === projectReal) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// git prints physical paths (macOS /var -> /private/var), so compare realpaths;
+// fall back to plain resolution when a listed path no longer exists on disk.
+async function realpathOrResolve(target: string): Promise<string> {
+  try {
+    return await fs.realpath(target);
+  } catch {
+    return path.resolve(target);
   }
 }
 

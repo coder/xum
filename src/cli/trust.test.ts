@@ -129,6 +129,16 @@ describe("xum trust CLI", () => {
     await fs.mkdir(other, { recursive: true });
     expect(await materializeResolvedTrust(realConfig, targetConfig, other)).toBe(false);
     expect(targetConfig.loadConfigOrDefault().projects.has(other)).toBe(false);
+
+    // A crafted .git file pointing gitdir at the trusted repository must not
+    // inherit its trust: the checkout is not registered as a linked worktree,
+    // so treating it as one would let arbitrary directories run repo-controlled
+    // automation under the trusted project's grant.
+    const spoofed = path.join(base, "spoofed");
+    await fs.mkdir(spoofed, { recursive: true });
+    await fs.writeFile(path.join(spoofed, ".git"), `gitdir: ${path.join(repo, ".git")}\n`, "utf-8");
+    expect(await materializeResolvedTrust(realConfig, targetConfig, spoofed)).toBe(false);
+    expect(targetConfig.loadConfigOrDefault().projects.has(spoofed)).toBe(false);
   }, 15_000);
 
   test("fails loudly when the trust change cannot be persisted", async () => {
