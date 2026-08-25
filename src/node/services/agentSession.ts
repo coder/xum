@@ -1680,6 +1680,12 @@ export class AgentSession {
     // Also clears any candidate armed during the acknowledgment await — a
     // post-goal intervention must not leave a consumable continuation behind.
     goalService.clearPendingContinuationForManualUserMessage(this.workspaceId);
+    if (goal?.status === "budget_limited") {
+      // Codex P2 (PRRT_kwDOPxxmWM6cJ6NM): the candidate delete above is
+      // in-memory only — persist the suppression so a restart cannot
+      // re-synthesize the autonomous wrap-up over the user's intervention.
+      await goalService.suppressBudgetWrapupForManualUserMessage(this.workspaceId);
+    }
     if (goal?.status !== "active") {
       return;
     }

@@ -2755,6 +2755,54 @@ describe("WorkspaceGoalService", () => {
     expect(serviceAccess.pendingGoalMutations.get(workspaceId)).toBeDefined();
   });
 
+  test("an old stream's drain leaves a retry stream's mutation for that stream's own drain", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cJ6M-): an un-awaited provider-error drain can
+    // still be looping when an automatic retry starts and installs its own
+    // set_goal. Claims are stream-scoped by stream-start generation: the old
+    // drain must not claim the retry's mutation — persisting it early would
+    // archive/replace the goal before the retry's accounting and strip a
+    // later user abort of its discard window.
+    await extensionMetadata.setStreaming(workspaceId, true);
+    const queued = await service.setGoal({ workspaceId, objective: "Queued mid-error" });
+    expect(queued.success).toBe(true);
+
+    const serviceAccess = service as unknown as {
+      fileLocks: { withLock: <T>(key: string, fn: () => Promise<T>) => Promise<T> };
+      pendingGoalMutations: Map<string, { objective: string }>;
+    };
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const gateTenure = serviceAccess.fileLocks.withLock(workspaceId, () => gate);
+
+    // Old drain (stream 1) blocks at its locked claim; the retry stream then
+    // starts and queues a replacement set_goal behind the same lock. Lock
+    // ordering guarantees the retry's install lands before the old drain's
+    // second claim pass (its finalization's chat-tail sync queues behind the
+    // setter's tenure).
+    const drainPromise = service.applyPendingAfterStreamEnd(workspaceId);
+    service.recordStreamStarted(workspaceId);
+    const retrySetterPromise = service.setGoal({ workspaceId, objective: "Retry-stream goal" });
+    releaseGate();
+    await gateTenure;
+    await drainPromise;
+    const retrySetter = await retrySetterPromise;
+    expect(retrySetter.success).toBe(true);
+
+    // The old drain claimed only its own stream's mutation; the retry's
+    // mutation is still queued for the retry's own stream-end drain.
+    expect(serviceAccess.pendingGoalMutations.get(workspaceId)?.objective).toBe(
+      "Retry-stream goal"
+    );
+    expect(await service.getGoal(workspaceId)).toMatchObject({ objective: "Queued mid-error" });
+
+    // The retry stream's own drain (entry generation matches) claims it.
+    const retryDrained = await service.applyPendingAfterStreamEnd(workspaceId);
+    expect(retryDrained).toMatchObject({ objective: "Retry-stream goal" });
+    expect(serviceAccess.pendingGoalMutations.get(workspaceId)).toBeUndefined();
+  });
+
   test("pause boundaries for a replaced goal do not reconcile the newer goal to paused", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cEl4F): a stale pause finalizer's boundary
     // append awaits history I/O after its identity check, so the row can land
@@ -2878,6 +2926,105 @@ describe("WorkspaceGoalService", () => {
     expect(await service.getGoal(workspaceId)).toMatchObject({
       goalId: goalB.goalId,
       status: "active",
+    });
+  });
+
+  test("legacy unscoped continuation rows behind another goal's rows do not reactivate the current goal", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cJ6NC): mixed-version history. A pre-upgrade
+    // continuation row has no goalId; once the scan crosses a row scoped to a
+    // DIFFERENT goal (goal A's boundary), it is inside A's history — the
+    // unscoped legacy row beneath belongs to A and must not reactivate the
+    // explicitly paused replacement B.
+    await appendUserHistoryMessage(historyService, workspaceId, "Continue working on the goal.", {
+      timestamp: Date.now(),
+      synthetic: true,
+      kind: "goal_continuation",
+      // no goalId: written before goal scoping existed
+    });
+    const goalA = await setGoalOk(service, { workspaceId, objective: "Goal A legacy era" });
+    const scopedBoundary = createMuxMessage(
+      `goal-paused-a-${crypto.randomUUID()}`,
+      "user",
+      "Goal paused by the user. Do not continue the goal until a later goal continuation message.",
+      {
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: { type: "goal-pause-boundary", goalId: goalA.goalId },
+      }
+    );
+    expect((await historyService.appendToHistory(workspaceId, scopedBoundary)).success).toBe(true);
+
+    const goalB = await setGoalOk(service, { workspaceId, objective: "Goal B replacement" });
+    // Simulate B's pause boundary append being lost (crash-equivalent), as in
+    // the scoped-row regression above.
+    const appendSpy = spyOn(historyService, "appendToHistory").mockImplementationOnce(() =>
+      Promise.resolve({ success: false, error: "injected: boundary append lost" })
+    );
+    await setGoalOk(service, { workspaceId, status: "paused" });
+    appendSpy.mockRestore();
+
+    // The legacy row sits behind A's mismatched boundary — not evidence for B.
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: goalB.goalId,
+      status: "paused",
+    });
+  });
+
+  test("a manual message during budget_limited durably suppresses the wrap-up across restarts", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cJ6NM): deleting the in-memory wrap-up
+    // candidate is not enough — after a restart the durable record still
+    // looks wrap-up-eligible (goal-attributable origin, not yet injected) and
+    // recovery re-synthesizes the autonomous wrap-up over the user's
+    // intervening message.
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Budget hit, then user intervened",
+      budgetCents: 100,
+    });
+    await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1.25,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      status: "budget_limited",
+      budgetLimitInjectedForGoalId: null,
+    });
+
+    // The manual-message hook persists the suppression.
+    await service.suppressBudgetWrapupForManualUserMessage(workspaceId);
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      status: "budget_limited",
+      budgetLimitOriginKind: "user",
+    });
+
+    // Simulate restart: recovery must honor the durable suppression.
+    const restartedService = new WorkspaceGoalService(
+      config,
+      historyService,
+      extensionMetadata,
+      analytics
+    );
+    const dispatcher = new IdleDispatcher();
+    const executed: Array<{ kind: string | undefined }> = [];
+    restartedService.registerGoalContinuationConsumer(dispatcher, {
+      hasActiveDescendantTasks: () => false,
+      getRuntimeState: () => ({ isRuntimeCompatible: true }),
+      executeGoalContinuation: (input) => {
+        executed.push({ kind: input.kind });
+        return Promise.resolve(true);
+      },
+      getKickoffSendOptions: () => Promise.resolve({ model: "openai:gpt-4o", agentId: "exec" }),
+    });
+    await restartedService.recoverPendingDispatchAfterRestart(workspaceId);
+    await drainPendingDispatches();
+
+    expect(executed).toHaveLength(0);
+    expect(await restartedService.getGoal(workspaceId)).toMatchObject({
+      status: "budget_limited",
+      budgetLimitInjectedForGoalId: null,
+      budgetLimitOriginKind: "user",
     });
   });
 

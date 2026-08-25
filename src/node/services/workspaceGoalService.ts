@@ -268,6 +268,15 @@ interface PendingGoalMutation {
   /** Stable id for the optimistic record returned before the deferred write drains. */
   projectedGoalId?: string | null;
   /**
+   * Stream-start generation at install time. A drain claims only mutations
+   * belonging to the stream it settles: an un-awaited provider-error drain
+   * overlapping an automatic retry must not claim a set_goal installed by the
+   * retry stream — persisting it early would archive/replace the goal before
+   * the retry's accounting and outlive a later user abort meant to discard it
+   * (Codex P1 PRRT_kwDOPxxmWM6cJ6M-).
+   */
+  streamStartGeneration?: number;
+  /**
    * Creation time of the optimistic record. The drain re-creates the durable
    * goal, but the user could already see (and react to) the projected goal
    * mid-stream — a later stream-end `createdAtMs` would misclassify a queued
@@ -619,6 +628,14 @@ export class WorkspaceGoalService {
       return { mode: null };
     }
 
+    // Codex P2 (PRRT_kwDOPxxmWM6cJ6NC): once the scan has skipped a row
+    // scoped to a DIFFERENT goal, it has crossed into an older goal's
+    // history. Legacy unscoped continuation rows beneath that crossing are
+    // that older goal's rows (written before goal scoping existed) and must
+    // not reactivate the current goal; unscoped rows keep their any-goal
+    // compatibility semantics only while the scan is still inside
+    // unattributed history.
+    let crossedOtherGoalHistory = false;
     for (let index = historyResult.data.length - 1; index >= 0; index -= 1) {
       const message = historyResult.data[index];
       if (message.role !== "user" || isSyntheticSnapshotUserMessage(message)) {
@@ -636,6 +653,10 @@ export class WorkspaceGoalService {
         // legacy rows without a goalId keep the old any-goal semantics.
         const rowGoalId = message.metadata.goalId;
         if (currentGoalId != null && rowGoalId != null && rowGoalId !== currentGoalId) {
+          crossedOtherGoalHistory = true;
+          continue;
+        }
+        if (rowGoalId == null && crossedOtherGoalHistory) {
           continue;
         }
         return { mode: "active" };
@@ -643,6 +664,7 @@ export class WorkspaceGoalService {
       if (message.metadata?.muxMetadata?.type === "goal-pause-boundary") {
         const boundaryGoalId = message.metadata.muxMetadata.goalId;
         if (currentGoalId != null && boundaryGoalId != null && boundaryGoalId !== currentGoalId) {
+          crossedOtherGoalHistory = true;
           // Codex P2 (PRRT_kwDOPxxmWM6cEl4F, PRRT_kwDOPxxmWM6cGSPK): a stale
           // pause finalizer's boundary can land AFTER a replacement goal (and
           // even after that goal's own manual rows). A mismatched goal-scoped
@@ -2461,6 +2483,7 @@ export class WorkspaceGoalService {
         // stream-end drain for user aborts).
         const pendingMutation: PendingGoalMutation = {
           objective,
+          streamStartGeneration: this.streamStartGenerations.get(input.workspaceId) ?? 0,
           ...(Object.hasOwn(input, "budgetCents")
             ? { budgetCents: input.budgetCents ?? null }
             : {}),
@@ -3221,6 +3244,35 @@ export class WorkspaceGoalService {
     });
   }
 
+  /**
+   * Durably suppress the autonomous budget wrap-up after a post-limit manual
+   * user message. Deleting the in-memory candidate is not enough: after a
+   * restart, `recoverPendingDispatchAfterRestart` sees a goal-attributable
+   * `budgetLimitOriginKind` with `budgetLimitInjectedForGoalId === null` and
+   * re-synthesizes the wrap-up despite the user's intervening message (Codex
+   * P2 PRRT_kwDOPxxmWM6cJ6NM). Re-stamping the origin as `"user"` reuses the
+   * existing durable suppression the recovery path already honors.
+   */
+  async suppressBudgetWrapupForManualUserMessage(workspaceId: string): Promise<void> {
+    assert(
+      workspaceId.trim().length > 0,
+      "suppressBudgetWrapupForManualUserMessage requires workspaceId"
+    );
+    return this.fileLocks.withLock(workspaceId, async () => {
+      const current = await this.readGoalFile(workspaceId);
+      if (current?.status !== "budget_limited" || current.budgetLimitOriginKind === "user") {
+        return;
+      }
+      const next = GoalRecordV1Schema.parse({
+        ...current,
+        budgetLimitOriginKind: "user",
+        updatedAtMs: Date.now(),
+      });
+      await this.writeGoal(workspaceId, next);
+      await this.pushSnapshot(workspaceId, next);
+    });
+  }
+
   async requireUserAcknowledgmentForCrashRecovery(
     workspaceId: string,
     sinceMs = Date.now()
@@ -3680,10 +3732,29 @@ export class WorkspaceGoalService {
             // the claim.
             return null;
           }
+          // Codex P1 (PRRT_kwDOPxxmWM6cJ6M-): claims are stream-scoped. A
+          // mutation stamped by a NEWER stream (an automatic retry that
+          // started while this un-awaited provider-error drain was still
+          // looping) belongs to that stream's own stream-end drain — claiming
+          // it here would persist/archive the goal before the retry's
+          // accounting and strip a later user abort of its discard window.
+          // Legacy unstamped mutations (none in practice — installs always
+          // stamp) fall back to claimable.
+          if (
+            (claimed.streamStartGeneration ?? streamStartGenerationAtEntry) !==
+            streamStartGenerationAtEntry
+          ) {
+            return null;
+          }
           claimedMutation = true;
           this.pendingGoalMutations.delete(workspaceId);
           this.pendingGoalSnapshots.delete(workspaceId);
-          const { projectedGoalId, projectedCreatedAtMs, ...pendingInput } = claimed;
+          const {
+            projectedGoalId,
+            projectedCreatedAtMs,
+            streamStartGeneration: _claimedGeneration,
+            ...pendingInput
+          } = claimed;
           const input = { workspaceId, ...pendingInput };
           const result = await this.persistGoalMutationLocked(input, {
             replacementGoalId: projectedGoalId ?? null,

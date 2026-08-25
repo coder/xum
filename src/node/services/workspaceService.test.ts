@@ -3850,6 +3850,64 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
     return { aiService, config, historyService, workspaceService, goalService, cleanup };
   }
 
+  test("requireIdle sends carry a live idle-admission probe re-evaluated at session gates", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cJ6NI): the preflight count check at
+    // sendMessage entry is a one-shot snapshot — a manual send can enter
+    // preflight during the later admission awaits, before the continuation
+    // makes the session busy. The forwarded admissionStale probe must sample
+    // the LIVE preflight count so AgentSession's admission gates (re-evaluated
+    // up to the last gate before the pre-turn batch becomes irrevocable) can
+    // refuse the continuation.
+    const { config, workspaceService, cleanup } = await createServices();
+    const workspaceId = "require-idle-admission-probe";
+    const internalAccess = workspaceService as unknown as {
+      sessions: Map<string, AgentSession>;
+      preflightSendCounts: Map<string, number>;
+    };
+    try {
+      await config.addWorkspace("/tmp/require-idle-probe-project", {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "require-idle-probe-project",
+        projectPath: "/tmp/require-idle-probe-project",
+        runtimeConfig: { type: "local" },
+      });
+      let capturedProbe: (() => boolean) | undefined;
+      const fakeSession = {
+        isBusy: mock(() => false),
+        emitMetadata: mock(() => undefined),
+        sendMessage: mock(
+          (_msg: string, _opts: unknown, internal?: { admissionStale?: () => boolean }) => {
+            capturedProbe = internal?.admissionStale;
+            return Promise.resolve(Ok(undefined));
+          }
+        ),
+      } as unknown as AgentSession;
+      internalAccess.sessions.set(workspaceId, fakeSession);
+
+      const result = await workspaceService.sendMessage(
+        workspaceId,
+        "Continue working on the goal.",
+        { model: "openai:gpt-4o", agentId: "exec" },
+        { synthetic: true, agentInitiated: true, requireIdle: true, goalContinuation: true }
+      );
+      expect(result.success).toBe(true);
+      expect(typeof capturedProbe).toBe("function");
+
+      // Live sampling: idle (only the continuation itself would hold a slot).
+      expect(capturedProbe?.()).toBe(false);
+      // A manual send entering preflight while the continuation is still in
+      // its admission awaits (continuation slot + manual slot) flips the
+      // probe stale — even though the entry snapshot passed.
+      internalAccess.preflightSendCounts.set(workspaceId, 2);
+      expect(capturedProbe?.()).toBe(true);
+      internalAccess.preflightSendCounts.delete(workspaceId);
+    } finally {
+      internalAccess.sessions.delete(workspaceId);
+      await cleanup();
+    }
+  });
+
   test("idle wait follows auto-retry startup into the resumed stream", async () => {
     const { workspaceService, cleanup } = await createServices();
     const workspaceId = "idle-wait-auto-retry-starting";

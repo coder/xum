@@ -10865,6 +10865,24 @@ export class WorkspaceService extends EventEmitter {
         });
       }
 
+      // Codex P1 (PRRT_kwDOPxxmWM6cJ6NI): the count check above is a one-shot
+      // snapshot — a manual send can enter preflight during the awaits between
+      // here and the session reporting busy (markInterruptedTaskRunning, the
+      // admission awaits inside AgentSession.sendMessage). Compose the
+      // caller's staleness probe with a live preflight re-check so
+      // AgentSession's admission gates (including the last gate before the
+      // pre-turn batch becomes irrevocable) re-validate idleness; refusal
+      // rolls back the synthetic row and idle-only callers retry.
+      if (internal?.requireIdle) {
+        const callerAdmissionStale = internal.admissionStale;
+        internal = {
+          ...internal,
+          admissionStale: () =>
+            callerAdmissionStale?.() === true ||
+            (this.preflightSendCounts.get(workspaceId) ?? 0) > 1,
+        };
+      }
+
       if (shouldQueue) {
         // Everything from here to queueMessage is synchronous, so a probe pass here cannot go
         // stale before the entry is enqueued.
