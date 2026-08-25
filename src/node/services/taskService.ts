@@ -51,7 +51,6 @@ import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
   createRuntimeContextForWorkspace,
   createRuntimeForWorkspace,
-  resolveWorkspaceRootPath,
 } from "@/node/runtime/runtimeHelpers";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import { runBackgroundInit } from "@/node/runtime/runtimeFactory";
@@ -3624,26 +3623,27 @@ export class TaskService {
   }
 
   /**
-   * Agent-discovery context (runtime + checkout root) for a workspace involved in a
-   * workspace turn. Uses resolveWorkspaceRootPath so Docker workspaces resolve the
-   * container-side runtime path instead of the host-side persisted path.
+   * Agent-discovery context for a workspace involved in a workspace turn. Uses
+   * createRuntimeContextForWorkspace — the same helper the stream uses in
+   * aiService — so validation resolves agents from the exact discovery path that
+   * will stream (Docker container-side paths, subproject directories included).
    */
   private buildWorkspaceTurnAgentContext(params: {
     runtimeConfig: RuntimeConfig;
     projectPath: string;
     workspaceName: string;
     persistedWorkspacePath?: string;
-  }): { runtime: Runtime; workspacePath: string; includeAgentPlugins: boolean } {
-    const metadataForRuntime = {
+    subProjectPath?: string;
+  }): WorkspaceTurnAgentContext {
+    const context = createRuntimeContextForWorkspace({
       runtimeConfig: params.runtimeConfig,
       projectPath: params.projectPath,
       name: params.workspaceName,
       namedWorkspacePath: coerceNonEmptyString(params.persistedWorkspacePath),
-    };
-    const runtime = createRuntimeForWorkspace(metadataForRuntime);
+      subProjectPath: coerceNonEmptyString(params.subProjectPath),
+    });
     return {
-      runtime,
-      workspacePath: resolveWorkspaceRootPath(metadataForRuntime, runtime),
+      ...context,
       includeAgentPlugins: this.workspaceService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS),
     };
   }
@@ -3921,6 +3921,7 @@ export class TaskService {
           projectPath: parentMeta.projectPath,
           workspaceName: parentMeta.name,
           persistedWorkspacePath: parentEntry?.workspace.path,
+          subProjectPath: parentMeta.subProjectPath,
         });
         const targetContext =
           targetEntry != null
@@ -3931,6 +3932,7 @@ export class TaskService {
                 // only satisfies the optional persisted-config type.
                 workspaceName: coerceNonEmptyString(targetEntry.workspace.name) ?? parentMeta.name,
                 persistedWorkspacePath: targetEntry.workspace.path,
+                subProjectPath: targetEntry.workspace.subProjectPath,
               })
             : ownerContext;
         const validation = await this.validateWorkspaceTurnAgentIdForTarget({
@@ -3981,6 +3983,7 @@ export class TaskService {
           projectPath: parentMeta.projectPath,
           workspaceName: parentMeta.name,
           persistedWorkspacePath: parentEntry?.workspace.path,
+          subProjectPath: parentMeta.subProjectPath,
         });
         const validation = await this.validateWorkspaceTurnAgentId({
           cfg,
@@ -4033,6 +4036,7 @@ export class TaskService {
           projectPath: createdMeta.projectPath,
           workspaceName: createdMeta.name,
           persistedWorkspacePath: createdMeta.namedWorkspacePath,
+          subProjectPath: createdMeta.subProjectPath,
         });
         const validation = await this.validateWorkspaceTurnAgentIdForTarget({
           cfg,
@@ -4042,7 +4046,12 @@ export class TaskService {
           targetBaseDivergesFromOwner,
         });
         if (!validation.success) {
-          agentValidationError = `${validation.error} — no turn was dispatched; the created workspace (${targetWorkspaceId}) is owned by this caller and can be retried via workspace.mode="existing" once ready`;
+          // Disposable workspaces are removed by the settlement's disposable cleanup, so
+          // only non-disposable workspaces are advertised as retryable.
+          agentValidationError =
+            args.workspace?.disposable === true
+              ? `${validation.error} — no turn was dispatched; the disposable workspace (${targetWorkspaceId}) was cleaned up`
+              : `${validation.error} — no turn was dispatched; the created workspace (${targetWorkspaceId}) is owned by this caller and can be retried via workspace.mode="existing" once ready`;
         } else {
           agentDefinitionContext = {
             ...validation.data.validatedContext,
