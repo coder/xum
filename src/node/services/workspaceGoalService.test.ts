@@ -52,6 +52,19 @@ async function appendUserHistoryMessage(
   expect(result.success).toBe(true);
 }
 
+async function appendAssistantHistoryMessage(
+  historyService: HistoryService,
+  workspaceId: string,
+  text: string,
+  metadata: Parameters<typeof createMuxMessage>[3] = { timestamp: Date.now() }
+): Promise<void> {
+  const result = await historyService.appendToHistory(
+    workspaceId,
+    createMuxMessage(`goal-test-assistant-${crypto.randomUUID()}`, "assistant", text, metadata)
+  );
+  expect(result.success).toBe(true);
+}
+
 async function getLastUserHistoryMessage(historyService: HistoryService, workspaceId: string) {
   const history = await historyService.getLastMessages(workspaceId, 20);
   expect(history.success).toBe(true);
@@ -456,6 +469,44 @@ describe("WorkspaceGoalService", () => {
     await appendUserHistoryMessage(historyService, workspaceId, "Typed mid-stream", {
       timestamp: created.createdAtMs + 500,
       enqueuedAtMs: created.createdAtMs - 500,
+    });
+
+    const reconciled = await service.getGoal(workspaceId);
+
+    expect(reconciled).toMatchObject({ status: "active" });
+  });
+
+  test("getGoal pauses a never-driven model-created goal on an unprocessed pre-goal row", async () => {
+    // Codex security P2 (PRRT_kwDOPxxmWM6cSGrq): only explicit user activation
+    // is consent. A model-published goal whose chat tail ends at a queue-raced
+    // manual row (no completed assistant row after it) fails closed to paused —
+    // timestamp order alone must not let the model outrun a queued correction.
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Model queue race",
+      initiator: "model",
+    });
+    await appendUserHistoryMessage(historyService, workspaceId, "Typed mid-stream", {
+      timestamp: created.createdAtMs + 500,
+      enqueuedAtMs: created.createdAtMs - 500,
+    });
+
+    const reconciled = await service.getGoal(workspaceId);
+
+    expect(reconciled).toMatchObject({ status: "paused" });
+  });
+
+  test("getGoal keeps a never-driven model-created goal active when the pre-goal prompt was processed", async () => {
+    // The initiating prompt's turn settled (completed assistant row follows
+    // it) — that turn PRODUCED the goal, so the prompt is not an unprocessed
+    // intervention. Candidate loss (restart/eviction) must not pause the
+    // fresh goal before it ever runs.
+    await appendUserHistoryMessage(historyService, workspaceId, "Set yourself a goal");
+    await appendAssistantHistoryMessage(historyService, workspaceId, "Goal created");
+    await setGoalOk(service, {
+      workspaceId,
+      objective: "Processed prompt",
+      initiator: "model",
     });
 
     const reconciled = await service.getGoal(workspaceId);

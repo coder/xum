@@ -54,6 +54,16 @@ export const GoalRecordV1Schema = z.object({
   budgetLimitOriginKind: GoalBudgetLimitOriginKindSchema.optional(),
   requireUserAcknowledgmentSinceMs: z.number().int().nonnegative().nullable(),
   lastContinuationFiredAtMs: z.number().int().nonnegative().nullable().optional(),
+  // Timestamp of the last EXPLICIT user action that made this goal active
+  // (direct create, Resume, board promote — never model set_goal,
+  // auto-promotion, or accounting re-arms). This is the consent anchor for
+  // the queue-race pause bypasses: a manual message authored before this
+  // moment was visibly pending when the user activated the goal, which is a
+  // genuine opt-in. Optional so legacy records load without migration; goals
+  // without it (including every model-created goal) FAIL CLOSED — a queued
+  // manual message always pauses them (Codex security P2
+  // PRRT_kwDOPxxmWM6cSGrq).
+  lastUserActivationAtMs: z.number().int().nonnegative().nullable().optional(),
   completionSummary: z.string().optional(),
   createdAtMs: z.number().int().nonnegative(),
   updatedAtMs: z.number().int().nonnegative(),

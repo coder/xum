@@ -257,12 +257,24 @@ interface ChatTailGoalModeResult {
   /**
    * When `pausedBy === "manual_user"`: the moment the user authored the pausing
    * row — its persisted enqueue time (queued sends) or the row timestamp.
-   * Reconciliation compares this against `goal.createdAtMs` to tell pre-goal
-   * rows (must not pause a never-driven goal) from genuine post-goal
-   * interventions (must pause even if the dispatch-time auto-pause was lost to
-   * a crash).
+   * Reconciliation compares this against the goal's explicit user-activation
+   * consent stamp (`lastUserActivationAtMs`) to tell rows the user visibly
+   * left pending while activating the goal (must not pause a never-driven
+   * goal) from genuine interventions (must pause even if the dispatch-time
+   * auto-pause was lost to a crash). Codex security P2 PRRT_kwDOPxxmWM6cSGrq:
+   * `createdAtMs` is deliberately NOT the anchor — a model publishing a goal
+   * after a queued correction would grandfather its autonomy past it.
    */
   manualRowAuthoredAtMs?: number;
+  /**
+   * When `pausedBy === "manual_user"`: true when a COMPLETED assistant row
+   * immediately follows the manual row, i.e. the turn that consumed the row
+   * settled. In the kickoff window this identifies the goal-creating turn's
+   * own initiating prompt (that turn PRODUCED the goal, so the row is not an
+   * unprocessed intervention); an unprocessed or queue-dispatched intervention
+   * is the tail's final row and stays false.
+   */
+  manualRowProcessed?: boolean;
   /**
    * `explicitPauseGenerations` value captured BEFORE the history read that
    * produced this evidence. Tail reads run outside the goal file lock, so an
@@ -810,10 +822,18 @@ export class WorkspaceGoalService {
       const authoredAtMs =
         toValidEpochMs(message.metadata?.enqueuedAtMs) ??
         toValidEpochMs(message.metadata?.timestamp);
+      // A COMPLETED assistant row immediately after the manual row proves the
+      // turn that consumed it settled (see manualRowProcessed field doc). A
+      // partial assistant row (crash mid-response) stays unprocessed so the
+      // fail-closed pause + crash-recovery acknowledgment gates apply.
+      const followerRow = historyResult.data[index + 1];
+      const manualRowProcessed =
+        followerRow?.role === "assistant" && followerRow.metadata?.partial !== true;
       return {
         mode: "paused",
         pausedBy: "manual_user",
         ...(authoredAtMs != null ? { manualRowAuthoredAtMs: authoredAtMs } : {}),
+        ...(manualRowProcessed ? { manualRowProcessed: true } : {}),
       };
     }
 
@@ -858,17 +878,32 @@ export class WorkspaceGoalService {
       // hooks) would silently pause the goal before it ever ran (user report:
       // scheduled heartbeats "pausing" fresh goals).
       //
-      // Scoped to rows AUTHORED before the goal existed (persisted enqueue time
-      // for queued sends, row timestamp otherwise): a row the user authored
-      // after the goal became visible is a genuine intervention and must still
-      // pause even when the dispatch-time auto-pause was lost to a crash
-      // (Codex P2 — persisted state stays self-healing). Explicit pause paths
-      // are unaffected: they append a goal-pause-boundary row, which reconciles
+      // Scoped to two provably-safe cases (Codex security P2
+      // PRRT_kwDOPxxmWM6cSGrq — "authored before the goal existed" alone is
+      // NOT consent, because a model can publish a goal AFTER the user queued
+      // a stop/correction and would grandfather its autonomy past it):
+      //  1. The manual row was PROCESSED — a completed assistant row follows
+      //     it, so for a never-driven goal it is the initiating prompt whose
+      //     turn produced the goal, not an unprocessed intervention. (An
+      //     intervention's dispatch-time hook pauses the goal durably before
+      //     its turn streams, so a later processed row cannot resurrect
+      //     autonomy; the residual gap is a pause-write failure that is
+      //     already logged and wrap-up-suppressed.)
+      //  2. The row was authored before the goal's explicit user-activation
+      //     consent stamp — the user activated the goal with the message
+      //     visibly pending, a genuine opt-in. Model-created goals carry no
+      //     stamp and fail closed.
+      // Rows authored after the consent stamp are genuine interventions and
+      // must still pause even when the dispatch-time auto-pause was lost to a
+      // crash (persisted state stays self-healing). Explicit pause paths are
+      // unaffected: they append a goal-pause-boundary row, which reconciles
       // via the pause_boundary branch.
       if (
         goal.lastContinuationFiredAtMs == null &&
-        chatTailMode.manualRowAuthoredAtMs != null &&
-        chatTailMode.manualRowAuthoredAtMs <= goal.createdAtMs
+        (chatTailMode.manualRowProcessed === true ||
+          (chatTailMode.manualRowAuthoredAtMs != null &&
+            goal.lastUserActivationAtMs != null &&
+            chatTailMode.manualRowAuthoredAtMs <= goal.lastUserActivationAtMs))
       ) {
         return goal;
       }
@@ -2362,6 +2397,32 @@ export class WorkspaceGoalService {
     return null;
   }
 
+  /**
+   * Explicit-user-activation consent stamp — the anchor for the queue-race
+   * pause bypasses (Codex security P2 PRRT_kwDOPxxmWM6cSGrq). Only explicit
+   * user actions that transition a goal into `active` stamp it (direct
+   * create, Resume, board promote); model set_goal, auto-promotion, and
+   * accounting re-arms leave it unset so their goals FAIL CLOSED — a queued
+   * manual message always pauses them. The oRPC schema deliberately omits
+   * `initiator`, so renderer calls default to "user" here while the model can
+   * only enter through tools that pass `initiator: "model"`.
+   */
+  private stampUserActivation(
+    next: GoalRecordV1,
+    previousStatus: GoalRecordV1["status"] | null,
+    initiator: GoalLifecycleInitiator | undefined,
+    activatedAtMs: number
+  ): GoalRecordV1 {
+    if (
+      next.status !== "active" ||
+      previousStatus === "active" ||
+      (initiator ?? "user") !== "user"
+    ) {
+      return next;
+    }
+    return GoalRecordV1Schema.parse({ ...next, lastUserActivationAtMs: activatedAtMs });
+  }
+
   private applyMutableFields(goal: GoalRecordV1, input: SetGoalInput): GoalRecordV1 {
     const completionSummary = input.completionSummary?.trim() ?? null;
     if (input.status != null) {
@@ -2885,11 +2946,13 @@ export class WorkspaceGoalService {
           // construction stamp predates the kickoff-model validation await,
           // the streaming re-check, and the async activity-snapshot read
           // inside publication — a message queued during any of those awaits
-          // postdated that stamp while the goal was not yet visible anywhere,
-          // so the pre-goal guard (enqueuedAtMs <= createdAtMs) misread it as
-          // an intervention against a goal the user could not have seen.
-          // Existing-goal branches keep their original durable createdAtMs —
-          // those goals were published long ago.
+          // postdated that stamp while the goal was not yet visible anywhere.
+          // For USER-drained creations, `createdAtMs` feeds the explicit
+          // activation consent stamp (see stampUserActivation in the creation
+          // branch), so a stale construction-time stamp would misread such a
+          // message as an intervention against a goal the user could not have
+          // seen. Existing-goal branches keep their original durable
+          // createdAtMs — those goals were published long ago.
           //
           // The identity guard (Codex P1 PRRT_kwDOPxxmWM6b-orH) skips the
           // re-stamp when a user abort (or competing setter) removed or
@@ -3063,7 +3126,12 @@ export class WorkspaceGoalService {
         // Apply other inline edits (status / budget / turnCap) on top of the
         // renamed record so a single payload can rename and update budget
         // atomically.
-        const withEdits = this.applyMutableFields(renamed, input);
+        const withEdits = this.stampUserActivation(
+          this.applyMutableFields(renamed, input),
+          current.status,
+          input.initiator,
+          Date.now()
+        );
         if (
           (withEdits.status === "active" || withEdits.status === "budget_limited") &&
           !(await this.canRunBudgetedGoalOnKickoffModel(input.workspaceId, withEdits))
@@ -3171,6 +3239,7 @@ export class WorkspaceGoalService {
               updatedAtMs: Date.now(),
             });
           }
+          updated = this.stampUserActivation(updated, previousStatus, input.initiator, Date.now());
           await this.writeGoal(input.workspaceId, updated);
           // Codex P1 (PRRT_kwDOPxxmWM6cLpIP): the write itself yields. A model
           // complete_goal takes this direct branch during the live stream; a
@@ -3302,6 +3371,12 @@ export class WorkspaceGoalService {
           updatedAtMs: publishedAtMs,
         });
       }
+      // Consent anchor for the queue-race pause bypasses: `createdAtMs` is the
+      // moment the user's create action became visible (direct creates) or the
+      // drained user mutation's publication stamp — a message authored before
+      // it was pending when the user acted. Model-initiated creations never
+      // stamp (fail closed).
+      next = this.stampUserActivation(next, null, input.initiator, next.createdAtMs);
       await this.writeGoal(input.workspaceId, next);
       // Codex P1 (PRRT_kwDOPxxmWM6cMGn8): the creation/replacement write
       // itself yields — this is the stream-end drain's main path for a
@@ -4950,6 +5025,9 @@ export class WorkspaceGoalService {
         updatedAtMs: now,
         completionSummary: undefined,
         requireUserAcknowledgmentSinceMs: null,
+        // The user is the only caller of board promotion — an explicit
+        // activation consent (see stampUserActivation).
+        lastUserActivationAtMs: now,
       });
       const activated = this.applyBudgetDrivenStatus(baseActivated);
 
@@ -5122,6 +5200,10 @@ export class WorkspaceGoalService {
       updatedAtMs: now,
       completionSummary: undefined,
       requireUserAcknowledgmentSinceMs: null,
+      // Auto-promotion is not user consent: clear any stale activation stamp
+      // a previously user-activated (then demoted) goal may still carry so the
+      // queue-race pause bypasses fail closed for this activation.
+      lastUserActivationAtMs: null,
     });
     const activated = this.applyBudgetDrivenStatus(baseActivated);
     // same pricing gate as `promoteUpcomingGoal`. If the next

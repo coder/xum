@@ -619,6 +619,58 @@ describe("AgentSession goal safety hooks", () => {
     session.dispose();
   });
 
+  test("queued messages predating a model-created goal still pause it", async () => {
+    // Codex security P2 (PRRT_kwDOPxxmWM6cSGrq): a model can publish a goal
+    // AFTER the user queued a stop/correction, so timestamp order alone must
+    // not shield the fresh goal's autonomy from the any-manual-turn-pauses
+    // boundary. Only an explicit user activation is consent; model-created
+    // goals carry no consent stamp and fail closed into the pause.
+    const workspaceId = "queued-predates-model-goal";
+    const { session, goalService, cleanup } = await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const enqueuedAtMs = Date.now();
+    const created = await setGoalOk(goalService, {
+      workspaceId,
+      objective: "Model-published goal",
+      initiator: "model",
+    });
+    expect(created.createdAtMs).toBeGreaterThanOrEqual(enqueuedAtMs);
+
+    const result = await session.sendMessage("Stop what you are doing", SEND_OPTIONS, {
+      enqueuedAtMs,
+    });
+
+    expect(result.success).toBe(true);
+    expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "paused" });
+    session.dispose();
+  });
+
+  test("a user Resume is consent for messages authored before it", async () => {
+    // The consent anchor is the explicit user activation, not goal creation:
+    // clicking Resume with a message already pending is a genuine opt-in, so
+    // the queued message must not instantly re-pause the resumed goal.
+    const workspaceId = "resume-consent-queue-race";
+    const { session, goalService, cleanup } = await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    await setGoalOk(goalService, { workspaceId, objective: "Resumable goal" });
+    await setGoalOk(goalService, { workspaceId, status: "paused", initiator: "user" });
+    const enqueuedAtMs = Date.now();
+    const resumed = await setGoalOk(goalService, {
+      workspaceId,
+      status: "active",
+      initiator: "user",
+    });
+    expect(resumed.lastUserActivationAtMs).toBeGreaterThanOrEqual(enqueuedAtMs);
+
+    const result = await session.sendMessage("Queued before the resume", SEND_OPTIONS, {
+      enqueuedAtMs,
+    });
+
+    expect(result.success).toBe(true);
+    expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
+    session.dispose();
+  });
+
   test("queued manual messages enqueued after goal creation still pause it", async () => {
     const workspaceId = "queued-postdates-goal";
     const { session, goalService, cleanup } = await createSessionHarness(workspaceId);

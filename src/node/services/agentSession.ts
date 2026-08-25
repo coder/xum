@@ -1680,12 +1680,25 @@ export class AgentSession {
     // Queue race: a message the user typed while the goal-creating turn was
     // still streaming predates the goal itself — the model's queued set_goal
     // applies at that turn's stream end, and only then does the queued message
-    // dispatch. The user cannot have been intervening against a goal they had
-    // not seen, so let the fresh goal keep its kickoff continuation instead of
-    // silently pausing it half a second after creation (user report: goals
-    // "paused by heartbeats" were actually killed here, then heartbeat turns
-    // kept the workspace moving while the goal sat paused).
-    if (input.enqueuedAtMs != null && goal != null && goal.createdAtMs >= input.enqueuedAtMs) {
+    // dispatch (user report: goals "paused by heartbeats" were actually killed
+    // here, then heartbeat turns kept the workspace moving while the goal sat
+    // paused).
+    //
+    // Codex security P2 (PRRT_kwDOPxxmWM6cSGrq): timestamp order alone is NOT
+    // consent — a model can publish a goal AFTER the user queued a
+    // stop/correction, and a "predates the goal" bypass would shield the new
+    // goal's autonomy from the any-manual-turn-pauses boundary even if the
+    // model ignores the corrective turn. The bypass therefore requires an
+    // EXPLICIT user activation (direct create, Resume, board promote — never
+    // model set_goal or auto-promotion; see stampUserActivation) that
+    // postdates the message's authoring: the user acted with the message
+    // already pending, a genuine opt-in. Model-created goals carry no consent
+    // stamp and fail closed into the visible, resumable pause below.
+    if (
+      input.enqueuedAtMs != null &&
+      goal?.lastUserActivationAtMs != null &&
+      goal.lastUserActivationAtMs >= input.enqueuedAtMs
+    ) {
       if (suspendedCandidate != null) {
         // The restore re-verifies goal identity + active status under the
         // goal file lock (Codex P2 PRRT_kwDOPxxmWM6cErQ7): a pause landing
