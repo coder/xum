@@ -102,6 +102,21 @@ describe("nested PTC edit records (exclusive posture)", () => {
     expect(diffs[0].diff).toBe(nestedDiff);
   });
 
+  it("returns nested batch paths newest-first", () => {
+    // The surrounding scan walks history backward to keep the LATEST edits
+    // under MAX_EDITED_FILES; nested records are chronological, so a batch
+    // must be traversed in reverse.
+    const messages: MuxMessage[] = [
+      createCodeExecutionMessage([
+        { toolName: "file_edit_insert", args: { path: "/first.ts" }, ok: true },
+        { toolName: "file_edit_insert", args: { path: "/second.ts" }, ok: true },
+        { toolName: "file_edit_insert", args: { path: "/third.ts" }, ok: true },
+      ]),
+    ];
+
+    expect(extractEditedFilePaths(messages)).toEqual(["/third.ts", "/second.ts", "/first.ts"]);
+  });
+
   it("kernel-compacted records surface the path but no diff", () => {
     // Kernel record compaction drops result contents (ok bit only): the edit
     // is still tracked by path, but no diff content survives to preserve.

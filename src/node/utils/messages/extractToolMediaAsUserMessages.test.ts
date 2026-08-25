@@ -81,6 +81,82 @@ describe("extractToolMediaAsUserMessages", () => {
     }
   });
 
+  it("extracts media from nested bridged tool records inside code_execution output", async () => {
+    // Exclusive PTC: bridged MCP tools run nested inside code_execution and
+    // their full results land in the classic record's toolCalls. Media there
+    // must become a model-visible attachment (with a placeholder in the
+    // record) instead of riding as raw base64 JSON text.
+    const base64 = (
+      await sharp({
+        create: {
+          width: 10,
+          height: 10,
+          channels: 3,
+          background: { r: 0, g: 0, b: 255 },
+        },
+      })
+        .png()
+        .toBuffer()
+    ).toString("base64");
+
+    const input: MuxMessage[] = [
+      {
+        id: "ce1",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call1",
+            toolName: "code_execution",
+            input: { code: "return xum.mcp__shots__take({});" },
+            state: "output-available",
+            output: {
+              success: true,
+              toolCalls: [
+                {
+                  toolName: "mcp__shots__take",
+                  args: {},
+                  result: {
+                    type: "content",
+                    value: [
+                      { type: "text", text: "took a screenshot" },
+                      { type: "media", mediaType: "image/png", data: base64 },
+                    ],
+                  },
+                },
+                // Kernel-compacted / error records carry no extractable result.
+                { toolName: "bash", args: { script: "true" }, ok: true, bytes: 4 },
+              ],
+            },
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    expect(rewritten).toHaveLength(2);
+
+    const toolPart = rewritten[0].parts[0];
+    if (toolPart.type !== "dynamic-tool" || toolPart.state !== "output-available") {
+      throw new Error("Expected an output-available dynamic-tool part");
+    }
+    const outputText = JSON.stringify(toolPart.output);
+    expect(outputText).toContain("[Attachment attached:");
+    expect(outputText).not.toContain(base64);
+    // Untouched sibling records survive the rewrite.
+    expect(outputText).toContain('"bytes":4');
+
+    const syntheticUser = rewritten[1];
+    expect(syntheticUser.role).toBe("user");
+    const filePart = syntheticUser.parts.find((part) => part.type === "file");
+    if (filePart?.type !== "file") {
+      throw new Error("Expected a synthetic file part for nested tool media");
+    }
+    expect(filePart.mediaType).toBe("image/png");
+    expect(filePart.url).toContain(base64.slice(0, 100));
+  });
+
   it("self-heals oversized raster tool attachments by downscaling them for provider requests", async () => {
     const oversizedPng = await sharp({
       create: {

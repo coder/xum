@@ -55,38 +55,6 @@ function createMockTool(
 }
 
 describe("ToolBridge", () => {
-  describe("media elision", () => {
-    it("replaces media items in content-container results with text placeholders", async () => {
-      // Bridged MCP tools may return { type: "content", value: [...media] }.
-      // Nested records bypass extractToolMediaAsUserMessages, so raw base64
-      // must never enter the sandbox result / model-visible record.
-      const bridge = new ToolBridge({
-        mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
-          type: "content",
-          value: [
-            { type: "text", text: "took a screenshot" },
-            { type: "media", mediaType: "image/png", data: "aGVsbG8=" },
-          ],
-        })),
-      });
-      let registeredMux: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
-      const mockRegisterObject = mock(
-        (name: string, obj: Record<string, (...args: unknown[]) => Promise<unknown>>) => {
-          if (name === "mux") registeredMux = obj;
-        }
-      );
-      bridge.register(createMockRuntime({ registerObject: mockRegisterObject }));
-
-      const result = (await registeredMux.mcp__shots__take({})) as {
-        value: Array<{ type: string; text?: string; data?: string }>;
-      };
-      expect(result.value[0]).toEqual({ type: "text", text: "took a screenshot" });
-      expect(result.value[1].type).toBe("text");
-      expect(result.value[1].text).toContain("media elided: image/png");
-      expect(JSON.stringify(result)).not.toContain("aGVsbG8=");
-    });
-  });
-
   describe("constructor", () => {
     it("filters out excluded tools", () => {
       const tools: Record<string, Tool> = {

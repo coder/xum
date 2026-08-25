@@ -20,4 +20,29 @@ describe("WorkspaceConfig taskExperiments", () => {
       parsed.taskExperiments && "programmaticToolCallingExclusive" in parsed.taskExperiments
     ).toBe(false);
   });
+
+  test("exclusive-only legacy tasks keep PTC (and therefore RLM) on resumption", () => {
+    // A task stamped by an older build with ONLY the exclusive flag opted into
+    // exactly the posture merged PTC activates; stripping the key would drop
+    // PTC and make the stamped rlm flag inert on restart-safe resumption.
+    const parsed = WorkspaceConfigSchema.parse({
+      path: "/tmp/ws",
+      taskExperiments: {
+        rlm: true,
+        programmaticToolCallingExclusive: true,
+      },
+    });
+    expect(parsed.taskExperiments?.programmaticToolCalling).toBe(true);
+    expect(parsed.taskExperiments?.rlm).toBe(true);
+  });
+
+  test("a legacy exclusive false is dropped without aliasing", () => {
+    const parsed = WorkspaceConfigSchema.parse({
+      path: "/tmp/ws",
+      taskExperiments: {
+        programmaticToolCallingExclusive: false,
+      },
+    });
+    expect(parsed.taskExperiments?.programmaticToolCalling).toBeUndefined();
+  });
 });

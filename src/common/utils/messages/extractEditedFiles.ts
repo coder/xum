@@ -93,7 +93,9 @@ export function extractEditedFilePaths(messages: MuxMessage[]): string[] {
 
       if (part.toolName === "code_execution") {
         // Nested edits that completed before a later failure still landed.
-        for (const record of collectNestedEditRecords(part.output)) {
+        // Records are chronological; reverse them so this newest-first scan
+        // keeps the LATEST edits of a large batch under MAX_EDITED_FILES.
+        for (const record of collectNestedEditRecords(part.output).reverse()) {
           if (!seen.has(record.filePath)) {
             seen.add(record.filePath);
             editedFiles.push(record.filePath);

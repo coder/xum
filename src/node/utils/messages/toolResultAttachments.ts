@@ -122,7 +122,7 @@ export function extractAttachmentsFromToolOutput(
   }
 
   if (!isContentContainer(output)) {
-    return null;
+    return extractAttachmentsFromNestedToolCalls(output);
   }
 
   const attachments: ExtractedToolAttachment[] = [];
@@ -160,6 +160,48 @@ export function extractAttachmentsFromToolOutput(
     newOutput: { type: "content", value: newValue },
     attachments,
   };
+}
+
+/**
+ * code_execution outputs carry nested tool-call records ({ toolName, args,
+ * result }). Classic (non-RLM) records retain the full bridged result, so a
+ * bridged MCP tool's media lands nested instead of top-level; extract it the
+ * same way top-level media is extracted so the model sees the attachment
+ * instead of raw base64 riding as JSON text. Kernel-compacted records drop
+ * result contents, so there is nothing to extract (the guest still received
+ * the full data and can offload it via vars/return handles).
+ */
+function extractAttachmentsFromNestedToolCalls(
+  output: unknown
+): { newOutput: unknown; attachments: ExtractedToolAttachment[] } | null {
+  if (typeof output !== "object" || output === null) {
+    return null;
+  }
+  const toolCalls = (output as { toolCalls?: unknown }).toolCalls;
+  if (!Array.isArray(toolCalls)) {
+    return null;
+  }
+
+  const attachments: ExtractedToolAttachment[] = [];
+  let didChange = false;
+  const newToolCalls = toolCalls.map((record: unknown) => {
+    if (typeof record !== "object" || record === null) {
+      return record;
+    }
+    const extracted = extractAttachmentsFromToolOutput((record as { result?: unknown }).result);
+    if (extracted == null) {
+      return record;
+    }
+    didChange = true;
+    attachments.push(...extracted.attachments);
+    return { ...record, result: extracted.newOutput };
+  });
+
+  if (!didChange) {
+    return null;
+  }
+
+  return { newOutput: { ...output, toolCalls: newToolCalls }, attachments };
 }
 
 type ProviderReadyToolAttachment =

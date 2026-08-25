@@ -8,8 +8,10 @@ import React, {
 } from "react";
 import {
   type ExperimentId,
+  EXPERIMENT_IDS,
   EXPERIMENTS,
   getExperimentKey,
+  getLegacyPtcExclusiveExperimentKey,
   isExperimentSupportedOnPlatform,
 } from "@/common/constants/experiments";
 import { getStorageChangeEvent } from "@/common/constants/events";
@@ -44,10 +46,33 @@ function isExperimentSupported(experimentId: ExperimentId): boolean {
 }
 
 /**
+ * Upgrade alias (see LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID): a stored legacy
+ * exclusive `true` opted into exactly the posture merged PTC activates, so PTC
+ * reads as enabled — winning even over an explicit supplement-off value,
+ * matching the backend read alias. setExperimentState rewrites the legacy key
+ * on every PTC toggle, so the alias never overrides a choice made in this
+ * build.
+ */
+export function hasLegacyPtcExclusiveOverride(): boolean {
+  try {
+    return window.localStorage.getItem(getLegacyPtcExclusiveExperimentKey()) === "true";
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Get explicit localStorage override for an experiment.
  * Returns undefined if no value is set or parsing fails.
  */
 function getExperimentOverrideSnapshot(experimentId: ExperimentId): boolean | undefined {
+  if (
+    experimentId === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING &&
+    hasLegacyPtcExclusiveOverride()
+  ) {
+    return true;
+  }
+
   const key = getExperimentKey(experimentId);
 
   try {
@@ -96,6 +121,15 @@ function setExperimentState(experimentId: ExperimentId, enabled: boolean): void 
 
   try {
     window.localStorage.setItem(key, JSON.stringify(enabled));
+
+    // Downgrade sync (see LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID): a downgraded
+    // renderer reads the pre-merge exclusive key as an explicit override that
+    // wins over the mirrored backend value in its send options, so a stale
+    // entry would resurrect supplement mode (stale false) or re-enable PTC
+    // after the user turned it off (stale true). Keep it equal to PTC.
+    if (experimentId === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING) {
+      window.localStorage.setItem(getLegacyPtcExclusiveExperimentKey(), JSON.stringify(enabled));
+    }
 
     // Dispatch custom event for same-tab synchronization
     const customEvent = new CustomEvent(getStorageChangeEvent(key), {
