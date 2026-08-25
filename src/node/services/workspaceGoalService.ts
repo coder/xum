@@ -2836,6 +2836,18 @@ export class WorkspaceGoalService {
           return stoppedBeforeEditWrite;
         }
         await this.writeGoal(input.workspaceId, withEdits);
+        // Codex P1 (PRRT_kwDOPxxmWM6cMpoV): same post-write window as the
+        // same-objective and creation branches — a queued rename claimed by
+        // the stream-end drain (or a live-stream edit) can have the Stop land
+        // inside writeGoal, after the pre-write check passed. Restore the
+        // prior record before releasing the lock so the aborted turn's edit
+        // never survives.
+        const stoppedDuringEditWrite = discardIfUserStopLanded();
+        if (stoppedDuringEditWrite) {
+          await this.writeGoal(input.workspaceId, current);
+          await this.pushSnapshot(input.workspaceId, current);
+          return stoppedDuringEditWrite;
+        }
         await this.pushSnapshot(input.workspaceId, withEdits);
         await this.pushLiveGoalPreviewOverlay(input.workspaceId, withEdits);
         this.emitBudgetChanged(current, withEdits, input);
@@ -3316,6 +3328,13 @@ export class WorkspaceGoalService {
     if (
       durable?.goalId !== goal.goalId ||
       durable.status !== "budget_limited" ||
+      // Codex P2 (PRRT_kwDOPxxmWM6cMpoe): manual suppression can complete
+      // during the unlocked awaits above (or before a caller passing a stale
+      // record). A durable user-origin record means the user already
+      // intervened — overwriting the live user-origin stamp with a
+      // goal-attributable one here would resurrect the wrap-up the
+      // suppression just disarmed.
+      durable.budgetLimitOriginKind === "user" ||
       this.pendingContinuationCandidates.has(workspaceId)
     ) {
       return;
@@ -3433,6 +3452,19 @@ export class WorkspaceGoalService {
       // goal.json stays goal-attributable — after a restart, recovery would
       // re-arm the autonomous wrap-up despite the manual intervention.
       // Memory only updates after the durable state it mirrors exists.
+      // Codex P2 (PRRT_kwDOPxxmWM6cKkGL): the durable stamp only protects
+      // restarts. The LIVE stream stamp stays goal-attributable through the
+      // manual turn's own accounting (recordStreamAccounting preserves
+      // budget_limited stamps), so the manual turn's stream-end would arm a
+      // fresh candidate that wrap-up eligibility accepts — dispatching the
+      // autonomous wrap-up right after the user's intervention. Re-mark the
+      // live stamp user-origin so eligibility rejects it in-process too.
+      const markLiveStampUserOrigin = (): void => {
+        const liveStamp = this.lastGoalStreamStamps.get(workspaceId);
+        if (liveStamp?.goalId === current.goalId && liveStamp.originKind !== "user") {
+          this.lastGoalStreamStamps.set(workspaceId, { ...liveStamp, originKind: "user" });
+        }
+      };
       if (current.budgetLimitOriginKind !== "user") {
         const next = GoalRecordV1Schema.parse({
           ...current,
@@ -3440,19 +3472,15 @@ export class WorkspaceGoalService {
           updatedAtMs: Date.now(),
         });
         await this.writeGoal(workspaceId, next);
+        // Codex P2 (PRRT_kwDOPxxmWM6cMpob): the durable origin is committed —
+        // publish the live suppression BEFORE the snapshot await. A snapshot
+        // failure after the write would otherwise throw out of this method
+        // with the live stamp still goal-attributable, letting this process's
+        // stream-end arm the wrap-up while goal.json already says "user".
+        markLiveStampUserOrigin();
         await this.pushSnapshot(workspaceId, next);
-      }
-      // Codex P2 (PRRT_kwDOPxxmWM6cKkGL): the durable stamp above only
-      // protects restarts. The LIVE stream stamp stays goal-attributable
-      // through the manual turn's own accounting (recordStreamAccounting
-      // preserves budget_limited stamps), so the manual turn's stream-end
-      // would arm a fresh candidate that wrap-up eligibility accepts —
-      // dispatching the autonomous wrap-up right after the user's
-      // intervention. Re-mark the live stamp user-origin so eligibility
-      // rejects it in-process too.
-      const liveStamp = this.lastGoalStreamStamps.get(workspaceId);
-      if (liveStamp?.goalId === current.goalId && liveStamp.originKind !== "user") {
-        this.lastGoalStreamStamps.set(workspaceId, { ...liveStamp, originKind: "user" });
+      } else {
+        markLiveStampUserOrigin();
       }
     });
   }

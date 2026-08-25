@@ -3199,6 +3199,100 @@ describe("WorkspaceGoalService", () => {
     expect(await service.getGoal(workspaceId)).toMatchObject({ budgetLimitOriginKind: "user" });
   });
 
+  test("a failed snapshot publish after the suppression write still updates the live stamp", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cMpob): once writeGoal committed, the durable
+    // record says the wrap-up is suppressed. If the follow-up snapshot publish
+    // fails, the method throws — but the live stamp must ALREADY be
+    // user-origin, or this process's stream-end arms and dispatches the
+    // wrap-up off the stale goal-attributable stamp while goal.json says
+    // "user".
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Snapshot publish fails",
+      budgetCents: 100,
+    });
+    await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1.25,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    const serviceAccess = service as unknown as {
+      pushSnapshot: (id: string, goal: GoalRecordV1 | null) => Promise<unknown>;
+      lastGoalStreamStamps: Map<string, { originKind: string }>;
+    };
+    expect(serviceAccess.lastGoalStreamStamps.get(workspaceId)?.originKind).toBe(
+      "goal_continuation"
+    );
+
+    const snapshotSpy = spyOn(serviceAccess, "pushSnapshot").mockImplementationOnce(() =>
+      Promise.reject(new Error("injected: snapshot publish lost"))
+    );
+    let threw = false;
+    try {
+      await service.suppressBudgetWrapupForManualUserMessage(workspaceId, created.goalId);
+    } catch {
+      threw = true;
+    }
+    snapshotSpy.mockRestore();
+    expect(threw).toBe(true);
+
+    // Durable and live state agree: suppression is in effect.
+    expect((await service.getGoal(workspaceId))?.budgetLimitOriginKind).toBe("user");
+    expect(serviceAccess.lastGoalStreamStamps.get(workspaceId)?.originKind).toBe("user");
+  });
+
+  test("the wrap-up armer honors a durable suppression that completed under a stale record", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cMpoe): armBudgetWrapupForBudgetLimitedGoal
+    // awaits kickoff options and the durable read unlocked, so a manual
+    // suppression can complete in that window (modeled here by passing the
+    // pre-suppression record). Without the durable origin recheck it would
+    // overwrite the live user-origin stamp with goal_continuation and arm a
+    // fresh candidate — resurrecting the wrap-up the suppression disarmed.
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Armer vs suppression",
+      budgetCents: 100,
+    });
+    await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1.25,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    const stale = await service.getGoal(workspaceId);
+    expect(stale).toMatchObject({ status: "budget_limited" });
+
+    // Registered after setup so no kickoff candidate exists — the armer must
+    // fall through to its durable recheck rather than an earlier guard.
+    const dispatcher = new IdleDispatcher();
+    const executed: Array<{ kind: string | undefined }> = [];
+    service.registerGoalContinuationConsumer(dispatcher, {
+      hasActiveDescendantTasks: () => false,
+      getRuntimeState: () => ({ isRuntimeCompatible: true }),
+      executeGoalContinuation: (input) => {
+        executed.push({ kind: input.kind });
+        return Promise.resolve(true);
+      },
+      getKickoffSendOptions: () => Promise.resolve({ model: "openai:gpt-4o", agentId: "exec" }),
+    });
+
+    await service.suppressBudgetWrapupForManualUserMessage(workspaceId, created.goalId);
+
+    const serviceAccess = service as unknown as {
+      armBudgetWrapupForBudgetLimitedGoal: (id: string, goal: GoalRecordV1) => Promise<void>;
+      lastGoalStreamStamps: Map<string, { originKind: string }>;
+      pendingContinuationCandidates: Map<string, unknown>;
+    };
+    await serviceAccess.armBudgetWrapupForBudgetLimitedGoal(workspaceId, stale!);
+    await drainPendingDispatches();
+
+    // The live suppression survives, no candidate was armed, nothing fired.
+    expect(serviceAccess.lastGoalStreamStamps.get(workspaceId)?.originKind).toBe("user");
+    expect(serviceAccess.pendingContinuationCandidates.has(workspaceId)).toBe(false);
+    expect(executed).toHaveLength(0);
+  });
+
   test("a stop landing inside the goal write restores the prior record", async () => {
     // Codex P1 (PRRT_kwDOPxxmWM6cLpIP): a model complete_goal takes the
     // direct mutable branch during the live stream. The final pre-write stop
@@ -3312,6 +3406,56 @@ describe("WorkspaceGoalService", () => {
       "number"
     );
     expect(serviceAccess.pendingGoalMutations.get(workspaceId)).toBeUndefined();
+  });
+
+  test("a stop landing during a drained rename's write restores the prior record", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cMpoV): the editInPlace branch persists via
+    // its own writeGoal and, unlike the same-objective and creation branches,
+    // had no post-write stop recheck. A queued rename claimed by the
+    // stream-end drain would keep the renamed record durable when the Stop
+    // landed inside that write.
+    const original = await setGoalOk(service, { workspaceId, objective: "Original name" });
+    await extensionMetadata.setStreaming(workspaceId, true);
+    const queued = await service.setGoal({
+      workspaceId,
+      objective: "Renamed mid-stream",
+      editInPlace: true,
+    });
+    expect(queued.success).toBe(true);
+
+    const serviceAccess = service as unknown as {
+      writeGoal: (id: string, goal: GoalRecordV1) => Promise<void>;
+    };
+    const realWrite = serviceAccess.writeGoal.bind(service);
+    let releaseWrite!: () => void;
+    const writeGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    let writeStarted = false;
+    const writeSpy = spyOn(serviceAccess, "writeGoal").mockImplementationOnce(
+      async (id: string, goal: GoalRecordV1) => {
+        writeStarted = true;
+        await writeGate;
+        return realWrite(id, goal);
+      }
+    );
+
+    const drainPromise = service.applyPendingAfterStreamEnd(workspaceId);
+    await waitForCondition(() => writeStarted, { timeoutMs: 5_000 });
+    const stopPromise = service.recordUserStoppedStream(workspaceId);
+    releaseWrite();
+
+    const drained = await drainPromise;
+    expect(drained).toBeNull();
+    await stopPromise;
+    writeSpy.mockRestore();
+
+    // The rename never survived; the stop gated the restored original.
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: original.goalId,
+      objective: "Original name",
+      status: "active",
+    });
   });
 
   test("an explicit Resume during pause finalization survives the stale boundary", async () => {
