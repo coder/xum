@@ -24,6 +24,23 @@ describe("MessageQueue", () => {
       expect(enqueuedAtMs).toBe(authoredAtMs);
     });
 
+    it("keeps the newest authoring time when batched adds arrive out of authoring order", () => {
+      // Codex security P2 (PRRT_kwDOPxxmWM6b_OS9): overlapping sends can
+      // complete preflight out of authoring order. The batched entry must
+      // report the NEWEST authoring time so a later post-goal stop/correction
+      // is never masked by an older pre-goal message — otherwise the batch
+      // would satisfy the pre-goal guard and keep the goal running despite
+      // the user's intervention.
+      const newerAuthoredAtMs = Date.now() - 1_000;
+      const olderAuthoredAtMs = Date.now() - 10_000;
+      queue.add("post-goal stop", undefined, { authoredAtMs: newerAuthoredAtMs });
+      // The older send finishes its preflight late and batches into the entry.
+      queue.add("pre-goal message", undefined, { authoredAtMs: olderAuthoredAtMs });
+
+      const { enqueuedAtMs } = queue.dequeueNext();
+      expect(enqueuedAtMs).toBe(newerAuthoredAtMs);
+    });
+
     it("falls back to enqueue-time sampling when authoring time is absent", () => {
       const before = Date.now();
       queue.add("plain add");

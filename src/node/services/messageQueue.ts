@@ -474,7 +474,11 @@ export class MessageQueue {
         addCount: 0,
         syntheticCount: 0,
         agentInitiatedCount: 0,
-        lastAddedAtMs: Date.now(),
+        // 0, not Date.now(): every add (including the entry-creating one)
+        // folds its authoring time in below via max(); seeding with the
+        // creation wall clock would swallow an authoredAtMs captured before
+        // slow send preflight, defeating the pre-goal queue-race guard.
+        lastAddedAtMs: 0,
       };
       this.entries.push(entry);
     }
@@ -539,7 +543,12 @@ export class MessageQueue {
     }
 
     entry.addCount += 1;
-    entry.lastAddedAtMs = internal?.authoredAtMs ?? Date.now();
+    // Codex security P2 (PRRT_kwDOPxxmWM6b_OS9): batched sends can finish
+    // preflight out of authoring order. Keep the NEWEST authoring time for
+    // the entry — a plain overwrite would let an older pre-goal message mask
+    // a later post-goal stop/correction, satisfying the pre-goal guard and
+    // granting the agent another autonomous turn despite the intervention.
+    entry.lastAddedAtMs = Math.max(entry.lastAddedAtMs, internal?.authoredAtMs ?? Date.now());
     if (internal?.synthetic === true) {
       entry.syntheticCount += 1;
     }
