@@ -1684,7 +1684,17 @@ export class AgentSession {
       // Codex P2 (PRRT_kwDOPxxmWM6cJ6NM): the candidate delete above is
       // in-memory only — persist the suppression so a restart cannot
       // re-synthesize the autonomous wrap-up over the user's intervention.
-      await goalService.suppressBudgetWrapupForManualUserMessage(this.workspaceId);
+      try {
+        await goalService.suppressBudgetWrapupForManualUserMessage(this.workspaceId);
+      } catch (error) {
+        // A transient write failure must not break the user's manual send;
+        // suppression fails closed (durable-first, so no in-memory state was
+        // published) and the next manual message retries it.
+        log.warn("Failed to persist budget wrap-up suppression", {
+          workspaceId: this.workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
     }
     if (goal?.status !== "active") {
       return;

@@ -473,6 +473,17 @@ export class WorkspaceGoalService {
    */
   private readonly streamEndDrainGenerations = new Map<string, number>();
   /**
+   * Highest stream-start generation any drain bump above was acting for
+   * (recorded with max semantics at both drain entry and exit). A drain bump
+   * only forces an in-flight setter onto the direct-persistence path when the
+   * bumping drain was settling the setter's own stream (or a newer one): an
+   * old un-awaited error drain exiting while a retry stream is live must not
+   * push the retry's setters past the deferral — the mutation they queue is
+   * stamped with the retry's generation and claimed by the retry's own drain
+   * (Codex P1 PRRT_kwDOPxxmWM6cLA0R).
+   */
+  private readonly lastDrainStreamStartGenerations = new Map<string, number>();
+  /**
    * Workspaces whose last stream has ended and fully drained (or was user
    * stopped, which skips the drain). The extension-metadata streaming flag
    * clears asynchronously after stream end, so setters admitted after the
@@ -2357,6 +2368,14 @@ export class WorkspaceGoalService {
     // hold a stale "live" long enough for a setter to queue a mutation the
     // drain has already stopped watching for.
     const drainGenerationAtEntry = this.streamEndDrainGenerations.get(input.workspaceId) ?? 0;
+    // Codex P1 (PRRT_kwDOPxxmWM6cLA0R): captured synchronously alongside the
+    // drain generation so the in-lock rechecks can tell whether a later drain
+    // bump came from a drain settling THIS setter's stream (stale → persist
+    // directly) or from an older stream's un-awaited error drain exiting while
+    // the setter's stream is live (queue normally — that stream's own drain
+    // claims the stamped mutation).
+    const setterStreamStartGenerationAtEntry =
+      this.streamStartGenerations.get(input.workspaceId) ?? 0;
     // Codex P1 (PRRT_kwDOPxxmWM6cCH_H): also captured synchronously at entry.
     // A user stop landing while this setter is in flight means the stopped
     // turn's goal change must be discarded — recordUserStoppedStream deletes
@@ -2399,7 +2418,11 @@ export class WorkspaceGoalService {
         if (
           !(await this.isWorkspaceStreaming(input.workspaceId)) ||
           this.drainSettledWorkspaces.has(input.workspaceId) ||
-          (this.streamEndDrainGenerations.get(input.workspaceId) ?? 0) !== drainGenerationAtEntry
+          this.drainRanForRelevantStreamSince(
+            input.workspaceId,
+            drainGenerationAtEntry,
+            setterStreamStartGenerationAtEntry
+          )
         ) {
           // The stream can end while this caller waits for the goal file lock.
           // Persist immediately instead of queueing after stream-end already
@@ -2465,7 +2488,11 @@ export class WorkspaceGoalService {
         if (
           !(await this.isWorkspaceStreaming(input.workspaceId)) ||
           this.drainSettledWorkspaces.has(input.workspaceId) ||
-          (this.streamEndDrainGenerations.get(input.workspaceId) ?? 0) !== drainGenerationAtEntry
+          this.drainRanForRelevantStreamSince(
+            input.workspaceId,
+            drainGenerationAtEntry,
+            setterStreamStartGenerationAtEntry
+          )
         ) {
           // Avoid queueing after the one stream-end drain has already observed no
           // pending mutation (stale-streaming reads included — see the
@@ -3263,7 +3290,22 @@ export class WorkspaceGoalService {
       if (current?.status !== "budget_limited") {
         return;
       }
-      // Codex P2 (PRRT_kwDOPxxmWM6cKkGL): the durable stamp below only
+      // Codex P2 (PRRT_kwDOPxxmWM6cLA0M): persist the durable origin FIRST.
+      // Publishing the in-memory suppression before the write would let a
+      // failed write leave this process suppressing the wrap-up while
+      // goal.json stays goal-attributable — after a restart, recovery would
+      // re-arm the autonomous wrap-up despite the manual intervention.
+      // Memory only updates after the durable state it mirrors exists.
+      if (current.budgetLimitOriginKind !== "user") {
+        const next = GoalRecordV1Schema.parse({
+          ...current,
+          budgetLimitOriginKind: "user",
+          updatedAtMs: Date.now(),
+        });
+        await this.writeGoal(workspaceId, next);
+        await this.pushSnapshot(workspaceId, next);
+      }
+      // Codex P2 (PRRT_kwDOPxxmWM6cKkGL): the durable stamp above only
       // protects restarts. The LIVE stream stamp stays goal-attributable
       // through the manual turn's own accounting (recordStreamAccounting
       // preserves budget_limited stamps), so the manual turn's stream-end
@@ -3275,16 +3317,6 @@ export class WorkspaceGoalService {
       if (liveStamp?.goalId === current.goalId && liveStamp.originKind !== "user") {
         this.lastGoalStreamStamps.set(workspaceId, { ...liveStamp, originKind: "user" });
       }
-      if (current.budgetLimitOriginKind === "user") {
-        return;
-      }
-      const next = GoalRecordV1Schema.parse({
-        ...current,
-        budgetLimitOriginKind: "user",
-        updatedAtMs: Date.now(),
-      });
-      await this.writeGoal(workspaceId, next);
-      await this.pushSnapshot(workspaceId, next);
     });
   }
 
@@ -3677,10 +3709,37 @@ export class WorkspaceGoalService {
     }
   }
 
-  private bumpStreamEndDrainGeneration(workspaceId: string): void {
+  private bumpStreamEndDrainGeneration(workspaceId: string, streamStartGeneration: number): void {
     this.streamEndDrainGenerations.set(
       workspaceId,
       (this.streamEndDrainGenerations.get(workspaceId) ?? 0) + 1
+    );
+    // Max semantics: concurrent drains can exit out of order, and a newer
+    // drain's entry must not be masked by an older drain's later exit.
+    this.lastDrainStreamStartGenerations.set(
+      workspaceId,
+      Math.max(this.lastDrainStreamStartGenerations.get(workspaceId) ?? 0, streamStartGeneration)
+    );
+  }
+
+  /**
+   * True when a stream-end drain started or exited since the caller captured
+   * `drainGenerationAtEntry` AND that drain was settling the caller's own
+   * stream or a newer one. Bumps from drains settling OLDER streams are
+   * ignored: the caller's stream is still live, so a queued mutation (stamped
+   * with the caller's stream-start generation) will be claimed by that
+   * stream's own drain (Codex P1 PRRT_kwDOPxxmWM6cLA0R).
+   */
+  private drainRanForRelevantStreamSince(
+    workspaceId: string,
+    drainGenerationAtEntry: number,
+    streamStartGenerationAtEntry: number
+  ): boolean {
+    if ((this.streamEndDrainGenerations.get(workspaceId) ?? 0) === drainGenerationAtEntry) {
+      return false;
+    }
+    return (
+      (this.lastDrainStreamStartGenerations.get(workspaceId) ?? 0) >= streamStartGenerationAtEntry
     );
   }
 
@@ -3695,7 +3754,7 @@ export class WorkspaceGoalService {
     // setters admitted BEFORE this drain detect it at their in-lock recheck
     // and persist directly instead of installing a mutation this drain may
     // already have stopped watching for.
-    this.bumpStreamEndDrainGeneration(workspaceId);
+    this.bumpStreamEndDrainGeneration(workspaceId, streamStartGenerationAtEntry);
     let drained: GoalRecordV1 | null = null;
 
     // Codex P2 (PRRT_kwDOPxxmWM6b_KgE): a queued setGoal may be holding the
@@ -3816,7 +3875,7 @@ export class WorkspaceGoalService {
     // admitted DURING this drain whose in-lock recheck runs after that final
     // check therefore sees a changed generation and persists directly; one
     // whose recheck ran earlier installed a mutation the loop drained.
-    this.bumpStreamEndDrainGeneration(workspaceId);
+    this.bumpStreamEndDrainGeneration(workspaceId, streamStartGenerationAtEntry);
     // Codex P2 (PRRT_kwDOPxxmWM6cCH_L): setters admitted AFTER this point
     // capture the already-bumped generation, so the generation gate cannot
     // help them — mark the workspace settled (also synchronously with the

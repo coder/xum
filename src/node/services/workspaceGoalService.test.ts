@@ -2815,6 +2815,77 @@ describe("WorkspaceGoalService", () => {
     expect(serviceAccess.pendingGoalMutations.get(workspaceId)).toBeUndefined();
   });
 
+  test("an old drain's exit does not force a retry stream's setter onto direct persistence", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cLA0R): the drain-generation staleness check
+    // was workspace-global. A setter in retry stream B that captured the
+    // generation, awaited its streaming read, and then observed the OLD
+    // stream-A drain's exit bump fell through to direct persistence while B
+    // was live — the replacement predated B's accounting and escaped a later
+    // Stop's discard window. Drain bumps are now stream-scoped: an older
+    // stream's bump leaves the setter on the deferral path, and its queued
+    // mutation is claimed by B's own drain.
+    await extensionMetadata.setStreaming(workspaceId, true);
+    const queued = await service.setGoal({ workspaceId, objective: "Queued mid-error" });
+    expect(queued.success).toBe(true);
+
+    const serviceAccess = service as unknown as {
+      isWorkspaceStreaming: (id: string) => Promise<boolean>;
+      pendingGoalMutations: Map<string, { objective: string }>;
+      fileLocks: { withLock: <T>(key: string, fn: () => Promise<T>) => Promise<T> };
+    };
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const gateTenure = serviceAccess.fileLocks.withLock(workspaceId, () => gate);
+
+    // Old drain D_A (settling stream A) blocks at its locked claim; the retry
+    // stream B then starts.
+    const drainPromise = service.applyPendingAfterStreamEnd(workspaceId);
+    service.recordStreamStarted(workspaceId);
+
+    // Hold the setter at its pre-lock streaming read (one-shot gate) so D_A's
+    // exit bump lands while the setter is in flight — Codex's interleaving.
+    const realIsStreaming = serviceAccess.isWorkspaceStreaming.bind(service);
+    let releaseSetterRead!: () => void;
+    const readGate = new Promise<void>((resolve) => {
+      releaseSetterRead = resolve;
+    });
+    let pendingReadGate: Promise<void> | null = readGate;
+    serviceAccess.isWorkspaceStreaming = async (id: string): Promise<boolean> => {
+      const hold = pendingReadGate;
+      pendingReadGate = null;
+      if (hold) {
+        await hold;
+      }
+      return realIsStreaming(id);
+    };
+    // Captures the pre-exit drain generation synchronously, then parks at the
+    // gated streaming read.
+    const setterPromise = service.setGoal({ workspaceId, objective: "Retry-stream replacement" });
+
+    // D_A completes: claims its own stream's mutation, then exits (bumping the
+    // drain generation FOR STREAM A) while the setter is still parked.
+    releaseGate();
+    await gateTenure;
+    await drainPromise;
+    expect(await service.getGoal(workspaceId)).toMatchObject({ objective: "Queued mid-error" });
+
+    // The setter resumes, sees the bump — but it came from stream A, not B:
+    // it must defer, not persist directly.
+    releaseSetterRead();
+    const setter = await setterPromise;
+    expect(setter.success).toBe(true);
+    expect(serviceAccess.pendingGoalMutations.get(workspaceId)?.objective).toBe(
+      "Retry-stream replacement"
+    );
+    expect(await service.getGoal(workspaceId)).toMatchObject({ objective: "Queued mid-error" });
+
+    // B's own drain claims the deferred replacement.
+    const drainedByB = await service.applyPendingAfterStreamEnd(workspaceId);
+    expect(drainedByB).toMatchObject({ objective: "Retry-stream replacement" });
+  });
+
   test("pause boundaries for a replaced goal do not reconcile the newer goal to paused", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cEl4F): a stale pause finalizer's boundary
     // append awaits history I/O after its identity check, so the row can land
@@ -3071,6 +3142,56 @@ describe("WorkspaceGoalService", () => {
       budgetLimitInjectedForGoalId: null,
       budgetLimitOriginKind: "user",
     });
+  });
+
+  test("a failed suppression write publishes no in-memory suppression", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cLA0M): the durable origin must persist
+    // BEFORE the live stamp updates. If the write fails (disk full, transient
+    // fs error), no in-memory suppression may exist — otherwise this process
+    // suppresses the wrap-up while goal.json stays goal-attributable, and a
+    // restart re-arms the autonomous wrap-up despite the manual intervention.
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Suppression write fails",
+      budgetCents: 100,
+    });
+    await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1.25,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    const serviceAccess = service as unknown as {
+      writeGoal: (id: string, goal: GoalRecordV1) => Promise<void>;
+      lastGoalStreamStamps: Map<string, { originKind: string }>;
+    };
+    expect(serviceAccess.lastGoalStreamStamps.get(workspaceId)?.originKind).toBe(
+      "goal_continuation"
+    );
+
+    const writeSpy = spyOn(serviceAccess, "writeGoal").mockImplementationOnce(() =>
+      Promise.reject(new Error("injected: suppression write lost"))
+    );
+    let threw = false;
+    try {
+      await service.suppressBudgetWrapupForManualUserMessage(workspaceId);
+    } catch {
+      threw = true;
+    }
+    writeSpy.mockRestore();
+    expect(threw).toBe(true);
+
+    // Fail closed: memory never got ahead of disk.
+    expect(serviceAccess.lastGoalStreamStamps.get(workspaceId)?.originKind).toBe(
+      "goal_continuation"
+    );
+    expect(await service.getGoal(workspaceId)).toMatchObject({ status: "budget_limited" });
+    expect((await service.getGoal(workspaceId))?.budgetLimitOriginKind).not.toBe("user");
+
+    // A retry (next manual message) succeeds and completes both halves.
+    await service.suppressBudgetWrapupForManualUserMessage(workspaceId);
+    expect(serviceAccess.lastGoalStreamStamps.get(workspaceId)?.originKind).toBe("user");
+    expect(await service.getGoal(workspaceId)).toMatchObject({ budgetLimitOriginKind: "user" });
   });
 
   test("getGoal during pause finalization does not reactivate the goal being paused", async () => {
