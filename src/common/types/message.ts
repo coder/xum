@@ -594,6 +594,14 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
       }
     | {
         type: "goal-pause-boundary";
+        /**
+         * Goal this boundary pauses. Chat-tail reconciliation ignores
+         * boundaries stamped for a different goal so a stale pause finalizer
+         * racing a replacement cannot silently pause the newer goal (Codex P2
+         * PRRT_kwDOPxxmWM6cEl4F). Optional for legacy rows, which keep the
+         * old any-goal semantics.
+         */
+        goalId?: string;
       }
     | {
         // Durable, provider-visible summary of an abandoned history branch

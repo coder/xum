@@ -2708,6 +2708,130 @@ describe("WorkspaceGoalService", () => {
     expect(await goalFileExists(config, workspaceId)).toBe(false);
   });
 
+  test("a stream starting during the stream-end drain leaves the workspace unsettled", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cEl37): the provider-error path launches the
+    // drain un-awaited, so an automatic retry's stream-start can land while
+    // the drain is persisting. The drain's exit must not re-add the settled
+    // marker the retry's recordStreamStarted just cleared — a set_goal in the
+    // retry stream would then persist mid-stream, bypassing abort-time
+    // discard and stream-end accounting.
+    await extensionMetadata.setStreaming(workspaceId, true);
+    const queued = await service.setGoal({ workspaceId, objective: "Queued mid-error" });
+    expect(queued.success).toBe(true);
+
+    const serviceAccess = service as unknown as {
+      fileLocks: { withLock: <T>(key: string, fn: () => Promise<T>) => Promise<T> };
+      pendingGoalMutations: Map<string, unknown>;
+      drainSettledWorkspaces: Set<string>;
+    };
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const gateTenure = serviceAccess.fileLocks.withLock(workspaceId, () => gate);
+
+    // The drain's locked claim queues behind the gate; the retry stream
+    // starts while it waits.
+    const drainPromise = service.applyPendingAfterStreamEnd(workspaceId);
+    service.recordStreamStarted(workspaceId);
+    releaseGate();
+    await gateTenure;
+    await drainPromise;
+
+    expect(serviceAccess.drainSettledWorkspaces.has(workspaceId)).toBe(false);
+    // Behavioral proof: a set_goal in the retry stream still defers to that
+    // stream's own stream-end drain instead of persisting mid-stream.
+    const setter = await service.setGoal({ workspaceId, objective: "Retry-stream goal" });
+    expect(setter.success).toBe(true);
+    expect(serviceAccess.pendingGoalMutations.get(workspaceId)).toBeDefined();
+  });
+
+  test("pause boundaries for a replaced goal do not reconcile the newer goal to paused", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cEl4F): a stale pause finalizer's boundary
+    // append awaits history I/O after its identity check, so the row can land
+    // AFTER a replacement persisted. Boundaries are goal-scoped: chat-tail
+    // reconciliation must ignore one stamped for a different goal instead of
+    // silently pausing the replacement.
+    const goalA = await setGoalOk(service, { workspaceId, objective: "Goal A" });
+    const goalB = await setGoalOk(service, { workspaceId, objective: "Goal B" });
+
+    const staleBoundary = createMuxMessage(
+      `goal-paused-stale-${crypto.randomUUID()}`,
+      "user",
+      "Goal paused by the user. Do not continue the goal until a later goal continuation message.",
+      {
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: { type: "goal-pause-boundary", goalId: goalA.goalId },
+      }
+    );
+    const appendResult = await historyService.appendToHistory(workspaceId, staleBoundary);
+    expect(appendResult.success).toBe(true);
+
+    // Reconciliation ignores the mismatched boundary — B stays active.
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: goalB.goalId,
+      status: "active",
+    });
+
+    // Legacy boundaries without a goalId keep the old any-goal semantics.
+    const legacyBoundary = createMuxMessage(
+      `goal-paused-legacy-${crypto.randomUUID()}`,
+      "user",
+      "Goal paused by the user. Do not continue the goal until a later goal continuation message.",
+      {
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: { type: "goal-pause-boundary" },
+      }
+    );
+    const legacyAppend = await historyService.appendToHistory(workspaceId, legacyBoundary);
+    expect(legacyAppend.success).toBe(true);
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: goalB.goalId,
+      status: "paused",
+    });
+  });
+
+  test("cost previews reset when the goal becomes ineligible for accounting mid-stream", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cEl4P): a status transition during the stream
+    // (pause, complete, or a budget edit flipping the goal budget_limited)
+    // makes further previews ineligible. The cached live preview must be
+    // cleared and the durable snapshot published — otherwise
+    // pushLiveGoalPreviewOverlay keeps re-emitting cost that final accounting
+    // discards, and the Goal UI snaps backward only at stream end.
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Preview reset",
+      budgetCents: 500,
+    });
+    await service.previewStreamAccounting({
+      workspaceId,
+      costUsd: 0.5,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "other",
+    });
+    const previews = (service as unknown as { liveGoalPreviewSnapshots: Map<string, unknown> })
+      .liveGoalPreviewSnapshots;
+    expect(previews.has(workspaceId)).toBe(true);
+
+    // Mid-stream pause makes the next delta ineligible.
+    await setGoalOk(service, { workspaceId, status: "paused" });
+    const snapshots = captureGoalActivity(service);
+    const returned = await service.previewStreamAccounting({
+      workspaceId,
+      costUsd: 0.6,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "other",
+    });
+
+    expect(previews.has(workspaceId)).toBe(false);
+    // The durable record (no accounted cost) is what gets published and
+    // returned — not the discarded preview cost.
+    expect(returned?.costCents).toBe(0);
+    expect(snapshots.at(-1)?.goal?.costCents).toBe(0);
+  });
+
   test("stale pause finalization does not pause a newer replacement goal", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cECpZ): pause finalization runs outside the
     // goal file lock — a replacement queued behind the pause's persist can

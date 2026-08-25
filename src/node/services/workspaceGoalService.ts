@@ -234,6 +234,13 @@ interface ChatTailGoalModeResult {
    */
   pausedBy?: "pause_boundary" | "manual_user";
   /**
+   * When `pausedBy === "pause_boundary"`: the goal the boundary row was
+   * stamped for. Reconciliation ignores boundaries belonging to a different
+   * goal (Codex P2 PRRT_kwDOPxxmWM6cEl4F); absent on legacy rows, which keep
+   * the old any-goal semantics.
+   */
+  boundaryGoalId?: string;
+  /**
    * When `pausedBy === "manual_user"`: the moment the user authored the pausing
    * row — its persisted enqueue time (queued sends) or the row timestamp.
    * Reconciliation compares this against `goal.createdAtMs` to tell pre-goal
@@ -470,6 +477,16 @@ export class WorkspaceGoalService {
    * PRRT_kwDOPxxmWM6cCH_L). Cleared when the next stream start is recorded.
    */
   private readonly drainSettledWorkspaces = new Set<string>();
+  /**
+   * Monotonic per-workspace stream-start counter, bumped synchronously by
+   * `recordStreamStarted`. The stream-end drain captures it at entry and only
+   * marks the workspace settled at exit when no newer stream started while it
+   * ran (Codex P1 PRRT_kwDOPxxmWM6cEl37): a provider-error drain runs
+   * un-awaited and can still be persisting when an automatic retry emits
+   * stream-start — re-adding the settled marker then would let a set_goal in
+   * the retry bypass mid-stream deferral.
+   */
+  private readonly streamStartGenerations = new Map<string, number>();
   private nextGoalStreamStampSequence = 1;
   private goalContinuationBridge: GoalContinuationRuntimeBridge | null = null;
   private goalContinuationDispatcher: IdleDispatcher | null = null;
@@ -569,7 +586,12 @@ export class WorkspaceGoalService {
         return { mode: "active" };
       }
       if (message.metadata?.muxMetadata?.type === "goal-pause-boundary") {
-        return { mode: "paused", pausedBy: "pause_boundary" };
+        const boundaryGoalId = message.metadata.muxMetadata.goalId;
+        return {
+          mode: "paused",
+          pausedBy: "pause_boundary",
+          ...(boundaryGoalId != null ? { boundaryGoalId } : {}),
+        };
       }
       if (message.metadata?.synthetic === true) {
         continue;
@@ -601,6 +623,20 @@ export class WorkspaceGoalService {
     chatTailMode: ChatTailGoalModeResult
   ): GoalRecordV1 {
     if (chatTailMode.mode == null || (goal.status !== "active" && goal.status !== "paused")) {
+      return goal;
+    }
+
+    // Codex P2 (PRRT_kwDOPxxmWM6cEl4F): a pause boundary stamped for a
+    // DIFFERENT goal is a stale pause finalizer's artifact — its append raced
+    // a replacement's persistence and landed after the newer goal was written.
+    // Applying it here would silently pause a goal the user never paused.
+    // Treat it as no signal; legacy boundaries without a goalId keep pausing
+    // whatever goal is current.
+    if (
+      chatTailMode.pausedBy === "pause_boundary" &&
+      chatTailMode.boundaryGoalId != null &&
+      chatTailMode.boundaryGoalId !== goal.goalId
+    ) {
       return goal;
     }
 
@@ -687,7 +723,10 @@ export class WorkspaceGoalService {
     });
   }
 
-  private async appendGoalPauseBoundaryIfNeeded(workspaceId: string): Promise<boolean> {
+  private async appendGoalPauseBoundaryIfNeeded(
+    workspaceId: string,
+    goalId: string
+  ): Promise<boolean> {
     const chatTailMode = await this.readChatTailGoalMode(workspaceId);
     if (chatTailMode.mode !== "active") {
       return true;
@@ -697,6 +736,8 @@ export class WorkspaceGoalService {
     // declarative state model as Resume without rewriting prior continuation
     // history. The row is model-visible but not rendered unless synthetic debug
     // messages are enabled, matching other context-only system breadcrumbs.
+    // The goalId scope keeps a stale pause's boundary from ever reconciling a
+    // replacement goal to paused (Codex P2 PRRT_kwDOPxxmWM6cEl4F).
     const message = createMuxMessage(
       `goal-paused-${Date.now()}-${crypto.randomUUID()}`,
       "user",
@@ -704,7 +745,7 @@ export class WorkspaceGoalService {
       {
         timestamp: Date.now(),
         synthetic: true,
-        muxMetadata: { type: "goal-pause-boundary" },
+        muxMetadata: { type: "goal-pause-boundary", goalId },
       }
     );
     const appendResult = await this.historyService.appendToHistory(workspaceId, message);
@@ -1271,6 +1312,10 @@ export class WorkspaceGoalService {
     // accounting previews (a match there means "deltas from this stream are
     // stale", set by terminal-error restoration).
     this.drainSettledWorkspaces.delete(workspaceId);
+    this.streamStartGenerations.set(
+      workspaceId,
+      (this.streamStartGenerations.get(workspaceId) ?? 0) + 1
+    );
   }
 
   async recordUserStoppedStream(workspaceId: string, stoppedAtMs = Date.now()): Promise<void> {
@@ -2730,7 +2775,10 @@ export class WorkspaceGoalService {
         return result;
       }
       this.pendingContinuationCandidates.delete(input.workspaceId);
-      const pauseBoundaryReady = await this.appendGoalPauseBoundaryIfNeeded(input.workspaceId);
+      const pauseBoundaryReady = await this.appendGoalPauseBoundaryIfNeeded(
+        input.workspaceId,
+        result.data.goalId
+      );
       if (!pauseBoundaryReady) {
         return result;
       }
@@ -3077,6 +3125,29 @@ export class WorkspaceGoalService {
   }
 
   /**
+   * A stream whose cost previews became ineligible mid-flight (the goal was
+   * paused/completed, or a budget edit flipped it to budget_limited while a
+   * maintenance stream ran) must not keep showing its earlier live preview.
+   *
+   * Codex P2 (PRRT_kwDOPxxmWM6cEl4P): merely returning the durable snapshot
+   * left the stale preview cached in `liveGoalPreviewSnapshots`, where
+   * `pushLiveGoalPreviewOverlay` kept re-emitting cost that final accounting
+   * discards — the Goal UI then snapped backward only at stream end. Clear the
+   * cache and publish the durable record once, so later deltas (no cached
+   * preview) stay cheap no-ops.
+   */
+  private async resetIneligibleCostPreview(
+    workspaceId: string,
+    current: GoalRecordV1
+  ): Promise<GoalSnapshot | null> {
+    const hadPreview = this.liveGoalPreviewSnapshots.delete(workspaceId);
+    if (hadPreview) {
+      return this.pushSnapshot(workspaceId, current);
+    }
+    return toGoalSnapshot(current);
+  }
+
+  /**
    * Push a live cost preview to the activity snapshot. The cost is the
    * cumulative current-stream cost on top of the durable base;
    * `recordStreamAccounting` performs final accounting at stream end.
@@ -3126,7 +3197,7 @@ export class WorkspaceGoalService {
       }
 
       if (current.status === "paused" || current.status === "complete") {
-        return toGoalSnapshot(current);
+        return this.resetIneligibleCostPreview(input.workspaceId, current);
       }
       // Mirror recordStreamAccounting's maintenance skip: final accounting
       // discards non-goal-driven cost on a budget_limited goal, so previewing
@@ -3137,7 +3208,7 @@ export class WorkspaceGoalService {
         previewOriginKind !== "goal_continuation" &&
         previewOriginKind !== "goal_budget_limit"
       ) {
-        return toGoalSnapshot(current);
+        return this.resetIneligibleCostPreview(input.workspaceId, current);
       }
 
       const preview = GoalRecordV1Schema.parse({
@@ -3419,6 +3490,11 @@ export class WorkspaceGoalService {
 
   async applyPendingAfterStreamEnd(workspaceId: string): Promise<GoalRecordV1 | null> {
     this.liveGoalPreviewSnapshots.delete(workspaceId);
+    // Codex P1 (PRRT_kwDOPxxmWM6cEl37): captured synchronously at entry. The
+    // provider-error path launches this drain un-awaited, so an automatic
+    // retry's stream-start can land while the drain is persisting — the exit
+    // below must not mark that newer live stream settled.
+    const streamStartGenerationAtEntry = this.streamStartGenerations.get(workspaceId) ?? 0;
     // Codex P2 (PRRT_kwDOPxxmWM6cBr9Q): bump the drain generation at entry so
     // setters admitted BEFORE this drain detect it at their in-lock recheck
     // and persist directly instead of installing a mutation this drain may
@@ -3520,7 +3596,14 @@ export class WorkspaceGoalService {
     // final empty-map check) so they observe a deterministic "no stream-end
     // hook is coming" state and persist directly until the next stream start
     // clears it.
-    this.drainSettledWorkspaces.add(workspaceId);
+    //
+    // Codex P1 (PRRT_kwDOPxxmWM6cEl37): unless a newer stream already started
+    // while this drain ran — its recordStreamStarted cleared the marker, and
+    // re-adding it here would let a set_goal in that live stream persist
+    // mid-stream, bypassing abort-time discard and stream-end accounting.
+    if ((this.streamStartGenerations.get(workspaceId) ?? 0) === streamStartGenerationAtEntry) {
+      this.drainSettledWorkspaces.add(workspaceId);
+    }
 
     // Stream-end deferred auto-promotion.
     //
