@@ -1,4 +1,5 @@
 import {
+  containsAgentEnvelopeLookalike,
   getValidAgentPeerMessageMeta,
   neutralizeAgentEnvelopeLookalikes,
   parseAgentMessageEnvelope,
@@ -57,7 +58,7 @@ export function neutralizeAgentEnvelopeLookalikesForProvider(messages: MuxMessag
     let msgChanged = false;
     const nextParts = msg.parts.map((part) => {
       if (part.type === "text") {
-        if (isAuthenticPeerRow || !part.text.includes("mux_agent_message")) {
+        if (isAuthenticPeerRow || !containsAgentEnvelopeLookalike(part.text)) {
           return part;
         }
         msgChanged = true;
@@ -110,7 +111,7 @@ function toRecord(value: unknown): Record<string, unknown> {
  */
 function neutralizeStringsDeep(value: unknown): unknown {
   if (typeof value === "string") {
-    return value.includes("mux_agent_message") ? neutralizeAgentEnvelopeLookalikes(value) : value;
+    return containsAgentEnvelopeLookalike(value) ? neutralizeAgentEnvelopeLookalikes(value) : value;
   }
   if (Array.isArray(value)) {
     let changed = false;
