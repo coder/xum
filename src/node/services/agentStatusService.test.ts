@@ -24,15 +24,13 @@ interface AgentStatusServiceInternals {
   runForWorkspace(
     workspaceId: string,
     observedRecency?: number | null,
-    streaming?: boolean,
-    hasSidebarStatus?: boolean | null
+    streaming?: boolean
   ): Promise<void>;
 }
 
 interface ActivitySnapshotForTest {
   streaming: boolean;
   recency?: number;
-  todoStatus?: { emoji: string; message: string };
 }
 
 describe("AgentStatusService", () => {
@@ -63,6 +61,8 @@ describe("AgentStatusService", () => {
   let getSidebarStatusInputHashMock: ReturnType<
     typeof mock<(workspaceId: string) => Promise<string | null>>
   >;
+  /** workspaceId → inputHash persisted with the current sidebar status. */
+  let sidebarSlot: Map<string, string | null>;
   let getSnapshotMock: ReturnType<
     typeof mock<(workspaceId: string) => Promise<{ recency: number } | null>>
   >;
@@ -128,16 +128,27 @@ describe("AgentStatusService", () => {
       emitWorkspaceActivity: emitWorkspaceActivityMock,
     } as unknown as WorkspaceService;
 
-    setSidebarStatusMock = mock((_workspaceId: string, _status: unknown, _options?: unknown) =>
-      Promise.resolve({ recency: 0 })
+    // Stateful fake for the shared status slot: mirrors the real service,
+    // where the reader returns a hash only while a live status backs it. The
+    // dedup recheck depends on this coupling, so a plain null-returning mock
+    // would wrongly invalidate every persisted settle.
+    sidebarSlot = new Map();
+    setSidebarStatusMock = mock(
+      (workspaceId: string, status: unknown, options?: { inputHash?: string | null }) => {
+        if (status) {
+          sidebarSlot.set(workspaceId, options?.inputHash ?? null);
+        } else {
+          sidebarSlot.delete(workspaceId);
+        }
+        return Promise.resolve({ recency: 0 });
+      }
     );
     // Default: no snapshots → no workspaces are streaming → idle intervals.
     // Tests that exercise the active intervals override this per-test.
     getAllSnapshotsMock = mock(() => Promise.resolve(new Map<string, ActivitySnapshotForTest>()));
     getSnapshotMock = mock((_workspaceId: string) => Promise.resolve(null));
-    // Default: no persisted dedup hash → first consideration behaves as before.
-    getSidebarStatusInputHashMock = mock((_workspaceId: string) =>
-      Promise.resolve<string | null>(null)
+    getSidebarStatusInputHashMock = mock((workspaceId: string) =>
+      Promise.resolve(sidebarSlot.get(workspaceId) ?? null)
     );
     mockExtensionMetadata = {
       setSidebarStatus: setSidebarStatusMock,
@@ -631,14 +642,7 @@ describe("AgentStatusService", () => {
     getAllSnapshotsMock.mockImplementation(() =>
       Promise.resolve(
         new Map<string, ActivitySnapshotForTest>([
-          // todoStatus present: mirrors production, where the first tick's
-          // successful persist writes the status this scheduler later sees.
-          // Without it the cleared-slot invalidation path would (correctly)
-          // force regeneration and mask the stale-recency behavior under test.
-          [
-            staleWorkspaceId,
-            { streaming: false, recency, todoStatus: { emoji: "🛠️", message: "Editing source" } },
-          ],
+          [staleWorkspaceId, { streaming: false, recency }],
         ])
       )
     );
@@ -1088,11 +1092,12 @@ describe("AgentStatusService", () => {
     });
   });
 
-  test("invalidates the in-memory settled hash when another writer clears the status slot", async () => {
-    // Codex review round 2: within one process, setTodoStatus(null) can clear
-    // the shared todoStatus slot after we settled by persisting. The cached
-    // hash must not keep the dedup branch skipping on the unchanged
-    // transcript, or the sidebar stays blank until the transcript changes.
+  test("regenerates when another writer clears the status slot behind a settled hash", async () => {
+    // Codex review rounds 2-3: setTodoStatus(null) can clear the shared
+    // todoStatus slot at any time after we settled by persisting — including
+    // between the scheduler's snapshot read and the dedup check. The dedup
+    // branch must confirm the persisted hash still exists at the skip
+    // decision, or the sidebar stays blank on an unchanged transcript.
     await historyHandle.historyService.appendToHistory(
       workspaceId,
       createMuxMessage("u1", "user", "Idle workspace")
@@ -1105,19 +1110,20 @@ describe("AgentStatusService", () => {
     expect(setSidebarStatusMock).toHaveBeenCalledTimes(1);
 
     // Status still present: normal dedup skip.
-    await internals.runForWorkspace(workspaceId, null, false, true);
+    await internals.runForWorkspace(workspaceId);
     expect(generateSpy).toHaveBeenCalledTimes(1);
 
     // Slot cleared by the todo path: the settled hash must drop and the
-    // same transcript must regenerate.
-    await internals.runForWorkspace(workspaceId, null, false, false);
+    // same transcript must regenerate on the very next consideration.
+    sidebarSlot.delete(workspaceId);
+    await internals.runForWorkspace(workspaceId);
     expect(generateSpy).toHaveBeenCalledTimes(2);
     expect(setSidebarStatusMock).toHaveBeenCalledTimes(2);
   });
 
-  test("a cleared status slot does not retrigger placeholder-settled transcripts", async () => {
+  test("an empty status slot does not retrigger placeholder-settled transcripts", async () => {
     // Placeholder settles never persisted a status, so "slot has no status"
-    // is their steady state, not an invalidation signal. Dropping their dedup
+    // is their steady state, not an invalidation signal. Rechecking them
     // would re-call the model on the same placeholder-producing transcript
     // every tick and burn provider budget.
     await historyHandle.historyService.appendToHistory(
@@ -1134,11 +1140,11 @@ describe("AgentStatusService", () => {
 
     const service = createService();
     const internals = getInternals(service);
-    await internals.runForWorkspace(workspaceId, null, false, false);
+    await internals.runForWorkspace(workspaceId);
     expect(generateSpy).toHaveBeenCalledTimes(1);
     expect(setSidebarStatusMock).not.toHaveBeenCalled();
 
-    await internals.runForWorkspace(workspaceId, null, false, false);
+    await internals.runForWorkspace(workspaceId);
     expect(generateSpy).toHaveBeenCalledTimes(1);
   });
 

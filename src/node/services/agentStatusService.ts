@@ -247,11 +247,7 @@ export class AgentStatusService {
       // present-progressive tense when the assistant is mid-response.
       // Snapshots were already read once per tick above.
       const streaming = snapshots.get(id)?.streaming === true;
-      // Whether a live sidebar status still backs the shared todoStatus slot;
-      // runForWorkspace uses the false case to drop a settled hash whose
-      // status another writer has since cleared.
-      const hasSidebarStatus = snapshots.get(id)?.todoStatus != null;
-      const promise = this.runForWorkspace(id, recency, streaming, hasSidebarStatus).finally(() => {
+      const promise = this.runForWorkspace(id, recency, streaming).finally(() => {
         state.inFlight = false;
         this.inFlightPromises.delete(promise);
       });
@@ -262,9 +258,7 @@ export class AgentStatusService {
   private async runForWorkspace(
     workspaceId: string,
     observedRecency: number | null = null,
-    streaming = false,
-    // null = caller has no signal about the persisted status slot.
-    hasSidebarStatus: boolean | null = null
+    streaming = false
   ): Promise<void> {
     try {
       const transcript = await this.buildTrailingTranscript(workspaceId);
@@ -308,16 +302,6 @@ export class AgentStatusService {
           }
         }
       }
-      // Codex review: another writer (the todo path) can clear the shared
-      // status slot after we settled by persisting. Keeping the settled hash
-      // would let the dedup branch skip regeneration and leave the sidebar
-      // blank until the transcript changes, so drop it. Placeholder settles
-      // (lastInputHashPersisted=false) keep their dedup — see the field doc.
-      if (hasSidebarStatus === false && state.lastInputHashPersisted) {
-        state.lastInputHash = null;
-        state.lastInputHashPersisted = false;
-      }
-
       const markRecencyObserved = () => {
         if (observedRecency !== null) {
           state.lastObservedRecency = observedRecency;
@@ -378,8 +362,24 @@ export class AgentStatusService {
       // the streaming bit must force a re-generation so the new liveness
       // hint actually applies.
       if (state.lastInputHash === dedupHash) {
-        markRecencyObserved();
-        return;
+        // Codex review: another writer (the todo path) can clear the shared
+        // status slot at any time, including between scheduler reads, so a
+        // dispatch-time snapshot would be stale here. Confirm at the skip
+        // decision itself: the authoritative reader returns null once the
+        // slot is cleared. Placeholder settles skip the recheck — they never
+        // persisted a status, so an empty slot is their steady state, and
+        // rechecking would retry the same placeholder transcript every tick.
+        const stillBacked =
+          !state.lastInputHashPersisted ||
+          (await this.extensionMetadata.getSidebarStatusInputHash(workspaceId)) === dedupHash;
+        if (stillBacked) {
+          markRecencyObserved();
+          return;
+        }
+        // Slot cleared (or rewritten) since we settled: drop the stale
+        // settle and regenerate now instead of leaving the sidebar blank.
+        state.lastInputHash = null;
+        state.lastInputHashPersisted = false;
       }
       if (isWaitingForProviderFailureCooldown(state, dedupHash, this.clock())) {
         // Provider-side failures are not permanently settled: after the
@@ -672,14 +672,25 @@ function computeTranscriptHash(transcript: string): string {
 }
 
 /**
+ * Codex review: the dedup hash is persisted across restarts, so unlike the
+ * old process-local cache it is no longer naturally invalidated by upgrades.
+ * Bump this when status-generation semantics change without changing
+ * transcript bytes (prompt guidance, placeholder rules, tool-summary
+ * interpretation) so persisted hashes from older builds miss once and
+ * stale statuses regenerate predictably.
+ */
+const STATUS_GENERATION_VERSION = "G1";
+
+/**
  * Dedup key for generation: combines the transcript hash with the
  * streaming bit, because `streaming` changes the prompt's tense guidance
  * (and therefore the generated status). Same transcript + different
- * streaming → must regenerate. Cheap: hashes a 3-byte prefix + the
+ * streaming → must regenerate. Cheap: hashes a short prefix + the
  * already-computed transcript hash.
  */
 function computeDedupHash(transcriptHash: string, streaming: boolean): string {
   return createHash("sha256")
+    .update(STATUS_GENERATION_VERSION + "\n")
     .update(streaming ? "S1\n" : "S0\n")
     .update(transcriptHash)
     .digest("hex");
