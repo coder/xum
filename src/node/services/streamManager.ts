@@ -3846,11 +3846,7 @@ export class StreamManager extends EventEmitter {
 
     return {
       messageId: streamInfo.messageId,
-      // Clamp AFTER categorization/enhancement: some SDK errors embed the
-      // entire serialized prompt in their message (AI_TypeValidationError via
-      // the cause walk), and an unbounded message would be persisted to
-      // history metadata, shipped over IPC, and rendered in the chat.
-      error: clampErrorMessage(errorMessage),
+      error: errorMessage,
       errorType,
       acpPromptId: streamInfo.initialMetadata?.acpPromptId,
     };
@@ -3864,6 +3860,14 @@ export class StreamManager extends EventEmitter {
     streamInfo: WorkspaceStreamInfo,
     payload: StreamErrorPayload & { errorType: StreamErrorType }
   ): Promise<void> {
+    // Clamp at the single choke point every stream error payload passes
+    // through before persist/emit, including buildStreamErrorPayload's
+    // early-return branches (e.g. ModelRefusalError, whose fallbackNote can
+    // embed another error's message). Some SDK errors embed the entire
+    // serialized prompt in their message (AI_TypeValidationError via the
+    // cause walk); unbounded, that would be persisted to history metadata,
+    // shipped over IPC, and rendered in the chat.
+    payload = { ...payload, error: clampErrorMessage(payload.error) };
     const refusalFinishReason =
       payload.errorType === "model_refusal"
         ? ([streamInfo.terminalFinishReason, streamInfo.terminalRawFinishReason].find(

@@ -10,7 +10,7 @@
  * tool-result model message, which the AI SDK validates against a strict
  * JSONValue schema. A non-JSON value that serialization would silently
  * normalize (e.g. `undefined` inside an array) instead fails that validation
- * and kills the live stream with AI_InvalidPromptError — while the retry,
+ * and kills the live stream with AI_InvalidPromptError, while the retry,
  * rebuilt from rehydrated history, succeeds. Normalizing up front keeps the
  * live and rehydrated shapes identical.
  */
@@ -49,18 +49,40 @@ function scrubToJsonSafe(value: unknown, ancestors: WeakSet<object>): unknown {
   if (ancestors.has(value)) return "[Circular]";
   ancestors.add(value);
   try {
-    const withToJson = value as { toJSON?: unknown };
-    if (typeof withToJson.toJSON === "function") {
+    // Read toJSON once, guarded: the property itself may be a throwing
+    // getter, which must degrade to "no toJSON" instead of throwing here.
+    let toJson: unknown;
+    try {
+      toJson = (value as { toJSON?: unknown }).toJSON;
+    } catch {
+      toJson = undefined;
+    }
+    if (typeof toJson === "function") {
       try {
-        return scrubToJsonSafe((withToJson.toJSON as (key?: string) => unknown)(), ancestors);
+        return scrubToJsonSafe((toJson as (this: unknown) => unknown).call(value), ancestors);
       } catch {
         return undefined;
       }
     }
     if (Array.isArray(value)) {
-      return value.map((element) => scrubToJsonSafe(element, ancestors) ?? null);
+      // Index loop instead of .map: .map skips holes in sparse arrays, which
+      // would survive the clone as `undefined` reads: the exact non-JSON
+      // shape this helper exists to eliminate. JSON.stringify emits null for
+      // holes; do the same, and for throwing index getters too (array length
+      // must be preserved, so dropping is not an option).
+      const items: unknown[] = new Array(value.length);
+      for (let i = 0; i < value.length; i++) {
+        let element: unknown;
+        try {
+          element = value[i];
+        } catch {
+          element = null;
+        }
+        items[i] = scrubToJsonSafe(element, ancestors) ?? null;
+      }
+      return items;
     }
-    const result: Record<string, unknown> = {};
+    const entries: Array<[string, unknown]> = [];
     for (const key of Object.keys(value)) {
       let element: unknown;
       try {
@@ -69,9 +91,12 @@ function scrubToJsonSafe(value: unknown, ancestors: WeakSet<object>): unknown {
         continue; // Throwing getter: drop the property, keep the rest.
       }
       const scrubbed = scrubToJsonSafe(element, ancestors);
-      if (scrubbed !== undefined) result[key] = scrubbed;
+      if (scrubbed !== undefined) entries.push([key, scrubbed]);
     }
-    return result;
+    // fromEntries defines own data properties, so a literal "__proto__" key
+    // stays a plain property instead of silently mutating the clone's
+    // prototype (and vanishing from the JSON shape).
+    return Object.fromEntries(entries);
   } finally {
     // Remove on the way out so shared (non-cyclic) references still clone;
     // only genuine ancestor revisits are treated as cycles.

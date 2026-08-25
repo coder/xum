@@ -63,4 +63,34 @@ describe("jsonSafeClone", () => {
     const cloned = jsonSafeClone(messy);
     expect(JSON.parse(JSON.stringify(cloned))).toEqual(cloned);
   });
+
+  it("fills sparse array holes with null in the fallback path", () => {
+    // BigInt forces the manual scrub; holes must become null (as JSON.stringify
+    // emits), not survive as undefined reads that fail strict JSONValue checks.
+    const value = { sparse: new Array(2) as unknown[], big: 1n };
+    const cloned = jsonSafeClone(value) as { sparse: unknown[]; big: string };
+    expect(cloned.sparse).toEqual([null, null]);
+    expect(Object.hasOwn(cloned.sparse, 0)).toBe(true);
+    expect(Object.hasOwn(cloned.sparse, 1)).toBe(true);
+    expect(JSON.parse(JSON.stringify(cloned))).toEqual(cloned);
+  });
+
+  it("treats a throwing toJSON getter as absent instead of throwing", () => {
+    const value = {
+      keep: "x",
+      get toJSON(): unknown {
+        throw new Error("toJSON getter boom");
+      },
+    };
+    expect(jsonSafeClone(value)).toEqual({ keep: "x" });
+  });
+
+  it("keeps a literal __proto__ key as an own property in the fallback path", () => {
+    const nested = JSON.parse('{"__proto__": {"x": 1}}') as Record<string, unknown>;
+    const value = { big: 1n, nested };
+    const cloned = jsonSafeClone(value) as { big: string; nested: Record<string, unknown> };
+    expect(Object.hasOwn(cloned.nested, "__proto__")).toBe(true);
+    expect(Object.getPrototypeOf(cloned.nested)).toBe(Object.prototype);
+    expect(JSON.stringify(cloned.nested)).toBe('{"__proto__":{"x":1}}');
+  });
 });
