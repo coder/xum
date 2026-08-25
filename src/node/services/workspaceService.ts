@@ -12081,7 +12081,17 @@ export class WorkspaceService extends EventEmitter {
       // Finished init states remain cached; only "running" should block continuations.
       isInitializing: initState?.status === "running",
       isRuntimeCompatible: true,
-      isBusy: session?.isBusy() === true,
+      // Codex P1 (PRRT_kwDOPxxmWM6cECpR): a direct send does not set PREPARING
+      // until late in AgentSession.sendMessage, so goal-continuation
+      // eligibility must also treat in-preflight sends as busy. Otherwise a
+      // kickoff candidate restored while a pre-goal manual send is mid-flight
+      // (row already durable, session still phase-idle) can be consumed and
+      // dispatched concurrently with — or ahead of — the user's turn.
+      // `preflightSendCounts` is incremented synchronously at sendMessage
+      // entry and held until the send settles; admitted sends have set
+      // PREPARING (busy) by the time it releases. Queue-dispatched sends set
+      // PREPARING synchronously before dispatch and are covered by isBusy().
+      isBusy: session?.isBusy() === true || (this.preflightSendCounts.get(workspaceId) ?? 0) > 0,
       hasQueuedMessages: session?.hasPendingManualFollowUp() === true,
       hasPendingFollowUp: false,
     };

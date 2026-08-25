@@ -2716,6 +2716,19 @@ export class WorkspaceGoalService {
     }
 
     if (input.status === "paused" && result.data.status === "paused") {
+      // Codex P2 (PRRT_kwDOPxxmWM6cECpZ): finalization runs outside the goal
+      // file lock, so a replacement or clear-and-promote queued behind our
+      // pause can persist before this resumes. Applying stale pause side
+      // effects would delete the NEWER goal's continuation candidate and
+      // append a pause boundary that chat-tail sync applies to the newer goal
+      // — silently pausing a replacement the user just created. Re-verify the
+      // paused goal is still the durable record (mirrors the arming identity
+      // check below); no await sits between this read and the candidate
+      // delete.
+      const durableAtPause = await this.readGoalFile(input.workspaceId);
+      if (durableAtPause?.goalId !== result.data.goalId || durableAtPause.status !== "paused") {
+        return result;
+      }
       this.pendingContinuationCandidates.delete(input.workspaceId);
       const pauseBoundaryReady = await this.appendGoalPauseBoundaryIfNeeded(input.workspaceId);
       if (!pauseBoundaryReady) {
@@ -2991,7 +3004,10 @@ export class WorkspaceGoalService {
     });
   }
 
-  async acknowledgeUser(workspaceId: string): Promise<GoalRecordV1 | null> {
+  async acknowledgeUser(
+    workspaceId: string,
+    options?: { authoredAtMs?: number | null }
+  ): Promise<GoalRecordV1 | null> {
     assert(workspaceId.trim().length > 0, "acknowledgeUser requires workspaceId");
     return this.fileLocks.withLock(workspaceId, async () => {
       const current = await this.readGoalFile(workspaceId);
@@ -3000,6 +3016,20 @@ export class WorkspaceGoalService {
         return null;
       }
       if (current.requireUserAcknowledgmentSinceMs == null) {
+        await this.pushSnapshot(workspaceId, current);
+        return current;
+      }
+      // Codex P1 (PRRT_kwDOPxxmWM6cECpj): a message authored BEFORE the
+      // acknowledgment gate was set cannot acknowledge it. A pre-goal send
+      // stuck in preflight across a user stop would otherwise clear the
+      // stop's durable gate; its pre-goal classification then skips the
+      // auto-pause, so after a restart (which loses the in-memory stop
+      // timestamp) recovery re-arms the goal despite the newer Stop. Callers
+      // acting for an explicit fresh user action (slash workflows, direct
+      // sends carrying their request-entry authoring time) postdate the gate
+      // and clear it as before.
+      const authoredAtMs = toValidEpochMs(options?.authoredAtMs);
+      if (authoredAtMs != null && authoredAtMs < current.requireUserAcknowledgmentSinceMs) {
         await this.pushSnapshot(workspaceId, current);
         return current;
       }

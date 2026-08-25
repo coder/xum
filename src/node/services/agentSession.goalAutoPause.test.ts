@@ -322,6 +322,32 @@ describe("AgentSession goal safety hooks", () => {
     session.dispose();
   });
 
+  test("delayed pre-stop sends do not clear a newer stop's acknowledgment gate", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cECpj): a pre-goal send stuck in preflight
+    // until after a user stop must not acknowledge that stop. Clearing the
+    // durable requireUserAcknowledgmentSinceMs gate here would let restart
+    // recovery re-arm the active goal despite the newer Stop action (the
+    // in-memory stop timestamp does not survive restarts).
+    const workspaceId = "pre-stop-send-keeps-gate";
+    const { session, goalService, cleanup } = await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const enqueuedAtMs = Date.now();
+    const created = await setGoalOk(goalService, { workspaceId, objective: "Fresh goal" });
+    await goalService.recordUserStoppedStream(workspaceId, created.createdAtMs + 5_000);
+
+    const result = await session.sendMessage("Queued before the goal existed", SEND_OPTIONS, {
+      enqueuedAtMs,
+    });
+
+    expect(result.success).toBe(true);
+    // Pre-goal classification keeps the goal active, but the stop's gate must
+    // survive so continuations stay blocked until the user acknowledges.
+    expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
+    const goal = await goalService.getGoal(workspaceId);
+    expect(goal?.requireUserAcknowledgmentSinceMs).not.toBeNull();
+    session.dispose();
+  });
+
   test("pre-goal queued sends restore the suspended kickoff candidate", async () => {
     // Complement to the suspension test above: a queued send authored before
     // the goal existed is not an intervention, so the taken candidate must be

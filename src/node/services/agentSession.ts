@@ -1645,7 +1645,12 @@ export class AgentSession {
     // candidate cleared conservatively (it was taken above): once the failed
     // send returns the workspace to idle, a stale candidate could otherwise
     // dispatch a continuation despite the user's persisted intervention.
-    const goal = await goalService.acknowledgeUser(this.workspaceId);
+    //
+    // The authoring time keeps a delayed pre-stop send from clearing a NEWER
+    // stop's acknowledgment gate (Codex P1 PRRT_kwDOPxxmWM6cECpj).
+    const goal = await goalService.acknowledgeUser(this.workspaceId, {
+      authoredAtMs: input.enqueuedAtMs,
+    });
 
     // Queue race: a message the user typed while the goal-creating turn was
     // still streaming predates the goal itself — the model's queued set_goal

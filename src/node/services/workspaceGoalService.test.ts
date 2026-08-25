@@ -2708,6 +2708,75 @@ describe("WorkspaceGoalService", () => {
     expect(await goalFileExists(config, workspaceId)).toBe(false);
   });
 
+  test("stale pause finalization does not pause a newer replacement goal", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cECpZ): pause finalization runs outside the
+    // goal file lock — a replacement queued behind the pause's persist can
+    // land before the pause's finalization resumes. The stale pause must not
+    // delete the newer goal's kickoff candidate or append a pause boundary
+    // that chat-tail sync applies to the newer goal.
+    const dispatcher = new IdleDispatcher();
+    service.registerGoalContinuationConsumer(dispatcher, {
+      hasActiveDescendantTasks: () => false,
+      // Busy runtime keeps armed candidates inspectable (not consumed).
+      getRuntimeState: () => ({ isRuntimeCompatible: true, isBusy: true }),
+      executeGoalContinuation: () => Promise.resolve(true),
+      getKickoffSendOptions: () => Promise.resolve({ model: "openai:gpt-4o", agentId: "exec" }),
+    });
+    const goalA = await setGoalOk(service, { workspaceId, objective: "Goal A" });
+    const goalB = await setGoalOk(service, { workspaceId, objective: "Goal B" });
+
+    // Replay goal A's pause finalization as if its setter resumed only after
+    // B replaced A (MutexMap admitted B between A's persist and finalize).
+    const internals = service as unknown as {
+      finalizeGoalPersistence: (
+        input: { workspaceId: string; status: GoalStatus },
+        result: { success: true; data: GoalRecordV1 }
+      ) => Promise<unknown>;
+      pendingContinuationCandidates: Map<string, { goalId: string }>;
+    };
+    await internals.finalizeGoalPersistence(
+      { workspaceId, status: "paused" },
+      { success: true, data: { ...goalA, status: "paused" } }
+    );
+
+    expect(internals.pendingContinuationCandidates.get(workspaceId)?.goalId).toBe(goalB.goalId);
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: goalB.goalId,
+      status: "active",
+    });
+    const history = await historyService.getLastMessages(workspaceId, 20);
+    expect(history.success).toBe(true);
+    if (history.success) {
+      const boundaryRows = history.data.filter(
+        (message) => message.metadata?.muxMetadata?.type === "goal-pause-boundary"
+      );
+      expect(boundaryRows).toHaveLength(0);
+    }
+  });
+
+  test("acknowledgeUser ignores messages authored before the acknowledgment gate", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cECpj): a send authored before a user stop
+    // set the acknowledgment gate cannot acknowledge that stop — clearing the
+    // durable gate would let restart recovery re-arm the goal despite the
+    // newer Stop action.
+    const created = await setGoalOk(service, { workspaceId, objective: "Gated goal" });
+    await service.recordUserStoppedStream(workspaceId, created.createdAtMs + 5_000);
+    const gated = await service.getGoal(workspaceId);
+    expect(gated?.requireUserAcknowledgmentSinceMs).not.toBeNull();
+
+    // Authored before the stop: the gate must survive.
+    const afterStale = await service.acknowledgeUser(workspaceId, {
+      authoredAtMs: created.createdAtMs + 1_000,
+    });
+    expect(afterStale?.requireUserAcknowledgmentSinceMs).not.toBeNull();
+
+    // Authored after the stop: an informed user action clears the gate.
+    const afterFresh = await service.acknowledgeUser(workspaceId, {
+      authoredAtMs: created.createdAtMs + 6_000,
+    });
+    expect(afterFresh?.requireUserAcknowledgmentSinceMs).toBeNull();
+  });
+
   test("a stale kickoff finalizer does not overwrite a newer goal's candidate", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cClKY): kickoff finalization runs outside the
     // goal file lock. While finalizer A awaits kickoff options, a newer setter

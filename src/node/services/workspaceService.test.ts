@@ -14525,6 +14525,24 @@ describe("WorkspaceService.getGoalContinuationRuntimeState", () => {
     expect(service.getGoalContinuationRuntimeState("ws-1").isInitializing).toBe(true);
   });
 
+  test("in-preflight direct sends report the workspace busy for goal continuations", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cECpR): a direct send does not set PREPARING
+    // until late in AgentSession.sendMessage, so a kickoff candidate restored
+    // while the send is mid-preflight (manual row already durable, session
+    // still phase-idle) could otherwise be consumed by goal-continuation
+    // eligibility and dispatched ahead of the user's turn. The runtime busy
+    // predicate must include sendMessage's preflight counter.
+    const service = await makeService(undefined);
+    expect(service.getGoalContinuationRuntimeState("ws-1").isBusy).toBe(false);
+
+    const counts = (service as unknown as { preflightSendCounts: Map<string, number> })
+      .preflightSendCounts;
+    counts.set("ws-1", 1);
+    expect(service.getGoalContinuationRuntimeState("ws-1").isBusy).toBe(true);
+    counts.delete("ws-1");
+    expect(service.getGoalContinuationRuntimeState("ws-1").isBusy).toBe(false);
+  });
+
   test("kickoff continuation fires on a freshly-init'd workspace", async () => {
     const workspaceId = "kickoff-after-init";
     const service = await makeService({
