@@ -18,7 +18,7 @@ import { isErrnoWithCode } from "@/node/utils/fs";
 import type { BackupCommandApproval } from "@/common/orpc/schemas/backup";
 
 export const BACKUP_SCHEMA_VERSION = 1;
-const BACKUP_MANIFEST_FILE = "manifest.json";
+export const BACKUP_MANIFEST_FILE = "manifest.json";
 /**
  * A payload is read wholly into memory on both sides, and the repository side is written by
  * whoever can push to the branch, so an oversized entry would crash the main process during

@@ -628,6 +628,55 @@ describe("backup adapters", () => {
     expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe("canonical\n");
   });
 
+  it("ignores a broken legacy mux/ tree when the configured xum/ backup exists", async () => {
+    await writeFixtureFile(muxRoot, "AGENTS.md", "canonical\n");
+    const gitRepo = createBackupGitRepo({ cacheRoot });
+    const payload = createBackupPayloadStore({ config });
+    const canonical = await gitRepo.prepare({ ...settings, path: "xum/" });
+    await payload.exportTo({ repositoryRoot: canonical.rootDir, managedPath: "xum/" });
+    await gitRepo.commitAndPush(canonical, {
+      message: "Back up Xum settings",
+      expectedRemoteCommit: canonical.remoteCommit,
+    });
+
+    // A leftover legacy tree that would fail payload validation (a gitlink here) must not
+    // block the canonical backup: unused, it is neither validated nor materialized.
+    const seed = path.join(tempDir, "legacy-seed");
+    await runGit(["clone", "--quiet", originPath, seed]);
+    await writeFixtureFile(seed, "mux/manifest.json", "not a real backup\n");
+    await runGit(["-C", seed, "add", "."]);
+    await runGit([
+      "-C",
+      seed,
+      "update-index",
+      "--add",
+      "--cacheinfo",
+      "160000,0123456789012345678901234567890123456789,mux/linked",
+    ]);
+    await runGit([
+      "-C",
+      seed,
+      "-c",
+      "user.email=legacy@example.com",
+      "-c",
+      "user.name=Legacy",
+      "commit",
+      "--quiet",
+      "-m",
+      "legacy leftovers",
+    ]);
+    await runGit(["-C", seed, "push", "--quiet", "origin", "main"]);
+
+    await writeFixtureFile(muxRoot, "AGENTS.md", "local edit\n");
+    const prepared = await gitRepo.prepare({ ...settings, path: "xum/" });
+    const restored = await payload.restore({
+      repositoryRoot: prepared.rootDir,
+      managedPath: "xum/",
+    });
+    expect(restored.changedFiles).toEqual(["AGENTS.md"]);
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe("canonical\n");
+  });
+
   it("reports preferences as changed only when the merge would change them", async () => {
     config.state = { projects: new Map(), userPreferences: { appearance: { theme: "dark" } } };
     const gitRepo = createBackupGitRepo({ cacheRoot });
