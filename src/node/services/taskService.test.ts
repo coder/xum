@@ -14167,6 +14167,125 @@ describe("TaskService", () => {
     );
   });
 
+  test("sendAgentTreeMessage refuses sends entering while the sender's subtree stop is persisting", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "sib-a", "sib-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    // task_stop bumps the subtree's stop epochs synchronously, then awaits stream shutdown
+    // before persisting terminal statuses. A send ENTERING in that window captures the bumped
+    // epochs as its clean baseline while the sender still reads running — only the in-progress
+    // stop latch can refuse it, keeping a prompt-influenced agent in the stopped subtree from
+    // waking workspaces outside it.
+    let markStopStarted: (() => void) | undefined;
+    const stopStarted = new Promise<void>((resolve) => {
+      markStopStarted = resolve;
+    });
+    let releaseStop: (() => void) | undefined;
+    const stopGate = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    const stopStream = mock(async (workspaceId: string) => {
+      if (workspaceId === "sib-a") {
+        markStopStarted?.();
+        await stopGate;
+      }
+    });
+    const isStreaming = mock((workspaceId: string) => workspaceId === "sib-a");
+    const { aiService } = createAIServiceMocks(config, { isStreaming, stopStream });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    const stopping = taskService.stopDescendantAgentTask("tree-root", "sib-a");
+    await stopStarted;
+
+    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "escape the stop")).toEqual(
+      Err({
+        code: "refused",
+        reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
+      })
+    );
+
+    releaseStop?.();
+    expect(await stopping).toEqual(Ok({ stoppedTaskIds: ["sib-a"] }));
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("sendAgentTreeMessage refuses sends entering while the target's stop is persisting", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "sib-a", "sib-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    // Mirror of the sender-side window: the target's stop is mid-cascade (epochs bumped,
+    // terminal status not yet persisted), so a send entering now must observe the target's
+    // in-progress stop latch instead of queueing a wake the stop was meant to prevent.
+    let markStopStarted: (() => void) | undefined;
+    const stopStarted = new Promise<void>((resolve) => {
+      markStopStarted = resolve;
+    });
+    let releaseStop: (() => void) | undefined;
+    const stopGate = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    const stopStream = mock(async (workspaceId: string) => {
+      if (workspaceId === "sib-b") {
+        markStopStarted?.();
+        await stopGate;
+      }
+    });
+    const isStreaming = mock((workspaceId: string) => workspaceId === "sib-b");
+    const { aiService } = createAIServiceMocks(config, { isStreaming, stopStream });
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { aiService, workspaceService });
+
+    const stopping = taskService.stopDescendantAgentTask("tree-root", "sib-b");
+    await stopStarted;
+
+    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "beat the stop")).toEqual(
+      Err({
+        code: "refused",
+        reason:
+          "Target was interrupted by the user and will not accept agent messages until the user resumes it.",
+      })
+    );
+
+    releaseStop?.();
+    expect(await stopping).toEqual(Ok({ stoppedTaskIds: ["sib-b"] }));
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   test("sendAgentTreeMessage bounds peer message size, sender titles, and aggregate budgets", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
