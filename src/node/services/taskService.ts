@@ -46,6 +46,7 @@ import {
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
+import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
   createRuntimeContextForWorkspace,
@@ -521,6 +522,13 @@ export interface WorkspaceTurnCreateArgs {
   ownerWorkspaceId: string;
   prompt: string;
   title: string;
+  /**
+   * Agent mode for the launched turn (e.g. "plan"). Defaults to exec for new
+   * workspaces and to the resumed identity for existing descendant agent
+   * workspaces. An explicit value is a per-turn override only — it never
+   * mutates the target workspace's persisted agent identity.
+   */
+  agentId?: string;
   modelString?: string;
   thinkingLevel?: ParsedThinkingInput;
   parentRuntimeAiSettings?: { modelString?: string; thinkingLevel?: ThinkingLevel };
@@ -3604,6 +3612,61 @@ export class TaskService {
     this.scheduleMaybeStartQueuedTasks();
   }
 
+  /**
+   * Fail-fast eligibility check for an explicit workspace-turn agentId.
+   * resolveAgentForStream silently falls back to exec for top-level workspaces,
+   * which would hide a caller's mistake — so unknown, internal (ui.hidden), and
+   * disabled agents are rejected here before any turn is dispatched. Mirrors
+   * the UI agent picker rule set, so custom user-visible agents pass without a
+   * hardcoded allowlist.
+   */
+  private async validateWorkspaceTurnAgentId(params: {
+    cfg: ReturnType<Config["loadConfigOrDefault"]>;
+    agentId: string;
+    /** Discovery context of the workspace whose turn will run (or the owner pre-create). */
+    runtimeConfig: RuntimeConfig;
+    projectPath: string;
+    workspaceName: string;
+    persistedWorkspacePath?: string;
+  }): Promise<Result<void, string>> {
+    assert(params.agentId.length > 0, "validateWorkspaceTurnAgentId: agentId must be non-empty");
+    const persistedPath = coerceNonEmptyString(params.persistedWorkspacePath);
+    const runtime = createRuntimeForWorkspace({
+      runtimeConfig: params.runtimeConfig,
+      projectPath: params.projectPath,
+      name: params.workspaceName,
+      namedWorkspacePath: persistedPath,
+    });
+    // Prefer the persisted checkout path over the name-derived one (canonical elsewhere too; see
+    // runtimeHelpers.resolveWorkspaceRootPath and the same pattern in Task.create).
+    const workspacePath =
+      params.projectPath === params.workspaceName
+        ? params.projectPath
+        : (persistedPath ?? runtime.getWorkspacePath(params.projectPath, params.workspaceName));
+
+    let frontmatter: Awaited<ReturnType<typeof resolveAgentFrontmatter>>;
+    try {
+      frontmatter = await resolveAgentFrontmatter(runtime, workspacePath, params.agentId);
+    } catch {
+      return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
+    }
+    if (!resolveAgentVisibility(frontmatter.ui).selectable) {
+      return Err(
+        `Task.createWorkspaceTurn: agentId is not selectable for workspace turns (${params.agentId})`
+      );
+    }
+    if (
+      isAgentEffectivelyDisabled({
+        cfg: params.cfg,
+        agentId: params.agentId,
+        resolvedFrontmatter: frontmatter,
+      })
+    ) {
+      return Err(`Task.createWorkspaceTurn: agentId is disabled (${params.agentId})`);
+    }
+    return Ok(undefined);
+  }
+
   async createWorkspaceTurn(
     args: WorkspaceTurnCreateArgs
   ): Promise<Result<WorkspaceTurnCreateResult, string>> {
@@ -3623,6 +3686,17 @@ export class TaskService {
     const queueDispatchMode = args.workspace?.queueDispatchMode ?? "tool-end";
     if (queueDispatchMode !== "tool-end" && queueDispatchMode !== "turn-end") {
       return Err("Task.createWorkspaceTurn: unsupported queueDispatchMode");
+    }
+    // Explicit agent override: validate syntax up front; eligibility (existence,
+    // selectability, enablement) is checked below against the workspace whose turn will run.
+    let requestedAgentId: string | undefined;
+    const rawAgentId = coerceNonEmptyString(args.agentId);
+    if (rawAgentId != null) {
+      const parsedAgentId = AgentIdSchema.safeParse(normalizeAgentId(rawAgentId, ""));
+      if (!parsedAgentId.success) {
+        return Err(`Task.createWorkspaceTurn: invalid agentId (${rawAgentId})`);
+      }
+      requestedAgentId = parsedAgentId.data;
     }
 
     await using _lock = await this.mutex.acquire();
@@ -3670,7 +3744,8 @@ export class TaskService {
     const turnId = this.config.generateStableId();
     const createdAt = getIsoNow();
     // New workspace turns use exec. Follow-ups in a persistent agent-task workspace preserve that
-    // child's original agent identity and task-level model settings.
+    // child's original agent identity and task-level model settings. An explicit args.agentId
+    // (validated above/below) overrides either default for this turn only.
     let workspaceTurnAgentId = "exec";
     let targetWorkspaceId: string;
     let targetAiSettings: ResolvedWorkspaceAiSettings | undefined;
@@ -3720,6 +3795,21 @@ export class TaskService {
         targetTaskThinkingLevel = targetEntry.workspace.taskThinkingLevel;
         targetTaskExperiments = targetEntry.workspace.taskExperiments;
       }
+      if (requestedAgentId != null) {
+        // Per-turn override: wins over resumed identity but never mutates the target
+        // workspace's persisted agent identity. Validate against the TARGET workspace's
+        // checkout (project-local agent definitions can diverge across branches).
+        const validation = await this.validateWorkspaceTurnAgentId({
+          cfg,
+          agentId: requestedAgentId,
+          runtimeConfig: targetEntry?.workspace.runtimeConfig ?? parentMeta.runtimeConfig,
+          projectPath: targetEntry?.projectPath ?? parentMeta.projectPath,
+          workspaceName: targetEntry?.workspace.name ?? parentMeta.name,
+          persistedWorkspacePath: targetEntry?.workspace.path,
+        });
+        if (!validation.success) return Err(validation.error);
+        workspaceTurnAgentId = requestedAgentId;
+      }
       // Follow-up sends continue the target workspace's own last-used settings
       // (persisted on every send, or manually changed by the user in that
       // workspace) instead of re-inheriting the owner's live settings on each
@@ -3738,6 +3828,19 @@ export class TaskService {
         if (!slot.success) return Err(slot.error);
       }
     } else {
+      if (requestedAgentId != null) {
+        // Pre-create stage: catch obviously bad ids (unknown/hidden/disabled) against the
+        // OWNER's checkout before creating any workspace.
+        const validation = await this.validateWorkspaceTurnAgentId({
+          cfg,
+          agentId: requestedAgentId,
+          runtimeConfig: parentMeta.runtimeConfig,
+          projectPath: parentMeta.projectPath,
+          workspaceName: parentMeta.name,
+          persistedWorkspacePath: parentEntry?.workspace.path,
+        });
+        if (!validation.success) return Err(validation.error);
+      }
       const slot = await ensureParallelSlot();
       if (!slot.success) return Err(slot.error);
       const tags = {
@@ -3760,6 +3863,27 @@ export class TaskService {
       }
       targetWorkspaceId = createResult.data.metadata.id;
       createdWorkspace = true;
+      if (requestedAgentId != null) {
+        // Post-create stage: re-validate against the TARGET checkout — project-local agent
+        // definitions can diverge across branches/worktrees, so owner-path resolution is not
+        // an invariant. On failure, do not dispatch the turn; the created workspace is left
+        // behind as failed evidence (no safe pre-record cleanup path exists).
+        const createdMeta = createResult.data.metadata;
+        const validation = await this.validateWorkspaceTurnAgentId({
+          cfg,
+          agentId: requestedAgentId,
+          runtimeConfig: createdMeta.runtimeConfig,
+          projectPath: createdMeta.projectPath,
+          workspaceName: createdMeta.name,
+          persistedWorkspacePath: createdMeta.namedWorkspacePath,
+        });
+        if (!validation.success) {
+          return Err(
+            `${validation.error} — agent unavailable in the created workspace (${targetWorkspaceId}); no turn was dispatched`
+          );
+        }
+      }
+      workspaceTurnAgentId = requestedAgentId ?? workspaceTurnAgentId;
     }
 
     // Unified per-field precedence (see resolveAgentAiSettings): explicit

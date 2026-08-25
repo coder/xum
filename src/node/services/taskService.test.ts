@@ -967,6 +967,200 @@ describe("TaskService", () => {
     });
   });
 
+  test("createWorkspaceTurn launches a new workspace with an explicit agent id", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+
+    const createWorkspace = mock(
+      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
+        Promise.resolve(Ok({ metadata: createWorkspaceTurnMetadata(projectPath) }))
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "plan",
+      prompt: "Plan a small change",
+      title: "Plan dogfood",
+      workspace: { mode: "new" },
+    });
+
+    expect(result.success).toBe(true);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const sendMessageCall = sendMessage.mock.calls[0] as unknown[];
+    expect(sendMessageCall[0]).toBe("childworkspace");
+    expect(sendMessageCall[2]).toMatchObject({ agentId: "plan" });
+  });
+
+  test("createWorkspaceTurn rejects invalid, unknown, and internal agent ids before creating a workspace", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+
+    const createWorkspace = mock(
+      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
+        Promise.resolve(Ok({ metadata: createWorkspaceTurnMetadata(projectPath) }))
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const attempt = (agentId: string) =>
+      taskService.createWorkspaceTurn({
+        ownerWorkspaceId: parentId,
+        agentId,
+        prompt: "Should not run",
+        title: "Bad agent",
+        workspace: { mode: "new" },
+      });
+
+    const invalidSyntax = await attempt("Not A Valid Id!");
+    expect(invalidSyntax.success).toBe(false);
+    if (!invalidSyntax.success) expect(invalidSyntax.error).toContain("invalid agentId");
+
+    const unknown = await attempt("doesnotexist");
+    expect(unknown.success).toBe(false);
+    if (!unknown.success) expect(unknown.error).toContain("unknown agentId");
+
+    // Built-in internal agents (ui.hidden) must not be launchable as workspace turns.
+    const internal = await attempt("compact");
+    expect(internal.success).toBe(false);
+    if (!internal.success) expect(internal.error).toContain("not selectable");
+
+    expect(createWorkspace).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("createWorkspaceTurn rejects disabled agents before creating a workspace", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir, {
+      agentAiDefaults: { custom: { enabled: false } },
+    });
+    await writeCustomAgentDefinition(projectPath);
+
+    const createWorkspace = mock(
+      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
+        Promise.resolve(Ok({ metadata: createWorkspaceTurnMetadata(projectPath) }))
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "custom",
+      prompt: "Should not run",
+      title: "Disabled agent",
+      workspace: { mode: "new" },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("disabled");
+    expect(createWorkspace).not.toHaveBeenCalled();
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("createWorkspaceTurn does not dispatch when the agent is unavailable in the created workspace", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    // Project-local agent exists in the OWNER's checkout, but the created workspace's checkout
+    // diverges (no agent definition there) — post-create re-validation must fail instead of
+    // silently streaming exec.
+    await writeCustomAgentDefinition(projectPath);
+    const divergedCheckout = path.join(rootDir, "diverged-checkout");
+    await fsPromises.mkdir(divergedCheckout, { recursive: true });
+
+    const divergedMetadata: WorkspaceMetadata & { namedWorkspacePath: string } = {
+      ...createWorkspaceTurnMetadata(projectPath),
+      namedWorkspacePath: divergedCheckout,
+    };
+    const createWorkspace = mock(
+      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
+        Promise.resolve(Ok({ metadata: divergedMetadata }))
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "custom",
+      prompt: "Should not dispatch",
+      title: "Diverged agent",
+      workspace: { mode: "new" },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("no turn was dispatched");
+    }
+    expect(createWorkspace).toHaveBeenCalledTimes(1);
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("createWorkspaceTurn explicit agentId overrides the resumed identity for that turn only", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["overridehandle", "overrideturn"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    const childWorkspaceId = "reported-child-override";
+    await config.editConfig((cfg) => {
+      const project = cfg.projects.get(projectPath);
+      assert(project, "test project must exist");
+      project.workspaces.push({
+        path: path.join(projectPath, "reported-child"),
+        id: childWorkspaceId,
+        name: "agent_explore_reported_child",
+        createdAt: "2026-06-19T00:00:00.000Z",
+        parentWorkspaceId: parentId,
+        agentType: "explore",
+        taskStatus: "reported",
+        reportedAt: "2026-06-19T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+      return cfg;
+    });
+
+    const sendMessage = mock(async (...args: unknown[]): Promise<Result<void>> => {
+      const internal = args[3] as { onAccepted?: () => Promise<void> | void } | undefined;
+      await internal?.onAccepted?.();
+      return Ok(undefined);
+    });
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "plan",
+      prompt: "Re-plan the follow-up",
+      title: "Override turn",
+      allowAgentWorkspace: true,
+      workspace: { mode: "existing", workspaceId: childWorkspaceId },
+    });
+
+    expect(result.success).toBe(true);
+    expect(sendMessage).toHaveBeenCalledWith(
+      childWorkspaceId,
+      "Re-plan the follow-up",
+      expect.objectContaining({ agentId: "plan" }),
+      expect.any(Object)
+    );
+    // Per-turn override only: the target's persisted agent identity must be untouched.
+    const childEntry = findWorkspaceInConfig(config, childWorkspaceId);
+    expect(childEntry?.agentType).toBe("explore");
+    expect(childEntry?.agentId).toBeUndefined();
+  });
+
   test("createWorkspaceTurn inherits pro mode from the parent's active non-exec agent", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["childworkspace", "turnhandle"]);
