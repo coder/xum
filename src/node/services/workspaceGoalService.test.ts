@@ -2413,6 +2413,33 @@ describe("WorkspaceGoalService", () => {
     expect(updated).toMatchObject({ status: "budget_limited", costCents: 125, turnsUsed: 1 });
   });
 
+  test("budget-limited goals ignore maintenance stream cost previews", async () => {
+    // Live previews must agree with final accounting: a heartbeat/wake stream
+    // on a budget_limited goal is discarded at stream end, so previewing its
+    // cost would show a climbing number that snaps back when the turn ends.
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Budget exhausted preview",
+      budgetCents: 100,
+    });
+    const limited = await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1.25,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    expect(limited).toMatchObject({ status: "budget_limited", costCents: 125 });
+
+    const preview = await service.previewStreamAccounting({
+      workspaceId,
+      costUsd: 0.42,
+      streamStartedAtMs: created.createdAtMs + 2,
+      streamOriginKind: "other",
+    });
+
+    expect(preview).toMatchObject({ status: "budget_limited", costCents: 125 });
+  });
+
   test("completed goals ignore later stream accounting", async () => {
     const created = await setGoalOk(service, {
       workspaceId,

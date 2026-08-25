@@ -2706,6 +2706,17 @@ export class WorkspaceGoalService {
       if (current.status === "paused" || current.status === "complete") {
         return toGoalSnapshot(current);
       }
+      // Mirror recordStreamAccounting's maintenance skip: final accounting
+      // discards non-goal-driven cost on a budget_limited goal, so previewing
+      // it would show climbing cost mid-stream that snaps back at stream end.
+      const previewOriginKind = input.streamOriginKind ?? "user";
+      if (
+        current.status === "budget_limited" &&
+        previewOriginKind !== "goal_continuation" &&
+        previewOriginKind !== "goal_budget_limit"
+      ) {
+        return toGoalSnapshot(current);
+      }
 
       const preview = GoalRecordV1Schema.parse({
         ...current,

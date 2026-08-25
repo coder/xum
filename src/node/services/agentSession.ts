@@ -2881,7 +2881,8 @@ export class AgentSession {
           const persisted = await this.preserveRejectedManualSend(
             message,
             options,
-            pricingGate.error
+            pricingGate.error,
+            internal?.enqueuedAtMs
           );
           // The user has explicitly intervened, so the goal-safety contract
           // for manual sends must still apply on the rejection path: clear any
@@ -4040,7 +4041,8 @@ export class AgentSession {
   private async preserveRejectedManualSend(
     message: string,
     options: (SendMessageOptions & { fileParts?: FilePart[] }) | undefined,
-    rejection: SendMessageError
+    rejection: SendMessageError,
+    enqueuedAtMs?: number
   ): Promise<boolean> {
     if (this.disposed) {
       return false;
@@ -4065,7 +4067,15 @@ export class AgentSession {
         createUserMessageId(),
         "user",
         trimmed,
-        {},
+        {
+          // Stamp authoring metadata like accepted turns do: goal-safety
+          // reconciliation reads it after a restart to classify this row as
+          // pre-goal (queued before the goal existed) vs a real intervention.
+          // Without it a rejected queued send would pause a never-driven goal
+          // on the next getGoal.
+          timestamp: Date.now(),
+          ...(enqueuedAtMs != null ? { enqueuedAtMs } : {}),
+        },
         additionalParts.length > 0 ? additionalParts : undefined
       );
       const appendResult = await this.historyService.appendToHistory(this.workspaceId, userMessage);
@@ -5160,6 +5170,8 @@ export class AgentSession {
     providerMetadata?: Record<string, unknown>;
     metadataModel?: string;
     isCompaction?: boolean;
+    goalKind?: GoalSyntheticMessageKind;
+    agentInitiated?: boolean;
   }): Promise<void> {
     if (!this.workspaceGoalService) {
       return;
@@ -5170,12 +5182,17 @@ export class AgentSession {
       input.providerMetadata,
       input.metadataModel
     );
+    // Classify like final accounting so previews and stream-end agree on
+    // whether this stream may charge a non-active goal — otherwise the Goal UI
+    // shows growing maintenance cost mid-stream that snaps back at stream end.
+    const streamOriginKind = getGoalStreamOriginKind(input);
     const costUsd = getTotalCost(displayUsage) ?? 0;
     try {
       await this.workspaceGoalService.previewStreamAccounting({
         workspaceId: this.workspaceId,
         costUsd,
         isCompaction: input.isCompaction === true,
+        streamOriginKind,
         streamStartedAtMs: this.activeStreamStartedAtMs ?? null,
       });
     } catch (error) {
@@ -5434,6 +5451,8 @@ export class AgentSession {
           this.activeStreamContext?.providersConfig ?? null
         ),
         isCompaction: this.activeCompactionRequest !== undefined,
+        goalKind: this.activeStreamContext?.goalKind,
+        agentInitiated: this.activeStreamContext?.agentInitiated,
       });
 
       // Never recurse compaction while we're already running a compaction request.
