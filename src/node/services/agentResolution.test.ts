@@ -584,6 +584,64 @@ describe("resolveAgentForStream strict resolution", () => {
     if (lenient.success) expect(lenient.data.effectiveAgentId).toBe("custom");
   });
 
+  test("hidden exec shadow fails loudly in strict mode instead of running the shadow", async () => {
+    using tempDir = new DisposableTempDir("agent-resolution-strict-exec-shadow");
+    const projectPath = path.join(tempDir.path, "project");
+    const agentsDir = path.join(projectPath, ".mux", "agents");
+    await fs.mkdir(agentsDir, { recursive: true });
+    // Discovery prefers a project exec shadow over the built-in; strict sends must gate
+    // exec like any other id instead of skipping the eligibility block for it.
+    await fs.writeFile(
+      path.join(agentsDir, "exec.md"),
+      ["---", "name: Exec", "ui:", "  hidden: true", "---", "Hidden exec shadow."].join("\n")
+    );
+
+    const strict = await resolveTopLevel({
+      projectPath,
+      agentId: "exec",
+      strictAgentResolution: true,
+    });
+    expect(strict.success).toBe(false);
+    if (!strict.success && strict.error.type === "unknown") {
+      expect(strict.error.raw).toContain("not selectable");
+    } else {
+      expect(strict.success === false && strict.error.type).toBe("unknown");
+    }
+  });
+
+  test("strict mode fails closed when eligibility resolution throws", async () => {
+    using tempDir = new DisposableTempDir("agent-resolution-strict-broken-base");
+    const projectPath = path.join(tempDir.path, "project");
+    const agentsDir = path.join(projectPath, ".mux", "agents");
+    await fs.mkdir(agentsDir, { recursive: true });
+    // A base pointing at a missing definition makes frontmatter resolution throw;
+    // strict sends must not stream a partially resolved prompt/tool policy.
+    await fs.writeFile(
+      path.join(agentsDir, "custom.md"),
+      ["---", "name: Custom", "base: missing-base", "---", "Broken chain."].join("\n")
+    );
+
+    const strict = await resolveTopLevel({
+      projectPath,
+      agentId: "custom",
+      strictAgentResolution: true,
+    });
+    expect(strict.success).toBe(false);
+    if (!strict.success && strict.error.type === "unknown") {
+      expect(strict.error.raw).toContain("could not be");
+    } else {
+      expect(strict.success === false && strict.error.type).toBe("unknown");
+    }
+
+    // Lenient sends keep the best-effort behavior.
+    const lenient = await resolveTopLevel({
+      projectPath,
+      agentId: "custom",
+      strictAgentResolution: false,
+    });
+    expect(lenient.success).toBe(true);
+  });
+
   test("disabled explicit agent fails loudly in strict mode for top-level workspaces", async () => {
     using tempDir = new DisposableTempDir("agent-resolution-strict-disabled");
     const projectPath = path.join(tempDir.path, "project");

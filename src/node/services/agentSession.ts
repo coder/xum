@@ -4285,6 +4285,10 @@ export class AgentSession {
     const sendOptions: SendMessageOptions = {
       ...params.baseOptions,
       agentId: "compact",
+      // This internal request intentionally runs the hidden compact agent, so the
+      // caller's strict explicit-agent gate must not apply to it. The post-compaction
+      // follow-up re-arms strictness via pickPreservedSendOptions.
+      strictAgentResolution: undefined,
       skipAiSettingsPersistence: true,
       model: resolved.selected.model,
       // Effective (clamped) thinking: this internal request skips persistence,

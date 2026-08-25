@@ -232,6 +232,9 @@ export async function resolveAgentForStream(
   let agentDiscoveryPath = agentDiscoveryCandidates[0]?.workspacePath ?? workspacePath;
 
   const isSubagentWorkspace = Boolean(metadata.parentWorkspaceId);
+  // Strict explicit-agent gating applies only to top-level sends: sub-agent workspaces
+  // already fail loudly and legitimately run hidden agents (explore, compact).
+  const strictTopLevel = strictAgentResolution === true && !isSubagentWorkspace;
 
   // --- Load agent definition (with fallback to exec) ---
   let agentDefinition: Awaited<ReturnType<typeof readAgentDefinition>> | undefined;
@@ -276,7 +279,7 @@ export async function resolveAgentForStream(
   }
 
   if (agentDefinition == null) {
-    if (strictAgentResolution && !isSubagentWorkspace) {
+    if (strictTopLevel) {
       const errorMessage = `Agent '${requestedAgentId}' could not be resolved in this workspace; refusing to fall back to exec for an explicit agent request.`;
       emitError(
         createErrorEvent(workspaceId, {
@@ -304,7 +307,9 @@ export async function resolveAgentForStream(
   // Disabled agents should never run as sub-agents, even if a task workspace already exists
   // on disk (e.g., config changed since creation).
   // For top-level workspaces, fall back to exec to keep the workspace usable.
-  if (agentDefinition.id !== "exec") {
+  // Strict sends also verify exec itself: discovery can select a project/global exec
+  // shadow, and a hidden shadow must hit the selectability gate below like any other id.
+  if (agentDefinition.id !== "exec" || strictTopLevel) {
     try {
       const resolvedFrontmatter = await resolveAgentFrontmatter(
         agentDiscoveryRuntime,
@@ -321,11 +326,7 @@ export async function resolveAgentForStream(
       // and an init hook or concurrent edit could hide the definition between
       // launch-time validation and this stream. Sub-agent workspaces legitimately run
       // hidden agents (explore, compact), so only strict top-level sends are gated.
-      if (
-        strictAgentResolution &&
-        !isSubagentWorkspace &&
-        !resolveAgentVisibility(resolvedFrontmatter.ui).selectable
-      ) {
+      if (strictTopLevel && !resolveAgentVisibility(resolvedFrontmatter.ui).selectable) {
         const errorMessage = `Agent '${agentDefinition.id}' is not selectable for explicit agent requests.`;
         emitError(
           createErrorEvent(workspaceId, {
@@ -371,6 +372,20 @@ export async function resolveAgentForStream(
         effectiveAgentId = agentDefinition.id;
       }
     } catch (error: unknown) {
+      // Strict sends fail closed when eligibility cannot be verified: a hook or edit
+      // that breaks the definition (e.g. a base pointing at a missing definition) after
+      // launch validation would otherwise stream a partially resolved prompt/tool policy.
+      if (strictTopLevel) {
+        const errorMessage = `Agent '${agentDefinition.id}' eligibility could not be verified (${getErrorMessage(error)}); refusing to stream an explicit agent request.`;
+        emitError(
+          createErrorEvent(workspaceId, {
+            messageId: createAssistantMessageId(),
+            error: errorMessage,
+            errorType: "unknown",
+          })
+        );
+        return Err({ type: "unknown", raw: errorMessage });
+      }
       // Best-effort only — do not fail a stream due to disablement resolution.
       workspaceLog.debug("Failed to resolve agent enablement; continuing", {
         agentId: agentDefinition.id,

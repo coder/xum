@@ -600,6 +600,49 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     session.dispose();
   });
 
+  test("clears strictAgentResolution on the internal compact request", async () => {
+    const workspaceId = "ws-auto-compaction-clears-strict";
+
+    const streamMessage = mock((_request: unknown) => Promise.resolve(Ok(undefined)));
+    const { session } = await createSessionHarness({
+      workspaceId,
+      streamMessage: streamMessage as unknown as AIService["streamMessage"],
+    });
+
+    // A strict explicit-agent workspace turn hitting auto-compaction: the internal
+    // request intentionally runs the hidden compact agent, so the strict gate must not
+    // apply to it (it would reject compact as not selectable and break compaction).
+    const baseOptions: SendMessageOptions = {
+      model: "anthropic:claude-sonnet-4-6",
+      agentId: "plan",
+      strictAgentResolution: true,
+    };
+    const followUpContent: CompactionFollowUpRequest = {
+      text: "Continue",
+      model: baseOptions.model,
+      agentId: "plan",
+    };
+
+    const internals = session as unknown as {
+      buildAutoCompactionRequest: (params: {
+        followUpContent: CompactionFollowUpRequest;
+        baseOptions: SendMessageOptions;
+        reason: "on-send" | "mid-stream";
+      }) => { sendOptions: SendMessageOptions };
+    };
+
+    const compactionRequest = internals.buildAutoCompactionRequest({
+      followUpContent,
+      baseOptions,
+      reason: "mid-stream",
+    });
+
+    expect(compactionRequest.sendOptions.agentId).toBe("compact");
+    expect(compactionRequest.sendOptions.strictAgentResolution).toBeUndefined();
+
+    session.dispose();
+  });
+
   test("compaction model explicit override takes priority over baseOptions.model", async () => {
     const workspaceId = "ws-auto-compaction-explicit-model-overrides-base-model";
 
