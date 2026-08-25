@@ -6561,12 +6561,12 @@ export class TaskService {
             }
 
             // Best-effort: stop any active stream immediately to avoid further token usage
-            // while preserving commit-worthy partial progress for inspection/resume.
-            let streamStopConfirmed = false;
+            // while preserving commit-worthy partial progress for inspection/resume. Success is
+            // NOT stop confirmation for latch purposes: an accepted-but-PREPARING turn has no
+            // registered stream yet, so stopStream no-ops with success while the turn can still
+            // start afterward — only terminal execution settlement confirms.
             try {
               const stopResult = await this.aiService.stopStream(id, { abandonPartial: false });
-              // No-active-stream stops report success, so idle descendants confirm trivially.
-              streamStopConfirmed = stopResult.success;
               if (!stopResult.success) {
                 log.debug("terminateAllDescendantAgentTasks: stopStream failed", { taskId: id });
               }
@@ -6605,18 +6605,16 @@ export class TaskService {
             if (preservedCompletedDescendant) {
               // A reawakened completed child executes under a live workspace-turn handle while
               // its STABLE status stays terminal, so this branch persists neither an interrupted
-              // status nor a terminal execution mirror. If its stream cancellation also failed,
-              // nothing admission-visible marks the stop once the latch drops — the still-running
-              // child could message a root or cousin right after Stop. Retain the latch (fail
-              // closed, same contract as the catch below) until stream termination or terminal
-              // execution settlement is confirmed; settlement releases it via
-              // releaseRetainedStopLatches so the child is not barred until restart.
+              // status nor a terminal execution mirror. Until that execution settles terminally,
+              // nothing admission-visible marks the stop once the latch drops — a still-running
+              // child (failed stream cancellation) or an accepted-but-PREPARING turn (stopStream
+              // no-ops with success before a stream registers, and the turn starts afterward)
+              // could message a root or cousin right after Stop. Retain the latch (fail closed,
+              // same contract as the catch below) whenever a live registration remains;
+              // settlement releases it via releaseRetainedStopLatches so the child is not
+              // barred until restart.
               const release = releaseById.get(id);
-              if (
-                release != null &&
-                !streamStopConfirmed &&
-                this.activeWorkspaceTurnHandleByWorkspaceId.has(id)
-              ) {
+              if (release != null && this.activeWorkspaceTurnHandleByWorkspaceId.has(id)) {
                 releaseById.delete(id);
                 this.retainStopLatchUntilSettlement(id, release);
                 // Park-then-recheck: a settlement racing this cascade may have persisted the
@@ -6627,7 +6625,7 @@ export class TaskService {
                   this.releaseRetainedStopLatches(id);
                 } else {
                   log.error(
-                    "terminateAllDescendantAgentTasks: unconfirmed stream stop for completed descendant with live execution; retaining stop latch",
+                    "terminateAllDescendantAgentTasks: unsettled live execution for completed descendant; retaining stop latch",
                     { taskId: id }
                   );
                 }

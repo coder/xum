@@ -16357,6 +16357,67 @@ describe("TaskService", () => {
     expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
   });
 
+  test("successful no-op stream stop still retains the latch for an unsettled PREPARING execution", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "branch-a", "branch-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        // Accepted-but-PREPARING reawakened child: the turn was admitted (accepted live handle,
+        // running mirror) but no stream registered yet, so the cascade's stopStream no-ops with
+        // SUCCESS while the prepared turn can still start afterward. Only terminal settlement
+        // confirms the stop — the latch must be retained despite the successful stop call.
+        projectWorkspace(projectPath, "leaf-a", "leaf-a", {
+          parentWorkspaceId: "branch-a",
+          taskStatus: "reported",
+          taskExecutionId: "wst_leaf",
+          taskExecutionStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    await registerLiveWorkspaceTurnHandle(taskService, "leaf-a", "wst_leaf");
+
+    taskService.markParentWorkspaceInterrupted("branch-a");
+    await taskService.terminateAllDescendantAgentTasks("branch-a");
+    expect(findWorkspaceInConfig(config, "leaf-a")?.taskStatus).toBe("reported");
+
+    const internals = taskService as unknown as { workspaceStopsInProgress: Map<string, number> };
+    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(true);
+
+    // User resume clears the level-triggered suppression; only the retained latch refuses the
+    // prepared turn's child until its execution settles.
+    taskService.resetAutoResumeCount("branch-a");
+    expect(
+      await taskService.sendAgentTreeMessage("leaf-a", "sib-b", "escape the preparing stop")
+    ).toEqual(
+      Err({
+        code: "refused",
+        reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
+      })
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    // Terminal settlement of the prepared execution releases the retained latch.
+    const interrupted = await taskService.interruptWorkspaceTurn("tree-root", "wst_leaf");
+    expect(interrupted.success).toBe(true);
+    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
+  });
+
   test("park-after-settlement race releases the latch on already-settled evidence", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
