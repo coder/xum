@@ -177,6 +177,19 @@ export function parseGitStatusScriptOutput(output: string): ParsedGitStatusOutpu
 }
 
 /**
+ * Git config keys that mark a repo as a promisor/partial clone. Previous
+ * versions of GIT_FETCH_SCRIPT fetched with --filter=blob:none, which made
+ * git persist this state (poisoning the repo: every later fetch stayed
+ * filtered and checkouts lazy-fetched blobs from the network). The fetch
+ * script's heal block and SSHRuntime's base-repo hygiene both unset these.
+ */
+export const PROMISOR_CONFIG_KEYS = [
+  "remote.origin.promisor",
+  "remote.origin.partialclonefilter",
+  "extensions.partialclone",
+] as const;
+
+/**
  * Smart git fetch script that minimizes lock contention.
  *
  * Uses ls-remote to check if remote has new commits before fetching.
@@ -212,6 +225,46 @@ if [ -z "$REMOTE_SHA" ]; then
   exit 0
 fi
 
+# One-time heal for repos that previous versions of this script converted
+# into promisor/partial clones. --no-filter (used below) stops the damage but
+# does not remove the persisted promisor config, nor backfill the blobs that
+# earlier filtered fetches omitted, and up-to-date repos would skip the fetch
+# entirely via the early-exit below. Left unhealed, "git worktree add"
+# (workspace creation) lazy-fetches those old blobs mid-checkout and fails on
+# transient network errors. Only repos whose filter is exactly the
+# "blob:none" this script used to write are healed.
+if [ "$(git config --local --get remote.origin.partialclonefilter 2>/dev/null)" = "blob:none" ]; then
+  # Lock in the shared git dir: sibling worktrees share repo config, so this
+  # keeps them from starting concurrent full refetches. A stale lock (killed
+  # heal) expires after an hour, which also rate-limits retries when the
+  # refetch keeps failing (e.g. huge repo on a slow link).
+  COMMON_DIR=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+  HEAL_LOCK="$COMMON_DIR/xum-promisor-heal.lock"
+  if [ -n "$COMMON_DIR" ] && [ -n "$(find "$HEAL_LOCK" -maxdepth 0 -type d -mmin +60 2>/dev/null)" ]; then
+    rmdir "$HEAL_LOCK" 2>/dev/null
+  fi
+  if [ -n "$COMMON_DIR" ] && mkdir "$HEAL_LOCK" 2>/dev/null; then
+    echo "HEAL: backfilling promisor partial clone"
+    # --refetch (git >= 2.36) negotiates as if the repo had nothing, so the
+    # server re-sends every object including previously filtered-out blobs.
+    # Unset the promisor config only after a successful refetch: stripping
+    # first would leave missing blobs with no lazy-fetch fallback, breaking
+    # checkouts outright instead of healing them.
+    if git -c protocol.version=2 \\
+        fetch origin \\
+        --refetch \\
+        --no-filter \\
+        --prune \\
+        --no-tags \\
+        --no-recurse-submodules \\
+        --no-write-fetch-head \\
+        2>&1; then
+${PROMISOR_CONFIG_KEYS.map((key) => `      git config --local --unset-all ${key} 2>/dev/null`).join("\n")}
+    fi
+    rmdir "$HEAL_LOCK" 2>/dev/null
+  fi
+fi
+
 # Check current local remote-tracking ref (no lock)
 LOCAL_SHA=$(git rev-parse --verify "refs/remotes/origin/$PRIMARY_BRANCH" 2>/dev/null || echo "")
 
@@ -230,9 +283,10 @@ fi
 # every commit fetched by this background loop without its blobs, so a later
 # "git worktree add" (workspace creation) must lazy-fetch blobs from the
 # remote mid-checkout and any transient network failure aborts it with
-# "fatal: could not fetch <oid> from promisor remote". --no-filter both avoids
-# poisoning healthy repos and overrides the persisted filter config in repos
-# that were already converted, so they heal going forward.
+# "fatal: could not fetch <oid> from promisor remote". --no-filter avoids
+# poisoning healthy repos and keeps this fetch unfiltered even in a repo that
+# is still poisoned (already-converted repos are backfilled and cleaned up by
+# the one-time heal block above).
 git -c protocol.version=2 \\
     -c fetch.negotiationAlgorithm=skipping \\
     fetch origin \\

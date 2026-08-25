@@ -39,6 +39,7 @@ import { expandTildeForSSH, cdCommandForSSH } from "./tildeExpansion";
 import { sleepWithAbort } from "@/node/utils/abort";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
+import { PROMISOR_CONFIG_KEYS } from "@/common/utils/git/gitStatus";
 import {
   type SSHRuntimeConfig,
   getControlPath,
@@ -106,11 +107,7 @@ const BASE_REPO_MAINTENANCE_WAIT_TIMEOUT_SECONDS = 30 * 60;
  *  `repo_has_promisor_remote()`. Unsetting all three is what makes
  *  receive-pack's `check_connected()` skip the buggy partial-clone fast
  *  path on subsequent pushes (see `stripBaseRepoPromisorConfig`). */
-const BASE_REPO_PROMISOR_CONFIG_KEYS = [
-  "remote.origin.promisor",
-  "remote.origin.partialclonefilter",
-  "extensions.partialclone",
-] as const;
+const BASE_REPO_PROMISOR_CONFIG_KEYS = PROMISOR_CONFIG_KEYS;
 const BASE_REPO_FRAGMENTED_PACK_THRESHOLD = 25;
 const PROJECT_SYNC_MAX_ATTEMPTS = 3;
 const PROJECT_SYNC_RETRYABLE_ERRORS = [
