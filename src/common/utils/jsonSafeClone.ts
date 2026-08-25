@@ -3,7 +3,8 @@
  * produce: `undefined`/function/symbol array elements become `null`, object
  * properties holding them are dropped, non-finite numbers become `null`, and
  * `toJSON` is honored. A defensive fallback covers values JSON.stringify
- * cannot serialize at all (BigInt, circular references, throwing getters).
+ * cannot serialize at all (BigInt, circular references, throwing getters,
+ * proxies with throwing traps).
  *
  * Why this exists: tool outputs are persisted as JSON and rehydrated on
  * reload, but the SAME in-memory object is also embedded in the next step's
@@ -97,6 +98,12 @@ function scrubToJsonSafe(value: unknown, ancestors: WeakSet<object>): unknown {
     // stays a plain property instead of silently mutating the clone's
     // prototype (and vanishing from the JSON shape).
     return Object.fromEntries(entries);
+  } catch {
+    // Reflective operations outside the per-property guards can throw for
+    // hostile exotic objects (Proxy ownKeys/length traps, revoked proxies).
+    // Children handle their own failures via recursion, so this only fires
+    // for THIS value being uninspectable: degrade it to a placeholder leaf.
+    return "[Unserializable]";
   } finally {
     // Remove on the way out so shared (non-cyclic) references still clone;
     // only genuine ancestor revisits are treated as cycles.

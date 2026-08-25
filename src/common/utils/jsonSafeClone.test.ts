@@ -85,6 +85,25 @@ describe("jsonSafeClone", () => {
     expect(jsonSafeClone(value)).toEqual({ keep: "x" });
   });
 
+  it("degrades objects with throwing reflective traps to a placeholder", () => {
+    const throwingOwnKeys = new Proxy(
+      {},
+      {
+        ownKeys() {
+          throw new Error("ownKeys trap");
+        },
+      }
+    );
+    expect(jsonSafeClone({ keep: 1, evil: throwingOwnKeys })).toEqual({
+      keep: 1,
+      evil: "[Unserializable]",
+    });
+
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+    expect(jsonSafeClone({ p: proxy, big: 1n })).toEqual({ p: "[Unserializable]", big: "1" });
+  });
+
   it("keeps a literal __proto__ key as an own property in the fallback path", () => {
     const nested = JSON.parse('{"__proto__": {"x": 1}}') as Record<string, unknown>;
     const value = { big: 1n, nested };
