@@ -32,9 +32,10 @@ export interface CodeExecutionResult {
   toolCalls: ToolCallRecord[];
   consoleOutput: ConsoleRecord[];
   duration_ms: number;
-  /** Media/display-file parts re-attached from nested tool results
-   * (e.g. attach_file); delivered to the model as real attachments. */
-  attachments?: unknown[];
+  /** Media parts re-attached from nested tool results (e.g. attach_file);
+   * delivered to the model as real attachments and rendered as previews on
+   * this card (nested results only carry a stub for the bytes). */
+  attachments?: Array<{ type: "media"; data: string; mediaType: string; filename?: string }>;
 }
 
 /** Nested tool call shape from streaming aggregator */

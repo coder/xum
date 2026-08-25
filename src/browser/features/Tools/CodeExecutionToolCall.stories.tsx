@@ -127,6 +127,10 @@ function GallerySection(props: {
  * SyntaxHighlighting stories into a single snapshot to conserve the snapshot
  * budget while preserving each distinct visual state.
  */
+/** 1x1 red PNG for carrier-attachment preview stories. */
+const RED_DOT_PNG =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
 export const Gallery: Story = {
   render: () => (
     <StoryShell>
@@ -138,6 +142,25 @@ export const Gallery: Story = {
             result: completedResult,
             status: "completed",
             nestedCalls: completedNestedCalls,
+          }}
+        />
+        <GallerySection
+          label="Completed (carrier media attachment)"
+          cardProps={{
+            args: { code: `await mux.attach_file({ path: "board.png" });` },
+            result: {
+              success: true,
+              result: { attached: true },
+              toolCalls: [
+                { toolName: "attach_file", args: { path: "board.png" }, duration_ms: 12 },
+              ],
+              consoleOutput: [],
+              duration_ms: 30,
+              attachments: [
+                { type: "media", data: RED_DOT_PNG, mediaType: "image/png", filename: "board.png" },
+              ],
+            },
+            status: "completed",
           }}
         />
         <GallerySection

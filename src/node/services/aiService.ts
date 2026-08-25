@@ -5,6 +5,7 @@ import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import assert from "@/common/utils/assert";
 import { type LanguageModel, type Tool } from "ai";
 
+import { projectHooksDisabled } from "@/node/utils/projectHooks";
 import { linkAbortSignal } from "@/node/utils/abort";
 import { ensurePrivateDir } from "@/node/utils/fs";
 import type { Result } from "@/common/types/result";
@@ -1979,7 +1980,11 @@ export class AIService extends EventEmitter {
       } = agentResult.data;
       const legacyModeForMetadata = getLegacyModeForAgentMetadata(effectiveAgentId, effectiveMode);
       const projectTrusted = isWorkspaceProjectTrusted(this.config, metadata);
-      const sharedExecutionTrusted = isWorkspaceTrustedForSharedExecution(metadata, cfg.projects);
+      // projectHooksDisabled: benchmark harnesses opt out of automatic repo
+      // hook execution (tool_env/tool_pre/tool_post) while keeping config
+      // trust for sub-agent delegation.
+      const sharedExecutionTrusted =
+        isWorkspaceTrustedForSharedExecution(metadata, cfg.projects) && !projectHooksDisabled();
       const agentAdvisorEnabled = resolveAdvisorEnabledForAgent(
         effectiveAgentId,
         cfg.agentAiDefaults?.[effectiveAgentId]?.advisorEnabled

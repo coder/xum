@@ -28,6 +28,17 @@ import { isMediaPart, type AISDKMediaPart } from "@/node/utils/messages/toolResu
  * type-valid guest code reading `.data` still gets a string instead of
  * undefined; the note explains where the real bytes went.
  */
+/**
+ * Aggregate per-eval budget for media bytes carried out of bridged results.
+ * The pending array lives host-side (outside QuickJS memory accounting), so
+ * guest code must not be able to grow it without bound by re-attaching large
+ * files in a loop; excess media stays behind with a budget stub instead.
+ */
+export const MAX_PENDING_ATTACHMENT_BYTES = 32 * 1024 * 1024;
+
+export const MEDIA_BUDGET_EXCEEDED_STUB =
+  "[media omitted: aggregate attachment budget for this code_execution call was exceeded; attach fewer or smaller files in one call]";
+
 export const MEDIA_DATA_STUB =
   "[base64 omitted: media is delivered to the model as an attachment on this code_execution result]";
 
@@ -428,19 +439,28 @@ export class ToolBridge {
       return serialized;
     }
     const mediaParts: AISDKMediaPart[] = [];
+    const pending = this.pendingAttachments.get(runtime) ?? [];
+    let pendingBytes = pending.reduce((sum, part) => sum + part.data.length, 0);
+    let changed = false;
     const newValue = serialized.value.map((item) => {
       if (!isMediaPart(item) || !isSupportedAttachmentMediaType(item.mediaType)) {
         return item;
       }
+      changed = true;
+      if (pendingBytes + item.data.length > MAX_PENDING_ATTACHMENT_BYTES) {
+        return { ...item, data: MEDIA_BUDGET_EXCEEDED_STUB };
+      }
+      pendingBytes += item.data.length;
       mediaParts.push(item);
       return { ...item, data: MEDIA_DATA_STUB };
     });
-    if (mediaParts.length === 0) {
+    if (!changed) {
       return serialized;
     }
-    const pending = this.pendingAttachments.get(runtime) ?? [];
-    pending.push(...mediaParts);
-    this.pendingAttachments.set(runtime, pending);
+    if (mediaParts.length > 0) {
+      pending.push(...mediaParts);
+      this.pendingAttachments.set(runtime, pending);
+    }
     return { type: "content", value: newValue };
   }
 

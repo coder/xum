@@ -78,6 +78,11 @@ cd "${MUX_APP_ROOT}"
 log "trusting project ${project_path}"
 bun src/cli/trust.ts --dir "${project_path}" || fatal "failed to trust project ${project_path}"
 
+# Trust is needed only for sub-agent delegation. Dataset tasks control the
+# repo contents, so automatic repo hook execution (.xum/init, tool_env) must
+# stay off: hooks would run dataset code with provider credentials in env.
+export MUX_DISABLE_PROJECT_HOOKS=1
+
 cmd=(bun src/cli/run.ts
   --dir "${project_path}"
   --model "${MUX_MODEL}"
@@ -193,10 +198,15 @@ for line in open(sys.argv[1]):
         pass
 # No run-complete found — aggregate the last usage-delta per message + sub-agent totals
 for usage in cumulative_by_msg.values():
-    result["input"] += (usage.get("inputTokens", 0) or 0)
+    input_tokens = usage.get("inputTokens", 0) or 0
+    cached = usage.get("cachedInputTokens", 0) or 0
+    # AI SDK inputTokens is inclusive of cached reads; split the buckets so
+    # consumers can sum input+cache_read without double counting (mirrors
+    # run-complete/createDisplayUsage semantics).
+    result["input"] += max(input_tokens - cached, 0)
     result["output"] += (usage.get("outputTokens", 0) or 0)
     # AI SDK usage shape only exposes cache reads; cache writes stay 0 here.
-    result["cache_read"] += (usage.get("cachedInputTokens", 0) or 0)
+    result["cache_read"] += cached
 result["input"] += subagent_input
 result["output"] += subagent_output
 print(json.dumps(result))

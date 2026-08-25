@@ -11,6 +11,33 @@ import {
   runWorkspaceInitHook,
 } from "./initHook";
 import type { InitLogger, WorkspaceInitParams } from "./Runtime";
+import { shouldSkipInitHook } from "./initHook";
+import { DISABLE_PROJECT_HOOKS_ENV } from "@/node/utils/projectHooks";
+
+describe("shouldSkipInitHook", () => {
+  const noopLogger: InitLogger = {
+    logStep: () => undefined,
+    logStdout: () => undefined,
+    logStderr: () => undefined,
+    logComplete: () => undefined,
+  };
+
+  it("skips trusted hooks when the project-hooks kill-switch is set", () => {
+    const prev = process.env[DISABLE_PROJECT_HOOKS_ENV];
+    process.env[DISABLE_PROJECT_HOOKS_ENV] = "1";
+    try {
+      expect(shouldSkipInitHook({ trusted: true }, noopLogger)).toBe(true);
+    } finally {
+      if (prev === undefined) {
+        delete process.env[DISABLE_PROJECT_HOOKS_ENV];
+      } else {
+        process.env[DISABLE_PROJECT_HOOKS_ENV] = prev;
+      }
+    }
+    // Without the kill-switch, trusted projects run hooks.
+    expect(shouldSkipInitHook({ trusted: true }, noopLogger)).toBe(false);
+  });
+});
 
 describe("LineBuffer", () => {
   it("should buffer incomplete lines", () => {

@@ -16,6 +16,7 @@ import type { CodeExecutionResult, NestedToolCall } from "./Shared/codeExecution
 import { cn } from "@/common/lib/utils";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { resolveCodeExecutionViewMode, type CodeExecutionViewMode } from "./codeExecutionViewMode";
+import { ToolResultImages } from "./Shared/ToolResultImages";
 
 interface CodeExecutionToolCallProps {
   args: { code: string };
@@ -105,6 +106,13 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
       ? result.result
       : JSON.stringify(result.result, null, 2);
   }, [result]);
+
+  // Carrier media from nested tool results, wrapped into the content shape
+  // ToolResultImages consumes.
+  const attachmentsResult =
+    result?.attachments && result.attachments.length > 0
+      ? { type: "content" as const, value: result.attachments }
+      : null;
 
   // Determine result icon and variant
   const isInterrupted = status === "interrupted";
@@ -203,6 +211,10 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
         ) : (
           <div className="text-muted text-xs italic">Execution in progress...</div>
         ))}
+
+      {/* Media carried out of nested tool results (attach_file): the nested
+          result only holds a stub, so previews render from the carrier. */}
+      {attachmentsResult && <ToolResultImages result={attachmentsResult} />}
     </fieldset>
   );
 };

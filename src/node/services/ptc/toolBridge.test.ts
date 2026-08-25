@@ -3,7 +3,13 @@
  */
 
 import { describe, it, expect, mock } from "bun:test";
-import { ToolBridge, MEDIA_DATA_STUB, type KernelBridgeOptions } from "./toolBridge";
+import {
+  ToolBridge,
+  MAX_PENDING_ATTACHMENT_BYTES,
+  MEDIA_BUDGET_EXCEEDED_STUB,
+  MEDIA_DATA_STUB,
+  type KernelBridgeOptions,
+} from "./toolBridge";
 import type { Tool } from "ai";
 import type { IJSRuntime, RuntimeLimits } from "./runtime";
 import type { PTCEvent, PTCExecutionResult } from "./types";
@@ -675,6 +681,36 @@ describe("attachment part stripping", () => {
 
     await b.captured.xum.attach_file({ path: "/b.png" });
     expect(bridge.drainPendingAttachments(b.runtime)).toEqual([mediaPart]);
+  });
+
+  it("caps aggregate carried media bytes per eval", async () => {
+    const bigData = "a".repeat(MAX_PENDING_ATTACHMENT_BYTES - 16);
+    const bigPart = { type: "media", data: bigData, mediaType: "image/png" };
+    const smallPart = { type: "media", data: "b".repeat(64), mediaType: "image/png" };
+    const bridge = new ToolBridge({
+      attach_file: createMockTool("attach_file", z.object({ path: z.string() }), (args) =>
+        (args as { path: string }).path === "/big.png"
+          ? { type: "content", value: [bigPart] }
+          : { type: "content", value: [smallPart] }
+      ),
+    });
+    const { captured, runtime } = registerCapturingXum(bridge);
+
+    const first = (await captured.xum.attach_file({ path: "/big.png" })) as {
+      value: Array<{ data: string }>;
+    };
+    expect(first.value[0].data).toBe(MEDIA_DATA_STUB);
+
+    // Second attach would push the aggregate over budget: it must be refused
+    // with the budget stub and must NOT be carried host-side.
+    const second = (await captured.xum.attach_file({ path: "/small.png" })) as {
+      value: Array<{ data: string }>;
+    };
+    expect(second.value[0].data).toBe(MEDIA_BUDGET_EXCEEDED_STUB);
+
+    const drained = bridge.drainPendingAttachments(runtime);
+    expect(drained).toHaveLength(1);
+    expect(drained[0].data).toBe(bigData);
   });
 
   it("register clears stale pending attachments for that runtime", async () => {
