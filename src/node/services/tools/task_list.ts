@@ -253,7 +253,14 @@ async function executeTreeScope(
       const resolvedExecution = await resolveAgentExecution(workspaceId, task.taskId);
       executionStatus = resolvedExecution?.record?.status ?? executionStatus;
     }
-    if (executionStatus != null) {
+    // Peer admission accepts only a RUNNING execution mirror: overlaying a queued/starting
+    // reawakening onto a sibling/ancestor row would advertise a target task_send_message always
+    // refuses. Those rows keep their stable terminal status, which the note already marks
+    // unaddressable. Descendant/self rows keep the full overlay (guidance may target any state).
+    const hideUnadmittedReawakening =
+      (task.relationship === "sibling" || task.relationship === "ancestor") &&
+      (executionStatus === "queued" || executionStatus === "starting");
+    if (executionStatus != null && !hideUnadmittedReawakening) {
       status = taskListStatusFromExecution(executionStatus);
     }
     if (!statusFilter.has(status)) {

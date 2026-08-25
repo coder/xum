@@ -12,7 +12,10 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import type { z } from "zod";
 import type { AgentMode } from "./mode";
 import type { AgentSkillScope } from "./agentSkill";
-import type { AgentMessageRelationship } from "@/common/utils/agentMessageEnvelope";
+import type {
+  AgentMessageRelationship,
+  AgentPeerMessageMeta,
+} from "@/common/utils/agentMessageEnvelope";
 import type { ThinkingLevel } from "./thinking";
 import { type ReviewNoteData, formatReviewForModel } from "./review";
 import { isMcpPromptCommandKey } from "@/common/utils/tools/mcpPromptCommandKey";
@@ -674,11 +677,13 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         ownerWorkspaceId: string;
         turnId: string;
         /**
-         * Marks a peer-message wake trigger that must carry the delegated turn's correlation
-         * instead of peer attribution (stream-end settlement reads this variant's type). The UI
-         * still renders such rows as machine notifications, never as human prompts.
+         * Peer attribution for a peer-message wake trigger that must carry the delegated turn's
+         * correlation (stream-end settlement reads this variant's type). Carrying the full
+         * attribution — not just a flag — lets correlation stripping downgrade the row to plain
+         * peer metadata, so the UI keeps rendering it as a machine notification, never as a
+         * human prompt.
          */
-        agentPeerMessageTrigger?: true;
+        agentPeerMessageTrigger?: AgentPeerMessageMeta;
       }
     | {
         // Intra-tree agent peer message (sibling/cousin or descendant→ancestor task_send_message).

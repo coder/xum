@@ -28,6 +28,7 @@ import {
 import { BACKGROUND_WORK_WAKE_OPENINGS } from "@/common/utils/machineTurnPrompts";
 import {
   type AgentMessageRelationship,
+  type AgentPeerMessageMeta,
   formatAgentMessageEnvelope,
 } from "@/common/utils/agentMessageEnvelope";
 import type { SendMessageOptions } from "@/common/orpc/types";
@@ -5270,15 +5271,31 @@ export class TaskService {
         return Err(interruptedRefusal);
       }
 
+      // A user stop on any of the SENDER's ancestors also invalidates this send: the descendant
+      // interruption cascade may not have reached the sender yet (its status still reads
+      // running), but a prompt-influenced agent in a stopped subtree must not wake workspaces
+      // outside it from its winding-down tool call.
+      const senderChainIds = [
+        senderWorkspaceId,
+        ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, senderWorkspaceId),
+      ];
+      const senderChainInterrupted = (): boolean =>
+        senderChainIds.some((id) => this.interruptedParentWorkspaceIds.has(id));
+      if (senderChainInterrupted()) {
+        return Err(senderInactiveRefusal);
+      }
+
       // Latch stop generations for the admission probe below: the suppression set and persisted
       // statuses are level-triggered, so a Stop followed by a quick user resume BETWEEN probe
       // evaluations (e.g. while a queued entry sits in PREPARING) would read as clean again. Any
       // bump after this capture keeps the send stale forever — the resumed workspace belongs to
-      // the user, not to a wake admitted before the stop.
-      const stopEpochIds = [senderWorkspaceId, ...targetChainIds];
-      const capturedStopEpochs = stopEpochIds.map((id) => this.getWorkspaceStopEpoch(id));
-      const stopEpochsChanged = (): boolean =>
-        stopEpochIds.some((id, i) => this.getWorkspaceStopEpoch(id) !== capturedStopEpochs[i]);
+      // the user, not to a wake admitted before the stop. Both endpoints' chains are captured;
+      // the per-chain probes attribute the refusal to the stopped side.
+      const capturedStopEpochs = new Map(
+        [...senderChainIds, ...targetChainIds].map((id) => [id, this.getWorkspaceStopEpoch(id)])
+      );
+      const chainStopEpochChanged = (chainIds: string[]): boolean =>
+        chainIds.some((id) => this.getWorkspaceStopEpoch(id) !== capturedStopEpochs.get(id));
 
       const throttleError = this.checkPeerMessageThrottles(
         senderWorkspaceId,
@@ -5308,6 +5325,13 @@ export class TaskService {
       });
       const muxMetadata: MuxMessageMetadata = {
         type: "agent-peer-message",
+        fromWorkspaceId: senderWorkspaceId,
+        ...(senderTitle != null ? { fromTitle: senderTitle } : {}),
+        relationship,
+      };
+      // Bare attribution (no discriminator) — carried on workspace-turn correlated triggers so
+      // correlation stripping can downgrade the row to plain peer metadata (see message.ts).
+      const peerTriggerMeta: AgentPeerMessageMeta = {
         fromWorkspaceId: senderWorkspaceId,
         ...(senderTitle != null ? { fromTitle: senderTitle } : {}),
         relationship,
@@ -5358,7 +5382,7 @@ export class TaskService {
       // present the backend trigger as a human prompt (and re-enter prompt navigation).
       const triggerMuxMetadata: MuxMessageMetadata =
         workspaceTurnMuxMetadata != null
-          ? { ...workspaceTurnMuxMetadata, agentPeerMessageTrigger: true }
+          ? { ...workspaceTurnMuxMetadata, agentPeerMessageTrigger: peerTriggerMeta }
           : muxMetadata;
 
       let sendOptions: SendMessageOptions;
@@ -5415,11 +5439,17 @@ export class TaskService {
       // resurrecting the stopped task via markInterruptedTaskRunning.
       let admissionRefusal: SendAgentTreeMessageError | null = null;
       const admissionStale = (): boolean => {
-        // Latched stop check first: unlike the level-triggered probes below, a generation bump
+        // Latched stop checks first: unlike the level-triggered probes below, a generation bump
         // stays observable even when a user resume already cleared suppression and restored
-        // running statuses between probe evaluations.
-        if (stopEpochsChanged()) {
+        // running statuses between probe evaluations. Target attribution wins when a shared
+        // ancestor (e.g. the tree root) was stopped — the target-side refusal tells the sender
+        // the recipient will not accept messages until the user resumes it.
+        if (chainStopEpochChanged(targetChainIds)) {
           admissionRefusal = interruptedRefusal;
+          return true;
+        }
+        if (chainStopEpochChanged(senderChainIds)) {
+          admissionRefusal = senderInactiveRefusal;
           return true;
         }
         if (targetChainInterrupted()) {
@@ -5430,15 +5460,33 @@ export class TaskService {
         // Sender revalidation: a reawakened child stopped mid-send (its owner interrupted the
         // workspace turn) must not wake an idle peer from its winding-down tool call. The
         // execution mirror is marked terminal with the handle transition, so this re-read
-        // observes the stop before stopStream completes.
+        // observes the stop before stopStream completes. The chain check covers a user stop on
+        // a sender ancestor whose cascade has not reached the sender yet.
         const freshSender = findWorkspaceEntry(freshCfg, senderWorkspaceId);
-        if (freshSender == null || isInactivePeerSender(freshSender.workspace)) {
+        if (
+          freshSender == null ||
+          senderChainInterrupted() ||
+          isInactivePeerSender(freshSender.workspace)
+        ) {
           admissionRefusal = senderInactiveRefusal;
           return true;
         }
         const freshEntry = findWorkspaceEntry(freshCfg, targetId);
         if (freshEntry == null) {
           admissionRefusal = { code: "not_found" as const };
+          return true;
+        }
+        // Archive is reversible-only but stops delivery: a target archived after the initial
+        // check (archive does not synchronize with in-flight guarded sends) must refuse here
+        // rather than accept or queue a peer turn behind the archive boundary.
+        if (
+          isWorkspaceArchived(freshEntry.workspace.archivedAt, freshEntry.workspace.unarchivedAt)
+        ) {
+          admissionRefusal = {
+            code: "not_active" as const,
+            taskStatus: freshEntry.workspace.taskStatus ?? "unknown",
+            message: "Target workspace is archived; only its parent can restore and reawaken it.",
+          };
           return true;
         }
         if (targetIsAgentTask) {
@@ -5662,6 +5710,13 @@ export class TaskService {
           this.getTaskDepthFromParentById(index.parentById, right) -
           this.getTaskDepthFromParentById(index.parentById, left)
       );
+      // Latch the stop for the whole subtree BEFORE any await below: stopStream waits for
+      // in-flight tool calls to settle, and one of those tool calls may be the very peer send
+      // this stop must invalidate — a bump deferred to the status transition would deadlock
+      // behind it and let every admission probe pass in the meantime.
+      for (const id of taskIds) {
+        this.bumpWorkspaceStopEpoch(id);
+      }
       const activeWorkspaceTurns = await this.taskHandleStore.listAllWorkspaceTurns({
         statuses: ["queued", "starting", "running"],
       });
@@ -10438,13 +10493,6 @@ export class TaskService {
     const tasks = this.listDescendantAgentTasks(rootWorkspaceId, {
       excludeWorkflowTasks: true,
     })
-      .filter((task) => {
-        // Archived state is independent of taskStatus (legacy archived rows can still read
-        // "running"), and sendAgentPeerMessage unconditionally refuses archived targets — hide
-        // them from peer discovery so the note's addressability claim stays true.
-        const entry = index.byId.get(task.taskId);
-        return entry == null || !isWorkspaceArchived(entry.archivedAt, entry.unarchivedAt);
-      })
       .map((task): TreeAgentTaskInfo => {
         const relationship: TreeAgentRelationship =
           task.taskId === workspaceId
@@ -10464,6 +10512,19 @@ export class TaskService {
         // tree note's "bestOf metadata ⇒ not peer-addressable" rule aligned with refusal behavior.
         const bestOf = task.bestOf ?? this.findNearestBestOfGroupUsingIndex(index, task.taskId);
         return { ...task, ...(bestOf != null ? { bestOf } : {}), relationship };
+      })
+      .filter((task) => {
+        // Archived state is independent of taskStatus (legacy archived rows can still read
+        // "running"), and sendAgentPeerMessage unconditionally refuses archived targets — hide
+        // them from PEER discovery so the note's addressability claim stays true. Archived
+        // DESCENDANTS stay visible: their delivery routes through the trusted
+        // sendMessageToDescendantAgentTask path, which can restore and reawaken an inactive
+        // child, so hiding them would strand a valid reusable task ID after compaction.
+        if (task.relationship === "descendant" || task.relationship === "self") {
+          return true;
+        }
+        const entry = index.byId.get(task.taskId);
+        return entry == null || !isWorkspaceArchived(entry.archivedAt, entry.unarchivedAt);
       });
 
     return {

@@ -57,6 +57,18 @@ export function getValidAgentPeerMessageMeta(muxMeta: unknown): AgentPeerMessage
   if (typeof muxMeta !== "object" || muxMeta === null) return null;
   const record = muxMeta as Record<string, unknown>;
   if (record.type !== "agent-peer-message") return null;
+  return getValidAgentPeerTriggerMeta(muxMeta);
+}
+
+/**
+ * Validates bare peer attribution without the metadata discriminator — the shape carried by
+ * `agentPeerMessageTrigger` on a workspace-turn correlated trigger row, whose carrier `type` is
+ * "workspace-turn-task". Corrupted or legacy values (for example the earlier boolean flag) fail
+ * closed to null so the row falls back to ordinary user rendering.
+ */
+export function getValidAgentPeerTriggerMeta(value: unknown): AgentPeerMessageMeta | null {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Record<string, unknown>;
   if (!isNonEmptyString(record.fromWorkspaceId)) return null;
   if (!isRelationship(record.relationship)) return null;
   if (record.fromTitle != null && typeof record.fromTitle !== "string") return null;

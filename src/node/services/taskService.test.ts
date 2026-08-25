@@ -13734,12 +13734,20 @@ describe("TaskService", () => {
     const [, , options, internalArg] = sendMessage.mock.calls[0] as [
       string,
       string,
-      { muxMetadata?: { type?: string; agentPeerMessageTrigger?: true } },
+      { muxMetadata?: { type?: string; agentPeerMessageTrigger?: object } },
       { workspaceTurnContinuation?: boolean; preTurnMessages?: MuxMessage[] },
     ];
-    // The correlation replaces peer attribution, so the explicit trigger flag must survive it —
-    // it is what keeps the UI rendering this row as a machine notification.
-    expect(options.muxMetadata).toEqual({ ...turnMetadata, agentPeerMessageTrigger: true });
+    // The correlation replaces peer attribution, so the nested attribution must survive it —
+    // it keeps the UI rendering this row as a machine notification even if the correlation is
+    // later stripped for a superseded continuation.
+    expect(options.muxMetadata).toEqual({
+      ...turnMetadata,
+      agentPeerMessageTrigger: {
+        fromWorkspaceId: "child-a",
+        fromTitle: "child-a",
+        relationship: "descendant",
+      },
+    });
     expect(internalArg.workspaceTurnContinuation).toBe(true);
     // Peer attribution stays on the assistant payload row.
     expect(internalArg.preTurnMessages?.[0]?.metadata?.muxMetadata?.type).toBe(
@@ -13924,6 +13932,110 @@ describe("TaskService", () => {
     );
   });
 
+  test("sendAgentTreeMessage refuses at the admission probe when the target is archived mid-send", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const workspaces = (targetArchivedAt?: string) => [
+      projectWorkspace(projectPath, "root", "tree-root"),
+      projectWorkspace(projectPath, "sib-a", "sib-a", {
+        parentWorkspaceId: "tree-root",
+        taskStatus: "running" as const,
+      }),
+      projectWorkspace(projectPath, "sib-b", "sib-b", {
+        parentWorkspaceId: "tree-root",
+        taskStatus: "running" as const,
+        ...(targetArchivedAt != null ? { archivedAt: targetArchivedAt } : {}),
+      }),
+    ];
+    await saveWorkspaces(config, projectPath, workspaces(), testTaskSettings());
+
+    // Archive does not synchronize with in-flight guarded sends and leaves taskStatus
+    // untouched, so only the probe's archived re-read can stop the peer turn from landing
+    // behind the archive boundary.
+    const sendMessage = mock(
+      async (
+        _targetId: string,
+        _message: string,
+        _options: unknown,
+        internal: { admissionStale?: () => boolean }
+      ) => {
+        await saveWorkspaces(
+          config,
+          projectPath,
+          workspaces("2026-08-24T00:00:00.000Z"),
+          testTaskSettings()
+        );
+        expect(internal.admissionStale?.()).toBe(true);
+        return Err({ type: "unknown", raw: "send admission stale" });
+      }
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "still around?")).toEqual(
+      Err({
+        code: "not_active",
+        taskStatus: "running",
+        message: "Target workspace is archived; only its parent can restore and reawaken it.",
+      })
+    );
+  });
+
+  test("sendAgentTreeMessage refuses when a sender ancestor is stopped mid-send", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "mid", "task-mid", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        // Sender is a grandchild under the stopped branch; the target is outside it.
+        projectWorkspace(projectPath, "leaf", "task-leaf", {
+          parentWorkspaceId: "task-mid",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "cousin", "task-cousin", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    // The user hard-stops the intermediate workspace while the leaf's send is in flight: the
+    // descendant cascade has not reached the leaf (its status still reads running), so only
+    // the sender-chain suppression/generation check can keep the stopped subtree from waking
+    // workspaces outside it.
+    const serviceHolder: { current?: TaskService } = {};
+    const sendMessage = mock(
+      (
+        _targetId: string,
+        _message: string,
+        _options: unknown,
+        internal: { admissionStale?: () => boolean }
+      ) => {
+        serviceHolder.current?.markParentWorkspaceInterrupted("task-mid");
+        expect(internal.admissionStale?.()).toBe(true);
+        return Promise.resolve(Err({ type: "unknown", raw: "send admission stale" }));
+      }
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    serviceHolder.current = taskService;
+
+    expect(await taskService.sendAgentTreeMessage("task-leaf", "task-cousin", "update?")).toEqual(
+      Err({
+        code: "refused",
+        reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
+      })
+    );
+  });
+
   test("sendAgentTreeMessage refuses at the admission probe when the sender is stopped mid-send", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
@@ -14075,7 +14187,8 @@ describe("TaskService", () => {
           taskStatus: "running",
         }),
         // Archived state is independent of taskStatus; peer sends refuse archived targets, so
-        // discovery must hide the row.
+        // discovery hides the row from PEERS — but keeps it for ancestors, whose descendant
+        // path can restore and reawaken it.
         projectWorkspace(projectPath, "arch", "task-arch", {
           parentWorkspaceId: "tree-root",
           taskStatus: "running",
@@ -14108,6 +14221,9 @@ describe("TaskService", () => {
     const fromRoot = taskService.listTaskTreeAgents("tree-root");
     expect(fromRoot.rootRelationship).toBe("self");
     expect(fromRoot.tasks.every((task) => task.relationship === "descendant")).toBe(true);
+    // Archived descendants stay discoverable: task_send_message's trusted descendant path can
+    // restore and reawaken them, so hiding the row would strand a valid reusable task ID.
+    expect(fromRoot.tasks.some((task) => task.taskId === "task-arch")).toBe(true);
   });
 
   test("pending parent guidance blocks stale report settlement at stream end", async () => {

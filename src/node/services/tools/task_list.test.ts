@@ -953,6 +953,49 @@ describe("task_list tool", () => {
     expect(parsed.tasks[1].relationship).toBe("self");
   });
 
+  it("tree scope does not advertise queued reawakenings on peer rows", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-reawakening");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+    const listTaskTreeAgents = mock(() => ({
+      rootWorkspaceId: "tree-root",
+      rootRelationship: "ancestor" as const,
+      tasks: [
+        { ...buildAgentTask("task-self", "running", "tree-root"), relationship: "self" as const },
+        // Sibling with a QUEUED reawakening: peer admission only accepts a running execution
+        // mirror, so the row must keep its stable terminal status (which the note marks
+        // unaddressable) instead of advertising an addressable-looking "queued".
+        {
+          ...buildAgentTask("task-sib-requeued", "reported", "tree-root"),
+          executionTaskId: "wtt-sib",
+          executionStatus: "queued" as const,
+          relationship: "sibling" as const,
+        },
+        // A RUNNING reawakened sibling stays overlaid: it genuinely accepts peer messages.
+        {
+          ...buildAgentTask("task-sib-live", "reported", "tree-root"),
+          executionTaskId: "wtt-live",
+          executionStatus: "running" as const,
+          relationship: "sibling" as const,
+        },
+      ],
+    }));
+    const tool = createTaskListTool({
+      ...baseConfig,
+      taskService: { listTaskTreeAgents } as unknown as TaskService,
+    });
+
+    const parsed = (await Promise.resolve(
+      tool.execute!(
+        { scope: "tree", statuses: ["workspace", "running", "queued", "reported"] },
+        mockToolCallOptions
+      )
+    )) as { tasks: Array<{ taskId: string; status: string }> };
+
+    const statusById = new Map(parsed.tasks.map((task) => [task.taskId, task.status]));
+    expect(statusById.get("task-sib-requeued")).toBe("reported");
+    expect(statusById.get("task-sib-live")).toBe("running");
+  });
+
   it("tree scope filters the root row like any other row when explicit statuses are passed", async () => {
     using tempDir = new TestTempDir("test-task-list-tree-explicit");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });

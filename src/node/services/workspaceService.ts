@@ -9594,7 +9594,20 @@ export class WorkspaceService extends EventEmitter {
         sendOptions: SendMessageOptions & { fileParts?: FilePart[] }
       ): SendMessageOptions & { fileParts?: FilePart[] } => {
         const withoutCorrelation = { ...sendOptions };
-        delete withoutCorrelation.muxMetadata;
+        // A peer-message trigger keeps its machine-notification identity even when its
+        // delegated-turn correlation is superseded: downgrade to plain peer attribution
+        // instead of deleting the metadata wholesale, or the fixed backend trigger would
+        // render as a human prompt and re-enter prompt navigation.
+        const typedMuxMetadata = sendOptions.muxMetadata as MuxMessageMetadata | undefined;
+        const peerTrigger =
+          typedMuxMetadata?.type === "workspace-turn-task"
+            ? typedMuxMetadata.agentPeerMessageTrigger
+            : undefined;
+        if (peerTrigger != null) {
+          withoutCorrelation.muxMetadata = { type: "agent-peer-message", ...peerTrigger };
+        } else {
+          delete withoutCorrelation.muxMetadata;
+        }
         return withoutCorrelation;
       };
       const getContinuationSendState = () => {

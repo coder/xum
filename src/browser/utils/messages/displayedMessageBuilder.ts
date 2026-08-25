@@ -13,7 +13,10 @@ import {
   sanitizeMcpPromptRefs,
 } from "@/common/types/message";
 import type { StreamErrorType } from "@/common/types/errors";
-import { getValidAgentPeerMessageMeta } from "@/common/utils/agentMessageEnvelope";
+import {
+  getValidAgentPeerMessageMeta,
+  getValidAgentPeerTriggerMeta,
+} from "@/common/utils/agentMessageEnvelope";
 import { GOAL_BUDGET_LIMIT_KIND, GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { getFollowUpContentText } from "@/browser/utils/compaction/format";
 import { getGoalClearedSummaryDisplayText } from "@/common/utils/goalClearedSummaryDisplay";
@@ -342,11 +345,16 @@ function buildUserDisplayedMessages(options: {
       // The peer-message wake trigger is a synthetic machine row: mark it so prompt
       // navigation skips it (the envelope payload itself is a separate assistant row). When the
       // recipient is executing a delegated workspace turn, the trigger carries that turn's
-      // correlation metadata instead of peer attribution — the explicit flag keeps the machine
-      // presentation.
+      // correlation metadata with the attribution nested on it. SECURITY/self-healing: require
+      // synthetic provenance AND validated attribution before collapsing the row — a corrupted
+      // human user row wearing peer metadata must fall back to ordinary rendering, not be
+      // disguised as a machine notification hidden from prompt navigation.
       agentPeerMessageTrigger:
-        muxMeta?.type === "agent-peer-message" ||
-        (muxMeta?.type === "workspace-turn-task" && muxMeta.agentPeerMessageTrigger === true)
+        message.metadata?.synthetic === true &&
+        (muxMeta?.type === "agent-peer-message"
+          ? getValidAgentPeerMessageMeta(muxMeta) != null
+          : muxMeta?.type === "workspace-turn-task" &&
+            getValidAgentPeerTriggerMeta(muxMeta.agentPeerMessageTrigger) != null)
           ? true
           : undefined,
     },

@@ -58,14 +58,15 @@ describe("buildDisplayedMessagesForMessage agent peer message metadata", () => {
 
   test("keeps the machine marker when the trigger carries a workspace-turn correlation", () => {
     // Upward sends into a delegated workspace turn replace the trigger's peer attribution with
-    // the turn correlation; the explicit flag must keep the machine presentation while an
-    // ordinary workspace-turn row stays a plain prompt.
+    // the turn correlation; the nested attribution must keep the machine presentation while an
+    // ordinary workspace-turn row stays a plain prompt and corrupted attribution falls back.
     const correlation = {
       type: "workspace-turn-task" as const,
       taskHandleId: "wt-1",
       ownerWorkspaceId: "owner-1",
       turnId: "turn-1",
     };
+    const attribution = { fromWorkspaceId: "task-sib", relationship: "sibling" as const };
     const build = (muxMetadata: MuxMessageMetadata) => {
       const message = createMuxMessage("trigger-2", "user", "Peer agent sent an agent message…", {
         historySequence: 4,
@@ -83,10 +84,38 @@ describe("buildDisplayedMessagesForMessage agent peer message metadata", () => {
       return row;
     };
 
-    expect(build({ ...correlation, agentPeerMessageTrigger: true }).agentPeerMessageTrigger).toBe(
-      true
-    );
+    expect(
+      build({ ...correlation, agentPeerMessageTrigger: attribution }).agentPeerMessageTrigger
+    ).toBe(true);
     expect(build(correlation).agentPeerMessageTrigger).toBeUndefined();
+    // Corrupted attribution (e.g. the legacy boolean flag) fails closed to ordinary rendering.
+    expect(
+      build({
+        ...correlation,
+        agentPeerMessageTrigger: true as unknown as typeof attribution,
+      }).agentPeerMessageTrigger
+    ).toBeUndefined();
+  });
+
+  test("non-synthetic user rows wearing peer metadata render as ordinary prompts", () => {
+    // A corrupted human user row must not be disguised as a machine notification and hidden
+    // from prompt navigation: trigger collapsing requires synthetic provenance.
+    const message = createMuxMessage("user-corrupt", "user", "please review my PR", {
+      historySequence: 5,
+      muxMetadata: {
+        type: "agent-peer-message",
+        fromWorkspaceId: "task-sib",
+        relationship: "sibling",
+      },
+    });
+    const displayed = buildDisplayedMessagesForMessage({
+      message,
+      hasActiveStream: false,
+      isContextBoundaryMessage: () => false,
+    });
+    const row = displayed[0];
+    if (row?.type !== "user") throw new Error(`expected user row, got ${row?.type}`);
+    expect(row.agentPeerMessageTrigger).toBeUndefined();
   });
 
   test("ordinary user rows carry no trigger marker", () => {
