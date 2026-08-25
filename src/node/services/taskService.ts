@@ -5461,215 +5461,227 @@ export class TaskService {
         });
       }
 
-      // Ancestor targets are often human-driven: default to turn-end so a peer message does not
-      // cut into an active turn unless the sender explicitly asks. Sibling sends keep tool-end.
-      const effectiveDispatchMode =
-        params.queueDispatchMode ?? (relation === "target_ancestor" ? "turn-end" : "tool-end");
+      // Everything from here to dispatch can throw (correlation lookup and resume-option
+      // resolution read the handle store/config): refund exceptional pre-persistence exits in
+      // the catch below, or transient failures would consume the pair/target budgets without
+      // delivering anything — eventually refusing valid peer messages until restart.
+      let payloadPersisted = false;
+      try {
+        // Ancestor targets are often human-driven: default to turn-end so a peer message does not
+        // cut into an active turn unless the sender explicitly asks. Sibling sends keep tool-end.
+        const effectiveDispatchMode =
+          params.queueDispatchMode ?? (relation === "target_ancestor" ? "turn-end" : "tool-end");
 
-      // Delegated-turn correlation: if the target is currently executing a delegated workspace
-      // turn, the trigger must carry that correlation (like wakeParentWorkspaceWithSynthetic-
-      // Message) — otherwise the queued peer wake dispatches as an unrelated turn and the next
-      // stream end settles the owner's delegated turn as interrupted/superseded. Peer
-      // attribution stays on the assistant payload row, so no provenance is lost; the queue
-      // still counts these entries by their dedupe-key prefix.
-      const workspaceTurnMuxMetadata =
-        await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(targetId);
-      // Keep the explicit trigger marker alongside the correlation: displayedMessageBuilder
-      // renders machine notifications from metadata, so a bare workspace-turn replacement would
-      // present the backend trigger as a human prompt (and re-enter prompt navigation).
-      const triggerMuxMetadata: MuxMessageMetadata =
-        workspaceTurnMuxMetadata != null
-          ? { ...workspaceTurnMuxMetadata, agentPeerMessageTrigger: peerTriggerMeta }
-          : muxMetadata;
+        // Delegated-turn correlation: if the target is currently executing a delegated workspace
+        // turn, the trigger must carry that correlation (like wakeParentWorkspaceWithSynthetic-
+        // Message) — otherwise the queued peer wake dispatches as an unrelated turn and the next
+        // stream end settles the owner's delegated turn as interrupted/superseded. Peer
+        // attribution stays on the assistant payload row, so no provenance is lost; the queue
+        // still counts these entries by their dedupe-key prefix.
+        const workspaceTurnMuxMetadata =
+          await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(targetId);
+        // Keep the explicit trigger marker alongside the correlation: displayedMessageBuilder
+        // renders machine notifications from metadata, so a bare workspace-turn replacement would
+        // present the backend trigger as a human prompt (and re-enter prompt navigation).
+        const triggerMuxMetadata: MuxMessageMetadata =
+          workspaceTurnMuxMetadata != null
+            ? { ...workspaceTurnMuxMetadata, agentPeerMessageTrigger: peerTriggerMeta }
+            : muxMetadata;
 
-      let sendOptions: SendMessageOptions;
-      if (relation === "target_ancestor") {
-        const resumeOptions = await this.resolveParentAutoResumeOptions(
-          targetId,
-          targetEntry,
-          defaultModel
-        );
-        sendOptions = {
-          model: resumeOptions.model,
-          agentId: resumeOptions.agentId,
-          thinkingLevel: resumeOptions.thinkingLevel,
-          reasoningMode: resumeOptions.reasoningMode,
-          muxMetadata: triggerMuxMetadata,
-          queueDispatchMode: effectiveDispatchMode,
-        };
-      } else {
-        const activeAgentId = resolveTaskAgentIdForResume(targetEntry.workspace);
-        const activeAiSettings = this.resolveWorkspaceAISettings(
-          targetEntry.workspace,
-          activeAgentId
-        );
-        sendOptions = {
-          model:
-            coerceNonEmptyString(activeAiSettings?.model) ??
-            targetEntry.workspace.taskModelString ??
-            defaultModel,
-          agentId: activeAgentId,
-          thinkingLevel: activeAiSettings?.thinkingLevel ?? targetEntry.workspace.taskThinkingLevel,
-          reasoningMode: coerceOpenAIReasoningMode(activeAiSettings?.reasoningMode),
-          experiments: targetEntry.workspace.taskExperiments,
-          muxMetadata: triggerMuxMetadata,
-          queueDispatchMode: effectiveDispatchMode,
-        };
-      }
-
-      // The envelope rides as an assistant-role pre-turn row (never a user turn), persisted
-      // atomically with the trigger through the target's own turn admission — a direct history
-      // append could land inside another turn's PREPARING window.
-      const payloadRow = createMuxMessage(payloadMessageId, "assistant", envelope, {
-        timestamp: Date.now(),
-        synthetic: true,
-        uiVisible: true,
-        muxMetadata,
-      });
-
-      // Admission staleness probe: neither interruptStream nor stopDescendantAgentTask takes
-      // this target's event lock, so a user Stop or task_stop can land during ANY await between
-      // here and the real admission — including WorkspaceService.sendMessage's own pricing/
-      // settings awaits and the session's turn preparation. The probe is synchronous and
-      // re-evaluated by WorkspaceService at the enqueue block and the session's turn-admission
-      // gates, so a stop in those windows refuses the send instead of queueing a wake or
-      // resurrecting the stopped task via markInterruptedTaskRunning.
-      let admissionRefusal: SendAgentTreeMessageError | null = null;
-      const admissionStale = (): boolean => {
-        // Latched stop checks first: unlike the level-triggered probes below, a generation bump
-        // stays observable even when a user resume already cleared suppression and restored
-        // running statuses between probe evaluations. The in-progress latch backstops stops
-        // whose cascade has not yet persisted terminal statuses. Target attribution wins when
-        // a shared ancestor (e.g. the tree root) was stopped — the target-side refusal tells
-        // the sender the recipient will not accept messages until the user resumes it.
-        if (chainStopEpochChanged(targetChainIds) || targetChainStopping()) {
-          admissionRefusal = interruptedRefusal;
-          return true;
-        }
-        if (chainStopEpochChanged(senderChainIds) || senderChainStopping()) {
-          admissionRefusal = senderInactiveRefusal;
-          return true;
-        }
-        if (targetChainInterrupted()) {
-          admissionRefusal = interruptedRefusal;
-          return true;
-        }
-        const freshCfg = this.config.loadConfigOrDefault();
-        // Sender revalidation: a reawakened child stopped mid-send (its owner interrupted the
-        // workspace turn) must not wake an idle peer from its winding-down tool call. The
-        // execution mirror is marked terminal with the handle transition, so this re-read
-        // observes the stop before stopStream completes. The chain check covers a user stop on
-        // a sender ancestor whose cascade has not reached the sender yet.
-        const freshSender = findWorkspaceEntry(freshCfg, senderWorkspaceId);
-        if (
-          freshSender == null ||
-          senderChainInterrupted() ||
-          isInactivePeerSender(freshSender.workspace)
-        ) {
-          admissionRefusal = senderInactiveRefusal;
-          return true;
-        }
-        const freshEntry = findWorkspaceEntry(freshCfg, targetId);
-        if (freshEntry == null) {
-          admissionRefusal = { code: "not_found" as const };
-          return true;
-        }
-        // Archive is reversible-only but stops delivery: a target archived after the initial
-        // check (archive does not synchronize with in-flight guarded sends) must refuse here
-        // rather than accept or queue a peer turn behind the archive boundary.
-        if (
-          isWorkspaceArchived(freshEntry.workspace.archivedAt, freshEntry.workspace.unarchivedAt)
-        ) {
-          admissionRefusal = {
-            code: "not_active" as const,
-            taskStatus: freshEntry.workspace.taskStatus ?? "unknown",
-            message: "Target workspace is archived; only its parent can restore and reawaken it.",
+        let sendOptions: SendMessageOptions;
+        if (relation === "target_ancestor") {
+          const resumeOptions = await this.resolveParentAutoResumeOptions(
+            targetId,
+            targetEntry,
+            defaultModel
+          );
+          sendOptions = {
+            model: resumeOptions.model,
+            agentId: resumeOptions.agentId,
+            thinkingLevel: resumeOptions.thinkingLevel,
+            reasoningMode: resumeOptions.reasoningMode,
+            muxMetadata: triggerMuxMetadata,
+            queueDispatchMode: effectiveDispatchMode,
           };
-          return true;
+        } else {
+          const activeAgentId = resolveTaskAgentIdForResume(targetEntry.workspace);
+          const activeAiSettings = this.resolveWorkspaceAISettings(
+            targetEntry.workspace,
+            activeAgentId
+          );
+          sendOptions = {
+            model:
+              coerceNonEmptyString(activeAiSettings?.model) ??
+              targetEntry.workspace.taskModelString ??
+              defaultModel,
+            agentId: activeAgentId,
+            thinkingLevel:
+              activeAiSettings?.thinkingLevel ?? targetEntry.workspace.taskThinkingLevel,
+            reasoningMode: coerceOpenAIReasoningMode(activeAiSettings?.reasoningMode),
+            experiments: targetEntry.workspace.taskExperiments,
+            muxMetadata: triggerMuxMetadata,
+            queueDispatchMode: effectiveDispatchMode,
+          };
         }
-        if (targetIsAgentTask) {
-          // task_stop persists taskStatus="interrupted" (and terminal execution mirrors) under
-          // the task-tree lifecycle lock; re-read the persisted state at admission so the stop
-          // always wins the race.
-          const freshStatus = freshEntry.workspace.taskStatus ?? "running";
+
+        // The envelope rides as an assistant-role pre-turn row (never a user turn), persisted
+        // atomically with the trigger through the target's own turn admission — a direct history
+        // append could land inside another turn's PREPARING window.
+        const payloadRow = createMuxMessage(payloadMessageId, "assistant", envelope, {
+          timestamp: Date.now(),
+          synthetic: true,
+          uiVisible: true,
+          muxMetadata,
+        });
+
+        // Admission staleness probe: neither interruptStream nor stopDescendantAgentTask takes
+        // this target's event lock, so a user Stop or task_stop can land during ANY await between
+        // here and the real admission — including WorkspaceService.sendMessage's own pricing/
+        // settings awaits and the session's turn preparation. The probe is synchronous and
+        // re-evaluated by WorkspaceService at the enqueue block and the session's turn-admission
+        // gates, so a stop in those windows refuses the send instead of queueing a wake or
+        // resurrecting the stopped task via markInterruptedTaskRunning.
+        let admissionRefusal: SendAgentTreeMessageError | null = null;
+        const admissionStale = (): boolean => {
+          // Latched stop checks first: unlike the level-triggered probes below, a generation bump
+          // stays observable even when a user resume already cleared suppression and restored
+          // running statuses between probe evaluations. The in-progress latch backstops stops
+          // whose cascade has not yet persisted terminal statuses. Target attribution wins when
+          // a shared ancestor (e.g. the tree root) was stopped — the target-side refusal tells
+          // the sender the recipient will not accept messages until the user resumes it.
+          if (chainStopEpochChanged(targetChainIds) || targetChainStopping()) {
+            admissionRefusal = interruptedRefusal;
+            return true;
+          }
+          if (chainStopEpochChanged(senderChainIds) || senderChainStopping()) {
+            admissionRefusal = senderInactiveRefusal;
+            return true;
+          }
+          if (targetChainInterrupted()) {
+            admissionRefusal = interruptedRefusal;
+            return true;
+          }
+          const freshCfg = this.config.loadConfigOrDefault();
+          // Sender revalidation: a reawakened child stopped mid-send (its owner interrupted the
+          // workspace turn) must not wake an idle peer from its winding-down tool call. The
+          // execution mirror is marked terminal with the handle transition, so this re-read
+          // observes the stop before stopStream completes. The chain check covers a user stop on
+          // a sender ancestor whose cascade has not reached the sender yet.
+          const freshSender = findWorkspaceEntry(freshCfg, senderWorkspaceId);
           if (
-            !hasLiveRunningExecution(freshEntry.workspace, targetId) &&
-            freshStatus !== "running" &&
-            freshStatus !== "awaiting_report"
+            freshSender == null ||
+            senderChainInterrupted() ||
+            isInactivePeerSender(freshSender.workspace)
+          ) {
+            admissionRefusal = senderInactiveRefusal;
+            return true;
+          }
+          const freshEntry = findWorkspaceEntry(freshCfg, targetId);
+          if (freshEntry == null) {
+            admissionRefusal = { code: "not_found" as const };
+            return true;
+          }
+          // Archive is reversible-only but stops delivery: a target archived after the initial
+          // check (archive does not synchronize with in-flight guarded sends) must refuse here
+          // rather than accept or queue a peer turn behind the archive boundary.
+          if (
+            isWorkspaceArchived(freshEntry.workspace.archivedAt, freshEntry.workspace.unarchivedAt)
           ) {
             admissionRefusal = {
               code: "not_active" as const,
-              taskStatus: freshStatus,
-              message:
-                "Target stopped before the message was admitted; peer messages cannot reactivate it.",
+              taskStatus: freshEntry.workspace.taskStatus ?? "unknown",
+              message: "Target workspace is archived; only its parent can restore and reawaken it.",
             };
             return true;
           }
+          if (targetIsAgentTask) {
+            // task_stop persists taskStatus="interrupted" (and terminal execution mirrors) under
+            // the task-tree lifecycle lock; re-read the persisted state at admission so the stop
+            // always wins the race.
+            const freshStatus = freshEntry.workspace.taskStatus ?? "running";
+            if (
+              !hasLiveRunningExecution(freshEntry.workspace, targetId) &&
+              freshStatus !== "running" &&
+              freshStatus !== "awaiting_report"
+            ) {
+              admissionRefusal = {
+                code: "not_active" as const,
+                taskStatus: freshStatus,
+                message:
+                  "Target stopped before the message was admitted; peer messages cannot reactivate it.",
+              };
+              return true;
+            }
+          }
+          return false;
+        };
+        // Recheck immediately before dispatch: resolveParentAutoResumeOptions and the
+        // workspace-turn lookup awaited since the first check.
+        if (admissionStale()) {
+          refundBudget();
+          return Err(admissionRefusal ?? interruptedRefusal);
         }
-        return false;
-      };
-      // Recheck immediately before dispatch: resolveParentAutoResumeOptions and the
-      // workspace-turn lookup awaited since the first check.
-      if (admissionStale()) {
-        refundBudget();
-        return Err(admissionRefusal ?? interruptedRefusal);
-      }
 
-      let accepted = false;
-      let payloadPersisted = false;
-      const sendResult = await this.workspaceService.sendMessage(targetId, trigger, sendOptions, {
-        admissionStale,
-        synthetic: true,
-        agentInitiated: true,
-        startStreamInBackground: true,
-        // Peer sends must not count as fresh user attention: resetAutoResumeCount also clears
-        // consecutivePeerWakes, so letting a peer message trigger it would let peers extend each
-        // other's wake budget indefinitely.
-        skipAutoResumeReset: true,
-        // Unique key ⇒ never coalesces (removable dedupe keys force a sealed queue entry), so
-        // sender attribution, queue caps, and previews survive later queued messages.
-        queueDedupeKey: `${AGENT_PEER_MESSAGE_DEDUPE_PREFIX}${senderWorkspaceId}:${randomUUID()}`,
-        removableQueueDedupeKey: true,
-        workspaceTurnContinuation: workspaceTurnMuxMetadata != null,
-        preTurnMessages: [payloadRow],
-        onPreTurnRowsPersisted: () => {
-          payloadPersisted = true;
-        },
-        onAccepted: () => {
-          accepted = true;
-        },
-      });
-      if (!sendResult.success) {
-        // Refund only when nothing landed in the target transcript: pre-horizon failures roll
-        // back every persisted pre-turn row, while post-persistence failures keep the charge —
-        // refunding durable rows would let a sender retry unlimited max-size payloads while the
-        // acceptance path is failing (same rationale as the family-message routes).
+        let accepted = false;
+        const sendResult = await this.workspaceService.sendMessage(targetId, trigger, sendOptions, {
+          admissionStale,
+          synthetic: true,
+          agentInitiated: true,
+          startStreamInBackground: true,
+          // Peer sends must not count as fresh user attention: resetAutoResumeCount also clears
+          // consecutivePeerWakes, so letting a peer message trigger it would let peers extend each
+          // other's wake budget indefinitely.
+          skipAutoResumeReset: true,
+          // Unique key ⇒ never coalesces (removable dedupe keys force a sealed queue entry), so
+          // sender attribution, queue caps, and previews survive later queued messages.
+          queueDedupeKey: `${AGENT_PEER_MESSAGE_DEDUPE_PREFIX}${senderWorkspaceId}:${randomUUID()}`,
+          removableQueueDedupeKey: true,
+          workspaceTurnContinuation: workspaceTurnMuxMetadata != null,
+          preTurnMessages: [payloadRow],
+          onPreTurnRowsPersisted: () => {
+            payloadPersisted = true;
+          },
+          onAccepted: () => {
+            accepted = true;
+          },
+        });
+        if (!sendResult.success) {
+          // Refund only when nothing landed in the target transcript: pre-horizon failures roll
+          // back every persisted pre-turn row, while post-persistence failures keep the charge —
+          // refunding durable rows would let a sender retry unlimited max-size payloads while the
+          // acceptance path is failing (same rationale as the family-message routes).
+          if (!payloadPersisted) {
+            refundBudget();
+          }
+          // A probe-triggered rejection surfaces the precise refusal (stop won the race), not a
+          // generic transport failure.
+          if (admissionRefusal != null) {
+            return Err(admissionRefusal);
+          }
+          return Err({
+            code: "send_failed" as const,
+            message: formatSendMessageError(sendResult.error).message,
+          });
+        }
+
+        // Charge the wake budget at ADMISSION (still inside the target's event lock), not at
+        // dispatch: acceptance callbacks fire only when an entry is dequeued into a turn, so any
+        // dispatch-time accounting leaves a dequeue-to-acceptance window where a parallel sender
+        // sees neither a queued entry nor an incremented counter. Counting admitted sends makes
+        // the budget independent of queue state; user attention still resets it.
+        this.consecutivePeerWakes.set(targetId, (this.consecutivePeerWakes.get(targetId) ?? 0) + 1);
+        this.recordPeerMessageSend(senderWorkspaceId, targetId, params.message, Date.now());
+        return Ok(
+          accepted
+            ? { delivery: "accepted" as const, relation }
+            : { delivery: "queued" as const, relation, queueDispatchMode: effectiveDispatchMode }
+        );
+      } catch (error: unknown) {
         if (!payloadPersisted) {
           refundBudget();
         }
-        // A probe-triggered rejection surfaces the precise refusal (stop won the race), not a
-        // generic transport failure.
-        if (admissionRefusal != null) {
-          return Err(admissionRefusal);
-        }
-        return Err({
-          code: "send_failed" as const,
-          message: formatSendMessageError(sendResult.error).message,
-        });
+        throw error;
       }
-
-      // Charge the wake budget at ADMISSION (still inside the target's event lock), not at
-      // dispatch: acceptance callbacks fire only when an entry is dequeued into a turn, so any
-      // dispatch-time accounting leaves a dequeue-to-acceptance window where a parallel sender
-      // sees neither a queued entry nor an incremented counter. Counting admitted sends makes
-      // the budget independent of queue state; user attention still resets it.
-      this.consecutivePeerWakes.set(targetId, (this.consecutivePeerWakes.get(targetId) ?? 0) + 1);
-      this.recordPeerMessageSend(senderWorkspaceId, targetId, params.message, Date.now());
-      return Ok(
-        accepted
-          ? { delivery: "accepted" as const, relation }
-          : { delivery: "queued" as const, relation, queueDispatchMode: effectiveDispatchMode }
-      );
     });
   }
 
@@ -11565,6 +11577,24 @@ export class TaskService {
     // Latch the stop: the suppression entry above is level-triggered and cleared by resume, so
     // in-flight peer-send admission also needs the monotonic generation to observe the stop.
     this.bumpWorkspaceStopEpoch(workspaceId);
+  }
+
+  /**
+   * Hold the stop-in-progress latch for a hard-interrupted workspace across the ENTIRE hard-stop
+   * flow: the caller acquires it synchronously at the request boundary (before awaiting the
+   * session interrupt) and releases it only after terminateAllDescendantAgentTasks persisted the
+   * descendants' terminal statuses. markParentWorkspaceInterrupted's suppression entry is
+   * level-triggered and cleared by the user's next real send, and the cascade's descendant-set
+   * latch only exists after the session-interrupt await plus the cascade's mutex acquisition —
+   * without this boundary latch, a still-running descendant could admit a peer send in those
+   * windows (the ancestor's epoch was bumped BEFORE the send captured its baseline, so it reads
+   * clean) and wake a cousin or the root after Stop. Latching the subtree root suffices: peer
+   * admission checks the latch on every endpoint's ancestor chain, which contains this
+   * workspace for all subtree members.
+   */
+  latchHardInterruptCascade(workspaceId: string): () => void {
+    assert(workspaceId.length > 0, "latchHardInterruptCascade: workspaceId must be non-empty");
+    return this.latchWorkspaceStopsInProgress([workspaceId]);
   }
 
   /**

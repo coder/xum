@@ -14484,6 +14484,126 @@ describe("TaskService", () => {
     }
   });
 
+  test("sendAgentTreeMessage refunds budget reservations when dispatch throws pre-persistence", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "sib-a", "sib-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    // Awaited preparation/dispatch can THROW (e.g. a transient handle-store read failure), and
+    // only returned failures reach the inline refund — a leaked reservation would consume the
+    // session-wide budgets without delivering anything, eventually refusing valid messages
+    // until restart.
+    let failFirst = true;
+    const sendMessage = mock((): Promise<Result<void>> => {
+      if (failFirst) {
+        failFirst = false;
+        return Promise.reject(new Error("transient handle store failure"));
+      }
+      return Promise.resolve(Ok(undefined));
+    });
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    // Exactly ONE aggregate slot left for sib-b: without the refund, the thrown first attempt
+    // permanently consumes it and the follow-up is budget-refused.
+    const internals = taskService as unknown as {
+      familyMessageTargetTotals: Map<string, { count: number; chars: number }>;
+    };
+    internals.familyMessageTargetTotals.set("sib-b", {
+      count: TASK_FAMILY_MESSAGE_TARGET_MAX_TOTAL_MESSAGES - 1,
+      chars: 0,
+    });
+
+    try {
+      await taskService.sendAgentTreeMessage("sib-a", "sib-b", "first try");
+      expect.unreachable("dispatch throw must propagate to the caller");
+    } catch (error) {
+      expect((error as Error).message).toBe("transient handle store failure");
+    }
+
+    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "second try")).toEqual(
+      Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
+    );
+  });
+
+  test("sendAgentTreeMessage refuses sends latched at the hard-stop request boundary", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "branch-a", "branch-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "leaf-a", "leaf-a", {
+          parentWorkspaceId: "branch-a",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    // WorkspaceService.interruptStream marks + latches synchronously at the request boundary,
+    // then AWAITS the session interrupt before the descendant cascade begins. A user resume
+    // during that await clears the level-triggered suppression while no descendant epoch has
+    // been bumped and the cascade latch does not exist yet — only the boundary latch can refuse
+    // sends entering here.
+    taskService.markParentWorkspaceInterrupted("branch-a");
+    const releaseHardStopLatch = taskService.latchHardInterruptCascade("branch-a");
+    taskService.resetAutoResumeCount("branch-a");
+
+    expect(await taskService.sendAgentTreeMessage("leaf-a", "sib-b", "escape the stop")).toEqual(
+      Err({
+        code: "refused",
+        reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
+      })
+    );
+    expect(await taskService.sendAgentTreeMessage("sib-b", "leaf-a", "wake the leaf")).toEqual(
+      Err({
+        code: "refused",
+        reason:
+          "Target was interrupted by the user and will not accept agent messages until the user resumes it.",
+      })
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    // interruptStream releases in its finally (including the failed-interrupt path); with
+    // suppression already cleared by the resume, peer messaging must recover — the boundary
+    // latch must not leak.
+    releaseHardStopLatch();
+    expect(await taskService.sendAgentTreeMessage("leaf-a", "sib-b", "after release")).toEqual(
+      Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
+    );
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
   test("listTaskTreeAgents tags relationships relative to the caller and excludes workflow subtrees", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");

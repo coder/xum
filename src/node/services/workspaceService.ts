@@ -10145,12 +10145,22 @@ export class WorkspaceService extends EventEmitter {
     workspaceId: string,
     options?: { soft?: boolean; abandonPartial?: boolean; sendQueuedImmediately?: boolean }
   ): Promise<Result<void>> {
+    let releaseHardStopLatch: (() => void) | undefined;
     try {
       this.taskService?.resetAutoResumeCount(workspaceId);
       if (!options?.soft) {
         // Mark before attempting the session interrupt to close races where a child
         // could report between stop initiation and descendant cascade termination.
         this.taskService?.markParentWorkspaceInterrupted(workspaceId);
+        // Latch synchronously at the request boundary, BEFORE the session-interrupt await
+        // below: the suppression mark above is level-triggered (a user resume clears it), so
+        // a peer send from a still-running descendant entering during that await — or during
+        // the cascade's own mutex acquisition — would otherwise capture the already-bumped
+        // ancestor epoch as its clean baseline and wake workspaces outside the stopped
+        // subtree. Released in the finally, after the descendant cascade persisted terminal
+        // statuses.
+        // Optional call: test harnesses mock TaskService with a narrow method surface.
+        releaseHardStopLatch = this.taskService?.latchHardInterruptCascade?.(workspaceId);
       }
 
       const session = this.getOrCreateSession(workspaceId);
@@ -10213,6 +10223,8 @@ export class WorkspaceService extends EventEmitter {
       const errorMessage = getErrorMessage(error);
       log.error("Unexpected error in interruptStream handler:", error);
       return Err(`Failed to interrupt stream: ${errorMessage}`);
+    } finally {
+      releaseHardStopLatch?.();
     }
   }
 
