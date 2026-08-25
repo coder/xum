@@ -2774,6 +2774,31 @@ describe("WorkspaceGoalService", () => {
       status: "active",
     });
 
+    // Codex P2 (PRRT_kwDOPxxmWM6cGSPK): a mismatched boundary is skipped, not
+    // treated as the tail's final signal — a genuine post-goal manual row
+    // beneath it must still reconcile the replacement to paused (covers a
+    // crash that lost the dispatch-time auto-pause).
+    await appendUserHistoryMessage(historyService, workspaceId, "Post-goal intervention", {
+      timestamp: goalB.createdAtMs + 5_000,
+    });
+    const buriedBoundary = createMuxMessage(
+      `goal-paused-buried-${crypto.randomUUID()}`,
+      "user",
+      "Goal paused by the user. Do not continue the goal until a later goal continuation message.",
+      {
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: { type: "goal-pause-boundary", goalId: goalA.goalId },
+      }
+    );
+    expect((await historyService.appendToHistory(workspaceId, buriedBoundary)).success).toBe(true);
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: goalB.goalId,
+      status: "paused",
+    });
+    // Reset for the legacy assertion below: resume B.
+    await setGoalOk(service, { workspaceId, status: "active" });
+
     // Legacy boundaries without a goalId keep the old any-goal semantics.
     const legacyBoundary = createMuxMessage(
       `goal-paused-legacy-${crypto.randomUUID()}`,
@@ -3037,6 +3062,18 @@ describe("WorkspaceGoalService", () => {
     // deterministic: [gate] -> drain claim -> replacement setter -> drain
     // persistence. The replacement setter therefore provably lands between
     // the drain's claim and its persistence tenure.
+    //
+    // Codex P2 (PRRT_kwDOPxxmWM6cGSPX): count lock admissions instead of
+    // sleeping — the replacement setter's asynchronous pre-lock streaming
+    // check has no time bound on a loaded worker, and releasing the gate
+    // before it enqueues would let the drain settle first and fail the
+    // `drained` assertion spuriously.
+    let lockCalls = 0;
+    const originalWithLock = serviceAccess.fileLocks.withLock.bind(serviceAccess.fileLocks);
+    serviceAccess.fileLocks.withLock = <T>(key: string, fn: () => Promise<T>): Promise<T> => {
+      lockCalls += 1;
+      return originalWithLock(key, fn);
+    };
     let releaseGate!: () => void;
     const gate = new Promise<void>((resolve) => {
       releaseGate = resolve;
@@ -3057,9 +3094,9 @@ describe("WorkspaceGoalService", () => {
       // coherent when the drain replays this mutation on the next pass.
       expectedGoalId: first.goalId,
     });
-    // Let the replacement setter finish its pre-lock streaming check and
-    // queue on the lock before the gate opens.
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    // Deterministic admission signal: gate (1), drain claim (2), replacement
+    // setter (3). Only then may the gate open.
+    await waitForCondition(() => lockCalls >= 3, { timeoutMs: 5_000 });
     releaseGate();
     await gateTenure;
 

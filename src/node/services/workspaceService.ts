@@ -10843,6 +10843,25 @@ export class WorkspaceService extends EventEmitter {
 
       const shouldQueue = !normalizedOptions?.editMessageId && session.isBusy();
 
+      // Codex P1 (PRRT_kwDOPxxmWM6cGSPP): a goal-continuation dispatch closure
+      // captured before a manual send entered preflight would otherwise win
+      // idle admission here — the session only reports busy late in
+      // AgentSession.sendMessage, so `isBusy()` alone cannot see the user's
+      // in-flight turn. `preflightSendCounts` includes THIS send (incremented
+      // synchronously at entry above), so any other in-preflight send makes
+      // the count exceed 1; refusing is safe because idle-only callers
+      // (continuations, heartbeats) treat this as a transient skip and retry.
+      if (
+        !shouldQueue &&
+        internal?.requireIdle &&
+        (this.preflightSendCounts.get(workspaceId) ?? 0) > 1
+      ) {
+        return Err({
+          type: "unknown",
+          raw: IDLE_ONLY_BUSY_SKIP_MESSAGE,
+        });
+      }
+
       if (shouldQueue) {
         // Everything from here to queueMessage is synchronous, so a probe pass here cannot go
         // stale before the entry is enqueued.

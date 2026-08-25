@@ -234,13 +234,6 @@ interface ChatTailGoalModeResult {
    */
   pausedBy?: "pause_boundary" | "manual_user";
   /**
-   * When `pausedBy === "pause_boundary"`: the goal the boundary row was
-   * stamped for. Reconciliation ignores boundaries belonging to a different
-   * goal (Codex P2 PRRT_kwDOPxxmWM6cEl4F); absent on legacy rows, which keep
-   * the old any-goal semantics.
-   */
-  boundaryGoalId?: string;
-  /**
    * When `pausedBy === "manual_user"`: the moment the user authored the pausing
    * row — its persisted enqueue time (queued sends) or the row timestamp.
    * Reconciliation compares this against `goal.createdAtMs` to tell pre-goal
@@ -562,7 +555,10 @@ export class WorkspaceGoalService {
     this.streamInterrupter = interrupter;
   }
 
-  private async readChatTailGoalMode(workspaceId: string): Promise<ChatTailGoalModeResult> {
+  private async readChatTailGoalMode(
+    workspaceId: string,
+    currentGoalId?: string | null
+  ): Promise<ChatTailGoalModeResult> {
     const historyResult = await this.historyService.getLastMessages(workspaceId, 100);
     if (!historyResult.success) {
       log.warn("Failed to read chat tail for goal mode reconciliation", {
@@ -587,11 +583,18 @@ export class WorkspaceGoalService {
       }
       if (message.metadata?.muxMetadata?.type === "goal-pause-boundary") {
         const boundaryGoalId = message.metadata.muxMetadata.goalId;
-        return {
-          mode: "paused",
-          pausedBy: "pause_boundary",
-          ...(boundaryGoalId != null ? { boundaryGoalId } : {}),
-        };
+        if (currentGoalId != null && boundaryGoalId != null && boundaryGoalId !== currentGoalId) {
+          // Codex P2 (PRRT_kwDOPxxmWM6cEl4F, PRRT_kwDOPxxmWM6cGSPK): a stale
+          // pause finalizer's boundary can land AFTER a replacement goal (and
+          // even after that goal's own manual rows). A mismatched goal-scoped
+          // boundary is not the tail's final signal — skip it and keep
+          // scanning so a genuine post-goal manual row beneath it still
+          // reconciles the replacement (e.g. to paused after a crash lost the
+          // dispatch-time auto-pause). Legacy rows without a goalId keep the
+          // old any-goal semantics.
+          continue;
+        }
+        return { mode: "paused", pausedBy: "pause_boundary" };
       }
       if (message.metadata?.synthetic === true) {
         continue;
@@ -626,19 +629,10 @@ export class WorkspaceGoalService {
       return goal;
     }
 
-    // Codex P2 (PRRT_kwDOPxxmWM6cEl4F): a pause boundary stamped for a
-    // DIFFERENT goal is a stale pause finalizer's artifact — its append raced
-    // a replacement's persistence and landed after the newer goal was written.
-    // Applying it here would silently pause a goal the user never paused.
-    // Treat it as no signal; legacy boundaries without a goalId keep pausing
-    // whatever goal is current.
-    if (
-      chatTailMode.pausedBy === "pause_boundary" &&
-      chatTailMode.boundaryGoalId != null &&
-      chatTailMode.boundaryGoalId !== goal.goalId
-    ) {
-      return goal;
-    }
+    // Mismatched goal-scoped pause boundaries (a stale pause finalizer's
+    // artifact racing a replacement) never reach here: readChatTailGoalMode
+    // skips them while scanning when given the current goal's identity (Codex
+    // P2 PRRT_kwDOPxxmWM6cEl4F, PRRT_kwDOPxxmWM6cGSPK).
 
     // Kickoff window: a freshly activated goal (model set_goal / user Resume)
     // arms a kickoff continuation candidate before its first goal_continuation
@@ -702,12 +696,24 @@ export class WorkspaceGoalService {
   }
 
   private async syncGoalStatusToChatTail(workspaceId: string): Promise<GoalRecordV1 | null> {
-    const chatTailMode = await this.readChatTailGoalMode(workspaceId);
+    // Chat-tail reads go through the history service, which shares
+    // `workspaceFileLocks` — reading the tail while holding the goal file lock
+    // deadlocks. Pre-read the goal identity unlocked so goal-scoped pause
+    // boundaries from replaced goals are skipped while scanning (Codex P2
+    // PRRT_kwDOPxxmWM6cGSPK); the locked section re-verifies the identity and
+    // skips reconciliation for this round when a concurrent setter changed it
+    // (the next read re-syncs against the fresh identity).
+    const preRead = await this.readGoalFile(workspaceId);
+    const chatTailMode =
+      preRead != null ? await this.readChatTailGoalMode(workspaceId, preRead.goalId) : null;
     return this.fileLocks.withLock(workspaceId, async () => {
       const current = await this.readGoalFile(workspaceId);
       if (!current) {
         await this.pushGoalReadSnapshot(workspaceId, null);
         return null;
+      }
+      if (chatTailMode == null || current.goalId !== preRead?.goalId) {
+        return current;
       }
 
       const next = this.applyChatTailGoalMode(workspaceId, current, chatTailMode);
@@ -727,7 +733,7 @@ export class WorkspaceGoalService {
     workspaceId: string,
     goalId: string
   ): Promise<boolean> {
-    const chatTailMode = await this.readChatTailGoalMode(workspaceId);
+    const chatTailMode = await this.readChatTailGoalMode(workspaceId, goalId);
     if (chatTailMode.mode !== "active") {
       return true;
     }
@@ -1680,14 +1686,23 @@ export class WorkspaceGoalService {
     workspaceId: string,
     options: { syncChatTail?: boolean } = {}
   ): Promise<GoalRecordV1 | null> {
-    const chatTailMode =
-      options.syncChatTail === true ? await this.readChatTailGoalMode(workspaceId) : null;
+    // Tail reads must stay outside the goal file lock (shared with the
+    // history service — see syncGoalStatusToChatTail). Pre-read the identity
+    // for boundary scoping; identity drift under the lock skips chat-tail
+    // reconciliation for this round only.
+    const preRead = options.syncChatTail === true ? await this.readGoalFile(workspaceId) : null;
+    const preReadChatTailMode =
+      preRead != null ? await this.readChatTailGoalMode(workspaceId, preRead.goalId) : null;
     return this.fileLocks.withLock(workspaceId, async () => {
       const current = await this.readGoalFile(workspaceId);
       if (!current) {
         await this.pushGoalReadSnapshot(workspaceId, null);
         return null;
       }
+      const chatTailMode =
+        preReadChatTailMode != null && current.goalId === preRead?.goalId
+          ? preReadChatTailMode
+          : null;
       const budgetNormalized = this.applyBudgetDrivenStatus(current);
       const next = chatTailMode
         ? this.applyChatTailGoalMode(workspaceId, budgetNormalized, chatTailMode)
@@ -1709,7 +1724,10 @@ export class WorkspaceGoalService {
     expectedGoalId: string,
     firedAtMs: number
   ): Promise<void> {
-    const chatTailMode = await this.readChatTailGoalMode(workspaceId);
+    // Read outside the goal file lock (shared with the history service) and
+    // scope boundary skipping to the expected goal — the locked section below
+    // already refuses when the durable goal is not that goal.
+    const chatTailMode = await this.readChatTailGoalMode(workspaceId, expectedGoalId);
     await this.fileLocks.withLock(workspaceId, async () => {
       const current = await this.readGoalFile(workspaceId);
       if (current?.goalId !== expectedGoalId) {
