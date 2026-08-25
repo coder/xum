@@ -210,6 +210,61 @@ describe("GIT_FETCH_SCRIPT", () => {
     }
   }, 20000);
 
+  test("keeps promisor config when object enumeration fails", async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), "mux-git-heal-enum-"));
+    const originDir = path.join(tempDir, "origin.git");
+    const seedDir = path.join(tempDir, "seed");
+    const workspaceDir = path.join(tempDir, "workspace");
+
+    const run = (cmd: string, cwd?: string) =>
+      execSync(cmd, { cwd, stdio: "pipe" }).toString().trim();
+    const configureIdentity = (cwd: string) => {
+      run('git config user.email "test@example.com"', cwd);
+      run('git config user.name "Test User"', cwd);
+      run("git config commit.gpgsign false", cwd);
+    };
+
+    try {
+      run(`git init --bare ${originDir}`);
+      run(`git -C ${originDir} config uploadpack.allowFilter true`);
+
+      run(`git clone ${originDir} ${seedDir}`);
+      configureIdentity(seedDir);
+      await writeFile(path.join(seedDir, "README.md"), "init\n");
+      run("git add README.md", seedDir);
+      run('git commit -m "init"', seedDir);
+      run("git branch -M main", seedDir);
+      run("git push -u origin main", seedDir);
+      run("git symbolic-ref HEAD refs/heads/main", originDir);
+
+      run(`git clone ${originDir} ${workspaceDir}`);
+      configureIdentity(workspaceDir);
+
+      await writeFile(path.join(seedDir, "data.txt"), "poisoned blob content\n");
+      run("git add data.txt", seedDir);
+      run('git commit -m "add data"', seedDir);
+      run("git push origin main", seedDir);
+      run("git fetch origin --filter=blob:none", workspaceDir);
+
+      // Point a local ref at an object the repo does not have at all:
+      // rev-list then exits 128 without reporting anything, which must read
+      // as "not proven complete" — never as "nothing missing".
+      await writeFile(
+        path.join(workspaceDir, ".git", "refs", "heads", "broken"),
+        "0123456789abcdef0123456789abcdef01234567\n"
+      );
+
+      const output = run(GIT_FETCH_SCRIPT, workspaceDir);
+      expect(output).toContain("HEAL: backfilling promisor partial clone");
+      expect(output).not.toContain("HEAL: promisor config removed");
+      expect(run("git config --local --get remote.origin.partialclonefilter", workspaceDir)).toBe(
+        "blob:none"
+      );
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  }, 20000);
+
   test("keeps promisor config when a force-push strands blobless commits in the reflog", async () => {
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "mux-git-heal-reflog-"));
     const originDir = path.join(tempDir, "origin.git");

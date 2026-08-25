@@ -243,13 +243,23 @@ if [ "$(git config --local --get remote.origin.partialclonefilter 2>/dev/null)" 
     if mkdir "$HEAL_LOCK" 2>/dev/null; then
       echo "$NOW" > "$HEAL_LOCK/started"
       echo "HEAL: backfilling promisor partial clone"
-      # Enumerate locally reachable objects the repo does not have. --reflog
-      # matters: an upstream force-push strands the displaced commit in the
-      # remote-tracking reflog, and recovery (e.g. git reset --hard
-      # origin/main@{1}) must keep lazy-fetching after an unsafe unset would
-      # have broken it, so reflog-only gaps count as missing too.
+      # Enumerate locally reachable objects the repo does not have (one OID
+      # per line). --reflog matters: an upstream force-push strands the
+      # displaced commit in the remote-tracking reflog, and recovery (e.g.
+      # git reset --hard origin/main@{1}) must keep lazy-fetching after an
+      # unsafe unset would have broken it, so reflog-only gaps count too.
+      # When rev-list itself fails (e.g. a local ref names a commit object
+      # the repo does not have at all, which exits 128 before reporting
+      # anything) a sentinel is printed instead: enumeration failure must
+      # read as "not proven complete", never as "nothing missing", or the
+      # unset below would strip the lazy-fetch fallback from a repo that
+      # still needs it.
       xum_missing_objects() {
-        git rev-list --objects --missing=print --all --reflog 2>/dev/null | sed -n 's/^?//p'
+        if xum_rl_out=$(git rev-list --objects --missing=print --all --reflog 2>/dev/null); then
+          printf '%s\\n' "$xum_rl_out" | sed -n 's/^?//p'
+        else
+          echo "enumeration-failed"
+        fi
       }
       HEAL_FETCHED=""
       MISSING=$(xum_missing_objects)
@@ -258,8 +268,10 @@ if [ "$(git config --local --get remote.origin.partialclonefilter 2>/dev/null)" 
       # hosts whose git predates --refetch (2.36), e.g. Ubuntu 22.04's 2.34.
       # OID wants ride the same protocol-v2 server capability the repo's
       # lazy fetch already depends on (this is a batched lazy fetch), and
-      # explicit wants bypass the persisted partial-clone filter.
-      if [ -n "$MISSING" ]; then
+      # explicit wants bypass the persisted partial-clone filter. Skipped on
+      # enumeration failure (no OID list to fetch); stage 2 still runs then,
+      # since a full refetch can restore a missing commit object itself.
+      if [ -n "$MISSING" ] && [ "$MISSING" != "enumeration-failed" ]; then
         if printf '%s\\n' "$MISSING" | git -c protocol.version=2 \\
             fetch origin \\
             --stdin \\

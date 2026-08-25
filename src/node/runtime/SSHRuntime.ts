@@ -2658,19 +2658,43 @@ export class SSHRuntime extends RemoteRuntime {
       // path where ensureBaseRepo() has retry/error handling instead of risking
       // materializing a worktree from still-poisoned shared config.
       `git --git-dir=${baseRepoPathArg} symbolic-ref HEAD ${baseRepoUnbornHeadArg} 2>/dev/null || { echo WARM_MISS:base-head-normalization-failed; exit 0; }`,
-      // Best-effort promisor strip, mirroring ensureBaseRepo()'s epilogue. The
-      // warm path skips ensureBaseRepo(), and background status fetches that
-      // ran `git fetch --filter=blob:none` inside sibling worktrees register
-      // the shared base repo as a promisor remote (remote.origin.promisor +
-      // partialclonefilter). Left in place, `git worktree add` below would
-      // lazy-fetch missing blobs from upstream mid-checkout, so a transient
-      // network drop aborts workspace creation with "could not fetch <oid>
-      // from promisor remote" instead of the repairable missing-objects path.
+    ];
+
+    // Best-effort promisor heal, mirroring GIT_FETCH_SCRIPT's heal block. The
+    // warm path skips ensureBaseRepo(), and background status fetches that
+    // ran `git fetch --filter=blob:none` inside sibling worktrees register
+    // the shared base repo as a promisor remote (remote.origin.promisor +
+    // partialclonefilter). Left in place, `git worktree add` below would
+    // lazy-fetch missing blobs from upstream mid-checkout, so a transient
+    // network drop aborts workspace creation with "could not fetch <oid>
+    // from promisor remote" instead of the repairable missing-objects path.
+    // But stripping the keys while objects are still missing is worse: a
+    // plain fetch never resends blobs of commits the client already has, so
+    // the repo would lose its lazy-fetch fallback and worktree add would
+    // silently fall back to the stale bundle ref despite origin being
+    // reachable. So: batch-fetch exactly the missing OIDs first (an eager
+    // lazy fetch, done while the promisor config still allows it), then strip
+    // the keys only when enumeration proves the object store complete.
+    // Enumeration failure counts as "not proven complete". Everything is
+    // best-effort; when the keys stay, lazy fetch plus the promisor-remote
+    // failure classification below still cover worktree materialization.
+    // This block runs after originPreamble so the backfill sees the freshly
+    // configured origin URL.
+    const warmBaseRepoPromisorHealPreamble = [
+      `if [ "$(git --git-dir=${baseRepoPathArg} config --local --get remote.origin.partialclonefilter 2>/dev/null)" = "blob:none" ]; then`,
+      `  xum_base_missing=$(git --git-dir=${baseRepoPathArg} rev-list --objects --missing=print --all --reflog 2>/dev/null) && xum_base_missing=$(printf '%s\\n' "$xum_base_missing" | sed -n 's/^?//p') || xum_base_missing=enumeration-failed`,
+      `  if [ -n "$xum_base_missing" ] && [ "$xum_base_missing" != "enumeration-failed" ]; then`,
+      `    printf '%s\\n' "$xum_base_missing" | git --git-dir=${baseRepoPathArg} -c protocol.version=2 fetch origin --stdin --no-tags --no-recurse-submodules --no-write-fetch-head >/dev/null 2>&1 || true`,
+      `    xum_base_missing=$(git --git-dir=${baseRepoPathArg} rev-list --objects --missing=print --all --reflog 2>/dev/null) && xum_base_missing=$(printf '%s\\n' "$xum_base_missing" | sed -n 's/^?//p') || xum_base_missing=enumeration-failed`,
+      `  fi`,
+      `  if [ -z "$xum_base_missing" ]; then`,
       ...BASE_REPO_PROMISOR_CONFIG_KEYS.map(
         (key) =>
-          `git --git-dir=${baseRepoPathArg} config --local --unset-all ${shescape.quote(key)} 2>/dev/null || true`
+          `    git --git-dir=${baseRepoPathArg} config --local --unset-all ${shescape.quote(key)} 2>/dev/null || true`
       ),
-    ];
+      `  fi`,
+      `fi`,
+    ].join("\n");
 
     const originPreamble = originUrlArg
       ? [
@@ -2695,6 +2719,8 @@ export class SSHRuntime extends RemoteRuntime {
       ...warmBaseRepoNormalizationPreamble,
       // Optional origin fetch (preserves slow-path origin-freshness).
       ...originPreamble,
+      // Promisor heal after origin setup so its backfill can reach upstream.
+      warmBaseRepoPromisorHealPreamble,
       // Choose the worktree base ref. Prefer freshly-fetched
       // `refs/remotes/origin/<trunk>` whenever the fetch succeeded; otherwise
       // fall back to the local-snapshot bundle ref, matching
