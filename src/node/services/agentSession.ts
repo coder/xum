@@ -3587,6 +3587,12 @@ export class AgentSession {
         await internal?.onCanceled?.(
           "Send refused: the caller's admission became stale before the turn was accepted."
         );
+      } else {
+        // Failed rollback leaves the rows durable, and the Err below still reaches the caller's
+        // OUTER refund paths (the direct-call failure branch and sendQueuedMessages'
+        // onAcceptedPreStreamFailure). Mark the rows persisted first so those payload-guarded
+        // refunds keep the charge — refunding here would leave provider-visible rows uncharged.
+        internal?.onPreTurnRowsPersisted?.();
       }
       return Err(
         createUnknownSendMessageError(
@@ -6525,7 +6531,22 @@ export class AgentSession {
             this.sendQueuedMessages();
           }
         })
-        .catch(() => {
+        .catch(async (error: unknown) => {
+          // A REJECTED sendMessage (thrown, not returned Err — e.g. an awaited history or goal
+          // service throwing pre-persistence) must reach the same failure hook as the
+          // returned-error branch above: peer sends refund their family-message reservation
+          // through it (payload-persistence-guarded, so post-persistence throws keep the
+          // charge). Swallowing the rejection here would strand the reservation until restart.
+          try {
+            await internal?.onAcceptedPreStreamFailure?.(
+              createUnknownSendMessageError(error instanceof Error ? error.message : String(error))
+            );
+          } catch (hookError: unknown) {
+            log.error("sendQueuedMessages: onAcceptedPreStreamFailure hook threw", {
+              workspaceId: this.workspaceId,
+              hookError,
+            });
+          }
           this.dispatchingQueuedEntry = false;
           this.dispatchingQueuedEntryMuxMetadata = undefined;
           if (this.turnPhase === TurnPhase.PREPARING) {

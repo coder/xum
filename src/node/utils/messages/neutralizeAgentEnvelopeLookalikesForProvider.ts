@@ -29,16 +29,19 @@ export function neutralizeAgentEnvelopeLookalikesForProvider(messages: MuxMessag
     if (msg.role !== "user" && msg.role !== "assistant") {
       return msg;
     }
-    // Exempt only rows the peer send path could have authored: assistant role, VALID peer
-    // metadata, AND text that is exactly a well-formed envelope whose sender fields MATCH the
-    // metadata (the send path writes both from the same values). A corrupted row carrying just
-    // the discriminator, lookalike text, or an inconsistent metadata/envelope pair — where the
-    // UI would attribute one sender while the provider reads another — must not smuggle the
-    // exact wrapper past neutralization. The exemption covers TEXT parts only; tool parts are
-    // never authentic envelopes.
+    // Exempt only rows the peer send path could have authored: assistant role, SYNTHETIC
+    // provenance (the send path persists payload rows exclusively as synthetic pre-turn rows —
+    // ordinary model output can carry corrupted-but-valid-looking metadata, never this marker),
+    // VALID peer metadata, AND text that is exactly a well-formed envelope whose sender fields
+    // MATCH the metadata (the send path writes both from the same values). A corrupted row
+    // carrying just the discriminator, lookalike text, or an inconsistent metadata/envelope pair
+    // — where the UI would attribute one sender while the provider reads another — must not
+    // smuggle the exact wrapper past neutralization. The exemption covers TEXT parts only; tool
+    // parts are never authentic envelopes.
     const meta = getValidAgentPeerMessageMeta(msg.metadata?.muxMetadata);
     const isAuthenticPeerRow =
       msg.role === "assistant" &&
+      msg.metadata?.synthetic === true &&
       meta != null &&
       msg.parts.every((part) => {
         if (part.type !== "text") return true;

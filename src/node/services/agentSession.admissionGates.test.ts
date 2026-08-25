@@ -142,6 +142,7 @@ describe("AgentSession.sendMessage (admission gates)", () => {
       Promise.resolve({ success: false as const, error: "sequence refresh failed" })
     );
     const canceled: string[] = [];
+    let preTurnRowsPersisted = 0;
 
     const result = await session.sendMessage(
       "peer trigger",
@@ -158,12 +159,19 @@ describe("AgentSession.sendMessage (admission gates)", () => {
         onCanceled: (reason: string) => {
           canceled.push(reason);
         },
+        onPreTurnRowsPersisted: () => {
+          preTurnRowsPersisted += 1;
+        },
       }
     );
     deleteSpy.mockRestore();
 
     expect(result.success).toBe(false);
     expect(canceled).toHaveLength(0);
+    // The failed rollback must be PROPAGATED as persistence: the Err still reaches the caller's
+    // outer refund paths (direct failure branch / queued onAcceptedPreStreamFailure), and only
+    // this marker keeps their payload-guarded refunds from releasing the charge on durable rows.
+    expect(preTurnRowsPersisted).toBe(1);
     expect(streamMessage).not.toHaveBeenCalled();
     // The rows stayed durable — consistent with the retained charge.
     const history = await historyService.getHistoryFromLatestBoundary(workspaceId);

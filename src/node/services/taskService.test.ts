@@ -16320,6 +16320,16 @@ describe("TaskService", () => {
       })
     );
     expect(sendMessage).not.toHaveBeenCalled();
+
+    // The retained latch is releasable, not permanent: authoritative terminal settlement of the
+    // child's execution (here an explicit turn interrupt persisting the terminal mirror) must
+    // free it — otherwise the child stays barred from peer messaging until restart even after
+    // every admission-visible marker refuses on its own.
+    const internals = taskService as unknown as { workspaceStopsInProgress: Map<string, number> };
+    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(true);
+    const interrupted = await taskService.interruptWorkspaceTurn("tree-root", "wst_leaf");
+    expect(interrupted.success).toBe(true);
+    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
   });
 
   test("sendAgentTreeMessage refuses sends latched at the hard-stop request boundary", async () => {
@@ -16549,6 +16559,19 @@ describe("TaskService", () => {
           parentWorkspaceId: "task-cand-child",
           taskStatus: "running",
         }),
+        projectWorkspace(projectPath, "wf", "task-wf", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+          workflowTask: { runId: "wfr_disc", stepId: "step" },
+        }),
+        projectWorkspace(projectPath, "wf-child", "task-wf-child", {
+          parentWorkspaceId: "task-wf",
+          taskStatus: "running",
+        }),
+        projectWorkspace(projectPath, "wf-grandchild", "task-wf-grandchild", {
+          parentWorkspaceId: "task-wf-child",
+          taskStatus: "running",
+        }),
       ],
       testTaskSettings()
     );
@@ -16567,10 +16590,24 @@ describe("TaskService", () => {
       "task-cand-grandchild": "descendant",
     });
 
-    // Unrestricted callers keep full peer discovery.
+    // A WORKFLOW-owned caller's restricted view must still contain its own subtree: workflow
+    // exclusion applies to callers OUTSIDE the subtree, and descendant guidance routes through
+    // the trusted path before peer workflow restrictions apply — dropping these rows would
+    // break the note's promise of self/descendant visibility.
+    const fromWfChild = taskService.listTaskTreeAgents("task-wf-child");
+    expect(fromWfChild.callerPeerMessagingRestricted).toBe(true);
+    expect(
+      Object.fromEntries(fromWfChild.tasks.map((task) => [task.taskId, task.relationship]))
+    ).toEqual({
+      "task-wf-child": "self",
+      "task-wf-grandchild": "descendant",
+    });
+
+    // Unrestricted callers keep full peer discovery — with workflow subtrees still hidden.
     const fromA = taskService.listTaskTreeAgents("task-a");
     expect(fromA.callerPeerMessagingRestricted).toBeUndefined();
     expect(fromA.tasks.some((task) => task.taskId === "task-cand")).toBe(true);
+    expect(fromA.tasks.some((task) => task.taskId.startsWith("task-wf"))).toBe(false);
   });
 
   test("sendAgentTreeMessage withholds correlation from unaccepted workspace-turn registrations", async () => {

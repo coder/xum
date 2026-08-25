@@ -1535,6 +1535,8 @@ export class TaskService {
    * must not clear each other's latch.
    */
   private readonly workspaceStopsInProgress = new Map<string, number>();
+  /** Stop latches retained past their cascade because the stop could not be confirmed; released on authoritative terminal settlement. */
+  private readonly retainedStopLatchReleasesByWorkspaceId = new Map<string, Array<() => void>>();
   /** Tracks consecutive auto-resumes per workspace. Reset when a user message is sent. */
   private consecutiveAutoResumes = new Map<string, number>();
   // Peer-messaging loop protection (in-memory, like consecutiveAutoResumes; restart clears it).
@@ -1866,6 +1868,35 @@ export class TaskService {
 
   private isWorkspaceStopInProgress(workspaceId: string): boolean {
     return this.workspaceStopsInProgress.has(workspaceId);
+  }
+
+  /**
+   * Park a stop latch whose owning cascade could not confirm the workspace's stop (failed
+   * stream cancellation or failed status persistence). The latch keeps refusing peer-message
+   * admission, but unlike an unconditionally discarded release it stays releasable: authoritative
+   * terminal settlement (releaseRetainedStopLatches) frees the workspace again instead of locking
+   * it out of peer messaging until restart.
+   */
+  private retainStopLatchUntilSettlement(workspaceId: string, release: () => void): void {
+    const releases = this.retainedStopLatchReleasesByWorkspaceId.get(workspaceId) ?? [];
+    releases.push(release);
+    this.retainedStopLatchReleasesByWorkspaceId.set(workspaceId, releases);
+  }
+
+  /**
+   * Release latches parked by retainStopLatchUntilSettlement. Call ONLY on admission-visible
+   * settlement evidence for the workspace: a persisted terminal (or cleared) execution mirror,
+   * or a persisted interrupted task status — either refuses peer sends on its own, so the latch
+   * is no longer the last line of defense. Each closure is removed before invocation because the
+   * underlying releases are plain refcount decrements, not idempotent.
+   */
+  private releaseRetainedStopLatches(workspaceId: string): void {
+    const releases = this.retainedStopLatchReleasesByWorkspaceId.get(workspaceId);
+    if (releases == null) return;
+    this.retainedStopLatchReleasesByWorkspaceId.delete(workspaceId);
+    for (const release of releases) {
+      release();
+    }
   }
 
   private recordTaskInterrupted(taskId: string, parentWorkspaceId: string | undefined): void {
@@ -6046,6 +6077,9 @@ export class TaskService {
           }
           if (transitioned) {
             this.recordTaskInterrupted(id, parentWorkspaceId);
+            // Authoritative settlement for latches parked by earlier failed cascades: the
+            // persisted interrupted status refuses peer sends on its own now.
+            this.releaseRetainedStopLatches(id);
             this.rejectWaiters(id, new Error("Task stopped"));
             metadataToEmit.add(id);
           }
@@ -6549,9 +6583,16 @@ export class TaskService {
               // nothing admission-visible marks the stop once the latch drops — the still-running
               // child could message a root or cousin right after Stop. Retain the latch (fail
               // closed, same contract as the catch below) until stream termination or terminal
-              // execution settlement is confirmed.
-              if (!streamStopConfirmed && this.activeWorkspaceTurnHandleByWorkspaceId.has(id)) {
+              // execution settlement is confirmed; settlement releases it via
+              // releaseRetainedStopLatches so the child is not barred until restart.
+              const release = releaseById.get(id);
+              if (
+                release != null &&
+                !streamStopConfirmed &&
+                this.activeWorkspaceTurnHandleByWorkspaceId.has(id)
+              ) {
                 releaseById.delete(id);
+                this.retainStopLatchUntilSettlement(id, release);
                 log.error(
                   "terminateAllDescendantAgentTasks: unconfirmed stream stop for completed descendant with live execution; retaining stop latch",
                   { taskId: id }
@@ -6569,6 +6610,9 @@ export class TaskService {
             if (transitionedToInterrupted) {
               this.recordTaskInterrupted(id, parentWorkspaceId);
             }
+            // The persisted interrupted status is authoritative settlement for any latch a
+            // PREVIOUS failed cascade parked for this id — refusal now rides the status itself.
+            this.releaseRetainedStopLatches(id);
 
             // Report monotonicity: descendants that did not complete a report must reject waiters
             // once the interrupt status transition is persisted.
@@ -6576,8 +6620,13 @@ export class TaskService {
             interruptedTaskIds.push(id);
           } catch (error: unknown) {
             // Retain this descendant's latch as the stop marker (see comment above) and keep
-            // processing the remaining descendants instead of aborting the whole cascade.
-            releaseById.delete(id);
+            // processing the remaining descendants instead of aborting the whole cascade;
+            // authoritative settlement (releaseRetainedStopLatches) frees it later.
+            const release = releaseById.get(id);
+            if (release != null) {
+              releaseById.delete(id);
+              this.retainStopLatchUntilSettlement(id, release);
+            }
             log.error(
               "terminateAllDescendantAgentTasks: interrupt processing failed; retaining stop latch",
               { taskId: id, error }
@@ -7788,6 +7837,13 @@ export class TaskService {
       { allowMissing: true }
     );
     if (updated) {
+      // A persisted terminal (or cleared) execution mirror is authoritative settlement: peer
+      // admission's live-execution rescue now refuses on its own, so any stop latch retained for
+      // an unconfirmed stop of this workspace has been superseded and must be released — holding
+      // it past settlement would bar the workspace from peer messaging until restart.
+      if (status == null || !isActiveWorkspaceTurnTaskStatus(status)) {
+        this.releaseRetainedStopLatches(workspaceId);
+      }
       await this.emitWorkspaceMetadata(workspaceId);
     }
   }
@@ -11522,9 +11578,9 @@ export class TaskService {
     // (independence) or a workflow-owned task (journal determinism) based on the sender's own
     // chain — advertising root/sibling/ancestor rows to such a caller would direct it at
     // targets it can never message. Descendant guidance stays valid, so those rows survive.
+    const callerWorkflowOwned = this.isWorkflowOwnedTaskUsingIndex(index, workspaceId);
     const callerRestricted =
-      this.isBestOfChainUsingIndex(index, workspaceId) ||
-      this.isWorkflowOwnedTaskUsingIndex(index, workspaceId);
+      this.isBestOfChainUsingIndex(index, workspaceId) || callerWorkflowOwned;
     const rootWorkspaceId = this.resolveRootWorkspaceIdUsingParentById(
       index.parentById,
       workspaceId
@@ -11536,9 +11592,19 @@ export class TaskService {
           coerceNonEmptyString(rootEntry.workspace.name))
         : undefined;
 
-    const tasks = this.listDescendantAgentTasks(rootWorkspaceId, {
-      excludeWorkflowTasks: true,
-    })
+    const tasks = this.listDescendantAgentTasks(rootWorkspaceId)
+      .filter((task) => {
+        if (!this.isWorkflowOwnedTaskUsingIndex(index, task.taskId)) return true;
+        // Workflow subtrees are hidden from callers OUTSIDE them (their I/O rides the runner's
+        // durable journal). A workflow-owned caller still owns its own subtree: descendant
+        // guidance routes through the trusted path before peer workflow restrictions apply, so
+        // the restricted view must keep the self/descendant rows its note promises.
+        return (
+          callerWorkflowOwned &&
+          (task.taskId === workspaceId ||
+            this.isDescendantAgentTaskUsingParentById(index.parentById, workspaceId, task.taskId))
+        );
+      })
       .map((task): TreeAgentTaskInfo => {
         const relationship: TreeAgentRelationship =
           task.taskId === workspaceId

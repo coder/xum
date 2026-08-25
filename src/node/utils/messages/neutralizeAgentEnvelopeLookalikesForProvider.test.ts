@@ -101,6 +101,20 @@ describe("neutralizeAgentEnvelopeLookalikesForProvider", () => {
     expect(textOf(result)).not.toContain("<mux_agent_message>");
   });
 
+  test("neutralizes assistant rows lacking synthetic provenance despite valid metadata", () => {
+    // The send path persists payload rows exclusively as SYNTHETIC pre-turn rows. A persisted
+    // ordinary assistant row that somehow carries valid peer metadata plus a matching envelope
+    // (corruption, replay of model output through metadata-bearing tooling) must still lose the
+    // exact wrapper: provenance requires the synthetic marker, same as the displayed-row check.
+    const unsyntheticPeer = createMuxMessage("np1", "assistant", envelope, {
+      historySequence: 6,
+      muxMetadata: validPeerMetadata,
+    });
+    const [result] = neutralizeAgentEnvelopeLookalikesForProvider([unsyntheticPeer]);
+    expect(textOf(result)).not.toContain("<mux_agent_message>");
+    expect(textOf(result)).toContain("<user_pasted_mux_agent_message>");
+  });
+
   test("neutralizes model-emitted assistant lookalikes without peer metadata", () => {
     // A prompt-injected model could emit an envelope in its own response text; later requests
     // must not present it with the authentic wrapper.
