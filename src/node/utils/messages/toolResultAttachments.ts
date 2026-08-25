@@ -81,11 +81,25 @@ function isMediaPart(value: unknown): value is AISDKMediaPart {
 
 function normalizeOptionalFilename(filename: string | undefined): string | undefined {
   const trimmed = filename?.trim();
-  return trimmed != null && trimmed.length > 0 ? trimmed : undefined;
+  if (trimmed == null || trimmed.length === 0) return undefined;
+  // Filenames are attacker-influencable metadata like media types: they ride
+  // into provider-visible placeholders and attachment file parts, so an
+  // unbounded value persisted by an MCP tool would bloat every later request.
+  return boundMetadataLabel(trimmed, 200);
+}
+
+/**
+ * Bound provider-visible metadata interpolation. Media types and filenames
+ * come from tool results (MCP servers copy them verbatim), and placeholder
+ * text persists in the provider copy of every later request — never
+ * interpolate them raw.
+ */
+function boundMetadataLabel(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max)}…` : text;
 }
 
 function buildAttachmentPlaceholder(item: AISDKMediaPart): AISDKTextPart {
-  const normalizedMediaType = normalizeAttachmentMediaType(item.mediaType);
+  const normalizedMediaType = boundMetadataLabel(normalizeAttachmentMediaType(item.mediaType), 100);
   const filename = normalizeOptionalFilename(item.filename);
   const label = filename != null ? `${filename} (${normalizedMediaType})` : normalizedMediaType;
   return {
@@ -95,7 +109,7 @@ function buildAttachmentPlaceholder(item: AISDKMediaPart): AISDKTextPart {
 }
 
 function buildUnsupportedMediaPlaceholder(item: AISDKMediaPart): AISDKTextPart {
-  const normalizedMediaType = normalizeAttachmentMediaType(item.mediaType);
+  const normalizedMediaType = boundMetadataLabel(normalizeAttachmentMediaType(item.mediaType), 100);
   const filename = normalizeOptionalFilename(item.filename);
   const label = filename != null ? `${filename} (${normalizedMediaType})` : normalizedMediaType;
   return {

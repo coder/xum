@@ -43,6 +43,16 @@ export function getAttachmentMediaTypeFromExtension(filename: string): string | 
 
 export function isSupportedAttachmentMediaType(mediaType: string): boolean {
   const normalized = normalizeAttachmentMediaType(mediaType);
+  // Media types are attacker-influencable metadata (e.g. MCP servers copy
+  // them verbatim into media parts), and every consumer of this predicate
+  // sits on a trust boundary that retains or interpolates the value
+  // (capture retention, request extraction, provider output sanitization).
+  // Require a well-formed type/subtype within a plausible length — a bare
+  // "image/" prefix check would qualify "image/" + megabytes of junk as a
+  // supported attachment type.
+  if (normalized.length > MAX_STAGED_MEDIA_TYPE_LENGTH || !MEDIA_TYPE_PATTERN.test(normalized)) {
+    return false;
+  }
   return normalized.startsWith("image/") || normalized === PDF_MEDIA_TYPE;
 }
 

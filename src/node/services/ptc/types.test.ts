@@ -85,17 +85,41 @@ describe("retainExemptKernelRecordResult", () => {
   });
 
   describe("media container budgets", () => {
-    it("charges media metadata against the budget (empty-data mediaType attack)", () => {
-      // transformMCPResult copies server-controlled MIME types unchanged and
-      // the supported-type check accepts any image/ prefix, so a part hiding
-      // megabytes in mediaType with an EMPTY data string must still be
-      // charged — and the placeholder must not echo the junk label.
+    it("rejects junk media types at validation instead of retaining them as supported", () => {
+      // transformMCPResult copies server-controlled MIME types unchanged; an
+      // "image/" + megabytes string must fail isSupportedAttachmentMediaType
+      // (well-formed type/subtype within the RFC-plausible length), or one
+      // retained part could bloat every later provider request through
+      // placeholder interpolation (round 11). The placeholder label itself
+      // stays bounded.
       const junkType = `image/${"m".repeat(KERNEL_RETAINED_MEDIA_BUDGET_BYTES)}`;
       const retained = retainExemptKernelRecordResult("mcp__shots__take", {
         type: "content",
         value: [
           { type: "media", mediaType: "image/png", data: "aGVsbG8=" },
-          { type: "media", mediaType: junkType, data: "" },
+          { type: "media", mediaType: junkType, data: "aGVsbG8=" },
+        ],
+      }) as RetainedContainer;
+      expect(retained.value[0]?.data).toBe("aGVsbG8=");
+      expect(retained.value[1]?.type).toBe("text");
+      expect(retained.value[1]?.text).toContain("not supported as a model attachment");
+      expect(retained.value[1]?.text!.length).toBeLessThan(300);
+    });
+
+    it("charges media metadata against the budget (empty-data filename attack)", () => {
+      // Payload hidden in a sibling metadata field of a well-formed part: the
+      // serialized-size charge is the backstop for metadata the validator
+      // cannot reject — and the placeholder must not echo the junk label.
+      const retained = retainExemptKernelRecordResult("mcp__shots__take", {
+        type: "content",
+        value: [
+          { type: "media", mediaType: "image/png", data: "aGVsbG8=" },
+          {
+            type: "media",
+            mediaType: "image/png",
+            data: "",
+            filename: "m".repeat(KERNEL_RETAINED_MEDIA_BUDGET_BYTES),
+          },
         ],
       }) as RetainedContainer;
       expect(retained.value[0]?.data).toBe("aGVsbG8=");
@@ -107,12 +131,11 @@ describe("retainExemptKernelRecordResult", () => {
     it("charges the budget in UTF-8 bytes, not UTF-16 code units", () => {
       // ~1.5M CJK chars ≈ 4.5 MiB in UTF-8 history — a character-based check
       // would retain this part under the 3 MiB budget.
-      const junkType = `image/${"画".repeat(1_500_000)}`;
       const retained = retainExemptKernelRecordResult("mcp__shots__take", {
         type: "content",
         value: [
           { type: "media", mediaType: "image/png", data: "aGVsbG8=" },
-          { type: "media", mediaType: junkType, data: "" },
+          { type: "media", mediaType: "image/png", data: "", filename: "画".repeat(1_500_000) },
         ],
       }) as RetainedContainer;
       expect(retained.value[0]?.data).toBe("aGVsbG8=");
