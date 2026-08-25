@@ -14,6 +14,7 @@ import type { IJSRuntime } from "./runtime";
 import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import { KERNEL_COMPACT_ARGS_CAP_BYTES } from "@/constants/kernelOutput";
 import { RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES } from "@/constants/resultHandles";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import {
   FULL_GRANTS,
   isBridgeToolGranted,
@@ -259,11 +260,11 @@ export class ToolBridge {
         }
 
         // Validate args against the tool's schema (Zod or AI SDK wrapper)
-        const validatedArgs = await this.validateArgs(toolName, boundTool, args);
+        const validatedArgs = await this.validateArgs(toolName, boundTool, args, abortSignal);
 
-        // An abort can land while an async wrapper validator is outstanding;
-        // without this recheck the tool would still execute after a timeout or
-        // user interrupt (mirrors the post-await recheck in mux.load).
+        // validateArgs races the validator against the abort signal; this
+        // recheck covers an abort that lands after validation settles but
+        // before execute (mirrors the post-await recheck in mux.load).
         if (abortSignal?.aborted) {
           throw new Error("Execution aborted");
         }
@@ -321,12 +322,14 @@ export class ToolBridge {
           throw new Error("Execution aborted");
         }
         const baseArgs = typeof args === "object" && args !== null ? args : {};
-        const validatedArgs = await this.validateArgs("task", taskTool, {
-          ...baseArgs,
-          run_in_background: true,
-        });
+        const validatedArgs = await this.validateArgs(
+          "task",
+          taskTool,
+          { ...baseArgs, run_in_background: true },
+          abortSignal
+        );
         // Same post-validation recheck as regular bridged tools: an abort that
-        // lands during an async validator must not spawn the child.
+        // lands after validation settles must not spawn the child.
         if (abortSignal?.aborted) {
           throw new Error("Execution aborted");
         }
@@ -414,7 +417,12 @@ export class ToolBridge {
     return typeof tool.execute === "function";
   }
 
-  private async validateArgs(toolName: string, tool: Tool, args: unknown): Promise<unknown> {
+  private async validateArgs(
+    toolName: string,
+    tool: Tool,
+    args: unknown,
+    abortSignal?: AbortSignal
+  ): Promise<unknown> {
     // AI SDK tools carry their schema on 'inputSchema'; some legacy tools use 'parameters'.
     const toolRecord = tool as { inputSchema?: unknown; parameters?: unknown };
     const schema = toolRecord.inputSchema ?? toolRecord.parameters;
@@ -441,9 +449,22 @@ export class ToolBridge {
     // normalized value, and may be async (ValidationResult | PromiseLike).
     const validate = (schema as { validate?: unknown }).validate;
     if (typeof validate === "function") {
-      const result = await (
-        validate as (value: unknown) => SchemaValidationResult | PromiseLike<SchemaValidationResult>
-      )(args);
+      const validation = Promise.resolve(
+        (
+          validate as (
+            value: unknown
+          ) => SchemaValidationResult | PromiseLike<SchemaValidationResult>
+        )(args)
+      );
+      // Race the validator against the runtime abort signal: QuickJS eval
+      // aborts only settle suspended asyncified host calls, so a validator
+      // that never settles would otherwise block this await forever and keep
+      // a persistent kernel locked past timeouts and interrupts.
+      const raced = await raceWithAbortAndTimeout(validation, { signal: abortSignal });
+      if (raced.kind !== "ok") {
+        throw new Error("Execution aborted");
+      }
+      const result = raced.value;
       if (!result.success) {
         const message = result.error instanceof Error ? result.error.message : String(result.error);
         throw new Error(`Invalid arguments for ${toolName}: ${message}`);

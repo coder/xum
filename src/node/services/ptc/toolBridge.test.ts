@@ -352,6 +352,55 @@ describe("ToolBridge", () => {
       expect(mockExecute).not.toHaveBeenCalled();
     });
 
+    it("rejects instead of hanging when an aborted wrapper validator never settles", async () => {
+      const controller = new AbortController();
+      const mockExecute = mock((_args: unknown) => ({ ok: true }));
+      const tools: Record<string, Tool> = {
+        mcp_hang: {
+          description: "JSON-Schema tool whose validator never settles",
+          inputSchema: jsonSchema<{ q?: string }>(
+            { type: "object", properties: { q: { type: "string" } } },
+            {
+              // Hangs forever; only the abort race can settle the call.
+              validate: () => new Promise<never>(() => undefined),
+            }
+          ),
+          execute: (args) => Promise.resolve(mockExecute(args)),
+        },
+      };
+
+      const bridge = new ToolBridge(tools);
+
+      let registeredMux: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+      const mockRegisterObject = mock(
+        (name: string, obj: Record<string, (...args: unknown[]) => Promise<unknown>>) => {
+          if (name === "mux") registeredMux = obj;
+          return undefined;
+        }
+      );
+      bridge.register(
+        createMockRuntime({
+          registerObject: mockRegisterObject,
+          getAbortSignal: mock(() => controller.signal),
+        })
+      );
+
+      const hang = registeredMux.mcp_hang as (...args: unknown[]) => Promise<unknown>;
+      const pending = hang({ q: "x" });
+      // Flush pending microtasks so the call is suspended on the validator,
+      // then abort mid-validation (exercises the race's listener path rather
+      // than the already-aborted pre-check).
+      await new Promise((r) => setImmediate(r));
+      controller.abort();
+      try {
+        await pending;
+        expect.unreachable("Should have thrown");
+      } catch (e) {
+        expect(String(e)).toContain("Execution aborted");
+      }
+      expect(mockExecute).not.toHaveBeenCalled();
+    });
+
     it("serializes non-JSON values", async () => {
       // Tool that returns a non-plain object (with circular reference)
       const circularObj: Record<string, unknown> = { a: 1 };
