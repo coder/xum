@@ -4141,11 +4141,26 @@ export class TaskService {
           ...ownerContext,
         });
         if (!validation.success) {
-          if (ownerVouchesForTargetBase) {
+          // Fatal only when the owner provably equals the base AND target init cannot
+          // add definitions: a committed project init hook runs at target creation and
+          // may install the requested agent even though the owner (initialized before
+          // the hook existed, or with per-workspace conditions) legitimately lacks it.
+          const ownerDiscovery = ownerContext;
+          const ownerInitHookResults = ownerVouchesForTargetBase
+            ? await Promise.all(
+                listProjectMetadataRelativePaths("init").map((relativePath) =>
+                  runtimePathExists(
+                    ownerDiscovery.runtime,
+                    ownerDiscovery.runtime.normalizePath(relativePath, ownerDiscovery.workspacePath)
+                  )
+                )
+              )
+            : [];
+          if (ownerVouchesForTargetBase && !ownerInitHookResults.some(Boolean)) {
             return Err(validation.error);
           }
           log.debug(
-            "Task.createWorkspaceTurn: owner-side agent validation failed; deferring to the target branch checkout",
+            "Task.createWorkspaceTurn: owner-side agent validation failed; deferring to the target checkout",
             { agentId: requestedAgentId, error: validation.error }
           );
         } else {

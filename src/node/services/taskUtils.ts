@@ -69,11 +69,12 @@ export async function tryReadGitCurrentBranch(
 }
 
 /**
- * True when the checkout has no uncommitted changes (including untracked files)
- * under the given pathspecs; undefined when this cannot be determined (no git,
- * unreachable runtime). Callers use this as proof that the committed base equals
- * the working tree for those paths, so "unknown" must stay distinguishable from
- * "clean".
+ * True when the checkout has no uncommitted changes (including untracked AND
+ * gitignored files — an ignored local file still shadows committed state for
+ * discovery-style readers) under the given pathspecs; undefined when this cannot
+ * be determined (no git, unreachable runtime). Callers use this as proof that the
+ * committed base equals the working tree for those paths, so "unknown" must stay
+ * distinguishable from "clean".
  */
 export async function tryReadGitPathsClean(
   runtime: Runtime,
@@ -85,7 +86,7 @@ export async function tryReadGitPathsClean(
 
   try {
     const quoted = pathspecs.map((pathspec) => `'${pathspec}'`).join(" ");
-    const result = await execBuffered(runtime, `git status --porcelain -- ${quoted}`, {
+    const result = await execBuffered(runtime, `git status --porcelain --ignored -- ${quoted}`, {
       cwd: workspacePath,
       timeout: 10,
     });

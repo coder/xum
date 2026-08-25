@@ -1029,10 +1029,12 @@ describe("TaskService", () => {
     stubStableIds(config, ["childworkspace", "turnhandle"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
     checkoutOwnerBranch(projectPath, "parent");
-    // An UNCOMMITTED hidden shadow of the built-in plan exists only in the owner's
-    // working tree: the new checkout is created from committed branch state and
-    // validly resolves the built-in, so the owner-side miss must stay advisory
-    // (branch equality is not checkout equality).
+    // A GITIGNORED hidden shadow of the built-in plan exists only in the owner's
+    // working tree (plain `git status` would not even list it): the new checkout is
+    // created from committed branch state and validly resolves the built-in, so the
+    // owner-side miss must stay advisory (branch equality is not checkout equality).
+    await fsPromises.writeFile(path.join(projectPath, ".gitignore"), ".mux/agents/\n");
+    commitOwnerAgentFiles(projectPath);
     const agentsDir = path.join(projectPath, ".mux", "agents");
     await fsPromises.mkdir(agentsDir, { recursive: true });
     await fsPromises.writeFile(
@@ -1069,6 +1071,48 @@ describe("TaskService", () => {
     expect(sendMessage).toHaveBeenCalledTimes(1);
     const sendMessageCall = sendMessage.mock.calls[0] as unknown[];
     expect(sendMessageCall[2]).toMatchObject({ agentId: "plan" });
+  });
+
+  test("createWorkspaceTurn defers owner-side misses when a committed init hook could install agents", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    checkoutOwnerBranch(projectPath, "parent");
+    // A committed project init hook runs at target creation and may install the
+    // requested agent; the owner (initialized before the hook existed) legitimately
+    // lacks it, so an owner-side miss must not reject the launch pre-create.
+    const muxDir = path.join(projectPath, ".mux");
+    await fsPromises.mkdir(muxDir, { recursive: true });
+    await fsPromises.writeFile(path.join(muxDir, "init"), "#!/bin/sh\nexit 0\n");
+    commitOwnerAgentFiles(projectPath);
+
+    const createWorkspace = mock(
+      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
+        Promise.resolve(Ok({ metadata: createWorkspaceTurnMetadata(projectPath) }))
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "hookinstalled",
+      prompt: "Should defer to the target",
+      title: "Hook-installed agent",
+      workspace: { mode: "new" },
+    });
+
+    // The miss defers to the created checkout, which is authoritative (validated
+    // post-create; here the hook did not actually install it, so the launch still
+    // fails — but only AFTER the target had its chance).
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("no turn was dispatched");
+    }
+    expect(createWorkspace).toHaveBeenCalledTimes(1);
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 
   test("createWorkspaceTurn rejects invalid, unknown, and internal agent ids before creating a workspace", async () => {
