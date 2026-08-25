@@ -9,7 +9,9 @@ import {
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
-import { toPersistedTaskExperiments } from "@/common/schemas/project";
+// Persisted task snapshots stamp the legacy exclusive mirror so downgraded
+// builds resume tasks in the exclusive posture (see withLegacyPtcExclusiveMirror).
+import { withLegacyPtcExclusiveMirror } from "@/common/constants/experiments";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
@@ -3445,7 +3447,7 @@ export class TaskService {
           taskModelString: plan.taskModelString,
           taskThinkingLevel: plan.effectiveThinkingLevel,
           taskOnRefusal: plan.onRefusal,
-          taskExperiments: toPersistedTaskExperiments(plan.experiments),
+          taskExperiments: withLegacyPtcExclusiveMirror(plan.experiments),
           taskIsolation: plan.sharedWorkspacePath != null ? "none" : undefined,
           taskAttentionPolicy: plan.attentionPolicy,
           projects: plan.parentMeta.projects,
@@ -5218,7 +5220,7 @@ export class TaskService {
           taskModelString,
           taskThinkingLevel: effectiveThinkingLevel,
           taskOnRefusal: args.onRefusal,
-          taskExperiments: toPersistedTaskExperiments(args.experiments),
+          taskExperiments: withLegacyPtcExclusiveMirror(args.experiments),
           taskIsolation: useSharedWorkspace ? "none" : undefined,
           taskAttentionPolicy: args.attentionPolicy,
           projects: parentMeta.projects,
@@ -5388,7 +5390,7 @@ export class TaskService {
         taskModelString,
         taskThinkingLevel: effectiveThinkingLevel,
         taskOnRefusal: args.onRefusal,
-        taskExperiments: toPersistedTaskExperiments(args.experiments),
+        taskExperiments: withLegacyPtcExclusiveMirror(args.experiments),
         taskIsolation: useSharedWorkspace ? "none" : undefined,
         taskAttentionPolicy: args.attentionPolicy,
         projects: inheritedProjects,

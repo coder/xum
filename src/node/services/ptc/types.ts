@@ -7,6 +7,12 @@
 
 import { FILE_EDIT_TOOL_NAMES } from "@/common/types/tools";
 import { isSupportedAttachmentMediaType } from "@/common/utils/attachments/supportedAttachmentMediaTypes";
+import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
+import { MAX_FILE_CONTENT_SIZE } from "@/common/constants/attachments";
+import {
+  KERNEL_COMPACT_ARGS_CAP_BYTES,
+  KERNEL_RETAINED_MEDIA_BUDGET_BYTES,
+} from "@/constants/kernelOutput";
 
 /**
  * Event emitted when a tool call starts within the sandbox.
@@ -118,16 +124,72 @@ export function isKernelRecordResultExempt(toolName: string, result: unknown): b
 /**
  * Capture-time counterpart of isKernelRecordResultExempt (see
  * KernelRecordBounds.captureRetained): returns the value the record should
- * retain, or undefined to apply normal result bounding. Media containers are
- * retained in SANITIZED form — unsupported media parts (audio/blobs, up to
- * 8 MiB each with no aggregate cap) are replaced with bounded text
- * placeholders BEFORE the record is retained and persisted, so a mixed
- * container (image + audio) keeps only its extractable payload.
+ * retain, or undefined to apply normal result bounding. Retained values are
+ * SANITIZED, never raw:
+ *
+ * - Persistence-critical results are reduced to the bounded shape the
+ *   extractors actually consume (see boundPersistenceCriticalResult) — the
+ *   raw results are unbounded upstream (generateDiff has no cap), so a loop
+ *   of large edits must not accumulate megabytes per execution in streamed
+ *   events and persisted records.
+ * - Media containers keep supported parts under an aggregate budget;
+ *   unsupported parts (audio/blobs) and over-budget parts become bounded
+ *   text placeholders BEFORE the record is retained and persisted.
  */
 export function retainExemptKernelRecordResult(toolName: string, result: unknown): unknown {
-  if (isPersistenceCriticalRecordToolName(toolName)) return result;
+  if (isPersistenceCriticalRecordToolName(toolName)) {
+    return boundPersistenceCriticalResult(toolName, result);
+  }
   if (!containsMediaContentPayload(result)) return undefined;
-  return boundUnsupportedMediaPartsAtCapture(result);
+  return sanitizeRetainedMediaContainer(result);
+}
+
+/**
+ * Reduce a persistence-critical result to the bounded shape the
+ * post-compaction extractors consume:
+ *
+ * - file_edit_*: { success?, diff?, error? } with the diff capped at
+ *   MAX_FILE_CONTENT_SIZE (+1 char so extractEditedFileDiffs still detects
+ *   truncation via its `length > cap` check) — the ui_only diff variant is
+ *   flattened onto `diff`, which the extractor reads as its fallback.
+ * - agent_skill_read: { success, skill } / { success, error } passes through
+ *   when its serialized size fits the same cap; oversized packages fall back
+ *   to normal bounding (undefined) and the snapshot degrades like any other
+ *   bounded record.
+ */
+function boundPersistenceCriticalResult(toolName: string, result: unknown): unknown {
+  if (typeof result !== "object" || result === null) return undefined;
+  const record = result as { success?: unknown; error?: unknown };
+  const success = typeof record.success === "boolean" ? { success: record.success } : {};
+  const error =
+    typeof record.error === "string"
+      ? { error: record.error.slice(0, KERNEL_COMPACT_ARGS_CAP_BYTES) }
+      : {};
+
+  if (toolName === "agent_skill_read") {
+    const skill = (result as { skill?: unknown }).skill;
+    const reduced = { ...success, ...error, ...(skill !== undefined ? { skill } : {}) };
+    try {
+      if (JSON.stringify(reduced).length > MAX_FILE_CONTENT_SIZE) return undefined;
+    } catch {
+      return undefined;
+    }
+    return reduced;
+  }
+
+  const rawDiff = (result as { diff?: unknown }).diff;
+  const uiOnlyDiff = getToolOutputUiOnly(result)?.file_edit?.diff;
+  const diff = typeof uiOnlyDiff === "string" ? uiOnlyDiff : rawDiff;
+  return {
+    ...success,
+    ...error,
+    ...(typeof diff === "string"
+      ? {
+          diff:
+            diff.length > MAX_FILE_CONTENT_SIZE ? diff.slice(0, MAX_FILE_CONTENT_SIZE + 1) : diff,
+        }
+      : {}),
+  };
 }
 
 /** Media-part shape check shared by the container predicates below. */
@@ -141,17 +203,33 @@ function asMediaPart(item: unknown): { data: string; mediaType?: string } | null
   };
 }
 
-/** See retainExemptKernelRecordResult: bound unsupported media parts inside an otherwise-retained container. */
-function boundUnsupportedMediaPartsAtCapture(result: unknown): unknown {
+/**
+ * See retainExemptKernelRecordResult: sanitize an otherwise-retained media
+ * container. Unsupported media parts are always replaced with bounded
+ * placeholders, and supported parts are charged against an aggregate budget
+ * (KERNEL_RETAINED_MEDIA_BUDGET_BYTES) — MCP enforces only a per-part guard,
+ * so many individually-allowed images could otherwise persist unbounded
+ * aggregate base64 into events and chat.jsonl rows.
+ */
+function sanitizeRetainedMediaContainer(result: unknown): unknown {
   const container = result as { type: "content"; value: unknown[] };
   let changed = false;
+  let retainedMediaBytes = 0;
   const value = container.value.map((item) => {
     const media = asMediaPart(item);
-    if (
-      media === null ||
-      (media.mediaType !== undefined && isSupportedAttachmentMediaType(media.mediaType))
-    ) {
+    if (media === null) {
       return item;
+    }
+    if (media.mediaType !== undefined && isSupportedAttachmentMediaType(media.mediaType)) {
+      if (retainedMediaBytes + media.data.length <= KERNEL_RETAINED_MEDIA_BUDGET_BYTES) {
+        retainedMediaBytes += media.data.length;
+        return item;
+      }
+      changed = true;
+      return {
+        type: "text",
+        text: `[media bounded at capture: ${media.mediaType}, ${media.data.length} base64 chars — aggregate media budget exceeded]`,
+      };
     }
     changed = true;
     return {

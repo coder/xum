@@ -166,7 +166,11 @@ import {
   SKILL_DYNAMIC_COMMAND_TIMEOUT_MS,
   SKILL_DYNAMIC_OUTPUT_CAP_BYTES,
 } from "@/node/services/agentSkills/skillDynamicContext";
-import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import {
+  aliasLegacyPtcExclusive,
+  EXPERIMENT_IDS,
+  type ExperimentId,
+} from "@/common/constants/experiments";
 import {
   awaitPendingBranchSummary,
   isRlmModeEnabled,
@@ -1943,7 +1947,10 @@ export class AgentSession {
         : undefined;
     const persistedAllowAgentSetGoal = persistedRetrySendOptions?.allowAgentSetGoal;
     const persistedProviderOptions = persistedRetrySendOptions?.providerOptions;
-    const persistedExperiments = persistedRetrySendOptions?.experiments;
+    // History rows load as raw JSON (no schema parse), so the legacy exclusive
+    // alias must be applied here: an old snapshot may carry only the exclusive
+    // flag, which activates exactly the posture merged PTC now provides.
+    const persistedExperiments = aliasLegacyPtcExclusive(persistedRetrySendOptions?.experiments);
 
     const lastUserMuxMetadata = lastUserMessage?.metadata?.muxMetadata;
     if (isCompactionRequestMetadata(lastUserMuxMetadata)) {

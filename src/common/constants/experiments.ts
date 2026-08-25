@@ -39,6 +39,35 @@ export type ExperimentId = (typeof EXPERIMENT_IDS)[keyof typeof EXPERIMENT_IDS];
  */
 export const LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID = "programmatic-tool-calling-exclusive";
 
+/**
+ * Read-side alias for persisted experiment-flag objects (camelCase form used
+ * by taskExperiments snapshots and startup-retry send options): a legacy
+ * exclusive `true` opted into exactly the posture merged PTC activates, so it
+ * wins even over an explicit `programmaticToolCalling: false`.
+ */
+export function aliasLegacyPtcExclusive<
+  T extends { programmaticToolCalling?: boolean; programmaticToolCallingExclusive?: boolean },
+>(
+  experiments: T | undefined
+): (Omit<T, "programmaticToolCalling"> & { programmaticToolCalling?: boolean }) | undefined {
+  if (experiments?.programmaticToolCallingExclusive !== true) return experiments;
+  if (experiments.programmaticToolCalling === true) return experiments;
+  return { ...experiments, programmaticToolCalling: true };
+}
+
+/**
+ * Write-side mirror for persisted experiment-flag objects: an enabled merged
+ * PTC also stamps the legacy exclusive key so a downgraded build runs the
+ * exclusive posture instead of reading bare PTC as the removed (~2x cost)
+ * supplement mode.
+ */
+export function withLegacyPtcExclusiveMirror<T extends { programmaticToolCalling?: boolean }>(
+  experiments: T | undefined
+): (T & { programmaticToolCallingExclusive?: boolean }) | undefined {
+  if (experiments?.programmaticToolCalling !== true) return experiments;
+  return { ...experiments, programmaticToolCallingExclusive: true };
+}
+
 export interface ExperimentDefinition {
   id: ExperimentId;
   name: string;

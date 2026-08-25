@@ -39,3 +39,13 @@ export const KERNEL_COMPACT_ARGS_CAP_BYTES = 2 * 1024;
 
 /** Bounded head shown for a mux.load ingestion ({key, bytes, lines, preview}). */
 export const KERNEL_LOAD_PREVIEW_CHARS = 512;
+
+/**
+ * Aggregate base64 budget for supported media parts retained in ONE kernel
+ * record/event (see retainExemptKernelRecordResult). MCP applies only a
+ * per-part guard, so a tool returning many individually-allowed images could
+ * otherwise persist unbounded aggregate base64 into partial.json/chat.jsonl
+ * rows. Sized to fit a typical screenshot or two (base64 of a ~1MB PNG is
+ * ~1.4MB); parts beyond the budget become bounded placeholders.
+ */
+export const KERNEL_RETAINED_MEDIA_BUDGET_BYTES = 3 * 1024 * 1024;

@@ -331,19 +331,3 @@ export const ProjectConfigSchema = z.object({
 
 export type WorktreeArchiveSnapshotProject = z.infer<typeof WorktreeArchiveSnapshotProjectSchema>;
 export type WorktreeArchiveSnapshot = z.infer<typeof WorktreeArchiveSnapshotSchema>;
-
-/**
- * Project runtime experiment flags onto the persisted taskExperiments
- * snapshot. A downgraded build interprets a bare `programmaticToolCalling:
- * true` as the removed supplement mode (~2x token cost), so an enabled PTC
- * also stamps the legacy exclusive flag — the same new-to-legacy mirror the
- * backend applies to feature_flags.json and the renderer applies to
- * localStorage. Read-side aliases (schema preprocess above + the runtime
- * config loader) handle the opposite direction.
- */
-export function toPersistedTaskExperiments<T extends { programmaticToolCalling?: boolean }>(
-  experiments: T | undefined
-): (T & { programmaticToolCallingExclusive?: boolean }) | undefined {
-  if (experiments?.programmaticToolCalling !== true) return experiments;
-  return { ...experiments, programmaticToolCallingExclusive: true };
-}

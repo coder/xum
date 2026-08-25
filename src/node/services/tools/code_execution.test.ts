@@ -15,6 +15,7 @@ import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import { createKernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RESULT_HANDLE_VARS_CAP_BYTES, VARS_SNAPSHOT_MAX_BYTES } from "@/constants/resultHandles";
+import { KERNEL_RETAINED_MEDIA_BUDGET_BYTES } from "@/constants/kernelOutput";
 import * as fs from "node:fs/promises";
 import * as nodePath from "node:path";
 
@@ -890,7 +891,7 @@ describe("createCodeExecutionTool", () => {
           z.object({ name: z.string() }),
           () => ({
             success: true,
-            content: "---\nname: demo\n---\nBody",
+            skill: { frontmatter: { name: "demo" }, body: "Body" },
           })
         ),
       };
@@ -911,7 +912,8 @@ describe("createCodeExecutionTool", () => {
       const editRecord = result.toolCalls.find((r) => r.toolName === "file_edit_insert");
       expect((editRecord?.result as { diff?: string })?.diff).toContain("+hello");
       const skillRecord = result.toolCalls.find((r) => r.toolName === "agent_skill_read");
-      expect((skillRecord?.result as { content?: string })?.content).toContain("name: demo");
+      const skill = (skillRecord?.result as { skill?: { body?: string } })?.skill;
+      expect(skill?.body).toBe("Body");
       await host.disposeScope("ws-persist-records");
     });
 
@@ -961,6 +963,80 @@ describe("createCodeExecutionTool", () => {
       const shotValue = (shotRecord?.result as { value?: Array<{ data?: string }> })?.value;
       expect(shotValue?.[1]?.data).toBe(mediaData);
       await host.disposeScope("ws-exempt-bounds");
+    });
+
+    it("caps oversized persistence payloads at capture (diff keeps the downstream truncation signal)", async () => {
+      // generateDiff is unbounded upstream; a >50k diff must be sliced at
+      // capture (to cap+1 chars, so extractEditedFileDiffs' `length > cap`
+      // truncation check still fires) instead of persisting megabytes.
+      using tmp = new DisposableTempDir("code-exec-oversized-diff");
+      const host = new SandboxHostService();
+      const hugeDiff = `@@ -0,0 +1 @@\n+${"y".repeat(80_000)}`;
+      const tools: Record<string, Tool> = {
+        file_edit_insert: createMockTool(
+          "file_edit_insert",
+          z.object({ path: z.string() }),
+          () => ({
+            success: true,
+            diff: hugeDiff,
+          })
+        ),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(tools),
+        undefined,
+        persistentRunner(host, "ws-oversized-diff", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        { code: 'mux.file_edit_insert({path: "/huge.ts"}); return true;' },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const record = result.toolCalls.find((r) => r.toolName === "file_edit_insert");
+      const diff = (record?.result as { diff?: string })?.diff;
+      expect(diff?.length).toBe(50_001);
+      expect(hugeDiff.startsWith(diff!)).toBe(true);
+      await host.disposeScope("ws-oversized-diff");
+    });
+
+    it("charges retained media against an aggregate budget", async () => {
+      // MCP applies only a per-part guard: many individually-allowed images
+      // must not persist unbounded aggregate base64 into records/events.
+      using tmp = new DisposableTempDir("code-exec-media-budget");
+      const host = new SandboxHostService();
+      const bigImage = "A".repeat(KERNEL_RETAINED_MEDIA_BUDGET_BYTES - 100);
+      const secondImage = "B".repeat(500);
+      const tools: Record<string, Tool> = {
+        mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
+          type: "content",
+          value: [
+            { type: "media", mediaType: "image/png", data: bigImage },
+            { type: "media", mediaType: "image/png", data: secondImage },
+          ],
+        })),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(tools),
+        undefined,
+        persistentRunner(host, "ws-media-budget", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        { code: "mux.mcp__shots__take({}); return true;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const record = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
+      const value = (
+        record?.result as { value?: Array<{ type?: string; data?: string; text?: string }> }
+      )?.value;
+      expect(value?.[0]?.data).toBe(bigImage);
+      expect(value?.[1]?.type).toBe("text");
+      expect(value?.[1]?.text).toContain("aggregate media budget exceeded");
+      await host.disposeScope("ws-media-budget");
     });
 
     it("bounds unsupported parts of mixed media containers at capture", async () => {

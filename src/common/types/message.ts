@@ -9,6 +9,7 @@ import type {
 } from "@/common/constants/contextBoundary";
 import type { GoalSyntheticMessageKind } from "@/constants/goals";
 import type { SendMessageOptions } from "@/common/orpc/types";
+import { withLegacyPtcExclusiveMirror } from "@/common/constants/experiments";
 import type { z } from "zod";
 import type { AgentMode } from "./mode";
 import type { AgentSkillScope } from "./agentSkill";
@@ -77,7 +78,9 @@ export function pickPreservedSendOptions(options: SendMessageOptions): Preserved
     reasoningMode: options.reasoningMode,
     additionalSystemInstructions: options.additionalSystemInstructions,
     providerOptions: options.providerOptions,
-    experiments: options.experiments,
+    // Downgrade-compat (see withLegacyPtcExclusiveMirror): preserved options
+    // can persist across restarts and build versions.
+    experiments: withLegacyPtcExclusiveMirror(options.experiments),
     disableWorkspaceAgents: options.disableWorkspaceAgents,
     // Delegated turns with explicit agent overrides must stay loud across the
     // compaction replay too — dropping this would let the follow-up silently
@@ -147,7 +150,9 @@ export function pickStartupRetrySendOptions(
     additionalSystemInstructions: options.additionalSystemInstructions,
     maxOutputTokens: options.maxOutputTokens,
     providerOptions: options.providerOptions,
-    experiments: options.experiments,
+    // Downgrade-compat: retry snapshots persist to chat.jsonl and cross build
+    // versions, so an enabled merged PTC also stamps the legacy exclusive key.
+    experiments: withLegacyPtcExclusiveMirror(options.experiments),
     disableWorkspaceAgents: options.disableWorkspaceAgents,
     // Keep explicit-agent turns loud across restart recovery (see pickPreservedSendOptions).
     strictAgentResolution: options.strictAgentResolution,
