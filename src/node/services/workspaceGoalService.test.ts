@@ -3107,6 +3107,85 @@ describe("WorkspaceGoalService", () => {
     expect(capturedProbe!()).toBe(true);
   });
 
+  test("the wrap-up dispatch admission probe goes stale when a manual message suppresses it", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cPBWX): a manual send during the wrap-up
+    // send's preflight can suppress the wrap-up without making the session
+    // busy; tryMarkBudgetLimitInjected refusing after acceptance is too late.
+    // The wrap-up dispatch must carry an admission probe that flips on
+    // candidate deletion, live-stamp ineligibility, or the suppression's
+    // durable terminal-status write.
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Wrap-up races manual suppression",
+      budgetCents: 100,
+    });
+    const dispatcher = new IdleDispatcher();
+    let capturedProbe: (() => boolean) | undefined;
+    let capturedKind: string | undefined;
+    service.registerGoalContinuationConsumer(dispatcher, {
+      hasActiveDescendantTasks: () => false,
+      getRuntimeState: () => ({ isRuntimeCompatible: true }),
+      executeGoalContinuation: (input) => {
+        capturedKind = input.kind;
+        capturedProbe = input.admissionStale;
+        // Model a send parked in preflight: never accept.
+        return Promise.resolve(false);
+      },
+      getKickoffSendOptions: () => Promise.resolve({ model: "openai:gpt-4o", agentId: "exec" }),
+    });
+    await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1.25,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    await service.requestContinuationAfterStreamEnd({
+      workspaceId,
+      sendOptions: { model: "openai:gpt-4o", agentId: "exec" },
+      streamEndedAtMs: 20_000,
+    });
+    await drainPendingDispatches();
+    await waitForCondition(() => capturedProbe != null, { timeoutMs: 5_000 });
+    expect(capturedKind).toBe(GOAL_BUDGET_LIMIT_KIND);
+
+    // Mid-preflight, before the intervention: not stale.
+    expect(capturedProbe!()).toBe(false);
+    // Manual suppression commits during the preflight: durable user-origin
+    // write (terminal-status bump) + live stamp re-mark — probe flips stale.
+    await service.suppressBudgetWrapupForManualUserMessage(workspaceId, created.goalId);
+    expect(capturedProbe!()).toBe(true);
+  });
+
+  test("the continuation admission probe goes stale when the goal completes mid-preflight", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cPBWd): a same-goal completion (or an
+    // accounting flip to budget_limited) during the send preflight neither
+    // deletes the candidate nor bumps the explicit-pause generation — the
+    // captured continuation would be admitted against a completed goal. The
+    // terminal-status generation must flip the probe.
+    const dispatcher = new IdleDispatcher();
+    let capturedProbe: (() => boolean) | undefined;
+    service.registerGoalContinuationConsumer(dispatcher, {
+      hasActiveDescendantTasks: () => false,
+      getRuntimeState: () => ({ isRuntimeCompatible: true }),
+      executeGoalContinuation: (input) => {
+        capturedProbe = input.admissionStale;
+        return Promise.resolve(false);
+      },
+      getKickoffSendOptions: () => Promise.resolve({ model: "openai:gpt-4o", agentId: "exec" }),
+    });
+    await setGoalOk(service, { workspaceId, objective: "Completion races dispatch" });
+    await drainPendingDispatches();
+    await waitForCondition(() => capturedProbe != null, { timeoutMs: 5_000 });
+
+    expect(capturedProbe!()).toBe(false);
+    await setGoalOk(service, {
+      workspaceId,
+      status: "complete",
+      completionSummary: "Completed during the preflight",
+    });
+    expect(capturedProbe!()).toBe(true);
+  });
+
   test("a stop landing during auto-promotion reads restores the completed goal", async () => {
     // Codex P1 (PRRT_kwDOPxxmWM6cOgXV): maybeAutoPromoteOnComplete awaits
     // board/streaming/pricing reads after the caller's publication sample. A

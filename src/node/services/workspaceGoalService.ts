@@ -566,6 +566,22 @@ export class WorkspaceGoalService {
    */
   private readonly explicitPauseGenerations = new Map<string, number>();
 
+  /**
+   * Codex P1 (PRRT_kwDOPxxmWM6cPBWd, PRRT_kwDOPxxmWM6cPBWX): monotonic
+   * per-workspace count of durable writes that commit a `complete` or
+   * `budget_limited` record, bumped inside `writeGoal` (the single goal.json
+   * write choke point, so every path — direct setters, drained mutations,
+   * accounting flips, child attribution, wrap-up suppression — is counted).
+   * Continuation/wrap-up dispatch admission probes capture it at dispatch
+   * entry: a same-goal terminal transition committing during the send
+   * preflight neither deletes the candidate nor bumps the pause generation,
+   * so without this the captured send would be admitted against a completed
+   * goal or in place of (or despite the suppression of) the budget wrap-up.
+   * Over-counting is safe: a refused send re-requests dispatch and
+   * eligibility re-derives the correct action from durable state.
+   */
+  private readonly terminalStatusGenerations = new Map<string, number>();
+
   private armPauseFinalizationHold(workspaceId: string, goalId: string): void {
     this.explicitPauseGenerations.set(
       workspaceId,
@@ -1088,6 +1104,15 @@ export class WorkspaceGoalService {
     const filePath = this.getFilePath(workspaceId);
     await fs.mkdir(path.dirname(filePath), { recursive: true });
     await writeFileAtomic(filePath, `${JSON.stringify(goal, null, 2)}\n`, "utf-8");
+    // See terminalStatusGenerations: bumped at the write commit point so
+    // in-flight dispatch admission probes observe terminal transitions from
+    // every write path.
+    if (goal.status === "complete" || goal.status === "budget_limited") {
+      this.terminalStatusGenerations.set(
+        workspaceId,
+        (this.terminalStatusGenerations.get(workspaceId) ?? 0) + 1
+      );
+    }
   }
 
   private async renameCorruptGoal(
@@ -1655,6 +1680,19 @@ export class WorkspaceGoalService {
           // dispatch to retry — we must not permanently flip
           // budgetLimitInjectedForGoalId or the goal gets stuck in budget_limited
           // with no wrap-up. Mirrors the active-continuation path below.
+          //
+          // Codex P1 (PRRT_kwDOPxxmWM6cPBWX): a manual send during this
+          // send's preflight can suppress the wrap-up (delete the candidate,
+          // stamp durable + live user origin) without ever making the session
+          // busy — e.g. an unpriced manual send rejected in its own
+          // preflight. tryMarkBudgetLimitInjected refusing after acceptance
+          // is too late (the wrap-up stream already started), so the
+          // admission probe re-validates the captured candidate, the live
+          // stamp's wrap-up eligibility, and the terminal-status generation
+          // (suppression's durable write bumps it before the live stamp
+          // updates) up to the last gate before the send is irrevocable.
+          const wrapupTerminalGenerationAtDispatch =
+            this.terminalStatusGenerations.get(workspaceId) ?? 0;
           const accepted = await this.goalContinuationBridge?.executeGoalContinuation({
             workspaceId,
             message,
@@ -1662,6 +1700,22 @@ export class WorkspaceGoalService {
             startStreamInBackground: false,
             kind: GOAL_BUDGET_LIMIT_KIND,
             goalId: goal.goalId,
+            admissionStale: () => {
+              if (this.pendingContinuationCandidates.get(workspaceId) !== candidate) {
+                return true;
+              }
+              const stamp = this.lastGoalStreamStamps.get(workspaceId);
+              if (
+                stamp?.goalId !== goal.goalId ||
+                !this.isBudgetWrapupEligibleOrigin(stamp.originKind)
+              ) {
+                return true;
+              }
+              return (
+                (this.terminalStatusGenerations.get(workspaceId) ?? 0) !==
+                wrapupTerminalGenerationAtDispatch
+              );
+            },
           });
           if (accepted !== true) {
             this.scheduleContinuationReRequest(workspaceId, Date.now() + 1_000);
@@ -1707,6 +1761,13 @@ export class WorkspaceGoalService {
         // batch becomes irrevocable. Reconciliation pauses do neither, so the
         // kickoff-window recovery dispatch still proceeds.
         const pauseGenerationAtDispatch = this.explicitPauseGenerations.get(workspaceId) ?? 0;
+        // Codex P1 (PRRT_kwDOPxxmWM6cPBWd): a same-goal transition to
+        // complete (model/user completion) or budget_limited (accounting or
+        // child attribution) during the preflight neither deletes the
+        // candidate nor bumps the pause generation — the terminal-status
+        // generation covers those, refusing a normal continuation against a
+        // completed goal or one that now owes the budget wrap-up instead.
+        const terminalGenerationAtDispatch = this.terminalStatusGenerations.get(workspaceId) ?? 0;
         const accepted = await this.goalContinuationBridge?.executeGoalContinuation({
           workspaceId,
           message,
@@ -1716,7 +1777,8 @@ export class WorkspaceGoalService {
           goalId: goal.goalId,
           admissionStale: () =>
             this.pendingContinuationCandidates.get(workspaceId) !== candidate ||
-            (this.explicitPauseGenerations.get(workspaceId) ?? 0) !== pauseGenerationAtDispatch,
+            (this.explicitPauseGenerations.get(workspaceId) ?? 0) !== pauseGenerationAtDispatch ||
+            (this.terminalStatusGenerations.get(workspaceId) ?? 0) !== terminalGenerationAtDispatch,
         });
         if (accepted !== true) {
           this.scheduleContinuationReRequest(workspaceId, Date.now() + 1_000);
