@@ -1630,20 +1630,22 @@ export class AgentSession {
     // anything manually typed by the user pauses until Resume appends a fresh
     // continuation. Legacy clients may still send the old "steer" policy; treat
     // it as pause so the invariant holds at this backend boundary.
-    let goal: Awaited<ReturnType<typeof goalService.acknowledgeUser>>;
-    try {
-      goal = await goalService.acknowledgeUser(this.workspaceId);
-    } catch (error) {
-      // Codex P2 (PRRT_kwDOPxxmWM6b-Uln): the manual row is already durably
-      // appended by this point. When acknowledgment fails we cannot read the
-      // goal to prove the pre-goal queue race below, so conservatively clear
-      // the kickoff candidate first (the pre-reorder behavior): once the
-      // failed send returns the workspace to idle, a stale candidate could
-      // otherwise dispatch a continuation despite the user's persisted
-      // intervention.
-      goalService.clearPendingContinuationForManualUserMessage(this.workspaceId);
-      throw error;
-    }
+    //
+    // Codex P1 (PRRT_kwDOPxxmWM6cClKd): the manual row is already durable, but
+    // a direct send has not marked the session busy yet — an eligibility check
+    // during the acknowledgment await below would see the workspace idle and
+    // consume a still-armed kickoff candidate, dispatching a continuation
+    // against the user's intervention. Take the candidate synchronously BEFORE
+    // any await; the pre-goal queue-race branch restores it.
+    const suspendedCandidate = goalService.takePendingContinuationCandidateForManualUserMessage(
+      this.workspaceId
+    );
+    // Codex P2 (PRRT_kwDOPxxmWM6b-Uln): on acknowledgment failure we cannot
+    // read the goal to prove the pre-goal queue race below, so leave the
+    // candidate cleared conservatively (it was taken above): once the failed
+    // send returns the workspace to idle, a stale candidate could otherwise
+    // dispatch a continuation despite the user's persisted intervention.
+    const goal = await goalService.acknowledgeUser(this.workspaceId);
 
     // Queue race: a message the user typed while the goal-creating turn was
     // still streaming predates the goal itself — the model's queued set_goal
@@ -1654,9 +1656,14 @@ export class AgentSession {
     // "paused by heartbeats" were actually killed here, then heartbeat turns
     // kept the workspace moving while the goal sat paused).
     if (input.enqueuedAtMs != null && goal != null && goal.createdAtMs >= input.enqueuedAtMs) {
+      if (suspendedCandidate != null) {
+        goalService.restorePendingContinuationCandidate(this.workspaceId, suspendedCandidate);
+      }
       return;
     }
 
+    // Also clears any candidate armed during the acknowledgment await — a
+    // post-goal intervention must not leave a consumable continuation behind.
     goalService.clearPendingContinuationForManualUserMessage(this.workspaceId);
     if (goal?.status !== "active") {
       return;
@@ -5363,6 +5370,11 @@ export class AgentSession {
         this.dispatchingQueuedEntryMuxMetadata = undefined;
         this.preparingWorkspaceTurnMetadata = undefined;
         this.activeStreamStartedAtMs = payload.startTime;
+        // Codex P1 (PRRT_kwDOPxxmWM6cClKS): a new live stream makes mid-stream
+        // setGoal deferral meaningful again — clear the goal service's settled
+        // fast-path synchronously so a model set_goal in THIS stream queues
+        // for its stream-end drain instead of writing goal.json mid-stream.
+        this.workspaceGoalService?.recordStreamStarted(this.workspaceId);
         this.queuedProviderToolEndAbortInFlight = false;
         this.activeToolCallIds.clear();
       }

@@ -241,23 +241,40 @@ describe("AgentSession goal safety hooks", () => {
     session.dispose();
   });
 
+  // Shared harness for the candidate-suspension tests: a busy runtime keeps
+  // eligibility deferring so armed kickoff candidates stay inspectable instead
+  // of being consumed by a live dispatch.
+  function registerBusyKickoffConsumer(goalService: WorkspaceGoalService): Map<string, unknown> {
+    goalService.registerGoalContinuationConsumer(new IdleDispatcher(), {
+      hasActiveDescendantTasks: () => false,
+      getRuntimeState: () => ({ isRuntimeCompatible: true, isBusy: true }),
+      executeGoalContinuation: () => Promise.resolve(true),
+      getKickoffSendOptions: () => Promise.resolve(SEND_OPTIONS),
+    });
+    return (goalService as unknown as { pendingContinuationCandidates: Map<string, unknown> })
+      .pendingContinuationCandidates;
+  }
+
   test("acknowledgment failure still clears the kickoff candidate", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6b-Uln): the manual row is durably appended
     // before goal safety runs. If acknowledgeUser() throws (goal /
     // extension-metadata write failure), the pre-goal queue-race guard can
     // never prove the message predates the goal, so the kickoff candidate must
-    // still be cleared conservatively — a stale candidate could otherwise
-    // dispatch a continuation against the user's persisted intervention once
-    // the failed send returns the workspace to idle.
+    // stay cleared conservatively — a stale candidate could otherwise dispatch
+    // a continuation against the user's persisted intervention once the failed
+    // send returns the workspace to idle. The candidate is taken synchronously
+    // before the acknowledgment await (Codex P1 PRRT_kwDOPxxmWM6cClKd), so a
+    // throw leaves it cleared without a separate clear call.
     const workspaceId = "ack-failure-clears-candidate";
     const { session, goalService, cleanup } = await createSessionHarness(workspaceId);
     cleanups.push(cleanup);
+    const candidates = registerBusyKickoffConsumer(goalService);
     const created = await setGoalOk(goalService, { workspaceId, objective: "Fresh goal" });
+    expect(candidates.has(workspaceId)).toBe(true);
 
     spyOn(goalService, "acknowledgeUser").mockImplementation(() =>
       Promise.reject(new Error("goal write failed"))
     );
-    const clearSpy = spyOn(goalService, "clearPendingContinuationForManualUserMessage");
 
     let thrown: unknown = null;
     try {
@@ -269,7 +286,62 @@ describe("AgentSession goal safety hooks", () => {
     }
 
     expect(thrown).toBeInstanceOf(Error);
-    expect(clearSpy).toHaveBeenCalledWith(workspaceId);
+    expect(candidates.has(workspaceId)).toBe(false);
+    session.dispose();
+  });
+
+  test("kickoff candidate is not consumable while a manual send is classified", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cClKd): a direct send appends its durable row
+    // before the session reports busy, so an eligibility check running during
+    // the acknowledgment await must not find (and consume) the kickoff
+    // candidate — it would dispatch a continuation against the user's
+    // intervention.
+    const workspaceId = "manual-classification-suspends-candidate";
+    const { session, goalService, cleanup } = await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const candidates = registerBusyKickoffConsumer(goalService);
+    const created = await setGoalOk(goalService, { workspaceId, objective: "Fresh goal" });
+    expect(candidates.has(workspaceId)).toBe(true);
+
+    const originalAcknowledge = goalService.acknowledgeUser.bind(goalService);
+    let eligibilityDuringAck: string | undefined;
+    spyOn(goalService, "acknowledgeUser").mockImplementation(async (id: string) => {
+      // Runs mid-classification: the candidate must already be suspended.
+      const eligibility = await goalService.checkGoalContinuationEligibility(id, Date.now());
+      eligibilityDuringAck = eligibility.eligible ? "eligible" : eligibility.reason;
+      return originalAcknowledge(id);
+    });
+
+    const result = await session.sendMessage("Typed with the goal in view", SEND_OPTIONS, {
+      enqueuedAtMs: created.createdAtMs + 1,
+    });
+
+    expect(result.success).toBe(true);
+    expect(eligibilityDuringAck).toBe("no_pending_candidate");
+    expect(candidates.has(workspaceId)).toBe(false);
+    session.dispose();
+  });
+
+  test("pre-goal queued sends restore the suspended kickoff candidate", async () => {
+    // Complement to the suspension test above: a queued send authored before
+    // the goal existed is not an intervention, so the taken candidate must be
+    // restored and the fresh goal must keep its kickoff continuation.
+    const workspaceId = "pre-goal-restores-candidate";
+    const { session, goalService, cleanup } = await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const candidates = registerBusyKickoffConsumer(goalService);
+    const enqueuedAtMs = Date.now();
+    const created = await setGoalOk(goalService, { workspaceId, objective: "Fresh goal" });
+    expect(created.createdAtMs).toBeGreaterThanOrEqual(enqueuedAtMs);
+    expect(candidates.has(workspaceId)).toBe(true);
+
+    const result = await session.sendMessage("Queued before the goal existed", SEND_OPTIONS, {
+      enqueuedAtMs,
+    });
+
+    expect(result.success).toBe(true);
+    expect(candidates.has(workspaceId)).toBe(true);
+    expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
     session.dispose();
   });
 

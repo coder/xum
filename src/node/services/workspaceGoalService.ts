@@ -193,12 +193,25 @@ export interface GoalContinuationRuntimeBridge {
 
 type PendingGoalContinuationSource = "stream_end" | "kickoff" | "budget_wrapup";
 
-interface PendingGoalContinuationCandidate {
+export interface PendingGoalContinuationCandidate {
   goalId: string;
   requestedAtMs: number;
   streamEndedAtMs: number;
   source: PendingGoalContinuationSource;
   sendOptions: SendMessageOptions;
+}
+
+interface GoalPersistenceOptions {
+  replacementGoalId?: string | null;
+  replacementCreatedAtMs?: number | null;
+  /**
+   * When provided, persistence re-checks the user-stop generation after every
+   * await preceding a durable write and discards the mutation if a stop landed
+   * (Codex P1 PRRT_kwDOPxxmWM6cClKV). Only the direct setter path passes this;
+   * the stream-end drain relies on `recordUserStoppedStream` deleting pending
+   * mutations before the drain claims them.
+   */
+  userStopGate?: { generationAtEntry: number };
 }
 
 /**
@@ -428,6 +441,16 @@ export class WorkspaceGoalService {
   private pendingContinuationCandidates = new Map<string, PendingGoalContinuationCandidate>();
   private continuationReRequestTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private lastUserStopAtMsByWorkspace = new Map<string, number>();
+  /**
+   * Monotonic per-workspace user-stop counter, bumped synchronously by
+   * `recordUserStoppedStream`. Setters capture it at entry and treat any
+   * change as "a stop landed while I was in flight" (Codex P1
+   * PRRT_kwDOPxxmWM6cClKV). The timestamp map above cannot serve this role:
+   * two stops in the same millisecond compare equal, and user-resume /
+   * promotion paths DELETE the timestamp, which a `!==` comparison would
+   * misread as a fresh stop and falsely discard an unrelated in-flight setter.
+   */
+  private readonly userStopGenerationsByWorkspace = new Map<string, number>();
   private recordedStreamStartedAtMsByWorkspace = new Map<string, number>();
   private lastGoalStreamStamps = new Map<string, GoalStreamStamp>();
   /**
@@ -1100,6 +1123,58 @@ export class WorkspaceGoalService {
   }
 
   /**
+   * Synchronously remove and return the pending continuation candidate so a
+   * manual user message can be classified without leaving the candidate
+   * consumable.
+   *
+   * Codex P1 (PRRT_kwDOPxxmWM6cClKd): a direct send on an idle workspace does
+   * not mark the session busy until after its durable row is appended, so an
+   * eligibility check running while `acknowledgeUser` is awaited would see an
+   * idle session, skip chat-tail sync for a kickoff candidate, and dispatch a
+   * continuation despite the user's intervention. Taking the candidate before
+   * that await closes the window; the pre-goal queue-race branch restores it
+   * via `restorePendingContinuationCandidate`.
+   */
+  takePendingContinuationCandidateForManualUserMessage(
+    workspaceId: string
+  ): PendingGoalContinuationCandidate | null {
+    assert(
+      workspaceId.trim().length > 0,
+      "takePendingContinuationCandidateForManualUserMessage requires workspaceId"
+    );
+    const candidate = this.pendingContinuationCandidates.get(workspaceId) ?? null;
+    this.pendingContinuationCandidates.delete(workspaceId);
+    return candidate;
+  }
+
+  /**
+   * Restore a candidate suspended by
+   * `takePendingContinuationCandidateForManualUserMessage` after the manual
+   * message proved to be a pre-goal queue-race send (authored before the goal
+   * existed — not an intervention). No-op when something newer armed during
+   * the suspension. Re-requests dispatch because a dispatch consumed during
+   * the suspension found no candidate and nothing else would retry.
+   */
+  restorePendingContinuationCandidate(
+    workspaceId: string,
+    candidate: PendingGoalContinuationCandidate
+  ): void {
+    assert(
+      workspaceId.trim().length > 0,
+      "restorePendingContinuationCandidate requires workspaceId"
+    );
+    if (this.pendingContinuationCandidates.has(workspaceId)) {
+      return;
+    }
+    this.pendingContinuationCandidates.set(workspaceId, candidate);
+    this.goalContinuationDispatcher
+      ?.requestDispatch(workspaceId, GOAL_CONTINUATION_IDLE_CONSUMER_NAME)
+      .catch((error: unknown) => {
+        log.warn("Failed to re-request dispatch after candidate restore", { workspaceId, error });
+      });
+  }
+
+  /**
    * Treat an agent's text-only `goal_continuation` turn as implicit
    * completion. The continuation prompt asks the agent to call
    * `complete_goal` explicitly, but real models sometimes finish with a
@@ -1174,10 +1249,38 @@ export class WorkspaceGoalService {
     return result.data;
   }
 
+  /**
+   * Notify the goal service that a new stream actually started. Synchronous on
+   * purpose: it must land before any setter admitted during the new stream
+   * checks the settled fast-path.
+   *
+   * Codex P1 (PRRT_kwDOPxxmWM6cClKS): `applyPendingAfterStreamEnd` marks the
+   * workspace settled after every drain (and `recordUserStoppedStream` after
+   * every abort), but production only cleared the marker on terminal-error
+   * restoration. Without this hook, every subsequent successful stream saw the
+   * stale settled marker and a model `set_goal` persisted goal.json mid-stream
+   * instead of deferring to the stream-end drain — archiving the outgoing goal
+   * before its stream accounting, skipping the new goal's accounting
+   * (createdAtMs postdates stream start), and leaving nothing for a user stop
+   * to discard.
+   */
+  recordStreamStarted(workspaceId: string): void {
+    assert(workspaceId.trim().length > 0, "recordStreamStarted requires workspaceId");
+    // Only the settled marker: recording the new stream's start time in
+    // `recordedStreamStartedAtMsByWorkspace` would suppress the stream's own
+    // accounting previews (a match there means "deltas from this stream are
+    // stale", set by terminal-error restoration).
+    this.drainSettledWorkspaces.delete(workspaceId);
+  }
+
   async recordUserStoppedStream(workspaceId: string, stoppedAtMs = Date.now()): Promise<void> {
     assert(workspaceId.trim().length > 0, "recordUserStoppedStream requires workspaceId");
     assert(Number.isFinite(stoppedAtMs) && stoppedAtMs >= 0, "user stop timestamp must be valid");
     this.lastUserStopAtMsByWorkspace.set(workspaceId, stoppedAtMs);
+    this.userStopGenerationsByWorkspace.set(
+      workspaceId,
+      (this.userStopGenerationsByWorkspace.get(workspaceId) ?? 0) + 1
+    );
     // A user stop ends the stream WITHOUT a stream-end drain (AgentSession
     // deliberately skips it), so treat the workspace as settled: setters
     // admitted after this stop must persist directly instead of queueing a
@@ -2079,7 +2182,8 @@ export class WorkspaceGoalService {
     // only already-installed mutations, so a setter still in its pre-install
     // awaits would otherwise install (or directly persist) a goal the abort
     // meant to discard.
-    const userStopAtMsAtEntry = this.lastUserStopAtMsByWorkspace.get(input.workspaceId) ?? null;
+    const userStopGenerationAtEntry =
+      this.userStopGenerationsByWorkspace.get(input.workspaceId) ?? 0;
 
     if (!objective && this.pendingGoalSnapshots.has(input.workspaceId)) {
       // Until stream-end persists the queued objective, status/budget-only edits
@@ -2105,7 +2209,7 @@ export class WorkspaceGoalService {
       (await this.isWorkspaceStreaming(input.workspaceId))
     ) {
       const deferredResult = await this.fileLocks.withLock(input.workspaceId, async () => {
-        if (this.userStopLandedSince(input.workspaceId, userStopAtMsAtEntry)) {
+        if (this.userStopLandedSince(input.workspaceId, userStopGenerationAtEntry)) {
           return Err({
             type: "invalid_transition" as const,
             message: GOAL_SET_DISCARDED_BY_USER_STOP_MESSAGE,
@@ -2171,7 +2275,7 @@ export class WorkspaceGoalService {
             message: UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
           });
         }
-        if (this.userStopLandedSince(input.workspaceId, userStopAtMsAtEntry)) {
+        if (this.userStopLandedSince(input.workspaceId, userStopGenerationAtEntry)) {
           return Err({
             type: "invalid_transition" as const,
             message: GOAL_SET_DISCARDED_BY_USER_STOP_MESSAGE,
@@ -2266,7 +2370,7 @@ export class WorkspaceGoalService {
       }
     }
 
-    if (this.userStopLandedSince(input.workspaceId, userStopAtMsAtEntry)) {
+    if (this.userStopLandedSince(input.workspaceId, userStopGenerationAtEntry)) {
       // Codex P1 (PRRT_kwDOPxxmWM6cCH_H): the abort can also land after the
       // pre-lock admission read `streaming=false` — do not fall through to
       // immediate persistence for a setter the stop meant to discard.
@@ -2275,12 +2379,21 @@ export class WorkspaceGoalService {
         message: GOAL_SET_DISCARDED_BY_USER_STOP_MESSAGE,
       });
     }
-    return this.setGoalImmediately({ ...input, objective });
+    // Codex P1 (PRRT_kwDOPxxmWM6cClKV): the check above is not the last word —
+    // setGoalImmediately still awaits the file lock, kickoff-model validation,
+    // history archival, and writes. Carry the stop generation through the
+    // locked persistence so an abort landing during any of those awaits
+    // discards the change instead of durably creating a goal from the aborted
+    // turn.
+    return this.setGoalImmediately(
+      { ...input, objective },
+      { userStopGate: { generationAtEntry: userStopGenerationAtEntry } }
+    );
   }
 
-  /** Whether a user stop was recorded after the caller captured `stopAtMsAtEntry`. */
-  private userStopLandedSince(workspaceId: string, stopAtMsAtEntry: number | null): boolean {
-    return (this.lastUserStopAtMsByWorkspace.get(workspaceId) ?? null) !== stopAtMsAtEntry;
+  /** Whether a user stop was recorded after the caller captured `generationAtEntry`. */
+  private userStopLandedSince(workspaceId: string, generationAtEntry: number): boolean {
+    return (this.userStopGenerationsByWorkspace.get(workspaceId) ?? 0) !== generationAtEntry;
   }
 
   private async canRunBudgetedGoalOnKickoffModel(
@@ -2299,12 +2412,12 @@ export class WorkspaceGoalService {
 
   private async setGoalImmediately(
     input: SetGoalInput & { objective?: string },
-    options?: { replacementGoalId?: string | null; replacementCreatedAtMs?: number | null }
+    options?: GoalPersistenceOptions
   ): Promise<Result<GoalRecordV1, GoalSetError>> {
     const result = await this.fileLocks.withLock(input.workspaceId, () =>
       this.persistGoalMutationLocked(input, options)
     );
-    return this.finalizeGoalPersistence(input, result);
+    return this.finalizeGoalPersistence(input, result, options);
   }
 
   /**
@@ -2317,9 +2430,26 @@ export class WorkspaceGoalService {
    */
   private async persistGoalMutationLocked(
     input: SetGoalInput & { objective?: string },
-    options?: { replacementGoalId?: string | null; replacementCreatedAtMs?: number | null }
+    options?: GoalPersistenceOptions
   ): Promise<Result<GoalRecordV1, GoalSetError>> {
+    // Codex P1 (PRRT_kwDOPxxmWM6cClKV): recordUserStoppedStream bumps the stop
+    // generation synchronously (it does NOT wait for this lock), so a stop can
+    // land during any await inside this tenure. Re-check after every await
+    // that precedes a durable write so the abort discards the change instead
+    // of acknowledging an already-written goal.
+    const discardIfUserStopLanded = (): Result<GoalRecordV1, GoalSetError> | null =>
+      options?.userStopGate != null &&
+      this.userStopLandedSince(input.workspaceId, options.userStopGate.generationAtEntry)
+        ? Err({
+            type: "invalid_transition" as const,
+            message: GOAL_SET_DISCARDED_BY_USER_STOP_MESSAGE,
+          })
+        : null;
     {
+      const stoppedBeforeRead = discardIfUserStopLanded();
+      if (stoppedBeforeRead) {
+        return stoppedBeforeRead;
+      }
       const current = await this.readGoalFile(input.workspaceId);
       const conflict =
         this.conflictForExpectedGoalId(current, input.expectedGoalId) ??
@@ -2384,6 +2514,10 @@ export class WorkspaceGoalService {
             message: UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
           });
         }
+        const stoppedBeforeEditWrite = discardIfUserStopLanded();
+        if (stoppedBeforeEditWrite) {
+          return stoppedBeforeEditWrite;
+        }
         await this.writeGoal(input.workspaceId, withEdits);
         await this.pushSnapshot(input.workspaceId, withEdits);
         await this.pushLiveGoalPreviewOverlay(input.workspaceId, withEdits);
@@ -2424,6 +2558,10 @@ export class WorkspaceGoalService {
               type: "invalid_transition" as const,
               message: UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
             });
+          }
+          const stoppedBeforeMutableWrite = discardIfUserStopLanded();
+          if (stoppedBeforeMutableWrite) {
+            return stoppedBeforeMutableWrite;
           }
 
           // User resume is an explicit opt-in after a stop/crash gate; clear
@@ -2477,6 +2615,10 @@ export class WorkspaceGoalService {
           message: UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
         });
       }
+      const stoppedBeforeArchive = discardIfUserStopLanded();
+      if (stoppedBeforeArchive) {
+        return stoppedBeforeArchive;
+      }
       this.liveGoalPreviewSnapshots.delete(input.workspaceId);
       // Archive the outgoing goal to history before we overwrite goal.json.
       // The new goal gets a fresh `goalId` so the right-sidebar GoalTab needs
@@ -2489,6 +2631,13 @@ export class WorkspaceGoalService {
           current,
           current.status === "complete" ? "completed" : "replaced"
         );
+        // A stop landing during the archive append leaves a cosmetic history
+        // entry, but the durable goal.json write below must still be
+        // discarded.
+        const stoppedAfterArchive = discardIfUserStopLanded();
+        if (stoppedAfterArchive) {
+          return stoppedAfterArchive;
+        }
       }
       await this.writeGoal(input.workspaceId, next);
       await this.pushSnapshot(input.workspaceId, next);
@@ -2529,11 +2678,22 @@ export class WorkspaceGoalService {
    */
   private async finalizeGoalPersistence(
     input: SetGoalInput & { objective?: string },
-    result: Result<GoalRecordV1, GoalSetError>
+    result: Result<GoalRecordV1, GoalSetError>,
+    options?: GoalPersistenceOptions
   ): Promise<Result<GoalRecordV1, GoalSetError>> {
     if (!result.success) {
       return result;
     }
+    // Codex P1 (PRRT_kwDOPxxmWM6cClKV): a stop landing after the durable write
+    // but before finalization already cleared continuation candidates — arming
+    // here would resurrect the autonomous loop the abort meant to halt. Only
+    // the arming side effects are stop-opposed: pause boundaries and chat-tail
+    // syncs make the written record stick and must still run. Evaluated lazily
+    // at each arm site so stops landing during earlier finalization awaits are
+    // seen too.
+    const stopVetoesArming = (): boolean =>
+      options?.userStopGate != null &&
+      this.userStopLandedSince(input.workspaceId, options.userStopGate.generationAtEntry);
 
     if (input.objective != null) {
       this.recordGoalSet(input.workspaceId, result.data);
@@ -2561,7 +2721,9 @@ export class WorkspaceGoalService {
     }
 
     if (result.data.status === "active") {
-      await this.armKickoffContinuationIfIdle(input.workspaceId, result.data);
+      if (!stopVetoesArming()) {
+        await this.armKickoffContinuationIfIdle(input.workspaceId, result.data);
+      }
       if (input.initiator === "model") {
         // A model-created set_goal starts from an ordinary user turn, not a
         // goal-continuation row. Do not reconcile it against chat tail here or
@@ -2571,7 +2733,7 @@ export class WorkspaceGoalService {
       const synced = await this.syncGoalStatusToChatTail(input.workspaceId);
       return Ok(synced ?? result.data);
     }
-    if (result.data.status === "budget_limited") {
+    if (result.data.status === "budget_limited" && !stopVetoesArming()) {
       await this.armBudgetWrapupForBudgetLimitedGoal(input.workspaceId, result.data);
     }
     return result;
@@ -2635,6 +2797,23 @@ export class WorkspaceGoalService {
       return;
     }
     if (sendOptions.agentId === "plan" || sendOptions.agentId === "compact") {
+      return;
+    }
+    // Codex P2 (PRRT_kwDOPxxmWM6cClKY): the kickoff-options await above runs
+    // outside the goal file lock, so a newer setter can persist a replacement
+    // goal AND arm its own candidate while this stale finalizer is suspended.
+    // Arming now would overwrite the newer goal's candidate with one that
+    // eligibility drops for goal-ID mismatch, leaving the durable goal with no
+    // kickoff. Re-verify this goal is still the durable active record, and do
+    // not overwrite a candidate that already belongs to it (no await sits
+    // between these checks and the arm below). A candidate for a DIFFERENT
+    // goal is stale by definition here — we just proved ours is durable — and
+    // must be replaced, or the durable goal is the one left kickoff-less.
+    const durable = await this.readGoalFile(workspaceId);
+    if (durable?.goalId !== goal.goalId || durable.status !== "active") {
+      return;
+    }
+    if (this.pendingContinuationCandidates.get(workspaceId)?.goalId === goal.goalId) {
       return;
     }
 
@@ -2754,6 +2933,20 @@ export class WorkspaceGoalService {
     }
     const sendOptions = await this.goalContinuationBridge.getKickoffSendOptions?.(workspaceId);
     if (!sendOptions || sendOptions.agentId === "plan" || sendOptions.agentId === "compact") {
+      return;
+    }
+    // Codex P2 (PRRT_kwDOPxxmWM6cClKY): mirror the kickoff arming re-check —
+    // the options await runs unlocked, so a candidate armed (or a replacement
+    // goal persisted) during it must win over this stale wrap-up finalizer.
+    if (this.pendingContinuationCandidates.has(workspaceId)) {
+      return;
+    }
+    const durable = await this.readGoalFile(workspaceId);
+    if (
+      durable?.goalId !== goal.goalId ||
+      durable.status !== "budget_limited" ||
+      this.pendingContinuationCandidates.has(workspaceId)
+    ) {
       return;
     }
 

@@ -2546,6 +2546,104 @@ describe("WorkspaceGoalService", () => {
     expect(await service.getGoal(workspaceId)).toMatchObject({ objective: "Post-drain goal" });
   });
 
+  test("recordStreamStarted clears the settled marker so the next stream defers mid-stream setGoal", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cClKS): every drain exit (and user stop) marks
+    // the workspace settled, but production only cleared the marker on
+    // terminal-error restoration. Without an explicit stream-start
+    // notification, a model set_goal in the NEXT successful stream bypassed
+    // deferral and wrote goal.json mid-stream.
+    await extensionMetadata.setStreaming(workspaceId, true);
+    const drained = await service.applyPendingAfterStreamEnd(workspaceId);
+    expect(drained).toBeNull();
+
+    // AgentSession's stream-start handler notifies synchronously.
+    service.recordStreamStarted(workspaceId);
+
+    const setter = await service.setGoal({ workspaceId, objective: "Mid-stream goal" });
+    expect(setter.success).toBe(true);
+    const serviceAccess = service as unknown as { pendingGoalMutations: Map<string, unknown> };
+    // Deferred again: the mutation queues for THIS stream's stream-end drain
+    // instead of persisting mid-stream.
+    expect(serviceAccess.pendingGoalMutations.get(workspaceId)).toBeDefined();
+    expect(await goalFileExists(config, workspaceId)).toBe(false);
+  });
+
+  test("a user stop landing while direct persistence awaits the goal lock discards the setter", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cClKV): the pre-persistence stop check is not
+    // the last word — setGoalImmediately still awaits the goal file lock and
+    // the durable writes. A stop landing during those awaits must discard the
+    // change instead of durably creating a goal from the aborted turn.
+    const serviceAccess = service as unknown as {
+      fileLocks: { withLock: <T>(key: string, fn: () => Promise<T>) => Promise<T> };
+    };
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const gateTenure = serviceAccess.fileLocks.withLock(workspaceId, () => gate);
+
+    // Direct path (no live stream): the setter passes its pre-lock stop check
+    // and queues behind the gate.
+    const setterPromise = service.setGoal({ workspaceId, objective: "Aborted direct goal" });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    // The stop bumps the stop generation synchronously; its own locked section
+    // queues behind the setter's tenure.
+    const stopPromise = service.recordUserStoppedStream(workspaceId);
+    releaseGate();
+    await gateTenure;
+    const [setter] = await Promise.all([setterPromise, stopPromise]);
+
+    expect(setter.success).toBe(false);
+    if (!setter.success) {
+      expect(setter.error.type).toBe("invalid_transition");
+    }
+    expect(await service.getGoal(workspaceId)).toBeNull();
+    expect(await goalFileExists(config, workspaceId)).toBe(false);
+  });
+
+  test("a stale kickoff finalizer does not overwrite a newer goal's candidate", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cClKY): kickoff finalization runs outside the
+    // goal file lock. While finalizer A awaits kickoff options, a newer setter
+    // B can persist directly and arm B's kickoff; A resuming afterwards must
+    // not replace B's candidate with a stale one that eligibility would drop
+    // for goal-ID mismatch — that would strand durable goal B with no kickoff.
+    const dispatcher = new IdleDispatcher();
+    let kickoffCalls = 0;
+    let releaseFirstKickoff!: () => void;
+    const firstKickoffGate = new Promise<void>((resolve) => {
+      releaseFirstKickoff = resolve;
+    });
+    service.registerGoalContinuationConsumer(dispatcher, {
+      hasActiveDescendantTasks: () => false,
+      // Busy runtime keeps eligibility deferring so armed candidates stay
+      // inspectable instead of being consumed by a live dispatch.
+      getRuntimeState: () => ({ isRuntimeCompatible: true, isBusy: true }),
+      executeGoalContinuation: () => Promise.resolve(true),
+      getKickoffSendOptions: async () => {
+        kickoffCalls += 1;
+        if (kickoffCalls === 1) {
+          await firstKickoffGate;
+        }
+        return { model: "openai:gpt-4o", agentId: "exec" };
+      },
+    });
+
+    const setterAPromise = service.setGoal({ workspaceId, objective: "Stale finalizer goal A" });
+    await waitForCondition(() => kickoffCalls === 1, { timeoutMs: 1_000 });
+    // B persists and arms its kickoff while A's finalizer is still suspended.
+    const goalB = await setGoalOk(service, { workspaceId, objective: "Newer goal B" });
+    releaseFirstKickoff();
+    const setterA = await setterAPromise;
+    expect(setterA.success).toBe(true);
+
+    const candidates = (
+      service as unknown as {
+        pendingContinuationCandidates: Map<string, { goalId: string }>;
+      }
+    ).pendingContinuationCandidates;
+    expect(candidates.get(workspaceId)?.goalId).toBe(goalB.goalId);
+  });
+
   test("stream-end drain racing publication persists the publication stamp", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6b_KgE): the stream can end while the queued
     // setter is still inside its publication await. The drain used to take the
