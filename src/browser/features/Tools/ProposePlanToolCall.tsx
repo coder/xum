@@ -57,6 +57,7 @@ import {
   clearPendingWorkspaceAgentId,
   markPendingWorkspaceAgentId,
 } from "@/browser/utils/workspaceAiSettingsSync";
+import { resolvePersistedAgentId } from "@/common/utils/agentIds";
 import {
   resolveWorkspaceAiSettingsForAgent,
   type WorkspaceAISettingsCache,
@@ -508,6 +509,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   }): {
     resolvedModel: string;
     resolvedThinking: ThinkingLevel;
+    resolvedSettings: {
+      model: string;
+      thinkingLevel: ThinkingLevel;
+      reasoningMode?: OpenAIReasoningMode;
+    };
     snapshot: TargetAgentSwitchSnapshot;
   } => {
     const modelKey = getModelKey(args.workspaceId);
@@ -539,9 +545,12 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
       });
 
-    // propose_plan renders in plan mode, so an unset key means plan.
+    // An unset key resolves to the provider's effective agent (workspace
+    // default exec), not plan: a latest historical propose_plan card can
+    // still offer Implement while no agent key was ever persisted, and a
+    // failure rollback must not switch the workspace to plan.
     const previousAgentId =
-      readPersistedState<string | null>(getAgentIdKey(args.workspaceId), null) ?? "plan";
+      readPersistedState<string | null>(getAgentIdKey(args.workspaceId), null) ?? currentAgentId;
 
     // The follow-up send persists this switch to the backend; guard the interim
     // against stale metadata broadcasts re-seeding the previous agent.
@@ -562,6 +571,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     return {
       resolvedModel,
       resolvedThinking,
+      resolvedSettings: {
+        model: resolvedModel,
+        thinkingLevel: resolvedThinking,
+        ...(resolvedReasoningMode != null ? { reasoningMode: resolvedReasoningMode } : {}),
+      },
       snapshot: {
         previousAgentId,
         model: existingModel,
@@ -610,7 +624,10 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     // agent the failed send left persisted.
     try {
       const info = await api.workspace.getInfo({ workspaceId });
-      if (info?.agentId != null && info.agentId !== targetAgentId) {
+      // Legacy workspaces may persist only agentType — resolve both identity
+      // fields the same way metadata seeding does.
+      const backendAgentId = info == null ? "" : resolvePersistedAgentId(info, "");
+      if (backendAgentId.length > 0 && backendAgentId !== targetAgentId) {
         rollbackTargetAgentSwitch(workspaceId, targetAgentId, snapshot);
       }
     } catch {
@@ -619,16 +636,23 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   };
 
   // A successful send does not guarantee the switch is durable: its settings
-  // persistence is best-effort (failures only log). Persist the selection
-  // explicitly — unless the user already picked another agent mid-send, in
-  // which case that newer write is authoritative and persisting this action's
-  // target would overwrite it (and its metadata echo would flip the UI back).
-  // A failed or rejected persistence leaves the backend on the previous
-  // agent, so restore the optimistic local switch instead of silently
-  // diverging.
+  // persistence is best-effort (failures only log). Retry the resolved
+  // settings together with the selection — an agent-only retry would leave
+  // the target bucket stale after a transient send-side write failure while
+  // this renderer already switched to the resolved settings. Skip when the
+  // user already picked another agent mid-send: that newer write is
+  // authoritative and persisting this action's target would overwrite it
+  // (and its metadata echo would flip the UI back). A failed or rejected
+  // persistence leaves the backend on the previous agent, so restore the
+  // optimistic local switch instead of silently diverging.
   const persistTargetAgentSwitchAfterSend = async (
     targetAgentId: string,
-    snapshot: TargetAgentSwitchSnapshot
+    snapshot: TargetAgentSwitchSnapshot,
+    resolvedSettings: {
+      model: string;
+      thinkingLevel: ThinkingLevel;
+      reasoningMode?: OpenAIReasoningMode;
+    }
   ) => {
     if (!workspaceId || !api) return;
     if (readPersistedState<string | null>(getAgentIdKey(workspaceId), null) !== targetAgentId) {
@@ -638,7 +662,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       const persistResult = await api.workspace.updateAgentAISettings({
         workspaceId,
         agentId: targetAgentId,
-        aiSettings: null,
+        aiSettings: resolvedSettings,
         persistSelectedAgentId: true,
       });
       if (!persistResult.success) {
@@ -678,10 +702,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         });
       }
 
-      const { resolvedModel, resolvedThinking, snapshot } = resolveAndPersistTargetAgentSettings({
-        workspaceId,
-        targetAgentId,
-      });
+      const { resolvedModel, resolvedThinking, resolvedSettings, snapshot } =
+        resolveAndPersistTargetAgentSettings({
+          workspaceId,
+          targetAgentId,
+        });
       switchSnapshot = snapshot;
       const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
 
@@ -699,7 +724,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         // Release the guard either way — backend echoes carry the
         // authoritative agent, and a successful no-op write emits no echo to
         // release it for us.
-        await persistTargetAgentSwitchAfterSend(targetAgentId, snapshot);
+        await persistTargetAgentSwitchAfterSend(targetAgentId, snapshot, resolvedSettings);
         clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
       } else {
         // Failed send: nothing will echo and a stuck guard would block
@@ -749,10 +774,11 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         });
       }
 
-      const { resolvedModel, resolvedThinking, snapshot } = resolveAndPersistTargetAgentSettings({
-        workspaceId,
-        targetAgentId,
-      });
+      const { resolvedModel, resolvedThinking, resolvedSettings, snapshot } =
+        resolveAndPersistTargetAgentSettings({
+          workspaceId,
+          targetAgentId,
+        });
       switchSnapshot = snapshot;
       const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
 
@@ -768,7 +794,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       });
       // See handleImplement: persist explicitly, then release the guard.
       if (sendResult.success) {
-        await persistTargetAgentSwitchAfterSend(targetAgentId, snapshot);
+        await persistTargetAgentSwitchAfterSend(targetAgentId, snapshot, resolvedSettings);
         clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
       } else {
         await rollbackFailedSendAgentSwitch(targetAgentId, snapshot);

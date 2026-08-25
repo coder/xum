@@ -66,17 +66,19 @@ interface MockApi {
     updateAgentAISettings: (args: {
       workspaceId: string;
       agentId: string;
-      aiSettings: null;
+      aiSettings: { model: string; thinkingLevel: string; reasoningMode?: string } | null;
       persistSelectedAgentId?: boolean;
     }) => Promise<{ success: boolean; error?: string }>;
-    getInfo: (args: { workspaceId: string }) => Promise<{ agentId?: string | null } | null>;
+    getInfo: (args: {
+      workspaceId: string;
+    }) => Promise<{ agentId?: string | null; agentType?: string | null } | null>;
   };
 }
 
 let updateAgentAISettingsCalls: Array<{
   workspaceId: string;
   agentId: string;
-  aiSettings: null;
+  aiSettings: { model: string; thinkingLevel: string; reasoningMode?: string } | null;
   persistSelectedAgentId?: boolean;
 }> = [];
 
@@ -550,10 +552,12 @@ describe("ProposePlanToolCall", () => {
     // persistence is best-effort) and then releases the guard so backend
     // agent updates apply again.
     await waitFor(() => expect(updateAgentAISettingsCalls).toHaveLength(1));
-    expect(updateAgentAISettingsCalls[0]).toEqual({
+    // The retry re-persists the resolved settings with the selection so a
+    // transiently failed send-side write cannot leave the bucket stale.
+    expect(updateAgentAISettingsCalls[0]).toMatchObject({
       workspaceId: WORKSPACE_ID,
       agentId: "exec",
-      aiSettings: null,
+      aiSettings: { model: execModel, thinkingLevel: execThinking },
       persistSelectedAgentId: true,
     });
     await waitFor(() =>
@@ -665,6 +669,66 @@ describe("ProposePlanToolCall", () => {
     );
     await waitFor(() =>
       expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true)
+    );
+  });
+
+  test("reconciles using legacy agentType when the rejected restore leaves plan persisted", async () => {
+    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
+
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({
+      sendMessage: (args) => {
+        sendMessageCalls.push(args);
+        return Promise.resolve({ success: false as const, error: "send rejected" });
+      },
+      updateAgentAISettings: () => Promise.resolve({ success: false, error: "unwritable config" }),
+      // Legacy workspaces may persist only agentType — reconciliation must
+      // resolve it like metadata seeding does instead of reading only agentId.
+      getInfo: () => Promise.resolve({ agentType: "plan" }),
+    });
+
+    const view = renderCompletedPlan();
+
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+    await waitFor(() => expect(updateAgentAISettingsCalls).toHaveLength(1));
+    await waitFor(() =>
+      expect(JSON.parse(window.localStorage.getItem(getAgentIdKey(WORKSPACE_ID))!)).toBe("plan")
+    );
+    expect(JSON.parse(window.localStorage.getItem(getModelKey(WORKSPACE_ID))!)).toBe(
+      "anthropic:claude-sonnet-4-5"
+    );
+  });
+
+  test("restores the effective exec default when no agent key was persisted", async () => {
+    // No persisted agent key: the workspace's effective agent is the
+    // provider default (exec), so a failed transition must restore exec —
+    // rolling back to plan would switch the workspace to a mode it never had.
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({
+      sendMessage: (args) => {
+        sendMessageCalls.push(args);
+        return Promise.resolve({ success: false as const, error: "send rejected" });
+      },
+    });
+
+    const view = renderPlanToolCall(
+      {
+        status: "completed",
+        result: { success: true, planPath: PLAN_PATH, planContent: PLAN_CONTENT },
+        isLatest: true,
+      },
+      "exec"
+    );
+
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+    await waitFor(() => expect(updateAgentAISettingsCalls).toHaveLength(1));
+    expect(updateAgentAISettingsCalls[0]?.agentId).toBe("exec");
+    await waitFor(() =>
+      expect(JSON.parse(window.localStorage.getItem(getAgentIdKey(WORKSPACE_ID))!)).toBe("exec")
     );
   });
 
