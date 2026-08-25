@@ -2931,6 +2931,24 @@ export class WorkspaceGoalService {
         });
       }
       await this.writeGoal(input.workspaceId, next);
+      // Codex P1 (PRRT_kwDOPxxmWM6cMGn8): the creation/replacement write
+      // itself yields — this is the stream-end drain's main path for a
+      // mid-stream set_goal. Mirror the mutable-branch post-write recheck
+      // (PRRT_kwDOPxxmWM6cLpIP): a Stop landing inside the write must not
+      // leave the aborted turn's goal durable. The archive entry above stays
+      // (cosmetic, same as a stop during the archive append); the durable
+      // record is restored — or removed when no goal existed before.
+      const stoppedDuringCreateWrite = discardIfUserStopLanded();
+      if (stoppedDuringCreateWrite) {
+        if (current) {
+          await this.writeGoal(input.workspaceId, current);
+          await this.pushSnapshot(input.workspaceId, current);
+        } else {
+          await fs.rm(this.getFilePath(input.workspaceId), { force: true });
+          await this.pushSnapshot(input.workspaceId, null);
+        }
+        return stoppedDuringCreateWrite;
+      }
       await this.pushSnapshot(input.workspaceId, next);
       this.emitBudgetChanged(current, next, input);
       this.emitLifecycle(current ? "goal_replaced" : "goal_created", {
@@ -3877,6 +3895,18 @@ export class WorkspaceGoalService {
           claimedMutation = true;
           this.pendingGoalMutations.delete(workspaceId);
           this.pendingGoalSnapshots.delete(workspaceId);
+          // Codex P1 (PRRT_kwDOPxxmWM6cMGn8): recordUserStoppedStream discards
+          // a queued mutation by deleting the pending-map entry, but this
+          // claim just removed it — a Stop landing during the persistence
+          // awaits below would no longer have anything to invalidate and the
+          // drain would durably archive/write the stopped turn's goal change.
+          // Capture the stop generation synchronously with the claim (stops
+          // BEFORE the claim already deleted the entry, so nothing older can
+          // false-discard) and carry it through persistence + finalization so
+          // every await rechecks it, mirroring setGoalImmediately.
+          const userStopGate = {
+            generationAtEntry: this.userStopGenerationsByWorkspace.get(workspaceId) ?? 0,
+          };
           const {
             projectedGoalId,
             projectedCreatedAtMs,
@@ -3887,19 +3917,24 @@ export class WorkspaceGoalService {
           const result = await this.persistGoalMutationLocked(input, {
             replacementGoalId: projectedGoalId ?? null,
             replacementCreatedAtMs: projectedCreatedAtMs ?? null,
+            userStopGate,
           });
           // Mirror setGoalImmediately: arm the pause-finalization hold under
           // the same lock tenure as the paused write.
           if (this.pauseFinalizationHoldApplies(input, result) && result.success) {
             this.armPauseFinalizationHold(workspaceId, result.data.goalId);
           }
-          return { input, result };
+          return { input, result, userStopGate };
         });
         if (tenure == null) {
           break;
         }
         try {
-          const finalized = await this.finalizeGoalPersistence(tenure.input, tenure.result);
+          const finalized = await this.finalizeGoalPersistence(tenure.input, tenure.result, {
+            // A stop landing after the durable write but before finalization
+            // must veto kickoff arming here too (same rule as the setter).
+            userStopGate: tenure.userStopGate,
+          });
           drained = finalized.success ? finalized.data : drained;
         } finally {
           if (

@@ -3256,6 +3256,64 @@ describe("WorkspaceGoalService", () => {
     );
   });
 
+  test("a stop landing during the drain's persistence discards the claimed mutation", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cMGn8): recordUserStoppedStream invalidates a
+    // queued mutation by deleting the pending-map entry, but the stream-end
+    // drain claims (removes) it before persisting. A Stop landing while the
+    // drain's locked persistence awaits I/O then has nothing left to delete —
+    // the drain would durably archive/write the stopped turn's goal change and
+    // the Stop merely acknowledgment-gates it. The claim must carry the stop
+    // generation through persistence so the write is discarded and the prior
+    // record survives.
+    const original = await setGoalOk(service, { workspaceId, objective: "Original goal" });
+    await extensionMetadata.setStreaming(workspaceId, true);
+    const queued = await service.setGoal({ workspaceId, objective: "Replacement mid-stream" });
+    expect(queued.success).toBe(true);
+
+    const serviceAccess = service as unknown as {
+      writeGoal: (id: string, goal: GoalRecordV1) => Promise<void>;
+      pendingGoalMutations: Map<string, { objective: string }>;
+    };
+    const realWrite = serviceAccess.writeGoal.bind(service);
+    let releaseWrite!: () => void;
+    const writeGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    let writeStarted = false;
+    const writeSpy = spyOn(serviceAccess, "writeGoal").mockImplementationOnce(
+      async (id: string, goal: GoalRecordV1) => {
+        writeStarted = true;
+        await writeGate;
+        return realWrite(id, goal);
+      }
+    );
+
+    // The drain claims the mutation and parks inside the replacement write.
+    const drainPromise = service.applyPendingAfterStreamEnd(workspaceId);
+    await waitForCondition(() => writeStarted, { timeoutMs: 5_000 });
+    // Stop lands mid-persistence: the pending-map entry is already claimed, so
+    // only the generation recheck inside the drain's tenure can discard it.
+    const stopPromise = service.recordUserStoppedStream(workspaceId);
+    releaseWrite();
+
+    const drained = await drainPromise;
+    expect(drained).toBeNull();
+    await stopPromise;
+    writeSpy.mockRestore();
+
+    // The aborted turn's replacement never became durable; the stop's queued
+    // section gated the restored original instead.
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: original.goalId,
+      objective: "Original goal",
+      status: "active",
+    });
+    expect(typeof (await service.getGoal(workspaceId))?.requireUserAcknowledgmentSinceMs).toBe(
+      "number"
+    );
+    expect(serviceAccess.pendingGoalMutations.get(workspaceId)).toBeUndefined();
+  });
+
   test("an explicit Resume during pause finalization survives the stale boundary", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cLpIT): a same-goal Resume can durably set the
     // goal active while the old pause finalizer is appending its boundary.
