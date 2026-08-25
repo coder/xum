@@ -559,7 +559,9 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
 
   return (
     <div
-      className="fixed inset-0 z-[2000] flex items-start justify-center bg-black/40 pt-[10vh]"
+      // Dim painted on a pseudo-element so iOS/iPadOS 26 WebKit's status-bar edge
+      // sampler ignores this fixed overlay (same pattern as Dialog/LeftSidebar).
+      className="fixed inset-0 z-[2000] flex items-start justify-center pt-[10vh] before:absolute before:inset-0 before:bg-black/40"
       onMouseDown={dismissPalette}
     >
       <Command
