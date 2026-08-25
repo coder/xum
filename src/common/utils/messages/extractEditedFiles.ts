@@ -71,10 +71,15 @@ function collectNestedEditRecords(output: unknown): NestedEditRecord[] {
     if (result !== undefined && result.success !== true) continue;
     const filePath = extractToolFilePath(record.args);
     if (!filePath) continue;
-    const diff =
+    const rawDiff =
       result !== undefined
         ? (getToolOutputUiOnly(result)?.file_edit?.diff ?? result.diff)
         : undefined;
+    // Untrusted persisted JSON again: a malformed row can carry a non-string
+    // diff (array/object) that would pass truthiness/length checks and then
+    // throw inside parsePatch/applyPatch on every compaction and recovery
+    // pass — admit strings only (the path-only edit record still counts).
+    const diff = typeof rawDiff === "string" ? rawDiff : undefined;
     records.push({
       filePath,
       ...(diff !== undefined ? { diff } : {}),
@@ -315,8 +320,10 @@ export function extractEditedFileDiffs(messages: MuxMessage[]): FileEditDiff[] {
       if (!output?.success) continue;
 
       const uiOnly = getToolOutputUiOnly(output);
-      const diff = uiOnly?.file_edit?.diff ?? output.diff;
-      if (!diff) continue;
+      const rawPartDiff = uiOnly?.file_edit?.diff ?? output.diff;
+      // Same untrusted-JSON guard as collectNestedEditRecords: strings only.
+      const diff = typeof rawPartDiff === "string" && rawPartDiff.length > 0 ? rawPartDiff : null;
+      if (diff === null) continue;
 
       const filePath = extractToolFilePath(part.input);
       if (!filePath) continue;

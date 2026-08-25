@@ -180,6 +180,51 @@ describe("nested PTC edit records (exclusive posture)", () => {
     expect(diffs[0].truncated).toBe(true);
   });
 
+  it("skips non-string diffs (nested and direct) instead of throwing in parsePatch", () => {
+    // Untrusted persisted JSON: a successful record can carry an array (or
+    // object) diff, which passes truthiness/length checks and would throw in
+    // parsePatch/applyPatch on every compaction/recovery pass (round 14).
+    // The edit still counts for path tracking; only the diff is dropped.
+    const goodDiff = makeDiff("/good.ts", "old", "new");
+    const messages: MuxMessage[] = [
+      createCodeExecutionMessage([
+        {
+          toolName: "file_edit_insert",
+          args: { path: "/array-diff.ts" },
+          result: { success: true, diff: ["not", "a", "string"] },
+        },
+        {
+          toolName: "file_edit_insert",
+          args: { path: "/good.ts" },
+          result: { success: true, diff: goodDiff },
+        },
+      ]),
+      {
+        id: "msg-direct-corrupt-diff",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool" as const,
+            toolCallId: "tc-direct-corrupt-diff",
+            toolName: "file_edit_replace_string",
+            state: "output-available" as const,
+            input: { path: "/direct-array-diff.ts" },
+            output: { success: true, diff: { corrupt: true } },
+          },
+        ],
+      },
+    ];
+
+    expect(extractEditedFilePaths(messages)).toEqual([
+      "/direct-array-diff.ts",
+      "/good.ts",
+      "/array-diff.ts",
+    ]);
+    const diffs = extractEditedFileDiffs(messages);
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0].path).toBe("/good.ts");
+  });
+
   it("kernel-compacted records surface the path but no diff", () => {
     // Current kernel compaction exempts file_edit_* records (results kept for
     // exactly this extractor), but result-less compact records still exist in
