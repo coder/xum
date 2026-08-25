@@ -134,22 +134,32 @@ function AgentProviderWithState(props: {
       // usePersistedState runs the updater synchronously, so `next` is
       // available right after the call.
       let next: string | null = null;
-      let changed = false;
+      let previous: string | null = null;
       setAgentIdRaw((prev) => {
         const explicitPrevAgentId =
           typeof prev === "string" && prev.trim().length > 0 ? prev : globalDefaultAgentId;
-        const previousAgentId = coerceAgentId(isProjectScope ? explicitPrevAgentId : prev);
-        next = coerceAgentId(typeof value === "function" ? value(previousAgentId) : value);
-        changed = next !== previousAgentId;
+        previous = coerceAgentId(isProjectScope ? explicitPrevAgentId : prev);
+        next = coerceAgentId(typeof value === "function" ? value(previous) : value);
         return next;
       });
 
       // Persist workspace mode changes so the selection is remembered
       // per-workspace across clients, not just in this client's localStorage.
-      if (!api || !workspaceId || isCurrentAgentLocked || next == null || !changed) {
+      if (!api || !workspaceId || isCurrentAgentLocked || next == null || next === previous) {
         return;
       }
       const nextAgentId: string = next;
+      const previousAgentId: string | null = previous;
+
+      // Optimistic local update above; on persistence failure roll the local
+      // selection back (unless it changed again meanwhile) so this client
+      // cannot silently diverge from the backend-authoritative agent.
+      const rollback = () => {
+        clearPendingWorkspaceAgentId(workspaceId, nextAgentId);
+        if (previousAgentId != null) {
+          setAgentIdRaw((current) => (current === nextAgentId ? previousAgentId : current));
+        }
+      };
 
       markPendingWorkspaceAgentId(workspaceId, nextAgentId);
       api.workspace
@@ -161,13 +171,10 @@ function AgentProviderWithState(props: {
         })
         .then((result) => {
           if (!result.success) {
-            clearPendingWorkspaceAgentId(workspaceId, nextAgentId);
+            rollback();
           }
         })
-        .catch(() => {
-          // Best-effort only: the next sendMessage persists the same selection.
-          clearPendingWorkspaceAgentId(workspaceId, nextAgentId);
-        });
+        .catch(rollback);
     },
     [api, globalDefaultAgentId, isCurrentAgentLocked, isProjectScope, setAgentIdRaw, workspaceId]
   );

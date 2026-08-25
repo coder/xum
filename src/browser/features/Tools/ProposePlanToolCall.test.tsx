@@ -14,6 +14,7 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { shouldApplyWorkspaceAgentIdFromBackend } from "@/browser/utils/workspaceAiSettingsSync";
 import {
   AGENT_AI_DEFAULTS_KEY,
   getAgentIdKey,
@@ -59,7 +60,9 @@ interface MockApi {
       mode?: "destructive" | "append-compaction-boundary" | null;
       deletePlanFile?: boolean;
     }) => Promise<ResultVoid>;
-    sendMessage: (args: SendMessageArgs) => Promise<{ success: true; data: undefined }>;
+    sendMessage: (
+      args: SendMessageArgs
+    ) => Promise<{ success: true; data: undefined } | { success: false; error: string }>;
   };
 }
 
@@ -518,6 +521,31 @@ describe("ProposePlanToolCall", () => {
       expect(JSON.parse(window.localStorage.getItem(modelKey)!)).toBe(execModel);
       expect(JSON.parse(window.localStorage.getItem(thinkingKey)!)).toBe(execThinking);
     }
+  });
+
+  test("clears the pending agent guard when the Implement send fails", async () => {
+    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
+
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({
+      sendMessage: (args) => {
+        sendMessageCalls.push(args);
+        return Promise.resolve({ success: false as const, error: "send rejected" });
+      },
+    });
+
+    const view = renderCompletedPlan();
+
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+
+    // The failed send cannot persist the switch, so the guard must be released:
+    // a differing backend agent update has to apply again instead of being
+    // rejected forever (probing with a non-matching agent does not mutate).
+    await waitFor(() =>
+      expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true)
+    );
   });
 
   test("uses workspace-by-agent override for Implement when exec defaults inherit", async () => {

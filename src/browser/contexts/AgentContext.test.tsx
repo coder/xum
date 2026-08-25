@@ -28,6 +28,13 @@ let updateAgentAISettingsCalls: Array<{
   aiSettings: { model: string } | null;
   persistSelectedAgentId?: boolean | null;
 }> = [];
+interface UpdateAgentAISettingsResult {
+  success: boolean;
+  error?: string;
+  data?: undefined;
+}
+let deferUpdateAgentAISettings = false;
+let resolveUpdateAgentAISettings: ((result: UpdateAgentAISettingsResult) => void) | null = null;
 
 let APIProvider!: typeof APIModule.APIProvider;
 let RouterProvider!: typeof RouterContextModule.RouterProvider;
@@ -206,9 +213,16 @@ function createApiClient(): APIClient {
       },
       truncateHistory: () => Promise.resolve({ success: true as const, data: undefined }),
       interruptStream: () => Promise.resolve({ success: true as const, data: undefined }),
-      updateAgentAISettings: (input: (typeof updateAgentAISettingsCalls)[number]) => {
+      updateAgentAISettings: (
+        input: (typeof updateAgentAISettingsCalls)[number]
+      ): Promise<UpdateAgentAISettingsResult> => {
         updateAgentAISettingsCalls.push(input);
-        return Promise.resolve({ success: true as const, data: undefined });
+        if (deferUpdateAgentAISettings) {
+          return new Promise((resolve) => {
+            resolveUpdateAgentAISettings = resolve;
+          });
+        }
+        return Promise.resolve({ success: true, data: undefined });
       },
     },
     projects: {
@@ -257,6 +271,8 @@ describe("AgentContext", () => {
     mockAgentDefinitions = [];
     mockWorkspaceMetadata = new Map();
     updateAgentAISettingsCalls = [];
+    deferUpdateAgentAISettings = false;
+    resolveUpdateAgentAISettings = null;
 
     originalWindow = globalThis.window;
     originalDocument = globalThis.document;
@@ -404,6 +420,44 @@ describe("AgentContext", () => {
     // Re-selecting the current agent is a no-op and must not hit the backend.
     contextValue?.setAgentId("plan");
     expect(updateAgentAISettingsCalls).toHaveLength(1);
+  });
+
+  test("failed persistence rolls back the local agent selection", async () => {
+    const projectPath = "/tmp/project";
+    const workspaceId = "main-workspace";
+    mockAgentDefinitions = [EXEC_AGENT, PLAN_AGENT];
+    mockWorkspaceMetadata.set(workspaceId, {});
+    window.localStorage.setItem(getAgentIdKey(workspaceId), JSON.stringify("exec"));
+    deferUpdateAgentAISettings = true;
+
+    let contextValue: AgentContextValue | undefined;
+
+    renderAgentHarness({
+      workspaceId,
+      projectPath,
+      onChange: (value) => (contextValue = value),
+    });
+
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("exec");
+    });
+
+    contextValue?.setAgentId("plan");
+
+    // Optimistic switch happens immediately...
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("plan");
+    });
+    await waitFor(() => {
+      expect(resolveUpdateAgentAISettings).not.toBeNull();
+    });
+
+    // ...then the backend rejects the write and the selection rolls back.
+    resolveUpdateAgentAISettings?.({ success: false, error: "offline" });
+
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("exec");
+    });
   });
 
   test("shortcut actions do not override a locked workspace agent", async () => {

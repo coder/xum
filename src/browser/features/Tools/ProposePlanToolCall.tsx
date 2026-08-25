@@ -53,7 +53,10 @@ import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
-import { markPendingWorkspaceAgentId } from "@/browser/utils/workspaceAiSettingsSync";
+import {
+  clearPendingWorkspaceAgentId,
+  markPendingWorkspaceAgentId,
+} from "@/browser/utils/workspaceAiSettingsSync";
 import {
   resolveWorkspaceAiSettingsForAgent,
   type WorkspaceAISettingsCache,
@@ -559,7 +562,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       });
       const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
 
-      await api.workspace.sendMessage({
+      const sendResult = await api.workspace.sendMessage({
         workspaceId,
         message: "Implement the plan",
         options: {
@@ -569,8 +572,14 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
           thinkingLevel: resolvedThinking,
         },
       });
+      if (!sendResult.success) {
+        // The send was what would persist the switch; without it the guard
+        // would block backend agent seeds for this workspace indefinitely.
+        clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
+      }
     } catch {
       // Best-effort: user can retry manually if sending fails.
+      clearPendingWorkspaceAgentId(workspaceId, "exec");
     } finally {
       isImplementingRef.current = false;
       if (isMountedRef.current) {
@@ -612,7 +621,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       });
       const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
 
-      await api.workspace.sendMessage({
+      const sendResult = await api.workspace.sendMessage({
         workspaceId,
         message: "Implement the plan",
         options: {
@@ -622,8 +631,12 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
           thinkingLevel: resolvedThinking,
         },
       });
+      if (!sendResult.success) {
+        clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
+      }
     } catch {
       // Best-effort: user can retry manually if sending fails.
+      clearPendingWorkspaceAgentId(workspaceId, "auto");
     } finally {
       isContinuingInAutoRef.current = false;
       if (isMountedRef.current) {
