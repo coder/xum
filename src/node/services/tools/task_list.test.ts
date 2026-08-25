@@ -1021,6 +1021,33 @@ describe("task_list tool", () => {
     expect(taskIds(result)).toEqual(["task-self"]);
   });
 
+  it("tree scope omits a missing root from discovery", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-missing-root");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+    // A retained descendant whose parent chain ends at a removed/corrupted workspace: sends to
+    // that ID return not_found, so the root row must not be published as addressable.
+    const listTaskTreeAgents = mock(() => ({
+      rootWorkspaceId: "vanished-root",
+      rootRelationship: "ancestor" as const,
+      rootMissing: true as const,
+      tasks: [
+        {
+          ...buildAgentTask("task-self", "running", "vanished-root"),
+          relationship: "self" as const,
+        },
+      ],
+    }));
+    const tool = createTaskListTool({
+      ...baseConfig,
+      taskService: { listTaskTreeAgents } as unknown as TaskService,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ scope: "tree" }, mockToolCallOptions)
+    );
+    expect(taskIds(result)).toEqual(["task-self"]);
+  });
+
   it("tree scope filters the root row like any other row when explicit statuses are passed", async () => {
     using tempDir = new TestTempDir("test-task-list-tree-explicit");
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });

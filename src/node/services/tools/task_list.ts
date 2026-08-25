@@ -229,8 +229,9 @@ async function executeTreeScope(
   // The root is a plain workspace with no task lifecycle: included by default, filtered like any
   // other row (status "workspace") when explicit statuses were passed. An ARCHIVED root is
   // omitted entirely — sendAgentPeerMessage refuses archived targets, so advertising the row
-  // would break the note's addressability claim.
-  if (statusFilter.has("workspace") && tree.rootArchived !== true) {
+  // would break the note's addressability claim. A MISSING root (parent chain ending at a
+  // removed/corrupted workspace) is omitted for the same reason: sends to it return not_found.
+  if (statusFilter.has("workspace") && tree.rootArchived !== true && tree.rootMissing !== true) {
     tasks.push({
       taskId: tree.rootWorkspaceId,
       status: "workspace",

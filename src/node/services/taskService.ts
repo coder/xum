@@ -700,6 +700,11 @@ export interface TaskTreeAgentsResult {
   rootRelationship: "self" | "ancestor";
   /** True when the root workspace is archived: peer sends refuse it, so discovery hides it. */
   rootArchived?: true;
+  /**
+   * True when the resolved root ID has no config entry (parent chain ends at a removed or
+   * corrupted workspace): peer sends return not_found for it, so discovery hides the row.
+   */
+  rootMissing?: true;
   tasks: TreeAgentTaskInfo[];
 }
 
@@ -1423,7 +1428,15 @@ export class TaskService {
   private readonly pendingWorkspaceTurnWaitersByHandleId = new Map<string, WorkspaceTurnWaiter[]>();
   private readonly activeWorkspaceTurnHandleByWorkspaceId = new Map<
     string,
-    { handleId: string; ownerWorkspaceId: string }
+    /**
+     * `accepted` distinguishes a creation-time reservation from an admitted turn:
+     * createWorkspaceTurn registers the handle (and writes a "running" mirror) BEFORE its
+     * sendMessage reaches turn admission, and that reservation can still fail requireIdle.
+     * Peer-send admission and peer discovery must only treat ACCEPTED registrations as live —
+     * otherwise a racing peer send could win admission on a reawakening terminal child and end
+     * up as the sole (prohibited) reactivator when the owner's send subsequently fails.
+     */
+    { handleId: string; ownerWorkspaceId: string; accepted: boolean }
   >();
   private readonly taskHandleStore: TaskHandleStore;
   private readonly terminalAttentionStore: TerminalAttentionStore;
@@ -2462,6 +2475,10 @@ export class TaskService {
           this.activeWorkspaceTurnHandleByWorkspaceId.set(task.id, {
             handleId: normalized.handleId,
             ownerWorkspaceId: normalized.ownerWorkspaceId,
+            // Fail closed: the restart killed any live stream, so this recovered registration
+            // exists for settlement ownership, not peer admission. A revival or a fresh
+            // acceptance re-marks the entry accepted.
+            accepted: false,
           });
         }
       } catch (error: unknown) {
@@ -3946,6 +3963,10 @@ export class TaskService {
       this.activeWorkspaceTurnHandleByWorkspaceId.set(targetWorkspaceId, {
         handleId,
         ownerWorkspaceId,
+        // Reservation only: the sendMessage below may still fail requireIdle or be canceled
+        // pre-admission. Peer-send admission must not treat this entry as live until
+        // markWorkspaceTurnAccepted flips it.
+        accepted: false,
       });
     }
 
@@ -3983,6 +4004,7 @@ export class TaskService {
         this.activeWorkspaceTurnHandleByWorkspaceId.set(targetWorkspaceId, {
           handleId,
           ownerWorkspaceId,
+          accepted: true,
         });
       });
     };
@@ -5194,17 +5216,25 @@ export class TaskService {
       // The persisted execution mirror can outlive its handle (crash between terminal handle
       // persistence and the config mirror write; failed startup reconciliation deliberately
       // leaves the mirror untouched), so a stale mirror may claim "running" for a stably
-      // terminal task. Require the matching LIVE handle registration before the mirror bypasses
-      // terminal status — an admitted send without a live handle would be uncorrelated and
-      // would peer-reactivate the terminal task.
+      // terminal task. Require the matching ACCEPTED live handle registration before the mirror
+      // bypasses terminal status — an admitted send without a live handle would be uncorrelated
+      // and would peer-reactivate the terminal task, and createWorkspaceTurn's creation-time
+      // reservation (registered with a "running" mirror BEFORE its send reaches turn admission)
+      // must not count either: the owner's requireIdle send can still fail, which would leave a
+      // racing peer send as the terminal child's sole (prohibited) reactivator.
       const hasLiveRunningExecution = (
         workspace: WorkspaceConfigEntry,
         workspaceId: string
-      ): boolean =>
-        workspace.taskExecutionStatus === "running" &&
-        workspace.taskExecutionId != null &&
-        this.activeWorkspaceTurnHandleByWorkspaceId.get(workspaceId)?.handleId ===
-          workspace.taskExecutionId;
+      ): boolean => {
+        const live = this.activeWorkspaceTurnHandleByWorkspaceId.get(workspaceId);
+        return (
+          workspace.taskExecutionStatus === "running" &&
+          workspace.taskExecutionId != null &&
+          live != null &&
+          live.handleId === workspace.taskExecutionId &&
+          live.accepted
+        );
+      };
       const isInactivePeerSender = (workspace: WorkspaceConfigEntry): boolean => {
         if (coerceNonEmptyString(workspace.parentWorkspaceId) == null) {
           // Root workspaces have no task lifecycle to go terminal.
@@ -9839,10 +9869,12 @@ export class TaskService {
       await this.deleteWorkspaceTurnTerminalAttention(record);
       await this.deletePersistentChildWorkspaceTurnAttention(current);
       await this.taskHandleStore.upsertWorkspaceTurn(next);
-      // Re-register so stream-end/abort/error settlement paths own the handle again.
+      // Re-register so stream-end/abort/error settlement paths own the handle again. The
+      // revived turn is a retry of an already-admitted turn, so the registration is accepted.
       this.activeWorkspaceTurnHandleByWorkspaceId.set(record.workspaceId, {
         handleId: record.handleId,
         ownerWorkspaceId: record.ownerWorkspaceId,
+        accepted: true,
       });
       log.debug("Workspace turn revived: child is retrying the same turn", {
         handleId: record.handleId,
@@ -10602,7 +10634,30 @@ export class TaskService {
         // nearest ancestor's candidate metadata when the row carries none of its own, keeping the
         // tree note's "bestOf metadata ⇒ not peer-addressable" rule aligned with refusal behavior.
         const bestOf = task.bestOf ?? this.findNearestBestOfGroupUsingIndex(index, task.taskId);
-        return { ...task, ...(bestOf != null ? { bestOf } : {}), relationship };
+        const info: TreeAgentTaskInfo = {
+          ...task,
+          ...(bestOf != null ? { bestOf } : {}),
+          relationship,
+        };
+        // A crash or failed startup reconciliation can leave a stale persisted "running"
+        // execution mirror on a stably terminal peer, and peer admission only honors a mirror
+        // backed by the matching ACCEPTED live handle — so peer discovery must apply the same
+        // predicate or it would advertise a nonterminal, addressable row task_send_message
+        // always refuses. Descendant/self rows keep the full overlay (guidance may target any
+        // state, and the ancestor-scoped snapshot in task_list refines them).
+        if (relationship === "sibling" || relationship === "ancestor") {
+          const live = this.activeWorkspaceTurnHandleByWorkspaceId.get(task.taskId);
+          const liveBacked =
+            task.executionTaskId != null &&
+            live != null &&
+            live.handleId === task.executionTaskId &&
+            live.accepted;
+          if (!liveBacked) {
+            delete info.executionTaskId;
+            delete info.executionStatus;
+          }
+        }
+        return info;
       })
       .filter((task) => {
         // Archived state is independent of taskStatus (legacy archived rows can still read
@@ -10629,6 +10684,10 @@ export class TaskService {
       ...(rootTitle != null ? { rootTitle } : {}),
       rootRelationship: rootWorkspaceId === workspaceId ? "self" : "ancestor",
       ...(rootArchived ? { rootArchived: true as const } : {}),
+      // Partial removal or config corruption can leave a retained descendant whose parent chain
+      // ends at a workspace that no longer exists; sendAgentTreeMessage returns not_found for
+      // that ID, so discovery must say so instead of advertising an addressable root row.
+      ...(rootEntry == null ? { rootMissing: true as const } : {}),
       tasks,
     };
   }

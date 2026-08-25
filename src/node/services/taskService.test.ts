@@ -239,12 +239,16 @@ async function registerLiveWorkspaceTurnHandle(
   taskService: TaskService,
   workspaceId: string,
   handleId: string,
-  ownerWorkspaceId = "tree-root"
+  ownerWorkspaceId = "tree-root",
+  // Admission additionally requires the registration to be ACCEPTED (creation-time
+  // reservations are registered before the owner's send passes turn admission); pass false to
+  // model that pre-acceptance window.
+  accepted = true
 ): Promise<void> {
   const internals = taskService as unknown as {
     activeWorkspaceTurnHandleByWorkspaceId: Map<
       string,
-      { handleId: string; ownerWorkspaceId: string }
+      { handleId: string; ownerWorkspaceId: string; accepted: boolean }
     >;
     taskHandleStore: TaskHandleStore;
   };
@@ -263,6 +267,7 @@ async function registerLiveWorkspaceTurnHandle(
   internals.activeWorkspaceTurnHandleByWorkspaceId.set(workspaceId, {
     handleId,
     ownerWorkspaceId,
+    accepted,
   });
 }
 
@@ -13875,6 +13880,61 @@ describe("TaskService", () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
+  test("sendAgentTreeMessage refuses a reawakening reservation until the turn is accepted", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "sib-a", "sib-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        // Reawakening in flight: createWorkspaceTurn registers the handle and writes the
+        // "running" mirror BEFORE its sendMessage passes turn admission. A peer send winning
+        // this window could start the terminal child's only turn when the owner's requireIdle
+        // send subsequently fails — a prohibited peer reactivation.
+        projectWorkspace(projectPath, "sib-b", "sib-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "reported",
+          taskExecutionId: "wst_preaccept",
+          taskExecutionStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    await registerLiveWorkspaceTurnHandle(
+      taskService,
+      "sib-b",
+      "wst_preaccept",
+      "tree-root",
+      false
+    );
+
+    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "hello")).toEqual(
+      Err({
+        code: "not_active",
+        taskStatus: "reported",
+        message: "Target is inactive; peer messages cannot reactivate it — ask its parent.",
+      })
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    // Once the owner's turn is admitted (onAccepted marks the registration accepted), the same
+    // target accepts peer messages.
+    await registerLiveWorkspaceTurnHandle(taskService, "sib-b", "wst_preaccept", "tree-root", true);
+    expect(await taskService.sendAgentTreeMessage("sib-a", "sib-b", "hello again")).toEqual(
+      Ok({ delivery: "queued", relation: "peer", queueDispatchMode: "tool-end" })
+    );
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
   test("sendAgentTreeMessage refuses at the admission probe when the target is stopped mid-send", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");
@@ -14470,6 +14530,92 @@ describe("TaskService", () => {
       testTaskSettings()
     );
     expect(taskService.listTaskTreeAgents("task-a").rootArchived).toBeUndefined();
+  });
+
+  test("listTaskTreeAgents flags a missing root so discovery can hide it", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    // Partial removal/config corruption: the retained child's parent chain ends at an ID with
+    // no config entry. Advertising that ID as an addressable root row would contradict
+    // sendAgentTreeMessage, which returns not_found for it.
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "orphan", "task-orphan", {
+          parentWorkspaceId: "vanished-root",
+          taskStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { taskService } = createTaskServiceHarness(config);
+
+    const tree = taskService.listTaskTreeAgents("task-orphan");
+    expect(tree.rootWorkspaceId).toBe("vanished-root");
+    expect(tree.rootMissing).toBe(true);
+    expect(tree.rootTitle).toBeUndefined();
+  });
+
+  test("listTaskTreeAgents strips stale execution overlays from peer rows", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "root", "tree-root"),
+        projectWorkspace(projectPath, "a", "task-a", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "running",
+        }),
+        // Stale persisted mirror: taskExecutionStatus survived a crash/failed reconciliation
+        // with no live handle. Peer admission refuses this target, so sibling discovery must
+        // keep its stable terminal status instead of advertising a running overlay.
+        projectWorkspace(projectPath, "b", "task-b", {
+          parentWorkspaceId: "tree-root",
+          taskStatus: "reported",
+          taskExecutionId: "wst_stale_overlay",
+          taskExecutionStatus: "running",
+        }),
+      ],
+      testTaskSettings()
+    );
+
+    const { taskService } = createTaskServiceHarness(config);
+
+    const stale = taskService
+      .listTaskTreeAgents("task-a")
+      .tasks.find((task) => task.taskId === "task-b");
+    expect(stale?.relationship).toBe("sibling");
+    expect(stale?.status).toBe("reported");
+    expect(stale?.executionStatus).toBeUndefined();
+    expect(stale?.executionTaskId).toBeUndefined();
+
+    // Backed by an ACCEPTED live handle (the same predicate peer admission uses), the overlay
+    // is advertised again.
+    await registerLiveWorkspaceTurnHandle(taskService, "task-b", "wst_stale_overlay");
+    const live = taskService
+      .listTaskTreeAgents("task-a")
+      .tasks.find((task) => task.taskId === "task-b");
+    expect(live?.executionStatus).toBe("running");
+    expect(live?.executionTaskId).toBe("wst_stale_overlay");
+
+    // A pre-acceptance reservation is not live for peers either.
+    await registerLiveWorkspaceTurnHandle(
+      taskService,
+      "task-b",
+      "wst_stale_overlay",
+      "tree-root",
+      false
+    );
+    const reserved = taskService
+      .listTaskTreeAgents("task-a")
+      .tasks.find((task) => task.taskId === "task-b");
+    expect(reserved?.executionStatus).toBeUndefined();
   });
 
   test("pending parent guidance blocks stale report settlement at stream end", async () => {
