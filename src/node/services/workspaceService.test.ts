@@ -9323,6 +9323,45 @@ describe("WorkspaceService maybePersistAISettingsFromOptions", () => {
     });
   });
 
+  test("refuses switch to plan when plan's stored model is unpriced even though exec is priced", async () => {
+    workspaceService.setWorkspaceGoalService({
+      getGoal: mock(() => Promise.resolve({ status: "active", budgetCents: 500 })),
+    } as unknown as WorkspaceGoalService);
+    (
+      workspaceService as unknown as { config: { loadConfigOrDefault: () => unknown } }
+    ).config.loadConfigOrDefault = mock(() => ({
+      projects: new Map([
+        [
+          "/tmp/proj",
+          {
+            workspaces: [
+              {
+                id: "ws",
+                path: "/tmp/proj/ws",
+                name: "ws",
+                aiSettingsByAgent: {
+                  // Goal continuations remap plan -> exec (priced), but
+                  // heartbeats dispatch the persisted plan agent as-is.
+                  exec: { model: "openai:gpt-4o-mini", thinkingLevel: "off" },
+                  plan: { model: "openai:not-priced-model", thinkingLevel: "off" },
+                },
+              },
+            ],
+          },
+        ],
+      ]),
+    }));
+
+    const result = await workspaceService.updateAgentAISettings("ws", "plan", null, {
+      persistSelectedAgentId: true,
+    });
+
+    expect(result).toEqual({
+      success: false,
+      error: "Target model has no pricing data. Pick a priced model before switching.",
+    });
+  });
+
   test("allows agent-only switch when the target agent has no stored model", async () => {
     const persistSpy = mock(() => Promise.resolve({ success: true as const, data: true }));
     workspaceService.setWorkspaceGoalService({

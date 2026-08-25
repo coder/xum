@@ -63,8 +63,21 @@ interface MockApi {
     sendMessage: (
       args: SendMessageArgs
     ) => Promise<{ success: true; data: undefined } | { success: false; error: string }>;
+    updateAgentAISettings: (args: {
+      workspaceId: string;
+      agentId: string;
+      aiSettings: null;
+      persistSelectedAgentId?: boolean;
+    }) => Promise<{ success: boolean; error?: string }>;
   };
 }
+
+let updateAgentAISettingsCalls: Array<{
+  workspaceId: string;
+  agentId: string;
+  aiSettings: null;
+  persistSelectedAgentId?: boolean;
+}> = [];
 
 let mockApi: MockApi | null = null;
 
@@ -263,6 +276,10 @@ function createMockApi(
         overrides.replaceChatHistory ?? (() => Promise.resolve({ success: true, data: undefined })),
       sendMessage:
         overrides.sendMessage ?? (() => Promise.resolve({ success: true, data: undefined })),
+      updateAgentAISettings: (args) => {
+        updateAgentAISettingsCalls.push(args);
+        return Promise.resolve({ success: true });
+      },
     },
   };
 }
@@ -316,6 +333,7 @@ describe("ProposePlanToolCall", () => {
   beforeEach(async () => {
     startHereCalls = [];
     selectableDiffRendererCalls = [];
+    updateAgentAISettingsCalls = [];
     mockApi = null;
     cleanupDom = installDom();
     await installProposePlanModuleMocks();
@@ -522,8 +540,16 @@ describe("ProposePlanToolCall", () => {
       expect(JSON.parse(window.localStorage.getItem(thinkingKey)!)).toBe(execThinking);
     }
 
-    // The guard is released once the send settles (a successful no-op
-    // persistence emits no echo), so backend agent updates apply again.
+    // A successful send persists the selection explicitly (send-side
+    // persistence is best-effort) and then releases the guard so backend
+    // agent updates apply again.
+    await waitFor(() => expect(updateAgentAISettingsCalls).toHaveLength(1));
+    expect(updateAgentAISettingsCalls[0]).toEqual({
+      workspaceId: WORKSPACE_ID,
+      agentId: "exec",
+      aiSettings: null,
+      persistSelectedAgentId: true,
+    });
     await waitFor(() =>
       expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true)
     );
@@ -552,6 +578,8 @@ describe("ProposePlanToolCall", () => {
     await waitFor(() =>
       expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true)
     );
+    // No explicit persistence for a switch whose send never went through.
+    expect(updateAgentAISettingsCalls).toHaveLength(0);
   });
 
   test("uses workspace-by-agent override for Implement when exec defaults inherit", async () => {

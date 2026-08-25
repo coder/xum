@@ -562,7 +562,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       });
       const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
 
-      await api.workspace.sendMessage({
+      const sendResult = await api.workspace.sendMessage({
         workspaceId,
         message: "Implement the plan",
         options: {
@@ -572,11 +572,27 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
           thinkingLevel: resolvedThinking,
         },
       });
-      // Success: the send persisted the switch, and a no-op persistence emits
-      // no metadata echo, so release the guard once the send settles (a real
-      // echo is ordered after any stale broadcast). Failure: nothing will echo
-      // and a stuck guard would block backend agent seeds indefinitely.
-      clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
+      if (sendResult.success) {
+        // A successful send does not guarantee the switch is durable: its
+        // settings persistence is best-effort (failures only log). Persist the
+        // selection explicitly, then release the guard either way — backend
+        // echoes carry the authoritative agent, and a successful no-op write
+        // emits no echo to release it for us.
+        try {
+          await api.workspace.updateAgentAISettings({
+            workspaceId,
+            agentId: targetAgentId,
+            aiSettings: null,
+            persistSelectedAgentId: true,
+          });
+        } finally {
+          clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
+        }
+      } else {
+        // Failed send: nothing will echo, and a stuck guard would block
+        // backend agent seeds indefinitely.
+        clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
+      }
     } catch {
       // Best-effort: user can retry manually if sending fails.
       clearPendingWorkspaceAgentId(workspaceId, "exec");
@@ -621,7 +637,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       });
       const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
 
-      await api.workspace.sendMessage({
+      const sendResult = await api.workspace.sendMessage({
         workspaceId,
         message: "Implement the plan",
         options: {
@@ -631,8 +647,22 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
           thinkingLevel: resolvedThinking,
         },
       });
-      // See handleImplement: release the guard once the send settles.
-      clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
+      // See handleImplement: persist the selection explicitly (send-side
+      // persistence is best-effort), then release the guard.
+      if (sendResult.success) {
+        try {
+          await api.workspace.updateAgentAISettings({
+            workspaceId,
+            agentId: targetAgentId,
+            aiSettings: null,
+            persistSelectedAgentId: true,
+          });
+        } finally {
+          clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
+        }
+      } else {
+        clearPendingWorkspaceAgentId(workspaceId, targetAgentId);
+      }
     } catch {
       // Best-effort: user can retry manually if sending fails.
       clearPendingWorkspaceAgentId(workspaceId, "auto");

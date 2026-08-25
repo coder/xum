@@ -9699,25 +9699,35 @@ export class WorkspaceService extends EventEmitter {
         // model in the meantime silently records 0 cost on the next stream
         // and budget enforcement quietly stops working.
         if (hasBudgetedResumableGoal(goal)) {
-          // Agent-only switches (null aiSettings) still redirect heartbeat and
-          // goal-continuation dispatches to the target agent, so gate on the
-          // same fully resolved model (bucket, configured/definition defaults,
-          // legacy fallback) that dispatch resolution would select.
-          const gatedModel =
-            normalizedSettings?.model ??
-            (options?.persistSelectedAgentId === true
-              ? (await this.resolveContinuationKickoffSendOptionsForAgent(workspaceId, agentId))
-                  ?.model
-              : undefined);
-          if (
-            gatedModel != null &&
-            !modelHasPricingData(
-              gatedModel,
-              typeof this.config.loadProvidersConfig === "function"
-                ? this.config.loadProvidersConfig()
-                : null
-            )
-          ) {
+          // Agent-only switches (null aiSettings) still redirect backend
+          // dispatches to the target agent, so gate every dispatch surface's
+          // fully resolved model: goal continuations remap plan/compact to
+          // exec, while heartbeats resolve the persisted agent as-is.
+          const gatedModels: string[] = [];
+          if (normalizedSettings != null) {
+            gatedModels.push(normalizedSettings.model);
+          } else if (options?.persistSelectedAgentId === true) {
+            const kickoff = await this.resolveContinuationKickoffSendOptionsForAgent(
+              workspaceId,
+              agentId
+            );
+            if (kickoff?.model != null) {
+              gatedModels.push(kickoff.model);
+            }
+            const heartbeat = await this.resolveContinuationKickoffSendOptionsForAgent(
+              workspaceId,
+              agentId,
+              { remapUiModes: false }
+            );
+            if (heartbeat?.model != null && heartbeat.model !== kickoff?.model) {
+              gatedModels.push(heartbeat.model);
+            }
+          }
+          const providersConfig =
+            typeof this.config.loadProvidersConfig === "function"
+              ? this.config.loadProvidersConfig()
+              : null;
+          if (gatedModels.some((model) => !modelHasPricingData(model, providersConfig))) {
             return Err(UNPRICED_TARGET_MODEL_GOAL_MESSAGE);
           }
         }
@@ -13466,16 +13476,19 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * Send options a backend continuation dispatch (goal kickoff, heartbeat)
-   * would use for the given selected agent — or for the persisted selected
-   * agent when `overrideAgentId` is null. Also backs the budgeted-goal pricing
-   * gate for agent-only switches, which must gate the same fully resolved
-   * model (bucket, configured/definition defaults, legacy fallback) that this
-   * dispatch path would select.
+   * Send options a goal-continuation kickoff would use for the given selected
+   * agent — or for the persisted selected agent when `overrideAgentId` is
+   * null. Also backs the budgeted-goal pricing gate for agent-only switches,
+   * which must gate the same fully resolved model (bucket,
+   * configured/definition defaults, legacy fallback) that dispatch selects.
+   * Heartbeats resolve the persisted agent WITHOUT the plan/compact→exec
+   * remap (buildHeartbeatSendOptions), so the gate probes that surface with
+   * `remapUiModes: false`.
    */
   private async resolveContinuationKickoffSendOptionsForAgent(
     workspaceId: string,
-    overrideAgentId: string | null
+    overrideAgentId: string | null,
+    opts?: { remapUiModes?: boolean }
   ): Promise<SendMessageOptions | null> {
     const config = this.config.loadConfigOrDefault();
     const workspaceMatch = this.config.findWorkspace(workspaceId);
@@ -13496,7 +13509,8 @@ export class WorkspaceService extends EventEmitter {
       WORKSPACE_DEFAULTS.agentId
     );
     const agentId =
-      persistedAgentId === "plan" || persistedAgentId === "compact"
+      (opts?.remapUiModes ?? true) &&
+      (persistedAgentId === "plan" || persistedAgentId === "compact")
         ? WORKSPACE_DEFAULTS.agentId
         : persistedAgentId;
     const selectedAgentSettings = workspaceEntry?.aiSettingsByAgent?.[agentId];
