@@ -1180,6 +1180,98 @@ describe("TaskService", () => {
     expect(sendMessage).not.toHaveBeenCalled();
   });
 
+  test("createWorkspaceTurn divergent trunkBranch defers validation to the target checkout", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    // Agent exists ONLY on the target branch checkout, not in the owner's checkout: an
+    // owner-side miss must not fail-fast when a different base branch was requested.
+    const targetBranchCheckout = path.join(rootDir, "target-branch-checkout");
+    const targetAgentsDir = path.join(targetBranchCheckout, ".mux", "agents");
+    await fsPromises.mkdir(targetAgentsDir, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(targetAgentsDir, "custom.md"),
+      [
+        "---",
+        "name: Custom",
+        "description: Target-branch-only agent",
+        "base: exec",
+        "---",
+        "",
+        "Body.",
+        "",
+      ].join("\n"),
+      "utf-8"
+    );
+
+    const targetMetadata: WorkspaceMetadata & { namedWorkspacePath: string } = {
+      ...createWorkspaceTurnMetadata(projectPath),
+      runtimeConfig: { type: "worktree", srcBaseDir: path.join(rootDir, "wt") },
+      namedWorkspacePath: targetBranchCheckout,
+    };
+    const createWorkspace = mock(
+      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
+        Promise.resolve(Ok({ metadata: targetMetadata }))
+    );
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "custom",
+      prompt: "Run the target-branch agent",
+      title: "Target branch agent",
+      workspace: { mode: "new", trunkBranch: "feature-branch" },
+    });
+
+    expect(result.success).toBe(true);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[2]).toMatchObject({ agentId: "custom" });
+  });
+
+  test("createWorkspaceTurn divergent trunkBranch fails closed for unreachable targets", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+
+    // A different base branch can shadow ANY id (even built-ins), so an unreachable
+    // target created from it cannot be verified at all.
+    const unreachableMetadata: WorkspaceMetadata & { namedWorkspacePath: string } = {
+      ...createWorkspaceTurnMetadata(projectPath),
+      runtimeConfig: { type: "worktree", srcBaseDir: path.join(rootDir, "wt") },
+      namedWorkspacePath: path.join(rootDir, "not-provisioned-branch"),
+    };
+    const createWorkspace = mock(
+      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
+        Promise.resolve(Ok({ metadata: unreachableMetadata }))
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "plan",
+      prompt: "Should not dispatch",
+      title: "Divergent unreachable",
+      workspace: { mode: "new", trunkBranch: "feature-branch" },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("different base branch");
+      expect(result.error).toContain("no turn was dispatched");
+    }
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   test("createWorkspaceTurn unreachable created checkout: built-ins launch, custom agents fail with a reachability error", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["childworkspace", "turnhandle"]);

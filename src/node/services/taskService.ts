@@ -519,6 +519,13 @@ function isAgentRunnableAsChild(
 
 type WorkspaceTurnQueueDispatchMode = "tool-end" | "turn-end";
 
+/** Agent-discovery context for a workspace involved in a workspace turn. */
+interface WorkspaceTurnAgentContext {
+  runtime: Runtime;
+  workspacePath: string;
+  includeAgentPlugins: boolean;
+}
+
 export interface WorkspaceTurnCreateArgs {
   ownerWorkspaceId: string;
   prompt: string;
@@ -3626,7 +3633,7 @@ export class TaskService {
     projectPath: string;
     workspaceName: string;
     persistedWorkspacePath?: string;
-  }): { runtime: Runtime; workspacePath: string } {
+  }): { runtime: Runtime; workspacePath: string; includeAgentPlugins: boolean } {
     const metadataForRuntime = {
       runtimeConfig: params.runtimeConfig,
       projectPath: params.projectPath,
@@ -3634,7 +3641,11 @@ export class TaskService {
       namedWorkspacePath: coerceNonEmptyString(params.persistedWorkspacePath),
     };
     const runtime = createRuntimeForWorkspace(metadataForRuntime);
-    return { runtime, workspacePath: resolveWorkspaceRootPath(metadataForRuntime, runtime) };
+    return {
+      runtime,
+      workspacePath: resolveWorkspaceRootPath(metadataForRuntime, runtime),
+      includeAgentPlugins: this.workspaceService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS),
+    };
   }
 
   /**
@@ -3652,18 +3663,16 @@ export class TaskService {
     /** Discovery context of the workspace whose turn will run (or the owner pre-create). */
     runtime: Runtime;
     workspacePath: string;
+    includeAgentPlugins: boolean;
   }): Promise<Result<void, string>> {
     assert(params.agentId.length > 0, "validateWorkspaceTurnAgentId: agentId must be non-empty");
-    const includeAgentPlugins = this.workspaceService.isExperimentEnabled(
-      EXPERIMENT_IDS.AGENT_PLUGINS
-    );
     let frontmatter: Awaited<ReturnType<typeof resolveAgentFrontmatter>>;
     try {
       frontmatter = await resolveAgentFrontmatter(
         params.runtime,
         params.workspacePath,
         params.agentId,
-        { includeAgentPlugins }
+        { includeAgentPlugins: params.includeAgentPlugins }
       );
     } catch {
       return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
@@ -3704,9 +3713,15 @@ export class TaskService {
   private async validateWorkspaceTurnAgentIdForTarget(params: {
     cfg: ReturnType<Config["loadConfigOrDefault"]>;
     agentId: string;
-    target: { runtime: Runtime; workspacePath: string };
-    owner: { runtime: Runtime; workspacePath: string };
-  }): Promise<Result<{ validatedContext: { runtime: Runtime; workspacePath: string } }, string>> {
+    target: WorkspaceTurnAgentContext;
+    owner: WorkspaceTurnAgentContext;
+    /**
+     * The target checkout was created from a base branch different from the owner's.
+     * Owner-side resolution then predicts nothing about the target (the target branch
+     * can shadow ANY id, including built-ins), so unreachable targets fail closed.
+     */
+    targetBaseDivergesFromOwner?: boolean;
+  }): Promise<Result<{ validatedContext: WorkspaceTurnAgentContext }, string>> {
     const reachable = await runtimePathExists(params.target.runtime, params.target.workspacePath);
     if (reachable) {
       const validation = await this.validateWorkspaceTurnAgentId({
@@ -3715,6 +3730,11 @@ export class TaskService {
         ...params.target,
       });
       return validation.success ? Ok({ validatedContext: params.target }) : validation;
+    }
+    if (params.targetBaseDivergesFromOwner === true) {
+      return Err(
+        `Task.createWorkspaceTurn: target checkout is not reachable yet and was created from a different base branch, so agentId (${params.agentId}) cannot be verified there`
+      );
     }
     const parsedAgentId = AgentIdSchema.safeParse(params.agentId);
     if (!parsedAgentId.success) {
@@ -3726,11 +3746,7 @@ export class TaskService {
         params.owner.runtime,
         params.owner.workspacePath,
         parsedAgentId.data,
-        {
-          includeAgentPlugins: this.workspaceService.isExperimentEnabled(
-            EXPERIMENT_IDS.AGENT_PLUGINS
-          ),
-        }
+        { includeAgentPlugins: params.owner.includeAgentPlugins }
       );
       resolvedScope = definition.scope;
     } catch {
@@ -3948,10 +3964,18 @@ export class TaskService {
         if (!slot.success) return Err(slot.error);
       }
     } else {
-      let ownerContext: { runtime: Runtime; workspacePath: string } | undefined;
+      let ownerContext: WorkspaceTurnAgentContext | undefined;
+      // A different base branch means owner-side agent resolution predicts nothing about
+      // the target checkout: agents may exist only on the target branch (so an owner-side
+      // miss must not fail-fast) and the target branch may shadow ANY id (so unreachable
+      // targets fail closed in validateWorkspaceTurnAgentIdForTarget).
+      const targetBaseDivergesFromOwner =
+        coerceNonEmptyString(args.workspace?.trunkBranch) != null &&
+        args.workspace?.trunkBranch !== parentMeta.name;
       if (requestedAgentId != null) {
         // Pre-create stage: catch obviously bad ids (unknown/hidden/disabled) against the
-        // OWNER's checkout before creating any workspace.
+        // OWNER's checkout before creating any workspace. Advisory when the requested base
+        // branch diverges — the target checkout is authoritative in that case.
         ownerContext = this.buildWorkspaceTurnAgentContext({
           runtimeConfig: parentMeta.runtimeConfig,
           projectPath: parentMeta.projectPath,
@@ -3963,8 +3987,15 @@ export class TaskService {
           agentId: requestedAgentId,
           ...ownerContext,
         });
-        if (!validation.success) return Err(validation.error);
-        agentDefinitionContext = { ...ownerContext, workspaceId: ownerWorkspaceId };
+        if (!validation.success) {
+          if (!targetBaseDivergesFromOwner) return Err(validation.error);
+          log.debug(
+            "Task.createWorkspaceTurn: owner-side agent validation failed; deferring to the target branch checkout",
+            { agentId: requestedAgentId, error: validation.error }
+          );
+        } else {
+          agentDefinitionContext = { ...ownerContext, workspaceId: ownerWorkspaceId };
+        }
       }
       const slot = await ensureParallelSlot();
       if (!slot.success) return Err(slot.error);
@@ -4008,6 +4039,7 @@ export class TaskService {
           agentId: requestedAgentId,
           target: targetContext,
           owner: ownerContext,
+          targetBaseDivergesFromOwner,
         });
         if (!validation.success) {
           agentValidationError = `${validation.error} — no turn was dispatched; the created workspace (${targetWorkspaceId}) is owned by this caller and can be retried via workspace.mode="existing" once ready`;
@@ -4525,6 +4557,9 @@ export class TaskService {
             runtime,
             workspacePath: parentWorkspacePath,
             workspaceId: parentWorkspaceId,
+            includeAgentPlugins: this.workspaceService.isExperimentEnabled(
+              EXPERIMENT_IDS.AGENT_PLUGINS
+            ),
           },
         }));
     } catch (error) {
