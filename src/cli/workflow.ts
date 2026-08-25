@@ -226,7 +226,12 @@ async function copyPersistentConfig(realConfig: Config, config: Config): Promise
 
 function buildExperimentsObject(experimentIds: readonly string[]) {
   return {
-    programmaticToolCalling: experimentIds.includes(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
+    // RLM implies the PTC parent flag: tool assembly only builds
+    // code_execution when a PTC flag is set, so rlm-mode alone would be inert
+    // (the desktop can't express that state — Settings nests RLM under PTC).
+    programmaticToolCalling:
+      experimentIds.includes(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING) ||
+      experimentIds.includes(EXPERIMENT_IDS.RLM),
     programmaticToolCallingExclusive: experimentIds.includes(
       EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE
     ),

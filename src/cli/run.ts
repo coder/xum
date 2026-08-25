@@ -321,6 +321,13 @@ function buildExperimentsObject(experimentIds: string[]): SendMessageOptions["ex
     assert(isSendMessageExperimentId(experimentId), `Unmapped experiment id: ${experimentId}`);
     experiments[SEND_MESSAGE_EXPERIMENT_FIELDS[experimentId]] = true;
   }
+  // RLM is a sub-experiment of PTC: tool assembly only builds code_execution
+  // when a PTC flag is set, so rlm-mode alone would be silently inert. Imply
+  // the parent flag, mirroring the desktop where Settings nests RLM under the
+  // PTC toggle (RLM itself then forces the exclusive kernel posture).
+  if (experiments.rlm && experiments.programmaticToolCallingExclusive !== true) {
+    experiments.programmaticToolCalling = true;
+  }
   return experiments;
 }
 
