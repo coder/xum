@@ -1680,15 +1680,19 @@ export class AgentSession {
     // Also clears any candidate armed during the acknowledgment await — a
     // post-goal intervention must not leave a consumable continuation behind.
     goalService.clearPendingContinuationForManualUserMessage(this.workspaceId);
-    if (goal?.status === "budget_limited") {
-      // Codex P2 (PRRT_kwDOPxxmWM6cJ6NM): the candidate delete above is
-      // in-memory only — persist the suppression so a restart cannot
-      // re-synthesize the autonomous wrap-up over the user's intervention.
+    // Codex P2 (PRRT_kwDOPxxmWM6cJ6NM): the candidate delete above is
+    // in-memory only — persist the suppression so a restart cannot
+    // re-synthesize the autonomous wrap-up over the user's intervention.
+    //
+    // Scoped to the acknowledged goal's identity: a replacement goal that
+    // persisted during the acknowledgment await must not be suppressed by a
+    // message that predates it (Codex P2 PRRT_kwDOPxxmWM6cLpID). The service
+    // re-verifies goalId + budget_limited status under its lock, so callers
+    // may invoke this on a stale snapshot and it no-ops unless suppression is
+    // actually owed.
+    const suppressWrapupForGoal = async (goalId: string): Promise<void> => {
       try {
-        // Scoped to the acknowledged goal's identity: a replacement goal that
-        // persisted during the acknowledgment await must not be suppressed by
-        // a message that predates it (Codex P2 PRRT_kwDOPxxmWM6cLpID).
-        await goalService.suppressBudgetWrapupForManualUserMessage(this.workspaceId, goal.goalId);
+        await goalService.suppressBudgetWrapupForManualUserMessage(this.workspaceId, goalId);
       } catch (error) {
         // A transient write failure must not break the user's manual send;
         // suppression fails closed (durable-first, so no in-memory state was
@@ -1698,6 +1702,9 @@ export class AgentSession {
           error: getErrorMessage(error),
         });
       }
+    };
+    if (goal?.status === "budget_limited") {
+      await suppressWrapupForGoal(goal.goalId);
     }
     if (goal?.status !== "active") {
       return;
@@ -1714,12 +1721,21 @@ export class AgentSession {
           workspaceId: this.workspaceId,
           error: result.error,
         });
+        // Codex P2 (PRRT_kwDOPxxmWM6cNQvL): the acknowledged snapshot said
+        // "active", but a queued child-attribution or budget edit can move
+        // the SAME goal to budget_limited during the awaits above — the pause
+        // is then rejected (budget-limited goals cannot pause) and the
+        // suppression branch above was skipped on the stale status. Suppress
+        // against the same goal identity; the locked recheck no-ops unless
+        // the goal really became budget-limited.
+        await suppressWrapupForGoal(goal.goalId);
       }
     } catch (error) {
       log.warn("Failed to auto-pause goal for manual user message", {
         workspaceId: this.workspaceId,
         error: getErrorMessage(error),
       });
+      await suppressWrapupForGoal(goal.goalId);
     }
   }
 

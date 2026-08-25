@@ -188,6 +188,60 @@ describe("AgentSession goal safety hooks", () => {
     });
   }
 
+  test("a same-goal budget-limit transition during acknowledgment still suppresses the wrap-up", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cNQvL): acknowledgeUser can return goal A as
+    // active while a queued child-attribution or budget edit then moves A to
+    // budget_limited. The stale status skips the suppression branch, and the
+    // auto-pause is rejected (budget-limited goals cannot pause) — without a
+    // recheck the manual stream-end re-arms the autonomous wrap-up despite
+    // the user's intervention. The pause-failure path must suppress against
+    // the same goal identity.
+    const workspaceId = "budget-limit-races-acknowledgment";
+    const { session, goalService, cleanup } = await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const created = await setGoalOk(goalService, {
+      workspaceId,
+      objective: "Races into budget_limited",
+      budgetCents: 100,
+    });
+
+    const realAcknowledge = goalService.acknowledgeUser.bind(goalService);
+    const ackSpy = spyOn(goalService, "acknowledgeUser").mockImplementationOnce(
+      async (...args: Parameters<WorkspaceGoalService["acknowledgeUser"]>) => {
+        const snapshot = await realAcknowledge(...args);
+        expect(snapshot).toMatchObject({ status: "active" });
+        // Same-goal transition landing after the stale-active snapshot.
+        await goalService.recordStreamAccounting({
+          workspaceId,
+          costUsd: 2,
+          streamStartedAtMs: created.createdAtMs + 1,
+          streamOriginKind: "goal_continuation",
+        });
+        return snapshot;
+      }
+    );
+
+    // Invoke the hook directly: in the sendMessage flow the manual row would
+    // already reconcile the goal to paused before acknowledgment, hiding the
+    // stale-active window this race needs.
+    const sessionAccess = session as unknown as {
+      applyManualUserMessageGoalSafety: (input: {
+        policy: "pause" | "steer";
+        enqueuedAtMs?: number;
+      }) => Promise<void>;
+    };
+    await sessionAccess.applyManualUserMessageGoalSafety({ policy: "pause" });
+    ackSpy.mockRestore();
+
+    // The wrap-up is durably suppressed despite the stale-active snapshot.
+    expect(await goalService.getGoal(workspaceId)).toMatchObject({
+      goalId: created.goalId,
+      status: "budget_limited",
+      budgetLimitOriginKind: "user",
+    });
+    session.dispose();
+  });
+
   test("synthetic messages do not auto-pause active goals", async () => {
     const workspaceId = "synthetic-does-not-pause";
     const { session, goalService, cleanup } = await createSessionHarness(workspaceId);
