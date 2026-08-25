@@ -663,6 +663,14 @@ function TimelinePreviewCard(props: {
       ) {
         return;
       }
+      // Duplicate panels can be mounted at once: narrow viewports CSS-hide the right
+      // sidebar without unmounting its Timeline tab while the mobile dialog mounts a
+      // second panel. Only the visible panel may act on this window-level shortcut:
+      // offsetParent is null inside display:none subtrees, and content outside an open
+      // modal dialog (or an inert-hidden sidebar) is marked aria-hidden/inert.
+      if (button.offsetParent === null || button.closest("[inert], [aria-hidden='true']") != null) {
+        return;
+      }
       event.preventDefault();
       button.click();
     };

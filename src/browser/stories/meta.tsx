@@ -13,6 +13,7 @@ import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import type { APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   SELECTED_WORKSPACE_KEY,
   SIDEBAR_AGE_GROUPING_KEY,
@@ -95,7 +96,9 @@ function resetStorybookPersistedStateForStory(): void {
     localStorage.removeItem(TERMINAL_BADGE_CONFIG_KEY);
     // The timeline dialog story enables the timeline experiment; clear it so
     // other stories' right-sidebar layouts don't gain an order-dependent tab.
-    localStorage.removeItem(getExperimentKey(EXPERIMENT_IDS.TIMELINE));
+    // Cleared via the persisted-state helper so mounted experiment subscribers
+    // observe the reset instead of holding a stale snapshot.
+    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TIMELINE), undefined);
   }
 }
 function getStorybookRenderKey(): string | null {
