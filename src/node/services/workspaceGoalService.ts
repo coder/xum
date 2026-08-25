@@ -1480,7 +1480,23 @@ export class WorkspaceGoalService {
         return false;
       }
       const current = await this.readGoalFile(workspaceId);
-      if (current?.goalId !== candidate.goalId || current.status !== "active") {
+      if (current?.goalId !== candidate.goalId) {
+        return false;
+      }
+      // Codex P2 (PRRT_kwDOPxxmWM6cPbjX): a suspended candidate can belong to
+      // a budget_limited goal (e.g. an auto-promoted revival whose retained
+      // spend already exceeds its budget) — the active-only rule would strand
+      // the owed wrap-up until a restart reconstructs it. Accept the restore
+      // when the durable record still owes its wrap-up: not user-suppressed
+      // and not already injected. Source-agnostic on purpose: eligibility's
+      // budget_limited branch dispatches the one-shot wrap-up from any
+      // candidate source. Other statuses keep the active-only rule (a
+      // pause/completion during classification wins).
+      const wrapupStillOwed =
+        current.status === "budget_limited" &&
+        current.budgetLimitOriginKind !== "user" &&
+        current.budgetLimitInjectedForGoalId !== current.goalId;
+      if (current.status !== "active" && !wrapupStillOwed) {
         return false;
       }
       this.pendingContinuationCandidates.set(workspaceId, candidate);

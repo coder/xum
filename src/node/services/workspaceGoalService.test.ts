@@ -3107,6 +3107,61 @@ describe("WorkspaceGoalService", () => {
     expect(capturedProbe!()).toBe(true);
   });
 
+  test("pre-goal queue races restore suspended budget wrap-up candidates", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cPbjX): a queued manual message that predates
+    // a budget_limited goal (e.g. an auto-promoted revival whose retained
+    // spend exceeds its budget) suspends the armed budget_wrapup candidate;
+    // the active-only restore rule would reject it and strand the owed
+    // wrap-up for the rest of the process. A matching budget-limited goal
+    // that still owes its wrap-up must accept the restore.
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Wrap-up survives pre-goal queue race",
+      budgetCents: 100,
+    });
+    const dispatcher = new IdleDispatcher();
+    service.registerGoalContinuationConsumer(dispatcher, {
+      hasActiveDescendantTasks: () => false,
+      // Busy runtime: the armed candidate stays pending instead of firing.
+      getRuntimeState: () => ({ isRuntimeCompatible: true, isBusy: true }),
+      executeGoalContinuation: () => Promise.resolve(true),
+      getKickoffSendOptions: () => Promise.resolve({ model: "openai:gpt-4o", agentId: "exec" }),
+    });
+    await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1.25,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    await service.requestContinuationAfterStreamEnd({
+      workspaceId,
+      sendOptions: { model: "openai:gpt-4o", agentId: "exec" },
+      streamEndedAtMs: 20_000,
+    });
+    const candidates = (
+      service as unknown as {
+        pendingContinuationCandidates: Map<string, { source: string }>;
+      }
+    ).pendingContinuationCandidates;
+    // Stream-end arming on a budget_limited goal produces the wrap-up's
+    // candidate (eligibility dispatches the wrap-up from any source).
+    expect(candidates.get(workspaceId)?.source).toBe("stream_end");
+
+    const suspended = service.takePendingContinuationCandidateForManualUserMessage(workspaceId);
+    expect(suspended).not.toBeNull();
+    expect(candidates.has(workspaceId)).toBe(false);
+    await service.restorePendingContinuationCandidate(workspaceId, suspended!);
+    expect(candidates.get(workspaceId)?.source).toBe("stream_end");
+
+    // A suppressed wrap-up is no longer owed — the restore must refuse it.
+    const suspendedAgain =
+      service.takePendingContinuationCandidateForManualUserMessage(workspaceId);
+    expect(suspendedAgain).not.toBeNull();
+    await service.suppressBudgetWrapupForManualUserMessage(workspaceId, created.goalId);
+    await service.restorePendingContinuationCandidate(workspaceId, suspendedAgain!);
+    expect(candidates.has(workspaceId)).toBe(false);
+  });
+
   test("the wrap-up dispatch admission probe goes stale when a manual message suppresses it", async () => {
     // Codex P1 (PRRT_kwDOPxxmWM6cPBWX): a manual send during the wrap-up
     // send's preflight can suppress the wrap-up without making the session
