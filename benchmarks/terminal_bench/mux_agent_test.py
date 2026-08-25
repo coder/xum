@@ -69,7 +69,7 @@ def _run_mux_runner_smoke(
 set -euo pipefail
 printf '%s\n' "$*" >"${FAKE_BUN_ARGS_FILE}"
 cat >/dev/null
-printf '{"type":"run-complete","usage":{"inputTokens":7,"outputTokens":11},"cost_usd":0.42}\n'
+printf '{"type":"run-complete","usage":{"inputTokens":7,"outputTokens":11,"cachedTokens":5,"cacheCreateTokens":3},"cost_usd":0.42}\n'
 exit "${FAKE_MUX_EXIT_CODE}"
 """,
     )
@@ -198,6 +198,8 @@ def test_mux_runner_scores_goal_mode_incomplete_exit(tmp_path: Path) -> None:
     assert json.loads(result.token_file.read_text()) == {
         "input": 7,
         "output": 11,
+        "cache_read": 5,
+        "cache_write": 3,
         "cost_usd": 0.42,
     }
     stdout_event = json.loads((result.log_dir / "stdout.txt").read_text())
@@ -221,6 +223,8 @@ def test_mux_runner_preserves_fatal_exit(tmp_path: Path) -> None:
     assert json.loads(result.token_file.read_text()) == {
         "input": 7,
         "output": 11,
+        "cache_read": 5,
+        "cache_write": 3,
         "cost_usd": 0.42,
     }
 

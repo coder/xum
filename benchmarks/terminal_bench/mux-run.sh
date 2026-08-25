@@ -146,7 +146,7 @@ tee_status="${pipeline_status[2]}"
 # run-complete is missing (e.g. process killed by timeout, stdout not flushed).
 python3 -c '
 import json, sys
-result = {"input": 0, "output": 0, "cost_usd": None}
+result = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost_usd": None}
 # Track cumulative usage from usage-delta events (keyed by messageId).
 # Each usage-delta contains cumulative totals for its message, so we keep the
 # latest per message and sum across messages at the end.
@@ -163,6 +163,9 @@ for line in open(sys.argv[1]):
             usage = obj.get("usage") or {}
             result["input"] = usage.get("inputTokens", 0) or 0
             result["output"] = usage.get("outputTokens", 0) or 0
+            # run-complete reports cache traffic separately from (uncached) input.
+            result["cache_read"] = usage.get("cachedTokens", 0) or 0
+            result["cache_write"] = usage.get("cacheCreateTokens", 0) or 0
             result["cost_usd"] = obj.get("cost_usd")
             print(json.dumps(result))
             sys.exit(0)
@@ -185,6 +188,8 @@ for line in open(sys.argv[1]):
 for usage in cumulative_by_msg.values():
     result["input"] += (usage.get("inputTokens", 0) or 0)
     result["output"] += (usage.get("outputTokens", 0) or 0)
+    # AI SDK usage shape only exposes cache reads; cache writes stay 0 here.
+    result["cache_read"] += (usage.get("cachedInputTokens", 0) or 0)
 result["input"] += subagent_input
 result["output"] += subagent_output
 print(json.dumps(result))

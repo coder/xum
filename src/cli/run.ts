@@ -288,6 +288,8 @@ function buildExperimentsObject(experimentIds: string[]): SendMessageOptions["ex
   return {
     programmaticToolCalling: experimentIds.includes("programmatic-tool-calling"),
     programmaticToolCallingExclusive: experimentIds.includes("programmatic-tool-calling-exclusive"),
+    // RLM is inert without a PTC parent flag (isRlmModeEnabled requires rlm AND ptc/ptcExclusive).
+    rlm: experimentIds.includes(EXPERIMENT_IDS.RLM),
     dynamicWorkflows: experimentIds.includes("dynamic-workflows"),
     workspaceHeartbeats: experimentIds.includes(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS),
   };
