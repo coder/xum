@@ -1,4 +1,6 @@
 import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
+import { AGENT_PEER_MESSAGE_DEDUPE_PREFIX } from "@/constants/agentMessaging";
+import { getValidAgentPeerTriggerMeta } from "@/common/utils/agentMessageEnvelope";
 import type { SendMessageError } from "@/common/types/errors";
 import type { MuxMessage } from "@/common/types/message";
 import type { ReviewNoteData } from "@/common/types/review";
@@ -52,6 +54,8 @@ interface WorkspaceTurnMetadata {
   taskHandleId: string;
   ownerWorkspaceId: string;
   turnId: string;
+  /** Peer attribution nested on correlated peer triggers (see MuxMessageMetadata). */
+  agentPeerMessageTrigger?: unknown;
 }
 
 function isWorkspaceTurnMetadata(meta: unknown): meta is WorkspaceTurnMetadata {
@@ -63,6 +67,14 @@ function isWorkspaceTurnMetadata(meta: unknown): meta is WorkspaceTurnMetadata {
     typeof obj.ownerWorkspaceId === "string" &&
     typeof obj.turnId === "string"
   );
+}
+
+// Peer messages are sealed single-message entries (their sends use removable dedupe keys), so
+// counting entries by this metadata type is an exact count of queued peer messages.
+function isAgentPeerMessageMetadata(meta: unknown): boolean {
+  if (typeof meta !== "object" || meta === null) return false;
+  const obj = meta as Record<string, unknown>;
+  return obj.type === "agent-peer-message" && typeof obj.fromWorkspaceId === "string";
 }
 
 // Type guard for metadata with reviews
@@ -106,6 +118,12 @@ interface QueuedMessageInternalOptions {
   preTurnMessages?: MuxMessage[];
   /** r54: fired once pre-turn rows cross the rollback horizon at dispatch. */
   onPreTurnRowsPersisted?: () => void;
+  /**
+   * Caller staleness probe re-emitted at dispatch and re-checked by the session's
+   * turn-admission gates. Peer agent sends use it so a Stop/task_stop landing after
+   * dequeue — where queue clearing can no longer see the entry — still refuses the turn.
+   */
+  admissionStale?: () => boolean;
 }
 
 type QueueClearCallbacks = Pick<
@@ -152,6 +170,8 @@ interface QueueEntry {
   preTurnMessages?: MuxMessage[];
   /** r54: fired once this entry's pre-turn rows cross the rollback horizon. */
   onPreTurnRowsPersisted?: () => void;
+  /** Caller staleness probe re-checked at this entry's dispatch admission (entries carrying it are sealed). */
+  admissionStale?: () => boolean;
 }
 
 /**
@@ -192,6 +212,17 @@ export class MessageQueue {
           isWorkspaceTurnMetadata(entry.muxMetadata) && entry.muxMetadata.taskHandleId === handleId
       )
     );
+  }
+
+  /** Queued intra-tree agent peer messages (sealed entries, one message each). */
+  countAgentPeerMessageEntries(): number {
+    // The dedupe-key prefix also matches triggers whose muxMetadata was replaced by a
+    // workspace-turn correlation (upward sends into a delegated turn keep the peer count).
+    return this.entries.filter(
+      (entry) =>
+        isAgentPeerMessageMetadata(entry.muxMetadata) ||
+        [...entry.dedupeKeys].some((key) => key.startsWith(AGENT_PEER_MESSAGE_DEDUPE_PREFIX))
+    ).length;
   }
 
   private getDispatchMode(entries: readonly QueueEntry[]): QueueDispatchMode {
@@ -303,9 +334,19 @@ export class MessageQueue {
       } else if (!matchesPriorCorrelation) {
         hasUnrelatedPredecessor = true;
         if (entry.workspaceTurnContinuation) {
-          entry.muxMetadata = undefined;
-          entry.onCanceled = undefined;
-          entry.onAcceptedPreStreamFailure = undefined;
+          // Mirror WorkspaceService.stripWorkspaceTurnCorrelation for entries whose correlation
+          // goes stale while QUEUED: a peer trigger keeps its machine-notification identity
+          // (downgraded to plain peer attribution) plus its onCanceled AND
+          // onAcceptedPreStreamFailure — both carry the sender's budget refund, tied to this
+          // entry rather than the superseded owner handle. Owner handle-settling callbacks are
+          // still dropped.
+          const peerTrigger = getValidAgentPeerTriggerMeta(metadata.agentPeerMessageTrigger);
+          entry.muxMetadata =
+            peerTrigger != null ? { type: "agent-peer-message", ...peerTrigger } : undefined;
+          if (peerTrigger == null) {
+            entry.onCanceled = undefined;
+            entry.onAcceptedPreStreamFailure = undefined;
+          }
         }
       } else {
         priorCorrelation ??= metadata;
@@ -426,6 +467,9 @@ export class MessageQueue {
       // family sends would join their triggers while both payload rows pile
       // onto one entry, and the payloads would then persist adjacently.
       (internal?.preTurnMessages?.length ?? 0) > 0 ||
+      // A staleness probe gates exactly one dispatch; batching would let one
+      // sender's stop-refusal veto unrelated queued messages.
+      internal?.admissionStale != null ||
       incomingHasAcceptedCallbacks;
     // Compaction starts its own entry (its metadata must not adopt earlier batched
     // texts), but stays open so a follow-up typed behind a pending /compact batches
@@ -520,6 +564,9 @@ export class MessageQueue {
     }
     if (internal?.cancelSignal != null) {
       entry.cancelSignal = internal.cancelSignal;
+    }
+    if (internal?.admissionStale != null) {
+      entry.admissionStale = internal.admissionStale;
     }
 
     entry.addCount += 1;
@@ -770,6 +817,7 @@ export class MessageQueue {
       entry.onAcceptedPreStreamFailure != null ||
       entry.onCanceled != null ||
       entry.cancelSignal != null ||
+      entry.admissionStale != null ||
       (entry.preTurnMessages?.length ?? 0) > 0;
     const internal = hasInternalOptions
       ? {
@@ -788,6 +836,7 @@ export class MessageQueue {
           ...(entry.onPreTurnRowsPersisted != null
             ? { onPreTurnRowsPersisted: entry.onPreTurnRowsPersisted }
             : {}),
+          ...(entry.admissionStale != null ? { admissionStale: entry.admissionStale } : {}),
         }
       : undefined;
 

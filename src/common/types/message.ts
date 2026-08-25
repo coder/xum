@@ -12,6 +12,10 @@ import type { SendMessageOptions } from "@/common/orpc/types";
 import type { z } from "zod";
 import type { AgentMode } from "./mode";
 import type { AgentSkillScope } from "./agentSkill";
+import type {
+  AgentMessageRelationship,
+  AgentPeerMessageMeta,
+} from "@/common/utils/agentMessageEnvelope";
 import type { ThinkingLevel } from "./thinking";
 import { type ReviewNoteData, formatReviewForModel } from "./review";
 import { isMcpPromptCommandKey } from "@/common/utils/tools/mcpPromptCommandKey";
@@ -672,6 +676,25 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         taskHandleId: string;
         ownerWorkspaceId: string;
         turnId: string;
+        /**
+         * Peer attribution for a peer-message wake trigger that must carry the delegated turn's
+         * correlation (stream-end settlement reads this variant's type). Carrying the full
+         * attribution — not just a flag — lets correlation stripping downgrade the row to plain
+         * peer metadata, so the UI keeps rendering it as a machine notification, never as a
+         * human prompt.
+         */
+        agentPeerMessageTrigger?: AgentPeerMessageMeta;
+      }
+    | {
+        // Intra-tree agent peer message (sibling/cousin or descendant→ancestor task_send_message).
+        // The <mux_agent_message> envelope stays in the message text for the model; this metadata
+        // drives the compact transcript card and queue-entry counting without re-parsing it.
+        type: "agent-peer-message";
+        /** Sender's tree target id — the reply address for task_send_message. */
+        fromWorkspaceId: string;
+        fromTitle?: string;
+        /** The sender's relationship to the recipient (mirrors the envelope enum). */
+        relationship: AgentMessageRelationship;
       }
   );
 
@@ -1015,6 +1038,11 @@ export type DisplayedMessage =
       bashMonitorWake?: {
         records: BashMonitorWakeDisplayRecord[];
       };
+      /**
+       * True for the fixed user-role notification that wakes a peer-message recipient (the
+       * payload itself is a separate assistant row). Excluded from human-prompt navigation.
+       */
+      agentPeerMessageTrigger?: true;
     }
   | {
       type: "assistant";
@@ -1042,6 +1070,15 @@ export type DisplayedMessage =
       /** Presentation hint for smooth streaming — indicates if this is live or replayed content. */
       streamPresentation?: {
         source: "live" | "replay";
+      };
+      /**
+       * Present when this synthetic assistant row is an intra-tree agent peer message payload
+       * (delivered as an assistant pre-turn row so peer bytes never gain user-role authority).
+       */
+      agentPeerMessage?: {
+        fromWorkspaceId: string;
+        fromTitle?: string;
+        relationship: AgentMessageRelationship;
       };
     }
   | {

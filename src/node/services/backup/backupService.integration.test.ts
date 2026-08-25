@@ -341,6 +341,32 @@ describe("BackupService against a real repository", () => {
     expect(service.getSettings()?.lastRestoredCommit).toBe(pushed.data.commit);
   });
 
+  it("restores and re-pushes a pre-rename mux/ backup through xum/ settings", async () => {
+    // The backup was pushed while the default managed path was still `mux/`.
+    const pushed = await pushOrThrow();
+
+    // A post-rename client points the default `xum/` path at the same repository.
+    await writeFixtureFile(muxRoot, "AGENTS.md", "locally diverged\n");
+    settings = { ...settings, path: "xum/" };
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.commit).toBe(pushed.data.commit);
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "global instructions\n"
+    );
+
+    // Pushing through the renamed settings updates mux/ in place instead of forking xum/.
+    await writeFixtureFile(muxRoot, "AGENTS.md", "updated after rename\n");
+    await pushOrThrow();
+    const clone = await cloneOrigin("after-rename");
+    const files = await listFiles(clone);
+    expect(files).toContain("mux/AGENTS.md");
+    expect(files.some((file) => file.startsWith("xum/"))).toBe(false);
+    expect(await fs.readFile(path.join(clone, "mux/AGENTS.md"), "utf-8")).toBe(
+      "updated after rename\n"
+    );
+  });
+
   it("reports an empty repository as reachable and bootstraps its first commit", async () => {
     const validated = await service.validate(settings);
     if (!validated.success) throw new Error(validated.error.message);

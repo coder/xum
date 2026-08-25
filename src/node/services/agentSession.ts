@@ -2747,6 +2747,14 @@ export class AgentSession {
        * post-mutation context by design.
        */
       admissionEpochStale?: () => boolean;
+      /**
+       * Caller-supplied staleness probe that, unlike the epoch probe above, IS threaded
+       * through queued entries (MessageQueue stores it per entry and re-emits it at
+       * dispatch). Peer agent sends use it so a Stop/task_stop landing after dequeue —
+       * where queue clearing can no longer see the entry — still refuses the turn at
+       * these admission gates instead of starting a privileged turn on a stopped target.
+       */
+      admissionStale?: () => boolean;
     }
   ): Promise<Result<void, SendMessageError>> {
     this.assertNotDisposed("sendMessage");
@@ -2755,22 +2763,41 @@ export class AgentSession {
 
     const isManualUserMessage = internal?.synthetic !== true;
 
+    // Single admission-staleness predicate for all three turn-admission gates below.
+    const isAdmissionStale = () =>
+      internal?.admissionEpochStale?.() === true || internal?.admissionStale?.() === true;
+
     const cancelSignal = internal?.cancelSignal;
     const persistedCancelableMessageIds: string[] = [];
     // Roll back synthetic snapshots if the invoking user row fails to persist, or
     // later provider requests could consume orphaned context.
-    const rollbackPersistedTurnRows = async (): Promise<void> => {
-      if (persistedCancelableMessageIds.length === 0) return;
+    /**
+     * Returns whether the rows are verifiably gone. deleteMessages can fail AFTER its atomic
+     * rewrite committed, so a reported failure re-reads the durable history before concluding —
+     * callers that couple side effects to the rollback (peer budget refunds) must only act when
+     * deletion actually committed, or a "canceled" payload would stay durable while no longer
+     * counting against the sender's budget.
+     */
+    const rollbackPersistedTurnRows = async (): Promise<boolean> => {
+      if (persistedCancelableMessageIds.length === 0) return true;
       const rollbackResult = await this.historyService.deleteMessages(
         this.workspaceId,
         persistedCancelableMessageIds
       );
-      if (!rollbackResult.success) {
-        log.error("Failed to roll back partially persisted turn rows", {
-          workspaceId: this.workspaceId,
-          error: rollbackResult.error,
-        });
-      }
+      if (rollbackResult.success) return true;
+      log.error("Failed to roll back partially persisted turn rows", {
+        workspaceId: this.workspaceId,
+        error: rollbackResult.error,
+      });
+      const historyResult = await this.historyService.getHistoryFromLatestBoundary(
+        this.workspaceId
+      );
+      return (
+        historyResult.success &&
+        persistedCancelableMessageIds.every(
+          (messageId) => !historyResult.data.some((message) => message.id === messageId)
+        )
+      );
     };
     let cancellationHandled = false;
     let cancellationDisabled = false;
@@ -3099,7 +3126,7 @@ export class AgentSession {
       // claims busy-ness), so whichever side runs first is observed by the
       // other. The epoch probe (r41) also refuses edits whose target rows a
       // completed mutation already discarded.
-      if (this.turnAdmissionBlocks > 0 || internal?.admissionEpochStale?.() === true) {
+      if (this.turnAdmissionBlocks > 0 || isAdmissionStale()) {
         return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
       }
 
@@ -3419,7 +3446,7 @@ export class AgentSession {
     // refuse while sends are in preflight (r42), so rows can no longer land
     // after a mutation commits; this check and the PREPARING gate remain
     // backstops for entry-accounting bypasses.
-    if (this.turnAdmissionBlocks > 0 || internal?.admissionEpochStale?.() === true) {
+    if (this.turnAdmissionBlocks > 0 || isAdmissionStale()) {
       return Err(createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE));
     }
 
@@ -3541,6 +3568,37 @@ export class AgentSession {
       if (await cancelBeforeAcceptance()) {
         return Ok(undefined);
       }
+    }
+
+    // Caller-probe staleness (peer sends racing a Stop) must resolve BEFORE the pre-turn batch
+    // becomes irrevocable below: the rows persisted by the appends above are still inside the
+    // rollback horizon here, so a Stop that landed during that history IO refuses the send and
+    // leaves no trace for a later human resume to replay into provider context. Past this point
+    // rollback is forbidden by design (goal sync observes the durable row), so a Stop landing in
+    // the remaining pre-stream awaits refuses the turn at the PREPARING gate with rows retained.
+    if (internal?.admissionStale?.() === true) {
+      const rolledBack = await rollbackPersistedTurnRows();
+      // Probe-carrying sends are peer messages whose caller already returned success when the
+      // entry was queued — the cancellation hook is their only way to observe this refusal and
+      // release the budget reservation (the refund closure is idempotent). Fire it ONLY when the
+      // rollback verifiably committed: rows that remain durable can enter provider context after
+      // a resume, so their charge must stand (budget charged ⇔ rows durable).
+      if (rolledBack) {
+        await internal?.onCanceled?.(
+          "Send refused: the caller's admission became stale before the turn was accepted."
+        );
+      } else {
+        // Failed rollback leaves the rows durable, and the Err below still reaches the caller's
+        // OUTER refund paths (the direct-call failure branch and sendQueuedMessages'
+        // onAcceptedPreStreamFailure). Mark the rows persisted first so those payload-guarded
+        // refunds keep the charge — refunding here would leave provider-visible rows uncharged.
+        internal?.onPreTurnRowsPersisted?.();
+      }
+      return Err(
+        createUnknownSendMessageError(
+          "Send refused: the caller's admission became stale before the turn was accepted."
+        )
+      );
     }
 
     // Goal synchronization can mutate goal.json based on this durable user row. Once it begins, the
@@ -3672,7 +3730,7 @@ export class AgentSession {
     // normally impossible since mutations refuse while sends are in
     // preflight (r42), but kept for paths that bypass WorkspaceService
     // entry accounting.
-    if (this.turnAdmissionBlocks > 0 || internal?.admissionEpochStale?.() === true) {
+    if (this.turnAdmissionBlocks > 0 || isAdmissionStale()) {
       const error = createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE);
       // The turn was already accepted (rows durable, onAccepted ran):
       // internal callers like the terminal-attention outbox mark state
@@ -6026,6 +6084,8 @@ export class AgentSession {
       preTurnMessages?: MuxMessage[];
       /** r54: fired once pre-turn rows cross the rollback horizon at dispatch. */
       onPreTurnRowsPersisted?: () => void;
+      /** Caller staleness probe re-checked at this entry's dispatch admission. */
+      admissionStale?: () => boolean;
     }
   ): "tool-end" | "turn-end" | null {
     this.assertNotDisposed("queueMessage");
@@ -6146,6 +6206,11 @@ export class AgentSession {
       !this.messageQueue.isEmpty() &&
       (dispatchMode == null || this.messageQueue.getNextQueueDispatchMode() === dispatchMode)
     );
+  }
+
+  /** Queued intra-tree agent peer messages awaiting dispatch (peer-message queue cap input). */
+  countQueuedAgentPeerMessages(): number {
+    return this.messageQueue.countAgentPeerMessageEntries();
   }
 
   /**
@@ -6466,7 +6531,22 @@ export class AgentSession {
             this.sendQueuedMessages();
           }
         })
-        .catch(() => {
+        .catch(async (error: unknown) => {
+          // A REJECTED sendMessage (thrown, not returned Err — e.g. an awaited history or goal
+          // service throwing pre-persistence) must reach the same failure hook as the
+          // returned-error branch above: peer sends refund their family-message reservation
+          // through it (payload-persistence-guarded, so post-persistence throws keep the
+          // charge). Swallowing the rejection here would strand the reservation until restart.
+          try {
+            await internal?.onAcceptedPreStreamFailure?.(
+              createUnknownSendMessageError(error instanceof Error ? error.message : String(error))
+            );
+          } catch (hookError: unknown) {
+            log.error("sendQueuedMessages: onAcceptedPreStreamFailure hook threw", {
+              workspaceId: this.workspaceId,
+              hookError,
+            });
+          }
           this.dispatchingQueuedEntry = false;
           this.dispatchingQueuedEntryMuxMetadata = undefined;
           if (this.turnPhase === TurnPhase.PREPARING) {

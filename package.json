@@ -294,7 +294,7 @@
         "zip"
       ],
       "icon": "build/icon.icns",
-      "artifactName": "xum-${version}-${arch}.${ext}",
+      "artifactName": "xum-${version}-${arch}-${os}.${ext}",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "entitlements": "build/entitlements.mac.plist",
@@ -305,7 +305,7 @@
       "target": "AppImage",
       "category": "Development",
       "icon": "build/icons",
-      "artifactName": "xum-${version}-${arch}.${ext}",
+      "artifactName": "xum-${version}-${arch}-${os}.${ext}",
       "desktop": {
         "StartupWMClass": "xum"
       }
@@ -313,7 +313,7 @@
     "win": {
       "target": "nsis",
       "icon": "build/icon.png",
-      "artifactName": "xum-${version}-${arch}.${ext}",
+      "artifactName": "xum-${version}-${arch}-${os}.${ext}",
       "sign": "scripts/sign-windows.js",
       "signingHashAlgorithms": [
         "sha256"

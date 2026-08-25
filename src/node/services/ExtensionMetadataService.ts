@@ -258,11 +258,15 @@ export class ExtensionMetadataService {
    *   exists but no metadata yet) are seeded with `recency=0` until the
    *   next real user interaction.
    * - Doesn't touch `hasTodos`. The todo-derivation path owns that flag.
+   * - Persists `inputHash` (AgentStatusService's dedup key for the input
+   *   that produced `status`) atomically with the status so a restarted
+   *   process can skip regenerating unchanged chats. A skipped write records
+   *   nothing; clearing the status clears the hash.
    */
   async setSidebarStatus(
     workspaceId: string,
     status: ExtensionAgentStatus | null,
-    options: { skipIfRecencyAdvancedSince?: number | null } = {}
+    options: { skipIfRecencyAdvancedSince?: number | null; inputHash?: string | null } = {}
   ): Promise<WorkspaceActivitySnapshot | null> {
     return this.withSerializedMutation(async () => {
       const data = await this.load();
@@ -286,13 +290,35 @@ export class ExtensionMetadataService {
       }
       if (status) {
         workspace.todoStatus = status;
+        // The hash must describe exactly the input that produced the
+        // persisted status; a write without a hash invalidates any stale one.
+        workspace.sidebarStatusInputHash = options.inputHash ?? null;
       } else {
         delete workspace.todoStatus;
+        delete workspace.sidebarStatusInputHash;
       }
       data.workspaces[workspaceId] = workspace;
       await this.save(data);
       return toWorkspaceActivitySnapshot(workspace);
     });
+  }
+
+  /**
+   * Backend-only reader for the dedup hash persisted by setSidebarStatus.
+   * Deliberately not part of getSnapshot()/getAllSnapshots():
+   * WorkspaceActivitySnapshot is an IPC shape and must not grow
+   * backend-only fields.
+   */
+  async getSidebarStatusInputHash(workspaceId: string): Promise<string | null> {
+    const data = await this.load();
+    const entry = coerceExtensionMetadata(data.workspaces[workspaceId]);
+    // Codex review: other writers (setTodoStatus, setStreaming) clear or
+    // replace the shared todoStatus slot without touching the hash. A hash
+    // with no live status behind it is orphaned and must read as absent —
+    // otherwise a restart would dedup an unchanged transcript against a
+    // cleared slot and leave the sidebar blank until the transcript changed.
+    if (!entry?.todoStatus) return null;
+    return entry.sidebarStatusInputHash ?? null;
   }
 
   /**

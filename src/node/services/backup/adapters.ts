@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { listBackupManagedPathSpellings } from "@/common/compat/legacyMux";
 import { VERSION } from "@/version";
 import type { Config } from "@/node/config";
 import type { BackupFileChange } from "@/common/orpc/schemas/backup";
@@ -95,6 +96,7 @@ export function createBackupGitRepo(options: {
         rootDir: cache.cachePath,
         credential: cache.credential ?? "ambient",
         remoteCommit,
+        managedPath: cache.effectiveManagedPath,
       };
       prepared.set(repository, cache);
       return repository;
@@ -144,6 +146,20 @@ function resolveMuxVersion(): string {
  */
 function sameMode(a: BackupFile, b: BackupFile): boolean {
   return (a.executable === true) === (b.executable === true);
+}
+
+/**
+ * Names every spelling that was considered, so the error explains the legacy fallback.
+ * The repository preparation selects the legacy `mux` spelling whenever it holds a
+ * manifest and the configured spelling does not, so reaching this with the configured
+ * path means the legacy spelling was checked and held no backup either.
+ */
+function describeMissingBackup(managedPath: string): string {
+  const [, ...legacySpellings] = listBackupManagedPathSpellings(managedPath);
+  const fallbacks = legacySpellings.map((spelling) => `'${spelling}'`).join(" or ");
+  return fallbacks === ""
+    ? `No Xum backup found in '${managedPath}' on this branch`
+    : `No Xum backup found in '${managedPath}' or legacy ${fallbacks} on this branch`;
 }
 
 export function createBackupPayloadStore(options: { config: Config }): BackupPayloadStore {
@@ -273,7 +289,7 @@ export function createBackupPayloadStore(options: { config: Config }): BackupPay
       if (!(await backupPayloadExists(sourceDir))) {
         throw new BackupServiceError(
           "INVALID_BACKUP",
-          `No Xum backup found in '${validateOptions.managedPath}' on this branch`
+          describeMissingBackup(validateOptions.managedPath)
         );
       }
       const payload = await readBackupPayload(sourceDir);

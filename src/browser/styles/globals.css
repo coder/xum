@@ -106,6 +106,10 @@
     --color-runtime-devcontainer-text: #34d399; /* emerald-400 */
 
     /* Background & Layout */
+    /* iOS standalone PWA status-bar band backdrop. Deliberately NOT overridden by
+       light themes: black-translucent renders white status-bar glyphs in every
+       theme, so the exposed band needs a constant dark surface behind them. */
+    --color-ios-status-bar-backdrop: hsla(240, 10%, 4%, 1);
     --color-background: hsl(0 0% 12%);
     --color-background-secondary: hsl(60 1% 15%);
     --color-border: #262626; /* neutral-800 */
@@ -1127,6 +1131,32 @@ body,
   background-color: var(--color-surface-primary);
 }
 
+/* iOS standalone (black-translucent) always renders white status-bar glyphs, and the
+   status-bar-style meta is read at launch, so it cannot follow runtime theme changes.
+   Light themes would expose a light surface behind the white glyphs; back the band
+   with a constant dark strip instead. Absolute pseudo-element (not fixed) so iOS 26's
+   Liquid Glass edge sampler ignores it; height collapses to 0 without top insets.
+   The @supports gate limits the strip to iOS/iPadOS WebKit: Android standalone PWAs
+   pick dark status glyphs from the light theme-color, so a dark band would invert
+   contrast there. -webkit-touch-callout only exists on iOS-family WebKit. */
+@media (display-mode: standalone) {
+  @supports (-webkit-touch-callout: none) {
+    :root[data-theme$="light"] body::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: env(safe-area-inset-top, 0px);
+      background-color: var(--color-ios-status-bar-backdrop);
+      /* Above the off-canvas drawer (z-index 1000); the band holds no interactive
+         content (layout pads it away), and pointer-events: none keeps taps working. */
+      z-index: 1001;
+      pointer-events: none;
+    }
+  }
+}
+
 /* iPadOS reports pointer: coarse even with a trackpad attached, so selection suppression
    must not be limited to phone widths. */
 @media (pointer: coarse) {
@@ -1180,6 +1210,21 @@ body,
     min-height: 44px !important;
     height: auto !important;
     flex-wrap: wrap !important;
+    /* iOS/iPadOS 26 WebKit samples background-color/backdrop-filter on fixed elements
+       near the viewport edges to synthesize a native Liquid Glass blur over the status
+       bar. Keep the fixed container transparent and paint the surface on a pseudo
+       element instead; the sampler ignores pseudo-elements and absolute children. */
+    background-color: transparent !important;
+  }
+
+  .mobile-sticky-header::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    /* Matches the bg-sidebar utility that these headers use outside this media query. */
+    background-color: var(--color-sidebar);
   }
 
   /* Add padding to content below fixed header so it's not hidden underneath.
@@ -1236,6 +1281,23 @@ body,
     padding-top: env(safe-area-inset-top, 0px) !important;
     padding-bottom: env(safe-area-inset-bottom, 0px) !important;
     padding-left: env(safe-area-inset-left, 0px) !important;
+
+    /* The collapsed drawer stays mounted (translateX(-100%) preserves the slide
+       transition), so iOS/iPadOS 26 WebKit still samples its background-color to
+       synthesize a Liquid Glass blur over the status bar. Keep the fixed container
+       transparent and paint the surface on a pseudo-element, which the sampler
+       ignores (same pattern as .mobile-sticky-header). */
+    background-color: transparent !important;
+  }
+
+  .mobile-sidebar::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    /* Matches the bg-sidebar utility on the sidebar container. */
+    background-color: var(--color-sidebar);
   }
 
   .mobile-sidebar-collapsed {

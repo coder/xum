@@ -2,8 +2,9 @@
  * Tool Bridge for PTC
  *
  * Bridges Xum tools into the QuickJS sandbox, making them callable via `xum.*`
- * (canonical) and `mux.*` (compatibility alias). Handles argument validation via
- * Zod schemas and result serialization.
+ * (canonical) and `mux.*` (compatibility alias). Handles argument validation
+ * (Zod-schema tools validate host-side; JSON-Schema-based tools such as MCP
+ * pass through to server-side validation) and result serialization.
  */
 
 import { randomUUID } from "node:crypto";
@@ -13,6 +14,7 @@ import type { IJSRuntime } from "./runtime";
 import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import { KERNEL_COMPACT_ARGS_CAP_BYTES } from "@/constants/kernelOutput";
 import { RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES } from "@/constants/resultHandles";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import {
   FULL_GRANTS,
   isBridgeToolGranted,
@@ -41,6 +43,12 @@ export const MEDIA_BUDGET_EXCEEDED_STUB =
 
 export const MEDIA_DATA_STUB =
   "[base64 omitted: media is delivered to the model as an attachment on this code_execution result]";
+
+/**
+ * Result shape of an AI SDK Schema's optional custom validator
+ * (provider-utils ValidationResult, which the 'ai' package does not re-export).
+ */
+type SchemaValidationResult = { success: true; value: unknown } | { success: false; error: Error };
 
 /**
  * RLM kernel extras for register(): host bindings that only exist on
@@ -283,8 +291,15 @@ export class ToolBridge {
           throw new Error("Execution aborted");
         }
 
-        // Validate args against tool's Zod schema
-        const validatedArgs = this.validateArgs(toolName, boundTool, args);
+        // Validate args against the tool's schema (Zod or AI SDK wrapper)
+        const validatedArgs = await this.validateArgs(toolName, boundTool, args, abortSignal);
+
+        // validateArgs races the validator against the abort signal; this
+        // recheck covers an abort that lands after validation settles but
+        // before execute (mirrors the post-await recheck in mux.load).
+        if (abortSignal?.aborted) {
+          throw new Error("Execution aborted");
+        }
 
         // Execute tool with full options (toolCallId and messages are required by type
         // but not used by most tools - generate synthetic values for sandbox context)
@@ -339,10 +354,17 @@ export class ToolBridge {
           throw new Error("Execution aborted");
         }
         const baseArgs = typeof args === "object" && args !== null ? args : {};
-        const validatedArgs = this.validateArgs("task", taskTool, {
-          ...baseArgs,
-          run_in_background: true,
-        });
+        const validatedArgs = await this.validateArgs(
+          "task",
+          taskTool,
+          { ...baseArgs, run_in_background: true },
+          abortSignal
+        );
+        // Same post-validation recheck as regular bridged tools: an abort that
+        // lands after validation settles must not spawn the child.
+        if (abortSignal?.aborted) {
+          throw new Error("Execution aborted");
+        }
         const result: unknown = await taskTool.execute!(validatedArgs, {
           abortSignal,
           toolCallId: syntheticToolCallId("task_spawn"),
@@ -479,18 +501,65 @@ export class ToolBridge {
     return typeof tool.execute === "function";
   }
 
-  private validateArgs(toolName: string, tool: Tool, args: unknown): unknown {
-    // Access the tool's Zod schema - AI SDK tools use 'inputSchema', some use 'parameters'
-    const toolRecord = tool as { inputSchema?: z.ZodType; parameters?: z.ZodType };
+  private async validateArgs(
+    toolName: string,
+    tool: Tool,
+    args: unknown,
+    abortSignal?: AbortSignal
+  ): Promise<unknown> {
+    // AI SDK tools carry their schema on 'inputSchema'; some legacy tools use 'parameters'.
+    const toolRecord = tool as { inputSchema?: unknown; parameters?: unknown };
     const schema = toolRecord.inputSchema ?? toolRecord.parameters;
-    if (!schema) return args;
+    if (schema == null) return args;
 
-    const result = schema.safeParse(args);
-    if (!result.success) {
-      const issues = result.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
-      throw new Error(`Invalid arguments for ${toolName}: ${issues}`);
+    // Built-in tools carry Zod schemas and are validated here for early,
+    // readable errors. Zod detection mirrors
+    // typeGenerator.getInputJsonSchema's "_def" check.
+    if (typeof schema === "object" && "_def" in schema) {
+      const result = (schema as z.ZodType).safeParse(args);
+      if (!result.success) {
+        const issues = result.error.issues
+          .map((i) => `${i.path.join(".")}: ${i.message}`)
+          .join("; ");
+        throw new Error(`Invalid arguments for ${toolName}: ${issues}`);
+      }
+      return result.data;
     }
-    return result.data;
+
+    // Non-Zod tools carry the AI SDK's jsonSchema() wrapper
+    // ({ jsonSchema: <raw JSON Schema>, validate? }), which has no safeParse.
+    // A wrapper-provided validator must be honored exactly like the direct
+    // (non-kernel) call path does: it may reject invalid input or return a
+    // normalized value, and may be async (ValidationResult | PromiseLike).
+    const validate = (schema as { validate?: unknown }).validate;
+    if (typeof validate === "function") {
+      const validation = Promise.resolve(
+        (
+          validate as (
+            value: unknown
+          ) => SchemaValidationResult | PromiseLike<SchemaValidationResult>
+        )(args)
+      );
+      // Race the validator against the runtime abort signal: QuickJS eval
+      // aborts only settle suspended asyncified host calls, so a validator
+      // that never settles would otherwise block this await forever and keep
+      // a persistent kernel locked past timeouts and interrupts.
+      const raced = await raceWithAbortAndTimeout(validation, { signal: abortSignal });
+      if (raced.kind !== "ok") {
+        throw new Error("Execution aborted");
+      }
+      const result = raced.value;
+      if (!result.success) {
+        const message = result.error instanceof Error ? result.error.message : String(result.error);
+        throw new Error(`Invalid arguments for ${toolName}: ${message}`);
+      }
+      return result.value;
+    }
+
+    // Validator-less JSON Schema (e.g. MCP tools): pass through untouched,
+    // matching the direct call path; the MCP server validates (and
+    // mcpServerManager sanitizes) on its side.
+    return args;
   }
 
   private serializeResult(result: unknown): unknown {

@@ -726,6 +726,10 @@ const WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE =
 // idle-compaction loop must not count it toward suppression.
 const IDLE_ONLY_BUSY_SKIP_MESSAGE = "Workspace is busy; idle-only send was skipped.";
 
+/** Returned when a caller-supplied admission probe (internal.admissionStale) flips mid-send. */
+const SEND_ADMISSION_STALE_MESSAGE =
+  "Send refused: the target was stopped or interrupted while the message was being admitted.";
+
 const BASH_MONITOR_WAKE_QUEUE_KEY_PREFIX = "bash-monitor-wake:";
 const BASH_MONITOR_CANCELED_QUEUE_REASON =
   "Background bash monitor was explicitly canceled before its wake dispatched.";
@@ -4316,6 +4320,13 @@ export class WorkspaceService extends EventEmitter {
     const trimmed = workspaceId.trim();
     assert(trimmed.length > 0, "emitChatEvent requires workspaceId");
     this.sessions.get(trimmed)?.emitChatEvent(message);
+  }
+
+  /** Queued agent peer messages behind a busy workspace; sessions are lazy, so no session ⇒ 0. */
+  public countQueuedAgentPeerMessages(workspaceId: string): number {
+    const trimmed = workspaceId.trim();
+    assert(trimmed.length > 0, "countQueuedAgentPeerMessages requires workspaceId");
+    return this.sessions.get(trimmed)?.countQueuedAgentPeerMessages() ?? 0;
   }
 
   public disposeSession(workspaceId: string): void {
@@ -10561,6 +10572,14 @@ export class WorkspaceService extends EventEmitter {
       /** Cancels a synthetic send even after it has left MessageQueue for PREPARING. */
       cancelSignal?: AbortSignal;
       /**
+       * Synchronous staleness probe from the caller, re-evaluated at the real admission points
+       * (the enqueue block and the session's turn-admission gates) in addition to the
+       * context-mutation epoch. Peer agent sends use it so a user Stop or task_stop landing
+       * during this method's awaits refuses the send instead of queueing a wake or resurrecting
+       * the stopped task via markInterruptedTaskRunning.
+       */
+      admissionStale?: () => boolean;
+      /**
        * Synthetic assistant rows persisted just before the turn's user row
        * (family-message payloads). Delivered atomically with the message —
        * queued alongside it when the workspace is busy — so they never land
@@ -10744,21 +10763,38 @@ export class WorkspaceService extends EventEmitter {
         sendOptions: SendMessageOptions & { fileParts?: FilePart[] }
       ): SendMessageOptions & { fileParts?: FilePart[] } => {
         const withoutCorrelation = { ...sendOptions };
-        delete withoutCorrelation.muxMetadata;
+        // A peer-message trigger keeps its machine-notification identity even when its
+        // delegated-turn correlation is superseded: downgrade to plain peer attribution
+        // instead of deleting the metadata wholesale, or the fixed backend trigger would
+        // render as a human prompt and re-enter prompt navigation.
+        const typedMuxMetadata = sendOptions.muxMetadata as MuxMessageMetadata | undefined;
+        const peerTrigger =
+          typedMuxMetadata?.type === "workspace-turn-task"
+            ? typedMuxMetadata.agentPeerMessageTrigger
+            : undefined;
+        if (peerTrigger != null) {
+          withoutCorrelation.muxMetadata = { type: "agent-peer-message", ...peerTrigger };
+        } else {
+          delete withoutCorrelation.muxMetadata;
+        }
         return withoutCorrelation;
       };
       const getContinuationSendState = () => {
         const preserveCorrelation =
           !isWorkspaceTurnContinuation ||
           !session.hasQueuedOrDispatchingEntry(workspaceTurnContinuationMetadata);
+        // Dropping callbacks on a superseded correlation protects the delegated-turn OWNER
+        // (its onCanceled settles the owner's handle, which the superseded entry no longer
+        // represents) — but a peer trigger's onCanceled is the sender's budget refund, tied to
+        // this entry rather than the foreign handle, so it survives the downgrade.
+        const isPeerTrigger = workspaceTurnContinuationMetadata?.agentPeerMessageTrigger != null;
         return {
           options: preserveCorrelation
             ? normalizedOptions
             : stripWorkspaceTurnCorrelation(normalizedOptions),
-          onCanceled: preserveCorrelation ? internal?.onCanceled : undefined,
-          onAcceptedPreStreamFailure: preserveCorrelation
-            ? internal?.onAcceptedPreStreamFailure
-            : undefined,
+          onCanceled: preserveCorrelation || isPeerTrigger ? internal?.onCanceled : undefined,
+          onAcceptedPreStreamFailure:
+            preserveCorrelation || isPeerTrigger ? internal?.onAcceptedPreStreamFailure : undefined,
         };
       };
 
@@ -10785,6 +10821,7 @@ export class WorkspaceService extends EventEmitter {
             startStreamInBackground: internal?.startStreamInBackground,
             goalContinuation: internal?.goalContinuation,
             admissionEpochStale,
+            admissionStale: internal?.admissionStale,
           });
         }
         return Err(pricingGate.error);
@@ -10796,6 +10833,11 @@ export class WorkspaceService extends EventEmitter {
       const shouldQueue = !normalizedOptions?.editMessageId && session.isBusy();
 
       if (shouldQueue) {
+        // Everything from here to queueMessage is synchronous, so a probe pass here cannot go
+        // stale before the entry is enqueued.
+        if (internal?.admissionStale?.() === true) {
+          return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
+        }
         const taskStatus = this.taskService?.getAgentTaskStatus?.(workspaceId);
         if (taskStatus === "interrupted") {
           return Err({
@@ -10881,6 +10923,10 @@ export class WorkspaceService extends EventEmitter {
             onAcceptedPreStreamFailure: continuationSendState.onAcceptedPreStreamFailure,
             preTurnMessages: internal?.preTurnMessages,
             onPreTurnRowsPersisted: internal?.onPreTurnRowsPersisted,
+            // Thread the probe onto the queued entry: a Stop landing after dequeue is
+            // invisible to queue clearing, so the session's turn-admission gates must
+            // re-check it at dispatch.
+            admissionStale: internal?.admissionStale,
           }
         );
 
@@ -10908,17 +10954,32 @@ export class WorkspaceService extends EventEmitter {
         this.taskService?.resetAutoResumeCount(workspaceId);
       }
 
+      // A stale caller probe must refuse BEFORE the interrupted-task rescue below: a peer send
+      // racing task_stop would otherwise flip the freshly stopped task back to running and start
+      // the very turn the stop was meant to prevent.
+      if (internal?.admissionStale?.() === true) {
+        return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
+      }
+
       // Non-destructive interrupt cascades preserve descendant task workspaces with
       // taskStatus=interrupted. Transition before starting a new stream so TaskService
       // stream-end handling does not early-return on interrupted status.
-      try {
-        resumedInterruptedTask =
-          (await this.taskService?.markInterruptedTaskRunning?.(workspaceId)) ?? false;
-      } catch (error: unknown) {
-        log.error("Failed to restore interrupted task status before sendMessage", {
-          workspaceId,
-          error,
-        });
+      //
+      // Guarded sends (peer messages) skip this rescue entirely: it exists for user-driven
+      // resumes, and a task_stop persisting `interrupted` between the probe pass above and the
+      // config read inside markInterruptedTaskRunning would otherwise be flipped straight back
+      // to running — after which every later probe sees an active status and admits the very
+      // turn the stop was meant to prevent.
+      if (internal?.admissionStale == null) {
+        try {
+          resumedInterruptedTask =
+            (await this.taskService?.markInterruptedTaskRunning?.(workspaceId)) ?? false;
+        } catch (error: unknown) {
+          log.error("Failed to restore interrupted task status before sendMessage", {
+            workspaceId,
+            error,
+          });
+        }
       }
 
       const continuationSendState = getContinuationSendState();
@@ -10964,6 +11025,7 @@ export class WorkspaceService extends EventEmitter {
         preTurnMessages: internal?.preTurnMessages,
         onPreTurnRowsPersisted: internal?.onPreTurnRowsPersisted,
         admissionEpochStale,
+        admissionStale: internal?.admissionStale,
       });
       if (!result.success) {
         log.error("sendMessage handler: session returned error", {
@@ -11302,12 +11364,22 @@ export class WorkspaceService extends EventEmitter {
     workspaceId: string,
     options?: { soft?: boolean; abandonPartial?: boolean; sendQueuedImmediately?: boolean }
   ): Promise<Result<void>> {
+    let releaseHardStopLatch: (() => void) | undefined;
     try {
       this.taskService?.resetAutoResumeCount(workspaceId);
       if (!options?.soft) {
         // Mark before attempting the session interrupt to close races where a child
         // could report between stop initiation and descendant cascade termination.
         this.taskService?.markParentWorkspaceInterrupted(workspaceId);
+        // Latch synchronously at the request boundary, BEFORE the session-interrupt await
+        // below: the suppression mark above is level-triggered (a user resume clears it), so
+        // a peer send from a still-running descendant entering during that await — or during
+        // the cascade's own mutex acquisition — would otherwise capture the already-bumped
+        // ancestor epoch as its clean baseline and wake workspaces outside the stopped
+        // subtree. Released in the finally, after the descendant cascade persisted terminal
+        // statuses.
+        // Optional call: test harnesses mock TaskService with a narrow method surface.
+        releaseHardStopLatch = this.taskService?.latchHardInterruptCascade?.(workspaceId);
       }
 
       const session = this.getOrCreateSession(workspaceId);
@@ -11370,6 +11442,8 @@ export class WorkspaceService extends EventEmitter {
       const errorMessage = getErrorMessage(error);
       log.error("Unexpected error in interruptStream handler:", error);
       return Err(`Failed to interrupt stream: ${errorMessage}`);
+    } finally {
+      releaseHardStopLatch?.();
     }
   }
 

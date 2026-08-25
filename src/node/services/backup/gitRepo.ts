@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { listBackupManagedPathSpellings } from "@/common/compat/legacyMux";
 import { execFileAsync, type ExecFileAsyncOptions } from "@/node/utils/disposableExec";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import {
@@ -14,7 +15,9 @@ import {
 } from "./credentials";
 import {
   assertBackupPathComplexity,
+  BACKUP_MANIFEST_FILE,
   BackupInvalidPayloadError,
+  isParseableBackupManifest,
   MAX_BACKUP_FILE_BYTES,
   MAX_BACKUP_FILE_COUNT,
   MAX_BACKUP_TOTAL_BYTES,
@@ -155,7 +158,10 @@ export interface BackupRepoCacheOptions extends Omit<GitCredentialOptions, "repo
   repoUrl: string;
   branch: string;
   cacheRoot: string;
-  /** Scopes the sparse checkout, so nothing outside it is ever materialized. */
+  /**
+   * Scopes the sparse checkout, so nothing outside it is ever materialized. materialize()
+   * may swap in the legacy `mux` spelling of this path; see `effectiveManagedPath`.
+   */
   managedPath: string;
   materializationLimits?: {
     maxFileBytes?: number;
@@ -208,6 +214,9 @@ interface ManagedBlobEntry {
 }
 
 const BLOB_PREFETCH_BATCH_SIZE = 16;
+
+/** One non-recursive ls-tree record for a bounded-length path; anything larger is hostile. */
+const MANIFEST_LOOKUP_MAX_OUTPUT_BYTES = 16384;
 
 export interface RemoteRefs {
   credential: BackupCredential;
@@ -675,6 +684,7 @@ export class BackupRepoCache {
   private readonly maxCacheObjectKib: number;
   private baseRemoteCommit: string | null | undefined;
   private usedCredential: BackupCredential | undefined;
+  private selectedManagedPath: string | undefined;
 
   constructor(private readonly options: BackupRepoCacheOptions) {
     this.cachePath = backupCachePath(options.cacheRoot, options.repoUrl, options.branch);
@@ -705,6 +715,16 @@ export class BackupRepoCache {
 
   get credential(): BackupCredential | undefined {
     return this.usedCredential;
+  }
+
+  /**
+   * The managed path this cache actually uses, resolved by materialize(). It is the
+   * configured spelling unless that tree has no backup manifest while the legacy `mux`
+   * spelling from before the product rename does — then reads and writes both follow the
+   * legacy spelling, so a pre-rename backup keeps working and pushes update it in place.
+   */
+  get effectiveManagedPath(): string {
+    return this.selectedManagedPath ?? this.options.managedPath;
   }
 
   private credentialOptions(): GitCredentialOptions {
@@ -1033,19 +1053,110 @@ export class BackupRepoCache {
     }
   }
 
-  private async listManagedBlobs(remoteCommit: string): Promise<ManagedBlobEntry[]> {
+  /**
+   * The one managed path this cache materializes, reads, and writes: the configured
+   * spelling, unless it holds no backup manifest at the fetched commit while a legacy
+   * spelling (`mux/`, from before the product rename) does. Selecting a single tree keeps
+   * every unselected spelling out of validation, the sparse checkout, and staging, so a
+   * broken or oversized tree under the other spelling can never block the backup that is
+   * actually in use, and pushes update the backup where it lives instead of forking it.
+   */
+  private async resolveEffectiveManagedPath(remoteCommit: string | null): Promise<string> {
+    const [configured, ...legacySpellings] = listBackupManagedPathSpellings(
+      this.options.managedPath
+    );
+    if (remoteCommit === null || legacySpellings.length === 0) return configured;
+    if (await this.treeHasReadableBackupManifest(remoteCommit, safeRelativePath(configured))) {
+      return configured;
+    }
+    for (const legacy of legacySpellings) {
+      if (await this.treeHasReadableBackupManifest(remoteCommit, safeRelativePath(legacy))) {
+        return legacy;
+      }
+    }
+    return configured;
+  }
+
+  /**
+   * True only when `<readPath>/manifest.json` is a blob at the given commit that parses as
+   * a backup manifest. Deliberately non-recursive: a directory spelled like the manifest is
+   * then a single `tree` record the type check rejects, rather than an unbounded listing of
+   * its descendants. Parsing matters because `manifest.json` is a generic filename: an
+   * unrelated or corrupt file under the configured spelling must not win the selection over
+   * a valid legacy backup that would then never be consulted.
+   */
+  private async treeHasReadableBackupManifest(
+    remoteCommit: string,
+    readPath: string
+  ): Promise<boolean> {
+    const { stdout } = await this.localGit(
+      ["ls-tree", "-z", remoteCommit, "--", `:(top,literal)${readPath}/${BACKUP_MANIFEST_FILE}`],
+      { env: { GIT_NO_LAZY_FETCH: "1" }, maxOutputBytes: MANIFEST_LOOKUP_MAX_OUTPUT_BYTES }
+    );
+    const record = stdout.split("\0")[0] ?? "";
+    const separator = record.indexOf("\t");
+    if (separator < 0) return false;
+    const [, objectType, objectId] = record.slice(0, separator).trim().split(/\s+/);
+    if (objectType !== "blob" || objectId === undefined || !/^[0-9a-f]{40,64}$/.test(objectId)) {
+      return false;
+    }
+    const manifest = await this.readProbedBlob(objectId);
+    return manifest !== null && isParseableBackupManifest(manifest);
+  }
+
+  /**
+   * Reads a probed blob's bytes, fetching it once through the credential ladder when the
+   * blob-filtered clone has only promised it. Returns null for a blob that still cannot be
+   * read afterwards, so the probe treats it as "not a usable manifest" rather than failing
+   * the whole preparation. Capped at the per-file payload limit before parsing: a manifest
+   * the restore path could never read must not be buffered whole in the main process, and
+   * the streaming cap kills the read as soon as it passes the limit.
+   */
+  private async readProbedBlob(objectId: string): Promise<string | null> {
+    const read = () =>
+      this.localGit(["cat-file", "blob", objectId], {
+        env: { GIT_NO_LAZY_FETCH: "1" },
+        maxOutputBytes: MAX_BACKUP_FILE_BYTES,
+      });
+    const isOverLimit = (error: unknown) =>
+      error instanceof Error &&
+      error.message === `Command produced more than ${MAX_BACKUP_FILE_BYTES} bytes of output`;
+    try {
+      return (await read()).stdout;
+    } catch (error) {
+      // Over-limit is definitive: the blob exists locally and is too large, so fetching
+      // it again could only re-buffer the same oversized bytes.
+      if (isOverLimit(error)) return null;
+      // Otherwise the blob is missing from the partial clone; fetch exactly it, like the
+      // pre-checkout size validation does for payload blobs.
+      await this.networkGit([
+        "-C",
+        this.cachePath,
+        "fetch",
+        "--refetch",
+        "--no-tags",
+        "--no-write-fetch-head",
+        ...localUploadPackArgs(this.repoUrl),
+        "origin",
+        objectId,
+      ]);
+      await this.assertObjectStoreWithinBudget();
+    }
+    try {
+      return (await read()).stdout;
+    } catch {
+      return null;
+    }
+  }
+
+  private async listManagedBlobs(
+    remoteCommit: string,
+    managedPath: string
+  ): Promise<ManagedBlobEntry[]> {
     let stdout: string;
     try {
       ({ stdout } = await this.localGit(
-        [
-          "ls-tree",
-          "-r",
-          "-l",
-          "-z",
-          remoteCommit,
-          "--",
-          `:(top,literal)${safeRelativePath(this.options.managedPath)}`,
-        ],
+        ["ls-tree", "-r", "-l", "-z", remoteCommit, "--", `:(top,literal)${managedPath}`],
         {
           env: { GIT_NO_LAZY_FETCH: "1" },
           maxOutputBytes: MAX_BACKUP_TOTAL_BYTES,
@@ -1124,15 +1235,18 @@ export class BackupRepoCache {
     return nextUsedBytes;
   }
 
-  private async validateManagedTreeBeforeCheckout(remoteCommit: string): Promise<void> {
-    const entries = await this.listManagedBlobs(remoteCommit);
+  private async validateManagedTreeBeforeCheckout(
+    remoteCommit: string,
+    managedPath: string
+  ): Promise<void> {
+    const entries = await this.listManagedBlobs(remoteCommit, managedPath);
     if (entries.length > this.materializationLimits.maxFileCount) {
       throw new BackupInvalidPayloadError(
         new Error(`Backup has more than ${this.materializationLimits.maxFileCount} files`)
       );
     }
 
-    const managedPrefix = `${safeRelativePath(this.options.managedPath)}/`;
+    const managedPrefix = `${managedPath}/`;
     try {
       const payloadPaths = entries.map((entry) => {
         if (!entry.path.startsWith(managedPrefix)) {
@@ -1175,7 +1289,7 @@ export class BackupRepoCache {
 
       const fetchedSizes = new Map<string, number>();
       const fetchedObjectIds = new Set(objectIds);
-      for (const entry of await this.listManagedBlobs(remoteCommit)) {
+      for (const entry of await this.listManagedBlobs(remoteCommit, managedPath)) {
         if (entry.size !== null && fetchedObjectIds.has(entry.objectId)) {
           fetchedSizes.set(entry.objectId, entry.size);
         }
@@ -1208,19 +1322,23 @@ export class BackupRepoCache {
    * and the checkout that follows is what applies it. Pre-checkout size validation fetches any
    * missing managed blobs through the credential ladder.
    */
-  private async applySparseCheckout(): Promise<void> {
+  private async applySparseCheckout(managedPath: string): Promise<void> {
     await writeOwnedGitInfoFile(
       this.cachePath,
       "sparse-checkout",
-      `/${escapeSparsePattern(safeRelativePath(this.options.managedPath))}/*\n`
+      `/${escapeSparsePattern(managedPath)}/*\n`
     );
   }
 
   async resetHardToRemote(): Promise<string | null> {
-    await this.applySparseCheckout();
+    // The managed path selection depends on the fetched commit's tree, so resolve it
+    // before the sparse pattern is written and the checkout materializes anything.
     const remoteCommit = await this.remoteBranchCommit();
+    this.selectedManagedPath = await this.resolveEffectiveManagedPath(remoteCommit);
+    const managedPath = safeRelativePath(this.selectedManagedPath);
+    await this.applySparseCheckout(managedPath);
     if (remoteCommit) {
-      await this.validateManagedTreeBeforeCheckout(remoteCommit);
+      await this.validateManagedTreeBeforeCheckout(remoteCommit, managedPath);
       // -f because a previous preview leaves modified tracked files in this cache. Without
       // it the checkout keeps them and the next preview reads the local export as if it
       // were the remote's backup.
@@ -1300,7 +1418,7 @@ export class BackupRepoCache {
   }
 
   async stageAndCommit(message: string): Promise<string | null> {
-    const target = safeRelativePath(this.options.managedPath);
+    const target = safeRelativePath(this.effectiveManagedPath);
     // -f because the target may be a dotfiles repo whose ignore rules match payload
     // names. Skipping one file would push a manifest that references missing content.
     await this.localGit(["add", "-A", "-f", "--", target]);
@@ -1365,7 +1483,7 @@ export class BackupRepoCache {
         "-z",
         "--untracked-files=all",
         "--",
-        safeRelativePath(this.options.managedPath),
+        safeRelativePath(this.effectiveManagedPath),
       ])
     ).stdout;
   }

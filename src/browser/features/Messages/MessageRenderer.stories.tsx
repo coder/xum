@@ -9,6 +9,7 @@ import {
 import { collapseLeftSidebar } from "@/browser/stories/helpers/uiState";
 import { userEvent, waitFor, within } from "@storybook/test";
 import {
+  createAgentPeerMessage,
   createAssistantMessage,
   createBashMonitorWakeMessage,
   createGoalBudgetLimitMessage,
@@ -794,6 +795,83 @@ export const BashMonitorWakeMessages: AppStory = {
     await waitFor(() => {
       if (canvas.queryByText(/failed to load tailwind config/) == null) {
         throw new Error("Expected expanded wake card to reveal the matched output");
+      }
+    });
+  },
+};
+
+/** Intra-tree agent peer messages: sibling row stays collapsed, ancestor-bound row expanded. */
+export const AgentPeerMessages: AppStory = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    pixel: {
+      matrix: { themes: ["dark", "light"], viewports: ["phone", "laptop"] },
+    },
+  },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        collapseLeftSidebar();
+        return setupSimpleChatStory({
+          workspaceId: "ws-agent-peer-messages",
+          messages: [
+            createUserMessage("msg-1", "Coordinate the migration with the other agents.", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 300000,
+            }),
+            createAgentPeerMessage("msg-2", {
+              historySequence: 2,
+              timestamp: STABLE_TIMESTAMP - 200000,
+              fromWorkspaceId: "task-schema-migrator",
+              fromTitle: "Schema Migrator",
+              relationship: "sibling",
+              message:
+                "Heads up: I renamed the `sessions` table to `workspace_sessions`. Update your queries before landing.",
+            }),
+            createAssistantMessage("msg-3", "Acknowledged — updating my queries now.", {
+              historySequence: 3,
+              timestamp: STABLE_TIMESTAMP - 150000,
+            }),
+            createAgentPeerMessage("msg-4", {
+              historySequence: 4,
+              timestamp: STABLE_TIMESTAMP - 60000,
+              fromWorkspaceId: "task-test-runner",
+              relationship: "descendant",
+              message: "Integration suite is green after the rename.\n\n- 412 passed\n- 0 failed",
+            }),
+          ],
+        });
+      }}
+    />
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const toggles = await waitFor(
+      () => {
+        const found = canvas.getAllByRole("button", { name: /show message/i });
+        if (found.length !== 2) {
+          throw new Error(`Expected 2 collapsed peer messages, found ${found.length}`);
+        }
+        return found;
+      },
+      { timeout: 15_000 }
+    );
+
+    // Sender attribution and relationship badges must be visible while collapsed.
+    if (canvas.queryByText(/Message from Schema Migrator/) == null) {
+      throw new Error("Expected titled peer message header");
+    }
+    if (canvas.queryByText(/Message from task-test-runner/) == null) {
+      throw new Error("Expected untitled peer message to fall back to the sender id");
+    }
+
+    // Expand the second (descendant) message; the sibling message stays collapsed.
+    await userEvent.click(toggles[1]);
+    await waitFor(() => {
+      if (canvas.queryByText(/412 passed/) == null) {
+        throw new Error("Expected expanded peer message to reveal the markdown body");
       }
     });
   },

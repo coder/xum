@@ -10,7 +10,7 @@ import {
   MEDIA_DATA_STUB,
   type KernelBridgeOptions,
 } from "./toolBridge";
-import type { Tool } from "ai";
+import { jsonSchema, type Tool } from "ai";
 import type { IJSRuntime, RuntimeLimits } from "./runtime";
 import type { PTCEvent, PTCExecutionResult } from "./types";
 import { z } from "zod";
@@ -220,6 +220,191 @@ describe("ToolBridge", () => {
       // Call with valid args - should succeed
       await fileRead({ filePath: "test.txt" });
       expect(mockExecute).toHaveBeenCalledTimes(1);
+    });
+
+    it("passes args through for JSON-Schema (MCP-style) tools", async () => {
+      // MCP tools carry the AI SDK's jsonSchema() wrapper instead of a Zod
+      // schema. Regression: validateArgs called schema.safeParse on it and
+      // every kernel-bridged MCP call died with a TypeError.
+      const mockExecute = mock((args: unknown) => ({ echoed: args }));
+      const tools: Record<string, Tool> = {
+        mcp_search: {
+          description: "MCP-style tool",
+          inputSchema: jsonSchema<{ query?: string }>({
+            type: "object",
+            properties: { query: { type: "string" } },
+          }),
+          execute: (args) => Promise.resolve(mockExecute(args)),
+        },
+      };
+
+      const bridge = new ToolBridge(tools);
+
+      let registeredMux: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+      const mockRegisterObject = mock(
+        (name: string, obj: Record<string, (...args: unknown[]) => Promise<unknown>>) => {
+          if (name === "mux") registeredMux = obj;
+          return undefined;
+        }
+      );
+      bridge.register(createMockRuntime({ registerObject: mockRegisterObject }));
+
+      const search = registeredMux.mcp_search as (...args: unknown[]) => Promise<unknown>;
+      const result = await search({ query: "eng" });
+
+      // Args flow through untouched — the MCP server is the validator of record.
+      expect(mockExecute).toHaveBeenCalledWith({ query: "eng" });
+      expect(result).toEqual({ echoed: { query: "eng" } });
+    });
+
+    it("honors a jsonSchema wrapper's custom validator (reject + normalize)", async () => {
+      const mockExecute = mock((args: unknown) => ({ echoed: args }));
+      const tools: Record<string, Tool> = {
+        mcp_guarded: {
+          description: "JSON-Schema tool with a wrapper validator",
+          inputSchema: jsonSchema<{ query: string }>(
+            { type: "object", properties: { query: { type: "string" } } },
+            {
+              // Async on purpose: covers the awaited PromiseLike path. Rejects
+              // invalid input and normalizes valid input, like direct AI SDK
+              // calls that honor Schema.validate.
+              validate: (value) => {
+                const query = (value as { query?: unknown }).query;
+                return Promise.resolve(
+                  typeof query === "string"
+                    ? { success: true as const, value: { query: query.trim() } }
+                    : { success: false as const, error: new Error("query must be a string") }
+                );
+              },
+            }
+          ),
+          execute: (args) => Promise.resolve(mockExecute(args)),
+        },
+      };
+
+      const bridge = new ToolBridge(tools);
+
+      let registeredMux: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+      const mockRegisterObject = mock(
+        (name: string, obj: Record<string, (...args: unknown[]) => Promise<unknown>>) => {
+          if (name === "mux") registeredMux = obj;
+          return undefined;
+        }
+      );
+      bridge.register(createMockRuntime({ registerObject: mockRegisterObject }));
+
+      const guarded = registeredMux.mcp_guarded as (...args: unknown[]) => Promise<unknown>;
+
+      // Rejection surfaces as a readable bridge error and never reaches execute.
+      try {
+        await guarded({ query: 42 });
+        expect.unreachable("Should have thrown");
+      } catch (e) {
+        expect(String(e)).toContain("Invalid arguments for mcp_guarded");
+        expect(String(e)).toContain("query must be a string");
+      }
+      expect(mockExecute).not.toHaveBeenCalled();
+
+      // Valid input reaches execute with the validator's normalized value.
+      const result = await guarded({ query: "  eng  " });
+      expect(mockExecute).toHaveBeenCalledWith({ query: "eng" });
+      expect(result).toEqual({ echoed: { query: "eng" } });
+    });
+
+    it("does not execute after an abort that lands during async validation", async () => {
+      const controller = new AbortController();
+      const mockExecute = mock((_args: unknown) => ({ ok: true }));
+      const tools: Record<string, Tool> = {
+        mcp_slow: {
+          description: "JSON-Schema tool whose validator races an abort",
+          inputSchema: jsonSchema<{ q?: string }>(
+            { type: "object", properties: { q: { type: "string" } } },
+            {
+              validate: (value) => {
+                // Abort lands while validation is outstanding; validation
+                // itself still succeeds.
+                controller.abort();
+                return Promise.resolve({ success: true as const, value: value as { q?: string } });
+              },
+            }
+          ),
+          execute: (args) => Promise.resolve(mockExecute(args)),
+        },
+      };
+
+      const bridge = new ToolBridge(tools);
+
+      let registeredMux: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+      const mockRegisterObject = mock(
+        (name: string, obj: Record<string, (...args: unknown[]) => Promise<unknown>>) => {
+          if (name === "mux") registeredMux = obj;
+          return undefined;
+        }
+      );
+      bridge.register(
+        createMockRuntime({
+          registerObject: mockRegisterObject,
+          getAbortSignal: mock(() => controller.signal),
+        })
+      );
+
+      const slow = registeredMux.mcp_slow as (...args: unknown[]) => Promise<unknown>;
+      try {
+        await slow({ q: "x" });
+        expect.unreachable("Should have thrown");
+      } catch (e) {
+        expect(String(e)).toContain("Execution aborted");
+      }
+      expect(mockExecute).not.toHaveBeenCalled();
+    });
+
+    it("rejects instead of hanging when an aborted wrapper validator never settles", async () => {
+      const controller = new AbortController();
+      const mockExecute = mock((_args: unknown) => ({ ok: true }));
+      const tools: Record<string, Tool> = {
+        mcp_hang: {
+          description: "JSON-Schema tool whose validator never settles",
+          inputSchema: jsonSchema<{ q?: string }>(
+            { type: "object", properties: { q: { type: "string" } } },
+            {
+              // Hangs forever; only the abort race can settle the call.
+              validate: () => new Promise<never>(() => undefined),
+            }
+          ),
+          execute: (args) => Promise.resolve(mockExecute(args)),
+        },
+      };
+
+      const bridge = new ToolBridge(tools);
+
+      let registeredMux: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+      const mockRegisterObject = mock(
+        (name: string, obj: Record<string, (...args: unknown[]) => Promise<unknown>>) => {
+          if (name === "mux") registeredMux = obj;
+          return undefined;
+        }
+      );
+      bridge.register(
+        createMockRuntime({
+          registerObject: mockRegisterObject,
+          getAbortSignal: mock(() => controller.signal),
+        })
+      );
+
+      const hang = registeredMux.mcp_hang as (...args: unknown[]) => Promise<unknown>;
+      const pending = hang({ q: "x" });
+      // Flush pending microtasks so the call is suspended on the validator,
+      // then abort mid-validation (exercises the race's listener path rather
+      // than the already-aborted pre-check).
+      await new Promise((r) => setImmediate(r));
+      controller.abort();
+      try {
+        await pending;
+        expect.unreachable("Should have thrown");
+      } catch (e) {
+        expect(String(e)).toContain("Execution aborted");
+      }
+      expect(mockExecute).not.toHaveBeenCalled();
     });
 
     it("serializes non-JSON values", async () => {
