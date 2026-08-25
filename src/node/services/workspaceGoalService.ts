@@ -226,6 +226,20 @@ function toValidEpochMs(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
+/**
+ * Codex P2 (PRRT_kwDOPxxmWM6cNxUY): chat.jsonl metadata is unchecked JSON, so
+ * a goal-scoping ID persisted on a continuation or pause-boundary row can be
+ * any shape at runtime. A malformed non-string value must not satisfy a
+ * `!== currentGoalId` mismatch test (it is not evidence the row belongs to a
+ * DIFFERENT goal) — skipping a pause boundary on corrupt data would let the
+ * scan reach an older continuation row and reactivate a durably paused goal
+ * after restart. Invalid values degrade to `null`, i.e. legacy unscoped
+ * semantics.
+ */
+function toValidGoalId(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
 interface ChatTailGoalModeResult {
   mode: "active" | "paused" | null;
   /**
@@ -709,7 +723,9 @@ export class WorkspaceGoalService {
         // continuation row and silently reactivate B. Rows scoped to a
         // different goal are invisible here, mirroring the boundary skip;
         // legacy rows without a goalId keep the old any-goal semantics.
-        const rowGoalId = message.metadata.goalId;
+        // Validated before comparison: a malformed ID is not a different goal
+        // (see toValidGoalId).
+        const rowGoalId = toValidGoalId(message.metadata.goalId);
         if (currentGoalId != null && rowGoalId != null && rowGoalId !== currentGoalId) {
           crossedOtherGoalHistory = true;
           continue;
@@ -720,7 +736,10 @@ export class WorkspaceGoalService {
         return { mode: "active" };
       }
       if (message.metadata?.muxMetadata?.type === "goal-pause-boundary") {
-        const boundaryGoalId = message.metadata.muxMetadata.goalId;
+        // Validated before comparison: a malformed ID must degrade to the
+        // legacy unscoped branch below (conservative paused, unscoped), not
+        // count as another goal's boundary (see toValidGoalId).
+        const boundaryGoalId = toValidGoalId(message.metadata.muxMetadata.goalId);
         if (currentGoalId != null && boundaryGoalId != null && boundaryGoalId !== currentGoalId) {
           crossedOtherGoalHistory = true;
           // Codex P2 (PRRT_kwDOPxxmWM6cEl4F, PRRT_kwDOPxxmWM6cGSPK): a stale

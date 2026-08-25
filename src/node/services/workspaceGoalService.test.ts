@@ -2958,6 +2958,46 @@ describe("WorkspaceGoalService", () => {
     });
   });
 
+  test("a malformed boundary goalId does not unpause the goal it belongs to", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cNxUY): chat.jsonl metadata is unchecked
+    // JSON — a corrupt non-string goalId on a pause boundary must not satisfy
+    // the mismatch test (it is not another goal's boundary). Skipping it
+    // would let the scan reach the goal's own older continuation row and
+    // reactivate a durably paused goal. Invalid IDs degrade to legacy
+    // unscoped semantics: conservative paused, not scoped.
+    const created = await setGoalOk(service, { workspaceId, objective: "Corrupt boundary" });
+    await appendUserHistoryMessage(historyService, workspaceId, "Continue working on the goal.", {
+      timestamp: Date.now(),
+      synthetic: true,
+      kind: "goal_continuation",
+      goalId: created.goalId,
+    });
+    const corruptBoundary = createMuxMessage(
+      `goal-paused-corrupt-${crypto.randomUUID()}`,
+      "user",
+      "Goal paused by the user. Do not continue the goal until a later goal continuation message.",
+      {
+        timestamp: Date.now(),
+        synthetic: true,
+        muxMetadata: { type: "goal-pause-boundary", goalId: 42 as unknown as string },
+      }
+    );
+    expect((await historyService.appendToHistory(workspaceId, corruptBoundary)).success).toBe(true);
+    // Durable pause written directly (no boundary append, no in-memory pause
+    // bookkeeping) — models the post-restart state where only the persisted
+    // artifacts remain.
+    await (
+      service as unknown as { writeGoal: (id: string, goal: GoalRecordV1) => Promise<void> }
+    ).writeGoal(workspaceId, { ...created, status: "paused", updatedAtMs: Date.now() });
+
+    // Reconciliation must not treat the corrupt boundary as another goal's
+    // row and reactivate off the continuation row beneath it.
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: created.goalId,
+      status: "paused",
+    });
+  });
+
   test("continuation rows for a replaced goal do not reconcile the newer goal to active", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cH3kV): goal A fired a continuation and was
     // paused, then replaced with goal B which the user pauses. When B's pause
