@@ -3009,7 +3009,20 @@ export class WorkspaceGoalService {
 
   async applyPendingAfterStreamEnd(workspaceId: string): Promise<GoalRecordV1 | null> {
     this.liveGoalPreviewSnapshots.delete(workspaceId);
-    const pending = this.pendingGoalMutations.get(workspaceId);
+    let pending = this.pendingGoalMutations.get(workspaceId);
+    if (pending) {
+      // Codex P2 (PRRT_kwDOPxxmWM6b_KgE): a queued setGoal may be holding the
+      // goal file lock mid-publication; its post-publication re-stamp replaces
+      // this mutation object with one carrying the finalized publication
+      // createdAtMs. Taking the mutation here without the locked handoff would
+      // drain the pre-publication construction stamp, and a message authored
+      // during the publication await would then be misclassified as a
+      // post-goal intervention. Wait for the lock to flush the setter, then
+      // re-read: the mutation may also have been legitimately discarded in
+      // that window (user abort / clearGoal).
+      await this.fileLocks.withLock(workspaceId, () => Promise.resolve());
+      pending = this.pendingGoalMutations.get(workspaceId);
+    }
     let drained: GoalRecordV1 | null = null;
 
     if (pending) {

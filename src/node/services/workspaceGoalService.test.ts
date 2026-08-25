@@ -2356,6 +2356,50 @@ describe("WorkspaceGoalService", () => {
     expect(await service.getGoal(workspaceId)).toBeNull();
   });
 
+  test("stream-end drain racing publication persists the publication stamp", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6b_KgE): the stream can end while the queued
+    // setter is still inside its publication await. The drain used to take the
+    // mutation synchronously — outside the goal file lock — and persist the
+    // pre-publication construction stamp, so a message authored during the
+    // publication await was misclassified as a post-goal intervention. The
+    // locked handoff must flush the setter first and drain the finalized
+    // publication stamp.
+    await extensionMetadata.setStreaming(workspaceId, true);
+    const drainPromises: Array<Promise<GoalRecordV1 | null>> = [];
+    let fireDrains = false;
+    let lastActivityReadMs = 0;
+    const originalGetSnapshot = extensionMetadata.getSnapshot.bind(extensionMetadata);
+    spyOn(extensionMetadata, "getSnapshot").mockImplementation(async (id: string) => {
+      const snapshot = await originalGetSnapshot(id);
+      if (fireDrains && drainPromises.length < 8) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        lastActivityReadMs = Date.now();
+        // Simulate the stream ending during this await: the stream-end drain
+        // races the setter that still holds the goal file lock. The drain
+        // fired during the publication read is the regression case; earlier
+        // fires see an empty mutation map and no-op.
+        drainPromises.push(service.applyPendingAfterStreamEnd(workspaceId));
+      }
+      return snapshot;
+    });
+
+    fireDrains = true;
+    const queued = await service.setGoal({
+      workspaceId,
+      objective: "Publication stamp handoff",
+    });
+    fireDrains = false;
+    expect(queued.success).toBe(true);
+    expect(drainPromises.length).toBeGreaterThan(0);
+    await Promise.all(drainPromises);
+
+    const persisted = await service.getGoal(workspaceId);
+    expect(persisted).not.toBeNull();
+    // The drain must persist the post-publication stamp, not the construction
+    // stamp taken before the publication activity read.
+    expect(persisted?.createdAtMs ?? -1).toBeGreaterThanOrEqual(lastActivityReadMs);
+  });
+
   test("queued mid-stream goal replacement preserves expectedGoalId at drain time", async () => {
     const created = await setGoalOk(service, { workspaceId, objective: "Original" });
     await extensionMetadata.setStreaming(workspaceId, true);
