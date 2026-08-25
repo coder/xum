@@ -31,8 +31,8 @@ import * as SkillIndicatorModule from "../SkillIndicator/SkillIndicator";
 import * as TimelineDialogModule from "@/browser/features/RightSidebar/Timeline/TimelineDialog";
 
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import type * as ExperimentsModuleType from "@/browser/hooks/useExperiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
   NARROW_VIEWPORT_MAX_WIDTH_PX,
   WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX,
@@ -112,7 +112,21 @@ let archiveWorkspaceMock = mock(
 );
 let archiveShowErrorMock = mock(() => undefined);
 
+// Timeline gate control. useExperimentValue must be module-mocked, not driven through
+// localStorage: bun module mocks are process-global, so another test file's leaked
+// useExperiments mock would otherwise override the real hook and poison these gates.
+let mockTimelineExperimentEnabled = false;
+
 function installWorkspaceMenuBarTestDoubles() {
+  const actualExperiments =
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    require("@/browser/hooks/useExperiments?real=1") as typeof ExperimentsModuleType;
+  void mock.module("@/browser/hooks/useExperiments", () => ({
+    ...actualExperiments,
+    useExperimentValue: (experimentId: string) =>
+      experimentId === EXPERIMENT_IDS.TIMELINE && mockTimelineExperimentEnabled,
+  }));
+
   preflightArchiveWorkspaceMock = mock(
     (_workspaceId: string): Promise<ArchivePreflightActionResult> => resolveArchivePreflight()
   );
@@ -324,6 +338,7 @@ const defaultProps: ComponentProps<typeof WorkspaceMenuBarComponent> = {
 describe("WorkspaceMenuBar archive confirmations", () => {
   beforeEach(() => {
     workspaceMetadata = new Map();
+    mockTimelineExperimentEnabled = false;
     cleanupDom = installDom();
     installWorkspaceMenuBarTestDoubles();
     /* eslint-disable @typescript-eslint/no-require-imports */
@@ -413,7 +428,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   it("offers the Timeline action on narrow viewports and opens the dialog", () => {
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TIMELINE), true);
+    mockTimelineExperimentEnabled = true;
     stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
 
     render(<WorkspaceMenuBar {...defaultProps} />);
@@ -431,7 +446,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   it("hides the Timeline action on wide viewports", () => {
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TIMELINE), true);
+    mockTimelineExperimentEnabled = true;
     stubMatchMedia(() => false);
 
     render(<WorkspaceMenuBar {...defaultProps} />);
@@ -448,7 +463,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   it("offers the Timeline action when the shell container hides the sidebar at wide viewports", () => {
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TIMELINE), true);
+    mockTimelineExperimentEnabled = true;
     stubMatchMedia(() => false);
 
     // Mimic WorkspaceShell: the shell wraps the menu bar and a CSS-hidden right sidebar
@@ -470,7 +485,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   it("re-gates the Timeline action when the viewport crosses the narrow breakpoint", () => {
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TIMELINE), true);
+    mockTimelineExperimentEnabled = true;
     let narrow = false;
     const media = stubMatchMedia(
       (query) => narrow && query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`
@@ -488,7 +503,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   it("opens the timeline dialog with the keyboard shortcut on narrow viewports", () => {
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TIMELINE), true);
+    mockTimelineExperimentEnabled = true;
     stubMatchMedia((query) => query === `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`);
 
     render(<WorkspaceMenuBar {...defaultProps} />);
@@ -502,7 +517,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
   });
 
   it("ignores the timeline shortcut while the sidebar is visible", () => {
-    updatePersistedState(getExperimentKey(EXPERIMENT_IDS.TIMELINE), true);
+    mockTimelineExperimentEnabled = true;
     stubMatchMedia(() => false);
 
     render(<WorkspaceMenuBar {...defaultProps} />);
