@@ -49,6 +49,15 @@ export interface ResolveAgentOptions {
   requestedAgentId: string | undefined;
   /** When true, skip workspace-specific agents (for "unbricking" broken agent files). */
   disableWorkspaceAgents: boolean;
+  /**
+   * When true, a top-level requested agent that cannot be resolved (or is
+   * disabled) fails the stream loudly instead of silently falling back to exec.
+   * Set by workspace-turn launches with explicit agent overrides: their
+   * pre-dispatch validation races init hooks and user edits, so this post-init
+   * resolution is the last sound gate against running a different agent than
+   * the caller asked for. Sub-agent workspaces already fail loudly.
+   */
+  strictAgentResolution?: boolean;
   /** Caller-supplied tool policy (applied AFTER agent policy for further restriction). */
   callerToolPolicy: ToolPolicy | undefined;
   /** Loaded config from Config.loadConfigOrDefault(). */
@@ -186,6 +195,7 @@ export async function resolveAgentForStream(
     workspacePath,
     requestedAgentId: rawAgentId,
     disableWorkspaceAgents,
+    strictAgentResolution,
     callerToolPolicy,
     cfg,
     emitError,
@@ -265,6 +275,17 @@ export async function resolveAgentForStream(
   }
 
   if (agentDefinition == null) {
+    if (strictAgentResolution && !isSubagentWorkspace) {
+      const errorMessage = `Agent '${requestedAgentId}' could not be resolved in this workspace; refusing to fall back to exec for an explicit agent request.`;
+      emitError(
+        createErrorEvent(workspaceId, {
+          messageId: createAssistantMessageId(),
+          error: errorMessage,
+          errorType: "unknown",
+        })
+      );
+      return Err({ type: "unknown", raw: errorMessage });
+    }
     workspaceLog.warn("Failed to load agent definition; falling back", {
       requestedAgentIds,
       agentDiscoveryPaths: agentDiscoveryCandidates.map((candidate) => candidate.workspacePath),
@@ -303,7 +324,7 @@ export async function resolveAgentForStream(
       if (effectivelyDisabled) {
         const errorMessage = `Agent '${agentDefinition.id}' is disabled.`;
 
-        if (isSubagentWorkspace) {
+        if (isSubagentWorkspace || strictAgentResolution) {
           const errorMessageId = createAssistantMessageId();
           emitError(
             createErrorEvent(workspaceId, {

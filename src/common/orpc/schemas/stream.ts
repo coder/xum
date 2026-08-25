@@ -801,6 +801,15 @@ export const SendMessageOptionsSchema = z.object({
    */
   disableWorkspaceAgents: z.boolean().optional(),
   /**
+   * When true, a top-level send whose agentId cannot be resolved (or is disabled)
+   * at stream time fails loudly instead of silently falling back to exec.
+   * Workspace-turn launches with explicit agent overrides set this: pre-dispatch
+   * validation races init hooks and user edits, so stream-time resolution — which
+   * runs after initialization completes — is the last sound gate against running
+   * a different agent than the caller asked for.
+   */
+  strictAgentResolution: z.boolean().optional(),
+  /**
    * Desktop/app-only capability: expose set_goal so an agent can create a
    * continuation-backed goal for its current parent workspace. Headless callers
    * omit this, so plain one-shot mux run stays one-shot.

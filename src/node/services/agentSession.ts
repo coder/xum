@@ -4715,6 +4715,7 @@ export class AgentSession {
       workspaceGoalService: this.workspaceGoalService,
       experiments: options?.experiments,
       disableWorkspaceAgents: options?.disableWorkspaceAgents,
+      strictAgentResolution: options?.strictAgentResolution,
       hasQueuedMessages: this.hasQueuedMessages.bind(this),
       openaiTruncationModeOverride,
       // Mid-turn thinking overrides clamp against the same floor as the

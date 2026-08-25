@@ -97,6 +97,16 @@ function initGitRepo(projectPath: string): void {
   execSync('git commit -m "init"', { cwd: projectPath, stdio: "ignore" });
 }
 
+/**
+ * Git-prove the owner workspace's checked-out branch: owner-side agent prechecks and
+ * unreachable-target vouching only apply when the effective base branch is verified
+ * against the branch actually checked out in the owner.
+ */
+function checkoutOwnerBranch(projectPath: string, branch: string): void {
+  initGitRepo(projectPath);
+  execSync(`git checkout -b ${branch}`, { cwd: projectPath, stdio: "ignore" });
+}
+
 async function collectFullHistory(service: HistoryService, workspaceId: string) {
   const messages: MuxMessage[] = [];
   const result = await service.iterateFullHistory(workspaceId, "forward", (chunk) => {
@@ -995,12 +1005,16 @@ describe("TaskService", () => {
     expect(sendMessage).toHaveBeenCalledTimes(1);
     const sendMessageCall = sendMessage.mock.calls[0] as unknown[];
     expect(sendMessageCall[0]).toBe("childworkspace");
-    expect(sendMessageCall[2]).toMatchObject({ agentId: "plan" });
+    // Explicit overrides also arm stream-time strict resolution: pre-dispatch validation
+    // races init hooks/user edits, so the stream must fail loudly instead of silently
+    // swapping in exec if the agent cannot be resolved post-init.
+    expect(sendMessageCall[2]).toMatchObject({ agentId: "plan", strictAgentResolution: true });
   });
 
   test("createWorkspaceTurn rejects invalid, unknown, and internal agent ids before creating a workspace", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    checkoutOwnerBranch(projectPath, "parent");
 
     const createWorkspace = mock(
       (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
@@ -1043,6 +1057,7 @@ describe("TaskService", () => {
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir, {
       agentAiDefaults: { custom: { enabled: false } },
     });
+    checkoutOwnerBranch(projectPath, "parent");
     await writeCustomAgentDefinition(projectPath);
 
     const createWorkspace = mock(
@@ -1142,6 +1157,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["childworkspace", "turnhandle"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
+    checkoutOwnerBranch(projectPath, "parent");
     // Shadow the built-in plan agent with a hidden project-local override in the OWNER's
     // checkout: eligibility for unreachable targets must consult the shadow, not just the
     // embedded definition.
@@ -1284,10 +1300,7 @@ describe("TaskService", () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["childworkspace", "turnhandle"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
-    // Owner vouching for an unreachable target requires git proof that the owner is
-    // actually checked out on the base branch the child is created from.
-    initGitRepo(projectPath);
-    execSync("git checkout -b parent", { cwd: projectPath, stdio: "ignore" });
+    checkoutOwnerBranch(projectPath, "parent");
     await writeCustomAgentDefinition(projectPath);
     // Deferred-provisioning runtimes return from create before the checkout is reachable.
     const unreachableCheckout = path.join(rootDir, "not-provisioned-yet");
@@ -1349,8 +1362,7 @@ describe("TaskService", () => {
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir, {
       workspaceName: "feature-foo",
     });
-    initGitRepo(projectPath);
-    execSync("git checkout -b feature/foo", { cwd: projectPath, stdio: "ignore" });
+    checkoutOwnerBranch(projectPath, "feature/foo");
 
     const unreachableMetadata: WorkspaceMetadata & { namedWorkspacePath: string } = {
       ...createWorkspaceTurnMetadata(projectPath),
@@ -1394,12 +1406,60 @@ describe("TaskService", () => {
     expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 
+  test("createWorkspaceTurn defers owner-side misses to the target when the base is unproven", async () => {
+    const config = await createTestConfig(rootDir);
+    stubStableIds(config, ["childworkspace", "turnhandle"]);
+    // Owner is on feature/foo but its workspace name is feature-foo: with trunkBranch
+    // omitted, the child is created from the DISTINCT feature-foo branch, which may carry
+    // agents absent from the owner's branch. An owner-side miss must not fail-fast here —
+    // the created target checkout is authoritative.
+    const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir, {
+      workspaceName: "feature-foo",
+    });
+    checkoutOwnerBranch(projectPath, "feature/foo");
+
+    const targetOnlyCheckout = path.join(rootDir, "target-only-agent");
+    const targetAgentsDir = path.join(targetOnlyCheckout, ".mux", "agents");
+    await fsPromises.mkdir(targetAgentsDir, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(targetAgentsDir, "custom.md"),
+      ["---", "name: Custom", "base: exec", "---", "Target-only agent."].join("\n")
+    );
+
+    const targetMetadata: WorkspaceMetadata & { namedWorkspacePath: string } = {
+      ...createWorkspaceTurnMetadata(projectPath),
+      runtimeConfig: { type: "worktree", srcBaseDir: path.join(rootDir, "wt") },
+      namedWorkspacePath: targetOnlyCheckout,
+    };
+    const createWorkspace = mock(
+      (): Promise<Result<{ metadata: WorkspaceMetadata }>> =>
+        Promise.resolve(Ok({ metadata: targetMetadata }))
+    );
+    const sendMessage = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const workspaceMocks = createWorkspaceServiceMocks({ create: createWorkspace, sendMessage });
+    const { taskService } = createTaskServiceHarness(config, {
+      workspaceService: workspaceMocks.workspaceService,
+    });
+
+    const result = await taskService.createWorkspaceTurn({
+      ownerWorkspaceId: parentId,
+      agentId: "custom",
+      prompt: "Run the target-only agent",
+      title: "Target-only agent",
+      workspace: { mode: "new" },
+    });
+
+    expect(result.success).toBe(true);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const sendMessageCall = sendMessage.mock.calls[0] as unknown[];
+    expect(sendMessageCall[2]).toMatchObject({ agentId: "custom" });
+  });
+
   test("createWorkspaceTurn unreachable cross-host target fails closed even for built-ins", async () => {
     const config = await createTestConfig(rootDir);
     stubStableIds(config, ["childworkspace", "turnhandle"]);
     const { parentId, projectPath } = await saveLocalParentWorkspace(config, rootDir);
-    initGitRepo(projectPath);
-    execSync("git checkout -b parent", { cwd: projectPath, stdio: "ignore" });
+    checkoutOwnerBranch(projectPath, "parent");
 
     // The created target lives on a remote host (per-workspace containers, Coder-style
     // per-workspace hosts). The owner's global agent roots say nothing about that host —

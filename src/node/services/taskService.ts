@@ -4058,17 +4058,18 @@ export class TaskService {
         );
         ownerVouchesForTargetBase = ownerBranch != null && ownerBranch === effectiveTrunkBranch;
         // Pre-create stage: catch obviously bad ids (unknown/hidden/disabled) against the
-        // OWNER's checkout before creating any workspace. Strict for an omitted
-        // trunkBranch (the child is created from the owner's own workspace line) or a
-        // verified same-branch request; advisory when the requested base may diverge —
-        // the target checkout is authoritative in that case.
+        // OWNER's checkout before creating any workspace. Fatal only when the owner's
+        // checked-out branch provably IS the target's base (an omitted trunkBranch still
+        // resolves to parentMeta.name, which may be a DIFFERENT branch than a slash-branch
+        // owner's — that distinct branch could carry target-only agents); otherwise the
+        // miss is advisory and the target checkout is authoritative post-create.
         const validation = await this.validateWorkspaceTurnAgentId({
           cfg,
           agentId: requestedAgentId,
           ...ownerContext,
         });
         if (!validation.success) {
-          if (requestedTrunkBranch == null || ownerVouchesForTargetBase) {
+          if (ownerVouchesForTargetBase) {
             return Err(validation.error);
           }
           log.debug(
@@ -4308,6 +4309,10 @@ export class TaskService {
         ...(mode === "existing" && requestedAgentId != null
           ? { skipAiSettingsPersistence: true }
           : {}),
+        // Explicit overrides were validated pre-dispatch, but that validation races init
+        // hooks and later edits; stream-time resolution runs after initialization and must
+        // fail loudly rather than silently swap in exec (see strictAgentResolution docs).
+        ...(requestedAgentId != null ? { strictAgentResolution: true } : {}),
       },
       {
         startStreamInBackground: true,

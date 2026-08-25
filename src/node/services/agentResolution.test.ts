@@ -472,6 +472,116 @@ describe("resolveAgentForStream agent identity", () => {
   });
 });
 
+describe("resolveAgentForStream strict resolution", () => {
+  function createTopLevelMetadata(projectPath: string): WorkspaceMetadata {
+    return {
+      id: PARENT_WORKSPACE_ID,
+      name: PARENT_WORKSPACE_ID,
+      projectName: path.basename(projectPath),
+      projectPath,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+  }
+
+  async function resolveTopLevel(params: {
+    projectPath: string;
+    agentId: string;
+    strictAgentResolution: boolean;
+    agentAiDefaults?: ProjectsConfig["agentAiDefaults"];
+  }) {
+    const cfg: ProjectsConfig = {
+      projects: new Map([
+        [
+          params.projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              { id: PARENT_WORKSPACE_ID, name: PARENT_WORKSPACE_ID, path: params.projectPath },
+            ],
+          },
+        ],
+      ]),
+      ...(params.agentAiDefaults ? { agentAiDefaults: params.agentAiDefaults } : {}),
+    };
+    return await resolveAgentForStream({
+      workspaceId: PARENT_WORKSPACE_ID,
+      metadata: createTopLevelMetadata(params.projectPath),
+      runtime: new LocalRuntime(params.projectPath),
+      workspacePath: params.projectPath,
+      requestedAgentId: params.agentId,
+      disableWorkspaceAgents: false,
+      strictAgentResolution: params.strictAgentResolution,
+      callerToolPolicy: undefined,
+      cfg,
+      emitError: () => undefined,
+      isAdvisorExperimentEnabled: false,
+    });
+  }
+
+  test("unresolvable explicit agent fails loudly instead of falling back to exec", async () => {
+    using tempDir = new DisposableTempDir("agent-resolution-strict-unknown");
+    const projectPath = path.join(tempDir.path, "project");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    // Default behavior: silent exec fallback keeps ordinary sends usable.
+    const lenient = await resolveTopLevel({
+      projectPath,
+      agentId: "doesnotexist",
+      strictAgentResolution: false,
+    });
+    expect(lenient.success).toBe(true);
+    if (lenient.success) expect(lenient.data.effectiveAgentId).toBe("exec");
+
+    // Strict mode (explicit workspace-turn overrides): running a different agent
+    // than requested must fail the stream, not silently swap in exec.
+    const strict = await resolveTopLevel({
+      projectPath,
+      agentId: "doesnotexist",
+      strictAgentResolution: true,
+    });
+    expect(strict.success).toBe(false);
+    if (!strict.success && strict.error.type === "unknown") {
+      expect(strict.error.raw).toContain("could not be resolved");
+    } else {
+      expect(strict.success === false && strict.error.type).toBe("unknown");
+    }
+  });
+
+  test("disabled explicit agent fails loudly in strict mode for top-level workspaces", async () => {
+    using tempDir = new DisposableTempDir("agent-resolution-strict-disabled");
+    const projectPath = path.join(tempDir.path, "project");
+    const agentsDir = path.join(projectPath, ".mux", "agents");
+    await fs.mkdir(agentsDir, { recursive: true });
+    await fs.writeFile(
+      path.join(agentsDir, "custom.md"),
+      ["---", "name: Custom", "base: exec", "---", "Custom agent."].join("\n")
+    );
+    const agentAiDefaults = { custom: { enabled: false } };
+
+    const lenient = await resolveTopLevel({
+      projectPath,
+      agentId: "custom",
+      strictAgentResolution: false,
+      agentAiDefaults,
+    });
+    expect(lenient.success).toBe(true);
+    if (lenient.success) expect(lenient.data.effectiveAgentId).toBe("exec");
+
+    const strict = await resolveTopLevel({
+      projectPath,
+      agentId: "custom",
+      strictAgentResolution: true,
+      agentAiDefaults,
+    });
+    expect(strict.success).toBe(false);
+    if (!strict.success && strict.error.type === "unknown") {
+      expect(strict.error.raw).toContain("disabled");
+    } else {
+      expect(strict.success === false && strict.error.type).toBe("unknown");
+    }
+  });
+});
+
 describe("resolveAgentForStream advisor defaults", () => {
   test("enables advisor by default for Exec and Plan sub-agents when the experiment is enabled", async () => {
     const [execPolicy, planPolicy] = await Promise.all([
