@@ -227,9 +227,6 @@ async function copyPersistentConfig(realConfig: Config, config: Config): Promise
 function buildExperimentsObject(experimentIds: readonly string[]) {
   return {
     programmaticToolCalling: experimentIds.includes(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
-    programmaticToolCallingExclusive: experimentIds.includes(
-      EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE
-    ),
     // Invoking `xum workflow` is an explicit opt-in, so the dynamic-workflows
     // experiment is enabled implicitly for this invocation (never persisted).
     dynamicWorkflows: true,

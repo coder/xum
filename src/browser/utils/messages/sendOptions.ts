@@ -93,9 +93,6 @@ export function getSendOptionsFromStorage(workspaceId: string): SendMessageOptio
     disableWorkspaceAgents,
     experiments: {
       programmaticToolCalling: isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
-      programmaticToolCallingExclusive: isExperimentEnabled(
-        EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE
-      ),
       rlm: isExperimentEnabled(EXPERIMENT_IDS.RLM),
       advisorTool: isExperimentEnabled(EXPERIMENT_IDS.ADVISOR_TOOL),
       dynamicWorkflows: isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS),

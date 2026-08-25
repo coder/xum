@@ -280,7 +280,6 @@ export interface ToolConfiguration {
   /** Experiments inherited from parent (for subagent spawning) */
   experiments?: {
     programmaticToolCalling?: boolean;
-    programmaticToolCallingExclusive?: boolean;
     /** RLM mode: inherited to subagent spawns so children are stamped at spawn time. */
     rlm?: boolean;
     advisorTool?: boolean;

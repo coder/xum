@@ -58,7 +58,7 @@ export interface PTCToolCallRecord {
    * suppressed result). The guest already received the full value during
    * execution; its channels for surfacing data are the return value, console
    * output, and `vars`. Absent in ephemeral/RLM-off records, which keep full
-   * inline results (byte-identical supplement-mode contract).
+   * inline results (the non-RLM inline-results contract).
    */
   ok?: boolean;
   bytes?: number;

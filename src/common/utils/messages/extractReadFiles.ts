@@ -20,7 +20,7 @@ interface NestedToolCallRecord {
  * exclusive posture file access happens as nested xum.file_read / xum.load
  * calls, so the outer part is named "code_execution" and the reads live in
  * its output's toolCalls records. Success = no error, and for kernel compact
- * records ok !== false (supplement-mode records carry no ok field).
+ * records ok !== false (non-RLM inline-results records carry no ok field).
  */
 function collectNestedReadPaths(output: unknown): string[] {
   if (typeof output !== "object" || output === null) return [];

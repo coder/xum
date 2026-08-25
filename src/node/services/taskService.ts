@@ -329,7 +329,6 @@ export interface TaskCreateArgs {
   /** Experiments to inherit to subagent */
   experiments?: {
     programmaticToolCalling?: boolean;
-    programmaticToolCallingExclusive?: boolean;
     /** RLM mode: persisted on the task record so RLM-gated child features survive restarts. */
     rlm?: boolean;
     advisorTool?: boolean;

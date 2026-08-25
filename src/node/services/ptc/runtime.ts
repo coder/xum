@@ -88,7 +88,7 @@ export interface IJSRuntime extends Disposable {
    * cannot protect host memory or the session history that streamed events
    * land in: a guest looping `xum.tool({big: vars.large})` would otherwise
    * retain and emit every full payload. Pass undefined to disable (ephemeral
-   * mode keeps full records — the byte-identical supplement contract).
+   * mode keeps full records — the non-RLM inline-results contract).
    */
   setKernelRecordBounds(bounds: KernelRecordBounds | undefined): void;
 

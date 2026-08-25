@@ -220,7 +220,7 @@ export class ToolBridge {
   register(runtime: IJSRuntime, kernel?: KernelBridgeOptions): void {
     // Kernel mode bounds record/event capture at creation (host memory and
     // streamed-to-history events); ephemeral registrations keep full records
-    // (the byte-identical supplement contract). Post-eval compaction still
+    // (the non-RLM inline-results contract). Post-eval compaction still
     // bounds the model-visible set.
     runtime.setKernelRecordBounds(
       kernel !== undefined

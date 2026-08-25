@@ -148,6 +148,33 @@ describe("ExperimentsService", () => {
     expect(service.isExperimentEnabled(EXPERIMENT_IDS.TOOL_SEARCH)).toBe(false);
   });
 
+  test("stale overrides for removed experiments are ignored, never rejected", async () => {
+    // "programmatic-tool-calling-exclusive" was a real experiment ID before
+    // PTC became exclusive-only. Users upgrading with the old key persisted
+    // must load cleanly with the stale entry filtered out.
+    await fs.writeFile(
+      path.join(tempDir, OVERRIDES_FILE),
+      JSON.stringify({
+        version: 1,
+        experiments: {},
+        overrides: {
+          "programmatic-tool-calling-exclusive": true,
+          [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: true,
+        },
+      }),
+      "utf-8"
+    );
+
+    const { telemetryService } = createTelemetryService();
+    const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    await service.initialize();
+
+    expect(service.isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING)).toBe(true);
+    expect(await service.getOverrides()).toEqual({
+      [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: true,
+    });
+  });
+
   test("a client with empty local state does not clear overrides it never knew about", async () => {
     await fs.writeFile(
       path.join(tempDir, OVERRIDES_FILE),

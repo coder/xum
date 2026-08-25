@@ -68,7 +68,6 @@ export type BranchSummaryAiService = Pick<
 export interface RlmExperimentFlags {
   rlm?: boolean;
   programmaticToolCalling?: boolean;
-  programmaticToolCallingExclusive?: boolean;
 }
 
 /**
@@ -95,10 +94,7 @@ export function isRlmModeEnabled(
   const rlm = experiments?.rlm ?? backend(EXPERIMENT_IDS.RLM);
   const ptc =
     experiments?.programmaticToolCalling ?? backend(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
-  const ptcExclusive =
-    experiments?.programmaticToolCallingExclusive ??
-    backend(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE);
-  return rlm && (ptc || ptcExclusive);
+  return rlm && ptc;
 }
 
 function extractTextForTranscript(message: MuxMessage): string {

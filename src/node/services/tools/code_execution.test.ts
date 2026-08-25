@@ -3,12 +3,7 @@
  */
 
 import { describe, it, expect, mock } from "bun:test";
-import {
-  createCodeExecutionTool,
-  retargetCodeExecutionTool,
-  clearTypeCaches,
-  type MountRunner,
-} from "./code_execution";
+import { createCodeExecutionTool, clearTypeCaches, type MountRunner } from "./code_execution";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { ToolBridge } from "@/node/services/ptc/toolBridge";
 import type { Tool, ToolExecutionOptions } from "ai";
@@ -506,65 +501,6 @@ describe("createCodeExecutionTool", () => {
       expect(result.toolCalls).toHaveLength(2);
       expect(result.toolCalls[0].result).toEqual({ count: 1 });
       expect(result.toolCalls[1].error).toContain("Second call failed");
-    });
-  });
-
-  describe("retargetCodeExecutionTool", () => {
-    it("retargets a captured execute reference onto the donor's bridge", async () => {
-      // The request.assemble wrapper scenario: middleware captured the
-      // pre-hook instance's execute, while a later rebuild removed `bash`
-      // from the bridgeable set. After retargeting, the captured reference
-      // must dispatch through the donor's bridge — bash is gone, file_read
-      // still works.
-      const bashExecute = mock(() => mockResults.bash);
-      const preHookTool = await createCodeExecutionTool(
-        runtimeFactory,
-        new ToolBridge({
-          bash: createMockTool("bash", z.object({ script: z.string() }), bashExecute),
-          file_read: createMockTool("file_read", z.object({ filePath: z.string() })),
-        })
-      );
-      const donorTool = await createCodeExecutionTool(
-        runtimeFactory,
-        new ToolBridge({
-          file_read: createMockTool("file_read", z.object({ filePath: z.string() })),
-        })
-      );
-
-      // Wrapper-style capture BEFORE the retarget.
-      const capturedExecute = preHookTool.execute!.bind(preHookTool);
-
-      expect(retargetCodeExecutionTool(preHookTool, donorTool)).toBe(true);
-
-      const bashResult = (await capturedExecute(
-        { code: 'return mux.bash({ script: "echo hi" })' },
-        mockToolCallOptions
-      )) as PTCExecutionResult;
-      expect(bashResult.success).toBe(false);
-      expect(bashExecute).not.toHaveBeenCalled();
-
-      const readResult = (await capturedExecute(
-        { code: 'return mux.file_read({ filePath: "a.txt" })' },
-        mockToolCallOptions
-      )) as PTCExecutionResult;
-      expect(readResult.success).toBe(true);
-      expect(readResult.result).toMatchObject({ content: "mock file content" });
-    });
-
-    it("returns false when either tool was not created by the factory", async () => {
-      const realTool = await createCodeExecutionTool(runtimeFactory, new ToolBridge({}));
-      const foreignTool = createMockTool("bash", z.object({ script: z.string() }));
-
-      expect(retargetCodeExecutionTool(foreignTool, realTool)).toBe(false);
-      expect(retargetCodeExecutionTool(realTool, foreignTool)).toBe(false);
-
-      // The real tool stays functional after rejected retargets.
-      const result = (await realTool.execute!(
-        { code: "return 7" },
-        mockToolCallOptions
-      )) as PTCExecutionResult;
-      expect(result.success).toBe(true);
-      expect(result.result).toBe(7);
     });
   });
 

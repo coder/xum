@@ -7,7 +7,6 @@
 
 export const EXPERIMENT_IDS = {
   PROGRAMMATIC_TOOL_CALLING: "programmatic-tool-calling",
-  PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE: "programmatic-tool-calling-exclusive",
   RLM: "rlm-mode",
   CONFIGURABLE_BIND_URL: "configurable-bind-url",
   MUX_GOVERNOR: "mux-governor",
@@ -55,14 +54,8 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
   [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: {
     id: EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
     name: "Programmatic Tool Calling",
-    description: "Enable code_execution tool for multi-tool workflows in a sandboxed JS runtime",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
-  [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE]: {
-    id: EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE,
-    name: "PTC Exclusive Mode",
-    description: "Replace all tools with code_execution (forces PTC usage)",
+    description:
+      "Replace the standard toolset with a sandboxed code_execution tool; bridged tools are called as xum.<tool>(...) from JS",
     enabledByDefault: false,
     showInSettings: true,
   },
@@ -73,7 +66,7 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     id: EXPERIMENT_IDS.RLM,
     name: "RLM Mode",
     description:
-      "Kernel-first exclusive toolset: code_execution becomes the primary tool, backed by a persistent sandbox kernel (vars survive across calls/turns, bulk file loads, result handles, fire-and-forget sub-agents). Implies PTC Exclusive posture; supplement mode is not supported.",
+      "Kernel-first exclusive toolset: code_execution becomes the primary tool, backed by a persistent sandbox kernel (vars survive across calls/turns, bulk file loads, result handles, fire-and-forget sub-agents). Requires Programmatic Tool Calling.",
     enabledByDefault: false,
     showInSettings: true,
   },

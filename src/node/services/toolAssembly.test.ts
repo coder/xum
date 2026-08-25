@@ -4,11 +4,7 @@ import * as path from "node:path";
 import { z } from "zod";
 import type { Tool } from "ai";
 
-import {
-  applyToolPolicyAndExperiments,
-  reconcileHookReplacedCodeExecution,
-  resolveBackendGatedPtcExperiments,
-} from "./toolAssembly";
+import { applyToolPolicyAndExperiments, resolveBackendGatedPtcExperiments } from "./toolAssembly";
 import { buildToolsetManifest } from "./turnEnvelope";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import { DisposableTempDir } from "@/node/services/tempDir";
@@ -24,14 +20,14 @@ function executableTool(description: string): Tool {
 }
 
 describe("applyToolPolicyAndExperiments", () => {
-  test("exclusive PTC mode keeps mcp_prompt_get directly visible", async () => {
+  test("PTC keeps mcp_prompt_get directly visible", async () => {
     const result = await applyToolPolicyAndExperiments({
       allTools: {
         bash: executableTool("Run a command"),
         mcp_prompt_get: executableTool("Fetch a prompt\n\nAvailable MCP prompts:\n- mcp__s__p"),
       },
       effectiveToolPolicy: undefined,
-      experiments: { programmaticToolCallingExclusive: true },
+      experiments: { programmaticToolCalling: true },
       emitNestedToolEvent: () => undefined,
     });
 
@@ -245,7 +241,7 @@ describe("persistent kernel graduation (RLM mode)", () => {
   });
 });
 
-describe("toolset composition (PTC × RLM × exclusive)", () => {
+describe("toolset composition (PTC × RLM)", () => {
   const originalEnv = process.env.MUX_SANDBOX_PERSISTENT_MOUNTS;
 
   beforeEach(() => {
@@ -277,7 +273,6 @@ describe("toolset composition (PTC × RLM × exclusive)", () => {
     sessionDir: string,
     experiments: {
       programmaticToolCalling?: boolean;
-      programmaticToolCallingExclusive?: boolean;
       rlm?: boolean;
     },
     capabilityGrants?: Parameters<typeof applyToolPolicyAndExperiments>[0]["capabilityGrants"]
@@ -291,15 +286,6 @@ describe("toolset composition (PTC × RLM × exclusive)", () => {
       capabilityGrants,
     });
 
-  const SUPPLEMENT_NAMES = [
-    "agent_report",
-    "ask_user_question",
-    "bash",
-    "code_execution",
-    "file_read",
-    "mcp_prompt_get",
-    "todo_write",
-  ];
   // Exclusive: bridgeable tools reachable only via code_execution; the
   // interaction tools and mcp_prompt_get stay model-visible.
   const EXCLUSIVE_NAMES = [
@@ -310,48 +296,19 @@ describe("toolset composition (PTC × RLM × exclusive)", () => {
     "todo_write",
   ];
 
-  test("PTC only: supplement set, no kernel surfaces", async () => {
+  test("PTC only: exclusive narrowed set, no kernel surfaces", async () => {
     using tmp = new DisposableTempDir("compose-ptc");
     const tools = await assemble("ws-compose-ptc", tmp.path, { programmaticToolCalling: true });
-    expect(Object.keys(tools).sort()).toEqual(SUPPLEMENT_NAMES);
-    expect(tools.code_execution.description).not.toContain("Persistent kernel");
-    expect(tools.code_execution.description).not.toContain("Kernel-first");
-  });
-
-  test("PTC + RLM: exclusive-only — RLM forces the kernel-first narrowed set", async () => {
-    // RLM is exclusive-only: supplement-mode RLM measured ~2x flat tokens/cost
-    // (flat schemas + kernel defs shipped while models took the flat path), so
-    // the rlm flag implies the exclusive posture even without the exclusive
-    // experiment. This pins the removal of supplement-mode RLM.
-    using tmp = new DisposableTempDir("compose-ptc-rlm");
-    try {
-      const tools = await assemble("ws-compose-ptc-rlm", tmp.path, {
-        programmaticToolCalling: true,
-        rlm: true,
-      });
-      expect(Object.keys(tools).sort()).toEqual([...EXCLUSIVE_NAMES, "refinement_rollback"].sort());
-      expect(tools.code_execution.description).toContain("Persistent kernel");
-      expect(tools.code_execution.description).toContain("Kernel-first");
-    } finally {
-      await sandboxHostService.disposeScope("ws-compose-ptc-rlm");
-    }
-  });
-
-  test("exclusive only: narrowed set, descriptions unchanged (no kernel surfaces)", async () => {
-    using tmp = new DisposableTempDir("compose-excl");
-    const tools = await assemble("ws-compose-excl", tmp.path, {
-      programmaticToolCallingExclusive: true,
-    });
     expect(Object.keys(tools).sort()).toEqual(EXCLUSIVE_NAMES);
     expect(tools.code_execution.description).not.toContain("Persistent kernel");
     expect(tools.code_execution.description).not.toContain("Kernel-first");
   });
 
-  test("exclusive + RLM: single-kernel posture — narrowed set + rollback + kernel-first preamble", async () => {
-    using tmp = new DisposableTempDir("compose-excl-rlm");
+  test("PTC + RLM: kernel-first narrowed set + rollback + kernel-first preamble", async () => {
+    using tmp = new DisposableTempDir("compose-ptc-rlm");
     try {
-      const tools = await assemble("ws-compose-excl-rlm", tmp.path, {
-        programmaticToolCallingExclusive: true,
+      const tools = await assemble("ws-compose-ptc-rlm", tmp.path, {
+        programmaticToolCalling: true,
         rlm: true,
       });
       expect(Object.keys(tools).sort()).toEqual([...EXCLUSIVE_NAMES, "refinement_rollback"].sort());
@@ -361,17 +318,17 @@ describe("toolset composition (PTC × RLM × exclusive)", () => {
       expect(desc.startsWith("**Kernel-first workflow:**")).toBe(true);
       expect(desc).toContain("Persistent kernel");
     } finally {
-      await sandboxHostService.disposeScope("ws-compose-excl-rlm");
+      await sandboxHostService.disposeScope("ws-compose-ptc-rlm");
     }
   });
 
-  test("exclusive + RLM re-applies the grants ceiling to non-bridgeable tools and refinement_rollback", async () => {
+  test("PTC + RLM re-applies the grants ceiling to non-bridgeable tools and refinement_rollback", async () => {
     using tmp = new DisposableTempDir("compose-excl-rlm-grants");
     try {
       const tools = await assemble(
         "ws-compose-excl-rlm-grants",
         tmp.path,
-        { programmaticToolCallingExclusive: true, rlm: true },
+        { programmaticToolCalling: true, rlm: true },
         {
           version: 1,
           bridgeTools: { allow: ["file_read"] },
@@ -430,11 +387,11 @@ describe("toolset composition (PTC × RLM × exclusive)", () => {
     }
   });
 
-  test("turn-envelope manifest fingerprints the narrowed exclusive + RLM toolset", async () => {
+  test("turn-envelope manifest fingerprints the narrowed PTC + RLM toolset", async () => {
     using tmp = new DisposableTempDir("compose-envelope");
     try {
       const tools = await assemble("ws-compose-envelope", tmp.path, {
-        programmaticToolCallingExclusive: true,
+        programmaticToolCalling: true,
         rlm: true,
       });
       const manifest = buildToolsetManifest(tools);
@@ -457,35 +414,6 @@ describe("toolset composition (PTC × RLM × exclusive)", () => {
   });
 });
 
-describe("reconcileHookReplacedCodeExecution", () => {
-  test("spread-style wrapper gets the rebuilt description but keeps its execute", () => {
-    const preHook = executableTool("defs: function bash; function file_read");
-    // Middleware wrapped by spreading the pre-hook tool: same description,
-    // new execute.
-    const wrappedExecute = () => Promise.resolve({ success: true, audited: true });
-    const hookReplacement: Tool = { ...preHook, execute: wrappedExecute };
-    const rebuilt = executableTool("defs: function file_read");
-
-    const result = reconcileHookReplacedCodeExecution(preHook, hookReplacement, rebuilt);
-
-    // Model-facing metadata follows the rebuilt toolset (bash removed)...
-    expect(result.description).toBe("defs: function file_read");
-    // ...while the middleware's execution wrapper is preserved.
-    expect(result.execute).toBe(wrappedExecute);
-  });
-
-  test("middleware-authored description is preserved", () => {
-    const preHook = executableTool("defs: function bash; function file_read");
-    const hookReplacement = executableTool("audited code execution");
-    const rebuilt = executableTool("defs: function file_read");
-
-    const result = reconcileHookReplacedCodeExecution(preHook, hookReplacement, rebuilt);
-
-    // Middleware took ownership of the model-facing contract; return it as-is.
-    expect(result).toBe(hookReplacement);
-  });
-});
-
 describe("resolveBackendGatedPtcExperiments", () => {
   const backendEnabled = new Set(["rlm-mode", "programmatic-tool-calling"]);
   const isEnabled = (id: string) => backendEnabled.has(id);
@@ -497,19 +425,21 @@ describe("resolveBackendGatedPtcExperiments", () => {
     const resolved = resolveBackendGatedPtcExperiments(undefined, isEnabled);
     expect(resolved.rlm).toBe(true);
     expect(resolved.programmaticToolCalling).toBe(true);
-    expect(resolved.programmaticToolCallingExclusive).toBe(false);
   });
 
   test("explicit renderer values (true or false) win over the backend", () => {
-    const resolved = resolveBackendGatedPtcExperiments(
-      { rlm: false, programmaticToolCallingExclusive: true },
-      isEnabled
-    );
+    const resolved = resolveBackendGatedPtcExperiments({ rlm: false }, isEnabled);
     // Explicit false is NOT backfilled to the backend's true.
     expect(resolved.rlm).toBe(false);
-    expect(resolved.programmaticToolCallingExclusive).toBe(true);
     // Undefined still backfills.
     expect(resolved.programmaticToolCalling).toBe(true);
+
+    // Explicit true wins over a backend-disabled flag.
+    const explicitTrue = resolveBackendGatedPtcExperiments(
+      { programmaticToolCalling: true },
+      () => false
+    );
+    expect(explicitTrue.programmaticToolCalling).toBe(true);
   });
 
   test("preserves unrelated experiment flags untouched", () => {

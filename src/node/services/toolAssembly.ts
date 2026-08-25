@@ -25,7 +25,6 @@ import type { CapabilityGrants } from "@/common/types/capabilityGrants";
 import type {
   PTCEventWithParent,
   createCodeExecutionTool as CreateCodeExecutionToolFn,
-  retargetCodeExecutionTool as RetargetCodeExecutionToolFn,
 } from "@/node/services/tools/code_execution";
 import type { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { ToolBridge } from "@/node/services/ptc/toolBridge";
@@ -50,7 +49,6 @@ import { getRuntimeTypeForTelemetry, roundToBase2 } from "@/common/telemetry/uti
 // Dynamic imports are justified: PTC pulls in ~10MB of dependencies that would slow startup.
 interface PTCModules {
   createCodeExecutionTool: typeof CreateCodeExecutionToolFn;
-  retargetCodeExecutionTool: typeof RetargetCodeExecutionToolFn;
   QuickJSRuntimeFactory: typeof QuickJSRuntimeFactory;
   ToolBridge: typeof ToolBridge;
   runtimeFactory: QuickJSRuntimeFactory | null;
@@ -71,49 +69,11 @@ async function getPTCModules(): Promise<PTCModules> {
 
   ptcModules = {
     createCodeExecutionTool: codeExecution.createCodeExecutionTool,
-    retargetCodeExecutionTool: codeExecution.retargetCodeExecutionTool,
     QuickJSRuntimeFactory: quickjs.QuickJSRuntimeFactory,
     ToolBridge: toolBridge.ToolBridge,
     runtimeFactory: null,
   };
   return ptcModules;
-}
-
-/**
- * Lazy-loading wrapper around code_execution's retargetCodeExecutionTool for
- * callers (aiService) that must not statically import the PTC modules.
- * Returns false when either tool was not created by createCodeExecutionTool.
- */
-export async function retargetCodeExecution(target: Tool, donor: Tool): Promise<boolean> {
-  const ptc = await getPTCModules();
-  return ptc.retargetCodeExecutionTool(target, donor);
-}
-
-/**
- * Reinstate a request.assemble middleware's code_execution replacement over a
- * rebuilt instance while reconciling stale model-facing metadata. A wrapper
- * built by spreading the pre-hook tool (`{ ...tool, execute: wrapped }`)
- * inherits its description, whose embedded TypeScript definitions still
- * advertise tools the rebuild removed/replaced — execution fails closed, but
- * the model keeps being instructed those tools exist. When the wrapper
- * inherited the pre-hook description verbatim, swap in the rebuilt
- * description; middleware that authored its own description keeps it (it took
- * ownership of the model-facing contract).
- */
-export function reconcileHookReplacedCodeExecution(
-  preHook: Tool,
-  hookReplacement: Tool,
-  rebuilt: Tool
-): Tool {
-  if (
-    hookReplacement.description !== undefined &&
-    hookReplacement.description === preHook.description &&
-    rebuilt.description !== undefined &&
-    rebuilt.description !== hookReplacement.description
-  ) {
-    return { ...hookReplacement, description: rebuilt.description };
-  }
-  return hookReplacement;
 }
 
 // ---------------------------------------------------------------------------
@@ -131,7 +91,6 @@ export interface ApplyToolPolicyAndExperimentsOptions {
   /** PTC experiment flags. */
   experiments?: {
     programmaticToolCalling?: boolean;
-    programmaticToolCallingExclusive?: boolean;
     /**
      * RLM mode: graduate code_execution onto the persistent per-workspace
      * kernel mount (shared `vars`, snapshot/restore). Gated on the PTC parent
@@ -166,7 +125,7 @@ export function persistentSandboxMountsEnabled(): boolean {
 }
 
 /**
- * Backfill the PTC/RLM experiment trio from the backend's persisted overrides
+ * Backfill the PTC/RLM experiment pair from the backend's persisted overrides
  * (same `?? isExperimentEnabled` pattern as other backend-gated experiments in
  * streamMessage). A renderer with no origin-local override sends `undefined`
  * for these flags while the effective UI and /refine gate resolve against the
@@ -183,9 +142,6 @@ export function resolveBackendGatedPtcExperiments(
     programmaticToolCalling:
       experiments?.programmaticToolCalling ??
       isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
-    programmaticToolCallingExclusive:
-      experiments?.programmaticToolCallingExclusive ??
-      isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE),
     rlm: experiments?.rlm ?? isExperimentEnabled(EXPERIMENT_IDS.RLM),
   };
 }
@@ -196,9 +152,11 @@ export function resolveBackendGatedPtcExperiments(
  * Steps:
  * 1. Merge extra tools (CLI tools bypass policy — injected by runtime, not user)
  * 2. Apply tool policy (agent → caller → system workspace deny/enable rules)
- * 3. If PTC experiment is enabled, lazy-load PTC and create code_execution tool:
- *    - Supplement mode: adds code_execution alongside existing tools
- *    - Exclusive mode: replaces bridgeable tools with code_execution only
+ * 3. If PTC experiment is enabled, lazy-load PTC and create code_execution tool,
+ *    replacing bridgeable tools with code_execution only (exclusive posture).
+ *    A supplement mode (code_execution alongside the flat tools) used to exist
+ *    but measured ~2x tokens/cost vs both PTC-off and exclusive, so it was
+ *    removed.
  *
  * @returns The final tool set ready for the AI model.
  */
@@ -231,15 +189,12 @@ export async function applyToolPolicyAndExperiments(
     ? applyToolPolicy(allToolsWithExtra, effectiveToolPolicy)
     : policyFilteredTools;
 
-  // Handle PTC experiments — add or replace tools with code_execution
+  // Handle PTC experiment — replace bridgeable tools with code_execution.
   let toolsForModel = policyFilteredTools;
-  // RLM is exclusive-only: supplement-mode RLM measured ~2x flat tokens/cost
-  // (flat schemas + kernel type defs shipped while models still take the flat
-  // path), so enabling RLM forces the kernel-first exclusive toolset. The
-  // standalone exclusive experiment stays usable without RLM (no kernel).
+  // RLM rides the PTC parent flag: this flag is only read inside the PTC
+  // branch below, so RLM alone (PTC off) is inert by construction.
   const rlmActive = experiments?.rlm === true;
-  const exclusiveActive = experiments?.programmaticToolCallingExclusive === true || rlmActive;
-  if (experiments?.programmaticToolCalling || experiments?.programmaticToolCallingExclusive) {
+  if (experiments?.programmaticToolCalling) {
     try {
       // Lazy-load PTC modules only when experiments are enabled
       const ptc = await getPTCModules();
@@ -287,41 +242,32 @@ export async function applyToolPolicyAndExperiments(
         toolBridge,
         emitNestedToolEvent,
         withMount,
-        // Kernel-first description preamble rides RLM (which is exclusive-only
-        // now); exclusive alone (or the env-var mount override) keeps today's
-        // exclusive descriptions byte-identical. createCodeExecutionTool
-        // additionally requires a live persistent mount before honoring it.
+        // Kernel-first description preamble rides RLM; PTC alone (or the
+        // env-var mount override) keeps the non-kernel exclusive descriptions.
+        // createCodeExecutionTool additionally requires a live persistent
+        // mount before honoring it.
         {
           kernelFirst: rlmActive,
           loadFile: sandbox?.kernelFileLoader,
         }
       );
 
-      if (exclusiveActive) {
-        // Exclusive mode: code_execution is mandatory — it's the only way to use bridged
-        // tools. The experiment flag is the opt-in; policy cannot disable it here since
-        // that would leave no way to access tools. nonBridgeable is policy-filtered but
-        // comes from the PRE-grant bridge input, so re-apply the grants ceiling here to
-        // keep grant-denied non-bridgeable tools out of the model-visible set.
-        const nonBridgeable = opts.capabilityGrants
-          ? applyCapabilityGrants(toolBridge.getNonBridgeableTools(), opts.capabilityGrants)
-          : toolBridge.getNonBridgeableTools();
-        // Keep mcp_prompt_get direct because sandbox declarations omit its
-        // multiline prompt catalog.
-        const promptGet = policyFilteredTools.mcp_prompt_get;
-        toolsForModel = {
-          ...nonBridgeable,
-          ...(promptGet !== undefined ? { mcp_prompt_get: promptGet } : {}),
-          code_execution: codeExecutionTool,
-        };
-      } else {
-        // Supplement mode: add code_execution, then apply policy to determine final set.
-        // This correctly handles all policy combinations (require, enable, disable).
-        toolsForModel = applyToolPolicy(
-          { ...policyFilteredTools, code_execution: codeExecutionTool },
-          effectiveToolPolicy
-        );
-      }
+      // code_execution is mandatory — it's the only way to use bridged
+      // tools. The experiment flag is the opt-in; policy cannot disable it here since
+      // that would leave no way to access tools. nonBridgeable is policy-filtered but
+      // comes from the PRE-grant bridge input, so re-apply the grants ceiling here to
+      // keep grant-denied non-bridgeable tools out of the model-visible set.
+      const nonBridgeable = opts.capabilityGrants
+        ? applyCapabilityGrants(toolBridge.getNonBridgeableTools(), opts.capabilityGrants)
+        : toolBridge.getNonBridgeableTools();
+      // Keep mcp_prompt_get direct because sandbox declarations omit its
+      // multiline prompt catalog.
+      const promptGet = policyFilteredTools.mcp_prompt_get;
+      toolsForModel = {
+        ...nonBridgeable,
+        ...(promptGet !== undefined ? { mcp_prompt_get: promptGet } : {}),
+        code_execution: codeExecutionTool,
+      };
 
       // RLM-only model surface: ID-addressed rollback of journaled harness
       // self-modifications (refinement rows). Read inside the PTC branch by
