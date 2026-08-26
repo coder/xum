@@ -193,7 +193,19 @@ export class ExtensionMetadataService {
   private probeQuarantineSidecar(): Promise<boolean> {
     return access(`${this.filePath}.corrupt`).then(
       () => true,
-      () => false
+      (error: unknown) => {
+        if (ExtensionMetadataService.isErrnoCode(error, "ENOENT")) {
+          return false;
+        }
+        // EACCES/EIO/...: the sidecar's existence is unknowable, and only a
+        // verified absence may let an ENOENT main read resolve as a healthy
+        // empty file — recoverable metadata may sit in the unprobeable
+        // sidecar. Propagate so the read stays a retryable failure for
+        // strict readers and fails the mutation for lenient writers (same
+        // tradeoff as the in-window recovery: failing one operation beats
+        // clobbering the sidecar's data with a partial save).
+        throw error;
+      }
     );
   }
 

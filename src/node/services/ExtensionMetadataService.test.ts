@@ -634,6 +634,29 @@ describe("ExtensionMetadataService", () => {
     expect(snapshots.get("ws-1")?.recency).toBe(42);
   });
 
+  test("a failing sidecar probe keeps a missing-main read retryable", async () => {
+    // Main file absent and the sidecar probe fails with EACCES: the
+    // sidecar's existence is unknowable, so the read must not resolve as an
+    // authoritative empty file — recoverable metadata may sit in the
+    // unprobeable sidecar. Only a verified ENOENT counts as absence.
+    const internals = service as unknown as {
+      probeQuarantineSidecar: () => Promise<boolean>;
+    };
+    internals.probeQuarantineSidecar = () => {
+      const error = new Error("permission denied") as NodeJS.ErrnoException;
+      error.code = "EACCES";
+      return Promise.reject(error);
+    };
+
+    let strictError: unknown = null;
+    try {
+      await service.getAllSnapshots({ throwOnError: true });
+    } catch (error) {
+      strictError = error;
+    }
+    expect(strictError).not.toBeNull();
+  });
+
   test("a lenient writer completes a crash-interrupted quarantine instead of clobbering it", async () => {
     // Same crash window as above, but hit by a normal (lenient) mutation.
     // Treating it as an empty file would save a partial one-entry file at
