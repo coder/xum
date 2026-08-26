@@ -2236,6 +2236,21 @@ export class Config {
             const data = fs.readFileSync(metadataPath, "utf-8");
             const metadata = JSON.parse(data) as WorkspaceMetadata;
             this.rememberLegacyTaskVariantWorkspace(projectPath, metadata, "metadata");
+            // Parseable-but-id-less metadata (e.g. `{}`) leaves this entry's
+            // identity unknowable: strict callers (the extension-metadata
+            // discard) must not conclude "not registered" from it, or a live
+            // workspace whose stable id lived only here gets its activity
+            // deleted and write-tombstoned. Mirrors the strict enumeration
+            // guard in getAllWorkspaceMetadata. The catch below rethrows this
+            // for strict callers and keeps ignoring it for lenient ones.
+            if (
+              options?.throwOnError &&
+              !(typeof metadata.id === "string" && metadata.id.length > 0)
+            ) {
+              throw new Error(
+                `Legacy workspace metadata at ${metadataPath} resolved without a usable id`
+              );
+            }
             if (metadata.id === workspaceId) {
               return {
                 workspacePath: workspace.path,
@@ -2270,6 +2285,18 @@ export class Config {
             const legacyData = fs.readFileSync(legacyMetadataPath, "utf-8");
             const legacyMetadata = JSON.parse(legacyData) as WorkspaceMetadata;
             this.rememberLegacyTaskVariantWorkspace(projectPath, legacyMetadata, "metadata");
+            // Same unknowable-identity guard as the basename lookup above:
+            // this is the authoritative file getAllWorkspaceMetadata resolves
+            // stable ids from, so an id-less parse here must fail closed in
+            // strict mode rather than fall through to "not registered".
+            if (
+              options?.throwOnError &&
+              !(typeof legacyMetadata.id === "string" && legacyMetadata.id.length > 0)
+            ) {
+              throw new Error(
+                `Legacy workspace metadata at ${legacyMetadataPath} resolved without a usable id`
+              );
+            }
             if (legacyMetadata.id === workspaceId) {
               return {
                 workspacePath: workspace.path,

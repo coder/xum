@@ -588,30 +588,38 @@ describe("ExtensionMetadataService", () => {
     expect(await readFile(filePath, "utf-8")).toBe(rawContent);
   });
 
-  test("a missing main file with the quarantine sidecar present is not an empty state", async () => {
-    // Mid-quarantine window: the corrupt (or concurrently repaired) bytes
-    // were renamed to the sidecar and the empty replacement is not written
-    // yet. Strict readers must get a retryable failure — an authoritative {}
-    // returned here could not be retracted by the subsequent restore.
+  test("a strict read resumes a crash-interrupted quarantine of corrupt bytes", async () => {
+    // Crash window: quarantine renamed main -> sidecar and died before
+    // writing the empty replacement. The next strict read must finish the
+    // recovery — never return an authoritative {} while the main path is
+    // missing, and never keep failing until an unrelated writer saves.
     await writeFile(`${filePath}.corrupt`, "{not json");
     // Main file intentionally absent (beforeEach never creates it).
 
-    let strictError: unknown = null;
-    try {
-      await service.getAllSnapshots({ throwOnError: true });
-    } catch (error) {
-      strictError = error;
-    }
-    expect(strictError).not.toBeNull();
-    // The failure is classified transient (errno-carrying), so no quarantine
-    // cascade: the main path stays absent rather than being reset to empty.
-    expect(await readFile(`${filePath}.corrupt`, "utf-8")).toBe("{not json");
-
-    // Lenient (writer) reads keep self-healing so mutations make progress.
-    expect((await service.getAllSnapshots()).size).toBe(0);
-
-    // Without the sidecar, a missing main file stays a healthy empty state.
-    await rm(`${filePath}.corrupt`);
+    // The moved bytes really were corrupt: recovery resets the main path to
+    // a valid empty file and keeps the bytes quarantined for inspection.
     expect((await service.getAllSnapshots({ throwOnError: true })).size).toBe(0);
+    expect(await readFile(`${filePath}.corrupt`, "utf-8")).toBe("{not json");
+    expect(JSON.parse(await readFile(filePath, "utf-8"))).toEqual({
+      version: 1,
+      workspaces: {},
+    });
+  });
+
+  test("a strict read restores healthy bytes stranded in the sidecar by a crashed quarantine", async () => {
+    // The crash can also strand a HEALTHY file in the sidecar: a concurrent
+    // writer repaired the main file right before quarantine's rename moved
+    // it aside. Recovery must restore it — resetting to empty would discard
+    // live activity data.
+    const healthy = {
+      version: 1,
+      workspaces: { "ws-1": { recency: 42, streaming: false } },
+    };
+    await writeFile(`${filePath}.corrupt`, JSON.stringify(healthy));
+
+    const snapshots = await service.getAllSnapshots({ throwOnError: true });
+    expect(snapshots.get("ws-1")?.recency).toBe(42);
+    // Restored to the main path (sidecar consumed by the restore).
+    expect(JSON.parse(await readFile(filePath, "utf-8"))).toEqual(healthy);
   });
 });

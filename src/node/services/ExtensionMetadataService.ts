@@ -214,9 +214,11 @@ export class ExtensionMetadataService {
           // replacement — the moved bytes may even be a concurrent writer's
           // healthy repair awaiting restore. Strict readers must see a
           // retryable failure (ENOENT carries an errno code, so callers
-          // classify it as transient), not an authoritative {} that a
-          // subsequent restore cannot retract. Lenient (writer) paths keep
-          // self-healing below so mutations always make progress.
+          // classify it as transient; getAllSnapshots additionally resumes a
+          // crash-interrupted recovery from this signature), not an
+          // authoritative {} that a subsequent restore cannot retract.
+          // Lenient (writer) paths keep self-healing below so mutations
+          // always make progress.
           const quarantined = await access(`${this.filePath}.corrupt`).then(
             () => true,
             () => false
@@ -615,91 +617,136 @@ export class ExtensionMetadataService {
       }
       const quarantinePath = `${this.filePath}.corrupt`;
       await rename(this.filePath, quarantinePath);
-      // The mutation queue is process-local: another backend's atomic save
-      // can land a healthy file between the validation above and the rename,
-      // and the rename would move THAT file aside. Re-validate the bytes that
-      // actually got moved and undo the move when they turn out healthy.
-      // Only deterministic parse corruption is the expected quarantine
-      // outcome here; a transient failure reading the sidecar means the
-      // moved bytes cannot be verified, so it propagates (retryable) rather
-      // than reporting a successful reset over possibly-healthy data.
-      let moved: unknown;
-      let movedParses = true;
-      try {
-        moved = JSON.parse(await readFile(quarantinePath, "utf-8")) as unknown;
-      } catch (readError) {
-        if (!ExtensionMetadataService.isDeterministicCorruption(readError)) {
-          throw readError;
-        }
-        movedParses = false;
+      return this.completeQuarantineRecovery(quarantinePath);
+    });
+  }
+
+  /**
+   * Finish a quarantine whose main file was already moved to the sidecar:
+   * restore the sidecar to the main path when its bytes turn out healthy,
+   * otherwise leave the corrupt bytes quarantined and reset the main path to
+   * a valid empty file. Factored out of quarantineCorruptFile so a recovery
+   * interrupted by a crash between the rename and this completion can be
+   * RESUMED on the next strict read (see resumeQuarantineRecovery) instead
+   * of leaving strict reads failing until an unrelated writer saves.
+   * Must run inside withSerializedMutation.
+   */
+  private async completeQuarantineRecovery(quarantinePath: string): Promise<boolean> {
+    // The mutation queue is process-local: another backend's atomic save
+    // can land a healthy file between the validation above and the rename,
+    // and the rename would move THAT file aside. Re-validate the bytes that
+    // actually got moved and undo the move when they turn out healthy.
+    // Only deterministic parse corruption is the expected quarantine
+    // outcome here; a transient failure reading the sidecar means the
+    // moved bytes cannot be verified, so it propagates (retryable) rather
+    // than reporting a successful reset over possibly-healthy data.
+    let moved: unknown;
+    let movedParses = true;
+    try {
+      moved = JSON.parse(await readFile(quarantinePath, "utf-8")) as unknown;
+    } catch (readError) {
+      if (!ExtensionMetadataService.isDeterministicCorruption(readError)) {
+        throw readError;
       }
-      if (movedParses && ExtensionMetadataService.isValidMetadataFileShape(moved)) {
-        // Restore without ever overwriting a newer file yet another writer
-        // may have re-created at the main path: link and COPYFILE_EXCL
-        // both fail with EEXIST in that case (the healthy leftover sidecar
-        // is then harmless and bounded by the fixed name).
+      movedParses = false;
+    }
+    if (movedParses && ExtensionMetadataService.isValidMetadataFileShape(moved)) {
+      // Restore without ever overwriting a newer file yet another writer
+      // may have re-created at the main path: link and COPYFILE_EXCL
+      // both fail with EEXIST in that case (the healthy leftover sidecar
+      // is then harmless and bounded by the fixed name).
+      try {
+        await link(quarantinePath, this.filePath);
+      } catch (linkError) {
+        if (ExtensionMetadataService.isErrnoCode(linkError, "EEXIST")) {
+          return false;
+        }
         try {
-          await link(quarantinePath, this.filePath);
-        } catch (linkError) {
-          if (ExtensionMetadataService.isErrnoCode(linkError, "EEXIST")) {
+          // Filesystems without hard-link support (or EPERM): copy-based
+          // restore with the same EEXIST no-overwrite guarantee.
+          await copyFile(quarantinePath, this.filePath, constants.COPYFILE_EXCL);
+        } catch (copyError) {
+          if (ExtensionMetadataService.isErrnoCode(copyError, "EEXIST")) {
             return false;
           }
-          try {
-            // Filesystems without hard-link support (or EPERM): copy-based
-            // restore with the same EEXIST no-overwrite guarantee.
-            await copyFile(quarantinePath, this.filePath, constants.COPYFILE_EXCL);
-          } catch (copyError) {
-            if (ExtensionMetadataService.isErrnoCode(copyError, "EEXIST")) {
-              return false;
-            }
-            // Restore failed with the main path missing: rethrow so the
-            // strict reader propagates a retryable failure instead of
-            // reading ENOENT as an authoritative empty state while the
-            // healthy bytes sit in the sidecar.
+          // Restore failed with the main path missing: rethrow so the
+          // strict reader propagates a retryable failure instead of
+          // reading ENOENT as an authoritative empty state while the
+          // healthy bytes sit in the sidecar.
+          throw copyError;
+        }
+      }
+      await unlink(quarantinePath).catch(() => undefined);
+      return false;
+    }
+    // Replace the quarantined main file with a valid EMPTY file instead of
+    // leaving the path missing: between the rename above and here, strict
+    // readers (this or another process) would otherwise observe ENOENT.
+    // A missing-main window is dangerous because load() treats plain
+    // ENOENT as a healthy empty state — combined with a concurrent writer
+    // repairing the file right before the rename, a reader in the gap
+    // could return an authoritative {} that a later restore cannot
+    // retract. With a real empty file the corrupt→empty transition is
+    // atomic (link/COPYFILE_EXCL below never overwrite a file a
+    // concurrent writer re-created first), and load()'s sidecar check
+    // turns any remaining missing-main window into a retryable failure
+    // instead of an empty read.
+    const emptyTmpPath = `${this.filePath}.empty.tmp`;
+    await writeFile(
+      emptyTmpPath,
+      JSON.stringify({ version: 1, workspaces: {} } satisfies ExtensionMetadataFile, null, 2),
+      "utf-8"
+    );
+    try {
+      await link(emptyTmpPath, this.filePath);
+    } catch (linkError) {
+      if (!ExtensionMetadataService.isErrnoCode(linkError, "EEXIST")) {
+        try {
+          await copyFile(emptyTmpPath, this.filePath, constants.COPYFILE_EXCL);
+        } catch (copyError) {
+          if (!ExtensionMetadataService.isErrnoCode(copyError, "EEXIST")) {
+            // Main path still missing: rethrow (retryable) so the caller's
+            // re-read hits the sidecar guard instead of reading ENOENT.
             throw copyError;
           }
         }
-        await unlink(quarantinePath).catch(() => undefined);
-        return false;
       }
-      // Replace the quarantined main file with a valid EMPTY file instead of
-      // leaving the path missing: between the rename above and here, strict
-      // readers (this or another process) would otherwise observe ENOENT.
-      // A missing-main window is dangerous because load() treats plain
-      // ENOENT as a healthy empty state — combined with a concurrent writer
-      // repairing the file right before the rename, a reader in the gap
-      // could return an authoritative {} that a later restore cannot
-      // retract. With a real empty file the corrupt→empty transition is
-      // atomic (link/COPYFILE_EXCL below never overwrite a file a
-      // concurrent writer re-created first), and load()'s sidecar check
-      // turns any remaining missing-main window into a retryable failure
-      // instead of an empty read.
-      const emptyTmpPath = `${this.filePath}.empty.tmp`;
-      await writeFile(
-        emptyTmpPath,
-        JSON.stringify({ version: 1, workspaces: {} } satisfies ExtensionMetadataFile, null, 2),
-        "utf-8"
+    }
+    await unlink(emptyTmpPath).catch(() => undefined);
+    log.error(
+      `Extension metadata file was corrupt; moved it to ${quarantinePath} and reset to empty`
+    );
+    return true;
+  }
+
+  /**
+   * Resume a quarantine that a crash interrupted between quarantineCorruptFile's
+   * rename and its completion: the main file is missing while the sidecar still
+   * holds the moved bytes. Without this, every strict read rethrows the ENOENT
+   * (load()'s sidecar guard classifies it retryable) until an unrelated writer
+   * happens to save — activity hydration would retry forever on an idle
+   * process. No-op when the main file reappeared or no sidecar exists.
+   */
+  private async resumeQuarantineRecovery(): Promise<void> {
+    await this.withSerializedMutation(async () => {
+      // Re-check inside the queue: a concurrent writer save or a sibling
+      // strict read may already have recovered the main path.
+      const mainExists = await access(this.filePath).then(
+        () => true,
+        () => false
       );
-      try {
-        await link(emptyTmpPath, this.filePath);
-      } catch (linkError) {
-        if (!ExtensionMetadataService.isErrnoCode(linkError, "EEXIST")) {
-          try {
-            await copyFile(emptyTmpPath, this.filePath, constants.COPYFILE_EXCL);
-          } catch (copyError) {
-            if (!ExtensionMetadataService.isErrnoCode(copyError, "EEXIST")) {
-              // Main path still missing: rethrow (retryable) so the caller's
-              // re-read hits the sidecar guard instead of reading ENOENT.
-              throw copyError;
-            }
-          }
-        }
+      if (mainExists) {
+        return;
       }
-      await unlink(emptyTmpPath).catch(() => undefined);
-      log.error(
-        `Extension metadata file was corrupt; moved it to ${quarantinePath} and reset to empty`
+      const quarantinePath = `${this.filePath}.corrupt`;
+      const sidecarExists = await access(quarantinePath).then(
+        () => true,
+        () => false
       );
-      return true;
+      if (!sidecarExists) {
+        return;
+      }
+      await this.completeQuarantineRecovery(quarantinePath);
     });
   }
 
@@ -714,21 +761,29 @@ export class ExtensionMetadataService {
       // last-known state and retries), but deterministic corruption would
       // fail every retry forever on an idle process. Quarantine the corrupt
       // bytes and re-read: the post-quarantine empty state is authoritative.
-      if (!ExtensionMetadataService.isDeterministicCorruption(error)) {
-        throw error;
-      }
-      try {
-        await this.quarantineCorruptFile();
-      } catch (quarantineError) {
-        // ENOENT means the file vanished between validation and rename
-        // (another process moved it) — the re-read below decides the
-        // outcome. Anything else (rename denied, sidecar unverifiable,
-        // restore failed) must stay a retryable failure: an ENOENT re-read
-        // would masquerade as authoritative empty while the moved bytes may
-        // hold healthy data.
-        if (!ExtensionMetadataService.isErrnoCode(quarantineError, "ENOENT")) {
-          throw quarantineError;
+      if (ExtensionMetadataService.isDeterministicCorruption(error)) {
+        try {
+          await this.quarantineCorruptFile();
+        } catch (quarantineError) {
+          // ENOENT means the file vanished between validation and rename
+          // (another process moved it) — the re-read below decides the
+          // outcome. Anything else (rename denied, sidecar unverifiable,
+          // restore failed) must stay a retryable failure: an ENOENT re-read
+          // would masquerade as authoritative empty while the moved bytes may
+          // hold healthy data.
+          if (!ExtensionMetadataService.isErrnoCode(quarantineError, "ENOENT")) {
+            throw quarantineError;
+          }
         }
+      } else if (ExtensionMetadataService.isErrnoCode(error, "ENOENT")) {
+        // load() only propagates ENOENT while the quarantine sidecar exists:
+        // a crash between quarantine's rename and its completion left the
+        // recovery half-done, and nothing else finishes it (lenient writer
+        // reads self-heal in memory without saving). Resume it here so
+        // strict reads stop failing on every retry across restarts.
+        await this.resumeQuarantineRecovery();
+      } else {
+        throw error;
       }
       data = await this.load(options);
     }
