@@ -530,6 +530,30 @@ describe("ExtensionMetadataService", () => {
     expect((await service.getAllSnapshots()).has("stale-workspace")).toBe(false);
   });
 
+  test("a writer enqueued while the prune is mid-fetch cannot resurrect a reclaimed entry", async () => {
+    // The prune publishes tombstones only while its queued mutation runs. A
+    // writer that passes its pre-queue tombstone check during the prune's
+    // known-ids fetch enqueues BEHIND the prune, so only the in-queue
+    // re-check stops it from recreating the entry the prune just reclaimed.
+    await service.updateRecency("stale-workspace", 100);
+    let releaseKnownIds!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseKnownIds = resolve;
+    });
+    const prune = service.pruneMissingWorkspaces(async () => {
+      await gate;
+      return new Set<string>();
+    });
+    const lateWriter = service.updateRecency("stale-workspace", 200);
+    releaseKnownIds();
+    expect(await prune).toBe(1);
+    await lateWriter;
+
+    expect((await service.getAllSnapshots()).has("stale-workspace")).toBe(false);
+    const persisted = JSON.parse(await readFile(filePath, "utf-8")) as ExtensionMetadataFile;
+    expect(persisted.workspaces["stale-workspace"]).toBeUndefined();
+  });
+
   test("pruneMissingWorkspaces does not rewrite the file when nothing is stale", async () => {
     // Compact (non-pretty) serialization: any rewrite through save() would
     // change the raw bytes, so byte-equality proves no write happened.

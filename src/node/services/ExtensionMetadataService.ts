@@ -110,23 +110,40 @@ export class ExtensionMetadataService {
     return normalized ? toWorkspaceActivitySnapshot(normalized) : null;
   }
 
+  /**
+   * Late write for a removed workspace: compute the snapshot for the caller
+   * but never persist it, so the deleted entry cannot be resurrected.
+   */
+  private buildTransientSnapshot(
+    workspaceId: string,
+    recency: number,
+    mutate: (workspace: ExtensionMetadata) => void
+  ): WorkspaceActivitySnapshot {
+    const transient = this.getOrCreateWorkspaceEntry(
+      { version: 1, workspaces: {} },
+      workspaceId,
+      recency
+    );
+    mutate(transient);
+    return toWorkspaceActivitySnapshot(transient);
+  }
+
   private async mutateWorkspaceSnapshot(
     workspaceId: string,
     recency: number,
     mutate: (workspace: ExtensionMetadata) => void
   ): Promise<WorkspaceActivitySnapshot> {
-    // Late write for a removed workspace: compute the snapshot for the caller
-    // but never persist it, so the deleted entry cannot be resurrected.
     if (this.deletedWorkspaceIds.has(workspaceId)) {
-      const transient = this.getOrCreateWorkspaceEntry(
-        { version: 1, workspaces: {} },
-        workspaceId,
-        recency
-      );
-      mutate(transient);
-      return toWorkspaceActivitySnapshot(transient);
+      return this.buildTransientSnapshot(workspaceId, recency, mutate);
     }
     return this.withSerializedMutation(async () => {
+      // Re-check inside the queue: pruneMissingWorkspaces publishes its
+      // tombstones only while its queued mutation runs, so a writer that
+      // passed the pre-queue check and enqueued behind the prune must not
+      // recreate an entry the prune just reclaimed.
+      if (this.deletedWorkspaceIds.has(workspaceId)) {
+        return this.buildTransientSnapshot(workspaceId, recency, mutate);
+      }
       const data = await this.load();
       const workspace = this.getOrCreateWorkspaceEntry(data, workspaceId, recency);
       mutate(workspace);
@@ -298,6 +315,11 @@ export class ExtensionMetadataService {
       return null;
     }
     return this.withSerializedMutation(async () => {
+      // Re-check inside the queue (see mutateWorkspaceSnapshot): tombstones
+      // published by an already-enqueued prune must be honored here too.
+      if (this.deletedWorkspaceIds.has(workspaceId)) {
+        return null;
+      }
       const data = await this.load();
       const existing = coerceExtensionMetadata(data.workspaces[workspaceId]);
       const workspace: ExtensionMetadata = existing ?? {
