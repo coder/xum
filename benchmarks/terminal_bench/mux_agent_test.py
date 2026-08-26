@@ -272,9 +272,15 @@ class _FakeEnvironment:
         command = _kwargs.get("command")
         if isinstance(command, str):
             self.exec_commands.append(command)
-        if isinstance(command, str) and command.startswith("tar "):
-            # Sessions-archive step: succeed only when the fake has one staged.
-            return _ExecResult(return_code=0 if self.session_archive else 1)
+        if (
+            isinstance(command, str)
+            and MuxAgent._SESSIONS_ARCHIVE_SANDBOX_PATH in command
+        ):
+            # Sessions-archive step: succeed only when the fake has one staged,
+            # reporting the archive size like the in-sandbox stat call does.
+            if self.session_archive is None:
+                return _ExecResult(return_code=1)
+            return _ExecResult(return_code=0, stdout=f"{len(self.session_archive)}\n")
         timeout_sec = _kwargs.get("timeout_sec")
         if self.delay_sec:
             if isinstance(timeout_sec, (int, float)) and timeout_sec < self.delay_sec:
@@ -509,10 +515,16 @@ def test_run_downloads_session_archive(
 
     asyncio.run(agent.run("do the task", environment, context))
 
-    tar_commands = [c for c in environment.exec_commands if c.startswith("tar ")]
-    assert tar_commands == [
-        f"tar -czf {MuxAgent._SESSIONS_ARCHIVE_SANDBOX_PATH} -C /root/.mux sessions"
+    tar_commands = [
+        c
+        for c in environment.exec_commands
+        if MuxAgent._SESSIONS_ARCHIVE_SANDBOX_PATH in c
     ]
+    assert len(tar_commands) == 1
+    # Only the known telemetry files are archived, from the mux config root.
+    assert "cd /root/.mux" in tar_commands[0]
+    for expected in ("chat.jsonl", "chat-archive.jsonl", "session-usage.json"):
+        assert expected in tar_commands[0]
     assert (
         MuxAgent._SESSIONS_ARCHIVE_SANDBOX_PATH,
         tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME,
@@ -570,6 +582,99 @@ def test_populate_context_uses_session_usage_when_token_file_missing(
     assert getattr(context, "n_output_tokens") == 20
     # No cost buckets recorded -> cost stays unset rather than a misleading 0.
     assert not hasattr(context, "cost_usd")
+
+
+def test_run_skips_oversized_session_archive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    monkeypatch.setattr(MuxAgent, "_SESSIONS_ARCHIVE_MAX_BYTES", 1)
+    agent = MuxAgent(logs_dir=tmp_path)
+    environment = _FakeEnvironment(
+        _ExecResult(return_code=0, stdout="out", stderr="err"),
+        session_archive=_sessions_archive_bytes({"ws-main": _usage_display()}),
+    )
+    context = SimpleNamespace()
+
+    asyncio.run(agent.run("do the task", environment, context))
+
+    assert not (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).exists()
+    assert (
+        MuxAgent._SESSIONS_ARCHIVE_SANDBOX_PATH,
+        tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME,
+    ) not in environment.download_attempts
+
+
+def test_populate_context_keeps_fresher_token_file_counts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    # Timeout scenario: stdout usage-deltas carry newer counts than the last
+    # persisted stream-end, so the session totals are staler (smaller).
+    (tmp_path / "mux-tokens.json").write_text(
+        '{"input": 500, "output": 90, "cache_read": 800, "cache_write": 40, "cost_usd": null}'
+    )
+    (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).write_bytes(
+        _sessions_archive_bytes({"ws-main": _usage_display()})
+    )
+    context = SimpleNamespace()
+
+    agent.populate_context_post_run(context)
+
+    assert getattr(context, "n_input_tokens") == 500 + 800 + 40
+    assert getattr(context, "n_output_tokens") == 90
+    # Stale session cost must not be attached to fresher token counts.
+    assert not hasattr(context, "cost_usd")
+
+
+def test_session_usage_leaves_cost_unset_for_unpriced_usage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    usage = _usage_display()
+    usage["byModel"]["custom:unknown-model"] = {
+        "input": {"tokens": 42},
+        "output": {"tokens": 9},
+    }
+    (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).write_bytes(
+        _sessions_archive_bytes({"ws-main": usage})
+    )
+
+    totals = agent._summarize_session_usage()
+
+    assert totals is not None
+    assert totals["input"] == 10 + 42
+    assert totals["cost_usd"] is None
+
+
+def test_session_usage_skips_malformed_entries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).write_bytes(
+        _sessions_archive_bytes(
+            {
+                "ws-bad-by-model": {"byModel": "corrupt", "version": 1},
+                "ws-bad-model-entry": {"byModel": {"m": None}, "version": 1},
+                "ws-bad-component": {
+                    "byModel": {"m": {"input": "corrupt", "output": {"tokens": 4}}},
+                    "version": 1,
+                },
+                "ws-main": _usage_display(),
+            }
+        )
+    )
+
+    totals = agent._summarize_session_usage()
+
+    assert totals is not None
+    # Malformed byModel skipped entirely; malformed components skipped per-field.
+    assert totals["sessions"] == 3
+    assert totals["input"] == 10
+    assert totals["output"] == 20 + 4
 
 
 def test_session_usage_skips_rolled_up_children(

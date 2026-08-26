@@ -235,6 +235,11 @@ class MuxAgent(BaseInstalledAgent):
     _SESSIONS_ARCHIVE_SANDBOX_PATH = "/tmp/mux-sessions.tar.gz"
     _SESSIONS_ARCHIVE_NAME = "mux-sessions.tar.gz"
     _SESSION_USAGE_SUMMARY_NAME = "mux-session-usage.json"
+    # Telemetry collection bounds: dataset-controlled trials must not be able to
+    # exhaust host disk/memory through the sessions archive.
+    _SESSIONS_ARCHIVE_MAX_BYTES = 256 * 1024 * 1024
+    _SESSION_USAGE_MAX_MEMBERS = 10_000
+    _SESSION_USAGE_FILE_MAX_BYTES = 16 * 1024 * 1024
 
     async def _stage_providers_config(
         self, environment: BaseEnvironment, env: dict[str, str]
@@ -469,18 +474,31 @@ class MuxAgent(BaseInstalledAgent):
         ).strip() or "/root/.mux"
         archive_path = self.logs_dir / self._SESSIONS_ARCHIVE_NAME
         archive_path.unlink(missing_ok=True)
+        # Archive only the known telemetry files (not arbitrary session content a
+        # task could plant) and report the archive size for the download bound.
+        script = (
+            "set -o pipefail\n"
+            f"cd {shlex.quote(config_root)} || exit 1\n"
+            "find sessions -type f \\( -name chat.jsonl -o -name chat-archive.jsonl "
+            "-o -name session-usage.json \\) -print0 "
+            f"| tar --null -czf {self._SESSIONS_ARCHIVE_SANDBOX_PATH} -T - || exit 1\n"
+            f"stat -c %s {self._SESSIONS_ARCHIVE_SANDBOX_PATH}\n"
+        )
         try:
             # Run as root like install(): the agent session writes under /root.
             result = await environment.exec(
-                command=(
-                    f"tar -czf {self._SESSIONS_ARCHIVE_SANDBOX_PATH} "
-                    f"-C {shlex.quote(config_root)} sessions"
-                ),
+                command=f"bash -c {shlex.quote(script)}",
                 user="root",
                 timeout_sec=120,
             )
             if result.return_code != 0:
                 return  # Sessions dir may not exist if the agent crashed early
+            try:
+                archive_bytes = int((result.stdout or "").strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                return
+            if archive_bytes > self._SESSIONS_ARCHIVE_MAX_BYTES:
+                return
             await environment.download_file(
                 self._SESSIONS_ARCHIVE_SANDBOX_PATH, archive_path
             )
@@ -502,25 +520,37 @@ class MuxAgent(BaseInstalledAgent):
         rolled_up_ids: set[str] = set()
         try:
             with tarfile.open(archive_path, "r:gz") as archive:
-                for member in archive.getmembers():
+                members_seen = 0
+                for member in archive:
+                    members_seen += 1
+                    if members_seen > self._SESSION_USAGE_MAX_MEMBERS:
+                        break
                     parts = Path(member.name).parts
                     if (
                         len(parts) < 3
                         or parts[-1] != "session-usage.json"
                         or not member.isfile()
+                        or member.size > self._SESSION_USAGE_FILE_MAX_BYTES
                     ):
                         continue
-                    extracted = archive.extractfile(member)
-                    if extracted is None:
+                    try:
+                        extracted = archive.extractfile(member)
+                        if extracted is None:
+                            continue
+                        data = json.loads(extracted.read().decode("utf-8"))
+                    except Exception:
+                        continue  # Skip malformed files, keep valid sessions
+                    if not isinstance(data, dict):
                         continue
-                    data = json.loads(extracted.read().decode("utf-8"))
                     session_id = parts[-2]
                     per_session[session_id] = data
-                    rolled_up_ids.update((data.get("rolledUpFrom") or {}).keys())
+                    rolled_up = data.get("rolledUpFrom")
+                    if isinstance(rolled_up, dict):
+                        rolled_up_ids.update(rolled_up.keys())
         except Exception:
             return None  # Corrupt/partial archive — telemetry stays best-effort
 
-        totals = {
+        totals: dict[str, Any] = {
             "input": 0,
             "output": 0,
             "reasoning": 0,
@@ -536,20 +566,51 @@ class MuxAgent(BaseInstalledAgent):
             "cached": "cache_read",
             "cacheCreate": "cache_write",
         }
+        cost_sum = 0.0
+        has_cost = False
+        has_unpriced_usage = False
         for session_id, data in per_session.items():
             if session_id in rolled_up_ids:
                 continue  # Parent session-usage.json already includes this child
+            by_model = data.get("byModel")
+            if not isinstance(by_model, dict):
+                continue  # Skip malformed/older shapes, keep valid sessions
             totals["sessions"] += 1
-            for usage in (data.get("byModel") or {}).values():
+            for usage in by_model.values():
+                if not isinstance(usage, dict):
+                    continue
+                if usage.get("hasUnknownCosts"):
+                    has_unpriced_usage = True
                 for bucket, key in bucket_to_key.items():
-                    component = usage.get(bucket) or {}
-                    totals[key] += component.get("tokens", 0) or 0
+                    component = usage.get(bucket)
+                    if not isinstance(component, dict):
+                        continue
+                    tokens = component.get("tokens")
+                    if not isinstance(tokens, (int, float)):
+                        tokens = 0
+                    totals[key] += int(tokens)
                     cost = component.get("cost_usd")
-                    if cost is not None:
-                        totals["cost_usd"] = (totals["cost_usd"] or 0.0) + cost
+                    if isinstance(cost, (int, float)):
+                        cost_sum += cost
+                        has_cost = True
+                    elif tokens > 0:
+                        # Nonzero usage without a price: reporting only the
+                        # priced subset would misstate total cost.
+                        has_unpriced_usage = True
         if totals["sessions"] == 0:
             return None
+        if has_cost and not has_unpriced_usage:
+            totals["cost_usd"] = cost_sum
         return totals
+
+    @staticmethod
+    def _total_tokens(data: dict[str, Any]) -> int:
+        total = 0
+        for key in ("input", "output", "reasoning", "cache_read", "cache_write"):
+            value = data.get(key)
+            if isinstance(value, (int, float)):
+                total += int(value)
+        return total
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         """Extract token usage and cost from the collected telemetry artifacts.
@@ -563,11 +624,15 @@ class MuxAgent(BaseInstalledAgent):
         token_file = self.logs_dir / "mux-tokens.json"
         if token_file.exists():
             try:
-                token_data = json.loads(token_file.read_text())
+                loaded = json.loads(token_file.read_text())
+                token_data = loaded if isinstance(loaded, dict) else None
             except Exception:
                 token_data = None
 
-        session_totals = self._summarize_session_usage()
+        try:
+            session_totals = self._summarize_session_usage()
+        except Exception:
+            session_totals = None  # Telemetry must never fail the trial
         if session_totals is not None:
             # Persist the aggregate next to mux-tokens.json for run analysis.
             try:
@@ -580,7 +645,14 @@ class MuxAgent(BaseInstalledAgent):
         data: dict[str, Any] | None
         if token_data is not None and token_data.get("cost_usd") is not None:
             data = token_data
-        elif session_totals is not None:
+        elif session_totals is not None and (
+            token_data is None
+            or self._total_tokens(session_totals) >= self._total_tokens(token_data)
+        ):
+            # Session totals only win when they reflect at least as much usage:
+            # a timeout can leave stdout usage-deltas newer than the last
+            # persisted stream-end, and those fresher token counts must not be
+            # replaced by stale (or empty) session files.
             data = session_totals
         else:
             data = token_data
