@@ -2240,8 +2240,36 @@ export class Config {
             }
           }
 
-          // Try legacy ID format as last resort
+          // Authoritative legacy path: getAllWorkspaceMetadata resolves an
+          // id-less entry's stable id from sessions/<generated-legacy-id>/
+          // metadata.json (NOT the basename path above). Callers verifying
+          // "is this id still registered" (e.g. the extension-metadata
+          // discard) must see the same identity, or a stable id that lives
+          // only in that file would be reported absent while its workspace
+          // remains registered.
           const legacyId = this.generateLegacyId(projectPath, workspace.path);
+          const legacyMetadataPath = path.join(this.getSessionDir(legacyId), "metadata.json");
+          if (fs.existsSync(legacyMetadataPath)) {
+            try {
+              const legacyData = fs.readFileSync(legacyMetadataPath, "utf-8");
+              const legacyMetadata = JSON.parse(legacyData) as WorkspaceMetadata;
+              this.rememberLegacyTaskVariantWorkspace(projectPath, legacyMetadata, "metadata");
+              if (legacyMetadata.id === workspaceId) {
+                return {
+                  workspacePath: workspace.path,
+                  projectPath,
+                  attributionProjectPath,
+                  projects: legacyMetadata.projects ?? workspace.projects,
+                  workspaceName: undefined,
+                  parentWorkspaceId: undefined,
+                };
+              }
+            } catch {
+              // Ignore parse errors, try legacy ID
+            }
+          }
+
+          // Try legacy ID format as last resort
           if (legacyId === workspaceId) {
             return {
               workspacePath: workspace.path,

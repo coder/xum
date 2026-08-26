@@ -3323,6 +3323,51 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("discardExtensionMetadataEntry keeps entries of id-less legacy workspaces", async () => {
+    // An id-less legacy config entry resolves its stable id from
+    // sessions/<generated-legacy-id>/metadata.json. The raw config scan
+    // cannot see that id, so the discard's registration check must resolve
+    // it through the same authoritative path getAllWorkspaceMetadata uses;
+    // otherwise the still-registered workspace would be reported absent and
+    // its activity writes permanently tombstoned for this process.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const stableId = "legacy-stable-id";
+      const projectPath = path.join(config.rootDir, "project");
+      const workspacePath = path.join(projectPath, "legacy-ws");
+      await fsPromises.writeFile(
+        path.join(config.rootDir, "config.json"),
+        JSON.stringify({
+          projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
+        })
+      );
+      const legacySessionDir = config.getSessionDir(
+        config.generateLegacyId(projectPath, workspacePath)
+      );
+      await fsPromises.mkdir(legacySessionDir, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(legacySessionDir, "metadata.json"),
+        JSON.stringify({ id: stableId, name: "legacy-ws" })
+      );
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency(stableId, 100);
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+
+      await workspaceService.discardExtensionMetadataEntry(stableId);
+
+      expect((await extensionMetadata.getAllSnapshots()).has(stableId)).toBe(true);
+      expect(extensionMetadata.isWorkspaceDeleted(stableId)).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("getActivityList quarantines a deterministically corrupt metadata file", async () => {
     // Parse/structure corruption fails identically on every retry, so a
     // strict read that only rethrows would leave activity hydration broken

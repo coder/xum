@@ -1,5 +1,5 @@
 import { dirname } from "path";
-import { mkdir, readFile, access, rename, link, unlink } from "fs/promises";
+import { mkdir, readFile, access, rename, link, unlink, copyFile } from "fs/promises";
 import { constants } from "fs";
 import writeFileAtomic from "write-file-atomic";
 import {
@@ -562,6 +562,10 @@ export class ExtensionMetadataService {
     return !(typeof error === "object" && error != null && "code" in error);
   }
 
+  private static isErrnoCode(error: unknown, code: string): boolean {
+    return typeof error === "object" && error != null && "code" in error && error.code === code;
+  }
+
   private static isValidMetadataFileShape(parsed: unknown): parsed is ExtensionMetadataFile {
     if (typeof parsed !== "object" || parsed === null) {
       return false;
@@ -603,16 +607,32 @@ export class ExtensionMetadataService {
       try {
         const moved: unknown = JSON.parse(await readFile(quarantinePath, "utf-8"));
         if (ExtensionMetadataService.isValidMetadataFileShape(moved)) {
+          // Restore without ever overwriting a newer file yet another writer
+          // may have re-created at the main path: link and COPYFILE_EXCL
+          // both fail with EEXIST in that case (the healthy leftover sidecar
+          // is then harmless and bounded by the fixed name).
           try {
-            // link (not rename) restores: it fails with EEXIST when yet
-            // another writer already re-created the main path, so a newer
-            // file is never overwritten by the restore.
             await link(quarantinePath, this.filePath);
-            await unlink(quarantinePath);
-          } catch {
-            // EEXIST or fs without hard links: a healthy leftover sidecar is
-            // harmless (bounded by the fixed name) — never destroy data.
+          } catch (linkError) {
+            if (ExtensionMetadataService.isErrnoCode(linkError, "EEXIST")) {
+              return false;
+            }
+            try {
+              // Filesystems without hard-link support (or EPERM): copy-based
+              // restore with the same EEXIST no-overwrite guarantee.
+              await copyFile(quarantinePath, this.filePath, constants.COPYFILE_EXCL);
+            } catch (copyError) {
+              if (ExtensionMetadataService.isErrnoCode(copyError, "EEXIST")) {
+                return false;
+              }
+              // Restore failed with the main path missing: rethrow so the
+              // strict reader propagates a retryable failure instead of
+              // reading ENOENT as an authoritative empty state while the
+              // healthy bytes sit in the sidecar.
+              throw copyError;
+            }
           }
+          await unlink(quarantinePath).catch(() => undefined);
           return false;
         }
       } catch {
