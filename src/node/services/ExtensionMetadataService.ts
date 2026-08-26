@@ -17,6 +17,14 @@ import type { GoalSnapshot } from "@/common/types/goal";
 import { log } from "@/node/services/log";
 
 /**
+ * Marker code for "file written by a newer schema version" load failures.
+ * Shaped like an errno code so the corruption/quarantine classification
+ * (isDeterministicCorruption: errors WITH a code are not quarantinable)
+ * treats downgrade encounters as retryable, never as resettable corruption.
+ */
+const UNSUPPORTED_METADATA_VERSION_CODE = "XUM_UNSUPPORTED_METADATA_VERSION";
+
+/**
  * Stateless service for managing workspace metadata used by VS Code extension integration.
  *
  * This service tracks:
@@ -223,6 +231,16 @@ export class ExtensionMetadataService {
         const content = await readFile(this.filePath, "utf-8");
         const parsed = JSON.parse(content) as ExtensionMetadataFile;
 
+        // A syntactically valid file whose version is not 1 was written by a
+        // build with a newer schema — NOT corruption. It must never be
+        // quarantined/reset (upgrading back would find the canonical file
+        // empty and lose all activity state) and never self-healed to {} by
+        // a lenient writer (saving version-1 bytes over it is the same data
+        // loss). Both read modes propagate; see the catch below.
+        if (ExtensionMetadataService.isUnsupportedVersion(parsed)) {
+          throw ExtensionMetadataService.unsupportedVersionError();
+        }
+
         // Validate structure, including the workspaces container: a parseable
         // file with e.g. an array or primitive `workspaces` would otherwise
         // enumerate as zero entries and masquerade as an authoritative empty
@@ -284,7 +302,11 @@ export class ExtensionMetadataService {
         }
       }
     }
-    if (options?.throwOnError || blockedByQuarantineWindow) {
+    if (
+      options?.throwOnError ||
+      blockedByQuarantineWindow ||
+      ExtensionMetadataService.isErrnoCode(lastError, UNSUPPORTED_METADATA_VERSION_CODE)
+    ) {
       throw lastError;
     }
     log.error("Failed to load metadata:", lastError);
@@ -604,8 +626,21 @@ export class ExtensionMetadataService {
       }
       // Deletion-only merge against a fresh snapshot (see doc comment above).
       const fresh = await this.load();
+      // Re-fetch the known ids AFTER the fresh load: with multiple instances
+      // a downgraded backend can re-register a deterministic legacy id (and
+      // write new activity for it) between the enumeration above and here.
+      // Deleting on the stale classification would destroy that new entry's
+      // recency/goal/status — clearing the tombstone later cannot restore
+      // data. A re-registered id is dropped from the deletion set and its
+      // write tombstone lifted. If the recheck fails, abort the prune (throw
+      // to the caller's catch) rather than deleting on stale knowledge.
+      const recheckedKnownIds = await getKnownWorkspaceIds();
       let prunedCount = 0;
       for (const workspaceId of staleWorkspaceIds) {
+        if (recheckedKnownIds.has(workspaceId)) {
+          this.deletedWorkspaceIds.delete(workspaceId);
+          continue;
+        }
         if (workspaceId in fresh.workspaces) {
           delete fresh.workspaces[workspaceId];
           prunedCount++;
@@ -655,6 +690,29 @@ export class ExtensionMetadataService {
 
   private static isErrnoCode(error: unknown, code: string): boolean {
     return typeof error === "object" && error != null && "code" in error && error.code === code;
+  }
+
+  /**
+   * A structurally sound file whose version is not 1: written by a newer
+   * schema, not corrupt. Carries the marker code so isDeterministicCorruption
+   * classifies it as non-quarantinable and load() refuses to self-heal it.
+   */
+  private static isUnsupportedVersion(parsed: unknown): boolean {
+    return (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      !Array.isArray(parsed) &&
+      "version" in parsed &&
+      (parsed as { version?: unknown }).version !== 1
+    );
+  }
+
+  private static unsupportedVersionError(): NodeJS.ErrnoException {
+    const error = new Error(
+      "Unsupported extension metadata file version (written by a newer build)"
+    ) as NodeJS.ErrnoException;
+    error.code = UNSUPPORTED_METADATA_VERSION_CODE;
+    return error;
   }
 
   private static isValidMetadataFileShape(parsed: unknown): parsed is ExtensionMetadataFile {

@@ -1334,7 +1334,15 @@ export class Config {
               throw new Error("Config projects entries must be [path, config] pairs");
             }
             const projectConfig: unknown = pair[1];
-            if (projectConfig === null || typeof projectConfig !== "object") {
+            // Arrays pass typeof "object": lenient normalization would turn
+            // an array-valued project config into a project with no
+            // workspaces, and destructive strict callers would then classify
+            // every one of its workspaces as removed.
+            if (
+              projectConfig === null ||
+              typeof projectConfig !== "object" ||
+              Array.isArray(projectConfig)
+            ) {
               throw new Error("Config project entries must be objects");
             }
             const workspaces = (projectConfig as { workspaces?: unknown }).workspaces;

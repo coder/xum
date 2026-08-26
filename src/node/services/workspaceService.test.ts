@@ -3241,7 +3241,10 @@ describe("WorkspaceService activity list scoping", () => {
       expect(activityList).not.toBeNull();
       expect(activityList?.[workspaceId]?.recency).toBe(100);
       expect(activityList?.["removed-workspace"]).toBeUndefined();
-      expect(metadataSpy).toHaveBeenCalledTimes(1);
+      // Both walks belong to the prune itself (enumeration + the fresh
+      // pre-deletion recheck that spares concurrently re-registered ids);
+      // the list's SCOPING reuses the prune's ids instead of paying a third.
+      expect(metadataSpy).toHaveBeenCalledTimes(2);
     } finally {
       await cleanup();
     }
@@ -3627,9 +3630,11 @@ describe("WorkspaceService activity list scoping", () => {
     // across restarts until some unrelated writer replaced the file. The
     // strict path quarantines the bytes (preserved for inspection, never
     // silently deleted) and the resulting empty state is authoritative.
+    // Note: a valid file with version !== 1 is deliberately NOT here — that
+    // is a newer build's schema, treated as unsupported (propagated, never
+    // quarantined/reset) so a downgrade round-trip cannot destroy it.
     const corruptFiles = [
       "{not json",
-      JSON.stringify({ version: 2, workspaces: {} }),
       JSON.stringify({ version: 1, workspaces: [] }),
       JSON.stringify({ version: 1, workspaces: "bogus" }),
       JSON.stringify({ version: 1, workspaces: null }),
@@ -3863,6 +3868,9 @@ describe("WorkspaceService activity list scoping", () => {
       "{not json",
       JSON.stringify({ projects: {} }),
       JSON.stringify({ projects: [["/tmp/project", { workspaces: "bogus" }]] }),
+      // Arrays pass typeof "object": lenient normalization turns an
+      // array-valued project config into a project with no workspaces.
+      JSON.stringify({ projects: [["/tmp/project", []]] }),
     ];
     for (const corruptConfig of corruptConfigs) {
       const { config, historyService, cleanup } = await createTestHistoryService();

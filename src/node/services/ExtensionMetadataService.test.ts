@@ -588,6 +588,82 @@ describe("ExtensionMetadataService", () => {
     expect(await readFile(filePath, "utf-8")).toBe(rawContent);
   });
 
+  test("pruneMissingWorkspaces spares ids re-registered mid-prune", async () => {
+    // With multiple instances, a downgraded backend can re-register a
+    // deterministic legacy id (and write its activity) between the prune's
+    // enumeration and its deletion pass. The recheck against a second fresh
+    // enumeration must spare that entry and lift its write tombstone —
+    // deleting on the stale classification would destroy data a later
+    // tombstone-clear cannot restore.
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        workspaces: {
+          "known-workspace": { recency: 100, streaming: false },
+          "revived-workspace": { recency: 200, streaming: false },
+        },
+      })
+    );
+    let fetches = 0;
+    const prunedCount = await service.pruneMissingWorkspaces(() => {
+      fetches += 1;
+      // First enumeration: revived-workspace looks stale. Recheck: it was
+      // re-registered concurrently.
+      return Promise.resolve(
+        fetches === 1
+          ? new Set(["known-workspace"])
+          : new Set(["known-workspace", "revived-workspace"])
+      );
+    });
+
+    expect(prunedCount).toBe(0);
+    const persisted = JSON.parse(await readFile(filePath, "utf-8")) as ExtensionMetadataFile;
+    expect(Object.keys(persisted.workspaces).sort()).toEqual([
+      "known-workspace",
+      "revived-workspace",
+    ]);
+    // Tombstone lifted: subsequent writes for the revived id persist.
+    expect(service.isWorkspaceDeleted("revived-workspace")).toBe(false);
+  });
+
+  test("a newer build's metadata version is unsupported, never quarantined or self-healed", async () => {
+    // Downgrade safety: a syntactically valid file with version !== 1 was
+    // written by a newer schema. Quarantining/resetting it (or a lenient
+    // writer self-healing to {} and saving version-1 bytes over it) would
+    // make the upgrade back find an empty canonical file and lose all
+    // activity state. Both read modes must propagate and leave the bytes
+    // untouched.
+    const newerFile = JSON.stringify({ version: 2, workspaces: {}, futureField: true });
+    await writeFile(filePath, newerFile);
+
+    // Strict read: retryable failure, no quarantine.
+    let strictError: unknown = null;
+    try {
+      await service.getAllSnapshots({ throwOnError: true });
+    } catch (error) {
+      strictError = error;
+    }
+    expect(strictError).not.toBeNull();
+
+    // Lenient write: the mutation fails instead of clobbering the file.
+    let writeError: unknown = null;
+    try {
+      await service.updateRecency("ws-1", 123);
+    } catch (error) {
+      writeError = error;
+    }
+    expect(writeError).not.toBeNull();
+
+    // Bytes untouched, no sidecar created.
+    expect(await readFile(filePath, "utf-8")).toBe(newerFile);
+    const sidecarExists = await readFile(`${filePath}.corrupt`, "utf-8").then(
+      () => true,
+      () => false
+    );
+    expect(sidecarExists).toBe(false);
+  });
+
   test("a strict read resumes a crash-interrupted quarantine of corrupt bytes", async () => {
     // Crash window: quarantine renamed main -> sidecar and died before
     // writing the empty replacement. The next strict read must finish the
