@@ -14,7 +14,6 @@ import { tool } from "ai";
 import { z } from "zod";
 import * as path from "path";
 import * as fs from "fs/promises";
-import * as fsSync from "fs";
 import { Config, type ProjectConfig } from "../node/config";
 import { materializeResolvedTrust } from "./trust";
 import { DisposableTempDir } from "../node/services/tempDir";
@@ -87,6 +86,7 @@ import {
   type ExperimentId,
 } from "../common/constants/experiments";
 import { getErrorMessage } from "@/common/utils/errors";
+import { prepareRunSessionRootOverride, writePrivateRunConfigFile } from "./runSessionRoot";
 import { describeCliGoalStop, driveCliGoalUntilTerminal } from "./goalRunDriver";
 import {
   parseGoalBudgetInputCents,
@@ -494,22 +494,21 @@ async function main(): Promise<number> {
   // Create ephemeral temp dir for session data (auto-cleaned on exit)
   using tempDir = new DisposableTempDir("mux-run");
 
+  // Use real config for providers, but the run-scoped root for session data.
+  const realConfig = new Config();
+
   // Session data root: the ephemeral temp dir by default. Benchmark/CI
   // harnesses can pin it (XUM_RUN_SESSION_ROOT / MUX_RUN_SESSION_ROOT) to
   // collect chat.jsonl and session-usage.json after the process exits; an
   // override root is left in place on exit.
-  const envSessionRoot = (
-    process.env.XUM_RUN_SESSION_ROOT ?? process.env.MUX_RUN_SESSION_ROOT
-  )?.trim();
-  // Empty/whitespace-only values mean "no override".
-  const sessionRootOverride = envSessionRoot === "" ? undefined : envSessionRoot;
-  if (sessionRootOverride !== undefined) {
-    fsSync.mkdirSync(sessionRootOverride, { recursive: true });
+  let sessionRootOverride: string | undefined;
+  try {
+    sessionRootOverride = prepareRunSessionRootOverride(process.env, realConfig.rootDir);
+  } catch (error) {
+    console.error(`Error: ${getErrorMessage(error)}`);
+    return 1;
   }
   const sessionRoot = sessionRootOverride ?? tempDir.path;
-
-  // Use real config for providers, but the run-scoped root for session data
-  const realConfig = new Config();
   const config = new Config(sessionRoot);
 
   // Copy providers and secrets from real config to ephemeral config
@@ -517,14 +516,14 @@ async function main(): Promise<number> {
   if (hasAnyConfiguredProvider(existingProviders)) {
     // Write providers to temp config so services can find them
     const providersFile = path.join(config.rootDir, "providers.jsonc");
-    fsSync.writeFileSync(providersFile, JSON.stringify(existingProviders, null, 2));
+    writePrivateRunConfigFile(providersFile, JSON.stringify(existingProviders, null, 2));
   }
 
   // Copy secrets so tools/MCP servers get project secrets (e.g., GH_TOKEN)
   const existingSecrets = realConfig.loadSecretsConfig();
   if (Object.keys(existingSecrets).length > 0) {
     const secretsFile = path.join(config.rootDir, "secrets.json");
-    fsSync.writeFileSync(secretsFile, JSON.stringify(existingSecrets, null, 2));
+    writePrivateRunConfigFile(secretsFile, JSON.stringify(existingSecrets, null, 2));
   }
 
   // Copy only project trust metadata so AIService can read trust flags.
