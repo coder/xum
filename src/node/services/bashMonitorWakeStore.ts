@@ -854,12 +854,11 @@ export class BashMonitorWakeStore {
           classified.delete(entry);
           continue;
         }
-        // Same policy as the stat failure above: never let a transient error silently
-        // reclassify a pending wake out of the returned set.
-        if (cached != null) {
-          if (cached.pending != null) records.push(cached.pending);
-          continue;
-        }
+        // Unlike the stat failure above, reaching this read means the stat signature
+        // DIFFERED from the cached one — the cached classification is known stale (the
+        // file changed generations, e.g. another instance superseded a pending wake or
+        // re-enqueued over a terminal one). Serving it could deliver a canceled wake or
+        // hide a new one, so propagate and let caller retries re-read instead.
         throw error;
       }
       const parsed = this.parse(raw);
@@ -960,9 +959,12 @@ export class BashMonitorWakeStore {
         restored = true;
       } catch (error) {
         if (!isErrnoWithCode(error, "EEXIST")) {
-          // Transient link failure: keep the leftover so a later scan retries the
-          // restore instead of deleting a never-recovered record.
-          return null;
+          // Transient link failure: the leftover (kept — never deleted unrecovered)
+          // still holds an unrestored record, so PROPAGATE rather than let this scan
+          // look successfully empty. Startup owner discovery then fails open and
+          // schedules this owner's drain, and the UI read path schedules its retry;
+          // a silent null would leave a stranded pending wake undelivered all session.
+          throw error;
         }
         // EEXIST: a newer record owns the original path and supersedes the stranded one.
       }
@@ -1025,9 +1027,12 @@ export class BashMonitorWakeStore {
           if (!isErrnoWithCode(error, "EEXIST")) {
             // Hard-link failure (EIO, ENOSPC, unsupported filesystem): the trash file
             // is now the only durable copy of this record. Keep it — a later scan's
-            // recoverStrandedPruneFile retries the restore — instead of deleting it in
-            // the removal below.
-            return parsed?.status === "pending" ? parsed : null;
+            // recoverStrandedPruneFile retries the restore — and PROPAGATE so caller
+            // retries engage. Publishing the record instead would let a drain deliver
+            // it while its canonical path is absent: the delivered-transition would
+            // no-op against ENOENT and the still-pending trash copy would later be
+            // restored and delivered again.
+            throw error;
           }
           // EEXIST: a newer record owns the canonical path and supersedes this capture.
           // Publish the canonical record's CURRENT pending state, never the discarded

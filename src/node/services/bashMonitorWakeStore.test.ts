@@ -429,7 +429,15 @@ describe("BashMonitorWakeStore", () => {
       Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
     );
     try {
-      expect((await store.listPending("owner-1")).map((r) => r.lines)).toEqual([["ERROR rearmed"]]);
+      // The failed restore propagates (caller retries engage) instead of publishing a
+      // record whose canonical path is absent — a drain delivering it could no-op its
+      // delivered-transition and cause a duplicate delivery after the later restore.
+      try {
+        await store.listPending("owner-1");
+        expect.unreachable("expected listPending to propagate the restore failure");
+      } catch (error) {
+        expect((error as NodeJS.ErrnoException).code).toBe("EIO");
+      }
     } finally {
       renameSpy.mockRestore();
       linkSpy.mockRestore();
@@ -528,6 +536,65 @@ describe("BashMonitorWakeStore", () => {
     }
     expect(strandedGone).toBe(true);
     expect((await fresh.get("owner-1", "proc-1"))?.lines).toEqual(["ERROR new generation"]);
+  });
+
+  test("a read failure after a generation change propagates instead of serving stale cache", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload());
+    expect(await store.listPending("owner-1")).toHaveLength(1); // classify as pending
+
+    // Another instance retires the wake: the file changes generations, so the cached
+    // pending classification is known stale. A failed re-read must not resurface it —
+    // a drain could deliver the canceled wake.
+    const other = new BashMonitorWakeStore(makeConfig(rootDir));
+    await other.markSuperseded("owner-1", "proc-1");
+    const file = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes", "proc-1.json");
+    const realReadFile = fsPromises.readFile;
+    const readSpy = spyOn(fsPromises, "readFile").mockImplementation(((
+      target: Parameters<typeof fsPromises.readFile>[0],
+      options: Parameters<typeof fsPromises.readFile>[1]
+    ) =>
+      target === file
+        ? Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
+        : realReadFile(target, options)) as unknown as typeof fsPromises.readFile);
+    try {
+      await store.listPending("owner-1");
+      expect.unreachable("expected listPending to propagate the changed-file read failure");
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("EIO");
+    } finally {
+      readSpy.mockRestore();
+    }
+    // Once readable again, the retired state wins.
+    expect(await store.listPending("owner-1")).toHaveLength(0);
+  });
+
+  test("a stranded-wake restore failure propagates so owner discovery fails open", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload());
+    const file = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes", "proc-1.json");
+    const stranded = `${file}.prune-crashed`;
+    await fsPromises.rename(file, stranded);
+
+    // Startup scenario: the stranded pending wake is found but its restore fails
+    // transiently. The scan must not look successfully empty — discovery would then
+    // never schedule this owner's drain and the wake would sit undelivered all session.
+    const linkSpy = spyOn(fsPromises, "link").mockImplementation(() =>
+      Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
+    );
+    try {
+      try {
+        await store.listPending("owner-1");
+        expect.unreachable("expected listPending to propagate the stranded restore failure");
+      } catch (error) {
+        expect((error as NodeJS.ErrnoException).code).toBe("EIO");
+      }
+      expect(await store.listPendingOwnerWorkspaceIds()).toEqual(["owner-1"]);
+    } finally {
+      linkSpy.mockRestore();
+    }
+    // Once the failure clears, the stranded wake is restored and listed.
+    expect((await store.listPending("owner-1")).map((r) => r.id)).toEqual(["proc-1"]);
   });
 
   test("listPending keeps serving a cached pending wake when stat transiently fails", async () => {
