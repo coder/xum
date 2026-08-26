@@ -675,6 +675,34 @@ describe("BashMonitorWakeStore", () => {
     expect(pending[0].lines).toEqual(["[monitor] process settled: exited (code 1)"]);
   });
 
+  test("a non-date persisted terminalOriginAt degrades to undefined instead of NaN-gating", async () => {
+    // The marker feeds Date.parse in generation gating, where NaN comparisons silently pass the
+    // wrong way (a newer process reusing the ID could not be rejected). Malformed values must
+    // degrade to the createdAt fallback, not reach the gate.
+    const config = makeConfig(rootDir);
+    const store = new BashMonitorWakeStore(config);
+    const record = await store.enqueueOrMergePending(
+      payload({
+        lines: ["[monitor] process settled: exited (code 1)"],
+        terminal: { status: "exited", exitCode: 1 },
+      })
+    );
+    const file = path.join(
+      config.getSessionDir("owner-1"),
+      "bash-monitor-wakes",
+      `${encodeURIComponent(record.processId)}.json`
+    );
+    const raw = JSON.parse(await fsPromises.readFile(file, "utf-8")) as Record<string, unknown>;
+    raw.terminalOriginAt = "not-a-timestamp";
+    await fsPromises.writeFile(file, JSON.stringify(raw), "utf-8");
+
+    const pending = await store.listPending("owner-1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0].terminalOriginAt).toBeUndefined();
+    // The rest of the record (including the terminal itself) survives untouched.
+    expect(pending[0].terminal).toEqual({ status: "exited", exitCode: 1 });
+  });
+
   test("enqueueMonitorLost skips the upgrade when the pending record already carries terminal", async () => {
     // Crash between wake persistence and registry deletion: recovery must not obscure the more
     // precise settlement fact with a "monitor lost" notice.

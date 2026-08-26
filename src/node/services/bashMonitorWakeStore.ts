@@ -158,8 +158,14 @@ const BashMonitorWakeRecordSchema = z
       .optional()
       .catch(undefined),
     // Same self-healing rule as `terminal`: malformed metadata degrades instead of dropping the
-    // durable wake. A missing marker falls back to createdAt at read time.
-    terminalOriginAt: z.string().optional().catch(undefined),
+    // durable wake. A missing marker falls back to createdAt at read time. The marker feeds
+    // Date.parse in generation gating, where NaN comparisons silently pass the wrong way, so a
+    // non-date string must degrade to undefined here rather than reach the gate.
+    terminalOriginAt: z
+      .string()
+      .refine((value) => Number.isFinite(Date.parse(value)))
+      .optional()
+      .catch(undefined),
     status: z.enum(BASH_MONITOR_WAKE_STATUSES),
     createdAt: z.string().min(1),
     updatedAt: z.string().min(1),
