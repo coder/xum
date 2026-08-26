@@ -22,7 +22,10 @@ import type * as RouterContextModule from "./RouterContext";
 import type * as WorkspaceContextModule from "./WorkspaceContext";
 
 let mockAgentDefinitions: AgentDefinitionDescriptor[] = [];
-let mockWorkspaceMetadata = new Map<string, { parentWorkspaceId?: string; agentId?: string }>();
+let mockWorkspaceMetadata = new Map<
+  string,
+  { parentWorkspaceId?: string; agentId?: string; agentType?: string }
+>();
 let updateAgentAISettingsCalls: Array<{
   workspaceId: string;
   agentId: string;
@@ -176,7 +179,7 @@ function Harness(props: HarnessProps) {
 
 function createWorkspaceMetadata(
   workspaceId: string,
-  overrides: { parentWorkspaceId?: string; agentId?: string } = {}
+  overrides: { parentWorkspaceId?: string; agentId?: string; agentType?: string } = {}
 ): FrontendWorkspaceMetadata {
   return {
     id: workspaceId,
@@ -582,6 +585,49 @@ describe("AgentContext", () => {
     // plan's rejection is skipped (a newer switch is active); review's
     // rejection must restore the backend's agent (exec), not its captured
     // previous agent (the also-rejected plan).
+    rejectPlanSwitch?.({ success: false, error: "unpriced model" });
+    rejectReviewSwitch?.({ success: false, error: "unpriced model" });
+
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("exec");
+    });
+  });
+
+  test("chained rejections resolve a legacy agentType baseline", async () => {
+    const projectPath = "/tmp/project";
+    const workspaceId = "main-workspace";
+    mockAgentDefinitions = [EXEC_AGENT, PLAN_AGENT, REVIEW_PROJECT_AGENT];
+    // Upgraded workspace: the authoritative selection exists only in the
+    // legacy agentType field.
+    mockWorkspaceMetadata.set(workspaceId, { agentType: "exec" });
+    window.localStorage.setItem(getAgentIdKey(workspaceId), JSON.stringify("exec"));
+    deferUpdateAgentAISettings = true;
+
+    let contextValue: AgentContextValue | undefined;
+
+    renderAgentHarness({
+      workspaceId,
+      projectPath,
+      onChange: (value) => (contextValue = value),
+    });
+
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("exec");
+    });
+
+    contextValue?.setAgentId("plan");
+    await waitFor(() => {
+      expect(resolveUpdateAgentAISettings).not.toBeNull();
+    });
+    const rejectPlanSwitch = resolveUpdateAgentAISettings;
+    resolveUpdateAgentAISettings = null;
+
+    contextValue?.setAgentId("review");
+    await waitFor(() => {
+      expect(resolveUpdateAgentAISettings).not.toBeNull();
+    });
+    const rejectReviewSwitch = getDeferredUpdateResolver();
+
     rejectPlanSwitch?.({ success: false, error: "unpriced model" });
     rejectReviewSwitch?.({ success: false, error: "unpriced model" });
 

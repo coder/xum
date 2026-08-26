@@ -51,6 +51,7 @@ import {
 } from "@/common/constants/storage";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { resolvePersistedAgentId } from "@/common/utils/agentIds";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import {
@@ -204,6 +205,13 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     ? workspaceContext?.workspaceMetadata.get(workspaceId)
     : undefined;
   const runtimeConfig = workspaceMetadata?.runtimeConfig;
+
+  // Authoritative restore baseline for typed send rejections: a pending
+  // picker switch may itself be rejected, so the captured pre-action agent is
+  // not necessarily what the backend stores. Resolved through the legacy
+  // compat resolver (agentType-only metadata), like metadata seeding.
+  const resolvedBackendAgentId = resolvePersistedAgentId(workspaceMetadata, "");
+  const backendAgentId = resolvedBackendAgentId.length > 0 ? resolvedBackendAgentId : null;
 
   // Fresh content from disk for the latest plan (external edit detection)
   // Only use cache for completed tools (page reload case) - not for in-flight tools
@@ -552,6 +560,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
             thinkingLevel: existingThinking,
             reasoningMode: existingReasoning,
           },
+          backendAgentId,
         }),
     };
   };

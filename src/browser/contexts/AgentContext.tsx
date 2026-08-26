@@ -37,7 +37,11 @@ import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking
 import { getErrorMessage } from "@/common/utils/errors";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { sortAgentsStable } from "@/browser/utils/agents";
-import { normalizeAgentId, resolveRemovedBuiltinAgentId } from "@/common/utils/agentIds";
+import {
+  normalizeAgentId,
+  resolvePersistedAgentId,
+  resolveRemovedBuiltinAgentId,
+} from "@/common/utils/agentIds";
 import {
   clearPendingWorkspaceAgentId,
   markPendingWorkspaceAgentId,
@@ -144,8 +148,11 @@ function AgentProviderWithState(props: {
 
   // Authoritative restore baseline for rejected switches: with chained
   // rejected switches, a captured "previous" can itself be a rejected agent,
-  // while the backend still stores the last accepted one.
-  const backendAgentId = currentMeta?.agentId ?? null;
+  // while the backend still stores the last accepted one. Resolved through
+  // the legacy compat resolver (agentType-only metadata), like metadata
+  // seeding.
+  const resolvedBackendAgentId = resolvePersistedAgentId(currentMeta, "");
+  const backendAgentId = resolvedBackendAgentId.length > 0 ? resolvedBackendAgentId : null;
 
   const workspaceId = props.workspaceId;
 

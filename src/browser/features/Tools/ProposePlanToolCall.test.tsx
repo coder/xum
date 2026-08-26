@@ -80,6 +80,11 @@ let updateAgentAISettingsCalls: Array<{
 }> = [];
 
 let mockApi: MockApi | null = null;
+// Workspace metadata visible to the component (useOptionalWorkspaceContext mock).
+let mockWorkspaceMetadataByWorkspace = new Map<
+  string,
+  { runtimeConfig?: unknown; agentId?: string; agentType?: string }
+>();
 
 let startHereCalls: Array<{
   workspaceId: string | undefined;
@@ -133,7 +138,10 @@ async function installProposePlanModuleMocks() {
   await mock.module("@/browser/contexts/WorkspaceContext", () => ({
     ...actualWorkspaceContextModule,
     useWorkspaceContext: () => ({
-      workspaceMetadata: new Map<string, { runtimeConfig?: unknown }>(),
+      workspaceMetadata: mockWorkspaceMetadataByWorkspace,
+    }),
+    useOptionalWorkspaceContext: () => ({
+      workspaceMetadata: mockWorkspaceMetadataByWorkspace,
     }),
   }));
   await mock.module("@/browser/hooks/useReviews", () => ({
@@ -338,6 +346,7 @@ describe("ProposePlanToolCall", () => {
     selectableDiffRendererCalls = [];
     updateAgentAISettingsCalls = [];
     mockApi = null;
+    mockWorkspaceMetadataByWorkspace = new Map();
     cleanupDom = installDom();
     await installProposePlanModuleMocks();
   });
@@ -590,6 +599,35 @@ describe("ProposePlanToolCall", () => {
     );
     // No compensating backend write.
     expect(updateAgentAISettingsCalls).toHaveLength(0);
+  });
+
+  test("rejected Implement restores the backend agent over a pending picker agent", async () => {
+    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
+    // Backend still stores plan; a rejected-in-flight picker switch left the
+    // local selection on "review" — the captured pre-action agent is NOT what
+    // the backend stores.
+    mockWorkspaceMetadataByWorkspace.set(WORKSPACE_ID, { agentId: "plan" });
+    window.localStorage.setItem(getAgentIdKey(WORKSPACE_ID), JSON.stringify("review"));
+
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({
+      sendMessage: (args) => {
+        sendMessageCalls.push(args);
+        return Promise.resolve({ success: false as const, error: "send rejected" });
+      },
+    });
+
+    const view = renderCompletedPlan();
+
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+
+    // The revert lands on the backend-authoritative agent, not the captured
+    // optimistic "review" selection the backend never accepted.
+    await waitFor(() =>
+      expect(JSON.parse(window.localStorage.getItem(getAgentIdKey(WORKSPACE_ID))!)).toBe("plan")
+    );
   });
 
   test("transport-failed Implement send keeps the optimistic switch", async () => {

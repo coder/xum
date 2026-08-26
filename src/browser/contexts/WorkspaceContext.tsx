@@ -213,15 +213,23 @@ function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadat
   // agent sits on the local default model while backend dispatches (heartbeats,
   // continuations) keep resolving the legacy settings. Real per-agent buckets
   // are never borrowed across agents.
-  const aiByAgent =
-    metadata.aiSettingsByAgent ??
-    (metadata.aiSettings
+  const modernByAgent = metadata.aiSettingsByAgent;
+  const aiByAgent = modernByAgent
+    ? metadata.aiSettings && !modernByAgent[activeAgentId]
+      ? // Coexistence: a partial modern map can lack the active agent while
+        // the legacy shared blob exists (e.g. only another agent wrote a
+        // modern bucket). Backend resolvers still fall back to the legacy
+        // workspaceEntry.aiSettings for the selected agent, so overlay it for
+        // the active agent only, preserving every real per-agent entry.
+        { ...modernByAgent, [activeAgentId]: metadata.aiSettings }
+      : modernByAgent
+    : metadata.aiSettings
       ? {
           plan: metadata.aiSettings,
           exec: metadata.aiSettings,
           [activeAgentId]: metadata.aiSettings,
         }
-      : undefined);
+      : undefined;
 
   if (!aiByAgent) {
     return;

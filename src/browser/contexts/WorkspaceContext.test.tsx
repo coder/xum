@@ -16,6 +16,7 @@ import {
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
   getThinkingLevelKey,
+  getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
@@ -614,6 +615,48 @@ describe("WorkspaceContext", () => {
     expect(JSON.parse(globalThis.localStorage.getItem(getThinkingLevelKey(workspaceId))!)).toBe(
       "low"
     );
+  });
+
+  test("legacy shared aiSettings fill a missing active bucket in a partial modern map", async () => {
+    const workspaceId = "ws-agent-legacy-coexist";
+
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createWorkspaceMetadata({
+              id: workspaceId,
+              agentId: "custom",
+              // Upgraded workspace: another agent already wrote a modern
+              // bucket, but the active custom agent has none.
+              aiSettings: { model: "openai:legacy-model", thinkingLevel: "low" },
+              aiSettingsByAgent: {
+                exec: { model: "openai:gpt-5.2", thinkingLevel: "high" },
+              },
+            }),
+          ]),
+      },
+      localStorage: {
+        [getAgentIdKey(workspaceId)]: JSON.stringify("custom"),
+        [getModelKey(workspaceId)]: JSON.stringify("openai:local-default"),
+      },
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
+
+    // The active agent hydrates from the legacy fallback, matching backend
+    // dispatch resolution...
+    expect(JSON.parse(globalThis.localStorage.getItem(getModelKey(workspaceId))!)).toBe(
+      "openai:legacy-model"
+    );
+    // ...while real per-agent buckets are preserved, not overwritten.
+    const byAgent = JSON.parse(
+      globalThis.localStorage.getItem(getWorkspaceAISettingsByAgentKey(workspaceId))!
+    ) as Record<string, { model: string }>;
+    expect(byAgent.exec?.model).toBe("openai:gpt-5.2");
+    expect(byAgent.custom?.model).toBe("openai:legacy-model");
   });
 
   test("stale metadata does not clobber a pending local agent switch", async () => {
