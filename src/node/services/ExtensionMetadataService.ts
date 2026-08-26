@@ -251,6 +251,24 @@ export class ExtensionMetadataService {
   }
 
   /**
+   * Consume the quarantine sidecar once every surviving entry is represented
+   * at the main path. ENOENT means a concurrent recovery already consumed
+   * it; any other failure must propagate (retryable) — reporting success
+   * with the sidecar still present would let a later process reconcile the
+   * stale sidecar again after the main file has moved on, repeatedly
+   * re-merging entries that pruning or removal already reclaimed.
+   */
+  private static async consumeQuarantineSidecar(quarantinePath: string): Promise<void> {
+    try {
+      await unlink(quarantinePath);
+    } catch (unlinkError) {
+      if (!ExtensionMetadataService.isErrnoCode(unlinkError, "ENOENT")) {
+        throw unlinkError;
+      }
+    }
+  }
+
+  /**
    * Seam for load()'s missing-main handling (and deterministic TOCTOU tests):
    * reports whether the quarantine sidecar currently exists.
    */
@@ -914,7 +932,7 @@ export class ExtensionMetadataService {
           throw copyError;
         }
       }
-      await unlink(quarantinePath).catch(() => undefined);
+      await ExtensionMetadataService.consumeQuarantineSidecar(quarantinePath);
       return false;
     }
     // Replace the quarantined main file with a valid EMPTY file instead of
@@ -998,9 +1016,11 @@ export class ExtensionMetadataService {
    * snapshot an older backend self-healed from the missing-main window;
    * treating it as authoritative would permanently hide every other
    * workspace's recency/goal/status while the full data sits in the sidecar.
-   * Merge sidecar-only entries into the main file (main wins per key — its
-   * writes are newer; ids this process write-tombstoned stay out) and consume
-   * the sidecar. Only same-schema (version 1) sidecars can be merged: a
+   * Merge sidecar entries into the main file (per FIELD: main wins fields it
+   * carries non-null values for — its writes are newer — while null/absent
+   * fields fill from the sidecar's complete pre-crash entry; ids this
+   * process write-tombstoned stay out) and consume the sidecar. Only
+   * same-schema (version 1) sidecars can be merged: a
    * corrupt sidecar is left as the bounded fixed-name leftover, while a
    * newer-schema sidecar is restored to the canonical path (superseding the
    * recreated file, preserved as its own leftover). Must run inside
@@ -1061,7 +1081,7 @@ export class ExtensionMetadataService {
           throw copyError;
         }
       }
-      await unlink(quarantinePath).catch(() => undefined);
+      await ExtensionMetadataService.consumeQuarantineSidecar(quarantinePath);
       return false;
     }
     if (!ExtensionMetadataService.isValidMetadataFileShape(sidecarParsed)) {
@@ -1091,18 +1111,64 @@ export class ExtensionMetadataService {
     }
     let modified = false;
     for (const [workspaceId, entry] of Object.entries(sidecarParsed.workspaces)) {
-      if (workspaceId in main.workspaces || this.deletedWorkspaceIds.has(workspaceId)) {
+      if (this.deletedWorkspaceIds.has(workspaceId)) {
         continue;
       }
-      main.workspaces[workspaceId] = entry;
-      modified = true;
+      if (!(workspaceId in main.workspaces)) {
+        // Sidecar-only entry: by definition no writer touched it since the
+        // quarantine (a live workspace's writes land in the recreated main),
+        // so a truthy streaming flag is a crash leftover. initialize()'s
+        // clearStaleStreaming already ran against the main file before this
+        // reconcile, so merging the flag verbatim would leave the workspace
+        // "streaming" forever; a genuinely streaming workspace re-asserts
+        // the flag with its next write.
+        main.workspaces[workspaceId] =
+          entry !== null &&
+          typeof entry === "object" &&
+          !Array.isArray(entry) &&
+          (entry as { streaming?: unknown }).streaming === true
+            ? { ...entry, streaming: false }
+            : entry;
+        modified = true;
+        continue;
+      }
+      // Same id on both sides: the recreated main entry is commonly a
+      // PARTIAL self-heal (e.g. a recency write initializes every other
+      // field to its default), so treating it as wholly authoritative would
+      // discard the sidecar entry's goal/status/model fields. Field-level
+      // merge instead: main wins every field it carries a non-null value
+      // for (its writes are newer); null/absent fields fill from the
+      // sidecar. An explicit pre-crash clear (null) can be re-filled with a
+      // stale value — the lesser loss than dropping every unaffected field
+      // (upgrade↔downgrade data preservation). `streaming` is never filled
+      // from the sidecar for the crash-leftover reason above.
+      const target: unknown = main.workspaces[workspaceId];
+      if (
+        target !== null &&
+        typeof target === "object" &&
+        !Array.isArray(target) &&
+        entry !== null &&
+        typeof entry === "object" &&
+        !Array.isArray(entry)
+      ) {
+        const targetRecord = target as unknown as Record<string, unknown>;
+        for (const [field, value] of Object.entries(entry as unknown as Record<string, unknown>)) {
+          if (field === "streaming" || value == null) {
+            continue;
+          }
+          if (targetRecord[field] == null) {
+            targetRecord[field] = value;
+            modified = true;
+          }
+        }
+      }
     }
     if (modified) {
       await this.save(main);
     }
     // Consumed either way: every surviving sidecar entry is now represented
     // at the main path.
-    await unlink(quarantinePath).catch(() => undefined);
+    await ExtensionMetadataService.consumeQuarantineSidecar(quarantinePath);
     return false;
   }
 

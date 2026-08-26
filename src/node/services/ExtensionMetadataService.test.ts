@@ -939,6 +939,63 @@ describe("ExtensionMetadataService", () => {
     expect(sidecarGone).toBe(true);
   });
 
+  test("reconcile preserves sidecar fields a partial recreated entry did not supersede", async () => {
+    // The recreated main entry is commonly a partial self-heal (a recency
+    // write initializes every other field to its default). Key-level
+    // main-wins would discard the sidecar entry's model/goal/unknown fields;
+    // the merge must be per field. Crash-stranded streaming flags must not
+    // leak back either: initialize()'s stale-streaming cleanup ran against
+    // the main file before this reconcile.
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        workspaces: {
+          "ws-1": { recency: 300, streaming: false, lastModel: null, lastThinkingLevel: null },
+        },
+      })
+    );
+    await writeFile(
+      `${filePath}.corrupt`,
+      JSON.stringify({
+        version: 1,
+        workspaces: {
+          "ws-1": {
+            recency: 42,
+            streaming: true,
+            lastModel: "anthropic:claude",
+            lastThinkingLevel: "high",
+            futureField: { fromNewerBuild: true },
+          },
+          "ws-2": { recency: 7, streaming: true, lastModel: null, lastThinkingLevel: null },
+        },
+      })
+    );
+    const restarted = new ExtensionMetadataService(filePath);
+
+    const snapshots = await restarted.getAllSnapshots({ throwOnError: true });
+    expect(snapshots.get("ws-1")?.recency).toBe(300);
+    expect(snapshots.get("ws-2")?.recency).toBe(7);
+    const persisted = JSON.parse(await readFile(filePath, "utf-8")) as {
+      workspaces: Record<string, Record<string, unknown>>;
+    };
+    // Main's newer write wins the fields it actually carries...
+    expect(persisted.workspaces["ws-1"]?.recency).toBe(300);
+    // ...while unaffected sidecar fields (including unknown newer-build
+    // fields) survive the reconcile instead of being discarded.
+    expect(persisted.workspaces["ws-1"]?.lastModel).toBe("anthropic:claude");
+    expect(persisted.workspaces["ws-1"]?.lastThinkingLevel).toBe("high");
+    expect(persisted.workspaces["ws-1"]?.futureField).toEqual({ fromNewerBuild: true });
+    // Crash-leftover streaming flags never come back from the sidecar.
+    expect(persisted.workspaces["ws-1"]?.streaming).toBe(false);
+    expect(persisted.workspaces["ws-2"]?.streaming).toBe(false);
+    const sidecarGone = await readFile(`${filePath}.corrupt`, "utf-8").then(
+      () => false,
+      () => true
+    );
+    expect(sidecarGone).toBe(true);
+  });
+
   test("an unprobeable sidecar during resumed recovery keeps the strict read retryable", async () => {
     // The once-per-process leftover check found the sidecar, but the
     // re-probe INSIDE the queued recovery transiently fails (EACCES/EIO
