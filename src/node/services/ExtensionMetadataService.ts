@@ -543,13 +543,33 @@ export class ExtensionMetadataService {
    * filter it from activity lists) until restart. Called from the activity
    * bootstrap with fresh config-derived id sets only — never with snapshot
    * or in-memory cache keys, which do not prove registration.
+   *
+   * `eligibleIds` must be a getTombstonedIds() snapshot captured BEFORE the
+   * registration evidence was gathered: clearing is sound only when the
+   * evidence postdates the tombstone. A tombstone published while the
+   * evidence reads were in flight (same-process removal during the activity
+   * list's authoritative enumeration await) would otherwise be cleared by a
+   * stale pre-removal view, un-suppressing late writers and letting the
+   * removed entry ride back into the renderer.
    */
-  clearTombstonesForRegisteredIds(registeredIds: ReadonlySet<string>): void {
-    for (const workspaceId of this.deletedWorkspaceIds) {
+  clearTombstonesForRegisteredIds(
+    registeredIds: ReadonlySet<string>,
+    eligibleIds: ReadonlySet<string>
+  ): void {
+    for (const workspaceId of eligibleIds) {
       if (registeredIds.has(workspaceId)) {
         this.deletedWorkspaceIds.delete(workspaceId);
       }
     }
+  }
+
+  /**
+   * Snapshot of the ids currently write-tombstoned in this process. Capture
+   * it before gathering registration evidence and pass it back to
+   * clearTombstonesForRegisteredIds as the set of clearable tombstones.
+   */
+  getTombstonedIds(): ReadonlySet<string> {
+    return new Set(this.deletedWorkspaceIds);
   }
 
   /**
@@ -909,15 +929,67 @@ export class ExtensionMetadataService {
    * Merge sidecar-only entries into the main file (main wins per key — its
    * writes are newer; ids this process write-tombstoned stay out) and consume
    * the sidecar. Only same-schema (version 1) sidecars can be merged: a
-   * corrupt or newer-schema sidecar is left as the bounded fixed-name
-   * leftover. Must run inside withSerializedMutation. Returns false (no
-   * empty reset happened).
+   * corrupt sidecar is left as the bounded fixed-name leftover, while a
+   * newer-schema sidecar is restored to the canonical path (superseding the
+   * recreated file, preserved as its own leftover). Must run inside
+   * withSerializedMutation. Returns false (no empty reset happened).
    */
   private async reconcileRecreatedMainWithSidecar(quarantinePath: string): Promise<boolean> {
     let sidecarParsed: unknown;
     try {
       sidecarParsed = JSON.parse(await readFile(quarantinePath, "utf-8")) as unknown;
-    } catch {
+    } catch (readError) {
+      // Sidecar gone: a concurrent recovery consumed it and the recreated
+      // main is all there is — nothing left to reconcile.
+      if (ExtensionMetadataService.isErrnoCode(readError, "ENOENT")) {
+        return false;
+      }
+      // Transient I/O failure (EACCES/EIO/...): the sidecar cannot be
+      // verified, and reporting success would make the caller accept the
+      // possibly-partial recreated main while the healthy sidecar is never
+      // inspected again (loads stop probing it once the main path exists).
+      // Propagate so the strict read stays retryable; only deterministic
+      // parse corruption below stays as the bounded fixed-name leftover.
+      if (!ExtensionMetadataService.isDeterministicCorruption(readError)) {
+        throw readError;
+      }
+      return false;
+    }
+    if (ExtensionMetadataService.isUnsupportedVersion(sidecarParsed)) {
+      // A newer build's schema stranded in the sidecar while an older-schema
+      // backend re-created the main path (usually a partial ENOENT self-heal
+      // holding one freshly mutated entry). Accepting the recreated file
+      // would lose the newer data permanently: nothing re-inspects the
+      // sidecar once the main path exists, so even re-upgrading reads the
+      // partial file — and a later quarantine's rename would destroy the
+      // sidecar bytes. Restore the newer bytes to the canonical path
+      // (upgrade↔downgrade preservation; this build's readers then see the
+      // same non-destructive retryable unsupported-version signal as any
+      // downgrade overlap) and preserve the recreated file as a bounded
+      // fixed-name leftover. A crash between the two steps leaves the
+      // resumable missing-main + sidecar state, which restores the
+      // unsupported sidecar via completeQuarantineRecovery.
+      await rename(this.filePath, `${this.filePath}.recreated`);
+      try {
+        await link(quarantinePath, this.filePath);
+      } catch (linkError) {
+        if (ExtensionMetadataService.isErrnoCode(linkError, "EEXIST")) {
+          // Yet another writer re-created the main path mid-swap: re-enter
+          // with the new file (the leftover keeps the latest superseded one).
+          return this.reconcileRecreatedMainWithSidecar(quarantinePath);
+        }
+        try {
+          await copyFile(quarantinePath, this.filePath, constants.COPYFILE_EXCL);
+        } catch (copyError) {
+          if (ExtensionMetadataService.isErrnoCode(copyError, "EEXIST")) {
+            return this.reconcileRecreatedMainWithSidecar(quarantinePath);
+          }
+          // Main path missing with the newer bytes still in the sidecar:
+          // rethrow (retryable) — the resumed recovery restores them.
+          throw copyError;
+        }
+      }
+      await unlink(quarantinePath).catch(() => undefined);
       return false;
     }
     if (!ExtensionMetadataService.isValidMetadataFileShape(sidecarParsed)) {
@@ -932,7 +1004,17 @@ export class ExtensionMetadataService {
         return false;
       }
       main = parsed;
-    } catch {
+    } catch (readError) {
+      // Main vanished again mid-reconcile: back to the resumable
+      // missing-main state the normal read paths already handle.
+      if (ExtensionMetadataService.isErrnoCode(readError, "ENOENT")) {
+        return false;
+      }
+      // Same transient-I/O contract as the sidecar read above: an
+      // unverifiable main must stay retryable, not report success.
+      if (!ExtensionMetadataService.isDeterministicCorruption(readError)) {
+        throw readError;
+      }
       return false;
     }
     let modified = false;

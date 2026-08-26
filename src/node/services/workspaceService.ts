@@ -13024,6 +13024,17 @@ export class WorkspaceService extends EventEmitter {
       }
       const freshPersistedIds: ReadonlySet<string> | null =
         freshSnapshots != null ? new Set(freshSnapshots.keys()) : null;
+      // Tombstones the registration evidence below may legitimately clear:
+      // only ones that already exist HERE, before the evidence is captured
+      // (the raw superset read is synchronous with this snapshot, and the
+      // authoritative enumeration runs later still). A same-process removal
+      // landing during the enumeration await publishes its tombstone after
+      // the evidence reads began — stale evidence still showing the id
+      // registered must not clear that fresh tombstone, or the pre-removal
+      // snapshot rides back into the renderer and late producers persist the
+      // entry again. Such a tombstone stays clearable by the NEXT list's
+      // fresh evidence if the id really is re-registered.
+      const clearableTombstoneIds = this.extensionMetadata.getTombstonedIds();
       let freshConfigIds: ReadonlySet<string> | null = null;
       try {
         freshConfigIds = this.config.readPersistedWorkspaceIdSuperset();
@@ -13101,7 +13112,10 @@ export class WorkspaceService extends EventEmitter {
         for (const workspaceId of authoritativeIds ?? []) {
           registeredIds.add(workspaceId);
         }
-        this.extensionMetadata.clearTombstonesForRegisteredIds(registeredIds);
+        this.extensionMetadata.clearTombstonesForRegisteredIds(
+          registeredIds,
+          clearableTombstoneIds
+        );
       }
       const activityById = Object.fromEntries(
         entries.filter(
@@ -13164,13 +13178,20 @@ export class WorkspaceService extends EventEmitter {
           ) {
             continue;
           }
-          // Same sync overlay path emitWorkspaceActivity uses; the per-id
-          // disk workflow probe already ran for this in-scope id above.
+          // Same overlay path emitWorkspaceActivity uses, except workflow
+          // runs come from the bootstrapping probe rather than the bare
+          // cache: a candidate admitted by the fresh config/snapshot re-reads
+          // never went through the per-id loop above, so its on-disk active
+          // workflow runs are not cached yet — a cached-only merge would omit
+          // activeWorkflowRunCount for exactly the cross-process
+          // registrations this merge exists to bootstrap, and the process-
+          // local subscription can never deliver the missing delta. Ids the
+          // per-id loop already probed resolve from the shared cached Set.
           const merged = this.mergeCurrentActiveBashMonitorCount(
             workspaceId,
-            this.mergeCachedActiveWorkflowRuns(
-              workspaceId,
-              this.overlayPendingGoal(workspaceId, lateSnapshot)
+            mergeActiveWorkflowRuns(
+              this.overlayPendingGoal(workspaceId, lateSnapshot),
+              await this.getActiveWorkflowRunIds(workspaceId)
             )
           );
           if (merged != null) {

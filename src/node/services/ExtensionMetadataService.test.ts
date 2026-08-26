@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import * as path from "path";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
@@ -824,6 +824,100 @@ describe("ExtensionMetadataService", () => {
       () => true
     );
     expect(sidecarGone).toBe(true);
+  });
+
+  test("reconcile restores an unsupported-version sidecar over a recreated partial main", async () => {
+    // Downgrade-overlap variant of the reconcile: a NEWER build's schema is
+    // stranded in the sidecar while an older-schema backend recreates a
+    // partial main during the crash window. Accepting the partial file would
+    // lose the newer data permanently — nothing re-inspects the sidecar once
+    // the main path exists, and a later quarantine's rename would destroy
+    // it. The newer bytes must win the canonical path; the recreated file is
+    // preserved as its own leftover.
+    const newerFile = JSON.stringify({ version: 2, workspaces: {}, futureField: true });
+    await writeFile(`${filePath}.corrupt`, newerFile);
+    // Main file intentionally absent; the probe hook recreates it as a
+    // partial version-1 file mid-recovery (modeling the older backend).
+    const partial = JSON.stringify({
+      version: 1,
+      workspaces: { "ws-partial": { recency: 300, streaming: false } },
+    });
+    const internals = service as unknown as {
+      probeQuarantineSidecar: () => Promise<boolean>;
+    };
+    const originalProbe = internals.probeQuarantineSidecar.bind(service);
+    internals.probeQuarantineSidecar = async () => {
+      await writeFile(filePath, partial);
+      internals.probeQuarantineSidecar = originalProbe;
+      return true;
+    };
+
+    let strictError: unknown = null;
+    try {
+      await service.getAllSnapshots({ throwOnError: true });
+    } catch (error) {
+      strictError = error;
+    }
+    // The swapped-in file still fails the CURRENT build's read — but with
+    // the non-destructive unsupported-version signal, not the partial data.
+    expect(strictError).not.toBeNull();
+    expect(await readFile(filePath, "utf-8")).toBe(newerFile);
+    expect(await readFile(`${filePath}.recreated`, "utf-8")).toBe(partial);
+    const sidecarGone = await readFile(`${filePath}.corrupt`, "utf-8").then(
+      () => false,
+      () => true
+    );
+    expect(sidecarGone).toBe(true);
+  });
+
+  test("an unreadable sidecar keeps reconcile retryable instead of accepting the partial main", async () => {
+    // Transient I/O failure reading the sidecar during reconcile: reporting
+    // success would make the read accept the recreated partial main while
+    // the (possibly healthy) sidecar is never inspected again. A directory
+    // at the sidecar path yields a deterministic errno (EISDIR) standing in
+    // for EACCES/EIO-class failures.
+    await mkdir(`${filePath}.corrupt`);
+    const partial = JSON.stringify({
+      version: 1,
+      workspaces: { "ws-partial": { recency: 300, streaming: false } },
+    });
+    const internals = service as unknown as {
+      probeQuarantineSidecar: () => Promise<boolean>;
+    };
+    const originalProbe = internals.probeQuarantineSidecar.bind(service);
+    internals.probeQuarantineSidecar = async () => {
+      await writeFile(filePath, partial);
+      internals.probeQuarantineSidecar = originalProbe;
+      return true;
+    };
+
+    let strictError: unknown = null;
+    try {
+      await service.getAllSnapshots({ throwOnError: true });
+    } catch (error) {
+      strictError = error;
+    }
+    expect(strictError).not.toBeNull();
+    expect((strictError as NodeJS.ErrnoException).code).toBe("EISDIR");
+    // Once the sidecar becomes readable (here: gone), the retry proceeds.
+    await rm(`${filePath}.corrupt`, { recursive: true });
+    const snapshots = await service.getAllSnapshots({ throwOnError: true });
+    expect(snapshots.get("ws-partial")?.recency).toBe(300);
+  });
+
+  test("clearTombstonesForRegisteredIds only clears tombstones the evidence postdates", async () => {
+    await service.updateRecency("ws-1", 100);
+    // Evidence snapshot captured BEFORE the removal: a tombstone published
+    // afterwards (same-process removal racing the activity list's evidence
+    // reads) must survive stale evidence claiming the id is registered.
+    const preEvidence = service.getTombstonedIds();
+    await service.deleteWorkspace("ws-1");
+    service.clearTombstonesForRegisteredIds(new Set(["ws-1"]), preEvidence);
+    expect(service.isWorkspaceDeleted("ws-1")).toBe(true);
+    // The next bootstrap snapshots the tombstone before its evidence reads,
+    // so a genuinely re-registered id is cleared then.
+    service.clearTombstonesForRegisteredIds(new Set(["ws-1"]), service.getTombstonedIds());
+    expect(service.isWorkspaceDeleted("ws-1")).toBe(false);
   });
 
   test("a strict read restores healthy bytes stranded in the sidecar by a crashed quarantine", async () => {

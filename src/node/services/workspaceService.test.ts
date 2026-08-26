@@ -143,6 +143,7 @@ const mockInitStateManager: Partial<InitStateManager> = {
 const mockExtensionMetadataService: Partial<ExtensionMetadataService> = {
   isWorkspaceDeleted: mock(() => false),
   clearTombstonesForRegisteredIds: mock(() => undefined),
+  getTombstonedIds: mock((): ReadonlySet<string> => new Set()),
   setStreaming: mock(() =>
     Promise.resolve({
       recency: Date.now(),
@@ -3651,6 +3652,76 @@ describe("WorkspaceService activity list scoping", () => {
 
         const activityList = await workspaceService.getActivityList();
         expect(activityList?.[workspaceId]?.recency).toBe(888);
+      } finally {
+        snapshotsSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("getActivityList bootstraps workflow runs for workspaces merged mid-list", async () => {
+    // A workspace admitted only by the fresh revalidation re-reads never went
+    // through the per-id loop, so its on-disk active workflow runs are not in
+    // the process-local cache. The merge must probe disk for them — a
+    // cached-only merge would omit activeWorkflowRunCount for exactly the
+    // cross-process registrations it exists to bootstrap, and the
+    // process-local activity subscription can never deliver that delta.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "brand-new-workflow-workspace";
+      const projectPath = path.join(config.rootDir, "project");
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      const realGetAllSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      let snapshotCalls = 0;
+      const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(
+        async (options?: { throwOnError?: boolean }) => {
+          snapshotCalls += 1;
+          if (snapshotCalls === 2) {
+            // The other backend registers the workspace, persists its first
+            // activity, AND starts a workflow run before the revalidation
+            // re-read.
+            await config.addWorkspace(projectPath, {
+              id: workspaceId,
+              name: workspaceId,
+              projectName: "project",
+              projectPath,
+              runtimeConfig: { type: "local" },
+            });
+            await extensionMetadata.updateRecency(workspaceId, 888);
+            const runStore = new WorkflowRunStore({
+              sessionDir: config.getSessionDir(workspaceId),
+            });
+            await runStore.createRun({
+              id: "wfr_midlist",
+              workspaceId,
+              workflow: {
+                name: "demo",
+                description: "Demo workflow",
+                scope: "global" as const,
+                executable: true,
+              },
+              source: "export default function workflow() { return {}; }",
+              args: {},
+              now: "2026-06-17T00:00:00.000Z",
+            });
+          }
+          return realGetAllSnapshots(options);
+        }
+      );
+      try {
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList?.[workspaceId]?.recency).toBe(888);
+        expect(activityList?.[workspaceId]?.activeWorkflowRunCount).toBe(1);
+        expect(activityList?.[workspaceId]?.activeWorkflowRunIds).toEqual(["wfr_midlist"]);
       } finally {
         snapshotsSpy.mockRestore();
       }
