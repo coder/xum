@@ -104,6 +104,38 @@ describe("revertRejectedAgentSwitch", () => {
     expect(read(getThinkingLevelKey(WORKSPACE_ID))).toBe("off");
   });
 
+  test("atomically hydrates another agent after the rejected agent was edited", () => {
+    seed(getAgentIdKey(WORKSPACE_ID), "plan");
+    // The user edits plan's model while its persistence request is in flight.
+    // Reverting identity to exec must not leave that plan model in the shared composer.
+    seed(getModelKey(WORKSPACE_ID), "openai:user-picked-for-plan");
+    seed(getThinkingLevelKey(WORKSPACE_ID), "high");
+    seed(getReasoningModeKey(WORKSPACE_ID), "standard");
+
+    revertRejectedAgentSwitch({
+      workspaceId: WORKSPACE_ID,
+      rejectedAgentId: "plan",
+      applied: { model: "openai:unpriced-x", thinkingLevel: "high", reasoningMode: "standard" },
+      previous: {
+        agentId: "exec",
+        model: "openai:old-exec",
+        thinkingLevel: "off",
+        reasoningMode: "standard",
+      },
+      backendMetadata: makeMetadata({
+        agentId: "exec",
+        aiSettingsByAgent: {
+          exec: { model: "openai:priced-exec", thinkingLevel: "low", reasoningMode: "pro" },
+        },
+      }),
+    });
+
+    expect(read(getAgentIdKey(WORKSPACE_ID))).toBe("exec");
+    expect(read(getModelKey(WORKSPACE_ID))).toBe("openai:priced-exec");
+    expect(read(getThinkingLevelKey(WORKSPACE_ID))).toBe("low");
+    expect(read(getReasoningModeKey(WORKSPACE_ID))).toBe("pro");
+  });
+
   test("newer user edits are never clobbered by the revert", () => {
     seed(getAgentIdKey(WORKSPACE_ID), "exec");
     // The user picked a different model after the rejected switch wrote its

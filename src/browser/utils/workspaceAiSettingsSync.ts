@@ -151,8 +151,9 @@ export function shouldApplyWorkspaceAgentIdFromBackend(
  * legacy shared blob, matching backend dispatch fallback), else from the
  * captured pre-switch values when the target IS the captured agent.
  *
- * Only state the rejected switch itself wrote is undone: newer user changes
- * (a different agent, or edited model/thinking/reasoning) always win.
+ * A newer agent selection always wins. When identity reverts, the shared composer
+ * must atomically hydrate the restore target; edits made while the rejected agent
+ * was active remain in that agent's cache instead of leaking across identities.
  */
 export function revertRejectedAgentSwitch(args: {
   workspaceId: string;
@@ -204,22 +205,28 @@ export function revertRejectedAgentSwitch(args: {
         }
       : null;
 
+  const isRestoringAnotherAgent = restoreAgentId !== currentAgentId;
+
   // Restore settings before the agent id so explicit-switch resolution runs
-  // against restored values instead of the rejected ones. Per-key guard: only
-  // undo state the rejected switch itself wrote, so newer user changes win.
+  // against restored values instead of the rejected ones. A cross-agent revert
+  // is atomic: every shared composer key must belong to the restored identity.
+  // Same-agent repair keeps the per-key guards so newer edits still win.
   if (restore) {
     if (
+      isRestoringAnotherAgent ||
       readPersistedState<string | null>(getModelKey(args.workspaceId), null) === args.applied.model
     ) {
       setWorkspaceModelWithOrigin(args.workspaceId, restore.model, "sync");
     }
     if (
+      isRestoringAnotherAgent ||
       readPersistedState<ThinkingLevel | null>(getThinkingLevelKey(args.workspaceId), null) ===
-      args.applied.thinkingLevel
+        args.applied.thinkingLevel
     ) {
       updatePersistedState(getThinkingLevelKey(args.workspaceId), restore.thinkingLevel);
     }
     if (
+      isRestoringAnotherAgent ||
       readPersistedState<OpenAIReasoningMode | null>(
         getReasoningModeKey(args.workspaceId),
         null
@@ -229,7 +236,7 @@ export function revertRejectedAgentSwitch(args: {
     }
   }
 
-  if (restoreAgentId !== currentAgentId) {
+  if (isRestoringAnotherAgent) {
     updatePersistedState(agentKey, restoreAgentId);
   }
 }
