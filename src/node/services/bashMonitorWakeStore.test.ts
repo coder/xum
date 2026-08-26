@@ -370,6 +370,142 @@ describe("BashMonitorWakeStore", () => {
     expect((await store.get("owner-1", "proc-1"))?.status).toBe("superseded");
   });
 
+  test("a failed CAS rollback keeps the captured record and propagates", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR stale"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    expect(await store.listPending("owner-1")).toHaveLength(1); // pre-classify canonical
+    const canonicalRecord = JSON.parse(await fsPromises.readFile(file, "utf-8")) as {
+      updatedAt: string;
+      lines: string[];
+    };
+    const leftoverPath = `${file}.prune-crashed`;
+    await fsPromises.writeFile(
+      leftoverPath,
+      JSON.stringify({
+        ...canonicalRecord,
+        lines: ["ERROR crafted"],
+        updatedAt: new Date(Date.parse(canonicalRecord.updatedAt) + 1_000).toISOString(),
+      }),
+      "utf-8"
+    );
+
+    // The canonical record changes between the compare-read and the CAS capture, and
+    // then the rollback link fails. The captured record — at that point the only
+    // durable copy — must be kept, and the failure must propagate.
+    const other = new BashMonitorWakeStore(makeConfig(rootDir));
+    const realReadFile = fsPromises.readFile;
+    let injected = false;
+    const readSpy = spyOn(fsPromises, "readFile").mockImplementation((async (
+      target: Parameters<typeof fsPromises.readFile>[0],
+      options: Parameters<typeof fsPromises.readFile>[1]
+    ) => {
+      const result = await realReadFile(target, options);
+      if (!injected && target === file) {
+        injected = true;
+        await other.enqueueOrMergePending(payload({ lines: ["ERROR merged"], totalMatches: 2 }));
+      }
+      return result;
+    }) as unknown as typeof fsPromises.readFile);
+    const realLink = fsPromises.link;
+    const linkSpy = spyOn(fsPromises, "link").mockImplementation((from, to) =>
+      String(from) !== leftoverPath && String(from).includes(".prune-")
+        ? Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
+        : realLink(from, to)
+    );
+    try {
+      await store.listPending("owner-1");
+      expect.unreachable("expected listPending to propagate the rollback failure");
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("EIO");
+    } finally {
+      readSpy.mockRestore();
+      linkSpy.mockRestore();
+    }
+    // The changed capture was NOT deleted: it survives as prune trash beside the
+    // crafted leftover, and once the crafted leftover is gone, recovery restores it.
+    const leftovers = (await fsPromises.readdir(dir)).filter((e) => e.includes(".prune-"));
+    expect(leftovers).toHaveLength(2);
+    await fsPromises.rm(leftoverPath, { force: true });
+    const settled = await store.listPending("owner-1");
+    expect(settled).toHaveLength(1);
+    expect(settled[0].lines).toEqual(["ERROR stale", "ERROR merged"]);
+  });
+
+  test("a valid stranded wake displaces a malformed canonical file", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR stranded"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    await fsPromises.rename(file, `${file}.prune-crashed`);
+    // A malformed canonical file appears (corruption); without quarantining it, every
+    // scan would hit the same dead end and the valid durable wake would never deliver.
+    await fsPromises.writeFile(file, "{not json", "utf-8");
+
+    const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+    const pending = await fresh.listPending("owner-1");
+    expect(pending.map((r) => r.lines)).toEqual([["ERROR stranded"]]);
+    expect((await fresh.get("owner-1", "proc-1"))?.lines).toEqual(["ERROR stranded"]);
+    const entries = await fsPromises.readdir(dir);
+    // The malformed content is quarantined as evidence, not deleted.
+    expect(entries.filter((e) => e.includes(".malformed-"))).toHaveLength(1);
+    expect(entries.filter((e) => e.includes(".prune-"))).toHaveLength(0);
+  });
+
+  test("a complete orphaned temp write is restored, not swept", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR only copy"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    // Crash between writeFile and the commit rename of a brand-new wake: the temp file
+    // is the ONLY durable copy (no canonical file exists).
+    const temp = `${file}.tmp-crashed`;
+    await fsPromises.rename(file, temp);
+    const past = new Date(Date.now() - 10 * 60 * 1000); // orphaned, but within retention
+    await fsPromises.utimes(temp, past, past);
+
+    const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+    const pending = await fresh.listPending("owner-1");
+    expect(pending.map((r) => r.lines)).toEqual([["ERROR only copy"]]);
+    // Restored to the canonical path (visible to delivery) and the temp is consumed.
+    expect((await fresh.get("owner-1", "proc-1"))?.lines).toEqual(["ERROR only copy"]);
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
+  });
+
+  test("stranded recovery publishes a canonical winner created mid-scan", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR older"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    const leftoverPath = `${file}.prune-crashed`;
+    await fsPromises.rename(file, leftoverPath);
+
+    // The canonical record is created AFTER this scan's readdir snapshot (so the scan
+    // never visits its entry) but before recovery's restore link. The canonical winner
+    // must still be published — otherwise the scan reports empty and startup discovery
+    // misses a wake whose writer already exited.
+    const other = new BashMonitorWakeStore(makeConfig(rootDir));
+    const realLink = fsPromises.link;
+    let injected = false;
+    const linkSpy = spyOn(fsPromises, "link").mockImplementation(async (from, to) => {
+      if (!injected && String(from) === leftoverPath) {
+        injected = true;
+        await other.enqueueOrMergePending(payload({ lines: ["ERROR winner"], totalMatches: 2 }));
+      }
+      return realLink(from, to);
+    });
+    try {
+      const pending = await store.listPending("owner-1");
+      expect(pending.map((r) => r.lines)).toEqual([["ERROR winner"]]);
+    } finally {
+      linkSpy.mockRestore();
+    }
+    // The older leftover was dropped as superseded.
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".prune-"))).toHaveLength(0);
+    expect((await store.get("owner-1", "proc-1"))?.lines).toEqual(["ERROR winner"]);
+  });
+
   test("a failed CAS capture propagates instead of hiding the stranded generation", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload({ lines: ["ERROR old"] }));
