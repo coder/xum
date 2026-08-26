@@ -6,6 +6,8 @@ import {
   collectDescendantAgents,
   getSubAgentStatusPresentation,
   isSubAgentActive,
+  mergeRetainedWorkflowGroups,
+  type WorkflowAgentGroup,
 } from "./SubAgentTasksDecoration";
 
 function workspace(
@@ -22,6 +24,50 @@ function workspace(
     ...options,
   };
 }
+
+describe("mergeRetainedWorkflowGroups", () => {
+  const group = (runId: string, workerIds: string[]): WorkflowAgentGroup => ({
+    runId,
+    workflowName: `wf-${runId}`,
+    workers: workerIds.map((id) => ({ workspace: workspace(id), depth: 1 })),
+  });
+
+  test("bridges the gap between sequential workers while the run stays active", () => {
+    const retained = new Map<string, WorkflowAgentGroup>();
+    // Step 1: a live worker exists.
+    const withWorker = mergeRetainedWorkflowGroups([group("run-1", ["w1"])], ["run-1"], retained);
+    expect(withWorker).toHaveLength(1);
+    expect(withWorker[0].workers).toHaveLength(1);
+    // Gap: the worker was deleted, the next one does not exist yet.
+    const gap = mergeRetainedWorkflowGroups([], ["run-1"], retained);
+    expect(gap).toHaveLength(1);
+    expect(gap[0]).toEqual({ runId: "run-1", workflowName: "wf-run-1", workers: [] });
+  });
+
+  test("drops the retained group once the run leaves the active set", () => {
+    const retained = new Map<string, WorkflowAgentGroup>();
+    mergeRetainedWorkflowGroups([group("run-1", ["w1"])], ["run-1"], retained);
+    expect(mergeRetainedWorkflowGroups([], [], retained)).toHaveLength(0);
+    expect(retained.size).toBe(0);
+  });
+
+  test("live groups win over retained entries and are never duplicated", () => {
+    const retained = new Map<string, WorkflowAgentGroup>();
+    mergeRetainedWorkflowGroups([group("run-1", ["w1"])], ["run-1"], retained);
+    mergeRetainedWorkflowGroups([], ["run-1"], retained);
+    // The next worker appeared: its live rows must render, exactly once.
+    const next = mergeRetainedWorkflowGroups([group("run-1", ["w2"])], ["run-1"], retained);
+    expect(next).toHaveLength(1);
+    expect(next[0].workers.map((worker) => worker.workspace.id)).toEqual(["w2"]);
+  });
+
+  test("passes through live groups whose run is not (yet) in the active set without retaining them", () => {
+    const retained = new Map<string, WorkflowAgentGroup>();
+    const merged = mergeRetainedWorkflowGroups([group("run-2", ["w1"])], [], retained);
+    expect(merged).toHaveLength(1);
+    expect(retained.size).toBe(0);
+  });
+});
 
 describe("collectDescendantAgents", () => {
   test("splits persistent user-owned descendants from workflow workers and excludes archived rows", () => {

@@ -8,7 +8,10 @@ import {
   Workflow,
 } from "lucide-react";
 
+import { useRef } from "react";
+
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
+import { useOptionalWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import { shortenWorkflowRunId } from "@/browser/components/ProjectSidebar/sidebarTaskGroups";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useRouter } from "@/browser/contexts/RouterContext";
@@ -121,6 +124,41 @@ export function collectDescendantAgents(
   return { subAgents, workflowGroups };
 }
 
+/**
+ * Sequential workflows delete each worker workspace once it reports, and the next
+ * worker may not exist yet — during that gap a purely row-derived group list goes
+ * empty and the run would vanish from the tray even though it is still active.
+ * Retain the last-seen group for every run the owner still reports active (header
+ * only: the retained workers' workspaces are deleted, so their rows must not
+ * render), and drop entries as soon as the run leaves the active set. Mirrors the
+ * ProjectSidebar's retainedWorkflowTaskGroupsRef lifecycle.
+ */
+export function mergeRetainedWorkflowGroups(
+  current: readonly WorkflowAgentGroup[],
+  activeRunIds: readonly string[],
+  retained: Map<string, WorkflowAgentGroup>
+): WorkflowAgentGroup[] {
+  const activeIds = new Set(activeRunIds);
+  for (const group of current) {
+    if (activeIds.has(group.runId)) {
+      retained.set(group.runId, group);
+    }
+  }
+  for (const runId of retained.keys()) {
+    if (!activeIds.has(runId)) {
+      retained.delete(runId);
+    }
+  }
+  const currentIds = new Set(current.map((group) => group.runId));
+  const merged = [...current];
+  for (const [runId, group] of retained) {
+    if (!currentIds.has(runId)) {
+      merged.push({ runId, workflowName: group.workflowName, workers: [] });
+    }
+  }
+  return merged;
+}
+
 export function getSubAgentStatusPresentation(workspace: FrontendWorkspaceMetadata): {
   label: string;
   icon: typeof Clock3;
@@ -200,10 +238,13 @@ function formatWorkflowSummary(workflowGroups: readonly WorkflowAgentGroup[]): s
       : `${workflowGroups.length} workflows`;
   // Workers vanish once they report, so a lingering all-inactive group (e.g. an
   // interrupted run) must not read as running.
+  // A worker-less group is a retained active run between sequential steps.
   const workers =
     activeWorkerCount > 0
       ? `${activeWorkerCount} active`
-      : `${workerCount} agent${workerCount === 1 ? "" : "s"}`;
+      : workerCount > 0
+        ? `${workerCount} agent${workerCount === 1 ? "" : "s"}`
+        : "running";
   return `${label} · ${workers}`;
 }
 
@@ -214,9 +255,16 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
     getSubAgentTasksExpandedKey(props.workspaceId),
     false
   );
-  const { subAgents, workflowGroups } = collectDescendantAgents(
+  const sidebarState = useOptionalWorkspaceSidebarState(props.workspaceId);
+  const retainedWorkflowGroupsRef = useRef<Map<string, WorkflowAgentGroup>>(new Map());
+  const { subAgents, workflowGroups: liveWorkflowGroups } = collectDescendantAgents(
     workspaceMetadata.values(),
     props.workspaceId
+  );
+  const workflowGroups = mergeRetainedWorkflowGroups(
+    liveWorkflowGroups,
+    sidebarState?.activeWorkflowRunIds ?? [],
+    retainedWorkflowGroupsRef.current
   );
 
   if (subAgents.length === 0 && workflowGroups.length === 0) {

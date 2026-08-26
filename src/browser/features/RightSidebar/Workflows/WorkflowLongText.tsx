@@ -36,7 +36,7 @@ interface WorkflowLongTextProps {
 export const WorkflowLongText: React.FC<WorkflowLongTextProps> = (props) => {
   const [expanded, setExpanded] = React.useState(false);
   const [dialogOpen, setDialogOpen] = React.useState(false);
-  const { preview, truncated } = getWorkflowTextPreview(props.text, props.charLimit);
+  const { preview, truncated, totalChars } = getWorkflowTextPreview(props.text, props.charLimit);
 
   const fullContent = props.markdown ? (
     <MarkdownRenderer content={props.text} />
@@ -59,7 +59,7 @@ export const WorkflowLongText: React.FC<WorkflowLongTextProps> = (props) => {
           aria-expanded={expanded}
           aria-label={expanded ? `Show less of ${props.title}` : `Show more of ${props.title}`}
         >
-          {expanded ? "Show less" : `Show more (${formatCompactCount(props.text.length)} chars)`}
+          {expanded ? "Show less" : `Show more (${formatCompactCount(totalChars)} chars)`}
         </button>
         <button
           type="button"

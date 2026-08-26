@@ -52,7 +52,10 @@ import { cn } from "@/common/lib/utils";
 import type { ReviewNoteData } from "@/common/types/review";
 import type { GoalSetError, GoalSnapshot, GoalStatus } from "@/common/types/goal";
 import { TerminalTab } from "@/browser/features/RightSidebar/TerminalTab";
-import { useOptionalWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
+import {
+  useOptionalWorkspaceSidebarState,
+  useWorkspaceActivityHydrated,
+} from "@/browser/stores/WorkspaceStore";
 import { shouldAutoActivateWorkflowsTab } from "@/browser/features/RightSidebar/Workflows/workflowDisplay";
 import {
   RIGHT_SIDEBAR_TABS,
@@ -1191,8 +1194,17 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // persisted tab, and switching away afterwards is respected. Does not
   // un-collapse a collapsed sidebar.
   const activeWorkflowRunCount = sidebarState?.activeWorkflowRunCount ?? 0;
+  const activityHydrated = useWorkspaceActivityHydrated();
   const previousActiveWorkflowRunCountRef = React.useRef<number | null>(null);
   React.useEffect(() => {
+    // Before activity hydration the store reports 0 for every workspace, so recording
+    // that as the baseline would misread hydration of a pre-existing active run as a
+    // fresh 0 → >0 start and steal the persisted tab on cold startup. Keep the baseline
+    // unknown until hydration; the first hydrated observation then counts as "first
+    // observation" and never activates.
+    if (!activityHydrated) {
+      return;
+    }
     const previous = previousActiveWorkflowRunCountRef.current;
     previousActiveWorkflowRunCountRef.current = activeWorkflowRunCount;
     if (
@@ -1202,7 +1214,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       return;
     }
     setLayout((prev) => selectOrAddTab(prev, "workflows"));
-  }, [activeWorkflowRunCount, setLayout, workflowsExperimentEnabled]);
+  }, [activityHydrated, activeWorkflowRunCount, setLayout, workflowsExperimentEnabled]);
 
   React.useEffect(() => {
     const handleOpenTouchReviewImmersive = (event: Event) => {

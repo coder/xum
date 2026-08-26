@@ -122,13 +122,21 @@ describe("shouldAutoActivateWorkflowsTab", () => {
 describe("getWorkflowTextPreview", () => {
   test("keeps text within the limit untouched", () => {
     const text = "short prompt";
-    expect(getWorkflowTextPreview(text)).toEqual({ truncated: false, preview: text });
+    expect(getWorkflowTextPreview(text)).toEqual({
+      truncated: false,
+      preview: text,
+      totalChars: text.length,
+    });
   });
   test("does not truncate when the hidden remainder would be within the tolerance", () => {
     const text = "a".repeat(
       WORKFLOW_TEXT_PREVIEW_CHAR_LIMIT + WORKFLOW_TEXT_PREVIEW_TOLERANCE_CHARS
     );
-    expect(getWorkflowTextPreview(text)).toEqual({ truncated: false, preview: text });
+    expect(getWorkflowTextPreview(text)).toEqual({
+      truncated: false,
+      preview: text,
+      totalChars: text.length,
+    });
   });
   test("truncates to the char limit once past the tolerance", () => {
     const text = "b".repeat(
@@ -137,10 +145,33 @@ describe("getWorkflowTextPreview", () => {
     expect(getWorkflowTextPreview(text)).toEqual({
       truncated: true,
       preview: "b".repeat(WORKFLOW_TEXT_PREVIEW_CHAR_LIMIT),
+      totalChars: text.length,
     });
   });
   test("trims trailing whitespace from the cut point and honors a custom limit", () => {
     const text = `word ${"x".repeat(500)}`;
-    expect(getWorkflowTextPreview(text, 5)).toEqual({ truncated: true, preview: "word" });
+    expect(getWorkflowTextPreview(text, 5)).toEqual({
+      truncated: true,
+      preview: "word",
+      totalChars: text.length,
+    });
+  });
+  test("measures and cuts in code points so surrogate pairs are never split", () => {
+    // 500 emoji = 1000 UTF-16 units; a unit-based cut at 5 would split a pair.
+    const text = "😀".repeat(500);
+    expect(getWorkflowTextPreview(text, 5)).toEqual({
+      truncated: true,
+      preview: "😀".repeat(5),
+      totalChars: 500,
+    });
+  });
+  test("does not truncate emoji text whose code-point count is within the limit", () => {
+    // UTF-16 length (2× the limit) would truncate; code-point length must not.
+    const text = "😀".repeat(WORKFLOW_TEXT_PREVIEW_CHAR_LIMIT);
+    expect(getWorkflowTextPreview(text)).toEqual({
+      truncated: false,
+      preview: text,
+      totalChars: WORKFLOW_TEXT_PREVIEW_CHAR_LIMIT,
+    });
   });
 });

@@ -91,16 +91,50 @@ export interface WorkflowTextPreview {
   truncated: boolean;
   /** First chars of the text when truncated, otherwise the full text. */
   preview: string;
+  /** Total character (code point) count, for the "Show more (N chars)" affordance. */
+  totalChars: number;
+}
+
+/** Unicode code-point count ("😀".length is 2 UTF-16 units but 1 character). */
+export function countCodePoints(text: string): number {
+  let count = 0;
+  for (let i = 0; i < text.length; count += 1) {
+    const code = text.codePointAt(i)!;
+    i += code > 0xffff ? 2 : 1;
+  }
+  return count;
 }
 
 export function getWorkflowTextPreview(
   text: string,
   charLimit: number = WORKFLOW_TEXT_PREVIEW_CHAR_LIMIT
 ): WorkflowTextPreview {
-  if (text.length <= charLimit + WORKFLOW_TEXT_PREVIEW_TOLERANCE_CHARS) {
-    return { truncated: false, preview: text };
+  // Measure and cut in Unicode code points, not UTF-16 units: a limit landing inside
+  // a surrogate pair would render a malformed replacement glyph, and emoji-heavy text
+  // would be counted (and truncated) at roughly twice its visible length.
+  const maxUntruncated = charLimit + WORKFLOW_TEXT_PREVIEW_TOLERANCE_CHARS;
+  let count = 0;
+  let cutUtf16 = 0;
+  let truncated = false;
+  for (let i = 0; i < text.length; count += 1) {
+    if (count === charLimit) {
+      cutUtf16 = i;
+    }
+    if (count === maxUntruncated) {
+      truncated = true;
+      break;
+    }
+    const code = text.codePointAt(i)!;
+    i += code > 0xffff ? 2 : 1;
   }
-  return { truncated: true, preview: text.slice(0, charLimit).trimEnd() };
+  if (!truncated) {
+    return { truncated: false, preview: text, totalChars: count };
+  }
+  return {
+    truncated: true,
+    preview: text.slice(0, cutUtf16).trimEnd(),
+    totalChars: countCodePoints(text),
+  };
 }
 
 export function formatWorkflowCost(costUsd: number | null | undefined): string {
