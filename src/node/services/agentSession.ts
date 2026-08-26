@@ -1905,21 +1905,22 @@ export class AgentSession {
     partial: MuxMessage | null;
     historyTail: MuxMessage[];
   }): Promise<StartupRetrySendOptions | undefined> {
-    const lastUserMessage = [...params.historyTail]
-      .reverse()
-      .find((message): message is MuxMessage & { role: "user" } =>
+    // Both lookups want the most recent match, so they share one newest-first copy.
+    // The spread is required because `.reverse()` mutates in place; `.find()` does not
+    // mutate, so reusing the same reversed array for both scans is safe.
+    const newestFirstHistoryTail = [...params.historyTail].reverse();
+
+    const lastUserMessage = newestFirstHistoryTail.find(
+      (message): message is MuxMessage & { role: "user" } =>
         this.shouldUseUserMessageForRetry(message)
-      );
+    );
 
     const lastAssistantMessage =
       params.partial?.role === "assistant"
         ? params.partial
-        : [...params.historyTail]
-            .reverse()
-            .find(
-              (message): message is MuxMessage & { role: "assistant" } =>
-                message.role === "assistant"
-            );
+        : newestFirstHistoryTail.find(
+            (message): message is MuxMessage & { role: "assistant" } => message.role === "assistant"
+          );
 
     const workspaceMetadata = await this.getWorkspaceMetadataForRetry();
 
