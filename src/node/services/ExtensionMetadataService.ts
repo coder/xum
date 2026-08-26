@@ -1143,16 +1143,17 @@ export class ExtensionMetadataService {
       // (upgrade↔downgrade data preservation). `streaming` is never filled
       // from the sidecar for the crash-leftover reason above.
       const target: unknown = main.workspaces[workspaceId];
+      const sidecarEntry: unknown = entry;
       if (
         target !== null &&
         typeof target === "object" &&
         !Array.isArray(target) &&
-        entry !== null &&
-        typeof entry === "object" &&
-        !Array.isArray(entry)
+        sidecarEntry !== null &&
+        typeof sidecarEntry === "object" &&
+        !Array.isArray(sidecarEntry)
       ) {
-        const targetRecord = target as unknown as Record<string, unknown>;
-        for (const [field, value] of Object.entries(entry as unknown as Record<string, unknown>)) {
+        const targetRecord = target as Record<string, unknown>;
+        for (const [field, value] of Object.entries(sidecarEntry)) {
           if (field === "streaming" || value == null) {
             continue;
           }
