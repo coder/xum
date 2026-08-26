@@ -24,7 +24,11 @@ import { toBashTaskId } from "./taskId";
 import { migrateToBackground } from "@/node/services/backgroundProcessExecutor";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { getToolEnvPath } from "@/node/services/hooks";
-import { GIT_NO_HOOKS_ENV, gitHooksAllowed } from "@/node/utils/gitNoHooksEnv";
+import {
+  gitHooksAllowed,
+  gitNoRepoAutomationEnv,
+  gitNoRepoAutomationEnvForLocalRepo,
+} from "@/node/utils/gitNoHooksEnv";
 import { getErrorMessage } from "@/common/utils/errors";
 import { emitChatEventBestEffort } from "./toolUtils";
 import type { BackgroundProcessMonitorConfig } from "@/node/services/backgroundProcessManager";
@@ -912,10 +916,14 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
         config.trusted && config.runtime ? await getToolEnvPath(config.runtime, config.cwd) : null;
       const toolEnvPrelude = buildToolEnvPrelude(toolEnvPath);
 
-      // Neutralize git hooks for untrusted projects — prevent repository-controlled
-      // hooks from executing when the model runs git subcommands (for example,
-      // `git commit` or `git am`) through this bash tool.
-      const hooksEnv = gitHooksAllowed(config.trusted) ? {} : GIT_NO_HOOKS_ENV;
+      // Neutralize repo-controlled git automation when trust is absent or the
+      // benchmark kill-switch is active. Local repos get dynamic filter-driver
+      // overrides too, covering highest-precedence .git/info/attributes.
+      const hooksEnv = gitHooksAllowed(config.trusted)
+        ? {}
+        : config.runtime instanceof LocalBaseRuntime
+          ? await gitNoRepoAutomationEnvForLocalRepo(config.cwd)
+          : gitNoRepoAutomationEnv();
 
       // On Windows, models sometimes emit cmd.exe-style `>nul` / `2>nul` redirections.
       // Since the bash tool runs via bash, `nul` becomes a real file in the workspace.

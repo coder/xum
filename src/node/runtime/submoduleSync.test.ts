@@ -178,6 +178,7 @@ describe("syncRuntimeGitSubmodules", () => {
   it("runs sync and update when .gitmodules exists on the runtime", async () => {
     const runtime = new RecordingRuntime([
       { stdout: "present", exitCode: 0 },
+      { stdout: "filter.evil.smudge\0filter.evil.required\0", exitCode: 0 },
       { exitCode: 0 },
       { exitCode: 0 },
     ]) as unknown as Runtime & RecordingRuntime;
@@ -192,11 +193,13 @@ describe("syncRuntimeGitSubmodules", () => {
     });
 
     expect(runtime.calls[0]?.command).toContain("if [ -f .gitmodules ]");
-    expect(runtime.calls.slice(1).map((call) => call.command)).toEqual([
+    expect(runtime.calls[1]?.command).toContain("emit_filter_keys");
+    expect(runtime.calls.slice(2).map((call) => call.command)).toEqual([
       "git submodule sync --recursive",
       "git submodule update --init --recursive",
     ]);
     expect(runtime.calls.map((call) => call.cwd)).toEqual([
+      "/remote/workspace",
       "/remote/workspace",
       "/remote/workspace",
       "/remote/workspace",
@@ -205,6 +208,17 @@ describe("syncRuntimeGitSubmodules", () => {
       GH_TOKEN: "token",
       GIT_TERMINAL_PROMPT: "0",
       GIT_CONFIG_KEY_0: "core.hooksPath",
+    });
+    expect(runtime.calls[2]?.env).toMatchObject({
+      GIT_CONFIG_COUNT: "7",
+      GIT_CONFIG_KEY_3: "filter.evil.clean",
+      GIT_CONFIG_VALUE_3: "",
+      GIT_CONFIG_KEY_4: "filter.evil.smudge",
+      GIT_CONFIG_VALUE_4: "",
+      GIT_CONFIG_KEY_5: "filter.evil.process",
+      GIT_CONFIG_VALUE_5: "",
+      GIT_CONFIG_KEY_6: "filter.evil.required",
+      GIT_CONFIG_VALUE_6: "false",
     });
     expect(steps).toEqual(["Initializing git submodules...", "Git submodules ready"]);
   });

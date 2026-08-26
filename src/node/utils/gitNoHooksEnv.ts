@@ -1,5 +1,6 @@
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { providerSecretEnvVarNames } from "@/node/utils/providerRequirements";
+import { execFileAsync } from "@/node/utils/disposableExec";
 
 /**
  * Environment variables that disable git hooks by pointing core.hooksPath
@@ -27,20 +28,21 @@ export function gitHooksAllowed(trusted?: boolean): boolean {
 }
 
 /** Empty tree OID: pointing GIT_ATTR_SOURCE here makes git ignore tracked
- * .gitattributes (git >= 2.40), so repo-assigned filter/smudge drivers never
- * run during checkout. Older gits ignore the variable; the secret blanking
- * below still removes the exfiltration value as a second layer. */
+ * .gitattributes (git >= 2.40). $GIT_DIR/info/attributes has higher
+ * precedence and is handled by the repo-aware filter-driver overrides below.
+ * Older gits ignore the variable; secret blanking remains a second layer. */
 const GIT_EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /**
  * Environment for repo-automation-off git executions. Hooks are only one of
  * git's repo-controlled process vectors: repo config can also define checkout
- * filters (filter.<name>.smudge selected by tracked .gitattributes),
- * fsmonitor daemons, credential helpers, and core.sshCommand. This override
- * set neutralizes each of those and additionally blanks provider secret env
- * vars, so any process that still slips through inherits nothing worth
- * exfiltrating. Values are empty strings rather than deletions because exec
- * helpers merge overrides onto process.env.
+ * filters (filter.<name>.smudge selected by attributes), fsmonitor daemons,
+ * credential helpers, and core.sshCommand. This static baseline suppresses
+ * tracked attributes and those non-filter vectors; repo-aware callers append
+ * overrides for drivers selected by $GIT_DIR/info/attributes. It also blanks
+ * provider secret env vars, so any process that still slips through inherits
+ * nothing worth exfiltrating. Values are empty strings rather than deletions
+ * because exec helpers merge overrides onto process.env.
  */
 export function gitNoRepoAutomationEnv(): Record<string, string> {
   const env: Record<string, string> = {
@@ -61,11 +63,114 @@ export function gitNoRepoAutomationEnv(): Record<string, string> {
   return env;
 }
 
+const FILTER_CONFIG_KEY_PATTERN = "^filter[.].*[.](clean|smudge|process|required)$";
+const FILTER_CONFIG_KEY_REGEX = /^filter[.](.+)[.](?:clean|smudge|process|required)$/i;
+const MAX_FILTER_DRIVERS = 128;
+const MAX_FILTER_CONFIG_OUTPUT_BYTES = 256 * 1024;
+
+function appendDisabledFilterDrivers(
+  env: Record<string, string>,
+  configKeys: Iterable<string>
+): Record<string, string> {
+  const filterNames = new Set<string>();
+  for (const key of configKeys) {
+    const match = FILTER_CONFIG_KEY_REGEX.exec(key);
+    const name = match?.[1];
+    if (name == null || name.length === 0 || name.length > 512 || /[\0\r\n]/.test(name)) {
+      continue;
+    }
+    filterNames.add(name);
+    if (filterNames.size > MAX_FILTER_DRIVERS) {
+      throw new Error(
+        "Refusing git operation with more than " + MAX_FILTER_DRIVERS + " filter drivers"
+      );
+    }
+  }
+
+  let configIndex = Number.parseInt(env.GIT_CONFIG_COUNT ?? "0", 10);
+  for (const name of [...filterNames].sort()) {
+    for (const [field, value] of [
+      ["clean", ""],
+      ["smudge", ""],
+      ["process", ""],
+      ["required", "false"],
+    ] as const) {
+      env["GIT_CONFIG_KEY_" + configIndex] = "filter." + name + "." + field;
+      env["GIT_CONFIG_VALUE_" + configIndex] = value;
+      configIndex += 1;
+    }
+  }
+  env.GIT_CONFIG_COUNT = String(configIndex);
+  return env;
+}
+
+export function gitNoRepoAutomationEnvForFilterConfigKeys(
+  configKeys: Iterable<string>
+): Record<string, string> {
+  return appendDisabledFilterDrivers(gitNoRepoAutomationEnv(), configKeys);
+}
+
+function isNoMatchingConfigError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code?: unknown }).code === 1
+  );
+}
+
 /**
- * Build a shell command prefix that neutralizes repo-controlled git
- * automation for untrusted projects. Returns empty string when hooks are
- * allowed, or "GIT_CONFIG_COUNT=3 ... " assignments when they must be
- * suppressed.
+ * Build a repo-aware automation-off environment for local git operations.
+ * GIT_ATTR_SOURCE suppresses tracked .gitattributes, but Git gives
+ * $GIT_DIR/info/attributes higher precedence. Discovering every configured
+ * filter driver and overriding it at command scope neutralizes both sources
+ * without mutating repository files (which would be racy and destructive).
+ */
+export async function gitNoRepoAutomationEnvForLocalRepo(
+  repoPath: string,
+  signal?: AbortSignal
+): Promise<Record<string, string>> {
+  const baseEnv = gitNoRepoAutomationEnv();
+  try {
+    using proc = execFileAsync(
+      "git",
+      [
+        "-C",
+        repoPath,
+        "config",
+        "--null",
+        "--name-only",
+        "--includes",
+        "--get-regexp",
+        FILTER_CONFIG_KEY_PATTERN,
+      ],
+      {
+        env: baseEnv,
+        signal,
+        timeoutMs: 10_000,
+        maxOutputBytes: MAX_FILTER_CONFIG_OUTPUT_BYTES,
+        killTreeOnTermination: true,
+      }
+    );
+    const { stdout } = await proc.result;
+    return appendDisabledFilterDrivers(baseEnv, stdout.split("\0"));
+  } catch (error) {
+    // git config --get-regexp exits 1 when no keys match.
+    if (isNoMatchingConfigError(error)) {
+      return baseEnv;
+    }
+    // Fail closed: materialization must not proceed with an unknown set of
+    // repo-configured checkout filters.
+    throw new Error("Failed to inspect repository checkout filters", { cause: error });
+  }
+}
+
+/**
+ * Build the static shell prefix for git operations where repository config
+ * cannot be inspected on the host (for example remote clone paths). Local
+ * materialization uses gitNoRepoAutomationEnvForLocalRepo so info-attribute
+ * filter drivers are also overridden. Returns empty string when automation
+ * is allowed.
  */
 export function gitNoHooksPrefix(trusted?: boolean): string {
   if (gitHooksAllowed(trusted)) return "";

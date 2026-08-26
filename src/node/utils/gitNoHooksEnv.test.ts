@@ -1,9 +1,13 @@
 import { afterEach, describe, test, expect } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { DisposableTempDir } from "@/node/services/tempDir";
 import {
   GIT_NO_HOOKS_ENV,
   gitHooksAllowed,
   gitNoHooksPrefix,
   gitNoRepoAutomationEnv,
+  gitNoRepoAutomationEnvForLocalRepo,
 } from "./gitNoHooksEnv";
 
 describe("GIT_NO_HOOKS_ENV", () => {
@@ -55,9 +59,9 @@ describe("gitNoRepoAutomationEnv", () => {
     expect(env.GIT_CONFIG_VALUE_1).toBe("false");
     expect(env.GIT_CONFIG_KEY_2).toBe("credential.helper");
     expect(env.GIT_CONFIG_VALUE_2).toBe("");
-    // Checkout filters (smudge/clean) select drivers via tracked
-    // .gitattributes; pointing the attributes source at the empty tree
-    // disables them.
+    // Pointing the tracked attributes source at the empty tree suppresses
+    // .gitattributes; the repo-aware builder below additionally overrides
+    // drivers selected by highest-precedence .git/info/attributes.
     expect(env.GIT_ATTR_SOURCE).toBe("4b825dc642cb6eb9a060e54bf8d69288fbee4904");
     // Environment beats repo-config core.sshCommand.
     expect(env.GIT_SSH_COMMAND).toBe("ssh");
@@ -69,6 +73,58 @@ describe("gitNoRepoAutomationEnv", () => {
     expect(env.OPENAI_API_KEY).toBe("");
     expect(env.AWS_SECRET_ACCESS_KEY).toBe("");
     expect(env.AWS_BEARER_TOKEN_BEDROCK).toBe("");
+  });
+
+  test("neutralizes filters selected by .git/info/attributes without mutating it", async () => {
+    using tmp = new DisposableTempDir("git-filter-automation-off");
+    const repo = path.join(tmp.path, "repo");
+    const worktree = path.join(tmp.path, "worktree");
+    const marker = path.join(tmp.path, "filter-ran");
+    const driver = path.join(tmp.path, "smudge.sh");
+    await fs.mkdir(repo, { recursive: true });
+    await Bun.$`git init`.cwd(repo).quiet();
+    await Bun.$`git config user.email test@example.com`.cwd(repo).quiet();
+    await Bun.$`git config user.name Test`.cwd(repo).quiet();
+    await fs.writeFile(path.join(repo, "data.txt"), "payload\n", "utf-8");
+    await Bun.$`git add data.txt`.cwd(repo).quiet();
+    await Bun.$`git commit -m init`.cwd(repo).quiet();
+    await fs.writeFile(
+      driver,
+      `#!/bin/sh\nprintf '%s' "\${ANTHROPIC_API_KEY-}" > "${marker}"\ncat\n`,
+      "utf-8"
+    );
+    await fs.chmod(driver, 0o755);
+    await Bun.$`git config filter.evil.smudge ${driver}`.cwd(repo).quiet();
+    await Bun.$`git config filter.evil.required true`.cwd(repo).quiet();
+    await fs.writeFile(
+      path.join(repo, ".git", "info", "attributes"),
+      "*.txt filter=evil\n",
+      "utf-8"
+    );
+
+    const env = await gitNoRepoAutomationEnvForLocalRepo(repo);
+    const filterKeys = Object.entries(env)
+      .filter(([key]) => key.startsWith("GIT_CONFIG_KEY_"))
+      .map(([, value]) => value);
+    expect(filterKeys).toContain("filter.evil.smudge");
+    expect(filterKeys).toContain("filter.evil.process");
+    expect(filterKeys).toContain("filter.evil.required");
+
+    await Bun.$`git worktree add ${worktree} -b safe-filter-checkout`
+      .cwd(repo)
+      .env({ ...process.env, ANTHROPIC_API_KEY: "secret", ...env })
+      .quiet();
+    expect(await fs.readFile(path.join(worktree, "data.txt"), "utf-8")).toBe("payload\n");
+    expect(await fs.readFile(path.join(repo, ".git", "info", "attributes"), "utf-8")).toBe(
+      "*.txt filter=evil\n"
+    );
+    let markerExists = true;
+    try {
+      await fs.access(marker);
+    } catch {
+      markerExists = false;
+    }
+    expect(markerExists).toBe(false);
   });
 });
 

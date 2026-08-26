@@ -15,7 +15,7 @@ import { shellQuote } from "@/common/utils/shell";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { toPosixPath } from "@/node/utils/paths";
 import { log } from "@/node/services/log";
-import { gitHooksAllowed, gitNoRepoAutomationEnv } from "@/node/utils/gitNoHooksEnv";
+import { gitHooksAllowed, gitNoRepoAutomationEnvForLocalRepo } from "@/node/utils/gitNoHooksEnv";
 import { WORKTREE_DELETE_GIT_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { syncLocalGitSubmodules } from "@/node/runtime/submoduleSync";
 import { syncXumignoreFiles } from "./xumignore";
@@ -42,8 +42,14 @@ export class WorktreeManager {
     return path.join(this.srcBaseDir, projectName, workspaceName);
   }
 
-  private getGitExecOptions(trusted?: boolean, signal?: AbortSignal): GitExecOptions {
-    const env = gitHooksAllowed(trusted) ? undefined : gitNoRepoAutomationEnv();
+  private async getGitExecOptions(
+    projectPath: string,
+    trusted?: boolean,
+    signal?: AbortSignal
+  ): Promise<GitExecOptions> {
+    const env = gitHooksAllowed(trusted)
+      ? undefined
+      : await gitNoRepoAutomationEnvForLocalRepo(projectPath, signal);
     return env || signal ? { ...(env ? { env } : {}), ...(signal ? { signal } : {}) } : undefined;
   }
 
@@ -82,7 +88,11 @@ export class WorktreeManager {
   }): Promise<WorkspaceCreationResult> {
     const { projectPath, branchName, trunkBranch, initLogger } = params;
     // Disable git hooks for untrusted projects (prevents post-checkout execution)
-    const noHooksEnv = this.getGitExecOptions(params.trusted, params.abortSignal);
+    const noHooksEnv = await this.getGitExecOptions(
+      projectPath,
+      params.trusted,
+      params.abortSignal
+    );
     const workspaceName = params.directoryName ?? branchName;
     const workspacePath =
       params.workspacePathOverride ?? this.getWorkspacePath(projectPath, workspaceName);
@@ -228,7 +238,7 @@ export class WorktreeManager {
     createdBranch: boolean;
     trusted?: boolean;
   }): Promise<void> {
-    const noHooksEnv = this.getGitExecOptions(args.trusted);
+    const noHooksEnv = await this.getGitExecOptions(args.projectPath, args.trusted);
 
     try {
       using removeProc = execFileAsync(
@@ -374,7 +384,7 @@ export class WorktreeManager {
     cleanStaleLock(projectPath);
 
     // Disable git hooks for untrusted projects
-    const noHooksEnv = this.getGitExecOptions(trusted);
+    const noHooksEnv = await this.getGitExecOptions(projectPath, trusted);
 
     // Compute workspace paths using canonical method
     const oldPath = this.getWorkspacePath(projectPath, oldName);
@@ -423,7 +433,7 @@ export class WorktreeManager {
     // Match deleteWorkspace() semantics so preflight stays idempotent and non-destructive.
     cleanStaleLock(projectPath);
 
-    const noHooksEnv = this.getGitExecOptions(trusted);
+    const noHooksEnv = await this.getGitExecOptions(projectPath, trusted);
     const workspacePath = this.getWorkspacePath(projectPath, workspaceName);
     const isInPlace = projectPath === workspaceName;
 
@@ -501,7 +511,7 @@ export class WorktreeManager {
 
     // Disable git hooks for untrusted projects and bound every git cleanup command.
     const noHooksEnv: GitExecOptions = {
-      ...(this.getGitExecOptions(trusted) ?? {}),
+      ...((await this.getGitExecOptions(projectPath, trusted)) ?? {}),
       timeoutMs: WORKTREE_DELETE_GIT_TIMEOUT_MS,
     };
 

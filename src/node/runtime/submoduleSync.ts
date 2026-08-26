@@ -4,7 +4,11 @@ import * as path from "node:path";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { getErrorMessage } from "@/common/utils/errors";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
-import { gitHooksAllowed, gitNoRepoAutomationEnv } from "@/node/utils/gitNoHooksEnv";
+import {
+  gitHooksAllowed,
+  gitNoRepoAutomationEnv,
+  gitNoRepoAutomationEnvForFilterConfigKeys,
+} from "@/node/utils/gitNoHooksEnv";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 
 import { LocalRuntime } from "./LocalRuntime";
@@ -33,15 +37,21 @@ interface RuntimeSubmoduleSyncArgs extends BaseSubmoduleSyncArgs {
 function buildGitExecutionEnv(options?: {
   env?: Record<string, string>;
   trusted?: boolean;
+  filterConfigKeys?: Iterable<string>;
 }): Record<string, string> {
+  const securityEnv = gitHooksAllowed(options?.trusted)
+    ? {}
+    : options?.filterConfigKeys == null
+      ? gitNoRepoAutomationEnv()
+      : gitNoRepoAutomationEnvForFilterConfigKeys(options.filterConfigKeys);
   return {
     ...(options?.env ?? {}),
     ...NON_INTERACTIVE_ENV_VARS,
     // Default-deny mirrors the rest of workspace materialization: untrusted
     // repos (and trusted ones under the project-automation kill switch) must
-    // not get a chance to run repo-controlled git hooks — including pre-seeded
-    // .git/modules/<name>/hooks — during submodule checkout.
-    ...(gitHooksAllowed(options?.trusted) ? {} : gitNoRepoAutomationEnv()),
+    // not run repo-controlled hooks or checkout filters, including pre-seeded
+    // .git/modules/<name> config/info state.
+    ...securityEnv,
   };
 }
 
@@ -74,8 +84,45 @@ async function runSubmoduleCommand(args: {
   }
 }
 
+const FILTER_CONFIG_DISCOVERY_COMMAND = `
+set -e
+emit_filter_keys() {
+  git config --null --name-only --includes "$@" --get-regexp '^filter[.].*[.](clean|smudge|process|required)$' || [ "$?" -eq 1 ]
+}
+emit_filter_keys
+common_dir=$(git rev-parse --git-common-dir)
+if [ -d "$common_dir/modules" ]; then
+  find "$common_dir/modules" -type f -name config -print0 | while IFS= read -r -d '' config; do
+    emit_filter_keys --file "$config"
+  done
+fi
+`;
+
+async function discoverRuntimeGitFilterConfigKeys(
+  args: RuntimeSubmoduleSyncArgs
+): Promise<string[]> {
+  const result = await execBuffered(args.runtime, FILTER_CONFIG_DISCOVERY_COMMAND, {
+    cwd: args.workspacePath,
+    timeout: GITMODULES_PROBE_TIMEOUT_SECS,
+    abortSignal: args.abortSignal,
+    env: buildGitExecutionEnv({ env: args.env, trusted: args.trusted }),
+    maxOutputBytes: 256 * 1024,
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(result.stderr || result.stdout || "git filter discovery failed");
+  }
+  return result.stdout.split("\0");
+}
+
 async function runSubmoduleMaterialization(args: RuntimeSubmoduleSyncArgs): Promise<void> {
-  const env = buildGitExecutionEnv({ env: args.env, trusted: args.trusted });
+  const filterConfigKeys = gitHooksAllowed(args.trusted)
+    ? undefined
+    : await discoverRuntimeGitFilterConfigKeys(args);
+  const env = buildGitExecutionEnv({
+    env: args.env,
+    trusted: args.trusted,
+    filterConfigKeys,
+  });
 
   // Skills, docs, and other workspace-managed files can live inside submodules.
   // Materialize them before init hooks or downstream runtime setup so later discovery
