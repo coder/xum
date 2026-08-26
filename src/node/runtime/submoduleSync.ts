@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { getErrorMessage } from "@/common/utils/errors";
 import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
-import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
+import { GIT_NO_HOOKS_ENV, gitHooksAllowed } from "@/node/utils/gitNoHooksEnv";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 
 import { LocalRuntime } from "./LocalRuntime";
@@ -37,9 +37,11 @@ function buildGitExecutionEnv(options?: {
   return {
     ...(options?.env ?? {}),
     ...NON_INTERACTIVE_ENV_VARS,
-    // Default-deny mirrors the rest of workspace materialization: untrusted repos
-    // must not get a chance to run repo-controlled git hooks during checkout.
-    ...(options?.trusted ? {} : GIT_NO_HOOKS_ENV),
+    // Default-deny mirrors the rest of workspace materialization: untrusted
+    // repos (and trusted ones under the project-automation kill switch) must
+    // not get a chance to run repo-controlled git hooks — including pre-seeded
+    // .git/modules/<name>/hooks — during submodule checkout.
+    ...(gitHooksAllowed(options?.trusted) ? {} : GIT_NO_HOOKS_ENV),
   };
 }
 
