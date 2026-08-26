@@ -2623,6 +2623,11 @@ export class WorkspaceService extends EventEmitter {
       .then(() => this.drainBashMonitorWakes(ownerWorkspaceId))
       .catch((error: unknown) => {
         log.error("Bash monitor wake drain failed", { ownerWorkspaceId, error });
+        // A failed drain may be the LAST trigger a persisted wake ever gets: startup
+        // recovery runs once, and with no open UI and no later process event nothing
+        // else re-drives delivery. Retry on a delay until a drain pass succeeds; the
+        // timer dedupes per owner, so persistent failure retries at a bounded rate.
+        this.scheduleBashMonitorWakeDrainRetry(ownerWorkspaceId);
       })
       .finally(() => {
         this.pendingBashMonitorWakeDrains.delete(promise);
@@ -2632,6 +2637,20 @@ export class WorkspaceService extends EventEmitter {
       });
     this.pendingBashMonitorWakeDrainsByOwner.set(ownerWorkspaceId, promise);
     this.pendingBashMonitorWakeDrains.add(promise);
+  }
+
+  // One retry timer per owner after a failed drain (see the catch above).
+  private readonly bashMonitorWakeDrainRetryTimers = new Map<string, NodeJS.Timeout>();
+
+  private scheduleBashMonitorWakeDrainRetry(ownerWorkspaceId: string): void {
+    if (this.bashMonitorWakeDrainRetryTimers.has(ownerWorkspaceId)) return;
+    const timer = setTimeout(() => {
+      this.bashMonitorWakeDrainRetryTimers.delete(ownerWorkspaceId);
+      this.scheduleBashMonitorWakeDrain(ownerWorkspaceId);
+    }, 1_000);
+    // Never hold process shutdown open for a delivery retry.
+    timer.unref();
+    this.bashMonitorWakeDrainRetryTimers.set(ownerWorkspaceId, timer);
   }
 
   private scheduleBashMonitorWakeDrainAfterRead(

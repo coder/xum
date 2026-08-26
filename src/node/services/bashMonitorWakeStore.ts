@@ -24,6 +24,14 @@ const MAX_WAKE_LINE_BYTES = 8_192;
 // re-checks records superseded seconds earlier within one history-clear operation.
 export const TERMINAL_WAKE_RETENTION_MS = 60 * 60 * 1000;
 
+// Exact suffix shapes appended by write() (temp) and pruneTerminalWakeFile (trash): a
+// randomUUID tail contains no dots. Anchoring with a no-dot tail matters because wake
+// ids are arbitrary process ids and encodeURIComponent escapes neither dots nor
+// hyphens — an id containing ".json.prune-" would otherwise make its own temp/trash
+// files (e.g. "x.json.prune-y.json.tmp-…") misparse as prune trash for the wrong id.
+const PRUNE_TRASH_SUFFIX_RE = /\.json\.prune-[^.]+$/;
+const TMP_WRITE_SUFFIX_RE = /\.json\.tmp-[^.]+$/;
+
 // Single-source the wake status enum so the exported TS type and the runtime
 // Zod validator below can't drift. Mirrors the `as const` tuple pattern used by
 // the sibling terminalAttentionStore notification enums.
@@ -783,7 +791,7 @@ export class BashMonitorWakeStore {
         // concurrently rewritten pending wake that neither scans nor delivery (both
         // address the original path) can see. Inspect stranded prune files and restore
         // pending content before any sweeping can touch it.
-        if (entry.includes(".json.prune-")) {
+        if (PRUNE_TRASH_SUFFIX_RE.test(entry)) {
           const rescued = await this.recoverStrandedPruneFile(
             ownerWorkspaceId,
             filePath,
@@ -796,7 +804,7 @@ export class BashMonitorWakeStore {
         // mid-write; sweep old ones so crash leaks stay bounded. A tmp file is an
         // uncommitted write — the durable state is whatever the target path holds — so
         // it is never restored, only swept.
-        if (entry.includes(".json.tmp-")) {
+        if (TMP_WRITE_SUFFIX_RE.test(entry)) {
           const leftoverStat = await fsPromises.stat(filePath).catch(() => null);
           if (leftoverStat != null && leftoverStat.mtimeMs < pruneBeforeMs) {
             await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
@@ -814,17 +822,19 @@ export class BashMonitorWakeStore {
           classified.delete(entry);
           continue;
         }
-        // Transient stat failure. Returning a partial result would look authoritative to
-        // callers (listBackgroundProcesses caches it as the last good pending set),
-        // silently dropping a durable pending wake. Serve the cached pending
-        // classification when we have one; otherwise propagate so the caller keeps its
-        // previous snapshot instead.
-        const cachedOnError = classified.get(entry);
-        if (cachedOnError != null) {
-          if (cachedOnError.pending != null) records.push(cachedOnError.pending);
-          continue;
-        }
+        // Transient stat failure: PROPAGATE, never serve the cached classification.
+        // Another instance may have superseded the cached pending record behind this
+        // very failure, and drains treat this listing as delivery authority — a served
+        // stale pending could append a synthetic turn for a durably canceled wake.
+        // Display continuity is the UI caller's job (last-good fallback + retry).
         throw error;
+      }
+      if (!stat.isFile()) {
+        // A directory/socket named *.json (corruption or a foreign tool) is not a wake
+        // record; skipping it keeps one weird artifact from failing every scan and
+        // blocking delivery of unrelated valid wakes.
+        classified.delete(entry);
+        continue;
       }
       const sig = `${stat.ino}:${stat.mtimeMs}:${stat.size}`;
       const cached = classified.get(entry);
@@ -945,11 +955,11 @@ export class BashMonitorWakeStore {
     filePath: string,
     pruneBeforeMs: number
   ): Promise<BashMonitorWakeRecord | null> {
-    // Split on the LAST ".json.prune-" so wake ids that themselves contain ".prune-"
-    // (encodeURIComponent escapes neither "." nor "-") still resolve correctly.
-    const marker = filePath.lastIndexOf(".json.prune-");
-    assert(marker >= 0, "recoverStrandedPruneFile requires a *.json.prune-* path");
-    const originalPath = filePath.slice(0, marker + ".json".length);
+    // The anchored suffix regex (see PRUNE_TRASH_SUFFIX_RE) guarantees the split is the
+    // actual trash marker, not a ".json.prune-" occurring inside an arbitrary wake id.
+    const marker = /^(.*\.json)\.prune-[^.]+$/.exec(filePath);
+    assert(marker != null, "recoverStrandedPruneFile requires a *.json.prune-* path");
+    const originalPath = marker[1];
     const id = BashMonitorWakeStore.wakeIdFromFileStem(
       path.basename(originalPath).slice(0, -".json".length)
     );
@@ -1011,13 +1021,78 @@ export class BashMonitorWakeStore {
           parsed.status === "pending" &&
           Date.parse(parsed.updatedAt) > Date.parse(canonical.updatedAt)
         ) {
-          await fsPromises.rename(filePath, originalPath);
-          return parsed;
+          return this.replaceCanonicalIfUnchanged(filePath, originalPath, parsed, canonical);
         }
       }
       await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
       return restored && parsed.status === "pending" ? parsed : null;
     });
+  }
+
+  /**
+   * Compare-and-swap replacement of the canonical wake file by a strictly newer pending
+   * leftover. A plain rename would be a blind overwrite: between reading `compared` and
+   * the rename, another instance can replace the canonical path with an even newer
+   * pending (new output) or terminal (canceled) record, which must not be resurrected
+   * or lost. Instead, atomically capture the canonical inode under a trash name, verify
+   * it still matches `compared`, and place the leftover with a no-clobber link. Every
+   * unexpected state backs off leaving the leftover in place — the next scan
+   * re-reconciles against the then-settled canonical record. The trash name uses the
+   * standard prune suffix, so a crash mid-swap is healed by recoverStrandedPruneFile.
+   * Caller must hold the per-record lock.
+   */
+  private async replaceCanonicalIfUnchanged(
+    leftoverPath: string,
+    originalPath: string,
+    leftover: BashMonitorWakeRecord,
+    compared: BashMonitorWakeRecord
+  ): Promise<BashMonitorWakeRecord | null> {
+    const cas = `${originalPath}.prune-${randomUUID()}`;
+    try {
+      await fsPromises.rename(originalPath, cas);
+    } catch {
+      // Canonical vanished mid-swap: back off; the next scan re-reconciles.
+      return null;
+    }
+    let captured: BashMonitorWakeRecord | null;
+    try {
+      captured = await this.readRecordAt(cas);
+    } catch (error) {
+      // Cannot verify what we captured: put it back (no-clobber) and propagate.
+      try {
+        await fsPromises.link(cas, originalPath);
+        await fsPromises.rm(cas, { force: true }).catch(() => undefined);
+      } catch {
+        // A newer write claimed the path; the cas file is healed as prune trash later.
+      }
+      throw error;
+    }
+    const unchanged =
+      captured != null &&
+      captured.updatedAt === compared.updatedAt &&
+      captured.status === compared.status;
+    if (!unchanged) {
+      // The canonical record changed under us: restore it and keep the leftover.
+      try {
+        await fsPromises.link(cas, originalPath);
+      } catch {
+        // A newer write already claimed the path; it supersedes the stale capture.
+      }
+      await fsPromises.rm(cas, { force: true }).catch(() => undefined);
+      return null;
+    }
+    let placed = false;
+    try {
+      await fsPromises.link(leftoverPath, originalPath);
+      placed = true;
+    } catch {
+      // Someone claimed the path mid-swap; keep the leftover for re-reconciliation.
+    }
+    // The captured record is verifiably the older one we compared: safe to drop.
+    await fsPromises.rm(cas, { force: true }).catch(() => undefined);
+    if (!placed) return null;
+    await fsPromises.rm(leftoverPath, { force: true }).catch(() => undefined);
+    return leftover;
   }
 
   /**

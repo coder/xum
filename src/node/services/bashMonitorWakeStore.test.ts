@@ -665,11 +665,14 @@ describe("BashMonitorWakeStore", () => {
     expect((await store.listPending("owner-1")).map((r) => r.id)).toEqual(["proc-1"]);
   });
 
-  test("listPending keeps serving a cached pending wake when stat transiently fails", async () => {
+  test("a transient stat failure propagates even with a cached classification", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload());
     expect(await store.listPending("owner-1")).toHaveLength(1); // classify into the cache
 
+    // Even a warm cache must not answer through a stat failure: the failure may hide a
+    // concurrent supersession by another instance, and drains treat this listing as
+    // delivery authority — a served stale pending could deliver a canceled wake.
     const file = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes", "proc-1.json");
     const realStat = fsPromises.stat;
     const statSpy = spyOn(fsPromises, "stat").mockImplementation(((
@@ -679,12 +682,106 @@ describe("BashMonitorWakeStore", () => {
         ? Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
         : realStat(target)) as unknown as typeof fsPromises.stat);
     try {
-      // A transient stat failure must not silently drop the durable pending record from
-      // an otherwise-successful (authoritative-looking) result.
-      expect((await store.listPending("owner-1")).map((r) => r.id)).toEqual(["proc-1"]);
+      await store.listPending("owner-1");
+      expect.unreachable("expected listPending to propagate the stat failure");
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("EIO");
     } finally {
       statSpy.mockRestore();
     }
+    // Once the failure clears, the durable record is served again.
+    expect((await store.listPending("owner-1")).map((r) => r.id)).toEqual(["proc-1"]);
+  });
+
+  test("non-regular *.json entries are skipped, not fatal", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload());
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    // A directory named like a record (corruption or a foreign tool) must not fail
+    // every scan and block delivery of the valid wake next to it.
+    await fsPromises.mkdir(path.join(dir, "not-a-file.json"));
+
+    expect((await store.listPending("owner-1")).map((r) => r.id)).toEqual(["proc-1"]);
+  });
+
+  test("temp files of ids containing the prune marker are never misparsed as trash", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    // Wake ids are arbitrary process ids; encodeURIComponent escapes neither dots nor
+    // hyphens, so this id's own files embed the literal prune marker.
+    await store.enqueueOrMergePending(payload({ processId: "x.json.prune-y", taskId: "bash:x" }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const canonical = path.join(dir, "x.json.prune-y.json");
+    // Crashed write: the temp file leaks next to the canonical record.
+    const temp = path.join(dir, "x.json.prune-y.json.tmp-abc123");
+    await fsPromises.copyFile(canonical, temp);
+
+    const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+    const pending = await fresh.listPending("owner-1");
+    // The temp file must not be treated as prune trash for the truncated id "x": that
+    // would link the record to x.json (undeliverable at its real id) and eat the temp.
+    expect(pending.map((r) => r.id)).toEqual(["x.json.prune-y"]);
+    const entries = await fsPromises.readdir(dir);
+    expect(entries).not.toContain("x.json");
+    expect(entries).toContain("x.json.prune-y.json.tmp-abc123"); // swept only once old
+  });
+
+  test("reconciliation never overwrites a canonical record changed mid-swap", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR stale"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    // Pre-classify the canonical file so the scan below serves it from cache: the only
+    // canonical read is then recovery's compare-read, making the injection point
+    // deterministic regardless of readdir order.
+    expect(await store.listPending("owner-1")).toHaveLength(1);
+    // Craft a stranded leftover STRICTLY NEWER than the canonical record, as left by an
+    // interrupted prune race on another instance.
+    const canonicalRecord = JSON.parse(await fsPromises.readFile(file, "utf-8")) as {
+      updatedAt: string;
+      lines: string[];
+    };
+    const leftover = {
+      ...canonicalRecord,
+      lines: ["ERROR crafted"],
+      updatedAt: new Date(Date.parse(canonicalRecord.updatedAt) + 1_000).toISOString(),
+    };
+    const leftoverPath = `${file}.prune-crashed`;
+    await fsPromises.writeFile(leftoverPath, JSON.stringify(leftover), "utf-8");
+
+    // Between recovery's canonical compare-read and its replacement, another instance
+    // merges even newer output into the canonical record. A blind rename would
+    // overwrite it with the crafted leftover, losing that output.
+    const other = new BashMonitorWakeStore(makeConfig(rootDir));
+    const realReadFile = fsPromises.readFile;
+    let injected = false;
+    const readSpy = spyOn(fsPromises, "readFile").mockImplementation((async (
+      target: Parameters<typeof fsPromises.readFile>[0],
+      options: Parameters<typeof fsPromises.readFile>[1]
+    ) => {
+      const result = await realReadFile(target, options);
+      if (!injected && target === file) {
+        injected = true;
+        await other.enqueueOrMergePending(payload({ lines: ["ERROR newest"], totalMatches: 2 }));
+      }
+      return result;
+    }) as unknown as typeof fsPromises.readFile);
+    try {
+      await store.listPending("owner-1");
+    } finally {
+      readSpy.mockRestore();
+    }
+    // The mid-swap write survived — a blind rename would have replaced it with the
+    // crafted leftover, losing "ERROR newest".
+    const current = await store.get("owner-1", "proc-1");
+    expect(current?.lines).toEqual(["ERROR stale", "ERROR newest"]);
+    // The leftover backed off (kept) rather than being consumed against a moved target.
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".prune-"))).toEqual([
+      "proc-1.json.prune-crashed",
+    ]);
+    await fsPromises.rm(leftoverPath, { force: true });
+    const settled = await store.listPending("owner-1");
+    expect(settled).toHaveLength(1);
+    expect(settled[0].lines).toEqual(["ERROR stale", "ERROR newest"]);
   });
 
   test("listPending propagates a transient stat failure it has no cached answer for", async () => {

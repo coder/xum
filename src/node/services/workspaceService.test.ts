@@ -390,6 +390,70 @@ describe("WorkspaceService bash monitor wakes", () => {
     }
   });
 
+  test("a failed drain retries on a delay until the wake delivers", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-drain-retry";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        async (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          await args[3]?.onAccepted?.();
+          return Ok(undefined);
+        }
+      );
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: BashMonitorWakeStore;
+        }
+      ).bashMonitorWakeStore;
+      // The drain's own scan fails once. Startup recovery may be the LAST trigger a
+      // persisted wake ever gets, so a single failed drain must not strand it.
+      const realListPending = wakeStore.listPending.bind(wakeStore);
+      let listCalls = 0;
+      spyOn(wakeStore, "listPending").mockImplementation((ownerWorkspaceId: string) => {
+        listCalls += 1;
+        if (listCalls === 1) {
+          return Promise.reject(new Error("transient scan failure"));
+        }
+        return realListPending(ownerWorkspaceId);
+      });
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-retry",
+        taskId: "bash:proc-retry",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED once"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+      });
+
+      // The delayed retry drain must still deliver the wake with no further triggers.
+      await waitForCondition(() => sendSpy.mock.calls.length === 1, { timeoutMs: 5_000 });
+      expect(listCalls).toBeGreaterThanOrEqual(2);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("a partially failed delivered batch still notifies subscribers immediately", async () => {
     const { config, cleanup } = await createTestHistoryService();
     try {
