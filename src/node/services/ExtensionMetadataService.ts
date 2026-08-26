@@ -199,9 +199,13 @@ export class ExtensionMetadataService {
 
   private async load(options?: { throwOnError?: boolean }): Promise<ExtensionMetadataFile> {
     // Bounded because the ENOENT branch below re-reads: each retry only
-    // happens after a fresh ENOENT with no sidecar, so the loop converges.
+    // happens after a fresh ENOENT, so the loop converges.
     const MAX_READ_ATTEMPTS = 3;
     let lastError: unknown;
+    // True when the final failed attempt hit the mid-quarantine window
+    // (main missing, sidecar present). That failure must never resolve as
+    // an empty file, even leniently — see the sidecar branch below.
+    let blockedByQuarantineWindow = false;
     for (let attempt = 1; attempt <= MAX_READ_ATTEMPTS; attempt++) {
       try {
         const content = await readFile(this.filePath, "utf-8");
@@ -223,6 +227,7 @@ export class ExtensionMetadataService {
         // from an authoritative empty state, while the default self-heals so
         // writers can always make progress.
         lastError = error;
+        blockedByQuarantineWindow = false;
         if (!ExtensionMetadataService.isErrnoCode(error, "ENOENT")) {
           break;
         }
@@ -230,15 +235,31 @@ export class ExtensionMetadataService {
         // healthy empty state: it is the (rare) window where quarantine
         // moved the file aside and has not yet written the empty
         // replacement — the moved bytes may even be a concurrent writer's
-        // healthy repair awaiting restore. Strict readers must see a
-        // retryable failure (ENOENT carries an errno code, so callers
-        // classify it as transient; getAllSnapshots additionally resumes a
-        // crash-interrupted recovery from this signature), not an
-        // authoritative {} that a subsequent restore cannot retract.
-        // Lenient (writer) paths keep self-healing below so mutations
-        // always make progress.
+        // healthy repair awaiting restore. Resolving this window as an
+        // empty file is never safe, lenient or strict: a lenient WRITER
+        // would mutate {} and save, recreating the main path — and the
+        // pending restore (deliberately no-overwrite) would then strand
+        // every other workspace's metadata in the sidecar for good.
         if (await this.probeQuarantineSidecar()) {
-          break;
+          blockedByQuarantineWindow = true;
+          if (options?.throwOnError) {
+            // Strict readers surface a retryable failure (ENOENT carries an
+            // errno code, so callers classify it as transient) and
+            // getAllSnapshots resumes the recovery through the mutation
+            // queue — never an authoritative {} that a subsequent restore
+            // cannot retract.
+            break;
+          }
+          // Lenient callers complete the recovery INLINE and re-read.
+          // Inline (unqueued) is deliberate: most lenient loads run inside
+          // withSerializedMutation, whose promise-chain queue is not
+          // reentrant — enqueueing resumeQuarantineRecovery here would
+          // deadlock. Racing a concurrent recovery is safe because every
+          // step is no-overwrite (link/COPYFILE_EXCL) and idempotent. A
+          // recovery failure propagates: failing one mutation in this
+          // pathological window beats destroying the sidecar's data.
+          await this.completeQuarantineRecovery(`${this.filePath}.corrupt`);
+          continue;
         }
         // No sidecar either. With multiple instances the failed read may
         // have raced another process's COMPLETED recovery — main restored
@@ -251,7 +272,7 @@ export class ExtensionMetadataService {
         }
       }
     }
-    if (options?.throwOnError) {
+    if (options?.throwOnError || blockedByQuarantineWindow) {
       throw lastError;
     }
     log.error("Failed to load metadata:", lastError);

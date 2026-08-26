@@ -634,6 +634,32 @@ describe("ExtensionMetadataService", () => {
     expect(snapshots.get("ws-1")?.recency).toBe(42);
   });
 
+  test("a lenient writer completes a crash-interrupted quarantine instead of clobbering it", async () => {
+    // Same crash window as above, but hit by a normal (lenient) mutation.
+    // Treating it as an empty file would save a partial one-entry file at
+    // the main path — and the pending restore (deliberately no-overwrite)
+    // would then strand every other workspace's metadata in the sidecar.
+    // The writer must instead complete the recovery inline and apply its
+    // mutation on top of the restored data.
+    const healthy = {
+      version: 1,
+      workspaces: { "ws-other": { recency: 42, streaming: false } },
+    };
+    await writeFile(`${filePath}.corrupt`, JSON.stringify(healthy));
+    // Main file intentionally absent (beforeEach never creates it).
+
+    await service.updateRecency("ws-new", 100);
+
+    const persisted = JSON.parse(await readFile(filePath, "utf-8")) as ExtensionMetadataFile;
+    expect(Object.keys(persisted.workspaces).sort()).toEqual(["ws-new", "ws-other"]);
+    // Sidecar consumed by the restore.
+    const sidecarGone = await readFile(`${filePath}.corrupt`, "utf-8").then(
+      () => false,
+      () => true
+    );
+    expect(sidecarGone).toBe(true);
+  });
+
   test("a strict read restores healthy bytes stranded in the sidecar by a crashed quarantine", async () => {
     // The crash can also strand a HEALTHY file in the sidecar: a concurrent
     // writer repaired the main file right before quarantine's rename moved
