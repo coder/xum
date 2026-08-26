@@ -1141,13 +1141,19 @@ export class BashMonitorWakeStore {
    * previous clear's cutoff when one exists, otherwise remove the file. A current
    * generation owned by a DIFFERENT clear (another instance committed a newer one) is
    * left untouched — demoting it would revive wakes that clear legitimately retired.
+   * Returns whether the pinned demotion durably landed: false means the standing
+   * generation declined it (foreign, refreshed, or committed) or the CAS lost its
+   * no-clobber race — callers restoring records on the crashed-staging path must
+   * treat that as "the clear is not rolled back" (see rollbackCrashedClearStaging).
    */
   private async rollbackClearTombstone(
     ownerWorkspaceId: string,
     clearId: string,
     onlyIfStagedAt?: string
-  ): Promise<void> {
-    await this.mutateClearedAt(ownerWorkspaceId, (current) => {
+  ): Promise<boolean> {
+    let demoted = false;
+    const applied = await this.mutateClearedAt(ownerWorkspaceId, (current) => {
+      demoted = false;
       if (current?.clearId !== clearId) return "keep";
       // Crash-rollback callers pin the exact staging generation they judged crashed:
       // between their read and this CAS, the owning instance may have refreshed
@@ -1161,6 +1167,7 @@ export class BashMonitorWakeStore {
       ) {
         return "keep";
       }
+      demoted = true;
       if (current.previousClearedAt != null) {
         // Demoted values carry no staging state: the previous clear committed long
         // ago (a clear only becomes "previous" after committing).
@@ -1168,6 +1175,7 @@ export class BashMonitorWakeStore {
       }
       return null;
     });
+    return applied && demoted;
   }
 
   /**
@@ -1182,23 +1190,35 @@ export class BashMonitorWakeStore {
    * before commitClear) resurrects those wakes into the cleared transcript — a
    * duplicate delivery, accepted as strictly better than silently losing wakes for a
    * transcript that was never cleared.
+   *
+   * Returns the canonical entry names left PENDING by this rollback so the calling
+   * scan can serve them: a record restored from an artifact rescued in the same scan
+   * (e.g. a stamped generation stranded in prune trash) has no canonical entry in the
+   * caller's readdir snapshot and would otherwise wait for the next scan.
    */
-  private async rollbackCrashedClearStaging(ownerWorkspaceId: string): Promise<void> {
+  private async rollbackCrashedClearStaging(ownerWorkspaceId: string): Promise<string[]> {
     const tomb = await this.readClearedAt(ownerWorkspaceId);
-    if (tomb?.phase !== "staged" || tomb.clearId == null) return;
-    if (this.activeClearIds.has(tomb.clearId)) return; // in flight, not crashed
+    if (tomb?.phase !== "staged" || tomb.clearId == null) return [];
+    if (this.activeClearIds.has(tomb.clearId)) return []; // in flight, not crashed
     const stagedAtMs = tomb.stagedAt != null ? Date.parse(tomb.stagedAt) : NaN;
-    if (Number.isNaN(stagedAtMs)) return; // unreadable staging age: leave it held
-    if (stagedAtMs > Date.now() - STAGED_CLEAR_ROLLBACK_GRACE_MS) return;
+    if (Number.isNaN(stagedAtMs)) return []; // unreadable staging age: leave it held
+    if (stagedAtMs > Date.now() - STAGED_CLEAR_ROLLBACK_GRACE_MS) return [];
     const clearId = tomb.clearId;
     const dir = this.dir(ownerWorkspaceId);
     let entries: string[];
     try {
       entries = await fsPromises.readdir(dir);
     } catch (error) {
-      if (isErrnoWithCode(error, "ENOENT")) return;
+      if (isErrnoWithCode(error, "ENOENT")) return [];
       throw error;
     }
+    const restored: Array<{
+      entry: string;
+      id: string;
+      filePath: string;
+      original: BashMonitorWakeRecord;
+      written: BashMonitorWakeRecord;
+    }> = [];
     for (const entry of entries) {
       if (!entry.endsWith(".json")) continue;
       const id = BashMonitorWakeStore.wakeIdFromFileStem(entry.slice(0, -".json".length));
@@ -1207,18 +1227,40 @@ export class BashMonitorWakeStore {
         const record = await this.readRecordAt(filePath);
         if (record?.status !== "superseded" || record.supersededByClearId !== clearId) return;
         const { supersededByClearId: _clearStamp, pendingUpdatedAtBeforeClear, ...rest } = record;
-        await this.write({
+        const written: BashMonitorWakeRecord = {
           ...rest,
           status: "pending",
           // The pre-clear updatedAt survives the round trip: snapshot keys and
           // acceptance logic key on it.
           updatedAt: pendingUpdatedAtBeforeClear ?? record.updatedAt,
-        });
+        };
+        await this.write(written);
+        restored.push({ entry, id, filePath, original: record, written });
       });
     }
     // Pinned to the staging generation read above: only the exact stagedAt judged
     // crashed may be demoted (see rollbackClearTombstone).
-    await this.rollbackClearTombstone(ownerWorkspaceId, clearId, tomb.stagedAt);
+    if (await this.rollbackClearTombstone(ownerWorkspaceId, clearId, tomb.stagedAt)) {
+      return restored.map((r) => r.entry);
+    }
+    // The pinned CAS DECLINED: between the tombstone read above and this
+    // authorization, the owning instance (resumed from a long stall) refreshed the
+    // staging (live, not crashed) or committed it (retirement final) — restoring its
+    // stamped records above was premature. Left pending, a record whose pre-clear
+    // updatedAt equals the cutoff would pass the strict pre-cutoff fence and deliver
+    // during a live clear or into an already-cleared transcript. Re-supersede exactly
+    // the generations restored above; a record that changed since (a live monitor
+    // merged new output) stays pending — mid-clear output must survive, and its
+    // pre-cutoff lines redelivering is the documented lesser failure.
+    for (const r of restored) {
+      await this.locks.withLock(`${ownerWorkspaceId}:${r.id}`, async () => {
+        const current = await this.readRecordAt(r.filePath);
+        if (current == null) return;
+        if (JSON.stringify(current) !== JSON.stringify(r.written)) return;
+        await this.write(r.original);
+      });
+    }
+    return [];
   }
 
   static wakeId(processId: string): string {
@@ -1459,17 +1501,6 @@ export class BashMonitorWakeStore {
       classified = new Map();
       this.classifiedFilesByOwner.set(ownerWorkspaceId, classified);
     }
-    // A staged clear tombstone abandoned past its grace window is a CRASHED clear
-    // staging (see rollbackCrashedClearStaging); resolve it before anything below
-    // consults the tombstone or the stamped records. The entries check keeps this off
-    // the hot path — tombstone artifacts exist only around clears and crashes. The
-    // effective tombstone is then read (post-rollback) for the pre-cutoff canonical
-    // check at the end of this scan.
-    let tomb: ClearTombstone | null = null;
-    if (entries.some((e) => e === "cleared-at" || e.startsWith("cleared-at.cas-"))) {
-      await this.rollbackCrashedClearStaging(ownerWorkspaceId);
-      tomb = await this.readClearedAt(ownerWorkspaceId);
-    }
     const records: BashMonitorWakeRecord[] = [];
     const seen = new Set<string>();
     const pruneBeforeMs = Date.now() - TERMINAL_WAKE_RETENTION_MS;
@@ -1536,6 +1567,28 @@ export class BashMonitorWakeStore {
     // generation is what gets served.
     for (const entry of recoveredEntries) {
       if (!recordEntries.includes(entry)) recordEntries.push(entry);
+    }
+    // A staged clear tombstone abandoned past its grace window is a CRASHED clear
+    // staging (see rollbackCrashedClearStaging); resolve it AFTER the artifact rescue
+    // above — a crash inside supersedeForClear's write (or an interrupted prune) can
+    // leave the only clear-stamped generation in a *.tmp-*/*.prune-* artifact, and
+    // the rollback restores canonical .json files only. Rolling back first would
+    // demote the tombstone while the stamped generation is still stranded; the rescue
+    // would then commit it as plain terminal content with no tombstone left to flip
+    // it back — a wake permanently lost for a history clear that never completed.
+    // (While the stale staging still stands, the rescue HOLDS pre-cutoff artifacts
+    // instead of consuming them — a bounded deferral, never a loss.) Records the
+    // rollback leaves pending are folded into the record pass: one restored from an
+    // artifact rescued this very scan has no canonical entry in the readdir snapshot
+    // above. The entries check keeps this off the hot path — tombstone artifacts
+    // exist only around clears and crashes. The effective tombstone is then read
+    // (post-rollback) for the pre-cutoff canonical check at the end of this scan.
+    let tomb: ClearTombstone | null = null;
+    if (entries.some((e) => e === "cleared-at" || e.startsWith("cleared-at.cas-"))) {
+      for (const entry of await this.rollbackCrashedClearStaging(ownerWorkspaceId)) {
+        if (!recordEntries.includes(entry)) recordEntries.push(entry);
+      }
+      tomb = await this.readClearedAt(ownerWorkspaceId);
     }
     for (const entry of recordEntries) {
       const filePath = path.join(dir, entry);

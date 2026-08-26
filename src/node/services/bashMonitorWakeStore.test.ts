@@ -2244,6 +2244,180 @@ describe("BashMonitorWakeStore", () => {
     await store.abandonWorkspaceClears("owner-1");
   });
 
+  test("a crash rollback whose pinned CAS declines re-supersedes the records it restored", async () => {
+    const owner = new BashMonitorWakeStore(makeConfig(rootDir));
+    await owner.enqueueOrMergePending(payload({ lines: ["ERROR retired mid-clear"] }));
+    // Strictly order wake < cutoff (same-millisecond stamps fail toward delivery).
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await owner.supersedeAllPending("owner-1");
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const tombPath = path.join(dir, "cleared-at");
+    // The owner stalls (e.g. laptop sleep) long enough for the staging to age past
+    // its grace window on disk.
+    const stagedTomb = JSON.parse(await fsPromises.readFile(tombPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    await fsPromises.writeFile(
+      tombPath,
+      JSON.stringify({
+        ...stagedTomb,
+        stagedAt: new Date(Date.now() - STAGED_CLEAR_ROLLBACK_GRACE_MS - 60_000).toISOString(),
+      }),
+      "utf-8"
+    );
+    // A foreign scan judges the staging crashed — but the owner RESUMES and its
+    // heartbeat refreshes the staging between the scan's tombstone read and its
+    // pinned rollback CAS. Injected on the scan's record-restore rename, which sits
+    // exactly inside that window.
+    const foreign = new BashMonitorWakeStore(makeConfig(rootDir));
+    const realRename = fsPromises.rename;
+    const injected = { fired: false };
+    const renameSpy = spyOn(fsPromises, "rename").mockImplementation((async (
+      from: Parameters<typeof realRename>[0],
+      to: Parameters<typeof realRename>[1]
+    ) => {
+      const result = await realRename(from, to);
+      if (
+        !injected.fired &&
+        String(from).includes("proc-1.json.tmp-") &&
+        String(to).endsWith("proc-1.json")
+      ) {
+        injected.fired = true;
+        await fsPromises.writeFile(
+          tombPath,
+          JSON.stringify({ ...stagedTomb, stagedAt: new Date().toISOString() }),
+          "utf-8"
+        );
+      }
+      return result;
+    }) as typeof fsPromises.rename);
+    try {
+      // The refreshed staging means the clear is LIVE, not crashed: the scan must not
+      // leave its stamped records pending (delivery during a live clear, and — when a
+      // pre-clear updatedAt equals the cutoff — past the strict pre-cutoff fence into
+      // an already-cleared transcript).
+      expect(await foreign.listPending("owner-1")).toEqual([]);
+    } finally {
+      renameSpy.mockRestore();
+    }
+    expect(injected.fired).toBe(true);
+    expect((await foreign.get("owner-1", "proc-1"))?.status).toBe("superseded");
+    // The refreshed staging survives the declined rollback.
+    const standing = JSON.parse(await fsPromises.readFile(tombPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    expect(standing.phase).toBe("staged");
+    // The owner never settles the clear and the staging ages out AGAIN: the next scan
+    // completes the rollback (re-superseded records restore idempotently).
+    await fsPromises.writeFile(
+      tombPath,
+      JSON.stringify({
+        ...stagedTomb,
+        stagedAt: new Date(Date.now() - STAGED_CLEAR_ROLLBACK_GRACE_MS - 60_000).toISOString(),
+      }),
+      "utf-8"
+    );
+    expect((await foreign.listPending("owner-1")).map((r) => r.lines)).toEqual([
+      ["ERROR retired mid-clear"],
+    ]);
+    expect((await foreign.get("owner-1", "proc-1"))?.status).toBe("pending");
+    await owner.abandonWorkspaceClears("owner-1");
+  });
+
+  test("a supersede stamp stranded in a temp is recovered before the crash rollback demotes the tombstone", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR stamped into temp"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const canonicalPath = path.join(dir, "proc-1.json");
+    const pendingRaw = await fsPromises.readFile(canonicalPath, "utf-8");
+    // Strictly order wake < cutoff (same-millisecond stamps fail toward delivery).
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await store.supersedeAllPending("owner-1");
+    // Reconstruct a crash inside supersedeForClear's write: the SUPERSEDED generation
+    // reached only the temp (aged past the freshness gate) while the canonical path
+    // still holds the pre-clear PENDING generation.
+    const supersededRaw = await fsPromises.readFile(canonicalPath, "utf-8");
+    const temp = `${canonicalPath}.tmp-crashed`;
+    await fsPromises.writeFile(temp, supersededRaw, "utf-8");
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(temp, past, past);
+    await fsPromises.writeFile(canonicalPath, pendingRaw, "utf-8");
+    // The owner crashed: its staging ages past the grace window.
+    const tombPath = path.join(dir, "cleared-at");
+    const stagedTomb = JSON.parse(await fsPromises.readFile(tombPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    await fsPromises.writeFile(
+      tombPath,
+      JSON.stringify({
+        ...stagedTomb,
+        stagedAt: new Date(Date.now() - STAGED_CLEAR_ROLLBACK_GRACE_MS - 60_000).toISOString(),
+      }),
+      "utf-8"
+    );
+    await store.abandonWorkspaceClears("owner-1");
+
+    // Rolling back BEFORE artifact reconciliation would demote the tombstone while
+    // the canonical record still reads pending; the newer superseded temp then
+    // commits with no tombstone left to restore it — a wake permanently lost for a
+    // history clear that never completed. Artifacts must reconcile first so the
+    // rollback sees the stamped generation.
+    const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+    expect((await fresh.listPending("owner-1")).map((r) => r.lines)).toEqual([
+      ["ERROR stamped into temp"],
+    ]);
+    const restored = await fresh.get("owner-1", "proc-1");
+    expect(restored?.status).toBe("pending");
+    // The pre-clear updatedAt survives the stamp → rollback round trip.
+    expect(restored?.updatedAt).toBe((JSON.parse(pendingRaw) as BashMonitorWakeRecord).updatedAt);
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
+    expect(existsSync(tombPath)).toBe(false);
+  });
+
+  test("a supersede stamp stranded in prune trash is restored and listed in the same scan as the rollback", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR stamped into prune trash"] }));
+    // Strictly order wake < cutoff (same-millisecond stamps fail toward delivery).
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await store.supersedeAllPending("owner-1");
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const canonicalPath = path.join(dir, "proc-1.json");
+    // An interrupted prune strands the ONLY stamped generation in trash: the canonical
+    // path is empty.
+    await fsPromises.rename(canonicalPath, `${canonicalPath}.prune-crashed`);
+    // The owner crashed: its staging ages past the grace window.
+    const tombPath = path.join(dir, "cleared-at");
+    const stagedTomb = JSON.parse(await fsPromises.readFile(tombPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    await fsPromises.writeFile(
+      tombPath,
+      JSON.stringify({
+        ...stagedTomb,
+        stagedAt: new Date(Date.now() - STAGED_CLEAR_ROLLBACK_GRACE_MS - 60_000).toISOString(),
+      }),
+      "utf-8"
+    );
+    await store.abandonWorkspaceClears("owner-1");
+
+    // Rolling back first would demote the tombstone with nothing at the canonical
+    // path; prune recovery then restores the record as plain TERMINAL content (its
+    // staged-clear hold reads the already-demoted tombstone) and nothing ever flips
+    // it back — a wake permanently lost. Artifacts must reconcile first, and the
+    // rollback's restored records must reach this very scan's listing.
+    const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+    expect((await fresh.listPending("owner-1")).map((r) => r.lines)).toEqual([
+      ["ERROR stamped into prune trash"],
+    ]);
+    expect((await fresh.get("owner-1", "proc-1"))?.status).toBe("pending");
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".prune-"))).toHaveLength(0);
+    expect(existsSync(tombPath)).toBe(false);
+  });
+
   test("a directory squatting on a tombstone capture is quarantined instead of failing heals", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload({ lines: ["ERROR heals anyway"] }));
