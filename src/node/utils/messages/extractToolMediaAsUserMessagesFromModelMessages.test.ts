@@ -281,6 +281,44 @@ describe("extractToolMediaAsUserMessagesFromModelMessages", () => {
     ).toBe(false);
   });
 
+  it("scrubs display-only bytes from code_execution carrier values", async () => {
+    const payload = Buffer.from("display-only secret bytes").toString("base64");
+    const displayPart = {
+      type: "display_file" as const,
+      mediaType: "text/markdown",
+      data: payload,
+      filename: "notes.md",
+      providerOptions: { mux: { displayOnly: true as const, size: 25 } },
+    };
+    const carrierOutput = {
+      success: true,
+      result: { copied: displayPart },
+      toolCalls: [],
+      consoleOutput: [],
+      duration_ms: 2,
+      attachments: [displayPart],
+    };
+    const input: ModelMessage[] = [
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-display-carrier",
+            toolName: "code_execution",
+            output: carrierOutput as unknown as ToolResultPart["output"],
+          },
+        ],
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessagesFromModelMessages(input);
+    expect(rewritten).toHaveLength(1);
+    expect(JSON.stringify(rewritten)).not.toContain(payload);
+    expect(JSON.stringify(rewritten)).toContain("File shown to user only");
+    expect(JSON.stringify(input)).toContain(payload);
+  });
+
   it("evicts oldest synthetic tool media instead of omitting a fresh extraction", async () => {
     // r34: history-level extraction can saturate the request-wide cap with
     // synthetic tool media. Those parts must be evictable (oldest-first) so a

@@ -1595,6 +1595,48 @@ describe("extractToolMediaAsUserMessages", () => {
     }
   });
 
+  it("scrubs display-only bytes copied through code_execution carrier values", async () => {
+    const payload = Buffer.from("display-only secret bytes").toString("base64");
+    const displayPart = {
+      type: "display_file" as const,
+      mediaType: "text/markdown",
+      data: payload,
+      filename: "notes.md",
+      providerOptions: { mux: { displayOnly: true as const, size: 25 } },
+    };
+    const carrierOutput = {
+      success: true,
+      result: { copied: displayPart },
+      toolCalls: [],
+      consoleOutput: [],
+      duration_ms: 2,
+      attachments: [displayPart],
+    };
+    const input: MuxMessage[] = [
+      {
+        id: "a-display-carrier",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call-display-carrier",
+            toolName: "code_execution",
+            input: { code: "return xum.attach_file({ path: '/notes.md' })" },
+            state: "output-available",
+            output: carrierOutput,
+          },
+        ],
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    expect(rewritten).toHaveLength(1);
+    expect(JSON.stringify(rewritten)).not.toContain(payload);
+    expect(JSON.stringify(rewritten)).toContain("File shown to user only");
+    expect(JSON.stringify(input)).toContain(payload);
+    expect(input[0].parts[0]).toMatchObject({ output: carrierOutput });
+  });
+
   it("delivers carrier media to the provider identically to native attach_file media", async () => {
     const base64 = (
       await sharp({

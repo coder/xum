@@ -201,7 +201,7 @@ export function extractAttachmentsFromToolOutput(
   }
 
   if (!isContentContainer(output)) {
-    // Standalone media leaf (r23): sandbox code can pluck a part out of a
+    // Standalone attachment leaf (r23): sandbox code can pluck a part out of a
     // container (`const part = image.value[0]`) and return it or pass it as
     // another tool's argument; capture retains it under the shared budget,
     // so the provider copy must rewrite it like containered parts.
@@ -221,6 +221,9 @@ export function extractAttachmentsFromToolOutput(
         };
       }
       return { newOutput: buildUnsupportedMediaPlaceholder(output), attachments: [] };
+    }
+    if (isDisplayOnlyFilePart(output)) {
+      return { newOutput: buildDisplayOnlyFilePlaceholder(output), attachments: [] };
     }
     const nested = extractAttachmentsFromNestedToolCalls(output, depth + 1);
     if (nested != null) {
@@ -522,9 +525,11 @@ function extractAttachmentsFromWrapperValue(
       for (const child of children) {
         if (typeof child !== "object" || child === null) continue;
         if (processed.has(child) || visiting.has(child)) continue;
-        // Media leaves and tool-output shapes are handled at the parent's
+        // Attachment leaves and tool-output shapes are handled at the parent's
         // exit phase via the recursive shape handlers, not span descent.
-        if (isMediaPart(child) || isToolOutputShaped(child)) continue;
+        if (isMediaPart(child) || isDisplayOnlyFilePart(child) || isToolOutputShaped(child)) {
+          continue;
+        }
         stack.push({ node: child, entered: false });
       }
       continue;
@@ -537,7 +542,7 @@ function extractAttachmentsFromWrapperValue(
       if (typeof child !== "object" || child === null) {
         return child;
       }
-      if (isMediaPart(child) || isToolOutputShaped(child)) {
+      if (isMediaPart(child) || isDisplayOnlyFilePart(child) || isToolOutputShaped(child)) {
         const extracted = extractAttachmentsFromToolOutput(child, depth + 1);
         if (extracted == null) {
           return child;
