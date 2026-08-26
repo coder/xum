@@ -3,7 +3,11 @@ import {
   isDisplayOnlyFilePart,
   type DisplayOnlyFilePart,
 } from "@/common/utils/attachments/displayOnlyFileParts";
-import { MAX_SVG_TEXT_CHARS, SVG_MEDIA_TYPE } from "@/common/constants/imageAttachments";
+import {
+  MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST,
+  MAX_SVG_TEXT_CHARS,
+  SVG_MEDIA_TYPE,
+} from "@/common/constants/imageAttachments";
 import {
   isSupportedAttachmentMediaType,
   normalizeAttachmentMediaType,
@@ -596,6 +600,17 @@ export async function prepareExtractedToolAttachmentForProvider(
 }
 export function createToolAttachmentSummaryText(count: number): string {
   return `[Attached ${count} attachment(s) from tool output]`;
+}
+
+/**
+ * Placeholder for extracted attachments dropped by the request-wide media cap
+ * (see MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST): capture bounds bytes and
+ * per-container parts, not distinct records across a transcript, so a looped
+ * media tool could otherwise fan out tens of thousands of synthetic provider
+ * parts (r28 security). The newest attachments are kept.
+ */
+export function createOmittedToolAttachmentText(omitted: number): string {
+  return `[${omitted} extracted media attachment(s) omitted: request-wide cap of ${MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST} media parts reached; newest attachments are kept]`;
 }
 
 export function createDataUrlForExtractedAttachment(attachment: ExtractedToolAttachment): string {

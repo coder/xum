@@ -1,7 +1,9 @@
 import type { MuxMessage } from "@/common/types/message";
+import { MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST } from "@/common/constants/imageAttachments";
 import { sanitizeAnthropicDocumentFilename } from "@/node/utils/messages/sanitizeAnthropicDocumentFilename";
 import {
   createDataUrlForExtractedAttachment,
+  createOmittedToolAttachmentText,
   createToolAttachmentSummaryText,
   extractAttachmentsFromToolOutput,
   prepareExtractedToolAttachmentForProvider,
@@ -26,7 +28,34 @@ import {
 export async function extractToolMediaAsUserMessages(
   messages: MuxMessage[]
 ): Promise<MuxMessage[]> {
-  let didChangeAnyMessage = false;
+  // Pass 1 — extract once per tool part. The request-wide media cap needs the
+  // TOTAL before any emission so the NEWEST attachments survive (the model
+  // usually needs its latest screenshot, not its oldest), and the extraction
+  // walk must not run twice per part.
+  const extractionsByPart = new Map<
+    MuxMessage["parts"][number],
+    NonNullable<ReturnType<typeof extractAttachmentsFromToolOutput>>
+  >();
+  let totalAttachments = 0;
+  for (const message of messages) {
+    if (message.role !== "assistant") continue;
+    for (const part of message.parts) {
+      if (part.type !== "dynamic-tool" || part.state !== "output-available") continue;
+      const extracted = extractAttachmentsFromToolOutput(part.output);
+      if (extracted == null) continue;
+      extractionsByPart.set(part, extracted);
+      totalAttachments += extracted.attachments.length;
+    }
+  }
+  if (extractionsByPart.size === 0) return messages;
+
+  // Capture-time bounding caps bytes and per-container parts, not distinct
+  // records across a transcript: a looped bridged media tool could otherwise
+  // fan out tens of thousands of synthetic provider parts that every later
+  // request re-processes (r28 security). Chronologically OLDEST overflow is
+  // omitted (replaced with one bounded placeholder per synthetic message).
+  let omitRemaining = Math.max(0, totalAttachments - MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST);
+
   const result: MuxMessage[] = [];
 
   for (const message of messages) {
@@ -45,9 +74,8 @@ export async function extractToolMediaAsUserMessages(
         newParts.push(part);
         continue;
       }
-
-      const extracted = extractAttachmentsFromToolOutput(part.output);
-      if (extracted == null) {
+      const extracted = extractionsByPart.get(part);
+      if (extracted === undefined) {
         newParts.push(part);
         continue;
       }
@@ -56,7 +84,16 @@ export async function extractToolMediaAsUserMessages(
       extractedAttachmentCount += extracted.attachments.length;
 
       const nextExtractedUserParts: MuxMessage["parts"] = [];
+      let omittedHere = 0;
       for (const attachment of extracted.attachments) {
+        if (omitRemaining > 0) {
+          // Over the request-wide cap: the payload was already replaced with
+          // a placeholder in the tool output; skipping BEFORE provider
+          // preparation also avoids the resize/data-url work.
+          omitRemaining--;
+          omittedHere++;
+          continue;
+        }
         const providerReadyAttachment = await prepareExtractedToolAttachmentForProvider(attachment);
         if (providerReadyAttachment.type === "text") {
           nextExtractedUserParts.push({
@@ -82,6 +119,12 @@ export async function extractToolMediaAsUserMessages(
         });
       }
 
+      if (omittedHere > 0) {
+        nextExtractedUserParts.push({
+          type: "text",
+          text: createOmittedToolAttachmentText(omittedHere),
+        });
+      }
       extractedUserParts = [...extractedUserParts, ...nextExtractedUserParts];
       newParts.push({
         ...part,
@@ -92,13 +135,9 @@ export async function extractToolMediaAsUserMessages(
     const rewrittenMessage = changedMessage
       ? ({ ...message, parts: newParts } satisfies MuxMessage)
       : message;
-    if (changedMessage) {
-      didChangeAnyMessage = true;
-    }
     result.push(rewrittenMessage);
 
     if (extractedUserParts.length > 0) {
-      didChangeAnyMessage = true;
       const timestamp = message.metadata?.timestamp ?? Date.now();
       result.push({
         id: `tool-media-${message.id}`,
@@ -118,5 +157,6 @@ export async function extractToolMediaAsUserMessages(
     }
   }
 
-  return didChangeAnyMessage ? result : messages;
+  // extractionsByPart is non-empty here, so at least one message changed.
+  return result;
 }

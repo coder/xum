@@ -1,6 +1,9 @@
 import { describe, expect, it } from "@jest/globals";
 import sharp from "sharp";
-import { MAX_IMAGE_DIMENSION } from "@/common/constants/imageAttachments";
+import {
+  MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST,
+  MAX_IMAGE_DIMENSION,
+} from "@/common/constants/imageAttachments";
 import type { MuxMessage } from "@/common/types/message";
 import { expectContentOutputValue } from "./testToolOutputHelpers";
 import { extractToolMediaAsUserMessages } from "./extractToolMediaAsUserMessages";
@@ -918,6 +921,55 @@ describe("extractToolMediaAsUserMessages", () => {
     expect(metadata.width).toBe(MAX_IMAGE_DIMENSION);
     expect(metadata.height).toBe(2);
     expect(resizedBase64).not.toBe(base64);
+  });
+
+  it("caps extracted media parts per request and keeps the newest attachments", async () => {
+    // Capture bounds bytes and per-container parts, not distinct records: a
+    // looped media tool could otherwise fan out tens of thousands of
+    // synthetic provider parts re-processed by every request (r28 security).
+    // Overflow is omitted OLDEST-first so the model keeps its latest
+    // screenshots, replaced by one bounded placeholder.
+    const svg = (marker: string) =>
+      Buffer.from(
+        `<svg xmlns="http://www.w3.org/2000/svg"><title>${marker}</title></svg>`
+      ).toString("base64");
+    const total = MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST + 2;
+    const value = Array.from({ length: total }, (_, i) => ({
+      type: "media",
+      mediaType: "image/svg+xml",
+      data: svg(`marker-${String(i).padStart(2, "0")}`),
+    }));
+    const input: MuxMessage[] = [
+      {
+        id: "a1",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call1",
+            toolName: "mcp__shots__take",
+            input: {},
+            state: "output-available",
+            output: { type: "content", value },
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    expect(rewritten).toHaveLength(2);
+    const synthetic = rewritten[1];
+    expect(synthetic.role).toBe("user");
+    // 1 summary + capped inlined attachments + 1 omission placeholder.
+    expect(synthetic.parts).toHaveLength(2 + MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST);
+    const text = JSON.stringify(synthetic.parts);
+    expect(text).toContain(`[Attached ${total} attachment(s) from tool output]`);
+    expect(text).toContain("2 extracted media attachment(s) omitted");
+    expect(text).not.toContain("marker-00");
+    expect(text).not.toContain("marker-01");
+    expect(text).toContain("marker-02");
+    expect(text).toContain(`marker-${total - 1}`);
   });
 
   it("rewrites attach_file PDF output into a synthetic user file part", async () => {

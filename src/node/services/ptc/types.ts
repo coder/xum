@@ -502,7 +502,14 @@ export function sanitizeCapturedMediaValue(
   // mode keeps full inline results/args by contract).
   const bytes = serializedJsonByteLength(sanitized);
   if (bytes === undefined || bytes > budget.remainingSanitizedBytes) {
-    return `[value bounded at capture: ${bytes ?? "unserializable"} serialized bytes after media sanitization exceed the remaining sanitized-value budget]`;
+    const marker = `[value bounded at capture: ${bytes ?? "unserializable"} serialized bytes after media sanitization exceed the remaining sanitized-value budget]`;
+    // The marker is charged too (r28): it is the only payload a media-bearing
+    // capture emits after exhaustion, so leaving it free would let a call
+    // loop append one uncharged marker record per call. The budget may go
+    // negative — every capture must still yield a bounded replacement — but
+    // the accounting reflects every emitted byte.
+    budget.remainingSanitizedBytes -= serializedJsonByteLength(marker) ?? marker.length;
+    return marker;
   }
   budget.remainingSanitizedBytes -= bytes;
   return sanitized;

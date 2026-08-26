@@ -1,6 +1,8 @@
 import type { FilePart, ImagePart, ModelMessage, TextPart, ToolResultPart } from "ai";
+import { MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST } from "@/common/constants/imageAttachments";
 import { sanitizeAnthropicDocumentFilename } from "@/node/utils/messages/sanitizeAnthropicDocumentFilename";
 import {
+  createOmittedToolAttachmentText,
   createToolAttachmentSummaryText,
   extractAttachmentsFromToolOutput,
   prepareExtractedToolAttachmentForProvider,
@@ -26,7 +28,36 @@ type ToolResultOutput = ToolResultPart["output"];
 export async function extractToolMediaAsUserMessagesFromModelMessages(
   messages: ModelMessage[]
 ): Promise<ModelMessage[]> {
-  let didChange = false;
+  // Pass 1 — extract once per tool-result part. The request-wide media cap
+  // needs the TOTAL before any emission so the NEWEST attachments survive,
+  // and the extraction walk must not run twice per part (see the MuxMessage
+  // variant in extractToolMediaAsUserMessages.ts).
+  const extractionsByPart = new Map<
+    object,
+    NonNullable<ReturnType<typeof extractAttachmentsFromToolOutput>>
+  >();
+  let totalAttachments = 0;
+  for (const message of messages) {
+    if (message.role !== "assistant" && message.role !== "tool") continue;
+    if (!Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part.type !== "tool-result") continue;
+      const extracted = extractAttachmentsFromToolOutput(part.output as unknown);
+      if (extracted == null) continue;
+      extractionsByPart.set(part, extracted);
+      totalAttachments += extracted.attachments.length;
+    }
+  }
+  if (extractionsByPart.size === 0) return messages;
+
+  // Request-wide cap (r28 security): capture bounds bytes and per-container
+  // parts, not distinct records, so a looped bridged media tool could
+  // otherwise fan out tens of thousands of synthetic provider parts.
+  // Chronologically OLDEST overflow is omitted behind a bounded placeholder.
+  const capState = {
+    omitRemaining: Math.max(0, totalAttachments - MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST),
+  };
+
   const result: ModelMessage[] = [];
 
   for (const message of messages) {
@@ -34,54 +65,23 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
       result.push(message);
       continue;
     }
-
-    let extractedAttachments: ExtractedToolAttachment[] = [];
-    let changedMessage = false;
-
-    if (message.role === "tool") {
-      const newContent = message.content.map((part) => {
-        if (part.type !== "tool-result") {
-          return part;
-        }
-
-        const extracted = extractAttachmentsFromToolOutput(part.output as unknown);
-        if (extracted == null) {
-          return part;
-        }
-
-        didChange = true;
-        changedMessage = true;
-        extractedAttachments = [...extractedAttachments, ...extracted.attachments];
-
-        return {
-          ...part,
-          output: extracted.newOutput as ToolResultOutput,
-        };
-      });
-
-      result.push(changedMessage ? { ...message, content: newContent } : message);
-      if (extractedAttachments.length > 0) {
-        result.push(await createSyntheticUserMessage(extractedAttachments));
-      }
-      continue;
-    }
-
     if (!Array.isArray(message.content)) {
       result.push(message);
       continue;
     }
 
+    let extractedAttachments: ExtractedToolAttachment[] = [];
+    let changedMessage = false;
+
     const newContent = message.content.map((part) => {
       if (part.type !== "tool-result") {
         return part;
       }
-
-      const extracted = extractAttachmentsFromToolOutput(part.output as unknown);
-      if (extracted == null) {
+      const extracted = extractionsByPart.get(part);
+      if (extracted === undefined) {
         return part;
       }
 
-      didChange = true;
       changedMessage = true;
       extractedAttachments = [...extractedAttachments, ...extracted.attachments];
 
@@ -91,17 +91,32 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
       };
     });
 
-    result.push(changedMessage ? { ...message, content: newContent } : message);
+    // The content arrays are structurally identical for both roles, but the
+    // union needs the role-specific rebuild.
+    result.push(
+      changedMessage
+        ? message.role === "tool"
+          ? {
+              ...message,
+              content: newContent as Extract<ModelMessage, { role: "tool" }>["content"],
+            }
+          : {
+              ...message,
+              content: newContent as Extract<ModelMessage, { role: "assistant" }>["content"],
+            }
+        : message
+    );
     if (extractedAttachments.length > 0) {
-      result.push(await createSyntheticUserMessage(extractedAttachments));
+      result.push(await createSyntheticUserMessage(extractedAttachments, capState));
     }
   }
 
-  return didChange ? result : messages;
+  return result;
 }
 
 async function createSyntheticUserMessage(
-  attachments: ExtractedToolAttachment[]
+  attachments: ExtractedToolAttachment[],
+  capState: { omitRemaining: number }
 ): Promise<ModelMessage> {
   const content: Array<TextPart | ImagePart | FilePart> = [
     {
@@ -110,7 +125,16 @@ async function createSyntheticUserMessage(
     },
   ];
 
+  let omittedHere = 0;
   for (const attachment of attachments) {
+    if (capState.omitRemaining > 0) {
+      // Over the request-wide cap: the payload was already replaced with a
+      // placeholder in the tool output; skipping BEFORE provider preparation
+      // also avoids the resize work.
+      capState.omitRemaining--;
+      omittedHere++;
+      continue;
+    }
     const providerReadyAttachment = await prepareExtractedToolAttachmentForProvider(attachment);
     if (providerReadyAttachment.type === "text") {
       content.push({
@@ -139,6 +163,12 @@ async function createSyntheticUserMessage(
             filename: sanitizeAnthropicDocumentFilename(preparedAttachment.filename),
           }
         : {}),
+    });
+  }
+  if (omittedHere > 0) {
+    content.splice(1, 0, {
+      type: "text",
+      text: createOmittedToolAttachmentText(omittedHere),
     });
   }
 

@@ -401,6 +401,20 @@ describe("sanitizeMediaRecordCapture", () => {
     expect(sanitizeCapturedMediaValue(mediaFree, shared)).toBe(mediaFree);
   });
 
+  it("charges overflow markers so exhausted captures cannot accumulate free bytes", () => {
+    // After exhaustion, a media-bearing capture still emits a bounded marker;
+    // the marker debits the shared budget too (r28), so the accounting covers
+    // every byte a call loop can persist — nothing is emitted for free.
+    const shared = createCaptureSanitizerBudget();
+    shared.remainingSanitizedBytes = 4;
+    const out = sanitizeCapturedMediaValue(
+      { media: { type: "media", mediaType: "image/png", data: "aGVsbG8=" } },
+      shared
+    );
+    expect(typeof out).toBe("string");
+    expect(shared.remainingSanitizedBytes).toBeLessThan(4);
+  });
+
   it("sanitizes standalone media leaves outside containers", () => {
     // Guest code can pluck a part out of a container (`image.value[0]`) and
     // return/log/pass it; container-only recognition would persist that copy
