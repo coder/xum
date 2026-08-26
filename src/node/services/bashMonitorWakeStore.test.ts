@@ -377,7 +377,9 @@ describe("BashMonitorWakeStore", () => {
     await store.enqueueOrMergePending(payload({ lines: ["ERROR stale"] }));
     const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
     const file = path.join(dir, "proc-1.json");
-    expect(await store.listPending("owner-1")).toHaveLength(1); // pre-classify canonical
+    // Terminal canonical: a strictly newer PENDING leftover takes the direct CAS path.
+    await store.markSuperseded("owner-1", "proc-1");
+    expect(await store.listPending("owner-1")).toEqual([]); // pre-classify canonical
     const canonicalRecord = JSON.parse(await fsPromises.readFile(file, "utf-8")) as {
       updatedAt: string;
       lines: string[];
@@ -388,6 +390,7 @@ describe("BashMonitorWakeStore", () => {
       JSON.stringify({
         ...canonicalRecord,
         lines: ["ERROR crafted"],
+        status: "pending",
         updatedAt: new Date(Date.parse(canonicalRecord.updatedAt) + 1_000).toISOString(),
       }),
       "utf-8"
@@ -432,7 +435,7 @@ describe("BashMonitorWakeStore", () => {
     await fsPromises.rm(leftoverPath, { force: true });
     const settled = await store.listPending("owner-1");
     expect(settled).toHaveLength(1);
-    expect(settled[0].lines).toEqual(["ERROR stale", "ERROR merged"]);
+    expect(settled[0].lines).toEqual(["ERROR merged"]);
   });
 
   test("a valid stranded wake displaces a malformed canonical file", async () => {
@@ -502,6 +505,103 @@ describe("BashMonitorWakeStore", () => {
     const pending = await fresh.listPending("owner-1");
     expect(pending.map((r) => r.lines)).toEqual([["ERROR fresh only copy"]]);
     expect((await fresh.get("owner-1", "proc-1"))?.lines).toEqual(["ERROR fresh only copy"]);
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
+  });
+
+  test("a surviving match temp cannot replay an already-delivered merged wake", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR matched pre-crash"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    const temp = `${file}.tmp-crashed`;
+    await fsPromises.rename(file, temp);
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(temp, past, past);
+    const notice = await store.enqueueMonitorLost(
+      {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        ownerWorkspaceId: "owner-1",
+        filter: "ERROR",
+        filterExclude: false,
+        script: "./watch.sh",
+      },
+      TREAT_ALL_AS_STALE()
+    );
+    expect(notice).not.toBeNull();
+
+    // The merge commits but the match-temp cleanup fails transiently, leaving the
+    // source temp on disk beside the committed merged canonical record.
+    const realRm = fsPromises.rm;
+    const rmSpy = spyOn(fsPromises, "rm").mockImplementation(((
+      target: Parameters<typeof realRm>[0],
+      options: Parameters<typeof realRm>[1]
+    ) =>
+      String(target) === temp
+        ? Promise.reject(Object.assign(new Error("EBUSY: busy"), { code: "EBUSY" }))
+        : realRm(target, options)) as typeof fsPromises.rm);
+    try {
+      const merged = await store.listPending("owner-1");
+      expect(merged.map((r) => r.lines)).toEqual([["ERROR matched pre-crash"]]);
+    } finally {
+      rmSpy.mockRestore();
+    }
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(1);
+    await store.markDelivered("owner-1", "proc-1");
+
+    // Re-scan: the canonical record subsumes the surviving temp — no fresh pending
+    // wake may be minted for already-delivered output.
+    expect(await store.listPending("owner-1")).toEqual([]);
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("delivered");
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
+  });
+
+  test("a failed stale-temp discard blocks canonical pruning in the same scan", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR stale"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    const temp = `${file}.tmp-crashed`;
+    await fsPromises.rename(file, temp);
+    const record = JSON.parse(await fsPromises.readFile(temp, "utf-8")) as {
+      updatedAt: string;
+    };
+    const superseded = {
+      ...record,
+      status: "superseded",
+      updatedAt: new Date(Date.parse(record.updatedAt) + 1_000).toISOString(),
+    };
+    await fsPromises.writeFile(file, JSON.stringify(superseded, null, 2), "utf-8");
+    const past = new Date(Date.now() - TERMINAL_WAKE_RETENTION_MS - 120_000);
+    await fsPromises.utimes(temp, past, past);
+    await fsPromises.utimes(file, past, past);
+
+    // The stale-temp discard fails transiently. Swallowing it would let this same
+    // scan's record pass prune the terminal canonical; the next scan would then
+    // restore the surviving pending temp as the only durable copy — resurrection.
+    const realRm = fsPromises.rm;
+    const rmSpy = spyOn(fsPromises, "rm").mockImplementation(((
+      target: Parameters<typeof realRm>[0],
+      options: Parameters<typeof realRm>[1]
+    ) =>
+      String(target) === temp
+        ? Promise.reject(Object.assign(new Error("EBUSY: busy"), { code: "EBUSY" }))
+        : realRm(target, options)) as typeof fsPromises.rm);
+    const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+    try {
+      await fresh.listPending("owner-1");
+      expect.unreachable("expected listPending to propagate the discard failure");
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("EBUSY");
+    } finally {
+      rmSpy.mockRestore();
+    }
+    // The canonical terminal record survived the aborted scan alongside the temp.
+    expect((await fresh.get("owner-1", "proc-1"))?.status).toBe("superseded");
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(1);
+    // The retry discards the temp first; only then is pruning safe.
+    expect(await fresh.listPending("owner-1")).toEqual([]);
+    expect(await fresh.get("owner-1", "proc-1")).toBeNull();
     expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
   });
 
@@ -782,7 +882,9 @@ describe("BashMonitorWakeStore", () => {
     await store.enqueueOrMergePending(payload({ lines: ["ERROR stale"] }));
     const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
     const file = path.join(dir, "proc-1.json");
-    expect(await store.listPending("owner-1")).toHaveLength(1); // pre-classify canonical
+    // Terminal canonical: a strictly newer PENDING leftover takes the direct CAS path.
+    await store.markSuperseded("owner-1", "proc-1");
+    expect(await store.listPending("owner-1")).toEqual([]); // pre-classify canonical
     const canonicalRecord = JSON.parse(await fsPromises.readFile(file, "utf-8")) as {
       updatedAt: string;
       lines: string[];
@@ -793,6 +895,7 @@ describe("BashMonitorWakeStore", () => {
       JSON.stringify({
         ...canonicalRecord,
         lines: ["ERROR crafted"],
+        status: "pending",
         updatedAt: new Date(Date.parse(canonicalRecord.updatedAt) + 1_000).toISOString(),
       }),
       "utf-8"
@@ -856,7 +959,11 @@ describe("BashMonitorWakeStore", () => {
 
   test("stranded recovery publishes a canonical winner created mid-scan", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
-    await store.enqueueOrMergePending(payload({ lines: ["ERROR older"] }));
+    // The captured generation's offset exceeds the winner's so no subsumption check
+    // can mistake the divergent winner for a superset of it.
+    await store.enqueueOrMergePending(
+      payload({ lines: ["ERROR older"], matchedThroughOffset: 500 })
+    );
     const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
     const file = path.join(dir, "proc-1.json");
     const leftoverPath = `${file}.prune-crashed`;
@@ -872,24 +979,31 @@ describe("BashMonitorWakeStore", () => {
     const linkSpy = spyOn(fsPromises, "link").mockImplementation(async (from, to) => {
       if (!injected && String(from) === leftoverPath) {
         injected = true;
-        await other.enqueueOrMergePending(payload({ lines: ["ERROR winner"], totalMatches: 2 }));
+        await other.enqueueOrMergePending(
+          payload({ lines: ["ERROR winner"], totalMatches: 2, matchedThroughOffset: 10 })
+        );
       }
       return realLink(from, to);
     });
     try {
+      // The mid-scan winner never saw the captured generation, so recovery merges
+      // both pending payloads instead of letting the newer timestamp win.
       const pending = await store.listPending("owner-1");
-      expect(pending.map((r) => r.lines)).toEqual([["ERROR winner"]]);
+      expect(pending.map((r) => r.lines)).toEqual([["ERROR older", "ERROR winner"]]);
     } finally {
       linkSpy.mockRestore();
     }
-    // The older leftover was dropped as superseded.
     expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".prune-"))).toHaveLength(0);
-    expect((await store.get("owner-1", "proc-1"))?.lines).toEqual(["ERROR winner"]);
+    expect((await store.get("owner-1", "proc-1"))?.lines).toEqual(["ERROR older", "ERROR winner"]);
+    expect((await store.get("owner-1", "proc-1"))?.totalMatches).toBe(3);
   });
 
   test("a failed CAS capture propagates instead of hiding the stranded generation", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload({ lines: ["ERROR old"] }));
+    // Terminal canonical: a strictly newer PENDING leftover takes the direct CAS path
+    // (divergent pending generations merge instead — covered elsewhere).
+    await store.markSuperseded("owner-1", "proc-1");
     const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
     const file = path.join(dir, "proc-1.json");
     const canonicalRecord = JSON.parse(await fsPromises.readFile(file, "utf-8")) as {
@@ -899,6 +1013,7 @@ describe("BashMonitorWakeStore", () => {
     const leftover = {
       ...canonicalRecord,
       lines: ["ERROR newer"],
+      status: "pending",
       updatedAt: new Date(Date.parse(canonicalRecord.updatedAt) + 1_000).toISOString(),
     };
     await fsPromises.writeFile(`${file}.prune-crashed`, JSON.stringify(leftover), "utf-8");
@@ -929,6 +1044,8 @@ describe("BashMonitorWakeStore", () => {
   test("a failed CAS placement restores the canonical record and propagates", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload({ lines: ["ERROR old"] }));
+    // Terminal canonical: a strictly newer PENDING leftover takes the direct CAS path.
+    await store.markSuperseded("owner-1", "proc-1");
     const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
     const file = path.join(dir, "proc-1.json");
     const canonicalRecord = JSON.parse(await fsPromises.readFile(file, "utf-8")) as {
@@ -941,6 +1058,7 @@ describe("BashMonitorWakeStore", () => {
       JSON.stringify({
         ...canonicalRecord,
         lines: ["ERROR newer"],
+        status: "pending",
         updatedAt: new Date(Date.parse(canonicalRecord.updatedAt) + 1_000).toISOString(),
       }),
       "utf-8"
@@ -1168,17 +1286,17 @@ describe("BashMonitorWakeStore", () => {
     expect(strandedGone).toBe(true);
   });
 
-  test("recovery keeps the newest of multiple stranded pending generations", async () => {
+  test("stranded pending generations of one id merge instead of newest-wins", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
     const file = path.join(dir, "proc-1.json");
     // Two interrupted prune races stranded two distinct pending generations of the same
-    // reused id with no canonical file. Whichever leftover recovery visits first, the
-    // NEWER generation must end up canonical — a first-restored older generation must
-    // not make the newer one look EEXIST-superseded.
+    // reused id with no canonical file. Neither generation ever saw the other, so
+    // whichever leftover recovery visits first, ONE merged record must carry both
+    // outputs — a newest-wins pick would permanently lose the other generation.
     await store.enqueueOrMergePending(payload({ lines: ["ERROR old gen"] }));
     await fsPromises.rename(file, `${file}.prune-gen-old`);
-    // Distinct updatedAt millisecond so the reconciliation comparison is strict.
+    // Distinct timestamps so ordering inside the merged record is deterministic.
     await new Promise((resolve) => setTimeout(resolve, 5));
     await store.enqueueOrMergePending(payload({ lines: ["ERROR new gen"] }));
     await fsPromises.rename(file, `${file}.prune-gen-new`);
@@ -1186,25 +1304,30 @@ describe("BashMonitorWakeStore", () => {
     const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
     const pending = await fresh.listPending("owner-1");
     expect(pending).toHaveLength(1);
-    expect(pending[0].lines).toEqual(["ERROR new gen"]);
-    expect((await fresh.get("owner-1", "proc-1"))?.lines).toEqual(["ERROR new gen"]);
+    expect(pending[0].lines).toEqual(["ERROR old gen", "ERROR new gen"]);
+    expect((await fresh.get("owner-1", "proc-1"))?.lines).toEqual([
+      "ERROR old gen",
+      "ERROR new gen",
+    ]);
     expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".prune-"))).toHaveLength(0);
   });
 
-  test("a stranded prune file never clobbers a newer record at the original path", async () => {
+  test("a stranded pending generation merges into a newer canonical record", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload({ lines: ["ERROR old generation"] }));
     const file = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes", "proc-1.json");
     const stranded = `${file}.prune-crashed`;
     await fsPromises.rename(file, stranded);
-    // A newer wake claims the original path after the crash.
+    // A newer wake claims the original path after the crash — written from scratch, so
+    // it cannot have merged (or even seen) the captured generation's output.
+    await new Promise((resolve) => setTimeout(resolve, 5));
     await store.enqueueOrMergePending(payload({ lines: ["ERROR new generation"] }));
 
     const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
     const pending = await fresh.listPending("owner-1");
     expect(pending).toHaveLength(1);
-    expect(pending[0].lines).toEqual(["ERROR new generation"]);
-    // The stranded leftover is dropped, not restored over the newer record.
+    expect(pending[0].lines).toEqual(["ERROR old generation", "ERROR new generation"]);
+    // The stranded leftover was consumed by the merge, not restored over the record.
     let strandedGone = false;
     try {
       await fsPromises.access(stranded);
@@ -1212,7 +1335,10 @@ describe("BashMonitorWakeStore", () => {
       strandedGone = true;
     }
     expect(strandedGone).toBe(true);
-    expect((await fresh.get("owner-1", "proc-1"))?.lines).toEqual(["ERROR new generation"]);
+    expect((await fresh.get("owner-1", "proc-1"))?.lines).toEqual([
+      "ERROR old generation",
+      "ERROR new generation",
+    ]);
   });
 
   test("a read failure after a generation change propagates instead of serving stale cache", async () => {
@@ -1342,7 +1468,9 @@ describe("BashMonitorWakeStore", () => {
     // Pre-classify the canonical file so the scan below serves it from cache: the only
     // canonical read is then recovery's compare-read, making the injection point
     // deterministic regardless of readdir order.
-    expect(await store.listPending("owner-1")).toHaveLength(1);
+    // Terminal canonical: a strictly newer PENDING leftover takes the direct CAS path.
+    await store.markSuperseded("owner-1", "proc-1");
+    expect(await store.listPending("owner-1")).toEqual([]);
     // Craft a stranded leftover STRICTLY NEWER than the canonical record, as left by an
     // interrupted prune race on another instance.
     const canonicalRecord = JSON.parse(await fsPromises.readFile(file, "utf-8")) as {
@@ -1352,6 +1480,7 @@ describe("BashMonitorWakeStore", () => {
     const leftover = {
       ...canonicalRecord,
       lines: ["ERROR crafted"],
+      status: "pending",
       updatedAt: new Date(Date.parse(canonicalRecord.updatedAt) + 1_000).toISOString(),
     };
     const leftoverPath = `${file}.prune-crashed`;
@@ -1382,7 +1511,7 @@ describe("BashMonitorWakeStore", () => {
     // The mid-swap write survived — a blind rename would have replaced it with the
     // crafted leftover, losing "ERROR newest".
     const current = await store.get("owner-1", "proc-1");
-    expect(current?.lines).toEqual(["ERROR stale", "ERROR newest"]);
+    expect(current?.lines).toEqual(["ERROR newest"]);
     // The leftover backed off (kept) rather than being consumed against a moved target.
     expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".prune-"))).toEqual([
       "proc-1.json.prune-crashed",
@@ -1390,7 +1519,7 @@ describe("BashMonitorWakeStore", () => {
     await fsPromises.rm(leftoverPath, { force: true });
     const settled = await store.listPending("owner-1");
     expect(settled).toHaveLength(1);
-    expect(settled[0].lines).toEqual(["ERROR stale", "ERROR newest"]);
+    expect(settled[0].lines).toEqual(["ERROR newest"]);
   });
 
   test("listPending propagates a transient stat failure it has no cached answer for", async () => {

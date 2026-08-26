@@ -293,6 +293,21 @@ function relabelStaleSettleLine(line: string): string {
   return `[monitor] an earlier run of this process ID settled:${line.slice(BASH_MONITOR_SETTLE_LINE_PREFIX.length)}; the ID has since been re-armed by a new process`;
 }
 
+/** True when `needle` appears as one contiguous run inside `haystack` (or is empty). */
+function containsContiguousSubsequence(
+  haystack: readonly string[],
+  needle: readonly string[]
+): boolean {
+  if (needle.length === 0) return true;
+  outer: for (let start = 0; start + needle.length <= haystack.length; start++) {
+    for (let index = 0; index < needle.length; index++) {
+      if (haystack[start + index] !== needle[index]) continue outer;
+    }
+    return true;
+  }
+  return false;
+}
+
 function removeDeliveredLineOverlap(
   currentLines: readonly string[],
   deliveredLines: readonly string[]
@@ -1099,6 +1114,68 @@ export class BashMonitorWakeStore {
   }
 
   /**
+   * Whether the canonical record already carries everything `other` offers, so `other`
+   * can be discarded without losing output. Within one process instance (equal
+   * createdAt — the instance token, see matchedThroughOffset) the offsets are
+   * comparable and only grow. Across instances (or with legacy records missing
+   * offsets), only a visible contiguous copy of the other record's lines proves
+   * subsumption; line caps can defeat that check, in which case the failure mode is a
+   * rare duplicated merge — never lost output.
+   */
+  private static pendingSubsumes(
+    canonical: BashMonitorWakeRecord,
+    other: BashMonitorWakeRecord
+  ): boolean {
+    if (
+      canonical.createdAt === other.createdAt &&
+      canonical.matchedThroughOffset != null &&
+      other.matchedThroughOffset != null &&
+      canonical.matchedThroughOffset >= other.matchedThroughOffset
+    ) {
+      return true;
+    }
+    return containsContiguousSubsequence(canonical.lines, other.lines);
+  }
+
+  /**
+   * Merge two DIVERGENT pending generations of one wake id. With multiple store
+   * instances, a prune can capture pending generation A while the canonical path is
+   * briefly absent, letting another instance's enqueue write generation B from
+   * scratch — B never saw A, so neither timestamp order proves subsumption and
+   * newest-wins would permanently lose the other generation's matched output. Older
+   * lines come first (delivery reads top-down); counters are summed; a lost-monitor
+   * notice outranks a match so the termination context and relaunch script survive
+   * the merge. Offsets are only comparable within one process instance, so a
+   * divergent same-instance split takes the max frontier while cross-instance merges
+   * keep the newer record's own frontier.
+   */
+  private static mergeDivergentPending(
+    a: BashMonitorWakeRecord,
+    b: BashMonitorWakeRecord
+  ): BashMonitorWakeRecord {
+    const [older, newer] = Date.parse(a.updatedAt) <= Date.parse(b.updatedAt) ? [a, b] : [b, a];
+    const bounded = boundLines([...older.lines, ...newer.lines]);
+    const merged: BashMonitorWakeRecord = {
+      ...newer,
+      lines: bounded.lines,
+      totalMatches: older.totalMatches + newer.totalMatches,
+      droppedLines: older.droppedLines + newer.droppedLines + bounded.droppedLines,
+      updatedAt: new Date().toISOString(),
+    };
+    if (older.kind === "monitor-lost" && newer.kind !== "monitor-lost") {
+      merged.kind = "monitor-lost";
+      if (merged.script == null && older.script != null) merged.script = older.script;
+    }
+    if (older.createdAt === newer.createdAt) {
+      merged.matchedThroughOffset = Math.max(
+        older.matchedThroughOffset ?? 0,
+        newer.matchedThroughOffset ?? 0
+      );
+    }
+    return merged;
+  }
+
+  /**
    * Handle a *.json.prune-* leftover. pruneTerminalWakeFile renames the path's current
    * inode aside before verifying it; a crash in that window strands the captured inode
    * under the trash name, where neither scans nor delivery (both address the original
@@ -1209,17 +1286,60 @@ export class BashMonitorWakeStore {
           return parsed;
         }
         const canonical = canonicalState.record;
+        if (parsed.status === "pending" && canonical.status === "pending") {
+          // DIVERGENT pending generations: the canonical record may have been written
+          // from scratch while a prune held this generation captured, so a newer
+          // timestamp is NOT proof it merged (or even saw) the captured output.
+          if (BashMonitorWakeStore.pendingSubsumes(canonical, parsed)) {
+            // rm(force) ignores ENOENT, so any failure here is real — PROPAGATE it:
+            // a silently surviving leftover could be restored as the only durable
+            // copy after the canonical record is later pruned or superseded.
+            await fsPromises.rm(filePath, { force: true });
+            return canonical;
+          }
+          if (parsed.kind === "monitor-lost" && canonical.kind === "match") {
+            // A fresh match proves this id was re-armed by a LIVE monitor, so the
+            // captured lost notice is stale (mirrors enqueueOrMergePending's rule of
+            // replacing stale notices rather than mislabeling live output).
+            await fsPromises.rm(filePath, { force: true });
+            return canonical;
+          }
+          const merged = BashMonitorWakeStore.mergeDivergentPending(parsed, canonical);
+          const mergedTemp = `${originalPath}.tmp-${randomUUID()}`;
+          await fsPromises.writeFile(mergedTemp, JSON.stringify(merged, null, 2), "utf-8");
+          const committed = await this.replaceCanonicalIfUnchanged(
+            mergedTemp,
+            originalPath,
+            merged,
+            canonical
+          );
+          if (committed == null) {
+            // The canonical record changed under the merge: discard the stale draft
+            // and keep the leftover for re-reconciliation next scan.
+            await fsPromises.rm(mergedTemp, { force: true }).catch(() => undefined);
+            return null;
+          }
+          // Consumed: the merged canonical now carries this generation's output. A
+          // failed removal PROPAGATES — the surviving leftover would merge again
+          // (duplicating lines) or resurrect after the canonical is retired.
+          await fsPromises.rm(filePath, { force: true });
+          return committed;
+        }
         if (
           parsed.status === "pending" &&
           Date.parse(parsed.updatedAt) > Date.parse(canonical.updatedAt)
         ) {
+          // Strictly newer pending leftover vs a TERMINAL canonical record: matches
+          // enqueued after delivery/supersession are legitimately new output.
           return this.replaceCanonicalIfUnchanged(filePath, originalPath, parsed, canonical);
         }
         // The canonical record wins: drop the superseded leftover and PUBLISH the
         // winner's pending state. Its file may postdate this scan's readdir snapshot
         // (created between our failed link and now), so returning null here could
-        // report a successful empty scan for a wake whose writer already exited.
-        await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
+        // report a successful empty scan for a wake whose writer already exited. The
+        // removal PROPAGATES failures so the leftover can never outlive the canonical
+        // record and be restored as a resurrected copy.
+        await fsPromises.rm(filePath, { force: true });
         return canonical.status === "pending" ? canonical : null;
       }
       await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
@@ -1326,6 +1446,17 @@ export class BashMonitorWakeStore {
         canonical.kind === "monitor-lost" &&
         canonical.status !== "superseded"
       ) {
+        // REPLAY guard: a previous scan's merge of THIS temp may have committed while
+        // its cleanup below failed, leaving the source temp eligible for another
+        // merge. Once the merged canonical delivers, re-merging would mint a fresh
+        // pending wake for already-delivered output. A canonical that provably
+        // carries this temp's payload subsumes it: discard the temp instead. The
+        // removal PROPAGATES failures — a silently surviving temp would replay after
+        // the canonical is delivered and pruned.
+        if (BashMonitorWakeStore.pendingSubsumes(canonical, parsed)) {
+          await fsPromises.rm(filePath, { force: true });
+          return canonical.status === "pending" ? canonical : null;
+        }
         // A crash stranded matched output, and restart recovery already wrote the
         // monitor-lost notice for the same id BEFORE this temp was scanned — so the
         // notice always carries the later updatedAt and a plain comparison would
@@ -1387,7 +1518,11 @@ export class BashMonitorWakeStore {
       // ages past retention and is pruned, a later scan would see no canonical record
       // and restore this stale pending temp, redelivering a deliberately superseded
       // wake. The freshness gate already passed, so no live writer can still own it.
-      await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
+      // A failed removal PROPAGATES (rm with force ignores ENOENT, so any error is
+      // real): aborting the scan here keeps the record pass from pruning the terminal
+      // canonical while the stale temp survives — the same resurrection, one fault
+      // later. The retry re-attempts both in artifact-first order.
+      await fsPromises.rm(filePath, { force: true });
       return null;
     });
   }
