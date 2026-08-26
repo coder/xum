@@ -649,6 +649,32 @@ def test_session_usage_leaves_cost_unset_for_unpriced_usage(
     assert totals["cost_usd"] is None
 
 
+def test_session_usage_enforces_aggregate_byte_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).write_bytes(
+        _sessions_archive_bytes(
+            {
+                "ws-1": _usage_display(),
+                "ws-2": _usage_display(),
+                "ws-3": _usage_display(),
+            }
+        )
+    )
+    # Cap below two members' worth: only the first parses, iteration stops.
+    member_bytes = len(json.dumps(_usage_display()).encode("utf-8"))
+    monkeypatch.setattr(
+        MuxAgent, "_SESSION_USAGE_MAX_TOTAL_BYTES", member_bytes + member_bytes // 2
+    )
+
+    totals = agent._summarize_session_usage()
+
+    assert totals is not None
+    assert totals["sessions"] == 1
+
+
 def test_session_usage_skips_malformed_entries(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

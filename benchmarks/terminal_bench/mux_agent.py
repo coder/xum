@@ -240,6 +240,7 @@ class MuxAgent(BaseInstalledAgent):
     _SESSIONS_ARCHIVE_MAX_BYTES = 256 * 1024 * 1024
     _SESSION_USAGE_MAX_MEMBERS = 10_000
     _SESSION_USAGE_FILE_MAX_BYTES = 16 * 1024 * 1024
+    _SESSION_USAGE_MAX_TOTAL_BYTES = 64 * 1024 * 1024
 
     async def _stage_providers_config(
         self, environment: BaseEnvironment, env: dict[str, str]
@@ -521,6 +522,7 @@ class MuxAgent(BaseInstalledAgent):
         try:
             with tarfile.open(archive_path, "r:gz") as archive:
                 members_seen = 0
+                bytes_read = 0
                 for member in archive:
                     members_seen += 1
                     if members_seen > self._SESSION_USAGE_MAX_MEMBERS:
@@ -533,11 +535,20 @@ class MuxAgent(BaseInstalledAgent):
                         or member.size > self._SESSION_USAGE_FILE_MAX_BYTES
                     ):
                         continue
+                    # Aggregate cap: many small-header members must not add up
+                    # to an unbounded allocation either.
+                    if bytes_read + member.size > self._SESSION_USAGE_MAX_TOTAL_BYTES:
+                        break
                     try:
                         extracted = archive.extractfile(member)
                         if extracted is None:
                             continue
-                        data = json.loads(extracted.read().decode("utf-8"))
+                        # Bounded read: never trust the header to limit allocation.
+                        raw = extracted.read(self._SESSION_USAGE_FILE_MAX_BYTES + 1)
+                        bytes_read += len(raw)
+                        if len(raw) > self._SESSION_USAGE_FILE_MAX_BYTES:
+                            continue
+                        data = json.loads(raw.decode("utf-8"))
                     except Exception:
                         continue  # Skip malformed files, keep valid sessions
                     if not isinstance(data, dict):
