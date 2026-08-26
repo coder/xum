@@ -98,13 +98,19 @@ describe("xum trust CLI", () => {
     expect(trustByPath.get(worktree)).toBe(false);
   }, 15_000);
 
-  test("replaceRunTrustProjects clears stale trust when the real config is empty", async () => {
+  test("replaceRunTrustProjects rebuilds config without foreign settings", async () => {
     using tmp = new DisposableTempDir("trust-replace-run");
     const realConfig = new Config(path.join(tmp.path, "real-root"));
     const targetConfig = new Config(path.join(tmp.path, "run-root"));
+    const intendedProject = path.join(tmp.path, "intended-project");
     const staleProject = path.join(tmp.path, "removed-project");
+    await realConfig.editConfig((config) => {
+      config.projects.set(intendedProject, { workspaces: [], trusted: true });
+      return config;
+    });
     await targetConfig.editConfig((config) => {
       config.projects.set(staleProject, { workspaces: [], trusted: true });
+      config.routeOverrides = { "anthropic:claude-opus-5": "direct" };
       return config;
     });
 
@@ -112,9 +118,16 @@ describe("xum trust CLI", () => {
 
     const onDisk = JSON.parse(
       await fs.readFile(path.join(targetConfig.rootDir, "config.json"), "utf8")
-    ) as { projects: unknown[] };
-    expect(onDisk.projects).toEqual([]);
-    expect(targetConfig.loadConfigOrDefault().projects.has(staleProject)).toBe(false);
+    ) as {
+      projects: Array<[string, { workspaces: unknown[]; trusted?: boolean }]>;
+      routeOverrides?: Record<string, string>;
+    };
+    expect(onDisk.projects).toEqual([[intendedProject, { workspaces: [], trusted: true }]]);
+    expect(onDisk.routeOverrides).toBeUndefined();
+    const reloaded = targetConfig.loadConfigOrDefault();
+    expect(reloaded.projects.has(staleProject)).toBe(false);
+    expect(reloaded.projects.get(intendedProject)?.trusted).toBe(true);
+    expect(reloaded.routeOverrides).toBeUndefined();
   });
 
   test("materializeResolvedTrust copies main-repo trust onto the exact worktree entry", async () => {

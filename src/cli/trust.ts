@@ -185,7 +185,7 @@ export async function replaceRunTrustProjects(
     });
   }
 
-  await targetConfig.editConfig((config) => ({ ...config, projects: trustOnlyProjects }));
+  await targetConfig.editConfig(() => ({ projects: trustOnlyProjects }));
 }
 
 /**
