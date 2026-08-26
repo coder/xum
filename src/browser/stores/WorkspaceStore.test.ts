@@ -4072,6 +4072,72 @@ describe("WorkspaceStore", () => {
       expect(authoritative).toBe(true);
       expect(listCallCount).toBeGreaterThanOrEqual(2);
     });
+
+    it("keeps newer subscription deltas over a stale bootstrap-retry list", async () => {
+      const workspaceId = "activity-retry-delta-race";
+      resetStore();
+
+      let listCallCount = 0;
+      let releaseSecondList!: (value: Record<string, WorkspaceActivitySnapshot> | null) => void;
+      const secondList = new Promise<Record<string, WorkspaceActivitySnapshot> | null>(
+        (resolve) => {
+          releaseSecondList = resolve;
+        }
+      );
+      mockActivityList.mockImplementation(
+        (): Promise<Record<string, WorkspaceActivitySnapshot> | null> => {
+          listCallCount += 1;
+          return listCallCount === 1 ? Promise.resolve(null) : secondList;
+        }
+      );
+
+      let releaseEvent!: () => void;
+      const eventGate = new Promise<void>((resolve) => {
+        releaseEvent = resolve;
+      });
+      const deltaSnapshot: WorkspaceActivitySnapshot = {
+        recency: new Date("2024-01-08T00:00:00.000Z").getTime(),
+        streaming: true,
+        lastModel: "claude-sonnet-4",
+        lastThinkingLevel: "high",
+      };
+      mockActivitySubscribe.mockImplementation(async function* (
+        _input?: void,
+        options?: { signal?: AbortSignal }
+      ): AsyncGenerator<WorkspaceActivityEvent, void, unknown> {
+        await eventGate;
+        yield { type: "activity", workspaceId, activity: deltaSnapshot };
+        await waitForAbortSignal(options?.signal);
+      });
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
+      createAndAddWorkspace(
+        store,
+        workspaceId,
+        {
+          createdAt: "2020-01-01T00:00:00.000Z",
+        },
+        false
+      );
+
+      // The bootstrap retry's list() is in flight (blocked)...
+      const secondListStarted = await waitUntil(() => listCallCount >= 2, 5000);
+      expect(secondListStarted).toBe(true);
+      // ...a live delta lands for this workspace while it is pending...
+      releaseEvent();
+      const deltaApplied = await waitUntil(
+        () => store.getWorkspaceState(workspaceId).canInterrupt === true
+      );
+      expect(deltaApplied).toBe(true);
+
+      // ...then the older list arrives WITHOUT that workspace: it must confer
+      // authority but must not clear the newer delta.
+      releaseSecondList({});
+      const authoritative = await waitUntil(() => store.isActivityAuthoritative());
+      expect(authoritative).toBe(true);
+      expect(store.getWorkspaceState(workspaceId).canInterrupt).toBe(true);
+    });
   });
 
   describe("terminal activity", () => {

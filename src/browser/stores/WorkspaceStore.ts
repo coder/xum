@@ -755,6 +755,11 @@ export class WorkspaceStore {
   // the concurrent-local warning can't pop in after the transcript reveals.
   private activityHydrated = false;
   private activityAuthoritative = false;
+  // Workspace ids that received a live subscription delta while a bootstrap-retry
+  // list() read was in flight (null while no retry read is pending). Those deltas
+  // are newer than the pending list response, which must not overwrite or clear
+  // them (see retryActivityBootstrapList).
+  private activityDeltaTouchesDuringRetry: Set<string> | null = null;
   private activityHydratedListeners = new Set<() => void>();
   // Workspaces whose persisted session usage fetch has settled (success or
   // failure). Distinguishes "usage unknown" from "no usage" for the same
@@ -3295,18 +3300,25 @@ export class WorkspaceStore {
     }
   }
 
-  private applyWorkspaceActivityList(snapshots: Record<string, WorkspaceActivitySnapshot>): void {
+  /** skipWorkspaceIds: ids whose live state is newer than this list (never overwritten or cleared). */
+  private applyWorkspaceActivityList(
+    snapshots: Record<string, WorkspaceActivitySnapshot>,
+    skipWorkspaceIds?: ReadonlySet<string>
+  ): void {
     const seenWorkspaceIds = new Set<string>();
 
     for (const [workspaceId, snapshot] of Object.entries(snapshots)) {
       seenWorkspaceIds.add(workspaceId);
+      if (skipWorkspaceIds?.has(workspaceId)) {
+        continue;
+      }
       this.applyWorkspaceActivitySnapshot(workspaceId, snapshot);
     }
 
     // An empty list is a valid all-idle result (backend read failures arrive as null
     // and never reach this method), so clear any cached snapshots it no longer lists.
     for (const workspaceId of Array.from(this.workspaceActivity.keys())) {
-      if (seenWorkspaceIds.has(workspaceId)) {
+      if (seenWorkspaceIds.has(workspaceId) || skipWorkspaceIds?.has(workspaceId)) {
         continue;
       }
       this.applyWorkspaceActivitySnapshot(workspaceId, null);
@@ -3682,6 +3694,7 @@ export class WorkspaceStore {
             if (signal.aborted || attemptController.signal.aborted) {
               return;
             }
+            this.activityDeltaTouchesDuringRetry?.add(event.workspaceId);
             this.applyWorkspaceActivitySnapshot(event.workspaceId, event.activity);
           });
         }
@@ -3730,7 +3743,9 @@ export class WorkspaceStore {
    * Bootstrap repair for a null (read-failure) activity list: retries list()
    * with the subscription backoff until a real list applies, authority was
    * gained elsewhere (e.g. a reconnect attempt's own bootstrap), or the owning
-   * attempt/store aborts. Never throws, so callers may fire-and-forget.
+   * attempt/store aborts. Runs concurrently with the live delta stream, so
+   * workspaces that receive a delta while a read is in flight are skipped when
+   * the (older) response applies. Never throws, so callers may fire-and-forget.
    */
   private async retryActivityBootstrapList(
     client: RouterClient<AppRouter>,
@@ -3744,23 +3759,33 @@ export class WorkspaceStore {
       if (signal.aborted || attemptSignal.aborted || this.activityAuthoritative) {
         return;
       }
+      // Live deltas that land while this read is in flight are newer than the
+      // response and must win: record them so the apply below skips their ids.
+      this.activityDeltaTouchesDuringRetry = new Set();
       let snapshots: Record<string, WorkspaceActivitySnapshot> | null = null;
       try {
         snapshots = await client.workspace.activity.list();
       } catch {
         // Transient transport failure: keep retrying; terminal subscription
         // failures are owned by the outer attempt loop.
+        this.activityDeltaTouchesDuringRetry = null;
         continue;
       }
       if (snapshots == null) {
+        this.activityDeltaTouchesDuringRetry = null;
         continue;
       }
       const appliedSnapshots = snapshots;
+      const deltaTouches = this.activityDeltaTouchesDuringRetry;
       queueMicrotask(() => {
+        // Cleared inside the microtask so delta microtasks already queued ahead
+        // of it still register; deltas queued after it run later and overwrite
+        // the list values anyway (newest wins in both directions).
+        this.activityDeltaTouchesDuringRetry = null;
         if (signal.aborted || attemptSignal.aborted) {
           return;
         }
-        this.applyWorkspaceActivityList(appliedSnapshots);
+        this.applyWorkspaceActivityList(appliedSnapshots, deltaTouches);
         this.markActivityHydrated(true);
       });
       return;
