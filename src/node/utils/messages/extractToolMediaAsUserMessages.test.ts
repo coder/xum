@@ -970,6 +970,86 @@ describe("extractToolMediaAsUserMessages", () => {
     expect(text).not.toContain("marker-01");
     expect(text).toContain("marker-02");
     expect(text).toContain(`marker-${total - 1}`);
+
+    // The rewritten TOOL OUTPUT coalesces the per-item placeholders too (r29
+    // security): a flooded transcript would otherwise keep tens of thousands
+    // of `[Attachment attached…]` parts — megabytes of provider JSON — even
+    // after the attachment cap.
+    const toolPart = rewritten[0].parts[0];
+    expect(toolPart.type).toBe("dynamic-tool");
+    if (toolPart.type === "dynamic-tool" && toolPart.state === "output-available") {
+      const outputValue = (toolPart.output as { value?: unknown[] }).value;
+      expect(outputValue).toHaveLength(1);
+      const coalesced = outputValue?.[0] as { type?: string; text?: string };
+      expect(coalesced.type).toBe("text");
+      expect(coalesced.text).toContain(`${total} attachments attached from tool output`);
+    }
+  });
+
+  it("keeps over-depth replacements schema-valid inside content containers", async () => {
+    // The over-depth replacement is a bare string; inserted raw into a
+    // content container's value array it would make the container malformed
+    // (AI SDK content entries must be typed parts) and fail model-message
+    // conversion on every later request (r29).
+    let deepItem: unknown = { note: "leaf" };
+    for (let i = 0; i < 70; i++) deepItem = { type: "json", value: deepItem };
+    let output: unknown = {
+      type: "content",
+      value: [
+        deepItem,
+        { type: "media", mediaType: "image/png", data: "aGVsbG8=", filename: "shot.png" },
+      ],
+    };
+    for (let i = 0; i < 64; i++) output = { type: "json", value: output };
+
+    const input: MuxMessage[] = [
+      {
+        id: "a1",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call1",
+            toolName: "mcp__shots__take",
+            input: {},
+            state: "output-available",
+            output,
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    expect(rewritten).toHaveLength(2);
+    const toolPart = rewritten[0].parts[0];
+    expect(toolPart.type).toBe("dynamic-tool");
+    if (toolPart.type === "dynamic-tool" && toolPart.state === "output-available") {
+      // Unwrap the 64 json layers back to the content container.
+      let current: unknown = toolPart.output;
+      for (let i = 0; i < 64; i++) {
+        current = (current as { value: unknown }).value;
+      }
+      const container = current as { type?: string; value?: unknown[] };
+      expect(container.type).toBe("content");
+      for (const entry of container.value ?? []) {
+        expect(typeof entry).toBe("object");
+        expect(typeof (entry as { type?: unknown }).type).toBe("string");
+      }
+      const overDepth = (container.value ?? []).find(
+        (entry) =>
+          typeof (entry as { text?: unknown }).text === "string" &&
+          (entry as { text: string }).text.includes("depth limit exceeded")
+      ) as { type?: string } | undefined;
+      expect(overDepth?.type).toBe("text");
+    }
+    // The media item beside the over-depth entry still extracted (the fake
+    // PNG bytes then fail provider preparation, which is fine — extraction
+    // reached it).
+    const synthetic = rewritten[1];
+    expect(JSON.stringify(synthetic.parts)).toContain(
+      "[Attached 1 attachment(s) from tool output]"
+    );
   });
 
   it("rewrites attach_file PDF output into a synthetic user file part", async () => {

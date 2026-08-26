@@ -1296,9 +1296,19 @@ describe("createCodeExecutionTool", () => {
           wrapped?: { value?: Array<{ type?: string; data?: string; text?: string }> };
         }
       )?.wrapped?.value;
-      expect(outer?.[0]?.data).toBe(bigImage);
+      // The outer return draws from the SAME execution allowance as the
+      // nested record (r29): the record capture already retained the first
+      // ~2MiB image out of the 3MiB budget, so the returned copy of the same
+      // container cannot retain it AGAIN — both copies exceeding the shared
+      // remainder collapse to placeholders instead of doubling the bound.
+      expect(outer?.[0]?.type).toBe("text");
+      expect(outer?.[0]?.text).toContain("aggregate media budget exceeded");
       expect(outer?.[1]?.type).toBe("text");
       expect(outer?.[1]?.text).toContain("aggregate media budget exceeded");
+      // The payload itself is not lost: the nested record retains it.
+      const shotsRecord = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
+      const recordValue = (shotsRecord?.result as { value?: Array<{ data?: string }> })?.value;
+      expect(recordValue?.[0]?.data).toBe(bigImage);
 
       const consoleArg = (
         result.consoleOutput[0]?.args[0] as {
@@ -1486,6 +1496,40 @@ describe("createCodeExecutionTool", () => {
       expect(record.error).toBeUndefined();
       expect(record.ok).toBe(false);
       await host.disposeScope("ws-result-failure");
+    });
+
+    it("keeps failure status when the failing result is oversized and capture-bounded", async () => {
+      // A failing result over the kernel result cap is replaced with a
+      // __kernelBounded marker at creation; the success bit must survive onto
+      // EVERY marker (r29 — not just the retained-budget branch), or
+      // compaction would report the failed call ok:true and read tracking
+      // would advertise a never-read path.
+      using tmp = new DisposableTempDir("code-exec-oversized-failure");
+      const host = new SandboxHostService();
+      const failingReadTools: Record<string, Tool> = {
+        file_read: createMockTool("file_read", z.object({ path: z.string() }), () => ({
+          success: false,
+          error: `Backend failure: ${"x".repeat(64 * 1024)}`,
+        })),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(failingReadTools),
+        undefined,
+        persistentRunner(host, "ws-oversized-failure", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        { code: 'const r = mux.file_read({path: "/missing.txt"}); return r.success;' },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      expect(result.result).toBe(false);
+      const record = result.toolCalls[0];
+      expect(record.toolName).toBe("file_read");
+      expect(record.error).toBeUndefined();
+      expect(record.ok).toBe(false);
+      await host.disposeScope("ws-oversized-failure");
     });
 
     it("bounds nested-call args/results at creation: emitted events never carry full payloads", async () => {

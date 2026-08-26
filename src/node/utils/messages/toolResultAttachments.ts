@@ -262,7 +262,15 @@ export function extractAttachmentsFromToolOutput(
     if (nested != null) {
       didChange = true;
       attachments.push(...nested.attachments);
-      newValue.push(nested.newOutput as AISDKContent);
+      // Content-container entries must stay typed content parts (AI SDK
+      // schema): an over-depth replacement is a bare string, and inserting it
+      // raw would make the container malformed and fail model-message
+      // conversion or provider validation on every later request (r29).
+      newValue.push(
+        typeof nested.newOutput === "string"
+          ? { type: "text", text: nested.newOutput }
+          : (nested.newOutput as AISDKContent)
+      );
       continue;
     }
 
@@ -611,6 +619,77 @@ export function createToolAttachmentSummaryText(count: number): string {
  */
 export function createOmittedToolAttachmentText(omitted: number): string {
   return `[${omitted} extracted media attachment(s) omitted: request-wide cap of ${MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST} media parts reached; newest attachments are kept]`;
+}
+
+const ATTACHMENT_PLACEHOLDER_PREFIX = "[Attachment attached";
+
+/**
+ * Coalesce runs of per-item attachment placeholders inside a rewritten tool
+ * output. Applied only to outputs whose attachments were (partly) omitted by
+ * the request-wide media cap: each media item still leaves a per-item
+ * `[Attachment attached: …]` text part behind, so a flooded transcript could
+ * carry tens of thousands of placeholder parts (megabytes of provider JSON)
+ * even after the attachment cap (r29 security). Consecutive placeholder parts
+ * collapse into one bounded summary; single placeholders stay individual.
+ * The walk mirrors extraction's shapes and depth bound — the value was
+ * already rebuilt (and depth-bounded) by extraction.
+ */
+export function coalesceAttachmentPlaceholders(output: unknown): unknown {
+  return coalescePlaceholderWalk(output, 0);
+}
+
+function coalescePlaceholderWalk(value: unknown, depth: number): unknown {
+  if (depth > MAX_NESTED_TOOL_EXTRACTION_DEPTH) return value;
+  if (Array.isArray(value)) {
+    const next: unknown[] = [];
+    let changed = false;
+    const run: unknown[] = [];
+    const flushRun = (): void => {
+      if (run.length === 0) return;
+      if (run.length === 1) {
+        next.push(run[0]);
+      } else {
+        changed = true;
+        next.push({
+          type: "text",
+          text: `[${run.length} attachments attached from tool output (per-item placeholders coalesced: request-wide media cap reached)]`,
+        });
+      }
+      run.length = 0;
+    };
+    for (const item of value) {
+      if (isAttachmentPlaceholderPart(item)) {
+        run.push(item);
+        continue;
+      }
+      flushRun();
+      const walked = coalescePlaceholderWalk(item, depth + 1);
+      if (walked !== item) changed = true;
+      next.push(walked);
+    }
+    flushRun();
+    return changed ? next : value;
+  }
+  if (typeof value === "object" && value !== null) {
+    let changed = false;
+    const entries = Object.entries(value as Record<string, unknown>).map(([key, child]) => {
+      const walked = coalescePlaceholderWalk(child, depth + 1);
+      if (walked !== child) changed = true;
+      return [key, walked] as const;
+    });
+    return changed ? Object.fromEntries(entries) : value;
+  }
+  return value;
+}
+
+function isAttachmentPlaceholderPart(value: unknown): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const part = value as { type?: unknown; text?: unknown };
+  return (
+    part.type === "text" &&
+    typeof part.text === "string" &&
+    part.text.startsWith(ATTACHMENT_PLACEHOLDER_PREFIX)
+  );
 }
 
 export function createDataUrlForExtractedAttachment(attachment: ExtractedToolAttachment): string {

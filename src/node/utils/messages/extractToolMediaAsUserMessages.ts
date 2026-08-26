@@ -2,6 +2,7 @@ import type { MuxMessage } from "@/common/types/message";
 import { MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST } from "@/common/constants/imageAttachments";
 import { sanitizeAnthropicDocumentFilename } from "@/node/utils/messages/sanitizeAnthropicDocumentFilename";
 import {
+  coalesceAttachmentPlaceholders,
   createDataUrlForExtractedAttachment,
   createOmittedToolAttachmentText,
   createToolAttachmentSummaryText,
@@ -83,17 +84,14 @@ export async function extractToolMediaAsUserMessages(
       changedMessage = true;
       extractedAttachmentCount += extracted.attachments.length;
 
+      // Over the request-wide cap: chronologically OLDEST attachments are
+      // omitted. Skipping BEFORE provider preparation avoids the
+      // resize/data-url work for payloads the request will never carry.
+      const omittedHere = Math.min(omitRemaining, extracted.attachments.length);
+      omitRemaining -= omittedHere;
+
       const nextExtractedUserParts: MuxMessage["parts"] = [];
-      let omittedHere = 0;
-      for (const attachment of extracted.attachments) {
-        if (omitRemaining > 0) {
-          // Over the request-wide cap: the payload was already replaced with
-          // a placeholder in the tool output; skipping BEFORE provider
-          // preparation also avoids the resize/data-url work.
-          omitRemaining--;
-          omittedHere++;
-          continue;
-        }
+      for (const attachment of extracted.attachments.slice(omittedHere)) {
         const providerReadyAttachment = await prepareExtractedToolAttachmentForProvider(attachment);
         if (providerReadyAttachment.type === "text") {
           nextExtractedUserParts.push({
@@ -128,7 +126,13 @@ export async function extractToolMediaAsUserMessages(
       extractedUserParts = [...extractedUserParts, ...nextExtractedUserParts];
       newParts.push({
         ...part,
-        output: extracted.newOutput,
+        // Omitted attachments also leave per-item placeholders behind in the
+        // rewritten output; coalesce them so a flooded transcript cannot keep
+        // megabytes of placeholder JSON in every request (r29 security).
+        output:
+          omittedHere > 0
+            ? coalesceAttachmentPlaceholders(extracted.newOutput)
+            : extracted.newOutput,
       });
     }
 

@@ -701,10 +701,16 @@ ${xumTypes}
             // record's history row — the capture sanitizer only covers nested
             // tool-call records and console args, and request-time attachment
             // extraction rewrites only the provider copy, never
-            // partial.json/chat.jsonl. Budget it at the same boundary. Kernel
-            // mode is excluded on purpose: its outer result feeds vars-handle
+            // partial.json/chat.jsonl. Budget it at the same boundary, using
+            // the SAME execution allowance as the nested records (r29): a
+            // fresh per-value budget would retain the payload twice (record +
+            // outer result), doubling the intended media bound. Kernel mode
+            // is excluded on purpose: its outer result feeds vars-handle
             // offloading, which must store full fidelity for the guest.
-            result.result = sanitizeCapturedMediaValue(result.result);
+            result.result = sanitizeCapturedMediaValue(
+              result.result,
+              runtime.classicCaptureBudgetFor?.(result.toolCalls)
+            );
           }
 
           // RLM return-value offloading BEFORE the vars snapshot below, so the

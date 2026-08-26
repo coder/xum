@@ -647,7 +647,7 @@ export class QuickJSRuntime implements IJSRuntime {
       // Sanitize against the same shared per-execution budget; the guest
       // still passes the full value to the tool.
       return this.captureResultSanitizer !== undefined
-        ? this.captureResultSanitizer(toolName, value, this.classicSanitizerBudgetFor(toolCalls))
+        ? this.captureResultSanitizer(toolName, value, this.classicCaptureBudgetFor(toolCalls))
         : value;
     }
     const bounded = this.boundCapture(value, this.kernelRecordBounds.argsCapBytes);
@@ -694,7 +694,7 @@ export class QuickJSRuntime implements IJSRuntime {
             toolName,
             value,
             this.kernelRecordBounds === undefined
-              ? this.classicSanitizerBudgetFor(toolCalls)
+              ? this.classicCaptureBudgetFor(toolCalls)
               : undefined
           )
         : value;
@@ -722,24 +722,36 @@ export class QuickJSRuntime implements IJSRuntime {
         return retained;
       }
       // Budget exhausted: fall back to normal bounding — oversized results
-      // become honest-size markers, small results still pass inline. A
-      // boolean success bit is preserved onto the marker: compaction folds
-      // result.success===false into the compact ok bit, and a FAILED edit
-      // misattributed as ok:true would advertise a never-applied path in
-      // crash-safe edited-file tracking.
-      const bounded = this.boundCapture(sanitized, this.kernelRecordBounds.resultCapBytes);
-      const success = (retained as { success?: unknown }).success;
-      if (
-        typeof success === "boolean" &&
-        typeof bounded === "object" &&
-        bounded !== null &&
-        (bounded as { __kernelBounded?: boolean }).__kernelBounded === true
-      ) {
-        return { ...bounded, success };
-      }
-      return bounded;
+      // become honest-size markers, small results still pass inline.
+      return QuickJSRuntime.preserveSuccessBit(
+        this.boundCapture(sanitized, this.kernelRecordBounds.resultCapBytes),
+        retained
+      );
     }
-    return this.boundCapture(sanitized, this.kernelRecordBounds.resultCapBytes);
+    return QuickJSRuntime.preserveSuccessBit(
+      this.boundCapture(sanitized, this.kernelRecordBounds.resultCapBytes),
+      sanitized
+    );
+  }
+
+  /** A boolean success bit is preserved onto EVERY __kernelBounded result
+   * marker (r29 — not just the retained-budget-exhausted branch): compaction
+   * folds result.success===false into the compact ok bit, and a FAILED call
+   * whose oversized result was replaced by a marker would otherwise be
+   * misreported as ok:true — advertising a never-applied edit path or a
+   * never-read file in crash-safe attachment tracking. */
+  private static preserveSuccessBit(bounded: unknown, source: unknown): unknown {
+    if (typeof source !== "object" || source === null) return bounded;
+    const success = (source as { success?: unknown }).success;
+    if (
+      typeof success === "boolean" &&
+      typeof bounded === "object" &&
+      bounded !== null &&
+      (bounded as { __kernelBounded?: boolean }).__kernelBounded === true
+    ) {
+      return { ...bounded, success };
+    }
+    return bounded;
   }
 
   /** Get-or-create the retained-result budget for one attribution's record
@@ -754,8 +766,10 @@ export class QuickJSRuntime implements IJSRuntime {
   }
 
   /** Get-or-create the classic-mode shared sanitizer budget for one
-   * attribution's record array (see classicSanitizerBudgets). */
-  private classicSanitizerBudgetFor(toolCalls: PTCToolCallRecord[]): CaptureSanitizerBudget {
+   * attribution's record array (see classicSanitizerBudgets). Public because
+   * the classic outer return value persists into the same history row and
+   * must draw from the same allowance (r29; see IJSRuntime). */
+  classicCaptureBudgetFor(toolCalls: PTCToolCallRecord[]): CaptureSanitizerBudget {
     let budget = this.classicSanitizerBudgets.get(toolCalls);
     if (!budget) {
       budget = createCaptureSanitizerBudget();
@@ -1449,7 +1463,22 @@ export class QuickJSRuntime implements IJSRuntime {
         // sanitization only shrinks, never grows.
         const sanitizer = this.captureResultSanitizer;
         const captured =
-          sanitizer !== undefined ? args.map((arg) => sanitizer("console", arg)) : args;
+          sanitizer !== undefined
+            ? args.map((arg) =>
+                sanitizer(
+                  "console",
+                  arg,
+                  // Classic mode draws from the same execution allowance as
+                  // nested records and the outer return (r29): console-arg
+                  // media must not mint a fresh per-value budget. Kernel mode
+                  // keeps per-call allowances (cross-call growth is bounded
+                  // by the retained-result budget and this console budget).
+                  this.kernelRecordBounds === undefined
+                    ? this.classicCaptureBudgetFor(attribution.toolCalls)
+                    : undefined
+                )
+              )
+            : args;
         attribution.consoleOutput.push({ level, args: captured, timestamp });
         attribution.eventHandler?.({
           type: "console",

@@ -5,7 +5,12 @@
  * but designed to allow future migration to libbun or other runtimes.
  */
 
-import type { CaptureSanitizerBudget, PTCEvent, PTCExecutionResult } from "./types";
+import type {
+  CaptureSanitizerBudget,
+  PTCEvent,
+  PTCExecutionResult,
+  PTCToolCallRecord,
+} from "./types";
 
 /**
  * Resource limits for sandbox execution.
@@ -107,6 +112,15 @@ export interface IJSRuntime extends Disposable {
       | ((toolName: string, result: unknown, budget?: CaptureSanitizerBudget) => unknown)
       | undefined
   ): void;
+
+  /**
+   * Shared per-execution capture-sanitizer budget for a classic (non-kernel)
+   * execution's record array. The outer return value persists into the same
+   * history row as the nested records, so it must draw from the SAME
+   * allowance (r29) — sanitizing it against a fresh per-value budget would
+   * let one execution retain roughly twice the intended media bound.
+   */
+  classicCaptureBudgetFor?(toolCalls: PTCToolCallRecord[]): CaptureSanitizerBudget;
 
   /**
    * Route late guest-continuation execution through a host-provided gate.

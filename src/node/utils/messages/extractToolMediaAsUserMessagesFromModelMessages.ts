@@ -2,6 +2,7 @@ import type { FilePart, ImagePart, ModelMessage, TextPart, ToolResultPart } from
 import { MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST } from "@/common/constants/imageAttachments";
 import { sanitizeAnthropicDocumentFilename } from "@/node/utils/messages/sanitizeAnthropicDocumentFilename";
 import {
+  coalesceAttachmentPlaceholders,
   createOmittedToolAttachmentText,
   createToolAttachmentSummaryText,
   extractAttachmentsFromToolOutput,
@@ -70,7 +71,9 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
       continue;
     }
 
-    let extractedAttachments: ExtractedToolAttachment[] = [];
+    let keptAttachments: ExtractedToolAttachment[] = [];
+    let totalExtracted = 0;
+    let omittedForMessage = 0;
     let changedMessage = false;
 
     const newContent = message.content.map((part) => {
@@ -83,11 +86,21 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
       }
 
       changedMessage = true;
-      extractedAttachments = [...extractedAttachments, ...extracted.attachments];
+      totalExtracted += extracted.attachments.length;
+      // Over the request-wide cap: chronologically OLDEST attachments are
+      // omitted, and their per-item output placeholders are coalesced so a
+      // flooded transcript cannot keep megabytes of placeholder JSON in
+      // every request (r29 security).
+      const omittedHere = Math.min(capState.omitRemaining, extracted.attachments.length);
+      capState.omitRemaining -= omittedHere;
+      omittedForMessage += omittedHere;
+      keptAttachments = [...keptAttachments, ...extracted.attachments.slice(omittedHere)];
 
       return {
         ...part,
-        output: extracted.newOutput as ToolResultOutput,
+        output: (omittedHere > 0
+          ? coalesceAttachmentPlaceholders(extracted.newOutput)
+          : extracted.newOutput) as ToolResultOutput,
       };
     });
 
@@ -106,8 +119,10 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
             }
         : message
     );
-    if (extractedAttachments.length > 0) {
-      result.push(await createSyntheticUserMessage(extractedAttachments, capState));
+    if (totalExtracted > 0) {
+      result.push(
+        await createSyntheticUserMessage(keptAttachments, omittedForMessage, totalExtracted)
+      );
     }
   }
 
@@ -115,26 +130,18 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
 }
 
 async function createSyntheticUserMessage(
-  attachments: ExtractedToolAttachment[],
-  capState: { omitRemaining: number }
+  keptAttachments: ExtractedToolAttachment[],
+  omittedCount: number,
+  totalExtracted: number
 ): Promise<ModelMessage> {
   const content: Array<TextPart | ImagePart | FilePart> = [
     {
       type: "text",
-      text: createToolAttachmentSummaryText(attachments.length),
+      text: createToolAttachmentSummaryText(totalExtracted),
     },
   ];
 
-  let omittedHere = 0;
-  for (const attachment of attachments) {
-    if (capState.omitRemaining > 0) {
-      // Over the request-wide cap: the payload was already replaced with a
-      // placeholder in the tool output; skipping BEFORE provider preparation
-      // also avoids the resize work.
-      capState.omitRemaining--;
-      omittedHere++;
-      continue;
-    }
+  for (const attachment of keptAttachments) {
     const providerReadyAttachment = await prepareExtractedToolAttachmentForProvider(attachment);
     if (providerReadyAttachment.type === "text") {
       content.push({
@@ -165,10 +172,10 @@ async function createSyntheticUserMessage(
         : {}),
     });
   }
-  if (omittedHere > 0) {
+  if (omittedCount > 0) {
     content.splice(1, 0, {
       type: "text",
-      text: createOmittedToolAttachmentText(omittedHere),
+      text: createOmittedToolAttachmentText(omittedCount),
     });
   }
 
