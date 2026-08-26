@@ -873,16 +873,12 @@ describe("attachment part stripping", () => {
 
     const sandboxValue = (await captured.xum.attach_file({ path: "/board.png" })) as {
       type: string;
-      value: Array<{ type: string; data?: string; mediaType?: string }>;
+      value: Array<{ type: string; text?: string }>;
     };
-    // Media payload stubbed but the declared part shape survives: guest code
-    // following the generated attach_file type can still read .data/.mediaType.
     expect(JSON.stringify(sandboxValue)).not.toContain("BASE64DATA");
     expect(sandboxValue.type).toBe("content");
     expect(sandboxValue.value).toHaveLength(2);
-    expect(sandboxValue.value[1].type).toBe("media");
-    expect(sandboxValue.value[1].mediaType).toBe("image/png");
-    expect(sandboxValue.value[1].data).toBe(MEDIA_DATA_STUB);
+    expect(sandboxValue.value[1]).toEqual({ type: "text", text: MEDIA_DATA_STUB });
 
     expect(bridge.drainPendingAttachments(runtime)).toEqual([mediaPart]);
     // Drain empties the pending set
@@ -922,9 +918,9 @@ describe("attachment part stripping", () => {
     const { captured, runtime } = registerCapturingXum(bridge);
 
     const first = (await captured.xum.attach_file({ path: "/big.png" })) as {
-      value: Array<{ data: string }>;
+      value: Array<{ type: string; text?: string }>;
     };
-    expect(first.value[0].data).toBe(MEDIA_DATA_STUB);
+    expect(first.value[0]).toEqual({ type: "text", text: MEDIA_DATA_STUB });
 
     // Second attach would push the aggregate over budget: it must be refused
     // with the budget stub and must NOT be carried host-side.

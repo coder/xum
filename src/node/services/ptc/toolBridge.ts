@@ -477,10 +477,9 @@ export class ToolBridge {
    * are useless as sandbox values: guests cannot see pixels, and the base64
    * would bloat vars, result handles, model-visible records, and the
    * host-side nested-call records/events (which sit outside QuickJS memory
-   * accounting). Strip them per-runtime; supported model media and
-   * display-only files are carried onto code_execution's result, while
-   * unsupported media is discarded. Carried parts keep their declared shape;
-   * unsupported and over-budget media become text placeholders.
+   * accounting). Supported media and display-only files are carried onto
+   * code_execution's result, while unsupported media is discarded. Nested
+   * media copies become text so request extraction cannot treat stubs as files.
    */
   private stripAttachmentParts(runtime: IJSRuntime, serialized: unknown): unknown {
     if (!isToolContentResult(serialized)) {
@@ -502,11 +501,10 @@ export class ToolBridge {
       }
       pendingBytes += part.data.length;
       this.pendingAttachmentBytes.set(runtime, pendingBytes);
-      if (!carry) {
-        return { type: "text", text: stub };
+      if (carry) {
+        carriedParts.push(part);
       }
-      carriedParts.push(part);
-      return { ...part, data: stub };
+      return isMediaPart(part) ? { type: "text", text: stub } : { ...part, data: stub };
     };
     const newValue = serialized.value.map((item) => {
       if (isMediaPart(item)) {

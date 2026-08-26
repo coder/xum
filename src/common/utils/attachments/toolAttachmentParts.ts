@@ -22,11 +22,7 @@ export interface AISDKMediaPart {
  */
 export type ToolAttachmentPart = AISDKMediaPart | DisplayOnlyFilePart;
 
-/**
- * Stub markers written into carried parts' `data` when the PTC bridge strips
- * attachment bytes from nested tool results. Shared so the renderer can
- * suppress duplicate stub cards when the carrier renders the real bytes.
- */
+/** Placeholder markers used when the PTC bridge strips attachment bytes. */
 export const MEDIA_BUDGET_EXCEEDED_STUB =
   "[media omitted: aggregate attachment budget for this code_execution call was exceeded; attach fewer or smaller files in one call]";
 

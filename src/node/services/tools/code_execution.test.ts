@@ -6,6 +6,7 @@ import { describe, it, expect, mock } from "bun:test";
 import { createCodeExecutionTool, clearTypeCaches, type MountRunner } from "./code_execution";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { ToolBridge } from "@/node/services/ptc/toolBridge";
+import { extractAttachmentsFromToolOutput } from "@/node/utils/messages/toolResultAttachments";
 import { DISPLAY_DATA_STUB, MEDIA_DATA_STUB } from "@/common/utils/attachments/toolAttachmentParts";
 import type { Tool, ToolExecutionOptions } from "ai";
 import type { PTCEvent, PTCExecutionResult } from "@/node/services/ptc/types";
@@ -941,13 +942,10 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-persist-records");
     });
 
-    it("keeps oversized persistence results and media containers through capture bounding", async () => {
+    it("keeps oversized persistence results while carrying media separately", async () => {
       // Creation-time bounding replaces results over the 16KB threshold with
-      // a __kernelBounded marker BEFORE compaction runs, so the compaction
-      // exemption alone cannot save an oversized diff (repo caps allow up to
-      // ~50k chars) — and stripped media containers (stub in the record, raw
-      // bytes on the attachments carrier) must survive both stages so the
-      // carrier stays paired with a visible record.
+      // a __kernelBounded marker before compaction runs, so the persistence
+      // exemption must preserve the diff while media rides only the carrier.
       using tmp = new DisposableTempDir("code-exec-exempt-bounds");
       const host = new SandboxHostService();
       const bigDiff = `@@ -0,0 +1 @@\n+${"x".repeat(20_000)}`;
@@ -985,8 +983,9 @@ describe("createCodeExecutionTool", () => {
       expect((editRecord?.result as { diff?: string })?.diff).toBe(bigDiff);
 
       const shotRecord = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
-      const shotValue = (shotRecord?.result as { value?: Array<{ data?: string }> })?.value;
-      expect(shotValue?.[1]?.data).toBe(MEDIA_DATA_STUB);
+      expect(shotRecord?.result).toBeUndefined();
+      expect(shotRecord?.ok).toBe(true);
+      expect(shotRecord?.bytes).toBeGreaterThan(0);
       // The raw bytes ride the attachments carrier for request-time extraction.
       expect(result.attachments).toEqual([
         { type: "media", mediaType: "image/png", data: mediaData },
@@ -1474,12 +1473,9 @@ describe("createCodeExecutionTool", () => {
       )) as PTCExecutionResult;
       expect(result.success).toBe(true);
       const record = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
-      const value = (
-        record?.result as { value?: Array<{ type?: string; data?: string; text?: string }> }
-      )?.value;
-      expect(value?.[0]?.data).toBe(MEDIA_DATA_STUB);
-      expect(value?.[1]?.type).toBe("text");
-      expect(value?.[1]?.text).toContain("media omitted: audio/wav");
+      expect(record?.result).toBeUndefined();
+      expect(record?.ok).toBe(true);
+      expect(record?.bytes).toBeGreaterThan(0);
       expect(JSON.stringify(record)).not.toContain(audioData);
       expect(result.attachments).toEqual([
         { type: "media", mediaType: "image/png", data: "aGVsbG8=" },
@@ -2803,13 +2799,15 @@ describe("nested attachment delivery", () => {
     expect(result.success).toBe(true);
     // Original media rides the top-level result for the request-path lift
     expect(result.attachments).toEqual([mediaPart]);
-    // Sandbox-visible values (return value + nested record) carry the stubbed
-    // media shape, never the real base64 payload
     const sandboxVisible = JSON.stringify({ result: result.result, toolCalls: result.toolCalls });
     expect(sandboxVisible).not.toContain(mediaPart.data);
-    const returned = result.result as { value: Array<{ type: string; data?: string }> };
-    expect(returned.value[1].type).toBe("media");
-    expect(returned.value[1].data).toBe(MEDIA_DATA_STUB);
+    const extracted = extractAttachmentsFromToolOutput(result);
+    expect(extracted?.attachments).toEqual([
+      { data: mediaPart.data, mediaType: mediaPart.mediaType, filename: mediaPart.filename },
+    ]);
+
+    const returned = result.result as { value: Array<{ type: string; text?: string }> };
+    expect(returned.value[1]).toEqual({ type: "text", text: MEDIA_DATA_STUB });
   });
 
   it("re-attaches display-only files stripped from nested tool results", async () => {
