@@ -144,10 +144,11 @@ function buildDisplayOnlyFilePlaceholder(item: DisplayOnlyFilePart): AISDKTextPa
  * retained: those shapes are malformed by construction past the cap, and
  * retaining them would keep shipping whatever payload hides at the leaf
  * (e.g. raw base64) on every later request — trading the stack overflow for
- * context-limit failures. GENERIC wrapper descent instead stops at the cap
- * and leaves the subtree unchanged (see extractAttachmentsFromWrapperValue):
- * media-free deep JSON is plausibly legitimate output and must not be
- * silently truncated. Persisted history itself is never mutated.
+ * context-limit failures. GENERIC wrapper descent does NOT consume this cap:
+ * it is scanned iteratively without recursion (see
+ * extractAttachmentsFromWrapperValue), so media is rewritten at any wrapper
+ * depth while media-free deep JSON — plausibly legitimate output — passes
+ * through unchanged. Persisted history itself is never mutated.
  */
 const MAX_NESTED_TOOL_EXTRACTION_DEPTH = 64;
 
@@ -364,16 +365,41 @@ function extractAttachmentsFromNestedToolCalls(
 }
 
 /**
+ * Tool-output-shaped values route through the recursive shape handlers in
+ * extractAttachmentsFromToolOutput (which consume the shared depth cap);
+ * everything else is a generic wrapper scanned iteratively below.
+ */
+function isToolOutputShaped(value: unknown): boolean {
+  return (
+    isJsonContainer(value) ||
+    isContentContainer(value) ||
+    (typeof value === "object" &&
+      value !== null &&
+      Array.isArray((value as { toolCalls?: unknown }).toolCalls))
+  );
+}
+
+/**
  * Deep-walk arbitrary wrapper objects/arrays for media content containers.
  * Sandbox code can wrap bridged results (`return { image: xum.mcp(...) }`),
  * and capture-time sanitization intentionally RETAINS supported containers
  * under its budget — so the provider copy must rewrite them into
  * attachments/placeholders wherever they sit, or a normal screenshot ships as
  * both an attachment (from the duplicate nested record) and megabytes of raw
- * JSON (from the wrapped outer result) on every later request. Children route
- * back through extractAttachmentsFromToolOutput, so the shared depth cap
- * bounds the stack (cycles terminate because depth grows on each revisit) and
- * over-deep subtrees degrade to the bounded placeholder.
+ * JSON (from the wrapped outer result) on every later request.
+ *
+ * Generic wrapper spans are traversed ITERATIVELY (explicit stack, post-order
+ * copy-on-write rebuild) rather than recursively: wrapper shapes are
+ * model/attacker-authored, and abandoning the scan at a fixed depth would let
+ * a media container hidden below that many plain wrappers keep shipping raw
+ * base64 in every provider request, while recursing per wrapper level would
+ * trade that for stack overflow (capture-time sanitization retains supported
+ * containers far deeper than any safe recursion budget). Media-free deep JSON
+ * still passes through unchanged (null ⇒ caller keeps the original value).
+ * Recursion continues only through tool-output-shaped children
+ * (json/content/toolCalls edges), which stay bounded by the shared depth cap;
+ * in-memory cycles are skipped via the visiting/processed sets, and cyclic
+ * back-edges are kept as-is (persisted JSON history cannot contain them).
  */
 function extractAttachmentsFromWrapperValue(
   value: unknown,
@@ -382,34 +408,74 @@ function extractAttachmentsFromWrapperValue(
   if (typeof value !== "object" || value === null) {
     return null;
   }
-  // Generic wrappers past the cap are plausibly LEGITIMATE deep JSON (a
-  // media-free API tree), unlike tool-output-shaped chains: stop descending
-  // and leave the subtree unchanged instead of substituting the placeholder.
-  // The stack stays bounded because no recursion continues from here, and
-  // children below are invoked at depth + 1 ≤ cap, so the placeholder branch
-  // in extractAttachmentsFromToolOutput is reachable only through
-  // json/toolCalls edges that add further depth.
-  if (depth >= MAX_NESTED_TOOL_EXTRACTION_DEPTH) {
-    return null;
-  }
   const attachments: ExtractedToolAttachment[] = [];
-  let didChange = false;
-  const rewrite = (item: unknown): unknown => {
-    const extracted = extractAttachmentsFromToolOutput(item, depth + 1);
-    if (extracted == null) {
-      return item;
+  // Copy-on-write rebuilds keyed by original node identity; nodes absent from
+  // this map are unchanged and reused as-is (preserves identity for the
+  // media-free case).
+  const changed = new Map<object, unknown>();
+  const processed = new Set<object>();
+  const visiting = new Set<object>();
+  const stack: Array<{ node: object; entered: boolean }> = [{ node: value, entered: false }];
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    const node = frame.node;
+    if (!frame.entered) {
+      // Duplicate frames (shared children pushed by several parents) and
+      // cycle back-edges are dropped before descending.
+      if (processed.has(node) || visiting.has(node)) {
+        stack.pop();
+        continue;
+      }
+      frame.entered = true;
+      visiting.add(node);
+      // Descend generic object/array children first (post-order rebuild);
+      // tool-output-shaped children are handled at exit via the recursive
+      // shape handlers instead.
+      const children: unknown[] = Array.isArray(node)
+        ? node
+        : Object.values(node as Record<string, unknown>);
+      for (const child of children) {
+        if (typeof child !== "object" || child === null) continue;
+        if (processed.has(child) || visiting.has(child)) continue;
+        if (isToolOutputShaped(child)) continue;
+        stack.push({ node: child, entered: false });
+      }
+      continue;
     }
-    didChange = true;
-    attachments.push(...extracted.attachments);
-    return extracted.newOutput;
-  };
-  const newValue = Array.isArray(value)
-    ? value.map(rewrite)
-    : Object.fromEntries(Object.entries(value).map(([key, item]) => [key, rewrite(item)]));
-  if (!didChange) {
+    stack.pop();
+    visiting.delete(node);
+    processed.add(node);
+    let nodeChanged = false;
+    const rewriteChild = (child: unknown): unknown => {
+      if (typeof child !== "object" || child === null) {
+        return child;
+      }
+      if (isToolOutputShaped(child)) {
+        const extracted = extractAttachmentsFromToolOutput(child, depth + 1);
+        if (extracted == null) {
+          return child;
+        }
+        nodeChanged = true;
+        attachments.push(...extracted.attachments);
+        return extracted.newOutput;
+      }
+      if (changed.has(child)) {
+        nodeChanged = true;
+        return changed.get(child);
+      }
+      return child;
+    };
+    const rebuilt = Array.isArray(node)
+      ? node.map(rewriteChild)
+      : Object.fromEntries(Object.entries(node).map(([key, child]) => [key, rewriteChild(child)]));
+    if (nodeChanged) {
+      changed.set(node, rebuilt);
+    }
+  }
+  if (!changed.has(value)) {
     return null;
   }
-  return { newOutput: newValue, attachments };
+  return { newOutput: changed.get(value), attachments };
 }
 
 type ProviderReadyToolAttachment =

@@ -529,6 +529,67 @@ describe("extractToolMediaAsUserMessages", () => {
     expect(toolPart.output).toBe(deep);
   });
 
+  it("extracts media buried under deep generic wrapper chains", async () => {
+    // Capture-time sanitization retains supported containers under its budget
+    // regardless of wrapper depth, so the request-time scan must not abandon
+    // deep generic spans: a container hidden below more plain wrappers than a
+    // recursive depth budget allows would otherwise ship raw base64 in every
+    // provider request (round 17).
+    const base64 = (
+      await sharp({
+        create: { width: 10, height: 10, channels: 3, background: { r: 7, g: 8, b: 9 } },
+      })
+        .png()
+        .toBuffer()
+    ).toString("base64");
+
+    let deep: Record<string, unknown> = {
+      image: {
+        type: "content",
+        value: [{ type: "media", mediaType: "image/png", data: base64 }],
+      },
+      leaf: "kept",
+    };
+    for (let i = 0; i < 200; i++) {
+      deep = { next: deep };
+    }
+
+    const input: MuxMessage[] = [
+      {
+        id: "a-deep-media",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call1",
+            toolName: "code_execution",
+            input: { code: "..." },
+            state: "output-available",
+            output: deep,
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    expect(rewritten).toHaveLength(2);
+    const toolPart = rewritten[0].parts[0];
+    if (toolPart.type !== "dynamic-tool" || toolPart.state !== "output-available") {
+      throw new Error("Expected an output-available dynamic-tool part");
+    }
+    const outputText = JSON.stringify(toolPart.output);
+    // The buried container is rewritten to a placeholder while the media-free
+    // wrapper structure survives untouched.
+    expect(outputText).not.toContain(base64);
+    expect(outputText).toContain("[Attachment attached:");
+    expect(outputText).toContain('"leaf":"kept"');
+
+    const syntheticUser = rewritten[1];
+    const fileParts = syntheticUser.parts.filter((part) => part.type === "file");
+    expect(fileParts).toHaveLength(1);
+  });
+
   it("self-heals oversized raster tool attachments by downscaling them for provider requests", async () => {
     const oversizedPng = await sharp({
       create: {
