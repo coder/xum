@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shlex
+import tarfile
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -231,6 +232,9 @@ class MuxAgent(BaseInstalledAgent):
 
     _PROVIDERS_FILE_ENV_KEY = "MUX_PROVIDERS_FILE"
     _TOKEN_FILE_PATH = "/tmp/mux-tokens.json"
+    _SESSIONS_ARCHIVE_SANDBOX_PATH = "/tmp/mux-sessions.tar.gz"
+    _SESSIONS_ARCHIVE_NAME = "mux-sessions.tar.gz"
+    _SESSION_USAGE_SUMMARY_NAME = "mux-session-usage.json"
 
     async def _stage_providers_config(
         self, environment: BaseEnvironment, env: dict[str, str]
@@ -438,6 +442,8 @@ class MuxAgent(BaseInstalledAgent):
         except Exception:
             pass  # Token file may not exist if agent crashed early
 
+        await self._download_session_artifacts(environment)
+
         self.populate_context_post_run(context)
 
         if timeout_error is not None:
@@ -449,24 +455,153 @@ class MuxAgent(BaseInstalledAgent):
                 f"mux agent command failed (command {command_index}, exit {return_code})"
             )
 
+    async def _download_session_artifacts(self, environment: BaseEnvironment) -> None:
+        """Archive and download the mux sessions directory (chat.jsonl et al).
+
+        The stdout JSONL stream can lose its tail (including the run-complete
+        event that carries cost_usd) on remote backends, so the on-disk session
+        files — chat.jsonl and session-usage.json, persisted on every
+        stream-end — are the durable source for token/cost telemetry.
+        Best-effort: never fail the trial over telemetry collection.
+        """
+        config_root = (
+            self._env.get("MUX_CONFIG_ROOT") or "/root/.mux"
+        ).strip() or "/root/.mux"
+        archive_path = self.logs_dir / self._SESSIONS_ARCHIVE_NAME
+        archive_path.unlink(missing_ok=True)
+        try:
+            # Run as root like install(): the agent session writes under /root.
+            result = await environment.exec(
+                command=(
+                    f"tar -czf {self._SESSIONS_ARCHIVE_SANDBOX_PATH} "
+                    f"-C {shlex.quote(config_root)} sessions"
+                ),
+                user="root",
+                timeout_sec=120,
+            )
+            if result.return_code != 0:
+                return  # Sessions dir may not exist if the agent crashed early
+            await environment.download_file(
+                self._SESSIONS_ARCHIVE_SANDBOX_PATH, archive_path
+            )
+        except Exception:
+            archive_path.unlink(missing_ok=True)
+
+    def _summarize_session_usage(self) -> dict[str, Any] | None:
+        """Aggregate token/cost buckets from session-usage.json files in the archive.
+
+        Sums per-model ChatUsageDisplay buckets across session directories,
+        skipping child sessions that a parent already merged (rolledUpFrom
+        ledger) so delegated sub-agent usage is never double-counted.
+        """
+        archive_path = self.logs_dir / self._SESSIONS_ARCHIVE_NAME
+        if not archive_path.is_file():
+            return None
+
+        per_session: dict[str, dict[str, Any]] = {}
+        rolled_up_ids: set[str] = set()
+        try:
+            with tarfile.open(archive_path, "r:gz") as archive:
+                for member in archive.getmembers():
+                    parts = Path(member.name).parts
+                    if (
+                        len(parts) < 3
+                        or parts[-1] != "session-usage.json"
+                        or not member.isfile()
+                    ):
+                        continue
+                    extracted = archive.extractfile(member)
+                    if extracted is None:
+                        continue
+                    data = json.loads(extracted.read().decode("utf-8"))
+                    session_id = parts[-2]
+                    per_session[session_id] = data
+                    rolled_up_ids.update((data.get("rolledUpFrom") or {}).keys())
+        except Exception:
+            return None  # Corrupt/partial archive — telemetry stays best-effort
+
+        totals = {
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "cost_usd": None,
+            "sessions": 0,
+        }
+        bucket_to_key = {
+            "input": "input",
+            "output": "output",
+            "reasoning": "reasoning",
+            "cached": "cache_read",
+            "cacheCreate": "cache_write",
+        }
+        for session_id, data in per_session.items():
+            if session_id in rolled_up_ids:
+                continue  # Parent session-usage.json already includes this child
+            totals["sessions"] += 1
+            for usage in (data.get("byModel") or {}).values():
+                for bucket, key in bucket_to_key.items():
+                    component = usage.get(bucket) or {}
+                    totals[key] += component.get("tokens", 0) or 0
+                    cost = component.get("cost_usd")
+                    if cost is not None:
+                        totals["cost_usd"] = (totals["cost_usd"] or 0.0) + cost
+        if totals["sessions"] == 0:
+            return None
+        return totals
+
     def populate_context_post_run(self, context: AgentContext) -> None:
-        """Extract token usage and cost from the token file written by mux-run.sh."""
+        """Extract token usage and cost from the collected telemetry artifacts.
+
+        Prefers mux-tokens.json when it carries cost (the run-complete event was
+        observed); otherwise falls back to session-usage.json totals from the
+        downloaded sessions archive, which survive stdout truncation and agent
+        timeouts.
+        """
+        token_data: dict[str, Any] | None = None
         token_file = self.logs_dir / "mux-tokens.json"
         if token_file.exists():
             try:
-                data = json.loads(token_file.read_text())
-                # Harbor's context has no cache-token fields, and "input" is
-                # only the uncached portion. Fold cache read/write into the
-                # reported input total so cached legs are not understated;
-                # the per-bucket breakdown stays in mux-tokens.json.
-                context.n_input_tokens = (
-                    data.get("input", 0)
-                    + data.get("cache_read", 0)
-                    + data.get("cache_write", 0)
-                )
-                context.n_output_tokens = data.get("output", 0)
-                # cost_usd is computed by mux CLI from model pricing
-                if data.get("cost_usd") is not None:
-                    context.cost_usd = data["cost_usd"]
+                token_data = json.loads(token_file.read_text())
             except Exception:
-                pass  # Token/cost extraction is best-effort
+                token_data = None
+
+        session_totals = self._summarize_session_usage()
+        if session_totals is not None:
+            # Persist the aggregate next to mux-tokens.json for run analysis.
+            try:
+                (self.logs_dir / self._SESSION_USAGE_SUMMARY_NAME).write_text(
+                    json.dumps(session_totals, indent=1)
+                )
+            except Exception:
+                pass
+
+        data: dict[str, Any] | None
+        if token_data is not None and token_data.get("cost_usd") is not None:
+            data = token_data
+        elif session_totals is not None:
+            data = session_totals
+        else:
+            data = token_data
+        if data is None:
+            return
+
+        try:
+            # Harbor's context has no cache-token fields, and "input" is
+            # only the uncached portion. Fold cache read/write into the
+            # reported input total so cached legs are not understated;
+            # the per-bucket breakdown stays in the JSON artifacts.
+            context.n_input_tokens = (
+                data.get("input", 0)
+                + data.get("cache_read", 0)
+                + data.get("cache_write", 0)
+            )
+            # Keep run-complete semantics: "output" excludes reasoning tokens
+            # (the session summary reports reasoning as its own bucket).
+            context.n_output_tokens = data.get("output", 0)
+            # cost_usd is computed by mux from model pricing
+            if data.get("cost_usd") is not None:
+                context.cost_usd = data["cost_usd"]
+        except Exception:
+            pass  # Token/cost extraction is best-effort
