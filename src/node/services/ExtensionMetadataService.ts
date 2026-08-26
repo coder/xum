@@ -436,9 +436,16 @@ export class ExtensionMetadataService {
    * window where another process registers + writes a fresh entry that the
    * stale known-ids set misclassifies as prunable.
    *
-   * (A concurrent foreign-process write landing between our load and save can
-   * still be lost to this whole-file rewrite — that lost-update window is
-   * inherent to every existing writer of this file and unchanged here.)
+   * Cross-process writers (XUM_ALLOW_MULTIPLE_INSTANCES) are not serialized
+   * by the in-process queue, so this pass never rewrites its own working
+   * snapshot: it computes the stale-id set from the first load, then re-loads
+   * a FRESH snapshot and applies only those deletions before saving. A fresh
+   * entry another backend wrote between the two loads is preserved (its id
+   * was not in the first snapshot, so it is never classified stale), and
+   * since workspace ids are never reused, a stale id cannot have become live
+   * in between. The residual window (a foreign write landing during the
+   * final stringify+atomic-write) is the same lost-update window every
+   * existing writer of this file already has.
    *
    * Upgrade↔downgrade safety: surviving entries are round-tripped verbatim
    * (no coercion), so fields written by other builds are preserved and the
@@ -450,18 +457,28 @@ export class ExtensionMetadataService {
     return this.withSerializedMutation(async () => {
       const data = await this.load();
       const knownWorkspaceIds = await getKnownWorkspaceIds();
+      const staleWorkspaceIds = Object.keys(data.workspaces).filter(
+        (workspaceId) => !knownWorkspaceIds.has(workspaceId)
+      );
+      for (const workspaceId of staleWorkspaceIds) {
+        // Same guard as deleteWorkspace: a late in-process writer must not
+        // resurrect an entry this pass reclaims.
+        this.deletedWorkspaceIds.add(workspaceId);
+      }
+      if (staleWorkspaceIds.length === 0) {
+        return 0;
+      }
+      // Deletion-only merge against a fresh snapshot (see doc comment above).
+      const fresh = await this.load();
       let prunedCount = 0;
-      for (const workspaceId of Object.keys(data.workspaces)) {
-        if (!knownWorkspaceIds.has(workspaceId)) {
-          delete data.workspaces[workspaceId];
-          // Same guard as deleteWorkspace: a late writer must not resurrect
-          // an entry this pass just reclaimed.
-          this.deletedWorkspaceIds.add(workspaceId);
+      for (const workspaceId of staleWorkspaceIds) {
+        if (workspaceId in fresh.workspaces) {
+          delete fresh.workspaces[workspaceId];
           prunedCount++;
         }
       }
       if (prunedCount > 0) {
-        await this.save(data);
+        await this.save(fresh);
       }
       return prunedCount;
     });

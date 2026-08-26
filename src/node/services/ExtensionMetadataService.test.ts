@@ -479,6 +479,49 @@ describe("ExtensionMetadataService", () => {
     expect((await service.getAllSnapshots()).get("other-workspace")?.recency).toBe(300);
   });
 
+  test("pruneMissingWorkspaces preserves entries written by another process mid-prune", async () => {
+    // XUM_ALLOW_MULTIPLE_INSTANCES: a second backend can register a fresh
+    // workspace and complete its first metadata write between this pass's
+    // snapshot load and its pruned rewrite. The deletion-only merge against a
+    // fresh reload must preserve that entry instead of clobbering the file
+    // with the pre-write snapshot.
+    await service.updateRecency("known-workspace", 100);
+    await service.updateRecency("stale-workspace", 200);
+
+    const internals = service as unknown as ExtensionMetadataServiceInternals;
+    const originalLoad = internals.load.bind(service);
+    let foreignWriteInjected = false;
+    internals.load = async () => {
+      const data = await originalLoad();
+      if (!foreignWriteInjected) {
+        foreignWriteInjected = true;
+        // Simulate the foreign process's write landing after our snapshot.
+        const foreign = await originalLoad();
+        foreign.workspaces["foreign-new"] = {
+          recency: 300,
+          streaming: false,
+          lastModel: null,
+          lastThinkingLevel: null,
+          agentStatus: null,
+        };
+        await writeFile(filePath, JSON.stringify(foreign));
+      }
+      return data;
+    };
+    try {
+      expect(
+        await service.pruneMissingWorkspaces(() => Promise.resolve(new Set(["known-workspace"])))
+      ).toBe(1);
+    } finally {
+      internals.load = originalLoad;
+    }
+
+    const persisted = JSON.parse(await readFile(filePath, "utf-8")) as ExtensionMetadataFile;
+    expect(persisted.workspaces["foreign-new"]).toBeDefined();
+    expect(persisted.workspaces["known-workspace"]).toBeDefined();
+    expect(persisted.workspaces["stale-workspace"]).toBeUndefined();
+  });
+
   test("late writers cannot resurrect entries reclaimed by pruneMissingWorkspaces", async () => {
     await service.updateRecency("stale-workspace", 100);
     await service.pruneMissingWorkspaces(() => Promise.resolve(new Set<string>()));
