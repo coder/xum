@@ -261,6 +261,46 @@ describe("AgentSession.sendMessage budget gate", () => {
     session.dispose();
   });
 
+  test("rejected queued sends persist authoring metadata and pre-goal rows do not pause the goal", async () => {
+    // Queue race on the rejection path: a message the user typed before the
+    // goal existed can be rejected by the pricing gate when it dispatches
+    // after the goal-creating turn. The persisted row must carry authoring
+    // metadata (timestamp + enqueuedAtMs) so goal-safety reconciliation still
+    // classifies it as pre-goal after a restart, and the dispatch-time hook
+    // must leave the fresh goal active.
+    const workspaceId = "as-budget-gate-queued-pre-goal";
+    const { historyService, session, goalService, cleanup } =
+      await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+
+    const enqueuedAtMs = Date.now() - 1;
+    await setGoalOk(goalService, {
+      workspaceId,
+      objective: "Stay under budget",
+      budgetCents: 500,
+    });
+
+    const result = await session.sendMessage("Typed before the goal existed", UNPRICED_OPTIONS, {
+      enqueuedAtMs,
+    });
+    expect(result.success).toBe(false);
+
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success).toBe(true);
+    if (history.success) {
+      const userMessage = history.data.find((m) => m.role === "user");
+      expect(typeof userMessage?.metadata?.timestamp).toBe("number");
+      expect(userMessage?.metadata?.enqueuedAtMs).toBe(enqueuedAtMs);
+    }
+
+    // Dispatch-time guard: no pause. getGoal also re-runs chat-tail
+    // reconciliation against the persisted row, exercising the durable
+    // enqueuedAtMs path.
+    expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
+
+    session.dispose();
+  });
+
   test("empty manual rejected send does NOT pause an active goal", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM5_tUsx): an accidental blank submit must not
     // silently disable goal continuation. The pre-stream gate runs before the

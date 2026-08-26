@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { AgentIdSchema } from "./agentDefinition";
+import { AgentDefinitionScopeSchema, AgentIdSchema } from "./agentDefinition";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 import { AgentModeSchema } from "../../types/mode";
 import { ChatUsageDisplaySchema } from "./chatStats";
@@ -800,6 +800,49 @@ export const SendMessageOptionsSchema = z.object({
    * iterating on agent files - a broken agent in the worktree won't affect message sending.
    */
   disableWorkspaceAgents: z.boolean().optional(),
+  /**
+   * When truthy, a top-level send whose agentId cannot be resolved (or is hidden or
+   * disabled) at stream time fails loudly instead of silently falling back to exec.
+   * Workspace-turn launches with explicit agent overrides set this: pre-dispatch
+   * validation races init hooks and user edits, so stream-time resolution — which
+   * runs after initialization completes — is the last sound gate against running
+   * a different agent than the caller asked for. The object form additionally pins
+   * the validated definition's provenance: if the id resolves from a different
+   * scope than launch validation saw (e.g. a validated project shadow vanished and
+   * a global/built-in definition with the same id took over), the send fails
+   * instead of running a different prompt/tool policy. A single field (rather than
+   * a sibling flag) so every option-preservation path copies it verbatim.
+   */
+  strictAgentResolution: z
+    .union([
+      z.boolean(),
+      z.object({
+        expectedScope: AgentDefinitionScopeSchema,
+        /**
+         * Exact source identity from AgentDefinitionPackage.source ("built-in" or the
+         * discovery root). Scope alone collapses distinct candidates (project files
+         * and project plugins both report "project"), so this pins the definition
+         * itself when known.
+         */
+        expectedSource: z.string().optional(),
+        /**
+         * Provenance of the full resolved base chain (leaf first), pinned because
+         * stream-time inheritance resolution reloads every base independently — a
+         * vanished base shadow must not silently swap a different definition into
+         * the chain's prompt/tool policy.
+         */
+        expectedChain: z
+          .array(
+            z.object({
+              id: AgentIdSchema,
+              scope: AgentDefinitionScopeSchema,
+              source: z.string().optional(),
+            })
+          )
+          .optional(),
+      }),
+    ])
+    .optional(),
   /**
    * Desktop/app-only capability: expose set_goal so an agent can create a
    * continuation-backed goal for its current parent workspace. Headless callers

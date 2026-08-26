@@ -34,6 +34,7 @@ import {
   AgentSession,
   clearProviderConfigFixableAbandonMarkers,
   CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE,
+  inheritOpenWorkspaceTurnMetadata,
   type StreamErrorRecoveryOutcome,
 } from "@/node/services/agentSession";
 import type { HistoryService } from "@/node/services/historyService";
@@ -268,6 +269,7 @@ import type {
   WorkspaceGoalDefaultsOverrideSchema,
   WorkspaceHeartbeatSettingsSchema,
 } from "@/common/orpc/schemas";
+import { SendMessageOptionsSchema } from "@/common/orpc/schemas";
 import type {
   ArchiveLossyUntrackedFilesConfirmation,
   ArchivePreflightResult,
@@ -1822,6 +1824,29 @@ function extractUserPromptText(message: MuxMessage): string {
   return stripStagedAttachmentNotice(partsText).trim();
 }
 
+/**
+ * Canonical whitelist for options replayed from a persisted delegated-turn row
+ * (see getDelegatedTurnContinuationSendOptions). History metadata stores
+ * retrySendOptions as an untyped blob, so a malformed or tampered row must be
+ * rejected (parse failure) or stripped to exactly these fields — never spread
+ * verbatim into an internal send where extras like editMessageId would trigger
+ * the edit/truncation flow.
+ */
+const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick({
+  model: true,
+  agentId: true,
+  thinkingLevel: true,
+  reasoningMode: true,
+  toolPolicy: true,
+  additionalSystemInstructions: true,
+  maxOutputTokens: true,
+  providerOptions: true,
+  experiments: true,
+  disableWorkspaceAgents: true,
+  strictAgentResolution: true,
+  allowAgentSetGoal: true,
+});
+
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
 export class WorkspaceService extends EventEmitter {
   private readonly sessions = new Map<string, AgentSession>();
@@ -2094,6 +2119,38 @@ export class WorkspaceService extends EventEmitter {
   // after that user row and enter the send's request as a trailing foreign
   // assistant row (see acquireIdleTurnExclusion).
   private readonly preflightSendCounts = new Map<string, number>();
+  /**
+   * Codex P1 (PRRT_kwDOPxxmWM6cRi_J): sends the SESSION cannot observe yet —
+   * counted from service entry until the queue/session handoff, then released.
+   * Unlike preflightSendCounts (held for the whole service call for archive
+   * and refine interlocks), this feeds the session's follow-up idle probes:
+   * a follow-up redispatched from within the originating send's own turn
+   * (e.g. its on-send compaction completing) must not veto itself, and once
+   * handed off the session's own queue/turn-phase state governs visibility.
+   */
+  private readonly sessionInvisiblePreflightCounts = new Map<string, number>();
+
+  /** See sessionInvisiblePreflightCounts. Release is idempotent. */
+  private armSessionInvisiblePreflight(workspaceId: string): { release: () => void } & Disposable {
+    this.sessionInvisiblePreflightCounts.set(
+      workspaceId,
+      (this.sessionInvisiblePreflightCounts.get(workspaceId) ?? 0) + 1
+    );
+    let released = false;
+    const release = () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      const remaining = (this.sessionInvisiblePreflightCounts.get(workspaceId) ?? 1) - 1;
+      if (remaining <= 0) {
+        this.sessionInvisiblePreflightCounts.delete(workspaceId);
+      } else {
+        this.sessionInvisiblePreflightCounts.set(workspaceId, remaining);
+      }
+    };
+    return { release, [Symbol.dispose]: release };
+  }
   // In-flight renderer executeBash requests per workspace. Incremented in the same
   // synchronous block as executeBash's archivingWorkspaces check (mirroring
   // preflightSendCounts) so archive admission and bash execution always observe each other:
@@ -2614,7 +2671,11 @@ export class WorkspaceService extends EventEmitter {
       return;
     }
 
-    const sendOptions = await this.getWorkflowContinuationSendOptions(ownerWorkspaceId);
+    // An in-flight delegated workspace turn continues under its own send options
+    // (per-turn agent/model overrides are not in the workspace's persisted defaults).
+    const sendOptions =
+      (await this.getDelegatedTurnContinuationSendOptions(ownerWorkspaceId)) ??
+      (await this.getWorkflowContinuationSendOptions(ownerWorkspaceId));
     if (sendOptions == null) {
       log.debug("Bash monitor wake has no send options; leaving pending", { ownerWorkspaceId });
       return;
@@ -4218,6 +4279,15 @@ export class WorkspaceService extends EventEmitter {
       onPostCompactionStateChange: () => {
         this.schedulePostCompactionMetadataRefresh(workspaceId);
       },
+      // Codex P1 (PRRT_kwDOPxxmWM6cRJD-): expose service-level send
+      // preflights (manual sends counted but not yet queued or busy) to the
+      // session's follow-up idle probes so redispatched synthetic turns yield
+      // to them. Codex P1 (PRRT_kwDOPxxmWM6cRi_J): reads the session-invisible
+      // counter, not preflightSendCounts — the originating send's reservation
+      // is released at its queue/session handoff so a follow-up dispatched
+      // from within that turn does not veto itself.
+      hasExternalSendPreflight: () =>
+        (this.sessionInvisiblePreflightCounts.get(workspaceId) ?? 0) > 0,
     });
   }
 
@@ -10563,6 +10633,8 @@ export class WorkspaceService extends EventEmitter {
       goalContinuation?: boolean;
       /** Specific active-goal synthetic turn kind to persist on the user message. */
       goalKind?: GoalSyntheticMessageKind;
+      /** Goal identity persisted alongside goalKind so reconciliation can scope the row. */
+      goalId?: string;
       /** Force Copilot billing classification to "agent" for internal sends. */
       agentInitiated?: boolean;
       onAccepted?: () => Promise<void> | void;
@@ -10614,6 +10686,13 @@ export class WorkspaceService extends EventEmitter {
       agentId: options?.agentId,
       options,
     });
+    // Codex P2 (PRRT_kwDOPxxmWM6b-orA): capture authoring time at request
+    // entry, before the preflight awaits below (pricing gate, AI-settings
+    // persistence). Goal safety compares this against goal creation, so
+    // sampling later — at enqueue or dispatch — would misclassify a message
+    // the user authored before a goal became visible as an intervention
+    // against it, pausing the fresh goal.
+    const authoredAtMs = Date.now();
 
     let resumedInterruptedTask = false;
     let claimedAutoTitle = false;
@@ -10701,6 +10780,7 @@ export class WorkspaceService extends EventEmitter {
           }
         },
       };
+      using sessionInvisiblePreflight = this.armSessionInvisiblePreflight(workspaceId);
 
       // Guard: avoid creating sessions for workspaces that don't exist anymore.
       const workspaceConfig = this.config.findWorkspace(workspaceId);
@@ -10809,10 +10889,18 @@ export class WorkspaceService extends EventEmitter {
       );
       if (!pricingGate.success) {
         if (internal?.synthetic !== true) {
-          return session.sendMessage(message, normalizedOptions, {
+          // Codex P1 (PRRT_kwDOPxxmWM6cSCjs): unlike the accepted handoffs
+          // below, this rejected send never streams and cannot produce its own
+          // compaction follow-up, so the handoff release does not apply. Hold
+          // the reservation (released by `using` disposal after the await
+          // settles) so a completing goal-scoped follow-up cannot be admitted
+          // ahead of the user's intervention while the fallback persists the
+          // rejected row and applies goal safety.
+          return await session.sendMessage(message, normalizedOptions, {
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
             goalKind: internal?.goalKind,
+            goalId: internal?.goalId,
             cancelState: internal?.cancelState,
             cancelSignal: internal?.cancelSignal,
             onCanceled: internal?.onCanceled,
@@ -10821,6 +10909,10 @@ export class WorkspaceService extends EventEmitter {
             startStreamInBackground: internal?.startStreamInBackground,
             goalContinuation: internal?.goalContinuation,
             admissionEpochStale,
+            // The rejected manual send still persists the user row; carry the
+            // authoring time so goal safety and restart reconciliation can
+            // prove it predates any goal published during the pricing await.
+            enqueuedAtMs: authoredAtMs,
             admissionStale: internal?.admissionStale,
           });
         }
@@ -10831,6 +10923,43 @@ export class WorkspaceService extends EventEmitter {
       await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions, "send");
 
       const shouldQueue = !normalizedOptions?.editMessageId && session.isBusy();
+
+      // Codex P1 (PRRT_kwDOPxxmWM6cGSPP): a goal-continuation dispatch closure
+      // captured before a manual send entered preflight would otherwise win
+      // idle admission here — the session only reports busy late in
+      // AgentSession.sendMessage, so `isBusy()` alone cannot see the user's
+      // in-flight turn. `preflightSendCounts` includes THIS send (incremented
+      // synchronously at entry above), so any other in-preflight send makes
+      // the count exceed 1; refusing is safe because idle-only callers
+      // (continuations, heartbeats) treat this as a transient skip and retry.
+      if (
+        !shouldQueue &&
+        internal?.requireIdle &&
+        (this.preflightSendCounts.get(workspaceId) ?? 0) > 1
+      ) {
+        return Err({
+          type: "unknown",
+          raw: IDLE_ONLY_BUSY_SKIP_MESSAGE,
+        });
+      }
+
+      // Codex P1 (PRRT_kwDOPxxmWM6cJ6NI): the count check above is a one-shot
+      // snapshot — a manual send can enter preflight during the awaits between
+      // here and the session reporting busy (markInterruptedTaskRunning, the
+      // admission awaits inside AgentSession.sendMessage). Compose the
+      // caller's staleness probe with a live preflight re-check so
+      // AgentSession's admission gates (including the last gate before the
+      // pre-turn batch becomes irrevocable) re-validate idleness; refusal
+      // rolls back the synthetic row and idle-only callers retry.
+      if (internal?.requireIdle) {
+        const callerAdmissionStale = internal.admissionStale;
+        internal = {
+          ...internal,
+          admissionStale: () =>
+            callerAdmissionStale?.() === true ||
+            (this.preflightSendCounts.get(workspaceId) ?? 0) > 1,
+        };
+      }
 
       if (shouldQueue) {
         // Everything from here to queueMessage is synchronous, so a probe pass here cannot go
@@ -10907,12 +11036,14 @@ export class WorkspaceService extends EventEmitter {
         // we must not cancel foreground waits. Use the queue's effective dispatch mode
         // (not incoming options) because MessageQueue makes tool-end sticky.
         const continuationSendState = getContinuationSendState();
+        sessionInvisiblePreflight.release();
         const effectiveQueueDispatchMode = session.queueMessage(
           message,
           continuationSendState.options,
           {
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
+            authoredAtMs,
             workspaceTurnContinuation: internal?.workspaceTurnContinuation,
             dedupeKey: internal?.queueDedupeKey,
             removableDedupeKey: internal?.removableQueueDedupeKey,
@@ -11011,14 +11142,29 @@ export class WorkspaceService extends EventEmitter {
         claimedAutoTitle = true;
       }
 
+      // Handoff: the session releases the probe reservation the moment the
+      // turn synchronously claims PREPARING (onTurnAdmissionCommitted), so a
+      // follow-up redispatched from within this very turn (on-send compaction
+      // completion) does not veto itself — while the admission awaits between
+      // here and the busy claim stay covered. Codex P2 (PRRT_kwDOPxxmWM6cSRkH):
+      // releasing at the handoff itself left AgentSession's
+      // cancelBeforeAcceptance yield observable as idle, letting follow-up
+      // recovery admit an exec turn ahead of the accepted manual send. Refusal
+      // paths never fire the callback; the scoped disposal releases on return.
       const result = await session.sendMessage(message, continuationSendState.options, {
+        onTurnAdmissionCommitted: () => sessionInvisiblePreflight.release(),
         synthetic: internal?.synthetic,
         agentInitiated: internal?.agentInitiated,
         goalKind: internal?.goalKind,
+        goalId: internal?.goalId,
         goalContinuation: internal?.goalContinuation,
         startStreamInBackground: internal?.startStreamInBackground,
         cancelState: internal?.cancelState,
         cancelSignal: internal?.cancelSignal,
+        // Same authoring-time race as the queued path: the goal-creating
+        // stream can end during the preflight awaits above, making a fresh
+        // goal visible after the user hit enter but before this dispatch.
+        enqueuedAtMs: authoredAtMs,
         onCanceled: continuationSendState.onCanceled,
         onAccepted: internal?.onAccepted,
         onAcceptedPreStreamFailure,
@@ -11174,6 +11320,7 @@ export class WorkspaceService extends EventEmitter {
           }
         },
       };
+      using sessionInvisiblePreflight = this.armSessionInvisiblePreflight(workspaceId);
 
       // Guard: avoid creating sessions for workspaces that don't exist anymore.
       if (!this.config.findWorkspace(workspaceId)) {
@@ -11250,9 +11397,18 @@ export class WorkspaceService extends EventEmitter {
         });
       }
 
+      // Codex P1 (PRRT_kwDOPxxmWM6cSREO): resumeStream runs its own async
+      // admission (a second pricing gate) during which the session still
+      // reports idle — releasing the reservation before that await let
+      // follow-up recovery admit a recovered synthetic turn that then ran
+      // concurrently with the resumed stream. Hold the reservation until the
+      // session call settles: resumeStream returns once the stream has
+      // started (or refused), so no follow-up redispatched from within the
+      // resumed turn itself can observe the reservation and self-veto.
       const result = await session.resumeStream(normalizedOptions, {
         agentInitiated: internal?.agentInitiated,
       });
+      sessionInvisiblePreflight.release();
       if (!result.success) {
         log.error("resumeStream handler: session returned error", {
           workspaceId,
@@ -13394,7 +13550,17 @@ export class WorkspaceService extends EventEmitter {
       // Finished init states remain cached; only "running" should block continuations.
       isInitializing: initState?.status === "running",
       isRuntimeCompatible: true,
-      isBusy: session?.isBusy() === true,
+      // Codex P1 (PRRT_kwDOPxxmWM6cECpR): a direct send does not set PREPARING
+      // until late in AgentSession.sendMessage, so goal-continuation
+      // eligibility must also treat in-preflight sends as busy. Otherwise a
+      // kickoff candidate restored while a pre-goal manual send is mid-flight
+      // (row already durable, session still phase-idle) can be consumed and
+      // dispatched concurrently with — or ahead of — the user's turn.
+      // `preflightSendCounts` is incremented synchronously at sendMessage
+      // entry and held until the send settles; admitted sends have set
+      // PREPARING (busy) by the time it releases. Queue-dispatched sends set
+      // PREPARING synchronously before dispatch and are covered by isBusy().
+      isBusy: session?.isBusy() === true || (this.preflightSendCounts.get(workspaceId) ?? 0) > 0,
       hasQueuedMessages: session?.hasPendingManualFollowUp() === true,
       hasPendingFollowUp: false,
     };
@@ -13402,6 +13568,80 @@ export class WorkspaceService extends EventEmitter {
 
   getWorkflowContinuationSendOptions(workspaceId: string): Promise<SendMessageOptions | null> {
     return this.getGoalContinuationKickoffSendOptions(workspaceId);
+  }
+
+  /**
+   * Send options for continuing a STILL-OPEN delegated workspace turn (bash-monitor
+   * wakes cut turns at tool boundaries). The delegated prompt's persisted
+   * retrySendOptions carry the turn's own settings — including per-turn overrides
+   * (agentId, model, strictAgentResolution) that are deliberately NOT in the
+   * workspace's persisted defaults when the launch used skipAiSettingsPersistence —
+   * so resolving from workspace defaults would continue the turn under the wrong
+   * agent. Openness is decided by the same rule as workspace-turn correlation
+   * (inheritOpenWorkspaceTurnMetadata): only a correlated assistant cut with
+   * finishReason "tool-calls" leaves the turn open. Once a terminal assistant
+   * response closed the turn (or any other user send took over the conversation),
+   * a late monitor match is a NEW synthetic turn and resolves from the target's
+   * persisted defaults instead of resurrecting stale per-turn overrides.
+   *
+   * Carrier rows for the open turn's options, newest first: the correlated
+   * workspace-turn user row itself, and this mechanism's own wake continuations
+   * (their sends were dispatched with the delegated options and re-stamped them) —
+   * after an on-send compaction consumed a wake, the follow-up wake-typed row is
+   * the only carrier left inside the boundary while the summary still proves the
+   * turn is open. Persisted options are rebuilt through a canonical schema
+   * whitelist (history is untrusted at rest; a tampered row must not inject fields
+   * like editMessageId into an internal send). Continuations never persist these
+   * options as workspace defaults.
+   */
+  private async getDelegatedTurnContinuationSendOptions(
+    workspaceId: string
+  ): Promise<SendMessageOptions | null> {
+    // Tests construct WorkspaceService with partial HistoryService mocks (same
+    // defensive pattern as the iterateFullHistory caller above).
+    if (typeof this.historyService.getHistoryFromLatestBoundary !== "function") {
+      return null;
+    }
+    const history = await this.historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) {
+      return null;
+    }
+    const openTurn = inheritOpenWorkspaceTurnMetadata(history.data);
+    if (openTurn == null) {
+      return null;
+    }
+    for (let i = history.data.length - 1; i >= 0; i--) {
+      const message = history.data[i];
+      if (message.role !== "user") {
+        continue;
+      }
+      const muxMetadata = message.metadata?.muxMetadata;
+      const isOpenTurnRow =
+        muxMetadata?.type === "workspace-turn-task" &&
+        muxMetadata.taskHandleId === openTurn.taskHandleId &&
+        muxMetadata.turnId === openTurn.turnId;
+      const isWakeContinuationRow = muxMetadata?.type === "bash-monitor-wake";
+      if (!isOpenTurnRow && !isWakeContinuationRow) {
+        continue;
+      }
+      const parsed = DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA.safeParse(
+        message.metadata?.retrySendOptions
+      );
+      if (parsed.success) {
+        return {
+          ...parsed.data,
+          // Per-turn continuation settings must not become workspace defaults.
+          skipAiSettingsPersistence: true,
+        };
+      }
+      if (isOpenTurnRow) {
+        // The anchor row itself has no usable options; nothing older can be more
+        // authoritative for this turn.
+        return null;
+      }
+      // A wake row without valid options: keep walking toward the anchor row.
+    }
+    return null;
   }
 
   /**
@@ -13504,7 +13744,9 @@ export class WorkspaceService extends EventEmitter {
     message: string;
     startStreamInBackground?: boolean;
     kind?: GoalSyntheticMessageKind;
+    goalId?: string;
     options: SendMessageOptions;
+    admissionStale?: () => boolean;
   }): Promise<boolean> {
     assert(input.workspaceId.trim().length > 0, "executeGoalContinuation requires workspaceId");
     assert(input.message.trim().length > 0, "executeGoalContinuation requires message");
@@ -13530,7 +13772,11 @@ export class WorkspaceService extends EventEmitter {
           : undefined,
         requireIdle: true,
         goalKind,
+        goalId: input.goalId,
         goalContinuation: true,
+        // Composed with the requireIdle preflight probe (see the requireIdle
+        // admission section in sendMessage).
+        admissionStale: input.admissionStale,
       }
     );
 

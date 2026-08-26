@@ -321,6 +321,7 @@ export function buildTaskToolDescription(runtimeMode: RuntimeMode | undefined): 
     "\n\nIMPORTANT: Whether a sub-agent can see uncommitted changes depends on the runtime. " +
     `${getTaskRuntimeVisibilityGuidance(runtimeMode)} ` +
     "\n\nProvide agentId (preferred) or subagent_type, prompt, title, run_in_background, and optional n. For sub-agents, use title as a short, friendly reusable role name (for example, Reviewer or Simplicity Auditor), not a task summary. For kind=workspace, use a normal work-specific chat title. " +
+    'For kind=workspace, agentId optionally selects the agent mode for the launched turn (for example "plan"); it defaults to exec, and internal agents are not eligible. ' +
     "Use n only when you want several agents to try the same prompt independently. Omit it for a single task, and prefer non-interfering sub-agents for grouped runs (for example read-only agents like explore). " +
     `\n\nA terminal report makes the child inactive but leaves its workspace persistent. Keep each parent's direct standalone bench small and role-based: aim for at most ${SUBAGENT_REUSABLE_BENCH_TARGET} and keep it below ${SUBAGENT_REUSABLE_BENCH_EXCLUSIVE_LIMIT}; deliberate grouped n runs are temporary exceptions. Before spawning standalone work, prefer reawakening a known inactive child when its context or expertise fits, and retitle it if its reusable responsibility changes. At the target, add a role only for a genuinely distinct responsibility and prune an inactive overlapping or least-useful role before reaching the limit. Reawakening preserves the child's checkout, so for repository-dependent work, reuse it only when that snapshot is appropriate or instruct the child to verify and synchronize before acting; otherwise spawn a new child. Stop active work with task_stop; use irreversible task_remove for consumed grouped candidates, bench consolidation, explicit user requests, or clearly obsolete context—not routine end-of-turn cleanup. ` +
     "\n\nWhen the user explicitly asks for best-of-n work, the parent should begin with light preliminary analysis to extract shared context, constraints, or evaluation criteria that would otherwise be duplicated across children. " +
@@ -379,11 +380,13 @@ function refineTaskToolAgentArgs(
   const hasSubagentType = typeof args.subagent_type === "string" && args.subagent_type.length > 0;
 
   if (kind === "workspace") {
-    if (hasAgentId || hasSubagentType) {
+    // Workspace tasks accept agentId (agent mode for the launched turn, e.g. "plan") but keep
+    // rejecting the deprecated sub-agent alias subagent_type.
+    if (hasSubagentType) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "Workspace tasks do not accept agentId or subagent_type",
-        path: ["agentId"],
+        message: "Workspace tasks do not accept subagent_type",
+        path: ["subagent_type"],
       });
     }
     if (args.n != null) {

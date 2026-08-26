@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { getErrorMessage } from "./errors";
+import { clampErrorMessage, getErrorMessage } from "./errors";
 
 describe("getErrorMessage", () => {
   it("returns string representation of non-Error values", () => {
@@ -110,5 +110,29 @@ describe("getErrorMessage", () => {
     const err = new Error("self");
     err.cause = err;
     expect(getErrorMessage(err)).toBe("self");
+  });
+});
+
+describe("clampErrorMessage", () => {
+  it("returns short messages unchanged", () => {
+    expect(clampErrorMessage("boom", 100)).toBe("boom");
+  });
+
+  it("clamps oversized messages while keeping head and tail", () => {
+    const head = "Invalid prompt: schema mismatch. ";
+    const tail = " Error message: expected string, received undefined";
+    const message = head + "x".repeat(100_000) + tail;
+
+    const clamped = clampErrorMessage(message, 1_000);
+
+    expect(clamped.length).toBeLessThan(1_100);
+    expect(clamped.startsWith(head)).toBe(true);
+    expect(clamped.endsWith(tail)).toBe(true);
+    expect(clamped).toContain("chars omitted");
+  });
+
+  it("clamps at the default bound", () => {
+    const clamped = clampErrorMessage("y".repeat(500_000));
+    expect(clamped.length).toBeLessThan(10_000);
   });
 });

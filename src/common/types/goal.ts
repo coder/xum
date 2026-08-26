@@ -11,6 +11,25 @@ import type {
   GoalSnapshotSchema,
   GoalStatusSchema,
 } from "@/common/orpc/schemas/goal";
+import { GoalIdSchema } from "@/common/orpc/schemas/goal";
+
+/**
+ * Defensive validation for goal-scoping IDs read from unchecked persisted
+ * metadata (chat.jsonl rows, compaction summaries). Durable goal IDs are
+ * always UUIDs (see GoalIdSchema), so any non-UUID value is corrupt data —
+ * not another goal's identity (Codex P2 PRRT_kwDOPxxmWM6cNxUY,
+ * PRRT_kwDOPxxmWM6cRJEC).
+ *
+ * Callers treat a present-but-invalid ID by failure direction (Codex P2
+ * PRRT_kwDOPxxmWM6cOHpI): a pause BOUNDARY degrades to legacy unscoped
+ * semantics (conservative paused, never scoped), a CONTINUATION row is
+ * skipped outright (corrupt data must not manufacture activity evidence),
+ * and recovery paths discard the row's goal attribution entirely.
+ */
+export function toValidGoalId(value: unknown): string | null {
+  const parsed = GoalIdSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
 
 export type GoalStatus = z.infer<typeof GoalStatusSchema>;
 export type GoalRecordV1 = z.infer<typeof GoalRecordV1Schema>;

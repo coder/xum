@@ -3619,6 +3619,12 @@ export const router = (authToken?: string) => {
           }
           return Ok(undefined);
         }),
+      getRemovalBlockers: t
+        .input(schemas.projects.getRemovalBlockers.input)
+        .output(schemas.projects.getRemovalBlockers.output)
+        .handler(({ context, input }) => {
+          return context.projectService.getRemovalBlockers(input.projectPath);
+        }),
       secrets: {
         get: t
           .input(schemas.projects.secrets.get.input)
