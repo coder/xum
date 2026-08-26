@@ -485,9 +485,21 @@ async function main(): Promise<number> {
   // Create ephemeral temp dir for session data (auto-cleaned on exit)
   using tempDir = new DisposableTempDir("mux-run");
 
-  // Use real config for providers, but ephemeral temp dir for session data
+  // Session data root: the ephemeral temp dir by default. Benchmark/CI
+  // harnesses can pin it (XUM_RUN_SESSION_ROOT / MUX_RUN_SESSION_ROOT) to
+  // collect chat.jsonl and session-usage.json after the process exits; an
+  // override root is left in place on exit.
+  const sessionRootOverride = (
+    process.env.XUM_RUN_SESSION_ROOT ?? process.env.MUX_RUN_SESSION_ROOT
+  )?.trim();
+  if (sessionRootOverride) {
+    fsSync.mkdirSync(sessionRootOverride, { recursive: true });
+  }
+  const sessionRoot = sessionRootOverride || tempDir.path;
+
+  // Use real config for providers, but the run-scoped root for session data
   const realConfig = new Config();
-  const config = new Config(tempDir.path);
+  const config = new Config(sessionRoot);
 
   // Copy providers and secrets from real config to ephemeral config
   const existingProviders = realConfig.loadProvidersConfig();
@@ -1574,11 +1586,14 @@ main()
     if (process.stdout.writableNeedDrain) {
       const exit = () => process.exit(exitCode);
       process.stdout.once("drain", exit);
-      // Safety: if the downstream consumer closes (broken pipe) or backpressure
-      // never resolves, exit anyway after 1s to avoid hanging.
+      // Safety: if the downstream consumer closes (broken pipe), exit
+      // immediately. The backpressure timeout must be generous: the final
+      // --json stream-end + run-complete lines can be hundreds of KB, and a
+      // 1s cap was observed truncating them mid-line under pipe backpressure,
+      // silently losing cost telemetry in benchmark runs.
       process.stdout.once("error", exit);
       process.stdout.once("close", exit);
-      setTimeout(exit, 1000).unref();
+      setTimeout(exit, 30_000).unref();
     } else {
       process.exit(exitCode);
     }

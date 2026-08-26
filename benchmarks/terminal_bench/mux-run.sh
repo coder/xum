@@ -133,6 +133,12 @@ MUX_OUTPUT_FILE="${MUX_LOG_DIR}/stdout.txt"
 MUX_STDERR_FILE="${MUX_LOG_DIR}/stderr.txt"
 MUX_TOKEN_FILE="${MUX_TOKEN_FILE:-/tmp/mux-tokens.json}"
 
+# Pin the CLI's session data (chat.jsonl, session-usage.json) to a persistent
+# root instead of its ephemeral temp dir so the harness can archive it post-run.
+MUX_RUN_SESSION_ROOT="${MUX_RUN_SESSION_ROOT:-/tmp/mux-run-root}"
+export MUX_RUN_SESSION_ROOT
+mkdir -p "${MUX_RUN_SESSION_ROOT}"
+
 # Let Harbor classify task timeouts; GNU timeout would surface as exit 124.
 if [[ -n "${MUX_TIMEOUT_MS}" ]]; then
   if [[ ! "${MUX_TIMEOUT_MS}" =~ ^[0-9]+$ ]]; then
@@ -228,6 +234,12 @@ result["input"] += subagent_input
 result["output"] += subagent_output
 print(json.dumps(result))
 ' "${MUX_OUTPUT_FILE}" >"${MUX_TOKEN_FILE}" 2>/dev/null || true
+
+# Keep the full JSONL event stream and token summary with the archived session
+# data: the exec-channel stdout copy can lose its tail in remote transports.
+cp -f "${MUX_OUTPUT_FILE}" "${MUX_RUN_SESSION_ROOT}/run-stdout.jsonl" 2>/dev/null || true
+cp -f "${MUX_STDERR_FILE}" "${MUX_RUN_SESSION_ROOT}/run-stderr.log" 2>/dev/null || true
+cp -f "${MUX_TOKEN_FILE}" "${MUX_RUN_SESSION_ROOT}/mux-tokens.json" 2>/dev/null || true
 
 if [[ "${mux_status}" -eq 3 && "${mux_run_as_goal_enabled}" == "1" ]]; then
   printf '[mux-run] WARNING: mux goal run stopped incomplete (exit 3); leaving workspace for verifier scoring\n' >&2

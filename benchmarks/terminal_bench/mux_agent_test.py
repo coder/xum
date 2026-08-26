@@ -96,6 +96,7 @@ exit 99
             "MUX_APP_ROOT": str(app_root),
             "MUX_LOG_DIR": str(log_dir),
             "MUX_PROJECT_PATH": str(project_path),
+            "MUX_RUN_SESSION_ROOT": str(tmp_path / "session-root"),
             "MUX_TOKEN_FILE": str(token_file),
             "PATH": f"{fake_bin}{os.pathsep}{env.get('PATH', '')}",
         }
@@ -213,6 +214,11 @@ def test_mux_runner_scores_goal_mode_incomplete_exit(tmp_path: Path) -> None:
     }
     stdout_event = json.loads((result.log_dir / "stdout.txt").read_text())
     assert stdout_event["type"] == "run-complete"
+    # The full event stream and token summary are staged in the session root
+    # for the post-run archive, alongside the CLI-written session files.
+    session_root = result.log_dir.parents[2] / "session-root"
+    assert (session_root / "run-stdout.jsonl").is_file()
+    assert (session_root / "mux-tokens.json").is_file()
 
 
 def test_mux_runner_preserves_incomplete_exit_outside_goal_mode(tmp_path: Path) -> None:
@@ -521,9 +527,16 @@ def test_run_downloads_session_archive(
         if MuxAgent._SESSIONS_ARCHIVE_SANDBOX_PATH in c
     ]
     assert len(tar_commands) == 1
-    # Only the known telemetry files are archived, from the mux config root.
-    assert "cd /root/.mux" in tar_commands[0]
-    for expected in ("chat.jsonl", "chat-archive.jsonl", "session-usage.json"):
+    # Only the known telemetry files are archived, from the run session root.
+    assert "cd /tmp/mux-run-root" in tar_commands[0]
+    for expected in (
+        "chat.jsonl",
+        "chat-archive.jsonl",
+        "session-usage.json",
+        "run-stdout.jsonl",
+        "run-stderr.log",
+        "mux-tokens.json",
+    ):
         assert expected in tar_commands[0]
     assert (
         MuxAgent._SESSIONS_ARCHIVE_SANDBOX_PATH,

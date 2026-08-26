@@ -93,6 +93,7 @@ class MuxAgent(BaseInstalledAgent):
         # high --use-1m --budget 5.00). Avoids per-flag plumbing.
         "MUX_RUN_ARGS",
         "MUX_RUN_AS_GOAL",
+        "MUX_RUN_SESSION_ROOT",
     )
 
     def __init__(
@@ -148,6 +149,7 @@ class MuxAgent(BaseInstalledAgent):
         env.setdefault("MUX_APP_ROOT", "/opt/mux-app")
         env.setdefault("MUX_WORKSPACE_ID", "mux-bench")
         env.setdefault("MUX_PROJECT_CANDIDATES", self._DEFAULT_PROJECT_CANDIDATES)
+        env.setdefault("MUX_RUN_SESSION_ROOT", self._DEFAULT_RUN_SESSION_ROOT)
         if self._timeout_ms is not None:
             env["MUX_TIMEOUT_MS"] = self._timeout_ms
 
@@ -232,6 +234,7 @@ class MuxAgent(BaseInstalledAgent):
 
     _PROVIDERS_FILE_ENV_KEY = "MUX_PROVIDERS_FILE"
     _TOKEN_FILE_PATH = "/tmp/mux-tokens.json"
+    _DEFAULT_RUN_SESSION_ROOT = "/tmp/mux-run-root"
     _SESSIONS_ARCHIVE_SANDBOX_PATH = "/tmp/mux-sessions.tar.gz"
     _SESSIONS_ARCHIVE_NAME = "mux-sessions.tar.gz"
     _SESSION_USAGE_SUMMARY_NAME = "mux-session-usage.json"
@@ -470,21 +473,33 @@ class MuxAgent(BaseInstalledAgent):
         stream-end — are the durable source for token/cost telemetry.
         Best-effort: never fail the trial over telemetry collection.
         """
-        config_root = (
-            self._env.get("MUX_CONFIG_ROOT") or "/root/.mux"
-        ).strip() or "/root/.mux"
+        session_root = (
+            self._env.get("MUX_RUN_SESSION_ROOT") or self._DEFAULT_RUN_SESSION_ROOT
+        ).strip() or self._DEFAULT_RUN_SESSION_ROOT
         archive_path = self.logs_dir / self._SESSIONS_ARCHIVE_NAME
         archive_path.unlink(missing_ok=True)
         # Archive only the known telemetry files (not arbitrary session content a
         # task could plant) and report the archive size for the download bound.
         script = (
             "set -o pipefail\n"
-            f"cd {shlex.quote(config_root)} || exit 1\n"
-            "find sessions -type f \\( -name chat.jsonl -o -name chat-archive.jsonl "
-            "-o -name session-usage.json \\) -print0 "
+            f"cd {shlex.quote(session_root)} || exit 1\n"
+            "find . -type f \\( -name chat.jsonl -o -name chat-archive.jsonl "
+            "-o -name session-usage.json -o -name run-stdout.jsonl "
+            "-o -name run-stderr.log -o -name mux-tokens.json \\) -print0 "
             f"| tar --null -czf {self._SESSIONS_ARCHIVE_SANDBOX_PATH} -T - || exit 1\n"
             f"stat -c %s {self._SESSIONS_ARCHIVE_SANDBOX_PATH}\n"
         )
+        # Telemetry collection is best-effort, but silent failures cost a full
+        # benchmark run to notice: record every outcome to a diagnostic log.
+        diag_path = self.logs_dir / "mux-sessions-collect.log"
+
+        def _diag(message: str) -> None:
+            try:
+                with diag_path.open("a") as diag:
+                    diag.write(message.rstrip() + "\n")
+            except Exception:
+                pass
+
         try:
             # Run as root like install(): the agent session writes under /root.
             result = await environment.exec(
@@ -492,18 +507,27 @@ class MuxAgent(BaseInstalledAgent):
                 user="root",
                 timeout_sec=120,
             )
+            _diag(
+                f"archive exec rc={result.return_code} "
+                f"stdout={(result.stdout or '')[-500:]!r} "
+                f"stderr={(result.stderr or '')[-500:]!r}"
+            )
             if result.return_code != 0:
                 return  # Sessions dir may not exist if the agent crashed early
             try:
                 archive_bytes = int((result.stdout or "").strip().splitlines()[-1])
             except (ValueError, IndexError):
+                _diag("archive size parse failed")
                 return
             if archive_bytes > self._SESSIONS_ARCHIVE_MAX_BYTES:
+                _diag(f"archive too large: {archive_bytes} bytes")
                 return
             await environment.download_file(
                 self._SESSIONS_ARCHIVE_SANDBOX_PATH, archive_path
             )
-        except Exception:
+            _diag(f"downloaded {archive_bytes} bytes")
+        except Exception as exc:
+            _diag(f"collection failed: {type(exc).__name__}: {exc}")
             archive_path.unlink(missing_ok=True)
 
     def _summarize_session_usage(self) -> dict[str, Any] | None:
