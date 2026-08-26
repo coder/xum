@@ -297,6 +297,7 @@ import {
   BashMonitorWakeStore,
   buildBashMonitorWakeMetadata,
   buildBashMonitorWakePrompt,
+  type BashMonitorWakePromptContext,
   type BashMonitorWakeRecord,
 } from "@/node/services/bashMonitorWakeStore";
 import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycleHooks";
@@ -737,6 +738,10 @@ const BASH_MONITOR_CANCELED_QUEUE_REASON =
   "Background bash monitor was explicitly canceled before its wake dispatched.";
 const BASH_MONITOR_SHOWN_QUEUE_REASON =
   "Background bash monitor output was already shown before its wake dispatched.";
+// Re-arm retraction rebuilds rather than consumes: the store row was rewritten (stale terminal
+// cleared), so the queued prompt is stale but the wake itself must redeliver from the row.
+const BASH_MONITOR_REARMED_QUEUE_REASON =
+  "Background bash monitor was re-armed before its queued settlement wake dispatched.";
 
 interface QueuedBashMonitorWakeCancellation {
   abortController: AbortController;
@@ -1987,6 +1992,20 @@ export class WorkspaceService extends EventEmitter {
               payload.workspaceId,
               payload.processId
             );
+            // A wake already QUEUED behind an active owner stream embeds the pre-re-arm prompt
+            // (settled claim + terminal metadata). Retract it so the drain rebuilds from the
+            // rewritten row; only settled-claiming wakes are stale — a live process cannot have
+            // settled, so any queued terminal for this ID belongs to a dead prior generation.
+            const processKey = this.bashMonitorProcessKey(payload.workspaceId, payload.processId);
+            for (const [queueKey, cancellation] of this.queuedBashMonitorWakeKeysByProcess.get(
+              processKey
+            ) ?? []) {
+              if (!cancellation.matchedOutputByProcess.get(processKey)?.hasTerminal) continue;
+              cancellation.abortController.abort(BASH_MONITOR_REARMED_QUEUE_REASON);
+              this.removeQueuedMessagesByDedupeKeyPrefix(payload.workspaceId, queueKey, {
+                cancelReason: BASH_MONITOR_REARMED_QUEUE_REASON,
+              });
+            }
           }
         )
       )
@@ -2762,6 +2781,7 @@ export class WorkspaceService extends EventEmitter {
       const canQueryShownFrontier =
         typeof this.backgroundProcessManager.getSettledShownThroughOffset === "function";
       const supersededByShown: BashMonitorWakeRecord[] = [];
+      const promptContext = new Map<string, BashMonitorWakePromptContext>();
       for (const record of pending) {
         // A match record carries up to two independent signals, each with its own shown-condition:
         // matched output (matchedThroughOffset; shown when the offset frontier covers it) and
@@ -2793,6 +2813,18 @@ export class WorkspaceService extends EventEmitter {
                 supersededByShown.push(record);
                 continue;
               }
+              // Deliverable for its settlement signal only: the matched lines were already
+              // returned by an owner read, so the prompt flags them as consumed instead of
+              // presenting them as a fresh match condition.
+              if (record.terminal != null && record.matchedThroughOffset != null && matchedShown) {
+                promptContext.set(record.id, { matchedOutputAlreadyShown: true });
+              }
+            }
+            // A null state means the originating process instance is no longer registered
+            // (Xum restarted after the settlement persisted, or the ID was reclaimed by a newer
+            // generation): task_await on this record's task ID cannot return its report.
+            if (state == null && record.terminal != null) {
+              promptContext.set(record.id, { taskAwaitable: false });
             }
           } else if (canQueryShownFrontier && record.matchedThroughOffset != null) {
             // Legacy fallback without the non-blocking query: offset-only suppression, applied
@@ -2860,7 +2892,7 @@ export class WorkspaceService extends EventEmitter {
         return;
       }
 
-      prompt = buildBashMonitorWakePrompt(deliverable);
+      prompt = buildBashMonitorWakePrompt(deliverable, promptContext);
     } catch (error) {
       unregisterQueueKey();
       throw error;
@@ -2952,6 +2984,12 @@ export class WorkspaceService extends EventEmitter {
           cancellationCallbackHandled = true;
           unregisterQueueKey();
           if (delivered) return;
+          if (reason === BASH_MONITOR_REARMED_QUEUE_REASON) {
+            // Retraction-for-rebuild, not consumption: every record stays pending (the re-arm
+            // already rewrote the settled row) and the next drain re-delivers with fresh prompts.
+            this.scheduleBashMonitorWakeDrain(ownerWorkspaceId);
+            return;
+          }
           const wakeInvalidated =
             reason === BASH_MONITOR_CANCELED_QUEUE_REASON ||
             reason === BASH_MONITOR_SHOWN_QUEUE_REASON;

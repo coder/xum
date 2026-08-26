@@ -2306,6 +2306,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       });
 
       // Settle before dispose: the settlement helper still reads output.log through the handle.
+      // The "killed" disposition mirrors proc.status, which terminate() force-sets on the same
+      // best-effort semantics task_await/bash_output have always reported (runtime handles
+      // swallow transport/kill failures). The wake's own claims stay accurate either way: the
+      // monitor IS stopped (no further wakes) and Xum's bookkeeping considers the task killed.
+      // Verifying that a remote kill actually landed belongs to the RuntimeBackgroundHandle
+      // layer, where any improvement flows into every status surface at once.
       if (reservation) {
         await this.emitClaimedMonitorSettlement(reservation, {
           status: "killed",

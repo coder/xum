@@ -533,6 +533,25 @@ describe("BashMonitorWakeStore", () => {
     expect(await store.listPending("owner-1")).toHaveLength(0);
   });
 
+  test("a snapshot whose terminal was cleared by re-arm still transitions cleanly", async () => {
+    // Race: a queued settlement wake is accepted just as the same processId is re-armed. The
+    // cleared terminal is not undelivered content, so the accepted snapshot must fully
+    // transition instead of stranding an empty pending remainder that later delivers blank.
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(
+      payload({
+        lines: ["[monitor] process settled: exited (code 1)"],
+        matchedThroughOffset: undefined,
+        terminal: { status: "exited", exitCode: 1 },
+      })
+    );
+    const [snapshot] = await store.listPending("owner-1");
+    await store.clearStaleTerminalOnRearm("owner-1", "proc-1");
+
+    await store.markDeliveredSnapshot("owner-1", snapshot);
+    expect(await store.listPending("owner-1")).toHaveLength(0);
+  });
+
   test("a malformed persisted terminal degrades to no metadata instead of dropping the wake", async () => {
     const config = makeConfig(rootDir);
     const store = new BashMonitorWakeStore(config);

@@ -1020,6 +1020,149 @@ describe("WorkspaceService bash monitor wakes", () => {
       expect(prompt).toContain("A background bash monitor matched output.");
       expect(prompt).toContain("Status: exited (code 2)");
       expect(prompt).toContain("ERR boom");
+      // The matched lines were already covered by the shown frontier, so the prompt must flag
+      // them as consumed instead of presenting a fresh match condition.
+      expect(prompt).toContain("already returned to you by an earlier read");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("re-arming a processId retracts a queued settlement wake and redelivers it rebuilt", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-rearm-queued";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => true) }),
+      });
+      spyOn(workspaceService, "isBusyForMessage").mockReturnValue(true);
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(false);
+      type SendInternal = NonNullable<Parameters<WorkspaceService["sendMessage"]>[3]>;
+      const sends: Array<{ prompt: string; internal: SendInternal | undefined }> = [];
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          sends.push({ prompt: args[1], internal: args[3] });
+          return Promise.resolve(Ok(undefined));
+        }
+      );
+      const removeQueuedSpy = spyOn(
+        workspaceService,
+        "removeQueuedMessagesByDedupeKeyPrefix"
+      ).mockImplementation((_ownerWorkspaceId, _prefix, options) => {
+        // Mirror session behavior: removal invokes the queued turn's cancellation callback.
+        void sends[0]?.internal?.onCanceled?.(options?.cancelReason ?? "canceled");
+        return Ok(1);
+      });
+
+      // A settlement wake queues behind the busy owner stream.
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-rearm",
+        taskId: "bash:proc-rearm",
+        workspaceId,
+        filter: "READY",
+        filterExclude: false,
+        lines: ["[monitor] process settled: exited (code 1)"],
+        totalMatches: 0,
+        timestamp: Date.now(),
+        terminal: { status: "exited", exitCode: 1 },
+      });
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      expect(sends[0].prompt).toContain("Status: exited (code 1)");
+
+      // The same display-name-derived ID is re-armed by a live process: the queued turn's
+      // settled claim is now stale and must be retracted, NOT consumed — the record stays
+      // pending and redelivers rebuilt from the rewritten row (terminal cleared).
+      backgroundProcessManager.emit("monitor:armed", workspaceId, {
+        processId: "proc-rearm",
+        taskId: "bash:proc-rearm",
+        workspaceId,
+        filter: "READY",
+        filterExclude: false,
+        script: "watch.sh",
+        createdAt: new Date().toISOString(),
+      });
+
+      await waitForCondition(() => removeQueuedSpy.mock.calls.length === 1);
+      await waitForCondition(() => sendSpy.mock.calls.length === 2);
+      const rebuilt = sends[1].prompt;
+      expect(rebuilt).toContain("[monitor] process settled: exited (code 1)");
+      expect(rebuilt).not.toContain("Status: exited");
+      const wakeStore = (
+        workspaceService as unknown as { bashMonitorWakeStore: BashMonitorWakeStore }
+      ).bashMonitorWakeStore;
+      const pending = await wakeStore.listPending(workspaceId);
+      expect(pending).toHaveLength(1);
+      expect(pending[0].terminal).toBeUndefined();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("marks a recovered settlement wake as not awaitable when its process is gone", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-exit-unawaitable";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const seedWakeStore = new BashMonitorWakeStore(config);
+      await seedWakeStore.enqueueOrMergePending({
+        processId: "proc-gone",
+        taskId: "bash:proc-gone",
+        workspaceId,
+        filter: "READY",
+        filterExclude: false,
+        lines: ["[monitor] process settled: exited (code 0)"],
+        totalMatches: 0,
+        timestamp: Date.now(),
+        terminal: { status: "exited", exitCode: 0 },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+        // The originating instance is no longer registered (Xum restarted after settlement).
+        getMonitorWakeDeliveryState: mock(() => Promise.resolve(undefined)),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        async (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          await args[3]?.onAccepted?.();
+          return Ok(undefined);
+        }
+      );
+
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      const prompt = sendSpy.mock.calls[0][1];
+      // Never direct the agent at a task_await that would return not_found.
+      expect(prompt).toContain("no longer awaitable — Xum restarted since it settled");
+      expect(prompt).not.toContain("task_await({");
+      expect(prompt).toContain("no retrievable report beyond the output above");
     } finally {
       await cleanup();
     }
