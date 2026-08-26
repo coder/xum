@@ -86,7 +86,7 @@ import {
   type ExperimentId,
 } from "../common/constants/experiments";
 import { getErrorMessage } from "@/common/utils/errors";
-import { prepareRunSessionRootOverride, writePrivateRunConfigFile } from "./runSessionRoot";
+import { prepareRunSessionRootOverride, replacePrivateRunConfigFile } from "./runSessionRoot";
 import { describeCliGoalStop, driveCliGoalUntilTerminal } from "./goalRunDriver";
 import {
   parseGoalBudgetInputCents,
@@ -513,18 +513,21 @@ async function main(): Promise<number> {
 
   // Copy providers and secrets from real config to ephemeral config
   const existingProviders = realConfig.loadProvidersConfig();
-  if (hasAnyConfiguredProvider(existingProviders)) {
-    // Write providers to temp config so services can find them
-    const providersFile = path.join(config.rootDir, "providers.jsonc");
-    await writePrivateRunConfigFile(providersFile, JSON.stringify(existingProviders, null, 2));
-  }
+  const providersFile = path.join(config.rootDir, "providers.jsonc");
+  await replacePrivateRunConfigFile(
+    providersFile,
+    hasAnyConfiguredProvider(existingProviders)
+      ? JSON.stringify(existingProviders, null, 2)
+      : undefined
+  );
 
   // Copy secrets so tools/MCP servers get project secrets (e.g., GH_TOKEN)
   const existingSecrets = realConfig.loadSecretsConfig();
-  if (Object.keys(existingSecrets).length > 0) {
-    const secretsFile = path.join(config.rootDir, "secrets.json");
-    await writePrivateRunConfigFile(secretsFile, JSON.stringify(existingSecrets, null, 2));
-  }
+  const secretsFile = path.join(config.rootDir, "secrets.json");
+  await replacePrivateRunConfigFile(
+    secretsFile,
+    Object.keys(existingSecrets).length > 0 ? JSON.stringify(existingSecrets, null, 2) : undefined
+  );
 
   // Copy only project trust metadata so AIService can read trust flags.
   // Avoid importing workspace/task metadata into ephemeral CLI config because

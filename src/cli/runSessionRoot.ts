@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
+import { isErrnoWithCode } from "@/node/utils/fs";
 
 type RunSessionRootEnv = Readonly<Record<string, string | undefined>>;
 
@@ -64,6 +65,45 @@ export async function prepareRunSessionRootOverride(
   return envSessionRoot;
 }
 
-export async function writePrivateRunConfigFile(filePath: string, contents: string): Promise<void> {
-  await fs.writeFile(filePath, contents, { mode: 0o600 });
+export async function replacePrivateRunConfigFile(
+  filePath: string,
+  contents: string | undefined
+): Promise<void> {
+  const existing = await fs.lstat(filePath).catch((error: unknown) => {
+    if (isErrnoWithCode(error, "ENOENT")) {
+      return undefined;
+    }
+    throw error;
+  });
+  if (existing?.isSymbolicLink()) {
+    throw new Error(`Run config file must not be a symbolic link: ${filePath}`);
+  }
+  if (existing !== undefined) {
+    if (!existing.isFile()) {
+      throw new Error(`Run config path must be a regular file: ${filePath}`);
+    }
+    // Recreate instead of truncating so hard links are severed. O_EXCL below makes a raced
+    // replacement fail closed instead of following it.
+    await fs.unlink(filePath);
+  }
+
+  if (contents === undefined) {
+    return;
+  }
+
+  const handle = await fs.open(
+    filePath,
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0),
+    0o600
+  );
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile()) {
+      throw new Error(`Run config path must be a regular file: ${filePath}`);
+    }
+    await handle.chmod(0o600);
+    await handle.writeFile(contents, "utf8");
+  } finally {
+    await handle.close();
+  }
 }

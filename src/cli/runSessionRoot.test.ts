@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { prepareRunSessionRootOverride, writePrivateRunConfigFile } from "./runSessionRoot";
+import { prepareRunSessionRootOverride, replacePrivateRunConfigFile } from "./runSessionRoot";
 
 describe("prepareRunSessionRootOverride", () => {
   let tempDir: string;
@@ -27,12 +27,50 @@ describe("prepareRunSessionRootOverride", () => {
         await prepareRunSessionRootOverride({ XUM_RUN_SESSION_ROOT: overrideRoot }, realConfigRoot)
       ).toBe(overrideRoot);
       const providersFile = path.join(overrideRoot, "providers.jsonc");
-      await writePrivateRunConfigFile(providersFile, "{}");
+      await replacePrivateRunConfigFile(providersFile, "{}");
 
       expect((await fs.stat(overrideRoot)).mode & 0o777).toBe(0o700);
       expect((await fs.stat(providersFile)).mode & 0o777).toBe(0o600);
     } finally {
       process.umask(previousUmask);
+    }
+  });
+
+  test("rejects symlinked credential files without overwriting their targets", async () => {
+    const runRoot = path.join(tempDir, "run-session");
+    const targetFile = path.join(tempDir, "dataset-readable.json");
+    const providersFile = path.join(runRoot, "providers.jsonc");
+    await fs.mkdir(runRoot);
+    await fs.writeFile(targetFile, "dataset content");
+    await fs.symlink(targetFile, providersFile);
+
+    let error: unknown;
+    try {
+      await replacePrivateRunConfigFile(providersFile, "copied credentials");
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect(await fs.readFile(targetFile, "utf8")).toBe("dataset content");
+    expect((await fs.lstat(providersFile)).isSymbolicLink()).toBe(true);
+  });
+
+  test("removes stale credential files when the real configuration is empty", async () => {
+    const runRoot = path.join(tempDir, "run-session");
+    await fs.mkdir(runRoot);
+
+    for (const fileName of ["providers.jsonc", "secrets.json"]) {
+      const credentialFile = path.join(runRoot, fileName);
+      await fs.writeFile(credentialFile, "stale credentials");
+
+      await replacePrivateRunConfigFile(credentialFile, undefined);
+
+      const exists = await fs
+        .access(credentialFile)
+        .then(() => true)
+        .catch(() => false);
+      expect(exists).toBe(false);
     }
   });
 
