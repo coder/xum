@@ -153,6 +153,7 @@ describe("WorkspaceModeAISync", () => {
         subagentRunnable: false,
         base: "exec",
         aiDefaults: { model: definitionModel, thinkingLevel: "high" },
+        ownAiDefaults: { model: definitionModel, thinkingLevel: "high" },
       },
     ];
 
@@ -173,6 +174,58 @@ describe("WorkspaceModeAISync", () => {
       expect(readPersistedState(getThinkingLevelKey(workspaceId), "off")).toBe("high");
     });
     expect(consumeWorkspaceModelChange(workspaceId, definitionModel)).toBe("agent");
+  });
+
+  test("configured base defaults outrank inherited definition defaults", async () => {
+    const workspaceId = nextWorkspaceId();
+    const existingModel = "anthropic:claude-sonnet-4-5";
+    const agents: AgentDefinitionDescriptor[] = [
+      {
+        id: "plan",
+        scope: "built-in",
+        name: "Plan",
+        uiSelectable: true,
+        subagentRunnable: false,
+      },
+      {
+        id: "exec",
+        scope: "built-in",
+        name: "Exec",
+        uiSelectable: true,
+        subagentRunnable: false,
+        aiDefaults: { thinkingLevel: "low" },
+        ownAiDefaults: { thinkingLevel: "low" },
+      },
+      {
+        id: "researcher",
+        scope: "project",
+        name: "Researcher",
+        uiSelectable: true,
+        subagentRunnable: false,
+        base: "exec",
+        // Effective UI defaults include exec's inherited definition value, but
+        // the child has no definition default of its own.
+        aiDefaults: { thinkingLevel: "low" },
+      },
+    ];
+
+    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+      exec: { thinkingLevel: "high" },
+    });
+    updatePersistedState(getModelKey(workspaceId), existingModel);
+    updatePersistedState(getThinkingLevelKey(workspaceId), "off");
+
+    const { rerender } = renderSync({ workspaceId, agentId: "plan", agents });
+    await waitFor(() => {
+      expect(readPersistedState(getThinkingLevelKey(workspaceId), "off")).toBe("off");
+    });
+
+    rerender(<SyncHarness workspaceId={workspaceId} agentId="researcher" agents={agents} />);
+
+    await waitFor(() => {
+      expect(readPersistedState(getModelKey(workspaceId), "")).toBe(existingModel);
+      expect(readPersistedState(getThinkingLevelKey(workspaceId), "off")).toBe("high");
+    });
   });
 
   test("ignores workspace-by-agent values when settings are inherit", async () => {

@@ -1850,7 +1850,7 @@ export const router = (authToken?: string) => {
               return [];
             }
             if (entry.kind === "fallback") {
-              return [entry.descriptor];
+              return [{ ...entry.descriptor, ownAiDefaults: entry.descriptor.aiDefaults }];
             }
 
             return [
@@ -1863,6 +1863,7 @@ export const router = (authToken?: string) => {
                 subagentRunnable: entry.resolvedFrontmatter.subagent?.runnable ?? false,
                 base: entry.resolvedFrontmatter.base,
                 aiDefaults: entry.resolvedFrontmatter.ai,
+                ownAiDefaults: entry.descriptor.aiDefaults,
                 tools: entry.resolvedFrontmatter.tools,
               },
             ];

@@ -518,6 +518,7 @@ describe("AgentContext", () => {
       subagentRunnable: false,
       base: "exec",
       aiDefaults: { model: "openai:gpt-5.6-sol", thinkingLevel: "high" },
+      ownAiDefaults: { model: "openai:gpt-5.6-sol", thinkingLevel: "high" },
     };
     mockAgentDefinitions = [EXEC_AGENT, researcherAgent];
     mockWorkspaceMetadata.set(workspaceId, {});

@@ -214,7 +214,7 @@ function AgentProviderWithState(props: {
           agentDescriptorById: new Map(
             agents.map((agent) => [
               agent.id,
-              { base: agent.base, definitionAiDefaults: agent.aiDefaults },
+              { base: agent.base, definitionAiDefaults: agent.ownAiDefaults },
             ])
           ),
         });
