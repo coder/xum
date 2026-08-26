@@ -30,11 +30,20 @@ export type BashMonitorWakeStatus = (typeof BASH_MONITOR_WAKE_STATUSES)[number];
 const BASH_MONITOR_WAKE_KINDS = ["match", "monitor-lost"] as const;
 export type BashMonitorWakeKind = (typeof BASH_MONITOR_WAKE_KINDS)[number];
 
-/** Process settlement metadata carried on wake payloads/records; see BashMonitorWakeRecord. */
+/**
+ * Process settlement metadata carried on wake payloads/records; see BashMonitorWakeRecord.
+ * "unknown" is never emitted by the process manager: it is produced only by read-time
+ * sanitization when persisted settlement metadata is malformed — the settlement identity must
+ * survive (a settled record re-rendered as a live match would invite task_await on a dead or
+ * unrelated task ID) even when the exit details are unrecoverable.
+ */
 export interface BashMonitorWakeTerminal {
-  status: "exited" | "killed" | "failed";
+  status: "exited" | "killed" | "failed" | "unknown";
   exitCode?: number;
 }
+
+/** Read-time degrade for malformed persisted settlement metadata (see BashMonitorWakeTerminal). */
+const DEGRADED_TERMINAL: BashMonitorWakeTerminal = { status: "unknown" };
 
 export interface BashMonitorWakePayload {
   processId: string;
@@ -170,25 +179,28 @@ const BashMonitorWakeRecordSchema = z
     totalMatches: z.number().int().nonnegative(),
     droppedLines: z.number().int().nonnegative(),
     matchedThroughOffset: z.number().int().nonnegative().optional(),
-    // `.catch(undefined)`: a malformed terminal value (truncated edit, future shape change) must
-    // degrade to "no terminal metadata" instead of failing the whole record and silently dropping
-    // a durable wake forever (self-healing rule). The synthetic settlement line already stored in
-    // `lines` keeps the delivered wake actionable without it.
+    // Malformed settlement metadata (truncated edit, future shape change) must degrade instead
+    // of failing the whole record and silently dropping a durable wake forever (self-healing
+    // rule) — but it must degrade to an "unknown" SETTLEMENT, not to "no metadata": erasing the
+    // only structured settlement indication would re-classify the record as a live match whose
+    // prompt recommends task_await on a task ID that no longer exists (or now targets an
+    // unrelated re-armed process). A malformed exitCode alone degrades per-field, keeping the
+    // valid status. Absent/null stays "no settlement".
     terminal: z
       .object({
-        status: z.enum(["exited", "killed", "failed"]),
-        exitCode: z.number().int().optional(),
+        status: z.enum(["exited", "killed", "failed", "unknown"]),
+        exitCode: z.number().int().optional().catch(undefined),
       })
       .optional()
-      .catch(undefined),
-    // Same self-healing rule as `terminal`: degraded records keep the relabeled settle line.
+      .catch((ctx) => (ctx.input == null ? undefined : DEGRADED_TERMINAL)),
+    // Same degrade rule as `terminal`: a malformed stale disposition must stay a settlement.
     staleTerminal: z
       .object({
-        status: z.enum(["exited", "killed", "failed"]),
-        exitCode: z.number().int().optional(),
+        status: z.enum(["exited", "killed", "failed", "unknown"]),
+        exitCode: z.number().int().optional().catch(undefined),
       })
       .optional()
-      .catch(undefined),
+      .catch((ctx) => (ctx.input == null ? undefined : DEGRADED_TERMINAL)),
     // Same self-healing rule as `terminal`: malformed metadata degrades instead of dropping the
     // durable wake. A missing marker falls back to createdAt at read time. The marker feeds
     // Date.parse in generation gating, where NaN comparisons silently pass the wrong way, so a
@@ -332,6 +344,10 @@ function describeTerminal(terminal: BashMonitorWakeTerminal): string {
       return "killed (timeout or terminate)";
     case "failed":
       return "failed";
+    case "unknown":
+      // Read-time degrade of malformed persisted metadata; the synthetic settle line in the
+      // record's lines usually still carries the original human-readable status.
+      return "settled (exit details unrecoverable)";
   }
 }
 

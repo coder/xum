@@ -234,7 +234,8 @@ function getValidBashMonitorWakeRecords(
     isPlainObject(terminal) &&
     (terminal.status === "exited" ||
       terminal.status === "killed" ||
-      terminal.status === "failed") &&
+      terminal.status === "failed" ||
+      terminal.status === "unknown") &&
     (terminal.exitCode === undefined || typeof terminal.exitCode === "number");
   return records.map((record) => {
     const terminalValid = record.terminal === undefined || isValidTerminal(record.terminal);

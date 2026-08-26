@@ -664,7 +664,10 @@ describe("BashMonitorWakeStore", () => {
     expect(await store.listPending("owner-1")).toHaveLength(0);
   });
 
-  test("a malformed persisted terminal degrades to no metadata instead of dropping the wake", async () => {
+  test("a malformed persisted terminal degrades to an unknown settlement, never a live match", async () => {
+    // Erasing the only structured settlement indication would re-classify the record as a live
+    // match whose prompt recommends task_await on a task ID that no longer exists (registry row
+    // already removed). The settlement identity must survive the sanitization.
     const config = makeConfig(rootDir);
     const store = new BashMonitorWakeStore(config);
     const record = await store.enqueueOrMergePending(
@@ -681,9 +684,32 @@ describe("BashMonitorWakeStore", () => {
 
     const pending = await store.listPending("owner-1");
     expect(pending).toHaveLength(1);
-    expect(pending[0].terminal).toBeUndefined();
+    expect(pending[0].terminal).toEqual({ status: "unknown" });
     // The durable lines still deliver, so the degraded wake stays actionable.
     expect(pending[0].lines).toEqual(["[monitor] process settled: exited (code 1)"]);
+    // The prompt renders a settlement, not a fresh live match condition.
+    const prompt = buildBashMonitorWakePrompt(pending);
+    expect(prompt).toContain("Status: settled (exit details unrecoverable)");
+    expect(prompt).not.toContain("Matched process output");
+  });
+
+  test("a malformed exitCode degrades per-field, keeping the valid settlement status", async () => {
+    const config = makeConfig(rootDir);
+    const store = new BashMonitorWakeStore(config);
+    const record = await store.enqueueOrMergePending(
+      payload({ lines: ["[monitor] process settled: exited (code 1)"] })
+    );
+    const file = path.join(
+      config.getSessionDir("owner-1"),
+      "bash-monitor-wakes",
+      `${encodeURIComponent(record.processId)}.json`
+    );
+    const raw = JSON.parse(await fsPromises.readFile(file, "utf-8")) as Record<string, unknown>;
+    raw.terminal = { status: "exited", exitCode: "one" };
+    await fsPromises.writeFile(file, JSON.stringify(raw), "utf-8");
+
+    const pending = await store.listPending("owner-1");
+    expect(pending[0].terminal).toEqual({ status: "exited" });
   });
 
   test("a non-date persisted terminalOriginAt degrades to undefined instead of NaN-gating", async () => {

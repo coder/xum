@@ -561,13 +561,17 @@ export interface BashMonitorWakeDisplayRecord {
   displayName: string;
   filter: string;
   filterExclude: boolean;
-  /** Present when the wake reported process settlement (exit, kill, timeout). */
-  terminal?: { status: "exited" | "killed" | "failed"; exitCode?: number };
+  /**
+   * Present when the wake reported process settlement (exit, kill, timeout). "unknown" is the
+   * backend's read-time degrade of malformed persisted metadata — still a settlement for
+   * display.
+   */
+  terminal?: { status: "exited" | "killed" | "failed" | "unknown"; exitCode?: number };
   /**
    * Present when the wake carries a dead earlier generation's settlement whose processId was
    * re-armed by a new live process — still a settlement for display, never "monitor matched".
    */
-  staleTerminal?: { status: "exited" | "killed" | "failed"; exitCode?: number };
+  staleTerminal?: { status: "exited" | "killed" | "failed" | "unknown"; exitCode?: number };
 }
 
 export type MuxMessageMetadata = MuxMessageMetadataBase &

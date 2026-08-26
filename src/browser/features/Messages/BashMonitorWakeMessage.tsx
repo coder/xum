@@ -30,6 +30,9 @@ function summarizeTerminal(record: BashMonitorWakeDisplayRecord): string {
       return `${record.displayName} killed${suffix}`;
     case "failed":
       return `${record.displayName} failed${suffix}`;
+    case "unknown":
+      // Backend read-time degrade of malformed settlement metadata: still a settlement.
+      return `${record.displayName} settled${suffix}`;
   }
 }
 

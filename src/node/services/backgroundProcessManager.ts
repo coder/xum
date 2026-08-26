@@ -766,11 +766,19 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // A mid-file (or mid-content, after the byte cut) start almost certainly begins inside a
     // line; drop that partial fragment rather than presenting it as a complete output line.
     const rawLines = startedMidLine ? segments.slice(1) : segments;
-    return rawLines
+    const lines = rawLines
       .map((line) => this.sanitizeMonitorLine(line))
       .filter((line) => line.length > 0)
       .slice(-MONITOR_SETTLEMENT_TAIL_MAX_LINES)
       .map((line) => this.truncateMonitorLine(line));
+    if (lines.length > 0 || !startedMidLine) return lines;
+    // The whole window sat inside one oversized line (no line boundary in the final ~4 KB —
+    // e.g. long JSON diagnostics or a single-line compiler failure): dropping the lone fragment
+    // would deliver an empty tail exactly when that line IS the decisive output. Keep the
+    // bounded suffix, explicitly marked as a mid-line cut.
+    const fragment = this.sanitizeMonitorLine(segments[0] ?? "");
+    if (fragment.length === 0) return [];
+    return [this.truncateMonitorLine(`${MONITOR_TRUNCATION_MARKER}${fragment}`)];
   }
 
   private scheduleMonitorFlush(

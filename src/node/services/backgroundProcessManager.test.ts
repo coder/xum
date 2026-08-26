@@ -1446,6 +1446,32 @@ describe("BackgroundProcessManager", () => {
         }
       });
 
+      it("keeps a bounded suffix when the final output is one oversized line", async () => {
+        // No line boundary inside the final ~4 KB window: dropping the lone mid-line fragment
+        // would deliver an empty tail exactly when the oversized line (long JSON diagnostics,
+        // a single-line compiler failure) IS the decisive output.
+        const eventPromise = waitForMonitorMatch(manager, 8_000);
+        const result = await manager.spawn(
+          runtime,
+          testWorkspaceId,
+          "head -c 6000 /dev/zero | tr '\\0' X; printf 'TAIL_END\\n'",
+          {
+            cwd: process.cwd(),
+            displayName: "settle-tail-oversized-line",
+            monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
+          }
+        );
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+
+        const event = await eventPromise;
+        const tail = event.payload.tailLines ?? [];
+        // The bounded suffix survives with an explicit truncation marker instead of vanishing.
+        expect(tail).toHaveLength(1);
+        expect(tail[0]).toContain("[truncated]");
+        expect(tail[0]).toContain("TAIL_END");
+      });
+
       it("bounds oversized tail content and marks it mid-content (degraded size query)", () => {
         // A runtime handle's transient size-query failure degrades to 0, turning the tail read
         // into a full-file read; the post-read bound must re-cut to the final byte window and
