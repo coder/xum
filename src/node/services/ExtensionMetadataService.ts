@@ -1,5 +1,5 @@
 import { dirname } from "path";
-import { mkdir, readFile, access, rename } from "fs/promises";
+import { mkdir, readFile, access, rename, link, unlink } from "fs/promises";
 import { constants } from "fs";
 import writeFileAtomic from "write-file-atomic";
 import {
@@ -195,13 +195,7 @@ export class ExtensionMetadataService {
       // file with e.g. an array or primitive `workspaces` would otherwise
       // enumerate as zero entries and masquerade as an authoritative empty
       // state in strict reads.
-      if (
-        typeof parsed !== "object" ||
-        parsed?.version !== 1 ||
-        typeof parsed.workspaces !== "object" ||
-        parsed.workspaces === null ||
-        Array.isArray(parsed.workspaces)
-      ) {
+      if (!ExtensionMetadataService.isValidMetadataFileShape(parsed)) {
         throw new Error("Invalid extension metadata file structure");
       }
 
@@ -568,6 +562,19 @@ export class ExtensionMetadataService {
     return !(typeof error === "object" && error != null && "code" in error);
   }
 
+  private static isValidMetadataFileShape(parsed: unknown): parsed is ExtensionMetadataFile {
+    if (typeof parsed !== "object" || parsed === null) {
+      return false;
+    }
+    const candidate = parsed as { version?: unknown; workspaces?: unknown };
+    return (
+      candidate.version === 1 &&
+      typeof candidate.workspaces === "object" &&
+      candidate.workspaces !== null &&
+      !Array.isArray(candidate.workspaces)
+    );
+  }
+
   /**
    * Move a deterministically corrupt metadata file aside so strict readers
    * stop failing on every retry across process restarts (nothing else
@@ -586,13 +593,35 @@ export class ExtensionMetadataService {
         if (!ExtensionMetadataService.isDeterministicCorruption(error)) {
           return false;
         }
-        const quarantinePath = `${this.filePath}.corrupt`;
-        await rename(this.filePath, quarantinePath);
-        log.error(
-          `Extension metadata file was corrupt; moved it to ${quarantinePath} and reset to empty`
-        );
-        return true;
       }
+      const quarantinePath = `${this.filePath}.corrupt`;
+      await rename(this.filePath, quarantinePath);
+      // The mutation queue is process-local: another backend's atomic save
+      // can land a healthy file between the validation above and the rename,
+      // and the rename would move THAT file aside. Re-validate the bytes that
+      // actually got moved and undo the move when they turn out healthy.
+      try {
+        const moved: unknown = JSON.parse(await readFile(quarantinePath, "utf-8"));
+        if (ExtensionMetadataService.isValidMetadataFileShape(moved)) {
+          try {
+            // link (not rename) restores: it fails with EEXIST when yet
+            // another writer already re-created the main path, so a newer
+            // file is never overwritten by the restore.
+            await link(quarantinePath, this.filePath);
+            await unlink(quarantinePath);
+          } catch {
+            // EEXIST or fs without hard links: a healthy leftover sidecar is
+            // harmless (bounded by the fixed name) — never destroy data.
+          }
+          return false;
+        }
+      } catch {
+        // Still unreadable/corrupt — the expected quarantine outcome.
+      }
+      log.error(
+        `Extension metadata file was corrupt; moved it to ${quarantinePath} and reset to empty`
+      );
+      return true;
     });
   }
 
@@ -610,7 +639,12 @@ export class ExtensionMetadataService {
       if (!ExtensionMetadataService.isDeterministicCorruption(error)) {
         throw error;
       }
-      await this.quarantineCorruptFile();
+      try {
+        await this.quarantineCorruptFile();
+      } catch {
+        // Best-effort: e.g. the file vanished between validation and rename
+        // (another process moved it); the re-read below decides the outcome.
+      }
       data = await this.load(options);
     }
     const map = new Map<string, WorkspaceActivitySnapshot>();

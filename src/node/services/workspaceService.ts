@@ -12875,17 +12875,19 @@ export class WorkspaceService extends EventEmitter {
     try {
       // On the first bootstrap the prune already enumerated the config; reuse
       // that id set instead of paying the per-workspace disk walk twice.
-      const prefetchedKnownIds = await this.pruneStaleExtensionMetadataOnce();
       // Baseline for the post-await cross-process removal revalidation at
-      // the end of this method: captured before any snapshot/config await so
-      // ids deregistered from the shared config while this list computes can
-      // be told apart from ids the raw scan can never see.
+      // the end of this method: captured before ANY await (including the
+      // first-bootstrap prune, whose enumeration another backend's removal
+      // could otherwise outdate before this baseline is read) so ids
+      // deregistered from the shared config while this list computes can be
+      // told apart from ids the raw scan can never see.
       let initialConfigIds: ReadonlySet<string> | null = null;
       try {
         initialConfigIds = this.config.readPersistedWorkspaceIdSuperset();
       } catch {
         initialConfigIds = null;
       }
+      const prefetchedKnownIds = await this.pruneStaleExtensionMetadataOnce();
       // throwOnError: the default load self-heals an unreadable/malformed
       // metadata file into an empty one, which this list would then present
       // as an authoritative "no activity anywhere" answer — the renderer
