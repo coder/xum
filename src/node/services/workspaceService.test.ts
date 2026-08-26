@@ -1021,8 +1021,10 @@ describe("WorkspaceService bash monitor wakes", () => {
       expect(prompt).toContain("Status: exited (code 2)");
       expect(prompt).toContain("ERR boom");
       // The matched lines were already covered by the shown frontier, so the prompt must flag
-      // them as consumed instead of presenting a fresh match condition.
+      // them as consumed — but only up to the settle marker: the post-settlement tail may carry
+      // a decisive line the agent has never seen and must be presented as new.
       expect(prompt).toContain("already returned to you by an earlier read");
+      expect(prompt).toContain("lines after that marker are new output");
     } finally {
       await cleanup();
     }

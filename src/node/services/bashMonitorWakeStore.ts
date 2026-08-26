@@ -334,9 +334,12 @@ export function buildBashMonitorWakePrompt(
       // When the shown frontier already covered the matched output (an owner read consumed it
       // before the process exited), the wake is delivered for its settlement signal only; say so
       // explicitly so the agent does not re-trigger work on an already-consumed match condition.
+      // Scope the claim precisely: lines are ordered [matched..., settle marker, tail...], so
+      // anything after the synthetic settle marker is post-settlement tail the agent has NOT
+      // seen (e.g. the decisive unmatched failure line) and must not be disregarded.
       const alreadyShown =
         context?.get(record.id)?.matchedOutputAlreadyShown === true && record.lines.length > 0
-          ? "\nNote: the matched output below was already returned to you by an earlier read; only the settlement is new."
+          ? "\nNote: lines above the '[monitor] process settled' marker were already returned to you by an earlier read; the settlement status and any lines after that marker are new output."
           : "";
       const taskIdSuffix = isAwaitable(record)
         ? ""
@@ -466,6 +469,16 @@ export class BashMonitorWakeStore {
           ...(mergedMatchedThroughOffset != null
             ? { matchedThroughOffset: mergedMatchedThroughOffset }
             : {}),
+          // A terminal payload rebinds the record's generation marker (createdAt doubles as the
+          // drain gate's originNotAfterMs): the settling process is the record's live generation,
+          // and keeping an older createdAt would make getMonitorWakeDeliveryState reject the
+          // registered process (startTime > marker), falsely labeling its task ID no longer
+          // awaitable and disabling terminal-shown suppression. Same-generation settlements are
+          // unaffected (startTime <= old marker <= now), and matched-line fail-open survives: a
+          // cross-generation offset can only be too high, which over-delivers, never suppresses.
+          // Match-only merges keep the originating marker so a dead generation's undelivered
+          // lines are never offset-gated against a newer instance (comment above).
+          ...(payload.terminal != null ? { createdAt: now } : {}),
           updatedAt: now,
         };
         // Terminal state binds to a process *generation*, and a match-only payload can only come

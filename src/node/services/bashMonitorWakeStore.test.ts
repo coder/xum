@@ -576,6 +576,33 @@ describe("BashMonitorWakeStore", () => {
     ]);
   });
 
+  test("a terminal merge rebinds the generation marker; match-only merges keep it", async () => {
+    // createdAt doubles as the drain gate's originNotAfterMs. A settling process is the record's
+    // live generation: keeping an old marker would make the gate reject the registered process
+    // (startTime > marker), falsely labeling its task ID not awaitable and disabling
+    // terminal-shown suppression. Match-only merges keep the originating marker so a dead
+    // generation's undelivered lines are never offset-gated against a newer instance.
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    const first = await store.enqueueOrMergePending(
+      payload({ lines: ["ERROR old"], matchedThroughOffset: 50 })
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const settled = await store.enqueueOrMergePending(
+      payload({
+        lines: ["[monitor] process settled: exited (code 0)"],
+        matchedThroughOffset: undefined,
+        terminal: { status: "exited", exitCode: 0 },
+      })
+    );
+    expect(Date.parse(settled.createdAt)).toBeGreaterThan(Date.parse(first.createdAt));
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const matchOnly = await store.enqueueOrMergePending(
+      payload({ lines: ["ERROR new"], matchedThroughOffset: 90 })
+    );
+    expect(matchOnly.createdAt).toBe(settled.createdAt);
+  });
+
   test("a tail line is preserved when its only duplicate falls in the evicted prefix", async () => {
     // Existing record at the 50-line cap whose OLDEST line matches the settlement tail's final
     // output. Deduping against that soon-evicted occurrence would remove the tail copy and then

@@ -1338,6 +1338,75 @@ describe("BackgroundProcessManager", () => {
         expect(stoppedEvents).toHaveLength(0);
       });
 
+      it("abandons pending matches when shutdown lands during a failed settlement scan (wake_on_exit=false)", async () => {
+        const matchEvents: MonitorMatchPayload[] = [];
+        const stoppedEvents: MonitorStoppedPayload[] = [];
+        manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
+        manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+        const result = await manager.spawn(
+          runtime,
+          testWorkspaceId,
+          "printf 'ERR pending\\n'; sleep 0.5",
+          {
+            cwd: process.cwd(),
+            displayName: "settle-shutdown-scan-failure",
+            monitor: {
+              filter: "ERR",
+              pattern: /ERR/,
+              exclude: false,
+              cooldownMs: 60_000,
+              wakeOnExit: false,
+            },
+          }
+        );
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+
+        const proc = await manager.getProcess(result.processId);
+        expect(proc).not.toBeNull();
+        if (proc == null) return;
+
+        // Wait until the match is pending (unflushed under the long cooldown).
+        for (let attempt = 0; attempt < 80; attempt++) {
+          if ((proc.monitor?.pendingLines.length ?? 0) > 0) break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        expect(proc.monitor?.pendingLines).toEqual(["ERR pending"]);
+
+        // Fail the settlement scan read (only reads under the settled latch) while holding it
+        // open so beginShutdown deterministically lands mid-scan. The wake_on_exit=false branch
+        // has no tail read, so this is the only guard between the failed scan and the legacy
+        // pending-match emit.
+        let releaseScan!: () => void;
+        const scanGate = new Promise<void>((resolve) => {
+          releaseScan = resolve;
+        });
+        let scanStarted!: () => void;
+        const scanStartedPromise = new Promise<void>((resolve) => {
+          scanStarted = resolve;
+        });
+        const realReadOutput = proc.handle.readOutput.bind(proc.handle);
+        spyOn(proc.handle, "readOutput").mockImplementation(async (offset: number) => {
+          if (proc.monitor?.settled) {
+            scanStarted();
+            await scanGate;
+            throw new Error("scan read failed");
+          }
+          return realReadOutput(offset);
+        });
+
+        await scanStartedPromise;
+        manager.beginShutdown();
+        releaseScan();
+        await new Promise((resolve) => setTimeout(resolve, 300));
+
+        // The pending match must not be emitted during dispose; the armed registry record
+        // survives for the restart monitor-lost notice instead.
+        expect(matchEvents).toHaveLength(0);
+        expect(stoppedEvents).toHaveLength(0);
+      });
+
       it("bounds oversized tail content and marks it mid-content (degraded size query)", () => {
         // A runtime handle's transient size-query failure degrades to 0, turning the tail read
         // into a full-file read; the post-read bound must re-cut to the final byte window and

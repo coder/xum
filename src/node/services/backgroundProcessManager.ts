@@ -675,6 +675,10 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         `BackgroundProcessManager: settlement scan for ${proc.id} failed: ${getErrorMessage(error)}`
       );
     }
+    // A rejected scan read skips the success-path guard above, and the wake_on_exit=false branch
+    // below has no later guard of its own — recheck here so cancellation or a mid-scan
+    // beginShutdown can never leak a pending-match emit past this point.
+    if (monitor.stopped || this.shuttingDown) return;
 
     let tailLines: string[] = [];
     if (monitor.wakeOnExit) {
