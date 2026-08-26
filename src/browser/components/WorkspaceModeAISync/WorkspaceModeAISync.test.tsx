@@ -3,6 +3,7 @@ import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { installDom } from "../../../../tests/ui/dom";
 
 import { AgentProvider } from "@/browser/contexts/AgentContext";
+import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { consumeWorkspaceModelChange } from "@/browser/utils/modelChange";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
@@ -27,14 +28,19 @@ const noop = () => {
   // intentional noop for tests
 };
 
-function SyncHarness(props: { workspaceId: string; agentId: string }) {
+function SyncHarness(props: {
+  workspaceId: string;
+  agentId: string;
+  agents?: AgentDefinitionDescriptor[];
+}) {
+  const agents = props.agents ?? [];
   return (
     <AgentProvider
       value={{
         agentId: props.agentId,
         setAgentId: noop,
-        currentAgent: undefined,
-        agents: [],
+        currentAgent: agents.find((agent) => agent.id === props.agentId),
+        agents,
         loaded: true,
         loadFailed: false,
         refresh: () => Promise.resolve(),
@@ -48,8 +54,14 @@ function SyncHarness(props: { workspaceId: string; agentId: string }) {
   );
 }
 
-function renderSync(props: { workspaceId: string; agentId: string }) {
-  return render(<SyncHarness workspaceId={props.workspaceId} agentId={props.agentId} />);
+function renderSync(props: {
+  workspaceId: string;
+  agentId: string;
+  agents?: AgentDefinitionDescriptor[];
+}) {
+  return render(
+    <SyncHarness workspaceId={props.workspaceId} agentId={props.agentId} agents={props.agents} />
+  );
 }
 
 describe("WorkspaceModeAISync", () => {
@@ -121,10 +133,52 @@ describe("WorkspaceModeAISync", () => {
     });
   });
 
+  test("applies custom agent definition defaults on an explicit switch", async () => {
+    const workspaceId = nextWorkspaceId();
+    const existingModel = "anthropic:claude-sonnet-4-5";
+    const definitionModel = "openai:gpt-5.6-sol";
+    const agents: AgentDefinitionDescriptor[] = [
+      {
+        id: "plan",
+        scope: "built-in",
+        name: "Plan",
+        uiSelectable: true,
+        subagentRunnable: false,
+      },
+      {
+        id: "researcher",
+        scope: "project",
+        name: "Researcher",
+        uiSelectable: true,
+        subagentRunnable: false,
+        base: "exec",
+        aiDefaults: { model: definitionModel, thinkingLevel: "high" },
+      },
+    ];
+
+    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {});
+    updatePersistedState(getModelKey(workspaceId), existingModel);
+    updatePersistedState(getThinkingLevelKey(workspaceId), "off");
+
+    const { rerender } = renderSync({ workspaceId, agentId: "plan", agents });
+
+    await waitFor(() => {
+      expect(readPersistedState(getModelKey(workspaceId), "")).toBe(existingModel);
+    });
+
+    rerender(<SyncHarness workspaceId={workspaceId} agentId="researcher" agents={agents} />);
+
+    await waitFor(() => {
+      expect(readPersistedState(getModelKey(workspaceId), "")).toBe(definitionModel);
+      expect(readPersistedState(getThinkingLevelKey(workspaceId), "off")).toBe("high");
+    });
+    expect(consumeWorkspaceModelChange(workspaceId, definitionModel)).toBe("agent");
+  });
+
   test("ignores workspace-by-agent values when settings are inherit", async () => {
     const workspaceId = nextWorkspaceId();
 
-    const existingModel = "some-legacy-model";
+    const existingModel = "anthropic:claude-sonnet-4-5";
     const existingThinking = "off";
 
     // Inherit in Settings removes explicit per-agent defaults from AGENT_AI_DEFAULTS_KEY.
@@ -182,7 +236,7 @@ describe("WorkspaceModeAISync", () => {
   test("ignores same-agent workspace overrides when agent defaults are missing", async () => {
     const workspaceId = nextWorkspaceId();
 
-    const existingModel = "some-legacy-model";
+    const existingModel = "anthropic:claude-sonnet-4-5";
     const existingThinking = "high";
 
     updatePersistedState(AGENT_AI_DEFAULTS_KEY, {

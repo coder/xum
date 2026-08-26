@@ -80,7 +80,12 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
         existingModel,
         existingThinking,
         existingReasoningMode: existingReasoning,
-        agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
+        agentDescriptorById: new Map(
+          agents.map((agent) => [
+            agent.id,
+            { base: agent.base, definitionAiDefaults: agent.aiDefaults },
+          ])
+        ),
       });
 
     if (existingModel !== resolvedModel) {
