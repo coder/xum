@@ -602,7 +602,10 @@ export class WorkspaceGoalService {
    * corrupts the successor's budget.
    */
   private readonly goalIdentityGenerations = new Map<string, number>();
-  private readonly lastWrittenGoalIds = new Map<string, string>();
+  private readonly lastWrittenGoalIdentities = new Map<
+    string,
+    { goalId: string; objective: string }
+  >();
 
   private armPauseFinalizationHold(workspaceId: string, goalId: string): void {
     this.explicitPauseGenerations.set(
@@ -1184,8 +1187,18 @@ export class WorkspaceGoalService {
     }
     // See goalIdentityGenerations: identity changes (replacement, revival,
     // first write of the process) invalidate captured dispatch admissions.
-    if (this.lastWrittenGoalIds.get(workspaceId) !== goal.goalId) {
-      this.lastWrittenGoalIds.set(workspaceId, goal.goalId);
+    // Codex P1 (PRRT_kwDOPxxmWM6cS8B1): same-ID objective revisions
+    // (editInPlace renames) count too — a captured continuation's payload
+    // embeds the old objective, so admitting it after the user redirects the
+    // goal would run tools toward work the user just replaced. Limit-only
+    // edits stay fresh: they do not change what work runs, and newly
+    // exhausted limits flip status (bumping the terminal generation above).
+    const lastIdentity = this.lastWrittenGoalIdentities.get(workspaceId);
+    if (lastIdentity?.goalId !== goal.goalId || lastIdentity.objective !== goal.objective) {
+      this.lastWrittenGoalIdentities.set(workspaceId, {
+        goalId: goal.goalId,
+        objective: goal.objective,
+      });
       this.goalIdentityGenerations.set(
         workspaceId,
         (this.goalIdentityGenerations.get(workspaceId) ?? 0) + 1
@@ -4292,7 +4305,7 @@ export class WorkspaceGoalService {
       // Goal deletion is an identity transition too. In-flight admissions only
       // observe generation counters after their initial durable read, so clear
       // must invalidate them even when no upcoming goal is promoted.
-      this.lastWrittenGoalIds.delete(workspaceId);
+      this.lastWrittenGoalIdentities.delete(workspaceId);
       this.goalIdentityGenerations.set(
         workspaceId,
         (this.goalIdentityGenerations.get(workspaceId) ?? 0) + 1
@@ -5298,16 +5311,36 @@ export class WorkspaceGoalService {
     }
     // Codex P1 (PRRT_kwDOPxxmWM6cOgXV): last stop sample before the promotion
     // writes — an abort landing during this helper's own board/streaming/
-    // pricing reads must not promote a goal from the aborted turn. (A stop
-    // landing inside the writes below leaves the promoted goal active; the
-    // stop's queued locked section then installs its acknowledgment gate on
-    // it, halting autonomy.)
+    // pricing reads must not promote a goal from the aborted turn.
     if (options?.stopVeto?.() === true) {
       return null;
     }
+    // Snapshot for the post-write rollback below: the caller's completion (or
+    // prior record) currently occupies goal.json.
+    const priorGoal = options?.stopVeto != null ? await this.readGoalFile(workspaceId) : null;
     await this.writeBoard(workspaceId, { ...board, upcoming: rest });
     await this.writeGoal(workspaceId, activated);
     await this.pushSnapshot(workspaceId, activated);
+    // Codex P1 (PRRT_kwDOPxxmWM6cS8B4): the sample above precedes the three
+    // awaited writes. A Stop landing inside them would otherwise leave the
+    // promotion durable — the caller deliberately skips restoring once
+    // goal.json no longer holds its completion, so the aborted turn's
+    // completion would survive and the board would advance despite the Stop.
+    // Re-sample and roll the transaction back: restore the pre-promotion
+    // board and goal record and re-publish. The completed goal's history
+    // entry stays (append-only and cosmetic, matching stops that land during
+    // other archive appends); the caller's own recheck then restores its
+    // pre-completion record normally.
+    if (options?.stopVeto?.() === true) {
+      await this.writeBoard(workspaceId, board);
+      if (priorGoal != null) {
+        await this.writeGoal(workspaceId, priorGoal);
+      } else {
+        await fs.rm(this.getFilePath(workspaceId), { force: true });
+      }
+      await this.pushSnapshot(workspaceId, priorGoal);
+      return null;
+    }
     this.emitLifecycle("goal_created", {
       viaFork: false,
       sourceStatus: head.status,

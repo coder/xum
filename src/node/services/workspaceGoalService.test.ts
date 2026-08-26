@@ -3701,6 +3701,79 @@ describe("WorkspaceGoalService", () => {
     expect(upcomingEntry?.goal.goalId).toBe(queued.goalId);
   });
 
+  test("a stop landing during the promotion writes rolls the promotion back", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cS8B4): the pre-write veto above cannot see a
+    // Stop landing INSIDE the promotion's board/goal/snapshot writes. The
+    // promotion would complete durably, and the caller deliberately skips
+    // restoring once goal.json no longer holds its completion — leaving the
+    // aborted completion archived and the board advanced despite the Stop.
+    const created = await setGoalOk(service, { workspaceId, objective: "Abort mid-write" });
+    const queued = await service.addUpcomingGoal({ workspaceId, objective: "Next in queue" });
+
+    const serviceAccess = service as unknown as {
+      writeBoard: (id: string, board: unknown) => Promise<void>;
+    };
+    const realWriteBoard = serviceAccess.writeBoard.bind(service);
+    const boardSpy = spyOn(serviceAccess, "writeBoard").mockImplementationOnce(
+      async (id: string, board: unknown) => {
+        // Stop lands during the first promotion write: the generation bump is
+        // synchronous even though the locked acknowledgment waits behind the
+        // in-flight setter's lock tenure.
+        void service.recordUserStoppedStream(id);
+        return realWriteBoard(id, board);
+      }
+    );
+
+    const completed = await service.setGoal({
+      workspaceId,
+      status: "complete",
+      completionSummary: "Done before the user could stop it",
+      initiator: "model",
+    });
+    boardSpy.mockRestore();
+    expect(completed.success).toBe(false);
+    if (!completed.success) {
+      expect(completed.error.type).toBe("invalid_transition");
+    }
+
+    // The promotion transaction rolled back and the caller restored the
+    // pre-completion record.
+    expect(await service.getGoal(workspaceId)).toMatchObject({
+      goalId: created.goalId,
+      status: "active",
+    });
+    // The upcoming goal was not consumed by the aborted promotion.
+    const board = await service.getGoalBoard(workspaceId);
+    const upcomingEntry = board.entries.find((e) => e.section === "upcoming");
+    expect(upcomingEntry?.goal.goalId).toBe(queued.goalId);
+  });
+
+  test("a same-ID objective edit invalidates captured redispatch admissions", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cS8B1): an editInPlace rename keeps the
+    // goalId, so the identity generation previously stayed put — a captured
+    // continuation embedding the OLD objective could be admitted after the
+    // user redirected the goal.
+    const created = await setGoalOk(service, { workspaceId, objective: "Original objective" });
+    const admission = await service.buildGoalRedispatchAdmission(
+      workspaceId,
+      created.goalId,
+      GOAL_CONTINUATION_KIND
+    );
+    expect(admission.admissible).toBe(true);
+    if (!admission.admissible) {
+      throw new Error("expected admissible probe");
+    }
+    expect(admission.admissionStale()).toBe(false);
+
+    await setGoalOk(service, {
+      workspaceId,
+      objective: "Redirected objective",
+      editInPlace: true,
+    });
+
+    expect(admission.admissionStale()).toBe(true);
+  });
+
   test("a failed preview reset publication is retried on the next usage delta", async () => {
     // Codex P2 (PRRT_kwDOPxxmWM6cOgXY): the reset deleted the cached live
     // preview BEFORE publishing the durable snapshot. A failed publication
