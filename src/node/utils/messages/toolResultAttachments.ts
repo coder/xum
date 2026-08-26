@@ -215,6 +215,20 @@ export function extractAttachmentsFromToolOutput(
       continue;
     }
 
+    // Non-media parts can nest their own media containers (e.g. a custom part
+    // wrapping another MCP-style container). Capture-time sanitization retains
+    // such parts whole while within the aggregate budget (charged at full
+    // serialized size), so the provider copy must traverse them like any other
+    // wrapper — otherwise the nested base64 rides as raw JSON text in every
+    // later request (r18 retry).
+    const nested = extractAttachmentsFromToolOutput(item, depth + 1);
+    if (nested != null) {
+      didChange = true;
+      attachments.push(...nested.attachments);
+      newValue.push(nested.newOutput as AISDKContent);
+      continue;
+    }
+
     newValue.push(item);
   }
 

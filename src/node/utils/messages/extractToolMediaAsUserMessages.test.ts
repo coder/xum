@@ -529,6 +529,74 @@ describe("extractToolMediaAsUserMessages", () => {
     expect(toolPart.output).toBe(deep);
   });
 
+  it("extracts media containers nested inside non-media content parts", async () => {
+    // A content container can hold a custom non-media part that itself wraps
+    // another media container. Capture retains such parts whole while within
+    // the aggregate budget, so request-time extraction must traverse them —
+    // otherwise the nested base64 rides as raw JSON in every later provider
+    // request (r18 retry).
+    const makeBase64 = async (r: number) =>
+      (
+        await sharp({
+          create: { width: 10, height: 10, channels: 3, background: { r, g: 0, b: 0 } },
+        })
+          .png()
+          .toBuffer()
+      ).toString("base64");
+    const directBase64 = await makeBase64(10);
+    const nestedBase64 = await makeBase64(200);
+
+    const input: MuxMessage[] = [
+      {
+        id: "a-nested-part",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call1",
+            toolName: "mcp__shots__take",
+            input: {},
+            state: "output-available",
+            output: {
+              type: "content",
+              value: [
+                { type: "media", mediaType: "image/png", data: directBase64 },
+                {
+                  type: "custom",
+                  payload: {
+                    inner: {
+                      type: "content",
+                      value: [{ type: "media", mediaType: "image/png", data: nestedBase64 }],
+                    },
+                    note: "kept",
+                  },
+                },
+              ],
+            },
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    expect(rewritten).toHaveLength(2);
+    const toolPart = rewritten[0].parts[0];
+    if (toolPart.type !== "dynamic-tool" || toolPart.state !== "output-available") {
+      throw new Error("Expected an output-available dynamic-tool part");
+    }
+    const outputText = JSON.stringify(toolPart.output);
+    // Both the immediate media part AND the container nested inside the
+    // custom part are rewritten; non-media custom fields survive.
+    expect(outputText).not.toContain(directBase64);
+    expect(outputText).not.toContain(nestedBase64);
+    expect(outputText).toContain('"note":"kept"');
+
+    const syntheticUser = rewritten[1];
+    const fileParts = syntheticUser.parts.filter((part) => part.type === "file");
+    expect(fileParts).toHaveLength(2);
+  });
+
   it("extracts media buried under deep generic wrapper chains", async () => {
     // Capture-time sanitization retains supported containers under its budget
     // regardless of wrapper depth, so the request-time scan must not abandon
