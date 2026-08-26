@@ -19,7 +19,7 @@ import { promisify } from "node:util";
 import { Command } from "commander";
 
 import { getErrorMessage } from "@/common/utils/errors";
-import { Config } from "@/node/config";
+import { Config, type ProjectConfig } from "@/node/config";
 import { isProjectTrusted } from "@/node/utils/projectTrust";
 import { getParseOptions } from "./argv";
 import { exitAfterStdoutFlush } from "./processExit";
@@ -168,13 +168,28 @@ export async function resolveProjectTrusted(
   return mainRepoDir != null && isProjectTrusted(realConfig, mainRepoDir);
 }
 
+/** Replace all run-root trust entries so removed grants cannot survive root reuse. */
+export async function replaceRunTrustProjects(
+  realConfig: Config,
+  targetConfig: Config
+): Promise<void> {
+  const trustOnlyProjects = new Map<string, ProjectConfig>();
+  for (const [projectPath, projectConfig] of realConfig.loadConfigOrDefault().projects) {
+    if (projectConfig.trusted === undefined) {
+      continue;
+    }
+
+    trustOnlyProjects.set(projectPath, {
+      workspaces: [],
+      trusted: projectConfig.trusted,
+    });
+  }
+
+  await targetConfig.editConfig((config) => ({ ...config, projects: trustOnlyProjects }));
+}
+
 /**
- * Copy the checkout's *effective* trust (direct entry or main-repo fallback)
- * onto the exact project path in a target config. Headless `xum run` needs
- * this: trust for a linked worktree is recorded against the main repository,
- * but the task-spawn gate looks up the checkout's own project entry in the
- * ephemeral run config, so without materialization trusted worktrees could
- * not spawn sub-agents.
+ * Copy effective trust onto the target path because the task-spawn gate uses exact lookups.
  */
 export async function materializeResolvedTrust(
   realConfig: Config,

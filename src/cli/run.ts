@@ -14,8 +14,8 @@ import { tool } from "ai";
 import { z } from "zod";
 import * as path from "path";
 import * as fs from "fs/promises";
-import { Config, type ProjectConfig } from "../node/config";
-import { materializeResolvedTrust } from "./trust";
+import { Config } from "../node/config";
+import { materializeResolvedTrust, replaceRunTrustProjects } from "./trust";
 import { DisposableTempDir } from "../node/services/tempDir";
 import { AgentSession, type AgentSessionChatEvent } from "../node/services/agentSession";
 import { CodexOauthService } from "../node/services/codexOauthService";
@@ -539,25 +539,8 @@ async function main(): Promise<number> {
   // Copy only project trust metadata so AIService can read trust flags.
   // Avoid importing workspace/task metadata into ephemeral CLI config because
   // stale queued/running records can incorrectly throttle sub-agent tasks.
-  const existingConfig = realConfig.loadConfigOrDefault();
-  if (existingConfig.projects.size > 0) {
-    const trustOnlyProjects = new Map<string, ProjectConfig>();
-    for (const [projectPath, projectConfig] of existingConfig.projects) {
-      if (projectConfig.trusted === undefined) {
-        continue;
-      }
-
-      trustOnlyProjects.set(projectPath, {
-        workspaces: [],
-        trusted: projectConfig.trusted,
-      });
-    }
-
-    if (trustOnlyProjects.size > 0) {
-      // Config.saveConfig is private (lost-update safety); route through the queue.
-      await config.editConfig((cfg) => ({ ...cfg, projects: trustOnlyProjects }));
-    }
-  }
+  // Replace the full map so a reused run root cannot retain trust removed from real config.
+  await replaceRunTrustProjects(realConfig, config);
 
   const workspaceId = generateWorkspaceId();
   const projectDir = path.resolve(opts.dir);

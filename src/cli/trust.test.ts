@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { Config } from "@/node/config";
-import { materializeResolvedTrust, resolveProjectDir } from "./trust";
+import { materializeResolvedTrust, replaceRunTrustProjects, resolveProjectDir } from "./trust";
 
 const BUN_EXECUTABLE = process.execPath;
 const TRUST_ENTRY = path.join(import.meta.dir, "trust.ts");
@@ -97,6 +97,25 @@ describe("xum trust CLI", () => {
     expect(trustByPath.get(repo)).toBe(false);
     expect(trustByPath.get(worktree)).toBe(false);
   }, 15_000);
+
+  test("replaceRunTrustProjects clears stale trust when the real config is empty", async () => {
+    using tmp = new DisposableTempDir("trust-replace-run");
+    const realConfig = new Config(path.join(tmp.path, "real-root"));
+    const targetConfig = new Config(path.join(tmp.path, "run-root"));
+    const staleProject = path.join(tmp.path, "removed-project");
+    await targetConfig.editConfig((config) => {
+      config.projects.set(staleProject, { workspaces: [], trusted: true });
+      return config;
+    });
+
+    await replaceRunTrustProjects(realConfig, targetConfig);
+
+    const onDisk = JSON.parse(
+      await fs.readFile(path.join(targetConfig.rootDir, "config.json"), "utf8")
+    ) as { projects: unknown[] };
+    expect(onDisk.projects).toEqual([]);
+    expect(targetConfig.loadConfigOrDefault().projects.has(staleProject)).toBe(false);
+  });
 
   test("materializeResolvedTrust copies main-repo trust onto the exact worktree entry", async () => {
     using tmp = new DisposableTempDir("trust-materialize");

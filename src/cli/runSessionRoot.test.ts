@@ -115,6 +115,44 @@ describe("prepareRunSessionRootOverride", () => {
     }
   });
 
+  test("fails closed for replaced override roots when parent-relative writes are unavailable", async () => {
+    const realConfigRoot = path.join(tempDir, "real-config");
+    const runRoot = path.join(tempDir, "run-session");
+    const movedRoot = path.join(tempDir, "secured-session");
+    await fs.mkdir(runRoot);
+    await using preparedRoot = await prepareRunSessionRootOverride(
+      { XUM_RUN_SESSION_ROOT: runRoot },
+      realConfigRoot,
+      "darwin"
+    );
+    if (preparedRoot === undefined) {
+      throw new Error("Expected a prepared run session root");
+    }
+
+    await fs.rename(runRoot, movedRoot);
+    await fs.mkdir(runRoot);
+    const providersFile = path.join(runRoot, "providers.jsonc");
+
+    let error: unknown;
+    try {
+      await replacePrivateRunConfigFile(providersFile, "copied credentials", preparedRoot);
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    const replacementHasCredentials = await fs
+      .access(providersFile)
+      .then(() => true)
+      .catch(() => false);
+    expect(replacementHasCredentials).toBe(false);
+    const originalHasCredentials = await fs
+      .access(path.join(movedRoot, "providers.jsonc"))
+      .then(() => true)
+      .catch(() => false);
+    expect(originalHasCredentials).toBe(false);
+  });
+
   test("tightens a pre-existing override root", async () => {
     const realConfigRoot = path.join(tempDir, "real-config");
     const overrideRoot = path.join(tempDir, "run-session");
