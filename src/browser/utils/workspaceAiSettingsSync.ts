@@ -98,22 +98,46 @@ export function shouldApplyWorkspaceAiSettingsFromBackend(
   return false;
 }
 
-// Same pending-echo protection as AI settings, but for the workspace's active
-// agent selection: a local mode switch must not be reverted by a stale
-// metadata broadcast that raced the persistence write.
-const pendingAgentIdByWorkspace = new Map<string, string>();
+// Same pending-echo protection as AI settings, but retain the latest selection
+// until every overlapping persistence write settles. A matching latest echo
+// cannot consume the guard while an older write can still broadcast later.
+interface PendingAgentIdState {
+  latestAgentId: string;
+  pendingCount: number;
+  countsByAgentId: Map<string, number>;
+}
+
+const pendingAgentIdByWorkspace = new Map<string, PendingAgentIdState>();
 
 export function markPendingWorkspaceAgentId(workspaceId: string, agentId: string): void {
   if (!workspaceId || !agentId) {
     return;
   }
-  pendingAgentIdByWorkspace.set(workspaceId, agentId);
+  const pending = pendingAgentIdByWorkspace.get(workspaceId) ?? {
+    latestAgentId: agentId,
+    pendingCount: 0,
+    countsByAgentId: new Map<string, number>(),
+  };
+  pending.latestAgentId = agentId;
+  pending.pendingCount += 1;
+  pending.countsByAgentId.set(agentId, (pending.countsByAgentId.get(agentId) ?? 0) + 1);
+  pendingAgentIdByWorkspace.set(workspaceId, pending);
 }
 
 export function clearPendingWorkspaceAgentId(workspaceId: string, agentId: string): void {
-  // Clear only the matching entry so a failed write cannot wipe a newer
-  // pending selection from a rapid follow-up switch.
-  if (pendingAgentIdByWorkspace.get(workspaceId) === agentId) {
+  const pending = pendingAgentIdByWorkspace.get(workspaceId);
+  const count = pending?.countsByAgentId.get(agentId) ?? 0;
+  if (!pending || count === 0) {
+    return;
+  }
+
+  if (count === 1) {
+    pending.countsByAgentId.delete(agentId);
+  } else {
+    pending.countsByAgentId.set(agentId, count - 1);
+  }
+  pending.pendingCount -= 1;
+  if (pending.pendingCount === 0) {
     pendingAgentIdByWorkspace.delete(workspaceId);
   }
 }
@@ -123,14 +147,7 @@ export function shouldApplyWorkspaceAgentIdFromBackend(
   incomingAgentId: string
 ): boolean {
   const pending = pendingAgentIdByWorkspace.get(workspaceId);
-  if (!pending) {
-    return true;
-  }
-  if (pending === incomingAgentId) {
-    pendingAgentIdByWorkspace.delete(workspaceId);
-    return true;
-  }
-  return false;
+  return !pending || pending.latestAgentId === incomingAgentId;
 }
 
 /**

@@ -7,7 +7,12 @@ import {
   getThinkingLevelKey,
 } from "@/common/constants/storage";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { revertRejectedAgentSwitch } from "./workspaceAiSettingsSync";
+import {
+  clearPendingWorkspaceAgentId,
+  markPendingWorkspaceAgentId,
+  revertRejectedAgentSwitch,
+  shouldApplyWorkspaceAgentIdFromBackend,
+} from "./workspaceAiSettingsSync";
 
 const WORKSPACE_ID = "ws-revert";
 
@@ -34,6 +39,24 @@ function read(key: string): unknown {
   const raw = window.localStorage.getItem(key);
   return raw == null ? null : JSON.parse(raw);
 }
+
+describe("workspace agent persistence guard", () => {
+  test("retains the latest selection until every older write settles", () => {
+    markPendingWorkspaceAgentId(WORKSPACE_ID, "plan");
+    markPendingWorkspaceAgentId(WORKSPACE_ID, "review");
+
+    // The latest echo applies, but it must not consume the only ordering guard.
+    expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "review")).toBe(true);
+    expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(false);
+
+    // Even when the latest write settles first, the older write can still echo.
+    clearPendingWorkspaceAgentId(WORKSPACE_ID, "review");
+    expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(false);
+
+    clearPendingWorkspaceAgentId(WORKSPACE_ID, "plan");
+    expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true);
+  });
+});
 
 describe("revertRejectedAgentSwitch", () => {
   let cleanupDom: (() => void) | null = null;

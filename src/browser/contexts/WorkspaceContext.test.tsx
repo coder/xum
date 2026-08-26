@@ -22,7 +22,10 @@ import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import type { RecursivePartial } from "@/browser/testUtils";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
-import { markPendingWorkspaceAgentId } from "@/browser/utils/workspaceAiSettingsSync";
+import {
+  clearPendingWorkspaceAgentId,
+  markPendingWorkspaceAgentId,
+} from "@/browser/utils/workspaceAiSettingsSync";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 
@@ -709,7 +712,7 @@ describe("WorkspaceContext", () => {
       "exec"
     );
 
-    // The backend echo of the pending value clears the guard...
+    // The backend echo applies, but the guard remains until its write settles.
     await waitFor(() => expect(emitMetadata).toBeTruthy());
     act(() => {
       emitMetadata?.({
@@ -718,8 +721,9 @@ describe("WorkspaceContext", () => {
       });
     });
     await waitFor(() => expect(ctx().workspaceMetadata.get(workspaceId)?.agentId).toBe("exec"));
+    clearPendingWorkspaceAgentId(workspaceId, "exec");
 
-    // ...so later backend updates apply again.
+    // Once the write settles, later backend updates apply again.
     await waitFor(() => expect(emitMetadata).toBeTruthy());
     act(() => {
       emitMetadata?.({
