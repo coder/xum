@@ -1276,11 +1276,12 @@ describe("WorkspaceService bash monitor wakes", () => {
       await waitForCondition(() => sendSpy.mock.calls.length === 2);
       const rebuilt = sends[1].prompt;
       // The old settle notice survives but is re-attributed: rendered verbatim, it would read
-      // as the re-armed live task having settled.
+      // as the re-armed live task having settled. The preserved stale disposition renders an
+      // earlier-run status and never a live match inviting task_await on the reused ID.
       expect(rebuilt).not.toContain("[monitor] process settled");
-      expect(rebuilt).toContain("exited (code 1)");
-      expect(rebuilt).toContain("re-armed");
-      expect(rebuilt).not.toContain("Status: exited");
+      expect(rebuilt).toContain("Status: exited (code 1) — earlier run of this process ID");
+      expect(rebuilt).not.toContain("Matched process output");
+      expect(rebuilt).not.toContain("task_await(");
       const wakeStore = (
         workspaceService as unknown as { bashMonitorWakeStore: BashMonitorWakeStore }
       ).bashMonitorWakeStore;

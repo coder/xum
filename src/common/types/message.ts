@@ -563,6 +563,11 @@ export interface BashMonitorWakeDisplayRecord {
   filterExclude: boolean;
   /** Present when the wake reported process settlement (exit, kill, timeout). */
   terminal?: { status: "exited" | "killed" | "failed"; exitCode?: number };
+  /**
+   * Present when the wake carries a dead earlier generation's settlement whose processId was
+   * re-armed by a new live process — still a settlement for display, never "monitor matched".
+   */
+  staleTerminal?: { status: "exited" | "killed" | "failed"; exitCode?: number };
 }
 
 export type MuxMessageMetadata = MuxMessageMetadataBase &

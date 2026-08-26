@@ -8,18 +8,28 @@ interface BashMonitorWakeMessageProps {
   className?: string;
 }
 
+/** A stale terminal (re-armed processId) still summarizes as a settlement, never as a match. */
+function settlementOf(
+  record: BashMonitorWakeDisplayRecord
+): BashMonitorWakeDisplayRecord["terminal"] {
+  return record.terminal ?? record.staleTerminal;
+}
+
 function summarizeTerminal(record: BashMonitorWakeDisplayRecord): string {
-  const terminal = record.terminal;
+  const terminal = settlementOf(record);
   if (terminal == null) return `${record.displayName} monitor matched`;
+  // Attribute a stale settlement to the earlier run so the card cannot read as the live
+  // (re-armed) process having settled.
+  const suffix = record.terminal == null ? " — earlier run, ID re-armed" : "";
   switch (terminal.status) {
     case "exited":
       return terminal.exitCode != null
-        ? `${record.displayName} exited (code ${terminal.exitCode})`
-        : `${record.displayName} exited`;
+        ? `${record.displayName} exited (code ${terminal.exitCode})${suffix}`
+        : `${record.displayName} exited${suffix}`;
     case "killed":
-      return `${record.displayName} killed`;
+      return `${record.displayName} killed${suffix}`;
     case "failed":
-      return `${record.displayName} failed`;
+      return `${record.displayName} failed${suffix}`;
   }
 }
 
@@ -33,10 +43,10 @@ function summarizeRecords(records: BashMonitorWakeDisplayRecord[]): string {
 
   const matchRecords = records.filter((record) => record.kind === "match");
   if (matchRecords.length === records.length) {
-    if (matchRecords.every((record) => record.terminal != null)) {
+    if (matchRecords.every((record) => settlementOf(record) != null)) {
       return `${records.length} background processes finished`;
     }
-    if (matchRecords.some((record) => record.terminal != null)) {
+    if (matchRecords.some((record) => settlementOf(record) != null)) {
       return `${records.length} background monitor updates`;
     }
     return `${records.length} background monitors matched`;
