@@ -12972,7 +12972,14 @@ export class WorkspaceService extends EventEmitter {
       );
       return Object.fromEntries(
         entries.filter(
-          (entry): entry is readonly [string, WorkspaceActivitySnapshot] => entry != null
+          (entry): entry is readonly [string, WorkspaceActivitySnapshot] =>
+            entry != null &&
+            // Revalidate after the per-workspace awaits above: a workspace
+            // removed while this list was computing would otherwise ride the
+            // delayed response past emitWorkspaceActivity's tombstone
+            // suppression — a renderer that already processed the removal
+            // event would re-insert the deleted id until the next reconnect.
+            !this.extensionMetadata.isWorkspaceDeleted(entry[0])
         )
       );
     } catch (error) {

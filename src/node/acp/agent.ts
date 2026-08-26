@@ -444,7 +444,21 @@ export class MuxAgent implements Agent {
     const [activeWorkspaces, archivedWorkspaces, workspaceActivity] = await Promise.all([
       this.server.client.workspace.list({ archived: false }),
       this.server.client.workspace.list({ archived: true }),
-      this.server.client.workspace.activity.list(),
+      // activity.list rejects on an unreadable/corrupt extensionMetadata.json
+      // so the renderer can keep last-known state instead of applying a bogus
+      // authoritative empty list. Here activity only refines recency
+      // sorting/updatedAt and there is no cached state to preserve, so a
+      // failure must not take down session listing for otherwise healthy
+      // sessions — degrade to an empty activity view instead.
+      this.server.client.workspace.activity
+        .list()
+        .catch((error: unknown): WorkspaceActivityById => {
+          console.error(
+            "[acp] Failed to list workspace activity; listing sessions without it",
+            error
+          );
+          return {};
+        }),
     ]);
 
     const allWorkspaces = dedupeWorkspacesById([...activeWorkspaces, ...archivedWorkspaces]);

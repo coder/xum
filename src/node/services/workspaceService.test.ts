@@ -141,6 +141,7 @@ const mockInitStateManager: Partial<InitStateManager> = {
   clearInMemoryState: mock(() => undefined),
 };
 const mockExtensionMetadataService: Partial<ExtensionMetadataService> = {
+  isWorkspaceDeleted: mock(() => false),
   setStreaming: mock(() =>
     Promise.resolve({
       recency: Date.now(),
@@ -3362,6 +3363,78 @@ describe("WorkspaceService activity list scoping", () => {
       } finally {
         await cleanup();
       }
+    }
+  });
+
+  test("getActivityList rejects when the metadata path exists but cannot be read", async () => {
+    // Only a genuinely missing file (ENOENT) is a healthy empty state. Any
+    // other read failure (here EISDIR; EACCES/ENOTDIR/EIO in the field) must
+    // reject in strict reads instead of masquerading as an authoritative
+    // empty list.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const metadataPath = path.join(config.rootDir, "extensionMetadata.json");
+      await fsPromises.mkdir(metadataPath, { recursive: true });
+      const extensionMetadata = new ExtensionMetadataService(metadataPath);
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+
+      // Lenient reads (writer paths) still self-heal.
+      expect((await extensionMetadata.getAllSnapshots()).size).toBe(0);
+
+      let rejected = false;
+      try {
+        await workspaceService.getActivityList();
+      } catch {
+        rejected = true;
+      }
+      expect(rejected).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("getActivityList drops workspaces removed while the list was computing", async () => {
+    // A removal that lands between the snapshot read and the response must
+    // not ride the delayed list past emitWorkspaceActivity's tombstone
+    // suppression: a renderer that already processed the removal event would
+    // re-insert the deleted id until the next reconnect.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "removed-mid-list";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency(workspaceId, 100);
+      const readSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      spyOn(extensionMetadata, "getAllSnapshots").mockImplementationOnce(async () => {
+        const snapshots = await readSnapshots();
+        // Simulates a concurrent removal completing after this request read
+        // its snapshot view but before the response was assembled.
+        await extensionMetadata.deleteWorkspace(workspaceId);
+        return snapshots;
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+
+      const activityList = await workspaceService.getActivityList();
+      expect(activityList[workspaceId]).toBeUndefined();
+    } finally {
+      await cleanup();
     }
   });
 

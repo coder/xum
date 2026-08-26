@@ -188,13 +188,6 @@ export class ExtensionMetadataService {
 
   private async load(options?: { throwOnError?: boolean }): Promise<ExtensionMetadataFile> {
     try {
-      await access(this.filePath, constants.F_OK);
-    } catch {
-      // A missing file is a healthy empty state in both modes.
-      return { version: 1, workspaces: {} };
-    }
-
-    try {
       const content = await readFile(this.filePath, "utf-8");
       const parsed = JSON.parse(content) as ExtensionMetadataFile;
 
@@ -214,9 +207,16 @@ export class ExtensionMetadataService {
 
       return parsed;
     } catch (error) {
-      // throwOnError lets read paths distinguish "file exists but is
-      // unreadable/malformed" from an authoritative empty state; the default
-      // self-heals so writers can always make progress.
+      // Only a genuinely missing file is a healthy empty state. Other read
+      // failures (EACCES/ENOTDIR/EIO, parse or structure errors) must not
+      // masquerade as one: throwOnError lets read paths distinguish them
+      // from an authoritative empty state, while the default self-heals so
+      // writers can always make progress.
+      if (typeof error === "object" && error != null && "code" in error) {
+        if (error.code === "ENOENT") {
+          return { version: 1, workspaces: {} };
+        }
+      }
       if (options?.throwOnError) {
         throw error;
       }
