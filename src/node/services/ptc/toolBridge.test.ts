@@ -8,6 +8,7 @@ import {
   DISPLAY_DATA_STUB,
   MEDIA_BUDGET_EXCEEDED_STUB,
   MEDIA_DATA_STUB,
+  MEDIA_UNSUPPORTED_STUB,
 } from "@/common/utils/attachments/toolAttachmentParts";
 import { jsonSchema, type Tool } from "ai";
 import type { IJSRuntime, RuntimeLimits } from "./runtime";
@@ -910,7 +911,7 @@ describe("attachment part stripping", () => {
   it("caps aggregate carried media bytes per eval", async () => {
     const bigData = "a".repeat(MAX_PENDING_ATTACHMENT_BYTES - 16);
     const bigPart = { type: "media", data: bigData, mediaType: "image/png" };
-    const smallPart = { type: "media", data: "b".repeat(64), mediaType: "image/png" };
+    const smallPart = { type: "media", data: "b".repeat(64), mediaType: "application/pdf" };
     const bridge = new ToolBridge({
       attach_file: createMockTool("attach_file", z.object({ path: z.string() }), (args) =>
         (args as { path: string }).path === "/big.png"
@@ -927,10 +928,10 @@ describe("attachment part stripping", () => {
 
     // Second attach would push the aggregate over budget: it must be refused
     // with the budget stub and must NOT be carried host-side.
-    const second = (await captured.xum.attach_file({ path: "/small.png" })) as {
-      value: Array<{ data: string }>;
+    const second = (await captured.xum.attach_file({ path: "/small.pdf" })) as {
+      value: Array<{ type: string; text?: string }>;
     };
-    expect(second.value[0].data).toBe(MEDIA_BUDGET_EXCEEDED_STUB);
+    expect(second.value[0]).toEqual({ type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB });
 
     const drained = bridge.drainPendingAttachments(runtime);
     expect(drained).toHaveLength(1);
@@ -972,13 +973,9 @@ describe("attachment part stripping", () => {
 
     expect(await captured.xum.bash({ script: "true" })).toEqual(bashResult);
     const sandboxValue = (await captured.xum.attach_file({ path: "/x.bin" })) as {
-      value: Array<{ type: string; data: string; mediaType: string }>;
+      value: Array<{ type: string; text?: string }>;
     };
-    expect(sandboxValue.value[0]).toEqual({
-      type: "media",
-      data: MEDIA_DATA_STUB,
-      mediaType: "application/x-custom",
-    });
+    expect(sandboxValue.value[0]).toEqual({ type: "text", text: MEDIA_UNSUPPORTED_STUB });
     // Unsupported media is discarded rather than forwarded to the provider.
     expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
   });
@@ -1001,14 +998,14 @@ describe("attachment part stripping", () => {
     const { captured, runtime } = registerCapturingXum(bridge);
 
     const unsupported = (await captured.xum.attach_file({ path: "/audio.bin" })) as {
-      value: Array<{ data: string }>;
+      value: Array<{ type: string; text?: string }>;
     };
-    expect(unsupported.value[0].data).toBe(MEDIA_DATA_STUB);
+    expect(unsupported.value[0]).toEqual({ type: "text", text: MEDIA_UNSUPPORTED_STUB });
 
     const supported = (await captured.xum.attach_file({ path: "/image.png" })) as {
-      value: Array<{ data: string }>;
+      value: Array<{ type: string; text?: string }>;
     };
-    expect(supported.value[0].data).toBe(MEDIA_BUDGET_EXCEEDED_STUB);
+    expect(supported.value[0]).toEqual({ type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB });
     expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
   });
 

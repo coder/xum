@@ -33,6 +33,9 @@ export const MEDIA_BUDGET_EXCEEDED_STUB =
 export const MEDIA_DATA_STUB =
   "[base64 omitted: media is delivered to the model as an attachment on this code_execution result]";
 
+export const MEDIA_UNSUPPORTED_STUB =
+  "[media omitted: this media type is not supported as a model attachment]";
+
 export const DISPLAY_DATA_STUB =
   "[base64 omitted: file is shown to the user on this code_execution result; its bytes are never sent to the model]";
 

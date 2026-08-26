@@ -27,6 +27,7 @@ import {
   DISPLAY_DATA_STUB,
   MEDIA_BUDGET_EXCEEDED_STUB,
   MEDIA_DATA_STUB,
+  MEDIA_UNSUPPORTED_STUB,
   isMediaPart,
   type ToolAttachmentPart,
 } from "@/common/utils/attachments/toolAttachmentParts";
@@ -478,8 +479,8 @@ export class ToolBridge {
    * host-side nested-call records/events (which sit outside QuickJS memory
    * accounting). Strip them per-runtime; supported model media and
    * display-only files are carried onto code_execution's result, while
-   * unsupported media is discarded. Every stripped part keeps its declared
-   * shape with `data` swapped for a stub and shares the aggregate budget.
+   * unsupported media is discarded. Carried parts keep their declared shape;
+   * unsupported and over-budget media become text placeholders.
    */
   private stripAttachmentParts(runtime: IJSRuntime, serialized: unknown): unknown {
     if (!isToolContentResult(serialized)) {
@@ -489,21 +490,29 @@ export class ToolBridge {
     const pending = this.pendingAttachments.get(runtime) ?? [];
     let pendingBytes = this.pendingAttachmentBytes.get(runtime) ?? 0;
     let changed = false;
-    const strip = <T extends ToolAttachmentPart>(part: T, stub: string, carry: boolean): T => {
+    const strip = <T extends ToolAttachmentPart>(
+      part: T,
+      stub: string,
+      carry: boolean
+    ): T | { type: "text"; text: string } => {
       if (pendingBytes + part.data.length > MAX_PENDING_ATTACHMENT_BYTES) {
-        return { ...part, data: MEDIA_BUDGET_EXCEEDED_STUB };
+        return isMediaPart(part)
+          ? { type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB }
+          : { ...part, data: MEDIA_BUDGET_EXCEEDED_STUB };
       }
       pendingBytes += part.data.length;
       this.pendingAttachmentBytes.set(runtime, pendingBytes);
-      if (carry) {
-        carriedParts.push(part);
+      if (!carry) {
+        return { type: "text", text: stub };
       }
+      carriedParts.push(part);
       return { ...part, data: stub };
     };
     const newValue = serialized.value.map((item) => {
       if (isMediaPart(item)) {
         changed = true;
-        return strip(item, MEDIA_DATA_STUB, isSupportedAttachmentMediaType(item.mediaType));
+        const supported = isSupportedAttachmentMediaType(item.mediaType);
+        return strip(item, supported ? MEDIA_DATA_STUB : MEDIA_UNSUPPORTED_STUB, supported);
       }
       if (isDisplayOnlyFilePart(item)) {
         changed = true;
