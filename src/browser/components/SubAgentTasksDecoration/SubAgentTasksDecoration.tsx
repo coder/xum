@@ -33,6 +33,8 @@ interface DescendantSubAgent {
 // Matches useWorkflowRunById's refresh cadence; polls only while a nested gap group renders.
 const NESTED_RUN_VERIFY_INTERVAL_MS = 2_000;
 const NESTED_RUN_VERIFY_MAX_FAILURES = 3;
+const RUN_DISCOVERY_RETRY_BASE_MS = 1_000;
+const RUN_DISCOVERY_RETRY_MAX_MS = 30_000;
 
 const ACTIVE_SUBAGENT_STATUSES = new Set<FrontendWorkspaceMetadata["taskStatus"]>([
   "queued",
@@ -421,33 +423,51 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
       return;
     }
     let cancelled = false;
-    api.workflows
-      .listActiveRuns({ workspaceIds: ownerIdsKey.split("\u0000") })
-      .then((summaries) => {
-        if (cancelled) {
-          return;
-        }
-        let seeded = false;
-        for (const summary of summaries) {
-          if (!summary.nested || observedWorkflowRunsRef.current.has(summary.runId)) {
-            continue;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let attempt = 0;
+    const discover = () => {
+      api.workflows
+        .listActiveRuns({ workspaceIds: ownerIdsKey.split("\u0000") })
+        .then((summaries) => {
+          if (cancelled) {
+            return;
           }
-          observedWorkflowRunsRef.current.set(summary.runId, {
-            workflowName: summary.workflowName ?? undefined,
-            ownerWorkspaceId: summary.workspaceId,
-            activityCovered: false,
-          });
-          seeded = true;
-        }
-        if (seeded) {
-          setObservedSeedVersion((version) => version + 1);
-        }
-      })
-      .catch(() => {
-        // Best-effort: live rows and activity still drive the tray.
-      });
+          let seeded = false;
+          for (const summary of summaries) {
+            if (!summary.nested || observedWorkflowRunsRef.current.has(summary.runId)) {
+              continue;
+            }
+            observedWorkflowRunsRef.current.set(summary.runId, {
+              workflowName: summary.workflowName ?? undefined,
+              ownerWorkspaceId: summary.workspaceId,
+              activityCovered: false,
+            });
+            seeded = true;
+          }
+          if (seeded) {
+            setObservedSeedVersion((version) => version + 1);
+          }
+        })
+        .catch(() => {
+          if (cancelled) {
+            return;
+          }
+          // A transient store failure must not end discovery for the rest of a
+          // nested run's worker gap (this effect otherwise re-runs only when
+          // the owner set changes): retry with capped backoff while mounted.
+          attempt += 1;
+          retryTimer = setTimeout(
+            discover,
+            Math.min(RUN_DISCOVERY_RETRY_MAX_MS, RUN_DISCOVERY_RETRY_BASE_MS * 2 ** attempt)
+          );
+        });
+    };
+    discover();
     return () => {
       cancelled = true;
+      if (retryTimer != null) {
+        clearTimeout(retryTimer);
+      }
     };
   }, [api, ownerIdsKey]);
   // Nested gap groups carry no activity signal, so verify their durable run records

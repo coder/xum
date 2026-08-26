@@ -781,7 +781,7 @@ export default function workflow({ args }) {
   });
 });
 
-describe("WorkflowService.getRunStatusForLiveness", () => {
+describe("WorkflowRunStore.getRunStatusForLiveness", () => {
   test("maps only definitively-missing records to null and rethrows read failures", async () => {
     using tmp = new DisposableTempDir("workflow-service-liveness");
     const source = `export default function workflow() {
@@ -809,14 +809,14 @@ describe("WorkflowService.getRunStatusForLiveness", () => {
 
     // Existing record: real status.
     expect(
-      await service.getRunStatusForLiveness({ workspaceId: "workspace-1", runId: "wfr_liveness" })
+      await runStore.getRunStatusForLiveness({ workspaceId: "workspace-1", runId: "wfr_liveness" })
     ).toBe("completed");
     // Definitively missing record / wrong owner: null (settled for that ref).
     expect(
-      await service.getRunStatusForLiveness({ workspaceId: "workspace-1", runId: "wfr_absent" })
+      await runStore.getRunStatusForLiveness({ workspaceId: "workspace-1", runId: "wfr_absent" })
     ).toBeNull();
     expect(
-      await service.getRunStatusForLiveness({ workspaceId: "workspace-2", runId: "wfr_liveness" })
+      await runStore.getRunStatusForLiveness({ workspaceId: "workspace-2", runId: "wfr_liveness" })
     ).toBeNull();
 
     // A transient read/parse failure must propagate (callers retry) instead of
@@ -824,13 +824,13 @@ describe("WorkflowService.getRunStatusForLiveness", () => {
     const runFile = path.join(tmp.path, "workflows", "wfr_liveness", "run.json");
     await fs.writeFile(runFile, "{ not json", "utf-8");
     await expect(
-      service.getRunStatusForLiveness({ workspaceId: "workspace-1", runId: "wfr_liveness" })
+      runStore.getRunStatusForLiveness({ workspaceId: "workspace-1", runId: "wfr_liveness" })
     ).rejects.toThrow();
     expect(await service.getRun({ workspaceId: "workspace-1", runId: "wfr_liveness" })).toBeNull();
   });
 });
 
-describe("WorkflowService.listActiveRunSummaries", () => {
+describe("WorkflowRunStore.listActiveRunSummaries", () => {
   test("includes nested active runs and excludes settled or foreign-workspace runs", async () => {
     using tmp = new DisposableTempDir("workflow-service-active-summaries");
     const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
@@ -891,11 +891,53 @@ describe("WorkflowService.listActiveRunSummaries", () => {
       args: {},
     });
 
-    const summaries = await service.listActiveRunSummaries({ workspaceId: "workspace-1" });
+    const summaries = await runStore.listActiveRunSummaries({ workspaceId: "workspace-1" });
     summaries.sort((a, b) => a.runId.localeCompare(b.runId));
     expect(summaries).toEqual([
       { runId: "wfr_nested_active", workflowName: "implementation-loop", nested: true },
       { runId: "wfr_top_active", workflowName: "deep-research", nested: false },
     ]);
   });
+
+  test("treats a missing workflows dir as empty", async () => {
+    using tmp = new DisposableTempDir("workflow-store-discovery-fresh");
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    expect(await runStore.listActiveRunSummaries({ workspaceId: "workspace-1" })).toEqual([]);
+  });
+
+  // Root bypasses permission bits and Windows ignores POSIX modes, so the
+  // unreadable-dir scenario is only reproducible on non-root POSIX runs.
+  const canDropDirPermissions = process.platform !== "win32" && process.getuid?.() !== 0;
+  test.skipIf(!canDropDirPermissions)(
+    "rejects discovery when the workflows dir is unreadable instead of reporting empty",
+    async () => {
+      using tmp = new DisposableTempDir("workflow-store-discovery-unreadable");
+      const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+      await runStore.createRun({
+        id: "wfr_unreadable",
+        workspaceId: "workspace-1",
+        workflow: {
+          name: "deep-research",
+          description: "Research a topic",
+          scope: "built-in" as const,
+          executable: true,
+        },
+        source: "export default async function workflow() { return 'ok'; }\n",
+        args: {},
+        now: "2026-05-29T00:00:00.000Z",
+      });
+      const workflowsDir = path.join(tmp.path, "workflows");
+      await fs.chmod(workflowsDir, 0o000);
+      try {
+        // Strict discovery must surface the failure so callers retry…
+        await expect(
+          runStore.listActiveRunSummaries({ workspaceId: "workspace-1" })
+        ).rejects.toThrow();
+        // …while lenient callers (activity/UI lists) still degrade to empty.
+        expect(await runStore.listRunStatusSnapshots()).toEqual([]);
+      } finally {
+        await fs.chmod(workflowsDir, 0o755);
+      }
+    }
+  );
 });

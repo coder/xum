@@ -1984,25 +1984,33 @@ export const router = (authToken?: string) => {
         .input(schemas.workflows.getRunStatuses.input)
         .output(schemas.workflows.getRunStatuses.output)
         .handler(async ({ context, input }) => {
-          // Bulk nested-run liveness for the sub-agent tray: one renderer round trip
-          // covers all candidates (owners may differ, so contexts resolve per owner).
-          // A ref whose context resolution or read rejects is omitted (transient);
-          // the liveness read maps only a definitively-missing durable record to a
-          // null status, so callers can tell "gone" from "retry later".
-          const contexts = new Map<string, ReturnType<typeof resolveWorkflowContext>>();
-          const resolveFor = (workspaceId: string) => {
-            let resolved = contexts.get(workspaceId);
-            if (resolved == null) {
-              resolved = resolveWorkflowContext(context, workspaceId);
-              contexts.set(workspaceId, resolved);
+          // Bulk nested-run liveness for the sub-agent tray: one renderer round
+          // trip covers all candidates. Reads go straight to each owner's run
+          // store (plain host-side session state) instead of through
+          // resolveWorkflowContext, which waits on workspace initialization — one
+          // stuck provisioning owner must not stall verification for the rest.
+          // A ref whose read rejects is omitted (transient); the store maps only
+          // a definitively-missing durable record to a null status, so callers
+          // can tell "gone" from "retry later". With the workflows experiment
+          // off there are no runs to verify — empty, not an error.
+          if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
+            return [];
+          }
+          const stores = new Map<string, WorkflowRunStore>();
+          const storeFor = (workspaceId: string) => {
+            let store = stores.get(workspaceId);
+            if (store == null) {
+              store = new WorkflowRunStore({
+                sessionDir: context.config.getSessionDir(workspaceId),
+              });
+              stores.set(workspaceId, store);
             }
-            return resolved;
+            return store;
           };
           const entries = await Promise.all(
             input.runs.map(async (ref) => {
               try {
-                const { service } = await resolveFor(ref.workspaceId);
-                const status = await service.getRunStatusForLiveness({
+                const status = await storeFor(ref.workspaceId).getRunStatusForLiveness({
                   workspaceId: ref.workspaceId,
                   runId: ref.runId,
                 });
@@ -2018,17 +2026,23 @@ export const router = (authToken?: string) => {
         .input(schemas.workflows.listActiveRuns.input)
         .output(schemas.workflows.listActiveRuns.output)
         .handler(async ({ context, input }) => {
-          // Discovery is best-effort per owner: a deleted workspace contributes
-          // nothing instead of failing the whole bulk read.
+          // Cold-mount discovery for the tray. Same no-initialization-wait rule
+          // as getRunStatuses above, and strict per owner: a deleted workspace's
+          // missing session dir reads as empty, but a transient store failure
+          // rejects the whole call so the tray retries instead of caching "no
+          // active runs" for the rest of a nested run's worker gap. With the
+          // workflows experiment off there is nothing to discover — empty, not
+          // an error the tray would uselessly retry.
+          if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
+            return [];
+          }
           const results = await Promise.all(
             input.workspaceIds.map(async (workspaceId) => {
-              try {
-                const { service } = await resolveWorkflowContext(context, workspaceId);
-                const summaries = await service.listActiveRunSummaries({ workspaceId });
-                return summaries.map((summary) => ({ workspaceId, ...summary }));
-              } catch {
-                return [];
-              }
+              const runStore = new WorkflowRunStore({
+                sessionDir: context.config.getSessionDir(workspaceId),
+              });
+              const summaries = await runStore.listActiveRunSummaries({ workspaceId });
+              return summaries.map((summary) => ({ workspaceId, ...summary }));
             })
           );
           return results.flat();

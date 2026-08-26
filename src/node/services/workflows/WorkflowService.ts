@@ -2,7 +2,6 @@ import * as crypto from "node:crypto";
 import * as path from "node:path";
 
 import {
-  isActiveWorkflowRunStatus,
   isTerminalWorkflowRunStatus,
   type WorkflowScriptDescriptor,
   type WorkflowRunRecord,
@@ -12,7 +11,6 @@ import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWor
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getWorkflowCheckpointRetryEligibility } from "@/common/utils/workflowRetryEligibility";
-import { isErrnoWithCode } from "@/node/utils/fs";
 import { log } from "@/node/services/log";
 import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
 import { WORKFLOW_RUN_TASK_ID_PREFIX } from "@/node/services/tools/taskId";
@@ -221,66 +219,6 @@ export class WorkflowService {
     } catch {
       return null;
     }
-  }
-
-  /**
-   * Liveness read for the bulk run-status endpoint. Unlike getRun(), which maps
-   * every storage failure to null, only a definitively-missing record (ENOENT /
-   * ENOTDIR anywhere in the run's read path, or a workspace mismatch) maps to
-   * null here; transient read/parse failures propagate so callers can treat
-   * them as retryable instead of as a settled/missing run.
-   */
-  async getRunStatusForLiveness(input: {
-    workspaceId: string;
-    runId: string;
-  }): Promise<WorkflowRunStatus | null> {
-    assert(
-      input.workspaceId.length > 0,
-      "WorkflowService.getRunStatusForLiveness: workspaceId is required"
-    );
-    assert(input.runId.length > 0, "WorkflowService.getRunStatusForLiveness: runId is required");
-    try {
-      const run = await this.runStore.getRun(input.runId);
-      return run.workspaceId === input.workspaceId ? run.status : null;
-    } catch (error) {
-      if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) {
-        return null;
-      }
-      throw error;
-    }
-  }
-
-  /**
-   * Active-run discovery for the sub-agent tray's cold mount. Unlike listRuns(),
-   * nested (parentWorkflow) runs are included: they are deliberately absent from
-   * workspace activity, so a tray mounting during a nested run's between-workers
-   * gap has no other way to learn the run exists. Per-record read failures
-   * degrade to a nameless entry rather than failing discovery.
-   */
-  async listActiveRunSummaries(input: {
-    workspaceId: string;
-  }): Promise<Array<{ runId: string; workflowName: string | null; nested: boolean }>> {
-    assert(
-      input.workspaceId.length > 0,
-      "WorkflowService.listActiveRunSummaries: workspaceId is required"
-    );
-    const snapshots = await this.runStore.listRunStatusSnapshots();
-    return await Promise.all(
-      snapshots
-        .filter(
-          (snapshot) =>
-            snapshot.workspaceId === input.workspaceId && isActiveWorkflowRunStatus(snapshot.status)
-        )
-        .map(async (snapshot) => {
-          let workflowName: string | null = null;
-          try {
-            workflowName = (await this.runStore.getRun(snapshot.id)).workflow.name ?? null;
-          } catch {
-            // Name is presentation-only; the id still seeds the tray group.
-          }
-          return { runId: snapshot.id, workflowName, nested: snapshot.parentWorkflow != null };
-        })
-    );
   }
 
   private async notifyRunStatusChanged(

@@ -990,6 +990,12 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         return Promise.resolve(agentPackage);
       },
     },
+    workflows: {
+      // The tray's cold-mount discovery and nested-run liveness poll run in any
+      // story that renders chat input; resolve empty so no groups are seeded.
+      getRunStatuses: () => Promise.resolve([]),
+      listActiveRuns: () => Promise.resolve([]),
+    },
     agentSkills: {
       list: () => Promise.resolve(agentSkills),
       listDiagnostics: () =>
