@@ -10,7 +10,7 @@ export interface AISDKMediaPart {
   data: string;
   mediaType: string;
   /** Untrusted optional metadata: persisted rows and MCP outputs may carry any
-   * shape here — recognition ignores it (r24) and consumers drop non-strings
+   * shape here: recognition ignores it (r24) and consumers drop non-strings
    * (r25) instead of throwing during provider-request preparation. */
   filename?: unknown;
 }

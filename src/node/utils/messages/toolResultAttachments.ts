@@ -120,43 +120,6 @@ function buildDisplayOnlyFilePlaceholder(item: DisplayOnlyFilePart): AISDKTextPa
 }
 
 /**
- * Split media/display-file parts out of a tool-result value array, replacing
- * each with a small text placeholder. Returns the original parts so callers
- * can route them (provider extraction, PTC bridge stripping).
- */
-export function splitAttachmentPartsFromValueArray(items: unknown[]): {
-  newItems: AISDKContent[];
-  mediaParts: AISDKMediaPart[];
-  displayParts: DisplayOnlyFilePart[];
-  didChange: boolean;
-} {
-  const newItems: AISDKContent[] = [];
-  const mediaParts: AISDKMediaPart[] = [];
-  const displayParts: DisplayOnlyFilePart[] = [];
-  let didChange = false;
-
-  for (const item of items) {
-    if (isMediaPart(item) && isSupportedAttachmentMediaType(item.mediaType)) {
-      didChange = true;
-      mediaParts.push(item);
-      newItems.push(buildAttachmentPlaceholder(item));
-      continue;
-    }
-
-    if (isDisplayOnlyFilePart(item)) {
-      didChange = true;
-      displayParts.push(item);
-      newItems.push(buildDisplayOnlyFilePlaceholder(item));
-      continue;
-    }
-
-    newItems.push(item as AISDKContent);
-  }
-
-  return { newItems, mediaParts, displayParts, didChange };
-}
-
-/**
  * Depth bound for the mutual recursion between extractAttachmentsFromToolOutput
  * and extractAttachmentsFromNestedToolCalls (json wrappers count too). History
  * rows are untrusted persisted JSON: a syntactically valid row nesting

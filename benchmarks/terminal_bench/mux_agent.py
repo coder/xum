@@ -550,8 +550,8 @@ class MuxAgent(BaseInstalledAgent):
 
         The stdout JSONL stream can lose its tail (including the run-complete
         event that carries cost_usd) on remote backends, so the on-disk session
-        files — chat.jsonl and session-usage.json, persisted on every
-        stream-end — are the durable source for token/cost telemetry.
+        files (chat.jsonl and session-usage.json, persisted on every
+        stream-end) are the durable source for token/cost telemetry.
         Best-effort: never fail the trial over telemetry collection.
         """
         session_root = (
@@ -573,7 +573,7 @@ class MuxAgent(BaseInstalledAgent):
             telemetry_source += (
                 " | while IFS= read -r -d '' path; do "
                 f'case "$path" in {excluded_patterns}) ;; '
-                '*) printf \'%s\\0\' "$path" ;; esac; done'
+                "*) printf '%s\\0' \"$path\" ;; esac; done"
             )
         # Stream only known telemetry files and cap raw archive bytes before
         # base64 expansion so sandbox tasks cannot inflate the host transfer.
@@ -702,7 +702,7 @@ class MuxAgent(BaseInstalledAgent):
                     session_id = parts[-2]
                     per_session[session_id] = data
         except Exception:
-            return None  # Corrupt/partial archive — telemetry stays best-effort
+            return None  # Corrupt/partial archive: telemetry stays best-effort
 
         for data in per_session.values():
             if not self._has_usable_session_usage(data):

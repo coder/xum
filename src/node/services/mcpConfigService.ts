@@ -325,7 +325,7 @@ export class MCPConfigService {
     const globalCfg = await this.getGlobalConfig();
     const globalServers = omitReservedPluginKeys(globalCfg.servers, "global");
 
-    // projectAutomationDisabled: benchmark harness kill-switch — dataset
+    // projectAutomationDisabled: benchmark harness kill-switch: dataset
     // repos keep config trust for delegation, but repo-configured MCP
     // servers must not start with provider credentials in the environment.
     const projectConfigAllowed = trusted && !projectAutomationDisabled();

@@ -7,7 +7,7 @@ import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import {
   gitHooksAllowed,
   gitNoRepoAutomationEnv,
-  gitNoRepoAutomationEnvForFilterConfigKeys,
+  gitNoRepoAutomationEnvForConfigKeys,
 } from "@/node/utils/gitNoHooksEnv";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 
@@ -50,7 +50,7 @@ function buildGitExecutionEnv(options?: {
     ? {}
     : options?.filterConfigKeys == null
       ? gitNoRepoAutomationEnv()
-      : gitNoRepoAutomationEnvForFilterConfigKeys(options.filterConfigKeys);
+      : gitNoRepoAutomationEnvForConfigKeys(options.filterConfigKeys);
   return {
     ...(options?.env ?? {}),
     ...NON_INTERACTIVE_ENV_VARS,

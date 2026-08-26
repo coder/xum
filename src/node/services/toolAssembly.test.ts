@@ -71,7 +71,7 @@ describe("applyToolPolicyAndExperiments", () => {
     });
     expect(Object.keys(result).sort()).toEqual(["advisor", "code_execution", "memory"]);
 
-    // The media tools must actually be reachable inside the sandbox — hidden
+    // The media tools must actually be reachable inside the sandbox; hidden
     // from the model-visible set but not dropped.
     const evalResult = (await result.code_execution.execute!(
       { code: "return [typeof mux.attach_file, typeof mux.desktop_screenshot];" },

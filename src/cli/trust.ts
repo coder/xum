@@ -62,7 +62,7 @@ async function ensureDirectory(dirPath: string): Promise<void> {
 }
 
 // git prints exactly one trailing LF after a path; strip only that
-// terminator, because the path itself may legitimately end in whitespace —
+// terminator, because the path itself may legitimately end in whitespace,
 // including a carriage return on Unix, where "\r" is a valid path byte and
 // must survive. Windows filenames cannot contain "\r", so a CRLF pair there
 // is always a line terminator and strips as a unit.

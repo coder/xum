@@ -160,12 +160,6 @@ export function gitNoRepoAutomationEnvForConfigKeys(
   return appendDisabledRepoAutomationDrivers(gitNoRepoAutomationEnv(), configKeys);
 }
 
-export function gitNoRepoAutomationEnvForFilterConfigKeys(
-  configKeys: Iterable<string>
-): Record<string, string> {
-  return gitNoRepoAutomationEnvForConfigKeys(configKeys);
-}
-
 export function gitEnvPrefix(env: Record<string, string>): string {
   return (
     Object.entries(env)

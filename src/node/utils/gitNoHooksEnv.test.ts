@@ -7,7 +7,7 @@ import {
   gitHooksAllowed,
   gitNoHooksPrefix,
   gitNoRepoAutomationEnv,
-  gitNoRepoAutomationEnvForFilterConfigKeys,
+  gitNoRepoAutomationEnvForConfigKeys,
   gitNoRepoAutomationEnvForLocalRepo,
 } from "./gitNoHooksEnv";
 
@@ -83,18 +83,18 @@ describe("gitNoRepoAutomationEnv", () => {
 
   test("rejects filter driver names that cannot be overridden safely", () => {
     const longName = "a".repeat(513);
-    expect(() => gitNoRepoAutomationEnvForFilterConfigKeys([`filter.${longName}.smudge`])).toThrow(
+    expect(() => gitNoRepoAutomationEnvForConfigKeys([`filter.${longName}.smudge`])).toThrow(
       "unsupported driver name"
     );
-    expect(() => gitNoRepoAutomationEnvForFilterConfigKeys([`diff.${longName}.command`])).toThrow(
+    expect(() => gitNoRepoAutomationEnvForConfigKeys([`diff.${longName}.command`])).toThrow(
       "unsupported driver name"
     );
-    expect(() => gitNoRepoAutomationEnvForFilterConfigKeys([`merge.${longName}.driver`])).toThrow(
+    expect(() => gitNoRepoAutomationEnvForConfigKeys([`merge.${longName}.driver`])).toThrow(
       "unsupported driver name"
     );
-    expect(() =>
-      gitNoRepoAutomationEnvForFilterConfigKeys([`remote.${longName}.uploadpack`])
-    ).toThrow("unsupported driver name");
+    expect(() => gitNoRepoAutomationEnvForConfigKeys([`remote.${longName}.uploadpack`])).toThrow(
+      "unsupported driver name"
+    );
   });
 
   test("neutralizes filters selected by .git/info/attributes without mutating it", async () => {

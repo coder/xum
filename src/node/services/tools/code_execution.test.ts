@@ -1297,7 +1297,7 @@ describe("createCodeExecutionTool", () => {
       const audioData = "d2F2".repeat(50);
       const tools: Record<string, Tool> = {
         // Wrapped: raw media reaches the guest/records. The rec tool below
-        // stays a top-level carrier — the bridge stubs its audio data, and
+        // stays a top-level carrier; the bridge stubs its audio data, and
         // capture still bounds the stubbed unsupported part to a placeholder.
         mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
           shot: {
@@ -1412,7 +1412,7 @@ describe("createCodeExecutionTool", () => {
       const image = "A".repeat(500);
       const tools: Record<string, Tool> = {
         // Wrapped: a top-level carrier would be rebuilt as a bare {type,value}
-        // by the bridge's strip, silently dropping the spoofed field — the
+        // by the bridge's strip, silently dropping the spoofed field; the
         // wrapper keeps the spoof adjacent to RAW retained media (the r27
         // marker-vs-media compaction race this test exists for).
         mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
@@ -1445,7 +1445,7 @@ describe("createCodeExecutionTool", () => {
     it("bounds unsupported parts of mixed media containers at capture", async () => {
       // A mixed top-level container is stripped by the bridge: the image's
       // bytes ride the attachments carrier while the unsupported audio payload
-      // (up to 8 MiB per part) is discarded — neither may persist raw into the
+      // (up to 8 MiB per part) is discarded; neither may persist raw into the
       // record/chat.jsonl, and capture still bounds the stubbed audio part to
       // a placeholder.
       using tmp = new DisposableTempDir("code-exec-mixed-media");

@@ -418,7 +418,7 @@ export function computeAgentPluginContainers(args: {
   projectTrusted: boolean;
 }): AgentPluginContainer[] {
   const containers: AgentPluginContainer[] = [];
-  // projectAutomationDisabled: benchmark harness kill-switch — dataset repos
+  // projectAutomationDisabled: benchmark harness kill-switch: dataset repos
   // must not contribute plugin containers (hooks.js tool middleware, plugin
   // MCP, slash commands) even when trusted for delegation; global containers
   // below stay active. Mirrors the init/tool_env/project-MCP gating.

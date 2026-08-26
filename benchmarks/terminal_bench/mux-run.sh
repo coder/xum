@@ -225,7 +225,7 @@ for line in open(sys.argv[1]):
                 result["cache_write"] += (model_usage.get("cacheCreate") or {}).get("tokens", 0)
     except Exception:
         pass
-# No run-complete found — aggregate the last usage-delta per message + sub-agent totals
+# No run-complete found: aggregate the last usage-delta per message + sub-agent totals
 for usage, meta in cumulative_by_msg.values():
     input_tokens = usage.get("inputTokens", 0) or 0
     details = usage.get("inputTokenDetails") or {}
