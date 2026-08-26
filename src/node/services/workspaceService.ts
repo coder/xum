@@ -298,6 +298,7 @@ import {
   BashMonitorWakeStore,
   buildBashMonitorWakeMetadata,
   buildBashMonitorWakePrompt,
+  type BashMonitorClearToken,
   type BashMonitorWakePromptContext,
   type BashMonitorWakeRecord,
 } from "@/node/services/bashMonitorWakeStore";
@@ -12340,7 +12341,7 @@ export class WorkspaceService extends EventEmitter {
 
   private async retirePendingBashMonitorWakesBeforeHistoryClear(
     workspaceId: string
-  ): Promise<Result<{ snapshots: BashMonitorWakeRecord[]; clearedAt: string }>> {
+  ): Promise<Result<{ snapshots: BashMonitorWakeRecord[] } & BashMonitorClearToken>> {
     try {
       return Ok(await this.bashMonitorWakeStore.supersedeAllPending(workspaceId));
     } catch (error) {
@@ -12381,7 +12382,10 @@ export class WorkspaceService extends EventEmitter {
     // re-show) pending-wake rows; nothing else re-emits for already-exited processes.
     this.notifyBashMonitorWakeStateChanged(workspaceId);
     const staged = retireResult.data.snapshots;
-    const retiredClearedAt = retireResult.data.clearedAt;
+    const clearToken = {
+      clearId: retireResult.data.clearId,
+      clearedAt: retireResult.data.clearedAt,
+    };
     const restoreSnapshots = async (includeUnaccepted: boolean): Promise<void> => {
       const acceptedAfter = await this.findAcceptedBashMonitorWakeSnapshots(workspaceId, staged);
       const restorable = staged.filter((record) => {
@@ -12395,7 +12399,7 @@ export class WorkspaceService extends EventEmitter {
         await this.bashMonitorWakeStore.restorePendingSnapshots(
           workspaceId,
           restorable,
-          retiredClearedAt
+          clearToken
         );
       } finally {
         // Notify even when restoration throws partway: earlier records in the pass are
@@ -12409,6 +12413,11 @@ export class WorkspaceService extends EventEmitter {
       if (clearResult.success) {
         if (options?.discardUnacceptedOnSuccess !== true) {
           await restoreSnapshots(true);
+        } else {
+          // Full clear committed: promote the staged tombstone so pre-clear deferred
+          // temps stop being held and become condemned. Without this, a crash-scan
+          // would eventually treat the staging as failed and resurrect them.
+          await this.bashMonitorWakeStore.commitClear(workspaceId, clearToken);
         }
         return clearResult;
       }

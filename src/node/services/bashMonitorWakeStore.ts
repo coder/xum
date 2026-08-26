@@ -39,6 +39,13 @@ const TMP_WRITE_SUFFIX_RE = /\.json\.tmp-[^.]+$/;
 // older is an orphan from a crash. Exported for tests.
 export const TEMP_RECOVERY_MIN_AGE_MS = 60 * 1000;
 
+// A STAGED clear tombstone older than this is a crashed clear staging: the owning
+// instance promotes or rolls back within its own request, so nothing else ever
+// resolves it. Scans roll it back after this grace — failing toward delivery, per the
+// store's documented bias — while the grace keeps another instance's scans from
+// rolling back a clear that is merely in flight. Exported for tests.
+export const STAGED_CLEAR_ROLLBACK_GRACE_MS = 5 * 60 * 1000;
+
 /**
  * Delay until a deferred fresh temp should be rechecked: an epsilon past the gate so
  * the re-driven scan's own freshness check cannot lose a same-millisecond race against
@@ -192,6 +199,35 @@ export interface BashMonitorWakeRecord {
   createdAt: string;
   updatedAt: string;
   deliveredAt?: string;
+  /**
+   * Set when a history clear superseded this record (see supersedeAllPending): the
+   * clear's identity plus the pre-clear updatedAt let a CRASHED clear staging be
+   * rolled back losslessly at scan time — snapshot keys and acceptance logic key on
+   * the original updatedAt, so it must survive the round trip.
+   */
+  supersededByClearId?: string;
+  pendingUpdatedAtBeforeClear?: string;
+}
+
+/** Identifies one history-clear transaction (see supersedeAllPending / commitClear). */
+export interface BashMonitorClearToken {
+  clearId: string;
+  clearedAt: string;
+}
+
+/**
+ * Durable history-clear tombstone contents. `phase` distinguishes a STAGED clear
+ * (visible wakes retired, outcome unknown — deferred temps are held, not condemned)
+ * from a COMMITTED one (retirement is final — pre-clear temps are condemned). A
+ * missing phase reads as committed: demoted previous-generation values carry no
+ * staging state, and committed is the protective default.
+ */
+interface ClearTombstone {
+  clearedAt: string;
+  clearId?: string;
+  phase?: "staged" | "committed";
+  stagedAt?: string;
+  previousClearedAt?: string;
 }
 
 /**
@@ -251,6 +287,8 @@ const BashMonitorWakeRecordSchema = z
     createdAt: z.string().min(1),
     updatedAt: z.string().min(1),
     deliveredAt: z.string().optional(),
+    supersededByClearId: z.string().optional(),
+    pendingUpdatedAtBeforeClear: z.string().optional(),
   })
   // Strip (not reject) unknown keys: this is a persisted, evolving record, so a record written by
   // a newer build that added a field must still parse here and deliver rather than be dropped as
@@ -567,6 +605,12 @@ export class BashMonitorWakeStore {
   onDeferredTempRecoveryDue: ((ownerWorkspaceId: string) => void) | null = null;
   // One unref'd timer per deferred temp path, fired just past the freshness gate.
   private readonly deferredTempRecoveryTimers = new Map<string, NodeJS.Timeout>();
+  // Dedicated lock map for tombstone mutations (record locks key on `${owner}:${id}`
+  // where id is an arbitrary process id, so sharing them risks collisions).
+  private readonly clearedAtLocks = new MutexMap<string>();
+  // Clears begun by THIS instance that have not yet committed or rolled back; scans
+  // must never treat their staged tombstones as crashed.
+  private readonly activeClearIds = new Set<string>();
 
   constructor(private readonly config: Pick<Config, "getSessionDir" | "sessionsDir">) {}
 
@@ -602,111 +646,285 @@ export class BashMonitorWakeStore {
     return path.join(this.dir(ownerWorkspaceId), "cleared-at");
   }
 
-  private async writeClearedAt(ownerWorkspaceId: string, clearedAt: string): Promise<void> {
+  /**
+   * Atomically mutate the clear tombstone under a CAS: the current generation is
+   * CAPTURED (renamed aside) before `decide` runs, so the decision applies to exactly
+   * the generation being replaced — a plain read-then-write could demote or clobber a
+   * NEWER tombstone published by another instance between the read and the write.
+   * `decide` returns the next generation, "keep" to restore the capture untouched, or
+   * null to remove the tombstone. The final placement uses a no-clobber link, so a
+   * generation claimed by another instance mid-mutation wins and ours backs off. A
+   * crash mid-dance strands the capture under a .cas- name, which reads heal (see
+   * readClearedAt), so protection is never silently lost. In-process mutations are
+   * serialized by a dedicated lock.
+   */
+  private async mutateClearedAt(
+    ownerWorkspaceId: string,
+    decide: (current: ClearTombstone | null) => ClearTombstone | "keep" | null
+  ): Promise<void> {
     const target = this.clearedAtFile(ownerWorkspaceId);
-    await fsPromises.mkdir(path.dirname(target), { recursive: true });
-    // Carry the value being replaced: a ROLLBACK of this clear must restore the prior
-    // tombstone rather than deleting the file wholesale, or an older successful
-    // clear's protection would die with a newer failed one and let a pre-old-clear
-    // temp deliver permanently retired output. Only one level is needed — a clear
-    // becomes "previous" only after committing, and committed clears are never
-    // rolled back.
-    const previousClearedAtMs = await this.readClearedAtMs(ownerWorkspaceId);
-    await this.writeClearedAtFile(target, {
-      clearedAt,
-      ...(previousClearedAtMs != null
-        ? { previousClearedAt: new Date(previousClearedAtMs).toISOString() }
-        : {}),
+    await this.clearedAtLocks.withLock(ownerWorkspaceId, async () => {
+      await fsPromises.mkdir(path.dirname(target), { recursive: true });
+      const capture = `${target}.cas-${randomUUID()}`;
+      let captured = false;
+      try {
+        await fsPromises.rename(target, capture);
+        captured = true;
+      } catch (error) {
+        if (!isErrnoWithCode(error, "ENOENT")) throw error;
+        // Absent: heal a crash-stranded capture back first so its protection joins
+        // the decision, then retry the capture once.
+        if ((await this.healClearedAtFromLeftovers(ownerWorkspaceId)) != null) {
+          try {
+            await fsPromises.rename(target, capture);
+            captured = true;
+          } catch (retryError) {
+            if (!isErrnoWithCode(retryError, "ENOENT")) throw retryError;
+          }
+        }
+      }
+      let current: ClearTombstone | null = null;
+      if (captured) {
+        let raw: string | null;
+        try {
+          raw = await fsPromises.readFile(capture, "utf-8");
+        } catch (error) {
+          // Cannot verify what we captured: put it back (no-clobber) and propagate.
+          try {
+            await fsPromises.link(capture, target);
+            await fsPromises.rm(capture, { force: true }).catch(() => undefined);
+          } catch {
+            // A newer write claimed the path; the capture heals as a leftover later.
+          }
+          throw error;
+        }
+        current = BashMonitorWakeStore.parseTombstone(raw);
+      }
+      const next = decide(current);
+      if (next === "keep") {
+        if (captured) {
+          try {
+            await fsPromises.link(capture, target);
+          } catch (error) {
+            if (!isErrnoWithCode(error, "EEXIST")) throw error; // capture heals later
+          }
+          await fsPromises.rm(capture, { force: true }).catch(() => undefined);
+        }
+        return;
+      }
+      if (next == null) {
+        // Removal failures PROPAGATE: a stranded capture would heal back as standing
+        // protection (the safe direction), and the caller must know removal failed.
+        if (captured) await fsPromises.rm(capture, { force: true });
+        return;
+      }
+      const temp = `${target}.tmp-${randomUUID()}`;
+      await fsPromises.writeFile(temp, JSON.stringify(next), "utf-8");
+      try {
+        await fsPromises.link(temp, target);
+      } catch (error) {
+        await fsPromises.rm(temp, { force: true }).catch(() => undefined);
+        if (!isErrnoWithCode(error, "EEXIST")) {
+          if (captured) {
+            try {
+              await fsPromises.link(capture, target);
+              await fsPromises.rm(capture, { force: true }).catch(() => undefined);
+            } catch {
+              // A newer write claimed the path; the capture heals as a leftover later.
+            }
+          }
+          throw error;
+        }
+        // EEXIST: another instance claimed the path mid-mutation. Its generation
+        // wins this race and supersedes both our decision and our capture.
+        if (captured) await fsPromises.rm(capture, { force: true }).catch(() => undefined);
+        return;
+      }
+      await fsPromises.rm(temp, { force: true }).catch(() => undefined);
+      if (captured) await fsPromises.rm(capture, { force: true }).catch(() => undefined);
     });
   }
 
-  private async writeClearedAtFile(
-    target: string,
-    record: { clearedAt: string; previousClearedAt?: string }
-  ): Promise<void> {
-    // Atomic like write(): a torn tombstone must never be a file's settled content.
-    // The temp name matches no artifact pattern either, so scans skip it too.
-    const temp = `${target}.tmp-${randomUUID()}`;
-    await fsPromises.writeFile(temp, JSON.stringify(record), "utf-8");
+  /**
+   * Restore the newest crash-stranded tombstone capture (a .cas- leftover from a
+   * mutation interrupted between its capture rename and final placement) back to the
+   * canonical path, and report it. Stale older leftovers are swept once a newer value
+   * stands. Returns the tombstone now effective, or null when none exists.
+   */
+  private async healClearedAtFromLeftovers(
+    ownerWorkspaceId: string
+  ): Promise<ClearTombstone | null> {
+    const target = this.clearedAtFile(ownerWorkspaceId);
+    const dir = path.dirname(target);
+    const base = path.basename(target);
+    let entries: string[];
     try {
-      await fsPromises.rename(temp, target);
+      entries = await fsPromises.readdir(dir);
     } catch (error) {
-      await fsPromises.rm(temp, { force: true }).catch(() => undefined);
+      if (isErrnoWithCode(error, "ENOENT")) return null;
       throw error;
+    }
+    let newest: ClearTombstone | null = null;
+    let newestPath: string | null = null;
+    for (const entry of entries) {
+      if (!entry.startsWith(`${base}.cas-`)) continue;
+      const leftoverPath = path.join(dir, entry);
+      let raw: string;
+      try {
+        raw = await fsPromises.readFile(leftoverPath, "utf-8");
+      } catch (error) {
+        if (isErrnoWithCode(error, "ENOENT")) continue; // concurrently consumed
+        throw error;
+      }
+      const parsed = BashMonitorWakeStore.parseTombstone(raw);
+      if (parsed == null) {
+        await fsPromises.rm(leftoverPath, { force: true }).catch(() => undefined);
+        continue;
+      }
+      if (newest == null || Date.parse(parsed.clearedAt) > Date.parse(newest.clearedAt)) {
+        newest = parsed;
+        newestPath = leftoverPath;
+      }
+    }
+    if (newest == null || newestPath == null) return null;
+    try {
+      await fsPromises.link(newestPath, target);
+      await fsPromises.rm(newestPath, { force: true }).catch(() => undefined);
+    } catch {
+      // EEXIST (a concurrent writer re-established the path) or transient: the
+      // leftover stays for a later heal; the newest protection is still reported.
+    }
+    return newest;
+  }
+
+  private static parseTombstone(raw: string): ClearTombstone | null {
+    try {
+      const parsed = JSON.parse(raw) as Partial<ClearTombstone>;
+      if (typeof parsed.clearedAt !== "string" || Number.isNaN(Date.parse(parsed.clearedAt))) {
+        return null;
+      }
+      return parsed as ClearTombstone;
+    } catch {
+      // Corrupted tombstone: fail toward DELIVERY (a lost wake is worse than a rare
+      // resurrected one); the next clear rewrites it.
+      return null;
     }
   }
 
   /**
-   * Roll back exactly ONE clear's tombstone, identified by the clearedAt it wrote:
-   * restore the previous clear's value when one exists, otherwise remove the file. The
-   * identity check matters with multiple instances — another instance may have
-   * committed a NEWER clear since, and demoting its tombstone would revive deferred
-   * wakes that newer clear legitimately retired; a current generation that is not the
-   * one being rolled back is left untouched. (supersedeAllPending writes its tombstone
-   * last, so its own failure path never promotes one and never calls this.) Failures
-   * PROPAGATE — a stale surviving tombstone would silently discard a revived wake's
-   * deferred temp.
+   * The effective clear tombstone, or null when none applies (absent or malformed).
+   * Transient failures PROPAGATE: guessing "no clear happened" could restore and
+   * deliver a retired wake. An absent canonical path falls back to crash-stranded
+   * captures so an interrupted mutation never silently drops protection.
    */
-  private async rollbackClearedAt(
-    ownerWorkspaceId: string,
-    expectedClearedAt: string
-  ): Promise<void> {
-    const target = this.clearedAtFile(ownerWorkspaceId);
-    let raw: string;
-    try {
-      raw = await fsPromises.readFile(target, "utf-8");
-    } catch (error) {
-      if (isErrnoWithCode(error, "ENOENT")) return; // nothing to roll back
-      throw error;
-    }
-    let current: string | null = null;
-    let previous: string | null = null;
-    try {
-      const parsed = JSON.parse(raw) as { clearedAt?: unknown; previousClearedAt?: unknown };
-      current = typeof parsed.clearedAt === "string" ? parsed.clearedAt : null;
-      previous =
-        typeof parsed.previousClearedAt === "string" &&
-        !Number.isNaN(Date.parse(parsed.previousClearedAt))
-          ? parsed.previousClearedAt
-          : null;
-    } catch {
-      // Malformed tombstones already provide no protection to preserve.
-      current = null;
-      previous = null;
-    }
-    if (current != null && current !== expectedClearedAt) {
-      // A different clear owns the current tombstone: not ours to roll back.
-      return;
-    }
-    if (previous != null) {
-      await this.writeClearedAtFile(target, { clearedAt: previous });
-      return;
-    }
-    await fsPromises.rm(target, { force: true });
-  }
-
-  /** Epoch ms of the latest history clear, or null when none applies (absent or malformed). */
-  private async readClearedAtMs(ownerWorkspaceId: string): Promise<number | null> {
+  private async readClearedAt(ownerWorkspaceId: string): Promise<ClearTombstone | null> {
     let raw: string;
     try {
       raw = await fsPromises.readFile(this.clearedAtFile(ownerWorkspaceId), "utf-8");
     } catch (error) {
-      if (isErrnoWithCode(error, "ENOENT")) return null;
-      // Transient failures PROPAGATE: guessing "no clear happened" here could restore
-      // and deliver a retired wake; caller retries re-read instead.
+      if (!isErrnoWithCode(error, "ENOENT")) throw error;
+      return this.healClearedAtFromLeftovers(ownerWorkspaceId);
+    }
+    const tomb = BashMonitorWakeStore.parseTombstone(raw);
+    if (tomb == null) {
+      log.debug("Ignoring malformed bash monitor wake clear tombstone", { ownerWorkspaceId });
+    }
+    return tomb;
+  }
+
+  /**
+   * Promote a clear's tombstone to COMMITTED after the history clear durably
+   * succeeded: pre-clear deferred temps stop being held and become condemned. The
+   * update is monotonic — a newer cutoff published since is never lowered — and
+   * re-establishes the committed cutoff if a foreign rollback removed the staging.
+   */
+  async commitClear(ownerWorkspaceId: string, token: BashMonitorClearToken): Promise<void> {
+    this.activeClearIds.delete(token.clearId);
+    await this.mutateClearedAt(ownerWorkspaceId, (current) => {
+      if (current == null) {
+        return { clearedAt: token.clearedAt, clearId: token.clearId, phase: "committed" };
+      }
+      if (current.clearId === token.clearId) {
+        if (current.phase === "committed") return "keep";
+        const { stagedAt: _stagedAt, ...rest } = current;
+        return { ...rest, phase: "committed" };
+      }
+      // Monotonic: a newer (or equal) cutoff subsumes ours; never lower it.
+      if (Date.parse(current.clearedAt) >= Date.parse(token.clearedAt)) return "keep";
+      return {
+        clearedAt: token.clearedAt,
+        clearId: token.clearId,
+        phase: "committed",
+        previousClearedAt: current.clearedAt,
+      };
+    });
+  }
+
+  /**
+   * Roll back exactly ONE clear's tombstone, identified by its clear id: restore the
+   * previous clear's cutoff when one exists, otherwise remove the file. A current
+   * generation owned by a DIFFERENT clear (another instance committed a newer one) is
+   * left untouched — demoting it would revive wakes that clear legitimately retired.
+   */
+  private async rollbackClearTombstone(ownerWorkspaceId: string, clearId: string): Promise<void> {
+    await this.mutateClearedAt(ownerWorkspaceId, (current) => {
+      if (current?.clearId !== clearId) return "keep";
+      if (current.previousClearedAt != null) {
+        // Demoted values carry no staging state: the previous clear committed long
+        // ago (a clear only becomes "previous" after committing).
+        return { clearedAt: current.previousClearedAt, phase: "committed" };
+      }
+      return null;
+    });
+  }
+
+  /**
+   * Roll back a clear staging orphaned by a crash: the owning instance promotes or
+   * rolls back within its own request, so a STAGED tombstone past the grace window
+   * with no in-process active clear can only be a crash between staging and the
+   * history clear's outcome. Failing toward DELIVERY (the store's documented bias):
+   * stamped records flip back to pending with their original updatedAt, then the
+   * tombstone demotes — in that order, so a crash mid-rollback leaves the staged
+   * tombstone in place and the next scan resumes (record restores are idempotent).
+   * The rare symmetric window (crash AFTER the history clear durably succeeded but
+   * before commitClear) resurrects those wakes into the cleared transcript — a
+   * duplicate delivery, accepted as strictly better than silently losing wakes for a
+   * transcript that was never cleared.
+   */
+  private async rollbackCrashedClearStaging(ownerWorkspaceId: string): Promise<void> {
+    const tomb = await this.readClearedAt(ownerWorkspaceId);
+    if (tomb?.phase !== "staged" || tomb.clearId == null) return;
+    if (this.activeClearIds.has(tomb.clearId)) return; // in flight, not crashed
+    const stagedAtMs = tomb.stagedAt != null ? Date.parse(tomb.stagedAt) : NaN;
+    if (Number.isNaN(stagedAtMs)) return; // unreadable staging age: leave it held
+    if (stagedAtMs > Date.now() - STAGED_CLEAR_ROLLBACK_GRACE_MS) return;
+    const clearId = tomb.clearId;
+    const dir = this.dir(ownerWorkspaceId);
+    let entries: string[];
+    try {
+      entries = await fsPromises.readdir(dir);
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT")) return;
       throw error;
     }
-    try {
-      const parsed = JSON.parse(raw) as { clearedAt?: unknown };
-      const ms = typeof parsed.clearedAt === "string" ? Date.parse(parsed.clearedAt) : NaN;
-      if (Number.isNaN(ms)) throw new Error("invalid clearedAt");
-      return ms;
-    } catch {
-      // Corrupted tombstone: fail toward DELIVERY (a lost wake is worse than a rare
-      // resurrected one) and keep the file as evidence until the next clear rewrites it.
-      log.debug("Ignoring malformed bash monitor wake clear tombstone", { ownerWorkspaceId });
-      return null;
+    for (const entry of entries) {
+      if (!entry.endsWith(".json")) continue;
+      const id = BashMonitorWakeStore.wakeIdFromFileStem(entry.slice(0, -".json".length));
+      const filePath = path.join(dir, entry);
+      await this.locks.withLock(`${ownerWorkspaceId}:${id}`, async () => {
+        const record = await this.readRecordAt(filePath);
+        if (record?.status !== "superseded" || record.supersededByClearId !== clearId) return;
+        const { supersededByClearId: _clearStamp, pendingUpdatedAtBeforeClear, ...rest } = record;
+        await this.write({
+          ...rest,
+          status: "pending",
+          // The pre-clear updatedAt survives the round trip: snapshot keys and
+          // acceptance logic key on it.
+          updatedAt: pendingUpdatedAtBeforeClear ?? record.updatedAt,
+        });
+      });
     }
+    await this.rollbackClearTombstone(ownerWorkspaceId, clearId);
   }
 
   static wakeId(processId: string): string {
@@ -946,6 +1164,13 @@ export class BashMonitorWakeStore {
     if (classified == null) {
       classified = new Map();
       this.classifiedFilesByOwner.set(ownerWorkspaceId, classified);
+    }
+    // A staged clear tombstone abandoned past its grace window is a CRASHED clear
+    // staging (see rollbackCrashedClearStaging); resolve it before anything below
+    // consults the tombstone or the stamped records. The entries check keeps this off
+    // the hot path — tombstone artifacts exist only around clears and crashes.
+    if (entries.some((e) => e === "cleared-at" || e.startsWith("cleared-at.cas-"))) {
+      await this.rollbackCrashedClearStaging(ownerWorkspaceId);
     }
     const records: BashMonitorWakeRecord[] = [];
     const seen = new Set<string>();
@@ -1527,15 +1752,26 @@ export class BashMonitorWakeStore {
         return null;
       }
       if (parsed.status === "pending") {
-        const clearedAtMs = await this.readClearedAtMs(ownerWorkspaceId);
-        if (clearedAtMs != null && Date.parse(parsed.updatedAt) <= clearedAtMs) {
-          // A history clear retired every wake stamped before it, but this temp was
-          // INVISIBLE to that clear's scan (the freshness gate deferred it). Restoring
-          // it would deliver a pre-clear wake into the freshly cleared transcript —
-          // condemn it instead. A fresh temp may still belong to a live writer, so
-          // only consumable ones are removed (failures PROPAGATE, matching the
-          // stale-discard discipline below); fresh ones are left unrestored, with no
-          // re-drive, for a later scan's consumable sweep.
+        const tomb = await this.readClearedAt(ownerWorkspaceId);
+        if (tomb != null && Date.parse(parsed.updatedAt) <= Date.parse(tomb.clearedAt)) {
+          if (tomb.phase === "staged") {
+            // The owning clear's outcome is UNKNOWN: hold the temp — neither restore
+            // (a committed clear must not see this wake delivered) nor discard (a
+            // rolled-back clear must still deliver it). Promotion condemns it;
+            // rollback demotes the tombstone so the next scan restores it; a crashed
+            // staging is rolled back by scans after the grace window. The re-drive
+            // timer (armed from now, one full recheck interval) keeps resolution
+            // independent of external scans.
+            this.scheduleDeferredTempRecovery(ownerWorkspaceId, filePath, Date.now());
+            return null;
+          }
+          // COMMITTED: the clear retired every wake stamped before it, but this temp
+          // was INVISIBLE to that clear's scan (the freshness gate deferred it).
+          // Restoring it would deliver a pre-clear wake into the freshly cleared
+          // transcript — condemn it instead. A fresh temp may still belong to a live
+          // writer, so only consumable ones are removed (failures PROPAGATE, matching
+          // the stale-discard discipline below); fresh ones are left unrestored, with
+          // no re-drive, for a later scan's consumable sweep.
           if (consumable) await fsPromises.rm(filePath, { force: true });
           return null;
         }
@@ -1906,49 +2142,91 @@ export class BashMonitorWakeStore {
     return ownerWorkspaceIds;
   }
 
+  /**
+   * Stage a history clear: retire every visible pending wake (stamped with this
+   * clear's identity for lossless crash rollback) and publish a STAGED tombstone that
+   * holds — never yet condemns — deferred pre-clear temps. The caller must complete
+   * the transaction: commitClear once the history clear durably succeeded, or
+   * restorePendingSnapshots to roll back. A staging orphaned by a crash is rolled
+   * back by scans after STAGED_CLEAR_ROLLBACK_GRACE_MS.
+   */
   async supersedeAllPending(
     ownerWorkspaceId: string
-  ): Promise<{ snapshots: BashMonitorWakeRecord[]; clearedAt: string }> {
+  ): Promise<{ snapshots: BashMonitorWakeRecord[] } & BashMonitorClearToken> {
     // Captured BEFORE the scan: the tombstone below retires only wakes stamped before
     // the clear began, so output enqueued mid-clear survives it. Returned so a later
-    // rollback can identify exactly this clear's tombstone (see rollbackClearedAt).
+    // commit or rollback can identify exactly this clear's tombstone.
     const clearedAt = new Date().toISOString();
+    const clearId = randomUUID();
+    this.activeClearIds.add(clearId);
     const pending = await this.listPending(ownerWorkspaceId);
     const staged: BashMonitorWakeRecord[] = [];
     try {
       for (const record of pending) {
-        await this.markSuperseded(ownerWorkspaceId, record.id);
+        await this.supersedeForClear(ownerWorkspaceId, record.id, clearId);
         staged.push(record);
       }
-      // Durable tombstone for wakes this clear could NOT see: a crash-orphaned temp
-      // inside the freshness gate is invisible to the listPending above, and without
-      // the tombstone its deferred re-drive would later restore and deliver a
+      // Durable STAGED tombstone for wakes this clear could NOT see: a crash-orphaned
+      // temp inside the freshness gate is invisible to the listPending above, and
+      // without the tombstone its deferred re-drive would later restore and deliver a
       // pre-clear wake into the cleared transcript. Written only after every visible
       // wake retired; a failure here fails the clear (snapshots restored below).
-      await this.writeClearedAt(ownerWorkspaceId, clearedAt);
-      return { snapshots: pending, clearedAt };
+      // Monotonic: a newer concurrent cutoff is never lowered — this clear's own
+      // rollback then finds a foreign identity and correctly leaves it alone.
+      await this.mutateClearedAt(ownerWorkspaceId, (current) => {
+        if (current != null && Date.parse(current.clearedAt) >= Date.parse(clearedAt)) {
+          return "keep";
+        }
+        return {
+          clearedAt,
+          clearId,
+          phase: "staged",
+          stagedAt: new Date().toISOString(),
+          ...(current != null ? { previousClearedAt: current.clearedAt } : {}),
+        };
+      });
+      return { snapshots: pending, clearedAt, clearId };
     } catch (error) {
       // Records only — NOT the tombstone rollback in restorePendingSnapshots: the
       // tombstone write above is the try block's last step, so on this path it was
       // never promoted, and demoting here would strip the PREVIOUS clear's
       // protection instead.
+      this.activeClearIds.delete(clearId);
       await this.restoreSnapshotRecords(ownerWorkspaceId, staged);
       throw error;
     }
   }
 
+  /** Supersede one pending record on behalf of a clear, stamping rollback metadata. */
+  private async supersedeForClear(
+    ownerWorkspaceId: string,
+    id: string,
+    clearId: string
+  ): Promise<void> {
+    await this.locks.withLock(`${ownerWorkspaceId}:${id}`, async () => {
+      const record = await this.get(ownerWorkspaceId, id);
+      if (record?.status !== "pending") return;
+      await this.write({
+        ...this.withTerminalStatus(record, "superseded"),
+        supersededByClearId: clearId,
+        pendingUpdatedAtBeforeClear: record.updatedAt,
+      });
+    });
+  }
+
   async restorePendingSnapshots(
     ownerWorkspaceId: string,
     snapshots: readonly BashMonitorWakeRecord[],
-    clearedAt: string
+    token: BashMonitorClearToken
   ): Promise<void> {
-    // Rolling back a clear also rolls back ITS tombstone (identified by the clearedAt
+    // Rolling back a clear also rolls back ITS tombstone (identified by the token
     // that supersedeAllPending returned) — restoring the previous clear's value, never
-    // deleting the file wholesale, and never touching a newer clear's tombstone: the
-    // wakes below return to pending, so a sibling deferred temp must not stay
+    // deleting the file wholesale, and never touching a different clear's tombstone:
+    // the wakes below return to pending, so a sibling deferred temp must not stay
     // condemned by the rolled-back clear, while temps retired by OTHER clears must
     // stay condemned.
-    await this.rollbackClearedAt(ownerWorkspaceId, clearedAt);
+    this.activeClearIds.delete(token.clearId);
+    await this.rollbackClearTombstone(ownerWorkspaceId, token.clearId);
     await this.restoreSnapshotRecords(ownerWorkspaceId, snapshots);
   }
 

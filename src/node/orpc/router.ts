@@ -5526,9 +5526,34 @@ export const router = (authToken?: string) => {
             // pre-persistence snapshot over a newer one) and retries failed reads —
             // a change event may be the only signal an exited process ever emits, so
             // dropping it would leave the renderer stale with no reconnect.
+            // Bootstrap failures FAIL OPEN: if the very first read keeps failing (e.g.
+            // a remote status probe is down), endless silent retries would leave the
+            // subscriber without any signal — BackgroundBashStore could never run its
+            // error path that marks workspace state known, blocking the chat view's
+            // first-paint barrier indefinitely. Surface the first pre-snapshot failure
+            // as a subscription error instead; once a snapshot has been delivered the
+            // reader's silent retry loop takes over (the renderer has state to show).
+            // Boxed (not bare `let`s) so the reader closure's writes stay visible to
+            // the generator body: TS flow analysis keeps a captured let narrowed to
+            // its initial null in this scope, so `throw bootstrap.error` would be
+            // rejected as throwing a non-Error.
+            const bootstrap = { delivered: false, error: null as Error | null };
             const reader = createCoalescedReader({
               read: async () => {
-                queue.push(await getState());
+                let state: Awaited<ReturnType<typeof getState>>;
+                try {
+                  state = await getState();
+                } catch (error) {
+                  if (!bootstrap.delivered) {
+                    bootstrap.error =
+                      error instanceof Error ? error : new Error(getErrorMessage(error));
+                    queue.end();
+                    return;
+                  }
+                  throw error;
+                }
+                bootstrap.delivered = true;
+                queue.push(state);
               },
               retryDelayMs: 1_000,
             });
@@ -5546,6 +5571,7 @@ export const router = (authToken?: string) => {
               // regresses the renderer with no later event to repair it.
               reader.trigger();
               yield* queue.iterate();
+              if (bootstrap.error != null) throw bootstrap.error;
             } finally {
               signal?.removeEventListener("abort", onAbort);
               queue.end();
