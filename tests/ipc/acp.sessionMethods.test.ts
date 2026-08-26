@@ -32,8 +32,12 @@ interface HarnessOptions {
   activeWorkspaces?: WorkspaceInfo[];
   archivedWorkspaces?: WorkspaceInfo[];
   workspaceActivity?: WorkspaceActivityById;
-  /** Reject activity.list with this error (simulates unreadable extensionMetadata.json). */
-  activityListError?: Error;
+  /**
+   * Resolve activity.list with null — the backend's read-failure signal for
+   * an unreadable extensionMetadata.json (getActivityList never rejects; it
+   * logs and returns null so callers can tell failure from an idle {}).
+   */
+  activityListUnavailable?: boolean;
   onChatEvents?: WorkspaceChatMessage[];
   onChatStream?: AsyncIterable<WorkspaceChatMessage>;
   requireTrustedProjectForCreate?: boolean;
@@ -136,8 +140,8 @@ function createMockServer(options?: HarnessOptions): MockServer {
       },
       activity: {
         list: async () => {
-          if (options?.activityListError) {
-            throw options.activityListError;
+          if (options?.activityListUnavailable) {
+            return null;
           }
           return workspaceActivity;
         },
@@ -401,9 +405,10 @@ describe("ACP session list/resume/fork support", () => {
   });
 
   it("lists sessions when the activity list is unavailable", async () => {
-    // activity.list rejects when extensionMetadata.json is unreadable so the
-    // renderer can keep cached state; ACP has none, so session listing must
-    // degrade to no-activity sorting instead of failing wholesale.
+    // activity.list resolves null when extensionMetadata.json is unreadable
+    // so the renderer can keep cached state; ACP has none, so session
+    // listing must degrade to no-activity sorting instead of failing
+    // wholesale.
     const workspace = createWorkspaceInfo({
       id: "ws-no-activity",
       projectPath: "/repo/a",
@@ -412,7 +417,7 @@ describe("ACP session list/resume/fork support", () => {
     });
     const harness = createHarness({
       activeWorkspaces: [workspace],
-      activityListError: new Error("extension metadata unreadable"),
+      activityListUnavailable: true,
     });
 
     await harness.agent.initialize({ protocolVersion: PROTOCOL_VERSION });
