@@ -423,6 +423,15 @@ export class ToolBridge {
     args: unknown,
     abortSignal?: AbortSignal
   ): Promise<unknown> {
+    // Guests may call a capability with zero arguments (mux.tool()). Provider
+    // tool calls always deliver an args object, and downstream consumers (MCP
+    // servers, Zod object schemas) assume one — passing undefined through
+    // produced opaque TypeErrors instead of readable validation errors.
+    // Treat a zero-arg call as the canonical empty-args call.
+    if (args === undefined) {
+      args = {};
+    }
+
     // AI SDK tools carry their schema on 'inputSchema'; some legacy tools use 'parameters'.
     const toolRecord = tool as { inputSchema?: unknown; parameters?: unknown };
     const schema = toolRecord.inputSchema ?? toolRecord.parameters;

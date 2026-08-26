@@ -1156,10 +1156,12 @@ export type DisplayedMessage =
       /** Durable workflow run attachment recovered from partial history. */
       workflowRun?: MuxToolPart["workflowRun"];
       // Nested tool calls for code_execution (from PTC streaming or reconstructed from result)
+      // input is optional to mirror NestedToolCallSchema: zero-arg kernel calls
+      // persist without an input key.
       nestedCalls?: Array<{
         toolCallId: string;
         toolName: string;
-        input: unknown;
+        input?: unknown;
         output?: unknown;
         state: "input-available" | "output-available" | "output-redacted";
         failed?: boolean;

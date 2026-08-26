@@ -38,7 +38,12 @@ import {
   type GoalSyntheticMessageKind,
 } from "@/constants/goals";
 import type { SendMessageError } from "@/common/types/errors";
-import { AgentIdSchema, SendMessageOptionsSchema, SkillNameSchema } from "@/common/orpc/schemas";
+import {
+  AgentIdSchema,
+  ChatMuxMessageSchema,
+  SendMessageOptionsSchema,
+  SkillNameSchema,
+} from "@/common/orpc/schemas";
 import { normalizeAgentId, resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
 import {
   buildStreamErrorEventData,
@@ -2437,9 +2442,26 @@ export class AgentSession {
     let sentRowCount = 0;
     let emittedReplayMessages = false;
 
-    const emitReplayMessage = (message: WorkspaceChatMessage): void => {
+    // Self-healing: persisted rows can fail the current wire schema (older
+    // writers, schema drift, corruption). oRPC validates every event yielded to
+    // onChat subscribers and a single invalid row terminates the iterator,
+    // which would permanently brick workspace fetch. Skip such rows instead of
+    // letting one bad line take down the whole transcript.
+    const emitReplayMessage = (message: WorkspaceChatMessage): boolean => {
+      const validation = ChatMuxMessageSchema.safeParse(message);
+      if (!validation.success) {
+        const row = message as { id?: string; metadata?: { historySequence?: number } };
+        log.warn("onChat replay: skipping persisted row that fails the wire schema", {
+          workspaceId: this.workspaceId,
+          messageId: row.id,
+          historySequence: row.metadata?.historySequence,
+          issue: validation.error.issues[0],
+        });
+        return false;
+      }
       emittedReplayMessages = true;
       listener({ workspaceId: this.workspaceId, message });
+      return true;
     };
 
     let replayedTerminalStreamError = false;
@@ -2682,8 +2704,9 @@ export class AgentSession {
           }
 
           // Add type: "message" for discriminated union (messages from chat.jsonl don't have it)
-          sentRowCount += 1;
-          emitReplayMessage({ ...message, type: "message" });
+          if (emitReplayMessage({ ...message, type: "message" })) {
+            sentRowCount += 1;
+          }
         }
 
         for (let index = history.length - 1; index >= 0; index -= 1) {
