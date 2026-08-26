@@ -716,6 +716,9 @@ describe("BashMonitorWakeStore", () => {
     const due = new Promise<string>((resolve) => {
       store.onDeferredTempRecoveryDue = resolve;
     });
+    // Strictly order wake < cutoff: a same-millisecond stamp is deliberately
+    // ambiguous and fails toward delivery, which is not the case under test.
+    await new Promise((resolve) => setTimeout(resolve, 5));
     // The clear cannot see the deferred temp (freshness gate), so nothing pending is
     // retired — but once COMMITTED, its durable tombstone condemns the invisible
     // pre-clear wake.
@@ -765,6 +768,8 @@ describe("BashMonitorWakeStore", () => {
     await fsPromises.rename(path.join(dir, "proc-1.json"), temp);
     const nearGate = new Date(Date.now() - TEMP_RECOVERY_MIN_AGE_MS + 100);
     await fsPromises.utimes(temp, nearGate, nearGate);
+    // Strictly order wake < cutoff (same-millisecond stamps fail toward delivery).
+    await new Promise((resolve) => setTimeout(resolve, 5));
     // Clear #1 commits, permanently retiring the deferred wake via its tombstone.
     const clearOne = await store.supersedeAllPending("owner-1");
     expect(clearOne.snapshots).toEqual([]);
@@ -797,6 +802,8 @@ describe("BashMonitorWakeStore", () => {
     await fsPromises.rename(path.join(dir, "proc-1.json"), temp);
     const nearGate = new Date(Date.now() - TEMP_RECOVERY_MIN_AGE_MS + 100);
     await fsPromises.utimes(temp, nearGate, nearGate);
+    // Strictly order wake < cutoff (same-millisecond stamps fail toward delivery).
+    await new Promise((resolve) => setTimeout(resolve, 5));
     // Clear #1 commits its tombstone.
     const clearOne = await store.supersedeAllPending("owner-1");
     expect(clearOne.snapshots).toEqual([]);
@@ -910,7 +917,9 @@ describe("BashMonitorWakeStore", () => {
     await fsPromises.rename(path.join(dir, "proc-1.json"), temp);
     const nearGate = new Date(Date.now() - TEMP_RECOVERY_MIN_AGE_MS + 100);
     await fsPromises.utimes(temp, nearGate, nearGate);
-    // ...and clear B then commits, retiring it via B's tombstone.
+    // ...and clear B then commits, retiring it via B's tombstone. Strictly order
+    // wake < B's cutoff (same-millisecond stamps fail toward delivery).
+    await new Promise((resolve) => setTimeout(resolve, 5));
     const clearB = await store.supersedeAllPending("owner-1");
     await store.commitClear("owner-1", clearB);
 
@@ -983,6 +992,8 @@ describe("BashMonitorWakeStore", () => {
     await fsPromises.utimes(temp, past, past);
     // A tombstone mutation crashed between its capture rename and final placement:
     // the only durable copy of the committed cutoff is the stranded capture.
+    // Strictly order wake < cutoff (same-millisecond stamps fail toward delivery).
+    await new Promise((resolve) => setTimeout(resolve, 5));
     await fsPromises.writeFile(
       path.join(dir, "cleared-at.cas-crashed"),
       JSON.stringify({
@@ -1046,6 +1057,8 @@ describe("BashMonitorWakeStore", () => {
     const nearGate = new Date(Date.now() - TEMP_RECOVERY_MIN_AGE_MS + 5_000);
     await fsPromises.utimes(temp, nearGate, nearGate);
 
+    // Strictly order wake < cutoff (same-millisecond stamps fail toward delivery).
+    await new Promise((resolve) => setTimeout(resolve, 5));
     const clear = await store.supersedeAllPending("owner-1");
     // The temp ages past the gate while the clear's outcome is still unknown.
     const past = new Date(Date.now() - 10 * 60 * 1000);
@@ -1282,8 +1295,10 @@ describe("BashMonitorWakeStore", () => {
     await fsPromises.rename(path.join(dir, "proc-1.json"), temp);
     const nearGate = new Date(Date.now() - TEMP_RECOVERY_MIN_AGE_MS + 5_000);
     await fsPromises.utimes(temp, nearGate, nearGate);
-    // Clear A captures its cutoff (past the wake) but stalls before its staging
+    // Clear A captures its cutoff (past the wake — strictly ordered, since
+    // same-millisecond stamps fail toward delivery) but stalls before its staging
     // lands...
+    await new Promise((resolve) => setTimeout(resolve, 5));
     const clearA = await store.supersedeAllPending("owner-1");
     // ...so clear B (another instance) stages a NEWER cutoff having never seen A's:
     // B's tombstone records NO predecessor.
@@ -1357,6 +1372,9 @@ describe("BashMonitorWakeStore", () => {
   test("an interrupted clear rollback restores records before demoting the tombstone", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload({ lines: ["ERROR restored first"] }));
+    // Strictly order wake < cutoff (same-millisecond stamps fail toward delivery),
+    // so the mid-rollback hold below is deterministic.
+    await new Promise((resolve) => setTimeout(resolve, 5));
     const clear = await store.supersedeAllPending("owner-1");
     // The rollback's tombstone demotion fails (crash-equivalent) mid-rollback: the
     // records must ALREADY be pending again — with the demotion first, a crash in
@@ -1528,7 +1546,7 @@ describe("BashMonitorWakeStore", () => {
     // Workspace removal abandons the clear writers, then deletes the session
     // directory. Without the abandon, the still-armed heartbeat's mutateClearedAt
     // would mkdir the directory straight back into existence.
-    store.abandonWorkspaceClears("owner-1");
+    await store.abandonWorkspaceClears("owner-1");
     const sessionDir = path.join(rootDir, "sessions", "owner-1");
     await fsPromises.rm(sessionDir, { recursive: true, force: true });
     await new Promise((resolve) => setTimeout(resolve, 150));
@@ -1851,6 +1869,208 @@ describe("BashMonitorWakeStore", () => {
     // The clear rolls back: the held record delivers again.
     await store.restorePendingSnapshots("owner-1", clear.snapshots, clear);
     expect((await store.listPending("owner-1")).map((r) => r.lines)).toEqual([["ERROR pre-clear"]]);
+  });
+
+  test("abandoning drains heartbeat ticks that already fired", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir), {
+      stagedClearRefreshIntervalMs: 25,
+    });
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR retired"] }));
+    await store.supersedeAllPending("owner-1");
+    // Park the heartbeat's tombstone write so one tick is mid-mutation (holding the
+    // tombstone lock) while the next tick queues behind it — the queued tick has not
+    // yet run its mkdir.
+    const realWriteFile = fsPromises.writeFile;
+    const writeCalls = { count: 0 };
+    const writeSpy = spyOn(fsPromises, "writeFile").mockImplementation((async (
+      target: Parameters<typeof realWriteFile>[0],
+      data: Parameters<typeof realWriteFile>[1]
+    ) => {
+      if (typeof target === "string" && target.includes("cleared-at.tmp-")) {
+        writeCalls.count += 1;
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+      return realWriteFile(target, data, "utf-8");
+    }) as typeof fsPromises.writeFile);
+    try {
+      const start = Date.now();
+      while (writeCalls.count === 0 && Date.now() - start < 2_000) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(writeCalls.count).toBeGreaterThan(0);
+      // Let a second tick fire and queue behind the parked mutation.
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      // Removal-time abandon must DRAIN the fired ticks, not merely disarm the
+      // interval: a queued tick's mutateClearedAt runs its recursive mkdir only
+      // after the parked one releases the lock — which, without the drain, is after
+      // removal already deleted the session directory.
+      await store.abandonWorkspaceClears("owner-1");
+    } finally {
+      writeSpy.mockRestore();
+    }
+    const sessionDir = path.join(rootDir, "sessions", "owner-1");
+    await fsPromises.rm(sessionDir, { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(existsSync(sessionDir)).toBe(false);
+  });
+
+  test("the clear never retires a snapshot stamped after its cutoff", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR pre"] }));
+    // Another instance's wake lands AFTER the clear captured its cutoff but before
+    // its snapshot scan, so it appears in the snapshot with an unambiguously
+    // post-cutoff timestamp.
+    const listSpy = spyOn(store, "listPending").mockImplementation(async (owner: string) => {
+      listSpy.mockRestore();
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await store.enqueueOrMergePending(
+        payload({ processId: "proc-late", taskId: "bash:proc-late", lines: ["ERROR after cutoff"] })
+      );
+      return store.listPending(owner);
+    });
+
+    const clear = await store.supersedeAllPending("owner-1");
+    expect(clear.snapshots.map((r) => r.id)).toEqual(["proc-1"]);
+    expect((await store.get("owner-1", "proc-late"))?.status).toBe("pending");
+    await store.commitClear("owner-1", clear);
+    expect((await store.listPending("owner-1")).map((r) => r.id)).toEqual(["proc-late"]);
+  });
+
+  test("a record stamped in the cutoff millisecond survives canonical reconciliation", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR cutoff instant"] }));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const clear = await store.supersedeAllPending("owner-1");
+    await store.commitClear("owner-1", clear);
+
+    // Another instance's mid-clear wake lands stamped in the cutoff's own
+    // millisecond: the timestamp cannot order it before the clear, and the
+    // transaction's invariant is that mid-clear output survives.
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    const raw = JSON.parse(await fsPromises.readFile(file, "utf-8")) as Record<string, unknown>;
+    delete raw.supersededByClearId;
+    delete raw.pendingUpdatedAtBeforeClear;
+    await fsPromises.writeFile(
+      file,
+      JSON.stringify({
+        ...raw,
+        status: "pending",
+        lines: ["ERROR mid-clear"],
+        updatedAt: clear.clearedAt,
+      }),
+      "utf-8"
+    );
+
+    const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+    expect((await fresh.listPending("owner-1")).map((r) => r.lines)).toEqual([["ERROR mid-clear"]]);
+    expect((await fresh.get("owner-1", "proc-1"))?.status).toBe("pending");
+  });
+
+  test("a stranded leftover that is the canonical inode is dropped, not merged", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    // Offset-less record (legacy, or a terminal-only settlement): the subsumption
+    // guards cannot prove same-generation identity for it.
+    await store.enqueueOrMergePending(
+      payload({ lines: ["ERROR only once"], matchedThroughOffset: undefined })
+    );
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    // A prior recovery linked the captured inode back to the canonical path but
+    // crashed (or failed) before removing the leftover name: two names, one inode.
+    await fsPromises.link(
+      path.join(dir, "proc-1.json"),
+      path.join(dir, "proc-1.json.prune-stranded")
+    );
+
+    const pending = await store.listPending("owner-1");
+    // Merging the record against itself would double its lines and counters.
+    expect(pending.map((r) => r.lines)).toEqual([["ERROR only once"]]);
+    expect(pending[0].totalMatches).toBe(1);
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".prune-"))).toHaveLength(0);
+  });
+
+  test("a refreshed staging is not demoted by a stale crash rollback", async () => {
+    const storeA = new BashMonitorWakeStore(makeConfig(rootDir));
+    await storeA.enqueueOrMergePending(payload({ lines: ["ERROR held"] }));
+    const clear = await storeA.supersedeAllPending("owner-1");
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const tombPath = path.join(dir, "cleared-at");
+    // Another instance's scan reads a staging aged past the grace window...
+    const staged = JSON.parse(await fsPromises.readFile(tombPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    const staleStagedAt = new Date(Date.now() - STAGED_CLEAR_ROLLBACK_GRACE_MS - 60_000);
+    await fsPromises.writeFile(
+      tombPath,
+      JSON.stringify({ ...staged, stagedAt: staleStagedAt.toISOString() }),
+      "utf-8"
+    );
+    // ...but the owner's heartbeat refresh lands between that read and the demote's
+    // CAS capture. clearId alone cannot tell a refreshed (live) staging from the
+    // crashed one the scan judged.
+    const refreshedStagedAt = new Date().toISOString();
+    const writeRefreshedTombstone = () =>
+      fsPromises.writeFile(
+        tombPath,
+        JSON.stringify({ ...staged, stagedAt: refreshedStagedAt }),
+        "utf-8"
+      );
+    const realRename = fsPromises.rename;
+    const injected = { fired: false };
+    const renameSpy = spyOn(fsPromises, "rename").mockImplementation((async (
+      from: Parameters<typeof realRename>[0],
+      to: Parameters<typeof realRename>[1]
+    ) => {
+      if (!injected.fired && String(from).endsWith("cleared-at") && String(to).includes(".cas-")) {
+        injected.fired = true;
+        await writeRefreshedTombstone();
+      }
+      return realRename(from, to);
+    }) as typeof fsPromises.rename);
+    try {
+      const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+      await fresh.listPending("owner-1");
+    } finally {
+      renameSpy.mockRestore();
+    }
+    // The demote captured a refreshed generation (live clear): the tombstone stands.
+    expect(existsSync(tombPath)).toBe(true);
+    const after = JSON.parse(await fsPromises.readFile(tombPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    expect(after.phase).toBe("staged");
+    expect(after.stagedAt).toBe(refreshedStagedAt);
+    // The owner can still settle its clear normally afterwards.
+    await storeA.restorePendingSnapshots("owner-1", clear.snapshots, clear);
+    expect((await storeA.listPending("owner-1")).map((r) => r.lines)).toEqual([["ERROR held"]]);
+  });
+
+  test("an aged stranded prune capture owned by a staged clear is restored, not swept", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR staged capture"] }));
+    const clear = await store.supersedeAllPending("owner-1");
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    // A terminal prune captured the stamped record and crashed before verifying;
+    // the stranded copy then ages past the retention window while the clear is
+    // still staged (long clear, or promotion retries).
+    const leftover = path.join(dir, "proc-1.json.prune-crashed");
+    await fsPromises.rename(path.join(dir, "proc-1.json"), leftover);
+    const past = new Date(Date.now() - TERMINAL_WAKE_RETENTION_MS - 60_000);
+    await fsPromises.utimes(leftover, past, past);
+
+    // Another instance's scan must restore the clear's only rollback source, not
+    // sweep it by age (rollbackCrashedClearStaging restores canonical files only).
+    const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+    expect(await fresh.listPending("owner-1")).toEqual([]);
+    expect((await fresh.get("owner-1", "proc-1"))?.status).toBe("superseded");
+
+    // The clear then fails and rolls back: the held record restores and delivers.
+    await store.restorePendingSnapshots("owner-1", clear.snapshots, clear);
+    expect((await store.listPending("owner-1")).map((r) => r.lines)).toEqual([
+      ["ERROR staged capture"],
+    ]);
   });
 
   test("terminal pruning spares records owned by an unresolved staged clear", async () => {

@@ -1140,6 +1140,63 @@ describe("WorkspaceService bash monitor wakes", () => {
     }
   });
 
+  test("a terminal-only pending wake lists as settled, never as a match", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-settled-label";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = {
+        cleanup: mock(() => Promise.resolve()),
+        list: mock(() => Promise.resolve([])),
+        getMonitorSnapshot: mock(() => undefined),
+      } as unknown as BackgroundProcessManager;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      // Park every drain so the pending record stays undelivered while we assert on it.
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(true);
+      spyOn(workspaceService, "waitForIdleAndNoQueuedMessages").mockImplementation(
+        () => new Promise(() => undefined)
+      );
+
+      const wakeStore = (
+        workspaceService as unknown as { bashMonitorWakeStore: BashMonitorWakeStore }
+      ).bashMonitorWakeStore;
+      // wakeOnExit settlement: the monitored process exited without ever matching
+      // its filter, so the durable record has kind "match" with zero matches.
+      await wakeStore.enqueueOrMergePending({
+        processId: "proc-settled-label",
+        taskId: "bash:proc-settled-label",
+        workspaceId,
+        filter: "NEVER",
+        filterExclude: false,
+        lines: ["[monitor] process settled: exited (code 1)"],
+        totalMatches: 0,
+        timestamp: Date.now(),
+        terminal: { status: "exited", exitCode: 1 },
+      });
+
+      const listing = await workspaceService.listBackgroundProcesses(workspaceId);
+      expect(listing).toHaveLength(1);
+      // No match ever occurred: the row must not claim one.
+      expect(listing[0].monitor?.pendingWakeKind).toBe("settled");
+      expect(listing[0].monitor?.totalMatches).toBe(0);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("listBackgroundProcesses keeps a pending wake visible on a reused monitorless process ID", async () => {
     const { config, cleanup } = await createTestHistoryService();
     try {

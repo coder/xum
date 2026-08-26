@@ -123,10 +123,13 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                             widths — hiding the only explanation for an exited row. */}
                         {proc.monitor.pendingWakeKind != null && (
                           <div className="text-secondary text-[10px]">
-                            {/* monitor-lost wakes report a terminated watcher, not a match */}
+                            {/* settled wakes report a process exit without any filter match;
+                                monitor-lost wakes report a terminated watcher, not a match */}
                             {proc.monitor.pendingWakeKind === "match"
                               ? "match found — waking agent…"
-                              : "monitor lost — waking agent…"}
+                              : proc.monitor.pendingWakeKind === "settled"
+                                ? "process settled — waking agent…"
+                                : "monitor lost — waking agent…"}
                           </div>
                         )}
                       </>

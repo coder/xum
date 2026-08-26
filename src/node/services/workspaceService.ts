@@ -6520,7 +6520,10 @@ export class WorkspaceService extends EventEmitter {
       // same lock — so the barrier waits out the in-flight clear transaction AND
       // any already-fired retry.
       await this.bashMonitorHistoryLocks.withLock(workspaceId, () => Promise.resolve());
-      this.bashMonitorWakeStore.abandonWorkspaceClears(workspaceId);
+      // Awaited: abandon also DRAINS heartbeat ticks that already fired, whose
+      // mutateClearedAt (queued outside the history lock) would otherwise mkdir the
+      // directory back after the deletion below.
+      await this.bashMonitorWakeStore.abandonWorkspaceClears(workspaceId);
 
       // Remove session data
       const sessionDir = this.config.getSessionDir(workspaceId);
@@ -13845,6 +13848,18 @@ export class WorkspaceService extends EventEmitter {
       pendingWakes = this.lastGoodPendingWakesByWorkspace.get(workspaceId) ?? [];
       this.schedulePendingWakeReadRetry(workspaceId);
     }
+    // A wake whose only event is process settlement (terminal-only wakeOnExit, or an
+    // earlier run's preserved settlement) still has kind "match" in the durable
+    // record; labeling it "match" in the UI would report a match the filter never
+    // produced. Coalesced records with real matches keep the match label.
+    const pendingWakeKindOf = (
+      record: BashMonitorWakeRecord
+    ): "match" | "monitor-lost" | "settled" =>
+      record.kind === "monitor-lost"
+        ? "monitor-lost"
+        : record.totalMatches === 0 && (record.terminal != null || record.staleTerminal != null)
+          ? "settled"
+          : "match";
     // Present monitor state derived purely from a durable wake record, for rows (or reused
     // process IDs) that have no live monitor snapshot to decorate.
     const monitorFromWakeRecord = (record: BashMonitorWakeRecord) => ({
@@ -13855,7 +13870,7 @@ export class WorkspaceService extends EventEmitter {
       droppedLines: record.droppedLines,
       lastLines: record.lines,
       stopped: true,
-      pendingWakeKind: record.kind,
+      pendingWakeKind: pendingWakeKindOf(record),
     });
     const liveProcessById = new Map(processes.map((p) => [p.id, p] as const));
     // A pending wake decorates the live row only when it belongs to that process
@@ -13879,7 +13894,7 @@ export class WorkspaceService extends EventEmitter {
         pendingWake != null
           ? {
               ...(monitor ?? monitorFromWakeRecord(pendingWake)),
-              pendingWakeKind: pendingWake.kind,
+              pendingWakeKind: pendingWakeKindOf(pendingWake),
             }
           : monitor;
       return {

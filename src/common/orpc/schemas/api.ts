@@ -195,7 +195,10 @@ export const BackgroundProcessMonitorInfoSchema = z.object({
    * lost wake in the UI (nothing running, no visible pending delivery). Carries the wake
    * kind so the UI does not claim a "match" for monitor-lost restart notices.
    */
-  pendingWakeKind: z.enum(["match", "monitor-lost"]).optional(),
+  // "settled": the wake reports only process settlement (a monitored process that
+  // exited without ever matching, or an earlier run's preserved settlement) — never
+  // labeled as a match the filter did not produce.
+  pendingWakeKind: z.enum(["match", "monitor-lost", "settled"]).optional(),
 });
 
 // Background process info (for UI display)
