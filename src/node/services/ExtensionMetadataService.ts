@@ -69,12 +69,17 @@ export class ExtensionMetadataService {
    * so a tombstone never blocks a legitimate new workspace; recreations of
    * legacy fixed-id workspaces happen in a different (downgraded) process.
    */
-  private readonly deletedWorkspaceIds = new Set<string>();
+  // Map value is the tombstone's GENERATION (monotonic per process):
+  // clearing paths that await between reading registration evidence and
+  // deleting must only clear the exact tombstone the evidence preceded — a
+  // same-process removal republishing the tombstone mid-probe must survive
+  // the stale positive (see recheckTombstonedRegistration).
+  private readonly deletedWorkspaceIds = new Map<string, number>();
+  private tombstoneGeneration = 0;
 
-  // Once-per-process latch for the leftover-sidecar reconcile in
-  // getAllSnapshots (see the comment there). Reset on failure so the next
-  // strict read retries instead of permanently skipping the recovery.
-  private checkedLeftoverQuarantineSidecar = false;
+  private publishTombstone(workspaceId: string): void {
+    this.deletedWorkspaceIds.set(workspaceId, ++this.tombstoneGeneration);
+  }
 
   /**
    * Optional registration probe for writes hitting a tombstoned id (see
@@ -175,11 +180,21 @@ export class ExtensionMetadataService {
     if (this.registrationProbe == null) {
       return false;
     }
+    // Capture the tombstone's generation before the probe: a same-process
+    // removal can republish the tombstone while the probe awaits, and a
+    // probe that read config just before that deregistration returns a
+    // stale positive that must not clear the NEWER tombstone (the removal's
+    // queued deletion may run before the caller's queued write, which would
+    // then recreate the removed entry).
+    const generationBefore = this.deletedWorkspaceIds.get(workspaceId);
     try {
       if (!(await this.registrationProbe(workspaceId))) {
         return false;
       }
     } catch {
+      return false;
+    }
+    if (this.deletedWorkspaceIds.get(workspaceId) !== generationBefore) {
       return false;
     }
     this.deletedWorkspaceIds.delete(workspaceId);
@@ -651,7 +666,7 @@ export class ExtensionMetadataService {
    * clearTombstonesForRegisteredIds as the set of clearable tombstones.
    */
   getTombstonedIds(): ReadonlySet<string> {
-    return new Set(this.deletedWorkspaceIds);
+    return new Set(this.deletedWorkspaceIds.keys());
   }
 
   /**
@@ -661,7 +676,7 @@ export class ExtensionMetadataService {
   async deleteWorkspace(workspaceId: string): Promise<void> {
     // Synchronously, before the queued mutation: any writer enqueued from now
     // on must see the tombstone (see deletedWorkspaceIds).
-    this.deletedWorkspaceIds.add(workspaceId);
+    this.publishTombstone(workspaceId);
     await this.withSerializedMutation(async () => {
       const data = await this.load();
 
@@ -729,7 +744,7 @@ export class ExtensionMetadataService {
       for (const workspaceId of staleWorkspaceIds) {
         // Same guard as deleteWorkspace: a late in-process writer must not
         // resurrect an entry this pass reclaims.
-        this.deletedWorkspaceIds.add(workspaceId);
+        this.publishTombstone(workspaceId);
       }
       if (staleWorkspaceIds.length === 0) {
         return 0;
@@ -1112,7 +1127,25 @@ export class ExtensionMetadataService {
     let modified = false;
     for (const [workspaceId, entry] of Object.entries(sidecarParsed.workspaces)) {
       if (this.deletedWorkspaceIds.has(workspaceId)) {
-        continue;
+        // The tombstone may be stale: a downgraded backend can re-register a
+        // deterministic legacy id after this process pruned it, and the
+        // sidecar may hold that workspace's ONLY copy (consumed below, so a
+        // wrong drop is permanent — unlike write suppression, which
+        // self-heals). Revalidate registration first. Without a probe the
+        // local removal knowledge stands; a FAILING probe aborts the
+        // reconcile (retryable) rather than consuming the sidecar on
+        // unknowable evidence. Same generation contract as
+        // recheckTombstonedRegistration: a tombstone republished mid-probe
+        // survives the stale positive.
+        if (this.registrationProbe == null) {
+          continue;
+        }
+        const generationBefore = this.deletedWorkspaceIds.get(workspaceId);
+        const registered = await this.registrationProbe(workspaceId);
+        if (!registered || this.deletedWorkspaceIds.get(workspaceId) !== generationBefore) {
+          continue;
+        }
+        this.deletedWorkspaceIds.delete(workspaceId);
       }
       if (!(workspaceId in main.workspaces)) {
         // Sidecar-only entry: by definition no writer touched it since the
@@ -1210,29 +1243,25 @@ export class ExtensionMetadataService {
       }
       data = await this.load(options);
     }
-    // Once per process: a crash between quarantineCorruptFile's rename and
-    // its completion can strand the full snapshot in the sidecar while
-    // another backend recreates a VALID (typically partial, single-entry)
-    // main file from the missing-main window before this process starts.
-    // Every other recovery path triggers only on ENOENT or corruption, so a
-    // valid recreated main would otherwise hide the stranded healthy or
-    // newer-version data forever. Probe the fixed sidecar path once and
-    // reconcile before answering; a probe/reconcile failure resets the
-    // latch and propagates so the read stays retryable rather than
-    // presenting the partial file as authoritative. Deterministically
-    // corrupt sidecar leftovers stay put (reconcile leaves them), costing
-    // one no-op reconcile attempt per process.
-    if (!this.checkedLeftoverQuarantineSidecar) {
-      this.checkedLeftoverQuarantineSidecar = true;
-      try {
-        if (await this.probeQuarantineSidecar()) {
-          await this.resumeQuarantineRecovery();
-          data = await this.load(options);
-        }
-      } catch (error) {
-        this.checkedLeftoverQuarantineSidecar = false;
-        throw error;
-      }
+    // A crash between quarantineCorruptFile's rename and its completion can
+    // strand the full snapshot in the sidecar while another backend
+    // recreates a VALID (typically partial, single-entry) main file from
+    // the missing-main window — leaving no ENOENT or corruption for the
+    // other recovery triggers. Quarantines are cross-process, so this can
+    // happen at ANY point in this process's lifetime, not just before
+    // startup: probe the fixed sidecar path on every authoritative read (a
+    // process-lifetime latch would hide a sidecar stranded after its first
+    // read until restart). The probe is one access() syscall next to the
+    // full-file read this method already does; the reconcile only runs when
+    // a sidecar actually exists. Failures propagate so the read stays
+    // retryable rather than presenting a partial file as authoritative. A
+    // deterministically corrupt leftover (kept for inspection by design)
+    // costs one no-op reconcile per read while it exists — corruption
+    // incidents are rare and the leftover is consumed by the next
+    // quarantine or manual cleanup.
+    if (await this.probeQuarantineSidecar()) {
+      await this.resumeQuarantineRecovery();
+      data = await this.load(options);
     }
     const map = new Map<string, WorkspaceActivitySnapshot>();
     for (const [workspaceId, entry] of Object.entries(data.workspaces)) {

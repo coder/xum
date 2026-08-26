@@ -996,12 +996,95 @@ describe("ExtensionMetadataService", () => {
     expect(sidecarGone).toBe(true);
   });
 
+  test("a strict read reconciles a sidecar stranded after earlier successful reads", async () => {
+    // Quarantines are cross-process: another backend can crash mid-quarantine
+    // (stranding a healthy sidecar) at any point in this process's lifetime,
+    // not just before startup. A process-lifetime latch would hide that
+    // sidecar until restart; the probe must run on every authoritative read.
+    await service.updateRecency("ws-main", 100);
+    expect((await service.getAllSnapshots({ throwOnError: true })).has("ws-main")).toBe(true);
+    // Stranded AFTER the first successful read.
+    await writeFile(
+      `${filePath}.corrupt`,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-other": { recency: 42, streaming: false } },
+      })
+    );
+
+    const snapshots = await service.getAllSnapshots({ throwOnError: true });
+    expect(snapshots.get("ws-main")?.recency).toBe(100);
+    expect(snapshots.get("ws-other")?.recency).toBe(42);
+    const sidecarGone = await readFile(`${filePath}.corrupt`, "utf-8").then(
+      () => false,
+      () => true
+    );
+    expect(sidecarGone).toBe(true);
+  });
+
+  test("reconcile revalidates tombstoned sidecar entries against registration", async () => {
+    // A tombstone may be stale (id re-registered by a downgraded backend)
+    // and the sidecar holds that workspace's ONLY copy — dropping is
+    // permanent, unlike write suppression. With the probe denying
+    // registration the entry is dropped; with the probe confirming it, the
+    // entry is merged and the tombstone lifted.
+    await service.updateRecency("ws-legacy", 100);
+    await service.deleteWorkspace("ws-legacy");
+    let registered = false;
+    service.setRegistrationProbe(() => Promise.resolve(registered));
+    await writeFile(
+      `${filePath}.corrupt`,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-legacy": { recency: 42, streaming: false } },
+      })
+    );
+    expect((await service.getAllSnapshots({ throwOnError: true })).has("ws-legacy")).toBe(false);
+    expect(service.isWorkspaceDeleted("ws-legacy")).toBe(true);
+    // Re-registered: a re-stranded sidecar entry must survive the reconcile.
+    registered = true;
+    await writeFile(
+      `${filePath}.corrupt`,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-legacy": { recency: 43, streaming: false } },
+      })
+    );
+    const snapshots = await service.getAllSnapshots({ throwOnError: true });
+    expect(snapshots.get("ws-legacy")?.recency).toBe(43);
+    expect(service.isWorkspaceDeleted("ws-legacy")).toBe(false);
+  });
+
+  test("a tombstone published during the registration probe survives a stale positive", async () => {
+    await service.updateRecency("ws-1", 100);
+    await service.deleteWorkspace("ws-1");
+    let resolveProbe: ((registered: boolean) => void) | null = null;
+    service.setRegistrationProbe(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveProbe = resolve;
+        })
+    );
+    // The write parks on the probe (invoked synchronously up to the await).
+    const write = service.updateRecency("ws-1", 200);
+    expect(resolveProbe).not.toBeNull();
+    // While the probe is in flight, the workspace is removed AGAIN: a newer
+    // tombstone generation is published. The probe's positive answer is
+    // stale (it read config before the deregistration) and must not clear
+    // the newer tombstone — otherwise the parked write recreates the entry
+    // right after the removal's queued deletion.
+    await service.deleteWorkspace("ws-1");
+    resolveProbe!(true);
+    await write;
+    expect(service.isWorkspaceDeleted("ws-1")).toBe(true);
+    expect((await service.getAllSnapshots()).has("ws-1")).toBe(false);
+  });
+
   test("an unprobeable sidecar during resumed recovery keeps the strict read retryable", async () => {
-    // The once-per-process leftover check found the sidecar, but the
-    // re-probe INSIDE the queued recovery transiently fails (EACCES/EIO
-    // class): reporting it absent would accept the recreated partial main
-    // and never look at the sidecar again for the process lifetime. The
-    // failure must propagate (latch reset) so a later read reconciles.
+    // The per-read leftover check found the sidecar, but the re-probe
+    // INSIDE the queued recovery transiently fails (EACCES/EIO class):
+    // reporting it absent would silently accept the recreated partial main.
+    // The failure must propagate (retryable) so a later read reconciles.
     await writeFile(
       filePath,
       JSON.stringify({
