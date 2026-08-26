@@ -789,11 +789,29 @@ export class BashMonitorWakeStore {
     if (newest == null || newestPath == null) return null;
     try {
       await fsPromises.link(newestPath, target);
-      await fsPromises.rm(newestPath, { force: true }).catch(() => undefined);
-    } catch {
-      // EEXIST (a concurrent writer re-established the path) or transient: the
-      // leftover stays for a later heal; the newest protection is still reported.
+    } catch (error) {
+      // Non-EEXIST placement failures PROPAGATE: reporting a capture that never
+      // durably won could hand the caller a cutoff no later read reproduces.
+      if (!isErrnoWithCode(error, "EEXIST")) throw error;
+      // EEXIST: a concurrent mutation re-established the canonical path after we
+      // selected the capture — ITS generation won and may carry a NEWER cutoff (a
+      // mid-dance mutation's capture holds the PREVIOUS generation, not the one it
+      // is publishing). Report the winner, not our stale selection: a caller judging
+      // a wake between the two cutoffs would otherwise restore what the newer clear
+      // retired. The leftover stays behind for a later heal, so its protection is
+      // never silently lost.
+      let raw: string;
+      try {
+        raw = await fsPromises.readFile(target, "utf-8");
+      } catch (readError) {
+        if (!isErrnoWithCode(readError, "ENOENT")) throw readError;
+        // The winner was removed again before we could read it: the capture remains
+        // the newest standing protection.
+        return newest;
+      }
+      return BashMonitorWakeStore.parseTombstone(raw) ?? newest;
     }
+    await fsPromises.rm(newestPath, { force: true }).catch(() => undefined);
     return newest;
   }
 
@@ -802,6 +820,18 @@ export class BashMonitorWakeStore {
       const parsed = JSON.parse(raw) as Partial<ClearTombstone>;
       if (typeof parsed.clearedAt !== "string" || Number.isNaN(Date.parse(parsed.clearedAt))) {
         return null;
+      }
+      if (parsed.phase === "staged") {
+        // A staged tombstone is only actionable through its transaction fields:
+        // without clearId no rollback (crashed-stage or owner) can ever claim it, and
+        // without a readable stagedAt the grace window never expires — while temp
+        // recovery keeps holding pre-clear temps for an outcome that cannot arrive,
+        // leaving those wakes undeliverable forever. Treat the corrupt shape as
+        // malformed (fail toward delivery); the next clear rewrites the file.
+        if (typeof parsed.clearId !== "string" || parsed.clearId.length === 0) return null;
+        if (typeof parsed.stagedAt !== "string" || Number.isNaN(Date.parse(parsed.stagedAt))) {
+          return null;
+        }
       }
       return parsed as ClearTombstone;
     } catch {

@@ -800,6 +800,98 @@ describe("WorkspaceService bash monitor wakes", () => {
     }
   });
 
+  test("a failed tombstone promotion after a successful full clear neither restores wakes nor fails the clear", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-clear-commit-retry";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+        notifyMonitorWakeStateChanged: mock(() => undefined),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      // Park drains so the seeded record stays pending until the clear retires it.
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(true);
+      spyOn(workspaceService, "waitForIdleAndNoQueuedMessages").mockImplementation(
+        () => new Promise(() => undefined)
+      );
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: BashMonitorWakeStore;
+        }
+      ).bashMonitorWakeStore;
+      await wakeStore.enqueueOrMergePending({
+        processId: "proc-commit-retry",
+        taskId: "bash:proc-commit-retry",
+        workspaceId,
+        filter: "WAKE:",
+        filterExclude: false,
+        lines: ["WAKE: retired"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 10,
+      });
+
+      const clearHistory = (
+        workspaceService as unknown as {
+          clearHistoryWithRetiredBashMonitorWakes: (
+            workspaceId: string,
+            clear: () => Promise<Result<void>>,
+            options?: { discardUnacceptedOnSuccess?: boolean }
+          ) => Promise<Result<void>>;
+        }
+      ).clearHistoryWithRetiredBashMonitorWakes.bind(workspaceService);
+      const restoreSpy = spyOn(wakeStore, "restorePendingSnapshots");
+      // The tombstone promotion fails transiently AFTER the history clear durably
+      // succeeded; subsequent calls run the real implementation (the retry path).
+      const commitSpy = spyOn(wakeStore, "commitClear").mockImplementationOnce(() =>
+        Promise.reject(new Error("EIO: tombstone write failed"))
+      );
+      const result = await clearHistory(workspaceId, () => Promise.resolve(Ok(undefined)), {
+        discardUnacceptedOnSuccess: true,
+      });
+      // The transcript is durably cleared: the caller must see the successful clear,
+      // and the retired wakes must NOT be restored into the cleared transcript.
+      expect(result.success).toBe(true);
+      expect(restoreSpy).not.toHaveBeenCalled();
+      expect(await wakeStore.listPending(workspaceId)).toEqual([]);
+      // The promotion retries in the background until the committed tombstone lands
+      // durably (otherwise the staged-clear grace scan would eventually roll the
+      // staging back and resurrect the retired wakes).
+      const tombPath = path.join(
+        config.getSessionDir(workspaceId),
+        "bash-monitor-wakes",
+        "cleared-at"
+      );
+      const deadline = Date.now() + 5_000;
+      let tomb: { phase?: string } | null = null;
+      while (Date.now() < deadline) {
+        tomb = JSON.parse(await fsPromises.readFile(tombPath, "utf-8")) as { phase?: string };
+        if (tomb.phase === "committed") break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(tomb?.phase).toBe("committed");
+      expect(commitSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(restoreSpy).not.toHaveBeenCalled();
+      expect(await wakeStore.listPending(workspaceId)).toEqual([]);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("listBackgroundProcesses keeps a pending wake visible on a reused monitorless process ID", async () => {
     const { config, cleanup } = await createTestHistoryService();
     try {

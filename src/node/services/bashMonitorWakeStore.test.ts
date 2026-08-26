@@ -1037,6 +1037,91 @@ describe("BashMonitorWakeStore", () => {
     expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
   });
 
+  test("healing defers to a tombstone that wins the canonical link race", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    // Clear #1 commits an old cutoff.
+    const clearOne = await store.supersedeAllPending("owner-1");
+    await store.commitClear("owner-1", clearOne);
+    // A wake arrives after that cutoff and crashes into a consumable deferred temp.
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR between cutoffs"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const temp = path.join(dir, "proc-1.json.tmp-crashed");
+    await fsPromises.rename(path.join(dir, "proc-1.json"), temp);
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(temp, past, past);
+
+    const tombPath = path.join(dir, "cleared-at");
+    const newerTombstone = JSON.stringify({
+      clearedAt: new Date(Date.now() + 60_000).toISOString(),
+      clearId: "clear-b",
+      phase: "committed",
+    });
+    // Another instance's clear B begins a tombstone mutation mid-scan: by the time
+    // the temp is inspected, B has CAPTURED the canonical (cleared-at is absent; only
+    // B's .cas- capture of the OLD generation remains on disk)...
+    const realStat = fsPromises.stat;
+    let capturedByB = false;
+    const statSpy = spyOn(fsPromises, "stat").mockImplementation((async (
+      p: Parameters<typeof realStat>[0]
+    ) => {
+      if (!capturedByB && String(p) === temp) {
+        capturedByB = true;
+        await fsPromises.rename(tombPath, `${tombPath}.cas-instance-b`);
+      }
+      return realStat(p);
+    }) as typeof fsPromises.stat);
+    // ...and B publishes its NEWER cutoff exactly when the healing read tries to link
+    // the stale capture back, losing the race.
+    const realLink = fsPromises.link;
+    let publishedByB = false;
+    const linkSpy = spyOn(fsPromises, "link").mockImplementation((async (
+      from: Parameters<typeof realLink>[0],
+      to: Parameters<typeof realLink>[1]
+    ) => {
+      if (!publishedByB && String(to) === tombPath && String(from).includes(".cas-")) {
+        publishedByB = true;
+        await fsPromises.writeFile(tombPath, newerTombstone, "utf-8");
+      }
+      return realLink(from, to);
+    }) as typeof fsPromises.link);
+    try {
+      // The heal must report B's winning cutoff, not the stale capture it selected:
+      // the deferred wake between the two cutoffs was retired by B's clear, so
+      // restoring it would deliver retired output into B's cleared transcript.
+      expect(await store.listPending("owner-1")).toEqual([]);
+      expect(await store.get("owner-1", "proc-1")).toBeNull();
+      expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
+    } finally {
+      statSpy.mockRestore();
+      linkSpy.mockRestore();
+    }
+  });
+
+  test("an incomplete staged tombstone reads as malformed instead of holding wakes forever", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR held hostage"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const temp = path.join(dir, "proc-1.json.tmp-crashed");
+    await fsPromises.rename(path.join(dir, "proc-1.json"), temp);
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(temp, past, past);
+    // Corruption left a staged tombstone WITHOUT its transaction fields: no clearId
+    // for any rollback to ever claim, no stagedAt for the grace window to expire —
+    // every scan would hold the pre-clear temp for an outcome that cannot arrive.
+    await fsPromises.writeFile(
+      path.join(dir, "cleared-at"),
+      JSON.stringify({ clearedAt: new Date(Date.now() + 60_000).toISOString(), phase: "staged" }),
+      "utf-8"
+    );
+
+    // The invalid staged shape reads as malformed (fail toward delivery): the wake
+    // recovers and delivers instead of being deferred indefinitely.
+    const pending = await store.listPending("owner-1");
+    expect(pending.map((r) => r.lines)).toEqual([["ERROR held hostage"]]);
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("pending");
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
+  });
+
   test("deferred recovery delays are bounded for corrupt or future mtimes", () => {
     const now = Date.now();
     // Near the gate: fires just past it (epsilon), no spurious full-interval wait.

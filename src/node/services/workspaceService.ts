@@ -12408,21 +12408,9 @@ export class WorkspaceService extends EventEmitter {
         this.notifyBashMonitorWakeStateChanged(workspaceId);
       }
     };
+    let clearResult: Result<T>;
     try {
-      const clearResult = await clear();
-      if (clearResult.success) {
-        if (options?.discardUnacceptedOnSuccess !== true) {
-          await restoreSnapshots(true);
-        } else {
-          // Full clear committed: promote the staged tombstone so pre-clear deferred
-          // temps stop being held and become condemned. Without this, a crash-scan
-          // would eventually treat the staging as failed and resurrect them.
-          await this.bashMonitorWakeStore.commitClear(workspaceId, clearToken);
-        }
-        return clearResult;
-      }
-      await restoreSnapshots(true);
-      return clearResult;
+      clearResult = await clear();
     } catch (error) {
       try {
         await restoreSnapshots(true);
@@ -12434,6 +12422,57 @@ export class WorkspaceService extends EventEmitter {
       }
       throw error;
     }
+    if (!clearResult.success) {
+      await restoreSnapshots(true);
+      return clearResult;
+    }
+    if (options?.discardUnacceptedOnSuccess !== true) {
+      await restoreSnapshots(true);
+      return clearResult;
+    }
+    // Full clear committed: promote the staged tombstone so pre-clear deferred
+    // temps stop being held and become condemned. Without this, a crash-scan
+    // would eventually treat the staging as failed and resurrect them. The
+    // transcript is durably cleared at this point, so a failed promotion must
+    // NOT reach any restore path (that would resurrect retired wakes straight
+    // into the cleared transcript) nor fail the caller's successful clear —
+    // leave the staging standing (it keeps holding pre-clear temps) and retry
+    // the promotion in the background until it lands.
+    try {
+      await this.bashMonitorWakeStore.commitClear(workspaceId, clearToken);
+    } catch (commitError) {
+      log.error("Failed to promote bash monitor clear tombstone; will retry", {
+        workspaceId,
+        error: commitError,
+      });
+      this.scheduleBashMonitorClearCommitRetry(workspaceId, clearToken);
+    }
+    return clearResult;
+  }
+
+  // One retry timer per clear transaction for a tombstone promotion that failed AFTER
+  // the history clear durably succeeded (see above): nothing else re-drives the
+  // promotion, and an unpromoted staging would eventually be rolled back as crashed —
+  // resurrecting retired wakes into the cleared transcript.
+  private readonly bashMonitorClearCommitRetryTimers = new Map<string, NodeJS.Timeout>();
+
+  private scheduleBashMonitorClearCommitRetry(
+    workspaceId: string,
+    clearToken: BashMonitorClearToken
+  ): void {
+    const key = `${workspaceId}:${clearToken.clearId}`;
+    if (this.bashMonitorClearCommitRetryTimers.has(key)) return;
+    const timer = setTimeout(() => {
+      this.bashMonitorClearCommitRetryTimers.delete(key);
+      this.bashMonitorWakeStore.commitClear(workspaceId, clearToken).catch((error: unknown) => {
+        log.debug("Bash monitor clear tombstone promotion retry failed", { workspaceId, error });
+        this.scheduleBashMonitorClearCommitRetry(workspaceId, clearToken);
+      });
+    }, 1_000);
+    // Never hold process shutdown open for a promotion retry: a staging orphaned by
+    // shutdown is reconciled by the staged-clear grace scan on the next start.
+    timer.unref();
+    this.bashMonitorClearCommitRetryTimers.set(key, timer);
   }
 
   async truncateHistory(workspaceId: string, percentage?: number): Promise<Result<void>> {
