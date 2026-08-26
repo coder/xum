@@ -5468,7 +5468,14 @@ describe("WorkspaceGoalService", () => {
       objective: "Preview without metadata",
       budgetCents: 1_000,
     });
-    await extensionMetadata.deleteWorkspace(workspaceId);
+    // Clear the snapshot by rewriting the file directly: deleteWorkspace now
+    // write-tombstones removed workspaces for the rest of the process, which
+    // would (correctly) block the preview persistence below. This test
+    // simulates a LIVE workspace that merely has no activity snapshot yet.
+    await fs.writeFile(
+      path.join(config.rootDir, "extensionMetadata.json"),
+      JSON.stringify({ version: 1, workspaces: {} })
+    );
     const activityUpdates = captureGoalActivity(service);
 
     const preview = await service.previewStreamAccounting({
