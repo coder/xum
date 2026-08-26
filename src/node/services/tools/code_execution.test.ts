@@ -1138,6 +1138,48 @@ describe("createCodeExecutionTool", () => {
       expect(partOf(records[2])?.text).toContain("aggregate media budget exceeded");
     });
 
+    it("sanitizes media containers passed as args to another bridged call in classic mode", async () => {
+      // `const img = mux.<mediaTool>({}); mux.<consumer>({payload: img})`
+      // copies the container into the consumer record's ARGS and start/end
+      // events; without bounding, repeated passes persist unbudgeted base64
+      // (r22). Args share the same per-execution capture budget as results.
+      const image = "A".repeat(1_300_000);
+      const tools: Record<string, Tool> = {
+        mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
+          type: "content",
+          value: [{ type: "media", mediaType: "image/png", data: image }],
+        })),
+        mcp__sink__send: createMockTool("mcp__sink__send", z.object({}).passthrough(), () => ({
+          ok: true,
+        })),
+      };
+      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge(tools));
+
+      const result = (await tool.execute!(
+        {
+          code:
+            "const img = mux.mcp__shots__take({}); " +
+            "mux.mcp__sink__send({payload: img}); " +
+            "mux.mcp__sink__send({payload: img}); return true;",
+        },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const sinkRecords = result.toolCalls.filter((r) => r.toolName === "mcp__sink__send");
+      expect(sinkRecords).toHaveLength(2);
+      const argPart = (record: (typeof sinkRecords)[number]) =>
+        (
+          record.args as {
+            payload?: { value?: Array<{ type?: string; data?: string; text?: string }> };
+          }
+        )?.payload?.value?.[0];
+      // Result (1.3MB) + first args copy (1.3MB) fit the shared 3MiB budget;
+      // the second args copy exceeds it and degrades to a placeholder.
+      expect(argPart(sinkRecords[0])?.data).toBe(image);
+      expect(argPart(sinkRecords[1])?.type).toBe("text");
+      expect(argPart(sinkRecords[1])?.text).toContain("aggregate media budget exceeded");
+    });
+
     it("charges retained results against one execution-wide budget", async () => {
       // Retention bypasses the per-record 16KiB kernel cap by design, but a
       // loop of retained calls (each up to ~3MiB of media) must not grow

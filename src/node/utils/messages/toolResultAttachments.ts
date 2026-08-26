@@ -286,16 +286,32 @@ function extractAttachmentsFromNestedToolCalls(
     if (typeof record !== "object" || record === null) {
       return record;
     }
-    const extracted = extractAttachmentsFromToolOutput(
+    const rewrites: Record<string, unknown> = {};
+    const extractedResult = extractAttachmentsFromToolOutput(
       (record as { result?: unknown }).result,
       depth + 1
     );
-    if (extracted == null) {
+    if (extractedResult != null) {
+      pushUnique(extractedResult.attachments);
+      rewrites.result = extractedResult.newOutput;
+    }
+    // Nested-call ARGS too (r22): sandbox code can pass a bridged media
+    // result into another tool ({payload: image}); classic capture retains
+    // the copy under the shared budget, so the provider copy must rewrite it
+    // like result media or the base64 rides as JSON in every later request.
+    const extractedArgs = extractAttachmentsFromToolOutput(
+      (record as { args?: unknown }).args,
+      depth + 1
+    );
+    if (extractedArgs != null) {
+      pushUnique(extractedArgs.attachments);
+      rewrites.args = extractedArgs.newOutput;
+    }
+    if (extractedResult == null && extractedArgs == null) {
       return record;
     }
     didChange = true;
-    pushUnique(extracted.attachments);
-    return { ...record, result: extracted.newOutput };
+    return { ...record, ...rewrites };
   });
 
   const outerResult = (output as { result?: unknown }).result;

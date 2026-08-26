@@ -328,7 +328,7 @@ export class QuickJSRuntime implements IJSRuntime {
       // Kernel mode bounds captured args/results at creation: records and
       // streamed events must never retain full guest payloads (host memory +
       // session history growth); the guest still receives full values.
-      const recordArgs = this.boundCaptureArgs(args[0], name);
+      const recordArgs = this.boundCaptureArgs(args[0], name, this.toolCalls);
 
       // Emit start event
       this.eventHandler?.({
@@ -508,7 +508,7 @@ export class QuickJSRuntime implements IJSRuntime {
           const result = await fn(...args);
           const endTime = Date.now();
           // Same creation-time bounding as synchronous bridges (kernel mode).
-          const recordArgs = this.boundCaptureArgs(args[0], name);
+          const recordArgs = this.boundCaptureArgs(args[0], name, toolCalls);
           const recordResult = this.boundCaptureResult(result, name, toolCalls);
           toolCalls.push({
             toolName: name,
@@ -534,7 +534,7 @@ export class QuickJSRuntime implements IJSRuntime {
           const endTime = Date.now();
           const errorStr = error instanceof Error ? error.message : String(error);
           const recordError = this.boundCaptureError(errorStr);
-          const recordArgs = this.boundCaptureArgs(args[0], name);
+          const recordArgs = this.boundCaptureArgs(args[0], name, toolCalls);
           toolCalls.push({
             toolName: name,
             args: recordArgs,
@@ -633,8 +633,22 @@ export class QuickJSRuntime implements IJSRuntime {
     };
   }
 
-  private boundCaptureArgs(value: unknown, toolName: string): unknown {
-    if (this.kernelRecordBounds === undefined) return value;
+  private boundCaptureArgs(
+    value: unknown,
+    toolName: string,
+    toolCalls: PTCToolCallRecord[]
+  ): unknown {
+    if (this.kernelRecordBounds === undefined) {
+      // Classic mode has no args cap, but media containers passed AS
+      // ARGUMENTS to another bridged tool (e.g. {payload: image}) would
+      // otherwise copy unbudgeted base64 into every start/end event and
+      // record (r22) — the result sanitizer only covers the producing call.
+      // Sanitize against the same shared per-execution budget; the guest
+      // still passes the full value to the tool.
+      return this.captureResultSanitizer !== undefined
+        ? this.captureResultSanitizer(toolName, value, this.classicSanitizerBudgetFor(toolCalls))
+        : value;
+    }
     const bounded = this.boundCapture(value, this.kernelRecordBounds.argsCapBytes);
     if (bounded === value) return value;
     // The marker replaced the args entirely: merge back attribution fields
@@ -911,7 +925,7 @@ export class QuickJSRuntime implements IJSRuntime {
         const callId = generateCallId();
 
         // Same creation-time bounding as registerFunction (kernel mode).
-        const recordArgs = this.boundCaptureArgs(args[0], methodName);
+        const recordArgs = this.boundCaptureArgs(args[0], methodName, this.toolCalls);
 
         // Emit start event
         this.eventHandler?.({

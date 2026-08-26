@@ -56,6 +56,31 @@ describe("retainExemptKernelRecordResult", () => {
       expect(retained).toBeUndefined();
     });
 
+    it("keeps emoji-leading bodies when the budget is below a lone-surrogate escape", () => {
+      // Serialized length is NOT monotonic in code units across a surrogate
+      // pair: a code-unit midpoint inside a leading emoji serializes to a
+      // 6-char \udXXX escape and would reject a budget the whole 2-char pair
+      // fits, losing the package entirely — the search must test complete
+      // code points (r22). Budget is pinned to 3 chars via a pad field the
+      // schema strips.
+      const note = "\n\n[Skill body truncated at capture to fit the retained-record cap]";
+      const noteChars = JSON.stringify(note).length - 2;
+      const emptyBodySkill = { ...oversizedSkill, body: "", pad: "" };
+      const overheadEmpty = JSON.stringify({ success: true, skill: emptyBodySkill }).length;
+      const pad = "p".repeat(MAX_FILE_CONTENT_SIZE - overheadEmpty - noteChars - 3);
+      const retained = retainExemptKernelRecordResult("agent_skill_read", {
+        success: true,
+        skill: { ...oversizedSkill, body: "🎉".repeat(60), pad },
+      }) as { success?: boolean; skill?: { body?: string } };
+      expect(retained?.success).toBe(true);
+      // Exactly one whole emoji fits the 3-char budget (2 serialized chars).
+      expect(retained?.skill?.body?.startsWith("🎉")).toBe(true);
+      expect(retained?.skill?.body?.startsWith("🎉🎉")).toBe(false);
+      expect(retained?.skill?.body?.endsWith(note)).toBe(true);
+      expect(JSON.stringify(retained).length).toBeLessThanOrEqual(MAX_FILE_CONTENT_SIZE);
+      expect(AgentSkillPackageSchema.safeParse(retained?.skill).success).toBe(true);
+    });
+
     it("truncates escape-heavy bodies by serialized budget instead of dropping them", () => {
       // An all-newline body serializes at ~2x its raw length; a raw-length
       // budget treated that inflation as fixed overhead, went negative, and

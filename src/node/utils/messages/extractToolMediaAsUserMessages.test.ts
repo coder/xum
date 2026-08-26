@@ -529,6 +529,64 @@ describe("extractToolMediaAsUserMessages", () => {
     expect(toolPart.output).toBe(deep);
   });
 
+  it("redacts media containers passed as nested tool-call args", async () => {
+    // Sandbox code can pass a bridged media result into another tool
+    // ({payload: image}); classic capture retains the args copy under the
+    // shared budget, so request-time extraction must rewrite it like result
+    // media (r22).
+    const base64 = (
+      await sharp({
+        create: { width: 10, height: 10, channels: 3, background: { r: 3, g: 1, b: 4 } },
+      })
+        .png()
+        .toBuffer()
+    ).toString("base64");
+    const mediaContainer = {
+      type: "content",
+      value: [{ type: "media", mediaType: "image/png", data: base64 }],
+    };
+
+    const input: MuxMessage[] = [
+      {
+        id: "ce-args",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call1",
+            toolName: "code_execution",
+            input: { code: "mux.mcp__sink__send({payload: img});" },
+            state: "output-available",
+            output: {
+              success: true,
+              result: null,
+              toolCalls: [
+                {
+                  toolName: "mcp__sink__send",
+                  args: { payload: mediaContainer, note: "kept" },
+                  result: { ok: true },
+                },
+              ],
+            },
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    expect(rewritten).toHaveLength(2);
+    const toolPart = rewritten[0].parts[0];
+    if (toolPart.type !== "dynamic-tool" || toolPart.state !== "output-available") {
+      throw new Error("Expected an output-available dynamic-tool part");
+    }
+    const outputText = JSON.stringify(toolPart.output);
+    expect(outputText).not.toContain(base64);
+    expect(outputText).toContain('"note":"kept"');
+    const fileParts = rewritten[1].parts.filter((part) => part.type === "file");
+    expect(fileParts).toHaveLength(1);
+  });
+
   it("extracts media containers nested inside non-media content parts", async () => {
     // A content container can hold a custom non-media part that itself wraps
     // another media container. Capture retains such parts whole while within

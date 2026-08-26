@@ -231,34 +231,43 @@ function boundOversizedSkillPackage(
   const overhead = reducedLength - serializedBodyChars;
   const serializedBudget = MAX_FILE_CONTENT_SIZE - overhead - noteSerializedChars;
   if (serializedBudget <= 0) return undefined;
-  // Largest raw-body prefix whose serialized form fits the budget. Escape
-  // expansion is per-character, so the predicate is monotonic in prefix
-  // length (the one exception — a lone trailing high surrogate escaping to 6
-  // chars where the completed pair costs 2 — can only make the search settle
-  // on a slightly shorter prefix; `low` is only ever advanced to a value that
-  // TESTED as fitting, so the result always fits).
+  // Largest raw-body prefix whose serialized form fits the budget, searched
+  // over CODE-POINT boundaries (r22): serialized length is NOT monotonic in
+  // code units across a surrogate pair — a lone high surrogate escapes to 6
+  // chars while the completed pair serializes as 2, so a code-unit midpoint
+  // landing inside a leading emoji could reject a budget the whole pair fits.
+  // Boundary prefixes never split pairs, and appending one code point (or one
+  // unpaired surrogate, kept as its own unit) strictly grows the serialized
+  // form, restoring monotonicity for the search.
+  const boundaries: number[] = [0];
+  for (let i = 0; i < body.length; ) {
+    const code = body.charCodeAt(i);
+    const isPair =
+      code >= 0xd800 &&
+      code <= 0xdbff &&
+      i + 1 < body.length &&
+      body.charCodeAt(i + 1) >= 0xdc00 &&
+      body.charCodeAt(i + 1) <= 0xdfff;
+    i += isPair ? 2 : 1;
+    boundaries.push(i);
+  }
   let low = 0;
-  let high = body.length;
+  let high = boundaries.length - 1;
   while (low < high) {
     const mid = Math.ceil((low + high) / 2);
-    const midSerializedChars = JSON.stringify(body.slice(0, mid)).length - 2;
+    const midSerializedChars = JSON.stringify(body.slice(0, boundaries[mid])).length - 2;
     if (midSerializedChars <= serializedBudget) {
       low = mid;
     } else {
       high = mid - 1;
     }
   }
-  // Do not end the retained body on a split surrogate pair: dropping a
-  // trailing lone HIGH surrogate strictly shrinks the serialized form.
-  if (low > 0) {
-    const lastCode = body.charCodeAt(low - 1);
-    if (lastCode >= 0xd800 && lastCode <= 0xdbff) low -= 1;
-  }
-  if (low <= 0) return undefined;
+  const cut = boundaries[low];
+  if (cut <= 0) return undefined;
   return {
     ...success,
     ...error,
-    skill: { ...skill, body: `${body.slice(0, low)}${SKILL_BODY_CAPTURE_TRUNCATION_NOTE}` },
+    skill: { ...skill, body: `${body.slice(0, cut)}${SKILL_BODY_CAPTURE_TRUNCATION_NOTE}` },
   };
 }
 
