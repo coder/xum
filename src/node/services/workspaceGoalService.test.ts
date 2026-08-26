@@ -3748,6 +3748,74 @@ describe("WorkspaceGoalService", () => {
     expect(upcomingEntry?.goal.goalId).toBe(queued.goalId);
   });
 
+  test("raising the budget out of budget_limited invalidates captured wrap-up admissions", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cTN_o): re-arming budget_limited→active by
+    // raising the exhausted limit changes neither identity, objective, nor
+    // pause state — a budget wrap-up admission captured before the raise
+    // would stay fresh and charge a stale stopping turn after reactivation.
+    const created = await setGoalOk(service, {
+      workspaceId,
+      objective: "Re-armed budget",
+      budgetCents: 100,
+    });
+    await service.recordStreamAccounting({
+      workspaceId,
+      costUsd: 1.25,
+      streamStartedAtMs: created.createdAtMs + 1,
+      streamOriginKind: "goal_continuation",
+    });
+    expect(await service.getGoal(workspaceId)).toMatchObject({ status: "budget_limited" });
+    const admission = await service.buildGoalRedispatchAdmission(
+      workspaceId,
+      created.goalId,
+      GOAL_BUDGET_LIMIT_KIND
+    );
+    expect(admission.admissible).toBe(true);
+    if (!admission.admissible) {
+      throw new Error("expected admissible probe");
+    }
+    expect(admission.admissionStale()).toBe(false);
+
+    // User raises the limit: applyBudgetDrivenStatus re-arms the goal active.
+    await setGoalOk(service, { workspaceId, budgetCents: 1_000 });
+    expect(await service.getGoal(workspaceId)).toMatchObject({ status: "active" });
+
+    expect(admission.admissionStale()).toBe(true);
+  });
+
+  test("getGoal preserves Resume consent for previously driven goals", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cTN_r): the consent arm must apply
+    // independently of the never-driven kickoff guard. A user who explicitly
+    // resumes with a queued message pending has opted in — the row's
+    // dispatch-time tail sync runs before manual-message goal safety, and
+    // writing the resumed goal back to paused would discard the Resume with
+    // no repair path (candidate restoration requires an active goal).
+    await setGoalOk(service, { workspaceId, objective: "Driven then resumed" });
+    await driveOneContinuation();
+    // Keep the resume from arming a kickoff candidate so this exercises the
+    // durable path (candidates are lost on restart/eviction anyway).
+    (service as unknown as { suppressKickoffContinuation: boolean }).suppressKickoffContinuation =
+      true;
+    try {
+      await setGoalOk(service, { workspaceId, status: "paused" });
+      const authoredAtMs = Date.now();
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      await setGoalOk(service, { workspaceId, status: "active" });
+      // The queued row dispatches after the Resume; its authoring predates it.
+      await appendUserHistoryMessage(historyService, workspaceId, "Queued before resume", {
+        timestamp: Date.now(),
+        enqueuedAtMs: authoredAtMs,
+      });
+
+      const reconciled = await service.getGoal(workspaceId);
+
+      expect(reconciled).toMatchObject({ status: "active" });
+    } finally {
+      (service as unknown as { suppressKickoffContinuation: boolean }).suppressKickoffContinuation =
+        false;
+    }
+  });
+
   test("a same-ID objective edit invalidates captured redispatch admissions", async () => {
     // Codex P1 (PRRT_kwDOPxxmWM6cS8B1): an editInPlace rename keeps the
     // goalId, so the identity generation previously stayed put — a captured

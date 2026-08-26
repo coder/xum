@@ -606,6 +606,7 @@ export class WorkspaceGoalService {
     string,
     { goalId: string; objective: string }
   >();
+  private readonly lastWrittenGoalStatuses = new Map<string, GoalRecordV1["status"]>();
 
   private armPauseFinalizationHold(workspaceId: string, goalId: string): void {
     this.explicitPauseGenerations.set(
@@ -920,12 +921,24 @@ export class WorkspaceGoalService {
       // via the pause_boundary branch. Strict ordering (Codex P2
       // PRRT_kwDOPxxmWM6cS8Bu): same-millisecond equality cannot prove the
       // row was pending at activation — it fails closed to pause.
+      //
+      // The consent arm applies independently of the never-driven guard
+      // (Codex P2 PRRT_kwDOPxxmWM6cTN_r): a user who explicitly resumed with
+      // the queued message already pending has opted in, and the row's
+      // dispatch-time tail sync runs BEFORE manual-message goal safety —
+      // writing the resumed goal back to paused here would discard the Resume
+      // with no repair path (candidate restoration requires an active goal).
+      // The processed-row arm stays scoped to the kickoff window: for a
+      // driven goal, a settled manual turn with no later continuation row
+      // means the dispatch-time auto-pause was lost, and reconciling to
+      // paused is the self-healing path.
+      const consentCoversManualRow =
+        chatTailMode.manualRowAuthoredAtMs != null &&
+        goal.lastUserActivationAtMs != null &&
+        chatTailMode.manualRowAuthoredAtMs < goal.lastUserActivationAtMs;
       if (
-        goal.lastContinuationFiredAtMs == null &&
-        (chatTailMode.manualRowProcessed === true ||
-          (chatTailMode.manualRowAuthoredAtMs != null &&
-            goal.lastUserActivationAtMs != null &&
-            chatTailMode.manualRowAuthoredAtMs < goal.lastUserActivationAtMs))
+        consentCoversManualRow ||
+        (goal.lastContinuationFiredAtMs == null && chatTailMode.manualRowProcessed === true)
       ) {
         return goal;
       }
@@ -1162,8 +1175,19 @@ export class WorkspaceGoalService {
     await writeFileAtomic(filePath, `${JSON.stringify(goal, null, 2)}\n`, "utf-8");
     // See terminalStatusGenerations: bumped at the write commit point so
     // in-flight dispatch admission probes observe terminal transitions from
-    // every write path.
-    if (goal.status === "complete" || goal.status === "budget_limited") {
+    // every write path. Codex P1 (PRRT_kwDOPxxmWM6cTN_o): transitions OUT of
+    // a terminal status bump too — raising/removing an exhausted limit
+    // re-arms budget_limited→active without changing identity, objective, or
+    // pause state, and a captured budget wrap-up admission would otherwise
+    // stay fresh and charge a stale stopping turn after reactivation.
+    // Non-terminal→non-terminal writes (per-stream accounting on active
+    // goals) still never bump.
+    const isTerminalStatus = goal.status === "complete" || goal.status === "budget_limited";
+    const previousWrittenStatus = this.lastWrittenGoalStatuses.get(workspaceId);
+    const wasTerminalStatus =
+      previousWrittenStatus === "complete" || previousWrittenStatus === "budget_limited";
+    this.lastWrittenGoalStatuses.set(workspaceId, goal.status);
+    if (isTerminalStatus || wasTerminalStatus) {
       this.terminalStatusGenerations.set(
         workspaceId,
         (this.terminalStatusGenerations.get(workspaceId) ?? 0) + 1
@@ -4306,6 +4330,7 @@ export class WorkspaceGoalService {
       // observe generation counters after their initial durable read, so clear
       // must invalidate them even when no upcoming goal is promoted.
       this.lastWrittenGoalIdentities.delete(workspaceId);
+      this.lastWrittenGoalStatuses.delete(workspaceId);
       this.goalIdentityGenerations.set(
         workspaceId,
         (this.goalIdentityGenerations.get(workspaceId) ?? 0) + 1
