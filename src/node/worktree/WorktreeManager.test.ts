@@ -342,6 +342,38 @@ describe("WorktreeManager.renameWorkspace", () => {
       await fixture.cleanup();
     }
   }, 20_000);
+
+  it("returns a structured failure when git preflight cannot inspect the repository", async () => {
+    const fixture = await createWorktreeManagerFixture();
+
+    try {
+      const oldName = "rename-preflight-old";
+      const createResult = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: oldName,
+        trunkBranch: "main",
+        initLogger: fixture.initLogger,
+        trusted: true,
+      });
+      expect(createResult.success).toBe(true);
+      await fsPromises.rm(fixture.projectPath, { recursive: true, force: true });
+
+      const result = await fixture.manager.renameWorkspace(
+        fixture.projectPath,
+        oldName,
+        "rename-preflight-new",
+        false
+      );
+
+      expect(result.success).toBe(false);
+      if (result.success) {
+        throw new Error("Expected renameWorkspace to fail");
+      }
+      expect(result.error).toContain("Failed to inspect repository automation drivers");
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
 });
 
 describe("WorktreeManager.deleteWorkspace", () => {

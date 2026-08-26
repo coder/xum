@@ -398,7 +398,12 @@ export class WorktreeManager {
     cleanStaleLock(projectPath);
 
     // Disable git hooks for untrusted projects
-    const noHooksEnv = await this.getGitExecOptions(projectPath, trusted);
+    let noHooksEnv: GitExecOptions;
+    try {
+      noHooksEnv = await this.getGitExecOptions(projectPath, trusted);
+    } catch (error) {
+      return { success: false, error: `Failed to rename workspace: ${getErrorMessage(error)}` };
+    }
 
     // Compute workspace paths using canonical method
     const oldPath = this.getWorkspacePath(projectPath, oldName);
