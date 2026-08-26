@@ -726,7 +726,7 @@ def test_run_excludes_preexisting_session_directories(
     assert getattr(context, "cost_usd") == pytest.approx(0.15)
 
 
-def test_populate_context_backfills_from_session_usage_when_cost_missing(
+def test_populate_context_prefers_priced_session_when_not_older(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
@@ -788,7 +788,7 @@ def test_run_rejects_oversized_streamed_session_archive(
     assert "streamed archive too large" in diagnostic
 
 
-def test_populate_context_prefers_priced_session_totals_over_unpriced_tokens(
+def test_populate_context_prefers_fresher_unpriced_stdout_counts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
@@ -803,12 +803,12 @@ def test_populate_context_prefers_priced_session_totals_over_unpriced_tokens(
 
     agent.populate_context_post_run(context)
 
-    assert getattr(context, "n_input_tokens") == 115
-    assert getattr(context, "n_output_tokens") == 20
-    assert getattr(context, "cost_usd") == pytest.approx(0.15)
+    assert getattr(context, "n_input_tokens") == 500 + 800 + 40
+    assert getattr(context, "n_output_tokens") == 90
+    assert not hasattr(context, "cost_usd")
 
 
-def test_populate_context_falls_back_from_non_finite_token_file_counts(
+def test_populate_context_keeps_valid_fresher_non_finite_token_file_counts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
@@ -823,13 +823,13 @@ def test_populate_context_falls_back_from_non_finite_token_file_counts(
 
     agent.populate_context_post_run(context)
 
-    assert getattr(context, "n_input_tokens") == 115
-    assert getattr(context, "n_output_tokens") == 20
-    assert getattr(context, "cost_usd") == pytest.approx(0.15)
+    assert getattr(context, "n_input_tokens") == 0
+    assert getattr(context, "n_output_tokens") == 1000
+    assert not hasattr(context, "cost_usd")
 
 
 @pytest.mark.parametrize("cost_json", ["1e309", "-0.01", '"invalid"'])
-def test_populate_context_falls_back_from_invalid_stdout_cost(
+def test_populate_context_keeps_fresher_counts_for_invalid_stdout_cost(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cost_json: str
 ) -> None:
     monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
@@ -844,9 +844,9 @@ def test_populate_context_falls_back_from_invalid_stdout_cost(
 
     agent.populate_context_post_run(context)
 
-    assert getattr(context, "n_input_tokens") == 115
-    assert getattr(context, "n_output_tokens") == 20
-    assert getattr(context, "cost_usd") == pytest.approx(0.15)
+    assert getattr(context, "n_input_tokens") == 500
+    assert getattr(context, "n_output_tokens") == 90
+    assert not hasattr(context, "cost_usd")
 
 
 def test_populate_context_leaves_invalid_stdout_cost_unset_without_session(

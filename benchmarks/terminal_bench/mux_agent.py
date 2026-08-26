@@ -811,10 +811,6 @@ class MuxAgent(BaseInstalledAgent):
         token_cost = token_data.get("cost_usd") if token_data is not None else None
         if token_data is not None and self._is_valid_usage_number(token_cost):
             data = token_data
-        elif session_totals is not None and self._is_valid_usage_number(
-            session_totals.get("cost_usd")
-        ):
-            data = session_totals
         elif session_totals is not None and (
             token_data is None
             or self._total_tokens(session_totals) >= self._total_tokens(token_data)
