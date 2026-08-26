@@ -235,7 +235,7 @@ describe("onChat since-mode reconnect cursor contract", () => {
     if (!historyResult.success) {
       throw new Error(`Failed to read history: ${historyResult.error}`);
     }
-    const persistedIds = (historyResult.data as MuxMessage[]).map((message) => message.id);
+    const persistedIds = historyResult.data.map((message) => message.id);
     expect(aggregator.getAllMessages().map((message) => message.id)).toEqual(persistedIds);
   });
 });
