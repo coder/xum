@@ -12378,7 +12378,7 @@ describe("WorkspaceService remove lifecycle coordination", () => {
       makeAgentTaskIntegrationFake({
         withTaskTreeLifecycleLock: runWithTaskTreeLifecycleLock,
         hasActiveDescendantAgentTasksForWorkspace,
-        listDescendantAgentTaskIdsDeepestFirst: mock(() => []),
+        cascadeRemoveInactiveDescendantsWhileTaskTreeLocked: mock(async () => Ok(undefined)),
       })
     );
 

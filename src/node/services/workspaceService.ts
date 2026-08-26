@@ -5558,15 +5558,15 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
         return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
       }
 
-      const descendantIds =
-        this.agentTaskIntegration?.listDescendantAgentTaskIdsDeepestFirst(workspaceId) ?? [];
-      for (const descendantId of descendantIds) {
-        const childResult = await this.removeUnlocked(descendantId, true);
-        if (!childResult.success) {
-          return Err(
-            `Failed to cascade-remove descendant workspace ${descendantId}: ${childResult.error}`
-          );
-        }
+      // Cascade-remove inactive descendants through TaskService, which handles
+      // git-patch-artifact waits, ownership tombstones, and force-flag passthrough.
+      const cascadeResult =
+        await this.agentTaskIntegration?.cascadeRemoveInactiveDescendantsWhileTaskTreeLocked(
+          workspaceId,
+          force
+        );
+      if (cascadeResult != null && !cascadeResult.success) {
+        return Err(cascadeResult.error);
       }
 
       // Stop any active stream before deleting metadata/config to avoid tool calls racing with removal.
