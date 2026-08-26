@@ -648,42 +648,52 @@ export class BashMonitorWakeStore {
   // abandonWorkspaceClears).
   private readonly stagedClearRefreshTimers = new Map<
     string,
-    { timer: NodeJS.Timeout; ownerWorkspaceId: string; inFlight: Promise<void> | null }
+    { timer: NodeJS.Timeout; ownerWorkspaceId: string }
   >();
+
+  // In-flight heartbeat tick mutations, keyed by owner and tracked INDEPENDENTLY of
+  // the timer entries above: commitClear (and rollback) disarm a clear's timer while
+  // a fired tick can still be queued on the tombstone lock behind their own mutation,
+  // and abandonWorkspaceClears must be able to drain those orphaned ticks too — an
+  // undrained tick's recursive mkdir would recreate the session directory after
+  // removal deletes it. Ticks remove themselves once settled.
+  private readonly heartbeatTicksByOwner = new Map<string, Set<Promise<void>>>();
 
   private armStagedClearRefresh(ownerWorkspaceId: string, clearId: string): void {
     this.disarmStagedClearRefresh(clearId);
-    const entry: {
-      timer: NodeJS.Timeout;
-      ownerWorkspaceId: string;
-      inFlight: Promise<void> | null;
-    } = {
-      timer: setInterval(() => {
-        // Best-effort: a missed refresh only narrows the liveness window and the next
-        // tick tries again — refresh failures must never break the clear itself. The
-        // guard on clearId keeps a heartbeat that outlives its generation (raced away
-        // by a newer clear) from resurrecting or touching a foreign tombstone.
-        // Tracked (not fire-and-forget) so abandonWorkspaceClears can DRAIN a tick
-        // that already fired: even a "keep" no-op re-creates the wake directory
-        // (mutateClearedAt mkdirs before capturing), which removal must never race.
-        // Ticks serialize on the per-owner tombstone lock, so the latest assignment
-        // settles last and awaiting it covers every earlier queued tick.
-        entry.inFlight = this.mutateClearedAt(ownerWorkspaceId, (current) =>
-          current?.clearId === clearId && current.phase === "staged"
-            ? { ...current, stagedAt: new Date().toISOString() }
-            : "keep"
-        ).then(
-          () => undefined,
-          () => undefined
-        );
-      }, this.stagedClearRefreshIntervalMs),
-      ownerWorkspaceId,
-      inFlight: null,
-    };
+    const timer = setInterval(() => {
+      // Best-effort: a missed refresh only narrows the liveness window and the next
+      // tick tries again — refresh failures must never break the clear itself. The
+      // guard on clearId keeps a heartbeat that outlives its generation (raced away
+      // by a newer clear) from resurrecting or touching a foreign tombstone.
+      // Tracked (not fire-and-forget) in heartbeatTicksByOwner so
+      // abandonWorkspaceClears can DRAIN a tick that already fired, even after this
+      // timer is disarmed: even a "keep" no-op re-creates the wake directory
+      // (mutateClearedAt mkdirs before capturing), which removal must never race.
+      let ticks = this.heartbeatTicksByOwner.get(ownerWorkspaceId);
+      if (ticks == null) {
+        ticks = new Set();
+        this.heartbeatTicksByOwner.set(ownerWorkspaceId, ticks);
+      }
+      const trackedTicks = ticks;
+      const tick: Promise<void> = this.mutateClearedAt(ownerWorkspaceId, (current) =>
+        current?.clearId === clearId && current.phase === "staged"
+          ? { ...current, stagedAt: new Date().toISOString() }
+          : "keep"
+      ).then(
+        () => {
+          trackedTicks.delete(tick);
+        },
+        () => {
+          trackedTicks.delete(tick);
+        }
+      );
+      trackedTicks.add(tick);
+    }, this.stagedClearRefreshIntervalMs);
     // Never hold process shutdown open: a staging orphaned by shutdown is exactly
     // what the grace scan reconciles.
-    entry.timer.unref();
-    this.stagedClearRefreshTimers.set(clearId, entry);
+    timer.unref();
+    this.stagedClearRefreshTimers.set(clearId, { timer, ownerWorkspaceId });
   }
 
   private disarmStagedClearRefresh(clearId: string): void {
@@ -703,19 +713,25 @@ export class BashMonitorWakeStore {
    * instead of being held forever by a marker whose owner will never settle it.
    */
   async abandonWorkspaceClears(ownerWorkspaceId: string): Promise<void> {
-    const drains: Array<Promise<void>> = [];
     for (const [clearId, entry] of this.stagedClearRefreshTimers) {
       if (entry.ownerWorkspaceId !== ownerWorkspaceId) continue;
       clearInterval(entry.timer);
       this.stagedClearRefreshTimers.delete(clearId);
       this.activeClearIds.delete(clearId);
-      // clearInterval cancels ticks that have not fired, but a tick that already
-      // fired holds a live mutateClearedAt promise outside any caller-visible lock;
-      // its recursive mkdir would recreate the session directory if removal deleted
-      // it mid-mutation. Collect and drain those before the caller proceeds.
-      if (entry.inFlight != null) drains.push(entry.inFlight);
     }
-    await Promise.all(drains);
+    // clearInterval cancels ticks that have not fired, but a tick that already fired
+    // holds a live mutateClearedAt promise outside any caller-visible lock; its
+    // recursive mkdir would recreate the session directory if removal deleted it
+    // mid-mutation. Drained from the owner-keyed tick set rather than the timer
+    // entries above, because a tick can outlive its timer: commitClear disarms the
+    // timer while the tick is still queued on the tombstone lock behind the commit's
+    // own mutation. The snapshot is complete — fired ticks register synchronously and
+    // the timers above are already cleared, so no new tick can appear.
+    const ticks = this.heartbeatTicksByOwner.get(ownerWorkspaceId);
+    if (ticks != null) {
+      await Promise.all([...ticks]);
+      this.heartbeatTicksByOwner.delete(ownerWorkspaceId);
+    }
   }
 
   private scheduleDeferredTempRecovery(
@@ -1243,15 +1259,28 @@ export class BashMonitorWakeStore {
     if (await this.rollbackClearTombstone(ownerWorkspaceId, clearId, tomb.stagedAt)) {
       return restored.map((r) => r.entry);
     }
-    // The pinned CAS DECLINED: between the tombstone read above and this
-    // authorization, the owning instance (resumed from a long stall) refreshed the
-    // staging (live, not crashed) or committed it (retirement final) — restoring its
-    // stamped records above was premature. Left pending, a record whose pre-clear
-    // updatedAt equals the cutoff would pass the strict pre-cutoff fence and deliver
-    // during a live clear or into an already-cleared transcript. Re-supersede exactly
-    // the generations restored above; a record that changed since (a live monitor
-    // merged new output) stays pending — mid-clear output must survive, and its
-    // pre-cutoff lines redelivering is the documented lesser failure.
+    // The pinned CAS DECLINED. Adjudicate WHY before compensating: a TWIN scan racing
+    // this same crashed staging can restore the records in parallel and demote the
+    // tombstone between our read and our CAS. Its rollback COMPLETED — the records
+    // restored above are legitimately pending, and re-superseding them with no staged
+    // tombstone left on disk would strand them beyond any recovery, permanently
+    // losing wakes for a history clear that never ran. Only a standing generation
+    // still owned by THIS clear proves otherwise; a foreign or absent generation
+    // also needs no compensation — its committed cutoff (when one stands) retires
+    // pre-cutoff records through the canonical fence on its own.
+    const standing = await this.readClearedAt(ownerWorkspaceId);
+    if (standing?.clearId !== clearId) {
+      return restored.map((r) => r.entry);
+    }
+    // This clear still owns the tombstone: the owning instance (resumed from a long
+    // stall) refreshed the staging (live, not crashed) or committed it (retirement
+    // final) — restoring its stamped records above was premature. Left pending, a
+    // record whose pre-clear updatedAt equals the cutoff would pass the strict
+    // pre-cutoff fence and deliver during a live clear or into an already-cleared
+    // transcript. Re-supersede exactly the generations restored above; a record that
+    // changed since (a live monitor merged new output) stays pending — mid-clear
+    // output must survive, and its pre-cutoff lines redelivering is the documented
+    // lesser failure.
     for (const r of restored) {
       await this.locks.withLock(`${ownerWorkspaceId}:${r.id}`, async () => {
         const current = await this.readRecordAt(r.filePath);

@@ -2418,6 +2418,111 @@ describe("BashMonitorWakeStore", () => {
     expect(existsSync(tombPath)).toBe(false);
   });
 
+  test("a declined rollback leaves records pending when a twin scan already demoted the tombstone", async () => {
+    const owner = new BashMonitorWakeStore(makeConfig(rootDir));
+    await owner.enqueueOrMergePending(payload({ lines: ["ERROR restored by twin scans"] }));
+    // Strictly order wake < cutoff (same-millisecond stamps fail toward delivery).
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await owner.supersedeAllPending("owner-1");
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const tombPath = path.join(dir, "cleared-at");
+    // The owner crashed: its staging ages past the grace window.
+    const stagedTomb = JSON.parse(await fsPromises.readFile(tombPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    await fsPromises.writeFile(
+      tombPath,
+      JSON.stringify({
+        ...stagedTomb,
+        stagedAt: new Date(Date.now() - STAGED_CLEAR_ROLLBACK_GRACE_MS - 60_000).toISOString(),
+      }),
+      "utf-8"
+    );
+    await owner.abandonWorkspaceClears("owner-1");
+    // A TWIN scan completes the same rollback between this scan's record restore and
+    // its pinned CAS: record restores are idempotent, and the twin's demotion removes
+    // the tombstone (this clear had no predecessor). Injected on the scan's
+    // record-restore rename, which sits exactly inside that window.
+    const scan = new BashMonitorWakeStore(makeConfig(rootDir));
+    const realRename = fsPromises.rename;
+    const injected = { fired: false };
+    const renameSpy = spyOn(fsPromises, "rename").mockImplementation((async (
+      from: Parameters<typeof realRename>[0],
+      to: Parameters<typeof realRename>[1]
+    ) => {
+      const result = await realRename(from, to);
+      if (
+        !injected.fired &&
+        String(from).includes("proc-1.json.tmp-") &&
+        String(to).endsWith("proc-1.json")
+      ) {
+        injected.fired = true;
+        await fsPromises.rm(tombPath, { force: true });
+      }
+      return result;
+    }) as typeof fsPromises.rename);
+    try {
+      // The declined CAS here means "already rolled back", not "owner alive":
+      // re-superseding would strand the record with NO staged tombstone left on disk
+      // for any recovery to find — a permanently lost wake.
+      expect((await scan.listPending("owner-1")).map((r) => r.lines)).toEqual([
+        ["ERROR restored by twin scans"],
+      ]);
+    } finally {
+      renameSpy.mockRestore();
+    }
+    expect(injected.fired).toBe(true);
+    expect((await scan.get("owner-1", "proc-1"))?.status).toBe("pending");
+  });
+
+  test("a heartbeat tick disarmed mid-flight is still drained by abandonWorkspaceClears", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir), {
+      stagedClearRefreshIntervalMs: 30,
+    });
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR cleared"] }));
+    // Strictly order wake < cutoff (same-millisecond stamps fail toward delivery).
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const clear = await store.supersedeAllPending("owner-1");
+    const sessionDir = path.join(rootDir, "sessions", "owner-1");
+    const dir = path.join(sessionDir, "bash-monitor-wakes");
+    const tombPath = path.join(dir, "cleared-at");
+    // Stall the first tombstone capture long enough for heartbeat ticks to fire and
+    // queue on the tombstone lock behind it: commitClear then disarms the heartbeat
+    // TIMER while those fired ticks are still pending.
+    const realRename = fsPromises.rename;
+    let release = (): void => undefined;
+    const gateOpen = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const gate = { blocked: false };
+    const renameSpy = spyOn(fsPromises, "rename").mockImplementation((async (
+      from: Parameters<typeof realRename>[0],
+      to: Parameters<typeof realRename>[1]
+    ) => {
+      if (!gate.blocked && String(from) === tombPath && String(to).includes(".cas-")) {
+        gate.blocked = true;
+        await gateOpen;
+      }
+      return realRename(from, to);
+    }) as typeof fsPromises.rename);
+    try {
+      const commit = store.commitClear("owner-1", clear);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      release();
+      await commit;
+    } finally {
+      renameSpy.mockRestore();
+    }
+    // Removal's teardown: the timer entry is already gone (commitClear disarmed it),
+    // but the fired-and-queued ticks must still be drained — an undrained tick's
+    // recursive mkdir would recreate the session directory after removal deletes it.
+    await store.abandonWorkspaceClears("owner-1");
+    await fsPromises.rm(sessionDir, { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(existsSync(sessionDir)).toBe(false);
+  });
+
   test("a directory squatting on a tombstone capture is quarantined instead of failing heals", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload({ lines: ["ERROR heals anyway"] }));
