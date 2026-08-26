@@ -12,6 +12,7 @@ import {
   retainPersistenceCriticalArgsFields,
   sanitizeCapturedMediaValue,
   sanitizeMediaRecordCapture,
+  SANITIZER_BUDGET_EXHAUSTED_STUB,
 } from "./types";
 
 interface RetainedContainer {
@@ -402,9 +403,9 @@ describe("sanitizeMediaRecordCapture", () => {
   });
 
   it("charges overflow markers so exhausted captures cannot accumulate free bytes", () => {
-    // After exhaustion, a media-bearing capture still emits a bounded marker;
-    // the marker debits the shared budget too (r28), so the accounting covers
-    // every byte a call loop can persist — nothing is emitted for free.
+    // A media-bearing capture over the remaining allowance emits a bounded
+    // marker; the marker debits the shared budget too (r28), so total marker
+    // bytes stay bounded by the initial allowance.
     const shared = createCaptureSanitizerBudget();
     shared.remainingSanitizedBytes = 4;
     const out = sanitizeCapturedMediaValue(
@@ -413,6 +414,18 @@ describe("sanitizeMediaRecordCapture", () => {
     );
     expect(typeof out).toBe("string");
     expect(shared.remainingSanitizedBytes).toBeLessThan(4);
+
+    // Once the counter is spent, retention STOPS (r30): every further
+    // media-bearing capture returns one constant stub with no further debit,
+    // so a fast call loop cannot accumulate size-annotated markers or drive
+    // the counter unboundedly negative.
+    const exhausted = shared.remainingSanitizedBytes;
+    const second = sanitizeCapturedMediaValue(
+      { media: { type: "media", mediaType: "image/png", data: "aGVsbG8=" } },
+      shared
+    );
+    expect(second).toBe(SANITIZER_BUDGET_EXHAUSTED_STUB);
+    expect(shared.remainingSanitizedBytes).toBe(exhausted);
   });
 
   it("sanitizes standalone media leaves outside containers", () => {

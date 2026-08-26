@@ -986,6 +986,63 @@ describe("extractToolMediaAsUserMessages", () => {
     }
   });
 
+  it("coalesces omitted placeholders across separate nested records", async () => {
+    // One small image per bridged call leaves a SINGLETON placeholder in each
+    // record's value array — run-based coalescing would keep every one, so
+    // thousands of looped records would still carry megabytes of placeholder
+    // JSON after the attachment cap (r30). Coalescing is global across the
+    // whole tool output.
+    const svg = (i: number) =>
+      Buffer.from(
+        `<svg xmlns="http://www.w3.org/2000/svg"><title>rec-${String(i).padStart(2, "0")}</title></svg>`
+      ).toString("base64");
+    const total = MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST + 2;
+    const toolCalls = Array.from({ length: total }, (_, i) => ({
+      toolName: "mcp__shots__take",
+      args: {},
+      result: {
+        type: "content",
+        value: [{ type: "media", mediaType: "image/svg+xml", data: svg(i) }],
+      },
+    }));
+    const input: MuxMessage[] = [
+      {
+        id: "a1",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call1",
+            toolName: "code_execution",
+            input: { code: "..." },
+            state: "output-available",
+            output: { success: true, toolCalls },
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    expect(rewritten).toHaveLength(2);
+    const toolPart = rewritten[0].parts[0];
+    expect(toolPart.type).toBe("dynamic-tool");
+    if (toolPart.type === "dynamic-tool" && toolPart.state === "output-available") {
+      const outputJson = JSON.stringify(toolPart.output);
+      // No per-record singleton placeholders survive; one bounded summary does.
+      expect(outputJson).not.toContain("[Attachment attached");
+      expect(outputJson.split("placeholders coalesced").length - 1).toBe(1);
+      expect(outputJson).toContain(`${total} attachments attached from tool output`);
+    }
+    // Newest attachments still ride in the synthetic message; the two oldest
+    // were omitted by the request-wide cap.
+    const syntheticJson = JSON.stringify(rewritten[1].parts);
+    expect(syntheticJson).toContain("rec-02");
+    expect(syntheticJson).toContain(`rec-${total - 1}`);
+    expect(syntheticJson).not.toContain("rec-00");
+    expect(syntheticJson).not.toContain("rec-01");
+  });
+
   it("keeps over-depth replacements schema-valid inside content containers", async () => {
     // The over-depth replacement is a bare string; inserted raw into a
     // content container's value array it would make the container malformed

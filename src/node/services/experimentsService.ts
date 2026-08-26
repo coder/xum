@@ -32,19 +32,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** Parse the persisted overrides file contents (shared by the service and CLI reads). */
-async function readOverridesFile(filePath: string): Promise<Map<ExperimentId, boolean>> {
+async function readOverridesFile(filePath: string): Promise<{
+  overrides: Map<ExperimentId, boolean>;
+  /** True when the persisted file already carries the enabled legacy
+   * exclusive mirror (see LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID). */
+  hasLegacyPtcMirror: boolean;
+}> {
   const overrides = new Map<ExperimentId, boolean>();
+  let hasLegacyPtcMirror = false;
   try {
     const raw = await fs.readFile(filePath, "utf-8");
     const parsed = JSON.parse(raw) as unknown;
 
     if (!isRecord(parsed) || parsed.version !== OVERRIDES_FILE_VERSION) {
-      return overrides;
+      return { overrides, hasLegacyPtcMirror };
     }
 
     const persisted = parsed.overrides;
     if (!isRecord(persisted)) {
-      return overrides;
+      return { overrides, hasLegacyPtcMirror };
     }
 
     for (const [key, value] of Object.entries(persisted)) {
@@ -62,11 +68,12 @@ async function readOverridesFile(filePath: string): Promise<Map<ExperimentId, bo
     // exclusive posture regardless of the supplement flag.
     if (persisted[LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID] === true) {
       overrides.set(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING, true);
+      hasLegacyPtcMirror = true;
     }
   } catch {
     // Ignore missing/corrupt overrides
   }
-  return overrides;
+  return { overrides, hasLegacyPtcMirror };
 }
 
 /**
@@ -85,7 +92,7 @@ export async function readPersistedExperimentEnabled(
   }
 
   const xumHome = options?.xumHome ?? getXumHome();
-  const overrides = await readOverridesFile(path.join(xumHome, OVERRIDES_FILE_NAME));
+  const { overrides } = await readOverridesFile(path.join(xumHome, OVERRIDES_FILE_NAME));
   return overrides.get(experimentId) === true;
 }
 
@@ -126,8 +133,17 @@ export class ExperimentsService {
       return;
     }
 
-    await this.loadOverridesFromDisk();
+    const needsLegacyPtcMirrorRewrite = await this.loadOverridesFromDisk();
     this.initialized = true;
+
+    // Downgrade sync at startup (r30): a pre-merge file can carry ptc:true
+    // without the enabled legacy exclusive mirror (setOverride is the only
+    // other writer, so a user who upgrades and never touches a setting would
+    // downgrade into the removed supplement posture). Persist the mirror now;
+    // writeOverridesToDisk stamps it and failures are ignored as usual.
+    if (needsLegacyPtcMirrorRewrite) {
+      await this.writeOverridesToDisk();
+    }
 
     for (const [experimentId, enabled] of this.overrides) {
       this.telemetryService.setFeatureFlagVariant(
@@ -202,10 +218,14 @@ export class ExperimentsService {
     assert(this.initialized, "ExperimentsService failed to initialize");
   }
 
-  private async loadOverridesFromDisk(): Promise<void> {
-    for (const [experimentId, enabled] of await readOverridesFile(this.overridesFilePath)) {
+  /** Returns true when the persisted file enables PTC without the legacy
+   * downgrade mirror and needs a rewrite (see initialize). */
+  private async loadOverridesFromDisk(): Promise<boolean> {
+    const { overrides, hasLegacyPtcMirror } = await readOverridesFile(this.overridesFilePath);
+    for (const [experimentId, enabled] of overrides) {
       this.overrides.set(experimentId, enabled);
     }
+    return overrides.get(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING) === true && !hasLegacyPtcMirror;
   }
 
   private async writeOverridesToDisk(): Promise<void> {

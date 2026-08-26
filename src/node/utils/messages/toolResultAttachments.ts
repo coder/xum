@@ -623,63 +623,102 @@ export function createOmittedToolAttachmentText(omitted: number): string {
 
 const ATTACHMENT_PLACEHOLDER_PREFIX = "[Attachment attached";
 
+/** See coalesceAttachmentPlaceholders: replacement for every placeholder
+ * after the first — constant so a flooded transcript's coalesced records
+ * carry only per-record structural overhead. */
+const COALESCED_PLACEHOLDER_STUB = { type: "text", text: "[attachment placeholder coalesced]" };
+
 /**
- * Coalesce runs of per-item attachment placeholders inside a rewritten tool
- * output. Applied only to outputs whose attachments were (partly) omitted by
- * the request-wide media cap: each media item still leaves a per-item
+ * Coalesce per-item attachment placeholders inside a rewritten tool output.
+ * Applied only to outputs whose attachments were (partly) omitted by the
+ * request-wide media cap: each media item still leaves a per-item
  * `[Attachment attached: …]` text part behind, so a flooded transcript could
  * carry tens of thousands of placeholder parts (megabytes of provider JSON)
- * even after the attachment cap (r29 security). Consecutive placeholder parts
- * collapse into one bounded summary; single placeholders stay individual.
+ * even after the attachment cap (r29 security). Coalescing is GLOBAL across
+ * the whole output, not per-array (r30): one small image per nested record
+ * leaves singleton placeholders in separate `value` arrays, so run-based
+ * coalescing would preserve every one of them. The FIRST placeholder becomes
+ * a bounded summary carrying the total; later ones are dropped from arrays
+ * and stubbed in non-array positions. A single placeholder stays individual.
  * The walk mirrors extraction's shapes and depth bound — the value was
  * already rebuilt (and depth-bounded) by extraction.
  */
 export function coalesceAttachmentPlaceholders(output: unknown): unknown {
-  return coalescePlaceholderWalk(output, 0);
+  const total = countAttachmentPlaceholders(output, 0);
+  if (total <= 1) return output;
+  const state = { total, replacedSummary: false };
+  return coalescePlaceholderWalk(output, 0, state);
 }
 
-function coalescePlaceholderWalk(value: unknown, depth: number): unknown {
+function countAttachmentPlaceholders(value: unknown, depth: number): number {
+  if (depth > MAX_NESTED_TOOL_EXTRACTION_DEPTH) return 0;
+  if (isAttachmentPlaceholderPart(value)) return 1;
+  if (Array.isArray(value)) {
+    let count = 0;
+    for (const item of value) count += countAttachmentPlaceholders(item, depth + 1);
+    return count;
+  }
+  if (typeof value === "object" && value !== null) {
+    let count = 0;
+    for (const child of Object.values(value as Record<string, unknown>)) {
+      count += countAttachmentPlaceholders(child, depth + 1);
+    }
+    return count;
+  }
+  return 0;
+}
+
+function coalescePlaceholderWalk(
+  value: unknown,
+  depth: number,
+  state: { total: number; replacedSummary: boolean }
+): unknown {
   if (depth > MAX_NESTED_TOOL_EXTRACTION_DEPTH) return value;
+  if (isAttachmentPlaceholderPart(value)) {
+    // Non-array position (e.g. a nested record's whole result): cannot be
+    // dropped structurally, so stub it after the first summary.
+    if (!state.replacedSummary) {
+      state.replacedSummary = true;
+      return buildCoalescedPlaceholderSummary(state.total);
+    }
+    return COALESCED_PLACEHOLDER_STUB;
+  }
   if (Array.isArray(value)) {
     const next: unknown[] = [];
     let changed = false;
-    const run: unknown[] = [];
-    const flushRun = (): void => {
-      if (run.length === 0) return;
-      if (run.length === 1) {
-        next.push(run[0]);
-      } else {
-        changed = true;
-        next.push({
-          type: "text",
-          text: `[${run.length} attachments attached from tool output (per-item placeholders coalesced: request-wide media cap reached)]`,
-        });
-      }
-      run.length = 0;
-    };
     for (const item of value) {
       if (isAttachmentPlaceholderPart(item)) {
-        run.push(item);
+        changed = true;
+        if (!state.replacedSummary) {
+          state.replacedSummary = true;
+          next.push(buildCoalescedPlaceholderSummary(state.total));
+        }
+        // Later placeholders are dropped from arrays entirely.
         continue;
       }
-      flushRun();
-      const walked = coalescePlaceholderWalk(item, depth + 1);
+      const walked = coalescePlaceholderWalk(item, depth + 1, state);
       if (walked !== item) changed = true;
       next.push(walked);
     }
-    flushRun();
     return changed ? next : value;
   }
   if (typeof value === "object" && value !== null) {
     let changed = false;
     const entries = Object.entries(value as Record<string, unknown>).map(([key, child]) => {
-      const walked = coalescePlaceholderWalk(child, depth + 1);
+      const walked = coalescePlaceholderWalk(child, depth + 1, state);
       if (walked !== child) changed = true;
       return [key, walked] as const;
     });
     return changed ? Object.fromEntries(entries) : value;
   }
   return value;
+}
+
+function buildCoalescedPlaceholderSummary(total: number): { type: "text"; text: string } {
+  return {
+    type: "text",
+    text: `[${total} attachments attached from tool output (per-item placeholders coalesced: request-wide media cap reached)]`,
+  };
 }
 
 function isAttachmentPlaceholderPart(value: unknown): boolean {

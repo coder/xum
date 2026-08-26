@@ -173,6 +173,31 @@ describe("ExperimentsService", () => {
     });
   });
 
+  test("initialization persists the downgrade mirror for a bare ptc:true file", async () => {
+    // A pre-merge file can carry ptc:true without the legacy exclusive key
+    // (setOverride is the only other writer): a user who upgrades and never
+    // touches a setting must still downgrade into the exclusive posture, not
+    // the removed supplement mode (r30).
+    await fs.writeFile(
+      path.join(tempDir, OVERRIDES_FILE),
+      JSON.stringify({
+        version: 1,
+        experiments: {},
+        overrides: { "programmatic-tool-calling": true },
+      }),
+      "utf-8"
+    );
+
+    const { telemetryService } = createTelemetryService();
+    const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    await service.initialize();
+
+    expect((await readOverridesFile()).overrides).toEqual({
+      [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: true,
+      "programmatic-tool-calling-exclusive": true,
+    });
+  });
+
   test("a disabled legacy exclusive override stays ignored", async () => {
     await fs.writeFile(
       path.join(tempDir, OVERRIDES_FILE),

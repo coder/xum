@@ -466,6 +466,12 @@ export function createCaptureSanitizerBudget(): CaptureSanitizerBudget {
   };
 }
 
+/** Constant replacement for media-bearing values captured after the shared
+ * sanitized-value allowance is spent (r30): retention stops entirely rather
+ * than emitting another size-annotated marker per call. */
+export const SANITIZER_BUDGET_EXHAUSTED_STUB =
+  "[media-bearing value omitted: capture sanitizer budget exhausted]";
+
 /**
  * Tool-name-free form of sanitizeMediaRecordCapture for values that are not
  * nested tool records: the classic execution's outer return value and console
@@ -501,18 +507,23 @@ export function sanitizeCapturedMediaValue(
   // small marker. Media-free values are untouched and uncharged (classic
   // mode keeps full inline results/args by contract).
   const bytes = serializedJsonByteLength(sanitized);
-  if (bytes === undefined || bytes > budget.remainingSanitizedBytes) {
-    const marker = `[value bounded at capture: ${bytes ?? "unserializable"} serialized bytes after media sanitization exceed the remaining sanitized-value budget]`;
-    // The marker is charged too (r28): it is the only payload a media-bearing
-    // capture emits after exhaustion, so leaving it free would let a call
-    // loop append one uncharged marker record per call. The budget may go
-    // negative — every capture must still yield a bounded replacement — but
-    // the accounting reflects every emitted byte.
-    budget.remainingSanitizedBytes -= serializedJsonByteLength(marker) ?? marker.length;
-    return marker;
+  if (bytes !== undefined && bytes <= budget.remainingSanitizedBytes) {
+    budget.remainingSanitizedBytes -= bytes;
+    return sanitized;
   }
-  budget.remainingSanitizedBytes -= bytes;
-  return sanitized;
+  // Over the remaining allowance (or unserializable).
+  if (budget.remainingSanitizedBytes <= 0) {
+    // Exhausted (r30): retention STOPS — a constant stub with no further
+    // debit, so a fast call loop cannot keep accumulating size-annotated
+    // markers nor drive the counter unboundedly negative. Per-record
+    // structural overhead is all that remains, same as any non-media loop.
+    return SANITIZER_BUDGET_EXHAUSTED_STUB;
+  }
+  const marker = `[value bounded at capture: ${bytes ?? "unserializable"} serialized bytes after media sanitization exceed the remaining sanitized-value budget]`;
+  // The marker is charged too (r28): total marker bytes stay bounded by the
+  // initial allowance, after which the exhausted branch above takes over.
+  budget.remainingSanitizedBytes -= serializedJsonByteLength(marker) ?? marker.length;
+  return marker;
 }
 
 /**
