@@ -10,6 +10,7 @@ import {
   buildBashMonitorWakePrompt,
   deferredTempRecoveryDelayMs,
   STAGED_CLEAR_ROLLBACK_GRACE_MS,
+  MAX_TOMBSTONE_FUTURE_SKEW_MS,
   TEMP_RECOVERY_MIN_AGE_MS,
   TERMINAL_WAKE_RETENTION_MS,
   type BashMonitorWakePayload,
@@ -1327,6 +1328,62 @@ describe("BashMonitorWakeStore", () => {
     expect(pending[0].kind).toBe("monitor-lost");
     expect(pending[0].script).toBe("echo relaunch");
     expect(pending[0].lines).toEqual(["ERROR matched output", "ERROR earlier undelivered"]);
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
+  });
+
+  test("an interrupted clear rollback restores records before demoting the tombstone", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR restored first"] }));
+    const clear = await store.supersedeAllPending("owner-1");
+    // The rollback's tombstone demotion fails (crash-equivalent) mid-rollback: the
+    // records must ALREADY be pending again — with the demotion first, a crash in
+    // this window would leave them permanently stamped superseded with no staged
+    // tombstone left on disk to resume their recovery from.
+    const realRename = fsPromises.rename;
+    const renameSpy = spyOn(fsPromises, "rename").mockImplementation(((
+      from: Parameters<typeof realRename>[0],
+      to: Parameters<typeof realRename>[1]
+    ) =>
+      String(to).includes("cleared-at.cas-")
+        ? Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
+        : realRename(from, to)) as typeof fsPromises.rename);
+    try {
+      await store.restorePendingSnapshots("owner-1", clear.snapshots, clear);
+      expect.unreachable("expected the tombstone demotion failure to propagate");
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("EIO");
+    } finally {
+      renameSpy.mockRestore();
+    }
+    const pending = await store.listPending("owner-1");
+    expect(pending.map((r) => r.lines)).toEqual([["ERROR restored first"]]);
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("pending");
+  });
+
+  test("an implausibly future tombstone reads as malformed instead of standing forever", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR outlives the glitch"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const temp = path.join(dir, "proc-1.json.tmp-crashed");
+    await fsPromises.rename(path.join(dir, "proc-1.json"), temp);
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(temp, past, past);
+    // A clock rollback (or corruption) persisted a committed cutoff FAR in the
+    // future: accepted, it would condemn every subsequently orphaned temp while the
+    // monotonic clear logic never replaces it with a normal current-time cutoff.
+    await fsPromises.writeFile(
+      path.join(dir, "cleared-at"),
+      JSON.stringify({
+        clearedAt: new Date(Date.now() + 2 * MAX_TOMBSTONE_FUTURE_SKEW_MS).toISOString(),
+        clearId: "clear-future",
+        phase: "committed",
+      }),
+      "utf-8"
+    );
+
+    const pending = await store.listPending("owner-1");
+    expect(pending.map((r) => r.lines)).toEqual([["ERROR outlives the glitch"]]);
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("pending");
     expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
   });
 

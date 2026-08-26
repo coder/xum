@@ -47,6 +47,16 @@ export const TEMP_RECOVERY_MIN_AGE_MS = 60 * 1000;
 export const STAGED_CLEAR_ROLLBACK_GRACE_MS = 5 * 60 * 1000;
 
 /**
+ * Tombstone timestamps further in the future than this are implausible (clock
+ * rollback or corruption) and read as malformed. A future committed cutoff would
+ * otherwise condemn every subsequently orphaned temp while the monotonic clear logic
+ * refuses to replace it with normal current-time cutoffs; a future staged one would
+ * never reach its rollback grace and hold wakes forever. Generous enough for real
+ * cross-instance clock skew.
+ */
+export const MAX_TOMBSTONE_FUTURE_SKEW_MS = 60 * 60 * 1000;
+
+/**
  * Delay until a deferred fresh temp should be rechecked: an epsilon past the gate so
  * the re-driven scan's own freshness check cannot lose a same-millisecond race against
  * the gate arithmetic. The delay is CAPPED to one bounded recheck interval: a far-future
@@ -832,6 +842,12 @@ export class BashMonitorWakeStore {
       if (typeof parsed.clearedAt !== "string" || Number.isNaN(Date.parse(parsed.clearedAt))) {
         return null;
       }
+      // Implausibly FUTURE timestamps (see MAX_TOMBSTONE_FUTURE_SKEW_MS) read as
+      // malformed so the persisted state self-heals: fail toward delivery, and the
+      // next clear rewrites the file with a sane cutoff.
+      if (Date.parse(parsed.clearedAt) > Date.now() + MAX_TOMBSTONE_FUTURE_SKEW_MS) {
+        return null;
+      }
       if (parsed.phase != null && parsed.phase !== "staged" && parsed.phase !== "committed") {
         // An unknown phase (corruption, or a newer build's state) must not silently
         // take the committed path — only the exact "staged" value enters the hold, so
@@ -848,6 +864,11 @@ export class BashMonitorWakeStore {
         // malformed (fail toward delivery); the next clear rewrites the file.
         if (typeof parsed.clearId !== "string" || parsed.clearId.length === 0) return null;
         if (typeof parsed.stagedAt !== "string" || Number.isNaN(Date.parse(parsed.stagedAt))) {
+          return null;
+        }
+        // A far-future stagedAt would keep the staging outside its rollback grace
+        // forever, holding pre-clear temps for an outcome that never resolves.
+        if (Date.parse(parsed.stagedAt) > Date.now() + MAX_TOMBSTONE_FUTURE_SKEW_MS) {
           return null;
         }
       }
@@ -2317,9 +2338,15 @@ export class BashMonitorWakeStore {
     // the wakes below return to pending, so a sibling deferred temp must not stay
     // condemned by the rolled-back clear, while temps retired by OTHER clears must
     // stay condemned.
+    //
+    // Records FIRST, tombstone SECOND — the same order as rollbackCrashedClearStaging,
+    // and for the same reason: a crash between the two leaves the staged tombstone
+    // standing, so the grace scan can resume the rollback (record restores are
+    // idempotent). Demoting the tombstone first would strand still-stamped records
+    // with nothing left on disk to trigger their recovery.
     this.activeClearIds.delete(token.clearId);
-    await this.rollbackClearTombstone(ownerWorkspaceId, token.clearId);
     await this.restoreSnapshotRecords(ownerWorkspaceId, snapshots);
+    await this.rollbackClearTombstone(ownerWorkspaceId, token.clearId);
   }
 
   private async restoreSnapshotRecords(
