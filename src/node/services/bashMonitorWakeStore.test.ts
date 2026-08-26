@@ -214,6 +214,23 @@ describe("BashMonitorWakeStore", () => {
     readFileSpy.mockRestore();
   });
 
+  test("listPending reclassifies a filename rewritten by another store instance", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload());
+    expect((await store.listPending("owner-1")).map((r) => r.id)).toEqual(["proc-1"]);
+
+    // Another instance retires the wake, then the re-armed process ID produces a NEW
+    // pending wake under the same filename. The filename is not immutable content.
+    const other = new BashMonitorWakeStore(makeConfig(rootDir));
+    await other.markSuperseded("owner-1", "proc-1");
+    expect(await store.listPending("owner-1")).toHaveLength(0);
+    await other.enqueueOrMergePending(payload({ lines: ["ERROR rearmed"] }));
+
+    const pending = await store.listPending("owner-1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0].lines).toEqual(["ERROR rearmed"]);
+  });
+
   test("listPending discovers wakes written by another store instance after seeding", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload({ processId: "proc-a", taskId: "bash:proc-a" }));

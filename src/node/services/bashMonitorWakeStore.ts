@@ -1,4 +1,5 @@
-import type { Dirent } from "node:fs";
+import { randomUUID } from "node:crypto";
+import type { Dirent, Stats } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
@@ -499,23 +500,24 @@ export function buildBashMonitorWakePrompt(
 
 export class BashMonitorWakeStore {
   private readonly locks = new MutexMap<string>();
-  // Pending-id index so the hot listPending path (recomputed for every background-bash
-  // UI snapshot) reads only currently-pending records instead of reading every
-  // historical wake file — terminal records are never pruned from disk, so long-lived
-  // workspaces accumulate them. Seeded per owner by one full directory scan; afterwards
-  // write() keeps it in sync because every durable mutation funnels through write().
-  // Seeding merges instead of replacing: a concurrent write can land between the
-  // directory read and installation, and the read-verify in listPending drops stale ids.
+  // Classification cache so the hot listPending path (recomputed for every
+  // background-bash UI snapshot) avoids reading every historical wake file — terminal
+  // records are never pruned from disk, so long-lived workspaces accumulate them.
   //
   // Another store instance can share this session directory (multiple service handles,
-  // or a second app process under XUM_ALLOW_MULTIPLE_INSTANCES), so the warm path still
-  // lists the directory each call — one cheap readdir, not per-file reads — and classifies
-  // only file names it has never seen (classifiedFilesByOwner), which is how wakes written
-  // by other instances are discovered. Cross-instance retirements are handled by the
-  // read-verify pass on the pending set.
-  private readonly pendingIdsByOwner = new Map<string, Set<string>>();
-  private readonly classifiedFilesByOwner = new Map<string, Set<string>>();
-  private readonly seededPendingOwners = new Set<string>();
+  // or a second app process under XUM_ALLOW_MULTIPLE_INSTANCES), and wake ids are
+  // process ids, so a retired filename can later be rewritten as a new pending wake.
+  // File names are therefore never treated as immutable: each listPending call lists
+  // the directory and stats every wake file (cheap syscalls), and re-reads contents
+  // only when the stat signature (inode/mtime/size) differs from the classified one.
+  // write() is atomic (temp + rename), so every durable mutation changes the inode and
+  // a torn in-progress write can never persist as the final content of a file.
+  // `pending` caches the parsed record for pending files (few, bounded) so unchanged
+  // pending wakes need no re-read either; terminal/malformed files cache null.
+  private readonly classifiedFilesByOwner = new Map<
+    string,
+    Map<string, { sig: string; pending: BashMonitorWakeRecord | null }>
+  >();
 
   constructor(private readonly config: Pick<Config, "getSessionDir" | "sessionsDir">) {}
 
@@ -753,67 +755,53 @@ export class BashMonitorWakeStore {
     try {
       entries = await fsPromises.readdir(dir);
     } catch (error) {
-      if (isErrnoWithCode(error, "ENOENT")) {
-        this.seededPendingOwners.add(ownerWorkspaceId);
-        return [];
-      }
+      if (isErrnoWithCode(error, "ENOENT")) return [];
       throw error;
     }
 
-    const classified = this.getOrCreateOwnerSet(this.classifiedFilesByOwner, ownerWorkspaceId);
-    const ids = this.getOrCreateOwnerSet(this.pendingIdsByOwner, ownerWorkspaceId);
-    const seeding = !this.seededPendingOwners.has(ownerWorkspaceId);
+    let classified = this.classifiedFilesByOwner.get(ownerWorkspaceId);
+    if (classified == null) {
+      classified = new Map();
+      this.classifiedFilesByOwner.set(ownerWorkspaceId, classified);
+    }
     const records: BashMonitorWakeRecord[] = [];
-
-    // Read file contents only for names never classified by this instance (the whole
-    // directory when seeding; afterwards just wakes written by other store instances).
+    const seen = new Set<string>();
     for (const entry of entries) {
       if (!entry.endsWith(".json")) continue;
-      if (classified.has(entry)) continue;
-      const raw = await fsPromises.readFile(path.join(dir, entry), "utf-8").catch(() => null);
-      // Transient read failure: leave unclassified so the next call retries.
-      if (raw == null && !seeding) continue;
-      classified.add(entry);
-      const parsed = raw == null ? null : this.parse(raw);
-      if (parsed?.status === "pending") {
-        records.push(parsed);
-        ids.add(parsed.id);
-      }
-    }
-    this.seededPendingOwners.add(ownerWorkspaceId);
-
-    // Read-verify the previously known pending set; drop ids retired on disk (possibly by
-    // another instance). Newly discovered records above are already verified.
-    const discoveredIds = new Set(records.map((record) => record.id));
-    for (const id of [...ids]) {
-      if (discoveredIds.has(id)) continue;
-      let record: BashMonitorWakeRecord | null;
+      seen.add(entry);
+      const filePath = path.join(dir, entry);
+      let stat: Stats;
       try {
-        record = await this.get(ownerWorkspaceId, id);
+        stat = await fsPromises.stat(filePath);
       } catch {
-        // Transient read failure: keep the index entry so the next call retries.
+        // Deleted between readdir and stat (or transiently unreadable): drop the cache
+        // entry so the next call reclassifies from scratch.
+        classified.delete(entry);
         continue;
       }
-      if (record?.status === "pending") {
-        records.push(record);
-      } else {
-        // Terminal, deleted, or malformed on disk: the id no longer belongs in the index.
-        ids.delete(id);
+      const sig = `${stat.ino}:${stat.mtimeMs}:${stat.size}`;
+      const cached = classified.get(entry);
+      if (cached?.sig === sig) {
+        if (cached.pending != null) records.push(cached.pending);
+        continue;
       }
+      const raw = await fsPromises.readFile(filePath, "utf-8").catch(() => null);
+      if (raw == null) {
+        // Transient read failure: leave unclassified so the next call retries.
+        classified.delete(entry);
+        continue;
+      }
+      const parsed = this.parse(raw);
+      const pending = parsed?.status === "pending" ? parsed : null;
+      classified.set(entry, { sig, pending });
+      if (pending != null) records.push(pending);
+    }
+    // Forget cache entries whose files vanished so the map cannot grow past the directory.
+    for (const entry of [...classified.keys()]) {
+      if (!seen.has(entry)) classified.delete(entry);
     }
     records.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
     return records;
-  }
-
-  private getOrCreateOwnerSet(
-    map: Map<string, Set<string>>,
-    ownerWorkspaceId: string
-  ): Set<string> {
-    const existing = map.get(ownerWorkspaceId);
-    if (existing != null) return existing;
-    const created = new Set<string>();
-    map.set(ownerWorkspaceId, created);
-    return created;
   }
 
   async listPendingOwnerWorkspaceIds(): Promise<string[]> {
@@ -1054,24 +1042,19 @@ export class BashMonitorWakeStore {
   private async write(record: BashMonitorWakeRecord): Promise<void> {
     const dir = this.dir(record.ownerWorkspaceId);
     await fsPromises.mkdir(dir, { recursive: true });
-    await fsPromises.writeFile(
-      this.file(record.ownerWorkspaceId, record.id),
-      JSON.stringify(record, null, 2),
-      "utf-8"
-    );
-    // Keep the pending index in sync with the durable state (index only after the write
-    // succeeds, so the index can never claim a pending record that is not on disk). Also
-    // mark the file name classified so the warm listPending pass does not re-read our own
-    // writes as unknown cross-instance files.
-    this.getOrCreateOwnerSet(this.classifiedFilesByOwner, record.ownerWorkspaceId).add(
-      `${encodeURIComponent(record.id)}.json`
-    );
-    const ids = this.getOrCreateOwnerSet(this.pendingIdsByOwner, record.ownerWorkspaceId);
-    if (record.status === "pending") {
-      ids.add(record.id);
-    } else {
-      ids.delete(record.id);
-    }
+    // Atomic replace: another store instance classifying this file by stat signature must
+    // never observe a torn half-written JSON as the file's settled content, and the rename
+    // allocates a fresh inode so every durable mutation changes the signature.
+    const target = this.file(record.ownerWorkspaceId, record.id);
+    const temp = `${target}.tmp-${randomUUID()}`;
+    await fsPromises.writeFile(temp, JSON.stringify(record, null, 2), "utf-8");
+    await fsPromises.rename(temp, target);
+    // Invalidate rather than update the classification cache: computing the new stat
+    // signature here could race a concurrent rewrite by another instance and pair our
+    // record with their signature. The next listPending re-reads this one file.
+    this.classifiedFilesByOwner
+      .get(record.ownerWorkspaceId)
+      ?.delete(`${encodeURIComponent(record.id)}.json`);
   }
 
   private parse(raw: string): BashMonitorWakeRecord | null {
