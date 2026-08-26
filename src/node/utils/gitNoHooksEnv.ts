@@ -60,6 +60,11 @@ export function gitNoRepoAutomationEnv(): Record<string, string> {
   for (const name of providerSecretEnvVarNames()) {
     env[name] = "";
   }
+  // Root-dir pointers are not secrets, but they lead any residual
+  // repo-controlled process straight to providers.jsonc (benchmark harnesses
+  // export them); blank them alongside the provider secrets.
+  env.XUM_ROOT = "";
+  env.MUX_ROOT = "";
   return env;
 }
 

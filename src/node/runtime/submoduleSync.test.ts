@@ -167,6 +167,77 @@ describe("syncLocalGitSubmodules", () => {
     }
   }, 30_000);
 
+  it("does not fetch through pre-seeded upload-pack config when automation is off", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "mux-submodule-nofetch-"));
+
+    try {
+      const submoduleRepo = path.join(tempRoot, "submodule-src");
+      const projectRepo = path.join(tempRoot, "project");
+
+      await initGitRepo(submoduleRepo, { "SKILL.md": "v1\n" });
+      await initGitRepo(projectRepo, { "README.md": "hello\n" });
+
+      git(projectRepo, ["config", "protocol.file.allow", "always"]);
+      execFileSync(
+        "git",
+        ["-c", "protocol.file.allow=always", "submodule", "add", submoduleRepo, "vendor/docs"],
+        { cwd: projectRepo, stdio: "ignore" }
+      );
+      git(projectRepo, ["commit", "-m", "add submodule"]);
+
+      // Advance the submodule source and point the gitlink at the new commit
+      // WITHOUT fetching it into .git/modules, so materialization could only
+      // obtain it via the implicit fetch this test forbids.
+      await fs.writeFile(path.join(submoduleRepo, "SKILL.md"), "v2\n", "utf-8");
+      git(submoduleRepo, ["add", "."]);
+      git(submoduleRepo, ["commit", "-m", "v2"]);
+      const missingCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: submoduleRepo })
+        .toString()
+        .trim();
+      git(projectRepo, [
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        `160000,${missingCommit},vendor/docs`,
+      ]);
+      git(projectRepo, ["commit", "-m", "bump submodule"]);
+
+      // A fetch for the missing commit would execute this configured program.
+      const moduleConfig = path.join(projectRepo, ".git", "modules", "vendor", "docs", "config");
+      expect(await pathExists(moduleConfig)).toBe(true);
+      const marker = path.join(tempRoot, "upload-pack-ran");
+      const uploadPack = path.join(tempRoot, "upload-pack.sh");
+      await fs.writeFile(uploadPack, `#!/bin/sh\nprintf ran > "${marker}"\nexit 1\n`, "utf-8");
+      await fs.chmod(uploadPack, 0o755);
+      execFileSync(
+        "git",
+        ["config", "--file", moduleConfig, "remote.origin.uploadpack", uploadPack],
+        { stdio: "ignore" }
+      );
+
+      // Materialize the checkout in place (like benchmark task repos): linked
+      // worktrees would get a private per-worktree module gitdir and never
+      // read the pre-seeded module config this test targets.
+      const { logger } = createInitLogger();
+      let errorMessage = "";
+      try {
+        await syncLocalGitSubmodules({
+          workspacePath: projectRepo,
+          initLogger: logger,
+          env: { GIT_ALLOW_PROTOCOL: "file" },
+          trusted: false,
+        });
+      } catch (error) {
+        errorMessage = error instanceof Error ? error.message : String(error);
+      }
+      expect(errorMessage).toContain("Failed to initialize git submodules");
+
+      expect(await pathExists(marker)).toBe(false);
+    } finally {
+      await fs.rm(tempRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("throws when probing local .gitmodules fails for reasons other than absence", async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "mux-submodule-probe-"));
 
@@ -214,7 +285,7 @@ describe("syncRuntimeGitSubmodules", () => {
     expect(runtime.calls[1]?.command).toContain("emit_filter_keys");
     expect(runtime.calls.slice(2).map((call) => call.command)).toEqual([
       "git submodule sync --recursive",
-      "git submodule update --init --recursive --checkout",
+      "git submodule update --init --recursive --checkout --no-fetch",
     ]);
     expect(runtime.calls.map((call) => call.cwd)).toEqual([
       "/remote/workspace",

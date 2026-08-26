@@ -23,6 +23,11 @@ const SUBMODULE_SYNC_COMMAND = "git submodule sync --recursive";
 // Command-line --checkout overrides repo-configured
 // submodule.<name>.update=!command strategies.
 const SUBMODULE_UPDATE_COMMAND = "git submodule update --init --recursive --checkout";
+// Automation-off updates must not fetch: when a gitlink commit is missing, the
+// implicit fetch honors remote.<name>.uploadpack from the pre-seeded
+// .git/modules/<name>/config, and git has no env override for upload-pack.
+// Local objects are the only trusted source; missing commits fail closed.
+const SUBMODULE_UPDATE_NO_FETCH_COMMAND = `${SUBMODULE_UPDATE_COMMAND} --no-fetch`;
 
 interface BaseSubmoduleSyncArgs {
   workspacePath: string;
@@ -117,7 +122,8 @@ async function discoverRuntimeGitFilterConfigKeys(
 }
 
 async function runSubmoduleMaterialization(args: RuntimeSubmoduleSyncArgs): Promise<void> {
-  const filterConfigKeys = gitHooksAllowed(args.trusted)
+  const hooksAllowed = gitHooksAllowed(args.trusted);
+  const filterConfigKeys = hooksAllowed
     ? undefined
     : await discoverRuntimeGitFilterConfigKeys(args);
   const env = buildGitExecutionEnv({
@@ -146,7 +152,7 @@ async function runSubmoduleMaterialization(args: RuntimeSubmoduleSyncArgs): Prom
       workspacePath: args.workspacePath,
       abortSignal: args.abortSignal,
       env,
-      command: SUBMODULE_UPDATE_COMMAND,
+      command: hooksAllowed ? SUBMODULE_UPDATE_COMMAND : SUBMODULE_UPDATE_NO_FETCH_COMMAND,
       timeout: SUBMODULE_UPDATE_TIMEOUT_SECS,
       fallbackError: "git submodule update failed",
     });

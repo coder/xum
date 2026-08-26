@@ -15,7 +15,11 @@ import { shellQuote } from "@/common/utils/shell";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { toPosixPath } from "@/node/utils/paths";
 import { log } from "@/node/services/log";
-import { gitHooksAllowed, gitNoRepoAutomationEnvForLocalRepo } from "@/node/utils/gitNoHooksEnv";
+import {
+  gitHooksAllowed,
+  gitNoRepoAutomationEnv,
+  gitNoRepoAutomationEnvForLocalRepo,
+} from "@/node/utils/gitNoHooksEnv";
 import { WORKTREE_DELETE_GIT_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { syncLocalGitSubmodules } from "@/node/runtime/submoduleSync";
 import { syncXumignoreFiles } from "./xumignore";
@@ -440,7 +444,6 @@ export class WorktreeManager {
     // Match deleteWorkspace() semantics so preflight stays idempotent and non-destructive.
     cleanStaleLock(projectPath);
 
-    const noHooksEnv = await this.getGitExecOptions(projectPath, trusted);
     const workspacePath = this.getWorkspacePath(projectPath, workspaceName);
     const isInPlace = projectPath === workspaceName;
 
@@ -452,6 +455,20 @@ export class WorktreeManager {
 
     if (isInPlace) {
       return { success: true };
+    }
+
+    // Resolve the git environment only after the idempotent checks above:
+    // repo-aware filter discovery fails closed when the main checkout is
+    // missing or corrupted, and preflight must keep returning its declared
+    // result so stale workspaces stay deletable (via force).
+    let noHooksEnv: GitExecOptions;
+    try {
+      noHooksEnv = await this.getGitExecOptions(projectPath, trusted);
+    } catch (error) {
+      return {
+        success: false,
+        error: `Failed to inspect worktree before deletion: ${getErrorMessage(error)}`,
+      };
     }
 
     try {
@@ -517,8 +534,20 @@ export class WorktreeManager {
     cleanStaleLock(projectPath);
 
     // Disable git hooks for untrusted projects and bound every git cleanup command.
+    let repoInspectionError: string | null = null;
+    let gitExecOptions: GitExecOptions;
+    try {
+      gitExecOptions = await this.getGitExecOptions(projectPath, trusted);
+    } catch (error) {
+      // Repo-aware filter discovery fails closed when the main checkout is
+      // missing or corrupted. Cleanup must still work, so fall back to the
+      // static automation-off environment; content-inspecting git commands
+      // are skipped below while this error is set.
+      repoInspectionError = getErrorMessage(error);
+      gitExecOptions = { env: gitNoRepoAutomationEnv() };
+    }
     const noHooksEnv: GitExecOptions = {
-      ...((await this.getGitExecOptions(projectPath, trusted)) ?? {}),
+      ...gitExecOptions,
       timeoutMs: WORKTREE_DELETE_GIT_TIMEOUT_MS,
     };
 
@@ -561,6 +590,26 @@ export class WorktreeManager {
     // The workspace directory itself is the user's real project checkout.
     if (isInPlace) {
       return { success: true, deletedPath };
+    }
+
+    if (repoInspectionError !== null) {
+      // Without repo-aware filter overrides, git worktree remove must not run:
+      // its dirty-worktree check refreshes the index, which can execute
+      // repo-configured clean filters. Force removal bypasses git content
+      // inspection entirely; non-force deletion reports the blocker instead.
+      if (!force) {
+        return { success: false, error: `Failed to remove worktree: ${repoInspectionError}` };
+      }
+      try {
+        await this.pruneWorktreesBestEffort(projectPath, noHooksEnv);
+        await this.forceRemoveWorkspaceDirectory(deletedPath);
+        return deleteBranchAndSucceed();
+      } catch (rmError) {
+        return {
+          success: false,
+          error: `Failed to remove worktree via git and rm: ${getErrorMessage(rmError)}`,
+        };
+      }
     }
 
     try {

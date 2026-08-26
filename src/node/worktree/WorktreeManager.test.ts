@@ -322,6 +322,49 @@ describe("WorktreeManager.renameWorkspace", () => {
 });
 
 describe("WorktreeManager.deleteWorkspace", () => {
+  it("keeps returning declared results and force-deletes when the main checkout is gone", async () => {
+    const fixture = await createWorktreeManagerFixture({
+      tempDirPrefix: "worktree-manager-delete-",
+    });
+
+    try {
+      const { projectPath, manager, initLogger } = fixture;
+      const branchName = "feature-stale-cleanup";
+      const createResult = await manager.createWorkspace({
+        projectPath,
+        branchName,
+        trunkBranch: "main",
+        initLogger,
+      });
+      expect(createResult.success).toBe(true);
+      if (!createResult.success) return;
+      if (!createResult.workspacePath) {
+        throw new Error("Expected workspacePath from createWorkspace");
+      }
+      const workspacePath = createResult.workspacePath;
+
+      // Simulate a deleted main checkout with a stale managed workspace left
+      // behind: repo-aware filter discovery fails closed for it.
+      await fsPromises.rm(projectPath, { recursive: true, force: true });
+
+      const preflight = await manager.canDeleteWorkspaceWithoutForce(projectPath, branchName);
+      expect(preflight.success).toBe(false);
+
+      const nonForce = await manager.deleteWorkspace(projectPath, branchName, false);
+      expect(nonForce.success).toBe(false);
+
+      const forced = await manager.deleteWorkspace(projectPath, branchName, true);
+      expect(forced.success).toBe(true);
+      const workspaceRemains = await fsPromises.access(workspacePath).then(
+        () => true,
+        () => false
+      );
+      expect(workspaceRemains).toBe(false);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
   it("deletes non-agent branches when removing worktrees (force)", async () => {
     const fixture = await createWorktreeManagerFixture({
       tempDirPrefix: "worktree-manager-delete-",
