@@ -553,7 +553,7 @@ describe("ProposePlanToolCall", () => {
     );
   });
 
-  test("clears the pending agent guard when the Implement send fails", async () => {
+  test("typed rejection reverts the optimistic Implement switch", async () => {
     startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
 
     const sendMessageCalls: SendMessageArgs[] = [];
@@ -570,16 +570,51 @@ describe("ProposePlanToolCall", () => {
 
     await waitFor(() => expect(sendMessageCalls.length).toBe(1));
 
-    // The failed send cannot persist the switch, so the guard must be released:
-    // a differing backend agent update has to apply again instead of being
-    // rejected forever (probing with a non-matching agent does not mutate).
+    // A typed rejection cannot self-heal: the same gate refuses the next send
+    // before it can re-persist the switch, so the optimistic switch reverts
+    // to the pre-click selection.
+    await waitFor(() =>
+      expect(JSON.parse(window.localStorage.getItem(getAgentIdKey(WORKSPACE_ID))!)).toBe("plan")
+    );
+    expect(JSON.parse(window.localStorage.getItem(getModelKey(WORKSPACE_ID))!)).toBe(
+      "anthropic:claude-sonnet-4-5"
+    );
+    expect(JSON.parse(window.localStorage.getItem(getThinkingLevelKey(WORKSPACE_ID))!)).toBe(
+      "high"
+    );
+    // The guard must be released: a differing backend agent update has to
+    // apply again instead of being rejected forever (probing with a
+    // non-matching agent does not mutate).
     await waitFor(() =>
       expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true)
     );
-    // No compensating backend write and no local rollback: the switch stays
-    // and the next send re-persists it.
+    // No compensating backend write.
     expect(updateAgentAISettingsCalls).toHaveLength(0);
+  });
+
+  test("transport-failed Implement send keeps the optimistic switch", async () => {
+    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
+
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({
+      sendMessage: (args) => {
+        sendMessageCalls.push(args);
+        return Promise.reject(new Error("network down"));
+      },
+    });
+
+    const view = renderCompletedPlan();
+
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+    await waitFor(() =>
+      expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true)
+    );
+    // Transport failures self-heal (the next successful send re-persists the
+    // selection), so the switch stays.
     expect(JSON.parse(window.localStorage.getItem(getAgentIdKey(WORKSPACE_ID))!)).toBe("exec");
+    expect(updateAgentAISettingsCalls).toHaveLength(0);
   });
 
   test("uses workspace-by-agent override for Implement when exec defaults inherit", async () => {

@@ -56,6 +56,7 @@ import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import {
   clearPendingWorkspaceAgentId,
   markPendingWorkspaceAgentId,
+  revertRejectedAgentSwitch,
 } from "@/browser/utils/workspaceAiSettingsSync";
 import {
   resolveWorkspaceAiSettingsForAgent,
@@ -482,6 +483,8 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   }): {
     resolvedModel: string;
     resolvedThinking: ThinkingLevel;
+    /** Undo this switch after a typed send rejection (transport failures keep it). */
+    revertSelection: () => void;
   } => {
     const modelKey = getModelKey(args.workspaceId);
     const thinkingKey = getThinkingLevelKey(args.workspaceId);
@@ -512,6 +515,9 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
       });
 
+    const previousAgentId =
+      readPersistedState<string | null>(getAgentIdKey(args.workspaceId), null) ?? currentAgentId;
+
     // The follow-up send persists this switch to the backend; guard the interim
     // against stale metadata broadcasts re-seeding the previous agent.
     markPendingWorkspaceAgentId(args.workspaceId, args.targetAgentId);
@@ -528,7 +534,26 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       updatePersistedState(reasoningKey, resolvedReasoningMode);
     }
 
-    return { resolvedModel, resolvedThinking };
+    return {
+      resolvedModel,
+      resolvedThinking,
+      revertSelection: () =>
+        revertRejectedAgentSwitch({
+          workspaceId: args.workspaceId,
+          rejectedAgentId: args.targetAgentId,
+          applied: {
+            model: resolvedModel,
+            thinkingLevel: resolvedThinking,
+            reasoningMode: resolvedReasoningMode,
+          },
+          previous: {
+            agentId: previousAgentId,
+            model: existingModel,
+            thinkingLevel: existingThinking,
+            reasoningMode: existingReasoning,
+          },
+        }),
+    };
   };
 
   const handleImplement = async () => {
@@ -559,17 +584,19 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         });
       }
 
-      const { resolvedModel, resolvedThinking } = resolveAndPersistTargetAgentSettings({
-        workspaceId,
-        targetAgentId,
-      });
+      const { resolvedModel, resolvedThinking, revertSelection } =
+        resolveAndPersistTargetAgentSettings({
+          workspaceId,
+          targetAgentId,
+        });
       const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
 
       // The send carries the switch and persists it backend-side best-effort
-      // (maybePersistAISettingsFromOptions). A failed send keeps the local
-      // switch (the next send re-persists it), so there is no client-side
-      // rollback or reconciliation.
-      await api.workspace.sendMessage({
+      // (maybePersistAISettingsFromOptions). A transport-failed send keeps the
+      // local switch (the next send re-persists it), but a typed rejection
+      // (e.g. the budgeted-goal pricing gate) refuses every send before
+      // persistence — no self-heal is coming — so it reverts the switch.
+      const result = await api.workspace.sendMessage({
         workspaceId,
         message: "Implement the plan",
         options: {
@@ -579,6 +606,9 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
           thinkingLevel: resolvedThinking,
         },
       });
+      if (!result.success) {
+        revertSelection();
+      }
     } catch {
       // Best-effort: user can retry manually if sending fails.
     } finally {
@@ -620,15 +650,16 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         });
       }
 
-      const { resolvedModel, resolvedThinking } = resolveAndPersistTargetAgentSettings({
-        workspaceId,
-        targetAgentId,
-      });
+      const { resolvedModel, resolvedThinking, revertSelection } =
+        resolveAndPersistTargetAgentSettings({
+          workspaceId,
+          targetAgentId,
+        });
       const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
 
-      // See handleImplement: the send persists the switch best-effort; no
-      // client-side rollback.
-      await api.workspace.sendMessage({
+      // See handleImplement: transport failures keep the switch; typed
+      // rejections revert it.
+      const result = await api.workspace.sendMessage({
         workspaceId,
         message: "Implement the plan",
         options: {
@@ -638,6 +669,9 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
           thinkingLevel: resolvedThinking,
         },
       });
+      if (!result.success) {
+        revertSelection();
+      }
     } catch {
       // Best-effort: user can retry manually if sending fails.
     } finally {

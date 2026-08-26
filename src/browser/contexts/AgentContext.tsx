@@ -13,11 +13,7 @@ import {
 
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
-import {
-  readPersistedState,
-  updatePersistedState,
-  usePersistedState,
-} from "@/browser/hooks/usePersistedState";
+import { readPersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { matchesKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
@@ -32,7 +28,6 @@ import {
   GLOBAL_SCOPE_ID,
 } from "@/common/constants/storage";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
-import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import {
   resolveWorkspaceAiSettingsForAgent,
   type WorkspaceAISettingsCache,
@@ -46,6 +41,7 @@ import { normalizeAgentId, resolveRemovedBuiltinAgentId } from "@/common/utils/a
 import {
   clearPendingWorkspaceAgentId,
   markPendingWorkspaceAgentId,
+  revertRejectedAgentSwitch,
 } from "@/browser/utils/workspaceAiSettingsSync";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
@@ -146,6 +142,11 @@ function AgentProviderWithState(props: {
   // is locked, so local changes must never be written back.
   const isCurrentAgentLocked = currentMeta?.parentWorkspaceId != null;
 
+  // Authoritative restore baseline for rejected switches: with chained
+  // rejected switches, a captured "previous" can itself be a rejected agent,
+  // while the backend still stores the last accepted one.
+  const backendAgentId = currentMeta?.agentId ?? null;
+
   const workspaceId = props.workspaceId;
 
   // Declared before setAgentId: switches resolve the target agent's settings
@@ -223,7 +224,8 @@ function AgentProviderWithState(props: {
       // rollback. A typed rejection cannot self-heal that way: the backend
       // evaluated and refused this selection (e.g. the budgeted-goal pricing
       // gate) and the same gate refuses sends before they re-persist settings,
-      // so a rejection restores the pre-switch selection instead.
+      // so a rejection restores the backend-authoritative (or pre-switch)
+      // selection instead (revertRejectedAgentSwitch).
 
       // The picker closes on selection, so a rejected switch would otherwise
       // be silent (e.g. budgeted-goal pricing gate).
@@ -237,32 +239,23 @@ function AgentProviderWithState(props: {
         );
       };
 
-      // Undo exactly what this switch wrote, and only while it is still in
-      // effect: any agent/model/thinking change the user made after the
-      // optimistic switch wins over the revert.
       const revertRejectedSwitch = () => {
-        const currentAgentId = coerceAgentId(
-          readPersistedState<string | null>(getAgentIdKey(workspaceId), null)
-        );
-        if (currentAgentId !== nextAgentId) {
-          return;
-        }
-        // Restore settings before the agent id so WorkspaceModeAISync
-        // re-resolves the previous agent from pre-switch values instead of
-        // carrying over the rejected ones.
-        if (readPersistedState<string>(modelKey, getDefaultModel()) === resolvedModel) {
-          setWorkspaceModelWithOrigin(workspaceId, previousModel, "sync");
-        }
-        if (readPersistedState<ThinkingLevel>(thinkingKey, "off") === resolvedThinking) {
-          updatePersistedState(thinkingKey, previousThinking);
-        }
-        if (
-          readPersistedState<OpenAIReasoningMode>(reasoningKey, "standard") ===
-          resolvedReasoningMode
-        ) {
-          updatePersistedState(reasoningKey, previousReasoning);
-        }
-        setAgentIdRaw(previousAgentId);
+        revertRejectedAgentSwitch({
+          workspaceId,
+          rejectedAgentId: nextAgentId,
+          applied: {
+            model: resolvedModel,
+            thinkingLevel: resolvedThinking,
+            reasoningMode: resolvedReasoningMode,
+          },
+          previous: {
+            agentId: previousAgentId,
+            model: previousModel,
+            thinkingLevel: previousThinking,
+            reasoningMode: previousReasoning,
+          },
+          backendAgentId,
+        });
       };
 
       markPendingWorkspaceAgentId(workspaceId, nextAgentId);
@@ -297,6 +290,7 @@ function AgentProviderWithState(props: {
     [
       agents,
       api,
+      backendAgentId,
       globalDefaultAgentId,
       isCurrentAgentLocked,
       isProjectScope,

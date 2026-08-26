@@ -37,6 +37,13 @@ interface UpdateAgentAISettingsResult {
 let deferUpdateAgentAISettings = false;
 let resolveUpdateAgentAISettings: ((result: UpdateAgentAISettingsResult) => void) | null = null;
 
+// Function-boundary read: flow analysis narrows the module let to null after
+// an explicit reset and cannot see the mock's runtime reassignment, so tests
+// that reset-and-recapture must read through this accessor.
+function getDeferredUpdateResolver(): ((result: UpdateAgentAISettingsResult) => void) | null {
+  return resolveUpdateAgentAISettings;
+}
+
 let APIProvider!: typeof APIModule.APIProvider;
 let RouterProvider!: typeof RouterContextModule.RouterProvider;
 let ProjectProvider!: typeof ProjectContextModule.ProjectProvider;
@@ -536,6 +543,51 @@ describe("AgentContext", () => {
     } finally {
       window.removeEventListener(CUSTOM_EVENTS.AGENT_SWITCH_ERROR_TOAST, toastListener);
     }
+  });
+
+  test("chained rejections restore the backend's authoritative agent", async () => {
+    const projectPath = "/tmp/project";
+    const workspaceId = "main-workspace";
+    mockAgentDefinitions = [EXEC_AGENT, PLAN_AGENT, REVIEW_PROJECT_AGENT];
+    // Backend still stores exec: neither chained switch gets accepted.
+    mockWorkspaceMetadata.set(workspaceId, { agentId: "exec" });
+    window.localStorage.setItem(getAgentIdKey(workspaceId), JSON.stringify("exec"));
+    deferUpdateAgentAISettings = true;
+
+    let contextValue: AgentContextValue | undefined;
+
+    renderAgentHarness({
+      workspaceId,
+      projectPath,
+      onChange: (value) => (contextValue = value),
+    });
+
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("exec");
+    });
+
+    contextValue?.setAgentId("plan");
+    await waitFor(() => {
+      expect(resolveUpdateAgentAISettings).not.toBeNull();
+    });
+    const rejectPlanSwitch = resolveUpdateAgentAISettings;
+    resolveUpdateAgentAISettings = null;
+
+    contextValue?.setAgentId("review");
+    await waitFor(() => {
+      expect(resolveUpdateAgentAISettings).not.toBeNull();
+    });
+    const rejectReviewSwitch = getDeferredUpdateResolver();
+
+    // plan's rejection is skipped (a newer switch is active); review's
+    // rejection must restore the backend's agent (exec), not its captured
+    // previous agent (the also-rejected plan).
+    rejectPlanSwitch?.({ success: false, error: "unpriced model" });
+    rejectReviewSwitch?.({ success: false, error: "unpriced model" });
+
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("exec");
+    });
   });
 
   test("shortcut actions do not override a locked workspace agent", async () => {
