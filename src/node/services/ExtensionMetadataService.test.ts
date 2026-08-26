@@ -787,6 +787,45 @@ describe("ExtensionMetadataService", () => {
     expect(sidecarGone).toBe(true);
   });
 
+  test("recovery reconciles a partial main file recreated during the crash window", async () => {
+    // An older backend can observe the missing-main window as an empty file
+    // and save a PARTIAL snapshot before recovery restores the sidecar.
+    // EEXIST is not success: the sidecar's other entries must be merged into
+    // the recreated file (main wins per key) instead of being abandoned.
+    const sidecar = {
+      version: 1,
+      workspaces: { "ws-other": { recency: 42, streaming: false } },
+    };
+    await writeFile(`${filePath}.corrupt`, JSON.stringify(sidecar));
+    // Main file intentionally absent; the probe hook below recreates it as a
+    // partial file mid-recovery (modeling the concurrent older backend).
+    const internals = service as unknown as {
+      probeQuarantineSidecar: () => Promise<boolean>;
+    };
+    const originalProbe = internals.probeQuarantineSidecar.bind(service);
+    internals.probeQuarantineSidecar = async () => {
+      await writeFile(
+        filePath,
+        JSON.stringify({
+          version: 1,
+          workspaces: { "ws-new": { recency: 300, streaming: false } },
+        })
+      );
+      internals.probeQuarantineSidecar = originalProbe;
+      return true;
+    };
+
+    const snapshots = await service.getAllSnapshots({ throwOnError: true });
+    expect(snapshots.get("ws-new")?.recency).toBe(300);
+    expect(snapshots.get("ws-other")?.recency).toBe(42);
+    // Sidecar consumed by the reconcile.
+    const sidecarGone = await readFile(`${filePath}.corrupt`, "utf-8").then(
+      () => false,
+      () => true
+    );
+    expect(sidecarGone).toBe(true);
+  });
+
   test("a strict read restores healthy bytes stranded in the sidecar by a crashed quarantine", async () => {
     // The crash can also strand a HEALTHY file in the sidecar: a concurrent
     // writer repaired the main file right before quarantine's rename moved

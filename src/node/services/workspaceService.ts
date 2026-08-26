@@ -13078,6 +13078,11 @@ export class WorkspaceService extends EventEmitter {
       const isRemovedPerAuthoritativeIdentity = (workspaceId: string): boolean =>
         initialConfigIds != null &&
         !initialConfigIds.has(workspaceId) &&
+        // An id visible in the FRESH raw view is verifiably registered
+        // regardless of what the (possibly earlier) authoritative
+        // enumeration saw — e.g. a workspace registered after that
+        // enumeration ran must not read as removed.
+        !(freshConfigIds?.has(workspaceId) ?? false) &&
         authoritativeIds != null &&
         !authoritativeIds.has(workspaceId);
       // Tombstones are process-local removal knowledge; the shared config is
@@ -13134,7 +13139,19 @@ export class WorkspaceService extends EventEmitter {
       // writes produce no delta). Merge in-scope additions from the fresh
       // re-read, subject to the same removal guards as retained entries.
       if (freshSnapshots != null) {
-        for (const workspaceId of workspaceIds) {
+        // Merge scope: the (possibly stale) per-id scope PLUS fresh-snapshot
+        // ids the fresh raw config view proves registered — a workspace
+        // registered and written between the scope reads and the fresh
+        // re-read is in both fresh views but in neither stale one.
+        const mergeCandidateIds = new Set(workspaceIds);
+        if (freshConfigIds != null) {
+          for (const workspaceId of freshSnapshots.keys()) {
+            if (freshConfigIds.has(workspaceId)) {
+              mergeCandidateIds.add(workspaceId);
+            }
+          }
+        }
+        for (const workspaceId of mergeCandidateIds) {
           if (workspaceId in activityById) {
             continue;
           }

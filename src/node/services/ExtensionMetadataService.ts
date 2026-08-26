@@ -795,14 +795,17 @@ export class ExtensionMetadataService {
         ExtensionMetadataService.isUnsupportedVersion(moved))
     ) {
       // Restore without ever overwriting a newer file yet another writer
-      // may have re-created at the main path: link and COPYFILE_EXCL
-      // both fail with EEXIST in that case (the healthy leftover sidecar
-      // is then harmless and bounded by the fixed name).
+      // may have re-created at the main path: link and COPYFILE_EXCL both
+      // fail with EEXIST in that case. EEXIST is NOT a successful recovery
+      // though — the re-created file may be a PARTIAL snapshot an older
+      // backend self-healed from the missing-main window (older builds read
+      // ENOENT as empty and save their one mutated entry), so the sidecar's
+      // other entries must be reconciled into it rather than abandoned.
       try {
         await link(quarantinePath, this.filePath);
       } catch (linkError) {
         if (ExtensionMetadataService.isErrnoCode(linkError, "EEXIST")) {
-          return false;
+          return this.reconcileRecreatedMainWithSidecar(quarantinePath);
         }
         try {
           // Filesystems without hard-link support (or EPERM): copy-based
@@ -810,7 +813,7 @@ export class ExtensionMetadataService {
           await copyFile(quarantinePath, this.filePath, constants.COPYFILE_EXCL);
         } catch (copyError) {
           if (ExtensionMetadataService.isErrnoCode(copyError, "EEXIST")) {
-            return false;
+            return this.reconcileRecreatedMainWithSidecar(quarantinePath);
           }
           // Restore failed with the main path missing: rethrow so the
           // strict reader propagates a retryable failure instead of
@@ -874,13 +877,6 @@ export class ExtensionMetadataService {
     await this.withSerializedMutation(async () => {
       // Re-check inside the queue: a concurrent writer save or a sibling
       // strict read may already have recovered the main path.
-      const mainExists = await access(this.filePath).then(
-        () => true,
-        () => false
-      );
-      if (mainExists) {
-        return;
-      }
       const quarantinePath = `${this.filePath}.corrupt`;
       const sidecarExists = await access(quarantinePath).then(
         () => true,
@@ -889,8 +885,71 @@ export class ExtensionMetadataService {
       if (!sidecarExists) {
         return;
       }
+      const mainExists = await access(this.filePath).then(
+        () => true,
+        () => false
+      );
+      if (mainExists) {
+        // Main was recreated during the crash window — possibly a PARTIAL
+        // file another backend self-healed from the missing-main state.
+        // Merge the sidecar's other entries back instead of abandoning them.
+        await this.reconcileRecreatedMainWithSidecar(quarantinePath);
+        return;
+      }
       await this.completeQuarantineRecovery(quarantinePath);
     });
+  }
+
+  /**
+   * A restore found the main path already re-created (EEXIST), or a resumed
+   * recovery found both files present. The re-created file may be a PARTIAL
+   * snapshot an older backend self-healed from the missing-main window;
+   * treating it as authoritative would permanently hide every other
+   * workspace's recency/goal/status while the full data sits in the sidecar.
+   * Merge sidecar-only entries into the main file (main wins per key — its
+   * writes are newer; ids this process write-tombstoned stay out) and consume
+   * the sidecar. Only same-schema (version 1) sidecars can be merged: a
+   * corrupt or newer-schema sidecar is left as the bounded fixed-name
+   * leftover. Must run inside withSerializedMutation. Returns false (no
+   * empty reset happened).
+   */
+  private async reconcileRecreatedMainWithSidecar(quarantinePath: string): Promise<boolean> {
+    let sidecarParsed: unknown;
+    try {
+      sidecarParsed = JSON.parse(await readFile(quarantinePath, "utf-8")) as unknown;
+    } catch {
+      return false;
+    }
+    if (!ExtensionMetadataService.isValidMetadataFileShape(sidecarParsed)) {
+      return false;
+    }
+    let main: ExtensionMetadataFile;
+    try {
+      const parsed = JSON.parse(await readFile(this.filePath, "utf-8")) as unknown;
+      if (!ExtensionMetadataService.isValidMetadataFileShape(parsed)) {
+        // Corrupt/newer-schema main: leave both files for the normal read
+        // classification paths rather than merging across schemas.
+        return false;
+      }
+      main = parsed;
+    } catch {
+      return false;
+    }
+    let modified = false;
+    for (const [workspaceId, entry] of Object.entries(sidecarParsed.workspaces)) {
+      if (workspaceId in main.workspaces || this.deletedWorkspaceIds.has(workspaceId)) {
+        continue;
+      }
+      main.workspaces[workspaceId] = entry;
+      modified = true;
+    }
+    if (modified) {
+      await this.save(main);
+    }
+    // Consumed either way: every surviving sidecar entry is now represented
+    // at the main path.
+    await unlink(quarantinePath).catch(() => undefined);
+    return false;
   }
 
   async getAllSnapshots(options?: {

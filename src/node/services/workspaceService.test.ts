@@ -3608,6 +3608,57 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("getActivityList merges workspaces registered and written entirely mid-list", async () => {
+    // Harder variant of the mid-list merge: the workspace is registered AND
+    // written after every scope read (baseline, prune, refresh), so it is in
+    // neither the per-id scope nor the initial snapshots — only the fresh
+    // revalidation views (snapshot re-read + raw config re-read) know it.
+    // The merge must admit ids those fresh views agree on.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "brand-new-workspace";
+      const projectPath = path.join(config.rootDir, "project");
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      const realGetAllSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      let snapshotCalls = 0;
+      const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(
+        async (options?: { throwOnError?: boolean }) => {
+          snapshotCalls += 1;
+          if (snapshotCalls === 2) {
+            // The other backend registers the workspace and persists its
+            // first activity between the initial read and the revalidation
+            // re-read (before the fresh raw config re-read).
+            await config.addWorkspace(projectPath, {
+              id: workspaceId,
+              name: workspaceId,
+              projectName: "project",
+              projectPath,
+              runtimeConfig: { type: "local" },
+            });
+            await extensionMetadata.updateRecency(workspaceId, 888);
+          }
+          return realGetAllSnapshots(options);
+        }
+      );
+      try {
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList?.[workspaceId]?.recency).toBe(888);
+      } finally {
+        snapshotsSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("getActivityList drops snapshotless legacy entries removed mid-list", async () => {
     // A legacy id-less config entry's stable id is resolved authoritatively
     // during enumeration and can never appear in the raw config-id baseline,
