@@ -14904,7 +14904,7 @@ describe("WorkspaceService fork", () => {
     }
   });
 
-  test("auto-generated fork names normalize legacy fork families before the validation fallback", async () => {
+  test("forks inherit persisted agent settings while normalizing legacy fork families", async () => {
     const sourceWorkspaceId = "source-workspace";
     const newWorkspaceId = "forked-workspace";
     const sourceProjectPath = path.join(tempDir, "project");
@@ -14916,6 +14916,12 @@ describe("WorkspaceService fork", () => {
       projectName: "project",
       runtimeConfig: { type: "local" },
       namedWorkspacePath: path.join(sourceProjectPath, "Feature-fork-2"),
+      agentType: " Researcher ",
+      aiSettingsByAgent: {
+        researcher: { model: "openai:gpt-5.6-sol", thinkingLevel: "high" },
+        exec: { model: "anthropic:claude-sonnet-4-6", thinkingLevel: "medium" },
+      },
+      aiSettings: { model: "google:gemini-2.5-pro", thinkingLevel: "low" },
     };
     const forkedWorkspacePath = path.join(sourceProjectPath, "feature-1");
 
@@ -15003,6 +15009,18 @@ describe("WorkspaceService fork", () => {
       expect(result.data.metadata.name).toBe("feature-1");
       expect(result.data.metadata.forkFamilyBaseName).toBe("Feature");
       expect(result.data.metadata.namedWorkspacePath).toBe(forkedWorkspacePath);
+      expect(result.data.metadata.agentId).toBe("researcher");
+      expect(result.data.metadata.aiSettingsByAgent).toEqual(sourceMetadata.aiSettingsByAgent);
+      expect(result.data.metadata.aiSettings).toEqual(sourceMetadata.aiSettings);
+
+      const persistedMetadata = (await config.getAllWorkspaceMetadata()).find(
+        (workspace) => workspace.id === newWorkspaceId
+      );
+      expect(persistedMetadata).toMatchObject({
+        agentId: "researcher",
+        aiSettingsByAgent: sourceMetadata.aiSettingsByAgent,
+        aiSettings: sourceMetadata.aiSettings,
+      });
     } finally {
       orchestrateForkSpy.mockRestore();
       copyPlanSpy.mockRestore();
