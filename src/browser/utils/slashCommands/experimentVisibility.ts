@@ -7,7 +7,6 @@ export interface SlashCommandExperimentSnapshot {
   memoryConsolidation?: boolean;
   rlm?: boolean;
   programmaticToolCalling?: boolean;
-  programmaticToolCallingExclusive?: boolean;
 }
 
 export function resolveSlashCommandExperimentValue(
@@ -27,11 +26,7 @@ export function resolveSlashCommandExperimentValue(
       // Sub-experiment of Programmatic Tool Calling: the backend refuses
       // /refine unless RLM AND a PTC parent flag are on, so the sub-flag
       // alone must not surface the command.
-      return (
-        snapshot.rlm === true &&
-        (snapshot.programmaticToolCalling === true ||
-          snapshot.programmaticToolCallingExclusive === true)
-      );
+      return snapshot.rlm === true && snapshot.programmaticToolCalling === true;
     default:
       return undefined;
   }

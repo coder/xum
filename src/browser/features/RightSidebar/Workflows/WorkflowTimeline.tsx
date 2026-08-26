@@ -14,7 +14,6 @@ import {
   Zap,
 } from "lucide-react";
 
-import { MarkdownRenderer } from "@/browser/features/Messages/MarkdownRenderer";
 import { WorkflowJsonBlock } from "@/browser/features/Tools/WorkflowToolShared";
 import { useWorkflowRunById } from "@/browser/hooks/useWorkflowRunById";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
@@ -24,6 +23,7 @@ import {
 } from "@/common/types/workflow";
 
 import { WorkflowLiveDot } from "./WorkflowBadges";
+import { WorkflowLongText } from "./WorkflowLongText";
 import {
   projectWorkflowRun,
   type WorkflowPhaseView,
@@ -322,7 +322,11 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
               {step.status === "failed" ? (
                 <div className="flex gap-2 text-[12.5px] leading-relaxed" style={{ color }}>
                   <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  <span>{step.error ?? "Sub-agent failed"}</span>
+                  <WorkflowLongText
+                    className="flex-1"
+                    text={step.error ?? "Sub-agent failed"}
+                    title={`${step.title} — error`}
+                  />
                 </div>
               ) : (
                 <>
@@ -333,7 +337,11 @@ const WorkflowStepRow: React.FC<WorkflowStepRowProps> = (props) => {
                   )}
                   {showReport && (
                     <div className="text-content-secondary text-[12.5px]">
-                      <MarkdownRenderer content={step.result!.reportMarkdown} />
+                      <WorkflowLongText
+                        markdown
+                        text={step.result!.reportMarkdown}
+                        title={`${step.title} — report`}
+                      />
                     </div>
                   )}
                   {hasStructuredOutput && (
@@ -449,7 +457,12 @@ const WorkflowPhaseSection: React.FC<WorkflowPhaseSectionProps> = (props) => {
       {open && hasInfo && (
         <div className="mb-1.5 ml-[30px] flex flex-col gap-1">
           {phase.detail != null && (
-            <div className="text-content-secondary text-[12px]">{phase.detail}</div>
+            <div className="text-content-secondary text-[12px]">
+              <WorkflowLongText
+                text={phase.detail}
+                title={`${phase.label.length > 0 ? phase.label : "Phase"} — details`}
+              />
+            </div>
           )}
           {detailObject != null && (
             <WorkflowJsonBlock
@@ -513,7 +526,7 @@ const WorkflowFinalReport: React.FC<{ view: WorkflowRunView }> = (props) => {
         <>
           {showReport && (
             <div className="text-content-secondary text-[12.5px]">
-              <MarkdownRenderer content={result.reportMarkdown} />
+              <WorkflowLongText markdown text={result.reportMarkdown} title="Final report" />
             </div>
           )}
           {stats.length > 0 && (
@@ -565,7 +578,7 @@ export const WorkflowTimeline: React.FC<WorkflowTimelineProps> = (props) => {
           }}
         >
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-          <span>{view.errorMessage}</span>
+          <WorkflowLongText className="flex-1" text={view.errorMessage} title="Workflow error" />
         </div>
       )}
       <WorkflowFinalReport view={view} />

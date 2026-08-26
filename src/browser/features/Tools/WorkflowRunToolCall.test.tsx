@@ -622,6 +622,147 @@ describe("WorkflowRunToolCall", () => {
     expect(view.container.textContent).toContain("running · 0/0 steps · child-phase");
   });
 
+  test("shows live step progress in the header while the run is active", () => {
+    const timestamp = "2026-05-29T00:00:00.000Z";
+    const laterTimestamp = "2026-05-29T00:00:05.000Z";
+    const run: WorkflowRunRecord = {
+      id: "wfr_progress01",
+      workspaceId: "workspace-1",
+      workflow: {
+        name: "deep-research",
+        description: "Deep research",
+        scope: "built-in",
+        requestedScriptPath: TEST_WORKFLOW_SCRIPT_PATH,
+        canonicalScriptPath: TEST_WORKFLOW_SCRIPT_PATH,
+        sourceKind: "skill",
+        sourceHash: "sha256:progress",
+        executable: true,
+      },
+      source: "export default function workflow() { return null; }",
+      sourceHash: "sha256:progress",
+      args: {},
+      status: "running",
+      createdAt: timestamp,
+      updatedAt: laterTimestamp,
+      events: [
+        { sequence: 1, type: "status", at: timestamp, status: "running" },
+        { sequence: 2, type: "phase", at: timestamp, name: "research" },
+        {
+          sequence: 3,
+          type: "task",
+          at: timestamp,
+          stepId: "step-1",
+          taskId: "task-1",
+          status: "started",
+          title: "Survey prior art",
+        },
+        {
+          sequence: 4,
+          type: "task",
+          at: laterTimestamp,
+          stepId: "step-1",
+          taskId: "task-1",
+          status: "completed",
+          title: "Survey prior art",
+        },
+        {
+          sequence: 5,
+          type: "task",
+          at: laterTimestamp,
+          stepId: "step-2",
+          taskId: "task-2",
+          status: "started",
+          title: "Draft report",
+        },
+      ],
+      steps: [
+        {
+          stepId: "step-1",
+          inputHash: "hash-1",
+          status: "completed",
+          taskId: "task-1",
+          startedAt: timestamp,
+          completedAt: laterTimestamp,
+        },
+        {
+          stepId: "step-2",
+          inputHash: "hash-2",
+          status: "started",
+          taskId: "task-2",
+          startedAt: laterTimestamp,
+        },
+      ],
+    };
+    const client = {
+      workflows: {
+        getRun: async () => run,
+      },
+    };
+
+    const view = renderWithStickyToolProviders(
+      <APIHarness client={client}>
+        <WorkflowRunToolCall
+          args={{ script_path: TEST_WORKFLOW_SCRIPT_PATH, args: {}, run_in_background: false }}
+          status="executing"
+          result={{ status: "running", runId: run.id, result: null, run }}
+        />
+      </APIHarness>
+    );
+
+    // Progress is a collapsed-header affordance; the expanded body already shows events.
+    const header = getWorkflowHeader(view);
+    expect(header.textContent).not.toContain("1/2 steps");
+    fireEvent.click(header);
+    expect(header.textContent).toContain("1/2 steps · Draft report");
+  });
+
+  test("omits header progress once the run completes", () => {
+    const timestamp = "2026-05-29T00:00:00.000Z";
+    const run: WorkflowRunRecord = {
+      ...createWorkflowRunForExpansionTest({ id: "wfr_progress02", status: "completed" }),
+      events: [
+        { sequence: 1, type: "phase", at: timestamp, name: "research" },
+        {
+          sequence: 2,
+          type: "task",
+          at: timestamp,
+          stepId: "step-1",
+          taskId: "task-1",
+          status: "completed",
+          title: "Survey prior art",
+        },
+        { sequence: 3, type: "status", at: timestamp, status: "completed" },
+      ],
+      steps: [
+        {
+          stepId: "step-1",
+          inputHash: "hash-1",
+          status: "completed",
+          taskId: "task-1",
+          startedAt: timestamp,
+          completedAt: timestamp,
+        },
+      ],
+    };
+    const client = {
+      workflows: {
+        getRun: async () => null,
+      },
+    };
+
+    const view = renderWithStickyToolProviders(
+      <APIHarness client={client}>
+        <WorkflowRunToolCall
+          args={{ script_path: TEST_WORKFLOW_SCRIPT_PATH, args: {}, run_in_background: false }}
+          status="completed"
+          result={{ status: "completed", runId: run.id, result: null, run }}
+        />
+      </APIHarness>
+    );
+
+    expect(getWorkflowHeader(view).textContent).not.toContain("steps");
+  });
+
   test("does not fetch collapsed terminal child rows after the parent run is terminal", async () => {
     const timestamp = "2026-05-29T00:00:00.000Z";
     let getRunCount = 0;

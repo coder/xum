@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 import { Command } from "commander";
 
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { EXPERIMENT_IDS, LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID } from "@/common/constants/experiments";
 import type { ProjectConfig } from "@/common/types/project";
 import { parseRuntimeModeAndHost, RUNTIME_MODE, type RuntimeConfig } from "@/common/types/runtime";
 import {
@@ -165,7 +165,13 @@ async function gatherStdin(): Promise<string> {
 }
 
 function collectExperiments(value: string, previous: string[]): string[] {
-  const experimentId = value.trim().toLowerCase();
+  let experimentId = value.trim().toLowerCase();
+  // Hidden compat alias: "PTC Exclusive Mode" merged into PTC, and the merged
+  // flag activates exactly the old exclusive posture — keep existing
+  // automation that passes the removed ID working instead of erroring.
+  if (experimentId === LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID) {
+    experimentId = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
+  }
   if (!VALID_EXPERIMENT_IDS.has(experimentId)) {
     throw new Error(
       `Unknown experiment "${value}". Valid experiments: ${[...VALID_EXPERIMENT_IDS].join(", ")}`
@@ -227,14 +233,11 @@ async function copyPersistentConfig(realConfig: Config, config: Config): Promise
 function buildExperimentsObject(experimentIds: readonly string[]) {
   return {
     // RLM implies the PTC parent flag: tool assembly only builds
-    // code_execution when a PTC flag is set, so rlm-mode alone would be inert
+    // code_execution when the PTC flag is set, so rlm-mode alone would be inert
     // (the desktop can't express that state — Settings nests RLM under PTC).
     programmaticToolCalling:
       experimentIds.includes(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING) ||
       experimentIds.includes(EXPERIMENT_IDS.RLM),
-    programmaticToolCallingExclusive: experimentIds.includes(
-      EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE
-    ),
     // RLM rides the PTC parent; without this passthrough `-e rlm-mode` was
     // silently dropped and workflow sends ran the non-kernel PTC toolset.
     rlm: experimentIds.includes(EXPERIMENT_IDS.RLM),

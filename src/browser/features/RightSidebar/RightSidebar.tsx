@@ -52,7 +52,11 @@ import { cn } from "@/common/lib/utils";
 import type { ReviewNoteData } from "@/common/types/review";
 import type { GoalSetError, GoalSnapshot, GoalStatus } from "@/common/types/goal";
 import { TerminalTab } from "@/browser/features/RightSidebar/TerminalTab";
-import { useOptionalWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
+import {
+  useOptionalWorkspaceSidebarState,
+  useWorkspaceActivityAuthoritative,
+} from "@/browser/stores/WorkspaceStore";
+import { shouldAutoActivateWorkflowsTab } from "@/browser/features/RightSidebar/Workflows/workflowDisplay";
 import {
   RIGHT_SIDEBAR_TABS,
   isTabType,
@@ -1182,6 +1186,36 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     window.addEventListener(CUSTOM_EVENTS.OPEN_GOAL_TAB, handleOpenGoalTab);
     return () => window.removeEventListener(CUSTOM_EVENTS.OPEN_GOAL_TAB, handleOpenGoalTab);
   }, [setCollapsed, setLayout, workspaceId]);
+
+  // Auto-surface the Workflows tab when a run starts: the tab is the primary
+  // run-detail surface (the chat card stays collapsed while it exists), but a
+  // background-added tab with a small badge is easy to miss. Only a mounted
+  // 0 → >0 transition activates — opening a workspace mid-run keeps the user's
+  // persisted tab, and switching away afterwards is respected. Does not
+  // un-collapse a collapsed sidebar.
+  const activeWorkflowRunCount = sidebarState?.activeWorkflowRunCount ?? 0;
+  const activityAuthoritative = useWorkspaceActivityAuthoritative();
+  const previousActiveWorkflowRunCountRef = React.useRef<number | null>(null);
+  React.useEffect(() => {
+    // Before an AUTHORITATIVE activity snapshot the store reports 0 for every
+    // workspace — both pre-hydration and after a failure-path self-heal (which marks
+    // hydrated with an empty map). Recording that 0 as the baseline would misread the
+    // eventual real snapshot of a pre-existing active run as a fresh 0 → >0 start and
+    // steal the persisted tab. Keep the baseline unknown until authoritative data; the
+    // first authoritative observation counts as "first observation" and never activates.
+    if (!activityAuthoritative) {
+      return;
+    }
+    const previous = previousActiveWorkflowRunCountRef.current;
+    previousActiveWorkflowRunCountRef.current = activeWorkflowRunCount;
+    if (
+      !workflowsExperimentEnabled ||
+      !shouldAutoActivateWorkflowsTab(previous, activeWorkflowRunCount)
+    ) {
+      return;
+    }
+    setLayout((prev) => selectOrAddTab(prev, "workflows"));
+  }, [activityAuthoritative, activeWorkflowRunCount, setLayout, workflowsExperimentEnabled]);
 
   React.useEffect(() => {
     const handleOpenTouchReviewImmersive = (event: Event) => {

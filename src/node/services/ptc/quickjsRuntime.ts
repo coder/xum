@@ -14,7 +14,12 @@ import { QuickJSAsyncFFI } from "@jitl/quickjs-wasmfile-release-asyncify/ffi";
 import crypto from "crypto";
 import type { IJSRuntime, IJSRuntimeFactory, KernelRecordBounds, RuntimeLimits } from "./runtime";
 import type { PTCEvent, PTCExecutionResult, PTCToolCallRecord, PTCConsoleRecord } from "./types";
-import { CONSOLE_CAPTURE_BUDGET_BYTES } from "@/constants/kernelOutput";
+import type { CaptureSanitizerBudget } from "./types";
+import { createCaptureSanitizerBudget } from "./types";
+import {
+  CONSOLE_CAPTURE_BUDGET_BYTES,
+  KERNEL_RETAINED_EXECUTION_BUDGET_BYTES,
+} from "@/constants/kernelOutput";
 import { sliceUtf8Bytes } from "@/common/utils/sliceUtf8Bytes";
 
 /** Capture-time console retention accounting for one eval (see setupConsole). */
@@ -182,6 +187,33 @@ export class QuickJSRuntime implements IJSRuntime {
   private pendingJobGate?: (run: () => void) => void;
   /** Kernel-mode caps on record/event capture; see IJSRuntime.setKernelRecordBounds. */
   private kernelRecordBounds?: KernelRecordBounds;
+  /** Mode-independent record sanitizer; see IJSRuntime.setCaptureResultSanitizer. */
+  private captureResultSanitizer?: (
+    toolName: string,
+    result: unknown,
+    budget?: CaptureSanitizerBudget
+  ) => unknown;
+  /** Per-execution shared media budget for the capture sanitizer in CLASSIC
+   * (non-kernel) mode, keyed like retainedResultBudgets. Classic records keep
+   * full inline results and have no kernel caps, so without sharing, every
+   * call would mint a fresh per-value media allowance and a model-authored
+   * loop of bridged media calls could persist unbounded multi-megabyte
+   * records into partial/final history (r19). Kernel mode keeps per-call
+   * allowances — its cross-call growth is already bounded by
+   * retainedResultBudgets. */
+  private readonly classicSanitizerBudgets = new WeakMap<
+    PTCToolCallRecord[],
+    CaptureSanitizerBudget
+  >();
+  /** Per-execution byte budgets for RETAINED record results, keyed by the
+   * attribution's record array like consoleBudgets (fresh array per eval;
+   * late fire-and-forget settlements share their originating eval's budget).
+   * Retained results bypass the per-record kernel bound by design, so their
+   * SUM must be bounded here (see boundCaptureResult). */
+  private readonly retainedResultBudgets = new WeakMap<
+    PTCToolCallRecord[],
+    { remainingBytes: number }
+  >();
   /** Monotonic eval counter + the generation currently inside eval() (null
    * between evals). Distinguishes settlements arriving mid-eval (queued for
    * the eval's own drain points) from truly-late ones between evals (gated).
@@ -297,7 +329,7 @@ export class QuickJSRuntime implements IJSRuntime {
       // Kernel mode bounds captured args/results at creation: records and
       // streamed events must never retain full guest payloads (host memory +
       // session history growth); the guest still receives full values.
-      const recordArgs = this.boundCaptureArgs(args[0]);
+      const recordArgs = this.boundCaptureArgs(args[0], name, this.toolCalls);
 
       // Emit start event
       this.eventHandler?.({
@@ -312,7 +344,7 @@ export class QuickJSRuntime implements IJSRuntime {
         const result = await fn(...args);
         const endTime = Date.now();
         const duration_ms = endTime - startTime;
-        const recordResult = this.boundCaptureResult(result);
+        const recordResult = this.boundCaptureResult(result, name, this.toolCalls);
 
         // Record tool call
         this.toolCalls.push({
@@ -477,8 +509,8 @@ export class QuickJSRuntime implements IJSRuntime {
           const result = await fn(...args);
           const endTime = Date.now();
           // Same creation-time bounding as synchronous bridges (kernel mode).
-          const recordArgs = this.boundCaptureArgs(args[0]);
-          const recordResult = this.boundCaptureResult(result);
+          const recordArgs = this.boundCaptureArgs(args[0], name, toolCalls);
+          const recordResult = this.boundCaptureResult(result, name, toolCalls);
           toolCalls.push({
             toolName: name,
             args: recordArgs,
@@ -503,7 +535,7 @@ export class QuickJSRuntime implements IJSRuntime {
           const endTime = Date.now();
           const errorStr = error instanceof Error ? error.message : String(error);
           const recordError = this.boundCaptureError(errorStr);
-          const recordArgs = this.boundCaptureArgs(args[0]);
+          const recordArgs = this.boundCaptureArgs(args[0], name, toolCalls);
           toolCalls.push({
             toolName: name,
             args: recordArgs,
@@ -565,6 +597,14 @@ export class QuickJSRuntime implements IJSRuntime {
     this.kernelRecordBounds = bounds;
   }
 
+  setCaptureResultSanitizer(
+    sanitizer:
+      | ((toolName: string, result: unknown, budget?: CaptureSanitizerBudget) => unknown)
+      | undefined
+  ): void {
+    this.captureResultSanitizer = sanitizer;
+  }
+
   /**
    * Bound a guest-supplied value at record/event CREATION time (kernel mode
    * only). Records live in host memory for the whole eval and events land in
@@ -594,10 +634,30 @@ export class QuickJSRuntime implements IJSRuntime {
     };
   }
 
-  private boundCaptureArgs(value: unknown): unknown {
-    return this.kernelRecordBounds === undefined
-      ? value
-      : this.boundCapture(value, this.kernelRecordBounds.argsCapBytes);
+  private boundCaptureArgs(
+    value: unknown,
+    toolName: string,
+    toolCalls: PTCToolCallRecord[]
+  ): unknown {
+    if (this.kernelRecordBounds === undefined) {
+      // Classic mode has no args cap, but media containers passed AS
+      // ARGUMENTS to another bridged tool (e.g. {payload: image}) would
+      // otherwise copy unbudgeted base64 into every start/end event and
+      // record (r22) — the result sanitizer only covers the producing call.
+      // Sanitize against the same shared per-execution budget; the guest
+      // still passes the full value to the tool.
+      return this.captureResultSanitizer !== undefined
+        ? this.captureResultSanitizer(toolName, value, this.classicCaptureBudgetFor(toolCalls))
+        : value;
+    }
+    const bounded = this.boundCapture(value, this.kernelRecordBounds.argsCapBytes);
+    if (bounded === value) return value;
+    // The marker replaced the args entirely: merge back attribution fields
+    // (e.g. the file path of a persistence-critical edit) so post-compaction
+    // extractors can still attribute the record. Marker fields are spread
+    // last so retained fields can never spoof __kernelBounded/bytes/preview.
+    const retained = this.kernelRecordBounds.captureArgsRetained?.(toolName, value);
+    return retained !== undefined ? { ...retained, ...(bounded as object) } : bounded;
   }
 
   /**
@@ -617,10 +677,105 @@ export class QuickJSRuntime implements IJSRuntime {
     return `${sliceUtf8Bytes(errorStr, capBytes)}…[${bytes} bytes total; truncated]`;
   }
 
-  private boundCaptureResult(value: unknown): unknown {
-    return this.kernelRecordBounds === undefined
-      ? value
-      : this.boundCapture(value, this.kernelRecordBounds.resultCapBytes);
+  private boundCaptureResult(
+    value: unknown,
+    toolName: string,
+    toolCalls: PTCToolCallRecord[]
+  ): unknown {
+    // The mode-independent sanitizer runs first (both classic and kernel
+    // mode): media containers are budgeted at capture because records/events
+    // persist into session history in every mode, and request-time
+    // attachment extraction rewrites only the provider copy. Classic mode
+    // shares ONE sanitizer budget per execution (see classicSanitizerBudgets);
+    // kernel mode keeps per-call allowances backed by the retained budget.
+    const sanitized =
+      this.captureResultSanitizer !== undefined
+        ? this.captureResultSanitizer(
+            toolName,
+            value,
+            this.kernelRecordBounds === undefined
+              ? this.classicCaptureBudgetFor(toolCalls)
+              : undefined
+          )
+        : value;
+    if (this.kernelRecordBounds === undefined) return sanitized;
+    // Retained records (persistence-critical tools, media containers) keep a
+    // possibly sanitized full result: compaction and request-time extractors
+    // reconstruct context from them, so a bounded preview would silently
+    // lose it.
+    const retained = this.kernelRecordBounds.captureRetained?.(toolName, sanitized);
+    if (retained !== undefined) {
+      // Execution-wide budget on retained results: each is individually
+      // bounded, but retention bypasses the per-record kernel cap by design,
+      // so a loop of retained calls would otherwise append ~3MiB containers
+      // or 50k-char persistence records without limit. Unserializable
+      // values count as overflow — never retain for free.
+      let size: number;
+      try {
+        size = Buffer.byteLength(JSON.stringify(retained) ?? "", "utf8");
+      } catch {
+        size = Number.POSITIVE_INFINITY;
+      }
+      const budget = this.retainedBudgetFor(toolCalls);
+      if (size <= budget.remainingBytes) {
+        budget.remainingBytes -= size;
+        return retained;
+      }
+      // Budget exhausted: fall back to normal bounding — oversized results
+      // become honest-size markers, small results still pass inline.
+      return QuickJSRuntime.preserveSuccessBit(
+        this.boundCapture(sanitized, this.kernelRecordBounds.resultCapBytes),
+        retained
+      );
+    }
+    return QuickJSRuntime.preserveSuccessBit(
+      this.boundCapture(sanitized, this.kernelRecordBounds.resultCapBytes),
+      sanitized
+    );
+  }
+
+  /** A boolean success bit is preserved onto EVERY __kernelBounded result
+   * marker (r29 — not just the retained-budget-exhausted branch): compaction
+   * folds result.success===false into the compact ok bit, and a FAILED call
+   * whose oversized result was replaced by a marker would otherwise be
+   * misreported as ok:true — advertising a never-applied edit path or a
+   * never-read file in crash-safe attachment tracking. */
+  private static preserveSuccessBit(bounded: unknown, source: unknown): unknown {
+    if (typeof source !== "object" || source === null) return bounded;
+    const success = (source as { success?: unknown }).success;
+    if (
+      typeof success === "boolean" &&
+      typeof bounded === "object" &&
+      bounded !== null &&
+      (bounded as { __kernelBounded?: boolean }).__kernelBounded === true
+    ) {
+      return { ...bounded, success };
+    }
+    return bounded;
+  }
+
+  /** Get-or-create the retained-result budget for one attribution's record
+   * array (keying mirrors consoleBudgetFor). */
+  private retainedBudgetFor(toolCalls: PTCToolCallRecord[]): { remainingBytes: number } {
+    let budget = this.retainedResultBudgets.get(toolCalls);
+    if (!budget) {
+      budget = { remainingBytes: KERNEL_RETAINED_EXECUTION_BUDGET_BYTES };
+      this.retainedResultBudgets.set(toolCalls, budget);
+    }
+    return budget;
+  }
+
+  /** Get-or-create the classic-mode shared sanitizer budget for one
+   * attribution's record array (see classicSanitizerBudgets). Public because
+   * the classic outer return value persists into the same history row and
+   * must draw from the same allowance (r29; see IJSRuntime). */
+  classicCaptureBudgetFor(toolCalls: PTCToolCallRecord[]): CaptureSanitizerBudget {
+    let budget = this.classicSanitizerBudgets.get(toolCalls);
+    if (!budget) {
+      budget = createCaptureSanitizerBudget();
+      this.classicSanitizerBudgets.set(toolCalls, budget);
+    }
+    return budget;
   }
 
   setPendingJobGate(gate: (run: () => void) => void): void {
@@ -785,7 +940,7 @@ export class QuickJSRuntime implements IJSRuntime {
         const callId = generateCallId();
 
         // Same creation-time bounding as registerFunction (kernel mode).
-        const recordArgs = this.boundCaptureArgs(args[0]);
+        const recordArgs = this.boundCaptureArgs(args[0], methodName, this.toolCalls);
 
         // Emit start event
         this.eventHandler?.({
@@ -800,7 +955,7 @@ export class QuickJSRuntime implements IJSRuntime {
           const result = await fn(...args);
           const endTime = Date.now();
           const duration_ms = endTime - startTime;
-          const recordResult = this.boundCaptureResult(result);
+          const recordResult = this.boundCaptureResult(result, methodName, this.toolCalls);
 
           // Record tool call
           this.toolCalls.push({
@@ -1301,11 +1456,34 @@ export class QuickJSRuntime implements IJSRuntime {
         }
 
         budget.retainedBytes += size;
-        attribution.consoleOutput.push({ level, args, timestamp });
+        // Media containers are budgeted at capture like tool-call records
+        // (see setCaptureResultSanitizer): console events stream into session
+        // history immediately, so any later sanitization would miss the
+        // streamed copy. Budget accounting stays on the raw size above —
+        // sanitization only shrinks, never grows.
+        const sanitizer = this.captureResultSanitizer;
+        const captured =
+          sanitizer !== undefined
+            ? args.map((arg) =>
+                sanitizer(
+                  "console",
+                  arg,
+                  // Classic mode draws from the same execution allowance as
+                  // nested records and the outer return (r29): console-arg
+                  // media must not mint a fresh per-value budget. Kernel mode
+                  // keeps per-call allowances (cross-call growth is bounded
+                  // by the retained-result budget and this console budget).
+                  this.kernelRecordBounds === undefined
+                    ? this.classicCaptureBudgetFor(attribution.toolCalls)
+                    : undefined
+                )
+              )
+            : args;
+        attribution.consoleOutput.push({ level, args: captured, timestamp });
         attribution.eventHandler?.({
           type: "console",
           level,
-          args,
+          args: captured,
           timestamp,
         });
       });

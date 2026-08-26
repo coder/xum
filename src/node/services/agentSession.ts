@@ -25,6 +25,7 @@ import type {
   FilePart,
   OnChatMode,
   OnChatCursor,
+  OnChatDowngradeReason,
   ProvidersConfigMap,
   StreamErrorMessage,
 } from "@/common/orpc/types";
@@ -37,7 +38,12 @@ import {
   type GoalSyntheticMessageKind,
 } from "@/constants/goals";
 import type { SendMessageError } from "@/common/types/errors";
-import { AgentIdSchema, SendMessageOptionsSchema, SkillNameSchema } from "@/common/orpc/schemas";
+import {
+  AgentIdSchema,
+  ChatMuxMessageSchema,
+  SendMessageOptionsSchema,
+  SkillNameSchema,
+} from "@/common/orpc/schemas";
 import { normalizeAgentId, resolvePersistedAgentIdCandidates } from "@/common/utils/agentIds";
 import {
   buildStreamErrorEventData,
@@ -166,7 +172,11 @@ import {
   SKILL_DYNAMIC_COMMAND_TIMEOUT_MS,
   SKILL_DYNAMIC_OUTPUT_CAP_BYTES,
 } from "@/node/services/agentSkills/skillDynamicContext";
-import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
+import {
+  aliasLegacyPtcExclusive,
+  EXPERIMENT_IDS,
+  type ExperimentId,
+} from "@/common/constants/experiments";
 import {
   awaitPendingBranchSummary,
   isRlmModeEnabled,
@@ -1943,7 +1953,10 @@ export class AgentSession {
         : undefined;
     const persistedAllowAgentSetGoal = persistedRetrySendOptions?.allowAgentSetGoal;
     const persistedProviderOptions = persistedRetrySendOptions?.providerOptions;
-    const persistedExperiments = persistedRetrySendOptions?.experiments;
+    // History rows load as raw JSON (no schema parse), so the legacy exclusive
+    // alias must be applied here: an old snapshot may carry only the exclusive
+    // flag, which activates exactly the posture merged PTC now provides.
+    const persistedExperiments = aliasLegacyPtcExclusive(persistedRetrySendOptions?.experiments);
 
     const lastUserMuxMetadata = lastUserMessage?.metadata?.muxMetadata;
     if (isCompactionRequestMetadata(lastUserMuxMetadata)) {
@@ -2428,11 +2441,34 @@ export class AgentSession {
     let replayMode: "full" | "since" | "live" = "full";
     let hasOlderHistory: boolean | undefined;
     let serverCursor: OnChatCursor | undefined;
+    // Silent since→full downgrades caused full-history re-transfers on nearly every
+    // workspace switch-back for months. Keep every downgrade observable: classified
+    // reason on the caught-up payload plus a log line with row counts.
+    let downgradeReason: OnChatDowngradeReason | undefined;
+    let epochRowCount: number | undefined;
+    let sentRowCount = 0;
     let emittedReplayMessages = false;
 
-    const emitReplayMessage = (message: WorkspaceChatMessage): void => {
+    // Self-healing: persisted rows can fail the current wire schema (older
+    // writers, schema drift, corruption). oRPC validates every event yielded to
+    // onChat subscribers and a single invalid row terminates the iterator,
+    // which would permanently brick workspace fetch. Skip such rows instead of
+    // letting one bad line take down the whole transcript.
+    const emitReplayMessage = (message: WorkspaceChatMessage): boolean => {
+      const validation = ChatMuxMessageSchema.safeParse(message);
+      if (!validation.success) {
+        const row = message as { id?: string; metadata?: { historySequence?: number } };
+        log.warn("onChat replay: skipping persisted row that fails the wire schema", {
+          workspaceId: this.workspaceId,
+          messageId: row.id,
+          historySequence: row.metadata?.historySequence,
+          issue: validation.error.issues[0],
+        });
+        return false;
+      }
       emittedReplayMessages = true;
       listener({ workspaceId: this.workspaceId, message });
+      return true;
     };
 
     let replayedTerminalStreamError = false;
@@ -2546,8 +2582,13 @@ export class AgentSession {
       let sinceHistorySequence: number | undefined;
       let afterTimestamp: number | undefined;
 
+      if (!historyResult.success && mode?.type === "since") {
+        downgradeReason = "history-read-failed";
+      }
+
       if (historyResult.success) {
         const history = historyResult.data;
+        epochRowCount = history.length;
 
         // Cursor-based replay: only use incremental mode when all provided cursor segments are valid.
         const historyCursor = mode?.type === "since" ? mode.cursor.history : undefined;
@@ -2599,6 +2640,13 @@ export class AgentSession {
 
           if (matchedHistoryCursor && oldestHistoryMatches && priorHistoryMatches) {
             sinceHistorySequence = historyCursor.historySequence;
+          } else {
+            // Classify by the first failing predicate so downgrades are diagnosable.
+            downgradeReason = !matchedHistoryCursor
+              ? "cursor-row-missing"
+              : !oldestHistoryMatches
+                ? "oldest-mismatch"
+                : "fingerprint-mismatch";
           }
         }
 
@@ -2663,7 +2711,9 @@ export class AgentSession {
           }
 
           // Add type: "message" for discriminated union (messages from chat.jsonl don't have it)
-          emitReplayMessage({ ...message, type: "message" });
+          if (emitReplayMessage({ ...message, type: "message" })) {
+            sentRowCount += 1;
+          }
         }
 
         for (let index = history.length - 1; index >= 0; index -= 1) {
@@ -2727,6 +2777,9 @@ export class AgentSession {
       if (replayMode !== "full" && !emittedReplayMessages && !emittedReplayStreamEvents) {
         replayMode = "full";
       }
+      if (mode?.type === "since" && replayMode === "full") {
+        downgradeReason ??= "history-read-failed";
+      }
 
       // Replay failed, so do not advertise a trustworthy reconnect cursor.
       serverCursor = undefined;
@@ -2766,6 +2819,18 @@ export class AgentSession {
         });
       }
 
+      // Surface since→full downgrades (and replay shape in general) in logs. Row counts
+      // only — no JSON.stringify byte accounting on this hot path.
+      const wasDowngraded = mode?.type === "since" && replayMode === "full";
+      log.debug("onChat replay", {
+        workspaceId: this.workspaceId,
+        requestedMode: mode?.type ?? "full",
+        replayMode,
+        ...(wasDowngraded && downgradeReason !== undefined ? { downgradeReason } : {}),
+        epochRowCount,
+        sentRowCount,
+      });
+
       // Send caught-up after ALL historical data (including init events)
       // This signals frontend that replay is complete and future events are real-time
       listener({
@@ -2773,6 +2838,7 @@ export class AgentSession {
         message: {
           type: "caught-up",
           replay: replayMode,
+          ...(wasDowngraded && downgradeReason !== undefined ? { downgradeReason } : {}),
           ...(hasOlderHistory !== undefined ? { hasOlderHistory } : {}),
           cursor: serverCursor,
         },
@@ -7123,7 +7189,13 @@ export class AgentSession {
       reasoningMode: followUp.reasoningMode,
       additionalSystemInstructions: followUp.additionalSystemInstructions,
       providerOptions: followUp.providerOptions,
-      experiments: followUp.experiments,
+      // Raw JSON boundary (same as the startup-retry snapshot read above): an
+      // older build may have persisted {programmaticToolCalling: false,
+      // programmaticToolCallingExclusive: true}, and the explicit false would
+      // otherwise win over backend overrides while the removed legacy field
+      // is ignored — silently downgrading the crash-safe follow-up to
+      // PTC-off (and making its rlm flag inert).
+      experiments: aliasLegacyPtcExclusive(followUp.experiments),
       allowAgentSetGoal: followUp.allowAgentSetGoal,
       disableWorkspaceAgents: followUp.disableWorkspaceAgents,
       // Explicit-agent turns stay loud on the resumed turn too: the requested agent

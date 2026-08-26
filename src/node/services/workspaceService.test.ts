@@ -1439,9 +1439,9 @@ describe("WorkspaceService bash monitor wakes", () => {
       // Reconnect bootstrap must still return the zero-count tombstone even though the
       // clear emit failed, so the renderer's stale "watching" snapshot gets replaced.
       const activityList = await workspaceService.getActivityList();
-      const entry = activityList[workspaceId];
+      const entry = activityList?.[workspaceId];
       expect(entry).toBeDefined();
-      expect(entry.activeBashMonitorCount).toBeUndefined();
+      expect(entry?.activeBashMonitorCount).toBeUndefined();
     } finally {
       await cleanup();
     }
@@ -1486,9 +1486,9 @@ describe("WorkspaceService bash monitor wakes", () => {
       // Reconnect bootstrap: the list must include a zero-count tombstone so the
       // renderer's last-known "watching" snapshot gets replaced rather than preserved.
       const activityList = await workspaceService.getActivityList();
-      const entry = activityList[workspaceId];
+      const entry = activityList?.[workspaceId];
       expect(entry).toBeDefined();
-      expect(entry.activeBashMonitorCount).toBeUndefined();
+      expect(entry?.activeBashMonitorCount).toBeUndefined();
     } finally {
       await cleanup();
     }
@@ -2943,15 +2943,15 @@ describe("WorkspaceService workflow activity", () => {
         now: "2026-06-17T00:00:01.000Z",
       });
 
-      expect((await workspaceService.getActivityList())[workspaceId]?.activeWorkflowRunIds).toEqual(
-        ["wfr_active"]
-      );
-      expect((await workspaceService.getActivityList())[workspaceId]?.activeWorkflowRunCount).toBe(
-        1
-      );
-      expect((await workspaceService.getActivityList())[workspaceId]?.activeWorkflowRunCount).toBe(
-        1
-      );
+      expect(
+        (await workspaceService.getActivityList())?.[workspaceId]?.activeWorkflowRunIds
+      ).toEqual(["wfr_active"]);
+      expect(
+        (await workspaceService.getActivityList())?.[workspaceId]?.activeWorkflowRunCount
+      ).toBe(1);
+      expect(
+        (await workspaceService.getActivityList())?.[workspaceId]?.activeWorkflowRunCount
+      ).toBe(1);
       expect(listStatusSnapshotsSpy).toHaveBeenCalledTimes(1);
 
       const activityEvents: Array<{
@@ -2968,8 +2968,8 @@ describe("WorkspaceService workflow activity", () => {
       expect(activityEvents.at(-1)?.activity?.activeWorkflowRunCount).toBeUndefined();
 
       const clearedActivityList = await workspaceService.getActivityList();
-      expect(clearedActivityList[workspaceId]).toBeDefined();
-      expect(clearedActivityList[workspaceId]?.activeWorkflowRunCount).toBeUndefined();
+      expect(clearedActivityList?.[workspaceId]).toBeDefined();
+      expect(clearedActivityList?.[workspaceId]?.activeWorkflowRunCount).toBeUndefined();
 
       await workspaceService.emitWorkflowRunActivity({
         workspaceId,
@@ -3044,9 +3044,9 @@ describe("WorkspaceService workflow activity", () => {
 
       expect(listStatusSnapshotsSpy).toHaveBeenCalledTimes(1);
       expect(activityEvents.at(-1)?.activity?.activeWorkflowRunCount).toBe(2);
-      expect((await workspaceService.getActivityList())[workspaceId]?.activeWorkflowRunCount).toBe(
-        2
-      );
+      expect(
+        (await workspaceService.getActivityList())?.[workspaceId]?.activeWorkflowRunCount
+      ).toBe(2);
     } finally {
       listStatusSnapshotsSpy.mockRestore();
       releaseScan.resolve();
@@ -3114,7 +3114,7 @@ describe("WorkspaceService workflow activity", () => {
 
       expect(activityEvents.at(-1)?.activity?.activeWorkflowRunCount).toBeUndefined();
       expect(
-        (await workspaceService.getActivityList())[workspaceId]?.activeWorkflowRunCount
+        (await workspaceService.getActivityList())?.[workspaceId]?.activeWorkflowRunCount
       ).toBeUndefined();
     } finally {
       getSnapshotSpy.mockRestore();
@@ -5717,7 +5717,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         // The bootstrap path (renderer reconnect/reload) builds straight from
         // persisted metadata, so it must apply the same overlay.
         const listed = await workspaceService.getActivityList();
-        expect(listed[workspaceId]?.goal).toMatchObject({
+        expect(listed?.[workspaceId]?.goal).toMatchObject({
           objective: "Optimistic mid-stream goal",
           pendingPersistence: true,
         });

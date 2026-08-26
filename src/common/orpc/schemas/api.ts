@@ -1800,7 +1800,8 @@ export const workspace = {
   activity: {
     list: {
       input: z.void(),
-      output: z.record(z.string(), WorkspaceActivitySnapshotSchema),
+      // null signals a backend read failure; {} is a legitimate all-idle result.
+      output: z.record(z.string(), WorkspaceActivitySnapshotSchema).nullable(),
     },
     subscribe: {
       input: z.void(),
@@ -2149,6 +2150,27 @@ export const agentSkills = {
 };
 
 // Workflows
+
+// Shared wire shapes for the sub-agent tray's run-liveness/discovery endpoints:
+// the renderer imports these types so contract changes propagate through one
+// definition instead of drifting across manually repeated object shapes.
+export const WorkflowRunLivenessEntrySchema = z.object({
+  runId: WorkflowRunIdSchema,
+  // null = no durable record for this ref (settled); failed reads are omitted upstream.
+  status: WorkflowRunStatusSchema.nullable(),
+});
+export type WorkflowRunLivenessEntry = z.infer<typeof WorkflowRunLivenessEntrySchema>;
+
+export const WorkflowActiveRunSummarySchema = z.object({
+  /** Workspace whose durable run store owns the run. */
+  workspaceId: z.string(),
+  runId: WorkflowRunIdSchema,
+  workflowName: z.string().nullable(),
+  /** Nested (workflow-in-workflow) runs are absent from workspace activity. */
+  nested: z.boolean(),
+});
+export type WorkflowActiveRunSummary = z.infer<typeof WorkflowActiveRunSummarySchema>;
+
 export const workflows = {
   listRuns: {
     input: z.object({ workspaceId: z.string().min(1) }).strict(),
@@ -2157,6 +2179,27 @@ export const workflows = {
   getRun: {
     input: z.object({ workspaceId: z.string().min(1), runId: WorkflowRunIdSchema }).strict(),
     output: WorkflowRunRecordSchema.nullable(),
+  },
+  // Bulk liveness lookup: one renderer round trip covers runs owned by different
+  // workspaces. status null = no durable record; a ref whose read failed is omitted
+  // from the output so callers can tell transient errors from a settled/missing run.
+  getRunStatuses: {
+    input: z
+      .object({
+        runs: z.array(
+          z.object({ workspaceId: z.string().min(1), runId: WorkflowRunIdSchema }).strict()
+        ),
+      })
+      .strict(),
+    output: z.array(WorkflowRunLivenessEntrySchema),
+  },
+  // Cold-mount discovery for the sub-agent tray: nested (parentWorkflow) runs are
+  // deliberately absent from workspace activity, so a tray mounting during such a
+  // run's between-workers gap needs one bulk read to find active runs across the
+  // candidate owner workspaces.
+  listActiveRuns: {
+    input: z.object({ workspaceIds: z.array(z.string().min(1)) }).strict(),
+    output: z.array(WorkflowActiveRunSummarySchema),
   },
   interrupt: {
     input: z.object({ workspaceId: z.string().min(1), runId: WorkflowRunIdSchema }).strict(),

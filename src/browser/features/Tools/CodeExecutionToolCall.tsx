@@ -121,9 +121,18 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
   const displayAttachments = attachmentParts.filter(isDisplayOnlyFilePart);
   const attachmentsResult =
     mediaAttachments.length > 0 ? { type: "content" as const, value: mediaAttachments } : null;
-  const downloadOnlyMedia = mediaAttachments.filter(
-    (media) => sanitizeImageData(media.mediaType, media.data) === null
-  );
+  const downloadOnlyMedia = mediaAttachments
+    .filter((media) => sanitizeImageData(media.mediaType, media.data) === null)
+    .map((media) => ({
+      type: "media" as const,
+      data: media.data,
+      mediaType: media.mediaType,
+      // Untrusted optional metadata (r24/r25): only well-formed filenames
+      // reach the download card.
+      ...(typeof media.filename === "string" && media.filename.length > 0
+        ? { filename: media.filename }
+        : {}),
+    }));
 
   // Determine result icon and variant
   const isInterrupted = status === "interrupted";

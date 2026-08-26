@@ -12748,7 +12748,7 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
-  async getActivityList(): Promise<Record<string, WorkspaceActivitySnapshot>> {
+  async getActivityList(): Promise<Record<string, WorkspaceActivitySnapshot> | null> {
     try {
       const snapshots = await this.extensionMetadata.getAllSnapshots();
       const workspaceIds = new Set(snapshots.keys());
@@ -12824,7 +12824,9 @@ export class WorkspaceService extends EventEmitter {
       );
     } catch (error) {
       log.error("Failed to list activity:", error);
-      return {};
+      // null (not {}) so the renderer can tell a read failure from a legitimately
+      // idle deployment — {} is a valid successful result when nothing is active.
+      return null;
     }
   }
   async getChatHistory(workspaceId: string): Promise<MuxMessage[]> {

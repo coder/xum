@@ -695,9 +695,6 @@ export function ExperimentsSection() {
   const workspaceHeartbeatsEnabled = useExperimentValue(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const ptcEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
-  const ptcExclusiveEnabled = useExperimentValue(
-    EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE
-  );
   const settingsConfigRequestRef = useRef<{
     api: APIClient;
     request: Promise<SettingsConfig>;
@@ -808,16 +805,6 @@ export function ExperimentsSection() {
                   <SubExperimentRows experimentIds={PTC_SUB_EXPERIMENT_IDS} />
                 </ExperimentSettingsPanel>
               )}
-              {/* RLM rides EITHER accepted PTC parent (toolAssembly accepts
-                  exclusive + rlm too); render under Exclusive only when plain
-                  PTC is off so the row never appears twice. */}
-              {exp.id === EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE &&
-                ptcExclusiveEnabled &&
-                !ptcEnabled && (
-                  <ExperimentSettingsPanel>
-                    <SubExperimentRows experimentIds={PTC_SUB_EXPERIMENT_IDS} />
-                  </ExperimentSettingsPanel>
-                )}
               {exp.id === EXPERIMENT_IDS.PORTABLE_DESKTOP && <PortableDesktopExperimentWarning />}
               {exp.id === EXPERIMENT_IDS.CONFIGURABLE_BIND_URL && <ConfigurableBindUrlControls />}
             </React.Fragment>

@@ -30,13 +30,12 @@ import {
   isMediaPart,
   type ToolAttachmentPart,
 } from "@/common/utils/attachments/toolAttachmentParts";
+import {
+  retainExemptKernelRecordResult,
+  retainPersistenceCriticalArgsFields,
+  sanitizeMediaRecordCapture,
+} from "./types";
 
-/**
- * Sandbox-facing stand-in for stripped media payloads. Keeps the advertised
- * result shape (AttachFileToolResultSchema promises `data: string`) so
- * type-valid guest code reading `.data` still gets a string instead of
- * undefined; the note explains where the real bytes went.
- */
 /**
  * Aggregate per-eval budget for attachment bytes stripped from bridged
  * results. Forwardable parts live host-side outside QuickJS memory accounting;
@@ -158,6 +157,17 @@ const EXCLUDED_TOOLS = new Set([
   "todo_read", // UI-specific
   "status_set", // UI-specific
   "agent_report", // Must be top-level for taskService to read args from history
+  // Context-coupled tools: AIService keys system-prompt context off their
+  // top-level presence (memory index / hot-set block for `memory`, proactive
+  // guidance for `advisor`). Bridging them would silently drop that context
+  // in the exclusive posture.
+  "memory",
+  "advisor",
+  // Media-producing built-ins (attach_file, desktop_screenshot) are
+  // deliberately bridgeable: stripAttachmentParts removes their base64 from
+  // sandbox-visible values and the code_execution attachments carrier delivers
+  // the real bytes to request-time extraction, so guest code like
+  // xum.attach_file(...) works without retaining media in QuickJS memory.
 ]);
 
 /**
@@ -257,16 +267,27 @@ export class ToolBridge {
     this.pendingAttachmentBytes.delete(runtime);
     // Kernel mode bounds record/event capture at creation (host memory and
     // streamed-to-history events); ephemeral registrations keep full records
-    // (the byte-identical supplement contract). Post-eval compaction still
-    // bounds the model-visible set.
+    // (the non-RLM inline-results contract). Post-eval compaction still
+    // bounds the model-visible set. Exempt records (persistence-critical
+    // tools, media containers) keep full results through BOTH stages — see
+    // isKernelRecordResultExempt.
     runtime.setKernelRecordBounds(
       kernel !== undefined
         ? {
             argsCapBytes: KERNEL_COMPACT_ARGS_CAP_BYTES,
             resultCapBytes: RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES,
+            captureRetained: retainExemptKernelRecordResult,
+            captureArgsRetained: retainPersistenceCriticalArgsFields,
           }
         : undefined
     );
+    // Media containers are budgeted at capture in BOTH modes: classic records
+    // keep full inline results by contract, but exclusive PTC makes the
+    // bridge the only route to executable MCP tools, and request-time
+    // attachment extraction rewrites only the provider copy — records/events
+    // persisted into partial.json/chat.jsonl need the budget regardless of
+    // kernel mode.
+    runtime.setCaptureResultSanitizer(sanitizeMediaRecordCapture);
     const xumObj: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
 
     // Grant-denied tools get an explicit stub: the guest sees a clear
@@ -522,6 +543,15 @@ export class ToolBridge {
     args: unknown,
     abortSignal?: AbortSignal
   ): Promise<unknown> {
+    // Guests may call a capability with zero arguments (mux.tool()). Provider
+    // tool calls always deliver an args object, and downstream consumers (MCP
+    // servers, Zod object schemas) assume one — passing undefined through
+    // produced opaque TypeErrors instead of readable validation errors.
+    // Treat a zero-arg call as the canonical empty-args call.
+    if (args === undefined) {
+      args = {};
+    }
+
     // AI SDK tools carry their schema on 'inputSchema'; some legacy tools use 'parameters'.
     const toolRecord = tool as { inputSchema?: unknown; parameters?: unknown };
     const schema = toolRecord.inputSchema ?? toolRecord.parameters;
@@ -579,7 +609,11 @@ export class ToolBridge {
 
   private serializeResult(result: unknown): unknown {
     try {
-      // Round-trip through JSON to ensure QuickJS can handle the value
+      // Round-trip through JSON to ensure QuickJS can handle the value.
+      // Media returned by bridged MCP tools passes through intact: the guest
+      // may legitimately process the bytes, and the classic (non-RLM) record
+      // keeps the full result so extractAttachmentsFromToolOutput can lift
+      // nested media into model-visible multimodal parts at request time.
       return JSON.parse(JSON.stringify(result));
     } catch {
       return { error: "Result not JSON-serializable" };

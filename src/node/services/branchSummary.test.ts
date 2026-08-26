@@ -136,12 +136,9 @@ function meatyExchange(idPrefix: string): MuxMessage[] {
 }
 
 describe("isRlmModeEnabled", () => {
-  test("send-option experiments gate on RLM plus a PTC parent flag", () => {
+  test("send-option experiments gate on RLM plus the PTC parent flag", () => {
     expect(isRlmModeEnabled({ rlm: true, programmaticToolCalling: true }, undefined)).toBe(true);
-    expect(isRlmModeEnabled({ rlm: true, programmaticToolCallingExclusive: true }, undefined)).toBe(
-      true
-    );
-    // RLM without a PTC parent stays inert; PTC without RLM stays off.
+    // RLM without the PTC parent stays inert; PTC without RLM stays off.
     expect(isRlmModeEnabled({ rlm: true }, undefined)).toBe(false);
     expect(isRlmModeEnabled({ programmaticToolCalling: true }, undefined)).toBe(false);
   });
@@ -162,17 +159,9 @@ describe("isRlmModeEnabled", () => {
     const allOn = () => true;
     expect(isRlmModeEnabled({ rlm: false, programmaticToolCalling: true }, allOn)).toBe(false);
     expect(isRlmModeEnabled({ rlm: true, programmaticToolCalling: true }, () => false)).toBe(true);
-    // Per-field fallback (matching resolveBackendGatedPtcExperiments): an
-    // explicit ptc: false does not silence a backend-enabled ptcExclusive —
-    // tool assembly would build the exclusive kernel in this scenario, and
-    // this predicate must agree with it.
-    expect(isRlmModeEnabled({ rlm: true, programmaticToolCalling: false }, allOn)).toBe(true);
-    expect(
-      isRlmModeEnabled(
-        { rlm: true, programmaticToolCalling: false, programmaticToolCallingExclusive: false },
-        allOn
-      )
-    ).toBe(false);
+    // Explicit ptc: false is authoritative and must not fall through to
+    // machine overrides that have PTC enabled.
+    expect(isRlmModeEnabled({ rlm: true, programmaticToolCalling: false }, allOn)).toBe(false);
   });
 
   test("missing flags on a defined experiments object fall back to backend overrides", () => {

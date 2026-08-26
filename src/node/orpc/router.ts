@@ -115,6 +115,7 @@ import * as path from "node:path";
 
 import type { DevToolsEvent } from "@/common/types/devtools";
 import type { WorkflowRunStreamEvent } from "@/common/types/workflow";
+import type { WorkflowRunLivenessEntry } from "@/common/orpc/schemas/api";
 import type { MuxMessage } from "@/common/types/message";
 import { coerceThinkingLevel } from "@/common/types/thinking";
 import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
@@ -400,6 +401,25 @@ async function resolveWorkspaceAgentPluginsMcpContext(
 
 function isTrustedProjectPath(context: ORPCContext, projectPath?: string | null): boolean {
   return isProjectTrusted(context.config, projectPath);
+}
+
+/**
+ * SECURITY: the workflow liveness/discovery handlers construct per-owner
+ * session paths straight from config.getSessionDir(workspaceId) without the
+ * workspace-metadata lookup resolveWorkflowContext performs, so an owner ID
+ * must be a single path segment — separators or dot segments could otherwise
+ * escape the sessions root via path.join. Unsafe IDs cannot name a real
+ * workspace, so callers skip them rather than erroring.
+ */
+export function isPathSafeWorkspaceId(workspaceId: string): boolean {
+  return (
+    workspaceId.length > 0 &&
+    workspaceId !== "." &&
+    workspaceId !== ".." &&
+    !workspaceId.includes("/") &&
+    !workspaceId.includes("\\") &&
+    path.basename(workspaceId) === workspaceId
+  );
 }
 
 function assertDynamicWorkflowsEnabled(context: ORPCContext): void {
@@ -1978,6 +1998,76 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) => {
           const { service } = await resolveWorkflowContext(context, input.workspaceId);
           return service.getRun({ workspaceId: input.workspaceId, runId: input.runId });
+        }),
+      getRunStatuses: t
+        .input(schemas.workflows.getRunStatuses.input)
+        .output(schemas.workflows.getRunStatuses.output)
+        .handler(async ({ context, input }) => {
+          // Bulk nested-run liveness for the sub-agent tray: one renderer round
+          // trip covers all candidates. Reads go straight to each owner's run
+          // store (plain host-side session state) instead of through
+          // resolveWorkflowContext, which waits on workspace initialization — one
+          // stuck provisioning owner must not stall verification for the rest.
+          // A ref whose read rejects is omitted (transient); the store maps only
+          // a definitively-missing durable record to a null status, so callers
+          // can tell "gone" from "retry later". With the workflows experiment
+          // off there are no runs to verify — empty, not an error.
+          if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
+            return [];
+          }
+          const stores = new Map<string, WorkflowRunStore>();
+          const storeFor = (workspaceId: string) => {
+            let store = stores.get(workspaceId);
+            if (store == null) {
+              store = new WorkflowRunStore({
+                sessionDir: context.config.getSessionDir(workspaceId),
+              });
+              stores.set(workspaceId, store);
+            }
+            return store;
+          };
+          const entries = await Promise.all(
+            input.runs.map(async (ref) => {
+              if (!isPathSafeWorkspaceId(ref.workspaceId)) {
+                return null;
+              }
+              try {
+                const status = await storeFor(ref.workspaceId).getRunStatusForLiveness({
+                  workspaceId: ref.workspaceId,
+                  runId: ref.runId,
+                });
+                return { runId: ref.runId, status };
+              } catch {
+                return null;
+              }
+            })
+          );
+          return entries.filter((entry): entry is WorkflowRunLivenessEntry => entry != null);
+        }),
+      listActiveRuns: t
+        .input(schemas.workflows.listActiveRuns.input)
+        .output(schemas.workflows.listActiveRuns.output)
+        .handler(async ({ context, input }) => {
+          // Cold-mount discovery for the tray. Same no-initialization-wait rule
+          // as getRunStatuses above, and strict per owner: a deleted workspace's
+          // missing session dir reads as empty, but a transient store failure
+          // rejects the whole call so the tray retries instead of caching "no
+          // active runs" for the rest of a nested run's worker gap. With the
+          // workflows experiment off there is nothing to discover — empty, not
+          // an error the tray would uselessly retry.
+          if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
+            return [];
+          }
+          const results = await Promise.all(
+            input.workspaceIds.filter(isPathSafeWorkspaceId).map(async (workspaceId) => {
+              const runStore = new WorkflowRunStore({
+                sessionDir: context.config.getSessionDir(workspaceId),
+              });
+              const summaries = await runStore.listActiveRunSummaries({ workspaceId });
+              return summaries.map((summary) => ({ workspaceId, ...summary }));
+            })
+          );
+          return results.flat();
         }),
       interrupt: t
         .input(schemas.workflows.interrupt.input)

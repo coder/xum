@@ -81,7 +81,11 @@ import { createRuntime, runFullInit } from "../node/runtime/runtimeFactory";
 import type { Runtime } from "../node/runtime/Runtime";
 import { execSync } from "child_process";
 import { getParseOptions } from "./argv";
-import { EXPERIMENT_IDS, type ExperimentId } from "../common/constants/experiments";
+import {
+  EXPERIMENT_IDS,
+  LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID,
+  type ExperimentId,
+} from "../common/constants/experiments";
 import { getErrorMessage } from "@/common/utils/errors";
 import { describeCliGoalStop, driveCliGoalUntilTerminal } from "./goalRunDriver";
 import {
@@ -274,7 +278,6 @@ function renderUnknown(value: unknown): string {
  */
 const SEND_MESSAGE_EXPERIMENT_FIELDS = {
   [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: "programmaticToolCalling",
-  [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE]: "programmaticToolCallingExclusive",
   [EXPERIMENT_IDS.RLM]: "rlm",
   [EXPERIMENT_IDS.DYNAMIC_WORKFLOWS]: "dynamicWorkflows",
   // Deliberately absent (accepting them would be a silent no-op or worse,
@@ -304,7 +307,13 @@ function isSendMessageExperimentId(
 }
 
 function collectExperiments(value: string, previous: string[]): string[] {
-  const experimentId = value.trim().toLowerCase();
+  let experimentId = value.trim().toLowerCase();
+  // Hidden compat alias: "PTC Exclusive Mode" merged into PTC, and the merged
+  // flag activates exactly the old exclusive posture — keep existing
+  // automation that passes the removed ID working instead of erroring.
+  if (experimentId === LEGACY_PTC_EXCLUSIVE_EXPERIMENT_ID) {
+    experimentId = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
+  }
   // App-level experiments (e.g. agent-browser) have no send-options field and
   // would be silent no-ops in a headless run, so reject them loudly.
   if (!isSendMessageExperimentId(experimentId)) {
@@ -334,10 +343,10 @@ function buildExperimentsObject(experimentIds: string[]): SendMessageOptions["ex
     experiments[SEND_MESSAGE_EXPERIMENT_FIELDS[experimentId]] = true;
   }
   // RLM is a sub-experiment of PTC: tool assembly only builds code_execution
-  // when a PTC flag is set, so rlm-mode alone would be silently inert. Imply
+  // when the PTC flag is set, so rlm-mode alone would be silently inert. Imply
   // the parent flag, mirroring the desktop where Settings nests RLM under the
-  // PTC toggle (RLM itself then forces the exclusive kernel posture).
-  if (experiments.rlm && experiments.programmaticToolCallingExclusive !== true) {
+  // PTC toggle (PTC is exclusive-only, so RLM then runs the kernel posture).
+  if (experiments.rlm) {
     experiments.programmaticToolCalling = true;
   }
   return experiments;

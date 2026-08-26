@@ -34,6 +34,7 @@ function createMockRuntime(overrides: Partial<IJSRuntime> = {}): IJSRuntime {
     registerSyncFunction: mock((_name: string, _fn: () => unknown) => undefined),
     setVarsProperty: mock((_key: string, _value: string) => undefined),
     setKernelRecordBounds: mock(() => undefined),
+    setCaptureResultSanitizer: mock(() => undefined),
     setPendingJobGate: mock((_gate: (run: () => void) => void) => undefined),
     setLimits: mock((_limits: RuntimeLimits) => undefined),
     onEvent: mock((_handler: (event: PTCEvent) => void) => undefined),
@@ -254,6 +255,45 @@ describe("ToolBridge", () => {
       // Args flow through untouched — the MCP server is the validator of record.
       expect(mockExecute).toHaveBeenCalledWith({ query: "eng" });
       expect(result).toEqual({ echoed: { query: "eng" } });
+    });
+
+    it("normalizes a zero-argument call to empty args", async () => {
+      // Guests may call mux.tool() with no arguments. Providers always send an
+      // args object and downstream consumers (MCP servers, Zod object schemas)
+      // assume one — undefined must become {} so the call behaves like the
+      // provider path instead of dying with an opaque TypeError downstream.
+      const mcpExecute = mock((args: unknown) => ({ echoed: args }));
+      const zodExecute = mock(() => ({ ok: true }));
+      const tools: Record<string, Tool> = {
+        mcp_list: {
+          description: "MCP-style tool with only optional params",
+          inputSchema: jsonSchema<{ limit?: number }>({
+            type: "object",
+            properties: { limit: { type: "number" } },
+          }),
+          execute: (args) => Promise.resolve(mcpExecute(args)),
+        },
+        file_read: createMockTool("file_read", z.object({}), zodExecute),
+      };
+
+      const bridge = new ToolBridge(tools);
+
+      let registeredMux: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+      const mockRegisterObject = mock(
+        (name: string, obj: Record<string, (...args: unknown[]) => Promise<unknown>>) => {
+          if (name === "mux") registeredMux = obj;
+          return undefined;
+        }
+      );
+      bridge.register(createMockRuntime({ registerObject: mockRegisterObject }));
+
+      const mcpList = registeredMux.mcp_list as (...args: unknown[]) => Promise<unknown>;
+      await mcpList();
+      expect(mcpExecute).toHaveBeenCalledWith({});
+
+      const fileRead = registeredMux.file_read as (...args: unknown[]) => Promise<unknown>;
+      await fileRead();
+      expect(zodExecute).toHaveBeenCalledTimes(1);
     });
 
     it("honors a jsonSchema wrapper's custom validator (reject + normalize)", async () => {

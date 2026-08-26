@@ -3230,6 +3230,7 @@ describe("WorkflowRunner", () => {
             registerSyncFunction: noop,
             setVarsProperty: noop,
             setKernelRecordBounds: noop,
+            setCaptureResultSanitizer: noop,
             setPendingJobGate: noop,
             onEvent: noop,
             abort: noop,

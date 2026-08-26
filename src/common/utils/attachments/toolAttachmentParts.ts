@@ -5,7 +5,10 @@ export interface AISDKMediaPart {
   type: "media";
   data: string;
   mediaType: string;
-  filename?: string;
+  /** Untrusted optional metadata: persisted rows and MCP outputs may carry any
+   * shape here — recognition ignores it (r24) and consumers drop non-strings
+   * (r25) instead of throwing during provider-request preparation. */
+  filename?: unknown;
 }
 
 /**
@@ -39,10 +42,12 @@ export function isMediaPart(value: unknown): value is AISDKMediaPart {
   }
 
   const record = value as Record<string, unknown>;
+  // Optional metadata must not gate recognition (r24): a persisted leaf with
+  // e.g. filename:null must still be recognized and stripped, or its retained
+  // base64 would ride raw in provider-visible JSON.
   return (
     record.type === "media" &&
     typeof record.data === "string" &&
-    typeof record.mediaType === "string" &&
-    (record.filename === undefined || typeof record.filename === "string")
+    typeof record.mediaType === "string"
   );
 }

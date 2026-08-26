@@ -5,7 +5,7 @@ import * as path from "node:path";
 
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import { StreamEndEventSchema } from "@/common/orpc/schemas/stream";
+import { StreamEndEventSchema, ToolCallStartEventSchema } from "@/common/orpc/schemas/stream";
 import type {
   CompletedMessagePart,
   ToolCallExecutionStartEvent,
@@ -356,6 +356,50 @@ describe("StreamManager - workflow run attachments", () => {
       runId: "wfr_race",
       timestamp: timestamp + 1,
     });
+  });
+});
+
+describe("StreamManager - nested tool call normalization", () => {
+  test("normalizes zero-arg nested calls to {} for the persisted record and the wire event", () => {
+    const streamManager = new StreamManager(historyService);
+    const workspaceId = "nested-normalize-workspace";
+    const messageId = "nested-normalize-message";
+    const timestamp = Date.now();
+    const parts: CompletedMessagePart[] = [
+      {
+        type: "dynamic-tool",
+        toolCallId: "parent-1",
+        toolName: "code_execution",
+        input: { code: "mux.linear_list_teams()" },
+        state: "input-available",
+        timestamp,
+      },
+    ];
+    const streamInfo = createStreamInfoForTests({ messageId, parts });
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+
+    const events: unknown[] = [];
+    streamManager.on("tool-call-start", (event: unknown) => events.push(event));
+
+    streamManager.emitNestedToolEvent(workspaceId, messageId, {
+      type: "tool-call-start",
+      callId: "nested-1",
+      toolName: "linear_list_teams",
+      // Zero-argument guest call: JSON cannot represent undefined, so both the
+      // persisted record and the wire event must carry {} instead.
+      args: undefined,
+      parentToolCallId: "parent-1",
+      startTime: timestamp,
+    });
+
+    const parentPart = parts[0] as { nestedCalls?: Array<{ input?: unknown }> };
+    expect(parentPart.nestedCalls).toHaveLength(1);
+    expect(parentPart.nestedCalls?.[0]?.input).toEqual({});
+
+    // The live event must survive oRPC output validation (args key required).
+    expect(events).toHaveLength(1);
+    expect(ToolCallStartEventSchema.safeParse(events[0]).success).toBe(true);
+    expect((events[0] as { args?: unknown }).args).toEqual({});
   });
 });
 
