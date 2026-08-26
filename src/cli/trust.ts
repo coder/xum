@@ -61,10 +61,13 @@ async function ensureDirectory(dirPath: string): Promise<void> {
   }
 }
 
-// git prints exactly one trailing newline after a path; strip only that
-// terminator, because the path itself may legitimately end in whitespace.
+// git prints exactly one trailing LF after a path; strip only that
+// terminator, because the path itself may legitimately end in whitespace —
+// including a carriage return on Unix, where "\r" is a valid path byte and
+// must survive. Windows filenames cannot contain "\r", so a CRLF pair there
+// is always a line terminator and strips as a unit.
 function stripTrailingNewline(stdout: string): string {
-  return stdout.replace(/\r?\n$/, "");
+  return process.platform === "win32" ? stdout.replace(/\r?\n$/, "") : stdout.replace(/\n$/, "");
 }
 
 export async function findGitRoot(cwd: string): Promise<string | null> {
@@ -191,7 +194,11 @@ export async function materializeResolvedTrust(
     project.trusted = true;
     return config;
   });
-  return true;
+  // Config.saveConfig swallows write errors, so confirm the exact-path entry
+  // landed on disk (mirrors runTrust's post-write verification): returning
+  // true without persistence would let the run proceed while the task-spawn
+  // gate still reads the checkout as untrusted.
+  return targetConfig.loadConfigOrDefault().projects.get(projectDir)?.trusted === true;
 }
 
 async function runTrust(options: TrustCLIOptions): Promise<number> {

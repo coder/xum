@@ -82,6 +82,7 @@ bun src/cli/trust.ts --dir "${project_path}" || fatal "failed to trust project $
 # repo contents, so automatic repo-controlled automation (.xum/init, tool
 # hooks, project-local MCP servers) must stay off: it would run dataset code
 # with provider credentials in env.
+export XUM_DISABLE_PROJECT_AUTOMATION=1
 export MUX_DISABLE_PROJECT_AUTOMATION=1
 
 cmd=(bun src/cli/run.ts

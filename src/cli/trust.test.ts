@@ -147,6 +147,15 @@ describe("xum trust CLI", () => {
     expect(await materializeResolvedTrust(realConfig, targetConfig, trailing)).toBe(true);
     expect(targetConfig.loadConfigOrDefault().projects.get(trailing)?.trusted).toBe(true);
 
+    // A trailing carriage return is likewise a valid Unix path byte: git
+    // emits "<path>\r" + LF, so only the LF terminator may be stripped.
+    if (process.platform !== "win32") {
+      const trailingCr = path.join(base, "wt-cr\r");
+      await Bun.$`git worktree add ${trailingCr} -b feature-cr`.cwd(repo).quiet();
+      expect(await materializeResolvedTrust(realConfig, targetConfig, trailingCr)).toBe(true);
+      expect(targetConfig.loadConfigOrDefault().projects.get(trailingCr)?.trusted).toBe(true);
+    }
+
     // A crafted .git file pointing gitdir at the trusted repository must not
     // inherit its trust: the checkout is not registered as a linked worktree,
     // so treating it as one would let arbitrary directories run repo-controlled
@@ -156,6 +165,14 @@ describe("xum trust CLI", () => {
     await fs.writeFile(path.join(spoofed, ".git"), `gitdir: ${path.join(repo, ".git")}\n`, "utf-8");
     expect(await materializeResolvedTrust(realConfig, targetConfig, spoofed)).toBe(false);
     expect(targetConfig.loadConfigOrDefault().projects.has(spoofed)).toBe(false);
+
+    // Config.saveConfig swallows write errors; when the ephemeral config root
+    // is unwritable (a regular file), materialization must report failure
+    // instead of letting the run proceed with delegation silently blocked.
+    const unwritableRoot = path.join(base, "unwritable-root");
+    await fs.writeFile(unwritableRoot, "not a directory\n", "utf-8");
+    const unwritableConfig = new Config(unwritableRoot);
+    expect(await materializeResolvedTrust(realConfig, unwritableConfig, worktree)).toBe(false);
   }, 15_000);
 
   test("fails loudly when the trust change cannot be persisted", async () => {
