@@ -682,6 +682,151 @@ describe("WorkspaceService bash monitor wakes", () => {
     }
   });
 
+  test("listBackgroundProcesses keeps a prior-generation wake off a reused monitored process", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-prior-generation-listing";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      // The reused process spawned AFTER the wake was created (future startTime makes the
+      // ordering deterministic without sleeping), and carries its own unrelated monitor.
+      const reusedProcess = {
+        id: "proc-gen",
+        pid: 6161,
+        script: "./watch.sh",
+        displayName: "Watcher",
+        startTime: Date.now() + 60_000,
+        status: "running" as const,
+        workspaceId,
+        isForeground: false,
+      };
+      const liveMonitor = {
+        filter: "NEW:",
+        filter_exclude: false,
+        cooldown_ms: 1_000,
+        totalMatches: 0,
+        droppedLines: 0,
+        lastLines: [],
+        stopped: false,
+      };
+      const backgroundProcessManager = {
+        cleanup: mock(() => Promise.resolve()),
+        list: mock(() => Promise.resolve([reusedProcess])),
+        getMonitorSnapshot: mock(() => liveMonitor),
+      } as unknown as BackgroundProcessManager;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(true);
+      spyOn(workspaceService, "waitForIdleAndNoQueuedMessages").mockImplementation(
+        () => new Promise(() => undefined)
+      );
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: BashMonitorWakeStore;
+        }
+      ).bashMonitorWakeStore;
+      await wakeStore.enqueueOrMergePending({
+        processId: "proc-gen",
+        taskId: "bash:proc-gen",
+        workspaceId,
+        filter: "WAKE:",
+        filterExclude: false,
+        lines: ["WAKE: old generation"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 10,
+      });
+
+      const listing = await workspaceService.listBackgroundProcesses(workspaceId);
+      expect(listing).toHaveLength(2);
+      // The live row keeps its own monitor untouched: no foreign wake kind, no mixed
+      // filter/match counts.
+      const liveRow = listing.find((row) => row.id === "proc-gen");
+      expect(liveRow?.monitor?.filter).toBe("NEW:");
+      expect(liveRow?.monitor?.pendingWakeKind).toBeUndefined();
+      // The prior-generation wake renders as its own synthesized row under a distinct id.
+      const wakeRow = listing.find((row) => row.id === "proc-gen#pending-wake");
+      expect(wakeRow?.synthesized).toBe(true);
+      expect(wakeRow?.monitor?.filter).toBe("WAKE:");
+      expect(wakeRow?.monitor?.pendingWakeKind).toBe("match");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("listBackgroundProcesses republishes the last good pending-wake set on a read failure", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-last-good-listing";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = {
+        cleanup: mock(() => Promise.resolve()),
+        list: mock(() => Promise.resolve([])),
+        getMonitorSnapshot: mock(() => undefined),
+      } as unknown as BackgroundProcessManager;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(true);
+      spyOn(workspaceService, "waitForIdleAndNoQueuedMessages").mockImplementation(
+        () => new Promise(() => undefined)
+      );
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: BashMonitorWakeStore;
+        }
+      ).bashMonitorWakeStore;
+      await wakeStore.enqueueOrMergePending({
+        processId: "proc-last-good",
+        taskId: "bash:proc-last-good",
+        workspaceId,
+        filter: "WAKE:",
+        filterExclude: false,
+        lines: ["WAKE: done"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 10,
+      });
+
+      // Seed the last-good snapshot with a successful read.
+      expect(await workspaceService.listBackgroundProcesses(workspaceId)).toHaveLength(1);
+
+      // A transient read failure must not publish an authoritative empty set: the durable
+      // wake is still on disk and an exited process emits no later change to restore it.
+      spyOn(wakeStore, "listPending").mockImplementationOnce(() =>
+        Promise.reject(new Error("transient wake-store I/O failure"))
+      );
+      const listing = await workspaceService.listBackgroundProcesses(workspaceId);
+      expect(listing).toHaveLength(1);
+      expect(listing[0].id).toBe("proc-last-good");
+      expect(listing[0].monitor?.pendingWakeKind).toBe("match");
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("explicit monitor cancellation supersedes a match racing persistence", async () => {
     const { config, cleanup } = await createTestHistoryService();
     try {

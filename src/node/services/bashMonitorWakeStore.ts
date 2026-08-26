@@ -17,6 +17,12 @@ import { stripAnsiControlChars } from "@/node/utils/ansi";
 export const BASH_MONITOR_WAKE_DIR = "bash-monitor-wakes";
 const MAX_WAKE_LINES = 50;
 const MAX_WAKE_LINE_BYTES = 8_192;
+// Terminal (delivered/superseded) wake files are pruned once they are older than this.
+// Without pruning the directory grows forever and every listPending — invoked per
+// background-bash UI snapshot — pays a stat for each historical file. The retention
+// window must comfortably exceed the only post-terminal read: restorePendingSnapshots
+// re-checks records superseded seconds earlier within one history-clear operation.
+export const TERMINAL_WAKE_RETENTION_MS = 60 * 60 * 1000;
 
 // Single-source the wake status enum so the exported TS type and the runtime
 // Zod validator below can't drift. Mirrors the `as const` tuple pattern used by
@@ -514,9 +520,11 @@ export class BashMonitorWakeStore {
   // a torn in-progress write can never persist as the final content of a file.
   // `pending` caches the parsed record for pending files (few, bounded) so unchanged
   // pending wakes need no re-read either; terminal/malformed files cache null.
+  // `prunable` marks parsed terminal records (never malformed files, which are kept as
+  // evidence) so old ones can be deleted without re-reading their contents.
   private readonly classifiedFilesByOwner = new Map<
     string,
-    Map<string, { sig: string; pending: BashMonitorWakeRecord | null }>
+    Map<string, { sig: string; pending: BashMonitorWakeRecord | null; prunable: boolean }>
   >();
 
   constructor(private readonly config: Pick<Config, "getSessionDir" | "sessionsDir">) {}
@@ -766,6 +774,7 @@ export class BashMonitorWakeStore {
     }
     const records: BashMonitorWakeRecord[] = [];
     const seen = new Set<string>();
+    const pruneBeforeMs = Date.now() - TERMINAL_WAKE_RETENTION_MS;
     for (const entry of entries) {
       if (!entry.endsWith(".json")) continue;
       seen.add(entry);
@@ -782,7 +791,14 @@ export class BashMonitorWakeStore {
       const sig = `${stat.ino}:${stat.mtimeMs}:${stat.size}`;
       const cached = classified.get(entry);
       if (cached?.sig === sig) {
-        if (cached.pending != null) records.push(cached.pending);
+        if (cached.pending != null) {
+          records.push(cached.pending);
+        } else if (cached.prunable && stat.mtimeMs < pruneBeforeMs) {
+          // Old terminal record: delete it so the directory (and this scan) stays bounded.
+          // Best-effort; concurrent transitions re-check current status themselves.
+          await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
+          classified.delete(entry);
+        }
         continue;
       }
       const raw = await fsPromises.readFile(filePath, "utf-8").catch(() => null);
@@ -793,7 +809,13 @@ export class BashMonitorWakeStore {
       }
       const parsed = this.parse(raw);
       const pending = parsed?.status === "pending" ? parsed : null;
-      classified.set(entry, { sig, pending });
+      const prunable = parsed != null && parsed.status !== "pending";
+      if (prunable && stat.mtimeMs < pruneBeforeMs) {
+        await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
+        classified.delete(entry);
+        continue;
+      }
+      classified.set(entry, { sig, pending, prunable });
       if (pending != null) records.push(pending);
     }
     // Forget cache entries whose files vanished so the map cannot grow past the directory.

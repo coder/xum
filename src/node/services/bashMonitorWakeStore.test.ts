@@ -8,6 +8,7 @@ import {
   BashMonitorWakeStore,
   buildBashMonitorWakeMetadata,
   buildBashMonitorWakePrompt,
+  TERMINAL_WAKE_RETENTION_MS,
   type BashMonitorWakePayload,
   type BashMonitorWakeRecord,
 } from "@/node/services/bashMonitorWakeStore";
@@ -229,6 +230,36 @@ describe("BashMonitorWakeStore", () => {
     const pending = await store.listPending("owner-1");
     expect(pending).toHaveLength(1);
     expect(pending[0].lines).toEqual(["ERROR rearmed"]);
+  });
+
+  test("listPending prunes terminal wake files past the retention window", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ processId: "proc-old", taskId: "bash:proc-old" }));
+    await store.markDelivered("owner-1", "proc-old");
+    await store.enqueueOrMergePending(
+      payload({ processId: "proc-live", taskId: "bash:proc-live" })
+    );
+
+    // Backdate the terminal file beyond the retention window (fresh terminal files stay).
+    const oldFile = path.join(
+      rootDir,
+      "sessions",
+      "owner-1",
+      "bash-monitor-wakes",
+      "proc-old.json"
+    );
+    const past = new Date(Date.now() - TERMINAL_WAKE_RETENTION_MS - 60_000);
+    await fsPromises.utimes(oldFile, past, past);
+
+    expect((await store.listPending("owner-1")).map((r) => r.id)).toEqual(["proc-live"]);
+    // The old terminal record is gone from disk so future scans stay bounded.
+    let pruned = false;
+    try {
+      await fsPromises.access(oldFile);
+    } catch {
+      pruned = true;
+    }
+    expect(pruned).toBe(true);
   });
 
   test("listPending discovers wakes written by another store instance after seeding", async () => {

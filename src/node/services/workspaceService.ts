@@ -4073,6 +4073,14 @@ export class WorkspaceService extends EventEmitter {
     return this.backgroundProcessManager.getActiveMonitorCount(workspaceId);
   }
 
+  // Last successfully read pending-wake set per workspace. On a transient wake-store read
+  // failure, listBackgroundProcesses republishes this instead of an (authoritative-looking)
+  // empty set that would clear pending-wake UI state with no later event to restore it.
+  private readonly lastGoodPendingWakesByWorkspace = new Map<
+    string,
+    readonly BashMonitorWakeRecord[]
+  >();
+
   private notifyBashMonitorWakeStateChanged(workspaceId: string): void {
     // Tests may construct WorkspaceService with a partial BackgroundProcessManager stub
     // (same reason the constructor guards the event subscriptions).
@@ -13648,12 +13656,16 @@ export class WorkspaceService extends EventEmitter {
     let pendingWakes: readonly BashMonitorWakeRecord[];
     try {
       pendingWakes = await this.bashMonitorWakeStore.listPending(workspaceId);
+      this.lastGoodPendingWakesByWorkspace.set(workspaceId, pendingWakes);
     } catch (error) {
+      // Publishing an empty set here would authoritatively clear durable pending-wake
+      // state on a transient I/O failure — and an already-exited process may never emit
+      // another change event to restore it. Fail to the last good snapshot instead.
       log.debug("Failed to read pending bash monitor wakes for process listing", {
         workspaceId,
         error,
       });
-      pendingWakes = [];
+      pendingWakes = this.lastGoodPendingWakesByWorkspace.get(workspaceId) ?? [];
     }
     // Present monitor state derived purely from a durable wake record, for rows (or reused
     // process IDs) that have no live monitor snapshot to decorate.
@@ -13667,16 +13679,24 @@ export class WorkspaceService extends EventEmitter {
       stopped: true,
       pendingWakeKind: record.kind,
     });
-    const pendingWakeByProcessId = new Map(
-      pendingWakes.map((record) => [record.processId, record] as const)
-    );
-    const liveProcessIds = new Set(processes.map((p) => p.id));
+    const liveProcessById = new Map(processes.map((p) => [p.id, p] as const));
+    // A pending wake decorates the live row only when it belongs to that process
+    // generation (created at/after spawn). An older wake merely shares a reused
+    // display-name-derived ID; overlaying it onto the new process's monitor would mix
+    // another generation's wake with the live filter/match counts and point its output
+    // action at the wrong process, so such wakes get their own synthesized row below.
+    const wakeOnLiveRow = new Map<string, BashMonitorWakeRecord>();
+    for (const record of pendingWakes) {
+      const live = liveProcessById.get(record.processId);
+      if (live != null && Date.parse(record.createdAt) >= live.startTime) {
+        wakeOnLiveRow.set(record.processId, record);
+      }
+    }
     const rows: BackgroundProcessInfo[] = processes.map((p) => {
       const monitor = this.backgroundProcessManager.getMonitorSnapshot(p);
-      const pendingWake = pendingWakeByProcessId.get(p.id);
-      // A restarted workspace can reuse a display-name-derived process ID while the prior
-      // generation's wake is still pending. Even when the new process carries no monitor,
-      // the durable wake must stay visible, so fall back to a record-derived snapshot.
+      const pendingWake = wakeOnLiveRow.get(p.id);
+      // Same-generation wake on a monitorless row (e.g. the monitor was stopped after the
+      // match): fall back to a record-derived snapshot so the wake stays visible.
       const monitorPayload =
         pendingWake != null
           ? {
@@ -13700,10 +13720,14 @@ export class WorkspaceService extends EventEmitter {
     // from the wake record so the pending-delivery state stays visible — that restart window
     // is exactly the state this listing is meant to expose.
     for (const record of pendingWakes) {
-      if (liveProcessIds.has(record.processId)) continue;
+      if (wakeOnLiveRow.has(record.processId)) continue;
       const startTime = Date.parse(record.createdAt);
       rows.push({
-        id: record.processId,
+        // Prior-generation wakes whose ID is reused by a live process need a distinct row
+        // identity; nothing dereferences synthesized ids (no output/terminate actions).
+        id: liveProcessById.has(record.processId)
+          ? `${record.processId}#pending-wake`
+          : record.processId,
         // No live process behind this row; `synthesized` (not the pid) tells the renderer
         // that output/terminate actions cannot work.
         pid: 0,
