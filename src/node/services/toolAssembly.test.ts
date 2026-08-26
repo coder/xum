@@ -50,12 +50,13 @@ describe("applyToolPolicyAndExperiments", () => {
     expect(evalResult.result).toBe("undefined");
   });
 
-  test("context-coupled and media tools stay model-visible under PTC", async () => {
+  test("context-coupled tools stay model-visible under PTC; media tools bridge", async () => {
     // memory/advisor: AIService keys system-prompt context (memory index /
     // hot set, advisor guidance) off their top-level presence. attach_file /
-    // desktop_screenshot: top-level outputs guarantee model-visible media in
-    // both classic and kernel modes (kernel-compacted nested records drop
-    // result contents, so nested media would be lost to the model there).
+    // desktop_screenshot are bridgeable instead: the ToolBridge strips their
+    // base64 from sandbox-visible values and the code_execution attachments
+    // carrier delivers the real bytes to request-time extraction, so nested
+    // media reaches the model without a top-level tool slot.
     const result = await applyToolPolicyAndExperiments({
       allTools: {
         bash: executableTool("Run a command"),
@@ -68,13 +69,16 @@ describe("applyToolPolicyAndExperiments", () => {
       experiments: { programmaticToolCalling: true },
       emitNestedToolEvent: () => undefined,
     });
-    expect(Object.keys(result).sort()).toEqual([
-      "advisor",
-      "attach_file",
-      "code_execution",
-      "desktop_screenshot",
-      "memory",
-    ]);
+    expect(Object.keys(result).sort()).toEqual(["advisor", "code_execution", "memory"]);
+
+    // The media tools must actually be reachable inside the sandbox — hidden
+    // from the model-visible set but not dropped.
+    const evalResult = (await result.code_execution.execute!(
+      { code: "return [typeof mux.attach_file, typeof mux.desktop_screenshot];" },
+      { toolCallId: "test-call-id", messages: [], context: undefined }
+    )) as { success: boolean; result?: unknown };
+    expect(evalResult.success).toBe(true);
+    expect(evalResult.result).toEqual(["function", "function"]);
   });
 
   test("a disable-all policy yields no tools at all (no code_execution)", async () => {
