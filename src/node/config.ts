@@ -2182,7 +2182,19 @@ export class Config {
    * Find a workspace by ID.
    * @returns Stored config project key plus a separate attribution project path, or null
    */
-  findWorkspace(workspaceId: string): {
+  findWorkspace(
+    workspaceId: string,
+    options?: {
+      /**
+       * Propagate failures that hide a workspace's identity (unreadable or
+       * unparseable config / legacy session metadata.json) instead of
+       * skipping the entry. Callers making destructive "id is not
+       * registered" decisions must use this: a lenient miss is
+       * indistinguishable from a genuine absence.
+       */
+      throwOnError?: boolean;
+    }
+  ): {
     workspacePath: string;
     projectPath: string;
     attributionProjectPath?: string;
@@ -2191,7 +2203,7 @@ export class Config {
     parentWorkspaceId?: string;
     pendingAutoTitle?: boolean;
   } | null {
-    const config = this.loadConfigOrDefault();
+    const config = this.loadConfigOrDefault({ throwOnError: options?.throwOnError });
 
     for (const [projectPath, project] of config.projects) {
       for (const workspace of project.workspaces) {
@@ -2220,24 +2232,29 @@ export class Config {
 
           // Try loading metadata with basename as ID (works for old workspaces)
           const metadataPath = path.join(this.getSessionDir(workspaceBasename), "metadata.json");
-          if (fs.existsSync(metadataPath)) {
-            try {
-              const data = fs.readFileSync(metadataPath, "utf-8");
-              const metadata = JSON.parse(data) as WorkspaceMetadata;
-              this.rememberLegacyTaskVariantWorkspace(projectPath, metadata, "metadata");
-              if (metadata.id === workspaceId) {
-                return {
-                  workspacePath: workspace.path,
-                  projectPath,
-                  attributionProjectPath,
-                  projects: metadata.projects ?? workspace.projects,
-                  workspaceName: undefined,
-                  parentWorkspaceId: undefined,
-                };
-              }
-            } catch {
-              // Ignore parse errors, try legacy ID
+          try {
+            const data = fs.readFileSync(metadataPath, "utf-8");
+            const metadata = JSON.parse(data) as WorkspaceMetadata;
+            this.rememberLegacyTaskVariantWorkspace(projectPath, metadata, "metadata");
+            if (metadata.id === workspaceId) {
+              return {
+                workspacePath: workspace.path,
+                projectPath,
+                attributionProjectPath,
+                projects: metadata.projects ?? workspace.projects,
+                workspaceName: undefined,
+                parentWorkspaceId: undefined,
+              };
             }
+          } catch (error) {
+            // A genuinely missing file is the common case (most entries have
+            // no legacy metadata.json). The entry's identity may live in an
+            // unreadable/unparseable one though, so strict callers must not
+            // conclude "absent" from a failed lookup.
+            if (!isEnoentError(error) && options?.throwOnError) {
+              throw error;
+            }
+            // Ignore errors, try legacy ID
           }
 
           // Authoritative legacy path: getAllWorkspaceMetadata resolves an
@@ -2249,24 +2266,26 @@ export class Config {
           // remains registered.
           const legacyId = this.generateLegacyId(projectPath, workspace.path);
           const legacyMetadataPath = path.join(this.getSessionDir(legacyId), "metadata.json");
-          if (fs.existsSync(legacyMetadataPath)) {
-            try {
-              const legacyData = fs.readFileSync(legacyMetadataPath, "utf-8");
-              const legacyMetadata = JSON.parse(legacyData) as WorkspaceMetadata;
-              this.rememberLegacyTaskVariantWorkspace(projectPath, legacyMetadata, "metadata");
-              if (legacyMetadata.id === workspaceId) {
-                return {
-                  workspacePath: workspace.path,
-                  projectPath,
-                  attributionProjectPath,
-                  projects: legacyMetadata.projects ?? workspace.projects,
-                  workspaceName: undefined,
-                  parentWorkspaceId: undefined,
-                };
-              }
-            } catch {
-              // Ignore parse errors, try legacy ID
+          try {
+            const legacyData = fs.readFileSync(legacyMetadataPath, "utf-8");
+            const legacyMetadata = JSON.parse(legacyData) as WorkspaceMetadata;
+            this.rememberLegacyTaskVariantWorkspace(projectPath, legacyMetadata, "metadata");
+            if (legacyMetadata.id === workspaceId) {
+              return {
+                workspacePath: workspace.path,
+                projectPath,
+                attributionProjectPath,
+                projects: legacyMetadata.projects ?? workspace.projects,
+                workspaceName: undefined,
+                parentWorkspaceId: undefined,
+              };
             }
+          } catch (error) {
+            // Same strict-mode contract as the basename lookup above.
+            if (!isEnoentError(error) && options?.throwOnError) {
+              throw error;
+            }
+            // Ignore errors, try legacy ID
           }
 
           // Try legacy ID format as last resort

@@ -604,39 +604,48 @@ export class ExtensionMetadataService {
       // can land a healthy file between the validation above and the rename,
       // and the rename would move THAT file aside. Re-validate the bytes that
       // actually got moved and undo the move when they turn out healthy.
+      // Only deterministic parse corruption is the expected quarantine
+      // outcome here; a transient failure reading the sidecar means the
+      // moved bytes cannot be verified, so it propagates (retryable) rather
+      // than reporting a successful reset over possibly-healthy data.
+      let moved: unknown;
+      let movedParses = true;
       try {
-        const moved: unknown = JSON.parse(await readFile(quarantinePath, "utf-8"));
-        if (ExtensionMetadataService.isValidMetadataFileShape(moved)) {
-          // Restore without ever overwriting a newer file yet another writer
-          // may have re-created at the main path: link and COPYFILE_EXCL
-          // both fail with EEXIST in that case (the healthy leftover sidecar
-          // is then harmless and bounded by the fixed name).
+        moved = JSON.parse(await readFile(quarantinePath, "utf-8")) as unknown;
+      } catch (readError) {
+        if (!ExtensionMetadataService.isDeterministicCorruption(readError)) {
+          throw readError;
+        }
+        movedParses = false;
+      }
+      if (movedParses && ExtensionMetadataService.isValidMetadataFileShape(moved)) {
+        // Restore without ever overwriting a newer file yet another writer
+        // may have re-created at the main path: link and COPYFILE_EXCL
+        // both fail with EEXIST in that case (the healthy leftover sidecar
+        // is then harmless and bounded by the fixed name).
+        try {
+          await link(quarantinePath, this.filePath);
+        } catch (linkError) {
+          if (ExtensionMetadataService.isErrnoCode(linkError, "EEXIST")) {
+            return false;
+          }
           try {
-            await link(quarantinePath, this.filePath);
-          } catch (linkError) {
-            if (ExtensionMetadataService.isErrnoCode(linkError, "EEXIST")) {
+            // Filesystems without hard-link support (or EPERM): copy-based
+            // restore with the same EEXIST no-overwrite guarantee.
+            await copyFile(quarantinePath, this.filePath, constants.COPYFILE_EXCL);
+          } catch (copyError) {
+            if (ExtensionMetadataService.isErrnoCode(copyError, "EEXIST")) {
               return false;
             }
-            try {
-              // Filesystems without hard-link support (or EPERM): copy-based
-              // restore with the same EEXIST no-overwrite guarantee.
-              await copyFile(quarantinePath, this.filePath, constants.COPYFILE_EXCL);
-            } catch (copyError) {
-              if (ExtensionMetadataService.isErrnoCode(copyError, "EEXIST")) {
-                return false;
-              }
-              // Restore failed with the main path missing: rethrow so the
-              // strict reader propagates a retryable failure instead of
-              // reading ENOENT as an authoritative empty state while the
-              // healthy bytes sit in the sidecar.
-              throw copyError;
-            }
+            // Restore failed with the main path missing: rethrow so the
+            // strict reader propagates a retryable failure instead of
+            // reading ENOENT as an authoritative empty state while the
+            // healthy bytes sit in the sidecar.
+            throw copyError;
           }
-          await unlink(quarantinePath).catch(() => undefined);
-          return false;
         }
-      } catch {
-        // Still unreadable/corrupt — the expected quarantine outcome.
+        await unlink(quarantinePath).catch(() => undefined);
+        return false;
       }
       log.error(
         `Extension metadata file was corrupt; moved it to ${quarantinePath} and reset to empty`
@@ -661,9 +670,16 @@ export class ExtensionMetadataService {
       }
       try {
         await this.quarantineCorruptFile();
-      } catch {
-        // Best-effort: e.g. the file vanished between validation and rename
-        // (another process moved it); the re-read below decides the outcome.
+      } catch (quarantineError) {
+        // ENOENT means the file vanished between validation and rename
+        // (another process moved it) — the re-read below decides the
+        // outcome. Anything else (rename denied, sidecar unverifiable,
+        // restore failed) must stay a retryable failure: an ENOENT re-read
+        // would masquerade as authoritative empty while the moved bytes may
+        // hold healthy data.
+        if (!ExtensionMetadataService.isErrnoCode(quarantineError, "ENOENT")) {
+          throw quarantineError;
+        }
       }
       data = await this.load(options);
     }

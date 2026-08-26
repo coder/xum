@@ -12797,7 +12797,13 @@ export class WorkspaceService extends EventEmitter {
       // and the targeted findWorkspace lookup covers normalized/legacy ids
       // (metadata.json / generated legacy ids) the raw scan cannot see.
       const knownIds = this.config.readPersistedWorkspaceIdSuperset();
-      if (knownIds.has(workspaceId) || this.config.findWorkspace(workspaceId) != null) {
+      // throwOnError: a lenient findWorkspace swallows unreadable legacy
+      // metadata.json files, and "identity unknowable" must fail closed here
+      // (skip the delete) rather than read as "not registered".
+      if (
+        knownIds.has(workspaceId) ||
+        this.config.findWorkspace(workspaceId, { throwOnError: true }) != null
+      ) {
         log.debug("Skipping extension metadata discard: workspace still persisted in config", {
           workspaceId,
         });
@@ -12906,6 +12912,23 @@ export class WorkspaceService extends EventEmitter {
       let workspaceIds: Set<string>;
       if (prefetchedKnownIds != null) {
         workspaceIds = prefetchedKnownIds;
+        // The prune enumerated config BEFORE the snapshot read above, so a
+        // workspace registered in between (whose first activity write is
+        // already in `snapshots`) would be missing here — and an
+        // authoritative list omitting it would clear its live-arrived
+        // renderer state with no retry. Re-admit snapshot ids that a fresh
+        // raw config view now knows (cheap sync read; on failure the
+        // prefetched view stands and the miss is a transient one).
+        try {
+          const refreshedConfigIds = this.config.readPersistedWorkspaceIdSuperset();
+          for (const workspaceId of snapshots.keys()) {
+            if (!workspaceIds.has(workspaceId) && refreshedConfigIds.has(workspaceId)) {
+              workspaceIds.add(workspaceId);
+            }
+          }
+        } catch (error) {
+          log.debug("Failed to refresh config ids for first-bootstrap scoping", { error });
+        }
       } else {
         try {
           // throwOnError so a corrupted config.json actually reaches the
