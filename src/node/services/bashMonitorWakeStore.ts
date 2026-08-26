@@ -927,10 +927,17 @@ export class BashMonitorWakeStore {
       path.basename(originalPath).slice(0, -".json".length)
     );
     return this.locks.withLock(`${ownerWorkspaceId}:${id}`, async () => {
-      // Unreadable (vanished via a concurrent recover, or transiently failing): keep
-      // whatever may exist for a later retry.
-      const raw = await fsPromises.readFile(filePath, "utf-8").catch(() => null);
-      if (raw == null) return null;
+      // Vanished (concurrent recover already handled it): nothing to do. Any other read
+      // failure PROPAGATES — swallowing it would turn this scan into a successful empty
+      // result, silently bypassing both the caller's transient-failure policy and
+      // startup owner discovery, which would then never schedule this owner's delivery.
+      let raw: string;
+      try {
+        raw = await fsPromises.readFile(filePath, "utf-8");
+      } catch (error) {
+        if (isErrnoWithCode(error, "ENOENT")) return null;
+        throw error;
+      }
       const parsed = this.parse(raw);
       if (parsed?.status !== "pending") {
         // Old terminal and malformed content was already destined for pruning; sweep it
@@ -1037,7 +1044,19 @@ export class BashMonitorWakeStore {
     const ownerWorkspaceIds: string[] = [];
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
-      if ((await this.listPending(entry.name)).length > 0) {
+      try {
+        if ((await this.listPending(entry.name)).length > 0) {
+          ownerWorkspaceIds.push(entry.name);
+        }
+      } catch (error) {
+        // Fail OPEN for owner discovery: a transient scan failure must not silently
+        // skip this owner — its drain would then never be scheduled and a durable
+        // pending wake could sit undelivered forever. The drain re-reads pending wakes
+        // itself, so a spurious schedule for an owner with none is a harmless no-op.
+        log.debug("Pending wake scan failed during owner discovery; scheduling anyway", {
+          ownerWorkspaceId: entry.name,
+          error,
+        });
         ownerWorkspaceIds.push(entry.name);
       }
     }

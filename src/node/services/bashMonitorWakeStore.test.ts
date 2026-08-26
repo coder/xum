@@ -299,6 +299,39 @@ describe("BashMonitorWakeStore", () => {
     expect(later[0].lines).toEqual(["ERROR rearmed"]);
   });
 
+  test("owner discovery fails open when a stranded leftover cannot be read", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload());
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    const stranded = `${file}.prune-crashed`;
+    await fsPromises.rename(file, stranded);
+
+    const realReadFile = fsPromises.readFile;
+    const readSpy = spyOn(fsPromises, "readFile").mockImplementation(((
+      target: Parameters<typeof fsPromises.readFile>[0],
+      options: Parameters<typeof fsPromises.readFile>[1]
+    ) =>
+      target === stranded
+        ? Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
+        : realReadFile(target, options)) as unknown as typeof fsPromises.readFile);
+    try {
+      // The leftover read failure propagates instead of producing an empty scan…
+      try {
+        await store.listPending("owner-1");
+        expect.unreachable("expected listPending to propagate the leftover read failure");
+      } catch (error) {
+        expect((error as NodeJS.ErrnoException).code).toBe("EIO");
+      }
+      // …and startup owner discovery still schedules this owner rather than skipping it.
+      expect(await store.listPendingOwnerWorkspaceIds()).toEqual(["owner-1"]);
+    } finally {
+      readSpy.mockRestore();
+    }
+    // Once the transient failure clears, the stranded wake is recovered.
+    expect((await store.listPending("owner-1")).map((r) => r.id)).toEqual(["proc-1"]);
+  });
+
   test("a failed restore keeps the captured wake for a later recovery scan", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload());

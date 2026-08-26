@@ -605,6 +605,37 @@ describe("WorkspaceService bash monitor wakes", () => {
       expect(result.success).toBe(true);
       // One nudge after the durable retire, one after the post-clear restore pass.
       expect(notifyWakeStateChanged.mock.calls.length).toBeGreaterThanOrEqual(2);
+
+      // A restore pass that throws partway may already have rewritten earlier records to
+      // pending; subscribers must still be nudged or they keep the post-retirement
+      // snapshot (hiding those wakes) until unrelated process activity.
+      await wakeStore.enqueueOrMergePending({
+        processId: "proc-clear",
+        taskId: "bash:proc-clear",
+        workspaceId,
+        filter: "WAKE:",
+        filterExclude: false,
+        lines: ["WAKE: again"],
+        totalMatches: 2,
+        timestamp: Date.now(),
+        matchedThroughOffset: 20,
+      });
+      const restoreSpy = spyOn(wakeStore, "restorePendingSnapshots").mockImplementation(() =>
+        Promise.reject(new Error("disk full mid-restore"))
+      );
+      notifyWakeStateChanged.mockClear();
+      let rejected = false;
+      try {
+        await clearHistory(workspaceId, () => Promise.resolve(Ok(undefined)));
+      } catch {
+        rejected = true;
+      }
+      expect(rejected).toBe(true);
+      expect(restoreSpy).toHaveBeenCalled();
+      // Retire nudge plus one from each attempted restore pass (without the finally,
+      // the throwing restore would leave only the single retire nudge).
+      expect(notifyWakeStateChanged.mock.calls.length).toBeGreaterThanOrEqual(2);
+      restoreSpy.mockRestore();
     } finally {
       await cleanup();
     }

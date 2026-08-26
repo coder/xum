@@ -12358,8 +12358,14 @@ export class WorkspaceService extends EventEmitter {
           (acceptedBefore.has(key) && acceptedAfter?.has(key) === true)
         );
       });
-      await this.bashMonitorWakeStore.restorePendingSnapshots(workspaceId, restorable);
-      this.notifyBashMonitorWakeStateChanged(workspaceId);
+      try {
+        await this.bashMonitorWakeStore.restorePendingSnapshots(workspaceId, restorable);
+      } finally {
+        // Notify even when restoration throws partway: earlier records in the pass are
+        // already durably pending again, and without a nudge subscribers would keep the
+        // post-retirement snapshot (hiding those wakes) until unrelated activity.
+        this.notifyBashMonitorWakeStateChanged(workspaceId);
+      }
     };
     try {
       const clearResult = await clear();
