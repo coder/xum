@@ -8,7 +8,7 @@ import {
   DISPLAY_DATA_STUB,
   MEDIA_BUDGET_EXCEEDED_STUB,
   MEDIA_DATA_STUB,
-  MEDIA_UNSUPPORTED_STUB,
+  mediaUnsupportedStub,
 } from "@/common/utils/attachments/toolAttachmentParts";
 import { jsonSchema, type Tool } from "ai";
 import type { IJSRuntime, RuntimeLimits } from "./runtime";
@@ -975,7 +975,10 @@ describe("attachment part stripping", () => {
     const sandboxValue = (await captured.xum.attach_file({ path: "/x.bin" })) as {
       value: Array<{ type: string; text?: string }>;
     };
-    expect(sandboxValue.value[0]).toEqual({ type: "text", text: MEDIA_UNSUPPORTED_STUB });
+    expect(sandboxValue.value[0]).toEqual({
+      type: "text",
+      text: mediaUnsupportedStub("application/x-custom"),
+    });
     // Unsupported media is discarded rather than forwarded to the provider.
     expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
   });
@@ -1000,7 +1003,7 @@ describe("attachment part stripping", () => {
     const unsupported = (await captured.xum.attach_file({ path: "/audio.bin" })) as {
       value: Array<{ type: string; text?: string }>;
     };
-    expect(unsupported.value[0]).toEqual({ type: "text", text: MEDIA_UNSUPPORTED_STUB });
+    expect(unsupported.value[0]).toEqual({ type: "text", text: mediaUnsupportedStub("audio/wav") });
 
     const supported = (await captured.xum.attach_file({ path: "/image.png" })) as {
       value: Array<{ type: string; text?: string }>;

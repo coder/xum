@@ -27,7 +27,7 @@ import {
   DISPLAY_DATA_STUB,
   MEDIA_BUDGET_EXCEEDED_STUB,
   MEDIA_DATA_STUB,
-  MEDIA_UNSUPPORTED_STUB,
+  mediaUnsupportedStub,
   isMediaPart,
   type ToolAttachmentPart,
 } from "@/common/utils/attachments/toolAttachmentParts";
@@ -512,7 +512,11 @@ export class ToolBridge {
       if (isMediaPart(item)) {
         changed = true;
         const supported = isSupportedAttachmentMediaType(item.mediaType);
-        return strip(item, supported ? MEDIA_DATA_STUB : MEDIA_UNSUPPORTED_STUB, supported);
+        return strip(
+          item,
+          supported ? MEDIA_DATA_STUB : mediaUnsupportedStub(item.mediaType),
+          supported
+        );
       }
       if (isDisplayOnlyFilePart(item)) {
         changed = true;

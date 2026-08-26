@@ -3278,7 +3278,9 @@ describe("TaskService", () => {
       expect(result.error).toContain("no turn was dispatched");
     }
     expect(sendMessage).not.toHaveBeenCalled();
-  });
+    // The unreachable probe drives real docker CLI calls whose internal
+    // timeouts (10-30s) can exceed the 5s default on loaded CI runners.
+  }, 20_000);
 
   test("createWorkspaceTurn does not verify agents while the created workspace is still initializing", async () => {
     const config = await createTestConfig(rootDir);

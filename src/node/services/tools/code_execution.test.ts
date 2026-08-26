@@ -1479,7 +1479,7 @@ describe("createCodeExecutionTool", () => {
       )?.value;
       expect(value?.[0]?.data).toBe(MEDIA_DATA_STUB);
       expect(value?.[1]?.type).toBe("text");
-      expect(value?.[1]?.text).toContain("media bounded at capture: audio/wav");
+      expect(value?.[1]?.text).toContain("media omitted: audio/wav");
       expect(JSON.stringify(record)).not.toContain(audioData);
       expect(result.attachments).toEqual([
         { type: "media", mediaType: "image/png", data: "aGVsbG8=" },
