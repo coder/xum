@@ -2042,7 +2042,10 @@ export class WorkspaceService extends EventEmitter {
     // the clear. Cost: an occasional duplicate emit, which renderers apply idempotently.
     this.lastEmittedBashMonitorCounts.delete(workspaceId);
     void this.extensionMetadata
-      .getSnapshot(workspaceId)
+      // Strict: emitting a suspect (partial-main) snapshot after a failed
+      // sidecar reconcile would clear goal/status in the renderer; the
+      // catch below already retains "unknown" and re-emits on next change.
+      .getSnapshot(workspaceId, { throwOnError: true })
       .then((snapshot) => {
         this.emitWorkspaceActivity(workspaceId, snapshot);
         // Record only after a successful emit. Re-read the count because the emit merges
@@ -3920,10 +3923,23 @@ export class WorkspaceService extends EventEmitter {
     assert(event.workspaceId.length > 0, "emitWorkflowRunActivity requires workspaceId");
     assert(event.runId.length > 0, "emitWorkflowRunActivity requires runId");
     await this.updateActiveWorkflowRunCount(event);
-    this.emitWorkspaceActivity(
-      event.workspaceId,
-      await this.extensionMetadata.getSnapshot(event.workspaceId)
-    );
+    let snapshot: WorkspaceActivitySnapshot | null;
+    try {
+      snapshot = await this.extensionMetadata.getSnapshot(event.workspaceId, {
+        throwOnError: true,
+      });
+    } catch (error) {
+      // Emitting a suspect (partial-main) snapshot after a failed sidecar
+      // reconcile would clear goal/status in the renderer with no repair
+      // event. Retention is recoverable: the run count is already cached,
+      // so the next emit or list read delivers it.
+      log.debug("Skipping workflow-run activity emit after failed snapshot read", {
+        workspaceId: event.workspaceId,
+        error,
+      });
+      return;
+    }
+    this.emitWorkspaceActivity(event.workspaceId, snapshot);
   }
 
   /**

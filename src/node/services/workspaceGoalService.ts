@@ -1281,7 +1281,21 @@ export class WorkspaceGoalService {
     workspaceId: string,
     snapshot: GoalSnapshot
   ): Promise<boolean> {
-    const activity = await this.extensionMetadata.getSnapshot(workspaceId);
+    let activity: WorkspaceActivitySnapshot | null;
+    try {
+      activity = await this.extensionMetadata.getSnapshot(workspaceId, { throwOnError: true });
+    } catch (error) {
+      // A suspect baseline (failed sidecar reconcile / unreadable main)
+      // must not feed an emitted overlay: partial-main fields would clear
+      // status in the renderer. Report non-delivery instead — callers that
+      // must guarantee delivery fall back to pushSnapshot, whose lenient
+      // write path self-heals.
+      log.debug("Skipping transient goal emit after failed snapshot read", {
+        workspaceId,
+        error,
+      });
+      return false;
+    }
     if (!activity) {
       // No baseline activity snapshot to overlay the transient goal on
       // (extensionMetadata has no entry for this workspace yet). Callers

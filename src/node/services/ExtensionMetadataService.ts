@@ -668,20 +668,32 @@ export class ExtensionMetadataService {
     });
   }
 
-  async getSnapshot(workspaceId: string): Promise<WorkspaceActivitySnapshot | null> {
+  async getSnapshot(
+    workspaceId: string,
+    options?: { throwOnError?: boolean }
+  ): Promise<WorkspaceActivitySnapshot | null> {
     // Same leftover-sidecar reconcile as getAllSnapshots (see the comment
     // there): live emissions read through this path after the subscription
     // bootstraps, so without it a recreated partial main would feed emitted
     // snapshots (clearing goal/status in the renderer) while the healthy
-    // subscription never triggers another list read. Best-effort here: an
-    // unprobeable sidecar must not block a live emission — the strict list
-    // read propagates the same failure and keeps hydration retryable.
+    // subscription never triggers another list read.
+    // Strict callers (the emit paths) must also propagate a FAILED
+    // reconcile instead of reading through it: with a sidecar present the
+    // main file is suspect (typically a partial recreation), and emitting
+    // it would clear goal/status in the renderer with no guaranteed
+    // strict-list retry to repair — skipping the emit retains the
+    // renderer's last-known snapshot until the reconcile succeeds. Lenient
+    // callers (settings/eligibility readers) keep availability: a stranded
+    // sidecar must never block message sending or heartbeats.
     try {
       await this.reconcileLeftoverSidecarIfPresent();
     } catch (error) {
+      if (options?.throwOnError) {
+        throw error;
+      }
       log.debug("Leftover sidecar reconcile failed during snapshot read", { error });
     }
-    const data = await this.load();
+    const data = await this.load(options);
     return this.toSnapshot(data.workspaces[workspaceId]);
   }
 

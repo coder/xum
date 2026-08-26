@@ -905,6 +905,39 @@ describe("ExtensionMetadataService", () => {
     expect(snapshots.get("ws-partial")?.recency).toBe(300);
   });
 
+  test("a strict snapshot read propagates a failed sidecar reconcile instead of the partial main", async () => {
+    // Live emissions read per-workspace snapshots after the subscription
+    // bootstraps. With a sidecar stranded next to a recreated partial main
+    // and the reconcile failing transiently, emitting the partial main
+    // would clear goal/status in the renderer with no guaranteed
+    // strict-list retry — strict readers (the emit paths) must skip the
+    // emit by propagating, while lenient readers (settings/eligibility)
+    // keep availability.
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-partial": { recency: 300, streaming: false } },
+      })
+    );
+    // A directory at the sidecar path yields a deterministic errno (EISDIR)
+    // standing in for EACCES/EIO-class reconcile failures.
+    await mkdir(`${filePath}.corrupt`);
+
+    let strictError: unknown = null;
+    try {
+      await service.getSnapshot("ws-partial", { throwOnError: true });
+    } catch (error) {
+      strictError = error;
+    }
+    expect((strictError as NodeJS.ErrnoException | null)?.code).toBe("EISDIR");
+    // Lenient readers keep availability on the same state.
+    expect((await service.getSnapshot("ws-partial"))?.recency).toBe(300);
+    // Once the sidecar becomes readable (here: gone), the strict read heals.
+    await rm(`${filePath}.corrupt`, { recursive: true });
+    expect((await service.getSnapshot("ws-partial", { throwOnError: true }))?.recency).toBe(300);
+  });
+
   test("a strict read reconciles a leftover sidecar next to a recreated valid main", async () => {
     // Crash between quarantine's rename and its completion, then another
     // backend recreates a VALID partial main from the missing-main window
