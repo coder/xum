@@ -204,10 +204,15 @@ const SKILL_BODY_CAPTURE_TRUNCATION_NOTE =
  * supported 50k snapshot limit plus frontmatter overhead) must degrade to a
  * bounded body like createLoadedSkillSnapshot does, not lose the whole
  * package to a __kernelBounded marker (which compaction then drops entirely,
- * erasing the skill instructions from every later turn). Serialized escape
- * inflation only ever over-estimates the non-body overhead, so the sliced
- * package is guaranteed to fit. Returns undefined (normal bounding) for
- * malformed packages the extractor would reject anyway.
+ * erasing the skill instructions from every later turn).
+ *
+ * The budget is computed in SERIALIZED space (r21): subtracting the RAW body
+ * length from the package's serialized length treated the body's own escape
+ * inflation (newlines, quotes, backslashes serialize to 2+ chars) as fixed
+ * overhead, so an escape-heavy body drove the budget negative and lost the
+ * whole package even though a shorter serialized prefix fits. Returns
+ * undefined (normal bounding) for malformed packages the extractor would
+ * reject anyway, or when the true non-body overhead alone exceeds the cap.
  */
 function boundOversizedSkillPackage(
   skill: unknown,
@@ -220,12 +225,40 @@ function boundOversizedSkillPackage(
   if (typeof body !== "string") return undefined;
   // Serialized note length minus the surrounding quotes.
   const noteSerializedChars = JSON.stringify(SKILL_BODY_CAPTURE_TRUNCATION_NOTE).length - 2;
-  const budget = MAX_FILE_CONTENT_SIZE - (reducedLength - body.length) - noteSerializedChars;
-  if (budget <= 0) return undefined;
+  // True non-body overhead: package serialized length minus the body's
+  // SERIALIZED content chars (between its quotes).
+  const serializedBodyChars = JSON.stringify(body).length - 2;
+  const overhead = reducedLength - serializedBodyChars;
+  const serializedBudget = MAX_FILE_CONTENT_SIZE - overhead - noteSerializedChars;
+  if (serializedBudget <= 0) return undefined;
+  // Largest raw-body prefix whose serialized form fits the budget. Escape
+  // expansion is per-character, so the predicate is monotonic in prefix
+  // length (the one exception — a lone trailing high surrogate escaping to 6
+  // chars where the completed pair costs 2 — can only make the search settle
+  // on a slightly shorter prefix; `low` is only ever advanced to a value that
+  // TESTED as fitting, so the result always fits).
+  let low = 0;
+  let high = body.length;
+  while (low < high) {
+    const mid = Math.ceil((low + high) / 2);
+    const midSerializedChars = JSON.stringify(body.slice(0, mid)).length - 2;
+    if (midSerializedChars <= serializedBudget) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+  // Do not end the retained body on a split surrogate pair: dropping a
+  // trailing lone HIGH surrogate strictly shrinks the serialized form.
+  if (low > 0) {
+    const lastCode = body.charCodeAt(low - 1);
+    if (lastCode >= 0xd800 && lastCode <= 0xdbff) low -= 1;
+  }
+  if (low <= 0) return undefined;
   return {
     ...success,
     ...error,
-    skill: { ...skill, body: `${body.slice(0, budget)}${SKILL_BODY_CAPTURE_TRUNCATION_NOTE}` },
+    skill: { ...skill, body: `${body.slice(0, low)}${SKILL_BODY_CAPTURE_TRUNCATION_NOTE}` },
   };
 }
 

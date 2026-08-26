@@ -55,6 +55,26 @@ describe("retainExemptKernelRecordResult", () => {
       });
       expect(retained).toBeUndefined();
     });
+
+    it("truncates escape-heavy bodies by serialized budget instead of dropping them", () => {
+      // An all-newline body serializes at ~2x its raw length; a raw-length
+      // budget treated that inflation as fixed overhead, went negative, and
+      // lost the whole package to a marker even though a shorter serialized
+      // prefix fits (r21).
+      const retained = retainExemptKernelRecordResult("agent_skill_read", {
+        success: true,
+        skill: { ...oversizedSkill, body: "\n".repeat(MAX_FILE_CONTENT_SIZE) },
+      }) as { success?: boolean; skill?: { body?: string } };
+      expect(retained?.success).toBe(true);
+      expect(retained?.skill?.body?.startsWith("\n\n\n")).toBe(true);
+      expect(
+        retained?.skill?.body?.endsWith(
+          "[Skill body truncated at capture to fit the retained-record cap]"
+        )
+      ).toBe(true);
+      expect(JSON.stringify(retained).length).toBeLessThanOrEqual(MAX_FILE_CONTENT_SIZE);
+      expect(AgentSkillPackageSchema.safeParse(retained?.skill).success).toBe(true);
+    });
   });
 
   describe("file_edit_* diff bounding", () => {
