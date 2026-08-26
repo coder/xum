@@ -62,6 +62,7 @@ type PreservedSendOptions = Pick<
   | "providerOptions"
   | "experiments"
   | "disableWorkspaceAgents"
+  | "strictAgentResolution"
   | "allowAgentSetGoal"
   | "skipAiSettingsPersistence"
 >;
@@ -78,6 +79,10 @@ export function pickPreservedSendOptions(options: SendMessageOptions): Preserved
     providerOptions: options.providerOptions,
     experiments: options.experiments,
     disableWorkspaceAgents: options.disableWorkspaceAgents,
+    // Delegated turns with explicit agent overrides must stay loud across the
+    // compaction replay too — dropping this would let the follow-up silently
+    // fall back to exec if the agent vanished in the meantime.
+    strictAgentResolution: options.strictAgentResolution,
     allowAgentSetGoal: options.allowAgentSetGoal,
     skipAiSettingsPersistence: options.skipAiSettingsPersistence,
   };
@@ -95,14 +100,30 @@ export type StartupRetrySendOptions = Pick<
   | "providerOptions"
   | "experiments"
   | "disableWorkspaceAgents"
+  | "strictAgentResolution"
   | "allowAgentSetGoal"
 > & {
-  /** Correlation for a delegated workspace turn that must survive restart recovery. */
-  muxMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+  /**
+   * Correlation metadata that must survive restart recovery: delegated
+   * workspace turns and interrupted compaction requests. A resumed compaction
+   * stream needs its original metadata so trailing synthetic rows cannot break
+   * compaction detection (resolveCompactionRequest only skips synthetic rows
+   * when the stream itself identifies as a compaction request).
+   */
+  muxMetadata?:
+    | Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+    | Extract<MuxMessageMetadata, { type: "compaction-request" }>;
   /** Internal-only Copilot billing override for startup auto-retry. */
   agentInitiated?: boolean;
   /** Internal goal continuation classification for startup auto-retry accounting. */
   goalKind?: GoalSyntheticMessageKind;
+  /**
+   * Goal identity matching `goalKind`. Not persisted by
+   * pickStartupRetrySendOptions (the user row's own metadata.goalId is the
+   * durable copy); startup recovery re-derives it so resumed streams keep
+   * goal-scoped compaction follow-ups (Codex P2 PRRT_kwDOPxxmWM6cIv2E).
+   */
+  goalId?: string;
 };
 
 /**
@@ -128,6 +149,8 @@ export function pickStartupRetrySendOptions(
     providerOptions: options.providerOptions,
     experiments: options.experiments,
     disableWorkspaceAgents: options.disableWorkspaceAgents,
+    // Keep explicit-agent turns loud across restart recovery (see pickPreservedSendOptions).
+    strictAgentResolution: options.strictAgentResolution,
     allowAgentSetGoal: options.allowAgentSetGoal,
     ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     ...(agentInitiated === true ? { agentInitiated: true } : {}),
@@ -164,6 +187,13 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
   agentInitiated?: boolean;
   /** Internal goal continuation classification for synthetic follow-up accounting. */
   goalKind?: GoalSyntheticMessageKind;
+  /**
+   * Goal identity matching `goalKind`. Preserved through compaction so the
+   * re-dispatched follow-up row stays goal-scoped for chat-tail
+   * reconciliation instead of degrading to a legacy unscoped row (Codex P2
+   * PRRT_kwDOPxxmWM6cIv2E).
+   */
+  goalId?: string;
   /** Internal dispatch guardrails for crash-safe follow-up recovery. */
   dispatchOptions?: CompactionFollowUpDispatchOptions;
   /**
@@ -598,6 +628,14 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
       }
     | {
         type: "goal-pause-boundary";
+        /**
+         * Goal this boundary pauses. Chat-tail reconciliation ignores
+         * boundaries stamped for a different goal so a stale pause finalizer
+         * racing a replacement cannot silently pause the newer goal (Codex P2
+         * PRRT_kwDOPxxmWM6cEl4F). Optional for legacy rows, which keep the
+         * old any-goal semantics.
+         */
+        goalId?: string;
       }
     | {
         // Durable, provider-visible summary of an abandoned history branch
@@ -830,6 +868,13 @@ export interface MuxMetadata {
   partial?: boolean; // Whether this message was interrupted and is incomplete
   synthetic?: boolean; // Whether this message was synthetically generated (e.g., [CONTINUE] sentinel)
   /**
+   * For queue-dispatched user turns: when the user last added to the queued
+   * entry. The row `timestamp` is stamped at dispatch (after the blocking turn
+   * ends), so goal safety needs this to durably tell messages typed before a
+   * mid-turn goal existed from genuine interventions against a visible goal.
+   */
+  enqueuedAtMs?: number;
+  /**
    * UI hint: show in the chat UI even when synthetic.
    *
    * Synthetic messages are hidden by default because most are for model context only.
@@ -867,6 +912,14 @@ export interface MuxMetadata {
   muxMetadata?: MuxMessageMetadata; // Command metadata used by both frontend and backend message flows
   /** Persisted discriminator for synthetic user turns created by the active-goal loop. */
   kind?: "goal_continuation" | "goal_budget_limit";
+  /**
+   * Goal identity for `kind` rows. Chat-tail reconciliation only accepts a
+   * continuation row as "goal is active" evidence when it was dispatched for
+   * the goal being reconciled — a replaced goal's continuation must not
+   * reactivate its successor (Codex P2 PRRT_kwDOPxxmWM6cH3kV). Legacy rows
+   * without a goalId keep the old any-goal semantics.
+   */
+  goalId?: string;
 
   /**
    * ACP-only correlation id propagated through stream events so prompt() can

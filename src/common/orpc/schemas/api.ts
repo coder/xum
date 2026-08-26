@@ -35,6 +35,7 @@ import {
   GoalSetInputSchema,
 } from "./goal";
 import { ProjectConfigSchema } from "./project";
+import { ProjectWorkspaceCountsSchema } from "@/common/utils/projectRemoval";
 import {
   MemoryChangeEventSchema,
   MemoryConsolidationRecordSchema,
@@ -754,6 +755,12 @@ export const projects = {
   remove: {
     input: z.object({ projectPath: z.string(), force: z.boolean().nullish() }).passthrough(),
     output: ResultSchema(z.void(), ProjectRemoveErrorSchema),
+  },
+  // Read-only preflight for the delete confirmation dialog: projects.list no
+  // longer embeds archived workspaces, so blocker counts come from the backend.
+  getRemovalBlockers: {
+    input: z.object({ projectPath: z.string() }),
+    output: ProjectWorkspaceCountsSchema,
   },
   list: {
     input: z.void(),

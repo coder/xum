@@ -62,6 +62,7 @@ import {
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
+import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
 import { orchestrateFork } from "@/node/services/utils/forkOrchestrator";
 import {
   createRuntimeContextForWorkspace,
@@ -73,9 +74,13 @@ import type { InitLogger, Runtime } from "@/node/runtime/Runtime";
 import { readPlanFile } from "@/node/utils/runtime/helpers";
 import {
   coerceNonEmptyString,
+  tryReadGitBranchMatchesOrigin,
+  tryReadGitCurrentBranch,
   tryReadGitHeadCommitSha,
+  tryReadGitPathsClean,
   findWorkspaceEntry,
 } from "@/node/services/taskUtils";
+import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
 import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
 import { getTaskGroupCount } from "@/common/utils/tools/taskGroups";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
@@ -102,10 +107,15 @@ import { defaultModel, normalizeSelectedModel } from "@/common/utils/ai/models";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
-import { runtimeModeSupportsSharedTaskWorkspace, type RuntimeConfig } from "@/common/types/runtime";
+import {
+  RUNTIME_MODE,
+  runtimeModeSupportsSharedTaskWorkspace,
+  type RuntimeConfig,
+} from "@/common/types/runtime";
 import type { ProjectRef, WorkspaceMetadata } from "@/common/types/workspace";
 import { getRuntimeType } from "@/node/runtime/initHook";
 import { AgentIdSchema } from "@/common/orpc/schemas";
+import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
 import {
   normalizeAgentId,
   resolvePersistedAgentId,
@@ -562,10 +572,72 @@ function isAgentRunnableAsChild(
 
 type WorkspaceTurnQueueDispatchMode = "tool-end" | "turn-end";
 
+/**
+ * Project-relative paths that contribute agent definitions to discovery
+ * (project agent roots, project plugin containers). Owner-side vouching for a
+ * freshly created checkout requires these to be clean in the owner: the child is
+ * created from committed branch state, so uncommitted changes here make
+ * owner-side agent resolution diverge from what the target will see.
+ */
+const AGENT_DEFINITION_PROJECT_PATHSPECS: readonly string[] = [
+  ...listProjectMetadataRelativePaths("agents"),
+  ...listProjectMetadataRelativePaths("plugins"),
+  ".agents/plugins",
+];
+
+/** Provenance of one hop of a validated agent's base chain (strict-send pinning). */
+interface WorkspaceTurnAgentChainEntry {
+  id: string;
+  scope: AgentDefinitionScope;
+  source?: string;
+}
+
+/** Agent-discovery context for a workspace involved in a workspace turn. */
+interface WorkspaceTurnAgentContext {
+  runtime: Runtime;
+  workspacePath: string;
+  includeAgentPlugins: boolean;
+  /** Source config, kept so owner/target contexts can be compared for host identity. */
+  runtimeConfig: RuntimeConfig;
+}
+
+/**
+ * Whether agent discovery for both runtime configs reads the same host filesystem,
+ * i.e. the owner's global/plugin agent roots are literally the target's roots.
+ * Local-family runtimes (local/worktree) share the local machine. Plain SSH shares
+ * the remote home only for an identical host/port with no Coder indirection —
+ * CoderSSHRuntime.finalizeConfig derives a distinct per-workspace host, so a Coder
+ * owner's ~/.xum/agents says nothing about the child's. Docker/devcontainer get
+ * per-workspace containers and never share.
+ */
+function runtimeConfigsShareAgentHost(a: RuntimeConfig, b: RuntimeConfig): boolean {
+  const isLocalFamily = (rc: RuntimeConfig): boolean =>
+    rc.type === RUNTIME_MODE.LOCAL || rc.type === RUNTIME_MODE.WORKTREE;
+  if (isLocalFamily(a) && isLocalFamily(b)) {
+    return true;
+  }
+  if (a.type === RUNTIME_MODE.SSH && b.type === RUNTIME_MODE.SSH) {
+    return (
+      a.coder == null && b.coder == null && a.host === b.host && (a.port ?? 22) === (b.port ?? 22)
+    );
+  }
+  return false;
+}
+
 export interface WorkspaceTurnCreateArgs {
   ownerWorkspaceId: string;
   prompt: string;
   title: string;
+  /**
+   * Agent mode for the launched turn (e.g. "plan"). Defaults to exec for new
+   * workspaces and to the resumed identity for existing descendant agent
+   * workspaces. For a new workspace the requested agent becomes its default;
+   * on an existing normal workspace it is a per-turn override dispatched with
+   * AI-settings persistence disabled, so the target's saved agent/settings are
+   * untouched. Rejected for descendant agent workspaces, whose persisted
+   * identity always wins at stream time.
+   */
+  agentId?: string;
   modelString?: string;
   thinkingLevel?: ParsedThinkingInput;
   parentRuntimeAiSettings?: { modelString?: string; thinkingLevel?: ThinkingLevel };
@@ -3845,6 +3917,241 @@ export class TaskService {
     this.scheduleMaybeStartQueuedTasks();
   }
 
+  /**
+   * Agent-discovery context for a workspace involved in a workspace turn. Uses
+   * createRuntimeContextForWorkspace — the same helper the stream uses in
+   * aiService — so validation resolves agents from the exact discovery path that
+   * will stream (Docker container-side paths, subproject directories included).
+   */
+  private buildWorkspaceTurnAgentContext(params: {
+    runtimeConfig: RuntimeConfig;
+    projectPath: string;
+    workspaceName: string;
+    persistedWorkspacePath?: string;
+    subProjectPath?: string;
+  }): WorkspaceTurnAgentContext {
+    const context = createRuntimeContextForWorkspace({
+      runtimeConfig: params.runtimeConfig,
+      projectPath: params.projectPath,
+      name: params.workspaceName,
+      namedWorkspacePath: coerceNonEmptyString(params.persistedWorkspacePath),
+      subProjectPath: coerceNonEmptyString(params.subProjectPath),
+    });
+    return {
+      ...context,
+      includeAgentPlugins: this.workspaceService.isExperimentEnabled(EXPERIMENT_IDS.AGENT_PLUGINS),
+      runtimeConfig: params.runtimeConfig,
+    };
+  }
+
+  /**
+   * Fail-fast eligibility check for an explicit workspace-turn agentId.
+   * resolveAgentForStream silently falls back to exec for top-level workspaces,
+   * which would hide a caller's mistake — so unknown, internal (ui.hidden), and
+   * disabled agents are rejected here before any turn is dispatched. Mirrors
+   * the UI agent picker rule set (including Agent Plugins roots when that
+   * experiment is enabled), so custom user-visible agents pass without a
+   * hardcoded allowlist.
+   */
+  private async validateWorkspaceTurnAgentId(params: {
+    cfg: ReturnType<Config["loadConfigOrDefault"]>;
+    agentId: string;
+    /** Workspace the validation is for (log correlation in chain resolution). */
+    workspaceId: string;
+    /** Discovery context of the workspace whose turn will run (or the owner pre-create). */
+    runtime: Runtime;
+    workspacePath: string;
+    includeAgentPlugins: boolean;
+  }): Promise<
+    Result<
+      {
+        scope: AgentDefinitionScope;
+        source?: string;
+        chain: WorkspaceTurnAgentChainEntry[];
+      },
+      string
+    >
+  > {
+    assert(params.agentId.length > 0, "validateWorkspaceTurnAgentId: agentId must be non-empty");
+    const parsedAgentId = AgentIdSchema.safeParse(params.agentId);
+    if (!parsedAgentId.success) {
+      return Err(`Task.createWorkspaceTurn: invalid agentId (${params.agentId})`);
+    }
+    // The winning definition's provenance (scope + exact source) AND the resolved
+    // base chain's provenance are captured so the dispatched turn can pin them at
+    // stream time (strictAgentResolution): a validated definition or base shadow
+    // vanishing must not let a different candidate with the same id run under a
+    // strict send.
+    let scope: AgentDefinitionScope;
+    let source: string | undefined;
+    let chain: WorkspaceTurnAgentChainEntry[];
+    try {
+      const definition = await readAgentDefinition(
+        params.runtime,
+        params.workspacePath,
+        parsedAgentId.data,
+        { includeAgentPlugins: params.includeAgentPlugins }
+      );
+      scope = definition.scope;
+      source = definition.source;
+      const resolvedChain = await resolveAgentInheritanceChain({
+        runtime: params.runtime,
+        workspacePath: params.workspacePath,
+        agentId: parsedAgentId.data,
+        agentDefinition: definition,
+        workspaceId: params.workspaceId,
+        includeAgentPlugins: params.includeAgentPlugins,
+      });
+      chain = resolvedChain.map((entry) => ({
+        id: entry.id,
+        scope: entry.scope,
+        ...(entry.source != null ? { source: entry.source } : {}),
+      }));
+    } catch {
+      return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
+    }
+    let frontmatter: Awaited<ReturnType<typeof resolveAgentFrontmatter>>;
+    try {
+      frontmatter = await resolveAgentFrontmatter(
+        params.runtime,
+        params.workspacePath,
+        params.agentId,
+        { includeAgentPlugins: params.includeAgentPlugins }
+      );
+    } catch {
+      return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
+    }
+    if (!resolveAgentVisibility(frontmatter.ui).selectable) {
+      return Err(
+        `Task.createWorkspaceTurn: agentId is not selectable for workspace turns (${params.agentId})`
+      );
+    }
+    if (
+      isAgentEffectivelyDisabled({
+        cfg: params.cfg,
+        agentId: params.agentId,
+        resolvedFrontmatter: frontmatter,
+      })
+    ) {
+      return Err(`Task.createWorkspaceTurn: agentId is disabled (${params.agentId})`);
+    }
+    return Ok({ scope, ...(source != null ? { source } : {}), chain });
+  }
+
+  /**
+   * Validate an explicit agentId against the TARGET workspace's checkout, tolerating
+   * targets that are not reachable yet (deferred provisioning, stopped containers)
+   * without permitting a silent exec fallback later:
+   * - reachable checkout: strict validation against the target. If that fails while
+   *   the target's init hook is still running, the verdict is not trustworthy (the
+   *   hook may still be installing/rewriting agent definitions), so the launch fails
+   *   with an explicitly transient error instead of a definitive "unknown agentId";
+   * - unreachable checkout: resolve the definition via the OWNER's context, but only
+   *   when the owner and target run agent discovery on the same host filesystem
+   *   (runtimeConfigsShareAgentHost) — cross-host (Coder per-workspace hosts, per-
+   *   workspace containers), the owner's global roots say nothing about the target's,
+   *   and even a built-in could be shadowed by a target-host global definition, so
+   *   everything fails closed. Same-host, project shadows and global roots are
+   *   visible through the owner: a checkout-dependent (project-scope) winner still
+   *   fails with a reachability error — it cannot be verified in the target and
+   *   dispatching anyway would let resolveAgentForStream silently fall back to exec
+   *   (wrong prompt/tool policy) — while host-side definitions (built-in, global,
+   *   plugin) are validated against the owner context and the launch proceeds.
+   * Waiting for provisioning/init here is not an option: createWorkspaceTurn holds
+   * the service-wide task mutex for its whole body. Failures in these windows settle
+   * as retryable errors (mode="existing" once the target is ready) rather than
+   * dispatching an unverified id.
+   */
+  private async validateWorkspaceTurnAgentIdForTarget(params: {
+    cfg: ReturnType<Config["loadConfigOrDefault"]>;
+    agentId: string;
+    /** Target workspace id (log correlation in chain resolution). */
+    workspaceId: string;
+    target: WorkspaceTurnAgentContext;
+    owner: WorkspaceTurnAgentContext;
+    /** Whether the target workspace's init hook is still running (see doc above). */
+    targetInitPending: boolean;
+    /**
+     * Whether the owner's checkout is a sound predictor of the target's agent
+     * definitions. Only true for workspaces this call just created from the branch
+     * verified (via git) to be checked out in the owner right now. False for existing
+     * targets (their checkout has unknown provenance — any branch, uncommitted shadows)
+     * and for new workspaces whose base branch differs from or cannot be proven equal
+     * to the owner's. When false, unreachable targets fail closed instead of trusting
+     * owner-side resolution.
+     */
+    ownerResolutionPredictsTarget: boolean;
+  }): Promise<
+    Result<
+      {
+        validatedContext: WorkspaceTurnAgentContext;
+        scope: AgentDefinitionScope;
+        source?: string;
+        chain: WorkspaceTurnAgentChainEntry[];
+      },
+      string
+    >
+  > {
+    const reachable = await runtimePathExists(params.target.runtime, params.target.workspacePath);
+    if (reachable) {
+      const validation = await this.validateWorkspaceTurnAgentId({
+        cfg: params.cfg,
+        agentId: params.agentId,
+        workspaceId: params.workspaceId,
+        ...params.target,
+      });
+      if (validation.success) {
+        return Ok({ validatedContext: params.target, ...validation.data });
+      }
+      if (params.targetInitPending) {
+        return Err(
+          `Task.createWorkspaceTurn: the target workspace is still initializing, so agentId (${params.agentId}) could not be verified yet (${validation.error})`
+        );
+      }
+      return validation;
+    }
+    if (!params.ownerResolutionPredictsTarget) {
+      return Err(
+        `Task.createWorkspaceTurn: target checkout is not reachable (provisioning, stopped runtime, or unknown checkout state), so agentId (${params.agentId}) cannot be verified there`
+      );
+    }
+    if (!runtimeConfigsShareAgentHost(params.owner.runtimeConfig, params.target.runtimeConfig)) {
+      return Err(
+        `Task.createWorkspaceTurn: target checkout is not reachable and runs on a different host than the owner, so agentId (${params.agentId}) cannot be verified there`
+      );
+    }
+    const parsedAgentId = AgentIdSchema.safeParse(params.agentId);
+    if (!parsedAgentId.success) {
+      return Err(`Task.createWorkspaceTurn: invalid agentId (${params.agentId})`);
+    }
+    let resolvedScope: AgentDefinitionScope;
+    try {
+      const definition = await readAgentDefinition(
+        params.owner.runtime,
+        params.owner.workspacePath,
+        parsedAgentId.data,
+        { includeAgentPlugins: params.owner.includeAgentPlugins }
+      );
+      resolvedScope = definition.scope;
+    } catch {
+      return Err(`Task.createWorkspaceTurn: unknown agentId (${params.agentId})`);
+    }
+    if (resolvedScope === "project") {
+      return Err(
+        `Task.createWorkspaceTurn: target checkout is not reachable yet (provisioning or stopped runtime), so project-local agentId (${params.agentId}) cannot be verified there`
+      );
+    }
+    const validation = await this.validateWorkspaceTurnAgentId({
+      cfg: params.cfg,
+      agentId: params.agentId,
+      workspaceId: params.workspaceId,
+      ...params.owner,
+    });
+    return validation.success
+      ? Ok({ validatedContext: params.owner, ...validation.data })
+      : validation;
+  }
+
   async createWorkspaceTurn(
     args: WorkspaceTurnCreateArgs
   ): Promise<Result<WorkspaceTurnCreateResult, string>> {
@@ -3864,6 +4171,17 @@ export class TaskService {
     const queueDispatchMode = args.workspace?.queueDispatchMode ?? "tool-end";
     if (queueDispatchMode !== "tool-end" && queueDispatchMode !== "turn-end") {
       return Err("Task.createWorkspaceTurn: unsupported queueDispatchMode");
+    }
+    // Explicit agent override: validate syntax up front; eligibility (existence,
+    // selectability, enablement) is checked below against the workspace whose turn will run.
+    let requestedAgentId: string | undefined;
+    const rawAgentId = coerceNonEmptyString(args.agentId);
+    if (rawAgentId != null) {
+      const parsedAgentId = AgentIdSchema.safeParse(normalizeAgentId(rawAgentId, ""));
+      if (!parsedAgentId.success) {
+        return Err(`Task.createWorkspaceTurn: invalid agentId (${rawAgentId})`);
+      }
+      requestedAgentId = parsedAgentId.data;
     }
 
     await using _lock = await this.mutex.acquire();
@@ -3911,8 +4229,25 @@ export class TaskService {
     const turnId = this.config.generateStableId();
     const createdAt = getIsoNow();
     // New workspace turns use exec. Follow-ups in a persistent agent-task workspace preserve that
-    // child's original agent identity and task-level model settings.
+    // child's original agent identity and task-level model settings. An explicit args.agentId
+    // (validated above/below) overrides either default for this turn only.
     let workspaceTurnAgentId = "exec";
+    // Definition context of the checkout the explicit agent was validated against, so
+    // agent-authored frontmatter `ai` defaults participate in AI-settings resolution
+    // (mirrors the sub-agent creation path). Left unset for default exec/resume turns.
+    let agentDefinitionContext: NodeAgentDefinitionContext | undefined;
+    // Provenance (scope + exact source + base chain) of the definition that
+    // authorized the dispatch; pinned at stream time via strictAgentResolution so a
+    // vanished definition or base shadow cannot silently hand any hop to a
+    // different candidate.
+    let validatedAgentProvenance:
+      | { scope: AgentDefinitionScope; source?: string; chain: WorkspaceTurnAgentChainEntry[] }
+      | undefined;
+    // Post-create target validation failure. Deferred (not returned immediately) so the
+    // workspace-turn record is still written first: the record marks the created workspace
+    // as owner-owned and retryable via mode="existing", and the failure settles through the
+    // normal handle machinery instead of stranding an unowned workspace.
+    let agentValidationError: string | undefined;
     let targetWorkspaceId: string;
     let targetAiSettings: ResolvedWorkspaceAiSettings | undefined;
     let targetTaskModelString: string | undefined;
@@ -3961,6 +4296,64 @@ export class TaskService {
         targetTaskThinkingLevel = targetEntry.workspace.taskThinkingLevel;
         targetTaskExperiments = targetEntry.workspace.taskExperiments;
       }
+      if (requestedAgentId != null) {
+        // Persistent agent-task children are pinned to their persisted identity:
+        // resolveAgentForStream ignores the per-send agentId whenever metadata has
+        // parentWorkspaceId, so an override could never actually run — reject instead of
+        // resolving settings for an agent that will not stream.
+        if (targetIsAgentWorkspace) {
+          return Err(
+            `Task.createWorkspaceTurn: explicit agentId is not supported for descendant agent workspaces (${targetWorkspaceId} keeps its persisted agent identity)`
+          );
+        }
+        // Per-turn override for a normal owner-created workspace: wins for this turn but
+        // never mutates the target workspace's saved agent/settings (the dispatch below
+        // skips AI-settings persistence). Validate against the TARGET workspace's checkout
+        // (project-local agent definitions can diverge across branches).
+        const ownerContext = this.buildWorkspaceTurnAgentContext({
+          runtimeConfig: parentMeta.runtimeConfig,
+          projectPath: parentMeta.projectPath,
+          workspaceName: parentMeta.name,
+          persistedWorkspacePath: parentEntry?.workspace.path,
+          subProjectPath: parentMeta.subProjectPath,
+        });
+        const targetContext =
+          targetEntry != null
+            ? this.buildWorkspaceTurnAgentContext({
+                runtimeConfig: targetEntry.workspace.runtimeConfig ?? parentMeta.runtimeConfig,
+                projectPath: targetEntry.projectPath,
+                // Entries created by workspaceService.create always carry a name; the fallback
+                // only satisfies the optional persisted-config type.
+                workspaceName: coerceNonEmptyString(targetEntry.workspace.name) ?? parentMeta.name,
+                persistedWorkspacePath: targetEntry.workspace.path,
+                subProjectPath: targetEntry.workspace.subProjectPath,
+              })
+            : ownerContext;
+        const validation = await this.validateWorkspaceTurnAgentIdForTarget({
+          cfg,
+          agentId: requestedAgentId,
+          workspaceId: existingWorkspaceId,
+          target: targetContext,
+          owner: ownerContext,
+          targetInitPending:
+            this.initStateManager.getInitState(existingWorkspaceId)?.status === "running",
+          // Existing targets have unknown checkout provenance (any branch, uncommitted
+          // shadows), so an unreachable checkout fails closed rather than trusting the
+          // owner's resolution. Omitting agentId still works (default identity).
+          ownerResolutionPredictsTarget: false,
+        });
+        if (!validation.success) return Err(validation.error);
+        workspaceTurnAgentId = requestedAgentId;
+        validatedAgentProvenance = {
+          scope: validation.data.scope,
+          ...(validation.data.source != null ? { source: validation.data.source } : {}),
+          chain: validation.data.chain,
+        };
+        agentDefinitionContext = {
+          ...validation.data.validatedContext,
+          workspaceId: targetWorkspaceId,
+        };
+      }
       // Follow-up sends continue the target workspace's own last-used settings
       // (persisted on every send, or manually changed by the user in that
       // workspace) instead of re-inheriting the owner's live settings on each
@@ -3979,6 +4372,96 @@ export class TaskService {
         if (!slot.success) return Err(slot.error);
       }
     } else {
+      let ownerContext: WorkspaceTurnAgentContext | undefined;
+      // Owner-side vouching for the created checkout's agent definitions requires proof
+      // that the target's base IS the branch actually checked out in the owner. The
+      // workspace name cannot prove it: branch→name sanitization is not injective
+      // (feature/foo and feature-foo both map to feature-foo) in BOTH directions — a
+      // request naming the owner's workspace name may be a distinct colliding branch, and
+      // the omitted-arg default (parentMeta.name, passed as trunkBranch to create below)
+      // may itself differ from a slash-branch owner's real branch. A different/unproven
+      // base means agents may exist only on the target branch (owner-side misses must not
+      // fail-fast) and the target branch may shadow ANY id (unreachable targets fail
+      // closed in validateWorkspaceTurnAgentIdForTarget).
+      const requestedTrunkBranch = coerceNonEmptyString(args.workspace?.trunkBranch);
+      let ownerVouchesForTargetBase = false;
+      if (requestedAgentId != null) {
+        ownerContext = this.buildWorkspaceTurnAgentContext({
+          runtimeConfig: parentMeta.runtimeConfig,
+          projectPath: parentMeta.projectPath,
+          workspaceName: parentMeta.name,
+          persistedWorkspacePath: parentEntry?.workspace.path,
+          subProjectPath: parentMeta.subProjectPath,
+        });
+        const effectiveTrunkBranch = requestedTrunkBranch ?? parentMeta.name;
+        const ownerBranch = await tryReadGitCurrentBranch(
+          ownerContext.runtime,
+          ownerContext.workspacePath
+        );
+        const ownerBranchMatchesTargetBase =
+          ownerBranch != null && ownerBranch === effectiveTrunkBranch;
+        // Branch equality is not checkout equality: the child is created from COMMITTED
+        // branch state, so uncommitted agent-definition changes in the owner (a shadow
+        // added or removed) make owner-side resolution diverge from what the target will
+        // actually see. Vouching therefore also requires the agent-definition paths to
+        // be clean; unknown cleanliness (no git output) fails the vouch.
+        const ownerAgentDirsClean = ownerBranchMatchesTargetBase
+          ? await tryReadGitPathsClean(
+              ownerContext.runtime,
+              ownerContext.workspacePath,
+              AGENT_DEFINITION_PROJECT_PATHSPECS
+            )
+          : undefined;
+        // Nor is the owner's HEAD necessarily the target's base COMMIT: worktree
+        // creation may branch from origin/<trunkBranch> when the local branch can
+        // fast-forward, so a stale (or diverged) owner cannot vouch for definitions
+        // added or removed in the newer remote commit.
+        const ownerCommitMatchesOrigin =
+          ownerBranchMatchesTargetBase && ownerAgentDirsClean === true
+            ? await tryReadGitBranchMatchesOrigin(
+                ownerContext.runtime,
+                ownerContext.workspacePath,
+                effectiveTrunkBranch
+              )
+            : undefined;
+        // An explicit branchName can attach the worktree to an EXISTING branch of that
+        // name (WorktreeManager detects and reuses it), making the trunk comparison
+        // above meaningless for the actual base — never vouch in that case.
+        const requestedBranchName = coerceNonEmptyString(args.workspace?.branchName);
+        ownerVouchesForTargetBase =
+          requestedBranchName == null &&
+          ownerBranchMatchesTargetBase &&
+          ownerAgentDirsClean === true &&
+          ownerCommitMatchesOrigin === true;
+        // Pre-create stage: catch obviously bad ids (unknown/hidden/disabled) against the
+        // OWNER's checkout before creating any workspace. Fatal only when the owner's
+        // checked-out branch provably IS the target's base (an omitted trunkBranch still
+        // resolves to parentMeta.name, which may be a DIFFERENT branch than a slash-branch
+        // owner's — that distinct branch could carry target-only agents); otherwise the
+        // miss is advisory and the target checkout is authoritative post-create.
+        const validation = await this.validateWorkspaceTurnAgentId({
+          cfg,
+          agentId: requestedAgentId,
+          workspaceId: ownerWorkspaceId,
+          ...ownerContext,
+        });
+        if (!validation.success) {
+          // Owner-side misses are ALWAYS advisory: the created checkout is the only
+          // authoritative source of the target's agent definitions. No owner-side
+          // equivalence proof is sound here — worktree creation may fetch a newer
+          // origin commit, attach to an existing branchName, initialize submodules the
+          // owner never materialized, or run a committed init hook that installs the
+          // requested agent — so a pre-create rejection could deny a launch the real
+          // target would accept. Post-create validation (and, for anything it cannot
+          // see, the stream-time strict provenance pin) fails loudly instead.
+          log.debug(
+            "Task.createWorkspaceTurn: owner-side agent validation failed; deferring to the target checkout",
+            { agentId: requestedAgentId, error: validation.error }
+          );
+        } else {
+          agentDefinitionContext = { ...ownerContext, workspaceId: ownerWorkspaceId };
+        }
+      }
       const slot = await ensureParallelSlot();
       if (!slot.success) return Err(slot.error);
       const tags = {
@@ -4001,6 +4484,56 @@ export class TaskService {
       }
       targetWorkspaceId = createResult.data.metadata.id;
       createdWorkspace = true;
+      if (requestedAgentId != null && ownerContext != null) {
+        // Post-create stage: re-validate against the TARGET checkout — project-local agent
+        // definitions can diverge across branches/worktrees, so owner-path resolution is not
+        // an invariant. On failure, do NOT return before the workspace-turn record exists:
+        // the record marks the created workspace as owner-owned, so a mode="existing" retry
+        // (once the checkout is ready or with a valid agent) passes the ownership check
+        // instead of hitting invalid_scope. The failure settles through the normal handle
+        // machinery below.
+        const createdMeta = createResult.data.metadata;
+        const targetContext = this.buildWorkspaceTurnAgentContext({
+          runtimeConfig: createdMeta.runtimeConfig,
+          projectPath: createdMeta.projectPath,
+          workspaceName: createdMeta.name,
+          persistedWorkspacePath: createdMeta.namedWorkspacePath,
+          subProjectPath: createdMeta.subProjectPath,
+        });
+        const validation = await this.validateWorkspaceTurnAgentIdForTarget({
+          cfg,
+          agentId: requestedAgentId,
+          workspaceId: targetWorkspaceId,
+          target: targetContext,
+          owner: ownerContext,
+          // create() starts runBackgroundInit asynchronously; a reachable checkout whose
+          // init hook is still running may not have its final agent definitions yet.
+          targetInitPending:
+            this.initStateManager.getInitState(targetWorkspaceId)?.status === "running",
+          ownerResolutionPredictsTarget: ownerVouchesForTargetBase,
+        });
+        if (!validation.success) {
+          // Disposable workspaces are removed by the settlement's disposable cleanup.
+          // That cleanup is best-effort (failures are logged and swallowed), so the
+          // wording must not assert completed removal; if cleanup fails the workspace
+          // stays owner-owned and a mode="existing" retry still passes ownership.
+          agentValidationError =
+            args.workspace?.disposable === true
+              ? `${validation.error} — no turn was dispatched; automatic cleanup of the disposable workspace (${targetWorkspaceId}) was scheduled (if cleanup fails, it remains owned by this caller and retryable via workspace.mode="existing")`
+              : `${validation.error} — no turn was dispatched; the created workspace (${targetWorkspaceId}) is owned by this caller and can be retried via workspace.mode="existing" once ready`;
+        } else {
+          validatedAgentProvenance = {
+            scope: validation.data.scope,
+            ...(validation.data.source != null ? { source: validation.data.source } : {}),
+            chain: validation.data.chain,
+          };
+          agentDefinitionContext = {
+            ...validation.data.validatedContext,
+            workspaceId: targetWorkspaceId,
+          };
+        }
+      }
+      workspaceTurnAgentId = requestedAgentId ?? workspaceTurnAgentId;
     }
 
     // Unified per-field precedence (see resolveAgentAiSettings): explicit
@@ -4040,6 +4573,16 @@ export class TaskService {
             }
           : undefined,
         fallbacks: this.buildParentAiSettingsFallbacks(parentMeta, workspaceTurnAgentId),
+        // Explicit agent overrides resolve the agent's own frontmatter `ai` defaults from the
+        // checkout they were validated against (mirrors resolveTaskAISettings' definitionContext).
+        // Known tradeoff: these launch AI defaults are a snapshot — an init hook that later
+        // rewrites the agent's `ai` frontmatter does not retroactively change the model/thinking
+        // already selected here (waiting for init is not an option under the service-wide mutex).
+        // This is bounded to convenience defaults: callers wanting determinism pass explicit
+        // model/thinking, the send path re-clamps thinking and re-gates reasoning per model at
+        // request time, and the authoritative prompt/tool policy is always resolved at stream
+        // time (after init) with strictAgentResolution guarding agent identity.
+        ...(agentDefinitionContext != null ? { definitionContext: agentDefinitionContext } : {}),
       });
       // Selected (not effective) values: sendMessage persists what it
       // receives, and the send path re-clamps thinking and re-gates reasoning
@@ -4069,7 +4612,13 @@ export class TaskService {
       prompt,
       modelString: model,
       ...(thinkingLevel != null ? { thinkingLevel } : {}),
-      ...(args.attentionPolicy != null ? { attentionPolicy: args.attentionPolicy } : {}),
+      // Synchronous validation failure below returns the error directly to the caller, so
+      // never persist notify_on_terminal for it: settleWorkspaceTurn derives the terminal
+      // wake from the PERSISTED record's attentionPolicy, which would enqueue a duplicate
+      // notification on top of the synchronous Err.
+      ...(args.attentionPolicy != null && agentValidationError == null
+        ? { attentionPolicy: args.attentionPolicy }
+        : {}),
     };
     // Serialize handle persistence with owned-workspace lifecycle mutations: archive holds the
     // same per-workspace locks for its active-turn check + archive call, so either this handle
@@ -4140,6 +4689,26 @@ export class TaskService {
       await this.updateAgentTaskExecutionState(targetWorkspaceId, handleId, record.status);
     }
 
+    if (agentValidationError != null) {
+      // Deferred post-create validation failure: the record above keeps the created
+      // workspace owner-owned (retryable via mode="existing"); settle the handle as a
+      // normal error instead of dispatching the turn. The record was persisted without
+      // attentionPolicy (see above), so settlement cannot enqueue a terminal wake on
+      // top of the synchronous Err returned below.
+      const next: WorkspaceTurnTaskHandleRecord = {
+        ...record,
+        status: "error",
+        updatedAt: getIsoNow(),
+        error: agentValidationError,
+      };
+      await this.settleWorkspaceTurn({
+        record,
+        next,
+        waiterSettlement: { status: "error", error: new Error(agentValidationError) },
+      });
+      return Err(agentValidationError);
+    }
+
     const markWorkspaceTurnAccepted = async () => {
       await this.workspaceTurnSettlementLocks.withLock(handleId, async () => {
         const current = await this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, handleId);
@@ -4190,6 +4759,31 @@ export class TaskService {
         muxMetadata: this.buildWorkspaceTurnMuxMetadata(record),
         experiments: args.experiments ?? targetTaskExperiments,
         ...(mode === "existing" ? { queueDispatchMode } : {}),
+        // A per-turn agent override on an existing workspace must not overwrite the target's
+        // saved agent/settings (maybePersistAISettingsFromOptions persists them on every
+        // ordinary send). New workspaces still persist: the requested agent IS their default.
+        ...(mode === "existing" && requestedAgentId != null
+          ? { skipAiSettingsPersistence: true }
+          : {}),
+        // Explicit overrides were validated pre-dispatch, but that validation races init
+        // hooks and later edits; stream-time resolution runs after initialization and must
+        // fail loudly rather than silently swap in exec — and, when the validated scope is
+        // known, must not run a different-provenance definition for the same id (see
+        // strictAgentResolution docs).
+        ...(requestedAgentId != null
+          ? {
+              strictAgentResolution:
+                validatedAgentProvenance != null
+                  ? {
+                      expectedScope: validatedAgentProvenance.scope,
+                      ...(validatedAgentProvenance.source != null
+                        ? { expectedSource: validatedAgentProvenance.source }
+                        : {}),
+                      expectedChain: validatedAgentProvenance.chain,
+                    }
+                  : true,
+            }
+          : {}),
       },
       {
         startStreamInBackground: true,
@@ -4539,6 +5133,9 @@ export class TaskService {
             runtime,
             workspacePath: parentWorkspacePath,
             workspaceId: parentWorkspaceId,
+            includeAgentPlugins: this.workspaceService.isExperimentEnabled(
+              EXPERIMENT_IDS.AGENT_PLUGINS
+            ),
           },
         }));
     } catch (error) {

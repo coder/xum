@@ -93,7 +93,7 @@ import {
   normalizeUsageModelKey,
   resolveModelForMetadata,
 } from "@/common/utils/providers/modelEntries";
-import { getErrorMessage } from "@/common/utils/errors";
+import { clampErrorMessage, getErrorMessage } from "@/common/utils/errors";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { shellQuote } from "@/common/utils/shell";
 import { classify429Capacity } from "@/common/utils/errors/classify429Capacity";
@@ -3860,6 +3860,14 @@ export class StreamManager extends EventEmitter {
     streamInfo: WorkspaceStreamInfo,
     payload: StreamErrorPayload & { errorType: StreamErrorType }
   ): Promise<void> {
+    // Clamp at the single choke point every stream error payload passes
+    // through before persist/emit, including buildStreamErrorPayload's
+    // early-return branches (e.g. ModelRefusalError, whose fallbackNote can
+    // embed another error's message). Some SDK errors embed the entire
+    // serialized prompt in their message (AI_TypeValidationError via the
+    // cause walk); unbounded, that would be persisted to history metadata,
+    // shipped over IPC, and rendered in the chat.
+    payload = { ...payload, error: clampErrorMessage(payload.error) };
     const refusalFinishReason =
       payload.errorType === "model_refusal"
         ? ([streamInfo.terminalFinishReason, streamInfo.terminalRawFinishReason].find(

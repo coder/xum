@@ -53,6 +53,7 @@ const NON_RETRYABLE_STREAM_ERRORS = [
   "aborted", // User cancelled - should not auto-retry
   "runtime_not_ready", // Container/runtime unavailable - permanent failure
   "model_refusal", // Provider declined to answer - retrying the same request will refuse again
+  "agent_resolution", // Strict explicit-agent contract failure - deterministic, retrying reproduces it
 ] as const satisfies readonly StreamErrorType[];
 
 const NON_RETRYABLE_STREAM_ERROR_SET = new Set<string>(NON_RETRYABLE_STREAM_ERRORS);

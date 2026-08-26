@@ -96,6 +96,14 @@ type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMode"]>;
 interface QueuedMessageInternalOptions {
   synthetic?: boolean;
   agentInitiated?: boolean;
+  /**
+   * When the sender authored this message (request entry), before any send
+   * preflight awaits (pricing gate, settings persistence). Goal safety
+   * compares the authoring time against goal creation, so sampling at
+   * enqueue time would misclassify a message authored before a goal became
+   * visible as an intervention against it (Codex P2 PRRT_kwDOPxxmWM6b-orA).
+   */
+  authoredAtMs?: number;
   /** True only for a report that continues an existing workspace turn. */
   workspaceTurnContinuation?: boolean;
   /** Keep this queued add isolated so its dedupe key can be removed without affecting siblings. */
@@ -161,6 +169,13 @@ interface QueueEntry {
   addCount: number;
   syntheticCount: number;
   agentInitiatedCount: number;
+  /**
+   * Timestamp of the latest add batched into this entry. Dispatch exposes it so
+   * goal safety can tell messages typed before a goal existed (queued while the
+   * goal-creating turn was still streaming) from genuine interventions against
+   * a goal the user has already seen.
+   */
+  lastAddedAtMs: number;
   onCanceled?: (reason: string) => Promise<void> | void;
   onAccepted?: () => Promise<void> | void;
   onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
@@ -503,6 +518,11 @@ export class MessageQueue {
         addCount: 0,
         syntheticCount: 0,
         agentInitiatedCount: 0,
+        // 0, not Date.now(): every add (including the entry-creating one)
+        // folds its authoring time in below via max(); seeding with the
+        // creation wall clock would swallow an authoredAtMs captured before
+        // slow send preflight, defeating the pre-goal queue-race guard.
+        lastAddedAtMs: 0,
       };
       this.entries.push(entry);
     }
@@ -570,6 +590,12 @@ export class MessageQueue {
     }
 
     entry.addCount += 1;
+    // Codex security P2 (PRRT_kwDOPxxmWM6b_OS9): batched sends can finish
+    // preflight out of authoring order. Keep the NEWEST authoring time for
+    // the entry — a plain overwrite would let an older pre-goal message mask
+    // a later post-goal stop/correction, satisfying the pre-goal guard and
+    // granting the agent another autonomous turn despite the intervention.
+    entry.lastAddedAtMs = Math.max(entry.lastAddedAtMs, internal?.authoredAtMs ?? Date.now());
     if (internal?.synthetic === true) {
       entry.syntheticCount += 1;
     }
@@ -784,6 +810,8 @@ export class MessageQueue {
     message: string;
     options?: SendMessageOptions & { fileParts?: FilePart[] };
     internal?: QueuedMessageInternalOptions;
+    /** Timestamp of the latest add batched into this entry (see QueueEntry.lastAddedAtMs). */
+    enqueuedAtMs?: number;
   } {
     const entry = this.entries.shift();
     if (entry === undefined) {
@@ -840,7 +868,7 @@ export class MessageQueue {
         }
       : undefined;
 
-    return { message: joinedMessages, options, internal };
+    return { message: joinedMessages, options, internal, enqueuedAtMs: entry.lastAddedAtMs };
   }
 
   /**

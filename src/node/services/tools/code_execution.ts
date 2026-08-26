@@ -32,6 +32,7 @@ import {
 } from "@/constants/resultHandles";
 import { KERNEL_COMPACT_ARGS_CAP_BYTES, KERNEL_CONSOLE_CAP_BYTES } from "@/constants/kernelOutput";
 import { sliceUtf8Bytes } from "@/common/utils/sliceUtf8Bytes";
+import { jsonSafeClone } from "@/common/utils/jsonSafeClone";
 
 // Default limits
 const DEFAULT_MEMORY_BYTES = 64 * 1024 * 1024; // 64MB
@@ -848,7 +849,17 @@ ${xumTypes}
               }
             }
           }
-          return result;
+          // Guest values arrive via ctx.dump() and can contain undefined (e.g.
+          // console.log(undefined) or a returned {a: undefined}) or other
+          // non-JSON values. Persistence JSON-normalizes them on reload, but
+          // the LIVE object is embedded verbatim in the next step's
+          // tool-result message, where the AI SDK's ModelMessage validation
+          // rejects it and kills the stream (AI_InvalidPromptError) — while
+          // the retry, rebuilt from rehydrated history, succeeds. Clone into
+          // the exact JSON shape persistence produces so live and rehydrated
+          // behavior are identical. Must stay the LAST step: the snapshot-
+          // conflict rewrites above reintroduce undefined fields.
+          return jsonSafeClone(result) as PTCExecutionResult;
         } finally {
           // A late abort of THIS call's signal must not poison a reused runtime.
           abortSignal?.removeEventListener("abort", onAbort);

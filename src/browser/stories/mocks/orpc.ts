@@ -78,6 +78,7 @@ import {
 import type { z } from "zod";
 import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { getProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
 
 /** Session usage data structure matching SessionUsageFileSchema */
 export interface MockSessionUsage {
@@ -1325,7 +1326,20 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
     },
     projects: {
-      list: () => Promise.resolve(Array.from(projects.entries())),
+      // Mirror the server-side read projection: projects.list excludes archived
+      // workspaces (the UI loads them on demand via workspace.list({archived:true})).
+      list: () =>
+        Promise.resolve(
+          Array.from(projects.entries()).map(([projectPath, project]): [string, ProjectConfig] => [
+            projectPath,
+            {
+              ...project,
+              workspaces: project.workspaces.filter(
+                (workspace) => !isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
+              ),
+            },
+          ])
+        ),
       create: () =>
         Promise.resolve({
           success: true,
@@ -1373,9 +1387,25 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         }
         return Promise.resolve({ success: true as const });
       },
-      remove: (input: { projectPath: string }) => {
+      // Read-only preflight used by the delete confirmation dialog.
+      getRemovalBlockers: (input: { projectPath: string }) => {
+        const project = projects.get(input.projectPath);
+        return Promise.resolve(getProjectWorkspaceCounts(project?.workspaces ?? []));
+      },
+      remove: (input: { projectPath: string; force?: boolean | null }) => {
         if (onProjectRemove) {
           return Promise.resolve(onProjectRemove(input.projectPath));
+        }
+        // Mirror the real backend: a non-forced removal of a project that still
+        // has workspaces is rejected with authoritative blocker counts, which
+        // the sidebar uses to populate the delete confirmation dialog.
+        const project = projects.get(input.projectPath);
+        const counts = getProjectWorkspaceCounts(project?.workspaces ?? []);
+        if (input.force !== true && counts.activeCount + counts.archivedCount > 0) {
+          return Promise.resolve({
+            success: false,
+            error: { type: "workspace_blockers", ...counts },
+          });
         }
         return Promise.resolve({ success: true, data: undefined });
       },

@@ -293,6 +293,8 @@ export interface StreamMessageOptions {
   /** Internal-only flag for Copilot billing attribution; never sourced from IPC schemas. */
   agentInitiated?: boolean;
   agentId?: string;
+  /** See SendMessageOptionsSchema.strictAgentResolution: explicit-agent sends fail loudly instead of falling back to exec. */
+  strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
   /** ACP prompt correlation id used to match stream events to a specific request. */
   acpPromptId?: string;
   /** Tool names that should be delegated back to ACP clients for this request. */
@@ -1409,6 +1411,7 @@ export class AIService extends EventEmitter {
       muxProviderOptions,
       agentInitiated,
       agentId,
+      strictAgentResolution,
       acpPromptId,
       delegatedToolNames,
       recordFileState,
@@ -1952,6 +1955,7 @@ export class AIService extends EventEmitter {
         runtime,
         workspacePath,
         requestedAgentId: agentId,
+        strictAgentResolution,
         disableWorkspaceAgents: disableWorkspaceAgents ?? false,
         callerToolPolicy: toolPolicy,
         cfg,
