@@ -186,6 +186,11 @@ function extractLoadedSkillSnapshotsFromCodeExecutionOutput(
   for (const record of toolCalls as Array<Record<string, unknown>>) {
     if (typeof record !== "object" || record === null) continue;
     if (record.toolName !== "agent_skill_read" || record.error !== undefined) continue;
+    // Nested history is untrusted: an explicit ok:false marks the call failed
+    // even when a schema-valid result rides alongside (r18). Other nested
+    // extractors treat ok:false as authoritative failure — do the same here so
+    // contradictory rows cannot inject a skill snapshot into later requests.
+    if (record.ok === false) continue;
     const snapshot = extractLoadedSkillSnapshotFromToolOutput(record.result);
     if (snapshot) {
       snapshots.push(snapshot);

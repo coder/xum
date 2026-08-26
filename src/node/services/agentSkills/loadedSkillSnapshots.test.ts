@@ -102,6 +102,25 @@ describe("extractLoadedSkillSnapshotsFromMessages", () => {
               // Failed and kernel-compacted records (no full result) yield nothing.
               { toolName: "agent_skill_read", args: { name: "failed-skill" }, error: "denied" },
               { toolName: "agent_skill_read", args: { name: "kernel-skill" }, ok: true, bytes: 9 },
+              // Contradictory untrusted row: explicit ok:false is authoritative
+              // failure even when a schema-valid result rides alongside (r18).
+              {
+                toolName: "agent_skill_read",
+                args: { name: "contradictory-skill" },
+                ok: false,
+                result: {
+                  success: true,
+                  skill: {
+                    scope: "project",
+                    directoryName: "contradictory-skill",
+                    frontmatter: {
+                      name: "contradictory-skill",
+                      description: "contradictory description",
+                    },
+                    body: "Contradictory body",
+                  },
+                },
+              },
               { toolName: "bash", args: { script: "true" }, result: { success: true } },
             ],
           },
