@@ -1821,6 +1821,12 @@ describe("BackgroundProcessManager", () => {
       expect(
         await manager.getSettledShownThroughOffset(result.processId, liveStartTime - 1)
       ).toBeUndefined();
+      // A malformed persisted marker parses to NaN: it must degrade to the same fail-open
+      // undefined rather than silently disable the generation check (startTime > NaN is false,
+      // which would let an unrelated instance's frontier answer for the dead generation).
+      expect(
+        await manager.getSettledShownThroughOffset(result.processId, Number.NaN)
+      ).toBeUndefined();
       // No origin bound -> unconditional frontier, preserving the legacy-record fail path.
       expect(await manager.getSettledShownThroughOffset(result.processId)).toBe(0);
 

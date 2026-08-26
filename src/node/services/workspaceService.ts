@@ -743,6 +743,19 @@ const BASH_MONITOR_SHOWN_QUEUE_REASON =
 const BASH_MONITOR_REARMED_QUEUE_REASON =
   "Background bash monitor was re-armed before its queued settlement wake dispatched.";
 
+/**
+ * Parse a persisted generation marker (ISO timestamp) into an `originNotAfterMs` bound. A
+ * malformed value degrades to NEGATIVE_INFINITY -- the fail-open bound under which every live
+ * process counts as a newer generation, so its read state can neither supersede the durable wake
+ * nor retract its queued turn. Raw Date.parse would instead yield NaN, which disables the
+ * generation check (`startTime > NaN` and `startTime <= NaN` are both false) and poisons the
+ * min/max bound accumulation across coalesced records.
+ */
+function parseGenerationMarkerMs(value: string): number {
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
+}
+
 interface QueuedBashMonitorWakeCancellation {
   abortController: AbortController;
   dispatchState: { canceledBeforeAcceptance: boolean };
@@ -2510,11 +2523,11 @@ export class WorkspaceService extends EventEmitter {
           // marker so the live settling process's own read can cover it.
           matchedOriginNotAfterMs: Math.min(
             previous?.matchedOriginNotAfterMs ?? Number.POSITIVE_INFINITY,
-            Date.parse(record.createdAt)
+            parseGenerationMarkerMs(record.createdAt)
           ),
           terminalOriginNotAfterMs: Math.max(
             previous?.terminalOriginNotAfterMs ?? Number.NEGATIVE_INFINITY,
-            Date.parse(record.terminalOriginAt ?? record.createdAt)
+            parseGenerationMarkerMs(record.terminalOriginAt ?? record.createdAt)
           ),
         });
       }
@@ -2816,7 +2829,7 @@ export class WorkspaceService extends EventEmitter {
           if (canQueryDeliveryState) {
             const state = await this.backgroundProcessManager.getMonitorWakeDeliveryState(
               record.processId,
-              Date.parse(record.createdAt)
+              parseGenerationMarkerMs(record.createdAt)
             );
             // The terminal signal binds to its own generation marker (terminalOriginAt): a
             // re-armed generation's settlement is gated against the live settling process, while
@@ -2832,7 +2845,7 @@ export class WorkspaceService extends EventEmitter {
                   ? state
                   : await this.backgroundProcessManager.getMonitorWakeDeliveryState(
                       record.processId,
-                      Date.parse(terminalMarker)
+                      parseGenerationMarkerMs(terminalMarker)
                     );
             if (state?.status === "blocked") {
               this.scheduleBashMonitorWakeDrainAfterRead(ownerWorkspaceId, state.readSettled);
@@ -2877,7 +2890,7 @@ export class WorkspaceService extends EventEmitter {
             const shownThroughOffset =
               await this.backgroundProcessManager.getSettledShownThroughOffset(
                 record.processId,
-                Date.parse(record.createdAt)
+                parseGenerationMarkerMs(record.createdAt)
               );
             if (
               record.terminal == null &&

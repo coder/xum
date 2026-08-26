@@ -131,6 +131,13 @@ export interface BashMonitorWakeRecord {
   deliveredAt?: string;
 }
 
+/**
+ * Prefix of the synthetic settlement line the process manager appends to a settlement wake's
+ * lines. Shared so re-arm relabeling (clearStaleTerminalOnRearm) and the prompt's consumed-match
+ * note cannot drift from the emitter.
+ */
+export const BASH_MONITOR_SETTLE_LINE_PREFIX = "[monitor] process settled:";
+
 const BashMonitorWakeRecordSchema = z
   .object({
     id: z.string().min(1),
@@ -201,6 +208,17 @@ function boundLines(lines: readonly string[]): { lines: string[]; droppedLines: 
   return { lines: sanitized.slice(-MAX_WAKE_LINES), droppedLines };
 }
 
+/**
+ * Re-attribute an old generation's synthetic settle notice after its processId was re-armed:
+ * verbatim, the line would render as the re-armed live task having settled. Non-settle lines pass
+ * through unchanged. No tool guidance in the durable line (same rule as the emitter): the new
+ * process may itself be gone when the wake finally delivers.
+ */
+function relabelStaleSettleLine(line: string): string {
+  if (!line.startsWith(BASH_MONITOR_SETTLE_LINE_PREFIX)) return line;
+  return `[monitor] an earlier run of this process ID settled:${line.slice(BASH_MONITOR_SETTLE_LINE_PREFIX.length)}; the ID has since been re-armed by a new process`;
+}
+
 function removeDeliveredLineOverlap(
   currentLines: readonly string[],
   deliveredLines: readonly string[]
@@ -208,9 +226,13 @@ function removeDeliveredLineOverlap(
   const maxOverlap = Math.min(currentLines.length, deliveredLines.length);
   for (let overlapLength = maxOverlap; overlapLength > 0; overlapLength--) {
     const deliveredSuffixStart = deliveredLines.length - overlapLength;
-    const overlapsDeliveredSuffix = currentLines
-      .slice(0, overlapLength)
-      .every((line, index) => line === deliveredLines[deliveredSuffixStart + index]);
+    const overlapsDeliveredSuffix = currentLines.slice(0, overlapLength).every((line, index) => {
+      const delivered = deliveredLines[deliveredSuffixStart + index];
+      // A re-arm can relabel the settle notice between the drain snapshot and its acceptance;
+      // the delivered original still covers the rewritten line, or the transition would strand
+      // a reworded duplicate remainder that later delivers on its own.
+      return line === delivered || line === relabelStaleSettleLine(delivered);
+    });
     if (overlapsDeliveredSuffix) {
       return currentLines.slice(overlapLength);
     }
@@ -355,7 +377,7 @@ export function buildBashMonitorWakePrompt(
       // seen (e.g. the decisive unmatched failure line) and must not be disregarded.
       const alreadyShown =
         context?.get(record.id)?.matchedOutputAlreadyShown === true && record.lines.length > 0
-          ? "\nNote: lines above the '[monitor] process settled' marker were already returned to you by an earlier read; the settlement status and any lines after that marker are new output."
+          ? `\nNote: lines above the '${BASH_MONITOR_SETTLE_LINE_PREFIX}' marker were already returned to you by an earlier read; the settlement status and any lines after that marker are new output.`
           : "";
       const taskIdSuffix = isAwaitable(record)
         ? ""
@@ -821,7 +843,8 @@ export class BashMonitorWakeStore {
    * without this, an undelivered settlement wake would render the re-armed live task as already
    * settled -- and promise no further wakes -- until the new generation's first match clears it,
    * a gap that misleads the agent whenever the new process has not matched yet. The old
-   * generation's lines (including its synthetic settle notice) stay deliverable.
+   * generation's lines stay deliverable, with its synthetic settle notice relabeled to name the
+   * earlier run so the delivered wake cannot read as the live task having settled.
    */
   async clearStaleTerminalOnRearm(ownerWorkspaceId: string, processId: string): Promise<void> {
     assert(
@@ -835,7 +858,15 @@ export class BashMonitorWakeStore {
       if (record?.status !== "pending" || record.kind !== "match" || record.terminal == null) {
         return;
       }
-      const cleared: BashMonitorWakeRecord = { ...record, updatedAt: new Date().toISOString() };
+      const cleared: BashMonitorWakeRecord = {
+        ...record,
+        // Re-attribute the old generation's synthetic settle notice: left verbatim, the rebuilt
+        // record would render as a fresh live match whose task ID (now targeting the re-armed
+        // process) "settled". Matched/tail lines stay untouched -- they are genuine undelivered
+        // output; only the settlement claim needs a generation label.
+        lines: record.lines.map(relabelStaleSettleLine),
+        updatedAt: new Date().toISOString(),
+      };
       delete cleared.terminal;
       delete cleared.terminalOriginAt;
       await this.write(cleared);

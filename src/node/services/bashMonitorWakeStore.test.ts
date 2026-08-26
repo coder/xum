@@ -506,7 +506,7 @@ describe("BashMonitorWakeStore", () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(
       payload({
-        lines: ["[monitor] process settled: exited (code 1)"],
+        lines: ["[monitor] process settled: exited (code 1)", "tail line after settle"],
         matchedThroughOffset: undefined,
         terminal: { status: "exited", exitCode: 1 },
       })
@@ -517,8 +517,13 @@ describe("BashMonitorWakeStore", () => {
     expect(pending).toHaveLength(1);
     expect(pending[0].terminal).toBeUndefined();
     expect(pending[0].status).toBe("pending");
-    // The old generation's settle notice stays deliverable as plain lines.
-    expect(pending[0].lines).toEqual(["[monitor] process settled: exited (code 1)"]);
+    // The old generation's settle notice stays deliverable but is re-attributed: verbatim, it
+    // would render as the re-armed live task having settled. Other lines stay untouched.
+    expect(pending[0].lines).toHaveLength(2);
+    expect(pending[0].lines[0]).not.toContain("[monitor] process settled");
+    expect(pending[0].lines[0]).toContain("exited (code 1)");
+    expect(pending[0].lines[0]).toContain("re-armed");
+    expect(pending[0].lines[1]).toBe("tail line after settle");
   });
 
   test("clearStaleTerminalOnRearm leaves terminal-less and non-pending records untouched", async () => {

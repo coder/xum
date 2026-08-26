@@ -1121,6 +1121,88 @@ describe("WorkspaceService bash monitor wakes", () => {
     }
   });
 
+  test("a malformed persisted createdAt fails open and delivers instead of NaN-gating", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-nan-created-at";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      // A terminal row created directly binds both signals to createdAt (no terminalOriginAt).
+      // Corrupt createdAt on disk: Date.parse would yield NaN, and a NaN bound disables the
+      // generation check (startTime > NaN is false), letting a newer process that reused the ID
+      // supersede the old durable settlement with its own read state. The bound must degrade so
+      // delivery fails open instead.
+      const seedWakeStore = new BashMonitorWakeStore(config);
+      await seedWakeStore.enqueueOrMergePending({
+        processId: "proc-nan",
+        taskId: "bash:proc-nan",
+        workspaceId,
+        filter: "ERR",
+        filterExclude: false,
+        lines: ["[monitor] process settled: exited (code 1)"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        terminal: { status: "exited", exitCode: 1 },
+      });
+      const recordFile = path.join(
+        config.getSessionDir(workspaceId),
+        "bash-monitor-wakes",
+        "proc-nan.json"
+      );
+      const raw = JSON.parse(await fsPromises.readFile(recordFile, "utf-8")) as Record<
+        string,
+        unknown
+      >;
+      raw.createdAt = "not-a-date";
+      await fsPromises.writeFile(recordFile, JSON.stringify(raw), "utf-8");
+
+      // A live process reusing the ID has already been shown ITS terminal status. Mirrors the
+      // production generation gate: a bound older than startTime rejects the query (undefined).
+      const liveStart = Date.now() - 1_000;
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+        getMonitorWakeDeliveryState: mock((_processId: string, originNotAfterMs?: number) => {
+          if (originNotAfterMs != null && !(liveStart <= originNotAfterMs)) {
+            return Promise.resolve(undefined);
+          }
+          return Promise.resolve({
+            status: "settled" as const,
+            shownThroughOffset: 100,
+            terminalStatusShown: true,
+          });
+        }),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        async (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          await args[3]?.onAccepted?.();
+          return Ok(undefined);
+        }
+      );
+
+      // The degraded bound makes every live instance a generation mismatch: the old settlement
+      // delivers (conservatively marked unawaitable) instead of being silently superseded.
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      const prompt = sendSpy.mock.calls[0][1];
+      expect(prompt).toContain("Status: exited (code 1)");
+      expect(prompt).toContain("no longer awaitable");
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("re-arming a processId retracts a queued settlement wake and redelivers it rebuilt", async () => {
     const { config, cleanup } = await createTestHistoryService();
     try {
@@ -1193,7 +1275,11 @@ describe("WorkspaceService bash monitor wakes", () => {
       await waitForCondition(() => removeQueuedSpy.mock.calls.length === 1);
       await waitForCondition(() => sendSpy.mock.calls.length === 2);
       const rebuilt = sends[1].prompt;
-      expect(rebuilt).toContain("[monitor] process settled: exited (code 1)");
+      // The old settle notice survives but is re-attributed: rendered verbatim, it would read
+      // as the re-armed live task having settled.
+      expect(rebuilt).not.toContain("[monitor] process settled");
+      expect(rebuilt).toContain("exited (code 1)");
+      expect(rebuilt).toContain("re-armed");
       expect(rebuilt).not.toContain("Status: exited");
       const wakeStore = (
         workspaceService as unknown as { bashMonitorWakeStore: BashMonitorWakeStore }

@@ -12,6 +12,7 @@ import {
   BG_OUTPUT_SUBDIR,
 } from "./backgroundProcessExecutor";
 import { execBuffered } from "@/node/utils/runtime/helpers";
+import { BASH_MONITOR_SETTLE_LINE_PREFIX } from "./bashMonitorWakeStore";
 import { Ok, Err, type Result } from "@/common/types/result";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -720,7 +721,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // awaitability guidance lives only in the prompt builder, which renders it conditionally.
       // Downgraded builds keep actionability from their generic match-record closing guidance.
       const settleLine =
-        `[monitor] process settled: ${terminal.status}` +
+        `${BASH_MONITOR_SETTLE_LINE_PREFIX} ${terminal.status}` +
         `${terminal.exitCode !== undefined ? ` (code ${terminal.exitCode})` : ""}`;
       // The tail travels separately from the event lines: a matched line inside the final tail
       // window would otherwise render twice, and only the wake store can also see matches that
@@ -1546,7 +1547,10 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   ): Promise<MonitorWakeDeliveryState | undefined> {
     const proc = await this.getProcess(processId);
     if (!proc) return undefined;
-    if (originNotAfterMs != null && proc.startTime > originNotAfterMs) return undefined;
+    // Negated <= instead of > so a NaN bound (malformed persisted marker) also lands here:
+    // treating it as a generation mismatch fails open (the wake delivers) instead of letting an
+    // unrelated instance's read state supersede a durable wake or mark it awaitable.
+    if (originNotAfterMs != null && !(proc.startTime <= originNotAfterMs)) return undefined;
     if (proc.monitorWakeBlockingReadSettled) {
       return { status: "blocked", readSettled: proc.monitorWakeBlockingReadSettled };
     }
