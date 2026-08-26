@@ -262,8 +262,13 @@ function boundOversizedSkillPackage(
       high = mid - 1;
     }
   }
+  // cut === 0 (budget positive but smaller than the first code point) still
+  // retains the package with an empty body prefix + note (r23): the empty
+  // prefix is schema-valid and fits (serializedBudget > 0 established that
+  // overhead + note fit under the cap), while returning undefined would
+  // collapse the whole package to a kernel marker and erase the skill from
+  // post-compaction context.
   const cut = boundaries[low];
-  if (cut <= 0) return undefined;
   return {
     ...success,
     ...error,
@@ -480,6 +485,12 @@ function sanitizeMediaValueGraph(
     // Container parts are charged their FULL serialized size (nested payloads
     // included), so there is no need to descend into a sanitized container.
     result = sanitizeRetainedMediaContainer(value, budget);
+  } else if (asMediaPart(value) !== null) {
+    // STANDALONE media leaves too (r23): guest code can pluck a part out of
+    // a container (`const part = image.value[0]`) and return it, log it, or
+    // pass it as another tool's argument — container-only recognition would
+    // let that copy persist unbudgeted base64 on every call.
+    result = sanitizeStandaloneMediaPart(value, budget);
   } else if (Array.isArray(value)) {
     const mapped = value.map((item) => sanitizeMediaValueGraph(item, budget, memo, depth + 1));
     result = mapped.some((item, index) => item !== value[index]) ? mapped : value;
@@ -496,6 +507,32 @@ function sanitizeMediaValueGraph(
   }
   memo.set(value, result);
   return result;
+}
+
+/**
+ * Standalone {type:"media"} leaf outside any content container: unsupported
+ * media is always replaced, supported media is charged its full serialized
+ * size against the shared budget — mirroring sanitizeRetainedMediaContainer's
+ * per-part handling so plucked parts cost the same as containered ones.
+ */
+function sanitizeStandaloneMediaPart(value: object, budget: { remainingBytes: number }): unknown {
+  const media = asMediaPart(value);
+  if (media === null) return value;
+  if (media.mediaType === undefined || !isSupportedAttachmentMediaType(media.mediaType)) {
+    return {
+      type: "text",
+      text: `[media bounded at capture: ${boundedMediaTypeLabel(media.mediaType)}, ${media.data.length} base64 chars — not supported as a model attachment]`,
+    };
+  }
+  const serialized = serializedJsonByteLength(value);
+  if (serialized !== undefined && serialized <= budget.remainingBytes) {
+    budget.remainingBytes -= serialized;
+    return value;
+  }
+  return {
+    type: "text",
+    text: `[media bounded at capture: ${boundedMediaTypeLabel(media.mediaType)}, ${media.data.length} base64 chars — aggregate media budget exceeded]`,
+  };
 }
 
 /**

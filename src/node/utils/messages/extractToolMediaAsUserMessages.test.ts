@@ -587,6 +587,61 @@ describe("extractToolMediaAsUserMessages", () => {
     expect(fileParts).toHaveLength(1);
   });
 
+  it("redacts standalone media leaves plucked out of containers", async () => {
+    // `const part = image.value[0]; mux.sink({payload: part})` copies a BARE
+    // media part (no surrounding container) into args; capture retains it
+    // under the shared budget, so extraction must rewrite the leaf too (r23).
+    const base64 = (
+      await sharp({
+        create: { width: 10, height: 10, channels: 3, background: { r: 9, g: 9, b: 9 } },
+      })
+        .png()
+        .toBuffer()
+    ).toString("base64");
+
+    const input: MuxMessage[] = [
+      {
+        id: "ce-leaf",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call1",
+            toolName: "code_execution",
+            input: { code: "mux.mcp__sink__send({payload: img.value[0]});" },
+            state: "output-available",
+            output: {
+              success: true,
+              // Bare leaf in the outer result too.
+              result: { type: "media", mediaType: "image/png", data: base64 },
+              toolCalls: [
+                {
+                  toolName: "mcp__sink__send",
+                  args: { payload: { type: "media", mediaType: "image/png", data: base64 } },
+                  result: { ok: true },
+                },
+              ],
+            },
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    expect(rewritten).toHaveLength(2);
+    const toolPart = rewritten[0].parts[0];
+    if (toolPart.type !== "dynamic-tool" || toolPart.state !== "output-available") {
+      throw new Error("Expected an output-available dynamic-tool part");
+    }
+    const outputText = JSON.stringify(toolPart.output);
+    expect(outputText).not.toContain(base64);
+    expect(outputText).toContain("[Attachment attached:");
+    // Identical leaf in args and outer result dedupes into ONE attachment.
+    const fileParts = rewritten[1].parts.filter((part) => part.type === "file");
+    expect(fileParts).toHaveLength(1);
+  });
+
   it("extracts media containers nested inside non-media content parts", async () => {
     // A content container can hold a custom non-media part that itself wraps
     // another media container. Capture retains such parts whole while within

@@ -175,6 +175,27 @@ export function extractAttachmentsFromToolOutput(
   }
 
   if (!isContentContainer(output)) {
+    // Standalone media leaf (r23): sandbox code can pluck a part out of a
+    // container (`const part = image.value[0]`) and return it or pass it as
+    // another tool's argument; capture retains it under the shared budget,
+    // so the provider copy must rewrite it like containered parts.
+    if (isMediaPart(output)) {
+      if (isSupportedAttachmentMediaType(output.mediaType)) {
+        return {
+          newOutput: buildAttachmentPlaceholder(output),
+          attachments: [
+            {
+              data: output.data,
+              mediaType: normalizeAttachmentMediaType(output.mediaType),
+              ...(normalizeOptionalFilename(output.filename)
+                ? { filename: normalizeOptionalFilename(output.filename) }
+                : {}),
+            },
+          ],
+        };
+      }
+      return { newOutput: buildUnsupportedMediaPlaceholder(output), attachments: [] };
+    }
     const nested = extractAttachmentsFromNestedToolCalls(output, depth + 1);
     if (nested != null) {
       return nested;
@@ -467,7 +488,9 @@ function extractAttachmentsFromWrapperValue(
       for (const child of children) {
         if (typeof child !== "object" || child === null) continue;
         if (processed.has(child) || visiting.has(child)) continue;
-        if (isToolOutputShaped(child)) continue;
+        // Media leaves and tool-output shapes are handled at the parent's
+        // exit phase via the recursive shape handlers, not span descent.
+        if (isMediaPart(child) || isToolOutputShaped(child)) continue;
         stack.push({ node: child, entered: false });
       }
       continue;
@@ -480,7 +503,7 @@ function extractAttachmentsFromWrapperValue(
       if (typeof child !== "object" || child === null) {
         return child;
       }
-      if (isToolOutputShaped(child)) {
+      if (isMediaPart(child) || isToolOutputShaped(child)) {
         const extracted = extractAttachmentsFromToolOutput(child, depth + 1);
         if (extracted == null) {
           return child;

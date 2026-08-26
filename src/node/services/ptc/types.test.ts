@@ -81,6 +81,26 @@ describe("retainExemptKernelRecordResult", () => {
       expect(AgentSkillPackageSchema.safeParse(retained?.skill).success).toBe(true);
     });
 
+    it("retains an empty body prefix when the budget is below the first code point", () => {
+      // Budget of 1 char cannot fit the leading emoji (2 serialized chars),
+      // but the empty prefix + truncation note is schema-valid and fits —
+      // dropping the package entirely would erase the skill from
+      // post-compaction context (r23).
+      const note = "\n\n[Skill body truncated at capture to fit the retained-record cap]";
+      const noteChars = JSON.stringify(note).length - 2;
+      const emptyBodySkill = { ...oversizedSkill, body: "", pad: "" };
+      const overheadEmpty = JSON.stringify({ success: true, skill: emptyBodySkill }).length;
+      const pad = "p".repeat(MAX_FILE_CONTENT_SIZE - overheadEmpty - noteChars - 1);
+      const retained = retainExemptKernelRecordResult("agent_skill_read", {
+        success: true,
+        skill: { ...oversizedSkill, body: "🎉".repeat(60), pad },
+      }) as { success?: boolean; skill?: { body?: string } };
+      expect(retained?.success).toBe(true);
+      expect(retained?.skill?.body).toBe(note);
+      expect(JSON.stringify(retained).length).toBeLessThanOrEqual(MAX_FILE_CONTENT_SIZE);
+      expect(AgentSkillPackageSchema.safeParse(retained?.skill).success).toBe(true);
+    });
+
     it("truncates escape-heavy bodies by serialized budget instead of dropping them", () => {
       // An all-newline body serializes at ~2x its raw length; a raw-length
       // budget treated that inflation as fixed overhead, went negative, and
@@ -292,6 +312,31 @@ describe("sanitizeMediaRecordCapture", () => {
     expect(sanitized.note).toBe("kept");
     expect(sanitized.image.value[0]?.type).toBe("text");
     expect(sanitized.image.value[0]?.text).toContain("not supported as a model attachment");
+  });
+
+  it("sanitizes standalone media leaves outside containers", () => {
+    // Guest code can pluck a part out of a container (`image.value[0]`) and
+    // return/log/pass it; container-only recognition would persist that copy
+    // unbudgeted on every call (r23).
+    const bigImage = "A".repeat(2 * 1024 * 1024);
+    const leaf = () => ({ type: "media", mediaType: "image/png", data: bigImage });
+    const shared = { remainingBytes: KERNEL_RETAINED_MEDIA_BUDGET_BYTES };
+    const first = sanitizeCapturedMediaValue({ payload: leaf() }, shared) as {
+      payload: { type?: string; data?: string; text?: string };
+    };
+    const second = sanitizeCapturedMediaValue({ payload: leaf() }, shared) as {
+      payload: { type?: string; text?: string };
+    };
+    expect(first.payload.data).toBe(bigImage);
+    expect(second.payload.type).toBe("text");
+    expect(second.payload.text).toContain("aggregate media budget exceeded");
+
+    // Unsupported standalone leaves are always replaced.
+    const audio = sanitizeCapturedMediaValue({
+      payload: { type: "media", mediaType: "audio/wav", data: "d2F2".repeat(50) },
+    }) as { payload: { type?: string; text?: string } };
+    expect(audio.payload.type).toBe("text");
+    expect(audio.payload.text).toContain("not supported as a model attachment");
   });
 
   it("shares a caller-provided budget across separate captures", () => {
