@@ -5,7 +5,7 @@
  * but designed to allow future migration to libbun or other runtimes.
  */
 
-import type { PTCEvent, PTCExecutionResult } from "./types";
+import type { CaptureSanitizerBudget, PTCEvent, PTCExecutionResult } from "./types";
 
 /**
  * Resource limits for sandbox execution.
@@ -104,7 +104,7 @@ export interface IJSRuntime extends Disposable {
    */
   setCaptureResultSanitizer(
     sanitizer:
-      | ((toolName: string, result: unknown, budget?: { remainingBytes: number }) => unknown)
+      | ((toolName: string, result: unknown, budget?: CaptureSanitizerBudget) => unknown)
       | undefined
   ): void;
 

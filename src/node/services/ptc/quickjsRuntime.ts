@@ -14,10 +14,11 @@ import { QuickJSAsyncFFI } from "@jitl/quickjs-wasmfile-release-asyncify/ffi";
 import crypto from "crypto";
 import type { IJSRuntime, IJSRuntimeFactory, KernelRecordBounds, RuntimeLimits } from "./runtime";
 import type { PTCEvent, PTCExecutionResult, PTCToolCallRecord, PTCConsoleRecord } from "./types";
+import type { CaptureSanitizerBudget } from "./types";
+import { createCaptureSanitizerBudget } from "./types";
 import {
   CONSOLE_CAPTURE_BUDGET_BYTES,
   KERNEL_RETAINED_EXECUTION_BUDGET_BYTES,
-  KERNEL_RETAINED_MEDIA_BUDGET_BYTES,
 } from "@/constants/kernelOutput";
 import { sliceUtf8Bytes } from "@/common/utils/sliceUtf8Bytes";
 
@@ -190,7 +191,7 @@ export class QuickJSRuntime implements IJSRuntime {
   private captureResultSanitizer?: (
     toolName: string,
     result: unknown,
-    budget?: { remainingBytes: number }
+    budget?: CaptureSanitizerBudget
   ) => unknown;
   /** Per-execution shared media budget for the capture sanitizer in CLASSIC
    * (non-kernel) mode, keyed like retainedResultBudgets. Classic records keep
@@ -202,7 +203,7 @@ export class QuickJSRuntime implements IJSRuntime {
    * retainedResultBudgets. */
   private readonly classicSanitizerBudgets = new WeakMap<
     PTCToolCallRecord[],
-    { remainingBytes: number }
+    CaptureSanitizerBudget
   >();
   /** Per-execution byte budgets for RETAINED record results, keyed by the
    * attribution's record array like consoleBudgets (fresh array per eval;
@@ -598,7 +599,7 @@ export class QuickJSRuntime implements IJSRuntime {
 
   setCaptureResultSanitizer(
     sanitizer:
-      | ((toolName: string, result: unknown, budget?: { remainingBytes: number }) => unknown)
+      | ((toolName: string, result: unknown, budget?: CaptureSanitizerBudget) => unknown)
       | undefined
   ): void {
     this.captureResultSanitizer = sanitizer;
@@ -754,10 +755,10 @@ export class QuickJSRuntime implements IJSRuntime {
 
   /** Get-or-create the classic-mode shared sanitizer budget for one
    * attribution's record array (see classicSanitizerBudgets). */
-  private classicSanitizerBudgetFor(toolCalls: PTCToolCallRecord[]): { remainingBytes: number } {
+  private classicSanitizerBudgetFor(toolCalls: PTCToolCallRecord[]): CaptureSanitizerBudget {
     let budget = this.classicSanitizerBudgets.get(toolCalls);
     if (!budget) {
-      budget = { remainingBytes: KERNEL_RETAINED_MEDIA_BUDGET_BYTES };
+      budget = createCaptureSanitizerBudget();
       this.classicSanitizerBudgets.set(toolCalls, budget);
     }
     return budget;

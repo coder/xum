@@ -74,14 +74,17 @@ export const KERNEL_RETAINED_CONTAINER_MAX_PARTS = 64;
 export const KERNEL_RETAINED_EXECUTION_BUDGET_BYTES = 4 * KERNEL_RETAINED_MEDIA_BUDGET_BYTES;
 
 /**
- * Final serialized-size cap on ONE media-bearing value after the capture
- * sanitizer's graph walk. Placeholders replacing unsupported/over-budget
- * media do not consume the media budget (they must always be emitted for
- * safety), so a value flooding thousands of media nodes could otherwise
- * append placeholder structures without bound; a sanitized value that still
- * serializes above this cap collapses to a single bounded marker. 2x the
- * media budget leaves ample room for legitimately retained media plus
- * non-media siblings and placeholder overhead.
+ * Serialized-size allowance for media-BEARING values after the capture
+ * sanitizer's graph walk, shared across every capture charging the same
+ * budget (execution-wide in classic mode — see CaptureSanitizerBudget).
+ * Placeholders replacing unsupported/over-budget media do not consume the
+ * media budget (they must always be emitted for safety), so a value flooding
+ * thousands of media nodes — or a loop of calls each returning another
+ * placeholder-flooded record (r27 security) — could otherwise persist
+ * unbounded bytes; media-bearing sanitized values debit this allowance and
+ * collapse to a single bounded marker once it is spent. 2x the media budget
+ * leaves ample room for legitimately retained media plus non-media siblings
+ * and placeholder overhead.
  */
 export const KERNEL_SANITIZED_MEDIA_VALUE_MAX_BYTES = 2 * KERNEL_RETAINED_MEDIA_BUDGET_BYTES;
 

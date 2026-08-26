@@ -7,6 +7,7 @@ import {
   KERNEL_RETAINED_MEDIA_BUDGET_BYTES,
 } from "@/constants/kernelOutput";
 import {
+  createCaptureSanitizerBudget,
   retainExemptKernelRecordResult,
   retainPersistenceCriticalArgsFields,
   sanitizeCapturedMediaValue,
@@ -376,7 +377,28 @@ describe("sanitizeMediaRecordCapture", () => {
     }));
     const sanitized = sanitizeCapturedMediaValue({ payload: leaves });
     expect(typeof sanitized).toBe("string");
-    expect(sanitized as string).toContain("exceed the sanitized-value cap");
+    expect(sanitized as string).toContain("exceed the remaining sanitized-value budget");
+  });
+
+  it("charges media-bearing sanitized values against the shared execution budget", () => {
+    // Placeholders and non-media siblings never debit the media allowance, so
+    // a per-value-only cap let a loop of calls retain another multi-megabyte
+    // media-bearing record per call (r27 security): the sanitized bytes now
+    // debit the shared budget and later values collapse to a small marker.
+    const bigSibling = "x".repeat(4 * 1024 * 1024);
+    const value = () => ({
+      note: bigSibling,
+      media: { type: "media", mediaType: "audio/wav", data: "d2F2" },
+    });
+    const shared = createCaptureSanitizerBudget();
+    const first = sanitizeCapturedMediaValue(value(), shared);
+    expect(typeof first).toBe("object");
+    const second = sanitizeCapturedMediaValue(value(), shared);
+    expect(typeof second).toBe("string");
+    expect(second as string).toContain("exceed the remaining sanitized-value budget");
+    // Media-free values stay uncharged and untouched (classic contract).
+    const mediaFree = { note: bigSibling };
+    expect(sanitizeCapturedMediaValue(mediaFree, shared)).toBe(mediaFree);
   });
 
   it("sanitizes standalone media leaves outside containers", () => {
@@ -385,7 +407,7 @@ describe("sanitizeMediaRecordCapture", () => {
     // unbudgeted on every call (r23).
     const bigImage = "A".repeat(2 * 1024 * 1024);
     const leaf = () => ({ type: "media", mediaType: "image/png", data: bigImage });
-    const shared = { remainingBytes: KERNEL_RETAINED_MEDIA_BUDGET_BYTES };
+    const shared = createCaptureSanitizerBudget();
     const first = sanitizeCapturedMediaValue({ payload: leaf() }, shared) as {
       payload: { type?: string; data?: string; text?: string };
     };
@@ -413,7 +435,7 @@ describe("sanitizeMediaRecordCapture", () => {
       type: "content",
       value: [{ type: "media", mediaType: "image/png", data: bigImage }],
     });
-    const shared = { remainingBytes: KERNEL_RETAINED_MEDIA_BUDGET_BYTES };
+    const shared = createCaptureSanitizerBudget();
     const first = sanitizeCapturedMediaValue(container(), shared) as RetainedContainer;
     const second = sanitizeCapturedMediaValue(container(), shared) as RetainedContainer;
     expect(first.value[0]?.data).toBe(bigImage);

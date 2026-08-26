@@ -433,9 +433,37 @@ function sanitizeRetainedMediaContainer(
 export function sanitizeMediaRecordCapture(
   _toolName: string,
   result: unknown,
-  budget?: { remainingBytes: number }
+  budget?: CaptureSanitizerBudget
 ): unknown {
   return sanitizeCapturedMediaValue(result, budget);
+}
+
+/**
+ * Aggregate allowances shared across every capture that sanitizes against the
+ * same budget object (classic mode shares ONE per execution — see
+ * QuickJSRuntime.classicSanitizerBudgets; kernel mode gets a fresh one per
+ * call, its cross-call growth being bounded by the retained-result budget).
+ */
+export interface CaptureSanitizerBudget {
+  /** Bytes left for RETAINED supported media parts (and their retained
+   * container siblings) — see KERNEL_RETAINED_MEDIA_BUDGET_BYTES. */
+  remainingBytes: number;
+  /** Serialized bytes left for media-BEARING sanitized values as a whole,
+   * placeholders and non-media siblings included — see
+   * KERNEL_SANITIZED_MEDIA_VALUE_MAX_BYTES. Placeholders are emitted for
+   * safety and never debit the media allowance above, so without this
+   * charge a loop of calls returning unsupported media would retain another
+   * placeholder-flooded record per call without bound (r27 security).
+   * Media-free values stay uncharged (classic keeps them inline by
+   * contract). */
+  remainingSanitizedBytes: number;
+}
+
+export function createCaptureSanitizerBudget(): CaptureSanitizerBudget {
+  return {
+    remainingBytes: KERNEL_RETAINED_MEDIA_BUDGET_BYTES,
+    remainingSanitizedBytes: KERNEL_SANITIZED_MEDIA_VALUE_MAX_BYTES,
+  };
 }
 
 /**
@@ -458,7 +486,7 @@ export function sanitizeCapturedMediaValue(
   // A caller-shared budget bounds media across MULTIPLE captures (classic
   // mode shares one per execution — see QuickJSRuntime.boundCaptureResult);
   // absent, each call gets the standalone per-value allowance.
-  budget: { remainingBytes: number } = { remainingBytes: KERNEL_RETAINED_MEDIA_BUDGET_BYTES }
+  budget: CaptureSanitizerBudget = createCaptureSanitizerBudget()
 ): unknown {
   const state = { sawMedia: false };
   const sanitized = sanitizeMediaValueGraph(value, budget, state);
@@ -466,12 +494,17 @@ export function sanitizeCapturedMediaValue(
   // Final serialized-output cap (r24): placeholders replacing unsupported or
   // over-budget media never consume the media budget (they must always be
   // emitted for safety), so a value flooding many media nodes could append
-  // placeholder structures without bound. Media-free values are untouched
-  // (classic mode keeps full inline results/args by contract).
+  // placeholder structures without bound. The cap DEBITS the shared budget
+  // (r27 security): a per-value-only cap would let a loop of calls retain
+  // another placeholder-flooded multi-megabyte record per call — once the
+  // execution-wide allowance is spent, media-bearing values collapse to this
+  // small marker. Media-free values are untouched and uncharged (classic
+  // mode keeps full inline results/args by contract).
   const bytes = serializedJsonByteLength(sanitized);
-  if (bytes === undefined || bytes > KERNEL_SANITIZED_MEDIA_VALUE_MAX_BYTES) {
-    return `[value bounded at capture: ${bytes ?? "unserializable"} serialized bytes after media sanitization exceed the sanitized-value cap]`;
+  if (bytes === undefined || bytes > budget.remainingSanitizedBytes) {
+    return `[value bounded at capture: ${bytes ?? "unserializable"} serialized bytes after media sanitization exceed the remaining sanitized-value budget]`;
   }
+  budget.remainingSanitizedBytes -= bytes;
   return sanitized;
 }
 
