@@ -1472,13 +1472,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       // Capture the anchor up front: the context menu closes (unmounting the
       // button) while the preflight below is awaited, and a disconnected
       // element would resolve to zero coordinates.
-      const anchor =
-        buttonElement != null
-          ? (() => {
-              const rect = buttonElement.getBoundingClientRect();
-              return { top: rect.top + window.scrollY, left: rect.right + 10 };
-            })()
-          : undefined;
+      const anchor = resolvePopoverErrorAnchor(buttonElement);
       // projects.list excludes archived workspaces (read-side projection), so
       // blocker counts come from a read-only backend preflight instead of the
       // embedded workspace arrays. remove() is deliberately NOT used as the
