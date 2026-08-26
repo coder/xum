@@ -2038,6 +2038,11 @@ export class WorkspaceService extends EventEmitter {
                 cancelReason: BASH_MONITOR_REARMED_QUEUE_REASON,
               });
             }
+            // A re-armed process ID must not inherit its prior generation's pending
+            // monitor-lost wake in the background-bash listing. spawn() emits its change
+            // before this locked supersession runs, so subscribers need a fresh read now
+            // that the stale record is durably superseded.
+            this.notifyBashMonitorWakeStateChanged(payload.workspaceId);
           }
         )
       )
@@ -2709,10 +2714,9 @@ export class WorkspaceService extends EventEmitter {
     return this.bashMonitorRecoveryPromise.then(() =>
       this.bashMonitorHistoryLocks.withLock(ownerWorkspaceId, () =>
         this.drainBashMonitorWakesUnlocked(ownerWorkspaceId).finally(() => {
-          // Coarse unconditional emit after every drain pass: delivered/superseded
-          // transitions must clear the "match found — waking agent" indicator, and the
-          // drain has many exit paths. An occasional no-op emit is cheaper than
-          // threading per-transition notifications through each of them.
+          // Safety-net emit after every drain pass. Prompt transitions notify inline
+          // (reconcile loop, resolveWakeSnapshots), but the drain has many exit and
+          // error paths; a trailing no-op emit is cheaper than auditing each of them.
           this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
         })
       )
@@ -2728,6 +2732,9 @@ export class WorkspaceService extends EventEmitter {
       (await this.findAcceptedBashMonitorWakeSnapshots(ownerWorkspaceId, pendingSnapshot)) ??
       new Set<string>();
     const pending: BashMonitorWakeRecord[] = [];
+    // The drain can block on a full sendMessage turn below, so transitions applied in
+    // this reconcile loop must notify before that await — not from the drain's finally.
+    let reconciledTransition = false;
     for (const record of pendingSnapshot) {
       const snapshotKey = this.bashMonitorWakeSnapshotKey(record.processId, record.updatedAt);
       if (acceptedSnapshots.has(snapshotKey)) {
@@ -2736,6 +2743,7 @@ export class WorkspaceService extends EventEmitter {
             ownerWorkspaceId,
             record
           );
+          reconciledTransition = true;
           if (!deliveredSnapshot) {
             // New matches merged after the accepted snapshot. Keep the remainder pending for its own
             // wake rather than marking those unseen lines delivered with the older accepted turn.
@@ -2758,9 +2766,13 @@ export class WorkspaceService extends EventEmitter {
         )
       ) {
         await this.bashMonitorWakeStore.markSuperseded(ownerWorkspaceId, record.id);
+        reconciledTransition = true;
       } else {
         pending.push(record);
       }
+    }
+    if (reconciledTransition) {
+      this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
     }
     if (pending.length === 0) return;
 
@@ -2815,6 +2827,11 @@ export class WorkspaceService extends EventEmitter {
           hasUnresolvedMergedMatches = true;
         }
       }
+      // Notify as soon as the durable transition lands. The accepted-send path runs this
+      // while the drain is still awaiting the full sendMessage turn, so deferring to the
+      // drain's finally would keep "waking agent…" on screen for the whole wake-triggered
+      // stream even though the wake was already delivered.
+      this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
       if (hasUnresolvedMergedMatches) {
         this.scheduleBashMonitorWakeDrainAfterIdle(ownerWorkspaceId);
       }
@@ -13638,19 +13655,19 @@ export class WorkspaceService extends EventEmitter {
     // turn), so a one-shot watcher that matched and exited does not look like a lost wake.
     // Wake ids equal process ids (BashMonitorWakeStore.wakeId). The indicator must never
     // break process listing, so a wake-store read failure degrades to "no pending wakes".
-    let pendingWakeProcessIds: ReadonlySet<string>;
+    let pendingWakes: readonly BashMonitorWakeRecord[];
     try {
-      pendingWakeProcessIds = new Set(
-        (await this.bashMonitorWakeStore.listPending(workspaceId)).map((record) => record.processId)
-      );
+      pendingWakes = await this.bashMonitorWakeStore.listPending(workspaceId);
     } catch (error) {
       log.debug("Failed to read pending bash monitor wakes for process listing", {
         workspaceId,
         error,
       });
-      pendingWakeProcessIds = new Set();
+      pendingWakes = [];
     }
-    return processes.map((p) => {
+    const pendingWakeProcessIds = new Set(pendingWakes.map((record) => record.processId));
+    const liveProcessIds = new Set(processes.map((p) => p.id));
+    const rows = processes.map((p) => {
       const monitor = this.backgroundProcessManager.getMonitorSnapshot(p);
       const wakePending = pendingWakeProcessIds.has(p.id);
       return {
@@ -13666,6 +13683,35 @@ export class WorkspaceService extends EventEmitter {
         exitCode: p.exitCode,
       };
     });
+    // Durable pending wakes can outlive the in-memory process table (app restart wipes the
+    // manager while the wake store persists, and startup delivery can lag). Synthesize a row
+    // from the wake record so the pending-delivery state stays visible — that restart window
+    // is exactly the state this listing is meant to expose.
+    for (const record of pendingWakes) {
+      if (liveProcessIds.has(record.processId)) continue;
+      const startTime = Date.parse(record.createdAt);
+      rows.push({
+        id: record.processId,
+        // No live process behind this row; the renderer hides non-positive pids.
+        pid: 0,
+        script: record.script ?? "",
+        displayName: record.displayName,
+        startTime: Number.isNaN(startTime) ? Date.now() : startTime,
+        status: "exited",
+        monitor: {
+          filter: record.filter,
+          filter_exclude: record.filterExclude,
+          cooldown_ms: 0,
+          totalMatches: record.totalMatches,
+          droppedLines: record.droppedLines,
+          lastLines: record.lines,
+          stopped: true,
+          wakePending: true,
+        },
+        exitCode: undefined,
+      });
+    }
+    return rows;
   }
 
   /**

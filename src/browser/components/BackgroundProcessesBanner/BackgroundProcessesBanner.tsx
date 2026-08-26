@@ -121,7 +121,11 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                         )}
                       </div>
                     )}
-                    <div className="text-muted font-mono text-[10px]">pid {proc.pid}</div>
+                    {/* Rows synthesized from a durable pending wake (process gone after
+                        restart) carry no real pid. */}
+                    {proc.pid > 0 && (
+                      <div className="text-muted font-mono text-[10px]">pid {proc.pid}</div>
+                    )}
                   </div>
                   <div className="flex shrink-0 items-center gap-2">
                     {/* Exited-but-wake-pending rows have no live duration to increment */}
