@@ -376,8 +376,12 @@ function sanitizeRetainedMediaContainer(
  * individually-allowed images would persist unbounded multi-megabyte records
  * in default (non-RLM) PTC mode. The guest still receives the full value.
  */
-export function sanitizeMediaRecordCapture(_toolName: string, result: unknown): unknown {
-  return sanitizeCapturedMediaValue(result);
+export function sanitizeMediaRecordCapture(
+  _toolName: string,
+  result: unknown,
+  budget?: { remainingBytes: number }
+): unknown {
+  return sanitizeCapturedMediaValue(result, budget);
 }
 
 /**
@@ -403,8 +407,13 @@ const MAX_MEDIA_SANITIZE_DEPTH = 256;
  * linear; cycle back-edges resolve to a bounded placeholder — cyclic values
  * cannot JSON-persist anyway).
  */
-export function sanitizeCapturedMediaValue(value: unknown): unknown {
-  const budget = { remainingBytes: KERNEL_RETAINED_MEDIA_BUDGET_BYTES };
+export function sanitizeCapturedMediaValue(
+  value: unknown,
+  // A caller-shared budget bounds media across MULTIPLE captures (classic
+  // mode shares one per execution — see QuickJSRuntime.boundCaptureResult);
+  // absent, each call gets the standalone per-value allowance.
+  budget: { remainingBytes: number } = { remainingBytes: KERNEL_RETAINED_MEDIA_BUDGET_BYTES }
+): unknown {
   return sanitizeMediaValueGraph(value, budget, new Map<object, unknown>(), 0);
 }
 
@@ -497,13 +506,35 @@ export function isPersistenceCriticalRecordToolName(toolName: string): boolean {
  * not justify exempting the record from kernel bounding; extraction replaces
  * any unsupported parts that ride along in an exempted container with bounded
  * placeholders at request time.
+ *
+ * The search recurses through non-media parts (r19): a supported image nested
+ * inside a custom wrapper part must still exempt the container, or
+ * captureRetained declines and the whole result collapses to a
+ * __kernelBounded marker before request-time extraction ever sees a payload.
+ * Retention stays bounded either way — sanitizeRetainedMediaContainer charges
+ * every retained part its FULL serialized size (nested payloads included).
  */
 export function containsMediaContentPayload(result: unknown): boolean {
   if (typeof result !== "object" || result === null) return false;
   const container = result as { type?: unknown; value?: unknown };
   if (container.type !== "content" || !Array.isArray(container.value)) return false;
-  return container.value.some((item: unknown) => {
-    const media = asMediaPart(item);
-    return media?.mediaType !== undefined && isSupportedAttachmentMediaType(media.mediaType);
-  });
+  return container.value.some((item: unknown) => containsSupportedMediaValue(item, 0));
+}
+
+/** Bounded deep search for a supported media part inside arbitrary wrapper
+ * values. Depth-capped like the sanitizer walk (guest values are JSON
+ * round-tripped so cycles are unreachable; the cap fails CLOSED — a ladder
+ * deeper than any plausible legitimate shape simply loses the exemption and
+ * falls back to normal bounding). */
+function containsSupportedMediaValue(value: unknown, depth: number): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const media = asMediaPart(value);
+  if (media !== null) {
+    return media.mediaType !== undefined && isSupportedAttachmentMediaType(media.mediaType);
+  }
+  if (depth >= MAX_MEDIA_SANITIZE_DEPTH) return false;
+  const children: unknown[] = Array.isArray(value)
+    ? value
+    : Object.values(value as Record<string, unknown>);
+  return children.some((child) => containsSupportedMediaValue(child, depth + 1));
 }

@@ -85,6 +85,48 @@ describe("retainExemptKernelRecordResult", () => {
   });
 
   describe("media container budgets", () => {
+    it("exempts containers whose only supported media is nested inside a custom part", () => {
+      // A shallow immediate-part check would decline the exemption and
+      // collapse the whole result to a __kernelBounded marker, so the
+      // request-time traversal would never see a payload to extract (r19).
+      const nested = {
+        type: "content",
+        value: [
+          {
+            type: "custom",
+            payload: {
+              inner: {
+                type: "content",
+                value: [{ type: "media", mediaType: "image/png", data: "aGVsbG8=" }],
+              },
+            },
+          },
+        ],
+      };
+      const retained = retainExemptKernelRecordResult("mcp__shots__take", nested) as {
+        value: Array<{ type?: string }>;
+      };
+      expect(retained).toBeDefined();
+      expect(retained.value[0]?.type).toBe("custom");
+
+      // Unsupported nested media alone still does NOT exempt.
+      const unsupportedNested = {
+        type: "content",
+        value: [
+          {
+            type: "custom",
+            payload: {
+              inner: {
+                type: "content",
+                value: [{ type: "media", mediaType: "audio/wav", data: "d2F2" }],
+              },
+            },
+          },
+        ],
+      };
+      expect(retainExemptKernelRecordResult("mcp__shots__take", unsupportedNested)).toBeUndefined();
+    });
+
     it("rejects junk media types at validation instead of retaining them as supported", () => {
       // transformMCPResult copies server-controlled MIME types unchanged; an
       // "image/" + megabytes string must fail isSupportedAttachmentMediaType
@@ -190,6 +232,23 @@ describe("sanitizeMediaRecordCapture", () => {
     expect(sanitized.note).toBe("kept");
     expect(sanitized.image.value[0]?.type).toBe("text");
     expect(sanitized.image.value[0]?.text).toContain("not supported as a model attachment");
+  });
+
+  it("shares a caller-provided budget across separate captures", () => {
+    // Classic mode passes ONE budget per execution (r19): without sharing,
+    // each call would mint a fresh allowance and a loop of bridged media
+    // calls could persist unbounded multi-megabyte records.
+    const bigImage = "A".repeat(2 * 1024 * 1024);
+    const container = () => ({
+      type: "content",
+      value: [{ type: "media", mediaType: "image/png", data: bigImage }],
+    });
+    const shared = { remainingBytes: KERNEL_RETAINED_MEDIA_BUDGET_BYTES };
+    const first = sanitizeCapturedMediaValue(container(), shared) as RetainedContainer;
+    const second = sanitizeCapturedMediaValue(container(), shared) as RetainedContainer;
+    expect(first.value[0]?.data).toBe(bigImage);
+    expect(second.value[0]?.type).toBe("text");
+    expect(second.value[0]?.text).toContain("aggregate media budget exceeded");
   });
 
   it("shares one aggregate budget across all containers in a value", () => {

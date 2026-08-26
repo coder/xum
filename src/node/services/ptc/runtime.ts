@@ -103,7 +103,9 @@ export interface IJSRuntime extends Disposable {
    * Pass undefined to disable.
    */
   setCaptureResultSanitizer(
-    sanitizer: ((toolName: string, result: unknown) => unknown) | undefined
+    sanitizer:
+      | ((toolName: string, result: unknown, budget?: { remainingBytes: number }) => unknown)
+      | undefined
   ): void;
 
   /**

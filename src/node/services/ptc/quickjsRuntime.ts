@@ -17,6 +17,7 @@ import type { PTCEvent, PTCExecutionResult, PTCToolCallRecord, PTCConsoleRecord 
 import {
   CONSOLE_CAPTURE_BUDGET_BYTES,
   KERNEL_RETAINED_EXECUTION_BUDGET_BYTES,
+  KERNEL_RETAINED_MEDIA_BUDGET_BYTES,
 } from "@/constants/kernelOutput";
 import { sliceUtf8Bytes } from "@/common/utils/sliceUtf8Bytes";
 
@@ -186,7 +187,23 @@ export class QuickJSRuntime implements IJSRuntime {
   /** Kernel-mode caps on record/event capture; see IJSRuntime.setKernelRecordBounds. */
   private kernelRecordBounds?: KernelRecordBounds;
   /** Mode-independent record sanitizer; see IJSRuntime.setCaptureResultSanitizer. */
-  private captureResultSanitizer?: (toolName: string, result: unknown) => unknown;
+  private captureResultSanitizer?: (
+    toolName: string,
+    result: unknown,
+    budget?: { remainingBytes: number }
+  ) => unknown;
+  /** Per-execution shared media budget for the capture sanitizer in CLASSIC
+   * (non-kernel) mode, keyed like retainedResultBudgets. Classic records keep
+   * full inline results and have no kernel caps, so without sharing, every
+   * call would mint a fresh per-value media allowance and a model-authored
+   * loop of bridged media calls could persist unbounded multi-megabyte
+   * records into partial/final history (r19). Kernel mode keeps per-call
+   * allowances — its cross-call growth is already bounded by
+   * retainedResultBudgets. */
+  private readonly classicSanitizerBudgets = new WeakMap<
+    PTCToolCallRecord[],
+    { remainingBytes: number }
+  >();
   /** Per-execution byte budgets for RETAINED record results, keyed by the
    * attribution's record array like consoleBudgets (fresh array per eval;
    * late fire-and-forget settlements share their originating eval's budget).
@@ -580,7 +597,9 @@ export class QuickJSRuntime implements IJSRuntime {
   }
 
   setCaptureResultSanitizer(
-    sanitizer: ((toolName: string, result: unknown) => unknown) | undefined
+    sanitizer:
+      | ((toolName: string, result: unknown, budget?: { remainingBytes: number }) => unknown)
+      | undefined
   ): void {
     this.captureResultSanitizer = sanitizer;
   }
@@ -651,10 +670,18 @@ export class QuickJSRuntime implements IJSRuntime {
     // The mode-independent sanitizer runs first (both classic and kernel
     // mode): media containers are budgeted at capture because records/events
     // persist into session history in every mode, and request-time
-    // attachment extraction rewrites only the provider copy.
+    // attachment extraction rewrites only the provider copy. Classic mode
+    // shares ONE sanitizer budget per execution (see classicSanitizerBudgets);
+    // kernel mode keeps per-call allowances backed by the retained budget.
     const sanitized =
       this.captureResultSanitizer !== undefined
-        ? this.captureResultSanitizer(toolName, value)
+        ? this.captureResultSanitizer(
+            toolName,
+            value,
+            this.kernelRecordBounds === undefined
+              ? this.classicSanitizerBudgetFor(toolCalls)
+              : undefined
+          )
         : value;
     if (this.kernelRecordBounds === undefined) return sanitized;
     // Retained records (persistence-critical tools, media containers) keep a
@@ -707,6 +734,17 @@ export class QuickJSRuntime implements IJSRuntime {
     if (!budget) {
       budget = { remainingBytes: KERNEL_RETAINED_EXECUTION_BUDGET_BYTES };
       this.retainedResultBudgets.set(toolCalls, budget);
+    }
+    return budget;
+  }
+
+  /** Get-or-create the classic-mode shared sanitizer budget for one
+   * attribution's record array (see classicSanitizerBudgets). */
+  private classicSanitizerBudgetFor(toolCalls: PTCToolCallRecord[]): { remainingBytes: number } {
+    let budget = this.classicSanitizerBudgets.get(toolCalls);
+    if (!budget) {
+      budget = { remainingBytes: KERNEL_RETAINED_MEDIA_BUDGET_BYTES };
+      this.classicSanitizerBudgets.set(toolCalls, budget);
     }
     return budget;
   }

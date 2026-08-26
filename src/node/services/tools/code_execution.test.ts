@@ -1106,6 +1106,38 @@ describe("createCodeExecutionTool", () => {
       expect(value?.[1]?.text).toContain("aggregate media budget exceeded");
     });
 
+    it("shares one classic-mode capture budget across calls in an execution", async () => {
+      // Classic mode has no kernel caps and no retained-result budget, so a
+      // fresh per-call media allowance would let a model-authored loop of
+      // bridged media calls persist unbounded multi-megabyte records (r19).
+      // One shared per-execution budget bounds the sum: later calls' media
+      // degrade to placeholders.
+      const image = "A".repeat(1_300_000);
+      const tools: Record<string, Tool> = {
+        mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
+          type: "content",
+          value: [{ type: "media", mediaType: "image/png", data: image }],
+        })),
+      };
+      const tool = await createCodeExecutionTool(runtimeFactory, new ToolBridge(tools));
+
+      const result = (await tool.execute!(
+        { code: "for (let i = 0; i < 3; i++) { mux.mcp__shots__take({}); } return true;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const records = result.toolCalls.filter((r) => r.toolName === "mcp__shots__take");
+      expect(records).toHaveLength(3);
+      const partOf = (record: (typeof records)[number]) =>
+        (record.result as { value?: Array<{ type?: string; data?: string; text?: string }> })
+          ?.value?.[0];
+      // Two ~1.3MB images fit the shared 3MiB budget; the third exceeds it.
+      expect(partOf(records[0])?.data).toBe(image);
+      expect(partOf(records[1])?.data).toBe(image);
+      expect(partOf(records[2])?.type).toBe("text");
+      expect(partOf(records[2])?.text).toContain("aggregate media budget exceeded");
+    });
+
     it("charges retained results against one execution-wide budget", async () => {
       // Retention bypasses the per-record 16KiB kernel cap by design, but a
       // loop of retained calls (each up to ~3MiB of media) must not grow
