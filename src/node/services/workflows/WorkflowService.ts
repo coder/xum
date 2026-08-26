@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import * as path from "node:path";
 
 import {
+  isActiveWorkflowRunStatus,
   isTerminalWorkflowRunStatus,
   type WorkflowScriptDescriptor,
   type WorkflowRunRecord,
@@ -247,6 +248,39 @@ export class WorkflowService {
       }
       throw error;
     }
+  }
+
+  /**
+   * Active-run discovery for the sub-agent tray's cold mount. Unlike listRuns(),
+   * nested (parentWorkflow) runs are included: they are deliberately absent from
+   * workspace activity, so a tray mounting during a nested run's between-workers
+   * gap has no other way to learn the run exists. Per-record read failures
+   * degrade to a nameless entry rather than failing discovery.
+   */
+  async listActiveRunSummaries(input: {
+    workspaceId: string;
+  }): Promise<Array<{ runId: string; workflowName: string | null; nested: boolean }>> {
+    assert(
+      input.workspaceId.length > 0,
+      "WorkflowService.listActiveRunSummaries: workspaceId is required"
+    );
+    const snapshots = await this.runStore.listRunStatusSnapshots();
+    return await Promise.all(
+      snapshots
+        .filter(
+          (snapshot) =>
+            snapshot.workspaceId === input.workspaceId && isActiveWorkflowRunStatus(snapshot.status)
+        )
+        .map(async (snapshot) => {
+          let workflowName: string | null = null;
+          try {
+            workflowName = (await this.runStore.getRun(snapshot.id)).workflow.name ?? null;
+          } catch {
+            // Name is presentation-only; the id still seeds the tray group.
+          }
+          return { runId: snapshot.id, workflowName, nested: snapshot.parentWorkflow != null };
+        })
+    );
   }
 
   private async notifyRunStatusChanged(

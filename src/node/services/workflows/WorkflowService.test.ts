@@ -829,3 +829,73 @@ describe("WorkflowService.getRunStatusForLiveness", () => {
     expect(await service.getRun({ workspaceId: "workspace-1", runId: "wfr_liveness" })).toBeNull();
   });
 });
+
+describe("WorkflowService.listActiveRunSummaries", () => {
+  test("includes nested active runs and excludes settled or foreign-workspace runs", async () => {
+    using tmp = new DisposableTempDir("workflow-service-active-summaries");
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    const service = new WorkflowService({
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        async runAgent() {
+          throw new Error("No agent steps expected");
+        },
+      },
+      generateRunId: () => "wfr_completed_run",
+      runnerId: "runner-active-summaries",
+    });
+    const descriptor = {
+      name: "deep-research",
+      description: "Research a topic",
+      scope: "built-in" as const,
+      executable: true,
+    };
+    const source = "export default async function workflow() { return 'ok'; }\n";
+    const now = "2026-05-29T00:00:00.000Z";
+    // Active (pending) top-level and NESTED runs — nested runs are deliberately
+    // absent from workspace activity, so this discovery read is the only way a
+    // cold-mounted tray can learn about them mid-gap.
+    await runStore.createRun({
+      id: "wfr_top_active",
+      workspaceId: "workspace-1",
+      workflow: descriptor,
+      source,
+      args: {},
+      now,
+    });
+    await runStore.createRun({
+      id: "wfr_nested_active",
+      workspaceId: "workspace-1",
+      workflow: { ...descriptor, name: "implementation-loop" },
+      source,
+      args: {},
+      parentWorkflow: { runId: "wfr_top_active", stepId: "step-1", inputHash: "hash-1", depth: 1 },
+      now,
+    });
+    await runStore.createRun({
+      id: "wfr_other_workspace",
+      workspaceId: "workspace-2",
+      workflow: descriptor,
+      source,
+      args: {},
+      now,
+    });
+    // A settled run must not be discovered.
+    await service.startWorkflow({
+      script: createScript(
+        'export default function workflow() {\n  return { reportMarkdown: "done" };\n}\n'
+      ),
+      workspaceId: "workspace-1",
+      projectTrusted: true,
+      args: {},
+    });
+
+    const summaries = await service.listActiveRunSummaries({ workspaceId: "workspace-1" });
+    summaries.sort((a, b) => a.runId.localeCompare(b.runId));
+    expect(summaries).toEqual([
+      { runId: "wfr_nested_active", workflowName: "implementation-loop", nested: true },
+      { runId: "wfr_top_active", workflowName: "deep-research", nested: false },
+    ]);
+  });
+});

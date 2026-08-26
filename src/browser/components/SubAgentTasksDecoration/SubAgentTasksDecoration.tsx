@@ -13,7 +13,8 @@ import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
-import { isActiveWorkflowRunStatus, type WorkflowRunStatus } from "@/common/types/workflow";
+import { isActiveWorkflowRunStatus } from "@/common/types/workflow";
+import type { WorkflowRunLivenessEntry } from "@/common/orpc/schemas/api";
 import { shortenWorkflowRunId } from "@/browser/components/ProjectSidebar/sidebarTaskGroups";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useRouter } from "@/browser/contexts/RouterContext";
@@ -312,7 +313,7 @@ function formatWorkflowSummary(workflowGroups: readonly WorkflowAgentGroup[]): s
  */
 export function reconcileNestedRunLiveness(input: {
   candidateRunIds: readonly string[];
-  entries: ReadonlyArray<{ runId: string; status: WorkflowRunStatus | null }> | null;
+  entries: readonly WorkflowRunLivenessEntry[] | null;
   failureCounts: Map<string, number>;
   maxFailures: number;
 }): string[] {
@@ -320,7 +321,7 @@ export function reconcileNestedRunLiveness(input: {
   const statusByRunId =
     input.entries == null
       ? null
-      : new Map<string, WorkflowRunStatus | null>(
+      : new Map<string, WorkflowRunLivenessEntry["status"]>(
           input.entries.map((entry) => [entry.runId, entry.status])
         );
   for (const runId of input.candidateRunIds) {
@@ -356,6 +357,9 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
   const [deadNestedRunIds, setDeadNestedRunIds] = useState<ReadonlySet<string>>(
     () => new Set<string>()
   );
+  // Bumped when cold-mount discovery seeds the observed map (a ref mutation the
+  // merge below would otherwise not re-render for).
+  const [, setObservedSeedVersion] = useState(0);
   const {
     subAgents,
     workflowGroups: liveWorkflowGroups,
@@ -406,6 +410,46 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
       return changed ? next : previous;
     });
   }
+  // Cold-mount discovery: nested (parentWorkflow) runs never appear in workspace
+  // activity, so a tray mounting during such a run's between-workers gap would
+  // hide it until its next worker spawns. One bulk read per owner-set change seeds
+  // the observed map (nested runs only — activity already covers top-level runs on
+  // cold mounts); the liveness poll below keeps seeded groups honest.
+  const ownerIdsKey = [props.workspaceId, ...descendantWorkspaceIds].join("\u0000");
+  useEffect(() => {
+    if (api == null) {
+      return;
+    }
+    let cancelled = false;
+    api.workflows
+      .listActiveRuns({ workspaceIds: ownerIdsKey.split("\u0000") })
+      .then((summaries) => {
+        if (cancelled) {
+          return;
+        }
+        let seeded = false;
+        for (const summary of summaries) {
+          if (!summary.nested || observedWorkflowRunsRef.current.has(summary.runId)) {
+            continue;
+          }
+          observedWorkflowRunsRef.current.set(summary.runId, {
+            workflowName: summary.workflowName ?? undefined,
+            ownerWorkspaceId: summary.workspaceId,
+            activityCovered: false,
+          });
+          seeded = true;
+        }
+        if (seeded) {
+          setObservedSeedVersion((version) => version + 1);
+        }
+      })
+      .catch(() => {
+        // Best-effort: live rows and activity still drive the tray.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [api, ownerIdsKey]);
   // Nested gap groups carry no activity signal, so verify their durable run records
   // (same source useWorkflowRunById polls) while any are on screen — one bulk IPC
   // call per cycle. Settled, missing, or repeatedly unreachable runs are marked dead
@@ -448,9 +492,7 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
         return new Set([...previous, ...runIds]);
       });
     };
-    const reconcile = (
-      entries: ReadonlyArray<{ runId: string; status: WorkflowRunStatus | null }> | null
-    ) => {
+    const reconcile = (entries: readonly WorkflowRunLivenessEntry[] | null) => {
       if (!cancelled) {
         markDead(
           reconcileNestedRunLiveness({

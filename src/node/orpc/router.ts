@@ -114,7 +114,8 @@ import * as fsPromises from "fs/promises";
 import * as path from "node:path";
 
 import type { DevToolsEvent } from "@/common/types/devtools";
-import type { WorkflowRunStatus, WorkflowRunStreamEvent } from "@/common/types/workflow";
+import type { WorkflowRunStreamEvent } from "@/common/types/workflow";
+import type { WorkflowRunLivenessEntry } from "@/common/orpc/schemas/api";
 import type { MuxMessage } from "@/common/types/message";
 import { coerceThinkingLevel } from "@/common/types/thinking";
 import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
@@ -2011,9 +2012,26 @@ export const router = (authToken?: string) => {
               }
             })
           );
-          return entries.filter(
-            (entry): entry is { runId: string; status: WorkflowRunStatus | null } => entry != null
+          return entries.filter((entry): entry is WorkflowRunLivenessEntry => entry != null);
+        }),
+      listActiveRuns: t
+        .input(schemas.workflows.listActiveRuns.input)
+        .output(schemas.workflows.listActiveRuns.output)
+        .handler(async ({ context, input }) => {
+          // Discovery is best-effort per owner: a deleted workspace contributes
+          // nothing instead of failing the whole bulk read.
+          const results = await Promise.all(
+            input.workspaceIds.map(async (workspaceId) => {
+              try {
+                const { service } = await resolveWorkflowContext(context, workspaceId);
+                const summaries = await service.listActiveRunSummaries({ workspaceId });
+                return summaries.map((summary) => ({ workspaceId, ...summary }));
+              } catch {
+                return [];
+              }
+            })
           );
+          return results.flat();
         }),
       interrupt: t
         .input(schemas.workflows.interrupt.input)
