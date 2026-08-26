@@ -39,6 +39,21 @@ const TMP_WRITE_SUFFIX_RE = /\.json\.tmp-[^.]+$/;
 // older is an orphan from a crash. Exported for tests.
 export const TEMP_RECOVERY_MIN_AGE_MS = 60 * 1000;
 
+/**
+ * Delay until a deferred fresh temp should be rechecked: an epsilon past the gate so
+ * the re-driven scan's own freshness check cannot lose a same-millisecond race against
+ * the gate arithmetic. The delay is CAPPED to one bounded recheck interval: a far-future
+ * mtime (clock rollback, corrupted timestamps) could otherwise exceed Node's maximum
+ * timer delay, which Node clamps to ~1ms — a tight rescan loop burning CPU. A capped
+ * recheck re-evaluates the file age on each pass instead. Exported for tests.
+ */
+export function deferredTempRecoveryDelayMs(mtimeMs: number, nowMs: number): number {
+  return Math.min(
+    Math.max(0, mtimeMs + TEMP_RECOVERY_MIN_AGE_MS - nowMs) + 250,
+    TEMP_RECOVERY_MIN_AGE_MS + 250
+  );
+}
+
 // Single-source the wake status enum so the exported TS type and the runtime
 // Zod validator below can't drift. Mirrors the `as const` tuple pattern used by
 // the sibling terminalAttentionStore notification enums.
@@ -561,9 +576,7 @@ export class BashMonitorWakeStore {
     mtimeMs: number
   ): void {
     if (this.deferredTempRecoveryTimers.has(filePath)) return;
-    // Epsilon past the gate so the re-driven scan's own freshness check cannot lose a
-    // same-millisecond race against the gate arithmetic.
-    const delayMs = Math.max(0, mtimeMs + TEMP_RECOVERY_MIN_AGE_MS - Date.now()) + 250;
+    const delayMs = deferredTempRecoveryDelayMs(mtimeMs, Date.now());
     const timer = setTimeout(() => {
       this.deferredTempRecoveryTimers.delete(filePath);
       this.onDeferredTempRecoveryDue?.(ownerWorkspaceId);
@@ -819,48 +832,59 @@ export class BashMonitorWakeStore {
     const records: BashMonitorWakeRecord[] = [];
     const seen = new Set<string>();
     const pruneBeforeMs = Date.now() - TERMINAL_WAKE_RETENTION_MS;
+    // Reconcile crash artifacts BEFORE canonical records. Temp reconciliation verifies
+    // staleness against the canonical generation, so ordering matters: if a terminal
+    // canonical were pruned first (record pass below), a stale same-or-older pending
+    // temp would suddenly look like the only durable copy and be restored — quietly
+    // resurrecting and redelivering a deliberately superseded wake. Artifacts-first
+    // guarantees every temp is judged against the still-present canonical record.
+    const recordEntries: string[] = [];
     for (const entry of entries) {
+      if (entry.endsWith(".json")) {
+        recordEntries.push(entry);
+        continue;
+      }
       const filePath = path.join(dir, entry);
-      if (!entry.endsWith(".json")) {
-        const isPruneTrash = PRUNE_TRASH_SUFFIX_RE.test(entry);
-        const isTempWrite = TMP_WRITE_SUFFIX_RE.test(entry);
-        if (!isPruneTrash && !isTempWrite) continue;
-        // Non-regular artifact guard: recovery reads file contents, and readFile on a
-        // FIFO can block forever while EISDIR would fail every scan. ENOENT means a
-        // concurrent recover consumed it; transient stat failures propagate, matching
-        // the record-file policy above.
-        let artifactStat: Stats;
-        try {
-          artifactStat = await fsPromises.stat(filePath);
-        } catch (error) {
-          if (isErrnoWithCode(error, "ENOENT")) continue;
-          throw error;
-        }
-        if (!artifactStat.isFile()) continue;
-        // A crash between pruneTerminalWakeFile's capture rename and its verify/restore
-        // strands the captured inode as *.json.prune-*, and that inode may hold a
-        // concurrently rewritten pending wake that neither scans nor delivery (both
-        // address the original path) can see. Inspect stranded prune files and restore
-        // pending content before any sweeping can touch it.
-        if (isPruneTrash) {
-          const rescued = await this.recoverStrandedPruneFile(
-            ownerWorkspaceId,
-            filePath,
-            pruneBeforeMs
-          );
-          if (rescued != null) records.push(rescued);
-          continue;
-        }
-        // write() leaves *.json.tmp-* files behind only when the process crashed
-        // between writeFile and the commit rename (a rename failure observed by a live
-        // caller deletes its temp). A COMPLETE temp record may then be the only durable
-        // copy of a wake (a brand-new wake has no canonical file at all), so orphan
-        // temps are parsed and restored rather than treated as disposable; incomplete
-        // ones sweep once old so crash leaks stay bounded.
-        const rescued = await this.recoverOrphanTempFile(ownerWorkspaceId, filePath, pruneBeforeMs);
+      const isPruneTrash = PRUNE_TRASH_SUFFIX_RE.test(entry);
+      const isTempWrite = TMP_WRITE_SUFFIX_RE.test(entry);
+      if (!isPruneTrash && !isTempWrite) continue;
+      // Non-regular artifact guard: recovery reads file contents, and readFile on a
+      // FIFO can block forever while EISDIR would fail every scan. ENOENT means a
+      // concurrent recover consumed it; transient stat failures propagate, matching
+      // the record-file policy below.
+      let artifactStat: Stats;
+      try {
+        artifactStat = await fsPromises.stat(filePath);
+      } catch (error) {
+        if (isErrnoWithCode(error, "ENOENT")) continue;
+        throw error;
+      }
+      if (!artifactStat.isFile()) continue;
+      // A crash between pruneTerminalWakeFile's capture rename and its verify/restore
+      // strands the captured inode as *.json.prune-*, and that inode may hold a
+      // concurrently rewritten pending wake that neither scans nor delivery (both
+      // address the original path) can see. Inspect stranded prune files and restore
+      // pending content before any sweeping can touch it.
+      if (isPruneTrash) {
+        const rescued = await this.recoverStrandedPruneFile(
+          ownerWorkspaceId,
+          filePath,
+          pruneBeforeMs
+        );
         if (rescued != null) records.push(rescued);
         continue;
       }
+      // write() leaves *.json.tmp-* files behind only when the process crashed
+      // between writeFile and the commit rename (a rename failure observed by a live
+      // caller deletes its temp). A COMPLETE temp record may then be the only durable
+      // copy of a wake (a brand-new wake has no canonical file at all), so orphan
+      // temps are parsed and restored rather than treated as disposable; incomplete
+      // ones sweep once old so crash leaks stay bounded.
+      const rescued = await this.recoverOrphanTempFile(ownerWorkspaceId, filePath, pruneBeforeMs);
+      if (rescued != null) records.push(rescued);
+    }
+    for (const entry of recordEntries) {
+      const filePath = path.join(dir, entry);
       seen.add(entry);
       let stat: Stats;
       try {
@@ -1226,8 +1250,18 @@ export class BashMonitorWakeStore {
       path.basename(originalPath).slice(0, -".json".length)
     );
     return this.locks.withLock(`${ownerWorkspaceId}:${id}`, async () => {
-      const stat = await fsPromises.stat(filePath).catch(() => null);
-      if (!stat?.isFile()) return null; // vanished (live writer committed) or non-regular
+      let stat: Stats;
+      try {
+        stat = await fsPromises.stat(filePath);
+      } catch (error) {
+        // Vanished (live writer committed): nothing to do. Any other failure (EIO,
+        // EACCES) PROPAGATES — the temp may be the ONLY durable copy after a crash,
+        // and a silent empty scan would schedule neither a drain nor the
+        // deferred-recovery timer, stranding the wake until an unrelated scan.
+        if (isErrnoWithCode(error, "ENOENT")) return null;
+        throw error;
+      }
+      if (!stat.isFile()) return null; // non-regular imposter
       const consumable = stat.mtimeMs < Date.now() - TEMP_RECOVERY_MIN_AGE_MS;
       const old = stat.mtimeMs < pruneBeforeMs;
       const parsed = await this.readRecordAt(filePath);
@@ -1347,9 +1381,13 @@ export class BashMonitorWakeStore {
         );
         return committed?.status === "pending" ? committed : null;
       }
-      // Same-or-older than the canonical record: a stale uncommitted write, disposable
-      // once old (the canonical record is authoritative).
-      if (old) await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
+      // Same-or-older than the canonical record: a stale uncommitted write; the
+      // canonical record is authoritative. Discard the temp NOW, not once old —
+      // retaining it would open a resurrection window: once the (terminal) canonical
+      // ages past retention and is pruned, a later scan would see no canonical record
+      // and restore this stale pending temp, redelivering a deliberately superseded
+      // wake. The freshness gate already passed, so no live writer can still own it.
+      await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
       return null;
     });
   }

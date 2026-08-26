@@ -8,6 +8,7 @@ import {
   BashMonitorWakeStore,
   buildBashMonitorWakeMetadata,
   buildBashMonitorWakePrompt,
+  deferredTempRecoveryDelayMs,
   TEMP_RECOVERY_MIN_AGE_MS,
   TERMINAL_WAKE_RETENTION_MS,
   type BashMonitorWakePayload,
@@ -502,6 +503,84 @@ describe("BashMonitorWakeStore", () => {
     expect(pending.map((r) => r.lines)).toEqual([["ERROR fresh only copy"]]);
     expect((await fresh.get("owner-1", "proc-1"))?.lines).toEqual(["ERROR fresh only copy"]);
     expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
+  });
+
+  test("deferred recovery delays are bounded for corrupt or future mtimes", () => {
+    const now = Date.now();
+    // Near the gate: fires just past it (epsilon), no spurious full-interval wait.
+    expect(deferredTempRecoveryDelayMs(now - TEMP_RECOVERY_MIN_AGE_MS + 100, now)).toBe(350);
+    // Already past the gate: only the epsilon remains.
+    expect(deferredTempRecoveryDelayMs(now - TEMP_RECOVERY_MIN_AGE_MS - 5_000, now)).toBe(250);
+    // Far-future mtime (clock rollback / corrupted timestamps): the raw remaining time
+    // would exceed Node's max timer delay (clamped to ~1ms — a tight rescan loop);
+    // instead the delay caps at one bounded recheck interval.
+    expect(deferredTempRecoveryDelayMs(now + 2 ** 40, now)).toBe(TEMP_RECOVERY_MIN_AGE_MS + 250);
+  });
+
+  test("a transient stat failure during temp recovery propagates", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR only copy"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    const temp = `${file}.tmp-crashed`;
+    await fsPromises.rename(file, temp);
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(temp, past, past);
+
+    // The artifact guard's first stat succeeds; the recovery-internal second stat
+    // fails transiently. Swallowing it would turn the scan into a successful empty
+    // result that schedules neither a drain nor the deferred-recovery timer.
+    const realStat = fsPromises.stat;
+    let tempStats = 0;
+    const statSpy = spyOn(fsPromises, "stat").mockImplementation(((
+      p: Parameters<typeof realStat>[0]
+    ) =>
+      String(p) === temp && ++tempStats === 2
+        ? Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
+        : realStat(p)) as typeof fsPromises.stat);
+    try {
+      await store.listPending("owner-1");
+      expect.unreachable("expected listPending to propagate the stat failure");
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("EIO");
+    } finally {
+      statSpy.mockRestore();
+    }
+    // The temp was untouched; the next scan restores it.
+    expect((await store.listPending("owner-1")).map((r) => r.lines)).toEqual([["ERROR only copy"]]);
+  });
+
+  test("a stale crashed temp cannot resurrect a superseded wake across canonical pruning", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR stale"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    const temp = `${file}.tmp-crashed`;
+    await fsPromises.rename(file, temp);
+    // The wake was then re-enqueued and deliberately superseded (e.g. a history
+    // clear); by now BOTH files are past the terminal retention window.
+    const record = JSON.parse(await fsPromises.readFile(temp, "utf-8")) as {
+      updatedAt: string;
+    };
+    const superseded = {
+      ...record,
+      status: "superseded",
+      updatedAt: new Date(Date.parse(record.updatedAt) + 1_000).toISOString(),
+    };
+    await fsPromises.writeFile(file, JSON.stringify(superseded, null, 2), "utf-8");
+    const past = new Date(Date.now() - TERMINAL_WAKE_RETENTION_MS - 120_000);
+    await fsPromises.utimes(temp, past, past);
+    await fsPromises.utimes(file, past, past);
+
+    // One scan must both prune the terminal canonical AND discard the stale temp —
+    // in no order may the pruned canonical make the stale pending temp look like the
+    // only durable copy and resurrect the canceled wake.
+    const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+    expect(await fresh.listPending("owner-1")).toEqual([]);
+    expect(await fresh.get("owner-1", "proc-1")).toBeNull();
+    const entries = await fsPromises.readdir(dir).catch(() => [] as string[]);
+    expect(entries.filter((e) => e.includes(".tmp-"))).toHaveLength(0);
+    expect(await fresh.listPending("owner-1")).toEqual([]);
   });
 
   test("a transient orphan-temp placement failure propagates instead of hiding the wake", async () => {

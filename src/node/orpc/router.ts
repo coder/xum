@@ -5539,8 +5539,12 @@ export const router = (authToken?: string) => {
             service.onBackgroundBashChange(onChange);
 
             try {
-              // Emit initial state immediately
-              yield await getState();
+              // Bootstrap through the SAME serialized reader as event-driven reads. A
+              // separate `yield await getState()` can race an onChange-triggered read:
+              // the event read's snapshot waits in the queue while the slower bootstrap
+              // yields a NEWER snapshot first, and consuming the queued older value then
+              // regresses the renderer with no later event to repair it.
+              reader.trigger();
               yield* queue.iterate();
             } finally {
               signal?.removeEventListener("abort", onAbort);
