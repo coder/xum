@@ -179,7 +179,7 @@ describe("WorktreeManager.createWorkspace", () => {
       if (result.success) {
         throw new Error("Expected createWorkspace to fail");
       }
-      expect(result.error).toContain("Failed to inspect repository checkout filters");
+      expect(result.error).toContain("Failed to inspect repository automation drivers");
     } finally {
       await fixture.cleanup();
     }
