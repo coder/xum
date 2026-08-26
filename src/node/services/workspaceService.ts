@@ -2300,6 +2300,19 @@ export class WorkspaceService extends EventEmitter {
     });
     this.setupMetadataListeners();
     this.setupInitMetadataListeners();
+    // A cleared tombstone means a removed id was re-registered (downgraded
+    // concurrent backend re-creating a deterministic legacy id): evict the
+    // process-local activity caches bootstrapped for the REMOVED incarnation
+    // so the revived workspace re-probes disk instead of showing ghost
+    // workflow-run counts from session state that removal deleted.
+    // Guarded like the backgroundProcessManager subscriptions above: tests
+    // may construct WorkspaceService with a partial ExtensionMetadataService
+    // stub.
+    if (typeof this.extensionMetadata.setTombstoneClearedListener === "function") {
+      this.extensionMetadata.setTombstoneClearedListener((workspaceId) => {
+        this.evictWorkspaceActivityCaches(workspaceId);
+      });
+    }
     // r63 startup self-heal: reclaim removal tombstones left behind by a
     // removal whose config deregistration AND tombstone rollback both failed
     // — otherwise that workspace stays registered but refused every mutation
@@ -12812,12 +12825,28 @@ export class WorkspaceService extends EventEmitter {
         return;
       }
       await this.extensionMetadata.deleteWorkspace(workspaceId);
+      // Removal-side counterpart of the tombstone-cleared eviction: drop the
+      // process-local workflow/bash-monitor caches for the removed id so a
+      // later re-registration never inherits activity bootstrapped from
+      // session state that removal deleted.
+      this.evictWorkspaceActivityCaches(workspaceId);
     } catch (error) {
       log.debug("Failed to prune extension metadata after workspace deregistration", {
         workspaceId,
         error: getErrorMessage(error),
       });
     }
+  }
+
+  /**
+   * Evict process-local activity caches for a removed (or removed-then-
+   * revived) workspace id. The caches re-bootstrap from disk on next access;
+   * an in-flight bootstrap keeps populating its orphaned Set harmlessly.
+   */
+  private evictWorkspaceActivityCaches(workspaceId: string): void {
+    this.activeWorkflowRunIdsByWorkspace.delete(workspaceId);
+    this.activeWorkflowRunIdBootstrapsByWorkspace.delete(workspaceId);
+    this.bashMonitorSeenWorkspaces.delete(workspaceId);
   }
 
   /**
@@ -13137,6 +13166,25 @@ export class WorkspaceService extends EventEmitter {
         } catch (error) {
           log.debug("Failed to enumerate authoritative ids for removal revalidation", { error });
           authoritativeIds = null;
+        }
+        // The enumeration awaited disk: refresh the raw view so the
+        // like-for-like removal comparison below never compares two
+        // pre-removal reads. An inline-id workspace removed by another
+        // backend DURING the enumeration is invisible to the pre-await
+        // freshConfigIds (and deliberately exempt from the authoritative
+        // check, which skips ids present in the initial baseline), so its
+        // stale entry would otherwise pass the retained-entry filter with no
+        // cross-process event to correct it. Fresher raw evidence is
+        // strictly better for every downstream consumer; the tombstone-clear
+        // eligibility snapshot was captured before ALL evidence reads, so
+        // ordering stays sound.
+        try {
+          const refreshedEvidence = this.config.readPersistedWorkspaceIdEvidence();
+          freshConfigIds = refreshedEvidence.ids;
+          freshConfigHasRawInvisibleEntries = refreshedEvidence.hasWorkspaceEntriesWithoutIds;
+        } catch {
+          freshConfigIds = null;
+          freshConfigHasRawInvisibleEntries = true;
         }
       }
       const isRemovedPerAuthoritativeIdentity = (workspaceId: string): boolean =>

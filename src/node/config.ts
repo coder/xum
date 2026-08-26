@@ -1169,9 +1169,11 @@ export class Config {
           if (workspaces.some((entry) => !hasInlineStringId(entry))) {
             hasWorkspaceEntriesWithoutIds = true;
           }
-        } else if (workspaces !== null && typeof workspaces === "object") {
-          // A workspaces container in an uninterpretable shape may still
-          // describe registered workspaces; stay conservative.
+        } else if (workspaces !== undefined) {
+          // A PRESENT workspaces container in any non-array shape (object,
+          // null, primitive) is uninterpretable evidence — the original
+          // entries may have been mangled, so the raw id set cannot be
+          // proven complete. Only an absent key means "no entries here".
           hasWorkspaceEntriesWithoutIds = true;
         }
         for (const nested of Object.values(value)) {

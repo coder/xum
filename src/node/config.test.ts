@@ -957,6 +957,19 @@ describe("Config", () => {
       const evidence = new Config(tempDir).readPersistedWorkspaceIdEvidence();
       expect(evidence.hasWorkspaceEntriesWithoutIds).toBe(true);
       expect(evidence.ids.has("modern")).toBe(true);
+      // A PRESENT but malformed (non-array) container is uninterpretable:
+      // the original entries may have been mangled, so the id set must not
+      // be treated as complete evidence for destructive decisions.
+      for (const malformed of [null, "mangled", 7]) {
+        fs.writeFileSync(
+          configPath,
+          JSON.stringify({ projects: [["/repo", { workspaces: malformed }]] })
+        );
+        expect(new Config(tempDir).readPersistedWorkspaceIdEvidence()).toEqual({
+          ids: new Set(),
+          hasWorkspaceEntriesWithoutIds: true,
+        });
+      }
       // Missing file: healthy empty evidence (fresh install).
       fs.rmSync(configPath);
       expect(new Config(tempDir).readPersistedWorkspaceIdEvidence()).toEqual({

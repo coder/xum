@@ -84,6 +84,29 @@ export class ExtensionMetadataService {
   }
 
   /**
+   * Single exit point for clearing a tombstone (re-registration revival).
+   * Notifies the owner so process-local activity caches bootstrapped for the
+   * REMOVED incarnation (active workflow-run ids, bash-monitor seen set) are
+   * evicted — workspace removal never evicts them, and the revived
+   * incarnation's session state on disk may differ, so a stale cache would
+   * otherwise show ghost activity counts indefinitely.
+   */
+  private liftTombstone(workspaceId: string): void {
+    this.deletedWorkspaceIds.delete(workspaceId);
+    try {
+      this.tombstoneClearedListener?.(workspaceId);
+    } catch {
+      // Listener failures must not break the clearing path.
+    }
+  }
+
+  private tombstoneClearedListener: ((workspaceId: string) => void) | null = null;
+
+  setTombstoneClearedListener(listener: (workspaceId: string) => void): void {
+    this.tombstoneClearedListener = listener;
+  }
+
+  /**
    * Optional registration probe for writes hitting a tombstoned id (see
    * recheckTombstonedRegistration). Wired by the owner that can read the
    * shared config (coreServices); absent in bare constructions, where
@@ -199,7 +222,7 @@ export class ExtensionMetadataService {
     if (this.deletedWorkspaceIds.get(workspaceId) !== generationBefore) {
       return false;
     }
-    this.deletedWorkspaceIds.delete(workspaceId);
+    this.liftTombstone(workspaceId);
     return true;
   }
 
@@ -665,7 +688,7 @@ export class ExtensionMetadataService {
         registeredIds.has(workspaceId) &&
         this.deletedWorkspaceIds.get(workspaceId) === generation
       ) {
-        this.deletedWorkspaceIds.delete(workspaceId);
+        this.liftTombstone(workspaceId);
       }
     }
   }
@@ -690,17 +713,23 @@ export class ExtensionMetadataService {
     // on must see the tombstone (see deletedWorkspaceIds).
     const publishedGeneration = this.publishTombstone(workspaceId);
     await this.withSerializedMutation(async () => {
-      // In-queue registration revalidation: a downgraded backend can
-      // re-register a deterministic legacy id after the caller's
-      // deregistration checks (or while this deletion waited in the queue)
-      // and persist a fresh snapshot the unconditional delete would destroy.
-      // A probe-confirmed registration aborts the deletion and lifts the
-      // tombstone THIS call published (generation-guarded — a newer
-      // removal's tombstone stays). An unknowable probe keeps the tombstone
-      // and skips the disk deletion: a stale entry is recoverable (filtered
-      // by the tombstone now, reclaimed by a later removal or process-start
-      // prune), destroyed re-registered data is not. Without a probe the
-      // caller's own deregistration evidence stands.
+      const data = await this.load();
+      // In-queue registration revalidation, strictly AFTER the load (same
+      // ordering as the prune): a workspace is durably registered before its
+      // first metadata write, so any entry visible in the loaded snapshot
+      // was persisted before the load — a post-load probe reporting
+      // "unregistered" therefore postdates that write and proves the entry
+      // belongs to the removed incarnation. A downgraded backend
+      // re-registering a deterministic legacy id (after the caller's
+      // deregistration checks, or while this deletion waited in the queue)
+      // keeps its fresh snapshot: the probe-confirmed registration aborts
+      // the deletion and lifts the tombstone THIS call published
+      // (generation-guarded — a newer removal's tombstone stays). An
+      // unknowable probe keeps the tombstone and skips the disk deletion: a
+      // stale entry is recoverable (filtered by the tombstone now, reclaimed
+      // by a later removal or process-start prune), destroyed re-registered
+      // data is not. Without a probe the caller's own deregistration
+      // evidence stands.
       if (this.registrationProbe != null) {
         let registered: boolean;
         try {
@@ -710,13 +739,11 @@ export class ExtensionMetadataService {
         }
         if (registered) {
           if (this.deletedWorkspaceIds.get(workspaceId) === publishedGeneration) {
-            this.deletedWorkspaceIds.delete(workspaceId);
+            this.liftTombstone(workspaceId);
           }
           return;
         }
       }
-      const data = await this.load();
-
       // Key presence, not truthiness: malformed falsy persisted entries
       // (e.g. null) must be deleted too, or removal leaves a stale key
       // behind until the next process-start prune.
@@ -811,7 +838,7 @@ export class ExtensionMetadataService {
           if (
             this.deletedWorkspaceIds.get(workspaceId) === staleTombstoneGenerations.get(workspaceId)
           ) {
-            this.deletedWorkspaceIds.delete(workspaceId);
+            this.liftTombstone(workspaceId);
           }
           continue;
         }
@@ -1151,6 +1178,28 @@ export class ExtensionMetadataService {
     if (!ExtensionMetadataService.isValidMetadataFileShape(sidecarParsed)) {
       return false;
     }
+    // Resolve tombstone revalidations BEFORE reading the main file: the
+    // probes await config, and holding a pre-probe main snapshot across
+    // those awaits would let the save below write stale data over a
+    // concurrent backend's newer write. The tombstone may be stale (a
+    // downgraded backend can re-register a deterministic legacy id after
+    // this process pruned it), and the sidecar may hold that workspace's
+    // ONLY copy — consumed below, so a wrong drop is permanent, unlike
+    // write suppression, which self-heals. Without a probe the local
+    // removal knowledge stands; a FAILING probe aborts the reconcile
+    // (retryable) rather than consuming the sidecar on unknowable evidence.
+    // Same generation contract as recheckTombstonedRegistration: a
+    // tombstone republished mid-probe survives the stale positive.
+    for (const workspaceId of Object.keys(sidecarParsed.workspaces)) {
+      if (!this.deletedWorkspaceIds.has(workspaceId) || this.registrationProbe == null) {
+        continue;
+      }
+      const generationBefore = this.deletedWorkspaceIds.get(workspaceId);
+      const registered = await this.registrationProbe(workspaceId);
+      if (registered && this.deletedWorkspaceIds.get(workspaceId) === generationBefore) {
+        this.liftTombstone(workspaceId);
+      }
+    }
     let main: ExtensionMetadataFile;
     try {
       const parsed = JSON.parse(await readFile(this.filePath, "utf-8")) as unknown;
@@ -1176,25 +1225,9 @@ export class ExtensionMetadataService {
     let modified = false;
     for (const [workspaceId, entry] of Object.entries(sidecarParsed.workspaces)) {
       if (this.deletedWorkspaceIds.has(workspaceId)) {
-        // The tombstone may be stale: a downgraded backend can re-register a
-        // deterministic legacy id after this process pruned it, and the
-        // sidecar may hold that workspace's ONLY copy (consumed below, so a
-        // wrong drop is permanent — unlike write suppression, which
-        // self-heals). Revalidate registration first. Without a probe the
-        // local removal knowledge stands; a FAILING probe aborts the
-        // reconcile (retryable) rather than consuming the sidecar on
-        // unknowable evidence. Same generation contract as
-        // recheckTombstonedRegistration: a tombstone republished mid-probe
-        // survives the stale positive.
-        if (this.registrationProbe == null) {
-          continue;
-        }
-        const generationBefore = this.deletedWorkspaceIds.get(workspaceId);
-        const registered = await this.registrationProbe(workspaceId);
-        if (!registered || this.deletedWorkspaceIds.get(workspaceId) !== generationBefore) {
-          continue;
-        }
-        this.deletedWorkspaceIds.delete(workspaceId);
+        // Still tombstoned after the (pre-main-read) revalidation pass:
+        // the local removal knowledge stands.
+        continue;
       }
       if (!(workspaceId in main.workspaces)) {
         // Sidecar-only entry: by definition no writer touched it since the

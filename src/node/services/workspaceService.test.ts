@@ -144,6 +144,7 @@ const mockExtensionMetadataService: Partial<ExtensionMetadataService> = {
   isWorkspaceDeleted: mock(() => false),
   clearTombstonesForRegisteredIds: mock(() => undefined),
   getTombstonedIds: mock((): ReadonlyMap<string, number> => new Map()),
+  setTombstoneClearedListener: mock(() => undefined),
   setStreaming: mock(() =>
     Promise.resolve({
       recency: Date.now(),
@@ -3851,6 +3852,53 @@ describe("WorkspaceService activity list scoping", () => {
       } finally {
         snapshotsSpy.mockRestore();
       }
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a re-registered id does not inherit workflow caches from its removed incarnation", async () => {
+    // Workspace removal deletes session state without producing terminal
+    // workflow events, and the process-local run cache was never evicted:
+    // a deterministic legacy id re-registered by a downgraded backend would
+    // show the removed incarnation's ghost activeWorkflowRunCount forever
+    // (the per-id bootstrap returns the cached set without re-probing disk).
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "revived-workspace";
+      const projectPath = path.join(config.rootDir, "project");
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+      // Cache a live workflow run for the (unregistered) old incarnation.
+      await workspaceService.emitWorkflowRunActivity({
+        workspaceId,
+        runId: "wfr_ghost",
+        status: "running",
+      });
+      // Removal cleanup: deregistered (never in config here), so the entry
+      // is tombstoned and the process-local caches must be evicted.
+      await workspaceService.discardExtensionMetadataEntry(workspaceId);
+      // The downgraded backend re-registers the same id; its session dir has
+      // no workflow runs.
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+
+      const activityList = await workspaceService.getActivityList();
+      expect(activityList).not.toBeNull();
+      // No ghost count from the removed incarnation's cache: the revived id
+      // re-probes disk (empty) and stays absent from the list.
+      expect(activityList?.[workspaceId]).toBeUndefined();
     } finally {
       await cleanup();
     }
