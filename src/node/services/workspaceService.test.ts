@@ -3208,6 +3208,115 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("first bootstrap reuses the prune's config enumeration for scoping", async () => {
+    // getAllWorkspaceMetadata walks every workspace with per-workspace disk
+    // probes; the latency-sensitive first bootstrap must not pay it twice.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "activity-scoping-reuse";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency(workspaceId, 100);
+      await extensionMetadata.updateRecency("removed-workspace", 200);
+      const metadataSpy = spyOn(config, "getAllWorkspaceMetadata");
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+
+      const activityList = await workspaceService.getActivityList();
+      expect(activityList[workspaceId]?.recency).toBe(100);
+      expect(activityList["removed-workspace"]).toBeUndefined();
+      expect(metadataSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("suppresses activity emissions for removed workspaces", async () => {
+    // A late in-flight producer completing after removal must not broadcast:
+    // the renderer would re-insert the removed id into its activity map after
+    // already processing the metadata-removal event.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "activity-emit-after-removal";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+      const events: Array<{ workspaceId: string }> = [];
+      workspaceService.on("activity", (event) => events.push(event));
+
+      await workspaceService.updateAgentStatus(workspaceId, { emoji: "🛠️", message: "Working" });
+      expect(events.length).toBe(1);
+
+      await workspaceService.discardExtensionMetadataEntry(workspaceId);
+      // Simulates the producer that was already in flight when removal ran.
+      await workspaceService.updateAgentStatus(workspaceId, { emoji: "🛠️", message: "Late" });
+      expect(events.length).toBe(1);
+      // Clearing (null) emissions stay allowed for removed workspaces.
+      workspaceService.emitWorkspaceActivity(workspaceId, null);
+      expect(events.length).toBe(2);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("getActivityList rejects on metadata read failure instead of returning {}", async () => {
+    // With scoping, {} is a valid authoritative answer that clears renderer
+    // state; failures must be distinguishable so the renderer keeps its
+    // last-known snapshots and retries.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(() =>
+        Promise.reject(new Error("metadata unreadable"))
+      );
+      try {
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+        let rejected = false;
+        try {
+          await workspaceService.getActivityList();
+        } catch {
+          rejected = true;
+        }
+        expect(rejected).toBe(true);
+      } finally {
+        snapshotsSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("falls back to the unscoped union when config workspaces cannot be listed", async () => {
     // Real on-disk corruption shapes. loadConfigOrDefault SWALLOWS the first
     // (parse failure) and lenient-normalizes the rest (parseable but

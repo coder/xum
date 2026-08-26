@@ -422,6 +422,15 @@ export class ExtensionMetadataService {
   }
 
   /**
+   * Whether this process removed the workspace's entry (see
+   * deletedWorkspaceIds). Lets emit paths suppress late activity broadcasts
+   * whose disk writes the tombstone already blocked.
+   */
+  isWorkspaceDeleted(workspaceId: string): boolean {
+    return this.deletedWorkspaceIds.has(workspaceId);
+  }
+
+  /**
    * Delete metadata for a workspace.
    * Call this when a workspace is deleted.
    */
@@ -432,7 +441,10 @@ export class ExtensionMetadataService {
     await this.withSerializedMutation(async () => {
       const data = await this.load();
 
-      if (data.workspaces[workspaceId]) {
+      // Key presence, not truthiness: malformed falsy persisted entries
+      // (e.g. null) must be deleted too, or removal leaves a stale key
+      // behind until the next process-start prune.
+      if (workspaceId in data.workspaces) {
         delete data.workspaces[workspaceId];
         await this.save(data);
       }

@@ -3295,14 +3295,12 @@ export class WorkspaceStore {
   }
 
   private applyWorkspaceActivityList(snapshots: Record<string, WorkspaceActivitySnapshot>): void {
+    // An empty object is authoritative: the backend now rethrows on read
+    // failures (this path only runs on success), and the scoped list validly
+    // returns {} when no config-known workspace has activity. Applying it
+    // clears snapshots a disconnected renderer still holds for removed
+    // workspaces.
     const snapshotEntries = Object.entries(snapshots);
-
-    // Defensive fallback: workspace.activity.list returns {} on backend read failures.
-    // Preserve last-known snapshots instead of wiping sidebar activity state for all
-    // workspaces during a transient metadata read error.
-    if (snapshotEntries.length === 0) {
-      return;
-    }
 
     const seenWorkspaceIds = new Set<string>();
 

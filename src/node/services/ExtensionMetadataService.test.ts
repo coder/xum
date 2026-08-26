@@ -452,6 +452,23 @@ describe("ExtensionMetadataService", () => {
     expect(order).toEqual(["load", "fetch-known-ids"]);
   });
 
+  test("deleteWorkspace removes malformed falsy persisted entries", async () => {
+    // Key presence, not truthiness: a null entry must not survive removal
+    // (it would leak the key until the next process-start prune).
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "malformed-workspace": null, "other-workspace": { recency: 1 } },
+      })
+    );
+    await service.deleteWorkspace("malformed-workspace");
+
+    const persisted = JSON.parse(await readFile(filePath, "utf-8")) as ExtensionMetadataFile;
+    expect("malformed-workspace" in persisted.workspaces).toBe(false);
+    expect("other-workspace" in persisted.workspaces).toBe(true);
+  });
+
   test("late writers cannot resurrect a deleted workspace entry", async () => {
     // Removal cannot drain every in-flight metadata producer (e.g. a
     // stream-abort's fire-and-forget stop-status write), so writes landing

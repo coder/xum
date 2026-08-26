@@ -3903,6 +3903,15 @@ export class WorkspaceService extends EventEmitter {
     workspaceId: string,
     snapshot: WorkspaceActivitySnapshot | null
   ): void {
+    // A late in-flight producer (e.g. a stream-abort stop-status handler mid
+    // todo read) can complete after removal deleted this workspace's
+    // metadata entry. Its disk write is already blocked by the write
+    // tombstone; suppress the broadcast too, or the renderer re-inserts the
+    // removed id into its activity map after having processed the
+    // metadata-removal event. Null (clearing) emissions stay allowed.
+    if (snapshot !== null && this.extensionMetadata.isWorkspaceDeleted(workspaceId)) {
+      return;
+    }
     this.emit("activity", {
       workspaceId,
       activity: this.mergeCurrentActiveBashMonitorCount(
@@ -12789,15 +12798,23 @@ export class WorkspaceService extends EventEmitter {
    * from the activity bootstrap path; never a per-read scan.
    */
   private prunedStaleExtensionMetadata = false;
-  private async pruneStaleExtensionMetadataOnce(): Promise<void> {
+  /**
+   * Returns the config-known (normalized-view) workspace ids captured during
+   * the prune so the first activity bootstrap can reuse them for scoping —
+   * getAllWorkspaceMetadata walks every workspace with per-workspace disk
+   * probes, which large deployments should not pay twice in the
+   * latency-sensitive bootstrap. Null when the prune was skipped or failed.
+   */
+  private async pruneStaleExtensionMetadataOnce(): Promise<Set<string> | null> {
     if (this.prunedStaleExtensionMetadata) {
-      return;
+      return null;
     }
     // Latch before awaiting so concurrent bootstraps don't queue redundant
     // prunes; a failed attempt is retried on the next process start rather
     // than on every read.
     this.prunedStaleExtensionMetadata = true;
     try {
+      let normalizedIds: Set<string> | null = null;
       const prunedCount = await this.extensionMetadata.pruneMissingWorkspaces(async () => {
         // Invoked inside the file's serialized mutation AFTER the file load,
         // reading config fresh from disk (see pruneMissingWorkspaces), so a
@@ -12815,22 +12832,27 @@ export class WorkspaceService extends EventEmitter {
         // A missing config file resolves as a healthy empty set in both.
         const knownIds = this.config.readPersistedWorkspaceIdSuperset();
         const allMetadata = await this.config.getAllWorkspaceMetadata({ throwOnError: true });
-        for (const metadata of allMetadata) {
-          knownIds.add(metadata.id);
+        normalizedIds = new Set(allMetadata.map((metadata) => metadata.id));
+        for (const workspaceId of normalizedIds) {
+          knownIds.add(workspaceId);
         }
         return knownIds;
       });
       if (prunedCount > 0) {
         log.info(`Pruned ${prunedCount} stale extension metadata entries`);
       }
+      return normalizedIds;
     } catch (error) {
       log.debug("Failed to prune stale extension metadata entries", { error });
+      return null;
     }
   }
 
   async getActivityList(): Promise<Record<string, WorkspaceActivitySnapshot>> {
     try {
-      await this.pruneStaleExtensionMetadataOnce();
+      // On the first bootstrap the prune already enumerated the config; reuse
+      // that id set instead of paying the per-workspace disk walk twice.
+      const prefetchedKnownIds = await this.pruneStaleExtensionMetadataOnce();
       const snapshots = await this.extensionMetadata.getAllSnapshots();
       // Scope the list to config-known workspaces. extensionMetadata.json was
       // historically never pruned, so long-lived deployments accumulate stale
@@ -12841,26 +12863,30 @@ export class WorkspaceService extends EventEmitter {
       // WITHOUT a snapshot still flow through the tombstone logic below —
       // scoping only drops ids that are not in config at all.
       let workspaceIds: Set<string>;
-      try {
-        // throwOnError so a corrupted config.json actually reaches the
-        // fail-open fallback below instead of silently resolving as the
-        // empty default and dropping every live entry from the list.
-        workspaceIds = new Set(
-          (await this.config.getAllWorkspaceMetadata({ throwOnError: true })).map(
-            (metadata) => metadata.id
-          )
-        );
-      } catch (error) {
-        // Fail open: without the config view, stale ids cannot be told apart
-        // from live ones, and dropping live entries would strand renderer
-        // activity state. Fall back to the legacy unscoped union.
-        log.debug("Failed to scope activity list to known workspaces", { error });
-        workspaceIds = new Set(snapshots.keys());
-        for (const workspaceId of this.activeWorkflowRunIdsByWorkspace.keys()) {
-          workspaceIds.add(workspaceId);
-        }
-        for (const workspaceId of this.bashMonitorSeenWorkspaces) {
-          workspaceIds.add(workspaceId);
+      if (prefetchedKnownIds != null) {
+        workspaceIds = prefetchedKnownIds;
+      } else {
+        try {
+          // throwOnError so a corrupted config.json actually reaches the
+          // fail-open fallback below instead of silently resolving as the
+          // empty default and dropping every live entry from the list.
+          workspaceIds = new Set(
+            (await this.config.getAllWorkspaceMetadata({ throwOnError: true })).map(
+              (metadata) => metadata.id
+            )
+          );
+        } catch (error) {
+          // Fail open: without the config view, stale ids cannot be told apart
+          // from live ones, and dropping live entries would strand renderer
+          // activity state. Fall back to the legacy unscoped union.
+          log.debug("Failed to scope activity list to known workspaces", { error });
+          workspaceIds = new Set(snapshots.keys());
+          for (const workspaceId of this.activeWorkflowRunIdsByWorkspace.keys()) {
+            workspaceIds.add(workspaceId);
+          }
+          for (const workspaceId of this.bashMonitorSeenWorkspaces) {
+            workspaceIds.add(workspaceId);
+          }
         }
       }
 
@@ -12921,8 +12947,14 @@ export class WorkspaceService extends EventEmitter {
         )
       );
     } catch (error) {
+      // Rethrow instead of returning {}: with scoping, an empty result is a
+      // VALID authoritative answer (no known workspace has activity) that the
+      // renderer must apply to clear stale entries after a disconnected
+      // removal. Failures must therefore be distinguishable — the renderer's
+      // bootstrap loop treats a rejection as transient (keeps last-known
+      // state and retries with backoff).
       log.error("Failed to list activity:", error);
-      return {};
+      throw error;
     }
   }
   async getChatHistory(workspaceId: string): Promise<MuxMessage[]> {
