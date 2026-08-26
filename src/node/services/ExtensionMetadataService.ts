@@ -512,6 +512,25 @@ export class ExtensionMetadataService {
   }
 
   /**
+   * Drop write tombstones for ids a fresh config view proves are registered.
+   * Tombstones are process-local removal knowledge and the shared config is
+   * the authority: with XUM_ALLOW_MULTIPLE_INSTANCES a downgraded concurrent
+   * backend can legitimately re-register a deterministic legacy id this
+   * process pruned earlier, and without this hook the stale tombstone would
+   * suppress every one of the revived workspace's metadata writes (and
+   * filter it from activity lists) until restart. Called from the activity
+   * bootstrap with fresh config-derived id sets only — never with snapshot
+   * or in-memory cache keys, which do not prove registration.
+   */
+  clearTombstonesForRegisteredIds(registeredIds: ReadonlySet<string>): void {
+    for (const workspaceId of this.deletedWorkspaceIds) {
+      if (registeredIds.has(workspaceId)) {
+        this.deletedWorkspaceIds.delete(workspaceId);
+      }
+    }
+  }
+
+  /**
    * Delete metadata for a workspace.
    * Call this when a workspace is deleted.
    */

@@ -142,6 +142,7 @@ const mockInitStateManager: Partial<InitStateManager> = {
 };
 const mockExtensionMetadataService: Partial<ExtensionMetadataService> = {
   isWorkspaceDeleted: mock(() => false),
+  clearTombstonesForRegisteredIds: mock(() => undefined),
   setStreaming: mock(() =>
     Promise.resolve({
       recency: Date.now(),
@@ -3286,12 +3287,18 @@ describe("WorkspaceService activity list scoping", () => {
         }
       );
       const realMetadata = config.getAllWorkspaceMetadata.bind(config);
+      let metadataCalls = 0;
       const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(
         async (options?: { throwOnError?: boolean }) => {
-          // The prune's authoritative enumeration also predates the
-          // registration in the modeled race.
+          // Only the prune's enumeration (first call) predates the
+          // registration in the modeled race; the revalidation's fresh
+          // authoritative enumeration sees the registered workspace.
+          metadataCalls += 1;
           const all = await realMetadata(options);
-          return all.filter((metadata) => metadata.id !== lateWorkspaceId);
+          if (metadataCalls === 1) {
+            return all.filter((metadata) => metadata.id !== lateWorkspaceId);
+          }
+          return all;
         }
       );
       try {
@@ -3370,6 +3377,55 @@ describe("WorkspaceService activity list scoping", () => {
       expect(events.length).toBe(2);
       workspaceService.emitWorkspaceActivity(workspaceId, null);
       expect(events.length).toBe(2);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a re-registered id sheds its tombstone on the next activity list", async () => {
+    // Tombstones are process-local removal knowledge; the shared config is
+    // the authority. A downgraded concurrent backend can legitimately
+    // re-register a deterministic legacy id this process pruned — the next
+    // activity list observes the id in fresh config evidence and must lift
+    // the write suppression instead of muting the revived workspace until
+    // restart.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "revived-legacy-workspace";
+      const projectPath = path.join(config.rootDir, "project");
+      const workspaceEntry = {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" as const },
+      };
+      await config.addWorkspace(projectPath, workspaceEntry);
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency(workspaceId, 100);
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+      // Removal flow: deregister, then discard (delete + tombstone).
+      await config.removeWorkspace(workspaceId);
+      await workspaceService.discardExtensionMetadataEntry(workspaceId);
+      expect(extensionMetadata.isWorkspaceDeleted(workspaceId)).toBe(true);
+      // Writes are suppressed while tombstoned.
+      await extensionMetadata.updateRecency(workspaceId, 200);
+      expect((await extensionMetadata.getAllSnapshots()).has(workspaceId)).toBe(false);
+
+      // The "other backend" re-registers the same id in the shared config.
+      await config.addWorkspace(projectPath, workspaceEntry);
+
+      await workspaceService.getActivityList();
+      expect(extensionMetadata.isWorkspaceDeleted(workspaceId)).toBe(false);
+      // Writes persist again after the revival.
+      await extensionMetadata.updateRecency(workspaceId, 300);
+      expect((await extensionMetadata.getAllSnapshots()).get(workspaceId)?.recency).toBe(300);
     } finally {
       await cleanup();
     }

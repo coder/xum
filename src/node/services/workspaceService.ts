@@ -13049,23 +13049,55 @@ export class WorkspaceService extends EventEmitter {
       // comparison above is blind to their cross-process removal — a
       // snapshotless (workflow/bash-monitor-only) legacy entry removed
       // mid-list would otherwise ride the delayed authoritative response
-      // back into the renderer. Revalidate through the same authoritative
-      // lookup that produced the id: a verified "not registered" drops the
-      // entry, while an unknowable identity (unreadable/id-less
-      // metadata.json throws in strict mode) conservatively retains it.
-      // Cost note: ids present in the raw baseline skip this entirely, so
-      // modern deployments (every workspace id persisted in config) never
-      // pay the per-id lookup.
-      const isRemovedPerAuthoritativeIdentity = (workspaceId: string): boolean => {
-        if (initialConfigIds == null || initialConfigIds.has(workspaceId)) {
-          return false;
-        }
+      // back into the renderer. Revalidate against ONE fresh authoritative
+      // enumeration (per-id findWorkspace lookups would re-read and scan the
+      // whole config per entry — O(n²) on legacy-heavy first bootstraps,
+      // recreating the very stall this scoping removes): a verified "not
+      // registered" drops the entry, while an unknowable identity anywhere
+      // (unreadable/id-less metadata.json throws in strict mode) skips the
+      // recheck and conservatively retains every raw-invisible id. Computed
+      // only when a retained entry is actually missing from the raw
+      // baseline, so modern deployments (every workspace id persisted in
+      // config) never pay the extra walk.
+      let authoritativeIds: ReadonlySet<string> | null = null;
+      if (
+        initialConfigIds != null &&
+        entries.some((entry) => entry != null && !initialConfigIds.has(entry[0]))
+      ) {
         try {
-          return this.config.findWorkspace(workspaceId, { throwOnError: true }) == null;
-        } catch {
-          return false;
+          authoritativeIds = new Set(
+            (await this.config.getAllWorkspaceMetadata({ throwOnError: true })).map(
+              (metadata) => metadata.id
+            )
+          );
+        } catch (error) {
+          log.debug("Failed to enumerate authoritative ids for removal revalidation", { error });
+          authoritativeIds = null;
         }
-      };
+      }
+      const isRemovedPerAuthoritativeIdentity = (workspaceId: string): boolean =>
+        initialConfigIds != null &&
+        !initialConfigIds.has(workspaceId) &&
+        authoritativeIds != null &&
+        !authoritativeIds.has(workspaceId);
+      // Tombstones are process-local removal knowledge; the shared config is
+      // the authority. A downgraded concurrent backend can legitimately
+      // re-register a deterministic legacy id this process pruned earlier —
+      // observing the id in a FRESH config-derived view (raw superset or the
+      // strict authoritative enumeration above; never snapshot/cache keys,
+      // which do not prove registration) makes the tombstone stale, so its
+      // write suppression and list filtering must end. Cleared before the
+      // revalidation filter below so a re-registered id's entry survives.
+      if (freshConfigIds != null || authoritativeIds != null) {
+        const registeredIds = new Set<string>();
+        for (const workspaceId of freshConfigIds ?? []) {
+          registeredIds.add(workspaceId);
+        }
+        for (const workspaceId of authoritativeIds ?? []) {
+          registeredIds.add(workspaceId);
+        }
+        this.extensionMetadata.clearTombstonesForRegisteredIds(registeredIds);
+      }
       return Object.fromEntries(
         entries.filter(
           (entry): entry is readonly [string, WorkspaceActivitySnapshot] =>
