@@ -4081,6 +4081,25 @@ export class WorkspaceService extends EventEmitter {
     readonly BashMonitorWakeRecord[]
   >();
 
+  // One retry timer per workspace after a failed pending-wake read. The fallback above
+  // makes listBackgroundProcesses RESOLVE, so the subscription's failure-retry path never
+  // sees the error — and with no live process there may be no later change event either.
+  // Re-emitting a change re-drives a read; if that read fails again its own catch
+  // reschedules, giving the same bounded once-per-delay retry loop as the subscription,
+  // and the chain stops as soon as a read succeeds or no subscriber re-reads.
+  private readonly pendingWakeReadRetryTimers = new Map<string, NodeJS.Timeout>();
+
+  private schedulePendingWakeReadRetry(workspaceId: string): void {
+    if (this.pendingWakeReadRetryTimers.has(workspaceId)) return;
+    const timer = setTimeout(() => {
+      this.pendingWakeReadRetryTimers.delete(workspaceId);
+      this.notifyBashMonitorWakeStateChanged(workspaceId);
+    }, 1_000);
+    // Never hold process shutdown open for a UI refresh nudge.
+    timer.unref();
+    this.pendingWakeReadRetryTimers.set(workspaceId, timer);
+  }
+
   private notifyBashMonitorWakeStateChanged(workspaceId: string): void {
     // Tests may construct WorkspaceService with a partial BackgroundProcessManager stub
     // (same reason the constructor guards the event subscriptions).
@@ -13660,12 +13679,16 @@ export class WorkspaceService extends EventEmitter {
     } catch (error) {
       // Publishing an empty set here would authoritatively clear durable pending-wake
       // state on a transient I/O failure — and an already-exited process may never emit
-      // another change event to restore it. Fail to the last good snapshot instead.
+      // another change event to restore it. Fail to the last good snapshot instead, and
+      // schedule a retry: serving the fallback makes this call resolve, so the
+      // subscription's own failure retry never engages, and the fallback may be empty
+      // (no seed yet) or stale (wakes retired since) with no later event to correct it.
       log.debug("Failed to read pending bash monitor wakes for process listing", {
         workspaceId,
         error,
       });
       pendingWakes = this.lastGoodPendingWakesByWorkspace.get(workspaceId) ?? [];
+      this.schedulePendingWakeReadRetry(workspaceId);
     }
     // Present monitor state derived purely from a durable wake record, for rows (or reused
     // process IDs) that have no live monitor snapshot to decorate.

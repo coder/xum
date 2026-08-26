@@ -901,6 +901,55 @@ describe("WorkspaceService bash monitor wakes", () => {
     }
   });
 
+  test("a failed pending-wake read schedules a retry change notification", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-read-retry";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const notifyMonitorWakeStateChanged = mock((_changedWorkspaceId: string) => undefined);
+      const backgroundProcessManager = {
+        cleanup: mock(() => Promise.resolve()),
+        list: mock(() => Promise.resolve([])),
+        getMonitorSnapshot: mock(() => undefined),
+        notifyMonitorWakeStateChanged,
+      } as unknown as BackgroundProcessManager;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: BashMonitorWakeStore;
+        }
+      ).bashMonitorWakeStore;
+      spyOn(wakeStore, "listPending").mockImplementationOnce(() =>
+        Promise.reject(new Error("transient wake-store I/O failure"))
+      );
+
+      // The fallback makes this call RESOLVE, so the subscription's failure-retry path
+      // never engages — without a scheduled change notification nothing would ever
+      // re-read the wake store for an exited process.
+      expect(await workspaceService.listBackgroundProcesses(workspaceId)).toHaveLength(0);
+      const deadline = Date.now() + 5_000;
+      while (notifyMonitorWakeStateChanged.mock.calls.length === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(notifyMonitorWakeStateChanged).toHaveBeenCalledWith(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("explicit monitor cancellation supersedes a match racing persistence", async () => {
     const { config, cleanup } = await createTestHistoryService();
     try {

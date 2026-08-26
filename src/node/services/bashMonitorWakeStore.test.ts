@@ -299,6 +299,46 @@ describe("BashMonitorWakeStore", () => {
     expect(later[0].lines).toEqual(["ERROR rearmed"]);
   });
 
+  test("pruning keeps a freshly superseded record captured from a concurrent rewrite", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload());
+    await store.markDelivered("owner-1", "proc-1");
+    const file = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes", "proc-1.json");
+    const past = new Date(Date.now() - TERMINAL_WAKE_RETENTION_MS - 60_000);
+    await fsPromises.utimes(file, past, past);
+
+    // Between this instance's old-terminal classification and its capture rename,
+    // another instance enqueues a new pending wake and a history clear supersedes it —
+    // leaving a FRESH terminal record at the same path that restorePendingSnapshots may
+    // still need to flip back to pending.
+    const other = new BashMonitorWakeStore(makeConfig(rootDir));
+    const realRename = fsPromises.rename;
+    let injected = false;
+    let freshPending: Awaited<ReturnType<BashMonitorWakeStore["enqueueOrMergePending"]>> | null =
+      null;
+    const renameSpy = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+      if (!injected && String(from) === file && String(to).includes(".prune-")) {
+        injected = true;
+        freshPending = await other.enqueueOrMergePending(payload({ lines: ["ERROR fresh"] }));
+        await other.markSuperseded("owner-1", "proc-1");
+      }
+      return realRename(from, to);
+    });
+    try {
+      // Not pending, so nothing is listed — but the fresh terminal record must survive.
+      expect(await store.listPending("owner-1")).toHaveLength(0);
+    } finally {
+      renameSpy.mockRestore();
+    }
+    const current = await store.get("owner-1", "proc-1");
+    expect(current?.status).toBe("superseded");
+    expect(current?.lines).toEqual(["ERROR fresh"]);
+    // The record is still restorable: a failed history clear can roll it back to pending.
+    expect(freshPending).not.toBeNull();
+    await store.restorePendingSnapshots("owner-1", [freshPending!]);
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("pending");
+  });
+
   test("listPending restores a pending wake stranded in a crashed prune file", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload());

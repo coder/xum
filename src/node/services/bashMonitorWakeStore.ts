@@ -835,7 +835,12 @@ export class BashMonitorWakeStore {
           // Old terminal record: delete it so the directory (and this scan) stays
           // bounded. Deletion re-verifies the captured inode (see the helper) because a
           // concurrent writer may have renamed a new pending wake over this path.
-          const rescued = await this.pruneTerminalWakeFile(ownerWorkspaceId, entry, filePath);
+          const rescued = await this.pruneTerminalWakeFile(
+            ownerWorkspaceId,
+            entry,
+            filePath,
+            pruneBeforeMs
+          );
           classified.delete(entry);
           if (rescued != null) records.push(rescued);
         }
@@ -861,7 +866,12 @@ export class BashMonitorWakeStore {
       const pending = parsed?.status === "pending" ? parsed : null;
       const prunable = parsed != null && parsed.status !== "pending";
       if (prunable && stat.mtimeMs < pruneBeforeMs) {
-        const rescued = await this.pruneTerminalWakeFile(ownerWorkspaceId, entry, filePath);
+        const rescued = await this.pruneTerminalWakeFile(
+          ownerWorkspaceId,
+          entry,
+          filePath,
+          pruneBeforeMs
+        );
         classified.delete(entry);
         if (rescued != null) records.push(rescued);
         continue;
@@ -899,7 +909,9 @@ export class BashMonitorWakeStore {
    * record at the path, which then supersedes the stranded one and lets it be removed)
    * and the leftover deleted; a leftover that cannot be read or restored right now is
    * KEPT so a later scan retries rather than ever deleting an unrecovered pending wake.
-   * Non-pending leftovers are swept once old. Returns the restored pending record.
+   * Fresh terminal content is restored too — a freshly superseded record must stay
+   * visible at its path for restorePendingSnapshots rollback — while old or malformed
+   * leftovers are swept once past retention. Returns the restored pending record.
    */
   private async recoverStrandedPruneFile(
     ownerWorkspaceId: string,
@@ -918,17 +930,22 @@ export class BashMonitorWakeStore {
       // Unreadable (vanished via a concurrent recover, or transiently failing): keep
       // whatever may exist for a later retry.
       const raw = await fsPromises.readFile(filePath, "utf-8").catch(() => null);
-      const parsed = raw == null ? null : this.parse(raw);
+      if (raw == null) return null;
+      const parsed = this.parse(raw);
       if (parsed?.status !== "pending") {
-        // Terminal or malformed content was already destined for pruning; sweep it once
-        // old (the age gate keeps a live prune's in-flight trash out of reach).
-        if (raw != null) {
-          const leftoverStat = await fsPromises.stat(filePath).catch(() => null);
-          if (leftoverStat != null && leftoverStat.mtimeMs < pruneBeforeMs) {
-            await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
-          }
+        // Old terminal and malformed content was already destined for pruning; sweep it
+        // once old (the age gate keeps a live prune's in-flight trash out of reach).
+        const leftoverStat = await fsPromises.stat(filePath).catch(() => null);
+        if (leftoverStat != null && leftoverStat.mtimeMs < pruneBeforeMs) {
+          await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
+          return null;
         }
-        return null;
+        // Malformed-but-fresh content cannot be meaningfully restored; keep the
+        // leftover as evidence until the age gate sweeps it.
+        if (parsed == null) return null;
+        // Fresh terminal content falls through to the restore below: a freshly
+        // superseded record must stay visible at its path or restorePendingSnapshots
+        // cannot flip it back to pending after a failed history clear.
       }
       let restored = false;
       try {
@@ -937,13 +954,13 @@ export class BashMonitorWakeStore {
       } catch (error) {
         if (!isErrnoWithCode(error, "EEXIST")) {
           // Transient link failure: keep the leftover so a later scan retries the
-          // restore instead of deleting a never-recovered pending wake.
+          // restore instead of deleting a never-recovered record.
           return null;
         }
         // EEXIST: a newer record owns the original path and supersedes the stranded one.
       }
       await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
-      return restored ? parsed : null;
+      return restored && parsed.status === "pending" ? parsed : null;
     });
   }
 
@@ -961,7 +978,8 @@ export class BashMonitorWakeStore {
   private async pruneTerminalWakeFile(
     ownerWorkspaceId: string,
     entry: string,
-    filePath: string
+    filePath: string,
+    pruneBeforeMs: number
   ): Promise<BashMonitorWakeRecord | null> {
     const id = BashMonitorWakeStore.wakeIdFromFileStem(entry.slice(0, -".json".length));
     return this.locks.withLock(`${ownerWorkspaceId}:${id}`, async () => {
@@ -973,10 +991,22 @@ export class BashMonitorWakeStore {
       }
       const raw = await fsPromises.readFile(trash, "utf-8").catch(() => null);
       const parsed = raw == null ? null : this.parse(raw);
+      let restore: boolean;
       if (parsed == null || parsed.status === "pending") {
-        // Not verifiably terminal (raced rewrite, or a read/parse hiccup just now):
-        // restore it. link() refuses to clobber an even newer write that claimed the
-        // path since, in which case that newer record simply supersedes this one.
+        // Not verifiably terminal (raced rewrite, or a read/parse hiccup just now).
+        restore = true;
+      } else {
+        // Terminal content still needs its age re-verified against the CAPTURED inode:
+        // the prune decision came from an earlier stat, and a concurrent writer may have
+        // replaced the path with a freshly superseded record (e.g. a history clear's
+        // supersedeAllPending) that restorePendingSnapshots may still flip back to
+        // pending. A fresh mtime keeps it; an unreadable stat fails safe to restore.
+        const trashStat = await fsPromises.stat(trash).catch(() => null);
+        restore = trashStat == null || trashStat.mtimeMs >= pruneBeforeMs;
+      }
+      if (restore) {
+        // link() refuses to clobber an even newer write that claimed the path since, in
+        // which case that newer record simply supersedes this one.
         try {
           await fsPromises.link(trash, filePath);
         } catch {
