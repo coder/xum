@@ -1,8 +1,57 @@
 import * as fs from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
+import * as path from "node:path";
 import { isErrnoWithCode } from "@/node/utils/fs";
 
 type RunSessionRootEnv = Readonly<Record<string, string | undefined>>;
+
+export class PreparedRunSessionRoot implements AsyncDisposable {
+  constructor(
+    readonly path: string,
+    readonly canonicalPath: string,
+    private readonly handle: fs.FileHandle | undefined,
+    private readonly device: number,
+    private readonly inode: number
+  ) {}
+
+  async resolveConfigFilePath(filePath: string): Promise<string> {
+    if (path.resolve(path.dirname(filePath)) !== path.resolve(this.path)) {
+      throw new Error(`Run config file must be inside the secured session root: ${filePath}`);
+    }
+
+    // The proc fd path stays attached to the opened directory inode even if its original
+    // pathname is replaced before credential files are written.
+    if (process.platform === "linux" && this.handle !== undefined) {
+      return path.join("/proc/self/fd", String(this.handle.fd), path.basename(filePath));
+    }
+
+    if (process.platform === "win32") {
+      const current = await fs.lstat(this.path);
+      if (current.isSymbolicLink() || current.dev !== this.device || current.ino !== this.inode) {
+        throw new Error(`Run session root was replaced before writing config: ${this.path}`);
+      }
+      return filePath;
+    }
+
+    const currentHandle = await fs.open(
+      this.path,
+      fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | (fsConstants.O_NOFOLLOW ?? 0)
+    );
+    try {
+      const current = await currentHandle.stat();
+      if (!current.isDirectory() || current.dev !== this.device || current.ino !== this.inode) {
+        throw new Error(`Run session root was replaced before writing config: ${this.path}`);
+      }
+    } finally {
+      await currentHandle.close();
+    }
+    return filePath;
+  }
+
+  async [Symbol.asyncDispose](): Promise<void> {
+    await this.handle?.close();
+  }
+}
 
 function assertDirectoryNotSymlinked(
   rootPath: string,
@@ -13,14 +62,20 @@ function assertDirectoryNotSymlinked(
   }
 }
 
-async function hardenRunSessionRoot(rootPath: string): Promise<string> {
+async function hardenRunSessionRoot(rootPath: string): Promise<PreparedRunSessionRoot> {
   await fs.mkdir(rootPath, { recursive: true, mode: 0o700 });
   const created = await fs.lstat(rootPath);
   assertDirectoryNotSymlinked(rootPath, created);
 
   if (process.platform === "win32") {
     await fs.chmod(rootPath, 0o700);
-    return fs.realpath(rootPath);
+    return new PreparedRunSessionRoot(
+      rootPath,
+      await fs.realpath(rootPath),
+      undefined,
+      created.dev,
+      created.ino
+    );
   }
 
   const handle = await fs.open(
@@ -38,38 +93,46 @@ async function hardenRunSessionRoot(rootPath: string): Promise<string> {
     if (current.isSymbolicLink() || current.dev !== opened.dev || current.ino !== opened.ino) {
       throw new Error(`Run session root was replaced while being secured: ${rootPath}`);
     }
-    return canonical;
-  } finally {
+    return new PreparedRunSessionRoot(rootPath, canonical, handle, opened.dev, opened.ino);
+  } catch (error) {
     await handle.close();
+    throw error;
   }
 }
 
 export async function prepareRunSessionRootOverride(
   env: RunSessionRootEnv,
   realConfigRoot: string
-): Promise<string | undefined> {
+): Promise<PreparedRunSessionRoot | undefined> {
   const envSessionRoot = (env.XUM_RUN_SESSION_ROOT ?? env.MUX_RUN_SESSION_ROOT)?.trim();
   if (!envSessionRoot) {
     return undefined;
   }
 
-  const sessionRootCanonical = await hardenRunSessionRoot(envSessionRoot);
+  const preparedRoot = await hardenRunSessionRoot(envSessionRoot);
   // A missing real config root cannot be aliased; ignore ENOENT from realpath.
   const realConfigRootCanonical = await fs.realpath(realConfigRoot).catch(() => undefined);
-  if (realConfigRootCanonical !== undefined && sessionRootCanonical === realConfigRootCanonical) {
+  if (
+    realConfigRootCanonical !== undefined &&
+    preparedRoot.canonicalPath === realConfigRootCanonical
+  ) {
+    await preparedRoot[Symbol.asyncDispose]();
     throw new Error(
       "XUM_RUN_SESSION_ROOT / MUX_RUN_SESSION_ROOT must not resolve to the Xum config root"
     );
   }
 
-  return envSessionRoot;
+  return preparedRoot;
 }
 
 export async function replacePrivateRunConfigFile(
   filePath: string,
-  contents: string | undefined
+  contents: string | undefined,
+  preparedRoot?: PreparedRunSessionRoot
 ): Promise<void> {
-  const existing = await fs.lstat(filePath).catch((error: unknown) => {
+  const resolvedFilePath =
+    preparedRoot === undefined ? filePath : await preparedRoot.resolveConfigFilePath(filePath);
+  const existing = await fs.lstat(resolvedFilePath).catch((error: unknown) => {
     if (isErrnoWithCode(error, "ENOENT")) {
       return undefined;
     }
@@ -84,7 +147,7 @@ export async function replacePrivateRunConfigFile(
     }
     // Recreate instead of truncating so hard links are severed. O_EXCL below makes a raced
     // replacement fail closed instead of following it.
-    await fs.unlink(filePath);
+    await fs.unlink(resolvedFilePath);
   }
 
   if (contents === undefined) {
@@ -92,7 +155,7 @@ export async function replacePrivateRunConfigFile(
   }
 
   const handle = await fs.open(
-    filePath,
+    resolvedFilePath,
     fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | (fsConstants.O_NOFOLLOW ?? 0),
     0o600
   );

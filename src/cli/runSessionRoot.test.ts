@@ -23,11 +23,13 @@ describe("prepareRunSessionRootOverride", () => {
     // without the hardening; pin a permissive umask so the modes are proven.
     const previousUmask = process.umask(0o022);
     try {
-      expect(
-        await prepareRunSessionRootOverride({ XUM_RUN_SESSION_ROOT: overrideRoot }, realConfigRoot)
-      ).toBe(overrideRoot);
+      await using preparedRoot = await prepareRunSessionRootOverride(
+        { XUM_RUN_SESSION_ROOT: overrideRoot },
+        realConfigRoot
+      );
+      expect(preparedRoot?.path).toBe(overrideRoot);
       const providersFile = path.join(overrideRoot, "providers.jsonc");
-      await replacePrivateRunConfigFile(providersFile, "{}");
+      await replacePrivateRunConfigFile(providersFile, "{}", preparedRoot);
 
       expect((await fs.stat(overrideRoot)).mode & 0o777).toBe(0o700);
       expect((await fs.stat(providersFile)).mode & 0o777).toBe(0o600);
@@ -74,6 +76,45 @@ describe("prepareRunSessionRootOverride", () => {
     }
   });
 
+  test("keeps credential writes pinned when the session root path is replaced", async () => {
+    const realConfigRoot = path.join(tempDir, "real-config");
+    const runRoot = path.join(tempDir, "run-session");
+    const movedRoot = path.join(tempDir, "secured-session");
+    await fs.mkdir(runRoot);
+    await using preparedRoot = await prepareRunSessionRootOverride(
+      { XUM_RUN_SESSION_ROOT: runRoot },
+      realConfigRoot
+    );
+    if (preparedRoot === undefined) {
+      throw new Error("Expected a prepared run session root");
+    }
+
+    await fs.rename(runRoot, movedRoot);
+    await fs.mkdir(runRoot);
+    const providersFile = path.join(runRoot, "providers.jsonc");
+
+    let error: unknown;
+    try {
+      await replacePrivateRunConfigFile(providersFile, "copied credentials", preparedRoot);
+    } catch (caught) {
+      error = caught;
+    }
+
+    const replacementHasCredentials = await fs
+      .access(providersFile)
+      .then(() => true)
+      .catch(() => false);
+    expect(replacementHasCredentials).toBe(false);
+    if (process.platform === "linux") {
+      expect(error).toBeUndefined();
+      expect(await fs.readFile(path.join(movedRoot, "providers.jsonc"), "utf8")).toBe(
+        "copied credentials"
+      );
+    } else {
+      expect(error).toBeInstanceOf(Error);
+    }
+  });
+
   test("tightens a pre-existing override root", async () => {
     const realConfigRoot = path.join(tempDir, "real-config");
     const overrideRoot = path.join(tempDir, "run-session");
@@ -81,8 +122,12 @@ describe("prepareRunSessionRootOverride", () => {
     await fs.mkdir(overrideRoot, { mode: 0o755 });
     await fs.chmod(overrideRoot, 0o755);
 
-    await prepareRunSessionRootOverride({ XUM_RUN_SESSION_ROOT: overrideRoot }, realConfigRoot);
+    await using preparedRoot = await prepareRunSessionRootOverride(
+      { XUM_RUN_SESSION_ROOT: overrideRoot },
+      realConfigRoot
+    );
 
+    expect(preparedRoot?.path).toBe(overrideRoot);
     expect((await fs.stat(overrideRoot)).mode & 0o777).toBe(0o700);
   });
 

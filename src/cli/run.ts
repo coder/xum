@@ -86,7 +86,11 @@ import {
   type ExperimentId,
 } from "../common/constants/experiments";
 import { getErrorMessage } from "@/common/utils/errors";
-import { prepareRunSessionRootOverride, replacePrivateRunConfigFile } from "./runSessionRoot";
+import {
+  prepareRunSessionRootOverride,
+  replacePrivateRunConfigFile,
+  type PreparedRunSessionRoot,
+} from "./runSessionRoot";
 import { describeCliGoalStop, driveCliGoalUntilTerminal } from "./goalRunDriver";
 import {
   parseGoalBudgetInputCents,
@@ -501,14 +505,15 @@ async function main(): Promise<number> {
   // harnesses can pin it (XUM_RUN_SESSION_ROOT / MUX_RUN_SESSION_ROOT) to
   // collect chat.jsonl and session-usage.json after the process exits; an
   // override root is left in place on exit.
-  let sessionRootOverride: string | undefined;
+  let sessionRootOverride: PreparedRunSessionRoot | undefined;
   try {
     sessionRootOverride = await prepareRunSessionRootOverride(process.env, realConfig.rootDir);
   } catch (error) {
     console.error(`Error: ${getErrorMessage(error)}`);
     return 1;
   }
-  const sessionRoot = sessionRootOverride ?? tempDir.path;
+  await using preparedSessionRoot = sessionRootOverride;
+  const sessionRoot = preparedSessionRoot?.path ?? tempDir.path;
   const config = new Config(sessionRoot);
 
   // Copy providers and secrets from real config to ephemeral config
@@ -518,7 +523,8 @@ async function main(): Promise<number> {
     providersFile,
     hasAnyConfiguredProvider(existingProviders)
       ? JSON.stringify(existingProviders, null, 2)
-      : undefined
+      : undefined,
+    preparedSessionRoot
   );
 
   // Copy secrets so tools/MCP servers get project secrets (e.g., GH_TOKEN)
@@ -526,7 +532,8 @@ async function main(): Promise<number> {
   const secretsFile = path.join(config.rootDir, "secrets.json");
   await replacePrivateRunConfigFile(
     secretsFile,
-    Object.keys(existingSecrets).length > 0 ? JSON.stringify(existingSecrets, null, 2) : undefined
+    Object.keys(existingSecrets).length > 0 ? JSON.stringify(existingSecrets, null, 2) : undefined,
+    preparedSessionRoot
   );
 
   // Copy only project trust metadata so AIService can read trust flags.
