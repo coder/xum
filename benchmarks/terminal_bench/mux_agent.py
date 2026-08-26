@@ -635,6 +635,10 @@ class MuxAgent(BaseInstalledAgent):
         except OverflowError:
             return False
 
+    @staticmethod
+    def _is_valid_token_count(value: object) -> bool:
+        return not isinstance(value, bool) and isinstance(value, int) and value >= 0
+
     @classmethod
     def _has_usable_session_usage(cls, data: dict[str, Any]) -> bool:
         by_model = data.get("byModel")
@@ -648,7 +652,7 @@ class MuxAgent(BaseInstalledAgent):
                 if not isinstance(component, dict):
                     continue
                 tokens = component.get("tokens")
-                if cls._is_valid_usage_number(tokens) and tokens > 0:
+                if cls._is_valid_token_count(tokens) and tokens > 0:
                     return True
         return False
 
@@ -747,7 +751,7 @@ class MuxAgent(BaseInstalledAgent):
                     if not isinstance(component, dict):
                         continue
                     tokens = component.get("tokens")
-                    if not self._is_valid_usage_number(tokens):
+                    if not self._is_valid_token_count(tokens):
                         continue
                     totals[key] += int(tokens)
                     cost = component.get("cost_usd")
@@ -769,7 +773,7 @@ class MuxAgent(BaseInstalledAgent):
         total = 0
         for key in ("input", "output", "reasoning", "cache_read", "cache_write"):
             value = data.get(key)
-            if cls._is_valid_usage_number(value):
+            if cls._is_valid_token_count(value):
                 total += int(value)
         return total
 
@@ -831,7 +835,7 @@ class MuxAgent(BaseInstalledAgent):
             # reported input total so cached legs are not understated;
             # the per-bucket breakdown stays in the JSON artifacts.
             context.n_input_tokens = sum(
-                value if self._is_valid_usage_number(value) else 0
+                value if self._is_valid_token_count(value) else 0
                 for value in (
                     data.get("input"),
                     data.get("cache_read"),
@@ -842,7 +846,7 @@ class MuxAgent(BaseInstalledAgent):
             # (the session summary reports reasoning as its own bucket).
             output_tokens = data.get("output")
             context.n_output_tokens = (
-                output_tokens if self._is_valid_usage_number(output_tokens) else 0
+                output_tokens if self._is_valid_token_count(output_tokens) else 0
             )
             # cost_usd is computed by mux from model pricing
             cost_usd = data.get("cost_usd")

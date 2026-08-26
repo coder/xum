@@ -866,6 +866,23 @@ def test_populate_context_leaves_invalid_stdout_cost_unset_without_session(
     assert not hasattr(context, "cost_usd")
 
 
+def test_populate_context_rejects_fractional_stdout_token_counts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    (tmp_path / "mux-tokens.json").write_text(
+        '{"input": 1.9, "output": 2.9, "cost_usd": 0.5}'
+    )
+    context = SimpleNamespace()
+
+    agent.populate_context_post_run(context)
+
+    assert getattr(context, "n_input_tokens") == 0
+    assert getattr(context, "n_output_tokens") == 0
+    assert getattr(context, "cost_usd") == pytest.approx(0.5)
+
+
 def test_session_usage_leaves_cost_unset_for_unpriced_usage(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -964,6 +981,29 @@ def test_session_usage_skips_non_finite_tokens_without_losing_valid_sessions(
     assert totals["cost_usd"] == pytest.approx(0.15)
 
 
+def test_session_usage_discards_fractional_tokens_and_cost(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    fractional_usage = {
+        "byModel": {"m": {"input": {"tokens": 1.9, "cost_usd": 0.5}}},
+        "version": 1,
+    }
+    (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).write_bytes(
+        _sessions_archive_bytes(
+            {"ws-main": _usage_display(), "ws-fractional": fractional_usage}
+        )
+    )
+
+    totals = agent._summarize_session_usage()
+
+    assert totals is not None
+    assert totals["sessions"] == 2
+    assert totals["input"] == 10
+    assert totals["cost_usd"] == pytest.approx(0.15)
+
+
 def test_session_usage_skips_non_finite_cost_without_losing_valid_sessions(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1024,6 +1064,30 @@ def test_session_usage_keeps_child_of_zero_usage_rollup_parent(
     (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).write_bytes(
         _sessions_archive_bytes(
             {"ws-parent": zero_parent, "ws-child": _usage_display()}
+        )
+    )
+
+    totals = agent._summarize_session_usage()
+
+    assert totals is not None
+    assert totals["sessions"] == 2
+    assert totals["input"] == 10
+    assert totals["cost_usd"] == pytest.approx(0.15)
+
+
+def test_session_usage_keeps_child_of_fractional_usage_rollup_parent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    fractional_parent = {
+        "byModel": {"m": {"input": {"tokens": 1.9}}},
+        "rolledUpFrom": {"ws-child": True},
+        "version": 1,
+    }
+    (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).write_bytes(
+        _sessions_archive_bytes(
+            {"ws-parent": fractional_parent, "ws-child": _usage_display()}
         )
     )
 
