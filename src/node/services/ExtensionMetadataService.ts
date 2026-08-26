@@ -309,6 +309,22 @@ export class ExtensionMetadataService {
   }
 
   /**
+   * Shared leftover-sidecar recovery for the read paths (authoritative list
+   * and per-workspace snapshot reads): probe the fixed sidecar path and run
+   * the resumable recovery when one exists. Returns true when a sidecar was
+   * found (callers should re-read). Failures propagate; each caller decides
+   * whether its read contract is strict (list) or best-effort (live
+   * emissions).
+   */
+  private async reconcileLeftoverSidecarIfPresent(): Promise<boolean> {
+    if (!(await this.probeQuarantineSidecar())) {
+      return false;
+    }
+    await this.resumeQuarantineRecovery();
+    return true;
+  }
+
+  /**
    * Seam for load()'s missing-main handling (and deterministic TOCTOU tests):
    * reports whether the quarantine sidecar currently exists.
    */
@@ -642,6 +658,18 @@ export class ExtensionMetadataService {
   }
 
   async getSnapshot(workspaceId: string): Promise<WorkspaceActivitySnapshot | null> {
+    // Same leftover-sidecar reconcile as getAllSnapshots (see the comment
+    // there): live emissions read through this path after the subscription
+    // bootstraps, so without it a recreated partial main would feed emitted
+    // snapshots (clearing goal/status in the renderer) while the healthy
+    // subscription never triggers another list read. Best-effort here: an
+    // unprobeable sidecar must not block a live emission — the strict list
+    // read propagates the same failure and keeps hydration retryable.
+    try {
+      await this.reconcileLeftoverSidecarIfPresent();
+    } catch (error) {
+      log.debug("Leftover sidecar reconcile failed during snapshot read", { error });
+    }
     const data = await this.load();
     return this.toSnapshot(data.workspaces[workspaceId]);
   }
@@ -1341,8 +1369,7 @@ export class ExtensionMetadataService {
     // costs one no-op reconcile per read while it exists — corruption
     // incidents are rare and the leftover is consumed by the next
     // quarantine or manual cleanup.
-    if (await this.probeQuarantineSidecar()) {
-      await this.resumeQuarantineRecovery();
+    if (await this.reconcileLeftoverSidecarIfPresent()) {
       data = await this.load(options);
     }
     const map = new Map<string, WorkspaceActivitySnapshot>();

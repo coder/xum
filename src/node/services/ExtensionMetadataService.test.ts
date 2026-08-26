@@ -1048,6 +1048,37 @@ describe("ExtensionMetadataService", () => {
     expect(service.isWorkspaceDeleted("ws-legacy")).toBe(true);
   });
 
+  test("live snapshot reads reconcile a stranded sidecar too", async () => {
+    // After the activity subscription bootstraps, live metadata/workflow
+    // emissions read via getSnapshot — a healthy subscription never issues
+    // another list read, so getSnapshot must run the same leftover-sidecar
+    // reconcile or a recreated partial main would feed emitted snapshots
+    // indefinitely.
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-new": { recency: 300, streaming: false } },
+      })
+    );
+    await writeFile(
+      `${filePath}.corrupt`,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-other": { recency: 42, streaming: false } },
+      })
+    );
+    const restarted = new ExtensionMetadataService(filePath);
+
+    const snapshot = await restarted.getSnapshot("ws-other");
+    expect(snapshot?.recency).toBe(42);
+    const sidecarGone = await readFile(`${filePath}.corrupt`, "utf-8").then(
+      () => false,
+      () => true
+    );
+    expect(sidecarGone).toBe(true);
+  });
+
   test("a strict read reconciles a sidecar stranded after earlier successful reads", async () => {
     // Quarantines are cross-process: another backend can crash mid-quarantine
     // (stranding a healthy sidecar) at any point in this process's lifetime,

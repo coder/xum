@@ -1152,6 +1152,15 @@ export class Config {
       const id = (value as { id?: unknown }).id;
       return typeof id === "string" && id.length > 0;
     };
+    // Collect ids ONLY from direct entries of `workspaces` arrays — never
+    // from arbitrary nested objects. Workspace entries carry nested id-bearing
+    // objects (e.g. taskPendingGuidance items) whose ids can reference OTHER
+    // (including removed) workspaces; a whole-subtree scan would report those
+    // as registered, corrupting registration evidence (aborted deletions,
+    // lifted tombstones, ghost activity probes) and unbounding the activity
+    // scope. Under-collection stays safe: any workspaces container whose
+    // entries cannot be verified (id-less entry, non-array container) flips
+    // the incompleteness flag, routing callers to the strict enumeration.
     const collect = (value: unknown): void => {
       if (Array.isArray(value)) {
         for (const entry of value) {
@@ -1160,14 +1169,14 @@ export class Config {
         return;
       }
       if (value !== null && typeof value === "object") {
-        const id = (value as { id?: unknown }).id;
-        if (typeof id === "string" && id.length > 0) {
-          ids.add(id);
-        }
         const workspaces = (value as { workspaces?: unknown }).workspaces;
         if (Array.isArray(workspaces)) {
-          if (workspaces.some((entry) => !hasInlineStringId(entry))) {
-            hasWorkspaceEntriesWithoutIds = true;
+          for (const entry of workspaces) {
+            if (hasInlineStringId(entry)) {
+              ids.add((entry as { id: string }).id);
+            } else {
+              hasWorkspaceEntriesWithoutIds = true;
+            }
           }
         } else if (workspaces !== undefined) {
           // A PRESENT workspaces container in any non-array shape (object,

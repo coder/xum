@@ -930,6 +930,38 @@ describe("Config", () => {
       expect(() => new Config(tempDir).readPersistedWorkspaceIdSuperset()).toThrow();
     });
 
+    it("collects only workspace-entry ids, not nested id-bearing objects", () => {
+      // Workspace entries carry nested id-bearing objects (e.g.
+      // taskPendingGuidance items) whose ids can reference OTHER — including
+      // removed — workspaces. Treating those as registered would corrupt
+      // registration evidence (aborted deletions, lifted tombstones) and
+      // unbound the activity scope.
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [
+              "/repo",
+              {
+                workspaces: [
+                  {
+                    id: "ws-live",
+                    path: "/repo/ws",
+                    taskPendingGuidance: [{ id: "removed-workspace-id", message: "hi" }],
+                    parentWorkspaceId: "some-parent",
+                  },
+                ],
+              },
+            ],
+          ],
+        })
+      );
+      expect(new Config(tempDir).readPersistedWorkspaceIdEvidence()).toEqual({
+        ids: new Set(["ws-live"]),
+        hasWorkspaceEntriesWithoutIds: false,
+      });
+    });
+
     it("reports whether any workspace entry lacks an inline id", () => {
       // Completeness signal for registration evidence: with inline ids
       // everywhere, the raw view is complete and callers may skip the
