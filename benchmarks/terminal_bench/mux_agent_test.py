@@ -750,6 +750,26 @@ def test_populate_context_keeps_fresher_token_file_counts(
     assert not hasattr(context, "cost_usd")
 
 
+def test_populate_context_skips_non_finite_token_file_counts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    (tmp_path / "mux-tokens.json").write_text(
+        '{"input": 1e309, "output": 1000, "cost_usd": null}'
+    )
+    (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).write_bytes(
+        _sessions_archive_bytes({"ws-main": _usage_display()})
+    )
+    context = SimpleNamespace()
+
+    agent.populate_context_post_run(context)
+
+    assert getattr(context, "n_input_tokens") == 0
+    assert getattr(context, "n_output_tokens") == 1000
+    assert not hasattr(context, "cost_usd")
+
+
 def test_session_usage_leaves_cost_unset_for_unpriced_usage(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

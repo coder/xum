@@ -699,12 +699,12 @@ class MuxAgent(BaseInstalledAgent):
             totals["cost_usd"] = cost_sum
         return totals
 
-    @staticmethod
-    def _total_tokens(data: dict[str, Any]) -> int:
+    @classmethod
+    def _total_tokens(cls, data: dict[str, Any]) -> int:
         total = 0
         for key in ("input", "output", "reasoning", "cache_read", "cache_write"):
             value = data.get(key)
-            if isinstance(value, (int, float)):
+            if cls._is_valid_usage_number(value):
                 total += int(value)
         return total
 
@@ -760,14 +760,20 @@ class MuxAgent(BaseInstalledAgent):
             # only the uncached portion. Fold cache read/write into the
             # reported input total so cached legs are not understated;
             # the per-bucket breakdown stays in the JSON artifacts.
-            context.n_input_tokens = (
-                data.get("input", 0)
-                + data.get("cache_read", 0)
-                + data.get("cache_write", 0)
+            context.n_input_tokens = sum(
+                value if self._is_valid_usage_number(value) else 0
+                for value in (
+                    data.get("input"),
+                    data.get("cache_read"),
+                    data.get("cache_write"),
+                )
             )
             # Keep run-complete semantics: "output" excludes reasoning tokens
             # (the session summary reports reasoning as its own bucket).
-            context.n_output_tokens = data.get("output", 0)
+            output_tokens = data.get("output")
+            context.n_output_tokens = (
+                output_tokens if self._is_valid_usage_number(output_tokens) else 0
+            )
             # cost_usd is computed by mux from model pricing
             if data.get("cost_usd") is not None:
                 context.cost_usd = data["cost_usd"]
