@@ -474,7 +474,9 @@ export const RunningNarrowLongName: Story = {
   ),
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
     const canvas = within(canvasElement);
-    const name = await canvas.findByText(
+    // The expanded body repeats the workflow name, so take the header instance
+    // (first in DOM order) — clicking it bubbles to the ToolHeader toggle.
+    const [name] = await canvas.findAllByText(
       "deep-research-competitive-landscape-and-pricing-teardown"
     );
     await fireEvent.click(name);
