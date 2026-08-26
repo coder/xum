@@ -1242,6 +1242,32 @@ export class Config {
         // Config is stored as array of [path, config] pairs.
         // Older/newer files may omit `projects`; treat missing/invalid values as an empty map
         // so top-level settings (provider/runtime/server preferences) still load.
+        //
+        // Strict mode must NOT accept that lenient normalization: callers that
+        // make destructive "id is not in config" decisions (extension-metadata
+        // pruning, orphan session-dir cleanup) would interpret a structurally
+        // invalid-but-parseable file (e.g. `projects: {}` or a non-array
+        // `workspaces`) as an empty/partial workspace set and delete live
+        // data. A genuinely ABSENT `projects` key stays valid in strict mode:
+        // it is how older/newer builds persist a config with no projects.
+        if (options?.throwOnError && parsed.projects !== undefined) {
+          if (!Array.isArray(parsed.projects)) {
+            throw new Error("Config projects must be an array of [path, config] pairs");
+          }
+          for (const pair of parsed.projects) {
+            if (!Array.isArray(pair)) {
+              throw new Error("Config projects entries must be [path, config] pairs");
+            }
+            const projectConfig: unknown = pair[1];
+            if (projectConfig === null || typeof projectConfig !== "object") {
+              throw new Error("Config project entries must be objects");
+            }
+            const workspaces = (projectConfig as { workspaces?: unknown }).workspaces;
+            if (workspaces !== undefined && !Array.isArray(workspaces)) {
+              throw new Error("Config project workspaces must be an array");
+            }
+          }
+        }
         const rawPairs = Array.isArray(parsed.projects) ? parsed.projects : [];
         // Migrate: normalize project paths by stripping trailing slashes
         // This fixes configs created with paths like "/home/user/project/"

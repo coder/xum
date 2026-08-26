@@ -3209,31 +3209,40 @@ describe("WorkspaceService activity list scoping", () => {
   });
 
   test("falls back to the unscoped union when config workspaces cannot be listed", async () => {
-    const { config, historyService, cleanup } = await createTestHistoryService();
-    try {
-      const extensionMetadata = new ExtensionMetadataService(
-        path.join(config.rootDir, "extensionMetadata.json")
-      );
-      await extensionMetadata.updateRecency("possibly-live", 100);
-      // Real on-disk corruption: loadConfigOrDefault SWALLOWS this and
-      // resolves with the empty default unless callers opt into the strict
-      // read. Without throwOnError, this state would silently wipe every
-      // metadata entry (prune sees an "empty" config) and drop every live
-      // entry from the list instead of reaching the fail-open fallback.
-      await fsPromises.writeFile(path.join(config.rootDir, "config.json"), "{not json");
-      const workspaceService = createWorkspaceServiceForTest({
-        config,
-        historyService,
-        extensionMetadata,
-      });
-      // Fail open: without the config view, stale ids cannot be told apart
-      // from live ones, so nothing may be dropped from the list or pruned
-      // from disk.
-      const activityList = await workspaceService.getActivityList();
-      expect(activityList["possibly-live"]?.recency).toBe(100);
-      expect((await extensionMetadata.getAllSnapshots()).has("possibly-live")).toBe(true);
-    } finally {
-      await cleanup();
+    // Real on-disk corruption shapes. loadConfigOrDefault SWALLOWS the first
+    // (parse failure) and lenient-normalizes the rest (parseable but
+    // structurally invalid) into an empty/partial workspace view unless
+    // callers opt into the strict read. Without throwOnError + strict
+    // structural validation, each of these states would silently wipe every
+    // metadata entry (prune sees an "empty" config) and drop every live
+    // entry from the list instead of reaching the fail-open fallback.
+    const corruptConfigs = [
+      "{not json",
+      JSON.stringify({ projects: {} }),
+      JSON.stringify({ projects: [["/tmp/project", { workspaces: "bogus" }]] }),
+    ];
+    for (const corruptConfig of corruptConfigs) {
+      const { config, historyService, cleanup } = await createTestHistoryService();
+      try {
+        const extensionMetadata = new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        );
+        await extensionMetadata.updateRecency("possibly-live", 100);
+        await fsPromises.writeFile(path.join(config.rootDir, "config.json"), corruptConfig);
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+        // Fail open: without a trustworthy config view, stale ids cannot be
+        // told apart from live ones, so nothing may be dropped from the list
+        // or pruned from disk.
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList["possibly-live"]?.recency).toBe(100);
+        expect((await extensionMetadata.getAllSnapshots()).has("possibly-live")).toBe(true);
+      } finally {
+        await cleanup();
+      }
     }
   });
 

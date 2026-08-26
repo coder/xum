@@ -861,6 +861,48 @@ describe("Config", () => {
     });
   });
 
+  describe("strict structural validation (throwOnError)", () => {
+    // Destructive callers (extension-metadata pruning, orphan session-dir
+    // cleanup) must never receive a lenient-normalized empty/partial workspace
+    // view for a parseable but structurally invalid config: they would treat
+    // the omitted live workspaces as removed and delete their data.
+    const invalidShapes: Array<[string, unknown]> = [
+      ["non-array projects", { projects: {} }],
+      ["non-pair projects entry", { projects: ["not-a-pair"] }],
+      ["non-object project config", { projects: [["/repo", null]] }],
+      ["non-array workspaces", { projects: [["/repo", { workspaces: "bogus" }]] }],
+    ];
+
+    for (const [label, shape] of invalidShapes) {
+      it(`rejects ${label} in strict mode while lenient mode still loads`, async () => {
+        fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify(shape));
+        const strictConfig = new Config(tempDir);
+        expect(() => strictConfig.loadConfigOrDefault({ throwOnError: true })).toThrow();
+        // try/catch instead of rejects.toThrow: the node-side type-aware lint
+        // flags awaiting bun's expect() chain as await-thenable.
+        let strictMetadataRejected = false;
+        try {
+          await new Config(tempDir).getAllWorkspaceMetadata({ throwOnError: true });
+        } catch {
+          strictMetadataRejected = true;
+        }
+        expect(strictMetadataRejected).toBe(true);
+        // Ordinary loads keep the historical self-healing behavior: they
+        // never throw for these shapes (normalized stubs may survive).
+        expect(() => new Config(tempDir).loadConfigOrDefault()).not.toThrow();
+      });
+    }
+
+    it("accepts an absent projects key in strict mode (healthy empty config)", () => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({ defaultProjectDir: "/tmp" })
+      );
+      const loaded = new Config(tempDir).loadConfigOrDefault({ throwOnError: true });
+      expect(loaded.projects.size).toBe(0);
+    });
+  });
+
   describe("legacy task variant compatibility", () => {
     it("loads variant children as ordinary sub-agents without destroying downgrade metadata", async () => {
       const configFile = path.join(tempDir, "config.json");
