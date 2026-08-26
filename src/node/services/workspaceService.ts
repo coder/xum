@@ -12846,29 +12846,53 @@ export class WorkspaceService extends EventEmitter {
     this.prunedStaleExtensionMetadata = true;
     try {
       let normalizedIds: Set<string> | null = null;
-      const prunedCount = await this.extensionMetadata.pruneMissingWorkspaces(async () => {
-        // Invoked inside the file's serialized mutation AFTER the file load,
-        // reading config fresh from disk (see pruneMissingWorkspaces), so a
-        // concurrently created workspace — even in another backend process —
-        // cannot lose its just-written entry.
-        //
-        // Union of two views, both of which throw (aborting the prune, caught
-        // below) rather than resolving with a silently lossy id set:
-        // - the raw persisted superset covers entries loadConfigOrDefault's
-        //   validation/normalization would filter or discard (see
-        //   readPersistedWorkspaceIdSuperset), so a live workspace with a
-        //   malformed config entry is never treated as removed;
-        // - the strict normalized view covers ids produced by in-memory
-        //   config migrations that are not yet persisted verbatim.
-        // A missing config file resolves as a healthy empty set in both.
-        const knownIds = this.config.readPersistedWorkspaceIdSuperset();
-        const allMetadata = await this.config.getAllWorkspaceMetadata({ throwOnError: true });
-        normalizedIds = new Set(allMetadata.map((metadata) => metadata.id));
-        for (const workspaceId of normalizedIds) {
-          knownIds.add(workspaceId);
+      const prunedCount = await this.extensionMetadata.pruneMissingWorkspaces(
+        async () => {
+          // Invoked inside the file's serialized mutation AFTER the file load,
+          // reading config fresh from disk (see pruneMissingWorkspaces), so a
+          // concurrently created workspace — even in another backend process —
+          // cannot lose its just-written entry.
+          //
+          // Union of two views, both of which throw (aborting the prune, caught
+          // below) rather than resolving with a silently lossy id set:
+          // - the raw persisted superset covers entries loadConfigOrDefault's
+          //   validation/normalization would filter or discard (see
+          //   readPersistedWorkspaceIdSuperset), so a live workspace with a
+          //   malformed config entry is never treated as removed;
+          // - the strict normalized view covers ids produced by in-memory
+          //   config migrations that are not yet persisted verbatim.
+          // A missing config file resolves as a healthy empty set in both.
+          const knownIds = this.config.readPersistedWorkspaceIdSuperset();
+          const allMetadata = await this.config.getAllWorkspaceMetadata({ throwOnError: true });
+          normalizedIds = new Set(allMetadata.map((metadata) => metadata.id));
+          for (const workspaceId of normalizedIds) {
+            knownIds.add(workspaceId);
+          }
+          return knownIds;
+        },
+        async () => {
+          // Mid-prune re-registration recheck. The first callback's strict
+          // enumeration walks a session lookup per configured workspace;
+          // rerunning it doubles that cost on exactly the stale-heavy
+          // deployments this prune exists to fix, while the serialized
+          // metadata queue blocks live recency/status writes. The raw id view
+          // is complete registration evidence whenever every persisted
+          // workspace entry carries its id inline — only id-less legacy
+          // entries (whose stable id lives in session metadata.json) can be
+          // registered raw-invisibly, so the enumeration is repeated only
+          // when such entries exist. Both reads throw on failure, aborting
+          // the prune rather than deleting on lossy evidence.
+          const evidence = this.config.readPersistedWorkspaceIdEvidence();
+          if (!evidence.hasWorkspaceEntriesWithoutIds) {
+            return evidence.ids;
+          }
+          const allMetadata = await this.config.getAllWorkspaceMetadata({ throwOnError: true });
+          for (const metadata of allMetadata) {
+            evidence.ids.add(metadata.id);
+          }
+          return evidence.ids;
         }
-        return knownIds;
-      });
+      );
       if (prunedCount > 0) {
         log.info(`Pruned ${prunedCount} stale extension metadata entries`);
       }
@@ -13068,12 +13092,26 @@ export class WorkspaceService extends EventEmitter {
       // (unreadable/id-less metadata.json throws in strict mode) skips the
       // recheck and conservatively retains every raw-invisible id. Computed
       // only when a retained entry is actually missing from the raw
-      // baseline, so modern deployments (every workspace id persisted in
-      // config) never pay the extra walk.
+      // baseline (or a raw-invisible late snapshot needs admission below),
+      // so modern deployments (every workspace id persisted in config)
+      // never pay the extra walk.
+      // Second trigger: a fresh-snapshot id outside the per-id scope that
+      // the raw view cannot vouch for. It is either a raw-invisible legacy
+      // id a downgraded backend registered mid-list — which the merge below
+      // must ADMIT, and only the authoritative enumeration can prove
+      // registered — or noise the merge must keep excluding; either way the
+      // enumeration is the only view that can tell.
+      const hasRawInvisibleLateSnapshotId =
+        freshSnapshots != null &&
+        Array.from(freshSnapshots.keys()).some(
+          (workspaceId) =>
+            !workspaceIds.has(workspaceId) && !(freshConfigIds?.has(workspaceId) ?? false)
+        );
       let authoritativeIds: ReadonlySet<string> | null = null;
       if (
         initialConfigIds != null &&
-        entries.some((entry) => entry != null && !initialConfigIds.has(entry[0]))
+        (entries.some((entry) => entry != null && !initialConfigIds.has(entry[0])) ||
+          hasRawInvisibleLateSnapshotId)
       ) {
         try {
           authoritativeIds = new Set(
@@ -13154,48 +13192,91 @@ export class WorkspaceService extends EventEmitter {
       // re-read, subject to the same removal guards as retained entries.
       if (freshSnapshots != null) {
         // Merge scope: the (possibly stale) per-id scope PLUS fresh-snapshot
-        // ids the fresh raw config view proves registered — a workspace
+        // ids a fresh config-derived view proves registered — a workspace
         // registered and written between the scope reads and the fresh
-        // re-read is in both fresh views but in neither stale one.
+        // re-read is in both fresh views but in neither stale one. Raw-
+        // invisible ids (legacy stable ids resolved from session
+        // metadata.json) can never appear in the raw view, so they are
+        // admitted through the authoritative enumeration instead — without
+        // that, a legacy workspace registered by a downgraded backend
+        // mid-list would stay absent until reconnect (the process-local
+        // subscription cannot deliver the cross-process snapshot).
         const mergeCandidateIds = new Set(workspaceIds);
-        if (freshConfigIds != null) {
-          for (const workspaceId of freshSnapshots.keys()) {
-            if (freshConfigIds.has(workspaceId)) {
-              mergeCandidateIds.add(workspaceId);
-            }
+        for (const workspaceId of freshSnapshots.keys()) {
+          if (
+            (freshConfigIds?.has(workspaceId) ?? false) ||
+            (authoritativeIds?.has(workspaceId) ?? false)
+          ) {
+            mergeCandidateIds.add(workspaceId);
           }
         }
+        // Workflow-run bootstrap for candidates the per-id loop never saw:
+        // their on-disk active runs are not in the process-local cache, and
+        // a cached-only merge would omit activeWorkflowRunCount for exactly
+        // the cross-process registrations this merge exists to bootstrap.
+        // Probed BEFORE the final guard views below so no await separates
+        // guard evaluation from insertion (ids the per-id loop already
+        // probed resolve synchronously from the shared cached Set).
+        const probedWorkflowRunIds = new Map<string, ReadonlySet<string>>();
         for (const workspaceId of mergeCandidateIds) {
-          if (workspaceId in activityById) {
+          if (workspaceId in activityById || !freshSnapshots.has(workspaceId)) {
             continue;
           }
-          const lateSnapshot = freshSnapshots.get(workspaceId) ?? null;
-          if (
-            lateSnapshot == null ||
-            this.extensionMetadata.isWorkspaceDeleted(workspaceId) ||
-            isRemovedFromConfig(workspaceId) ||
-            isRemovedPerAuthoritativeIdentity(workspaceId)
-          ) {
-            continue;
+          probedWorkflowRunIds.set(workspaceId, await this.getActiveWorkflowRunIds(workspaceId));
+        }
+        if (probedWorkflowRunIds.size > 0) {
+          // Final post-probe views: the probes awaited disk, so a removal
+          // landing during them is invisible to every view captured above —
+          // inserting on those alone would ride the deleted id back into the
+          // renderer. Re-read the (post-prune bounded) metadata file and the
+          // raw config superset once more, then evaluate every guard with no
+          // awaits before insertion. A removed workspace's metadata key is
+          // deleted on removal, so the snapshot re-read also covers legacy
+          // ids the raw view cannot see; same-process removals are covered
+          // by the tombstone check. Best-effort like the other fresh
+          // re-reads: an unreadable view falls back to the pre-probe one.
+          let finalSnapshots: ReadonlyMap<string, WorkspaceActivitySnapshot> | null = null;
+          try {
+            finalSnapshots = await this.extensionMetadata.getAllSnapshots({ throwOnError: true });
+          } catch {
+            finalSnapshots = null;
           }
-          // Same overlay path emitWorkspaceActivity uses, except workflow
-          // runs come from the bootstrapping probe rather than the bare
-          // cache: a candidate admitted by the fresh config/snapshot re-reads
-          // never went through the per-id loop above, so its on-disk active
-          // workflow runs are not cached yet — a cached-only merge would omit
-          // activeWorkflowRunCount for exactly the cross-process
-          // registrations this merge exists to bootstrap, and the process-
-          // local subscription can never deliver the missing delta. Ids the
-          // per-id loop already probed resolve from the shared cached Set.
-          const merged = this.mergeCurrentActiveBashMonitorCount(
-            workspaceId,
-            mergeActiveWorkflowRuns(
-              this.overlayPendingGoal(workspaceId, lateSnapshot),
-              await this.getActiveWorkflowRunIds(workspaceId)
-            )
-          );
-          if (merged != null) {
-            activityById[workspaceId] = merged;
+          let finalConfigIds: ReadonlySet<string> | null = null;
+          try {
+            finalConfigIds = this.config.readPersistedWorkspaceIdSuperset();
+          } catch {
+            finalConfigIds = null;
+          }
+          for (const [workspaceId, activeWorkflowRunIds] of probedWorkflowRunIds) {
+            const lateSnapshot =
+              finalSnapshots != null
+                ? (finalSnapshots.get(workspaceId) ?? null)
+                : (freshSnapshots.get(workspaceId) ?? null);
+            if (
+              lateSnapshot == null ||
+              this.extensionMetadata.isWorkspaceDeleted(workspaceId) ||
+              isRemovedFromConfig(workspaceId) ||
+              isRemovedPerAuthoritativeIdentity(workspaceId) ||
+              // Verifiably deregistered from the raw config during the
+              // probes (post-probe counterpart of isRemovedFromConfig).
+              (initialConfigIds != null &&
+                finalConfigIds != null &&
+                initialConfigIds.has(workspaceId) &&
+                !finalConfigIds.has(workspaceId))
+            ) {
+              continue;
+            }
+            // Same overlay path emitWorkspaceActivity uses.
+            const merged = this.mergeCurrentActiveBashMonitorCount(
+              workspaceId,
+              mergeActiveWorkflowRuns(
+                this.overlayPendingGoal(workspaceId, lateSnapshot),
+                activeWorkflowRunIds
+              )
+            );
+            if (merged != null) {
+              activityById[workspaceId] = merged;
+            }
           }
         }
       }

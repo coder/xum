@@ -929,6 +929,41 @@ describe("Config", () => {
       fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify(["array-root"]));
       expect(() => new Config(tempDir).readPersistedWorkspaceIdSuperset()).toThrow();
     });
+
+    it("reports whether any workspace entry lacks an inline id", () => {
+      // Completeness signal for registration evidence: with inline ids
+      // everywhere, the raw view is complete and callers may skip the
+      // per-workspace authoritative enumeration; a single id-less (legacy)
+      // entry means a raw-invisible stable id may exist.
+      const configPath = path.join(tempDir, "config.json");
+      fs.writeFileSync(
+        configPath,
+        JSON.stringify({
+          projects: [["/repo", { workspaces: [{ id: "modern", path: "/repo/ws" }] }]],
+        })
+      );
+      expect(new Config(tempDir).readPersistedWorkspaceIdEvidence()).toEqual({
+        ids: new Set(["modern"]),
+        hasWorkspaceEntriesWithoutIds: false,
+      });
+      fs.writeFileSync(
+        configPath,
+        JSON.stringify({
+          projects: [
+            ["/repo", { workspaces: [{ id: "modern", path: "/repo/ws" }, { path: "/repo/old" }] }],
+          ],
+        })
+      );
+      const evidence = new Config(tempDir).readPersistedWorkspaceIdEvidence();
+      expect(evidence.hasWorkspaceEntriesWithoutIds).toBe(true);
+      expect(evidence.ids.has("modern")).toBe(true);
+      // Missing file: healthy empty evidence (fresh install).
+      fs.rmSync(configPath);
+      expect(new Config(tempDir).readPersistedWorkspaceIdEvidence()).toEqual({
+        ids: new Set(),
+        hasWorkspaceEntriesWithoutIds: false,
+      });
+    });
   });
 
   describe("legacy task variant compatibility", () => {

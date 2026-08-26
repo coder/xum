@@ -628,7 +628,15 @@ export class ExtensionMetadataService {
    * on-disk format is unchanged.
    */
   async pruneMissingWorkspaces(
-    getKnownWorkspaceIds: () => Promise<ReadonlySet<string>>
+    getKnownWorkspaceIds: () => Promise<ReadonlySet<string>>,
+    // Optional cheaper view for the mid-prune re-registration recheck: it
+    // only needs to answer "is this stale-classified id registered NOW", so
+    // callers whose full enumeration is expensive (per-workspace filesystem
+    // walks) can substitute an equally-complete but cheaper read. It must be
+    // COMPLETE (contain every currently registered id) or throw — resolving
+    // with a lossy set would let the prune delete a re-registered
+    // workspace's data. Defaults to getKnownWorkspaceIds.
+    recheckKnownWorkspaceIds?: () => Promise<ReadonlySet<string>>
   ): Promise<number> {
     return this.withSerializedMutation(async () => {
       const data = await this.load();
@@ -654,7 +662,7 @@ export class ExtensionMetadataService {
       // data. A re-registered id is dropped from the deletion set and its
       // write tombstone lifted. If the recheck fails, abort the prune (throw
       // to the caller's catch) rather than deleting on stale knowledge.
-      const recheckedKnownIds = await getKnownWorkspaceIds();
+      const recheckedKnownIds = await (recheckKnownWorkspaceIds ?? getKnownWorkspaceIds)();
       let prunedCount = 0;
       for (const workspaceId of staleWorkspaceIds) {
         if (recheckedKnownIds.has(workspaceId)) {

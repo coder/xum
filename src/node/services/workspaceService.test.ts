@@ -3242,10 +3242,14 @@ describe("WorkspaceService activity list scoping", () => {
       expect(activityList).not.toBeNull();
       expect(activityList?.[workspaceId]?.recency).toBe(100);
       expect(activityList?.["removed-workspace"]).toBeUndefined();
-      // Both walks belong to the prune itself (enumeration + the fresh
-      // pre-deletion recheck that spares concurrently re-registered ids);
-      // the list's SCOPING reuses the prune's ids instead of paying a third.
-      expect(metadataSpy).toHaveBeenCalledTimes(2);
+      // The single walk belongs to the prune's initial enumeration: the
+      // list's SCOPING reuses the prune's ids, and the prune's mid-pass
+      // re-registration recheck uses the raw config view (complete evidence
+      // here — every persisted workspace id is inline) instead of repeating
+      // the per-workspace walk while the metadata queue blocks live writes.
+      expect(metadataSpy).toHaveBeenCalledTimes(1);
+      // The stale entry really was reclaimed on disk, not merely filtered.
+      expect((await extensionMetadata.getAllSnapshots()).has("removed-workspace")).toBe(false);
     } finally {
       await cleanup();
     }
@@ -3726,6 +3730,120 @@ describe("WorkspaceService activity list scoping", () => {
         snapshotsSpy.mockRestore();
       }
     } finally {
+      await cleanup();
+    }
+  });
+
+  test("getActivityList admits raw-invisible legacy workspaces registered mid-list", async () => {
+    // A downgraded backend can register a legacy (id-less config entry)
+    // workspace mid-list: its stable id lives only in session metadata.json,
+    // so the fresh raw config re-read can never vouch for it. The merge must
+    // resolve such fresh-snapshot ids through the authoritative identity
+    // path instead of excluding them until reconnect.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const stableId = "late-legacy-stable-id";
+      const projectPath = path.join(config.rootDir, "project");
+      const workspacePath = path.join(projectPath, "legacy-ws");
+      const configPath = path.join(config.rootDir, "config.json");
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      const realGetAllSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      let snapshotCalls = 0;
+      const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(
+        async (options?: { throwOnError?: boolean }) => {
+          snapshotCalls += 1;
+          if (snapshotCalls === 2) {
+            await fsPromises.writeFile(
+              configPath,
+              JSON.stringify({
+                projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
+              })
+            );
+            const legacySessionDir = config.getSessionDir(
+              config.generateLegacyId(projectPath, workspacePath)
+            );
+            await fsPromises.mkdir(legacySessionDir, { recursive: true });
+            await fsPromises.writeFile(
+              path.join(legacySessionDir, "metadata.json"),
+              JSON.stringify({ id: stableId, name: "legacy-ws" })
+            );
+            await extensionMetadata.updateRecency(stableId, 777);
+          }
+          return realGetAllSnapshots(options);
+        }
+      );
+      try {
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList?.[stableId]?.recency).toBe(777);
+      } finally {
+        snapshotsSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("getActivityList drops mid-list additions removed during the workflow probe", async () => {
+    // The workflow-run bootstrap for late merge candidates awaits disk; a
+    // cross-process removal landing during that probe is invisible to every
+    // guard view captured before it. The final post-probe snapshot re-read
+    // must drop the entry instead of riding the deleted id back into the
+    // renderer (the process-local subscription cannot correct it).
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const metadataPath = path.join(config.rootDir, "extensionMetadata.json");
+    const listStatusSnapshotsSpy = spyOn(WorkflowRunStore.prototype, "listRunStatusSnapshots");
+    try {
+      const workspaceId = "late-then-removed";
+      const projectPath = path.join(config.rootDir, "project");
+      const extensionMetadata = new ExtensionMetadataService(metadataPath);
+      const realGetAllSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      let snapshotCalls = 0;
+      const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(
+        async (options?: { throwOnError?: boolean }) => {
+          snapshotCalls += 1;
+          if (snapshotCalls === 2) {
+            await config.addWorkspace(projectPath, {
+              id: workspaceId,
+              name: workspaceId,
+              projectName: "project",
+              projectPath,
+              runtimeConfig: { type: "local" },
+            });
+            await extensionMetadata.updateRecency(workspaceId, 888);
+          }
+          return realGetAllSnapshots(options);
+        }
+      );
+      listStatusSnapshotsSpy.mockImplementation(async () => {
+        // Another backend removes the workspace while the probe is awaited:
+        // its persisted metadata entry disappears, unseen by this process's
+        // tombstones.
+        await new ExtensionMetadataService(metadataPath).deleteWorkspace(workspaceId);
+        return [];
+      });
+      try {
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList).not.toBeNull();
+        expect(activityList?.[workspaceId]).toBeUndefined();
+      } finally {
+        snapshotsSpy.mockRestore();
+      }
+    } finally {
+      listStatusSnapshotsSpy.mockRestore();
       await cleanup();
     }
   });

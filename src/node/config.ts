@@ -1107,7 +1107,27 @@ export class Config {
    * a plain object; a missing file resolves as an empty set (fresh install).
    */
   readPersistedWorkspaceIdSuperset(): Set<string> {
+    return this.readPersistedWorkspaceIdEvidence().ids;
+  }
+
+  /**
+   * readPersistedWorkspaceIdSuperset plus a completeness signal: whether any
+   * persisted workspace entry lacks an inline string id. Only such id-less
+   * (legacy) entries can be registered "raw-invisibly" — their stable id
+   * lives in the session metadata.json, which only the authoritative
+   * enumeration resolves. When this reports false, the raw id set is
+   * complete registration evidence and callers can skip that per-workspace
+   * enumeration. Detection is conservative in the destructive direction:
+   * any workspaces container whose entries cannot be verified to carry ids
+   * reports true (over-reporting merely costs an extra enumeration, while
+   * under-reporting could let a pruner delete a live legacy workspace).
+   */
+  readPersistedWorkspaceIdEvidence(): {
+    ids: Set<string>;
+    hasWorkspaceEntriesWithoutIds: boolean;
+  } {
     const ids = new Set<string>();
+    let hasWorkspaceEntriesWithoutIds = false;
     let raw: string;
     try {
       raw = fs.readFileSync(this.configFile, "utf-8");
@@ -1117,7 +1137,7 @@ export class Config {
       // set and let destructive callers treat every workspace as removed.
       // Only a genuinely missing file is a healthy empty set (fresh install).
       if (isEnoentError(error)) {
-        return ids;
+        return { ids, hasWorkspaceEntriesWithoutIds };
       }
       throw error;
     }
@@ -1125,6 +1145,13 @@ export class Config {
     if (!parsedValue || typeof parsedValue !== "object" || Array.isArray(parsedValue)) {
       throw new Error("Config root must be a JSON object");
     }
+    const hasInlineStringId = (value: unknown): boolean => {
+      if (value === null || typeof value !== "object") {
+        return false;
+      }
+      const id = (value as { id?: unknown }).id;
+      return typeof id === "string" && id.length > 0;
+    };
     const collect = (value: unknown): void => {
       if (Array.isArray(value)) {
         for (const entry of value) {
@@ -1137,13 +1164,23 @@ export class Config {
         if (typeof id === "string" && id.length > 0) {
           ids.add(id);
         }
+        const workspaces = (value as { workspaces?: unknown }).workspaces;
+        if (Array.isArray(workspaces)) {
+          if (workspaces.some((entry) => !hasInlineStringId(entry))) {
+            hasWorkspaceEntriesWithoutIds = true;
+          }
+        } else if (workspaces !== null && typeof workspaces === "object") {
+          // A workspaces container in an uninterpretable shape may still
+          // describe registered workspaces; stay conservative.
+          hasWorkspaceEntriesWithoutIds = true;
+        }
         for (const nested of Object.values(value)) {
           collect(nested);
         }
       }
     };
     collect((parsedValue as { projects?: unknown }).projects);
-    return ids;
+    return { ids, hasWorkspaceEntriesWithoutIds };
   }
 
   loadConfigOrDefault(options?: { throwOnError?: boolean }): ProjectsConfig {
