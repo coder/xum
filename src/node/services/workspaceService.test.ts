@@ -3600,6 +3600,76 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("falls back to the unscoped union when config.json exists but cannot be read", async () => {
+    // EISDIR here; EACCES/ENOTDIR/EIO in the field. existsSync-style probes
+    // report all of these as "missing", which would masquerade as an empty
+    // config and let the prune delete every metadata entry instead of
+    // failing open.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency("possibly-live", 100);
+      const configPath = path.join(config.rootDir, "config.json");
+      await fsPromises.rm(configPath, { force: true });
+      await fsPromises.mkdir(configPath);
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+
+      const activityList = await workspaceService.getActivityList();
+      expect(activityList["possibly-live"]?.recency).toBe(100);
+      expect((await extensionMetadata.getAllSnapshots()).has("possibly-live")).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("fails open when a legacy workspace's identity lookup fails", async () => {
+    // A legacy config entry without an id resolves its authoritative stable
+    // id from its session metadata.json. If that file is unreadable or
+    // unparseable, the lenient path substitutes the generated path id — the
+    // strict enumeration must instead propagate the failure so the prune
+    // cannot classify the real stable id's entries as stale.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency("legacy-stable-id", 100);
+      const projectPath = path.join(config.rootDir, "project");
+      const workspacePath = path.join(projectPath, "legacy-ws");
+      await fsPromises.writeFile(
+        path.join(config.rootDir, "config.json"),
+        JSON.stringify({
+          projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
+        })
+      );
+      // Corrupt the metadata.json holding that entry's stable id.
+      const legacySessionDir = config.getSessionDir(
+        config.generateLegacyId(projectPath, workspacePath)
+      );
+      await fsPromises.mkdir(legacySessionDir, { recursive: true });
+      await fsPromises.writeFile(path.join(legacySessionDir, "metadata.json"), "{not json");
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+
+      const activityList = await workspaceService.getActivityList();
+      // Fail open: the identity of the legacy workspace is unknowable, so
+      // nothing may be dropped from the list or pruned from disk.
+      expect(activityList["legacy-stable-id"]?.recency).toBe(100);
+      expect((await extensionMetadata.getAllSnapshots()).has("legacy-stable-id")).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("never prunes entries whose config entry is discarded by normalization", async () => {
     // A parseable config entry that lenient normalization filters out (null
     // project path): the workspace vanishes from the normalized view — and

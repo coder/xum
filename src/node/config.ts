@@ -80,6 +80,11 @@ import { coerceThinkingLevel, type ThinkingLevel } from "@/common/types/thinking
 export type { Workspace, ProjectConfig, ProjectsConfig, ProviderConfig, CanonicalProvidersConfig };
 export type ProvidersConfig = CanonicalProvidersConfig | Record<string, ProviderConfig>;
 
+/** True only for fs errors whose errno code is ENOENT (genuinely missing path). */
+function isEnoentError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
 function isValidHeartbeatIntervalMs(intervalMs: unknown): intervalMs is number {
   return (
     typeof intervalMs === "number" &&
@@ -1103,10 +1108,20 @@ export class Config {
    */
   readPersistedWorkspaceIdSuperset(): Set<string> {
     const ids = new Set<string>();
-    if (!fs.existsSync(this.configFile)) {
-      return ids;
+    let raw: string;
+    try {
+      raw = fs.readFileSync(this.configFile, "utf-8");
+    } catch (error) {
+      // No existsSync probe: it also returns false for EACCES/ENOTDIR/EIO,
+      // which would report a transiently unreadable config as an empty id
+      // set and let destructive callers treat every workspace as removed.
+      // Only a genuinely missing file is a healthy empty set (fresh install).
+      if (isEnoentError(error)) {
+        return ids;
+      }
+      throw error;
     }
-    const parsedValue: unknown = JSON.parse(fs.readFileSync(this.configFile, "utf-8"));
+    const parsedValue: unknown = JSON.parse(raw);
     if (!parsedValue || typeof parsedValue !== "object" || Array.isArray(parsedValue)) {
       throw new Error("Config root must be a JSON object");
     }
@@ -1137,8 +1152,20 @@ export class Config {
     // actually failed parsing.
     let rawBytes: Buffer | undefined;
     try {
-      if (fs.existsSync(this.configFile)) {
+      try {
         rawBytes = fs.readFileSync(this.configFile);
+      } catch (readError) {
+        // No existsSync probe: it also returns false for EACCES/ENOTDIR/EIO,
+        // which would silently select the fresh-install default while the
+        // config is merely transiently unreadable — in strict mode that
+        // empty view feeds destructive "not in config" decisions. Route
+        // non-ENOENT failures through the shared failure path below
+        // (throwOnError callers rethrow); only ENOENT means missing.
+        if (!isEnoentError(readError)) {
+          throw readError;
+        }
+      }
+      if (rawBytes !== undefined) {
         const parsedValue: unknown = JSON.parse(rawBytes.toString("utf-8"));
         if (!parsedValue || typeof parsedValue !== "object" || Array.isArray(parsedValue)) {
           throw new Error("Config root must be a JSON object");
@@ -2460,9 +2487,21 @@ export class Config {
           const metadataPath = path.join(this.getSessionDir(legacyId), "metadata.json");
           let metadataFound = false;
 
-          if (fs.existsSync(metadataPath)) {
-            const data = fs.readFileSync(metadataPath, "utf-8");
-            const metadata = JSON.parse(data) as WorkspaceMetadata;
+          let legacyMetadataRaw: string | undefined;
+          try {
+            legacyMetadataRaw = fs.readFileSync(metadataPath, "utf-8");
+          } catch (readError) {
+            // Missing is normal (most entries never had a legacy
+            // metadata.json). Any other failure means the workspace's
+            // authoritative stable id is unknowable right now — surface it
+            // to the catch below instead of silently substituting the
+            // generated legacy path id via the !metadataFound branch.
+            if (!isEnoentError(readError)) {
+              throw readError;
+            }
+          }
+          if (legacyMetadataRaw !== undefined) {
+            const metadata = JSON.parse(legacyMetadataRaw) as WorkspaceMetadata;
             this.rememberLegacyTaskVariantWorkspace(projectPath, metadata, "metadata");
 
             // Ensure required fields are present
@@ -2636,6 +2675,14 @@ export class Config {
             );
           }
         } catch (error) {
+          // Strict callers make destructive "id is not known" decisions (the
+          // extension-metadata prune): for a legacy entry whose stable id
+          // lives only in its unreadable/unparseable metadata.json, the
+          // generated-path-id fallback below would classify the real id's
+          // entries as stale. Propagate the identity-lookup failure instead.
+          if (options?.throwOnError) {
+            throw error;
+          }
           log.error(`Failed to load/migrate workspace metadata:`, error);
           // Fallback to basic metadata if migration fails
           const legacyId = this.generateLegacyId(projectPath, workspace.path);

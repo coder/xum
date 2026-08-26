@@ -12876,6 +12876,16 @@ export class WorkspaceService extends EventEmitter {
       // On the first bootstrap the prune already enumerated the config; reuse
       // that id set instead of paying the per-workspace disk walk twice.
       const prefetchedKnownIds = await this.pruneStaleExtensionMetadataOnce();
+      // Baseline for the post-await cross-process removal revalidation at
+      // the end of this method: captured before any snapshot/config await so
+      // ids deregistered from the shared config while this list computes can
+      // be told apart from ids the raw scan can never see.
+      let initialConfigIds: ReadonlySet<string> | null = null;
+      try {
+        initialConfigIds = this.config.readPersistedWorkspaceIdSuperset();
+      } catch {
+        initialConfigIds = null;
+      }
       // throwOnError: the default load self-heals an unreadable/malformed
       // metadata file into an empty one, which this list would then present
       // as an authoritative "no activity anywhere" answer — the renderer
@@ -12985,33 +12995,24 @@ export class WorkspaceService extends EventEmitter {
       } catch {
         freshPersistedIds = null;
       }
-      let freshConfigIds: Set<string> | null = null;
+      let freshConfigIds: ReadonlySet<string> | null = null;
       try {
-        // Mirror the prune's union: raw superset (covers entries lenient
-        // normalization would filter) plus the strictly validated view
-        // (covers ids of normalized entries; cheap — no fs enrichment
-        // probes). The strict load throwing on structurally invalid configs
-        // keeps this revalidation exactly as fail-open as the initial
-        // scoping above: an untrustworthy config view skips it entirely.
         freshConfigIds = this.config.readPersistedWorkspaceIdSuperset();
-        const strictConfig = this.config.loadConfigOrDefault({ throwOnError: true });
-        for (const [, project] of strictConfig.projects) {
-          for (const workspace of project.workspaces) {
-            if (workspace.id) {
-              freshConfigIds.add(workspace.id);
-            }
-          }
-        }
       } catch {
         freshConfigIds = null;
       }
-      // Same guard-rails as discardExtensionMetadataEntry: the raw superset
-      // misses normalized/legacy ids, so ids absent from it get a targeted
-      // findWorkspace lookup before being treated as removed.
+      // Like-for-like raw-superset comparison only: an id that WAS persisted
+      // in config before the awaits and is gone from the fresh raw view was
+      // verifiably deregistered. Ids the raw scan cannot see (legacy entries
+      // whose stable id lives in a session metadata.json, in-memory migration
+      // ids) never appear in either view and are conservatively retained —
+      // dropping them on a cheap fresh view would misclassify identity-lookup
+      // gaps as removals. Skipped when either superset read fails.
       const isRemovedFromConfig = (workspaceId: string): boolean =>
+        initialConfigIds != null &&
         freshConfigIds != null &&
-        !freshConfigIds.has(workspaceId) &&
-        this.config.findWorkspace(workspaceId) == null;
+        initialConfigIds.has(workspaceId) &&
+        !freshConfigIds.has(workspaceId);
       return Object.fromEntries(
         entries.filter(
           (entry): entry is readonly [string, WorkspaceActivitySnapshot] =>
