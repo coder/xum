@@ -819,6 +819,13 @@ describe("WorkflowRunStore.getRunStatusForLiveness", () => {
       await runStore.getRunStatusForLiveness({ workspaceId: "workspace-2", runId: "wfr_liveness" })
     ).toBeNull();
 
+    // A missing presentation-only file must not read as "run gone": liveness
+    // consults only the durable status snapshot, never source/step files.
+    await fs.rm(path.join(tmp.path, "workflows", "wfr_liveness", "source.js"));
+    expect(
+      await runStore.getRunStatusForLiveness({ workspaceId: "workspace-1", runId: "wfr_liveness" })
+    ).toBe("completed");
+
     // A transient read/parse failure must propagate (callers retry) instead of
     // masquerading as a missing record — unlike getRun(), which maps it to null.
     const runFile = path.join(tmp.path, "workflows", "wfr_liveness", "run.json");
@@ -938,6 +945,52 @@ describe("WorkflowRunStore.listActiveRunSummaries", () => {
       } finally {
         await fs.chmod(workflowsDir, 0o755);
       }
+
+      // Per-record IO failures must also reject in strict mode: silently
+      // omitting an unreadable-but-active run would be a false success.
+      const runFile = path.join(workflowsDir, "wfr_unreadable", "run.json");
+      await fs.chmod(runFile, 0o000);
+      try {
+        await expect(
+          runStore.listActiveRunSummaries({ workspaceId: "workspace-1" })
+        ).rejects.toThrow();
+      } finally {
+        await fs.chmod(runFile, 0o644);
+      }
     }
   );
+
+  test("skips a corrupt run record instead of hiding every other run", async () => {
+    using tmp = new DisposableTempDir("workflow-store-discovery-corrupt");
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    const descriptor = {
+      name: "deep-research",
+      description: "Research a topic",
+      scope: "built-in" as const,
+      executable: true,
+    };
+    const source = "export default async function workflow() { return 'ok'; }\n";
+    await runStore.createRun({
+      id: "wfr_healthy",
+      workspaceId: "workspace-1",
+      workflow: descriptor,
+      source,
+      args: {},
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    await runStore.createRun({
+      id: "wfr_corrupt",
+      workspaceId: "workspace-1",
+      workflow: descriptor,
+      source,
+      args: {},
+      now: "2026-05-29T00:00:01.000Z",
+    });
+    // Permanent data corruption (not an IO error) self-heals by omission —
+    // one bad record must not turn discovery into a forever-rejecting call
+    // that hides the healthy run too.
+    await fs.writeFile(path.join(tmp.path, "workflows", "wfr_corrupt", "run.json"), "{ not json");
+    const summaries = await runStore.listActiveRunSummaries({ workspaceId: "workspace-1" });
+    expect(summaries.map((summary) => summary.runId)).toEqual(["wfr_healthy"]);
+  });
 });

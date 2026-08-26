@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
+import { fireEvent, waitFor, within } from "@storybook/test";
 
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -459,15 +460,41 @@ export const RunningBackgroundWithRun: Story = {
 
 /**
  * Narrow-container regression: a long workflow name must truncate instead of
- * starving the collapsed header's step-progress summary. No API provider, so the
- * static run record renders without polling.
+ * starving the collapsed header's progress summary. No API provider, so the
+ * static run record renders without polling. The dynamic-workflows experiment
+ * is off in this lightweight story and the run is still running, so the card
+ * mounts expanded — the play collapses it via the header toggle so the
+ * snapshot pins the collapsed narrow header this story exists to cover.
  */
 export const RunningNarrowLongName: Story = {
   render: (args) => (
-    <div style={{ width: 360 }}>
+    <div data-testid="narrow-workflow-card" style={{ width: 360 }}>
       <WorkflowRunToolCall {...args} />
     </div>
   ),
+  play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+    const canvas = within(canvasElement);
+    const name = await canvas.findByText(
+      "deep-research-competitive-landscape-and-pricing-teardown"
+    );
+    await fireEvent.click(name);
+    // Collapsed header must keep the progress summary (the run's active phase)
+    // visible next to the truncated long name.
+    await waitFor(() => canvas.getByText("scope"));
+    const container = canvasElement.querySelector('[data-testid="narrow-workflow-card"]');
+    if (!(container instanceof HTMLElement)) {
+      throw new Error("Narrow workflow story container not found");
+    }
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    );
+    if (container.scrollWidth > container.clientWidth + 1) {
+      throw new Error(
+        `Workflow card overflowed its ${container.clientWidth}px container by ` +
+          `${container.scrollWidth - container.clientWidth}px`
+      );
+    }
+  },
   args: {
     args: {
       script_path: DEEP_RESEARCH_SCRIPT_PATH,

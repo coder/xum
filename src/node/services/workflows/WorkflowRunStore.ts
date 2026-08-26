@@ -28,7 +28,7 @@ import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWor
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
-import { isErrnoWithCode } from "@/node/utils/fs";
+import { isErrnoException, isErrnoWithCode } from "@/node/utils/fs";
 import { workflowRunStreamHub } from "@/node/services/workflows/workflowRunStreamHub";
 
 const WorkflowRunStatusSnapshotSchema = WorkflowRunRecordSchema.pick({
@@ -234,7 +234,7 @@ export class WorkflowRunStore {
   }
 
   async listRunStatusSnapshots(options?: {
-    strictDirRead?: boolean;
+    strict?: boolean;
   }): Promise<WorkflowRunStatusSnapshot[]> {
     let entries: Dirent[];
     try {
@@ -244,7 +244,7 @@ export class WorkflowRunStore {
       // Strict callers (discovery) need any other failure to propagate so it
       // is not mistaken for an authoritative empty result.
       if (
-        options?.strictDirRead !== true ||
+        options?.strict !== true ||
         isErrnoWithCode(error, "ENOENT") ||
         isErrnoWithCode(error, "ENOTDIR")
       ) {
@@ -260,6 +260,21 @@ export class WorkflowRunStore {
           try {
             return await this.getRunStatusSnapshot(entry.name);
           } catch (error) {
+            // ENOENT/ENOTDIR: the run vanished between readdir and read —
+            // legitimately absent in any mode. Other errno failures (EACCES,
+            // EIO, ...) are retryable IO, so strict callers reject instead of
+            // reporting a false-success omission of an active run. Non-errno
+            // failures (invalid JSON/schema, stray non-run dirs) are permanent
+            // data problems: self-heal by skipping so one corrupt record
+            // cannot hide every other run forever.
+            if (
+              options?.strict === true &&
+              isErrnoException(error) &&
+              !isErrnoWithCode(error, "ENOENT") &&
+              !isErrnoWithCode(error, "ENOTDIR")
+            ) {
+              throw error;
+            }
             log.warn(
               `Skipping unreadable workflow run status '${entry.name}': ${getErrorMessage(error)}`
             );
@@ -274,10 +289,13 @@ export class WorkflowRunStore {
   }
 
   /**
-   * Liveness read for the bulk run-status endpoint. Only a definitively-missing
-   * record (ENOENT / ENOTDIR anywhere in the run's read path, or a workspace
-   * mismatch) maps to null; transient read/parse failures propagate so callers
-   * can treat them as retryable instead of as a settled/missing run.
+   * Liveness read for the bulk run-status endpoint. Reads the status snapshot
+   * (durable run.json + status journal) rather than the full record so a
+   * missing presentation-only file (source.js, step outputs) cannot read as
+   * "run gone": only a definitively-missing durable record (ENOENT / ENOTDIR)
+   * or a workspace mismatch maps to null; transient read/parse failures
+   * propagate so callers can treat them as retryable instead of as a
+   * settled/missing run.
    */
   async getRunStatusForLiveness(input: {
     workspaceId: string;
@@ -289,8 +307,8 @@ export class WorkflowRunStore {
     );
     assert(input.runId.length > 0, "WorkflowRunStore.getRunStatusForLiveness: runId is required");
     try {
-      const run = await this.getRun(input.runId);
-      return run.workspaceId === input.workspaceId ? run.status : null;
+      const snapshot = await this.getRunStatusSnapshot(input.runId);
+      return snapshot.workspaceId === input.workspaceId ? snapshot.status : null;
     } catch (error) {
       if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) {
         return null;
@@ -303,10 +321,10 @@ export class WorkflowRunStore {
    * Active-run discovery for the sub-agent tray's cold mount. Unlike listRuns(),
    * nested (parentWorkflow) runs are included: they are deliberately absent from
    * workspace activity, so a tray mounting during a nested run's between-workers
-   * gap has no other way to learn the run exists. Per-record read failures
-   * degrade to a nameless entry, but a directory-level read failure rejects
-   * (strictDirRead) so discovery callers retry instead of caching an empty
-   * result for the rest of the gap.
+   * gap has no other way to learn the run exists. Name reads degrade to a
+   * nameless entry, but directory-level and per-record IO failures reject
+   * (strict mode) so discovery callers retry instead of caching an empty or
+   * incomplete result for the rest of the gap.
    */
   async listActiveRunSummaries(input: {
     workspaceId: string;
@@ -315,7 +333,7 @@ export class WorkflowRunStore {
       input.workspaceId.length > 0,
       "WorkflowRunStore.listActiveRunSummaries: workspaceId is required"
     );
-    const snapshots = await this.listRunStatusSnapshots({ strictDirRead: true });
+    const snapshots = await this.listRunStatusSnapshots({ strict: true });
     return await Promise.all(
       snapshots
         .filter(

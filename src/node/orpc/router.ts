@@ -403,6 +403,25 @@ function isTrustedProjectPath(context: ORPCContext, projectPath?: string | null)
   return isProjectTrusted(context.config, projectPath);
 }
 
+/**
+ * SECURITY: the workflow liveness/discovery handlers construct per-owner
+ * session paths straight from config.getSessionDir(workspaceId) without the
+ * workspace-metadata lookup resolveWorkflowContext performs, so an owner ID
+ * must be a single path segment — separators or dot segments could otherwise
+ * escape the sessions root via path.join. Unsafe IDs cannot name a real
+ * workspace, so callers skip them rather than erroring.
+ */
+export function isPathSafeWorkspaceId(workspaceId: string): boolean {
+  return (
+    workspaceId.length > 0 &&
+    workspaceId !== "." &&
+    workspaceId !== ".." &&
+    !workspaceId.includes("/") &&
+    !workspaceId.includes("\\") &&
+    path.basename(workspaceId) === workspaceId
+  );
+}
+
 function assertDynamicWorkflowsEnabled(context: ORPCContext): void {
   if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
     throw new ORPCError("BAD_REQUEST", {
@@ -2009,6 +2028,9 @@ export const router = (authToken?: string) => {
           };
           const entries = await Promise.all(
             input.runs.map(async (ref) => {
+              if (!isPathSafeWorkspaceId(ref.workspaceId)) {
+                return null;
+              }
               try {
                 const status = await storeFor(ref.workspaceId).getRunStatusForLiveness({
                   workspaceId: ref.workspaceId,
@@ -2037,7 +2059,7 @@ export const router = (authToken?: string) => {
             return [];
           }
           const results = await Promise.all(
-            input.workspaceIds.map(async (workspaceId) => {
+            input.workspaceIds.filter(isPathSafeWorkspaceId).map(async (workspaceId) => {
               const runStore = new WorkflowRunStore({
                 sessionDir: context.config.getSessionDir(workspaceId),
               });

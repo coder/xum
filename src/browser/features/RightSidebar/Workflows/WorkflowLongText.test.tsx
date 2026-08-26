@@ -63,7 +63,10 @@ describe("WorkflowLongText", () => {
     fireEvent.click(getByLabelText("Show more of step — report"));
     // Streamdown may flush parsed blocks a tick after the click re-render (its
     // scheduling differs across bun versions), so poll instead of asserting
-    // synchronously.
-    await waitFor(() => expect(queryByRole("heading")?.textContent).toBe("Findings"));
+    // synchronously — with headroom beyond waitFor's 1s default, which loaded
+    // CI runners exceed.
+    await waitFor(() => expect(queryByRole("heading")?.textContent).toBe("Findings"), {
+      timeout: 5000,
+    });
   });
 });
