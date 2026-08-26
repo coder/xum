@@ -3791,6 +3791,130 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("getActivityList bootstraps workflow-only workspaces registered mid-list", async () => {
+    // A backend can register a workspace after the scope reads and start a
+    // workflow WITHOUT writing extension metadata: the fresh snapshot re-read
+    // never contains the id, so admission must come from the fresh raw
+    // config view alone — otherwise the workflow-only activity is missing
+    // from the authoritative response until reconnect.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "workflow-only-late-workspace";
+      const projectPath = path.join(config.rootDir, "project");
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      const realGetAllSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      let snapshotCalls = 0;
+      const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(
+        async (options?: { throwOnError?: boolean }) => {
+          snapshotCalls += 1;
+          if (snapshotCalls === 2) {
+            // Registered + workflow started, but NO metadata write.
+            await config.addWorkspace(projectPath, {
+              id: workspaceId,
+              name: workspaceId,
+              projectName: "project",
+              projectPath,
+              runtimeConfig: { type: "local" },
+            });
+            const runStore = new WorkflowRunStore({
+              sessionDir: config.getSessionDir(workspaceId),
+            });
+            await runStore.createRun({
+              id: "wfr_workflow_only",
+              workspaceId,
+              workflow: {
+                name: "demo",
+                description: "Demo workflow",
+                scope: "global" as const,
+                executable: true,
+              },
+              source: "export default function workflow() { return {}; }",
+              args: {},
+              now: "2026-06-17T00:00:00.000Z",
+            });
+          }
+          return realGetAllSnapshots(options);
+        }
+      );
+      try {
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList?.[workspaceId]?.activeWorkflowRunCount).toBe(1);
+        expect(activityList?.[workspaceId]?.activeWorkflowRunIds).toEqual(["wfr_workflow_only"]);
+      } finally {
+        snapshotsSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("getActivityList drops late additions deregistered during the workflow probe", async () => {
+    // A workspace registered AFTER the initial raw baseline and removed
+    // while the workflow probe awaits sits in the normal gap between config
+    // deregistration and extension-metadata cleanup: its snapshot still
+    // exists, so only the post-probe raw config re-read (compared against
+    // the fresh view that admitted it — the initial baseline never saw it)
+    // can prove the removal.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const listStatusSnapshotsSpy = spyOn(WorkflowRunStore.prototype, "listRunStatusSnapshots");
+    try {
+      const workspaceId = "late-then-deregistered";
+      const projectPath = path.join(config.rootDir, "project");
+      const configPath = path.join(config.rootDir, "config.json");
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      const realGetAllSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      let snapshotCalls = 0;
+      const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(
+        async (options?: { throwOnError?: boolean }) => {
+          snapshotCalls += 1;
+          if (snapshotCalls === 2) {
+            await config.addWorkspace(projectPath, {
+              id: workspaceId,
+              name: workspaceId,
+              projectName: "project",
+              projectPath,
+              runtimeConfig: { type: "local" },
+            });
+            await extensionMetadata.updateRecency(workspaceId, 888);
+          }
+          return realGetAllSnapshots(options);
+        }
+      );
+      listStatusSnapshotsSpy.mockImplementation(async () => {
+        // Another backend deregisters the workspace mid-probe; its metadata
+        // entry intentionally survives (cleanup has not run yet).
+        await fsPromises.writeFile(configPath, JSON.stringify({ projects: [] }));
+        return [];
+      });
+      try {
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList).not.toBeNull();
+        expect(activityList?.[workspaceId]).toBeUndefined();
+      } finally {
+        snapshotsSpy.mockRestore();
+      }
+    } finally {
+      listStatusSnapshotsSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
   test("getActivityList drops mid-list additions removed during the workflow probe", async () => {
     // The workflow-run bootstrap for late merge candidates awaits disk; a
     // cross-process removal landing during that probe is invisible to every

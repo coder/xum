@@ -13210,6 +13210,19 @@ export class WorkspaceService extends EventEmitter {
             mergeCandidateIds.add(workspaceId);
           }
         }
+        // Workflow-only late registrations: a workspace registered after the
+        // scope reads can have active workflow runs but no metadata snapshot
+        // at all, so admission cannot come from fresh-snapshot keys alone —
+        // every fresh raw id outside the stale per-id scope is a candidate.
+        // Ids with neither a snapshot nor live activity cost one workflow
+        // probe and are dropped by the emptiness check below.
+        if (freshConfigIds != null) {
+          for (const workspaceId of freshConfigIds) {
+            if (!workspaceIds.has(workspaceId)) {
+              mergeCandidateIds.add(workspaceId);
+            }
+          }
+        }
         // Workflow-run bootstrap for candidates the per-id loop never saw:
         // their on-disk active runs are not in the process-local cache, and
         // a cached-only merge would omit activeWorkflowRunCount for exactly
@@ -13219,7 +13232,13 @@ export class WorkspaceService extends EventEmitter {
         // probed resolve synchronously from the shared cached Set).
         const probedWorkflowRunIds = new Map<string, ReadonlySet<string>>();
         for (const workspaceId of mergeCandidateIds) {
-          if (workspaceId in activityById || !freshSnapshots.has(workspaceId)) {
+          if (
+            workspaceId in activityById ||
+            // In-scope ids without a late snapshot were fully decided by the
+            // per-id loop (probe + zero-tombstone logic); re-probing them
+            // would only trigger the final re-reads below on every list.
+            (workspaceIds.has(workspaceId) && !freshSnapshots.has(workspaceId))
+          ) {
             continue;
           }
           probedWorkflowRunIds.set(workspaceId, await this.getActiveWorkflowRunIds(workspaceId));
@@ -13253,16 +13272,33 @@ export class WorkspaceService extends EventEmitter {
                 ? (finalSnapshots.get(workspaceId) ?? null)
                 : (freshSnapshots.get(workspaceId) ?? null);
             if (
-              lateSnapshot == null ||
+              // Nothing to contribute: no persisted snapshot and no live
+              // counts (a workflow-only candidate legitimately has no
+              // snapshot, so its absence alone is not removal evidence).
+              (lateSnapshot == null &&
+                activeWorkflowRunIds.size === 0 &&
+                this.getActiveBashMonitorCount(workspaceId) === 0) ||
               this.extensionMetadata.isWorkspaceDeleted(workspaceId) ||
               isRemovedFromConfig(workspaceId) ||
               isRemovedPerAuthoritativeIdentity(workspaceId) ||
+              // Persisted snapshot vanished during the probes (metadata keys
+              // only disappear through removal) — also covers legacy ids the
+              // raw views cannot see.
+              (finalSnapshots != null &&
+                freshSnapshots.has(workspaceId) &&
+                !finalSnapshots.has(workspaceId)) ||
               // Verifiably deregistered from the raw config during the
-              // probes (post-probe counterpart of isRemovedFromConfig).
-              (initialConfigIds != null &&
-                finalConfigIds != null &&
-                initialConfigIds.has(workspaceId) &&
-                !finalConfigIds.has(workspaceId))
+              // probes: the id was visible in an EARLIER raw view — the
+              // initial baseline or the fresh re-read that admitted it (a
+              // late registration is absent from the initial baseline by
+              // definition) — and is gone from the post-probe view. During
+              // the normal gap between config deregistration and metadata
+              // cleanup the snapshot still exists, so the vanish check
+              // above cannot catch this.
+              (finalConfigIds != null &&
+                !finalConfigIds.has(workspaceId) &&
+                ((initialConfigIds?.has(workspaceId) ?? false) ||
+                  (freshConfigIds?.has(workspaceId) ?? false)))
             ) {
               continue;
             }

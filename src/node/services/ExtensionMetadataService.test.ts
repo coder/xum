@@ -905,6 +905,40 @@ describe("ExtensionMetadataService", () => {
     expect(snapshots.get("ws-partial")?.recency).toBe(300);
   });
 
+  test("a strict read reconciles a leftover sidecar next to a recreated valid main", async () => {
+    // Crash between quarantine's rename and its completion, then another
+    // backend recreates a VALID partial main from the missing-main window
+    // before this process starts: no read ever sees ENOENT or corruption,
+    // so without the once-per-process sidecar check the full snapshot would
+    // stay stranded in the sidecar forever.
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-new": { recency: 300, streaming: false } },
+      })
+    );
+    await writeFile(
+      `${filePath}.corrupt`,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-other": { recency: 42, streaming: false } },
+      })
+    );
+    // Fresh instance: models the restarted process.
+    const restarted = new ExtensionMetadataService(filePath);
+
+    const snapshots = await restarted.getAllSnapshots({ throwOnError: true });
+    expect(snapshots.get("ws-new")?.recency).toBe(300);
+    expect(snapshots.get("ws-other")?.recency).toBe(42);
+    // Sidecar consumed by the reconcile.
+    const sidecarGone = await readFile(`${filePath}.corrupt`, "utf-8").then(
+      () => false,
+      () => true
+    );
+    expect(sidecarGone).toBe(true);
+  });
+
   test("clearTombstonesForRegisteredIds only clears tombstones the evidence postdates", async () => {
     await service.updateRecency("ws-1", 100);
     // Evidence snapshot captured BEFORE the removal: a tombstone published

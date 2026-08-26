@@ -71,6 +71,11 @@ export class ExtensionMetadataService {
    */
   private readonly deletedWorkspaceIds = new Set<string>();
 
+  // Once-per-process latch for the leftover-sidecar reconcile in
+  // getAllSnapshots (see the comment there). Reset on failure so the next
+  // strict read retries instead of permanently skipping the recovery.
+  private checkedLeftoverQuarantineSidecar = false;
+
   /**
    * Serialize all mutating operations on the shared metadata file.
    * Prevents cross-workspace read-modify-write races since all workspaces
@@ -1078,6 +1083,30 @@ export class ExtensionMetadataService {
         throw error;
       }
       data = await this.load(options);
+    }
+    // Once per process: a crash between quarantineCorruptFile's rename and
+    // its completion can strand the full snapshot in the sidecar while
+    // another backend recreates a VALID (typically partial, single-entry)
+    // main file from the missing-main window before this process starts.
+    // Every other recovery path triggers only on ENOENT or corruption, so a
+    // valid recreated main would otherwise hide the stranded healthy or
+    // newer-version data forever. Probe the fixed sidecar path once and
+    // reconcile before answering; a probe/reconcile failure resets the
+    // latch and propagates so the read stays retryable rather than
+    // presenting the partial file as authoritative. Deterministically
+    // corrupt sidecar leftovers stay put (reconcile leaves them), costing
+    // one no-op reconcile attempt per process.
+    if (!this.checkedLeftoverQuarantineSidecar) {
+      this.checkedLeftoverQuarantineSidecar = true;
+      try {
+        if (await this.probeQuarantineSidecar()) {
+          await this.resumeQuarantineRecovery();
+          data = await this.load(options);
+        }
+      } catch (error) {
+        this.checkedLeftoverQuarantineSidecar = false;
+        throw error;
+      }
     }
     const map = new Map<string, WorkspaceActivitySnapshot>();
     for (const [workspaceId, entry] of Object.entries(data.workspaces)) {
