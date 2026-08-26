@@ -587,6 +587,50 @@ describe("extractToolMediaAsUserMessages", () => {
     expect(fileParts).toHaveLength(1);
   });
 
+  it("drops non-string filename metadata instead of throwing during extraction", async () => {
+    // filename: 123 passes leaf recognition (optional metadata is ignored),
+    // and .trim() on it would throw while preparing EVERY later provider
+    // request — one malformed persisted row must not brick the workspace
+    // (r25, self-healing rule).
+    const base64 = (
+      await sharp({
+        create: { width: 10, height: 10, channels: 3, background: { r: 8, g: 8, b: 8 } },
+      })
+        .png()
+        .toBuffer()
+    ).toString("base64");
+
+    const input: MuxMessage[] = [
+      {
+        id: "ce-numname",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call1",
+            toolName: "mcp__shots__take",
+            input: {},
+            state: "output-available",
+            output: {
+              type: "content",
+              value: [{ type: "media", mediaType: "image/png", data: base64, filename: 123 }],
+            },
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    expect(rewritten).toHaveLength(2);
+    const outputText = JSON.stringify((rewritten[0].parts[0] as { output?: unknown }).output);
+    expect(outputText).not.toContain(base64);
+    const fileParts = rewritten[1].parts.filter((part) => part.type === "file");
+    expect(fileParts).toHaveLength(1);
+    // The malformed filename is dropped, not sent.
+    expect(fileParts[0]).not.toHaveProperty("filename", 123);
+  });
+
   it("extracts media leaves whose optional metadata is malformed", async () => {
     // Capture recognition ignores optional metadata (asMediaPart), so a
     // retained leaf with filename:null must not be rejected by a stricter

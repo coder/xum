@@ -426,7 +426,7 @@ describe("sanitizeMediaRecordCapture", () => {
     expect(sanitized.b.value[0]?.text).toContain("aggregate media budget exceeded");
   });
 
-  it("bounds cyclic and overly deep values instead of hanging or leaking", () => {
+  it("bounds cyclic and deeply nested media values instead of hanging or leaking", () => {
     const audio = { type: "media", mediaType: "audio/wav", data: "d2F2" };
     const cyclic: Record<string, unknown> = { container: { type: "content", value: [audio] } };
     cyclic.self = cyclic;
@@ -434,13 +434,22 @@ describe("sanitizeMediaRecordCapture", () => {
     expect(sanitizedCycle.self).toBe("[cyclic value bounded at capture]");
     expect((sanitizedCycle.container as RetainedContainer).value[0]?.type).toBe("text");
 
-    // A media container buried past the depth cap must fail CLOSED: the
-    // subtree becomes a placeholder rather than passing through unsanitized.
+    // A media container buried under many wrapper levels is still found and
+    // sanitized — the iterative walk has no depth limit to smuggle past (r25).
     let deep: unknown = { type: "content", value: [audio] };
     for (let i = 0; i < 300; i++) deep = { next: deep };
     const sanitizedDeep = JSON.stringify(sanitizeCapturedMediaValue(deep));
-    expect(sanitizedDeep).toContain("nesting depth limit exceeded");
+    expect(sanitizedDeep).toContain("not supported as a model attachment");
     expect(sanitizedDeep).not.toContain("d2F2");
+  });
+
+  it("preserves media-free deep values with identity intact", () => {
+    // Classic mode keeps full inline results/args by contract: depth-based
+    // replacement of legitimate media-free deep JSON silently truncated real
+    // output (r25).
+    let deep: Record<string, unknown> = { leaf: "value" };
+    for (let i = 0; i < 300; i++) deep = { next: deep };
+    expect(sanitizeCapturedMediaValue(deep)).toBe(deep);
   });
 
   it("bounds containers holding only unsupported media", () => {

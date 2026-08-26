@@ -469,7 +469,7 @@ export function sanitizeCapturedMediaValue(
   budget: { remainingBytes: number } = { remainingBytes: KERNEL_RETAINED_MEDIA_BUDGET_BYTES }
 ): unknown {
   const state = { sawMedia: false };
-  const sanitized = sanitizeMediaValueGraph(value, budget, new Map<object, unknown>(), 0, state);
+  const sanitized = sanitizeMediaValueGraph(value, budget, state);
   if (!state.sawMedia) return sanitized;
   // Final serialized-output cap (r24): placeholders replacing unsupported or
   // over-budget media never consume the media budget (they must always be
@@ -483,54 +483,109 @@ export function sanitizeCapturedMediaValue(
   return sanitized;
 }
 
+/**
+ * Iterative (explicit stack, post-order copy-on-write) traversal of the
+ * value graph: media containers and standalone leaves are sanitized wherever
+ * they sit, while media-free spans pass through with IDENTITY preserved —
+ * classic mode keeps full inline results/args by contract, so depth-based
+ * replacement of legitimate deep JSON is not acceptable (r25); iteration
+ * removes the need for any depth bound. In-memory cycle back-edges resolve
+ * to a bounded placeholder (cyclic values cannot JSON-persist anyway);
+ * shared subtrees are processed once and reused.
+ */
 function sanitizeMediaValueGraph(
-  value: unknown,
+  root: unknown,
   budget: { remainingBytes: number },
-  memo: Map<object, unknown>,
-  depth: number,
   state: { sawMedia: boolean }
 ): unknown {
-  if (typeof value !== "object" || value === null) return value;
-  const existing = memo.get(value);
-  if (existing !== undefined) return existing;
-  if (depth >= MAX_MEDIA_SANITIZE_DEPTH) {
-    return "[value bounded at capture: nesting depth limit exceeded]";
-  }
-  // Pre-seed so a cycle back-edge encountered while this node is still being
-  // processed resolves to a placeholder instead of recursing forever.
-  memo.set(value, "[cyclic value bounded at capture]");
-
-  let result: unknown;
-  if (isMediaContentContainer(value)) {
-    // Container parts are charged their FULL serialized size (nested payloads
-    // included), so there is no need to descend into a sanitized container.
+  if (typeof root !== "object" || root === null) return root;
+  if (isMediaContentContainer(root)) {
     state.sawMedia = true;
-    result = sanitizeRetainedMediaContainer(value, budget);
-  } else if (asMediaPart(value) !== null) {
+    return sanitizeRetainedMediaContainer(root, budget);
+  }
+  if (asMediaPart(root) !== null) {
     // STANDALONE media leaves too (r23): guest code can pluck a part out of
     // a container (`const part = image.value[0]`) and return it, log it, or
     // pass it as another tool's argument — container-only recognition would
     // let that copy persist unbudgeted base64 on every call.
     state.sawMedia = true;
-    result = sanitizeStandaloneMediaPart(value, budget);
-  } else if (Array.isArray(value)) {
-    const mapped = value.map((item) =>
-      sanitizeMediaValueGraph(item, budget, memo, depth + 1, state)
-    );
-    result = mapped.some((item, index) => item !== value[index]) ? mapped : value;
-  } else {
-    const record = value as Record<string, unknown>;
-    let changed = false;
-    const mapped: Record<string, unknown> = {};
-    for (const [key, item] of Object.entries(record)) {
-      const sanitized = sanitizeMediaValueGraph(item, budget, memo, depth + 1, state);
-      mapped[key] = sanitized;
-      if (sanitized !== item) changed = true;
-    }
-    result = changed ? mapped : value;
+    return sanitizeStandaloneMediaPart(root, budget);
   }
-  memo.set(value, result);
-  return result;
+  // Copy-on-write rebuilds keyed by original node identity; nodes absent
+  // from this map are unchanged and reused as-is.
+  const changed = new Map<object, unknown>();
+  const processed = new Set<object>();
+  const visiting = new Set<object>();
+  const stack: Array<{ node: object; entered: boolean }> = [{ node: root, entered: false }];
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    const node = frame.node;
+    if (!frame.entered) {
+      if (processed.has(node) || visiting.has(node)) {
+        stack.pop();
+        continue;
+      }
+      frame.entered = true;
+      visiting.add(node);
+      const children: unknown[] = Array.isArray(node)
+        ? node
+        : Object.values(node as Record<string, unknown>);
+      for (const child of children) {
+        if (typeof child !== "object" || child === null) continue;
+        if (processed.has(child) || visiting.has(child)) continue;
+        // Media shapes are handled atomically at the parent's exit phase
+        // (container parts are charged their full serialized size, so there
+        // is no need to descend into them).
+        if (isMediaContentContainer(child) || asMediaPart(child) !== null) continue;
+        stack.push({ node: child, entered: false });
+      }
+      continue;
+    }
+    stack.pop();
+    let nodeChanged = false;
+    const rewriteChild = (child: unknown): unknown => {
+      if (typeof child !== "object" || child === null) return child;
+      if (isMediaContentContainer(child)) {
+        state.sawMedia = true;
+        const sanitized = sanitizeRetainedMediaContainer(child, budget);
+        if (sanitized !== child) nodeChanged = true;
+        return sanitized;
+      }
+      if (asMediaPart(child) !== null) {
+        state.sawMedia = true;
+        const sanitized = sanitizeStandaloneMediaPart(child, budget);
+        if (sanitized !== child) nodeChanged = true;
+        return sanitized;
+      }
+      // Back-edge to a node still being processed (self/ancestor cycle):
+      // bounded placeholder instead of infinite structure.
+      if (visiting.has(child)) {
+        nodeChanged = true;
+        return "[cyclic value bounded at capture]";
+      }
+      if (changed.has(child)) {
+        nodeChanged = true;
+        return changed.get(child);
+      }
+      return child;
+    };
+    // Rebuild while this node is still in `visiting` so self-references are
+    // detected as cycles.
+    const rebuilt = Array.isArray(node)
+      ? node.map(rewriteChild)
+      : Object.fromEntries(
+          Object.entries(node as Record<string, unknown>).map(([key, child]) => [
+            key,
+            rewriteChild(child),
+          ])
+        );
+    visiting.delete(node);
+    processed.add(node);
+    if (nodeChanged) {
+      changed.set(node, rebuilt);
+    }
+  }
+  return changed.has(root) ? changed.get(root) : root;
 }
 
 /**

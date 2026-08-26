@@ -23,7 +23,10 @@ interface AISDKMediaPart {
   type: "media";
   data: string;
   mediaType: string;
-  filename?: string;
+  /** Untrusted optional metadata: persisted rows may carry any shape here —
+   * recognition ignores it (r24) and normalizeOptionalFilename drops
+   * non-strings (r25). */
+  filename?: unknown;
 }
 
 interface AISDKTextPart {
@@ -83,9 +86,14 @@ function isMediaPart(value: unknown): value is AISDKMediaPart {
   );
 }
 
-function normalizeOptionalFilename(filename: string | undefined): string | undefined {
-  const trimmed = filename?.trim();
-  if (trimmed == null || trimmed.length === 0) return undefined;
+function normalizeOptionalFilename(filename: unknown): string | undefined {
+  // History rows are untrusted: recognition ignores optional metadata (r24),
+  // so a persisted leaf can carry filename: 123 — calling .trim() on it would
+  // throw during provider-request preparation and brick the workspace (r25,
+  // self-healing rule). Non-string metadata is dropped, never thrown on.
+  if (typeof filename !== "string") return undefined;
+  const trimmed = filename.trim();
+  if (trimmed.length === 0) return undefined;
   // Filenames are attacker-influencable metadata like media types: they ride
   // into provider-visible placeholders and attachment file parts, so an
   // unbounded value persisted by an MCP tool would bloat every later request.
