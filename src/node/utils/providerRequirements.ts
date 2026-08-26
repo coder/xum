@@ -94,6 +94,27 @@ export const BEDROCK_AUTH_ENV_VARS = {
   profile: "AWS_PROFILE",
 } as const;
 
+/**
+ * Secret-bearing provider env var names (API keys / auth tokens plus AWS
+ * credential material). Consumed by repo-automation-off git executions
+ * (gitNoHooksEnv) to blank provider secrets so repo-controlled processes
+ * cannot exfiltrate them. Excludes non-secret vars (base URLs, org IDs,
+ * regions), which unrelated tooling legitimately reads.
+ */
+export function providerSecretEnvVarNames(): string[] {
+  const names = new Set<string>();
+  for (const mapping of Object.values(PROVIDER_ENV_VARS)) {
+    for (const key of mapping.apiKey ?? []) {
+      names.add(key);
+    }
+  }
+  names.add(AZURE_OPENAI_ENV_VARS.apiKey);
+  names.add(BEDROCK_AUTH_ENV_VARS.accessKeyId);
+  names.add(BEDROCK_AUTH_ENV_VARS.secretAccessKey);
+  names.add(BEDROCK_AUTH_ENV_VARS.bearerToken);
+  return [...names];
+}
+
 /** Resolve first non-empty env var from a list of candidates */
 function resolveEnv(
   keys: string[] | undefined,

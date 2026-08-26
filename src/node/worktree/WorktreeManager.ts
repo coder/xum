@@ -15,7 +15,7 @@ import { shellQuote } from "@/common/utils/shell";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { toPosixPath } from "@/node/utils/paths";
 import { log } from "@/node/services/log";
-import { GIT_NO_HOOKS_ENV, gitHooksAllowed } from "@/node/utils/gitNoHooksEnv";
+import { gitHooksAllowed, gitNoRepoAutomationEnv } from "@/node/utils/gitNoHooksEnv";
 import { WORKTREE_DELETE_GIT_TIMEOUT_MS } from "@/constants/terminationTimeouts";
 import { syncLocalGitSubmodules } from "@/node/runtime/submoduleSync";
 import { syncXumignoreFiles } from "./xumignore";
@@ -43,7 +43,7 @@ export class WorktreeManager {
   }
 
   private getGitExecOptions(trusted?: boolean, signal?: AbortSignal): GitExecOptions {
-    const env = gitHooksAllowed(trusted) ? undefined : GIT_NO_HOOKS_ENV;
+    const env = gitHooksAllowed(trusted) ? undefined : gitNoRepoAutomationEnv();
     return env || signal ? { ...(env ? { env } : {}), ...(signal ? { signal } : {}) } : undefined;
   }
 
