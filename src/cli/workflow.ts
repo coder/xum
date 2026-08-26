@@ -232,7 +232,15 @@ async function copyPersistentConfig(realConfig: Config, config: Config): Promise
 
 function buildExperimentsObject(experimentIds: readonly string[]) {
   return {
-    programmaticToolCalling: experimentIds.includes(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
+    // RLM implies the PTC parent flag: tool assembly only builds
+    // code_execution when the PTC flag is set, so rlm-mode alone would be inert
+    // (the desktop can't express that state — Settings nests RLM under PTC).
+    programmaticToolCalling:
+      experimentIds.includes(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING) ||
+      experimentIds.includes(EXPERIMENT_IDS.RLM),
+    // RLM rides the PTC parent; without this passthrough `-e rlm-mode` was
+    // silently dropped and workflow sends ran the non-kernel PTC toolset.
+    rlm: experimentIds.includes(EXPERIMENT_IDS.RLM),
     // Invoking `xum workflow` is an explicit opt-in, so the dynamic-workflows
     // experiment is enabled implicitly for this invocation (never persisted).
     dynamicWorkflows: true,
