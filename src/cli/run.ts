@@ -513,7 +513,7 @@ async function main(): Promise<number> {
     return 1;
   }
   await using preparedSessionRoot = sessionRootOverride;
-  const sessionRoot = preparedSessionRoot?.path ?? tempDir.path;
+  const sessionRoot = preparedSessionRoot?.resolveConfigRootPath() ?? tempDir.path;
   const config = new Config(sessionRoot);
 
   // Copy providers and secrets from real config to ephemeral config

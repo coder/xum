@@ -5,6 +5,12 @@ import { isErrnoWithCode } from "@/node/utils/fs";
 
 type RunSessionRootEnv = Readonly<Record<string, string | undefined>>;
 
+interface RunSessionRootPreparationOptions {
+  platform?: NodeJS.Platform;
+  effectiveUid?: number;
+  getOwnerUid?: (stat: Awaited<ReturnType<typeof fs.stat>>) => number;
+}
+
 export class PreparedRunSessionRoot implements AsyncDisposable {
   constructor(
     readonly path: string,
@@ -13,18 +19,26 @@ export class PreparedRunSessionRoot implements AsyncDisposable {
     private readonly platform: NodeJS.Platform
   ) {}
 
+  resolveConfigRootPath(): string {
+    // The proc fd path stays attached to the opened directory inode even if its original
+    // pathname is replaced before config files are read or written.
+    if (this.platform === "linux" && this.handle !== undefined) {
+      return path.join("/proc/self/fd", String(this.handle.fd));
+    }
+
+    throw new Error("Run session root overrides require Linux for safe config access");
+  }
+
   resolveConfigFilePath(filePath: string): string {
-    if (path.resolve(path.dirname(filePath)) !== path.resolve(this.path)) {
+    const configRootPath = this.resolveConfigRootPath();
+    const parentPath = path.resolve(path.dirname(filePath));
+    if (parentPath === path.resolve(configRootPath)) {
+      return filePath;
+    }
+    if (parentPath !== path.resolve(this.path)) {
       throw new Error(`Run config file must be inside the secured session root: ${filePath}`);
     }
-
-    // The proc fd path stays attached to the opened directory inode even if its original
-    // pathname is replaced before credential files are written.
-    if (this.platform === "linux" && this.handle !== undefined) {
-      return path.join("/proc/self/fd", String(this.handle.fd), path.basename(filePath));
-    }
-
-    throw new Error("Run session root overrides require Linux for safe config writes");
+    return path.join(configRootPath, path.basename(filePath));
   }
 
   async [Symbol.asyncDispose](): Promise<void> {
@@ -41,13 +55,34 @@ function assertDirectoryNotSymlinked(
   }
 }
 
+function assertSessionRootOwner(
+  rootPath: string,
+  stat: Awaited<ReturnType<typeof fs.stat>>,
+  options: RunSessionRootPreparationOptions
+): void {
+  const platform = options.platform ?? process.platform;
+  const effectiveUid = options.effectiveUid ?? process.geteuid?.();
+  if (platform === "win32") {
+    return;
+  }
+  if (effectiveUid === undefined) {
+    throw new Error(`Unable to verify run session root ownership: ${rootPath}`);
+  }
+  const ownerUid = options.getOwnerUid?.(stat) ?? stat.uid;
+  if (ownerUid !== effectiveUid) {
+    throw new Error(`Run session root must be owned by the current user: ${rootPath}`);
+  }
+}
+
 async function hardenRunSessionRoot(
   rootPath: string,
-  platform: NodeJS.Platform
+  options: RunSessionRootPreparationOptions
 ): Promise<PreparedRunSessionRoot> {
+  const platform = options.platform ?? process.platform;
   await fs.mkdir(rootPath, { recursive: true, mode: 0o700 });
   const created = await fs.lstat(rootPath);
   assertDirectoryNotSymlinked(rootPath, created);
+  assertSessionRootOwner(rootPath, created, options);
 
   if (platform === "win32") {
     await fs.chmod(rootPath, 0o700);
@@ -63,6 +98,7 @@ async function hardenRunSessionRoot(
     if (!opened.isDirectory()) {
       throw new Error(`Run session root must be a directory: ${rootPath}`);
     }
+    assertSessionRootOwner(rootPath, opened, options);
     await handle.chmod(0o700);
     const canonical = await fs.realpath(rootPath);
     const current = await fs.lstat(rootPath);
@@ -79,14 +115,14 @@ async function hardenRunSessionRoot(
 export async function prepareRunSessionRootOverride(
   env: RunSessionRootEnv,
   realConfigRoot: string,
-  platform: NodeJS.Platform = process.platform
+  options: RunSessionRootPreparationOptions = {}
 ): Promise<PreparedRunSessionRoot | undefined> {
   const envSessionRoot = (env.XUM_RUN_SESSION_ROOT ?? env.MUX_RUN_SESSION_ROOT)?.trim();
   if (!envSessionRoot) {
     return undefined;
   }
 
-  const preparedRoot = await hardenRunSessionRoot(envSessionRoot, platform);
+  const preparedRoot = await hardenRunSessionRoot(envSessionRoot, options);
   // A missing real config root cannot be aliased; ignore ENOENT from realpath.
   const realConfigRootCanonical = await fs.realpath(realConfigRoot).catch(() => undefined);
   if (
@@ -107,6 +143,7 @@ export async function replacePrivateRunConfigFile(
   contents: string | undefined,
   preparedRoot?: PreparedRunSessionRoot
 ): Promise<void> {
+  // Resolve through the pinned root before any path-based filesystem operation.
   const resolvedFilePath =
     preparedRoot === undefined ? filePath : preparedRoot.resolveConfigFilePath(filePath);
   const existing = await fs.lstat(resolvedFilePath).catch((error: unknown) => {
