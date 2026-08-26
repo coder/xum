@@ -1009,8 +1009,15 @@ export class BashMonitorWakeStore {
         // which case that newer record simply supersedes this one.
         try {
           await fsPromises.link(trash, filePath);
-        } catch {
-          // EEXIST (or transient failure): leave whatever owns the path in place.
+        } catch (error) {
+          if (!isErrnoWithCode(error, "EEXIST")) {
+            // Hard-link failure (EIO, ENOSPC, unsupported filesystem): the trash file
+            // is now the only durable copy of this record. Keep it — a later scan's
+            // recoverStrandedPruneFile retries the restore — instead of deleting it in
+            // the removal below.
+            return parsed?.status === "pending" ? parsed : null;
+          }
+          // EEXIST: a newer record owns the canonical path and supersedes this capture.
         }
       }
       await fsPromises.rm(trash, { force: true }).catch(() => undefined);

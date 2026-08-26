@@ -299,6 +299,46 @@ describe("BashMonitorWakeStore", () => {
     expect(later[0].lines).toEqual(["ERROR rearmed"]);
   });
 
+  test("a failed restore keeps the captured wake for a later recovery scan", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload());
+    await store.markDelivered("owner-1", "proc-1");
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    const past = new Date(Date.now() - TERMINAL_WAKE_RETENTION_MS - 60_000);
+    await fsPromises.utimes(file, past, past);
+
+    // Prune captures a concurrently rewritten pending wake, but restoring it to the
+    // canonical path fails (EIO / ENOSPC / link-unsupported filesystem). The capture is
+    // then the only durable copy and must not be deleted.
+    const other = new BashMonitorWakeStore(makeConfig(rootDir));
+    const realRename = fsPromises.rename;
+    let injected = false;
+    const renameSpy = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+      if (!injected && String(from) === file && String(to).includes(".prune-")) {
+        injected = true;
+        await other.enqueueOrMergePending(payload({ lines: ["ERROR rearmed"] }));
+      }
+      return realRename(from, to);
+    });
+    const linkSpy = spyOn(fsPromises, "link").mockImplementationOnce(() =>
+      Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
+    );
+    try {
+      expect((await store.listPending("owner-1")).map((r) => r.lines)).toEqual([["ERROR rearmed"]]);
+    } finally {
+      renameSpy.mockRestore();
+      linkSpy.mockRestore();
+    }
+    // The capture survived as a prune leftover…
+    const leftovers = (await fsPromises.readdir(dir)).filter((e) => e.includes(".prune-"));
+    expect(leftovers).toHaveLength(1);
+    // …and the next scan's stranded-leftover recovery restores it to the canonical path.
+    expect((await store.listPending("owner-1")).map((r) => r.lines)).toEqual([["ERROR rearmed"]]);
+    expect((await store.get("owner-1", "proc-1"))?.lines).toEqual(["ERROR rearmed"]);
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".prune-"))).toHaveLength(0);
+  });
+
   test("pruning keeps a freshly superseded record captured from a concurrent rewrite", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload());
