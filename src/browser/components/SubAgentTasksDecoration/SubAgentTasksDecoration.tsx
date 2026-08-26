@@ -151,10 +151,14 @@ export function mergeRetainedWorkflowGroups(
   }
   const currentIds = new Set(current.map((group) => group.runId));
   const merged = [...current];
-  for (const [runId, group] of retained) {
-    if (!currentIds.has(runId)) {
-      merged.push({ runId, workflowName: group.workflowName, workers: [] });
+  // Seed from the active set, not just retained entries: a cold mount can land
+  // mid-gap (no live workers observed yet), and the run must still show. Runs never
+  // observed have no name; the header falls back to the shortened run id.
+  for (const runId of activeIds) {
+    if (currentIds.has(runId)) {
+      continue;
     }
+    merged.push({ runId, workflowName: retained.get(runId)?.workflowName, workers: [] });
   }
   return merged;
 }

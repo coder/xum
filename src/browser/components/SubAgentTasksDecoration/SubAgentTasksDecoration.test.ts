@@ -61,6 +61,11 @@ describe("mergeRetainedWorkflowGroups", () => {
     expect(next[0].workers.map((worker) => worker.workspace.id)).toEqual(["w2"]);
   });
 
+  test("synthesizes a header-only group on a cold mount mid-gap (active run, nothing observed)", () => {
+    const merged = mergeRetainedWorkflowGroups([], ["run-cold"], new Map());
+    expect(merged).toEqual([{ runId: "run-cold", workflowName: undefined, workers: [] }]);
+  });
+
   test("passes through live groups whose run is not (yet) in the active set without retaining them", () => {
     const retained = new Map<string, WorkflowAgentGroup>();
     const merged = mergeRetainedWorkflowGroups([group("run-2", ["w1"])], [], retained);
