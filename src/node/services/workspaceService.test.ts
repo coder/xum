@@ -1044,6 +1044,102 @@ describe("WorkspaceService bash monitor wakes", () => {
     }
   });
 
+  test("an already-fired clear-promotion retry runs its commitClear under the history lock", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-retry-lock";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+        notifyMonitorWakeStateChanged: mock(() => undefined),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(true);
+      spyOn(workspaceService, "waitForIdleAndNoQueuedMessages").mockImplementation(
+        () => new Promise(() => undefined)
+      );
+      const wakeStore = (
+        workspaceService as unknown as { bashMonitorWakeStore: BashMonitorWakeStore }
+      ).bashMonitorWakeStore;
+      await wakeStore.enqueueOrMergePending({
+        processId: "proc-retry-lock",
+        taskId: "bash:proc-retry-lock",
+        workspaceId,
+        filter: "WAKE:",
+        filterExclude: false,
+        lines: ["WAKE: retired by clear"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 10,
+      });
+
+      // The clear succeeds but its promotion fails once, scheduling a retry.
+      const commitSpy = spyOn(wakeStore, "commitClear").mockImplementationOnce(() =>
+        Promise.reject(new Error("transient promotion failure"))
+      );
+      const clearHistory = (
+        workspaceService as unknown as {
+          clearHistoryWithRetiredBashMonitorWakes: (
+            workspaceId: string,
+            clear: () => Promise<Result<void>>,
+            options?: { discardUnacceptedOnSuccess?: boolean }
+          ) => Promise<Result<void>>;
+        }
+      ).clearHistoryWithRetiredBashMonitorWakes.bind(workspaceService);
+      const result = await clearHistory(workspaceId, () => Promise.resolve(Ok(undefined)), {
+        discardUnacceptedOnSuccess: true,
+      });
+      expect(result.success).toBe(true);
+
+      // Park the retry's commitClear mid-flight.
+      const parkedBox: { release: () => void } = { release: () => undefined };
+      const parked = new Promise<void>((resolve) => {
+        parkedBox.release = resolve;
+      });
+      commitSpy.mockImplementation(() => parked);
+      await waitForCondition(() => commitSpy.mock.calls.length >= 2, { timeoutMs: 3_000 });
+
+      // Removal's pre-deletion barrier serializes on bashMonitorHistoryLocks. The
+      // already-fired retry can pass the removingWorkspaces check just before
+      // removal begins, so its commitClear (whose tombstone mutation mkdirs the
+      // wake directory) must hold the same lock — otherwise a stalled promotion
+      // recreates session data after the directory is deleted.
+      const locks = (
+        workspaceService as unknown as {
+          bashMonitorHistoryLocks: {
+            withLock: (key: string, fn: () => Promise<void>) => Promise<void>;
+          };
+        }
+      ).bashMonitorHistoryLocks;
+      let barrierAcquired = false;
+      const barrier = locks.withLock(workspaceId, () => {
+        barrierAcquired = true;
+        return Promise.resolve();
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(barrierAcquired).toBe(false);
+
+      parkedBox.release();
+      await barrier;
+      expect(barrierAcquired).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("listBackgroundProcesses keeps a pending wake visible on a reused monitorless process ID", async () => {
     const { config, cleanup } = await createTestHistoryService();
     try {

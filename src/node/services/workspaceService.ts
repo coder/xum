@@ -6500,9 +6500,10 @@ export class WorkspaceService extends EventEmitter {
       // intentionally keeps its staged heartbeat armed for cross-instance liveness,
       // and both that heartbeat and a late tombstone promotion drive
       // mutateClearedAt, whose mkdir would recreate the directory after deletion.
-      // New clears are refused by the removingWorkspaces guard (set above),
-      // promotion retries re-check it when they fire, and this barrier covers the
-      // one transaction that may already hold the lock.
+      // New clears are refused by the removingWorkspaces guard (set above), and
+      // promotion retries both re-check it and run their commitClear under this
+      // same lock — so the barrier waits out the in-flight clear transaction AND
+      // any already-fired retry.
       await this.bashMonitorHistoryLocks.withLock(workspaceId, () => Promise.resolve());
       this.bashMonitorWakeStore.abandonWorkspaceClears(workspaceId);
 
@@ -12492,20 +12493,30 @@ export class WorkspaceService extends EventEmitter {
     if (this.bashMonitorClearCommitRetryTimers.has(key)) return;
     const timer = setTimeout(() => {
       this.bashMonitorClearCommitRetryTimers.delete(key);
-      // A removed (or mid-removal) workspace must never have its session directory
-      // recreated by a late promotion: the tombstone mutation's mkdir would
-      // resurrect deleted session data and could leak a cleared-at file into a
-      // future workspace reusing the ID.
-      if (
-        this.removingWorkspaces.has(workspaceId) ||
-        this.config.findWorkspace(workspaceId) == null
-      ) {
-        return;
-      }
-      this.bashMonitorWakeStore.commitClear(workspaceId, clearToken).catch((error: unknown) => {
-        log.debug("Bash monitor clear tombstone promotion retry failed", { workspaceId, error });
-        this.scheduleBashMonitorClearCommitRetry(workspaceId, clearToken);
-      });
+      // Serialized through the history lock so removal's pre-deletion barrier also
+      // waits out an ALREADY-FIRED retry: a retry that passed the guard below just
+      // before removal began would otherwise run commitClear (whose tombstone
+      // mutation mkdirs the wake directory) concurrently with — or after — session
+      // deletion. Holding the lock also makes the removingWorkspaces re-check
+      // race-free: removal sets the flag before its barrier acquires this lock.
+      void this.bashMonitorHistoryLocks
+        .withLock(workspaceId, async () => {
+          // A removed (or mid-removal) workspace must never have its session
+          // directory recreated by a late promotion: the tombstone mutation's mkdir
+          // would resurrect deleted session data and could leak a cleared-at file
+          // into a future workspace reusing the ID.
+          if (
+            this.removingWorkspaces.has(workspaceId) ||
+            this.config.findWorkspace(workspaceId) == null
+          ) {
+            return;
+          }
+          await this.bashMonitorWakeStore.commitClear(workspaceId, clearToken);
+        })
+        .catch((error: unknown) => {
+          log.debug("Bash monitor clear tombstone promotion retry failed", { workspaceId, error });
+          this.scheduleBashMonitorClearCommitRetry(workspaceId, clearToken);
+        });
     }, 1_000);
     // Never hold process shutdown open for a promotion retry: a staging orphaned by
     // shutdown is reconciled by the staged-clear grace scan on the next start.

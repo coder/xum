@@ -1388,9 +1388,13 @@ export class BashMonitorWakeStore {
     // A staged clear tombstone abandoned past its grace window is a CRASHED clear
     // staging (see rollbackCrashedClearStaging); resolve it before anything below
     // consults the tombstone or the stamped records. The entries check keeps this off
-    // the hot path — tombstone artifacts exist only around clears and crashes.
+    // the hot path — tombstone artifacts exist only around clears and crashes. The
+    // effective tombstone is then read (post-rollback) for the pre-cutoff canonical
+    // check at the end of this scan.
+    let tomb: ClearTombstone | null = null;
     if (entries.some((e) => e === "cleared-at" || e.startsWith("cleared-at.cas-"))) {
       await this.rollbackCrashedClearStaging(ownerWorkspaceId);
+      tomb = await this.readClearedAt(ownerWorkspaceId);
     }
     const records: BashMonitorWakeRecord[] = [];
     const seen = new Set<string>();
@@ -1551,9 +1555,51 @@ export class BashMonitorWakeStore {
         newestById.set(record.id, record);
       }
     }
-    const deduped = [...newestById.values()];
+    let deduped = [...newestById.values()];
+    // Pre-cutoff records that (re)surfaced as CANONICAL after a clear's snapshot — a
+    // crash-stalled writer's rename landing late, or a cross-instance recovery
+    // restoring an old generation. The tombstone otherwise fences only orphan-temp
+    // recovery, so such a record would stay pending and deliver pre-clear output
+    // into the cleared transcript. Mirroring the temp rules: a COMMITTED cutoff
+    // retires it durably; a STAGED one holds it (neither deliver nor retire) until
+    // the transaction commits, rolls back, or is grace-rolled-back as crashed.
+    if (tomb != null) {
+      const cutoffMs = Date.parse(tomb.clearedAt);
+      const listable: BashMonitorWakeRecord[] = [];
+      for (const record of deduped) {
+        // NaN-safe: an unparseable updatedAt fails toward delivery (listed).
+        if (!(Date.parse(record.updatedAt) <= cutoffMs)) {
+          listable.push(record);
+          continue;
+        }
+        if (tomb.phase !== "staged") {
+          await this.retirePreCutoffCanonical(ownerWorkspaceId, record, cutoffMs);
+        }
+      }
+      deduped = listable;
+    }
     deduped.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
     return deduped;
+  }
+
+  /**
+   * Durably retire a pending canonical record stamped at/before a COMMITTED clear's
+   * cutoff (see the pre-cutoff check in listPending). Re-verified under the record
+   * lock against the current generation, so a post-cutoff merge racing this scan is
+   * never retired. Durable (not a per-scan suppression) so the record cannot outlive
+   * its clear indefinitely and re-deliver through any path that reads it directly.
+   */
+  private async retirePreCutoffCanonical(
+    ownerWorkspaceId: string,
+    snapshot: BashMonitorWakeRecord,
+    cutoffMs: number
+  ): Promise<void> {
+    await this.locks.withLock(`${ownerWorkspaceId}:${snapshot.id}`, async () => {
+      const record = await this.get(ownerWorkspaceId, snapshot.id);
+      if (record?.status !== "pending") return;
+      if (!(Date.parse(record.updatedAt) <= cutoffMs)) return;
+      await this.write(this.withTerminalStatus(record, "superseded"));
+    });
   }
 
   /**
@@ -2451,27 +2497,25 @@ export class BashMonitorWakeStore {
         if (current != null) {
           const currentMs = Date.parse(current.clearedAt);
           const ourMs = Date.parse(clearedAt);
-          // A strictly newer cutoff always wins; an EQUAL cutoff blocks us only while
-          // it is another clear's in-flight STAGING (same-millisecond concurrent
-          // clears). An equal COMMITTED cutoff retires exactly what ours would, so
-          // staging over it (with it as rollback predecessor) loses nothing — and
-          // same-millisecond sequential clears in one process keep working.
-          if (currentMs > ourMs || (currentMs === ourMs && current.phase === "staged")) {
+          // A COMMITTED current with a strictly newer cutoff subsumes ours. ANY
+          // staged current blocks us regardless of cutoff order: an unresolved
+          // staged transaction's stamped records are recoverable only through ITS
+          // tombstone, so replacing it (even with a newer cutoff) would — after a
+          // crash of both processes — leave restart rollback restoring only records
+          // stamped with the standing clearId, stranding the older clear's records
+          // superseded forever. A crashed staging cannot wedge this: the listPending
+          // above already rolled back stagings past their grace window. An equal
+          // COMMITTED cutoff retires exactly what ours would, so staging over it
+          // (with it as rollback predecessor) loses nothing — and same-millisecond
+          // sequential clears in one process keep working.
+          if (currentMs > ourMs || current.phase === "staged") {
             return "keep";
           }
         }
-        // The rollback predecessor must be a COMMITTED cutoff: inheriting a staged
-        // current's own cutoff would let OUR later rollback materialize it as
-        // committed, permanently retiring wakes for a clear that never succeeded. A
-        // staged current's committed predecessor carries forward instead; if its
-        // owner commits later, commitClear's monotonic branch inserts that cutoff
-        // into our previousClearedAt.
-        const committedPredecessor =
-          current == null
-            ? null
-            : current.phase === "staged"
-              ? (current.previousClearedAt ?? null)
-              : current.clearedAt;
+        // Reaching here, current is null or COMMITTED (any staged current returned
+        // above). That committed cutoff is our rollback predecessor: our later
+        // rollback restores it rather than dropping the standing protection.
+        const committedPredecessor = current == null ? null : current.clearedAt;
         decidedToStage = true;
         return {
           clearedAt,
@@ -2500,7 +2544,7 @@ export class BashMonitorWakeStore {
         // Snapshots list only what was ACTUALLY retired: a record that changed past
         // the cutoff stays pending, and restoring it on rollback would be wrong (its
         // restore would clobber the newer merged generation back to the snapshot).
-        if (await this.supersedeForClear(ownerWorkspaceId, record, clearId)) {
+        if (await this.supersedeForClear(ownerWorkspaceId, record, clearId, clearedAt)) {
           staged.push(record);
         }
       }
@@ -2531,7 +2575,8 @@ export class BashMonitorWakeStore {
   private async supersedeForClear(
     ownerWorkspaceId: string,
     snapshot: BashMonitorWakeRecord,
-    clearId: string
+    clearId: string,
+    clearedAt: string
   ): Promise<boolean> {
     return this.locks.withLock(`${ownerWorkspaceId}:${snapshot.id}`, async () => {
       const record = await this.get(ownerWorkspaceId, snapshot.id);
@@ -2546,7 +2591,25 @@ export class BashMonitorWakeStore {
       // millisecond, leaving the timestamp unchanged while lines and counters differ
       // (replaceCanonicalIfUnchanged documents the same possibility). Both sides are
       // parses of the same writer's serialized bytes, so key order is stable.
-      if (JSON.stringify(record) !== JSON.stringify(snapshot)) return false;
+      if (JSON.stringify(record) !== JSON.stringify(snapshot)) {
+        // The surviving record must stay distinguishable from a pre-clear stray:
+        // listPending holds/retires pending records stamped at/before the cutoff
+        // (see the pre-cutoff canonical check), and a same-millisecond merge leaves
+        // updatedAt at its pre-clear value even though the content is
+        // post-snapshot. Re-stamp it past the cutoff (the +1ms floor covers a bump
+        // landing within the cutoff's own millisecond) so the very clear this
+        // record survived can never later retire it. In-flight delivery snapshots
+        // keyed on the old updatedAt then decline and redeliver — the same
+        // documented lesser failure as above.
+        const cutoffMs = Date.parse(clearedAt);
+        if (Date.parse(record.updatedAt) <= cutoffMs) {
+          await this.write({
+            ...record,
+            updatedAt: new Date(Math.max(Date.now(), cutoffMs + 1)).toISOString(),
+          });
+        }
+        return false;
+      }
       await this.write({
         ...this.withTerminalStatus(record, "superseded"),
         supersededByClearId: clearId,
