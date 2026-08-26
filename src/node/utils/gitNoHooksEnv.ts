@@ -50,7 +50,7 @@ const GIT_EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 export function gitNoRepoAutomationEnv(): Record<string, string> {
   const env: Record<string, string> = {
     ...GIT_NO_HOOKS_ENV,
-    GIT_CONFIG_COUNT: "5",
+    GIT_CONFIG_COUNT: "11",
     GIT_CONFIG_KEY_1: "core.fsmonitor",
     GIT_CONFIG_VALUE_1: "false",
     // An empty credential.helper value resets the helper list.
@@ -60,6 +60,18 @@ export function gitNoRepoAutomationEnv(): Record<string, string> {
     GIT_CONFIG_VALUE_3: "none",
     GIT_CONFIG_KEY_4: "core.askPass",
     GIT_CONFIG_VALUE_4: "",
+    GIT_CONFIG_KEY_5: "commit.gpgSign",
+    GIT_CONFIG_VALUE_5: "false",
+    GIT_CONFIG_KEY_6: "tag.gpgSign",
+    GIT_CONFIG_VALUE_6: "false",
+    GIT_CONFIG_KEY_7: "gpg.program",
+    GIT_CONFIG_VALUE_7: "",
+    GIT_CONFIG_KEY_8: "gpg.openpgp.program",
+    GIT_CONFIG_VALUE_8: "",
+    GIT_CONFIG_KEY_9: "gpg.x509.program",
+    GIT_CONFIG_VALUE_9: "",
+    GIT_CONFIG_KEY_10: "gpg.ssh.program",
+    GIT_CONFIG_VALUE_10: "",
     GIT_ATTR_SOURCE: GIT_EMPTY_TREE_OID,
     // Environment beats repo-config core.sshCommand.
     GIT_SSH_COMMAND: "ssh",
@@ -166,6 +178,18 @@ export function gitEnvPrefix(env: Record<string, string>): string {
       .map(([key, value]) => `${key}=${shellQuote(value)}`)
       .join(" ") + " "
   );
+}
+
+export function combineGitNoRepoAutomationEnvs(
+  envs: Iterable<Record<string, string>>
+): Record<string, string> {
+  const configKeys: string[] = [];
+  for (const env of envs) {
+    for (const [key, value] of Object.entries(env)) {
+      if (key.startsWith("GIT_CONFIG_KEY_")) configKeys.push(value);
+    }
+  }
+  return gitNoRepoAutomationEnvForConfigKeys(configKeys);
 }
 
 export async function gitNoRepoAutomationEnvForRuntimeRepo(

@@ -1634,16 +1634,20 @@ describe("remote bash git hardening", () => {
     const runtime = {
       exec(command: string, options: ExecOptions): Promise<ExecStream> {
         calls.push({ command, options });
-        return Promise.resolve(
-          calls.length === 1
-            ? createExecStream("filter.evil.smudge\0filter.evil.required\0")
-            : createExecStream("done\n")
-        );
+        if (options.cwd === "/remote/project-a") return Promise.resolve(createExecStream("", 1));
+        if (options.cwd === "/remote/project-b") {
+          return Promise.resolve(createExecStream("filter.evil.smudge\0filter.evil.required\0"));
+        }
+        return Promise.resolve(createExecStream("done\n"));
       },
     } as unknown as Runtime;
     const config = createTestToolConfig("/remote/workspace");
     config.runtime = runtime;
     config.trusted = false;
+    config.projects = [
+      { projectName: "project-a", projectPath: "/remote/project-a" },
+      { projectName: "project-b", projectPath: "/remote/project-b" },
+    ];
     config.secrets = { ANTHROPIC_API_KEY: "secret" };
     const tool = createBashTool(config);
 
@@ -1658,10 +1662,11 @@ describe("remote bash git hardening", () => {
     )) as BashToolResult;
 
     expect(result.success).toBe(true);
-    expect(calls).toHaveLength(2);
-    expect(calls[0]?.command).toContain("git config --null --name-only");
-    expect(calls[1]?.options.env?.ANTHROPIC_API_KEY).toBe("");
-    expect(Object.values(calls[1]?.options.env ?? {})).toContain("filter.evil.smudge");
+    expect(calls).toHaveLength(3);
+    expect(calls[0]?.options.cwd).toBe("/remote/project-a");
+    expect(calls[1]?.options.cwd).toBe("/remote/project-b");
+    expect(calls[2]?.options.env?.ANTHROPIC_API_KEY).toBe("");
+    expect(Object.values(calls[2]?.options.env ?? {})).toContain("filter.evil.smudge");
   });
 
   it("fails closed when remote driver discovery fails", async () => {
@@ -1669,12 +1674,16 @@ describe("remote bash git hardening", () => {
     const runtime = {
       exec(): Promise<ExecStream> {
         callCount += 1;
-        return Promise.resolve(createExecStream("", 2));
+        return Promise.resolve(createExecStream("", callCount === 1 ? 1 : 2));
       },
     } as unknown as Runtime;
     const config = createTestToolConfig("/remote/workspace");
     config.runtime = runtime;
     config.trusted = false;
+    config.projects = [
+      { projectName: "project-a", projectPath: "/remote/project-a" },
+      { projectName: "project-b", projectPath: "/remote/project-b" },
+    ];
     const tool = createBashTool(config);
 
     let rejection: unknown;
@@ -1695,7 +1704,7 @@ describe("remote bash git hardening", () => {
     expect((rejection as Error).message).toContain(
       "Failed to inspect repository automation drivers"
     );
-    expect(callCount).toBe(1);
+    expect(callCount).toBe(2);
   });
 });
 

@@ -25,6 +25,7 @@ import { migrateToBackground } from "@/node/services/backgroundProcessExecutor";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { getToolEnvPath } from "@/node/services/hooks";
 import {
+  combineGitNoRepoAutomationEnvs,
   gitHooksAllowed,
   gitNoRepoAutomationEnv,
   gitNoRepoAutomationEnvForLocalRepo,
@@ -920,13 +921,24 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
       // Neutralize repo-controlled git automation when trust is absent or the
       // benchmark kill-switch is active. Repo-aware discovery covers drivers
       // selected by highest-precedence .git/info/attributes on every runtime.
-      const hooksEnv = gitHooksAllowed(config.trusted)
-        ? {}
-        : config.runtime instanceof LocalBaseRuntime
-          ? await gitNoRepoAutomationEnvForLocalRepo(config.cwd, abortSignal)
-          : config.runtime != null
-            ? await gitNoRepoAutomationEnvForRuntimeRepo(config.runtime, config.cwd, abortSignal)
-            : gitNoRepoAutomationEnv();
+      let hooksEnv: Record<string, string> = {};
+      if (!gitHooksAllowed(config.trusted)) {
+        const repoPaths =
+          config.projects != null && config.projects.length > 0
+            ? [...new Set(config.projects.map((project) => project.projectPath))]
+            : [config.cwd];
+        const repoEnvs: Array<Record<string, string>> = [];
+        for (const repoPath of repoPaths) {
+          repoEnvs.push(
+            config.runtime instanceof LocalBaseRuntime
+              ? await gitNoRepoAutomationEnvForLocalRepo(repoPath, abortSignal)
+              : config.runtime != null
+                ? await gitNoRepoAutomationEnvForRuntimeRepo(config.runtime, repoPath, abortSignal)
+                : gitNoRepoAutomationEnv()
+          );
+        }
+        hooksEnv = combineGitNoRepoAutomationEnvs(repoEnvs);
+      }
 
       // On Windows, models sometimes emit cmd.exe-style `>nul` / `2>nul` redirections.
       // Since the bash tool runs via bash, `nul` becomes a real file in the workspace.

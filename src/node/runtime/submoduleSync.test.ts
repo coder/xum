@@ -419,15 +419,15 @@ describe("syncRuntimeGitSubmodules", () => {
       GIT_CONFIG_KEY_0: "core.hooksPath",
     });
     expect(runtime.calls[2]?.env).toMatchObject({
-      GIT_CONFIG_COUNT: "9",
-      GIT_CONFIG_KEY_5: "filter.evil.clean",
-      GIT_CONFIG_VALUE_5: "",
-      GIT_CONFIG_KEY_6: "filter.evil.smudge",
-      GIT_CONFIG_VALUE_6: "",
-      GIT_CONFIG_KEY_7: "filter.evil.process",
-      GIT_CONFIG_VALUE_7: "",
-      GIT_CONFIG_KEY_8: "filter.evil.required",
-      GIT_CONFIG_VALUE_8: "false",
+      GIT_CONFIG_COUNT: "15",
+      GIT_CONFIG_KEY_11: "filter.evil.clean",
+      GIT_CONFIG_VALUE_11: "",
+      GIT_CONFIG_KEY_12: "filter.evil.smudge",
+      GIT_CONFIG_VALUE_12: "",
+      GIT_CONFIG_KEY_13: "filter.evil.process",
+      GIT_CONFIG_VALUE_13: "",
+      GIT_CONFIG_KEY_14: "filter.evil.required",
+      GIT_CONFIG_VALUE_14: "false",
     });
     expect(steps).toEqual(["Initializing git submodules...", "Git submodules ready"]);
   });

@@ -35,7 +35,7 @@ describe("gitNoHooksPrefix", () => {
 
   test("returns env prefix when untrusted (false)", () => {
     const prefix = gitNoHooksPrefix(false);
-    expect(prefix).toContain("GIT_CONFIG_COUNT='5'");
+    expect(prefix).toContain("GIT_CONFIG_COUNT='11'");
     expect(prefix).toContain("core.hooksPath");
     expect(prefix).toContain("/dev/null");
     expect(prefix).toContain("GIT_CONFIG_PARAMETERS=");
@@ -44,7 +44,7 @@ describe("gitNoHooksPrefix", () => {
 
   test("returns env prefix when untrusted (undefined)", () => {
     const prefix = gitNoHooksPrefix(undefined);
-    expect(prefix).toContain("GIT_CONFIG_COUNT='5'");
+    expect(prefix).toContain("GIT_CONFIG_COUNT='11'");
     expect(prefix).toEndWith(" ");
   });
 });
@@ -53,7 +53,7 @@ describe("gitNoRepoAutomationEnv", () => {
   test("neutralizes every repo-controlled git execution vector", () => {
     const env = gitNoRepoAutomationEnv();
     // Hooks, fsmonitor, and credential helpers via env config entries.
-    expect(env.GIT_CONFIG_COUNT).toBe("5");
+    expect(env.GIT_CONFIG_COUNT).toBe("11");
     expect(env.GIT_CONFIG_KEY_0).toBe("core.hooksPath");
     expect(env.GIT_CONFIG_VALUE_0).toBe("/dev/null");
     expect(env.GIT_CONFIG_KEY_1).toBe("core.fsmonitor");
@@ -64,6 +64,18 @@ describe("gitNoRepoAutomationEnv", () => {
     expect(env.GIT_CONFIG_VALUE_3).toBe("none");
     expect(env.GIT_CONFIG_KEY_4).toBe("core.askPass");
     expect(env.GIT_CONFIG_VALUE_4).toBe("");
+    expect(env.GIT_CONFIG_KEY_5).toBe("commit.gpgSign");
+    expect(env.GIT_CONFIG_VALUE_5).toBe("false");
+    expect(env.GIT_CONFIG_KEY_6).toBe("tag.gpgSign");
+    expect(env.GIT_CONFIG_VALUE_6).toBe("false");
+    expect(env.GIT_CONFIG_KEY_7).toBe("gpg.program");
+    expect(env.GIT_CONFIG_VALUE_7).toBe("");
+    expect(env.GIT_CONFIG_KEY_8).toBe("gpg.openpgp.program");
+    expect(env.GIT_CONFIG_VALUE_8).toBe("");
+    expect(env.GIT_CONFIG_KEY_9).toBe("gpg.x509.program");
+    expect(env.GIT_CONFIG_VALUE_9).toBe("");
+    expect(env.GIT_CONFIG_KEY_10).toBe("gpg.ssh.program");
+    expect(env.GIT_CONFIG_VALUE_10).toBe("");
     // Pointing the tracked attributes source at the empty tree suppresses
     // .gitattributes; the repo-aware builder below additionally overrides
     // drivers selected by highest-precedence .git/info/attributes.
@@ -258,6 +270,41 @@ describe("gitNoRepoAutomationEnv", () => {
     expect(configKeys).toContain("remote.origin.uploadpack");
     expect(configKeys).toContain("remote.origin.receivepack");
     expect(configKeys).toContain("remote.origin.vcs");
+  });
+
+  test("disables repo-configured commit signing programs", async () => {
+    using tmp = new DisposableTempDir("git-signing-automation-off");
+    const repo = path.join(tmp.path, "repo");
+    const marker = path.join(tmp.path, "signer-ran");
+    const signer = path.join(tmp.path, "signer.sh");
+    await fs.mkdir(repo, { recursive: true });
+    await Bun.$`git init`.cwd(repo).quiet();
+    await Bun.$`git config user.email test@example.com`.cwd(repo).quiet();
+    await Bun.$`git config user.name Test`.cwd(repo).quiet();
+    await fs.writeFile(path.join(repo, "data.txt"), "payload\n", "utf-8");
+    await Bun.$`git add data.txt`.cwd(repo).quiet();
+    await Bun.$`git commit -m init`.cwd(repo).quiet();
+    await fs.writeFile(signer, `#!/bin/sh\ntouch "${marker}"\nexit 1\n`, "utf-8");
+    await fs.chmod(signer, 0o755);
+    await Bun.$`git config commit.gpgSign true`.cwd(repo).quiet();
+    await Bun.$`git config gpg.program ${signer}`.cwd(repo).quiet();
+
+    await Bun.$`git commit --allow-empty -m unsafe`.cwd(repo).quiet().nothrow();
+    await fs.access(marker);
+    await fs.rm(marker);
+
+    const env = gitNoRepoAutomationEnv();
+    const result = await Bun.$`git commit --allow-empty -m safe`
+      .cwd(repo)
+      .env({ ...process.env, ...env })
+      .quiet()
+      .nothrow();
+    expect(result.exitCode).toBe(0);
+    const markerExists = await fs.access(marker).then(
+      () => true,
+      () => false
+    );
+    expect(markerExists).toBe(false);
   });
 });
 
