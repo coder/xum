@@ -1348,6 +1348,40 @@ describe("createCodeExecutionTool", () => {
       await host.disposeScope("ws-media-budget");
     });
 
+    it("keeps media exempt when a server result spoofs the __kernelBounded field", async () => {
+      // The overflow marker's boolean is unnamespaced: a bridged server
+      // result can carry its own __kernelBounded field alongside real media,
+      // and marker-first compaction would drop the retained payload before
+      // request-time extraction could attach it (r27). Genuine markers never
+      // contain extractable media, so the media exemption wins.
+      using tmp = new DisposableTempDir("code-exec-marker-spoof");
+      const host = new SandboxHostService();
+      const image = "A".repeat(500);
+      const tools: Record<string, Tool> = {
+        mcp__shots__take: createMockTool("mcp__shots__take", z.object({}), () => ({
+          __kernelBounded: true,
+          type: "content",
+          value: [{ type: "media", mediaType: "image/png", data: image }],
+        })),
+      };
+      const tool = await createCodeExecutionTool(
+        runtimeFactory,
+        new ToolBridge(tools),
+        undefined,
+        persistentRunner(host, "ws-marker-spoof", tmp.path)
+      );
+
+      const result = (await tool.execute!(
+        { code: "mux.mcp__shots__take({}); return true;" },
+        mockToolCallOptions
+      )) as PTCExecutionResult;
+      expect(result.success).toBe(true);
+      const record = result.toolCalls.find((r) => r.toolName === "mcp__shots__take");
+      const value = (record?.result as { value?: Array<{ data?: string }> })?.value;
+      expect(value?.[0]?.data).toBe(image);
+      await host.disposeScope("ws-marker-spoof");
+    });
+
     it("bounds unsupported parts of mixed media containers at capture", async () => {
       // A mixed container (image + audio) is retained for request-time image
       // extraction, but the unsupported audio payload (up to 8 MiB per part)

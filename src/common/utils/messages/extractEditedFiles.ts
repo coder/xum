@@ -282,16 +282,19 @@ export function extractEditedFileDiffs(messages: MuxMessage[]): FileEditDiff[] {
   // combined diff is incomplete no matter how the combination goes.
   const captureTruncatedPaths = new Set<string>();
 
+  // Update edit order (move to end if already exists).
+  const bumpRecency = (filePath: string): void => {
+    const idx = editOrder.indexOf(filePath);
+    if (idx !== -1) editOrder.splice(idx, 1);
+    editOrder.push(filePath);
+  };
+
   const addDiff = (filePath: string, diff: string): void => {
     if (!diffsByPath.has(filePath)) {
       diffsByPath.set(filePath, []);
     }
     diffsByPath.get(filePath)!.push(diff);
-
-    // Update edit order (move to end if already exists)
-    const idx = editOrder.indexOf(filePath);
-    if (idx !== -1) editOrder.splice(idx, 1);
-    editOrder.push(filePath);
+    bumpRecency(filePath);
   };
 
   for (const message of messages) {
@@ -318,6 +321,11 @@ export function extractEditedFileDiffs(messages: MuxMessage[]): FileEditDiff[] {
             // diff must surface as incomplete rather than complete-looking
             // (r26 — mirrors the dropped-bounded-diff diffTruncated signal).
             captureTruncatedPaths.add(record.filePath);
+            // It is also the file's LATEST edit: recency must move with it
+            // (r27), or a recently edited file still ranked by its older
+            // retained diff could fall off the MAX_EDITED_FILES cut entirely
+            // once enough other files were edited in between.
+            if (diffsByPath.has(record.filePath)) bumpRecency(record.filePath);
           }
         }
         continue;

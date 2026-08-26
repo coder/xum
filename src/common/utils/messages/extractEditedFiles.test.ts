@@ -278,6 +278,35 @@ describe("nested PTC edit records (exclusive posture)", () => {
     expect(diffs[0].diff).toBe(earlierDiff);
     expect(diffs[0].truncated).toBe(true);
   });
+
+  it("moves recency to a later result-less edit so the file keeps its rank", () => {
+    // The result-less record is the file's LATEST edit: without a recency
+    // bump it stays ranked by its older retained diff and can fall off the
+    // MAX_EDITED_FILES cut once enough other files are edited in between
+    // (round 27).
+    const aDiff = makeDiff("/a.ts", "old", "new");
+    const bDiff = makeDiff("/b.ts", "old", "new");
+    const messages: MuxMessage[] = [
+      createCodeExecutionMessage([
+        {
+          toolName: "file_edit_replace_string",
+          args: { path: "/a.ts" },
+          result: { success: true, diff: aDiff },
+        },
+        {
+          toolName: "file_edit_replace_string",
+          args: { path: "/b.ts" },
+          result: { success: true, diff: bDiff },
+        },
+        { toolName: "file_edit_replace_string", args: { path: "/a.ts" }, ok: true, bytes: 9 },
+      ]),
+    ];
+
+    const diffs = extractEditedFileDiffs(messages);
+    expect(diffs.map((d) => d.path)).toEqual(["/a.ts", "/b.ts"]);
+    expect(diffs[0].truncated).toBe(true);
+    expect(diffs[1].truncated).toBe(false);
+  });
 });
 
 describe("extractEditedFilePaths", () => {

@@ -32,7 +32,11 @@ import {
 } from "@/constants/resultHandles";
 import { KERNEL_COMPACT_ARGS_CAP_BYTES, KERNEL_CONSOLE_CAP_BYTES } from "@/constants/kernelOutput";
 import { sliceUtf8Bytes } from "@/common/utils/sliceUtf8Bytes";
-import { isKernelRecordResultExempt, sanitizeCapturedMediaValue } from "@/node/services/ptc/types";
+import {
+  containsMediaContentPayload,
+  isKernelRecordResultExempt,
+  sanitizeCapturedMediaValue,
+} from "@/node/services/ptc/types";
 import { jsonSafeClone } from "@/common/utils/jsonSafeClone";
 
 // Default limits
@@ -313,7 +317,14 @@ function compactKernelToolCallRecords(result: PTCExecutionResult, loadActive: bo
     const captureBounded =
       typeof record.result === "object" &&
       record.result !== null &&
-      (record.result as { __kernelBounded?: boolean }).__kernelBounded === true;
+      (record.result as { __kernelBounded?: boolean }).__kernelBounded === true &&
+      // The boolean is unnamespaced, so a bridged server's result can carry
+      // its own __kernelBounded field alongside real media. A GENUINE runtime
+      // marker ({__kernelBounded, bytes, preview}) never contains extractable
+      // media, so the media exemption takes priority — otherwise a retained,
+      // sanitized media payload would be compacted away and the model would
+      // never receive the attachment (r27).
+      !containsMediaContentPayload(record.result);
     // Exempt records also keep their result (see isKernelRecordResultExempt;
     // creation-time capture bounding applies the same predicate, so the full
     // payload actually reaches this point): persistence extractors mine
