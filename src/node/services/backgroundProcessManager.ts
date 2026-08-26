@@ -411,6 +411,18 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     this.emit("change", workspaceId);
   }
 
+  /**
+   * Nudge background-bash subscribers after a monitor wake-state transition (pending
+   * enqueued, delivered, or superseded). Wake records live in BashMonitorWakeStore
+   * (owned by WorkspaceService), but subscribers observe them through this manager's
+   * "change" stream, so the owner needs a way to request an emit when only wake state
+   * — not process state — changed.
+   */
+  notifyMonitorWakeStateChanged(workspaceId: string): void {
+    assert(workspaceId.length > 0, "notifyMonitorWakeStateChanged requires a workspaceId");
+    this.emitChange(workspaceId);
+  }
+
   private createMonitorState(
     config: BackgroundProcessMonitorConfig,
     options: { pollIntervalMs: number }

@@ -189,6 +189,12 @@ export const BackgroundProcessMonitorInfoSchema = z.object({
   droppedLines: z.number(),
   lastLines: z.array(z.string()),
   stopped: z.boolean(),
+  /**
+   * True when a monitor match is durably queued but its synthetic wake turn has not been
+   * delivered yet. Without this, a one-shot watcher that matched and exited looks like a
+   * lost wake in the UI (nothing running, no visible pending delivery).
+   */
+  wakePending: z.boolean().optional(),
 });
 
 // Background process info (for UI display)

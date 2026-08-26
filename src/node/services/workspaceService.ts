@@ -2594,6 +2594,9 @@ export class WorkspaceService extends EventEmitter {
             }
             throw error;
           }
+          // Surface "match found — waking agent" immediately: a one-shot watcher that
+          // matched and exited would otherwise look like a lost wake until delivery.
+          this.notifyBashMonitorWakeStateChanged(payload.workspaceId);
           this.scheduleBashMonitorWakeDrain(payload.workspaceId);
         })
       );
@@ -2705,7 +2708,13 @@ export class WorkspaceService extends EventEmitter {
     // converting stale registry records.
     return this.bashMonitorRecoveryPromise.then(() =>
       this.bashMonitorHistoryLocks.withLock(ownerWorkspaceId, () =>
-        this.drainBashMonitorWakesUnlocked(ownerWorkspaceId)
+        this.drainBashMonitorWakesUnlocked(ownerWorkspaceId).finally(() => {
+          // Coarse unconditional emit after every drain pass: delivered/superseded
+          // transitions must clear the "match found — waking agent" indicator, and the
+          // drain has many exit paths. An occasional no-op emit is cheaper than
+          // threading per-transition notifications through each of them.
+          this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
+        })
       )
     );
   }
@@ -4040,6 +4049,15 @@ export class WorkspaceService extends EventEmitter {
       return 0;
     }
     return this.backgroundProcessManager.getActiveMonitorCount(workspaceId);
+  }
+
+  private notifyBashMonitorWakeStateChanged(workspaceId: string): void {
+    // Tests may construct WorkspaceService with a partial BackgroundProcessManager stub
+    // (same reason the constructor guards the event subscriptions).
+    if (typeof this.backgroundProcessManager.notifyMonitorWakeStateChanged !== "function") {
+      return;
+    }
+    this.backgroundProcessManager.notifyMonitorWakeStateChanged(workspaceId);
   }
 
   private mergeCurrentActiveBashMonitorCount(
@@ -13610,13 +13628,31 @@ export class WorkspaceService extends EventEmitter {
         droppedLines: number;
         lastLines: string[];
         stopped: boolean;
+        wakePending?: boolean;
       };
       exitCode?: number;
     }>
   > {
     const processes = await this.backgroundProcessManager.list(workspaceId);
+    // Surface durably-pending monitor wakes (matched but not yet delivered as a synthetic
+    // turn), so a one-shot watcher that matched and exited does not look like a lost wake.
+    // Wake ids equal process ids (BashMonitorWakeStore.wakeId). The indicator must never
+    // break process listing, so a wake-store read failure degrades to "no pending wakes".
+    let pendingWakeProcessIds: ReadonlySet<string>;
+    try {
+      pendingWakeProcessIds = new Set(
+        (await this.bashMonitorWakeStore.listPending(workspaceId)).map((record) => record.processId)
+      );
+    } catch (error) {
+      log.debug("Failed to read pending bash monitor wakes for process listing", {
+        workspaceId,
+        error,
+      });
+      pendingWakeProcessIds = new Set();
+    }
     return processes.map((p) => {
       const monitor = this.backgroundProcessManager.getMonitorSnapshot(p);
+      const wakePending = pendingWakeProcessIds.has(p.id);
       return {
         id: p.id,
         pid: p.pid,
@@ -13624,7 +13660,9 @@ export class WorkspaceService extends EventEmitter {
         displayName: p.displayName,
         startTime: p.startTime,
         status: p.status,
-        ...(monitor != null ? { monitor } : {}),
+        ...(monitor != null
+          ? { monitor: wakePending ? { ...monitor, wakePending } : monitor }
+          : {}),
         exitCode: p.exitCode,
       };
     });

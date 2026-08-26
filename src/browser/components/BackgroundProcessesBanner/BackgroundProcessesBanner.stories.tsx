@@ -91,3 +91,65 @@ export const BackgroundProcesses: AppStory = {
     },
   },
 };
+
+/**
+ * A one-shot watcher matched its monitor filter and exited, but the synthetic wake turn
+ * has not been delivered yet. The banner must keep the process visible with a pending
+ * indicator instead of vanishing (which previously looked like a lost wake).
+ */
+export const MonitorWakePendingAfterExit: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSimpleChatStory({
+          messages: [
+            createUserMessage("msg-1", "Watch the PR checks and wake me when they finish", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 60000,
+            }),
+            createAssistantMessage(
+              "msg-2",
+              "I've started a background watcher that prints WAKE: when the checks finish.",
+              {
+                historySequence: 2,
+                timestamp: STABLE_TIMESTAMP - 50000,
+                toolCalls: [
+                  createTerminalTool("call-1", "./watch_pr_checks.sh", "Watching PR checks..."),
+                ],
+              }
+            ),
+          ],
+          backgroundProcesses: [
+            {
+              id: "bash_watcher",
+              pid: 22345,
+              script: "./watch_pr_checks.sh",
+              displayName: "PR Checks Watcher",
+              startTime: Date.now() - 90000,
+              monitor: {
+                filter: "WAKE:",
+                filter_exclude: false,
+                cooldown_ms: 1000,
+                totalMatches: 1,
+                droppedLines: 0,
+                lastLines: ["WAKE: all checks green"],
+                stopped: true,
+                wakePending: true,
+              },
+              status: "exited",
+              exitCode: 0,
+            },
+          ],
+        })
+      }
+    />
+  ),
+  parameters: {
+    docs: {
+      description: {
+        story:
+          "A one-shot watcher matched and exited while its monitor wake is still pending delivery. The banner stays visible with a 'waking agent' indicator, no live duration, and no terminate button.",
+      },
+    },
+  },
+};

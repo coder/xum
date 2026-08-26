@@ -382,6 +382,89 @@ describe("WorkspaceService bash monitor wakes", () => {
     }
   });
 
+  test("listBackgroundProcesses surfaces wakePending until the monitor wake is delivered", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-wake-pending-listing";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      // A one-shot watcher: matched, printed its line, and exited before delivery.
+      const watcherProcess = {
+        id: "proc-watcher",
+        pid: 4242,
+        script: "./watch.sh",
+        displayName: "Watcher",
+        startTime: Date.now() - 5_000,
+        status: "exited" as const,
+        exitCode: 0,
+        workspaceId,
+        isForeground: false,
+      };
+      const backgroundProcessManager = {
+        cleanup: mock(() => Promise.resolve()),
+        list: mock(() => Promise.resolve([watcherProcess])),
+        getMonitorSnapshot: mock(() => ({
+          filter: "WAKE:",
+          filter_exclude: false,
+          cooldown_ms: 1_000,
+          totalMatches: 1,
+          droppedLines: 0,
+          lastLines: ["WAKE: done"],
+          stopped: true,
+        })),
+      } as unknown as BackgroundProcessManager;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      // Park every drain so the pending record stays undelivered while we assert on it.
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(true);
+      spyOn(workspaceService, "waitForIdleAndNoQueuedMessages").mockImplementation(
+        () => new Promise(() => undefined)
+      );
+
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: BashMonitorWakeStore;
+        }
+      ).bashMonitorWakeStore;
+      const record = await wakeStore.enqueueOrMergePending({
+        processId: "proc-watcher",
+        taskId: "bash:proc-watcher",
+        workspaceId,
+        filter: "WAKE:",
+        filterExclude: false,
+        lines: ["WAKE: done"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 10,
+      });
+
+      const pendingListing = await workspaceService.listBackgroundProcesses(workspaceId);
+      expect(pendingListing).toHaveLength(1);
+      expect(pendingListing[0].status).toBe("exited");
+      expect(pendingListing[0].monitor?.wakePending).toBe(true);
+
+      // Once the synthetic wake turn is delivered, the indicator must clear.
+      expect(await wakeStore.markDeliveredSnapshot(workspaceId, record)).toBe(true);
+      const deliveredListing = await workspaceService.listBackgroundProcesses(workspaceId);
+      expect(deliveredListing).toHaveLength(1);
+      expect(deliveredListing[0].monitor).toBeDefined();
+      expect(deliveredListing[0].monitor?.wakePending).toBeUndefined();
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("explicit monitor cancellation supersedes a match racing persistence", async () => {
     const { config, cleanup } = await createTestHistoryService();
     try {
