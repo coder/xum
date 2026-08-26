@@ -134,7 +134,7 @@ export const MonitorWakePendingAfterExit: AppStory = {
                 droppedLines: 0,
                 lastLines: ["WAKE: all checks green"],
                 stopped: true,
-                wakePending: true,
+                pendingWakeKind: "match",
               },
               status: "exited",
               exitCode: 0,
@@ -149,6 +149,54 @@ export const MonitorWakePendingAfterExit: AppStory = {
       description: {
         story:
           "A one-shot watcher matched and exited while its monitor wake is still pending delivery. The banner stays visible with a 'waking agent' indicator, no live duration, and no terminate button.",
+      },
+    },
+  },
+};
+
+export const MonitorLostWakePendingAfterRestart: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSimpleChatStory({
+          messages: [
+            createUserMessage("msg-1", "Watch the PR checks and wake me when they finish", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 60000,
+            }),
+          ],
+          backgroundProcesses: [
+            // Synthesized from a durable pending monitor-lost wake after restart: no live
+            // process (pid 0), so no pid line, no output action, and "monitor lost" wording
+            // instead of claiming a match.
+            {
+              id: "bash_watcher",
+              pid: 0,
+              script: "./watch_pr_checks.sh",
+              displayName: "PR Checks Watcher",
+              startTime: Date.now() - 90000,
+              monitor: {
+                filter: "WAKE:",
+                filter_exclude: false,
+                cooldown_ms: 0,
+                totalMatches: 0,
+                droppedLines: 0,
+                lastLines: [],
+                stopped: true,
+                pendingWakeKind: "monitor-lost",
+              },
+              status: "exited",
+            },
+          ],
+        })
+      }
+    />
+  ),
+  parameters: {
+    docs: {
+      description: {
+        story:
+          "An app restart terminated an armed watcher; its durable monitor-lost wake is still pending delivery. The synthesized row shows 'monitor lost' wording with no pid, duration, output, or terminate affordances.",
       },
     },
   },

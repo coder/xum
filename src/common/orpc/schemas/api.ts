@@ -190,11 +190,12 @@ export const BackgroundProcessMonitorInfoSchema = z.object({
   lastLines: z.array(z.string()),
   stopped: z.boolean(),
   /**
-   * True when a monitor match is durably queued but its synthetic wake turn has not been
+   * Set when a monitor wake is durably queued but its synthetic wake turn has not been
    * delivered yet. Without this, a one-shot watcher that matched and exited looks like a
-   * lost wake in the UI (nothing running, no visible pending delivery).
+   * lost wake in the UI (nothing running, no visible pending delivery). Carries the wake
+   * kind so the UI does not claim a "match" for monitor-lost restart notices.
    */
-  wakePending: z.boolean().optional(),
+  pendingWakeKind: z.enum(["match", "monitor-lost"]).optional(),
 });
 
 // Background process info (for UI display)

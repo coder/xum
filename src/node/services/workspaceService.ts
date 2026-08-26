@@ -274,6 +274,7 @@ import type {
   ArchiveLossyUntrackedFilesConfirmation,
   ArchivePreflightResult,
   ArchiveWorkspaceResult,
+  BackgroundProcessInfo,
 } from "@/common/orpc/schemas/api";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
@@ -13627,29 +13628,9 @@ export class WorkspaceService extends EventEmitter {
   /**
    * List background processes for a workspace.
    * Returns process info suitable for UI display (excludes handle).
+   * Typed against the shared IPC schema so the service and schema cannot drift.
    */
-  async listBackgroundProcesses(workspaceId: string): Promise<
-    Array<{
-      id: string;
-      pid: number;
-      script: string;
-      displayName?: string;
-      startTime: number;
-      status: "running" | "exited" | "killed" | "failed";
-      monitor?: {
-        filter: string;
-        filter_exclude: boolean;
-        cooldown_ms: number;
-        max_events?: number;
-        totalMatches: number;
-        droppedLines: number;
-        lastLines: string[];
-        stopped: boolean;
-        wakePending?: boolean;
-      };
-      exitCode?: number;
-    }>
-  > {
+  async listBackgroundProcesses(workspaceId: string): Promise<BackgroundProcessInfo[]> {
     const processes = await this.backgroundProcessManager.list(workspaceId);
     // Surface durably-pending monitor wakes (matched but not yet delivered as a synthetic
     // turn), so a one-shot watcher that matched and exited does not look like a lost wake.
@@ -13665,11 +13646,13 @@ export class WorkspaceService extends EventEmitter {
       });
       pendingWakes = [];
     }
-    const pendingWakeProcessIds = new Set(pendingWakes.map((record) => record.processId));
+    const pendingWakeKindByProcessId = new Map(
+      pendingWakes.map((record) => [record.processId, record.kind] as const)
+    );
     const liveProcessIds = new Set(processes.map((p) => p.id));
-    const rows = processes.map((p) => {
+    const rows: BackgroundProcessInfo[] = processes.map((p) => {
       const monitor = this.backgroundProcessManager.getMonitorSnapshot(p);
-      const wakePending = pendingWakeProcessIds.has(p.id);
+      const pendingWakeKind = pendingWakeKindByProcessId.get(p.id);
       return {
         id: p.id,
         pid: p.pid,
@@ -13678,7 +13661,7 @@ export class WorkspaceService extends EventEmitter {
         startTime: p.startTime,
         status: p.status,
         ...(monitor != null
-          ? { monitor: wakePending ? { ...monitor, wakePending } : monitor }
+          ? { monitor: pendingWakeKind != null ? { ...monitor, pendingWakeKind } : monitor }
           : {}),
         exitCode: p.exitCode,
       };
@@ -13706,7 +13689,7 @@ export class WorkspaceService extends EventEmitter {
           droppedLines: record.droppedLines,
           lastLines: record.lines,
           stopped: true,
-          wakePending: true,
+          pendingWakeKind: record.kind,
         },
         exitCode: undefined,
       });

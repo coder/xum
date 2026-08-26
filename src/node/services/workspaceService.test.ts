@@ -390,7 +390,7 @@ describe("WorkspaceService bash monitor wakes", () => {
     }
   });
 
-  test("listBackgroundProcesses surfaces wakePending until the monitor wake is delivered", async () => {
+  test("listBackgroundProcesses surfaces the pending wake kind until the monitor wake is delivered", async () => {
     const { config, cleanup } = await createTestHistoryService();
     try {
       const workspaceId = "bash-monitor-wake-pending-listing";
@@ -460,14 +460,14 @@ describe("WorkspaceService bash monitor wakes", () => {
       const pendingListing = await workspaceService.listBackgroundProcesses(workspaceId);
       expect(pendingListing).toHaveLength(1);
       expect(pendingListing[0].status).toBe("exited");
-      expect(pendingListing[0].monitor?.wakePending).toBe(true);
+      expect(pendingListing[0].monitor?.pendingWakeKind).toBe("match");
 
       // Once the synthetic wake turn is delivered, the indicator must clear.
       expect(await wakeStore.markDeliveredSnapshot(workspaceId, record)).toBe(true);
       const deliveredListing = await workspaceService.listBackgroundProcesses(workspaceId);
       expect(deliveredListing).toHaveLength(1);
       expect(deliveredListing[0].monitor).toBeDefined();
-      expect(deliveredListing[0].monitor?.wakePending).toBeUndefined();
+      expect(deliveredListing[0].monitor?.pendingWakeKind).toBeUndefined();
     } finally {
       await cleanup();
     }
@@ -528,7 +528,7 @@ describe("WorkspaceService bash monitor wakes", () => {
       expect(listing[0].status).toBe("exited");
       // Synthesized rows have no live process behind them.
       expect(listing[0].pid).toBe(0);
-      expect(listing[0].monitor?.wakePending).toBe(true);
+      expect(listing[0].monitor?.pendingWakeKind).toBe("match");
       expect(listing[0].monitor?.lastLines).toEqual(["WAKE: done"]);
 
       // Once delivered, the synthesized row must disappear entirely.

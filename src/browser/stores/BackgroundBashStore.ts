@@ -23,7 +23,7 @@ function areMonitorSnapshotsEqual(
     a.totalMatches === b.totalMatches &&
     a.droppedLines === b.droppedLines &&
     a.stopped === b.stopped &&
-    a.wakePending === b.wakePending &&
+    a.pendingWakeKind === b.pendingWakeKind &&
     a.lastLines.length === b.lastLines.length &&
     a.lastLines.every((line, index) => line === b.lastLines[index])
   );

@@ -43,7 +43,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
   // wake has not been delivered yet — otherwise a one-shot watcher that matched and exited
   // vanishes from the banner and looks like a lost wake.
   const visibleProcesses = processes.filter(
-    (p) => p.status === "running" || p.monitor?.wakePending === true
+    (p) => p.status === "running" || p.monitor?.pendingWakeKind != null
   );
   const viewingProcess = processes.find((p) => p.id === viewingProcessId) ?? null;
   const count = visibleProcesses.length;
@@ -116,8 +116,13 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                         watching /{proc.monitor.filter}/ · {proc.monitor.totalMatches} match
                         {proc.monitor.totalMatches === 1 ? "" : "es"}
                         {proc.monitor.stopped ? " · stopped" : ""}
-                        {proc.monitor.wakePending && (
-                          <span className="text-secondary"> · match found — waking agent…</span>
+                        {proc.monitor.pendingWakeKind != null && (
+                          <span className="text-secondary">
+                            {/* monitor-lost wakes report a terminated watcher, not a match */}
+                            {proc.monitor.pendingWakeKind === "match"
+                              ? " · match found — waking agent…"
+                              : " · monitor lost — waking agent…"}
+                          </span>
                         )}
                       </div>
                     )}
@@ -134,22 +139,26 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                         {formatDuration(Date.now() - proc.startTime)}
                       </span>
                     )}
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <button
-                          type="button"
-                          disabled={isTerminating}
-                          onClick={(e) => handleViewOutput(proc.id, e)}
-                          className={cn(
-                            "text-muted hover:text-secondary rounded p-1 transition-colors",
-                            isTerminating && "cursor-not-allowed"
-                          )}
-                        >
-                          <FileText size={14} />
-                        </button>
-                      </TooltipTrigger>
-                      <TooltipContent>View output</TooltipContent>
-                    </Tooltip>
+                    {/* Rows synthesized from a durable pending wake (pid 0) have no manager
+                        entry behind them, so fetching output is guaranteed to fail. */}
+                    {proc.pid > 0 && (
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <button
+                            type="button"
+                            disabled={isTerminating}
+                            onClick={(e) => handleViewOutput(proc.id, e)}
+                            className={cn(
+                              "text-muted hover:text-secondary rounded p-1 transition-colors",
+                              isTerminating && "cursor-not-allowed"
+                            )}
+                          >
+                            <FileText size={14} />
+                          </button>
+                        </TooltipTrigger>
+                        <TooltipContent>View output</TooltipContent>
+                      </Tooltip>
+                    )}
                     {/* Nothing to terminate once the process has exited */}
                     {proc.status === "running" && (
                       <Tooltip>

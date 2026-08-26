@@ -5513,9 +5513,19 @@ export const router = (authToken?: string) => {
               signal.addEventListener("abort", onAbort, { once: true });
             }
 
+            // Serialize event-driven reads: consecutive change events (e.g. spawn's emit
+            // followed by the post-persistence wake-state emit) would otherwise start
+            // overlapping getState() calls whose resolution order can invert, letting a
+            // stale pre-persistence snapshot overwrite the newer one.
+            let readTail: Promise<void> = Promise.resolve();
             const onChange = (changedWorkspaceId: string) => {
               if (changedWorkspaceId === workspaceId) {
-                void getState().then(queue.push);
+                readTail = readTail
+                  .then(async () => {
+                    queue.push(await getState());
+                  })
+                  // Keep the chain alive after a failed read; the next event retries.
+                  .catch(() => undefined);
               }
             };
 
