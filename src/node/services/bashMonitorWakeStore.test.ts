@@ -8,6 +8,7 @@ import {
   BashMonitorWakeStore,
   buildBashMonitorWakeMetadata,
   buildBashMonitorWakePrompt,
+  TEMP_RECOVERY_MIN_AGE_MS,
   TERMINAL_WAKE_RETENTION_MS,
   type BashMonitorWakePayload,
   type BashMonitorWakeRecord,
@@ -473,23 +474,160 @@ describe("BashMonitorWakeStore", () => {
     expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
   });
 
-  test("a fresh orphaned temp with no canonical record is placed immediately", async () => {
+  test("a fresh orphan temp is deferred, then re-driven once the live-writer gate elapses", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload({ lines: ["ERROR fresh only copy"] }));
     const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
     const file = path.join(dir, "proc-1.json");
-    // Crash before the commit rename, restart WITHIN the temp freshness gate: waiting
-    // for the gate would leave the only durable copy invisible with no re-drive.
+    // A temp within the freshness gate may equally be a crash orphan or a LIVE writer
+    // between writeFile and its commit rename. Recovery must not place it (a failed
+    // live write would silently become durable), but the deferral must not be terminal
+    // either — startup discovery alone would never retry.
     const temp = `${file}.tmp-crashed`;
     await fsPromises.rename(file, temp);
+    // Nearly past the gate so the deferred re-drive fires quickly in tests.
+    const nearGate = new Date(Date.now() - TEMP_RECOVERY_MIN_AGE_MS + 100);
+    await fsPromises.utimes(temp, nearGate, nearGate);
 
     const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+    const due = new Promise<string>((resolve) => {
+      fresh.onDeferredTempRecoveryDue = resolve;
+    });
+    // Within the gate: nothing is placed or published, but a re-drive is armed.
+    expect(await fresh.listPending("owner-1")).toEqual([]);
+    expect(await fresh.get("owner-1", "proc-1")).toBeNull();
+    expect(await due).toBe("owner-1");
+    // The re-driven scan places and publishes the only durable copy.
     const pending = await fresh.listPending("owner-1");
     expect(pending.map((r) => r.lines)).toEqual([["ERROR fresh only copy"]]);
     expect((await fresh.get("owner-1", "proc-1"))?.lines).toEqual(["ERROR fresh only copy"]);
-    // The temp itself stays (a possible live writer's commit rename of the same inode
-    // is a POSIX no-op); the age-gated sweep consumes it later.
-    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(1);
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
+  });
+
+  test("a transient orphan-temp placement failure propagates instead of hiding the wake", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR only copy"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    const temp = `${file}.tmp-crashed`;
+    await fsPromises.rename(file, temp);
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(temp, past, past); // consumable orphan
+
+    // The temp is the ONLY durable copy; a swallowed EIO would turn recovery into a
+    // successful empty scan that schedules neither a drain nor a read retry.
+    const linkSpy = spyOn(fsPromises, "link").mockImplementation(() =>
+      Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
+    );
+    try {
+      await store.listPending("owner-1");
+      expect.unreachable("expected listPending to propagate the placement failure");
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("EIO");
+    } finally {
+      linkSpy.mockRestore();
+    }
+    // The temp was kept, so the next scan restores it.
+    expect((await store.listPending("owner-1")).map((r) => r.lines)).toEqual([["ERROR only copy"]]);
+  });
+
+  test("quarantine never displaces a valid record regenerated over a malformed canonical", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR temp copy"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    const temp = `${file}.tmp-crashed`;
+    await fsPromises.rename(file, temp);
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(temp, past, past);
+    await fsPromises.writeFile(file, "{not json", "utf-8");
+
+    // Between recovery classifying the canonical file as malformed and the quarantine
+    // rename, another instance replaces it with a valid NEWER wake. A blind rename
+    // would move that live record to a .malformed- path scans intentionally ignore.
+    const regenerated = JSON.stringify(
+      {
+        ...(JSON.parse(await fsPromises.readFile(temp, "utf-8")) as object),
+        lines: ["ERROR regenerated"],
+        updatedAt: new Date().toISOString(),
+      },
+      null,
+      2
+    );
+    const realRename = fsPromises.rename;
+    const renameSpy = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+      if (String(from) === file && String(to).includes(".prune-")) {
+        renameSpy.mockRestore(); // interpose only on the quarantine capture
+        await fsPromises.writeFile(file, regenerated, "utf-8");
+      }
+      return realRename(from, to);
+    });
+    try {
+      const pending = await store.listPending("owner-1");
+      // The regenerated record is authoritative and published.
+      expect(pending.map((r) => r.lines)).toEqual([["ERROR regenerated"]]);
+    } finally {
+      renameSpy.mockRestore();
+    }
+    expect((await store.get("owner-1", "proc-1"))?.lines).toEqual(["ERROR regenerated"]);
+    const entries = await fsPromises.readdir(dir);
+    // Nothing valid was quarantined; the temp stays for re-reconciliation.
+    expect(entries.filter((e) => e.includes(".malformed-"))).toHaveLength(0);
+    expect(entries.filter((e) => e.includes(".prune-"))).toHaveLength(0);
+    expect(entries.filter((e) => e.includes(".tmp-"))).toHaveLength(1);
+  });
+
+  test("the match/notice merge backs off when the canonical record changes mid-merge", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR matched pre-crash"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    const temp = `${file}.tmp-crashed`;
+    await fsPromises.rename(file, temp);
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(temp, past, past);
+    const notice = await store.enqueueMonitorLost(
+      {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        ownerWorkspaceId: "owner-1",
+        filter: "ERROR",
+        filterExclude: false,
+        script: "./watch.sh",
+      },
+      TREAT_ALL_AS_STALE()
+    );
+    if (notice == null) throw new Error("expected a pending monitor-lost notice");
+
+    // Between the merge reading the pending notice and committing the merged record,
+    // another instance supersedes the wake (a deliberate cancel). A blind write would
+    // resurrect it with the crashed matched lines attached.
+    const superseded = JSON.stringify(
+      { ...notice, status: "superseded", updatedAt: new Date().toISOString() },
+      null,
+      2
+    );
+    const realRename = fsPromises.rename;
+    const renameSpy = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+      if (String(from) === file && String(to).includes(".prune-")) {
+        renameSpy.mockRestore(); // interpose only on the CAS capture
+        await fsPromises.writeFile(file, superseded, "utf-8");
+      }
+      return realRename(from, to);
+    });
+    try {
+      await store.listPending("owner-1");
+    } finally {
+      renameSpy.mockRestore();
+    }
+    // The cancel survives — the merge was never committed over it.
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("superseded");
+    expect((await store.get("owner-1", "proc-1"))?.lines).toEqual([]);
+    // The merged draft was discarded; the match temp stays for re-reconciliation.
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toEqual([
+      "proc-1.json.tmp-crashed",
+    ]);
+    expect(await store.listPending("owner-1")).toEqual([]);
   });
 
   test("a crashed match temp merges into a pending restart notice", async () => {

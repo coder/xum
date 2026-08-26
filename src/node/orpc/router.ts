@@ -75,7 +75,7 @@ import { secretsToRecord } from "@/common/types/secrets";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { roundToBase2 } from "@/common/telemetry/utils";
-import { createAsyncEventQueue } from "@/common/utils/asyncEventIterator";
+import { createAsyncEventQueue, createLatestValueQueue } from "@/common/utils/asyncEventIterator";
 import { createCoalescedReader } from "@/common/utils/coalescedReader";
 import { withQueueHeartbeat } from "@/common/utils/withQueueHeartbeat";
 import {
@@ -5504,7 +5504,11 @@ export const router = (authToken?: string) => {
               foregroundToolCallIds: service.getForegroundToolCallIds(workspaceId),
             });
 
-            const queue = createAsyncEventQueue<Awaited<ReturnType<typeof getState>>>();
+            // Latest-value queue, not FIFO: each pushed value is a FULL state snapshot,
+            // so an unconsumed older snapshot is disposable. A FIFO would retain every
+            // snapshot a slow ORPC consumer has not yet serialized — unbounded memory
+            // and stale intermediate UI replays under sustained monitor output.
+            const queue = createLatestValueQueue<Awaited<ReturnType<typeof getState>>>();
 
             const onAbort = () => {
               queue.end();
@@ -5516,7 +5520,7 @@ export const router = (authToken?: string) => {
 
             // Coalesce event-driven reads: a monitor with cooldown_ms 0 can emit one
             // change per matching output line, and reading full state once per event
-            // would queue an unbounded backlog of manager refreshes while only the
+            // would launch an unbounded backlog of manager refreshes while only the
             // latest state matters. The reader also serializes reads (overlapping
             // getState() calls could resolve out of order and publish a stale
             // pre-persistence snapshot over a newer one) and retries failed reads —

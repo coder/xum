@@ -2356,6 +2356,14 @@ export class WorkspaceService extends EventEmitter {
   ) {
     super();
     this.bashMonitorWakeStore = new BashMonitorWakeStore(config);
+    // A crash-orphaned temp write deferred by the store's live-writer freshness gate
+    // has no natural later trigger (startup discovery already ran and saw nothing
+    // pending). When the gate elapses, re-drive delivery: the drain's scan places the
+    // recovered wake and delivers it, and the notify refreshes the banner row.
+    this.bashMonitorWakeStore.onDeferredTempRecoveryDue = (ownerWorkspaceId) => {
+      this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
+      this.scheduleBashMonitorWakeDrain(ownerWorkspaceId);
+    };
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
     if (typeof this.backgroundProcessManager.on === "function") {
       this.backgroundProcessManager.on("output:shown", this.bashOutputShownListener);
