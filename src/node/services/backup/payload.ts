@@ -1136,15 +1136,40 @@ function valueHasRedactionAtPath(
  * (`GRAFANA_SERVICE_ACCOUNT_TOKEN=... mcp-grafana`), and nothing here can say which values
  * are secret, so every assignment value is replaced. Matched anywhere in the string, not
  * just before the program name, so `env NAME=value cmd` and trailing `KEY=value` arguments
- * are covered too. Restore puts the whole local command back at that path.
+ * are covered too. The value grammar consumes a whole shell word, escaped characters and
+ * quoted segments included, so an escape cannot carry part of the value past the
+ * replacement. Restore puts the whole local command back at that path.
  */
-const COMMAND_ENV_ASSIGNMENT = /(^|\s)([A-Za-z_][A-Za-z0-9_]*=)("[^"]*"|'[^']*'|\S+)/g;
+const COMMAND_ENV_ASSIGNMENT =
+  /(^|\s)([A-Za-z_][A-Za-z0-9_]*=)((?:\\[\s\S]|'[^']*'|"(?:\\[\s\S]|[^"\\])*"|[^\s\\'"]+)+)/g;
+
+/**
+ * An assignment value the word grammar could not fully consume: after replacement its
+ * remainder trails the marker, or the whole match failed and the original text follows the
+ * `=`. Either way the value's true extent is unknowable, e.g. an unterminated quote.
+ */
+const UNCONSUMED_ASSIGNMENT = new RegExp(
+  `(^|\\s)[A-Za-z_][A-Za-z0-9_]*=(?!${REDACTED_BACKUP_VALUE}(?=\\s|$))(?=\\S)`
+);
+
+/** `$(`, `\``, and `${` splice one word across whitespace the grammar cannot see past. */
+const SHELL_EXPANSION = /\$\(|\$\{|`/;
 
 function redactCommandEnvAssignments(command: string): string {
-  return command.replace(
+  const redacted = command.replace(
     COMMAND_ENV_ASSIGNMENT,
     (_match, lead: string, name: string) => `${lead}${name}${REDACTED_BACKUP_VALUE}`
   );
+  // When an assignment's boundaries cannot be trusted, no partial rewrite can be either,
+  // so the whole command goes local and restore puts the exact text back. Checked even
+  // when nothing was replaced: an unconsumable value means the replacement never ran.
+  if (
+    UNCONSUMED_ASSIGNMENT.test(redacted) ||
+    (redacted !== command && SHELL_EXPANSION.test(command))
+  ) {
+    return REDACTED_BACKUP_VALUE;
+  }
+  return redacted;
 }
 
 function redactMcpConfig(content: Buffer): {
@@ -2081,6 +2106,9 @@ async function restoreMcpFile(
       ? preserveLocalOnlyMcpServers(backupTree, localTree, localText)
       : ({ kind: "none" } satisfies LocalMcpServerMerge);
   const resolved = resolveRestoredCommands(backup, local, edits, redactedPaths);
+  for (const path of resolveRestoredUrls(backup, local, edits, resolved, redactedPaths)) {
+    resolved.add(path);
+  }
   for (const path of resolveRestoredHeaders(
     backup,
     local,
@@ -2276,6 +2304,56 @@ function resolveRestoredCommands(
     const commandPath = isBareMarker ? barePath : objectPath;
     edits.push({ path: commandPath, value: localCommand });
     handled.add(commandPath.join("\u0000"));
+  }
+  return handled;
+}
+
+/**
+ * Mirrors the command resolution for `url`: a marker is only ever replaced by the local
+ * value at the same path. Without one the marker must not survive as the endpoint the
+ * entry connects to, so the url is dropped when the entry still has a usable command
+ * (`collectMcpCommandApprovals` gates any command that removal makes runnable) and the
+ * whole server is removed otherwise.
+ */
+function resolveRestoredUrls(
+  backup: Record<string, unknown>,
+  local: Record<string, unknown>,
+  edits: Array<{ path: jsonc.JSONPath; value: unknown }>,
+  resolvedServers: ReadonlySet<string>,
+  redactedPaths: ReadonlySet<string> | undefined
+): Set<string> {
+  const handled = new Set<string>();
+  const servers = readRecord(backup.servers);
+  if (!servers) return handled;
+  const localServers = readRecord(local.servers) ?? {};
+
+  for (const [name, entry] of Object.entries(servers)) {
+    // An entry the command resolution removed has no url left to decide about.
+    if (resolvedServers.has(["servers", name].join("\u0000"))) continue;
+    const record = readRecord(entry);
+    const url = record?.url;
+    const urlPath: jsonc.JSONPath = ["servers", name, "url"];
+    if (typeof url !== "string" || !isRedactedBackupValue(url, urlPath, redactedPaths)) continue;
+
+    const localUrl = readUrl(readRecord(readOwn(localServers, name)));
+    if (localUrl !== undefined) {
+      edits.push({ path: urlPath, value: localUrl });
+      handled.add(urlPath.join("\u0000"));
+      continue;
+    }
+    const commandPath: jsonc.JSONPath = ["servers", name, "command"];
+    const command = record?.command;
+    // Either the command resolution already put the local command back at this path, or the
+    // backup carries a plain command of its own. A marker command never reaches the second
+    // arm: without a local command the command resolution removed the server above.
+    const hasCommand =
+      resolvedServers.has(commandPath.join("\u0000")) ||
+      (typeof command === "string" &&
+        command.trim() !== "" &&
+        !isRedactedBackupValue(command, commandPath, redactedPaths));
+    const removed: jsonc.JSONPath = hasCommand ? urlPath : ["servers", name];
+    edits.push({ path: removed, value: undefined });
+    handled.add(removed.join("\u0000"));
   }
   return handled;
 }

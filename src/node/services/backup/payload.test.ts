@@ -314,6 +314,40 @@ describe("backup payload", () => {
     expect((await readBackupPayload(destination)).redactions).toEqual(payload.redactions);
   });
 
+  it("consumes a whole shell word per assignment and localizes unparseable commands", async () => {
+    const cases: Array<[string, string]> = [
+      // An escaped space extends the word, so the credential's second half is inside it.
+      ["TOKEN=abc\\ hunter2 notes-mcp", `TOKEN=${REDACTED_BACKUP_VALUE} notes-mcp`],
+      // Quoted segments concatenate into the same word.
+      [`TOKEN="a hunter2"'b hunter2'c notes-mcp`, `TOKEN=${REDACTED_BACKUP_VALUE} notes-mcp`],
+      // An unterminated quote leaves the value's extent unknowable.
+      ["TOKEN='abc hunter2 notes-mcp", REDACTED_BACKUP_VALUE],
+      // So does a trailing backslash.
+      ["TOKEN=hunter2\\", REDACTED_BACKUP_VALUE],
+      // Expansions splice one word across whitespace.
+      ["TOKEN=$(cat hunter2) notes-mcp", REDACTED_BACKUP_VALUE],
+      ["TOKEN=${X:-abc hunter2} notes-mcp", REDACTED_BACKUP_VALUE],
+    ];
+    for (const [command, expected] of cases) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { notes: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const text = payloadFileText(payload, "mcp.jsonc");
+      expect(text).not.toContain("hunter2");
+      const mcp = jsonc.parse(text) as { servers: { notes: { command: string } } };
+      expect(mcp.servers.notes.command).toBe(expected);
+      expect(payload.manifest.mcpRedactions).toEqual([["servers", "notes", "command"]]);
+    }
+  });
+
   it("restores an inline-redacted command from the local config and drops it elsewhere", async () => {
     const command = "FOO_TOKEN=hunter2 notes-mcp --verbose";
     await writeFixtureFile(
@@ -352,6 +386,61 @@ describe("backup payload", () => {
       ).toString("utf-8")
     ) as { servers: Record<string, unknown> };
     expect(elsewhere.servers.notes).toBeUndefined();
+  });
+
+  it("restores a redacted URL from the local config and drops it elsewhere", async () => {
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          remote: { url: "https://user:hunter2@example.com/mcp" },
+          mixed: { command: "npx notes-mcp", url: "https://mcp.example.com/mcp?api_key=hunter2" },
+        },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+
+    const restored = jsonc.parse(
+      (
+        await resolveRestoredContent(
+          muxRoot,
+          payloadFile(payload, "mcp.jsonc"),
+          payload.manifest.mcpRedactions
+        )
+      ).toString("utf-8")
+    ) as { servers: Record<string, { command?: string; url?: string }> };
+    expect(restored.servers.remote.url).toBe("https://user:hunter2@example.com/mcp");
+    expect(restored.servers.mixed.url).toBe("https://mcp.example.com/mcp?api_key=hunter2");
+
+    // A machine without the local url must not keep the marker as a connectable endpoint:
+    // a url-only entry disappears, a mixed one falls back to its stdio command.
+    const otherRoot = path.join(tempDir, "other-url-root");
+    await fs.mkdir(otherRoot);
+    const elsewhere = jsonc.parse(
+      (
+        await resolveRestoredContent(
+          otherRoot,
+          payloadFile(payload, "mcp.jsonc"),
+          payload.manifest.mcpRedactions
+        )
+      ).toString("utf-8")
+    ) as { servers: Record<string, unknown> };
+    expect(elsewhere.servers.remote).toBeUndefined();
+    expect(elsewhere.servers.mixed).toEqual({ command: "npx notes-mcp" });
+
+    // The stdio fallback the url removal exposes still needs the user to read the command.
+    const approvals = await collectMcpCommandApprovals(
+      otherRoot,
+      payload.files,
+      payload.manifest.mcpRedactions
+    );
+    expect(approvals.map((approval) => approval.command)).toEqual(["npx notes-mcp"]);
   });
 
   it("blocks the export outright when a credential pattern survives redaction", async () => {
