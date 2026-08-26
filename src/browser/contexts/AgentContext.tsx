@@ -43,6 +43,7 @@ import {
   clearPendingWorkspaceAgentId,
   markPendingWorkspaceAgentId,
   revertRejectedAgentSwitch,
+  serializeWorkspaceAiSettingsWrite,
 } from "@/browser/utils/workspaceAiSettingsSync";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
@@ -261,8 +262,8 @@ function AgentProviderWithState(props: {
       };
 
       markPendingWorkspaceAgentId(workspaceId, nextAgentId);
-      api.workspace
-        .updateAgentAISettings({
+      serializeWorkspaceAiSettingsWrite(workspaceId, () =>
+        api.workspace.updateAgentAISettings({
           workspaceId,
           agentId: nextAgentId,
           aiSettings: {
@@ -272,6 +273,7 @@ function AgentProviderWithState(props: {
           },
           persistSelectedAgentId: true,
         })
+      )
         .then((result) => {
           if (!result.success) {
             notifySwitchRejected(typeof result.error === "string" ? result.error : "");

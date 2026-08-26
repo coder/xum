@@ -11,6 +11,7 @@ import {
   clearPendingWorkspaceAgentId,
   markPendingWorkspaceAgentId,
   revertRejectedAgentSwitch,
+  serializeWorkspaceAiSettingsWrite,
   shouldApplyWorkspaceAgentIdFromBackend,
 } from "./workspaceAiSettingsSync";
 
@@ -55,6 +56,41 @@ describe("workspace agent persistence guard", () => {
 
     clearPendingWorkspaceAgentId(WORKSPACE_ID, "plan");
     expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true);
+  });
+
+  test("commits overlapping selections in initiation order", async () => {
+    let resolvePlan!: () => void;
+    let resolveReview!: () => void;
+    const planCommit = new Promise<void>((resolve) => {
+      resolvePlan = resolve;
+    });
+    const reviewCommit = new Promise<void>((resolve) => {
+      resolveReview = resolve;
+    });
+    const started: string[] = [];
+    let persistedAgentId = "exec";
+
+    const planWrite = serializeWorkspaceAiSettingsWrite(WORKSPACE_ID, async () => {
+      started.push("plan");
+      await planCommit;
+      persistedAgentId = "plan";
+    });
+    const reviewWrite = serializeWorkspaceAiSettingsWrite(WORKSPACE_ID, async () => {
+      started.push("review");
+      await reviewCommit;
+      persistedAgentId = "review";
+    });
+
+    resolveReview();
+    await Promise.resolve();
+    expect(started).toEqual(["plan"]);
+    expect(persistedAgentId).toBe("exec");
+
+    resolvePlan();
+    await Promise.all([planWrite, reviewWrite]);
+
+    expect(started).toEqual(["plan", "review"]);
+    expect(persistedAgentId).toBe("review");
   });
 });
 

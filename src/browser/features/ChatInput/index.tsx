@@ -56,6 +56,7 @@ import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import {
   clearPendingWorkspaceAiSettings,
   markPendingWorkspaceAiSettings,
+  serializeWorkspaceAiSettingsWrite,
 } from "@/browser/utils/workspaceAiSettingsSync";
 import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
 import {
@@ -962,12 +963,13 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         reasoningMode,
       });
 
-      api.workspace
-        .updateAgentAISettings({
+      serializeWorkspaceAiSettingsWrite(workspaceId, () =>
+        api.workspace.updateAgentAISettings({
           workspaceId,
           agentId: normalizedAgentId,
           aiSettings: { model: selectedModel, thinkingLevel, reasoningMode },
         })
+      )
         .then((result) => {
           if (!result.success) {
             clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);

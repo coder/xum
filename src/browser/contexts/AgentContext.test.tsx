@@ -660,6 +660,14 @@ describe("AgentContext", () => {
         expect(toasts).toHaveLength(1);
       });
       expect(contextValue?.agentId).toBe("review");
+
+      await waitFor(() => {
+        expect(resolveUpdateAgentAISettings).not.toBeNull();
+      });
+      getDeferredUpdateResolver()?.({ success: true, data: undefined });
+      await waitFor(() => {
+        expect(shouldApplyWorkspaceAgentIdFromBackend(workspaceId, "plan")).toBe(true);
+      });
     } finally {
       window.removeEventListener(CUSTOM_EVENTS.AGENT_SWITCH_ERROR_TOAST, toastListener);
     }
@@ -695,15 +703,17 @@ describe("AgentContext", () => {
 
     contextValue?.setAgentId("review");
     await waitFor(() => {
+      expect(contextValue?.agentId).toBe("review");
+    });
+
+    // plan's rejection is skipped (a newer switch is active). Once that
+    // serialized write settles, review's rejection must restore the backend's
+    // agent (exec), not its captured previous agent (the also-rejected plan).
+    rejectPlanSwitch?.({ success: false, error: "unpriced model" });
+    await waitFor(() => {
       expect(resolveUpdateAgentAISettings).not.toBeNull();
     });
-    const rejectReviewSwitch = getDeferredUpdateResolver();
-
-    // plan's rejection is skipped (a newer switch is active); review's
-    // rejection must restore the backend's agent (exec), not its captured
-    // previous agent (the also-rejected plan).
-    rejectPlanSwitch?.({ success: false, error: "unpriced model" });
-    rejectReviewSwitch?.({ success: false, error: "unpriced model" });
+    getDeferredUpdateResolver()?.({ success: false, error: "unpriced model" });
 
     await waitFor(() => {
       expect(contextValue?.agentId).toBe("exec");
@@ -745,17 +755,16 @@ describe("AgentContext", () => {
     const acceptPlanSwitch = getDeferredUpdateResolver();
     resolveUpdateAgentAISettings = null;
 
-    // plan→review goes in flight BEFORE the acceptance echo arrives, so its
+    // plan→review is selected BEFORE the acceptance echo arrives, so its
     // render-time closure still sees the pre-echo backend state (exec).
     contextValue?.setAgentId("review");
+    acceptPlanSwitch?.({ success: true, data: undefined });
     await waitFor(() => {
       expect(resolveUpdateAgentAISettings).not.toBeNull();
     });
     const rejectReviewSwitch = getDeferredUpdateResolver();
     rejectReviewOnPlanCommit = () =>
       rejectReviewSwitch?.({ success: false, error: "unpriced model" });
-
-    acceptPlanSwitch?.({ success: true, data: undefined });
 
     // Reject review from a layout effect triggered by the accepted plan echo.
     // This is after plan metadata commits to WorkspaceContext/WorkspaceStore but
@@ -805,12 +814,14 @@ describe("AgentContext", () => {
 
     contextValue?.setAgentId("review");
     await waitFor(() => {
-      expect(resolveUpdateAgentAISettings).not.toBeNull();
+      expect(contextValue?.agentId).toBe("review");
     });
-    const rejectReviewSwitch = getDeferredUpdateResolver();
 
     rejectPlanSwitch?.({ success: false, error: "unpriced model" });
-    rejectReviewSwitch?.({ success: false, error: "unpriced model" });
+    await waitFor(() => {
+      expect(resolveUpdateAgentAISettings).not.toBeNull();
+    });
+    getDeferredUpdateResolver()?.({ success: false, error: "unpriced model" });
 
     await waitFor(() => {
       expect(contextValue?.agentId).toBe("exec");

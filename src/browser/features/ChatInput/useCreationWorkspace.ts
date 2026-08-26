@@ -16,6 +16,7 @@ import {
 } from "@/common/types/thinking";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
+import { serializeWorkspaceAiSettingsWrite } from "@/browser/utils/workspaceAiSettingsSync";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import {
@@ -622,8 +623,8 @@ export function useCreationWorkspace({
         // is portable across devices even before the first stream starts. Initial /goal commands do
         // not send a normal user message, so they await this write before setting the goal; that lets
         // the backend kickoff continuation use the same model/agent selected in creation.
-        const initialAiSettingsPersisted = api.workspace
-          .updateAgentAISettings({
+        const initialAiSettingsPersisted = serializeWorkspaceAiSettingsWrite(metadata.id, () =>
+          api.workspace.updateAgentAISettings({
             workspaceId: metadata.id,
             agentId: settings.agentId,
             aiSettings: {
@@ -633,7 +634,7 @@ export function useCreationWorkspace({
             },
             persistSelectedAgentId: true,
           })
-          .catch(() => null);
+        ).catch(() => null);
 
         const isDraftScope = typeof draftId === "string" && draftId.trim().length > 0;
         const pendingScopeId = projectPath

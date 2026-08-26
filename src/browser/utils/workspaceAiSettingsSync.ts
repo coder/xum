@@ -46,6 +46,24 @@ export function resolveEffectiveComposerModel(
   return normalizeModelPreference(preferredModel, metadataModel ?? defaultModel);
 }
 
+const workspaceAiSettingsWriteChains = new Map<string, Promise<unknown>>();
+
+/** Keep direct renderer writes in initiation order so the latest local choice commits last. */
+export function serializeWorkspaceAiSettingsWrite<T>(
+  workspaceId: string,
+  write: () => Promise<T>
+): Promise<T> {
+  const previous = workspaceAiSettingsWriteChains.get(workspaceId) ?? Promise.resolve();
+  const result = previous.then(write, write);
+  workspaceAiSettingsWriteChains.set(workspaceId, result);
+
+  return result.finally(() => {
+    if (workspaceAiSettingsWriteChains.get(workspaceId) === result) {
+      workspaceAiSettingsWriteChains.delete(workspaceId);
+    }
+  });
+}
+
 const pendingAiSettingsByWorkspace = new Map<string, WorkspaceAiSettingsSnapshot>();
 
 function getPendingKey(workspaceId: string, agentId: string): string {
