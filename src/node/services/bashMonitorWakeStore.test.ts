@@ -928,8 +928,14 @@ describe("BashMonitorWakeStore", () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     // Clear A stages, then stalls before its outcome.
     const clearA = await store.supersedeAllPending("owner-1");
+    // Strictly order A < wake < B: cutoffs have millisecond granularity, and a fast
+    // machine can otherwise run all three inside one millisecond — B's staging over
+    // A's still-staged equal cutoff then correctly aborts as a concurrent clear,
+    // which is not the interleaving under test.
+    await new Promise((resolve) => setTimeout(resolve, 5));
     // A wake arrives after A's cutoff and crashes into a deferred temp...
     await store.enqueueOrMergePending(payload({ lines: ["ERROR between clears"] }));
+    await new Promise((resolve) => setTimeout(resolve, 5));
     const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
     const temp = path.join(dir, "proc-1.json.tmp-crashed");
     await fsPromises.rename(path.join(dir, "proc-1.json"), temp);
@@ -1540,6 +1546,63 @@ describe("BashMonitorWakeStore", () => {
     }
   });
 
+  test("a record merged after the clear's snapshot survives the supersede", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR before cutoff"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    // Another instance merges NEW matched output into the record between the clear's
+    // snapshot and its per-record stamp (injected inside the stamp's own re-read).
+    const getSpy = spyOn(store, "get").mockImplementation(async (owner: string, id: string) => {
+      getSpy.mockRestore();
+      const raw = JSON.parse(await fsPromises.readFile(file, "utf-8")) as Record<
+        string,
+        unknown
+      > & { lines: string[]; updatedAt: string };
+      await fsPromises.writeFile(
+        file,
+        JSON.stringify({
+          ...raw,
+          lines: [...raw.lines, "ERROR after cutoff"],
+          totalMatches: 2,
+          matchedThroughOffset: 20,
+          updatedAt: new Date(Date.parse(raw.updatedAt) + 5_000).toISOString(),
+        }),
+        "utf-8"
+      );
+      return store.get(owner, id);
+    });
+
+    const clear = await store.supersedeAllPending("owner-1");
+    // The clear retires nothing: its only candidate changed past the cutoff, and the
+    // transaction explicitly intends mid-clear output to survive — superseding the
+    // merged record would permanently discard output the clear never saw.
+    expect(clear.snapshots).toEqual([]);
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("pending");
+    expect((await store.listPending("owner-1")).map((r) => r.lines)).toEqual([
+      ["ERROR before cutoff", "ERROR after cutoff"],
+    ]);
+    // Committing the clear still leaves the merged record deliverable.
+    await store.commitClear("owner-1", clear);
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("pending");
+  });
+
+  test("a directory squatting on a tombstone capture is quarantined instead of failing heals", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR heals anyway"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    // Corruption left a DIRECTORY under a .cas- capture name with no canonical
+    // tombstone: every heal — and with it every readClearedAt and listPending —
+    // would fail with EISDIR, permanently blocking the workspace's wakes.
+    await fsPromises.mkdir(path.join(dir, "cleared-at.cas-bad"));
+
+    const pending = await store.listPending("owner-1");
+    expect(pending.map((r) => r.lines)).toEqual([["ERROR heals anyway"]]);
+    const entries = await fsPromises.readdir(dir);
+    expect(entries).not.toContain("cleared-at.cas-bad");
+    expect(entries.some((e) => e.startsWith("cleared-at.malformed-"))).toBe(true);
+  });
+
   test("a directory squatting on the tombstone path is quarantined instead of failing scans", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload({ lines: ["ERROR still delivered"] }));
@@ -1918,6 +1981,23 @@ describe("BashMonitorWakeStore", () => {
     const file = path.join(dir, "proc-1.json");
     const leftoverPath = `${file}.prune-crashed`;
     await fsPromises.rename(file, leftoverPath);
+    // Backdate the captured generation: divergent generations in production come from
+    // different instants, but on a fast machine both test enqueues can share one
+    // millisecond — a createdAt collision that makes reverse subsumption mistake the
+    // divergent winner for the captured generation's own lineage.
+    const captured = JSON.parse(await fsPromises.readFile(leftoverPath, "utf-8")) as Record<
+      string,
+      unknown
+    > & { createdAt: string; updatedAt: string };
+    await fsPromises.writeFile(
+      leftoverPath,
+      JSON.stringify({
+        ...captured,
+        createdAt: new Date(Date.parse(captured.createdAt) - 60_000).toISOString(),
+        updatedAt: new Date(Date.parse(captured.updatedAt) - 60_000).toISOString(),
+      }),
+      "utf-8"
+    );
 
     // The canonical record is created AFTER this scan's readdir snapshot (so the scan
     // never visits its entry) but before recovery's restore link. The canonical winner

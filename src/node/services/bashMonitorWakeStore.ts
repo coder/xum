@@ -831,6 +831,25 @@ export class BashMonitorWakeStore {
     for (const entry of entries) {
       if (!entry.startsWith(`${base}.cas-`)) continue;
       const leftoverPath = path.join(dir, entry);
+      // Non-regular guard (matching readClearedAt's canonical-path behavior): a
+      // directory here would fail every heal with EISDIR — and, with the canonical
+      // absent, every readClearedAt and listPending with it — while a FIFO would
+      // block forever. Quarantine the imposter under a name outside the .cas-
+      // namespace so scans stop tripping over it.
+      let leftoverStat: Stats;
+      try {
+        leftoverStat = await fsPromises.stat(leftoverPath);
+      } catch (error) {
+        if (isErrnoWithCode(error, "ENOENT")) continue; // concurrently consumed
+        throw error;
+      }
+      if (!leftoverStat.isFile()) {
+        log.debug("Quarantining non-regular bash monitor wake tombstone capture", {
+          ownerWorkspaceId,
+        });
+        await fsPromises.rename(leftoverPath, `${target}.malformed-${randomUUID()}`);
+        continue;
+      }
       let raw: string;
       try {
         raw = await fsPromises.readFile(leftoverPath, "utf-8");
@@ -2362,8 +2381,12 @@ export class BashMonitorWakeStore {
     const staged: BashMonitorWakeRecord[] = [];
     try {
       for (const record of pending) {
-        await this.supersedeForClear(ownerWorkspaceId, record.id, clearId);
-        staged.push(record);
+        // Snapshots list only what was ACTUALLY retired: a record that changed past
+        // the cutoff stays pending, and restoring it on rollback would be wrong (its
+        // restore would clobber the newer merged generation back to the snapshot).
+        if (await this.supersedeForClear(ownerWorkspaceId, record, clearId)) {
+          staged.push(record);
+        }
       }
       // Durable STAGED tombstone for wakes this clear could NOT see: a crash-orphaned
       // temp inside the freshness gate is invisible to the listPending above, and
@@ -2421,7 +2444,10 @@ export class BashMonitorWakeStore {
         );
       }
       this.armStagedClearRefresh(ownerWorkspaceId, clearId);
-      return { snapshots: pending, clearedAt, clearId };
+      // Snapshots are the records ACTUALLY retired (see the loop above) — a record
+      // that changed past the cutoff stayed pending and must not be reported as
+      // retired, restored on rollback, or counted by acceptance bookkeeping.
+      return { snapshots: staged, clearedAt, clearId };
     } catch (error) {
       // Records only — NOT the tombstone rollback in restorePendingSnapshots: the
       // tombstone write above is the try block's last step, so on this path it was
@@ -2434,20 +2460,31 @@ export class BashMonitorWakeStore {
     }
   }
 
-  /** Supersede one pending record on behalf of a clear, stamping rollback metadata. */
+  /**
+   * Supersede one pending record on behalf of a clear, stamping rollback metadata.
+   * Returns whether the record was actually retired.
+   */
   private async supersedeForClear(
     ownerWorkspaceId: string,
-    id: string,
+    snapshot: BashMonitorWakeRecord,
     clearId: string
-  ): Promise<void> {
-    await this.locks.withLock(`${ownerWorkspaceId}:${id}`, async () => {
-      const record = await this.get(ownerWorkspaceId, id);
-      if (record?.status !== "pending") return;
+  ): Promise<boolean> {
+    return this.locks.withLock(`${ownerWorkspaceId}:${snapshot.id}`, async () => {
+      const record = await this.get(ownerWorkspaceId, snapshot.id);
+      if (record?.status !== "pending") return false;
+      // Only the SNAPSHOTTED generation is retired: another store instance can merge
+      // NEW matched output into this record between the clear's snapshot and this
+      // lock, and the clear's cutoff explicitly intends mid-clear output to survive.
+      // A changed generation stays pending — its pre-cutoff lines may then redeliver
+      // (the documented lesser failure) instead of the post-cutoff output being
+      // permanently discarded by a clear that never saw it.
+      if (record.updatedAt !== snapshot.updatedAt) return false;
       await this.write({
         ...this.withTerminalStatus(record, "superseded"),
         supersededByClearId: clearId,
         pendingUpdatedAtBeforeClear: record.updatedAt,
       });
+      return true;
     });
   }
 
