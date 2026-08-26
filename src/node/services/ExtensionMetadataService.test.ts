@@ -759,6 +759,34 @@ describe("ExtensionMetadataService", () => {
     expect(sidecarGone).toBe(true);
   });
 
+  test("recovery restores an unsupported-version sidecar instead of resetting it", async () => {
+    // A newer build's file can end up in the sidecar (crash-interrupted
+    // quarantine on a downgraded install, or a newer backend saving between
+    // the corruption check and the rename). It is preserved data, not
+    // corruption: recovery must put it back at the main path — installing
+    // the empty version-1 reset would hand the newer build an empty
+    // canonical file and lose all its activity state.
+    const newerFile = JSON.stringify({ version: 2, workspaces: {}, futureField: true });
+    await writeFile(`${filePath}.corrupt`, newerFile);
+    // Main file intentionally absent (crash window).
+
+    let strictError: unknown = null;
+    try {
+      await service.getAllSnapshots({ throwOnError: true });
+    } catch (error) {
+      strictError = error;
+    }
+    // The restored file still fails the CURRENT build's read — but with the
+    // non-destructive unsupported-version signal, not an empty reset.
+    expect(strictError).not.toBeNull();
+    expect(await readFile(filePath, "utf-8")).toBe(newerFile);
+    const sidecarGone = await readFile(`${filePath}.corrupt`, "utf-8").then(
+      () => false,
+      () => true
+    );
+    expect(sidecarGone).toBe(true);
+  });
+
   test("a strict read restores healthy bytes stranded in the sidecar by a crashed quarantine", async () => {
     // The crash can also strand a HEALTHY file in the sidecar: a concurrent
     // writer repaired the main file right before quarantine's rename moved

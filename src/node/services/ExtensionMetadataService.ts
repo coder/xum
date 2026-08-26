@@ -782,7 +782,18 @@ export class ExtensionMetadataService {
       }
       movedParses = false;
     }
-    if (movedParses && ExtensionMetadataService.isValidMetadataFileShape(moved)) {
+    if (
+      movedParses &&
+      (ExtensionMetadataService.isValidMetadataFileShape(moved) ||
+        // A newer build's schema stranded in the sidecar (crash-interrupted
+        // quarantine on a downgraded install, or a newer backend saving the
+        // main file between the in-queue corruption check and the rename) is
+        // preserved data, not corruption: restore it instead of falling
+        // through to the empty-reset below, which would hand the newer build
+        // an empty canonical file. The subsequent re-read then fails with
+        // the non-destructive unsupported-version signal.
+        ExtensionMetadataService.isUnsupportedVersion(moved))
+    ) {
       // Restore without ever overwriting a newer file yet another writer
       // may have re-created at the main path: link and COPYFILE_EXCL
       // both fail with EEXIST in that case (the healthy leftover sidecar

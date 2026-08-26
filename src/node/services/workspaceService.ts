@@ -13016,14 +13016,14 @@ export class WorkspaceService extends EventEmitter {
       // and the raw persisted config id superset once. Best-effort: an
       // unreadable re-read skips its revalidation instead of failing an
       // otherwise complete response.
-      let freshPersistedIds: ReadonlySet<string> | null = null;
+      let freshSnapshots: ReadonlyMap<string, WorkspaceActivitySnapshot> | null = null;
       try {
-        freshPersistedIds = new Set(
-          (await this.extensionMetadata.getAllSnapshots({ throwOnError: true })).keys()
-        );
+        freshSnapshots = await this.extensionMetadata.getAllSnapshots({ throwOnError: true });
       } catch {
-        freshPersistedIds = null;
+        freshSnapshots = null;
       }
+      const freshPersistedIds: ReadonlySet<string> | null =
+        freshSnapshots != null ? new Set(freshSnapshots.keys()) : null;
       let freshConfigIds: ReadonlySet<string> | null = null;
       try {
         freshConfigIds = this.config.readPersistedWorkspaceIdSuperset();
@@ -13098,7 +13098,7 @@ export class WorkspaceService extends EventEmitter {
         }
         this.extensionMetadata.clearTombstonesForRegisteredIds(registeredIds);
       }
-      return Object.fromEntries(
+      const activityById = Object.fromEntries(
         entries.filter(
           (entry): entry is readonly [string, WorkspaceActivitySnapshot] =>
             entry != null &&
@@ -13124,6 +13124,44 @@ export class WorkspaceService extends EventEmitter {
             !isRemovedPerAuthoritativeIdentity(entry[0])
         )
       );
+      // Addition-side counterpart of the fresh re-read: another backend can
+      // register a workspace AND persist its first activity after this
+      // process's initial snapshot read. The refreshed config admits the id
+      // into scope, but its per-id computation saw a null snapshot (and no
+      // local workflow/monitor caches, which are process-local), so the
+      // entry was omitted — and the activity subscription cannot heal that
+      // (it is backed by this process's EventEmitter, so cross-process
+      // writes produce no delta). Merge in-scope additions from the fresh
+      // re-read, subject to the same removal guards as retained entries.
+      if (freshSnapshots != null) {
+        for (const workspaceId of workspaceIds) {
+          if (workspaceId in activityById) {
+            continue;
+          }
+          const lateSnapshot = freshSnapshots.get(workspaceId) ?? null;
+          if (
+            lateSnapshot == null ||
+            this.extensionMetadata.isWorkspaceDeleted(workspaceId) ||
+            isRemovedFromConfig(workspaceId) ||
+            isRemovedPerAuthoritativeIdentity(workspaceId)
+          ) {
+            continue;
+          }
+          // Same sync overlay path emitWorkspaceActivity uses; the per-id
+          // disk workflow probe already ran for this in-scope id above.
+          const merged = this.mergeCurrentActiveBashMonitorCount(
+            workspaceId,
+            this.mergeCachedActiveWorkflowRuns(
+              workspaceId,
+              this.overlayPendingGoal(workspaceId, lateSnapshot)
+            )
+          );
+          if (merged != null) {
+            activityById[workspaceId] = merged;
+          }
+        }
+      }
+      return activityById;
     } catch (error) {
       log.error("Failed to list activity:", error);
       // null (not {}) so the renderer can tell a read failure from a legitimately
