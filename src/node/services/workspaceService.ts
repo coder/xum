@@ -3824,7 +3824,15 @@ export class WorkspaceService extends EventEmitter {
 
   private async getActiveWorkflowRunIds(workspaceId: string): Promise<Set<string>> {
     const activeRunIds = await this.resolveActiveWorkflowRunIds(workspaceId);
-    if (activeRunIds.size > 0) {
+    if (
+      activeRunIds.size > 0 &&
+      // Installation re-check in THIS continuation: an eviction (removal, or
+      // a tombstone lifted for revival) can land in the microtask gap after
+      // resolve's own final check. A detached set must not repopulate the
+      // seen marker — the evicted id's caches are empty, so a stale marker
+      // would fabricate zero-count entries for the idle revived workspace.
+      this.activeWorkflowRunIdsByWorkspace.get(workspaceId) === activeRunIds
+    ) {
       // A list- or event-delivered nonzero count is what makes a later zero
       // meaningful as a tombstone (see workflowRunSeenWorkspaces).
       this.workflowRunSeenWorkspaces.add(workspaceId);
@@ -3882,14 +3890,32 @@ export class WorkspaceService extends EventEmitter {
     runId: string;
     status: WorkflowRunStatus;
   }): Promise<number> {
-    const activeRunIds = await this.getActiveWorkflowRunIds(event.workspaceId);
-    if (isActiveWorkflowRunStatus(event.status)) {
-      activeRunIds.add(event.runId);
-      this.workflowRunSeenWorkspaces.add(event.workspaceId);
-    } else {
-      activeRunIds.delete(event.runId);
+    // Bounded retry (same reason as resolveActiveWorkflowRunIds): an
+    // eviction can land in the microtask gap after the cache read resolves,
+    // so the mutation below would hit a detached incarnation — and must not
+    // mark the seen set for an id whose caches were just evicted, or the
+    // idle revived workspace emits fabricated zero-count entries forever.
+    let detachedSize = 0;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const activeRunIds = await this.getActiveWorkflowRunIds(event.workspaceId);
+      if (isActiveWorkflowRunStatus(event.status)) {
+        activeRunIds.add(event.runId);
+      } else {
+        activeRunIds.delete(event.runId);
+      }
+      detachedSize = activeRunIds.size;
+      if (this.activeWorkflowRunIdsByWorkspace.get(event.workspaceId) !== activeRunIds) {
+        continue;
+      }
+      if (isActiveWorkflowRunStatus(event.status)) {
+        this.workflowRunSeenWorkspaces.add(event.workspaceId);
+      }
+      return activeRunIds.size;
     }
-    return activeRunIds.size;
+    // Eviction churn exhausted the retries (pathological): report the last
+    // detached mutation's size without seen-marking, mirroring the detached
+    // disk-probe fallback in resolveActiveWorkflowRunIds.
+    return detachedSize;
   }
 
   private mergeCachedActiveWorkflowRuns(
@@ -13068,6 +13094,22 @@ export class WorkspaceService extends EventEmitter {
         }
       }
 
+      // Re-establish the raw baseline when the pre-await read failed: with a
+      // null baseline BOTH cross-process removal guards stay disabled while
+      // the response is still authoritative — a workspace another backend
+      // removes during the probes below would ride back into the renderer
+      // with no event to correct it. This retry still precedes every per-id
+      // probe await, so it remains a valid "registered at list start"
+      // baseline; ids it cannot see flow through the authoritative-identity
+      // path instead. If it fails again the config is genuinely unreadable
+      // and the fail-open scoping above already chose availability.
+      if (initialConfigIds == null) {
+        try {
+          initialConfigIds = this.config.readPersistedWorkspaceIdSuperset();
+        } catch {
+          initialConfigIds = null;
+        }
+      }
       const entries = await Promise.all(
         Array.from(
           workspaceIds,

@@ -2640,23 +2640,35 @@ export class Config {
             continue; // Skip metadata file lookup
           }
 
-          // LEGACY FORMAT: Fall back to reading metadata.json
-          // Try legacy ID format first (project-workspace) - used by E2E tests and old workspaces
+          // LEGACY FORMAT: Fall back to reading metadata.json.
+          // findWorkspace resolves an id-less entry's stable id from EITHER
+          // sessions/<workspace-basename>/metadata.json (old layout, checked
+          // first there) or sessions/<generated-legacy-id>/metadata.json.
+          // Enumerate the same candidates in the same order: destructive
+          // callers (the extension-metadata prune) classify ids as stale
+          // against THIS enumeration, so a basename-backed stable id that
+          // findWorkspace can resolve but this walk cannot would be deleted
+          // as unknown.
           const legacyId = this.generateLegacyId(projectPath, workspace.path);
-          const metadataPath = path.join(this.getSessionDir(legacyId), "metadata.json");
           let metadataFound = false;
 
+          let metadataPath = "";
           let legacyMetadataRaw: string | undefined;
-          try {
-            legacyMetadataRaw = fs.readFileSync(metadataPath, "utf-8");
-          } catch (readError) {
-            // Missing is normal (most entries never had a legacy
-            // metadata.json). Any other failure means the workspace's
-            // authoritative stable id is unknowable right now — surface it
-            // to the catch below instead of silently substituting the
-            // generated legacy path id via the !metadataFound branch.
-            if (!isEnoentError(readError)) {
-              throw readError;
+          for (const candidateId of [workspaceBasename, legacyId]) {
+            const candidatePath = path.join(this.getSessionDir(candidateId), "metadata.json");
+            try {
+              legacyMetadataRaw = fs.readFileSync(candidatePath, "utf-8");
+              metadataPath = candidatePath;
+              break;
+            } catch (readError) {
+              // Missing is normal (most entries never had a legacy
+              // metadata.json). Any other failure means the workspace's
+              // authoritative stable id is unknowable right now — surface it
+              // to the catch below instead of silently substituting the
+              // generated legacy path id via the !metadataFound branch.
+              if (!isEnoentError(readError)) {
+                throw readError;
+              }
             }
           }
           if (legacyMetadataRaw !== undefined) {

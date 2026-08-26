@@ -3173,6 +3173,42 @@ describe("Config", () => {
       expect(workspace.name).toBe(workspaceName);
       expect(workspace.createdAt).toBe("2025-01-01T00:00:00.000Z");
     });
+
+    it("enumerates basename-backed legacy stable ids like findWorkspace", async () => {
+      // Oldest layout: an id-less config entry whose stable id lives in
+      // sessions/<workspace-basename>/metadata.json. findWorkspace resolves
+      // it (basename candidate first), so the enumeration must report the
+      // same identity — destructive callers (the extension-metadata prune)
+      // classify ids as stale against the enumeration, and a mismatch would
+      // delete the live workspace's activity data.
+      const projectPath = "/fake/project";
+      const workspaceName = "old-feature";
+      const workspacePath = path.join(config.srcDir, "project", workspaceName);
+      fs.mkdirSync(workspacePath, { recursive: true });
+
+      const sessionDir = config.getSessionDir(workspaceName);
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(sessionDir, "metadata.json"),
+        JSON.stringify({
+          id: "stable-basename-id",
+          name: workspaceName,
+          projectName: "project",
+          projectPath,
+          createdAt: "2025-01-01T00:00:00.000Z",
+        })
+      );
+
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [{ path: workspacePath }],
+        });
+        return cfg;
+      });
+
+      const allMetadata = await config.getAllWorkspaceMetadata({ throwOnError: true });
+      expect(allMetadata.map((metadata) => metadata.id)).toContain("stable-basename-id");
+    });
   });
 
   describe("transcriptOnly derivation", () => {

@@ -3250,6 +3250,133 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("a run-status event racing cache eviction does not strand the seen marker", async () => {
+    // An eviction (removal, or a tombstone lifted for revival) can land in
+    // the microtask gap after the run cache resolves. The status event must
+    // retry against the freshly installed cache instead of mutating the
+    // detached set and marking the seen set — a stale marker would fabricate
+    // zero-count entries for the idle revived workspace on every later list.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "evict-race";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+      const internals = workspaceService as unknown as {
+        getActiveWorkflowRunIds(workspaceId: string): Promise<Set<string>>;
+        evictWorkspaceActivityCaches(workspaceId: string): void;
+      };
+      const realGetActiveWorkflowRunIds = internals.getActiveWorkflowRunIds.bind(workspaceService);
+      let evicted = false;
+      internals.getActiveWorkflowRunIds = async (targetWorkspaceId: string) => {
+        const result = await realGetActiveWorkflowRunIds(targetWorkspaceId);
+        if (!evicted && targetWorkspaceId === workspaceId) {
+          evicted = true;
+          // Lands after the cache read resolved, before the caller's
+          // continuation — the exact revival-eviction window.
+          internals.evictWorkspaceActivityCaches(targetWorkspaceId);
+        }
+        return result;
+      };
+
+      await workspaceService.emitWorkflowRunActivity({
+        workspaceId,
+        runId: "wfr_race",
+        status: "running",
+      });
+      const activity = (await workspaceService.getActivityList())?.[workspaceId];
+      // The retried update must land the run in the INSTALLED cache (not a
+      // detached pre-eviction set that leaves only the stale seen marker).
+      expect(activity?.activeWorkflowRunCount).toBe(1);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("getActivityList re-establishes the config baseline after a transient initial read failure", async () => {
+    // The pre-await baseline read can fail transiently while the strict
+    // scoping enumeration succeeds. Without a replacement baseline both
+    // cross-process removal guards stay disabled on an authoritative
+    // response: a workspace another backend deregisters during the workflow
+    // probes (its metadata entry still present in the normal cleanup gap)
+    // would ride back into the renderer with no event to correct it.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const listStatusSnapshotsSpy = spyOn(WorkflowRunStore.prototype, "listRunStatusSnapshots");
+    try {
+      const workspaceId = "baseline-retry";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency(workspaceId, 321);
+      const realSuperset = config.readPersistedWorkspaceIdSuperset.bind(config);
+      let failedOnce = false;
+      const supersetSpy = spyOn(config, "readPersistedWorkspaceIdSuperset").mockImplementation(
+        () => {
+          if (!failedOnce) {
+            failedOnce = true;
+            throw new Error("transient config read failure");
+          }
+          return realSuperset();
+        }
+      );
+      let removedFromConfig = false;
+      listStatusSnapshotsSpy.mockImplementation(async () => {
+        if (!removedFromConfig) {
+          removedFromConfig = true;
+          // Another backend deregisters the workspace while the per-id
+          // probe awaits; its metadata entry intentionally stays behind.
+          const configPath = path.join(config.rootDir, "config.json");
+          const parsed = JSON.parse(await fsPromises.readFile(configPath, "utf-8")) as {
+            projects?: Array<[string, { workspaces?: Array<{ id?: string }> }]>;
+          };
+          for (const [, projectConfig] of parsed.projects ?? []) {
+            projectConfig.workspaces = (projectConfig.workspaces ?? []).filter(
+              (workspace) => workspace.id !== workspaceId
+            );
+          }
+          await fsPromises.writeFile(configPath, JSON.stringify(parsed));
+        }
+        return [];
+      });
+      try {
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList).not.toBeNull();
+        expect(activityList?.[workspaceId]).toBeUndefined();
+      } finally {
+        supersetSpy.mockRestore();
+      }
+    } finally {
+      listStatusSnapshotsSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
   test("first bootstrap reuses the prune's config enumeration for scoping", async () => {
     // getAllWorkspaceMetadata walks every workspace with per-workspace disk
     // probes; the latency-sensitive first bootstrap must not pay it twice.
