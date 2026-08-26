@@ -17,12 +17,9 @@ import {
 import { shellQuote } from "@/common/utils/shell";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import {
-  GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN,
-  MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES,
   gitEnvPrefix,
   gitHooksAllowed,
-  gitNoRepoAutomationEnv,
-  gitNoRepoAutomationEnvForConfigKeys,
+  gitNoRepoAutomationEnvForRuntimeRepo,
 } from "@/node/utils/gitNoHooksEnv";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
 import {
@@ -117,34 +114,7 @@ async function gitNoRepoAutomationPrefixForRuntime(params: {
 }): Promise<string> {
   if (gitHooksAllowed(params.trusted)) return "";
 
-  const basePrefix = gitEnvPrefix(gitNoRepoAutomationEnv());
-  const result = await execBuffered(
-    params.runtime,
-    `${basePrefix}git config --null --name-only --includes --get-regexp ${shellQuote(
-      GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN
-    )}`,
-    {
-      cwd: params.cwd,
-      timeout: 10,
-      maxOutputBytes: MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES + 1,
-    }
-  );
-  if (result.exitCode === 1 && result.stdout.length === 0) {
-    return basePrefix;
-  }
-  if (result.exitCode !== 0) {
-    throw new Error(
-      result.stderr.trim() ||
-        result.stdout.trim() ||
-        "Failed to inspect repository automation drivers"
-    );
-  }
-  if (
-    new TextEncoder().encode(result.stdout).byteLength > MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES
-  ) {
-    throw new Error("Repository automation driver config output exceeded the safety limit");
-  }
-  return gitEnvPrefix(gitNoRepoAutomationEnvForConfigKeys(result.stdout.split("\0")));
+  return gitEnvPrefix(await gitNoRepoAutomationEnvForRuntimeRepo(params.runtime, params.cwd));
 }
 
 async function tryRevParseHead(params: {

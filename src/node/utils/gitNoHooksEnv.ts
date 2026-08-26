@@ -1,4 +1,6 @@
 import { shellQuote } from "@/common/utils/shell";
+import type { Runtime } from "@/node/runtime/Runtime";
+import { execBuffered } from "@/node/utils/runtime/helpers";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { providerSecretEnvVarNames } from "@/node/utils/providerRequirements";
 import { execFileAsync } from "@/node/utils/disposableExec";
@@ -158,6 +160,42 @@ export function gitEnvPrefix(env: Record<string, string>): string {
       .map(([key, value]) => `${key}=${shellQuote(value)}`)
       .join(" ") + " "
   );
+}
+
+export async function gitNoRepoAutomationEnvForRuntimeRepo(
+  runtime: Runtime,
+  repoPath: string,
+  signal?: AbortSignal
+): Promise<Record<string, string>> {
+  const baseEnv = gitNoRepoAutomationEnv();
+  const result = await execBuffered(
+    runtime,
+    `${gitEnvPrefix(baseEnv)}git config --null --name-only --includes --get-regexp ${shellQuote(
+      GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN
+    )}`,
+    {
+      cwd: repoPath,
+      timeout: 10,
+      abortSignal: signal,
+      maxOutputBytes: MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES + 1,
+    }
+  );
+  if (result.exitCode === 1 && result.stdout.length === 0) {
+    return baseEnv;
+  }
+  if (result.exitCode !== 0) {
+    throw new Error(
+      result.stderr.trim() ||
+        result.stdout.trim() ||
+        "Failed to inspect repository automation drivers"
+    );
+  }
+  if (
+    new TextEncoder().encode(result.stdout).byteLength > MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES
+  ) {
+    throw new Error("Repository automation driver config output exceeded the safety limit");
+  }
+  return gitNoRepoAutomationEnvForConfigKeys(result.stdout.split("\0"));
 }
 
 function isNoMatchingConfigError(error: unknown): boolean {
