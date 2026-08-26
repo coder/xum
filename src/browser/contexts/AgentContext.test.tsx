@@ -15,7 +15,6 @@ import {
   getModelKey,
   getProjectScopeId,
   getThinkingLevelKey,
-  getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
 import { requireTestModule } from "@/browser/testUtils";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
@@ -58,6 +57,7 @@ let APIProvider!: typeof APIModule.APIProvider;
 let RouterProvider!: typeof RouterContextModule.RouterProvider;
 let ProjectProvider!: typeof ProjectContextModule.ProjectProvider;
 let WorkspaceProvider!: typeof WorkspaceContextModule.WorkspaceProvider;
+let useWorkspaceMetadata!: typeof WorkspaceContextModule.useWorkspaceMetadata;
 let AgentProvider!: typeof AgentContextModule.AgentProvider;
 let useAgent!: typeof AgentContextModule.useAgent;
 let isolatedModuleDir: string | null = null;
@@ -119,8 +119,9 @@ async function importIsolatedAgentModules() {
   ({ ProjectProvider } = requireTestModule<{
     ProjectProvider: typeof ProjectContextModule.ProjectProvider;
   }>(isolatedProjectPath));
-  ({ WorkspaceProvider } = requireTestModule<{
+  ({ WorkspaceProvider, useWorkspaceMetadata } = requireTestModule<{
     WorkspaceProvider: typeof WorkspaceContextModule.WorkspaceProvider;
+    useWorkspaceMetadata: typeof WorkspaceContextModule.useWorkspaceMetadata;
   }>(isolatedWorkspacePath));
   ({ AgentProvider, useAgent } = requireTestModule<{
     AgentProvider: typeof AgentContextModule.AgentProvider;
@@ -180,6 +181,20 @@ function Harness(props: HarnessProps) {
   React.useEffect(() => {
     props.onChange(value);
   }, [props, value]);
+
+  return null;
+}
+
+function MetadataLayoutHarness(props: {
+  workspaceId: string;
+  onChange: (metadata: FrontendWorkspaceMetadata | undefined) => void;
+}) {
+  const { workspaceMetadata } = useWorkspaceMetadata();
+  const metadata = workspaceMetadata.get(props.workspaceId);
+
+  React.useLayoutEffect(() => {
+    props.onChange(metadata);
+  }, [metadata, props]);
 
   return null;
 }
@@ -300,12 +315,19 @@ function renderAgentHarness(props: {
   projectPath: string;
   workspaceId?: string;
   onChange: (value: AgentContextValue) => void;
+  onMetadataLayout?: (metadata: FrontendWorkspaceMetadata | undefined) => void;
 }) {
   return render(
     <APIProvider client={createApiClient()}>
       <RouterProvider>
         <ProjectProvider>
           <WorkspaceProvider>
+            {props.workspaceId && props.onMetadataLayout ? (
+              <MetadataLayoutHarness
+                workspaceId={props.workspaceId}
+                onChange={props.onMetadataLayout}
+              />
+            ) : null}
             <AgentProvider workspaceId={props.workspaceId} projectPath={props.projectPath}>
               <Harness onChange={props.onChange} />
             </AgentProvider>
@@ -687,7 +709,7 @@ describe("AgentContext", () => {
     });
   });
 
-  test("rejection rollback uses fresh backend metadata from a mid-flight echo", async () => {
+  test("rejection rollback uses metadata committed before passive effects", async () => {
     const projectPath = "/tmp/project";
     const workspaceId = "main-workspace";
     mockAgentDefinitions = [EXEC_AGENT, PLAN_AGENT, REVIEW_PROJECT_AGENT];
@@ -696,11 +718,18 @@ describe("AgentContext", () => {
     deferUpdateAgentAISettings = true;
 
     let contextValue: AgentContextValue | undefined;
+    let rejectReviewOnPlanCommit: (() => void) | null = null;
 
     renderAgentHarness({
       workspaceId,
       projectPath,
       onChange: (value) => (contextValue = value),
+      onMetadataLayout: (metadata) => {
+        if (metadata?.agentId !== "plan") return;
+        const reject = rejectReviewOnPlanCommit;
+        rejectReviewOnPlanCommit = null;
+        reject?.();
+      },
     });
 
     await waitFor(() => {
@@ -722,11 +751,14 @@ describe("AgentContext", () => {
       expect(resolveUpdateAgentAISettings).not.toBeNull();
     });
     const rejectReviewSwitch = getDeferredUpdateResolver();
+    rejectReviewOnPlanCommit = () =>
+      rejectReviewSwitch?.({ success: false, error: "unpriced model" });
 
     acceptPlanSwitch?.({ success: true, data: undefined });
 
-    // Backend echo for the accepted switch lands mid-flight; the distinctive
-    // bucket makes the metadata flush observable.
+    // Reject review from a layout effect triggered by the accepted plan echo.
+    // This is after plan metadata commits to WorkspaceContext/WorkspaceStore but
+    // before AgentContext passive effects can refresh a render-fed ref.
     emitWorkspaceMetadata?.({
       workspaceId,
       metadata: createWorkspaceMetadata(workspaceId, {
@@ -734,18 +766,9 @@ describe("AgentContext", () => {
         aiSettingsByAgent: { plan: { model: "openai:echoed-plan", thinkingLevel: "low" } },
       }),
     });
-    await waitFor(() => {
-      const raw = window.localStorage.getItem(getWorkspaceAISettingsByAgentKey(workspaceId));
-      const cache =
-        raw == null ? null : (JSON.parse(raw) as Partial<Record<string, { model?: string }>>);
-      expect(cache?.plan?.model).toBe("openai:echoed-plan");
-    });
 
-    rejectReviewSwitch?.({ success: false, error: "unpriced model" });
-
-    // The rollback reads metadata at settle time: it restores the accepted
-    // plan agent, not the stale render-time exec baseline.
     await waitFor(() => {
+      expect(rejectReviewOnPlanCommit).toBeNull();
       expect(contextValue?.agentId).toBe("plan");
     });
   });

@@ -13,6 +13,7 @@ import {
 
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
+import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { readPersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { matchesKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
@@ -100,6 +101,7 @@ function AgentProviderWithState(props: {
 }) {
   const { api } = useAPI();
   const { workspaceMetadata } = useWorkspaceMetadata();
+  const workspaceStore = useWorkspaceStoreRaw();
   const currentMeta = props.workspaceId ? workspaceMetadata.get(props.workspaceId) : undefined;
 
   const scopeId = getScopeId(props.workspaceId, props.projectPath);
@@ -141,16 +143,6 @@ function AgentProviderWithState(props: {
   // Child/subagent workspaces keep the backend-assigned agent; their selection
   // is locked, so local changes must never be written back.
   const isCurrentAgentLocked = currentMeta?.parentWorkspaceId != null;
-
-  // Fresh authoritative metadata for rejection rollbacks, read at settle time
-  // via a ref: an accepted A→B write can update backend metadata while a
-  // later B→C switch is in flight, and C's rejection must restore B, not a
-  // render-time snapshot of A. (The pending guard may suppress B's
-  // localStorage echo, but the metadata map itself stays current.)
-  const currentMetaRef = useRef(currentMeta);
-  useEffect(() => {
-    currentMetaRef.current = currentMeta;
-  });
 
   const workspaceId = props.workspaceId;
 
@@ -264,7 +256,7 @@ function AgentProviderWithState(props: {
             thinkingLevel: previousThinking,
             reasoningMode: previousReasoning,
           },
-          backendMetadata: currentMetaRef.current,
+          backendMetadata: workspaceStore.getWorkspaceMetadata(workspaceId),
         });
       };
 
@@ -305,6 +297,7 @@ function AgentProviderWithState(props: {
       isProjectScope,
       setAgentIdRaw,
       workspaceId,
+      workspaceStore,
     ]
   );
 

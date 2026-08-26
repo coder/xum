@@ -38,6 +38,7 @@ import { useAPI } from "@/browser/contexts/API";
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
+import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import {
@@ -196,6 +197,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   const isAutoMode = currentAgentId === "auto";
   const openInEditor = useOpenInEditor();
   const workspaceContext = useOptionalWorkspaceContext();
+  const workspaceStore = useWorkspaceStoreRaw();
   const editorError = usePopoverError();
   const editButtonRef = useRef<HTMLDivElement>(null);
 
@@ -204,15 +206,6 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     ? workspaceContext?.workspaceMetadata.get(workspaceId)
     : undefined;
   const runtimeConfig = workspaceMetadata?.runtimeConfig;
-
-  // Fresh authoritative metadata for rejection rollbacks (see
-  // revertRejectedAgentSwitch): read at settle time via a ref so an in-flight
-  // picker write that lands mid-action cannot leave a stale baseline in the
-  // send handler's closure.
-  const workspaceMetadataRef = useRef(workspaceMetadata);
-  useEffect(() => {
-    workspaceMetadataRef.current = workspaceMetadata;
-  });
 
   // Fresh content from disk for the latest plan (external edit detection)
   // Only use cache for completed tools (page reload case) - not for in-flight tools
@@ -561,7 +554,8 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
             thinkingLevel: existingThinking,
             reasoningMode: existingReasoning,
           },
-          backendMetadata: workspaceMetadataRef.current,
+          backendMetadata:
+            workspaceStore.getWorkspaceMetadata(args.workspaceId) ?? workspaceMetadata,
         }),
     };
   };
