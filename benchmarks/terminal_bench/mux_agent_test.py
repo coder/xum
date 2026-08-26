@@ -607,11 +607,7 @@ def test_run_downloads_session_archive(
 
     asyncio.run(agent.run("do the task", environment, context))
 
-    tar_commands = [
-        c
-        for c in environment.exec_commands
-        if "/tmp/mux-sessions-" in c
-    ]
+    tar_commands = [c for c in environment.exec_commands if "/tmp/mux-sessions-" in c]
     assert len(tar_commands) == 1
     # Only the known telemetry files are archived, from the run session root.
     assert "cd /tmp/mux-run-root" in tar_commands[0]
@@ -835,9 +831,7 @@ def test_session_usage_skips_non_finite_tokens_without_losing_valid_sessions(
     monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
     agent = MuxAgent(logs_dir=tmp_path)
     invalid_usage = {
-        "byModel": {
-            "m": {"input": {"tokens": float("inf"), "cost_usd": 0.5}}
-        },
+        "byModel": {"m": {"input": {"tokens": float("inf"), "cost_usd": 0.5}}},
         "version": 1,
     }
     (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).write_bytes(

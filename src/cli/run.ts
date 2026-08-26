@@ -503,7 +503,7 @@ async function main(): Promise<number> {
   // override root is left in place on exit.
   let sessionRootOverride: string | undefined;
   try {
-    sessionRootOverride = prepareRunSessionRootOverride(process.env, realConfig.rootDir);
+    sessionRootOverride = await prepareRunSessionRootOverride(process.env, realConfig.rootDir);
   } catch (error) {
     console.error(`Error: ${getErrorMessage(error)}`);
     return 1;
@@ -516,14 +516,14 @@ async function main(): Promise<number> {
   if (hasAnyConfiguredProvider(existingProviders)) {
     // Write providers to temp config so services can find them
     const providersFile = path.join(config.rootDir, "providers.jsonc");
-    writePrivateRunConfigFile(providersFile, JSON.stringify(existingProviders, null, 2));
+    await writePrivateRunConfigFile(providersFile, JSON.stringify(existingProviders, null, 2));
   }
 
   // Copy secrets so tools/MCP servers get project secrets (e.g., GH_TOKEN)
   const existingSecrets = realConfig.loadSecretsConfig();
   if (Object.keys(existingSecrets).length > 0) {
     const secretsFile = path.join(config.rootDir, "secrets.json");
-    writePrivateRunConfigFile(secretsFile, JSON.stringify(existingSecrets, null, 2));
+    await writePrivateRunConfigFile(secretsFile, JSON.stringify(existingSecrets, null, 2));
   }
 
   // Copy only project trust metadata so AIService can read trust flags.

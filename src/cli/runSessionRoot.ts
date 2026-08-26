@@ -1,21 +1,23 @@
-import * as fs from "fs";
-import { ensurePrivateDirSync } from "@/node/utils/fs";
+import * as fs from "node:fs/promises";
+import { ensurePrivateDir } from "@/node/utils/fs";
 
 type RunSessionRootEnv = Readonly<Record<string, string | undefined>>;
 
-export function prepareRunSessionRootOverride(
+export async function prepareRunSessionRootOverride(
   env: RunSessionRootEnv,
   realConfigRoot: string
-): string | undefined {
+): Promise<string | undefined> {
   const envSessionRoot = (env.XUM_RUN_SESSION_ROOT ?? env.MUX_RUN_SESSION_ROOT)?.trim();
   if (!envSessionRoot) {
     return undefined;
   }
 
-  ensurePrivateDirSync(envSessionRoot);
+  await ensurePrivateDir(envSessionRoot);
+  // A missing real config root cannot be aliased; ignore ENOENT from realpath.
+  const realConfigRootCanonical = await fs.realpath(realConfigRoot).catch(() => undefined);
   if (
-    fs.existsSync(realConfigRoot) &&
-    fs.realpathSync(envSessionRoot) === fs.realpathSync(realConfigRoot)
+    realConfigRootCanonical !== undefined &&
+    (await fs.realpath(envSessionRoot)) === realConfigRootCanonical
   ) {
     throw new Error(
       "XUM_RUN_SESSION_ROOT / MUX_RUN_SESSION_ROOT must not resolve to the Xum config root"
@@ -25,6 +27,6 @@ export function prepareRunSessionRootOverride(
   return envSessionRoot;
 }
 
-export function writePrivateRunConfigFile(filePath: string, contents: string): void {
-  fs.writeFileSync(filePath, contents, { mode: 0o600 });
+export async function writePrivateRunConfigFile(filePath: string, contents: string): Promise<void> {
+  await fs.writeFile(filePath, contents, { mode: 0o600 });
 }

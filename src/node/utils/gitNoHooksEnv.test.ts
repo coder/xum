@@ -172,7 +172,11 @@ describe("gitNoRepoAutomationEnv", () => {
       .env({ ...process.env, ...env })
       .quiet()
       .nothrow();
-    await expect(fs.access(marker)).rejects.toThrow();
+    const markerExists = await fs.access(marker).then(
+      () => true,
+      () => false
+    );
+    expect(markerExists).toBe(false);
   });
 });
 

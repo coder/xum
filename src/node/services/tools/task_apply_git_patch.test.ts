@@ -553,7 +553,11 @@ describe("task_apply_git_patch tool", () => {
     )) as { success: boolean };
 
     expect(result.success).toBe(true);
-    await expect(fsPromises.access(marker)).rejects.toThrow();
+    const markerExists = await fsPromises.access(marker).then(
+      () => true,
+      () => false
+    );
+    expect(markerExists).toBe(false);
   }, 20_000);
 
   it("cleans staged patch files between dry-run and real apply when temp dir is inside the repo", async () => {
