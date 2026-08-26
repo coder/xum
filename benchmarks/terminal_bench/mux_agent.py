@@ -247,6 +247,7 @@ class MuxAgent(BaseInstalledAgent):
     _SESSION_USAGE_MAX_MEMBERS = 10_000
     _SESSION_USAGE_FILE_MAX_BYTES = 16 * 1024 * 1024
     _SESSION_USAGE_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+    _SESSION_SNAPSHOT_MAX_BYTES = 16 * 1024 * 1024
 
     async def _stage_providers_config(
         self, environment: BaseEnvironment, env: dict[str, str]
@@ -407,6 +408,8 @@ class MuxAgent(BaseInstalledAgent):
         context: AgentContext,
     ) -> None:
         """Run agent commands, download token file, then populate context."""
+        preexisting_session_dirs = await self._snapshot_session_usage_dirs(environment)
+
         # Execute commands (from base class logic, but without calling populate_context)
         command_result: tuple[int, int] | None = None
         failed_command: tuple[int, int] | None = None
@@ -489,7 +492,7 @@ class MuxAgent(BaseInstalledAgent):
         except Exception:
             pass  # Token file may not exist if agent crashed early
 
-        await self._download_session_artifacts(environment)
+        await self._download_session_artifacts(environment, preexisting_session_dirs)
 
         self.populate_context_post_run(context)
 
@@ -502,7 +505,47 @@ class MuxAgent(BaseInstalledAgent):
                 f"mux agent command failed (command {command_index}, exit {return_code})"
             )
 
-    async def _download_session_artifacts(self, environment: BaseEnvironment) -> None:
+    async def _snapshot_session_usage_dirs(
+        self, environment: BaseEnvironment
+    ) -> tuple[str, ...] | None:
+        session_root = (
+            self._env.get("MUX_RUN_SESSION_ROOT") or self._DEFAULT_RUN_SESSION_ROOT
+        ).strip() or self._DEFAULT_RUN_SESSION_ROOT
+        snapshot_limit = self._SESSION_SNAPSHOT_MAX_BYTES + 1
+        script = (
+            f"if [ ! -d {shlex.quote(session_root)} ]; then exit 0; fi\n"
+            f"cd {shlex.quote(session_root)} || exit 1\n"
+            "find . -type f -name session-usage.json -printf '%h\\0' "
+            f"2>/dev/null | head -c {snapshot_limit} | base64 -w0\n"
+        )
+        try:
+            result = await environment.exec(
+                command=f"bash -c {shlex.quote(script)}",
+                user="root",
+                timeout_sec=30,
+            )
+            if result.return_code != 0:
+                return None
+            snapshot = base64.b64decode(result.stdout or "", validate=True)
+            if len(snapshot) > self._SESSION_SNAPSHOT_MAX_BYTES:
+                return None
+            session_dirs = set()
+            for raw_path in snapshot.split(b"\0"):
+                if not raw_path:
+                    continue
+                path = raw_path.decode("utf-8")
+                if path != "." and not path.startswith("./"):
+                    return None
+                session_dirs.add(path)
+            return tuple(sorted(session_dirs))
+        except Exception:
+            return None
+
+    async def _download_session_artifacts(
+        self,
+        environment: BaseEnvironment,
+        preexisting_session_dirs: tuple[str, ...] | None,
+    ) -> None:
         """Archive and download the mux sessions directory (chat.jsonl et al).
 
         The stdout JSONL stream can lose its tail (including the run-complete
@@ -517,14 +560,26 @@ class MuxAgent(BaseInstalledAgent):
         archive_path = self.logs_dir / self._SESSIONS_ARCHIVE_NAME
         archive_path.unlink(missing_ok=True)
         stream_limit = self._SESSIONS_ARCHIVE_MAX_BYTES + 1
+        telemetry_source = (
+            "find . -type f \\( -name chat.jsonl -o -name chat-archive.jsonl "
+            "-o -name session-usage.json -o -name run-stdout.jsonl "
+            "-o -name run-stderr.log -o -name mux-tokens.json \\) -print0 "
+            "2>/dev/null"
+        )
+        if preexisting_session_dirs:
+            excluded_patterns = "|".join(
+                f"{shlex.quote(path)}/*" for path in preexisting_session_dirs
+            )
+            telemetry_source += (
+                " | while IFS= read -r -d '' path; do "
+                f'case "$path" in {excluded_patterns}) ;; '
+                '*) printf \'%s\\0\' "$path" ;; esac; done'
+            )
         # Stream only known telemetry files and cap raw archive bytes before
         # base64 expansion so sandbox tasks cannot inflate the host transfer.
         script = (
             f"cd {shlex.quote(session_root)} || exit 1\n"
-            "find . -type f \\( -name chat.jsonl -o -name chat-archive.jsonl "
-            "-o -name session-usage.json -o -name run-stdout.jsonl "
-            "-o -name run-stderr.log -o -name mux-tokens.json \\) -print0 "
-            "2>/dev/null | tar --null -czf - -T - 2>/dev/null "
+            f"{telemetry_source} | tar --null -czf - -T - 2>/dev/null "
             f"| head -c {stream_limit} | base64 -w0\n"
         )
         # Telemetry collection is best-effort, but silent failures cost a full
@@ -537,6 +592,10 @@ class MuxAgent(BaseInstalledAgent):
                     diag.write(message.rstrip() + "\n")
             except Exception:
                 pass
+
+        if preexisting_session_dirs is None:
+            _diag("session snapshot unavailable")
+            return
 
         try:
             # Run as root like install(): the agent session writes under /root.
@@ -588,7 +647,8 @@ class MuxAgent(BaseInstalledAgent):
                 component = usage.get(bucket)
                 if not isinstance(component, dict):
                     continue
-                if cls._is_valid_usage_number(component.get("tokens")):
+                tokens = component.get("tokens")
+                if cls._is_valid_usage_number(tokens) and tokens > 0:
                     return True
         return False
 
@@ -687,14 +747,14 @@ class MuxAgent(BaseInstalledAgent):
                     if not isinstance(component, dict):
                         continue
                     tokens = component.get("tokens")
-                    has_tokens = self._is_valid_usage_number(tokens)
-                    if has_tokens:
-                        totals[key] += int(tokens)
+                    if not self._is_valid_usage_number(tokens):
+                        continue
+                    totals[key] += int(tokens)
                     cost = component.get("cost_usd")
                     if self._is_valid_usage_number(cost):
                         cost_sum += cost
                         has_cost = True
-                    elif has_tokens and tokens > 0:
+                    elif tokens > 0:
                         # Nonzero usage without a price: reporting only the
                         # priced subset would misstate total cost.
                         has_unpriced_usage = True
@@ -747,7 +807,9 @@ class MuxAgent(BaseInstalledAgent):
         token_cost = token_data.get("cost_usd") if token_data is not None else None
         if token_data is not None and self._is_valid_usage_number(token_cost):
             data = token_data
-        elif token_cost is not None and session_totals is not None:
+        elif session_totals is not None and self._is_valid_usage_number(
+            session_totals.get("cost_usd")
+        ):
             data = session_totals
         elif session_totals is not None and (
             token_data is None

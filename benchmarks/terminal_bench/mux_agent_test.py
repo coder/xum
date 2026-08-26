@@ -303,12 +303,17 @@ class _FakeEnvironment:
         delay_sec: float = 0,
         session_archive: bytes | None = None,
         runner_exit_code: str | None = None,
+        preexisting_session_dirs: tuple[str, ...] = (),
+        token_payload: str | None = None,
     ) -> None:
         self.result = result
         self.command_dir = command_dir
         self.delay_sec = delay_sec
         self.session_archive = session_archive
         self.runner_exit_code = runner_exit_code
+        self.preexisting_session_dirs = preexisting_session_dirs
+        self.token_payload = token_payload
+        self.snapshot_requested = False
         self.exec_commands: list[str] = []
         self.download_attempts: list[tuple[str, Path]] = []
 
@@ -316,13 +321,31 @@ class _FakeEnvironment:
         command = _kwargs.get("command")
         if isinstance(command, str):
             self.exec_commands.append(command)
+        if (
+            isinstance(command, str)
+            and "find . -type f -name session-usage.json" in command
+        ):
+            self.snapshot_requested = True
+            snapshot = "\0".join(self.preexisting_session_dirs)
+            if snapshot:
+                snapshot += "\0"
+            return _ExecResult(
+                return_code=0, stdout=base64.b64encode(snapshot.encode()).decode()
+            )
         if isinstance(command, str) and "tar --null -czf - -T -" in command:
             if self.session_archive is None:
                 return _ExecResult(return_code=1)
+            archive_bytes = self.session_archive
+            if self.snapshot_requested and all(
+                path in command for path in self.preexisting_session_dirs
+            ):
+                archive_bytes = _archive_without_session_dirs(
+                    archive_bytes, self.preexisting_session_dirs
+                )
             cap_match = re.search(r"head -c (\d+)", command)
             assert cap_match is not None
             archive_cap = int(cap_match.group(1))
-            encoded = base64.b64encode(self.session_archive[:archive_cap]).decode()
+            encoded = base64.b64encode(archive_bytes[:archive_cap]).decode()
             return _ExecResult(return_code=0, stdout=encoded)
         timeout_sec = _kwargs.get("timeout_sec")
         if self.delay_sec:
@@ -348,7 +371,8 @@ class _FakeEnvironment:
             return
         assert source_path == MuxAgent._TOKEN_FILE_PATH
         target_path.write_text(
-            '{"input": 7, "output": 11, "cache_read": 5, "cache_write": 3, "cost_usd": 0.42}'
+            self.token_payload
+            or '{"input": 7, "output": 11, "cache_read": 5, "cache_write": 3, "cost_usd": 0.42}'
         )
 
 
@@ -580,6 +604,22 @@ def _sessions_archive_bytes(sessions: dict[str, dict]) -> bytes:
     return buffer.getvalue()
 
 
+def _archive_without_session_dirs(
+    archive_bytes: bytes, session_dirs: tuple[str, ...]
+) -> bytes:
+    excluded = tuple(path.removeprefix("./") + "/" for path in session_dirs)
+    source_buffer = io.BytesIO(archive_bytes)
+    target_buffer = io.BytesIO()
+    with tarfile.open(fileobj=source_buffer, mode="r:gz") as source:
+        with tarfile.open(fileobj=target_buffer, mode="w:gz") as target:
+            for member in source:
+                member_path = member.name.removeprefix("./")
+                if member_path.startswith(excluded):
+                    continue
+                target.addfile(member, source.extractfile(member))
+    return target_buffer.getvalue()
+
+
 def _usage_display(
     *,
     input_tokens: int = 10,
@@ -658,6 +698,34 @@ def test_run_streams_session_archive_through_byte_cap(
     assert getattr(context, "n_input_tokens") == 15
 
 
+def test_run_excludes_preexisting_session_directories(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    environment = _FakeEnvironment(
+        _ExecResult(return_code=0),
+        session_archive=_sessions_archive_bytes(
+            {
+                "ws-old": _usage_display(input_tokens=1000, output=1000),
+                "ws-current": _usage_display(),
+            }
+        ),
+        preexisting_session_dirs=("./sessions/ws-old",),
+        token_payload=(
+            '{"input": 1, "output": 1, "cache_read": 0, '
+            '"cache_write": 0, "cost_usd": null}'
+        ),
+    )
+    context = SimpleNamespace()
+
+    asyncio.run(agent.run("do the task", environment, context))
+
+    assert getattr(context, "n_input_tokens") == 115
+    assert getattr(context, "n_output_tokens") == 20
+    assert getattr(context, "cost_usd") == pytest.approx(0.15)
+
+
 def test_populate_context_backfills_from_session_usage_when_cost_missing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -720,13 +788,11 @@ def test_run_rejects_oversized_streamed_session_archive(
     assert "streamed archive too large" in diagnostic
 
 
-def test_populate_context_keeps_fresher_token_file_counts(
+def test_populate_context_prefers_priced_session_totals_over_unpriced_tokens(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
     agent = MuxAgent(logs_dir=tmp_path)
-    # Timeout scenario: stdout usage-deltas carry newer counts than the last
-    # persisted stream-end, so the session totals are staler (smaller).
     (tmp_path / "mux-tokens.json").write_text(
         '{"input": 500, "output": 90, "cache_read": 800, "cache_write": 40, "cost_usd": null}'
     )
@@ -737,13 +803,12 @@ def test_populate_context_keeps_fresher_token_file_counts(
 
     agent.populate_context_post_run(context)
 
-    assert getattr(context, "n_input_tokens") == 500 + 800 + 40
-    assert getattr(context, "n_output_tokens") == 90
-    # Stale session cost must not be attached to fresher token counts.
-    assert not hasattr(context, "cost_usd")
+    assert getattr(context, "n_input_tokens") == 115
+    assert getattr(context, "n_output_tokens") == 20
+    assert getattr(context, "cost_usd") == pytest.approx(0.15)
 
 
-def test_populate_context_skips_non_finite_token_file_counts(
+def test_populate_context_falls_back_from_non_finite_token_file_counts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
@@ -758,9 +823,9 @@ def test_populate_context_skips_non_finite_token_file_counts(
 
     agent.populate_context_post_run(context)
 
-    assert getattr(context, "n_input_tokens") == 0
-    assert getattr(context, "n_output_tokens") == 1000
-    assert not hasattr(context, "cost_usd")
+    assert getattr(context, "n_input_tokens") == 115
+    assert getattr(context, "n_output_tokens") == 20
+    assert getattr(context, "cost_usd") == pytest.approx(0.15)
 
 
 @pytest.mark.parametrize("cost_json", ["1e309", "-0.01", '"invalid"'])
@@ -896,6 +961,7 @@ def test_session_usage_skips_non_finite_tokens_without_losing_valid_sessions(
     assert totals is not None
     assert totals["sessions"] == 2
     assert totals["input"] == 10
+    assert totals["cost_usd"] == pytest.approx(0.15)
 
 
 def test_session_usage_skips_non_finite_cost_without_losing_valid_sessions(
@@ -941,6 +1007,30 @@ def test_session_usage_keeps_child_of_malformed_rollup_parent(
 
     assert totals is not None
     assert totals["sessions"] == 1
+    assert totals["input"] == 10
+    assert totals["cost_usd"] == pytest.approx(0.15)
+
+
+def test_session_usage_keeps_child_of_zero_usage_rollup_parent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    zero_parent = {
+        "byModel": {"m": {"input": {"tokens": 0}}},
+        "rolledUpFrom": {"ws-child": True},
+        "version": 1,
+    }
+    (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).write_bytes(
+        _sessions_archive_bytes(
+            {"ws-parent": zero_parent, "ws-child": _usage_display()}
+        )
+    )
+
+    totals = agent._summarize_session_usage()
+
+    assert totals is not None
+    assert totals["sessions"] == 2
     assert totals["input"] == 10
     assert totals["cost_usd"] == pytest.approx(0.15)
 
