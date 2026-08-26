@@ -1,5 +1,5 @@
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
-import type { AiSettingSource } from "@/common/types/agentAiSettings";
+import { targetWorkspaceBucketToLayer, type AiSettingSource } from "@/common/types/agentAiSettings";
 import {
   coerceOpenAIReasoningMode,
   coerceThinkingLevel,
@@ -7,7 +7,10 @@ import {
   type ThinkingLevel,
 } from "@/common/types/thinking";
 import { normalizeAgentId as normalizeWorkspaceAgentId } from "@/common/utils/agentIds";
-import { collectDeclaredAncestorLayers } from "@/common/utils/ai/agentAncestorLayers";
+import {
+  collectDeclaredAncestorLayers,
+  type AgentAncestorDescriptor,
+} from "@/common/utils/ai/agentAncestorLayers";
 import { resolveAgentAiSettings } from "@/common/utils/ai/resolveAgentAiSettings";
 
 export type WorkspaceAISettingsCache = Partial<
@@ -71,6 +74,7 @@ export function resolveWorkspaceAiSettingsForAgent(args: {
   existingReasoningMode?: OpenAIReasoningMode;
   /** Agent id -> base id, for base-chain reasoning-mode inheritance (custom agents). */
   agentBaseById?: ReadonlyMap<string, string | undefined>;
+  agentDescriptorById?: ReadonlyMap<string, AgentAncestorDescriptor>;
 }): {
   resolvedModel: string;
   resolvedThinking: ThinkingLevel;
@@ -78,67 +82,38 @@ export function resolveWorkspaceAiSettingsForAgent(args: {
 } {
   const normalizedAgentId = normalizeAgentId(args.agentId);
   const workspaceOverride = args.workspaceByAgent?.[normalizedAgentId];
+  const descriptorsById = new Map(args.agentDescriptorById ?? []);
+  for (const [id, base] of args.agentBaseById ?? []) {
+    descriptorsById.set(id, { ...descriptorsById.get(id), base });
+  }
+  const resolved = resolveAgentAiSettings({
+    targetAgentId: normalizedAgentId,
+    profile: "interactive",
+    targetWorkspaceSettings:
+      args.useWorkspaceByAgentFallback && workspaceOverride != null
+        ? targetWorkspaceBucketToLayer(workspaceOverride)
+        : undefined,
+    agentAiDefaults: args.agentAiDefaults,
+    targetDefinitionAiDefaults: descriptorsById.get(normalizedAgentId)?.definitionAiDefaults,
+    ancestors: collectDeclaredAncestorLayers(normalizedAgentId, descriptorsById),
+    parentRuntime: {
+      model: typeof args.existingModel === "string" ? args.existingModel : undefined,
+      thinkingLevel: coerceThinkingLevel(args.existingThinking),
+      reasoningMode: coerceOpenAIReasoningMode(args.existingReasoningMode),
+    },
+    defaultModel: args.fallbackModel,
+  });
 
-  // Field-wise across the agent's own entry then its base chain: an agent
-  // inheriting GPT-5.6 + pro from its base must resolve both together even
-  // when the active workspace runs a different provider's model.
-  const configuredDefaults = resolveConfiguredAiDefaults(
-    normalizedAgentId,
-    args.agentAiDefaults,
-    args.agentBaseById
-  );
-  const configuredModel = configuredDefaults.modelString;
-  const workspaceOverrideModel =
-    args.useWorkspaceByAgentFallback && typeof workspaceOverride?.model === "string"
-      ? workspaceOverride.model
-      : undefined;
-  const overrideModel = workspaceOverrideModel?.trim();
-  const existingModel = (typeof args.existingModel === "string" ? args.existingModel : "").trim();
-  // The workspace's own saved bucket wins on explicit switches, matching
-  // backend dispatch and ACP resolution (bucket → configured/base-chain
-  // defaults → current workspace value): persisting a switch must not
-  // overwrite the workspace's last-used settings with a global default.
-  const resolvedModel =
-    overrideModel && overrideModel.length > 0
-      ? overrideModel
-      : configuredModel && configuredModel.length > 0
-        ? configuredModel
-        : existingModel.length > 0
-          ? existingModel
-          : args.fallbackModel;
-
-  // Persisted workspace settings can be stale/corrupt; re-validate inherited values
-  // so mode sync keeps self-healing behavior instead of propagating invalid options.
-  const workspaceOverrideThinking = args.useWorkspaceByAgentFallback
-    ? coerceThinkingLevel(workspaceOverride?.thinkingLevel)
-    : undefined;
-  const resolvedThinking =
-    workspaceOverrideThinking ??
-    configuredDefaults.thinkingLevel ??
-    coerceThinkingLevel(args.existingThinking) ??
-    "off";
-
-  // An existing per-agent bucket owns the reasoning choice outright (matching
-  // targetWorkspaceBucketToLayer): a configured Pro default must not re-inject
-  // itself over a workspace deliberately toggled to Standard (every composer
-  // change rewrites the bucket, so its presence marks a workspace-level pick).
-  // Explicit switches restore the bucket's saved mode; background sync trusts
-  // the live workspace mode, which hydration seeds from the backend bucket.
-  // Absent reasoningMode on an existing entry (legacy entry saved before pro
-  // mode shipped) means "standard", matching the WorkspaceContext seeding
-  // semantics, instead of inheriting a possibly-pro workspace mode from the
-  // previously active agent.
-  // Without a bucket entry, configured defaults (and the base chain) apply,
-  // matching ACP resolution and the Settings card display, else the
-  // workspace's current mode carries over.
+  // Background sync trusts the live workspace mode, which hydration seeds from
+  // the backend bucket, instead of restoring the saved bucket or configured mode.
   const resolvedReasoningMode =
-    workspaceOverride != null
-      ? args.useWorkspaceByAgentFallback
-        ? (coerceOpenAIReasoningMode(workspaceOverride.reasoningMode) ?? "standard")
-        : (coerceOpenAIReasoningMode(args.existingReasoningMode) ?? "standard")
-      : (configuredDefaults.reasoningMode ??
-        coerceOpenAIReasoningMode(args.existingReasoningMode) ??
-        "standard");
+    workspaceOverride != null && !args.useWorkspaceByAgentFallback
+      ? (coerceOpenAIReasoningMode(args.existingReasoningMode) ?? "standard")
+      : (resolved.selected.reasoningMode ?? "standard");
 
-  return { resolvedModel, resolvedThinking, resolvedReasoningMode };
+  return {
+    resolvedModel: resolved.selected.model,
+    resolvedThinking: resolved.selected.thinkingLevel,
+    resolvedReasoningMode,
+  };
 }

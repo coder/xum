@@ -12,7 +12,9 @@ import { shouldApplyWorkspaceAgentIdFromBackend } from "@/browser/utils/workspac
 import {
   GLOBAL_SCOPE_ID,
   getAgentIdKey,
+  getModelKey,
   getProjectScopeId,
+  getThinkingLevelKey,
   getWorkspaceAISettingsByAgentKey,
 } from "@/common/constants/storage";
 import { requireTestModule } from "@/browser/testUtils";
@@ -481,6 +483,55 @@ describe("AgentContext", () => {
     // Re-selecting the current agent is a no-op and must not hit the backend.
     contextValue?.setAgentId("plan");
     expect(updateAgentAISettingsCalls).toHaveLength(1);
+  });
+
+  test("workspace agent selection persists definition AI defaults", async () => {
+    const projectPath = "/tmp/project";
+    const workspaceId = "main-workspace";
+    const researcherAgent: AgentDefinitionDescriptor = {
+      id: "researcher",
+      scope: "project",
+      name: "Researcher",
+      uiSelectable: true,
+      subagentRunnable: false,
+      base: "exec",
+      aiDefaults: { model: "openai:gpt-5.6-sol", thinkingLevel: "high" },
+    };
+    mockAgentDefinitions = [EXEC_AGENT, researcherAgent];
+    mockWorkspaceMetadata.set(workspaceId, {});
+    window.localStorage.setItem(getAgentIdKey(workspaceId), JSON.stringify("exec"));
+    window.localStorage.setItem(
+      getModelKey(workspaceId),
+      JSON.stringify("anthropic:claude-opus-4-6")
+    );
+    window.localStorage.setItem(getThinkingLevelKey(workspaceId), JSON.stringify("off"));
+
+    let contextValue: AgentContextValue | undefined;
+
+    renderAgentHarness({
+      workspaceId,
+      projectPath,
+      onChange: (value) => (contextValue = value),
+    });
+
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("exec");
+    });
+
+    contextValue?.setAgentId("researcher");
+
+    await waitFor(() => {
+      expect(updateAgentAISettingsCalls).toHaveLength(1);
+    });
+    expect(updateAgentAISettingsCalls[0]).toMatchObject({
+      workspaceId,
+      agentId: "researcher",
+      aiSettings: {
+        model: "openai:gpt-5.6-sol",
+        thinkingLevel: "high",
+      },
+      persistSelectedAgentId: true,
+    });
   });
 
   test("rejected persistence reverts the local agent selection", async () => {

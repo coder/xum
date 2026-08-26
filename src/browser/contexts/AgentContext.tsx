@@ -219,7 +219,12 @@ function AgentProviderWithState(props: {
           existingModel: previousModel,
           existingThinking: previousThinking,
           existingReasoningMode: previousReasoning,
-          agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
+          agentDescriptorById: new Map(
+            agents.map((agent) => [
+              agent.id,
+              { base: agent.base, definitionAiDefaults: agent.aiDefaults },
+            ])
+          ),
         });
 
       // The local update above is authoritative for this client and the write
