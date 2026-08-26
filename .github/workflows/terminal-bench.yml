@@ -284,6 +284,14 @@ jobs:
           fi
 
           ARTIFACT_NAME="terminal-bench-results-${SAFE_MODEL}-${SAFE_DATASET}-${SAFE_TASKS}-${RUN_ID}-a${RUN_ATTEMPT}"
+          # model_name and dataset are unbounded workflow inputs, so bounding
+          # SAFE_TASKS alone cannot guarantee the 256-char artifact-name limit.
+          # Cap the final composed name and disambiguate with a hash of the
+          # full name (which embeds RUN_ID/RUN_ATTEMPT, preserving uniqueness).
+          if [ "${#ARTIFACT_NAME}" -gt 200 ]; then
+            NAME_HASH=$(printf "%s" "$ARTIFACT_NAME" | sha256sum | cut -c1-8)
+            ARTIFACT_NAME="${ARTIFACT_NAME:0:200}-h${NAME_HASH}"
+          fi
           echo "name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
           echo "Artifact name: $ARTIFACT_NAME"
 
