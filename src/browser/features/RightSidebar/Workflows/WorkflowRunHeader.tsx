@@ -6,6 +6,7 @@ import type { WorkflowRunRecord } from "@/common/types/workflow";
 import { canRetryWorkflowFromCheckpoint } from "@/common/utils/workflowRetryEligibility";
 
 import { WorkflowScopeBadge, WorkflowStatusPill } from "./WorkflowBadges";
+import { WorkflowLongText } from "./WorkflowLongText";
 import type { WorkflowRunView } from "./projectWorkflowRun";
 import {
   formatWorkflowCost,
@@ -132,8 +133,12 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
               {entry.key != null && (
                 <span className="text-muted shrink-0 font-mono text-[11px]">{entry.key}</span>
               )}
-              {/* Wrap long values across lines so the full arg is visible, not truncated to one row. */}
-              <span className="min-w-0 break-words whitespace-pre-wrap">{entry.value}</span>
+              {/* Long values (often full prompts) preview-truncate; expand inline or open the full view. */}
+              <WorkflowLongText
+                className="flex-1"
+                text={entry.value}
+                title={entry.key != null ? `Argument: ${entry.key}` : "Workflow argument"}
+              />
             </div>
           ))}
         </div>

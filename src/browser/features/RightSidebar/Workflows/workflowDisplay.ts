@@ -62,15 +62,45 @@ export function formatWorkflowDuration(ms: number | null | undefined): string {
   return `${minutes}m ${totalSeconds % 60}s`;
 }
 
-/** Compact token count: 9.2k / 41k. */
+/** Compact count: 9.2k / 41k (tokens, characters, …). */
+export function formatCompactCount(count: number): string {
+  if (count >= 1000) {
+    return `${(count / 1000).toFixed(count >= 10_000 ? 0 : 1)}k`;
+  }
+  return String(count);
+}
+
+/** Compact token count: 9.2k / 41k; em dash when unknown. */
 export function formatWorkflowTokens(tokens: number | null | undefined): string {
   if (tokens == null) {
     return "—";
   }
-  if (tokens >= 1000) {
-    return `${(tokens / 1000).toFixed(tokens >= 10_000 ? 0 : 1)}k`;
+  return formatCompactCount(tokens);
+}
+
+/**
+ * Preview budget for long freeform workflow text (arg values / prompts, agent
+ * reports, error messages) rendered in the sidebar. Values within the tolerance
+ * render in full: a "Show more" that reveals only a few extra words is worse
+ * than just showing them.
+ */
+export const WORKFLOW_TEXT_PREVIEW_CHAR_LIMIT = 280;
+export const WORKFLOW_TEXT_PREVIEW_TOLERANCE_CHARS = 120;
+
+export interface WorkflowTextPreview {
+  truncated: boolean;
+  /** First chars of the text when truncated, otherwise the full text. */
+  preview: string;
+}
+
+export function getWorkflowTextPreview(
+  text: string,
+  charLimit: number = WORKFLOW_TEXT_PREVIEW_CHAR_LIMIT
+): WorkflowTextPreview {
+  if (text.length <= charLimit + WORKFLOW_TEXT_PREVIEW_TOLERANCE_CHARS) {
+    return { truncated: false, preview: text };
   }
-  return String(tokens);
+  return { truncated: true, preview: text.slice(0, charLimit).trimEnd() };
 }
 
 export function formatWorkflowCost(costUsd: number | null | undefined): string {

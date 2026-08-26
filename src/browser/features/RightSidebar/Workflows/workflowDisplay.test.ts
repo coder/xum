@@ -2,10 +2,13 @@ import { describe, expect, test } from "bun:test";
 
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
 import {
+  WORKFLOW_TEXT_PREVIEW_CHAR_LIMIT,
+  WORKFLOW_TEXT_PREVIEW_TOLERANCE_CHARS,
   formatWorkflowCost,
   formatWorkflowDuration,
   formatWorkflowTimeAgo,
   formatWorkflowTokens,
+  getWorkflowTextPreview,
   hasDisplayableWorkflowReport,
   shouldAutoActivateWorkflowsTab,
   workflowStructuredOutputEntries,
@@ -113,5 +116,31 @@ describe("shouldAutoActivateWorkflowsTab", () => {
     expect(shouldAutoActivateWorkflowsTab(1, 2)).toBe(false);
     expect(shouldAutoActivateWorkflowsTab(2, 0)).toBe(false);
     expect(shouldAutoActivateWorkflowsTab(0, 0)).toBe(false);
+  });
+});
+
+describe("getWorkflowTextPreview", () => {
+  test("keeps text within the limit untouched", () => {
+    const text = "short prompt";
+    expect(getWorkflowTextPreview(text)).toEqual({ truncated: false, preview: text });
+  });
+  test("does not truncate when the hidden remainder would be within the tolerance", () => {
+    const text = "a".repeat(
+      WORKFLOW_TEXT_PREVIEW_CHAR_LIMIT + WORKFLOW_TEXT_PREVIEW_TOLERANCE_CHARS
+    );
+    expect(getWorkflowTextPreview(text)).toEqual({ truncated: false, preview: text });
+  });
+  test("truncates to the char limit once past the tolerance", () => {
+    const text = "b".repeat(
+      WORKFLOW_TEXT_PREVIEW_CHAR_LIMIT + WORKFLOW_TEXT_PREVIEW_TOLERANCE_CHARS + 1
+    );
+    expect(getWorkflowTextPreview(text)).toEqual({
+      truncated: true,
+      preview: "b".repeat(WORKFLOW_TEXT_PREVIEW_CHAR_LIMIT),
+    });
+  });
+  test("trims trailing whitespace from the cut point and honors a custom limit", () => {
+    const text = `word ${"x".repeat(500)}`;
+    expect(getWorkflowTextPreview(text, 5)).toEqual({ truncated: true, preview: "word" });
   });
 });
