@@ -1793,7 +1793,8 @@ export const workspace = {
   activity: {
     list: {
       input: z.void(),
-      output: z.record(z.string(), WorkspaceActivitySnapshotSchema),
+      // null signals a backend read failure; {} is a legitimate all-idle result.
+      output: z.record(z.string(), WorkspaceActivitySnapshotSchema).nullable(),
     },
     subscribe: {
       input: z.void(),
@@ -2150,6 +2151,21 @@ export const workflows = {
   getRun: {
     input: z.object({ workspaceId: z.string().min(1), runId: WorkflowRunIdSchema }).strict(),
     output: WorkflowRunRecordSchema.nullable(),
+  },
+  // Bulk liveness lookup: one renderer round trip covers runs owned by different
+  // workspaces. status null = no durable record; a ref whose read failed is omitted
+  // from the output so callers can tell transient errors from a settled/missing run.
+  getRunStatuses: {
+    input: z
+      .object({
+        runs: z.array(
+          z.object({ workspaceId: z.string().min(1), runId: WorkflowRunIdSchema }).strict()
+        ),
+      })
+      .strict(),
+    output: z.array(
+      z.object({ runId: WorkflowRunIdSchema, status: WorkflowRunStatusSchema.nullable() })
+    ),
   },
   interrupt: {
     input: z.object({ workspaceId: z.string().min(1), runId: WorkflowRunIdSchema }).strict(),

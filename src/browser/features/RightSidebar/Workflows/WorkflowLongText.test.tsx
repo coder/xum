@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import { installDom } from "../../../../../tests/ui/dom";
 
@@ -52,7 +52,7 @@ describe("WorkflowLongText", () => {
     expect(container.textContent).not.toContain(text);
   });
 
-  test("markdown mode renders the preview as plain text and the expansion as markdown", () => {
+  test("markdown mode renders the preview as plain text and the expansion as markdown", async () => {
     const text = `## Findings\n\n${"finding ".repeat(200)}`;
     const { container, getByLabelText, queryByRole } = render(
       <WorkflowLongText markdown text={text} title="step — report" />
@@ -61,6 +61,9 @@ describe("WorkflowLongText", () => {
     expect(queryByRole("heading")).toBeNull();
     expect(container.textContent).toContain("## Findings");
     fireEvent.click(getByLabelText("Show more of step — report"));
-    expect(queryByRole("heading")?.textContent).toBe("Findings");
+    // Streamdown may flush parsed blocks a tick after the click re-render (its
+    // scheduling differs across bun versions), so poll instead of asserting
+    // synchronously.
+    await waitFor(() => expect(queryByRole("heading")?.textContent).toBe("Findings"));
   });
 });

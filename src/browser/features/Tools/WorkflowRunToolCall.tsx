@@ -1587,11 +1587,15 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
         <ExpandIcon expanded={expanded}>▶</ExpandIcon>
         <ToolIcon toolName={toolName} />
         <WorkflowKindBadge />
-        <ToolName>{displayName}</ToolName>
+        {/* min-w-0 + truncate lets a long workflow name yield space instead of holding
+            its intrinsic width and starving the progress summary at narrow widths. */}
+        <ToolName className="min-w-0 truncate">{displayName}</ToolName>
         {/* Collapsed-only: the expanded body already lists phases/steps, and duplicating
-            their text in the header would just add noise next to the event log. */}
+            their text in the header would just add noise next to the event log.
+            grow + basis floor keeps the summary usable when the name is long (the name
+            truncates first) and fills leftover space otherwise. */}
         {!expanded && headerProgressSummary != null && (
-          <span className="text-muted counter-nums min-w-0 truncate text-[10px]">
+          <span className="text-muted counter-nums min-w-0 grow basis-24 truncate text-[10px]">
             {headerProgressSummary}
           </span>
         )}

@@ -457,6 +457,39 @@ export const RunningBackgroundWithRun: Story = {
   },
 };
 
+/**
+ * Narrow-container regression: a long workflow name must truncate instead of
+ * starving the collapsed header's step-progress summary. No API provider, so the
+ * static run record renders without polling.
+ */
+export const RunningNarrowLongName: Story = {
+  render: (args) => (
+    <div style={{ width: 360 }}>
+      <WorkflowRunToolCall {...args} />
+    </div>
+  ),
+  args: {
+    args: {
+      script_path: DEEP_RESEARCH_SCRIPT_PATH,
+      args: { topic: "workflow run cards" },
+      run_in_background: true,
+    },
+    status: "completed",
+    result: {
+      status: "running",
+      runId: "wfr_story_foreground",
+      result: null,
+      run: {
+        ...foregroundDiscoveryRun,
+        workflow: {
+          ...foregroundDiscoveryRun.workflow,
+          name: "deep-research-competitive-landscape-and-pricing-teardown",
+        },
+      },
+    },
+  },
+};
+
 const nestedChildRun: WorkflowRunRecord = {
   id: "wfr_child_story",
   workspaceId: "workspace-1",

@@ -3295,34 +3295,22 @@ export class WorkspaceStore {
     }
   }
 
-  /** Returns whether the list was applied — {} is the backend's read-failure fallback. */
-  private applyWorkspaceActivityList(
-    snapshots: Record<string, WorkspaceActivitySnapshot>
-  ): boolean {
-    const snapshotEntries = Object.entries(snapshots);
-
-    // Defensive fallback: workspace.activity.list returns {} on backend read failures.
-    // Preserve last-known snapshots instead of wiping sidebar activity state for all
-    // workspaces during a transient metadata read error. Callers must not treat the
-    // skipped application as authoritative activity data.
-    if (snapshotEntries.length === 0) {
-      return false;
-    }
-
+  private applyWorkspaceActivityList(snapshots: Record<string, WorkspaceActivitySnapshot>): void {
     const seenWorkspaceIds = new Set<string>();
 
-    for (const [workspaceId, snapshot] of snapshotEntries) {
+    for (const [workspaceId, snapshot] of Object.entries(snapshots)) {
       seenWorkspaceIds.add(workspaceId);
       this.applyWorkspaceActivitySnapshot(workspaceId, snapshot);
     }
 
+    // An empty list is a valid all-idle result (backend read failures arrive as null
+    // and never reach this method), so clear any cached snapshots it no longer lists.
     for (const workspaceId of Array.from(this.workspaceActivity.keys())) {
       if (seenWorkspaceIds.has(workspaceId)) {
         continue;
       }
       this.applyWorkspaceActivitySnapshot(workspaceId, null);
     }
-    return true;
   }
 
   private applyTerminalActivity(
@@ -3573,9 +3561,10 @@ export class WorkspaceStore {
 
   /**
    * Hydrated means the first-paint barrier may release — including the bootstrap
-   * FAILURE path, which self-heals with an empty activity map. Authoritative is set
-   * only when a real activity snapshot list was applied, so consumers that must not
-   * mistake the empty failure-path map for "no activity" (e.g. the Workflows tab
+   * FAILURE path, which self-heals without activity data. Authoritative is set only
+   * when a real activity snapshot list was applied ({} from an all-idle backend
+   * counts; the null read-failure signal does not), so consumers that must not
+   * mistake failure-path state for "no activity" (e.g. the Workflows tab
    * auto-activation baseline) gate on it instead.
    */
   private markActivityHydrated(authoritative: boolean): void {
@@ -3652,10 +3641,14 @@ export class WorkspaceStore {
           if (signal.aborted || attemptController.signal.aborted) {
             return;
           }
-          // An empty list is the backend's non-throwing read-failure fallback; it must
-          // not flip the authoritative flag (baseline consumers would misread it as
-          // "no activity anywhere"). The retry/subscription path delivers real data later.
-          this.markActivityHydrated(this.applyWorkspaceActivityList(snapshots));
+          // null is the backend's read-failure signal: keep last-known snapshots and
+          // stay non-authoritative (the retry/subscription path delivers real data
+          // later). A non-null list — including {} on an all-idle deployment — is
+          // authoritative.
+          if (snapshots != null) {
+            this.applyWorkspaceActivityList(snapshots);
+          }
+          this.markActivityHydrated(snapshots != null);
         });
 
         // Start watchdog after bootstrap so slow list() doesn't trigger

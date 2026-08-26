@@ -65,7 +65,9 @@ const mockHistoryLoadMore = mock(
       hasOlder: false,
     })
 );
-const mockActivityList = mock(() => Promise.resolve<Record<string, WorkspaceActivitySnapshot>>({}));
+const mockActivityList = mock(() =>
+  Promise.resolve<Record<string, WorkspaceActivitySnapshot> | null>({})
+);
 
 type WorkspaceActivityEvent =
   | {
@@ -3903,8 +3905,8 @@ describe("WorkspaceStore", () => {
       }
     });
 
-    it("preserves cached activity snapshots when list returns an empty payload", async () => {
-      const workspaceId = "activity-list-empty-payload";
+    it("preserves cached activity snapshots when list reports a read failure (null)", async () => {
+      const workspaceId = "activity-list-read-failure";
       const initialRecency = new Date("2024-01-07T00:00:00.000Z").getTime();
       const snapshot: WorkspaceActivitySnapshot = {
         recency: initialRecency,
@@ -3917,7 +3919,69 @@ describe("WorkspaceStore", () => {
 
       let listCallCount = 0;
       mockActivityList.mockImplementation(
-        (): Promise<Record<string, WorkspaceActivitySnapshot>> => {
+        (): Promise<Record<string, WorkspaceActivitySnapshot> | null> => {
+          listCallCount += 1;
+          if (listCallCount === 1) {
+            return Promise.resolve({ [workspaceId]: snapshot });
+          }
+          return Promise.resolve(null);
+        }
+      );
+
+      // eslint-disable-next-line require-yield
+      mockActivitySubscribe.mockImplementation(async function* (
+        _input?: void,
+        options?: { signal?: AbortSignal }
+      ): AsyncGenerator<WorkspaceActivityEvent, void, unknown> {
+        await waitForAbortSignal(options?.signal);
+      });
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
+      createAndAddWorkspace(
+        store,
+        workspaceId,
+        {
+          createdAt: "2020-01-01T00:00:00.000Z",
+        },
+        false
+      );
+
+      const seededSnapshot = await waitUntil(() => {
+        const state = store.getWorkspaceState(workspaceId);
+        return state.recencyTimestamp === initialRecency && state.canInterrupt === true;
+      });
+      expect(seededSnapshot).toBe(true);
+
+      // Swap to a new client object to force activity subscription restart and a fresh list() call.
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
+
+      const sawRetryListCall = await waitUntil(() => listCallCount >= 2);
+      expect(sawRetryListCall).toBe(true);
+
+      const stateAfterFailedList = store.getWorkspaceState(workspaceId);
+      expect(stateAfterFailedList.recencyTimestamp).toBe(initialRecency);
+      expect(stateAfterFailedList.canInterrupt).toBe(true);
+      expect(stateAfterFailedList.currentModel).toBe(snapshot.lastModel);
+      expect(stateAfterFailedList.currentThinkingLevel).toBe(snapshot.lastThinkingLevel);
+    });
+
+    it("clears cached activity snapshots when a later list is legitimately empty", async () => {
+      const workspaceId = "activity-list-empty-clears";
+      const initialRecency = new Date("2024-01-07T00:00:00.000Z").getTime();
+      const snapshot: WorkspaceActivitySnapshot = {
+        recency: initialRecency,
+        streaming: true,
+        lastModel: "claude-sonnet-4",
+        lastThinkingLevel: "high",
+      };
+
+      resetStore();
+
+      let listCallCount = 0;
+      mockActivityList.mockImplementation(
+        (): Promise<Record<string, WorkspaceActivitySnapshot> | null> => {
           listCallCount += 1;
           if (listCallCount === 1) {
             return Promise.resolve({ [workspaceId]: snapshot });
@@ -3955,14 +4019,37 @@ describe("WorkspaceStore", () => {
       // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
       store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
 
-      const sawRetryListCall = await waitUntil(() => listCallCount >= 2);
-      expect(sawRetryListCall).toBe(true);
+      // {} is a valid all-idle payload (failures arrive as null), so the stale
+      // streaming snapshot must clear instead of being preserved.
+      const clearedStreaming = await waitUntil(
+        () => store.getWorkspaceState(workspaceId).canInterrupt === false
+      );
+      expect(clearedStreaming).toBe(true);
+    });
 
-      const stateAfterEmptyList = store.getWorkspaceState(workspaceId);
-      expect(stateAfterEmptyList.recencyTimestamp).toBe(initialRecency);
-      expect(stateAfterEmptyList.canInterrupt).toBe(true);
-      expect(stateAfterEmptyList.currentModel).toBe(snapshot.lastModel);
-      expect(stateAfterEmptyList.currentThinkingLevel).toBe(snapshot.lastThinkingLevel);
+    it("marks activity authoritative when the initial list is legitimately empty", async () => {
+      resetStore();
+      mockActivityList.mockResolvedValue({});
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
+
+      // An all-idle cold start must become authoritative, otherwise baseline
+      // consumers (Workflows tab auto-activation) would stay disarmed forever.
+      const authoritative = await waitUntil(() => store.isActivityAuthoritative());
+      expect(authoritative).toBe(true);
+    });
+
+    it("hydrates without authority when the initial list reports a read failure", async () => {
+      resetStore();
+      mockActivityList.mockResolvedValue(null);
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
+
+      const hydrated = await waitUntil(() => store.isActivityHydrated());
+      expect(hydrated).toBe(true);
+      expect(store.isActivityAuthoritative()).toBe(false);
     });
   });
 

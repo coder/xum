@@ -7,6 +7,7 @@ import {
   getSubAgentStatusPresentation,
   isSubAgentActive,
   mergeActiveWorkflowGroups,
+  reconcileNestedRunLiveness,
   type ObservedWorkflowRunInfo,
   type WorkflowAgentGroup,
 } from "./SubAgentTasksDecoration";
@@ -211,5 +212,60 @@ describe("collectDescendantAgents", () => {
         workspace("failed", { taskStatus: "reported", taskExecutionStatus: "error" })
       ).label
     ).toBe("Failed");
+  });
+});
+
+describe("reconcileNestedRunLiveness", () => {
+  test("kills settled and missing durable records immediately", () => {
+    const failureCounts = new Map<string, number>();
+    const dead = reconcileNestedRunLiveness({
+      candidateRunIds: ["wfr_done", "wfr_missing", "wfr_live"],
+      entries: [
+        { runId: "wfr_done", status: "completed" },
+        { runId: "wfr_missing", status: null },
+        { runId: "wfr_live", status: "running" },
+      ],
+      failureCounts,
+      maxFailures: 3,
+    });
+    expect(dead).toEqual(["wfr_done", "wfr_missing"]);
+    expect(failureCounts.size).toBe(0);
+  });
+
+  test("kills an unreachable run only after consecutive failed cycles", () => {
+    const failureCounts = new Map<string, number>();
+    const cycle = (
+      entries: ReadonlyArray<{ runId: string; status: "running" | null }> | null
+    ): string[] =>
+      reconcileNestedRunLiveness({
+        candidateRunIds: ["wfr_gap"],
+        entries,
+        failureCounts,
+        maxFailures: 3,
+      });
+
+    // Two failures (whole call, then per-ref omission) keep the group alive...
+    expect(cycle(null)).toEqual([]);
+    expect(cycle([])).toEqual([]);
+    // ...a successful read resets the streak...
+    expect(cycle([{ runId: "wfr_gap", status: "running" }])).toEqual([]);
+    expect(failureCounts.get("wfr_gap")).toBeUndefined();
+    // ...so a fresh streak needs the full threshold again.
+    expect(cycle(null)).toEqual([]);
+    expect(cycle(null)).toEqual([]);
+    expect(cycle(null)).toEqual(["wfr_gap"]);
+  });
+
+  test("counts a per-ref omission only against the omitted run", () => {
+    const failureCounts = new Map<string, number>();
+    const dead = reconcileNestedRunLiveness({
+      candidateRunIds: ["wfr_ok", "wfr_gone"],
+      entries: [{ runId: "wfr_ok", status: "backgrounded" }],
+      failureCounts,
+      maxFailures: 3,
+    });
+    expect(dead).toEqual([]);
+    expect(failureCounts.get("wfr_gone")).toBe(1);
+    expect(failureCounts.get("wfr_ok")).toBeUndefined();
   });
 });

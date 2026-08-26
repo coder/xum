@@ -163,8 +163,9 @@ type MetaRecord = Record<string, unknown>;
 type WorkspaceInfo = NonNullable<
   Awaited<ReturnType<ServerConnection["client"]["workspace"]["getInfo"]>>
 >;
-type WorkspaceActivityById = Awaited<
-  ReturnType<ServerConnection["client"]["workspace"]["activity"]["list"]>
+// NonNullable: the null read-failure signal is normalized to {} at the call site.
+type WorkspaceActivityById = NonNullable<
+  Awaited<ReturnType<ServerConnection["client"]["workspace"]["activity"]["list"]>>
 >;
 
 export class MuxAgent implements Agent {
@@ -441,11 +442,13 @@ export class MuxAgent implements Agent {
     const normalizedCwd = normalizeOptionalPath(params.cwd);
     const offset = parseSessionListCursor(params.cursor);
 
-    const [activeWorkspaces, archivedWorkspaces, workspaceActivity] = await Promise.all([
+    const [activeWorkspaces, archivedWorkspaces, workspaceActivityList] = await Promise.all([
       this.server.client.workspace.list({ archived: false }),
       this.server.client.workspace.list({ archived: true }),
       this.server.client.workspace.activity.list(),
     ]);
+    // null = backend activity read failure; session ordering degrades to metadata-only.
+    const workspaceActivity = workspaceActivityList ?? {};
 
     const allWorkspaces = dedupeWorkspacesById([...activeWorkspaces, ...archivedWorkspaces]);
     const filteredWorkspaces =

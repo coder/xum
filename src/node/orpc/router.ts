@@ -114,7 +114,7 @@ import * as fsPromises from "fs/promises";
 import * as path from "node:path";
 
 import type { DevToolsEvent } from "@/common/types/devtools";
-import type { WorkflowRunStreamEvent } from "@/common/types/workflow";
+import type { WorkflowRunStatus, WorkflowRunStreamEvent } from "@/common/types/workflow";
 import type { MuxMessage } from "@/common/types/message";
 import { coerceThinkingLevel } from "@/common/types/thinking";
 import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
@@ -1978,6 +1978,41 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) => {
           const { service } = await resolveWorkflowContext(context, input.workspaceId);
           return service.getRun({ workspaceId: input.workspaceId, runId: input.runId });
+        }),
+      getRunStatuses: t
+        .input(schemas.workflows.getRunStatuses.input)
+        .output(schemas.workflows.getRunStatuses.output)
+        .handler(async ({ context, input }) => {
+          // Bulk nested-run liveness for the sub-agent tray: one renderer round trip
+          // covers all candidates (owners may differ, so contexts resolve per owner).
+          // A ref whose context/read rejects is omitted so callers can distinguish
+          // transient failures from a definitively missing durable record.
+          const contexts = new Map<string, ReturnType<typeof resolveWorkflowContext>>();
+          const resolveFor = (workspaceId: string) => {
+            let resolved = contexts.get(workspaceId);
+            if (resolved == null) {
+              resolved = resolveWorkflowContext(context, workspaceId);
+              contexts.set(workspaceId, resolved);
+            }
+            return resolved;
+          };
+          const entries = await Promise.all(
+            input.runs.map(async (ref) => {
+              try {
+                const { service } = await resolveFor(ref.workspaceId);
+                const run = await service.getRun({
+                  workspaceId: ref.workspaceId,
+                  runId: ref.runId,
+                });
+                return { runId: ref.runId, status: run?.status ?? null };
+              } catch {
+                return null;
+              }
+            })
+          );
+          return entries.filter(
+            (entry): entry is { runId: string; status: WorkflowRunStatus | null } => entry != null
+          );
         }),
       interrupt: t
         .input(schemas.workflows.interrupt.input)

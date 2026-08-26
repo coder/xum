@@ -13,7 +13,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
-import { isActiveWorkflowRunStatus } from "@/common/types/workflow";
+import { isActiveWorkflowRunStatus, type WorkflowRunStatus } from "@/common/types/workflow";
 import { shortenWorkflowRunId } from "@/browser/components/ProjectSidebar/sidebarTaskGroups";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useRouter } from "@/browser/contexts/RouterContext";
@@ -303,6 +303,44 @@ function formatWorkflowSummary(workflowGroups: readonly WorkflowAgentGroup[]): s
   return `${label} · ${workers}`;
 }
 
+/**
+ * Fold one bulk verification response into the failure-streak state and return the
+ * run ids whose groups must drop. `entries` is the workflows.getRunStatuses result
+ * (refs whose read failed are omitted); null means the whole call failed. A settled
+ * or missing durable record dies immediately; an unreachable one dies only after
+ * maxFailures CONSECUTIVE failed cycles — a successful read resets its streak.
+ */
+export function reconcileNestedRunLiveness(input: {
+  candidateRunIds: readonly string[];
+  entries: ReadonlyArray<{ runId: string; status: WorkflowRunStatus | null }> | null;
+  failureCounts: Map<string, number>;
+  maxFailures: number;
+}): string[] {
+  const dead: string[] = [];
+  const statusByRunId =
+    input.entries == null
+      ? null
+      : new Map<string, WorkflowRunStatus | null>(
+          input.entries.map((entry) => [entry.runId, entry.status])
+        );
+  for (const runId of input.candidateRunIds) {
+    if (statusByRunId?.has(runId)) {
+      input.failureCounts.delete(runId);
+      const status = statusByRunId.get(runId) ?? null;
+      if (status == null || !isActiveWorkflowRunStatus(status)) {
+        dead.push(runId);
+      }
+      continue;
+    }
+    const failures = (input.failureCounts.get(runId) ?? 0) + 1;
+    input.failureCounts.set(runId, failures);
+    if (failures >= input.maxFailures) {
+      dead.push(runId);
+    }
+  }
+  return dead;
+}
+
 export function SubAgentTasksDecoration(props: { workspaceId: string }) {
   const { workspaceMetadata } = useWorkspaceMetadata();
   const { navigateToWorkspace } = useRouter();
@@ -369,8 +407,9 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
     });
   }
   // Nested gap groups carry no activity signal, so verify their durable run records
-  // (same source useWorkflowRunById polls) while any are on screen; mark settled,
-  // missing, or repeatedly unreachable runs dead so their groups drop out.
+  // (same source useWorkflowRunById polls) while any are on screen — one bulk IPC
+  // call per cycle. Settled, missing, or repeatedly unreachable runs are marked dead
+  // so their groups drop out.
   const nestedGapKey = workflowGroups
     .flatMap((group) => {
       const owner = group.ownerWorkspaceId;
@@ -393,34 +432,55 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
       return { runId, ownerWorkspaceId };
     });
     let cancelled = false;
+    // Serialize cycles: a lookup slower than the interval must not stack overlapping
+    // requests — skip ticks until the in-flight one settles.
+    let inFlight = false;
     const failureCounts = new Map<string, number>();
-    const markDead = (runId: string) => {
-      setDeadNestedRunIds((previous) =>
-        previous.has(runId) ? previous : new Set([...previous, runId])
-      );
+    const candidateRunIds = candidates.map((candidate) => candidate.runId);
+    const markDead = (runIds: readonly string[]) => {
+      if (runIds.length === 0) {
+        return;
+      }
+      setDeadNestedRunIds((previous) => {
+        if (runIds.every((runId) => previous.has(runId))) {
+          return previous;
+        }
+        return new Set([...previous, ...runIds]);
+      });
+    };
+    const reconcile = (
+      entries: ReadonlyArray<{ runId: string; status: WorkflowRunStatus | null }> | null
+    ) => {
+      if (!cancelled) {
+        markDead(
+          reconcileNestedRunLiveness({
+            candidateRunIds,
+            entries,
+            failureCounts,
+            maxFailures: NESTED_RUN_VERIFY_MAX_FAILURES,
+          })
+        );
+      }
     };
     const verify = () => {
-      for (const candidate of candidates) {
-        void api.workflows
-          .getRun({ workspaceId: candidate.ownerWorkspaceId, runId: candidate.runId })
-          .then((run) => {
-            if (!cancelled && (run == null || !isActiveWorkflowRunStatus(run.status))) {
-              markDead(candidate.runId);
-            }
-          })
-          .catch(() => {
-            if (cancelled) {
-              return;
-            }
-            // Transient IPC errors keep the group; a repeatedly unreachable record
-            // (e.g. the owning workspace was deleted) must not pin it forever.
-            const failures = (failureCounts.get(candidate.runId) ?? 0) + 1;
-            failureCounts.set(candidate.runId, failures);
-            if (failures >= NESTED_RUN_VERIFY_MAX_FAILURES) {
-              markDead(candidate.runId);
-            }
-          });
+      if (inFlight) {
+        return;
       }
+      inFlight = true;
+      api.workflows
+        .getRunStatuses({
+          runs: candidates.map((candidate) => ({
+            workspaceId: candidate.ownerWorkspaceId,
+            runId: candidate.runId,
+          })),
+        })
+        .then(reconcile)
+        // Transient IPC errors keep the group; a repeatedly unreachable record
+        // (e.g. the owning workspace was deleted) must not pin it forever.
+        .catch(() => reconcile(null))
+        .finally(() => {
+          inFlight = false;
+        });
     };
     verify();
     const interval = setInterval(verify, NESTED_RUN_VERIFY_INTERVAL_MS);
