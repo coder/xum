@@ -3903,8 +3903,13 @@ describe("WorkspaceStore", () => {
       }
     });
 
-    it("preserves cached activity snapshots when list returns an empty payload", async () => {
+    it("clears cached activity snapshots when list returns an authoritative empty payload", async () => {
+      // With backend scoping, {} is a valid authoritative answer (no known
+      // workspace has activity): a reconnecting client must clear snapshots
+      // for workspaces removed while it was disconnected. Read failures are
+      // delivered as rejections instead (covered below).
       const workspaceId = "activity-list-empty-payload";
+      const createdAtTimestamp = new Date("2020-01-01T00:00:00.000Z").getTime();
       const initialRecency = new Date("2024-01-07T00:00:00.000Z").getTime();
       const snapshot: WorkspaceActivitySnapshot = {
         recency: initialRecency,
@@ -3958,11 +3963,76 @@ describe("WorkspaceStore", () => {
       const sawRetryListCall = await waitUntil(() => listCallCount >= 2);
       expect(sawRetryListCall).toBe(true);
 
-      const stateAfterEmptyList = store.getWorkspaceState(workspaceId);
-      expect(stateAfterEmptyList.recencyTimestamp).toBe(initialRecency);
-      expect(stateAfterEmptyList.canInterrupt).toBe(true);
-      expect(stateAfterEmptyList.currentModel).toBe(snapshot.lastModel);
-      expect(stateAfterEmptyList.currentThinkingLevel).toBe(snapshot.lastThinkingLevel);
+      const sawClearedSnapshot = await waitUntil(() => {
+        const state = store.getWorkspaceState(workspaceId);
+        return state.recencyTimestamp === createdAtTimestamp && state.canInterrupt === false;
+      });
+      expect(sawClearedSnapshot).toBe(true);
+    });
+
+    it("keeps cached activity snapshots when a reconnect list() rejects", async () => {
+      // A rejection means the backend could not read its state (corrupt
+      // metadata/config); unlike an authoritative empty payload it must not
+      // wipe last-known renderer state — the bootstrap loop retries instead.
+      const workspaceId = "activity-list-rejected-payload";
+      const initialRecency = new Date("2024-01-07T00:00:00.000Z").getTime();
+      const snapshot: WorkspaceActivitySnapshot = {
+        recency: initialRecency,
+        streaming: true,
+        lastModel: "claude-sonnet-4",
+        lastThinkingLevel: "high",
+      };
+
+      resetStore();
+
+      let listCallCount = 0;
+      mockActivityList.mockImplementation(
+        (): Promise<Record<string, WorkspaceActivitySnapshot>> => {
+          listCallCount += 1;
+          if (listCallCount === 1) {
+            return Promise.resolve({ [workspaceId]: snapshot });
+          }
+          return Promise.reject(new Error("activity list unavailable"));
+        }
+      );
+
+      // eslint-disable-next-line require-yield
+      mockActivitySubscribe.mockImplementation(async function* (
+        _input?: void,
+        options?: { signal?: AbortSignal }
+      ): AsyncGenerator<WorkspaceActivityEvent, void, unknown> {
+        await waitForAbortSignal(options?.signal);
+      });
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
+      createAndAddWorkspace(
+        store,
+        workspaceId,
+        {
+          createdAt: "2020-01-01T00:00:00.000Z",
+        },
+        false
+      );
+
+      const seededSnapshot = await waitUntil(() => {
+        const state = store.getWorkspaceState(workspaceId);
+        return state.recencyTimestamp === initialRecency && state.canInterrupt === true;
+      });
+      expect(seededSnapshot).toBe(true);
+
+      // Swap to a new client object to force activity subscription restart and a fresh list() call.
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
+
+      const sawRejectedListCall = await waitUntil(() => listCallCount >= 2);
+      expect(sawRejectedListCall).toBe(true);
+
+      const stateAfterRejectedList = store.getWorkspaceState(workspaceId);
+      expect(stateAfterRejectedList.recencyTimestamp).toBe(initialRecency);
+      expect(stateAfterRejectedList.canInterrupt).toBe(true);
+      expect(stateAfterRejectedList.currentModel).toBe(snapshot.lastModel);
+      expect(stateAfterRejectedList.currentThinkingLevel).toBe(snapshot.lastThinkingLevel);
     });
   });
 
