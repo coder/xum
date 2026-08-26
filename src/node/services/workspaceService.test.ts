@@ -3438,6 +3438,52 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("getActivityList drops entries whose metadata another process removed mid-list", async () => {
+    // XUM_ALLOW_MULTIPLE_INSTANCES: a removal in another backend never
+    // reaches this process's in-memory tombstones, so the final response
+    // revalidates against a fresh read of the shared file instead.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "removed-by-other-process";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const metadataPath = path.join(config.rootDir, "extensionMetadata.json");
+      const extensionMetadata = new ExtensionMetadataService(metadataPath);
+      await extensionMetadata.updateRecency(workspaceId, 100);
+      const readSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      spyOn(extensionMetadata, "getAllSnapshots").mockImplementationOnce(async (options) => {
+        const snapshots = await readSnapshots(options);
+        // Simulates another backend's removal landing after this request read
+        // its snapshot view: rewrite the shared file without the entry, with
+        // no in-process deleteWorkspace tombstone.
+        await fsPromises.writeFile(
+          metadataPath,
+          JSON.stringify({ version: 1, workspaces: {} }),
+          "utf-8"
+        );
+        return snapshots;
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+
+      const activityList = await workspaceService.getActivityList();
+      expect(activityList[workspaceId]).toBeUndefined();
+      // The in-process tombstone was NOT the mechanism here.
+      expect(extensionMetadata.isWorkspaceDeleted(workspaceId)).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("getActivityList rejects on metadata read failure instead of returning {}", async () => {
     // With scoping, {} is a valid authoritative answer that clears renderer
     // state; failures must be distinguishable so the renderer keeps its

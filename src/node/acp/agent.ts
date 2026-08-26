@@ -35,6 +35,7 @@ import {
   buildCompactionPrompt,
 } from "@/common/constants/ui";
 import { execFileAsync } from "@/node/utils/disposableExec";
+import { log } from "@/node/services/log";
 import { RuntimeConfigSchema } from "@/common/orpc/schemas";
 import type { OnChatMode, SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
@@ -453,10 +454,7 @@ export class MuxAgent implements Agent {
       this.server.client.workspace.activity
         .list()
         .catch((error: unknown): WorkspaceActivityById => {
-          console.error(
-            "[acp] Failed to list workspace activity; listing sessions without it",
-            error
-          );
+          log.error("[acp] Failed to list workspace activity; listing sessions without it", error);
           return {};
         }),
     ]);

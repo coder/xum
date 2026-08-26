@@ -12970,6 +12970,23 @@ export class WorkspaceService extends EventEmitter {
           }
         )
       );
+      // Cross-process counterpart of the in-process tombstone check below:
+      // with XUM_ALLOW_MULTIPLE_INSTANCES another backend can delete a
+      // workspace's metadata entry while this list computes, invisible to
+      // this process's deletedWorkspaceIds. Re-read the (post-prune bounded)
+      // file once and drop entries whose persisted snapshot vanished — keys
+      // only disappear through removal. Entries without a persisted snapshot
+      // (workflow/bash-monitor tombstones, in-memory overlays) are kept.
+      // Best-effort: an unreadable re-read skips this revalidation instead
+      // of failing an otherwise complete response.
+      let freshPersistedIds: ReadonlySet<string> | null = null;
+      try {
+        freshPersistedIds = new Set(
+          (await this.extensionMetadata.getAllSnapshots({ throwOnError: true })).keys()
+        );
+      } catch {
+        freshPersistedIds = null;
+      }
       return Object.fromEntries(
         entries.filter(
           (entry): entry is readonly [string, WorkspaceActivitySnapshot] =>
@@ -12979,7 +12996,12 @@ export class WorkspaceService extends EventEmitter {
             // delayed response past emitWorkspaceActivity's tombstone
             // suppression — a renderer that already processed the removal
             // event would re-insert the deleted id until the next reconnect.
-            !this.extensionMetadata.isWorkspaceDeleted(entry[0])
+            !this.extensionMetadata.isWorkspaceDeleted(entry[0]) &&
+            !(
+              freshPersistedIds != null &&
+              snapshots.has(entry[0]) &&
+              !freshPersistedIds.has(entry[0])
+            )
         )
       );
     } catch (error) {
