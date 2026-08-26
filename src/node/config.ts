@@ -1418,7 +1418,12 @@ export class Config {
               throw new Error("Config project entries must be objects");
             }
             const workspaces = (projectConfig as { workspaces?: unknown }).workspaces;
-            if (workspaces !== undefined && !Array.isArray(workspaces)) {
+            // ProjectConfigSchema persists `workspaces` as a REQUIRED array,
+            // so a present project entry without the key is mangled state
+            // (readPersistedWorkspaceIdEvidence flags it incomplete too).
+            // Accepting it here would hand destructive callers an
+            // authoritatively-empty workspace set for that project.
+            if (!Array.isArray(workspaces)) {
               throw new Error("Config project workspaces must be an array");
             }
           }

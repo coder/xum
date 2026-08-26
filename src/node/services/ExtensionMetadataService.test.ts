@@ -997,12 +997,12 @@ describe("ExtensionMetadataService", () => {
   });
 
   test("a malformed version value quarantines instead of masquerading as a newer schema", async () => {
-    // Only a structurally plausible forward version (finite number != 1)
-    // earns non-destructive preservation. Corruption that mangles the
-    // version field (null/string/object) must quarantine and self-heal —
-    // preserving it would fail every read and write forever on a file no
-    // build can read.
-    for (const version of [null, "two", {}]) {
+    // Only a structurally plausible forward version (integer > 1) earns
+    // non-destructive preservation. Corruption that mangles the version
+    // field (null/string/object, or a numeric no schema lineage can produce:
+    // 0/-1/2.5) must quarantine and self-heal — preserving it would fail
+    // every read and write forever on a file no build can read.
+    for (const version of [null, "two", {}, 0, -1, 2.5]) {
       await writeFile(
         filePath,
         JSON.stringify({ version, workspaces: { "ws-1": { recency: 1, streaming: false } } })

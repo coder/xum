@@ -942,13 +942,14 @@ export class ExtensionMetadataService {
       return false;
     }
     const version = (parsed as { version?: unknown }).version;
-    // Only a structurally PLAUSIBLE forward version (a finite number other
+    // Only a structurally PLAUSIBLE forward version (an integer greater
     // than 1) earns the non-destructive preservation path. A malformed value
-    // (null, string, object — corruption or a mangled manual edit) must
-    // classify as deterministic corruption instead: preserving it would
-    // leave every strict read and lenient writer failing forever on a file
-    // no build can ever read, rather than quarantining and self-healing.
-    return typeof version === "number" && Number.isFinite(version) && version !== 1;
+    // (null, string, object, or a numeric no schema lineage can produce —
+    // 0, -1, 2.5) must classify as deterministic corruption instead:
+    // preserving it would leave every strict read and lenient writer failing
+    // forever on a file no build can ever read, rather than quarantining and
+    // self-healing.
+    return typeof version === "number" && Number.isInteger(version) && version > 1;
   }
 
   private static unsupportedVersionError(): NodeJS.ErrnoException {

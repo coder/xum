@@ -871,6 +871,11 @@ describe("Config", () => {
       ["non-pair projects entry", { projects: ["not-a-pair"] }],
       ["non-object project config", { projects: [["/repo", null]] }],
       ["non-array workspaces", { projects: [["/repo", { workspaces: "bogus" }]] }],
+      // ProjectConfigSchema always persists `workspaces`; a present project
+      // entry without the key is mangled state that raw evidence flags as
+      // incomplete — strict mode must not vouch "authoritatively empty" for
+      // it (the prune would delete every snapshot of that project).
+      ["missing workspaces key", { projects: [["/repo", {}]] }],
     ];
 
     for (const [label, shape] of invalidShapes) {
