@@ -3255,6 +3255,18 @@ describe("WorkspaceService activity list scoping", () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     try {
       const lateWorkspaceId = "late-registered-workspace";
+      // Registered for real (the mid-list registration lands in config.json
+      // in the modeled race); the spies below hide it from the baseline and
+      // prune reads so only the refresh discovers it — the authoritative
+      // removal recheck must then still find it registered.
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: lateWorkspaceId,
+        name: lateWorkspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
       const extensionMetadata = new ExtensionMetadataService(
         path.join(config.rootDir, "extensionMetadata.json")
       );
@@ -3267,10 +3279,19 @@ describe("WorkspaceService activity list scoping", () => {
           // Calls 1 (pre-await baseline) and 2 (prune enumeration) see the
           // pre-registration config; the refresh and the post-await
           // revalidation see the concurrently registered workspace.
-          if (supersetCalls >= 3) {
-            ids.add(lateWorkspaceId);
+          if (supersetCalls <= 2) {
+            ids.delete(lateWorkspaceId);
           }
           return ids;
+        }
+      );
+      const realMetadata = config.getAllWorkspaceMetadata.bind(config);
+      const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(
+        async (options?: { throwOnError?: boolean }) => {
+          // The prune's authoritative enumeration also predates the
+          // registration in the modeled race.
+          const all = await realMetadata(options);
+          return all.filter((metadata) => metadata.id !== lateWorkspaceId);
         }
       );
       try {
@@ -3291,6 +3312,7 @@ describe("WorkspaceService activity list scoping", () => {
         expect(activityList?.[lateWorkspaceId]?.activeWorkflowRunCount).toBe(1);
       } finally {
         supersetSpy.mockRestore();
+        metadataSpy.mockRestore();
       }
     } finally {
       await cleanup();
@@ -3470,6 +3492,74 @@ describe("WorkspaceService activity list scoping", () => {
 
       expect((await extensionMetadata.getAllSnapshots()).has(stableId)).toBe(true);
       expect(extensionMetadata.isWorkspaceDeleted(stableId)).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("getActivityList drops snapshotless legacy entries removed mid-list", async () => {
+    // A legacy id-less config entry's stable id is resolved authoritatively
+    // during enumeration and can never appear in the raw config-id baseline,
+    // so the raw-superset removal comparison is blind to it. If another
+    // backend removes the workspace while the per-id reads run, a
+    // snapshotless (workflow-only) entry has no metadata-file revalidation
+    // to catch it either — the authoritative findWorkspace recheck must
+    // drop it instead of reinserting the removed workspace.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const stableId = "legacy-stable-id";
+      const projectPath = path.join(config.rootDir, "project");
+      const workspacePath = path.join(projectPath, "legacy-ws");
+      const configPath = path.join(config.rootDir, "config.json");
+      await fsPromises.writeFile(
+        configPath,
+        JSON.stringify({
+          projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
+        })
+      );
+      const legacySessionDir = config.getSessionDir(
+        config.generateLegacyId(projectPath, workspacePath)
+      );
+      await fsPromises.mkdir(legacySessionDir, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(legacySessionDir, "metadata.json"),
+        JSON.stringify({ id: stableId, name: "legacy-ws" })
+      );
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+      // Workflow-only activity: no persisted snapshot.
+      await workspaceService.emitWorkflowRunActivity({
+        workspaceId: stableId,
+        runId: "legacy-run",
+        status: "running",
+      });
+      // Simulate the cross-process removal between the entry computation and
+      // the revalidation phase: the fresh metadata re-read is the first
+      // revalidation step, so rewriting config.json there lands mid-list.
+      const realGetAllSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      let snapshotCalls = 0;
+      const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(
+        async (options?: { throwOnError?: boolean }) => {
+          snapshotCalls += 1;
+          if (snapshotCalls === 2) {
+            await fsPromises.writeFile(configPath, JSON.stringify({ projects: [] }));
+          }
+          return realGetAllSnapshots(options);
+        }
+      );
+      try {
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList).not.toBeNull();
+        expect(activityList?.[stableId]).toBeUndefined();
+      } finally {
+        snapshotsSpy.mockRestore();
+      }
     } finally {
       await cleanup();
     }

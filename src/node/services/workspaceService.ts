@@ -13034,14 +13034,38 @@ export class WorkspaceService extends EventEmitter {
       // in config before the awaits and is gone from the fresh raw view was
       // verifiably deregistered. Ids the raw scan cannot see (legacy entries
       // whose stable id lives in a session metadata.json, in-memory migration
-      // ids) never appear in either view and are conservatively retained —
-      // dropping them on a cheap fresh view would misclassify identity-lookup
-      // gaps as removals. Skipped when either superset read fails.
+      // ids) never appear in either view — dropping them on a cheap fresh
+      // view would misclassify identity-lookup gaps as removals, so they are
+      // revalidated through the authoritative identity path below instead.
+      // Skipped when either superset read fails.
       const isRemovedFromConfig = (workspaceId: string): boolean =>
         initialConfigIds != null &&
         freshConfigIds != null &&
         initialConfigIds.has(workspaceId) &&
         !freshConfigIds.has(workspaceId);
+      // Raw-invisible ids (legacy stable ids resolved from session
+      // metadata.json during enumeration) need their own removal
+      // revalidation: the raw baseline can never contain them, so the
+      // comparison above is blind to their cross-process removal — a
+      // snapshotless (workflow/bash-monitor-only) legacy entry removed
+      // mid-list would otherwise ride the delayed authoritative response
+      // back into the renderer. Revalidate through the same authoritative
+      // lookup that produced the id: a verified "not registered" drops the
+      // entry, while an unknowable identity (unreadable/id-less
+      // metadata.json throws in strict mode) conservatively retains it.
+      // Cost note: ids present in the raw baseline skip this entirely, so
+      // modern deployments (every workspace id persisted in config) never
+      // pay the per-id lookup.
+      const isRemovedPerAuthoritativeIdentity = (workspaceId: string): boolean => {
+        if (initialConfigIds == null || initialConfigIds.has(workspaceId)) {
+          return false;
+        }
+        try {
+          return this.config.findWorkspace(workspaceId, { throwOnError: true }) == null;
+        } catch {
+          return false;
+        }
+      };
       return Object.fromEntries(
         entries.filter(
           (entry): entry is readonly [string, WorkspaceActivitySnapshot] =>
@@ -13062,7 +13086,10 @@ export class WorkspaceService extends EventEmitter {
             ) &&
             // Deregistered from the shared config mid-list — also covers
             // workflow/bash-monitor-only entries with no persisted snapshot.
-            !isRemovedFromConfig(entry[0])
+            !isRemovedFromConfig(entry[0]) &&
+            // Raw-invisible (legacy stable) ids: authoritative-lookup
+            // counterpart of the raw-superset comparison above.
+            !isRemovedPerAuthoritativeIdentity(entry[0])
         )
       );
     } catch (error) {
