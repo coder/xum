@@ -778,9 +778,25 @@ export class BashMonitorWakeStore {
     for (const entry of entries) {
       const filePath = path.join(dir, entry);
       if (!entry.endsWith(".json")) {
-        // write()/pruning leave *.json.tmp-* / *.json.prune-* files behind only when the
-        // process crashed mid-operation; sweep old ones so crash leaks stay bounded.
-        if (/\.json\.(?:tmp|prune)-/.test(entry)) {
+        // A crash between pruneTerminalWakeFile's capture rename and its verify/restore
+        // strands the captured inode as *.json.prune-*, and that inode may hold a
+        // concurrently rewritten pending wake that neither scans nor delivery (both
+        // address the original path) can see. Inspect stranded prune files and restore
+        // pending content before any sweeping can touch it.
+        if (entry.includes(".json.prune-")) {
+          const rescued = await this.recoverStrandedPruneFile(
+            ownerWorkspaceId,
+            filePath,
+            pruneBeforeMs
+          );
+          if (rescued != null) records.push(rescued);
+          continue;
+        }
+        // write() leaves *.json.tmp-* files behind only when the process crashed
+        // mid-write; sweep old ones so crash leaks stay bounded. A tmp file is an
+        // uncommitted write — the durable state is whatever the target path holds — so
+        // it is never restored, only swept.
+        if (entry.includes(".json.tmp-")) {
           const leftoverStat = await fsPromises.stat(filePath).catch(() => null);
           if (leftoverStat != null && leftoverStat.mtimeMs < pruneBeforeMs) {
             await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
@@ -862,6 +878,76 @@ export class BashMonitorWakeStore {
   }
 
   /**
+   * Best-effort lock key for a wake file name. Filenames are encodeURIComponent(id);
+   * fall back to the raw stem for foreign files that do not round-trip (no writer
+   * contends on those ids anyway).
+   */
+  private static wakeIdFromFileStem(stem: string): string {
+    try {
+      return decodeURIComponent(stem);
+    } catch {
+      return stem;
+    }
+  }
+
+  /**
+   * Handle a *.json.prune-* leftover. pruneTerminalWakeFile renames the path's current
+   * inode aside before verifying it; a crash in that window strands the captured inode
+   * under the trash name, where neither scans nor delivery (both address the original
+   * path) can see it — and blind sweeping would eventually delete it. Stranded pending
+   * content is linked back to its original path (link() refuses to clobber a newer
+   * record at the path, which then supersedes the stranded one and lets it be removed)
+   * and the leftover deleted; a leftover that cannot be read or restored right now is
+   * KEPT so a later scan retries rather than ever deleting an unrecovered pending wake.
+   * Non-pending leftovers are swept once old. Returns the restored pending record.
+   */
+  private async recoverStrandedPruneFile(
+    ownerWorkspaceId: string,
+    filePath: string,
+    pruneBeforeMs: number
+  ): Promise<BashMonitorWakeRecord | null> {
+    // Split on the LAST ".json.prune-" so wake ids that themselves contain ".prune-"
+    // (encodeURIComponent escapes neither "." nor "-") still resolve correctly.
+    const marker = filePath.lastIndexOf(".json.prune-");
+    assert(marker >= 0, "recoverStrandedPruneFile requires a *.json.prune-* path");
+    const originalPath = filePath.slice(0, marker + ".json".length);
+    const id = BashMonitorWakeStore.wakeIdFromFileStem(
+      path.basename(originalPath).slice(0, -".json".length)
+    );
+    return this.locks.withLock(`${ownerWorkspaceId}:${id}`, async () => {
+      // Unreadable (vanished via a concurrent recover, or transiently failing): keep
+      // whatever may exist for a later retry.
+      const raw = await fsPromises.readFile(filePath, "utf-8").catch(() => null);
+      const parsed = raw == null ? null : this.parse(raw);
+      if (parsed?.status !== "pending") {
+        // Terminal or malformed content was already destined for pruning; sweep it once
+        // old (the age gate keeps a live prune's in-flight trash out of reach).
+        if (raw != null) {
+          const leftoverStat = await fsPromises.stat(filePath).catch(() => null);
+          if (leftoverStat != null && leftoverStat.mtimeMs < pruneBeforeMs) {
+            await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
+          }
+        }
+        return null;
+      }
+      let restored = false;
+      try {
+        await fsPromises.link(filePath, originalPath);
+        restored = true;
+      } catch (error) {
+        if (!isErrnoWithCode(error, "EEXIST")) {
+          // Transient link failure: keep the leftover so a later scan retries the
+          // restore instead of deleting a never-recovered pending wake.
+          return null;
+        }
+        // EEXIST: a newer record owns the original path and supersedes the stranded one.
+      }
+      await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
+      return restored ? parsed : null;
+    });
+  }
+
+  /**
    * Delete a terminal wake file that is past its retention window. The prune decision is
    * check-then-act against an earlier stat/read, and wake ids are reused process ids, so
    * a concurrent writer (another store instance, or an enqueue in this process) may have
@@ -877,15 +963,7 @@ export class BashMonitorWakeStore {
     entry: string,
     filePath: string
   ): Promise<BashMonitorWakeRecord | null> {
-    const stem = entry.slice(0, -".json".length);
-    // Filenames are encodeURIComponent(id); fall back to the raw stem for foreign files
-    // that do not round-trip (no writer contends on those ids anyway).
-    let id = stem;
-    try {
-      id = decodeURIComponent(stem);
-    } catch {
-      // keep the raw stem
-    }
+    const id = BashMonitorWakeStore.wakeIdFromFileStem(entry.slice(0, -".json".length));
     return this.locks.withLock(`${ownerWorkspaceId}:${id}`, async () => {
       const trash = `${filePath}.prune-${randomUUID()}`;
       try {

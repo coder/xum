@@ -299,6 +299,53 @@ describe("BashMonitorWakeStore", () => {
     expect(later[0].lines).toEqual(["ERROR rearmed"]);
   });
 
+  test("listPending restores a pending wake stranded in a crashed prune file", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload());
+    const file = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes", "proc-1.json");
+    // Simulate a crash between the prune's capture rename and its verify/restore: the
+    // captured pending inode is stranded under the trash name.
+    const stranded = `${file}.prune-crashed`;
+    await fsPromises.rename(file, stranded);
+
+    const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+    const pending = await fresh.listPending("owner-1");
+    expect(pending.map((r) => r.id)).toEqual(["proc-1"]);
+    // Restored to the canonical path (visible to delivery reads) and the leftover is gone.
+    expect((await fresh.get("owner-1", "proc-1"))?.status).toBe("pending");
+    let strandedGone = false;
+    try {
+      await fsPromises.access(stranded);
+    } catch {
+      strandedGone = true;
+    }
+    expect(strandedGone).toBe(true);
+  });
+
+  test("a stranded prune file never clobbers a newer record at the original path", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR old generation"] }));
+    const file = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes", "proc-1.json");
+    const stranded = `${file}.prune-crashed`;
+    await fsPromises.rename(file, stranded);
+    // A newer wake claims the original path after the crash.
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR new generation"] }));
+
+    const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+    const pending = await fresh.listPending("owner-1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0].lines).toEqual(["ERROR new generation"]);
+    // The stranded leftover is dropped, not restored over the newer record.
+    let strandedGone = false;
+    try {
+      await fsPromises.access(stranded);
+    } catch {
+      strandedGone = true;
+    }
+    expect(strandedGone).toBe(true);
+    expect((await fresh.get("owner-1", "proc-1"))?.lines).toEqual(["ERROR new generation"]);
+  });
+
   test("listPending keeps serving a cached pending wake when stat transiently fails", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload());
