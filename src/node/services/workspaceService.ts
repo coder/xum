@@ -12317,6 +12317,10 @@ export class WorkspaceService extends EventEmitter {
     }
     const retireResult = await this.retirePendingBashMonitorWakesBeforeHistoryClear(workspaceId);
     if (!retireResult.success) return retireResult;
+    // History clears retire pending wakes without any process-state change, so
+    // background-bash subscribers need explicit nudges to drop (and, after a restore,
+    // re-show) pending-wake rows; nothing else re-emits for already-exited processes.
+    this.notifyBashMonitorWakeStateChanged(workspaceId);
     const staged = retireResult.data;
     const restoreSnapshots = async (includeUnaccepted: boolean): Promise<void> => {
       const acceptedAfter = await this.findAcceptedBashMonitorWakeSnapshots(workspaceId, staged);
@@ -12328,6 +12332,7 @@ export class WorkspaceService extends EventEmitter {
         );
       });
       await this.bashMonitorWakeStore.restorePendingSnapshots(workspaceId, restorable);
+      this.notifyBashMonitorWakeStateChanged(workspaceId);
     };
     try {
       const clearResult = await clear();

@@ -499,6 +499,15 @@ export function buildBashMonitorWakePrompt(
 
 export class BashMonitorWakeStore {
   private readonly locks = new MutexMap<string>();
+  // Pending-id index so the hot listPending path (recomputed for every background-bash
+  // UI snapshot) reads only currently-pending records instead of scanning every
+  // historical wake file — terminal records are never pruned from disk, so long-lived
+  // workspaces accumulate them. Seeded per owner by one full directory scan; afterwards
+  // write() keeps it in sync because every durable mutation funnels through write().
+  // Seeding merges instead of replacing: a concurrent write can land between the
+  // directory read and installation, and the read-verify in listPending drops stale ids.
+  private readonly pendingIdsByOwner = new Map<string, Set<string>>();
+  private readonly seededPendingOwners = new Set<string>();
 
   constructor(private readonly config: Pick<Config, "getSessionDir" | "sessionsDir">) {}
 
@@ -731,12 +740,41 @@ export class BashMonitorWakeStore {
   }
 
   async listPending(ownerWorkspaceId: string): Promise<BashMonitorWakeRecord[]> {
+    if (!this.seededPendingOwners.has(ownerWorkspaceId)) {
+      return this.seedPendingIndex(ownerWorkspaceId);
+    }
+    const ids = this.pendingIdsByOwner.get(ownerWorkspaceId);
+    const records: BashMonitorWakeRecord[] = [];
+    for (const id of [...(ids ?? [])]) {
+      let record: BashMonitorWakeRecord | null;
+      try {
+        record = await this.get(ownerWorkspaceId, id);
+      } catch {
+        // Transient read failure: keep the index entry so the next call retries.
+        continue;
+      }
+      if (record?.status === "pending") {
+        records.push(record);
+      } else {
+        // Terminal, deleted, or malformed on disk: the id no longer belongs in the index.
+        ids?.delete(id);
+      }
+    }
+    records.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+    return records;
+  }
+
+  /** One-time-per-owner full scan that both answers listPending and seeds the index. */
+  private async seedPendingIndex(ownerWorkspaceId: string): Promise<BashMonitorWakeRecord[]> {
     const dir = this.dir(ownerWorkspaceId);
     let entries: string[];
     try {
       entries = await fsPromises.readdir(dir);
     } catch (error) {
-      if (isErrnoWithCode(error, "ENOENT")) return [];
+      if (isErrnoWithCode(error, "ENOENT")) {
+        this.seededPendingOwners.add(ownerWorkspaceId);
+        return [];
+      }
       throw error;
     }
     const records: BashMonitorWakeRecord[] = [];
@@ -747,6 +785,12 @@ export class BashMonitorWakeStore {
       const parsed = this.parse(raw);
       if (parsed?.status === "pending") records.push(parsed);
     }
+    const ids = this.pendingIdsByOwner.get(ownerWorkspaceId) ?? new Set<string>();
+    for (const record of records) {
+      ids.add(record.id);
+    }
+    this.pendingIdsByOwner.set(ownerWorkspaceId, ids);
+    this.seededPendingOwners.add(ownerWorkspaceId);
     records.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
     return records;
   }
@@ -994,6 +1038,18 @@ export class BashMonitorWakeStore {
       JSON.stringify(record, null, 2),
       "utf-8"
     );
+    // Keep the pending index in sync with the durable state (index only after the write
+    // succeeds, so the index can never claim a pending record that is not on disk).
+    const ids = this.pendingIdsByOwner.get(record.ownerWorkspaceId);
+    if (record.status === "pending") {
+      if (ids != null) {
+        ids.add(record.id);
+      } else {
+        this.pendingIdsByOwner.set(record.ownerWorkspaceId, new Set([record.id]));
+      }
+    } else {
+      ids?.delete(record.id);
+    }
   }
 
   private parse(raw: string): BashMonitorWakeRecord | null {

@@ -2,7 +2,7 @@ import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 
 import {
   BashMonitorWakeStore,
@@ -187,6 +187,41 @@ describe("BashMonitorWakeStore", () => {
 
     const superseded = await store.markSupersededSnapshot("owner-1", snapshot);
     expect(superseded).toBe(true);
+    expect(await store.listPending("owner-1")).toHaveLength(0);
+  });
+
+  test("listPending stays correct across transitions on both the seeded and indexed paths", async () => {
+    // Records written by a previous process (fresh store instance = cold index).
+    const writer = new BashMonitorWakeStore(makeConfig(rootDir));
+    await writer.enqueueOrMergePending(payload({ processId: "proc-a", taskId: "bash:proc-a" }));
+    await writer.enqueueOrMergePending(payload({ processId: "proc-b", taskId: "bash:proc-b" }));
+    await writer.markDelivered("owner-1", "proc-a");
+
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    // Cold path: seeds the index from a full directory scan.
+    expect((await store.listPending("owner-1")).map((r) => r.id)).toEqual(["proc-b"]);
+
+    // Warm path: transitions and new enqueues must be reflected without a rescan.
+    const readdirSpy = spyOn(fsPromises, "readdir");
+    await store.markSuperseded("owner-1", "proc-b");
+    expect(await store.listPending("owner-1")).toHaveLength(0);
+    await store.enqueueOrMergePending(payload({ processId: "proc-c", taskId: "bash:proc-c" }));
+    expect((await store.listPending("owner-1")).map((r) => r.id)).toEqual(["proc-c"]);
+    // The hot UI path must not rescan the (unpruned, ever-growing) wake directory.
+    expect(readdirSpy).not.toHaveBeenCalled();
+    readdirSpy.mockRestore();
+  });
+
+  test("listPending self-heals index entries retired by another store instance", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload());
+    expect(await store.listPending("owner-1")).toHaveLength(1);
+
+    // A second instance (e.g. another service handle) retires the record on disk.
+    const other = new BashMonitorWakeStore(makeConfig(rootDir));
+    await other.markSuperseded("owner-1", "proc-1");
+
+    // The first instance's index still lists the id; the read-verify drops it.
     expect(await store.listPending("owner-1")).toHaveLength(0);
   });
 

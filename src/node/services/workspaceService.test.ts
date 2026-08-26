@@ -541,6 +541,72 @@ describe("WorkspaceService bash monitor wakes", () => {
     }
   });
 
+  test("history clears notify background-bash subscribers on retire and restore", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-history-clear-notify";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const notifyWakeStateChanged = mock(() => undefined);
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+        notifyMonitorWakeStateChanged: notifyWakeStateChanged,
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      // Park drains so the seeded record stays pending until the clear retires it.
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(true);
+      spyOn(workspaceService, "waitForIdleAndNoQueuedMessages").mockImplementation(
+        () => new Promise(() => undefined)
+      );
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: BashMonitorWakeStore;
+        }
+      ).bashMonitorWakeStore;
+      await wakeStore.enqueueOrMergePending({
+        processId: "proc-clear",
+        taskId: "bash:proc-clear",
+        workspaceId,
+        filter: "WAKE:",
+        filterExclude: false,
+        lines: ["WAKE: done"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 10,
+      });
+
+      // Retiring pending wakes for a history clear (and restoring them afterwards) has no
+      // process-state change, so the clear path itself must nudge subscribers.
+      const clearHistory = (
+        workspaceService as unknown as {
+          clearHistoryWithRetiredBashMonitorWakes: (
+            workspaceId: string,
+            clear: () => Promise<Result<void>>
+          ) => Promise<Result<void>>;
+        }
+      ).clearHistoryWithRetiredBashMonitorWakes.bind(workspaceService);
+      notifyWakeStateChanged.mockClear();
+      const result = await clearHistory(workspaceId, () => Promise.resolve(Ok(undefined)));
+      expect(result.success).toBe(true);
+      // One nudge after the durable retire, one after the post-clear restore pass.
+      expect(notifyWakeStateChanged.mock.calls.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("listBackgroundProcesses keeps a pending wake visible on a reused monitorless process ID", async () => {
     const { config, cleanup } = await createTestHistoryService();
     try {
