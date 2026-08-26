@@ -605,6 +605,150 @@ describe("BashMonitorWakeStore", () => {
     expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
   });
 
+  test("identical line text never proves subsumption across divergent generations", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    // Generation A is captured by a prune; generation B is then written from scratch
+    // with IDENTICAL line text (two distinct real events can read the same). B never
+    // carried A's event, so content must not be treated as proof of subsumption.
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR boom"] }));
+    await fsPromises.rename(file, `${file}.prune-crashed`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR boom"] }));
+
+    const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+    const pending = await fresh.listPending("owner-1");
+    expect(pending).toHaveLength(1);
+    // Both events survive as separate lines; a content-containment shortcut would
+    // have deleted the captured generation and lost its event.
+    expect(pending[0].lines).toEqual(["ERROR boom", "ERROR boom"]);
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".prune-"))).toHaveLength(0);
+  });
+
+  test("an incomplete fresh temp arms the deferred re-drive", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    await fsPromises.mkdir(dir, { recursive: true });
+    const file = path.join(dir, "proc-1.json");
+    // A live writer's writeFile is still in flight at scan time. Its process may yet
+    // complete the write and crash before the rename — leaving a complete orphan with
+    // no event, pending owner, or timer to trigger another scan unless armed here.
+    const temp = `${file}.tmp-crashed`;
+    await fsPromises.writeFile(temp, '{"id": "proc-1", "trunc', "utf-8");
+    const nearGate = new Date(Date.now() - TEMP_RECOVERY_MIN_AGE_MS + 100);
+    await fsPromises.utimes(temp, nearGate, nearGate);
+
+    const due = new Promise<string>((resolve) => {
+      store.onDeferredTempRecoveryDue = resolve;
+    });
+    expect(await store.listPending("owner-1")).toEqual([]);
+    expect(await due).toBe("owner-1");
+    // Simulate the crash having completed the write after that scan: the re-driven
+    // scan restores the now-complete record.
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR completed"] }));
+    const completed = await fsPromises.readFile(file, "utf-8");
+    await fsPromises.rm(file, { force: true });
+    await fsPromises.writeFile(temp, completed, "utf-8");
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(temp, past, past);
+    expect((await store.listPending("owner-1")).map((r) => r.lines)).toEqual([["ERROR completed"]]);
+  });
+
+  test("a doubly-failed write cleanup leaves no committable temp", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR keep pending"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+
+    // The commit rename fails AND the best-effort temp removal fails. The rejected
+    // supersede must not survive in committable form, or recovery would later make
+    // durable an operation the caller was told never happened.
+    const realRename = fsPromises.rename;
+    const realRm = fsPromises.rm;
+    const renameSpy = spyOn(fsPromises, "rename").mockImplementation((from, to) =>
+      String(from).includes(".json.tmp-")
+        ? Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
+        : realRename(from, to)
+    );
+    const rmSpy = spyOn(fsPromises, "rm").mockImplementation(((
+      target: Parameters<typeof realRm>[0],
+      options: Parameters<typeof realRm>[1]
+    ) =>
+      String(target).includes(".json.tmp-")
+        ? Promise.reject(Object.assign(new Error("EBUSY: busy"), { code: "EBUSY" }))
+        : realRm(target, options)) as typeof fsPromises.rm);
+    try {
+      await store.markSuperseded("owner-1", "proc-1");
+      expect.unreachable("expected markSuperseded to propagate the commit failure");
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("EIO");
+    } finally {
+      renameSpy.mockRestore();
+      rmSpy.mockRestore();
+    }
+    // The surviving temp was truncated to unparseable garbage: scans never commit the
+    // rejected supersede, and the wake stays pending.
+    const temps = (await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"));
+    expect(temps).toHaveLength(1);
+    expect((await fsPromises.stat(path.join(dir, temps[0]))).size).toBe(0);
+    const past = new Date(Date.now() - TERMINAL_WAKE_RETENTION_MS - 60_000);
+    await fsPromises.utimes(path.join(dir, temps[0]), past, past);
+    expect((await store.listPending("owner-1")).map((r) => r.lines)).toEqual([
+      ["ERROR keep pending"],
+    ]);
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("pending");
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
+  });
+
+  test("a history clear condemns wakes stranded in deferred temps", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR pre-clear"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    const temp = `${file}.tmp-crashed`;
+    await fsPromises.rename(file, temp);
+    const nearGate = new Date(Date.now() - TEMP_RECOVERY_MIN_AGE_MS + 100);
+    await fsPromises.utimes(temp, nearGate, nearGate);
+
+    const due = new Promise<string>((resolve) => {
+      store.onDeferredTempRecoveryDue = resolve;
+    });
+    // The clear cannot see the deferred temp (freshness gate), so nothing pending is
+    // retired — but its durable tombstone condemns the invisible pre-clear wake.
+    expect(await store.supersedeAllPending("owner-1")).toEqual([]);
+    expect(await due).toBe("owner-1");
+    // The re-driven scan discards the pre-clear temp instead of restoring and
+    // delivering it into the freshly cleared transcript.
+    expect(await store.listPending("owner-1")).toEqual([]);
+    expect(await store.get("owner-1", "proc-1")).toBeNull();
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
+  });
+
+  test("rolling back a failed clear also revives deferred temps", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR visible"] }));
+    await store.enqueueOrMergePending(
+      payload({ processId: "proc-2", taskId: "bash:proc-2", lines: ["ERROR deferred"] })
+    );
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const temp = path.join(dir, "proc-2.json.tmp-crashed");
+    await fsPromises.rename(path.join(dir, "proc-2.json"), temp);
+    const nearGate = new Date(Date.now() - TEMP_RECOVERY_MIN_AGE_MS + 100);
+    await fsPromises.utimes(temp, nearGate, nearGate);
+
+    const due = new Promise<string>((resolve) => {
+      store.onDeferredTempRecoveryDue = resolve;
+    });
+    const snapshots = await store.supersedeAllPending("owner-1");
+    expect(snapshots.map((r) => r.id)).toEqual(["proc-1"]);
+    // The clear later fails and is rolled back: the tombstone must not keep
+    // condemning the deferred temp's wake after its siblings return to pending.
+    await store.restorePendingSnapshots("owner-1", snapshots);
+    expect(await due).toBe("owner-1");
+    const pending = await store.listPending("owner-1");
+    expect(pending.map((r) => r.lines).sort()).toEqual([["ERROR deferred"], ["ERROR visible"]]);
+  });
+
   test("deferred recovery delays are bounded for corrupt or future mtimes", () => {
     const now = Date.now();
     // Near the gate: fires just past it (epsilon), no spurious full-interval wait.
@@ -995,7 +1139,9 @@ describe("BashMonitorWakeStore", () => {
     }
     expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".prune-"))).toHaveLength(0);
     expect((await store.get("owner-1", "proc-1"))?.lines).toEqual(["ERROR older", "ERROR winner"]);
-    expect((await store.get("owner-1", "proc-1"))?.totalMatches).toBe(3);
+    // totalMatches is a CUMULATIVE monitor counter, so the merge takes the max
+    // (summing would double count same-process split generations).
+    expect((await store.get("owner-1", "proc-1"))?.totalMatches).toBe(2);
   });
 
   test("a failed CAS capture propagates instead of hiding the stranded generation", async () => {

@@ -293,21 +293,6 @@ function relabelStaleSettleLine(line: string): string {
   return `[monitor] an earlier run of this process ID settled:${line.slice(BASH_MONITOR_SETTLE_LINE_PREFIX.length)}; the ID has since been re-armed by a new process`;
 }
 
-/** True when `needle` appears as one contiguous run inside `haystack` (or is empty). */
-function containsContiguousSubsequence(
-  haystack: readonly string[],
-  needle: readonly string[]
-): boolean {
-  if (needle.length === 0) return true;
-  outer: for (let start = 0; start + needle.length <= haystack.length; start++) {
-    for (let index = 0; index < needle.length; index++) {
-      if (haystack[start + index] !== needle[index]) continue outer;
-    }
-    return true;
-  }
-  return false;
-}
-
 function removeDeliveredLineOverlap(
   currentLines: readonly string[],
   deliveredLines: readonly string[]
@@ -604,6 +589,56 @@ export class BashMonitorWakeStore {
   private dir(ownerWorkspaceId: string): string {
     assert(ownerWorkspaceId.trim().length > 0, "BashMonitorWakeStore requires ownerWorkspaceId");
     return path.join(this.config.getSessionDir(ownerWorkspaceId), BASH_MONITOR_WAKE_DIR);
+  }
+
+  /**
+   * Durable history-clear tombstone. A clear retires every pending wake its scan can
+   * SEE, but a crash-orphaned temp inside the live-writer freshness gate is invisible
+   * to that scan — without a durable marker, the temp's deferred re-drive would later
+   * restore and deliver a pre-clear wake into the freshly cleared transcript. The name
+   * carries no ".json" suffix and matches no artifact pattern, so scans skip it.
+   */
+  private clearedAtFile(ownerWorkspaceId: string): string {
+    return path.join(this.dir(ownerWorkspaceId), "cleared-at");
+  }
+
+  private async writeClearedAt(ownerWorkspaceId: string, clearedAt: string): Promise<void> {
+    const target = this.clearedAtFile(ownerWorkspaceId);
+    await fsPromises.mkdir(path.dirname(target), { recursive: true });
+    // Atomic like write(): a torn tombstone must never be a file's settled content.
+    // The temp name matches no artifact pattern either, so scans skip it too.
+    const temp = `${target}.tmp-${randomUUID()}`;
+    await fsPromises.writeFile(temp, JSON.stringify({ clearedAt }), "utf-8");
+    try {
+      await fsPromises.rename(temp, target);
+    } catch (error) {
+      await fsPromises.rm(temp, { force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /** Epoch ms of the latest history clear, or null when none applies (absent or malformed). */
+  private async readClearedAtMs(ownerWorkspaceId: string): Promise<number | null> {
+    let raw: string;
+    try {
+      raw = await fsPromises.readFile(this.clearedAtFile(ownerWorkspaceId), "utf-8");
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT")) return null;
+      // Transient failures PROPAGATE: guessing "no clear happened" here could restore
+      // and deliver a retired wake; caller retries re-read instead.
+      throw error;
+    }
+    try {
+      const parsed = JSON.parse(raw) as { clearedAt?: unknown };
+      const ms = typeof parsed.clearedAt === "string" ? Date.parse(parsed.clearedAt) : NaN;
+      if (Number.isNaN(ms)) throw new Error("invalid clearedAt");
+      return ms;
+    } catch {
+      // Corrupted tombstone: fail toward DELIVERY (a lost wake is worse than a rare
+      // resurrected one) and keep the file as evidence until the next clear rewrites it.
+      log.debug("Ignoring malformed bash monitor wake clear tombstone", { ownerWorkspaceId });
+      return null;
+    }
   }
 
   static wakeId(processId: string): string {
@@ -1115,26 +1150,24 @@ export class BashMonitorWakeStore {
 
   /**
    * Whether the canonical record already carries everything `other` offers, so `other`
-   * can be discarded without losing output. Within one process instance (equal
-   * createdAt — the instance token, see matchedThroughOffset) the offsets are
-   * comparable and only grow. Across instances (or with legacy records missing
-   * offsets), only a visible contiguous copy of the other record's lines proves
-   * subsumption; line caps can defeat that check, in which case the failure mode is a
-   * rare duplicated merge — never lost output.
+   * can be discarded without losing output. ONLY durable same-record-lineage offset
+   * evidence proves that: equal createdAt (the instance token, see
+   * matchedThroughOffset) with the canonical frontier at or past the other's. Line
+   * CONTENT is never proof — distinct events can produce identical text (two separate
+   * "ERROR" lines), and a generation written from scratch never carried the other's
+   * event no matter how its lines read. Ambiguity falls through to a merge, whose
+   * failure mode is a rare duplicated line — never lost output.
    */
   private static pendingSubsumes(
     canonical: BashMonitorWakeRecord,
     other: BashMonitorWakeRecord
   ): boolean {
-    if (
+    return (
       canonical.createdAt === other.createdAt &&
       canonical.matchedThroughOffset != null &&
       other.matchedThroughOffset != null &&
       canonical.matchedThroughOffset >= other.matchedThroughOffset
-    ) {
-      return true;
-    }
-    return containsContiguousSubsequence(canonical.lines, other.lines);
+    );
   }
 
   /**
@@ -1158,7 +1191,12 @@ export class BashMonitorWakeStore {
     const merged: BashMonitorWakeRecord = {
       ...newer,
       lines: bounded.lines,
-      totalMatches: older.totalMatches + newer.totalMatches,
+      // totalMatches is the monitor's CUMULATIVE matchesCount, and split generations
+      // of one live process both report that same counter — summing would double
+      // count (1 then 2 → 3 for 2 real matches). Max never inflates; for genuinely
+      // different instances of a reused id it can undercount, but the value is
+      // informational and an inflated banner count is the worse failure.
+      totalMatches: Math.max(older.totalMatches, newer.totalMatches),
       droppedLines: older.droppedLines + newer.droppedLines + bounded.droppedLines,
       updatedAt: new Date().toISOString(),
     };
@@ -1387,9 +1425,33 @@ export class BashMonitorWakeStore {
       const parsed = await this.readRecordAt(filePath);
       if (parsed == null) {
         // Vanished, an incomplete crashed write, or a live writer mid-writeFile:
-        // disposable once old.
-        if (old) await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
+        // disposable once old. A FRESH incomplete temp may be a live writeFile whose
+        // process completes the write but crashes before the commit rename — by then
+        // a complete orphan wake with no process event, pending owner, or timer left
+        // to trigger another scan. Arm the same age-gated re-drive as complete temps:
+        // the re-driven scan re-reads it (complete by then → restored; still garbage →
+        // left for the retention sweep, which needs no timer because unparseable
+        // content past the gate can never become deliverable).
+        if (old) {
+          await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
+        } else if (!consumable) {
+          this.scheduleDeferredTempRecovery(ownerWorkspaceId, filePath, stat.mtimeMs);
+        }
         return null;
+      }
+      if (parsed.status === "pending") {
+        const clearedAtMs = await this.readClearedAtMs(ownerWorkspaceId);
+        if (clearedAtMs != null && Date.parse(parsed.updatedAt) <= clearedAtMs) {
+          // A history clear retired every wake stamped before it, but this temp was
+          // INVISIBLE to that clear's scan (the freshness gate deferred it). Restoring
+          // it would deliver a pre-clear wake into the freshly cleared transcript —
+          // condemn it instead. A fresh temp may still belong to a live writer, so
+          // only consumable ones are removed (failures PROPAGATE, matching the
+          // stale-discard discipline below); fresh ones are left unrestored, with no
+          // re-drive, for a later scan's consumable sweep.
+          if (consumable) await fsPromises.rm(filePath, { force: true });
+          return null;
+        }
       }
       if (!consumable) {
         // A COMPLETE fresh temp may still belong to a LIVE writer between writeFile
@@ -1758,6 +1820,9 @@ export class BashMonitorWakeStore {
   }
 
   async supersedeAllPending(ownerWorkspaceId: string): Promise<BashMonitorWakeRecord[]> {
+    // Captured BEFORE the scan: the tombstone below retires only wakes stamped before
+    // the clear began, so output enqueued mid-clear survives it.
+    const clearedAt = new Date().toISOString();
     const pending = await this.listPending(ownerWorkspaceId);
     const staged: BashMonitorWakeRecord[] = [];
     try {
@@ -1765,6 +1830,12 @@ export class BashMonitorWakeStore {
         await this.markSuperseded(ownerWorkspaceId, record.id);
         staged.push(record);
       }
+      // Durable tombstone for wakes this clear could NOT see: a crash-orphaned temp
+      // inside the freshness gate is invisible to the listPending above, and without
+      // the tombstone its deferred re-drive would later restore and deliver a
+      // pre-clear wake into the cleared transcript. Written only after every visible
+      // wake retired; a failure here fails the clear (snapshots restored below).
+      await this.writeClearedAt(ownerWorkspaceId, clearedAt);
       return pending;
     } catch (error) {
       await this.restorePendingSnapshots(ownerWorkspaceId, staged);
@@ -1776,6 +1847,11 @@ export class BashMonitorWakeStore {
     ownerWorkspaceId: string,
     snapshots: readonly BashMonitorWakeRecord[]
   ): Promise<void> {
+    // Rolling back a failed clear also rolls back its tombstone: the wakes below
+    // return to pending, so a sibling deferred temp must not stay condemned. Removal
+    // failures PROPAGATE — a stale surviving tombstone would silently discard that
+    // temp's output even though the clear never held.
+    await fsPromises.rm(this.clearedAtFile(ownerWorkspaceId), { force: true });
     for (const snapshot of snapshots) {
       const key = `${ownerWorkspaceId}:${snapshot.id}`;
       await this.locks.withLock(key, async () => {
@@ -1985,9 +2061,14 @@ export class BashMonitorWakeStore {
       await fsPromises.rename(temp, target);
     } catch (error) {
       // The caller observes and reports this failure (e.g. a history clear returns an
-      // error and leaves the wake pending). The temp must not survive it: orphan-temp
-      // recovery would otherwise later "commit" an operation the caller was told never
-      // happened — silently canceling or rewriting the wake behind the caller's back.
+      // error and leaves the wake pending). The temp must not survive it IN A
+      // RECOVERABLE FORM: orphan-temp recovery would otherwise later "commit" an
+      // operation the caller was told never happened — silently canceling or
+      // rewriting the wake behind the caller's back. Truncate FIRST: even if the
+      // removal below also fails, an empty temp is unparseable garbage that recovery
+      // sweeps instead of committing, and truncation frees rather than needs space,
+      // so it succeeds in the very ENOSPC/quota scenarios that fail a commit.
+      await fsPromises.truncate(temp, 0).catch(() => undefined);
       await fsPromises.rm(temp, { force: true }).catch(() => undefined);
       throw error;
     }
