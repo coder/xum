@@ -453,7 +453,9 @@ describe("WorkspaceGoalService", () => {
     // Reconciliation must not pause it — the in-memory kickoff candidate can be
     // lost (restart, eviction), and the next getGoal (heartbeat/wake tool
     // assembly) would otherwise silently pause the goal before it ever ran.
-    await appendUserHistoryMessage(historyService, workspaceId, "Set yourself a goal");
+    await appendUserHistoryMessage(historyService, workspaceId, "Set yourself a goal", {
+      timestamp: 10_000,
+    });
     await setGoalOk(service, { workspaceId, objective: "Follow chat tail" });
 
     const reconciled = await service.getGoal(workspaceId);
