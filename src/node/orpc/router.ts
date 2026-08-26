@@ -76,6 +76,7 @@ import { isMultiProject } from "@/common/utils/multiProject";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { roundToBase2 } from "@/common/telemetry/utils";
 import { createAsyncEventQueue } from "@/common/utils/asyncEventIterator";
+import { createCoalescedReader } from "@/common/utils/coalescedReader";
 import { withQueueHeartbeat } from "@/common/utils/withQueueHeartbeat";
 import {
   DEFAULT_LAYOUT_PRESETS_CONFIG,
@@ -5513,20 +5514,22 @@ export const router = (authToken?: string) => {
               signal.addEventListener("abort", onAbort, { once: true });
             }
 
-            // Serialize event-driven reads: consecutive change events (e.g. spawn's emit
-            // followed by the post-persistence wake-state emit) would otherwise start
-            // overlapping getState() calls whose resolution order can invert, letting a
-            // stale pre-persistence snapshot overwrite the newer one.
-            let readTail: Promise<void> = Promise.resolve();
+            // Coalesce event-driven reads: a monitor with cooldown_ms 0 can emit one
+            // change per matching output line, and reading full state once per event
+            // would queue an unbounded backlog of manager refreshes while only the
+            // latest state matters. The reader also serializes reads (overlapping
+            // getState() calls could resolve out of order and publish a stale
+            // pre-persistence snapshot over a newer one) and retries failed reads —
+            // a change event may be the only signal an exited process ever emits, so
+            // dropping it would leave the renderer stale with no reconnect.
+            const reader = createCoalescedReader({
+              read: async () => {
+                queue.push(await getState());
+              },
+              retryDelayMs: 1_000,
+            });
             const onChange = (changedWorkspaceId: string) => {
-              if (changedWorkspaceId === workspaceId) {
-                readTail = readTail
-                  .then(async () => {
-                    queue.push(await getState());
-                  })
-                  // Keep the chain alive after a failed read; the next event retries.
-                  .catch(() => undefined);
-              }
+              if (changedWorkspaceId === workspaceId) reader.trigger();
             };
 
             service.onBackgroundBashChange(onChange);
@@ -5538,6 +5541,7 @@ export const router = (authToken?: string) => {
             } finally {
               signal?.removeEventListener("abort", onAbort);
               queue.end();
+              reader.stop();
               service.offBackgroundBashChange(onChange);
             }
           }),

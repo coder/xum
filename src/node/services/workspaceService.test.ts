@@ -765,6 +765,80 @@ describe("WorkspaceService bash monitor wakes", () => {
     }
   });
 
+  test("listBackgroundProcesses keeps synthesized row ids collision-free", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-row-id-collision";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      // Process ids derive from arbitrary display names, so a live process can
+      // legitimately claim the suffixed id a prior-generation wake row would use.
+      const liveProcesses = ["proc-gen", "proc-gen#pending-wake"].map((id, index) => ({
+        id,
+        pid: 7000 + index,
+        script: "./watch.sh",
+        displayName: id,
+        startTime: Date.now() + 60_000,
+        status: "running" as const,
+        workspaceId,
+        isForeground: false,
+      }));
+      const backgroundProcessManager = {
+        cleanup: mock(() => Promise.resolve()),
+        list: mock(() => Promise.resolve(liveProcesses)),
+        getMonitorSnapshot: mock(() => undefined),
+      } as unknown as BackgroundProcessManager;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(true);
+      spyOn(workspaceService, "waitForIdleAndNoQueuedMessages").mockImplementation(
+        () => new Promise(() => undefined)
+      );
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: BashMonitorWakeStore;
+        }
+      ).bashMonitorWakeStore;
+      // Prior-generation wake for the reused id "proc-gen" (created before both spawns).
+      await wakeStore.enqueueOrMergePending({
+        processId: "proc-gen",
+        taskId: "bash:proc-gen",
+        workspaceId,
+        filter: "WAKE:",
+        filterExclude: false,
+        lines: ["WAKE: old generation"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 10,
+      });
+
+      const listing = await workspaceService.listBackgroundProcesses(workspaceId);
+      // Row ids double as React keys: every row keeps a unique identity even when a live
+      // process already owns the suffixed id the synthesized row would otherwise use.
+      expect(listing.map((row) => row.id).sort()).toEqual([
+        "proc-gen",
+        "proc-gen#pending-wake",
+        "proc-gen#pending-wake#pending-wake",
+      ]);
+      const wakeRow = listing.find((row) => row.synthesized === true);
+      expect(wakeRow?.id).toBe("proc-gen#pending-wake#pending-wake");
+      expect(wakeRow?.monitor?.pendingWakeKind).toBe("match");
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("listBackgroundProcesses republishes the last good pending-wake set on a read failure", async () => {
     const { config, cleanup } = await createTestHistoryService();
     try {

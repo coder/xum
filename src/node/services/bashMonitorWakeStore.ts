@@ -776,17 +776,39 @@ export class BashMonitorWakeStore {
     const seen = new Set<string>();
     const pruneBeforeMs = Date.now() - TERMINAL_WAKE_RETENTION_MS;
     for (const entry of entries) {
-      if (!entry.endsWith(".json")) continue;
-      seen.add(entry);
       const filePath = path.join(dir, entry);
+      if (!entry.endsWith(".json")) {
+        // write()/pruning leave *.json.tmp-* / *.json.prune-* files behind only when the
+        // process crashed mid-operation; sweep old ones so crash leaks stay bounded.
+        if (/\.json\.(?:tmp|prune)-/.test(entry)) {
+          const leftoverStat = await fsPromises.stat(filePath).catch(() => null);
+          if (leftoverStat != null && leftoverStat.mtimeMs < pruneBeforeMs) {
+            await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
+          }
+        }
+        continue;
+      }
+      seen.add(entry);
       let stat: Stats;
       try {
         stat = await fsPromises.stat(filePath);
-      } catch {
-        // Deleted between readdir and stat (or transiently unreadable): drop the cache
-        // entry so the next call reclassifies from scratch.
-        classified.delete(entry);
-        continue;
+      } catch (error) {
+        if (isErrnoWithCode(error, "ENOENT")) {
+          // Deleted between readdir and stat: legitimately gone.
+          classified.delete(entry);
+          continue;
+        }
+        // Transient stat failure. Returning a partial result would look authoritative to
+        // callers (listBackgroundProcesses caches it as the last good pending set),
+        // silently dropping a durable pending wake. Serve the cached pending
+        // classification when we have one; otherwise propagate so the caller keeps its
+        // previous snapshot instead.
+        const cachedOnError = classified.get(entry);
+        if (cachedOnError != null) {
+          if (cachedOnError.pending != null) records.push(cachedOnError.pending);
+          continue;
+        }
+        throw error;
       }
       const sig = `${stat.ino}:${stat.mtimeMs}:${stat.size}`;
       const cached = classified.get(entry);
@@ -794,25 +816,38 @@ export class BashMonitorWakeStore {
         if (cached.pending != null) {
           records.push(cached.pending);
         } else if (cached.prunable && stat.mtimeMs < pruneBeforeMs) {
-          // Old terminal record: delete it so the directory (and this scan) stays bounded.
-          // Best-effort; concurrent transitions re-check current status themselves.
-          await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
+          // Old terminal record: delete it so the directory (and this scan) stays
+          // bounded. Deletion re-verifies the captured inode (see the helper) because a
+          // concurrent writer may have renamed a new pending wake over this path.
+          const rescued = await this.pruneTerminalWakeFile(ownerWorkspaceId, entry, filePath);
           classified.delete(entry);
+          if (rescued != null) records.push(rescued);
         }
         continue;
       }
-      const raw = await fsPromises.readFile(filePath, "utf-8").catch(() => null);
-      if (raw == null) {
-        // Transient read failure: leave unclassified so the next call retries.
-        classified.delete(entry);
-        continue;
+      let raw: string;
+      try {
+        raw = await fsPromises.readFile(filePath, "utf-8");
+      } catch (error) {
+        if (isErrnoWithCode(error, "ENOENT")) {
+          classified.delete(entry);
+          continue;
+        }
+        // Same policy as the stat failure above: never let a transient error silently
+        // reclassify a pending wake out of the returned set.
+        if (cached != null) {
+          if (cached.pending != null) records.push(cached.pending);
+          continue;
+        }
+        throw error;
       }
       const parsed = this.parse(raw);
       const pending = parsed?.status === "pending" ? parsed : null;
       const prunable = parsed != null && parsed.status !== "pending";
       if (prunable && stat.mtimeMs < pruneBeforeMs) {
-        await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
+        const rescued = await this.pruneTerminalWakeFile(ownerWorkspaceId, entry, filePath);
         classified.delete(entry);
+        if (rescued != null) records.push(rescued);
         continue;
       }
       classified.set(entry, { sig, pending, prunable });
@@ -824,6 +859,55 @@ export class BashMonitorWakeStore {
     }
     records.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
     return records;
+  }
+
+  /**
+   * Delete a terminal wake file that is past its retention window. The prune decision is
+   * check-then-act against an earlier stat/read, and wake ids are reused process ids, so
+   * a concurrent writer (another store instance, or an enqueue in this process) may have
+   * renamed a NEW pending wake over the path in between — a plain rm-by-path would unlink
+   * that record and its synthetic turn would never deliver. Instead, atomically capture
+   * whatever inode currently owns the path under a unique trash name, verify it, and
+   * restore anything that is not a positively verified terminal record. Returns the
+   * rescued pending record when the capture raced a rewrite so the in-flight listing can
+   * still include it. The per-record lock serializes against same-process writers.
+   */
+  private async pruneTerminalWakeFile(
+    ownerWorkspaceId: string,
+    entry: string,
+    filePath: string
+  ): Promise<BashMonitorWakeRecord | null> {
+    const stem = entry.slice(0, -".json".length);
+    // Filenames are encodeURIComponent(id); fall back to the raw stem for foreign files
+    // that do not round-trip (no writer contends on those ids anyway).
+    let id = stem;
+    try {
+      id = decodeURIComponent(stem);
+    } catch {
+      // keep the raw stem
+    }
+    return this.locks.withLock(`${ownerWorkspaceId}:${id}`, async () => {
+      const trash = `${filePath}.prune-${randomUUID()}`;
+      try {
+        await fsPromises.rename(filePath, trash);
+      } catch {
+        return null; // already gone (concurrent prune or external cleanup)
+      }
+      const raw = await fsPromises.readFile(trash, "utf-8").catch(() => null);
+      const parsed = raw == null ? null : this.parse(raw);
+      if (parsed == null || parsed.status === "pending") {
+        // Not verifiably terminal (raced rewrite, or a read/parse hiccup just now):
+        // restore it. link() refuses to clobber an even newer write that claimed the
+        // path since, in which case that newer record simply supersedes this one.
+        try {
+          await fsPromises.link(trash, filePath);
+        } catch {
+          // EEXIST (or transient failure): leave whatever owns the path in place.
+        }
+      }
+      await fsPromises.rm(trash, { force: true }).catch(() => undefined);
+      return parsed?.status === "pending" ? parsed : null;
+    });
   }
 
   async listPendingOwnerWorkspaceIds(): Promise<string[]> {

@@ -262,6 +262,89 @@ describe("BashMonitorWakeStore", () => {
     expect(pruned).toBe(true);
   });
 
+  test("pruning rescues a pending wake concurrently rewritten over a terminal filename", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload());
+    await store.markDelivered("owner-1", "proc-1");
+    const file = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes", "proc-1.json");
+    const past = new Date(Date.now() - TERMINAL_WAKE_RETENTION_MS - 60_000);
+    await fsPromises.utimes(file, past, past);
+
+    // Another store instance renames a NEW pending wake over the path in the window
+    // between this instance classifying the file as old-terminal and deleting it. The
+    // injection point (the prune's own rename-to-trash) is exactly that window.
+    const other = new BashMonitorWakeStore(makeConfig(rootDir));
+    const realRename = fsPromises.rename;
+    let injected = false;
+    const renameSpy = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+      if (!injected && String(from) === file && String(to).includes(".prune-")) {
+        injected = true;
+        await other.enqueueOrMergePending(payload({ lines: ["ERROR rearmed"] }));
+      }
+      return realRename(from, to);
+    });
+    try {
+      // The prune must capture-and-verify rather than rm-by-path: the new pending wake
+      // is rescued and still part of this listing.
+      const pending = await store.listPending("owner-1");
+      expect(pending).toHaveLength(1);
+      expect(pending[0].status).toBe("pending");
+      expect(pending[0].lines).toEqual(["ERROR rearmed"]);
+    } finally {
+      renameSpy.mockRestore();
+    }
+    // The rescued record survived on disk for future scans and eventual delivery.
+    const later = await store.listPending("owner-1");
+    expect(later).toHaveLength(1);
+    expect(later[0].lines).toEqual(["ERROR rearmed"]);
+  });
+
+  test("listPending keeps serving a cached pending wake when stat transiently fails", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload());
+    expect(await store.listPending("owner-1")).toHaveLength(1); // classify into the cache
+
+    const file = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes", "proc-1.json");
+    const realStat = fsPromises.stat;
+    const statSpy = spyOn(fsPromises, "stat").mockImplementation(((
+      target: Parameters<typeof fsPromises.stat>[0]
+    ) =>
+      String(target) === file
+        ? Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
+        : realStat(target)) as unknown as typeof fsPromises.stat);
+    try {
+      // A transient stat failure must not silently drop the durable pending record from
+      // an otherwise-successful (authoritative-looking) result.
+      expect((await store.listPending("owner-1")).map((r) => r.id)).toEqual(["proc-1"]);
+    } finally {
+      statSpy.mockRestore();
+    }
+  });
+
+  test("listPending propagates a transient stat failure it has no cached answer for", async () => {
+    const seedStore = new BashMonitorWakeStore(makeConfig(rootDir));
+    await seedStore.enqueueOrMergePending(payload());
+
+    // Cold cache: this instance has never classified the file, so a partial result would
+    // silently omit a pending wake. Callers keep their last good snapshot on a throw.
+    const coldStore = new BashMonitorWakeStore(makeConfig(rootDir));
+    const realStat = fsPromises.stat;
+    const statSpy = spyOn(fsPromises, "stat").mockImplementation(((
+      target: Parameters<typeof fsPromises.stat>[0]
+    ) =>
+      String(target).endsWith("proc-1.json")
+        ? Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
+        : realStat(target)) as unknown as typeof fsPromises.stat);
+    try {
+      await coldStore.listPending("owner-1");
+      expect.unreachable("expected listPending to propagate the stat failure");
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("EIO");
+    } finally {
+      statSpy.mockRestore();
+    }
+  });
+
   test("listPending discovers wakes written by another store instance after seeding", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload({ processId: "proc-a", taskId: "bash:proc-a" }));

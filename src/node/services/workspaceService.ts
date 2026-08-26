@@ -13719,15 +13719,19 @@ export class WorkspaceService extends EventEmitter {
     // manager while the wake store persists, and startup delivery can lag). Synthesize a row
     // from the wake record so the pending-delivery state stays visible — that restart window
     // is exactly the state this listing is meant to expose.
+    // Row ids double as React keys. Process ids derive from arbitrary display names, so
+    // any fixed suffix for prior-generation wake rows can collide with a real live id
+    // (a process may literally be named "foo#pending-wake"); extend until unique instead.
+    // Nothing dereferences synthesized ids (no output/terminate actions).
+    const usedRowIds = new Set(rows.map((row) => row.id));
     for (const record of pendingWakes) {
       if (wakeOnLiveRow.has(record.processId)) continue;
       const startTime = Date.parse(record.createdAt);
+      let rowId = record.processId;
+      while (usedRowIds.has(rowId)) rowId = `${rowId}#pending-wake`;
+      usedRowIds.add(rowId);
       rows.push({
-        // Prior-generation wakes whose ID is reused by a live process need a distinct row
-        // identity; nothing dereferences synthesized ids (no output/terminate actions).
-        id: liveProcessById.has(record.processId)
-          ? `${record.processId}#pending-wake`
-          : record.processId,
+        id: rowId,
         // No live process behind this row; `synthesized` (not the pid) tells the renderer
         // that output/terminate actions cannot work.
         pid: 0,
