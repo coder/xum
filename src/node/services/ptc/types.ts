@@ -14,6 +14,7 @@ import {
   KERNEL_COMPACT_ARGS_CAP_BYTES,
   KERNEL_RETAINED_CONTAINER_MAX_PARTS,
   KERNEL_RETAINED_MEDIA_BUDGET_BYTES,
+  KERNEL_SANITIZED_MEDIA_VALUE_MAX_BYTES,
   KERNEL_RETAINED_PATH_MAX_CHARS,
 } from "@/constants/kernelOutput";
 
@@ -144,7 +145,10 @@ export function retainExemptKernelRecordResult(toolName: string, result: unknown
     return boundPersistenceCriticalResult(toolName, result);
   }
   if (!containsMediaContentPayload(result)) return undefined;
-  return sanitizeRetainedMediaContainer(result);
+  // The budgeted graph walk handles every exempt shape (containers, bare
+  // leaves, wrappers around either — r24); the container sanitizer alone
+  // would crash on non-container shapes the exemption now accepts.
+  return sanitizeCapturedMediaValue(result);
 }
 
 /**
@@ -229,8 +233,11 @@ function boundOversizedSkillPackage(
   // SERIALIZED content chars (between its quotes).
   const serializedBodyChars = JSON.stringify(body).length - 2;
   const overhead = reducedLength - serializedBodyChars;
+  // Zero is a VALID budget (r24): the empty body prefix + note then fits the
+  // cap exactly; only a negative budget (overhead + note alone exceed the
+  // cap) makes the package unretainable.
   const serializedBudget = MAX_FILE_CONTENT_SIZE - overhead - noteSerializedChars;
-  if (serializedBudget <= 0) return undefined;
+  if (serializedBudget < 0) return undefined;
   // Largest raw-body prefix whose serialized form fits the budget, searched
   // over CODE-POINT boundaries (r22): serialized length is NOT monotonic in
   // code units across a surrogate pair — a lone high surrogate escapes to 6
@@ -461,14 +468,27 @@ export function sanitizeCapturedMediaValue(
   // absent, each call gets the standalone per-value allowance.
   budget: { remainingBytes: number } = { remainingBytes: KERNEL_RETAINED_MEDIA_BUDGET_BYTES }
 ): unknown {
-  return sanitizeMediaValueGraph(value, budget, new Map<object, unknown>(), 0);
+  const state = { sawMedia: false };
+  const sanitized = sanitizeMediaValueGraph(value, budget, new Map<object, unknown>(), 0, state);
+  if (!state.sawMedia) return sanitized;
+  // Final serialized-output cap (r24): placeholders replacing unsupported or
+  // over-budget media never consume the media budget (they must always be
+  // emitted for safety), so a value flooding many media nodes could append
+  // placeholder structures without bound. Media-free values are untouched
+  // (classic mode keeps full inline results/args by contract).
+  const bytes = serializedJsonByteLength(sanitized);
+  if (bytes === undefined || bytes > KERNEL_SANITIZED_MEDIA_VALUE_MAX_BYTES) {
+    return `[value bounded at capture: ${bytes ?? "unserializable"} serialized bytes after media sanitization exceed the sanitized-value cap]`;
+  }
+  return sanitized;
 }
 
 function sanitizeMediaValueGraph(
   value: unknown,
   budget: { remainingBytes: number },
   memo: Map<object, unknown>,
-  depth: number
+  depth: number,
+  state: { sawMedia: boolean }
 ): unknown {
   if (typeof value !== "object" || value === null) return value;
   const existing = memo.get(value);
@@ -484,22 +504,26 @@ function sanitizeMediaValueGraph(
   if (isMediaContentContainer(value)) {
     // Container parts are charged their FULL serialized size (nested payloads
     // included), so there is no need to descend into a sanitized container.
+    state.sawMedia = true;
     result = sanitizeRetainedMediaContainer(value, budget);
   } else if (asMediaPart(value) !== null) {
     // STANDALONE media leaves too (r23): guest code can pluck a part out of
     // a container (`const part = image.value[0]`) and return it, log it, or
     // pass it as another tool's argument — container-only recognition would
     // let that copy persist unbudgeted base64 on every call.
+    state.sawMedia = true;
     result = sanitizeStandaloneMediaPart(value, budget);
   } else if (Array.isArray(value)) {
-    const mapped = value.map((item) => sanitizeMediaValueGraph(item, budget, memo, depth + 1));
+    const mapped = value.map((item) =>
+      sanitizeMediaValueGraph(item, budget, memo, depth + 1, state)
+    );
     result = mapped.some((item, index) => item !== value[index]) ? mapped : value;
   } else {
     const record = value as Record<string, unknown>;
     let changed = false;
     const mapped: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(record)) {
-      const sanitized = sanitizeMediaValueGraph(item, budget, memo, depth + 1);
+      const sanitized = sanitizeMediaValueGraph(item, budget, memo, depth + 1, state);
       mapped[key] = sanitized;
       if (sanitized !== item) changed = true;
     }
@@ -586,21 +610,33 @@ export function isPersistenceCriticalRecordToolName(toolName: string): boolean {
  * any unsupported parts that ride along in an exempted container with bounded
  * placeholders at request time.
  *
- * The search recurses through non-media parts (r19), but only NESTED CONTENT
- * CONTAINERS with an immediate supported media child count (r20): the capture
- * sanitizer (isMediaContentContainer) and the request-time extractor both
- * consume container shapes exclusively — bridged MCP results always arrive as
- * containers (transformMCPResult) — so exempting for a raw {type:"media"}
- * leaf outside any container would retain base64 that nothing downstream
- * budgets or rewrites. Such leaves are guest-authored arbitrary JSON, the
- * same class as any guest-returned string. Retention of exempted containers
- * stays bounded — sanitizeRetainedMediaContainer charges every retained part
- * its FULL serialized size (nested payloads included).
+ * The search recurses through wrappers and non-media parts (r19) and accepts
+ * the exact shapes the capture sanitizer bounds and the request-time
+ * extractor consumes: content containers with an immediate supported media
+ * child, and standalone supported media leaves (r24 — r20 restricted the
+ * predicate to containers when downstream was container-only; r23 taught
+ * both the sanitizer and the extractor to bound/extract standalone leaves,
+ * so declining the exemption for them now just collapses an extractable
+ * payload to a __kernelBounded marker). Retention stays bounded:
+ * retainExemptKernelRecordResult sanitizes through the same budgeted graph
+ * walk before the record is kept.
  */
 export function containsMediaContentPayload(result: unknown): boolean {
-  if (!isContentContainerShape(result)) return false;
-  if (hasImmediateSupportedMedia(result)) return true;
-  return result.value.some((item: unknown) => containsNestedSupportedContainer(item, 0));
+  return containsExtractableMediaValue(result, 0);
+}
+
+function containsExtractableMediaValue(value: unknown, depth: number): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  const media = asMediaPart(value);
+  if (media !== null) {
+    return media.mediaType !== undefined && isSupportedAttachmentMediaType(media.mediaType);
+  }
+  if (isContentContainerShape(value) && hasImmediateSupportedMedia(value)) return true;
+  if (depth >= MAX_MEDIA_SANITIZE_DEPTH) return false;
+  const children: unknown[] = Array.isArray(value)
+    ? value
+    : Object.values(value as Record<string, unknown>);
+  return children.some((child) => containsExtractableMediaValue(child, depth + 1));
 }
 
 function isContentContainerShape(value: unknown): value is { type: "content"; value: unknown[] } {
@@ -615,19 +651,4 @@ function hasImmediateSupportedMedia(container: { value: unknown[] }): boolean {
     const media = asMediaPart(item);
     return media?.mediaType !== undefined && isSupportedAttachmentMediaType(media.mediaType);
   });
-}
-
-/** Bounded deep search for a nested content container holding an immediate
- * supported media part. Depth-capped like the sanitizer walk (guest values
- * are JSON round-tripped so cycles are unreachable; the cap fails CLOSED — a
- * ladder deeper than any plausible legitimate shape simply loses the
- * exemption and falls back to normal bounding). */
-function containsNestedSupportedContainer(value: unknown, depth: number): boolean {
-  if (typeof value !== "object" || value === null) return false;
-  if (isContentContainerShape(value) && hasImmediateSupportedMedia(value)) return true;
-  if (depth >= MAX_MEDIA_SANITIZE_DEPTH) return false;
-  const children: unknown[] = Array.isArray(value)
-    ? value
-    : Object.values(value as Record<string, unknown>);
-  return children.some((child) => containsNestedSupportedContainer(child, depth + 1));
 }

@@ -587,6 +587,53 @@ describe("extractToolMediaAsUserMessages", () => {
     expect(fileParts).toHaveLength(1);
   });
 
+  it("extracts media leaves whose optional metadata is malformed", async () => {
+    // Capture recognition ignores optional metadata (asMediaPart), so a
+    // retained leaf with filename:null must not be rejected by a stricter
+    // request-time predicate — that would leave the retained base64 in
+    // provider JSON (r24). The malformed filename is dropped, not sent.
+    const base64 = (
+      await sharp({
+        create: { width: 10, height: 10, channels: 3, background: { r: 5, g: 5, b: 5 } },
+      })
+        .png()
+        .toBuffer()
+    ).toString("base64");
+
+    const input: MuxMessage[] = [
+      {
+        id: "ce-nullname",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call1",
+            toolName: "code_execution",
+            input: { code: "..." },
+            state: "output-available",
+            output: {
+              success: true,
+              result: {
+                wrapped: { type: "media", mediaType: "image/png", data: base64, filename: null },
+              },
+              toolCalls: [],
+            },
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    expect(rewritten).toHaveLength(2);
+    const outputText = JSON.stringify(
+      (rewritten[0].parts[0] as { output?: unknown }).output ?? rewritten[0].parts[0]
+    );
+    expect(outputText).not.toContain(base64);
+    const fileParts = rewritten[1].parts.filter((part) => part.type === "file");
+    expect(fileParts).toHaveLength(1);
+  });
+
   it("redacts standalone media leaves plucked out of containers", async () => {
     // `const part = image.value[0]; mux.sink({payload: part})` copies a BARE
     // media part (no surrounding container) into args; capture retains it

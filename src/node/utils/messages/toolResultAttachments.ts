@@ -71,11 +71,15 @@ function isMediaPart(value: unknown): value is AISDKMediaPart {
   }
 
   const record = value as Record<string, unknown>;
+  // Optional metadata must not gate recognition (r24): capture retains a
+  // leaf with e.g. filename:null (asMediaPart ignores filename), so a
+  // stricter predicate here would leave that retained base64 in
+  // provider-visible JSON. Malformed filenames are dropped downstream by
+  // normalizeOptionalFilename (null/non-string → no filename).
   return (
     record.type === "media" &&
     typeof record.data === "string" &&
-    typeof record.mediaType === "string" &&
-    (record.filename === undefined || typeof record.filename === "string")
+    typeof record.mediaType === "string"
   );
 }
 

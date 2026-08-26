@@ -81,6 +81,30 @@ describe("retainExemptKernelRecordResult", () => {
       expect(AgentSkillPackageSchema.safeParse(retained?.skill).success).toBe(true);
     });
 
+    it("retains the package when the body budget is exactly zero", () => {
+      // overhead + note == MAX_FILE_CONTENT_SIZE exactly: the empty prefix +
+      // note fits the cap exactly, so zero is a valid budget — only negative
+      // budgets (overhead + note alone exceed the cap) are unretainable (r24).
+      const note = "\n\n[Skill body truncated at capture to fit the retained-record cap]";
+      const noteChars = JSON.stringify(note).length - 2;
+      const emptyBodySkill = { ...oversizedSkill, body: "", pad: "" };
+      const overheadEmpty = JSON.stringify({ success: true, skill: emptyBodySkill }).length;
+      const zeroPad = "p".repeat(MAX_FILE_CONTENT_SIZE - overheadEmpty - noteChars);
+      const retained = retainExemptKernelRecordResult("agent_skill_read", {
+        success: true,
+        skill: { ...oversizedSkill, body: "🎉".repeat(60), pad: zeroPad },
+      }) as { success?: boolean; skill?: { body?: string } };
+      expect(retained?.skill?.body).toBe(note);
+      expect(JSON.stringify(retained).length).toBe(MAX_FILE_CONTENT_SIZE);
+
+      // One char more overhead → negative budget → unretainable.
+      const negative = retainExemptKernelRecordResult("agent_skill_read", {
+        success: true,
+        skill: { ...oversizedSkill, body: "🎉".repeat(60), pad: `${zeroPad}p` },
+      });
+      expect(negative).toBeUndefined();
+    });
+
     it("retains an empty body prefix when the budget is below the first code point", () => {
       // Budget of 1 char cannot fit the leading emoji (2 serialized chars),
       // but the empty prefix + truncation note is schema-valid and fits —
@@ -191,10 +215,9 @@ describe("retainExemptKernelRecordResult", () => {
       };
       expect(retainExemptKernelRecordResult("mcp__shots__take", unsupportedNested)).toBeUndefined();
 
-      // A raw {type:"media"} leaf OUTSIDE any nested content container does
-      // not exempt either (r20): the sanitizer and extractor only consume
-      // container shapes, so retaining for a bare leaf would persist base64
-      // nothing downstream budgets or rewrites.
+      // Standalone leaves and wrapper shapes exempt too (r24): capture
+      // sanitization bounds them and request-time extraction rewrites them,
+      // so declining would collapse an extractable payload to a marker.
       const rawLeaf = {
         type: "content",
         value: [
@@ -204,7 +227,22 @@ describe("retainExemptKernelRecordResult", () => {
           },
         ],
       };
-      expect(retainExemptKernelRecordResult("mcp__shots__take", rawLeaf)).toBeUndefined();
+      const retainedLeaf = retainExemptKernelRecordResult("mcp__shots__take", rawLeaf);
+      expect(retainedLeaf).toBeDefined();
+      const bareLeaf = retainExemptKernelRecordResult("mcp__shots__take", {
+        type: "media",
+        mediaType: "image/png",
+        data: "aGVsbG8=",
+      }) as { data?: string };
+      expect(bareLeaf?.data).toBe("aGVsbG8=");
+      // Unsupported bare leaves still do not exempt.
+      expect(
+        retainExemptKernelRecordResult("mcp__shots__take", {
+          type: "media",
+          mediaType: "audio/wav",
+          data: "d2F2",
+        })
+      ).toBeUndefined();
     });
 
     it("rejects junk media types at validation instead of retaining them as supported", () => {
@@ -312,6 +350,21 @@ describe("sanitizeMediaRecordCapture", () => {
     expect(sanitized.note).toBe("kept");
     expect(sanitized.image.value[0]?.type).toBe("text");
     expect(sanitized.image.value[0]?.text).toContain("not supported as a model attachment");
+  });
+
+  it("collapses placeholder floods to a single bounded marker", () => {
+    // Placeholders never consume the media budget (they must always be
+    // emitted), so a value flooding many media nodes could otherwise append
+    // placeholder structures without bound (r24): the sanitized value gets a
+    // final serialized cap.
+    const leaves = Array.from({ length: 60_000 }, () => ({
+      type: "media",
+      mediaType: "audio/wav",
+      data: "d2F2",
+    }));
+    const sanitized = sanitizeCapturedMediaValue({ payload: leaves });
+    expect(typeof sanitized).toBe("string");
+    expect(sanitized as string).toContain("exceed the sanitized-value cap");
   });
 
   it("sanitizes standalone media leaves outside containers", () => {

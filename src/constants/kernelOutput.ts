@@ -74,6 +74,18 @@ export const KERNEL_RETAINED_CONTAINER_MAX_PARTS = 64;
 export const KERNEL_RETAINED_EXECUTION_BUDGET_BYTES = 4 * KERNEL_RETAINED_MEDIA_BUDGET_BYTES;
 
 /**
+ * Final serialized-size cap on ONE media-bearing value after the capture
+ * sanitizer's graph walk. Placeholders replacing unsupported/over-budget
+ * media do not consume the media budget (they must always be emitted for
+ * safety), so a value flooding thousands of media nodes could otherwise
+ * append placeholder structures without bound; a sanitized value that still
+ * serializes above this cap collapses to a single bounded marker. 2x the
+ * media budget leaves ample room for legitimately retained media plus
+ * non-media siblings and placeholder overhead.
+ */
+export const KERNEL_SANITIZED_MEDIA_VALUE_MAX_BYTES = 2 * KERNEL_RETAINED_MEDIA_BUDGET_BYTES;
+
+/**
  * Max chars of a validated tool-arg file path preserved on a __kernelBounded
  * args marker (see retainPersistenceCriticalArgsFields). Covers Linux
  * PATH_MAX (4096); longer strings cannot be real paths of successful edits,
