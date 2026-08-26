@@ -498,13 +498,15 @@ async function main(): Promise<number> {
   // harnesses can pin it (XUM_RUN_SESSION_ROOT / MUX_RUN_SESSION_ROOT) to
   // collect chat.jsonl and session-usage.json after the process exits; an
   // override root is left in place on exit.
-  const sessionRootOverride = (
+  const envSessionRoot = (
     process.env.XUM_RUN_SESSION_ROOT ?? process.env.MUX_RUN_SESSION_ROOT
   )?.trim();
-  if (sessionRootOverride) {
+  // Empty/whitespace-only values mean "no override".
+  const sessionRootOverride = envSessionRoot === "" ? undefined : envSessionRoot;
+  if (sessionRootOverride !== undefined) {
     fsSync.mkdirSync(sessionRootOverride, { recursive: true });
   }
-  const sessionRoot = sessionRootOverride || tempDir.path;
+  const sessionRoot = sessionRootOverride ?? tempDir.path;
 
   // Use real config for providers, but the run-scoped root for session data
   const realConfig = new Config();
