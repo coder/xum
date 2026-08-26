@@ -996,6 +996,58 @@ describe("ExtensionMetadataService", () => {
     expect(sidecarGone).toBe(true);
   });
 
+  test("prune's re-registration spare keeps tombstones republished mid-recheck", async () => {
+    // The recheck enumeration awaits disk; a same-process removal landing in
+    // that window republishes the tombstone with a newer generation. The
+    // enumeration's pre-removal positive must clear only the prune's own
+    // tombstone — clearing the newer one would let a late writer recreate
+    // the removed entry right after the removal's queued deletion.
+    await service.updateRecency("ws-stale", 100);
+    let removal: Promise<void> | null = null;
+    await service.pruneMissingWorkspaces(
+      () => Promise.resolve(new Set<string>()),
+      () => {
+        // Removed again in this process while the recheck awaited:
+        // deleteWorkspace publishes its newer tombstone synchronously and
+        // queues the deletion behind the running prune.
+        removal = service.deleteWorkspace("ws-stale");
+        // The (stale) enumeration still reports the id registered.
+        return Promise.resolve(new Set(["ws-stale"]));
+      }
+    );
+    await removal!;
+    expect(service.isWorkspaceDeleted("ws-stale")).toBe(true);
+    // A late writer stays suppressed instead of recreating the entry.
+    await service.updateRecency("ws-stale", 200);
+    expect((await service.getAllSnapshots()).has("ws-stale")).toBe(false);
+  });
+
+  test("deleteWorkspace revalidates registration inside the queued deletion", async () => {
+    await service.updateRecency("ws-legacy", 100);
+    // Probe models a downgraded backend re-registering the id between the
+    // caller's deregistration checks and the queued deletion: the fresh
+    // snapshot must survive and the tombstone lift.
+    service.setRegistrationProbe(() => Promise.resolve(true));
+    await service.deleteWorkspace("ws-legacy");
+    expect((await service.getAllSnapshots()).get("ws-legacy")?.recency).toBe(100);
+    expect(service.isWorkspaceDeleted("ws-legacy")).toBe(false);
+    // An unknowable probe keeps the tombstone but never deletes on lossy
+    // evidence: the entry stays on disk (recoverable) while writes and
+    // lists are suppressed.
+    service.setRegistrationProbe(() => Promise.reject(new Error("io")));
+    await service.deleteWorkspace("ws-legacy");
+    expect(service.isWorkspaceDeleted("ws-legacy")).toBe(true);
+    const persisted = JSON.parse(await readFile(filePath, "utf-8")) as {
+      workspaces: Record<string, unknown>;
+    };
+    expect("ws-legacy" in persisted.workspaces).toBe(true);
+    // A verified-unregistered id deletes as before (the normal removal).
+    service.setRegistrationProbe(() => Promise.resolve(false));
+    await service.deleteWorkspace("ws-legacy");
+    expect((await service.getAllSnapshots()).has("ws-legacy")).toBe(false);
+    expect(service.isWorkspaceDeleted("ws-legacy")).toBe(true);
+  });
+
   test("a strict read reconciles a sidecar stranded after earlier successful reads", async () => {
     // Quarantines are cross-process: another backend can crash mid-quarantine
     // (stranding a healthy sidecar) at any point in this process's lifetime,
@@ -1059,12 +1111,19 @@ describe("ExtensionMetadataService", () => {
     await service.updateRecency("ws-1", 100);
     await service.deleteWorkspace("ws-1");
     let resolveProbe: ((registered: boolean) => void) | null = null;
-    service.setRegistrationProbe(
-      () =>
-        new Promise<boolean>((resolve) => {
+    let probeCalls = 0;
+    service.setRegistrationProbe(() => {
+      probeCalls += 1;
+      if (probeCalls === 1) {
+        // The write's probe: parked until the test resolves it below.
+        return new Promise<boolean>((resolve) => {
           resolveProbe = resolve;
-        })
-    );
+        });
+      }
+      // The removal's own in-queue revalidation reads FRESH config
+      // (deregistered), unlike the write's stale parked probe.
+      return Promise.resolve(false);
+    });
     // The write parks on the probe (invoked synchronously up to the await).
     const write = service.updateRecency("ws-1", 200);
     expect(resolveProbe).not.toBeNull();

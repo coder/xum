@@ -77,8 +77,10 @@ export class ExtensionMetadataService {
   private readonly deletedWorkspaceIds = new Map<string, number>();
   private tombstoneGeneration = 0;
 
-  private publishTombstone(workspaceId: string): void {
-    this.deletedWorkspaceIds.set(workspaceId, ++this.tombstoneGeneration);
+  private publishTombstone(workspaceId: string): number {
+    const generation = ++this.tombstoneGeneration;
+    this.deletedWorkspaceIds.set(workspaceId, generation);
+    return generation;
   }
 
   /**
@@ -686,8 +688,33 @@ export class ExtensionMetadataService {
   async deleteWorkspace(workspaceId: string): Promise<void> {
     // Synchronously, before the queued mutation: any writer enqueued from now
     // on must see the tombstone (see deletedWorkspaceIds).
-    this.publishTombstone(workspaceId);
+    const publishedGeneration = this.publishTombstone(workspaceId);
     await this.withSerializedMutation(async () => {
+      // In-queue registration revalidation: a downgraded backend can
+      // re-register a deterministic legacy id after the caller's
+      // deregistration checks (or while this deletion waited in the queue)
+      // and persist a fresh snapshot the unconditional delete would destroy.
+      // A probe-confirmed registration aborts the deletion and lifts the
+      // tombstone THIS call published (generation-guarded — a newer
+      // removal's tombstone stays). An unknowable probe keeps the tombstone
+      // and skips the disk deletion: a stale entry is recoverable (filtered
+      // by the tombstone now, reclaimed by a later removal or process-start
+      // prune), destroyed re-registered data is not. Without a probe the
+      // caller's own deregistration evidence stands.
+      if (this.registrationProbe != null) {
+        let registered: boolean;
+        try {
+          registered = await this.registrationProbe(workspaceId);
+        } catch {
+          return;
+        }
+        if (registered) {
+          if (this.deletedWorkspaceIds.get(workspaceId) === publishedGeneration) {
+            this.deletedWorkspaceIds.delete(workspaceId);
+          }
+          return;
+        }
+      }
       const data = await this.load();
 
       // Key presence, not truthiness: malformed falsy persisted entries
@@ -751,10 +778,12 @@ export class ExtensionMetadataService {
       const staleWorkspaceIds = Object.keys(data.workspaces).filter(
         (workspaceId) => !knownWorkspaceIds.has(workspaceId)
       );
+      const staleTombstoneGenerations = new Map<string, number>();
       for (const workspaceId of staleWorkspaceIds) {
         // Same guard as deleteWorkspace: a late in-process writer must not
-        // resurrect an entry this pass reclaims.
-        this.publishTombstone(workspaceId);
+        // resurrect an entry this pass reclaims. The generation scopes the
+        // re-registration spare below to THIS prune's tombstone.
+        staleTombstoneGenerations.set(workspaceId, this.publishTombstone(workspaceId));
       }
       if (staleWorkspaceIds.length === 0) {
         return 0;
@@ -773,7 +802,17 @@ export class ExtensionMetadataService {
       let prunedCount = 0;
       for (const workspaceId of staleWorkspaceIds) {
         if (recheckedKnownIds.has(workspaceId)) {
-          this.deletedWorkspaceIds.delete(workspaceId);
+          // Generation-guarded (see clearTombstonesForRegisteredIds): the
+          // recheck enumeration awaited disk, and a same-process removal can
+          // republish this tombstone mid-await — the enumeration's
+          // pre-removal positive must clear only the prune's own tombstone,
+          // never the newer removal's (a late writer would otherwise pass
+          // its in-queue check and recreate the removed entry).
+          if (
+            this.deletedWorkspaceIds.get(workspaceId) === staleTombstoneGenerations.get(workspaceId)
+          ) {
+            this.deletedWorkspaceIds.delete(workspaceId);
+          }
           continue;
         }
         if (workspaceId in fresh.workspaces) {
