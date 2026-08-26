@@ -993,8 +993,13 @@ export class BashMonitorWakeStore {
       const trash = `${filePath}.prune-${randomUUID()}`;
       try {
         await fsPromises.rename(filePath, trash);
-      } catch {
-        return null; // already gone (concurrent prune or external cleanup)
+      } catch (error) {
+        // Gone: a concurrent prune or external cleanup already took it. Anything else
+        // (EIO, EACCES) PROPAGATES — the path may hold a concurrently rewritten pending
+        // wake by now, and swallowing would return a successful snapshot without it,
+        // bypassing every caller-side retry.
+        if (isErrnoWithCode(error, "ENOENT")) return null;
+        throw error;
       }
       const raw = await fsPromises.readFile(trash, "utf-8").catch(() => null);
       const parsed = raw == null ? null : this.parse(raw);
@@ -1025,6 +1030,13 @@ export class BashMonitorWakeStore {
             return parsed?.status === "pending" ? parsed : null;
           }
           // EEXIST: a newer record owns the canonical path and supersedes this capture.
+          // Publish the canonical record's CURRENT pending state, never the discarded
+          // capture — the newer write may carry newer output or even have canceled the
+          // wake, and a drain must not deliver durably-retired content.
+          await fsPromises.rm(trash, { force: true }).catch(() => undefined);
+          const currentRaw = await fsPromises.readFile(filePath, "utf-8").catch(() => null);
+          const current = currentRaw == null ? null : this.parse(currentRaw);
+          return current?.status === "pending" ? current : null;
         }
       }
       await fsPromises.rm(trash, { force: true }).catch(() => undefined);

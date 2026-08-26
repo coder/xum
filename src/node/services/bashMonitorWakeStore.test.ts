@@ -299,6 +299,77 @@ describe("BashMonitorWakeStore", () => {
     expect(later[0].lines).toEqual(["ERROR rearmed"]);
   });
 
+  test("a transient prune capture failure propagates instead of hiding records", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload());
+    await store.markDelivered("owner-1", "proc-1");
+    const file = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes", "proc-1.json");
+    const past = new Date(Date.now() - TERMINAL_WAKE_RETENTION_MS - 60_000);
+    await fsPromises.utimes(file, past, past);
+
+    // The path may hold a concurrently rewritten pending wake by capture time, so a
+    // transient capture failure must not silently produce a successful partial snapshot.
+    const realRename = fsPromises.rename;
+    const renameSpy = spyOn(fsPromises, "rename").mockImplementation((from, to) =>
+      String(from) === file && String(to).includes(".prune-")
+        ? Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
+        : realRename(from, to)
+    );
+    try {
+      await store.listPending("owner-1");
+      expect.unreachable("expected listPending to propagate the capture failure");
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("EIO");
+    } finally {
+      renameSpy.mockRestore();
+    }
+    // The record was untouched; the next scan prunes it normally.
+    expect(await store.listPending("owner-1")).toHaveLength(0);
+    expect(await store.get("owner-1", "proc-1")).toBeNull();
+  });
+
+  test("an EEXIST-superseded capture publishes the canonical record, not the capture", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload());
+    await store.markDelivered("owner-1", "proc-1");
+    const file = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes", "proc-1.json");
+    const past = new Date(Date.now() - TERMINAL_WAKE_RETENTION_MS - 60_000);
+    await fsPromises.utimes(file, past, past);
+
+    const other = new BashMonitorWakeStore(makeConfig(rootDir));
+    const realRename = fsPromises.rename;
+    let renameInjected = false;
+    const renameSpy = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+      if (!renameInjected && String(from) === file && String(to).includes(".prune-")) {
+        renameInjected = true;
+        // The capture grabs this concurrently rewritten pending wake…
+        await other.enqueueOrMergePending(payload({ lines: ["ERROR captured"] }));
+      }
+      return realRename(from, to);
+    });
+    const realLink = fsPromises.link;
+    let linkInjected = false;
+    const linkSpy = spyOn(fsPromises, "link").mockImplementation(async (from, to) => {
+      if (!linkInjected && String(to) === file) {
+        linkInjected = true;
+        // …but before the restore lands, an even newer wake claims the canonical path
+        // and is immediately canceled. The restore must fail EEXIST and the canceled
+        // durable state must win: publishing the discarded capture would hand a drain
+        // durably-retired content.
+        await other.enqueueOrMergePending(payload({ lines: ["ERROR newer"] }));
+        await other.markSuperseded("owner-1", "proc-1");
+      }
+      return realLink(from, to);
+    });
+    try {
+      expect(await store.listPending("owner-1")).toHaveLength(0);
+    } finally {
+      renameSpy.mockRestore();
+      linkSpy.mockRestore();
+    }
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("superseded");
+  });
+
   test("owner discovery fails open when a stranded leftover cannot be read", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload());
