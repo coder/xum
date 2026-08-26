@@ -500,13 +500,21 @@ export function buildBashMonitorWakePrompt(
 export class BashMonitorWakeStore {
   private readonly locks = new MutexMap<string>();
   // Pending-id index so the hot listPending path (recomputed for every background-bash
-  // UI snapshot) reads only currently-pending records instead of scanning every
+  // UI snapshot) reads only currently-pending records instead of reading every
   // historical wake file — terminal records are never pruned from disk, so long-lived
   // workspaces accumulate them. Seeded per owner by one full directory scan; afterwards
   // write() keeps it in sync because every durable mutation funnels through write().
   // Seeding merges instead of replacing: a concurrent write can land between the
   // directory read and installation, and the read-verify in listPending drops stale ids.
+  //
+  // Another store instance can share this session directory (multiple service handles,
+  // or a second app process under XUM_ALLOW_MULTIPLE_INSTANCES), so the warm path still
+  // lists the directory each call — one cheap readdir, not per-file reads — and classifies
+  // only file names it has never seen (classifiedFilesByOwner), which is how wakes written
+  // by other instances are discovered. Cross-instance retirements are handled by the
+  // read-verify pass on the pending set.
   private readonly pendingIdsByOwner = new Map<string, Set<string>>();
+  private readonly classifiedFilesByOwner = new Map<string, Set<string>>();
   private readonly seededPendingOwners = new Set<string>();
 
   constructor(private readonly config: Pick<Config, "getSessionDir" | "sessionsDir">) {}
@@ -740,32 +748,6 @@ export class BashMonitorWakeStore {
   }
 
   async listPending(ownerWorkspaceId: string): Promise<BashMonitorWakeRecord[]> {
-    if (!this.seededPendingOwners.has(ownerWorkspaceId)) {
-      return this.seedPendingIndex(ownerWorkspaceId);
-    }
-    const ids = this.pendingIdsByOwner.get(ownerWorkspaceId);
-    const records: BashMonitorWakeRecord[] = [];
-    for (const id of [...(ids ?? [])]) {
-      let record: BashMonitorWakeRecord | null;
-      try {
-        record = await this.get(ownerWorkspaceId, id);
-      } catch {
-        // Transient read failure: keep the index entry so the next call retries.
-        continue;
-      }
-      if (record?.status === "pending") {
-        records.push(record);
-      } else {
-        // Terminal, deleted, or malformed on disk: the id no longer belongs in the index.
-        ids?.delete(id);
-      }
-    }
-    records.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
-    return records;
-  }
-
-  /** One-time-per-owner full scan that both answers listPending and seeds the index. */
-  private async seedPendingIndex(ownerWorkspaceId: string): Promise<BashMonitorWakeRecord[]> {
     const dir = this.dir(ownerWorkspaceId);
     let entries: string[];
     try {
@@ -777,22 +759,61 @@ export class BashMonitorWakeStore {
       }
       throw error;
     }
+
+    const classified = this.getOrCreateOwnerSet(this.classifiedFilesByOwner, ownerWorkspaceId);
+    const ids = this.getOrCreateOwnerSet(this.pendingIdsByOwner, ownerWorkspaceId);
+    const seeding = !this.seededPendingOwners.has(ownerWorkspaceId);
     const records: BashMonitorWakeRecord[] = [];
+
+    // Read file contents only for names never classified by this instance (the whole
+    // directory when seeding; afterwards just wakes written by other store instances).
     for (const entry of entries) {
       if (!entry.endsWith(".json")) continue;
+      if (classified.has(entry)) continue;
       const raw = await fsPromises.readFile(path.join(dir, entry), "utf-8").catch(() => null);
-      if (raw == null) continue;
-      const parsed = this.parse(raw);
-      if (parsed?.status === "pending") records.push(parsed);
+      // Transient read failure: leave unclassified so the next call retries.
+      if (raw == null && !seeding) continue;
+      classified.add(entry);
+      const parsed = raw == null ? null : this.parse(raw);
+      if (parsed?.status === "pending") {
+        records.push(parsed);
+        ids.add(parsed.id);
+      }
     }
-    const ids = this.pendingIdsByOwner.get(ownerWorkspaceId) ?? new Set<string>();
-    for (const record of records) {
-      ids.add(record.id);
-    }
-    this.pendingIdsByOwner.set(ownerWorkspaceId, ids);
     this.seededPendingOwners.add(ownerWorkspaceId);
+
+    // Read-verify the previously known pending set; drop ids retired on disk (possibly by
+    // another instance). Newly discovered records above are already verified.
+    const discoveredIds = new Set(records.map((record) => record.id));
+    for (const id of [...ids]) {
+      if (discoveredIds.has(id)) continue;
+      let record: BashMonitorWakeRecord | null;
+      try {
+        record = await this.get(ownerWorkspaceId, id);
+      } catch {
+        // Transient read failure: keep the index entry so the next call retries.
+        continue;
+      }
+      if (record?.status === "pending") {
+        records.push(record);
+      } else {
+        // Terminal, deleted, or malformed on disk: the id no longer belongs in the index.
+        ids.delete(id);
+      }
+    }
     records.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
     return records;
+  }
+
+  private getOrCreateOwnerSet(
+    map: Map<string, Set<string>>,
+    ownerWorkspaceId: string
+  ): Set<string> {
+    const existing = map.get(ownerWorkspaceId);
+    if (existing != null) return existing;
+    const created = new Set<string>();
+    map.set(ownerWorkspaceId, created);
+    return created;
   }
 
   async listPendingOwnerWorkspaceIds(): Promise<string[]> {
@@ -1039,16 +1060,17 @@ export class BashMonitorWakeStore {
       "utf-8"
     );
     // Keep the pending index in sync with the durable state (index only after the write
-    // succeeds, so the index can never claim a pending record that is not on disk).
-    const ids = this.pendingIdsByOwner.get(record.ownerWorkspaceId);
+    // succeeds, so the index can never claim a pending record that is not on disk). Also
+    // mark the file name classified so the warm listPending pass does not re-read our own
+    // writes as unknown cross-instance files.
+    this.getOrCreateOwnerSet(this.classifiedFilesByOwner, record.ownerWorkspaceId).add(
+      `${encodeURIComponent(record.id)}.json`
+    );
+    const ids = this.getOrCreateOwnerSet(this.pendingIdsByOwner, record.ownerWorkspaceId);
     if (record.status === "pending") {
-      if (ids != null) {
-        ids.add(record.id);
-      } else {
-        this.pendingIdsByOwner.set(record.ownerWorkspaceId, new Set([record.id]));
-      }
+      ids.add(record.id);
     } else {
-      ids?.delete(record.id);
+      ids.delete(record.id);
     }
   }
 

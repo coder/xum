@@ -201,15 +201,33 @@ describe("BashMonitorWakeStore", () => {
     // Cold path: seeds the index from a full directory scan.
     expect((await store.listPending("owner-1")).map((r) => r.id)).toEqual(["proc-b"]);
 
-    // Warm path: transitions and new enqueues must be reflected without a rescan.
-    const readdirSpy = spyOn(fsPromises, "readdir");
+    // Warm path: transitions and new enqueues must be reflected correctly.
     await store.markSuperseded("owner-1", "proc-b");
     expect(await store.listPending("owner-1")).toHaveLength(0);
     await store.enqueueOrMergePending(payload({ processId: "proc-c", taskId: "bash:proc-c" }));
+
+    // The hot UI path may re-list the directory (cross-instance discovery) but must not
+    // re-read the contents of already-classified terminal files (proc-a, proc-b).
+    const readFileSpy = spyOn(fsPromises, "readFile");
     expect((await store.listPending("owner-1")).map((r) => r.id)).toEqual(["proc-c"]);
-    // The hot UI path must not rescan the (unpruned, ever-growing) wake directory.
-    expect(readdirSpy).not.toHaveBeenCalled();
-    readdirSpy.mockRestore();
+    expect(readFileSpy).toHaveBeenCalledTimes(1);
+    readFileSpy.mockRestore();
+  });
+
+  test("listPending discovers wakes written by another store instance after seeding", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ processId: "proc-a", taskId: "bash:proc-a" }));
+    expect((await store.listPending("owner-1")).map((r) => r.id)).toEqual(["proc-a"]);
+
+    // A second instance (another service handle or app process sharing the session dir)
+    // durably enqueues a wake under a process ID this instance has never seen.
+    const other = new BashMonitorWakeStore(makeConfig(rootDir));
+    await other.enqueueOrMergePending(payload({ processId: "proc-b", taskId: "bash:proc-b" }));
+
+    expect((await store.listPending("owner-1")).map((r) => r.id).sort()).toEqual([
+      "proc-a",
+      "proc-b",
+    ]);
   });
 
   test("listPending self-heals index entries retired by another store instance", async () => {

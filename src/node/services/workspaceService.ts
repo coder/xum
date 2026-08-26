@@ -13708,7 +13708,9 @@ export class WorkspaceService extends EventEmitter {
         // that output/terminate actions cannot work.
         pid: 0,
         script: record.script ?? "",
-        displayName: record.displayName,
+        // Match records may carry neither displayName nor script; fall back to the
+        // processId (itself display-name derived) so the banner row is never blank.
+        displayName: record.displayName ?? record.processId,
         synthesized: true,
         startTime: Number.isNaN(startTime) ? Date.now() : startTime,
         status: "exited",

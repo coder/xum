@@ -530,6 +530,9 @@ describe("WorkspaceService bash monitor wakes", () => {
       // (the renderer keys unusable actions on the marker, not the placeholder pid).
       expect(listing[0].pid).toBe(0);
       expect(listing[0].synthesized).toBe(true);
+      // Match records may carry neither displayName nor script; the label must fall back
+      // to the (display-name derived) processId rather than rendering blank.
+      expect(listing[0].displayName).toBe("proc-restart-watcher");
       expect(listing[0].monitor?.pendingWakeKind).toBe("match");
       expect(listing[0].monitor?.lastLines).toEqual(["WAKE: done"]);
 
@@ -2648,7 +2651,9 @@ describe("WorkspaceService bash monitor wakes", () => {
           bashMonitorWakeStore: { listPending: (id: string) => Promise<unknown[]> };
         }
       ).bashMonitorWakeStore;
-      expect(await wakeStore.listPending(workspaceId)).toHaveLength(0);
+      // The sendSpy call count flips before its onAccepted delivery finishes, so wait for
+      // the durable transition instead of asserting it instantly.
+      await waitForCondition(async () => (await wakeStore.listPending(workspaceId)).length === 0);
 
       aiService.emit("error", { workspaceId, error: "startup failed" });
       await drainPendingDispatches();
