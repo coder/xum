@@ -35,7 +35,7 @@ describe("gitNoHooksPrefix", () => {
 
   test("returns env prefix when untrusted (false)", () => {
     const prefix = gitNoHooksPrefix(false);
-    expect(prefix).toContain("GIT_CONFIG_COUNT=3");
+    expect(prefix).toContain("GIT_CONFIG_COUNT='3'");
     expect(prefix).toContain("core.hooksPath");
     expect(prefix).toContain("/dev/null");
     expect(prefix).toContain("GIT_CONFIG_PARAMETERS=");
@@ -44,7 +44,7 @@ describe("gitNoHooksPrefix", () => {
 
   test("returns env prefix when untrusted (undefined)", () => {
     const prefix = gitNoHooksPrefix(undefined);
-    expect(prefix).toContain("GIT_CONFIG_COUNT=3");
+    expect(prefix).toContain("GIT_CONFIG_COUNT='3'");
     expect(prefix).toEndWith(" ");
   });
 });
@@ -79,7 +79,10 @@ describe("gitNoRepoAutomationEnv", () => {
   test("rejects filter driver names that cannot be overridden safely", () => {
     const longName = "a".repeat(513);
     expect(() => gitNoRepoAutomationEnvForFilterConfigKeys([`filter.${longName}.smudge`])).toThrow(
-      "unsupported filter driver name"
+      "unsupported driver name"
+    );
+    expect(() => gitNoRepoAutomationEnvForFilterConfigKeys([`diff.${longName}.command`])).toThrow(
+      "unsupported driver name"
     );
   });
 
@@ -134,6 +137,43 @@ describe("gitNoRepoAutomationEnv", () => {
     }
     expect(markerExists).toBe(false);
   });
+
+  test("neutralizes external diff drivers selected by .git/info/attributes", async () => {
+    using tmp = new DisposableTempDir("git-diff-automation-off");
+    const repo = path.join(tmp.path, "repo");
+    const marker = path.join(tmp.path, "diff-ran");
+    const driver = path.join(tmp.path, "diff.sh");
+    await fs.mkdir(repo, { recursive: true });
+    await Bun.$`git init`.cwd(repo).quiet();
+    await Bun.$`git config user.email test@example.com`.cwd(repo).quiet();
+    await Bun.$`git config user.name Test`.cwd(repo).quiet();
+    await fs.writeFile(path.join(repo, "data.txt"), "before\n", "utf-8");
+    await Bun.$`git add data.txt`.cwd(repo).quiet();
+    await Bun.$`git commit -m init`.cwd(repo).quiet();
+    await fs.writeFile(driver, `#!/bin/sh\ntouch "${marker}"\n`, "utf-8");
+    await fs.chmod(driver, 0o755);
+    await Bun.$`git config diff.evil.command ${driver}`.cwd(repo).quiet();
+    await fs.writeFile(path.join(repo, ".git", "info", "attributes"), "*.txt diff=evil\n", "utf-8");
+    await fs.writeFile(path.join(repo, "data.txt"), "after\n", "utf-8");
+
+    await Bun.$`git diff`.cwd(repo).quiet();
+    await fs.access(marker);
+    await fs.rm(marker);
+
+    const env = await gitNoRepoAutomationEnvForLocalRepo(repo);
+    const configKeys = Object.entries(env)
+      .filter(([key]) => key.startsWith("GIT_CONFIG_KEY_"))
+      .map(([, value]) => value);
+    expect(configKeys).toContain("diff.evil.command");
+    expect(configKeys).toContain("diff.evil.textconv");
+
+    await Bun.$`git diff`
+      .cwd(repo)
+      .env({ ...process.env, ...env })
+      .quiet()
+      .nothrow();
+    await expect(fs.access(marker)).rejects.toThrow();
+  });
 });
 
 describe("gitHooksAllowed", () => {
@@ -165,6 +205,6 @@ describe("gitHooksAllowed", () => {
     // Checkout filters and provider secrets are suppressed in the same
     // prefix, covering remote (SSH/Docker) materialization paths.
     expect(prefix).toContain("GIT_ATTR_SOURCE=");
-    expect(prefix).toContain("ANTHROPIC_API_KEY= ");
+    expect(prefix).toContain("ANTHROPIC_API_KEY='' ");
   });
 });

@@ -478,6 +478,84 @@ describe("task_apply_git_patch tool", () => {
     );
   }, 20_000);
 
+  it("blocks repo-configured smudge filters during dry-run worktree materialization", async () => {
+    const childRepo = path.join(rootDir, "child-filter");
+    const targetRepo = path.join(rootDir, "target-filter");
+    for (const repo of [childRepo, targetRepo]) {
+      await fsPromises.mkdir(repo, { recursive: true });
+      initGitRepo(repo);
+    }
+
+    await commitFile(childRepo, "README.md", "hello", "base");
+    await commitFile(targetRepo, "README.md", "hello", "base");
+    const baseSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+    await commitFile(childRepo, "README.md", "hello\nchild", "child change");
+    const headSha = execSync("git rev-parse HEAD", { cwd: childRepo, encoding: "utf-8" }).trim();
+
+    const marker = path.join(rootDir, "smudge-ran");
+    const driver = path.join(rootDir, "smudge.sh");
+    await fsPromises.writeFile(driver, `#!/bin/sh\ntouch "${marker}"\ncat\n`, "utf-8");
+    await fsPromises.chmod(driver, 0o755);
+    execSync(`git config filter.evil.smudge ${JSON.stringify(driver)}`, {
+      cwd: targetRepo,
+      stdio: "ignore",
+    });
+    execSync("git config filter.evil.required true", { cwd: targetRepo, stdio: "ignore" });
+    await fsPromises.writeFile(
+      path.join(targetRepo, ".git", "info", "attributes"),
+      "*.md filter=evil\n",
+      "utf-8"
+    );
+
+    const muxRoot = path.join(rootDir, "mux-filter");
+    const currentWorkspaceId = "current-workspace-filter";
+    const sessionDir = path.join(muxRoot, "sessions", currentWorkspaceId);
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    await writeWorkspaceConfig({
+      muxRoot,
+      workspaceId: currentWorkspaceId,
+      workspaceName: "current",
+      primaryProjectPath: targetRepo,
+      projects: [{ projectPath: targetRepo, projectName: "project" }],
+    });
+
+    const childTaskId = "child-task-filter";
+    await writePatchArtifact({
+      sessionDir,
+      workspaceId: currentWorkspaceId,
+      childTaskId,
+      projectArtifacts: [
+        await buildReadyProjectArtifact({
+          sessionDir,
+          childTaskId,
+          storageKey: "project",
+          projectPath: targetRepo,
+          projectName: "project",
+          childRepo,
+          baseSha,
+          headSha,
+        }),
+      ],
+    });
+
+    const tool = createTaskApplyGitPatchTool({
+      ...getTestDeps(),
+      workspaceId: currentWorkspaceId,
+      cwd: targetRepo,
+      runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
+      runtimeTempDir: "/tmp",
+      workspaceSessionDir: sessionDir,
+    });
+
+    const result = (await tool.execute!(
+      { task_id: childTaskId, dry_run: true },
+      mockToolCallOptions
+    )) as { success: boolean };
+
+    expect(result.success).toBe(true);
+    await expect(fsPromises.access(marker)).rejects.toThrow();
+  }, 20_000);
+
   it("cleans staged patch files between dry-run and real apply when temp dir is inside the repo", async () => {
     const childRepo = path.join(rootDir, "child");
     const targetRepo = path.join(rootDir, "target");

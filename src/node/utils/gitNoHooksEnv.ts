@@ -1,3 +1,4 @@
+import { shellQuote } from "@/common/utils/shell";
 import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { providerSecretEnvVarNames } from "@/node/utils/providerRequirements";
 import { execFileAsync } from "@/node/utils/disposableExec";
@@ -68,42 +69,57 @@ export function gitNoRepoAutomationEnv(): Record<string, string> {
   return env;
 }
 
-const FILTER_CONFIG_KEY_PATTERN = "^filter[.].*[.](clean|smudge|process|required)$";
-const FILTER_CONFIG_KEY_REGEX = /^filter[.](.+)[.](?:clean|smudge|process|required)$/i;
-const MAX_FILTER_DRIVERS = 128;
-const MAX_FILTER_CONFIG_OUTPUT_BYTES = 256 * 1024;
+export const GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN =
+  "^(filter[.].*[.](clean|smudge|process|required)|diff[.].*[.](command|textconv))$";
+export const MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES = 256 * 1024;
 
-function appendDisabledFilterDrivers(
+const REPO_AUTOMATION_CONFIG_KEY_REGEX =
+  /^(filter|diff)[.](.+)[.](clean|smudge|process|required|command|textconv)$/i;
+const MAX_REPO_AUTOMATION_DRIVERS = 128;
+
+function appendDisabledRepoAutomationDrivers(
   env: Record<string, string>,
   configKeys: Iterable<string>
 ): Record<string, string> {
-  const filterNames = new Set<string>();
+  const drivers = new Map<string, { kind: "filter" | "diff"; name: string }>();
   for (const key of configKeys) {
-    const match = FILTER_CONFIG_KEY_REGEX.exec(key);
+    const match = REPO_AUTOMATION_CONFIG_KEY_REGEX.exec(key);
     if (match == null) {
       continue;
     }
-    const name = match[1];
+    const kind = match[1].toLowerCase() as "filter" | "diff";
+    const name = match[2];
     if (name.length > 512 || /[\0\r\n]/.test(name)) {
-      throw new Error("Refusing git operation with an unsupported filter driver name");
+      throw new Error("Refusing git operation with an unsupported driver name");
     }
-    filterNames.add(name);
-    if (filterNames.size > MAX_FILTER_DRIVERS) {
+    drivers.set(kind + "\0" + name, { kind, name });
+    if (drivers.size > MAX_REPO_AUTOMATION_DRIVERS) {
       throw new Error(
-        "Refusing git operation with more than " + MAX_FILTER_DRIVERS + " filter drivers"
+        "Refusing git operation with more than " +
+          MAX_REPO_AUTOMATION_DRIVERS +
+          " repo automation drivers"
       );
     }
   }
 
   let configIndex = Number.parseInt(env.GIT_CONFIG_COUNT ?? "0", 10);
-  for (const name of [...filterNames].sort()) {
-    for (const [field, value] of [
-      ["clean", ""],
-      ["smudge", ""],
-      ["process", ""],
-      ["required", "false"],
-    ] as const) {
-      env["GIT_CONFIG_KEY_" + configIndex] = "filter." + name + "." + field;
+  for (const { kind, name } of [...drivers.values()].sort((a, b) =>
+    (a.kind + "\0" + a.name).localeCompare(b.kind + "\0" + b.name)
+  )) {
+    const fields =
+      kind === "filter"
+        ? ([
+            ["clean", ""],
+            ["smudge", ""],
+            ["process", ""],
+            ["required", "false"],
+          ] as const)
+        : ([
+            ["command", ""],
+            ["textconv", ""],
+          ] as const);
+    for (const [field, value] of fields) {
+      env["GIT_CONFIG_KEY_" + configIndex] = kind + "." + name + "." + field;
       env["GIT_CONFIG_VALUE_" + configIndex] = value;
       configIndex += 1;
     }
@@ -112,10 +128,24 @@ function appendDisabledFilterDrivers(
   return env;
 }
 
+export function gitNoRepoAutomationEnvForConfigKeys(
+  configKeys: Iterable<string>
+): Record<string, string> {
+  return appendDisabledRepoAutomationDrivers(gitNoRepoAutomationEnv(), configKeys);
+}
+
 export function gitNoRepoAutomationEnvForFilterConfigKeys(
   configKeys: Iterable<string>
 ): Record<string, string> {
-  return appendDisabledFilterDrivers(gitNoRepoAutomationEnv(), configKeys);
+  return gitNoRepoAutomationEnvForConfigKeys(configKeys);
+}
+
+export function gitEnvPrefix(env: Record<string, string>): string {
+  return (
+    Object.entries(env)
+      .map(([key, value]) => `${key}=${shellQuote(value)}`)
+      .join(" ") + " "
+  );
 }
 
 function isNoMatchingConfigError(error: unknown): boolean {
@@ -131,7 +161,7 @@ function isNoMatchingConfigError(error: unknown): boolean {
  * Build a repo-aware automation-off environment for local git operations.
  * GIT_ATTR_SOURCE suppresses tracked .gitattributes, but Git gives
  * $GIT_DIR/info/attributes higher precedence. Discovering every configured
- * filter driver and overriding it at command scope neutralizes both sources
+ * attribute driver and overriding it at command scope neutralizes both sources
  * without mutating repository files (which would be racy and destructive).
  */
 export async function gitNoRepoAutomationEnvForLocalRepo(
@@ -150,26 +180,26 @@ export async function gitNoRepoAutomationEnvForLocalRepo(
         "--name-only",
         "--includes",
         "--get-regexp",
-        FILTER_CONFIG_KEY_PATTERN,
+        GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN,
       ],
       {
         env: baseEnv,
         signal,
         timeoutMs: 10_000,
-        maxOutputBytes: MAX_FILTER_CONFIG_OUTPUT_BYTES,
+        maxOutputBytes: MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES,
         killTreeOnTermination: true,
       }
     );
     const { stdout } = await proc.result;
-    return appendDisabledFilterDrivers(baseEnv, stdout.split("\0"));
+    return appendDisabledRepoAutomationDrivers(baseEnv, stdout.split("\0"));
   } catch (error) {
     // git config --get-regexp exits 1 when no keys match.
     if (isNoMatchingConfigError(error)) {
       return baseEnv;
     }
     // Fail closed: materialization must not proceed with an unknown set of
-    // repo-configured checkout filters.
-    throw new Error("Failed to inspect repository checkout filters", { cause: error });
+    // repo-configured attribute drivers.
+    throw new Error("Failed to inspect repository automation drivers", { cause: error });
   }
 }
 
@@ -177,14 +207,10 @@ export async function gitNoRepoAutomationEnvForLocalRepo(
  * Build the static shell prefix for git operations where repository config
  * cannot be inspected on the host (for example remote clone paths). Local
  * materialization uses gitNoRepoAutomationEnvForLocalRepo so info-attribute
- * filter drivers are also overridden. Returns empty string when automation
+ * drivers are also overridden. Returns empty string when automation
  * is allowed.
  */
 export function gitNoHooksPrefix(trusted?: boolean): string {
   if (gitHooksAllowed(trusted)) return "";
-  return (
-    Object.entries(gitNoRepoAutomationEnv())
-      .map(([k, v]) => `${k}=${v}`)
-      .join(" ") + " "
-  );
+  return gitEnvPrefix(gitNoRepoAutomationEnv());
 }
