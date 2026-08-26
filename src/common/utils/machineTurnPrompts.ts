@@ -7,6 +7,8 @@ export const BASH_MONITOR_WAKE_HEADINGS = {
   matched: "A background bash monitor matched output.",
   lost: "Xum restarted and background bash monitors were lost.",
   mixed: "Background bash monitor updates (including monitors lost to a Xum restart).",
+  // Do not reword existing headings above: persisted timeline rows classify by exact prefix.
+  exited: "A monitored background bash process finished.",
 } as const;
 
 export const BACKGROUND_WORK_WAKE_OPENINGS = {

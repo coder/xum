@@ -31,6 +31,10 @@ const MONITOR_MAX_LAST_LINES = 20;
 const MONITOR_MAX_PROMPT_LINE_BYTES = Math.min(BASH_MAX_LINE_BYTES, 8_192);
 const MONITOR_MAX_INCOMPLETE_MATCH_BYTES = 1_000_000;
 const MONITOR_TRUNCATION_MARKER = "… [truncated] …";
+// Bounded recent-output tail included in a settlement wake so the agent sees the process's
+// final lines (e.g. the actual failure message) without a follow-up task_await round-trip.
+const MONITOR_SETTLEMENT_TAIL_BYTES = 4_096;
+const MONITOR_SETTLEMENT_TAIL_MAX_LINES = 10;
 
 export function computeTailStartOffset(fileSizeBytes: number, tailBytes: number): number {
   assert(
@@ -87,6 +91,12 @@ export interface BackgroundProcessMonitorConfig {
   exclude: boolean;
   maxEvents?: number;
   cooldownMs: number;
+  /**
+   * Also wake when the monitored process settles (exit, kill, timeout), not only on matching
+   * lines. An armed monitor means "wake me on this condition — and always at settlement,
+   * because after that the condition can never occur". Defaults to true when omitted.
+   */
+  wakeOnExit?: boolean;
 }
 
 export interface BackgroundProcessMonitorSnapshot {
@@ -100,6 +110,18 @@ export interface BackgroundProcessMonitorSnapshot {
   stopped: boolean;
 }
 
+/** Terminal disposition attached to a settlement wake payload. */
+export interface MonitorTerminalStatus {
+  status: "exited" | "killed" | "failed";
+  exitCode?: number;
+}
+
+/**
+ * Payload for a "monitor:match" event. Despite the name this is a monitor *update*: it carries
+ * matched output lines, a process-settlement notice, or both coalesced into one payload (pending
+ * matched lines still unflushed when the process settles ride along with the terminal metadata so
+ * a single wake turn reports "matched output, then exited").
+ */
 export interface MonitorMatchPayload {
   processId: string;
   taskId: string;
@@ -115,19 +137,32 @@ export interface MonitorMatchPayload {
    * File byte offset at the end of the last matched line, carried so the drain can re-check it
    * against the settled shown-frontier at delivery time. The emit-time suppression in
    * emitMonitorMatch is only a point-in-time fast path; drainBashMonitorWakes is authoritative.
+   *
+   * Present iff the payload carries undelivered matched lines. Settlement payloads whose matched
+   * lines were already shown (or that never matched) omit it — `lines` then holds only the
+   * synthetic settle line plus the output tail, which must never be offset-suppressed.
    */
-  matchedThroughOffset: number;
+  matchedThroughOffset?: number;
+  /** Present on settlement payloads: the process reached a terminal status. */
+  terminal?: MonitorTerminalStatus;
 }
 
 /** Emitted when a spawn arms a monitor; drives the persisted armed-monitor registry. */
 export type MonitorWakeDeliveryState =
   | { status: "blocked"; readSettled: Promise<void> }
-  | { status: "settled"; shownThroughOffset: number };
+  | { status: "settled"; shownThroughOffset: number; terminalStatusShown: boolean };
 
 export interface OutputShownPayload {
   processId: string;
   processStartTime: number;
   shownThroughOffset: number;
+  /**
+   * True once a model-visible read (task_await / bash_output) has reported the process's
+   * terminal status. Filtered reads count too: status/exitCode are never filtered out of tool
+   * results, and a zero-output or filtered post-exit read does not advance the shown offset, so
+   * queued settlement wakes need this explicit signal to be retracted.
+   */
+  terminalStatusShown: boolean;
 }
 
 export interface MonitorArmedPayload {
@@ -149,6 +184,8 @@ export interface MonitorStoppedPayload {
 }
 
 export interface BackgroundProcessMonitorState extends BackgroundProcessMonitorConfig {
+  /** Resolved settlement-wake policy (config default: true). */
+  wakeOnExit: boolean;
   matchesCount: number;
   pendingLines: string[];
   droppedLines: number;
@@ -166,6 +203,20 @@ export interface BackgroundProcessMonitorState extends BackgroundProcessMonitorC
   pollIntervalMs: number;
   incompleteLineBuffer: string;
   stopped: boolean;
+  /**
+   * Settlement claim latch. Set synchronously (single-threaded event loop makes the plain flag
+   * race-safe) by claimMonitorSettlement; once held, normal flush/stop triggers are suspended
+   * (accumulation-only mode) and the reservation owner performs the ONLY final combined emit and
+   * "completed" retirement. Explicit cancellation still wins: stopMonitor(canceled) sets
+   * `stopped`, which the settlement helper re-checks after every await.
+   */
+  settled: boolean;
+}
+
+/** Exclusive right to emit the single combined settlement wake for one monitor. */
+interface MonitorSettlementReservation {
+  proc: BackgroundProcess;
+  monitor: BackgroundProcessMonitorState;
 }
 
 /**
@@ -197,6 +248,13 @@ export interface BackgroundProcess {
    * the monitor's matchedThroughOffset are absolute file offsets, so suppression is race-free.
    */
   shownThroughOffset: number;
+  /**
+   * True once a model-visible getOutput caller (task_await / bash_output) has been returned a
+   * terminal status for this process. shownThroughOffset alone cannot express this: a zero-output
+   * process has EOF = 0 = shownThroughOffset, and filtered reads never advance the offset, yet
+   * both still report status/exitCode. Consulted when suppressing settlement wakes.
+   */
+  terminalStatusShownToAgent: boolean;
   /**
    * Resolves when the current read that must block same-process monitor delivery settles. This
    * includes unfiltered reads, which may advance shownThroughOffset, and filtered task_await reads,
@@ -328,6 +386,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     assert(options.pollIntervalMs > 0, "monitor poll interval must be positive");
     return {
       ...config,
+      wakeOnExit: config.wakeOnExit ?? true,
       matchesCount: 0,
       pendingLines: [],
       droppedLines: 0,
@@ -337,6 +396,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       matchedThroughOffset: 0,
       incompleteLineBuffer: "",
       stopped: false,
+      settled: false,
       pollIntervalMs: options.pollIntervalMs,
     };
   }
@@ -380,6 +440,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
   private emitMonitorMatch(proc: BackgroundProcess, monitor: BackgroundProcessMonitorState): void {
     if (monitor.pendingLines.length === 0) return;
+    // A claimed settlement suspends normal flushes: pending lines accumulate until the
+    // reservation owner emits the single combined settlement payload.
+    if (monitor.settled) return;
 
     if (monitor.flushTimer) {
       clearTimeout(monitor.flushTimer);
@@ -406,6 +469,24 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     monitor.pendingLines = [];
     monitor.droppedLines = 0;
 
+    this.emitMonitorUpdate(proc, monitor, {
+      lines,
+      droppedLines,
+      matchedThroughOffset: monitor.matchedThroughOffset,
+    });
+  }
+
+  /** Low-level "monitor:match" emitter shared by normal flushes and settlement payloads. */
+  private emitMonitorUpdate(
+    proc: BackgroundProcess,
+    monitor: BackgroundProcessMonitorState,
+    update: {
+      lines: string[];
+      droppedLines: number;
+      matchedThroughOffset?: number;
+      terminal?: MonitorTerminalStatus;
+    }
+  ): void {
     this.emit("monitor:match", proc.workspaceId, {
       processId: proc.id,
       taskId: `bash:${proc.id}`,
@@ -413,11 +494,14 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       ...(proc.displayName !== undefined ? { displayName: proc.displayName } : {}),
       filter: monitor.filter,
       filterExclude: monitor.exclude,
-      lines,
+      lines: update.lines,
       totalMatches: monitor.matchesCount,
-      ...(droppedLines > 0 ? { droppedLines } : {}),
+      ...(update.droppedLines > 0 ? { droppedLines: update.droppedLines } : {}),
       timestamp: Date.now(),
-      matchedThroughOffset: monitor.matchedThroughOffset,
+      ...(update.matchedThroughOffset !== undefined
+        ? { matchedThroughOffset: update.matchedThroughOffset }
+        : {}),
+      ...(update.terminal !== undefined ? { terminal: update.terminal } : {}),
     });
     this.emitChange(proc.workspaceId);
   }
@@ -481,6 +565,149 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     }
   }
 
+  /**
+   * Synchronously claim exclusive settlement ownership for a monitor. Returns null when the
+   * monitor is missing, already stopped (canceled / maxEvents-retired), already claimed, or the
+   * manager is shutting down (the persisted registry record must survive shutdown so the next
+   * startup can deliver the "monitor lost" notice; callers fall back to the legacy flush).
+   *
+   * Claiming (a) ends tail-loop ownership — its post-await guards return on the latch — and
+   * (b) switches the monitor to accumulation-only mode: cooldown flushes, cooldown_ms=0 immediate
+   * emits, and maxEvents retirement are all suppressed so the matched-lines emit can never split
+   * from the terminal emit. The reservation owner performs the ONLY final combined emit and the
+   * ONLY "completed" retirement, via emitClaimedMonitorSettlement.
+   */
+  private claimMonitorSettlement(proc: BackgroundProcess): MonitorSettlementReservation | null {
+    const monitor = proc.monitor;
+    if (!monitor || monitor.stopped || monitor.settled || this.shuttingDown) return null;
+    monitor.settled = true;
+    // A stale cooldown timer must not fire while the settlement helper awaits its final reads.
+    if (monitor.flushTimer) {
+      clearTimeout(monitor.flushTimer);
+      monitor.flushTimer = undefined;
+    }
+    return { proc, monitor };
+  }
+
+  /**
+   * Emit the single combined settlement wake for a claimed monitor, then retire it.
+   *
+   * The payload coalesces (in order): pending matched lines still undelivered at settlement, a
+   * synthetic settle line (the downgrade fallback: older builds strip the `terminal` field but
+   * still deliver an actionable match-shaped wake), and a bounded recent-output tail. It is
+   * emitted BEFORE "monitor:stopped" so the wake record is persisted before the armed-monitor
+   * registry record is deleted (both WorkspaceService listeners enqueue their work onto the same
+   * per-workspace mutex synchronously and in FIFO emit order).
+   *
+   * Cancellation wins during the claimed window: explicit cancel (task_stop, workspace cleanup)
+   * sets monitor.stopped and emits "monitor:stopped"(canceled); this helper re-checks that state
+   * after every await and no-ops, so no terminal wake and no duplicate "monitor:stopped" fire.
+   */
+  private async emitClaimedMonitorSettlement(
+    reservation: MonitorSettlementReservation,
+    terminal: MonitorTerminalStatus
+  ): Promise<void> {
+    const { proc, monitor } = reservation;
+    assert(monitor.settled, "emitClaimedMonitorSettlement requires a claimed settlement");
+
+    // stdout/stderr redirection can lag exit-code observation by a tick (same redirect-lag sleep
+    // the tail loop used before settlement centralized the final scan here).
+    await new Promise((resolve) => setTimeout(resolve, monitor.pollIntervalMs));
+    if (monitor.stopped) return;
+
+    // Final monitor scan: matches printed after the last poll (or sitting in the chunk the tail
+    // loop read but deliberately did not process before claiming) accumulate under settlement
+    // mode. Scan failure must not drop the wake.
+    try {
+      const finalChunkStartOffset = monitor.lastReadOffset;
+      const finalRead = await proc.handle.readOutput(finalChunkStartOffset);
+      if (monitor.stopped) return;
+      if (finalRead.newOffset >= finalChunkStartOffset) {
+        monitor.lastReadOffset = finalRead.newOffset;
+        this.processMonitorContent(proc, finalRead.content, {
+          chunkStartOffset: finalChunkStartOffset,
+          includeIncompleteLine: true,
+        });
+      }
+    } catch (error) {
+      log.debug(
+        `BackgroundProcessManager: settlement scan for ${proc.id} failed: ${getErrorMessage(error)}`
+      );
+    }
+
+    let tailLines: string[] = [];
+    if (monitor.wakeOnExit) {
+      try {
+        tailLines = await this.readSettlementTailLines(proc);
+      } catch (error) {
+        // Tail-read failure must not drop the wake; the synthetic settle line still delivers.
+        log.debug(
+          `BackgroundProcessManager: settlement tail read for ${proc.id} failed: ${getErrorMessage(error)}`
+        );
+      }
+      if (monitor.stopped) return;
+    }
+
+    const pendingLines = monitor.pendingLines;
+    const droppedLines = monitor.droppedLines;
+    monitor.pendingLines = [];
+    monitor.droppedLines = 0;
+    // The shown fast-path applies ONLY to whether pending matched lines are included; it must
+    // never skip the settle emit while an unshown terminal notice exists. matchedThroughOffset is
+    // carried iff undelivered matched lines are actually included, so a terminal-only payload can
+    // never be offset-suppressed downstream (a zero-output process has EOF = 0 = shown offset).
+    const includeMatched =
+      pendingLines.length > 0 && proc.shownThroughOffset < monitor.matchedThroughOffset;
+
+    if (!monitor.wakeOnExit) {
+      // wake_on_exit=false degrades to the legacy exit flush: matched lines only, no terminal
+      // metadata, no synthetic/tail lines.
+      if (includeMatched) {
+        this.emitMonitorUpdate(proc, monitor, {
+          lines: pendingLines,
+          droppedLines,
+          matchedThroughOffset: monitor.matchedThroughOffset,
+        });
+      }
+    } else {
+      const settleLine =
+        `[monitor] process settled: ${terminal.status}` +
+        `${terminal.exitCode !== undefined ? ` (code ${terminal.exitCode})` : ""}` +
+        ` — task_await bash:${proc.id} for the full report`;
+      this.emitMonitorUpdate(proc, monitor, {
+        lines: [...(includeMatched ? pendingLines : []), settleLine, ...tailLines],
+        droppedLines: includeMatched ? droppedLines : 0,
+        ...(includeMatched ? { matchedThroughOffset: monitor.matchedThroughOffset } : {}),
+        terminal,
+      });
+    }
+
+    // Retire AFTER the settlement emit so the wake persists before the registry record is
+    // deleted. emitMonitorMatch no-ops under the settled latch, so flushPending=true cannot
+    // produce a second, split emit here.
+    this.stopMonitor(proc, true);
+  }
+
+  /**
+   * Bounded tail of output.log for the settlement wake: last complete lines within the final
+   * ~4 KB, sanitized and middle-truncated like matched lines. Read failure propagates to the
+   * caller, which treats it as an empty tail.
+   */
+  private async readSettlementTailLines(proc: BackgroundProcess): Promise<string[]> {
+    const fileSizeBytes = await proc.handle.getOutputFileSize();
+    const offset = computeTailStartOffset(fileSizeBytes, MONITOR_SETTLEMENT_TAIL_BYTES);
+    const result = await proc.handle.readOutput(offset);
+    const segments = result.content.split("\n");
+    // A mid-file start almost certainly begins inside a line; drop that partial fragment rather
+    // than presenting it as a complete output line.
+    const rawLines = offset > 0 ? segments.slice(1) : segments;
+    return rawLines
+      .map((line) => this.sanitizeMonitorLine(line))
+      .filter((line) => line.length > 0)
+      .slice(-MONITOR_SETTLEMENT_TAIL_MAX_LINES)
+      .map((line) => this.truncateMonitorLine(line));
+  }
+
   private scheduleMonitorFlush(
     proc: BackgroundProcess,
     monitor: BackgroundProcessMonitorState
@@ -492,7 +719,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
     monitor.flushTimer ??= setTimeout(() => {
       monitor.flushTimer = undefined;
-      if (!monitor.stopped) {
+      if (!monitor.stopped && !monitor.settled) {
         this.emitMonitorMatch(proc, monitor);
       }
     }, monitor.cooldownMs);
@@ -586,6 +813,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       monitor.totalDroppedLines++;
     }
 
+    // Settlement accumulation mode: once a settlement claim is held, matches in the final
+    // chunk(s) only accumulate. No cooldown flush (a cooldown_ms=0 match must not emit ahead of
+    // the combined settlement payload) and no maxEvents retirement (stopMonitor would delete the
+    // registry record before the settlement wake persists).
+    if (monitor.settled) return;
+
     this.scheduleMonitorFlush(proc, monitor);
 
     if (monitor.maxEvents !== undefined && monitor.matchesCount >= monitor.maxEvents) {
@@ -672,21 +905,31 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     while (true) {
       const proc = this.processes.get(processId);
       const monitor = proc?.monitor;
-      if (!proc || !monitor || monitor.stopped) return;
+      if (!proc || !monitor || monitor.stopped || monitor.settled) return;
 
       const chunkStartOffset = monitor.lastReadOffset;
       const read = await proc.handle.readOutput(chunkStartOffset);
+      // A settlement claim (e.g. a timeout terminate) during the await owns every remaining
+      // byte; leave lastReadOffset untouched so its final scan re-reads this chunk.
+      if (monitor.stopped || monitor.settled) return;
       if (read.newOffset < chunkStartOffset) {
         log.debug(`BackgroundProcessManager: monitor read offset moved backwards for ${processId}`);
         this.stopMonitor(proc, true);
         return;
       }
 
-      monitor.lastReadOffset = read.newOffset;
-      this.processMonitorContent(proc, read.content, { chunkStartOffset });
-
+      // Check for exit BEFORE processing the just-read chunk: a matching line in the very chunk
+      // that accompanies the exit must coalesce into the single settlement payload instead of
+      // triggering a cooldown_ms=0 emit or maxEvents retirement ahead of it.
       const exitCode = await proc.handle.getExitCode();
+      if (monitor.stopped || monitor.settled) return;
+
       if (exitCode !== null) {
+        // Claim synchronously before any further await so a pending cooldown timer cannot fire
+        // during the redirect-lag sleep and a concurrent terminate cannot double-settle. The
+        // claimed helper re-reads from lastReadOffset, so the unprocessed chunk above is scanned
+        // exactly once, under settlement accumulation mode.
+        const reservation = this.claimMonitorSettlement(proc);
         if (proc.status === "running") {
           proc.status = "exited";
           proc.exitCode = exitCode;
@@ -699,18 +942,35 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
           this.emitChange(proc.workspaceId);
         }
 
-        // stdout/stderr redirection can lag exit-code observation by a tick.
-        await new Promise((resolve) => setTimeout(resolve, monitor.pollIntervalMs));
-        const finalChunkStartOffset = monitor.lastReadOffset;
-        const finalRead = await proc.handle.readOutput(finalChunkStartOffset);
-        monitor.lastReadOffset = finalRead.newOffset;
-        this.processMonitorContent(proc, finalRead.content, {
-          chunkStartOffset: finalChunkStartOffset,
-          includeIncompleteLine: true,
+        if (!reservation) {
+          // Shutdown suppressed the claim: keep the legacy exit flush so pending matched lines
+          // still persist (mergeable with the restart monitor-lost notice); no terminal payload.
+          monitor.lastReadOffset = read.newOffset;
+          this.processMonitorContent(proc, read.content, { chunkStartOffset });
+          // stdout/stderr redirection can lag exit-code observation by a tick.
+          await new Promise((resolve) => setTimeout(resolve, monitor.pollIntervalMs));
+          const finalChunkStartOffset = monitor.lastReadOffset;
+          const finalRead = await proc.handle.readOutput(finalChunkStartOffset);
+          monitor.lastReadOffset = finalRead.newOffset;
+          this.processMonitorContent(proc, finalRead.content, {
+            chunkStartOffset: finalChunkStartOffset,
+            includeIncompleteLine: true,
+          });
+          this.stopMonitor(proc, true);
+          return;
+        }
+
+        await this.emitClaimedMonitorSettlement(reservation, {
+          // The status-update branch above narrowed "running" to "exited"; a concurrent
+          // terminate may have set "killed"/"failed" instead — report whichever settled.
+          status: proc.status,
+          ...(proc.exitCode !== undefined ? { exitCode: proc.exitCode } : {}),
         });
-        this.stopMonitor(proc, true);
         return;
       }
+
+      monitor.lastReadOffset = read.newOffset;
+      this.processMonitorContent(proc, read.content, { chunkStartOffset });
 
       await new Promise((resolve) => setTimeout(resolve, monitor.pollIntervalMs));
     }
@@ -922,6 +1182,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       isForeground: config.isForeground ?? false,
       outputBytesRead: 0,
       shownThroughOffset: 0,
+      terminalStatusShownToAgent: false,
       outputLock: new AsyncMutex(),
       getOutputCallCount: 0,
       incompleteLineBuffer: "",
@@ -1054,6 +1315,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       isForeground: false, // Now in background
       outputBytesRead: 0,
       shownThroughOffset: 0,
+      terminalStatusShownToAgent: false,
       outputLock: new AsyncMutex(),
       getOutputCallCount: 0,
       incompleteLineBuffer: "",
@@ -1212,7 +1474,11 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     if (proc.monitorWakeBlockingReadSettled) {
       return { status: "blocked", readSettled: proc.monitorWakeBlockingReadSettled };
     }
-    return { status: "settled", shownThroughOffset: proc.shownThroughOffset };
+    return {
+      status: "settled",
+      shownThroughOffset: proc.shownThroughOffset,
+      terminalStatusShown: proc.terminalStatusShownToAgent,
+    };
   }
 
   /**
@@ -1459,6 +1725,15 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       currentStatus === "running" && !hasTrailingNewline ? allLines[allLines.length - 1] : "";
 
     const shownThroughOffsetBeforeRead = proc.shownThroughOffset;
+    const terminalStatusShownBeforeRead = proc.terminalStatusShownToAgent;
+
+    // A read that reports a terminal status has shown the settlement to the agent — filtered or
+    // not (status/exitCode are never filtered out of tool results, and the exit drain above
+    // returned all remaining output). getOutput's only callers are model-visible (task_await and
+    // bash_output); UI previews go through peekOutput/list, which never mark.
+    if (currentStatus !== "running") {
+      proc.terminalStatusShownToAgent = true;
+    }
 
     // Advance the monitor's "shown through" mark only on unfiltered reads. A filtered read may have
     // dropped matched lines, so it must not count as having shown them. End-of-last-complete-line =
@@ -1486,13 +1761,19 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
     const filteredOutput = applyFilter(linesToReturn);
 
-    if (proc.shownThroughOffset > shownThroughOffsetBeforeRead) {
+    if (
+      proc.shownThroughOffset > shownThroughOffsetBeforeRead ||
+      (proc.terminalStatusShownToAgent && !terminalStatusShownBeforeRead)
+    ) {
       // A wake can queue between sequential task_await reads. Notify the workspace after each
       // frontier advance so it can retract that queued wake before the next turn accepts it.
+      // The terminal-shown transition emits too: a filtered post-exit read or a zero-output exit
+      // never advances the offset, yet must still retract a queued settlement wake.
       this.emit("output:shown", proc.workspaceId, {
         processId: proc.id,
         processStartTime: proc.startTime,
         shownThroughOffset: proc.shownThroughOffset,
+        terminalStatusShown: proc.terminalStatusShownToAgent,
       });
     }
 
@@ -1973,7 +2254,17 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // If already terminated, return success (idempotent) after resolving any pending monitor flush.
     if (proc.status === "exited" || proc.status === "killed" || proc.status === "failed") {
       if (shouldFlushMonitor) {
-        this.stopMonitor(proc, true);
+        const reservation = this.claimMonitorSettlement(proc);
+        if (reservation) {
+          await this.emitClaimedMonitorSettlement(reservation, {
+            status: proc.status,
+            ...(proc.exitCode !== undefined ? { exitCode: proc.exitCode } : {}),
+          });
+        } else if (!proc.monitor?.settled) {
+          // Shutdown or already-stopped monitor: legacy flush (no-op when stopped). A held claim
+          // instead means the tail loop (or a concurrent terminate) owns the settlement emit.
+          this.stopMonitor(proc, true);
+        }
       } else {
         this.cancelMonitor(proc);
       }
@@ -1981,13 +2272,19 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       return { success: true };
     }
 
-    try {
-      if (shouldFlushMonitor) {
-        this.stopMonitor(proc, true);
-      } else {
-        this.cancelMonitor(proc);
-      }
+    // Claim settlement synchronously BEFORE the kill so the tail loop cannot settle concurrently
+    // and the kill's terminal payload is deterministic. Discard-mode termination (task_stop,
+    // workspace cleanup) is an explicit cancellation: it must never produce a settlement wake.
+    const reservation = shouldFlushMonitor ? this.claimMonitorSettlement(proc) : null;
+    if (!shouldFlushMonitor) {
+      this.cancelMonitor(proc);
+    } else if (!reservation && !proc.monitor?.settled) {
+      // Shutdown suppressed the claim: keep the legacy pre-kill flush (registry survives for the
+      // restart monitor-lost notice).
+      this.stopMonitor(proc, true);
+    }
 
+    try {
       await proc.handle.terminate();
 
       // Update process status and exit code
@@ -1999,6 +2296,14 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       await this.updateMetaFile(proc).catch((err: unknown) => {
         log.debug(`BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`);
       });
+
+      // Settle before dispose: the settlement helper still reads output.log through the handle.
+      if (reservation) {
+        await this.emitClaimedMonitorSettlement(reservation, {
+          status: "killed",
+          ...(proc.exitCode !== undefined ? { exitCode: proc.exitCode } : {}),
+        });
+      }
 
       // Dispose of the handle
       await proc.handle.dispose();
@@ -2016,6 +2321,13 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       await this.updateMetaFile(proc).catch((err: unknown) => {
         log.debug(`BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`);
       });
+      // The force-marked kill still settles: the claimed reservation owns the only wake emit.
+      if (reservation) {
+        await this.emitClaimedMonitorSettlement(reservation, {
+          status: "killed",
+          ...(proc.exitCode !== undefined ? { exitCode: proc.exitCode } : {}),
+        });
+      }
       // Ensure handle is cleaned up even on error
       await proc.handle.dispose();
       this.emitChange(proc.workspaceId);

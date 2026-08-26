@@ -225,7 +225,22 @@ function getValidBashMonitorWakeRecords(
     typeof record.displayName === "string" &&
     typeof record.filter === "string" &&
     typeof record.filterExclude === "boolean";
-  return records.every(isValidRecord) ? records : undefined;
+  if (!records.every(isValidRecord)) return undefined;
+  // Self-healing for the optional settlement field: an invalid terminal shape drops the field,
+  // not the record, so the wake still renders with its base summary.
+  const isValidTerminal = (
+    terminal: unknown
+  ): terminal is NonNullable<BashMonitorWakeDisplayRecord["terminal"]> =>
+    isPlainObject(terminal) &&
+    (terminal.status === "exited" ||
+      terminal.status === "killed" ||
+      terminal.status === "failed") &&
+    (terminal.exitCode === undefined || typeof terminal.exitCode === "number");
+  return records.map((record) => {
+    if (record.terminal === undefined || isValidTerminal(record.terminal)) return record;
+    const { terminal: _invalidTerminal, ...rest } = record;
+    return rest;
+  });
 }
 
 /**

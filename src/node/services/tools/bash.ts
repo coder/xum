@@ -977,17 +977,20 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
 
           const filterExclude = monitor.filter_exclude ?? false;
           const cooldownMs = monitor.cooldown_ms ?? 1000;
+          const wakeOnExit = monitor.wake_on_exit ?? true;
           monitorConfig = {
             filter: monitor.filter,
             pattern,
             exclude: filterExclude,
             cooldownMs,
+            wakeOnExit,
             ...(monitor.max_events != null ? { maxEvents: monitor.max_events } : {}),
           };
           monitorResult = {
             filter: monitor.filter,
             filter_exclude: filterExclude,
             cooldown_ms: cooldownMs,
+            wake_on_exit: wakeOnExit,
             ...(monitor.max_events != null ? { max_events: monitor.max_events } : {}),
           };
         }

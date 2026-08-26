@@ -553,6 +553,29 @@ This is a condition-driven wake-up. Continue from this event.`;
     expect(queryByText("auto")).toBeNull();
   });
 
+  test("summarizes a settlement wake with the terminal status", () => {
+    const message = createWakeMessage();
+    if (message.type !== "user") throw new Error("expected user message");
+    message.bashMonitorWake = {
+      records: [
+        {
+          kind: "match",
+          displayName: "Checks Watch",
+          filter: "All checks|passed|ready",
+          filterExclude: false,
+          terminal: { status: "exited", exitCode: 1 },
+        },
+      ],
+    };
+    const { getByText } = render(
+      <TooltipProvider>
+        <MessageRenderer message={message} />
+      </TooltipProvider>
+    );
+
+    expect(getByText("Checks Watch exited (code 1)")).toBeDefined();
+  });
+
   test("expanding reveals the full prompt and collapsing hides it again", () => {
     const { getByRole, queryByText } = render(
       <TooltipProvider>

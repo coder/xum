@@ -8,19 +8,40 @@ interface BashMonitorWakeMessageProps {
   className?: string;
 }
 
+function summarizeTerminal(record: BashMonitorWakeDisplayRecord): string {
+  const terminal = record.terminal;
+  if (terminal == null) return `${record.displayName} monitor matched`;
+  switch (terminal.status) {
+    case "exited":
+      return terminal.exitCode != null
+        ? `${record.displayName} exited (code ${terminal.exitCode})`
+        : `${record.displayName} exited`;
+    case "killed":
+      return `${record.displayName} killed`;
+    case "failed":
+      return `${record.displayName} failed`;
+  }
+}
+
 function summarizeRecords(records: BashMonitorWakeDisplayRecord[]): string {
   if (records.length === 1) {
     const record = records[0];
     return record.kind === "monitor-lost"
       ? `${record.displayName} monitor stopped after restart`
-      : `${record.displayName} monitor matched`;
+      : summarizeTerminal(record);
   }
 
-  const matchCount = records.filter((record) => record.kind === "match").length;
-  if (matchCount === records.length) {
+  const matchRecords = records.filter((record) => record.kind === "match");
+  if (matchRecords.length === records.length) {
+    if (matchRecords.every((record) => record.terminal != null)) {
+      return `${records.length} background processes finished`;
+    }
+    if (matchRecords.some((record) => record.terminal != null)) {
+      return `${records.length} background monitor updates`;
+    }
     return `${records.length} background monitors matched`;
   }
-  if (matchCount === 0) {
+  if (matchRecords.length === 0) {
     return `${records.length} background monitors stopped after restart`;
   }
   return `${records.length} background monitor updates`;

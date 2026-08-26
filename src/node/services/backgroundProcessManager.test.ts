@@ -261,10 +261,13 @@ describe("BackgroundProcessManager", () => {
       expect(result.success).toBe(true);
       const event = await eventPromise;
       expect(event.workspaceId).toBe(testWorkspaceId);
-      expect(event.payload.lines).toEqual(["READY"]);
+      // The unterminated line only matches at settlement, so the payload is the combined
+      // settlement wake: matched line first, then the synthetic settle line and output tail.
+      expect(event.payload.lines[0]).toBe("READY");
       expect(event.payload.totalMatches).toBe(1);
       expect(event.payload.filter).toBe("READY");
       expect(event.payload.filterExclude).toBe(false);
+      expect(event.payload.terminal).toEqual({ status: "exited", exitCode: 0 });
     });
 
     it("coalesces burst matches within the cooldown window", async () => {
@@ -287,7 +290,9 @@ describe("BackgroundProcessManager", () => {
 
       expect(result.success).toBe(true);
       const event = await eventPromise;
-      expect(event.payload.lines).toEqual(["ERR one", "ERR two"]);
+      // Depending on whether the exit is observed in the same poll, the burst arrives as a plain
+      // cooldown flush or coalesced into the settlement payload; the matched lines lead either way.
+      expect(event.payload.lines.slice(0, 2)).toEqual(["ERR one", "ERR two"]);
       expect(event.payload.totalMatches).toBe(2);
     });
 
@@ -306,7 +311,7 @@ describe("BackgroundProcessManager", () => {
 
       expect(result.success).toBe(true);
       const event = await eventPromise;
-      expect(event.payload.lines).toEqual(["done"]);
+      expect(event.payload.lines[0]).toBe("done");
     });
 
     it("stops monitoring after maxEvents without killing the process", async () => {
@@ -505,7 +510,14 @@ describe("BackgroundProcessManager", () => {
       });
     });
 
-    it("clears pending monitor timers when terminating an already-exited process", async () => {
+    it("resolves a pending cooldown flush into one settlement wake on exit", async () => {
+      // Previously a 10s cooldown timer could outlive the exited process until terminate()
+      // cleared it. Settlement now claims the monitor at exit: the timer is cancelled, the
+      // pending match coalesces into ONE combined settlement payload, and a later terminate on
+      // the already-exited process stays idempotent (no second wake).
+      const matches: MonitorMatchPayload[] = [];
+      manager.on("monitor:match", (_workspaceId, payload) => matches.push(payload));
+
       const result = await manager.spawn(runtime, testWorkspaceId, "echo ERR", {
         cwd: process.cwd(),
         displayName: "monitor-exited-terminate",
@@ -521,19 +533,24 @@ describe("BackgroundProcessManager", () => {
       if (!result.success) return;
 
       let proc = await manager.getProcess(result.processId);
-      for (let attempt = 0; attempt < 20; attempt++) {
+      for (let attempt = 0; attempt < 60; attempt++) {
         proc = await manager.getProcess(result.processId);
-        if (proc?.monitor?.flushTimer != null && proc.status === "exited") break;
+        if (proc?.monitor?.stopped) break;
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
 
       expect(proc?.status).toBe("exited");
-      expect(proc?.monitor?.flushTimer).toBeDefined();
-      const terminateResult = await manager.terminate(result.processId);
-
-      expect(terminateResult.success).toBe(true);
       expect(proc?.monitor?.stopped).toBe(true);
       expect(proc?.monitor?.flushTimer).toBeUndefined();
+      expect(matches).toHaveLength(1);
+      expect(matches[0].lines[0]).toBe("ERR");
+      expect(matches[0].terminal).toEqual({ status: "exited", exitCode: 0 });
+
+      const terminateResult = await manager.terminate(result.processId, {
+        monitorDisposition: "flush",
+      });
+      expect(terminateResult.success).toBe(true);
+      expect(matches).toHaveLength(1);
     });
 
     it("discards deferred monitor matches on explicit termination", async () => {
@@ -683,9 +700,12 @@ describe("BackgroundProcessManager", () => {
       const proc = await manager.getProcess(result.processId);
       expect(proc?.incompleteLineBuffer).toContain("ERR boom");
 
-      // On exit the monitor finalizes the buffered line; the agent never saw it, so it still wakes.
+      // On exit the monitor finalizes the buffered line; the agent never saw it, so it still wakes
+      // as part of the combined settlement payload (matched line first).
       const event = await eventPromise;
-      expect(event.payload.lines).toEqual(["ERR boom"]);
+      expect(event.payload.lines[0]).toBe("ERR boom");
+      expect(event.payload.matchedThroughOffset).toBeDefined();
+      expect(event.payload.terminal?.status).toBe("exited");
     });
 
     it("drops the wake for a matched line even when a trailing fragment follows it", async () => {
@@ -827,9 +847,12 @@ describe("BackgroundProcessManager", () => {
       proc = await manager.getProcess(result.processId);
       expect(proc?.shownThroughOffset ?? -1).toBe(0);
 
-      // Natural exit flushes the deferred match because the error was never shown.
+      // Natural exit flushes the deferred match because the error was never shown; it leads the
+      // combined settlement payload and keeps its matched-output offset.
       const event = await eventPromise;
-      expect(event.payload.lines).toEqual(["ERR boom"]);
+      expect(event.payload.lines[0]).toBe("ERR boom");
+      expect(event.payload.matchedThroughOffset).toBeDefined();
+      expect(event.payload.terminal?.status).toBe("exited");
     });
 
     it("does not advance the shown frontier across lines a prior filtered read consumed", async () => {
@@ -890,7 +913,7 @@ describe("BackgroundProcessManager", () => {
 
       expect(result.success).toBe(true);
       const event = await eventPromise;
-      expect(event.payload.lines).toEqual(["FAILED"]);
+      expect(event.payload.lines[0]).toBe("FAILED");
     });
 
     it("matches long complete lines when the token appears after the prompt cap", async () => {
@@ -913,7 +936,6 @@ describe("BackgroundProcessManager", () => {
 
       expect(result.success).toBe(true);
       const event = await eventPromise;
-      expect(event.payload.lines).toHaveLength(1);
       expect(event.payload.lines[0]).toContain("FAILED tail");
       expect(event.payload.lines[0]).toContain("truncated");
     });
@@ -950,6 +972,414 @@ describe("BackgroundProcessManager", () => {
       expect(incompleteLineBytes).toBeGreaterThan(0);
       expect(incompleteLineBytes).toBeLessThanOrEqual(1_000_000);
     });
+
+    describe("settlement wakes", () => {
+      it("wakes with a terminal payload when the process exits without any match, before monitor:stopped", async () => {
+        // Incident regression (workspace 31d3dfd254): a watcher script exits printing a failure
+        // line that never matches the filter -> previously the monitor retired silently and the
+        // idle owner was never woken.
+        const order: string[] = [];
+        const stoppedEvents: MonitorStoppedPayload[] = [];
+        const matchEvents: MonitorMatchPayload[] = [];
+        manager.on("monitor:match", (_workspaceId, payload) => {
+          order.push("match");
+          matchEvents.push(payload);
+        });
+        manager.on("monitor:stopped", (_workspaceId, payload) => {
+          order.push("stopped");
+          stoppedEvents.push(payload);
+        });
+
+        const result = await manager.spawn(
+          runtime,
+          testWorkspaceId,
+          "printf 'Unresolved review comments found\\n'; exit 1",
+          {
+            cwd: process.cwd(),
+            displayName: "settle-no-match",
+            monitor: {
+              filter: "All checks passed",
+              pattern: /All checks passed/,
+              exclude: false,
+              cooldownMs: 0,
+            },
+          }
+        );
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+
+        for (let attempt = 0; attempt < 80 && stoppedEvents.length === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+
+        expect(matchEvents).toHaveLength(1);
+        const payload = matchEvents[0];
+        expect(payload.terminal).toEqual({ status: "exited", exitCode: 1 });
+        // Terminal-only settlement: no undelivered matched output, so no offset signal that
+        // could ever falsely suppress the wake (EOF == shown offset for unread output is fine).
+        expect(payload.matchedThroughOffset).toBeUndefined();
+        // Synthetic settle line (downgrade fallback) + output tail with the actionable failure.
+        expect(
+          payload.lines.some((line) => line.includes("process settled: exited (code 1)"))
+        ).toBe(true);
+        expect(
+          payload.lines.some((line) => line.includes("Unresolved review comments found"))
+        ).toBe(true);
+        // Durability ordering: the wake emit precedes registry deletion.
+        expect(order).toEqual(["match", "stopped"]);
+        expect(stoppedEvents[0]).toEqual({ processId: result.processId, reason: "completed" });
+      });
+
+      it("wakes for a zero-output process (never suppressed by the offset gate)", async () => {
+        const eventPromise = waitForMonitorMatch(manager, 6_000);
+        const result = await manager.spawn(runtime, testWorkspaceId, "exit 3", {
+          cwd: process.cwd(),
+          displayName: "settle-zero-output",
+          monitor: { filter: "READY", pattern: /READY/, exclude: false, cooldownMs: 0 },
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+
+        const event = await eventPromise;
+        expect(event.payload.terminal).toEqual({ status: "exited", exitCode: 3 });
+        expect(event.payload.matchedThroughOffset).toBeUndefined();
+        expect(event.payload.lines).toEqual([
+          `[monitor] process settled: exited (code 3) — task_await bash:${result.processId} for the full report`,
+        ]);
+      });
+
+      it("timeout auto-termination settles with a deterministic killed payload", async () => {
+        const eventPromise = waitForMonitorMatch(manager, 10_000);
+        const result = await manager.spawn(runtime, testWorkspaceId, "sleep 30", {
+          cwd: process.cwd(),
+          displayName: "settle-timeout-kill",
+          monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
+          timeoutSecs: 1,
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+
+        const event = await eventPromise;
+        expect(event.payload.terminal?.status).toBe("killed");
+        expect(event.payload.lines.some((line) => line.includes("process settled: killed"))).toBe(
+          true
+        );
+      });
+
+      it("emits ONE coalesced payload for pending matched lines plus exit", async () => {
+        const matchEvents: MonitorMatchPayload[] = [];
+        manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
+
+        // The 10s cooldown guarantees the match is still pending when the exit is observed.
+        const result = await manager.spawn(
+          runtime,
+          testWorkspaceId,
+          "printf 'ERR boom\\n'; sleep 0.5; exit 2",
+          {
+            cwd: process.cwd(),
+            displayName: "settle-coalesced",
+            monitor: { filter: "ERR", pattern: /ERR/, exclude: false, cooldownMs: 10_000 },
+          }
+        );
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+
+        for (let attempt = 0; attempt < 80 && matchEvents.length === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        // Give a possible (buggy) second emit time to surface before asserting exactly one.
+        await new Promise((resolve) => setTimeout(resolve, 300));
+
+        expect(matchEvents).toHaveLength(1);
+        const payload = matchEvents[0];
+        expect(payload.lines[0]).toBe("ERR boom");
+        expect(payload.matchedThroughOffset).toBeDefined();
+        expect(payload.terminal).toEqual({ status: "exited", exitCode: 2 });
+        expect(
+          payload.lines.some((line) => line.includes("process settled: exited (code 2)"))
+        ).toBe(true);
+      });
+
+      it("emits no settlement wake on discard-mode termination (task_stop)", async () => {
+        const matchEvents: MonitorMatchPayload[] = [];
+        const stoppedEvents: MonitorStoppedPayload[] = [];
+        manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
+        manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+        const result = await manager.spawn(runtime, testWorkspaceId, "sleep 30", {
+          cwd: process.cwd(),
+          displayName: "settle-canceled",
+          monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+
+        await manager.terminate(result.processId);
+        await new Promise((resolve) => setTimeout(resolve, 400));
+
+        expect(matchEvents).toHaveLength(0);
+        expect(stoppedEvents).toEqual([{ processId: result.processId, reason: "canceled" }]);
+      });
+
+      it("wake_on_exit=false suppresses the terminal wake entirely on a no-match exit", async () => {
+        const matchEvents: MonitorMatchPayload[] = [];
+        const stoppedEvents: MonitorStoppedPayload[] = [];
+        manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
+        manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+        const result = await manager.spawn(runtime, testWorkspaceId, "printf 'nope\\n'; exit 1", {
+          cwd: process.cwd(),
+          displayName: "settle-opt-out",
+          monitor: {
+            filter: "NEVER",
+            pattern: /NEVER/,
+            exclude: false,
+            cooldownMs: 0,
+            wakeOnExit: false,
+          },
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+
+        for (let attempt = 0; attempt < 80 && stoppedEvents.length === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+
+        expect(stoppedEvents).toEqual([{ processId: result.processId, reason: "completed" }]);
+        expect(matchEvents).toHaveLength(0);
+      });
+
+      it("wake_on_exit=false still flushes pending matched lines without terminal metadata", async () => {
+        const matchEvents: MonitorMatchPayload[] = [];
+        manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
+
+        const result = await manager.spawn(
+          runtime,
+          testWorkspaceId,
+          "printf 'ERR boom\\n'; sleep 0.5",
+          {
+            cwd: process.cwd(),
+            displayName: "settle-opt-out-flush",
+            monitor: {
+              filter: "ERR",
+              pattern: /ERR/,
+              exclude: false,
+              cooldownMs: 10_000,
+              wakeOnExit: false,
+            },
+          }
+        );
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+
+        for (let attempt = 0; attempt < 80 && matchEvents.length === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+
+        expect(matchEvents).toHaveLength(1);
+        expect(matchEvents[0].lines).toEqual(["ERR boom"]);
+        expect(matchEvents[0].terminal).toBeUndefined();
+        expect(matchEvents[0].matchedThroughOffset).toBeDefined();
+      });
+
+      it("does not settle after maxEvents retirement", async () => {
+        const matchEvents: MonitorMatchPayload[] = [];
+        const stoppedEvents: MonitorStoppedPayload[] = [];
+        manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
+        manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+        // Match + retire while the process is still running, then let it exit.
+        const result = await manager.spawn(runtime, testWorkspaceId, "echo ERR1; sleep 1; exit 7", {
+          cwd: process.cwd(),
+          displayName: "settle-max-events",
+          monitor: {
+            filter: "ERR",
+            pattern: /ERR/,
+            exclude: false,
+            maxEvents: 1,
+            cooldownMs: 0,
+          },
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+
+        // Wait until the process has exited (well past the maxEvents retirement).
+        let proc = await manager.getProcess(result.processId);
+        for (let attempt = 0; attempt < 80; attempt++) {
+          proc = await manager.getProcess(result.processId);
+          if (proc?.status !== "running") break;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        await new Promise((resolve) => setTimeout(resolve, 300));
+
+        expect(matchEvents).toHaveLength(1);
+        expect(matchEvents[0].terminal).toBeUndefined();
+        expect(stoppedEvents).toEqual([{ processId: result.processId, reason: "completed" }]);
+      });
+
+      it("maxEvents reached inside the settlement scan still yields one combined payload", async () => {
+        // The matching line is unterminated, so it can only match during the settlement scan
+        // (includeIncompleteLine) — maxEvents retirement must not fire there and split the wake.
+        const matchEvents: MonitorMatchPayload[] = [];
+        const stoppedEvents: MonitorStoppedPayload[] = [];
+        manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
+        manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+        const result = await manager.spawn(runtime, testWorkspaceId, "printf 'ERR final'", {
+          cwd: process.cwd(),
+          displayName: "settle-max-events-scan",
+          monitor: {
+            filter: "ERR",
+            pattern: /ERR/,
+            exclude: false,
+            maxEvents: 1,
+            cooldownMs: 0,
+          },
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+
+        for (let attempt = 0; attempt < 80 && stoppedEvents.length === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+
+        expect(matchEvents).toHaveLength(1);
+        expect(matchEvents[0].lines[0]).toBe("ERR final");
+        expect(matchEvents[0].terminal).toEqual({ status: "exited", exitCode: 0 });
+        expect(stoppedEvents).toEqual([{ processId: result.processId, reason: "completed" }]);
+      });
+
+      it("still wakes when the settlement tail read fails", async () => {
+        const eventPromise = waitForMonitorMatch(manager, 6_000);
+        const result = await manager.spawn(runtime, testWorkspaceId, "printf 'boom\\n'; exit 1", {
+          cwd: process.cwd(),
+          displayName: "settle-tail-failure",
+          monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+
+        const proc = await manager.getProcess(result.processId);
+        expect(proc).not.toBeNull();
+        if (proc == null) return;
+        spyOn(proc.handle, "getOutputFileSize").mockImplementation(() =>
+          Promise.reject(new Error("tail read failed"))
+        );
+
+        const event = await eventPromise;
+        expect(event.payload.terminal).toEqual({ status: "exited", exitCode: 1 });
+        // Tail unavailable: the synthetic settle line alone still delivers.
+        expect(event.payload.lines).toEqual([
+          `[monitor] process settled: exited (code 1) — task_await bash:${result.processId} for the full report`,
+        ]);
+      });
+
+      it("cancellation during the claimed settlement window wins (no terminal wake, one canceled stop)", async () => {
+        const matchEvents: MonitorMatchPayload[] = [];
+        const stoppedEvents: MonitorStoppedPayload[] = [];
+        manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
+        manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+        const result = await manager.spawn(runtime, testWorkspaceId, "printf 'out\\n'", {
+          cwd: process.cwd(),
+          displayName: "settle-cancel-race",
+          monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+
+        const proc = await manager.getProcess(result.processId);
+        expect(proc).not.toBeNull();
+        if (proc == null) return;
+
+        // Hold the settlement helper inside its tail read so the cancel deterministically lands
+        // in the claimed window.
+        let releaseTail!: () => void;
+        const tailGate = new Promise<void>((resolve) => {
+          releaseTail = resolve;
+        });
+        let tailReadStarted!: () => void;
+        const tailReadStartedPromise = new Promise<void>((resolve) => {
+          tailReadStarted = resolve;
+        });
+        const realGetOutputFileSize = proc.handle.getOutputFileSize.bind(proc.handle);
+        spyOn(proc.handle, "getOutputFileSize").mockImplementation(async () => {
+          tailReadStarted();
+          await tailGate;
+          return realGetOutputFileSize();
+        });
+
+        await tailReadStartedPromise;
+        // Explicit cancel (task_stop path) while the settlement helper awaits the tail read.
+        await manager.terminate(result.processId);
+        releaseTail();
+        await new Promise((resolve) => setTimeout(resolve, 300));
+
+        expect(matchEvents).toHaveLength(0);
+        expect(stoppedEvents).toEqual([{ processId: result.processId, reason: "canceled" }]);
+      });
+
+      it("emits no settlement wakes during shutdown", async () => {
+        const matchEvents: MonitorMatchPayload[] = [];
+        const stoppedEvents: MonitorStoppedPayload[] = [];
+        manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
+        manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+        const result = await manager.spawn(runtime, testWorkspaceId, "printf 'bye\\n'; exit 1", {
+          cwd: process.cwd(),
+          displayName: "settle-shutdown",
+          monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+
+        manager.beginShutdown();
+
+        let proc = await manager.getProcess(result.processId);
+        for (let attempt = 0; attempt < 80; attempt++) {
+          proc = await manager.getProcess(result.processId);
+          if (proc?.status !== "running" && proc?.monitor?.stopped) break;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        await new Promise((resolve) => setTimeout(resolve, 300));
+
+        // No terminal wake and no monitor:stopped: the registry record must survive shutdown so
+        // the next startup delivers the monitor-lost notice instead.
+        expect(matchEvents).toHaveLength(0);
+        expect(stoppedEvents).toHaveLength(0);
+      });
+
+      it("marks terminalStatusShown on a filtered post-exit read without advancing the offset", async () => {
+        const shownEvents: OutputShownPayload[] = [];
+        manager.on("output:shown", (_workspaceId, payload) => shownEvents.push(payload));
+
+        const result = await manager.spawn(runtime, testWorkspaceId, "printf 'data\\n'", {
+          cwd: process.cwd(),
+          displayName: "terminal-shown-filtered",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+
+        // Wait for exit, then read with a filter that matches nothing.
+        let proc = await manager.getProcess(result.processId);
+        for (let attempt = 0; attempt < 80; attempt++) {
+          proc = await manager.getProcess(result.processId);
+          if (proc?.status !== "running") break;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        const output = await manager.getOutput(result.processId, "NOMATCH", false, 1);
+        expect(output.success).toBe(true);
+        if (output.success) {
+          expect(output.status).toBe("exited");
+          expect(output.output).toBe("");
+        }
+
+        expect(shownEvents).toHaveLength(1);
+        // Filtered reads never advance the shown offset, yet the terminal status was reported.
+        expect(shownEvents[0].shownThroughOffset).toBe(0);
+        expect(shownEvents[0].terminalStatusShown).toBe(true);
+      });
+    });
   });
 
   it("emits output:shown when an unfiltered read advances the shown frontier", async () => {
@@ -978,6 +1408,9 @@ describe("BackgroundProcessManager", () => {
           processId: result.processId,
           processStartTime: proc.startTime,
           shownThroughOffset: 5,
+          // Whether the same read already reported the exit is timing-dependent (the exit
+          // marker can land after the first content poll), so only the offset is exact here.
+          terminalStatusShown: expect.any(Boolean) as unknown as boolean,
         },
       },
     ]);
@@ -1090,7 +1523,7 @@ describe("BackgroundProcessManager", () => {
       if (!result.success) return;
 
       const event = await eventPromise;
-      expect(event.payload.lines).toEqual(["FAILED"]);
+      expect(event.payload.lines[0]).toBe("FAILED");
       // End of "FAILED\n" (6 chars + newline).
       expect(event.payload.matchedThroughOffset).toBe(7);
     });

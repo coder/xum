@@ -742,7 +742,16 @@ interface QueuedBashMonitorWakeCancellation {
   abortController: AbortController;
   dispatchState: { canceledBeforeAcceptance: boolean };
   invalidatedProcessKeys: Set<string>;
-  matchedOutputByProcess: Map<string, { matchedThroughOffset: number; originNotAfterMs: number }>;
+  /**
+   * Per-process signals a queued wake carries. A wake is retracted only when a shown event covers
+   * every present signal: matched output via the shown offset (absent on terminal-only wakes,
+   * vacuously covered), and settlement via the explicit terminal-shown flag (a filtered or
+   * zero-output post-exit read never advances the offset).
+   */
+  matchedOutputByProcess: Map<
+    string,
+    { matchedThroughOffset?: number; hasTerminal: boolean; originNotAfterMs: number }
+  >;
 }
 
 async function waitForAgentSessionIdle(session: AgentSession, signal?: AbortSignal): Promise<void> {
@@ -1916,11 +1925,15 @@ export class WorkspaceService extends EventEmitter {
       // Process IDs are reusable across restarts. Match the existing delivery gate's createdAt
       // generation bound so output from a newer process cannot supersede an older pending wake.
       const matchedOutput = cancellation.matchedOutputByProcess.get(processKey);
-      if (
-        matchedOutput == null ||
-        payload.processStartTime > matchedOutput.originNotAfterMs ||
-        payload.shownThroughOffset < matchedOutput.matchedThroughOffset
-      ) {
+      if (matchedOutput == null || payload.processStartTime > matchedOutput.originNotAfterMs) {
+        continue;
+      }
+      // Two-signal coverage: retract only when the read showed everything the wake carries.
+      const matchedCovered =
+        matchedOutput.matchedThroughOffset == null ||
+        payload.shownThroughOffset >= matchedOutput.matchedThroughOffset;
+      const terminalCovered = !matchedOutput.hasTerminal || payload.terminalStatusShown;
+      if (!matchedCovered || !terminalCovered) {
         continue;
       }
       cancellation.invalidatedProcessKeys.add(processKey);
@@ -2440,13 +2453,20 @@ export class WorkspaceService extends EventEmitter {
     };
     for (const record of records) {
       const processKey = this.bashMonitorProcessKey(ownerWorkspaceId, record.processId);
-      if (record.kind === "match" && record.matchedThroughOffset != null) {
+      if (
+        record.kind === "match" &&
+        (record.matchedThroughOffset != null || record.terminal != null)
+      ) {
         const previous = cancellation.matchedOutputByProcess.get(processKey);
+        // matchedThroughOffset stays absent for terminal-only wakes so retraction never applies
+        // an offset condition the wake does not carry (see two-signal coverage in the listener).
+        const matchedThroughOffset =
+          record.matchedThroughOffset != null || previous?.matchedThroughOffset != null
+            ? Math.max(previous?.matchedThroughOffset ?? 0, record.matchedThroughOffset ?? 0)
+            : undefined;
         cancellation.matchedOutputByProcess.set(processKey, {
-          matchedThroughOffset: Math.max(
-            previous?.matchedThroughOffset ?? 0,
-            record.matchedThroughOffset
-          ),
+          ...(matchedThroughOffset != null ? { matchedThroughOffset } : {}),
+          hasTerminal: (previous?.hasTerminal ?? false) || record.terminal != null,
           originNotAfterMs: Math.min(
             previous?.originNotAfterMs ?? Number.POSITIVE_INFINITY,
             Date.parse(record.createdAt)
@@ -2736,8 +2756,17 @@ export class WorkspaceService extends EventEmitter {
         typeof this.backgroundProcessManager.getSettledShownThroughOffset === "function";
       const supersededByShown: BashMonitorWakeRecord[] = [];
       for (const record of pending) {
-        let shownThroughOffset: number | undefined;
-        if (record.kind === "match" && record.matchedThroughOffset != null) {
+        // A match record carries up to two independent signals, each with its own shown-condition:
+        // matched output (matchedThroughOffset; shown when the offset frontier covers it) and
+        // settlement (terminal; shown only when the agent was returned the terminal status —
+        // NEVER via offsets alone, because a zero-output process has EOF = 0 = shown offset).
+        // Supersede only when every present signal is shown (vacuous for absent signals). Records
+        // with neither signal (legacy rows, or terminal stripped by a downgraded build's rewrite)
+        // fail open and deliver.
+        if (
+          record.kind === "match" &&
+          (record.matchedThroughOffset != null || record.terminal != null)
+        ) {
           if (canQueryDeliveryState) {
             const state = await this.backgroundProcessManager.getMonitorWakeDeliveryState(
               record.processId,
@@ -2747,16 +2776,34 @@ export class WorkspaceService extends EventEmitter {
               this.scheduleBashMonitorWakeDrainAfterRead(ownerWorkspaceId, state.readSettled);
               continue;
             }
-            shownThroughOffset = state?.shownThroughOffset;
-          } else if (canQueryShownFrontier) {
-            shownThroughOffset = await this.backgroundProcessManager.getSettledShownThroughOffset(
-              record.processId,
-              Date.parse(record.createdAt)
-            );
-          }
-          if (shownThroughOffset != null && shownThroughOffset >= record.matchedThroughOffset) {
-            supersededByShown.push(record);
-            continue;
+            if (state?.status === "settled") {
+              const matchedShown =
+                record.matchedThroughOffset == null ||
+                state.shownThroughOffset >= record.matchedThroughOffset;
+              // Partial manager stubs may omit terminalStatusShown; undefined fails open.
+              const terminalShown = record.terminal == null || state.terminalStatusShown === true;
+              if (matchedShown && terminalShown) {
+                supersededByShown.push(record);
+                continue;
+              }
+            }
+          } else if (canQueryShownFrontier && record.matchedThroughOffset != null) {
+            // Legacy fallback without the non-blocking query: offset-only suppression, applied
+            // strictly to records that carry no terminal signal (a terminal wake must never be
+            // offset-suppressed).
+            const shownThroughOffset =
+              await this.backgroundProcessManager.getSettledShownThroughOffset(
+                record.processId,
+                Date.parse(record.createdAt)
+              );
+            if (
+              record.terminal == null &&
+              shownThroughOffset != null &&
+              shownThroughOffset >= record.matchedThroughOffset
+            ) {
+              supersededByShown.push(record);
+              continue;
+            }
           }
         }
         deliverable.push(record);
