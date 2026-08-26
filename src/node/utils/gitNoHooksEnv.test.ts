@@ -84,6 +84,9 @@ describe("gitNoRepoAutomationEnv", () => {
     expect(() => gitNoRepoAutomationEnvForFilterConfigKeys([`diff.${longName}.command`])).toThrow(
       "unsupported driver name"
     );
+    expect(() => gitNoRepoAutomationEnvForFilterConfigKeys([`merge.${longName}.driver`])).toThrow(
+      "unsupported driver name"
+    );
   });
 
   test("neutralizes filters selected by .git/info/attributes without mutating it", async () => {

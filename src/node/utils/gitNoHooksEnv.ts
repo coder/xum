@@ -30,7 +30,7 @@ export function gitHooksAllowed(trusted?: boolean): boolean {
 
 /** Empty tree OID: pointing GIT_ATTR_SOURCE here makes git ignore tracked
  * .gitattributes (git >= 2.40). $GIT_DIR/info/attributes has higher
- * precedence and is handled by the repo-aware filter-driver overrides below.
+ * precedence and is handled by the repo-aware driver overrides below.
  * Older gits ignore the variable; secret blanking remains a second layer. */
 const GIT_EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
@@ -70,24 +70,24 @@ export function gitNoRepoAutomationEnv(): Record<string, string> {
 }
 
 export const GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN =
-  "^(filter[.].*[.](clean|smudge|process|required)|diff[.].*[.](command|textconv))$";
+  "^(filter[.].*[.](clean|smudge|process|required)|diff[.].*[.](command|textconv)|merge[.].*[.]driver)$";
 export const MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES = 256 * 1024;
 
 const REPO_AUTOMATION_CONFIG_KEY_REGEX =
-  /^(filter|diff)[.](.+)[.](clean|smudge|process|required|command|textconv)$/i;
+  /^(filter|diff|merge)[.](.+)[.](clean|smudge|process|required|command|textconv|driver)$/i;
 const MAX_REPO_AUTOMATION_DRIVERS = 128;
 
 function appendDisabledRepoAutomationDrivers(
   env: Record<string, string>,
   configKeys: Iterable<string>
 ): Record<string, string> {
-  const drivers = new Map<string, { kind: "filter" | "diff"; name: string }>();
+  const drivers = new Map<string, { kind: "filter" | "diff" | "merge"; name: string }>();
   for (const key of configKeys) {
     const match = REPO_AUTOMATION_CONFIG_KEY_REGEX.exec(key);
     if (match == null) {
       continue;
     }
-    const kind = match[1].toLowerCase() as "filter" | "diff";
+    const kind = match[1].toLowerCase() as "filter" | "diff" | "merge";
     const name = match[2];
     if (name.length > 512 || /[\0\r\n]/.test(name)) {
       throw new Error("Refusing git operation with an unsupported driver name");
@@ -114,10 +114,12 @@ function appendDisabledRepoAutomationDrivers(
             ["process", ""],
             ["required", "false"],
           ] as const)
-        : ([
-            ["command", ""],
-            ["textconv", ""],
-          ] as const);
+        : kind === "diff"
+          ? ([
+              ["command", ""],
+              ["textconv", ""],
+            ] as const)
+          : ([["driver", ""]] as const);
     for (const [field, value] of fields) {
       env["GIT_CONFIG_KEY_" + configIndex] = kind + "." + name + "." + field;
       env["GIT_CONFIG_VALUE_" + configIndex] = value;

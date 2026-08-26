@@ -1252,6 +1252,7 @@ async function applyProjectPatch(params: {
 
     const flags: string[] = [];
     if (params.threeWay) flags.push("--3way");
+    if (!gitHooksAllowed(params.trusted)) flags.push("--no-gpg-sign");
 
     if (params.dryRun) {
       const dryRunDirtyOverlap = await checkDirtyPatchPathOverlap({

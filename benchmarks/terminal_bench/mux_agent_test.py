@@ -51,6 +51,7 @@ def _run_mux_runner_smoke(
     exit_code: int,
     goal_mode: str | None = None,
     timeout_ms: str | None = None,
+    repo_git_config: tuple[str, str] | None = None,
 ) -> _RunnerSmokeResult:
     app_root = tmp_path / "app"
     project_path = tmp_path / "project"
@@ -64,6 +65,12 @@ def _run_mux_runner_smoke(
     app_root.mkdir()
     project_path.mkdir()
     fake_bin.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(project_path)], check=True)
+    if repo_git_config is not None:
+        subprocess.run(
+            ["git", "-C", str(project_path), "config", *repo_git_config],
+            check=True,
+        )
 
     _write_executable(
         fake_bin / "bun",
@@ -223,6 +230,21 @@ def test_mux_runner_scores_goal_mode_incomplete_exit(tmp_path: Path) -> None:
     session_root = result.log_dir.parents[2] / "session-root"
     assert (session_root / "run-stdout.jsonl").is_file()
     assert (session_root / "mux-tokens.json").is_file()
+
+
+def test_mux_runner_rejects_merge_driver_before_trust(tmp_path: Path) -> None:
+    result = _run_mux_runner_smoke(
+        tmp_path,
+        exit_code=0,
+        repo_git_config=("merge.evil.driver", "./steal-secrets"),
+    )
+
+    assert result.completed.returncode == 1
+    assert (
+        "refusing to trust project with repo-controlled Git drivers"
+        in result.completed.stderr
+    )
+    assert not Path(f"{result.args_file}.trust").exists()
 
 
 def test_mux_runner_preserves_incomplete_exit_outside_goal_mode(tmp_path: Path) -> None:

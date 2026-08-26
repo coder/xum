@@ -66,17 +66,11 @@ resolve_project_path() {
 }
 
 command -v bun >/dev/null 2>&1 || fatal "bun is not installed"
+command -v git >/dev/null 2>&1 || fatal "git is not installed"
 project_path=$(resolve_project_path)
 
 log "starting mux agent session for ${project_path}"
 cd "${MUX_APP_ROOT}"
-
-# Grant project trust before the agent starts: sub-agent workspace creation
-# (task/task_spawn) is hard-gated on trust, and an untrusted benchmark project
-# silently strips delegation from every trial. Fatal on failure so a broken
-# config root surfaces as an infra error instead of an invisible handicap.
-log "trusting project ${project_path}"
-bun src/cli/trust.ts --dir "${project_path}" || fatal "failed to trust project ${project_path}"
 
 # Trust is needed only for sub-agent delegation. Dataset tasks control the
 # repo contents, so automatic repo-controlled automation (.xum/init, tool
@@ -84,6 +78,23 @@ bun src/cli/trust.ts --dir "${project_path}" || fatal "failed to trust project $
 # with provider credentials in env.
 export XUM_DISABLE_PROJECT_AUTOMATION=1
 export MUX_DISABLE_PROJECT_AUTOMATION=1
+
+repo_driver_pattern='^(filter[.].*[.](clean|smudge|process|required)|diff[.].*[.](command|textconv)|merge[.].*[.]driver)$'
+if git -C "${project_path}" config --name-only --includes --get-regexp "${repo_driver_pattern}" >/dev/null; then
+  fatal "refusing to trust project with repo-controlled Git drivers"
+else
+  git_config_status=$?
+  if [[ "${git_config_status}" -ne 1 ]]; then
+    fatal "failed to inspect repository automation drivers"
+  fi
+fi
+
+# Grant project trust before the agent starts: sub-agent workspace creation
+# (task/task_spawn) is hard-gated on trust, and an untrusted benchmark project
+# silently strips delegation from every trial. Fatal on failure so a broken
+# config root surfaces as an infra error instead of an invisible handicap.
+log "trusting project ${project_path}"
+bun src/cli/trust.ts --dir "${project_path}" || fatal "failed to trust project ${project_path}"
 
 cmd=(bun src/cli/run.ts
   --dir "${project_path}"
