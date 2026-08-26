@@ -1980,6 +1980,13 @@ export class WorkspaceService extends EventEmitter {
               payload.workspaceId,
               payload.processId
             );
+            // A re-armed ID also invalidates an undelivered settlement wake's terminal metadata:
+            // the record must not render/gate the now-live task as already settled while the new
+            // generation has not matched yet (the match-merge path only covers the first match).
+            await this.bashMonitorWakeStore.clearStaleTerminalOnRearm(
+              payload.workspaceId,
+              payload.processId
+            );
           }
         )
       )

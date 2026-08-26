@@ -668,8 +668,8 @@ export class BashMonitorWakeStore {
    * Supersede a pending monitor-lost wake because its processId was re-armed by a live
    * monitor. After a restart the manager's ID space is empty, so relaunching the same
    * display_name reuses the old processId; an undelivered "no longer awaitable" notice
-   * would then describe a live task. Pending match wakes and terminal records are left
-   * untouched.
+   * would then describe a live task. Pending match wakes are left untouched (their stale
+   * terminal metadata is cleared separately by clearStaleTerminalOnRearm).
    */
   async supersedePendingMonitorLost(ownerWorkspaceId: string, processId: string): Promise<void> {
     assert(
@@ -682,6 +682,32 @@ export class BashMonitorWakeStore {
       const record = await this.get(ownerWorkspaceId, id);
       if (record?.status !== "pending" || record.kind !== "monitor-lost") return;
       await this.write(this.withTerminalStatus(record, "superseded"));
+    });
+  }
+
+  /**
+   * Clear stale terminal metadata from a pending match wake because its processId was re-armed
+   * by a live monitor. Terminal state binds to a process generation (see enqueueOrMergePending):
+   * without this, an undelivered settlement wake would render the re-armed live task as already
+   * settled -- and promise no further wakes -- until the new generation's first match clears it,
+   * a gap that misleads the agent whenever the new process has not matched yet. The old
+   * generation's lines (including its synthetic settle notice) stay deliverable.
+   */
+  async clearStaleTerminalOnRearm(ownerWorkspaceId: string, processId: string): Promise<void> {
+    assert(
+      ownerWorkspaceId.trim().length > 0,
+      "clearStaleTerminalOnRearm requires ownerWorkspaceId"
+    );
+    const id = BashMonitorWakeStore.wakeId(processId);
+    const key = `${ownerWorkspaceId}:${id}`;
+    await this.locks.withLock(key, async () => {
+      const record = await this.get(ownerWorkspaceId, id);
+      if (record?.status !== "pending" || record.kind !== "match" || record.terminal == null) {
+        return;
+      }
+      const cleared: BashMonitorWakeRecord = { ...record, updatedAt: new Date().toISOString() };
+      delete cleared.terminal;
+      await this.write(cleared);
     });
   }
 

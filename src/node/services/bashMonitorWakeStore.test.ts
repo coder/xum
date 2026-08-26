@@ -499,6 +499,40 @@ describe("BashMonitorWakeStore", () => {
     expect(merged.matchedThroughOffset).toBe(40);
   });
 
+  test("clearStaleTerminalOnRearm drops the old generation's terminal before any new match", async () => {
+    // Restart scenario: an undelivered settlement wake exists and the same display-name-derived
+    // ID is re-armed before it drains. The record must stop rendering/gating the live task as
+    // settled even though the new generation has not matched yet.
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(
+      payload({
+        lines: ["[monitor] process settled: exited (code 1)"],
+        matchedThroughOffset: undefined,
+        terminal: { status: "exited", exitCode: 1 },
+      })
+    );
+    await store.clearStaleTerminalOnRearm("owner-1", "proc-1");
+
+    const pending = await store.listPending("owner-1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0].terminal).toBeUndefined();
+    expect(pending[0].status).toBe("pending");
+    // The old generation's settle notice stays deliverable as plain lines.
+    expect(pending[0].lines).toEqual(["[monitor] process settled: exited (code 1)"]);
+  });
+
+  test("clearStaleTerminalOnRearm leaves terminal-less and non-pending records untouched", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    const record = await store.enqueueOrMergePending(
+      payload({ terminal: { status: "exited", exitCode: 0 } })
+    );
+    await store.markDelivered("owner-1", record.id);
+
+    // Delivered records are not rewritten by a re-arm.
+    await store.clearStaleTerminalOnRearm("owner-1", "proc-1");
+    expect(await store.listPending("owner-1")).toHaveLength(0);
+  });
+
   test("a malformed persisted terminal degrades to no metadata instead of dropping the wake", async () => {
     const config = makeConfig(rootDir);
     const store = new BashMonitorWakeStore(config);

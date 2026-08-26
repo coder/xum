@@ -1833,13 +1833,13 @@ export const TOOL_DEFINITIONS = {
                 "Process persists until timeout_secs expires, terminated, or workspace is removed." +
                 "\\n\\nFor long-running tasks like builds or compilations, prefer background mode to continue productive work in parallel. " +
                 "Without a monitor, raw background bash does not automatically wake the parent workspace when it prints output or exits. " +
-                "With monitor, matching complete output lines wake this workspace, including after your current response, and the workspace is also woken when the process settles (exit, kill, timeout) unless wake_on_exit is false; use task_await only if you need surrounding/full output. " +
+                "With monitor, matching complete output lines wake this workspace, including after your current response, and the workspace is also woken when the process settles (exit, kill, timeout) unless wake_on_exit is false, the monitor was retired by max_events, or the task was explicitly cancelled (task_stop / terminate); use task_await only if you need surrounding/full output. " +
                 "Before finishing, terminate monitored tasks that are no longer relevant so stale output cannot trigger a follow-up turn. " +
                 "Do not call task_await in the same parallel tool-call batch; wait for the returned taskId first. " +
                 "When you actually need the output, read it with task_await; do not poll task_await just because the process is still running."
             ),
           monitor: BashMonitorSchema.nullish().describe(
-            "Wake-on-match monitor. Valid only with run_in_background=true. Matching complete output lines wake this workspace without polling, even after the current response, and the workspace always wakes when the monitored process settles (exit, kill, timeout) unless wake_on_exit is false; terminate it before finishing if future wakes are no longer useful."
+            "Wake-on-match monitor. Valid only with run_in_background=true. Matching complete output lines wake this workspace without polling, even after the current response, and the workspace also wakes when the monitored process settles (exit, kill, timeout) unless wake_on_exit is false, the monitor was retired by max_events, or the task was explicitly cancelled (task_stop / terminate); terminate it before finishing if future wakes are no longer useful."
           ),
           display_name: z
             .string()
