@@ -8,10 +8,12 @@ import {
   Workflow,
 } from "lucide-react";
 
-import { useRef, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
+import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
+import { isActiveWorkflowRunStatus } from "@/common/types/workflow";
 import { shortenWorkflowRunId } from "@/browser/components/ProjectSidebar/sidebarTaskGroups";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useRouter } from "@/browser/contexts/RouterContext";
@@ -26,6 +28,10 @@ interface DescendantSubAgent {
   workspace: FrontendWorkspaceMetadata;
   depth: number;
 }
+
+// Matches useWorkflowRunById's refresh cadence; polls only while a nested gap group renders.
+const NESTED_RUN_VERIFY_INTERVAL_MS = 2_000;
+const NESTED_RUN_VERIFY_MAX_FAILURES = 3;
 
 const ACTIVE_SUBAGENT_STATUSES = new Set<FrontendWorkspaceMetadata["taskStatus"]>([
   "queued",
@@ -46,6 +52,8 @@ export interface WorkflowAgentGroup {
   runId: string;
   /** Display name stamped at spawn time; absent on runs from before the field existed. */
   workflowName?: string;
+  /** Workspace whose durable run store owns this run (the workers' spawner). */
+  ownerWorkspaceId?: string;
   workers: DescendantSubAgent[];
 }
 
@@ -102,7 +110,12 @@ export function collectDescendantAgents(
     } else {
       let group = groupsByRunId.get(next.runId);
       if (group == null) {
-        group = { runId: next.runId, workers: [] };
+        group = {
+          runId: next.runId,
+          // Workers run inside the workspace that owns the run's durable record.
+          ownerWorkspaceId: next.workspace.parentWorkspaceId,
+          workers: [],
+        };
         groupsByRunId.set(next.runId, group);
         workflowGroups.push(group);
       }
@@ -127,38 +140,76 @@ export function collectDescendantAgents(
   return { subAgents, workflowGroups, descendantWorkspaceIds: [...visited] };
 }
 
+/** Per-run info learned from observed worker rows; survives the workers' deletion. */
+export interface ObservedWorkflowRunInfo {
+  workflowName?: string;
+  /** Workspace whose durable run store owns this run (for liveness verification). */
+  ownerWorkspaceId?: string;
+  /**
+   * True once the run id has appeared in some owner's activity set. Nested
+   * (workflow-in-workflow) runs never do — the backend deliberately excludes runs
+   * with `parentWorkflow` from workspace activity — so their liveness must be
+   * verified against the durable run record instead.
+   */
+  activityCovered: boolean;
+}
+
 /**
  * Sequential workflows delete each worker workspace once it reports, and the next
  * worker may not exist yet — during that gap a purely row-derived group list goes
  * empty and the run would vanish from the tray even though it is still active.
  * Synthesize a header-only group (its workers' workspaces are deleted, so no rows)
- * for every active run id with no live workers — including on a cold mount mid-gap.
- * `runNames` caches display names learned from observed workers (mirroring the
- * ProjectSidebar's workflowRunNamesRef) and is pruned once a run is neither active
- * nor visible; never-observed runs fall back to the shortened run id.
+ * for every run known to be alive but currently worker-less:
+ *   - runs in some owner's activity set (`activeRunIds`), including on a cold
+ *     mount mid-gap where nothing was ever observed;
+ *   - observed nested runs, which activity never covers, until `isNestedRunDead`
+ *     reports their durable record as settled.
+ * `observed` (mutated: learn + prune) mirrors the ProjectSidebar's retention refs.
  */
 export function mergeActiveWorkflowGroups(
   current: readonly WorkflowAgentGroup[],
   activeRunIds: readonly string[],
-  runNames: Map<string, string>
+  observed: Map<string, ObservedWorkflowRunInfo>,
+  isNestedRunDead: (runId: string) => boolean
 ): WorkflowAgentGroup[] {
   const activeIds = new Set(activeRunIds);
   const currentIds = new Set(current.map((group) => group.runId));
   for (const group of current) {
+    const entry = observed.get(group.runId) ?? { activityCovered: false };
     if (group.workflowName != null) {
-      runNames.set(group.runId, group.workflowName);
+      entry.workflowName = group.workflowName;
     }
+    if (group.ownerWorkspaceId != null) {
+      entry.ownerWorkspaceId = group.ownerWorkspaceId;
+    }
+    observed.set(group.runId, entry);
   }
-  for (const runId of runNames.keys()) {
-    if (!activeIds.has(runId) && !currentIds.has(runId)) {
-      runNames.delete(runId);
+  for (const [runId, entry] of observed) {
+    entry.activityCovered ||= activeIds.has(runId);
+    if (currentIds.has(runId)) {
+      continue;
+    }
+    const dead = entry.activityCovered ? !activeIds.has(runId) : isNestedRunDead(runId);
+    if (dead) {
+      observed.delete(runId);
     }
   }
   const merged = [...current];
   for (const runId of activeIds) {
     if (!currentIds.has(runId)) {
-      merged.push({ runId, workflowName: runNames.get(runId), workers: [] });
+      merged.push({ runId, workflowName: observed.get(runId)?.workflowName, workers: [] });
     }
+  }
+  for (const [runId, entry] of observed) {
+    if (entry.activityCovered || currentIds.has(runId)) {
+      continue;
+    }
+    merged.push({
+      runId,
+      workflowName: entry.workflowName,
+      ownerWorkspaceId: entry.ownerWorkspaceId,
+      workers: [],
+    });
   }
   return merged;
 }
@@ -260,7 +311,13 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
     false
   );
   const workspaceStore = useWorkspaceStoreRaw();
-  const workflowRunNamesRef = useRef<Map<string, string>>(new Map());
+  const { api } = useAPI();
+  const observedWorkflowRunsRef = useRef<Map<string, ObservedWorkflowRunInfo>>(new Map());
+  // Nested runs whose durable record was verified settled (or unreachable); their
+  // synthesized gap groups must stop rendering. Reset entries when the run reappears.
+  const [deadNestedRunIds, setDeadNestedRunIds] = useState<ReadonlySet<string>>(
+    () => new Set<string>()
+  );
   const {
     subAgents,
     workflowGroups: liveWorkflowGroups,
@@ -269,9 +326,11 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
   // Union of active workflow run ids across this workspace AND its descendants: a run
   // owned by a descendant sub-agent appears only in that descendant's workspace-scoped
   // activity (never the root's), so reconciling against the root alone would drop a
-  // descendant-owned run during its between-workers gap. Snapshot is a joined string so
-  // useSyncExternalStore's Object.is comparison stays stable across recomputes.
-  const activeRunIdsKey = useSyncExternalStore(workspaceStore.subscribeDerived, () => {
+  // descendant-owned run during its between-workers gap. Activity snapshots publish via
+  // states.bump, so subscribe to the states store (subscribeDerived would miss workflow
+  // start/completion events that change no derived data). Snapshot is a joined string
+  // so useSyncExternalStore's Object.is comparison stays stable across recomputes.
+  const activeRunIdsKey = useSyncExternalStore(workspaceStore.subscribe, () => {
     const ids: string[] = [];
     const seen = new Set<string>();
     for (const ownerId of [props.workspaceId, ...descendantWorkspaceIds]) {
@@ -293,8 +352,83 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
   const workflowGroups = mergeActiveWorkflowGroups(
     liveWorkflowGroups,
     activeRunIdsKey.length > 0 ? activeRunIdsKey.split("\u0000") : [],
-    workflowRunNamesRef.current
+    observedWorkflowRunsRef.current,
+    (runId) => deadNestedRunIds.has(runId)
   );
+  // A dead-marked nested run that reacquired live workers (checkpoint retry) is alive
+  // again; clear its verdict. "Adjust state during render" pattern with a no-op guard.
+  const liveRunIds = new Set(liveWorkflowGroups.map((group) => group.runId));
+  if ([...deadNestedRunIds].some((runId) => liveRunIds.has(runId))) {
+    setDeadNestedRunIds((previous) => {
+      const next = new Set(previous);
+      let changed = false;
+      for (const runId of liveRunIds) {
+        changed = next.delete(runId) || changed;
+      }
+      return changed ? next : previous;
+    });
+  }
+  // Nested gap groups carry no activity signal, so verify their durable run records
+  // (same source useWorkflowRunById polls) while any are on screen; mark settled,
+  // missing, or repeatedly unreachable runs dead so their groups drop out.
+  const nestedGapKey = workflowGroups
+    .flatMap((group) => {
+      const owner = group.ownerWorkspaceId;
+      if (
+        group.workers.length > 0 ||
+        owner == null ||
+        observedWorkflowRunsRef.current.get(group.runId)?.activityCovered !== false
+      ) {
+        return [];
+      }
+      return [`${group.runId}\u0000${owner}`];
+    })
+    .join("\u0001");
+  useEffect(() => {
+    if (api == null || nestedGapKey.length === 0) {
+      return;
+    }
+    const candidates = nestedGapKey.split("\u0001").map((pair) => {
+      const [runId, ownerWorkspaceId] = pair.split("\u0000");
+      return { runId, ownerWorkspaceId };
+    });
+    let cancelled = false;
+    const failureCounts = new Map<string, number>();
+    const markDead = (runId: string) => {
+      setDeadNestedRunIds((previous) =>
+        previous.has(runId) ? previous : new Set([...previous, runId])
+      );
+    };
+    const verify = () => {
+      for (const candidate of candidates) {
+        void api.workflows
+          .getRun({ workspaceId: candidate.ownerWorkspaceId, runId: candidate.runId })
+          .then((run) => {
+            if (!cancelled && (run == null || !isActiveWorkflowRunStatus(run.status))) {
+              markDead(candidate.runId);
+            }
+          })
+          .catch(() => {
+            if (cancelled) {
+              return;
+            }
+            // Transient IPC errors keep the group; a repeatedly unreachable record
+            // (e.g. the owning workspace was deleted) must not pin it forever.
+            const failures = (failureCounts.get(candidate.runId) ?? 0) + 1;
+            failureCounts.set(candidate.runId, failures);
+            if (failures >= NESTED_RUN_VERIFY_MAX_FAILURES) {
+              markDead(candidate.runId);
+            }
+          });
+      }
+    };
+    verify();
+    const interval = setInterval(verify, NESTED_RUN_VERIFY_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [api, nestedGapKey]);
 
   if (subAgents.length === 0 && workflowGroups.length === 0) {
     return null;

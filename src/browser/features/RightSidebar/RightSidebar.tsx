@@ -54,7 +54,7 @@ import type { GoalSetError, GoalSnapshot, GoalStatus } from "@/common/types/goal
 import { TerminalTab } from "@/browser/features/RightSidebar/TerminalTab";
 import {
   useOptionalWorkspaceSidebarState,
-  useWorkspaceActivityHydrated,
+  useWorkspaceActivityAuthoritative,
 } from "@/browser/stores/WorkspaceStore";
 import { shouldAutoActivateWorkflowsTab } from "@/browser/features/RightSidebar/Workflows/workflowDisplay";
 import {
@@ -1194,15 +1194,16 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
   // persisted tab, and switching away afterwards is respected. Does not
   // un-collapse a collapsed sidebar.
   const activeWorkflowRunCount = sidebarState?.activeWorkflowRunCount ?? 0;
-  const activityHydrated = useWorkspaceActivityHydrated();
+  const activityAuthoritative = useWorkspaceActivityAuthoritative();
   const previousActiveWorkflowRunCountRef = React.useRef<number | null>(null);
   React.useEffect(() => {
-    // Before activity hydration the store reports 0 for every workspace, so recording
-    // that as the baseline would misread hydration of a pre-existing active run as a
-    // fresh 0 → >0 start and steal the persisted tab on cold startup. Keep the baseline
-    // unknown until hydration; the first hydrated observation then counts as "first
-    // observation" and never activates.
-    if (!activityHydrated) {
+    // Before an AUTHORITATIVE activity snapshot the store reports 0 for every
+    // workspace — both pre-hydration and after a failure-path self-heal (which marks
+    // hydrated with an empty map). Recording that 0 as the baseline would misread the
+    // eventual real snapshot of a pre-existing active run as a fresh 0 → >0 start and
+    // steal the persisted tab. Keep the baseline unknown until authoritative data; the
+    // first authoritative observation counts as "first observation" and never activates.
+    if (!activityAuthoritative) {
       return;
     }
     const previous = previousActiveWorkflowRunCountRef.current;
@@ -1214,7 +1215,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
       return;
     }
     setLayout((prev) => selectOrAddTab(prev, "workflows"));
-  }, [activityHydrated, activeWorkflowRunCount, setLayout, workflowsExperimentEnabled]);
+  }, [activityAuthoritative, activeWorkflowRunCount, setLayout, workflowsExperimentEnabled]);
 
   React.useEffect(() => {
     const handleOpenTouchReviewImmersive = (event: Event) => {

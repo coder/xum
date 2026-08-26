@@ -754,6 +754,7 @@ export class WorkspaceStore {
   // (useChatViewDataReady) waits on this so cross-workspace decorations like
   // the concurrent-local warning can't pop in after the transcript reveals.
   private activityHydrated = false;
+  private activityAuthoritative = false;
   private activityHydratedListeners = new Set<() => void>();
   // Workspaces whose persisted session usage fetch has settled (success or
   // failure). Distinguishes "usage unknown" from "no usage" for the same
@@ -3565,17 +3566,31 @@ export class WorkspaceStore {
     }
   }
 
-  private markActivityHydrated(): void {
-    if (this.activityHydrated) {
+  /**
+   * Hydrated means the first-paint barrier may release — including the bootstrap
+   * FAILURE path, which self-heals with an empty activity map. Authoritative is set
+   * only when a real activity snapshot list was applied, so consumers that must not
+   * mistake the empty failure-path map for "no activity" (e.g. the Workflows tab
+   * auto-activation baseline) gate on it instead.
+   */
+  private markActivityHydrated(authoritative: boolean): void {
+    const hydratedChanged = !this.activityHydrated;
+    const authoritativeChanged = authoritative && !this.activityAuthoritative;
+    if (!hydratedChanged && !authoritativeChanged) {
       return;
     }
     this.activityHydrated = true;
+    if (authoritative) {
+      this.activityAuthoritative = true;
+    }
     for (const listener of this.activityHydratedListeners) {
       listener();
     }
   }
 
   isActivityHydrated = (): boolean => this.activityHydrated;
+
+  isActivityAuthoritative = (): boolean => this.activityAuthoritative;
 
   subscribeActivityHydrated = (listener: () => void): (() => void) => {
     this.activityHydratedListeners.add(listener);
@@ -3633,7 +3648,7 @@ export class WorkspaceStore {
             return;
           }
           this.applyWorkspaceActivityList(snapshots);
-          this.markActivityHydrated();
+          this.markActivityHydrated(true);
         });
 
         // Start watchdog after bootstrap so slow list() doesn't trigger
@@ -3684,7 +3699,8 @@ export class WorkspaceStore {
           // Self-heal: a failing activity subscription must not hold the chat
           // view's first-paint barrier. Treat the (empty) activity map as
           // known; the retry loop will deliver real data when it recovers.
-          this.markActivityHydrated();
+          // Not authoritative: baseline consumers must not read this as "no activity".
+          this.markActivityHydrated(false);
         }
       } finally {
         releaseAttemptListeners();
@@ -5322,6 +5338,16 @@ export function useSessionUsageKnown(workspaceId: string): boolean {
 export function useWorkspaceActivityHydrated(): boolean {
   const store = getStoreInstance();
   return useSyncExternalStore(store.subscribeActivityHydrated, store.isActivityHydrated);
+}
+
+/**
+ * True only after a REAL activity snapshot list was applied — never via the
+ * failure-path self-heal. Gate logic that must not misread the empty failure-path
+ * map as "no activity" (e.g. auto-activation baselines) on this, not on hydrated.
+ */
+export function useWorkspaceActivityAuthoritative(): boolean {
+  const store = getStoreInstance();
+  return useSyncExternalStore(store.subscribeActivityHydrated, store.isActivityAuthoritative);
 }
 
 /** Rounded chrome value: identical raw-stat updates keep the snapshot primitive stable. */
