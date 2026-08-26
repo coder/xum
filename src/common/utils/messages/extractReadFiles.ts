@@ -45,12 +45,15 @@ function collectNestedReadPaths(output: unknown): string[] {
     // do) — a malformed row with neither result nor ok must not advertise a
     // never-read path.
     if (result === undefined && record.ok !== true) continue;
-    if (
-      typeof result === "object" &&
-      result !== null &&
-      (result as { success?: unknown }).success === false
-    ) {
-      continue;
+    // Records WITH a result must show the POSITIVE successful file_read shape
+    // (r33): a corrupted persisted row can carry null, a primitive, or a
+    // success-less object, and result presence alone must not tell the model
+    // an unread file was already inspected. Kernel `load` results are the
+    // exception — their retained {key, bytes, lines, preview} shape has no
+    // success field; load failures surface through error/ok above.
+    if (result !== undefined && record.toolName !== "load") {
+      if (typeof result !== "object" || result === null) continue;
+      if ((result as { success?: unknown }).success !== true) continue;
     }
     const filePath = extractToolFilePath(record.args);
     if (filePath) paths.push(filePath);

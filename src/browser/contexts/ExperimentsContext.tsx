@@ -142,6 +142,28 @@ function setExperimentState(experimentId: ExperimentId, enabled: boolean): void 
 }
 
 /**
+ * Upgrade reconciliation for the legacy exclusive mirror (r33): an old
+ * renderer can leave `programmatic-tool-calling: true` alongside a stale
+ * legacy exclusive `false` (or none), and setExperimentState rewrites the
+ * mirror only on toggles — a user who upgrades and never touches the setting
+ * would downgrade into the removed supplement posture, because a downgraded
+ * renderer treats the stale explicit legacy key as an override that wins over
+ * the backend's mirrored flag. Keep the mirror stamped whenever the EFFECTIVE
+ * PTC state (local override first, else the backend override) is enabled.
+ * Only the enabled state needs stamping: a legacy `true` already aliases
+ * effective PTC to true, so a disagreeing pair can only be
+ * (ptc: true, legacy: false/absent).
+ */
+function reconcileLegacyPtcExclusiveMirror(
+  backendOverrides: Partial<Record<ExperimentId, boolean>> | null
+): void {
+  const local = getExperimentOverrideSnapshot(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
+  const effective = local ?? backendOverrides?.[EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING];
+  if (effective !== true || hasLegacyPtcExclusiveOverride()) return;
+  updatePersistedState(getLegacyPtcExclusiveExperimentKey(), true);
+}
+
+/**
  * Context value type - provides setter function.
  * Individual experiment values are accessed via useExperimentValue hook.
  */
@@ -213,10 +235,14 @@ export function ExperimentsProvider(props: { children: React.ReactNode }) {
         const overrides = await api.experiments.getOverrides();
         if (!cancelled) {
           setBackendOverrides(overrides);
+          reconcileLegacyPtcExclusiveMirror(overrides);
         }
       } catch {
         if (!cancelled) {
           setBackendOverrides(null);
+          // Still reconciles the purely-local stale pair (ptc: true,
+          // legacy: false/absent) even when the backend is unreachable.
+          reconcileLegacyPtcExclusiveMirror(null);
         }
       }
     };

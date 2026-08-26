@@ -119,6 +119,17 @@ describe("extractReadFilePaths", () => {
                 args: { path: "/resolved-but-failed.ts" },
                 result: { success: false, error: "File not found" },
               },
+              // Corrupted persisted rows (r33): result PRESENCE alone must not
+              // advertise a read — null, primitive, and success-less results
+              // are all rejected; only the positive successful shape counts.
+              { toolName: "file_read", args: { path: "/corrupt-null.ts" }, result: null },
+              { toolName: "file_read", args: { path: "/corrupt-primitive.ts" }, result: 5 },
+              { toolName: "file_read", args: { path: "/corrupt-successless.ts" }, result: {} },
+              {
+                toolName: "file_read",
+                args: { path: "/classic-read.ts" },
+                result: { success: true, content: "x" },
+              },
             ],
           },
         },
@@ -129,9 +140,10 @@ describe("extractReadFilePaths", () => {
       codeExecutionMessage,
     ];
 
-    // Newest-first at every level: within the execution, /loaded.jsonl is
-    // chronologically after /nested-read.ts, so it surfaces first.
+    // Newest-first at every level: within the execution, /classic-read.ts is
+    // chronologically last, so it surfaces first.
     expect(extractReadFilePaths(messages)).toEqual([
+      "/classic-read.ts",
       "/loaded.jsonl",
       "/nested-read.ts",
       "/direct.ts",

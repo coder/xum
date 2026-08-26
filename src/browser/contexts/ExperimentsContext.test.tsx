@@ -253,6 +253,49 @@ describe("ExperimentsProvider", () => {
     });
   });
 
+  test("initialization stamps the legacy mirror over a stale explicit false", async () => {
+    // An old renderer can leave ptc:true beside a stale legacy exclusive
+    // `false`; upgrading without touching the toggle previously never rewrote
+    // the mirror, and a downgraded renderer treats the stale explicit key as
+    // an override that wins over the backend flag — resuming the removed
+    // supplement posture (r33). Initialization reconciles it.
+    currentClientMock = {
+      experiments: {
+        setOverride: mock(() => Promise.resolve()),
+        getOverrides: mock(() => Promise.resolve({})),
+      },
+    };
+
+    globalThis.window.localStorage.setItem(
+      getExperimentKey(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
+      JSON.stringify(true)
+    );
+    globalThis.window.localStorage.setItem(
+      getLegacyPtcExclusiveExperimentKey(),
+      JSON.stringify(false)
+    );
+
+    function Probe() {
+      const enabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
+      return <div data-testid="probe">{String(enabled)}</div>;
+    }
+
+    const { getByTestId } = render(
+      <APIProvider client={currentClientMock as APIClient}>
+        <ExperimentsProvider>
+          <Probe />
+        </ExperimentsProvider>
+      </APIProvider>
+    );
+
+    expect(getByTestId("probe").textContent).toBe("true");
+    await waitFor(() => {
+      expect(globalThis.window.localStorage.getItem(getLegacyPtcExclusiveExperimentKey())).toBe(
+        "true"
+      );
+    });
+  });
+
   test("stale legacy exclusive true reads as PTC on, and toggling PTC rewrites the legacy key", async () => {
     currentClientMock = {
       experiments: {
