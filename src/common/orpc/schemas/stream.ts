@@ -64,10 +64,27 @@ export const OnChatModeSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("live") }),
 ]);
 
+/**
+ * Why a requested since-mode replay was downgraded to full replay.
+ * Ordered by check precedence: the first failing predicate wins.
+ */
+export const OnChatDowngradeReasonSchema = z.enum([
+  "cursor-row-missing",
+  "oldest-mismatch",
+  "fingerprint-mismatch",
+  "history-read-failed",
+]);
+
 export const CaughtUpMessageSchema = z.object({
   type: z.literal("caught-up"),
   /** Which replay strategy the server actually used. */
   replay: z.enum(["full", "since", "live"]).optional(),
+  /**
+   * Present only when the client requested since-mode and the server downgraded to
+   * full replay. Silent downgrades defeat incremental reconnects, so this must stay
+   * observable to clients and tests.
+   */
+  downgradeReason: OnChatDowngradeReasonSchema.optional(),
   /**
    * Authoritative pagination signal for full replays.
    * Omitted for since/live replays so the client can preserve existing pagination state.

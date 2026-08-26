@@ -12877,7 +12877,7 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
-  async getActivityList(): Promise<Record<string, WorkspaceActivitySnapshot>> {
+  async getActivityList(): Promise<Record<string, WorkspaceActivitySnapshot> | null> {
     try {
       // On the first bootstrap the prune already enumerated the config; reuse
       // that id set instead of paying the per-workspace disk walk twice.
@@ -12898,8 +12898,9 @@ export class WorkspaceService extends EventEmitter {
       // metadata file into an empty one, which this list would then present
       // as an authoritative "no activity anywhere" answer — the renderer
       // applies that by wiping every cached streaming/status/goal snapshot
-      // with no retry (the subscription stays connected). Rejecting instead
-      // keeps last-known renderer state and lets the bootstrap loop retry.
+      // with no retry (the subscription stays connected). Throwing to the
+      // null-returning catch below instead keeps last-known renderer state
+      // and lets the bootstrap retry read the real list later.
       const snapshots = await this.extensionMetadata.getAllSnapshots({ throwOnError: true });
       // Scope the list to config-known workspaces. extensionMetadata.json was
       // historically never pruned, so long-lived deployments accumulate stale
@@ -13062,14 +13063,13 @@ export class WorkspaceService extends EventEmitter {
         )
       );
     } catch (error) {
-      // Rethrow instead of returning {}: with scoping, an empty result is a
-      // VALID authoritative answer (no known workspace has activity) that the
-      // renderer must apply to clear stale entries after a disconnected
-      // removal. Failures must therefore be distinguishable — the renderer's
-      // bootstrap loop treats a rejection as transient (keeps last-known
-      // state and retries with backoff).
       log.error("Failed to list activity:", error);
-      throw error;
+      // null (not {}) so the renderer can tell a read failure from a legitimately
+      // idle deployment — with scoping, {} is a valid authoritative answer (no
+      // known workspace has activity) that the renderer must apply to clear
+      // stale entries after a disconnected removal. On null the renderer keeps
+      // last-known state and retries in the background.
+      return null;
     }
   }
   async getChatHistory(workspaceId: string): Promise<MuxMessage[]> {

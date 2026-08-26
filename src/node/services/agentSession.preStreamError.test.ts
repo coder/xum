@@ -610,6 +610,7 @@ describe("AgentSession pre-stream errors", () => {
     );
     expect(caughtUp).toBeDefined();
     expect(caughtUp?.replay).toBe("since");
+    expect(caughtUp?.downgradeReason).toBeUndefined();
 
     const replayedMessageIds = events.reduce<string[]>((ids, event) => {
       if (
@@ -770,11 +771,90 @@ describe("AgentSession pre-stream errors", () => {
     );
     expect(caughtUp).toBeDefined();
     expect(caughtUp?.replay).toBe("full");
+    expect(caughtUp?.downgradeReason).toBe("fingerprint-mismatch");
 
     const replayedMessageIds = events.filter(isMuxMessage).map((message) => message.id);
     expect(replayedMessageIds).toContain(persistedFirst.id);
     expect(replayedMessageIds).toContain(persistedThird.id);
     expect(replayedMessageIds).not.toContain(persistedSecond.id);
+  });
+
+  it("classifies cursor-row-missing downgrades on since replay", async () => {
+    const workspaceId = "ws-replay-downgrade-cursor-row-missing";
+    const { session, cleanup, historyService } = await createReplaySessionHarness(workspaceId);
+    historyCleanup = cleanup;
+
+    const seedMessage = createMuxMessage("msg-history-seed", "assistant", "seed");
+    expect((await historyService.appendToHistory(workspaceId, seedMessage)).success).toBe(true);
+
+    const events: WorkspaceChatMessage[] = [];
+    await session.replayHistory(
+      ({ message }) => {
+        events.push(message);
+      },
+      {
+        type: "since",
+        cursor: {
+          history: {
+            messageId: "missing-message",
+            historySequence: 123,
+            oldestHistorySequence: 123,
+          },
+        },
+      }
+    );
+
+    const caughtUp = events.find(
+      (event): event is Extract<WorkspaceChatMessage, { type: "caught-up" }> =>
+        "type" in event && event.type === "caught-up"
+    );
+    expect(caughtUp?.replay).toBe("full");
+    expect(caughtUp?.downgradeReason).toBe("cursor-row-missing");
+  });
+
+  it("classifies oldest-mismatch downgrades on since replay", async () => {
+    const workspaceId = "ws-replay-downgrade-oldest-mismatch";
+    const { session, cleanup, historyService } = await createReplaySessionHarness(workspaceId);
+    historyCleanup = cleanup;
+
+    const seedMessage = createMuxMessage("msg-history-seed", "assistant", "seed");
+    expect((await historyService.appendToHistory(workspaceId, seedMessage)).success).toBe(true);
+
+    const historyResult = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!historyResult.success) {
+      throw new Error(`Failed to read seeded history: ${historyResult.error}`);
+    }
+    const persistedSeed = historyResult.data.find((message) => message.id === seedMessage.id);
+    const seedHistorySequence = persistedSeed?.metadata?.historySequence;
+    if (!persistedSeed || seedHistorySequence === undefined) {
+      throw new Error("Expected seeded history message with historySequence");
+    }
+
+    const events: WorkspaceChatMessage[] = [];
+    await session.replayHistory(
+      ({ message }) => {
+        events.push(message);
+      },
+      {
+        type: "since",
+        cursor: {
+          history: {
+            messageId: persistedSeed.id,
+            historySequence: seedHistorySequence,
+            // Claim an older replay window than the server currently has, as if rows
+            // below the cursor were truncated while the client was disconnected.
+            oldestHistorySequence: seedHistorySequence - 1,
+          },
+        },
+      }
+    );
+
+    const caughtUp = events.find(
+      (event): event is Extract<WorkspaceChatMessage, { type: "caught-up" }> =>
+        "type" in event && event.type === "caught-up"
+    );
+    expect(caughtUp?.replay).toBe("full");
+    expect(caughtUp?.downgradeReason).toBe("oldest-mismatch");
   });
 
   it("keeps since replay mode when failure occurs after incremental payload is emitted", async () => {

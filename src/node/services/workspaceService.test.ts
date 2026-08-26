@@ -1450,9 +1450,9 @@ describe("WorkspaceService bash monitor wakes", () => {
       // Reconnect bootstrap must still return the zero-count tombstone even though the
       // clear emit failed, so the renderer's stale "watching" snapshot gets replaced.
       const activityList = await workspaceService.getActivityList();
-      const entry = activityList[workspaceId];
+      const entry = activityList?.[workspaceId];
       expect(entry).toBeDefined();
-      expect(entry.activeBashMonitorCount).toBeUndefined();
+      expect(entry?.activeBashMonitorCount).toBeUndefined();
     } finally {
       await cleanup();
     }
@@ -1507,9 +1507,9 @@ describe("WorkspaceService bash monitor wakes", () => {
       // Reconnect bootstrap: the list must include a zero-count tombstone so the
       // renderer's last-known "watching" snapshot gets replaced rather than preserved.
       const activityList = await workspaceService.getActivityList();
-      const entry = activityList[workspaceId];
+      const entry = activityList?.[workspaceId];
       expect(entry).toBeDefined();
-      expect(entry.activeBashMonitorCount).toBeUndefined();
+      expect(entry?.activeBashMonitorCount).toBeUndefined();
     } finally {
       await cleanup();
     }
@@ -2964,15 +2964,15 @@ describe("WorkspaceService workflow activity", () => {
         now: "2026-06-17T00:00:01.000Z",
       });
 
-      expect((await workspaceService.getActivityList())[workspaceId]?.activeWorkflowRunIds).toEqual(
-        ["wfr_active"]
-      );
-      expect((await workspaceService.getActivityList())[workspaceId]?.activeWorkflowRunCount).toBe(
-        1
-      );
-      expect((await workspaceService.getActivityList())[workspaceId]?.activeWorkflowRunCount).toBe(
-        1
-      );
+      expect(
+        (await workspaceService.getActivityList())?.[workspaceId]?.activeWorkflowRunIds
+      ).toEqual(["wfr_active"]);
+      expect(
+        (await workspaceService.getActivityList())?.[workspaceId]?.activeWorkflowRunCount
+      ).toBe(1);
+      expect(
+        (await workspaceService.getActivityList())?.[workspaceId]?.activeWorkflowRunCount
+      ).toBe(1);
       expect(listStatusSnapshotsSpy).toHaveBeenCalledTimes(1);
 
       const activityEvents: Array<{
@@ -2989,8 +2989,8 @@ describe("WorkspaceService workflow activity", () => {
       expect(activityEvents.at(-1)?.activity?.activeWorkflowRunCount).toBeUndefined();
 
       const clearedActivityList = await workspaceService.getActivityList();
-      expect(clearedActivityList[workspaceId]).toBeDefined();
-      expect(clearedActivityList[workspaceId]?.activeWorkflowRunCount).toBeUndefined();
+      expect(clearedActivityList?.[workspaceId]).toBeDefined();
+      expect(clearedActivityList?.[workspaceId]?.activeWorkflowRunCount).toBeUndefined();
 
       await workspaceService.emitWorkflowRunActivity({
         workspaceId,
@@ -3074,9 +3074,9 @@ describe("WorkspaceService workflow activity", () => {
 
       expect(listStatusSnapshotsSpy).toHaveBeenCalledTimes(1);
       expect(activityEvents.at(-1)?.activity?.activeWorkflowRunCount).toBe(2);
-      expect((await workspaceService.getActivityList())[workspaceId]?.activeWorkflowRunCount).toBe(
-        2
-      );
+      expect(
+        (await workspaceService.getActivityList())?.[workspaceId]?.activeWorkflowRunCount
+      ).toBe(2);
     } finally {
       listStatusSnapshotsSpy.mockRestore();
       releaseScan.resolve();
@@ -3155,7 +3155,7 @@ describe("WorkspaceService workflow activity", () => {
 
       expect(activityEvents.at(-1)?.activity?.activeWorkflowRunCount).toBeUndefined();
       expect(
-        (await workspaceService.getActivityList())[workspaceId]?.activeWorkflowRunCount
+        (await workspaceService.getActivityList())?.[workspaceId]?.activeWorkflowRunCount
       ).toBeUndefined();
     } finally {
       getSnapshotSpy.mockRestore();
@@ -3192,8 +3192,9 @@ describe("WorkspaceService activity list scoping", () => {
       });
 
       const activityList = await workspaceService.getActivityList();
-      expect(activityList[workspaceId]?.recency).toBe(100);
-      expect(activityList["removed-workspace"]).toBeUndefined();
+      expect(activityList).not.toBeNull();
+      expect(activityList?.[workspaceId]?.recency).toBe(100);
+      expect(activityList?.["removed-workspace"]).toBeUndefined();
 
       // The one-time lazy cleanup dropped the stale entry from disk while
       // keeping the still-existing workspace's entry.
@@ -3236,8 +3237,9 @@ describe("WorkspaceService activity list scoping", () => {
       });
 
       const activityList = await workspaceService.getActivityList();
-      expect(activityList[workspaceId]?.recency).toBe(100);
-      expect(activityList["removed-workspace"]).toBeUndefined();
+      expect(activityList).not.toBeNull();
+      expect(activityList?.[workspaceId]?.recency).toBe(100);
+      expect(activityList?.["removed-workspace"]).toBeUndefined();
       expect(metadataSpy).toHaveBeenCalledTimes(1);
     } finally {
       await cleanup();
@@ -3414,11 +3416,11 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
-  test("getActivityList rejects when the metadata path exists but cannot be read", async () => {
+  test("getActivityList returns null when the metadata path exists but cannot be read", async () => {
     // Only a genuinely missing file (ENOENT) is a healthy empty state. Any
     // other read failure (here EISDIR; EACCES/ENOTDIR/EIO in the field) must
-    // reject in strict reads instead of masquerading as an authoritative
-    // empty list.
+    // surface as the null read-failure signal instead of masquerading as an
+    // authoritative empty list.
     const { config, historyService, cleanup } = await createTestHistoryService();
     try {
       const metadataPath = path.join(config.rootDir, "extensionMetadata.json");
@@ -3433,13 +3435,7 @@ describe("WorkspaceService activity list scoping", () => {
       // Lenient reads (writer paths) still self-heal.
       expect((await extensionMetadata.getAllSnapshots()).size).toBe(0);
 
-      let rejected = false;
-      try {
-        await workspaceService.getActivityList();
-      } catch {
-        rejected = true;
-      }
-      expect(rejected).toBe(true);
+      expect(await workspaceService.getActivityList()).toBeNull();
     } finally {
       await cleanup();
     }
@@ -3480,7 +3476,8 @@ describe("WorkspaceService activity list scoping", () => {
       });
 
       const activityList = await workspaceService.getActivityList();
-      expect(activityList[workspaceId]).toBeUndefined();
+      expect(activityList).not.toBeNull();
+      expect(activityList?.[workspaceId]).toBeUndefined();
     } finally {
       await cleanup();
     }
@@ -3524,7 +3521,8 @@ describe("WorkspaceService activity list scoping", () => {
       });
 
       const activityList = await workspaceService.getActivityList();
-      expect(activityList[workspaceId]).toBeUndefined();
+      expect(activityList).not.toBeNull();
+      expect(activityList?.[workspaceId]).toBeUndefined();
       // The in-process tombstone was NOT the mechanism here.
       expect(extensionMetadata.isWorkspaceDeleted(workspaceId)).toBe(false);
     } finally {
@@ -3567,17 +3565,18 @@ describe("WorkspaceService activity list scoping", () => {
       });
 
       const activityList = await workspaceService.getActivityList();
-      expect(activityList[workspaceId]).toBeUndefined();
+      expect(activityList).not.toBeNull();
+      expect(activityList?.[workspaceId]).toBeUndefined();
       expect(extensionMetadata.isWorkspaceDeleted(workspaceId)).toBe(false);
     } finally {
       await cleanup();
     }
   });
 
-  test("getActivityList rejects on metadata read failure instead of returning {}", async () => {
+  test("getActivityList returns null on metadata read failure instead of {}", async () => {
     // With scoping, {} is a valid authoritative answer that clears renderer
-    // state; failures must be distinguishable so the renderer keeps its
-    // last-known snapshots and retries.
+    // state; failures must be distinguishable (null) so the renderer keeps
+    // its last-known snapshots and retries.
     const { config, historyService, cleanup } = await createTestHistoryService();
     try {
       const extensionMetadata = new ExtensionMetadataService(
@@ -3592,13 +3591,7 @@ describe("WorkspaceService activity list scoping", () => {
           historyService,
           extensionMetadata,
         });
-        let rejected = false;
-        try {
-          await workspaceService.getActivityList();
-        } catch {
-          rejected = true;
-        }
-        expect(rejected).toBe(true);
+        expect(await workspaceService.getActivityList()).toBeNull();
       } finally {
         snapshotsSpy.mockRestore();
       }
@@ -3637,7 +3630,7 @@ describe("WorkspaceService activity list scoping", () => {
         // told apart from live ones, so nothing may be dropped from the list
         // or pruned from disk.
         const activityList = await workspaceService.getActivityList();
-        expect(activityList["possibly-live"]?.recency).toBe(100);
+        expect(activityList?.["possibly-live"]?.recency).toBe(100);
         expect((await extensionMetadata.getAllSnapshots()).has("possibly-live")).toBe(true);
       } finally {
         await cleanup();
@@ -3666,7 +3659,7 @@ describe("WorkspaceService activity list scoping", () => {
       });
 
       const activityList = await workspaceService.getActivityList();
-      expect(activityList["possibly-live"]?.recency).toBe(100);
+      expect(activityList?.["possibly-live"]?.recency).toBe(100);
       expect((await extensionMetadata.getAllSnapshots()).has("possibly-live")).toBe(true);
     } finally {
       await cleanup();
@@ -3708,7 +3701,7 @@ describe("WorkspaceService activity list scoping", () => {
       const activityList = await workspaceService.getActivityList();
       // Fail open: the identity of the legacy workspace is unknowable, so
       // nothing may be dropped from the list or pruned from disk.
-      expect(activityList["legacy-stable-id"]?.recency).toBe(100);
+      expect(activityList?.["legacy-stable-id"]?.recency).toBe(100);
       expect((await extensionMetadata.getAllSnapshots()).has("legacy-stable-id")).toBe(true);
     } finally {
       await cleanup();
@@ -6409,7 +6402,7 @@ describe("WorkspaceService truncateHistory goal acknowledgment", () => {
         // The bootstrap path (renderer reconnect/reload) builds straight from
         // persisted metadata, so it must apply the same overlay.
         const listed = await workspaceService.getActivityList();
-        expect(listed[workspaceId]?.goal).toMatchObject({
+        expect(listed?.[workspaceId]?.goal).toMatchObject({
           objective: "Optimistic mid-stream goal",
           pendingPersistence: true,
         });

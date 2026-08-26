@@ -11,7 +11,7 @@ import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { ForegroundWaitBackgroundedError } from "@/node/services/taskService";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import type { ORPCContext } from "./context";
-import { router } from "./router";
+import { isPathSafeWorkspaceId, router } from "./router";
 
 describe("router workspace goal validation", () => {
   test("goal routes do not touch goal files for unknown workspaces", async () => {
@@ -1301,5 +1301,25 @@ describe("projects.setCodeWorkspaceSyncPath", () => {
       (JSON.parse(fs.readFileSync(file, "utf-8")) as { folders: Array<{ path: string }> }).folders;
     expect(foldersOf(fileA).map((f) => f.path)).not.toContain(worktreePath);
     expect(foldersOf(fileB).map((f) => f.path)).toContain(worktreePath);
+  });
+});
+
+describe("isPathSafeWorkspaceId", () => {
+  test("accepts single-segment ids and rejects traversal attempts", () => {
+    expect(isPathSafeWorkspaceId("workspace-1")).toBe(true);
+    expect(isPathSafeWorkspaceId("xum-mike-workflow-visibility-3we4")).toBe(true);
+    for (const unsafe of [
+      "",
+      ".",
+      "..",
+      "../evil",
+      "..\\evil",
+      "a/../b",
+      "nested/dir",
+      "/absolute",
+      "C:\\sessions",
+    ]) {
+      expect(isPathSafeWorkspaceId(unsafe)).toBe(false);
+    }
   });
 });

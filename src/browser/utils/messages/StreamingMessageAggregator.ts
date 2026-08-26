@@ -48,12 +48,12 @@ import { completeInProgressTodoItems } from "@/common/utils/todoList";
 import { AgentSkillReadToolResultSchema } from "@/common/utils/tools/toolDefinitions";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
 
-import { computePriorHistoryFingerprint } from "@/common/orpc/onChatCursorFingerprint";
 import type {
   WorkspaceChatMessage,
   StreamErrorMessage,
   DeleteMessage,
   OnChatCursor,
+  OnChatHistoryCursor,
 } from "@/common/orpc/types";
 import { isInitStart, isInitOutput, isInitEnd, isMuxMessage } from "@/common/orpc/types";
 import {
@@ -520,6 +520,13 @@ export class StreamingMessageAggregator {
    *  Used for reconnect cursors instead of the absolute minimum (which
    *  includes user-loaded older pages via loadOlderHistory). */
   private establishedOldestHistorySequence: number | null = null;
+
+  /** Server-issued history cursor from the last caught-up, reused verbatim on reconnect.
+   *  The client's in-memory representation intentionally diverges from persisted rows
+   *  (compact-on-append parts, adopted tool outputs, client timestamps), so recomputing
+   *  cursor fingerprints locally would mismatch and silently downgrade every since
+   *  reconnect to a full replay. */
+  private lastServerHistoryCursor: OnChatHistoryCursor | null = null;
 
   // Delta history for token counting and TPS calculation
   private deltaHistory = new Map<string, DeltaRecordStorage>();
@@ -1223,6 +1230,23 @@ export class StreamingMessageAggregator {
       (a, b) => (a.metadata?.historySequence ?? 0) - (b.metadata?.historySequence ?? 0)
     );
 
+    this.replayDerivedState(chronologicalMessages, hasActiveStream, opts);
+  }
+
+  /**
+   * Replay message-derived state (skills, todos, agent status, review pins) from rows
+   * in chronological order, then run the shared post-replay normalization: persisted
+   * agent-status fallback, completed-todo cleanup on idle replays, cache invalidation,
+   * and pending-stream settle detection.
+   *
+   * Shared by loadHistoricalMessages and reconcileSinceReplay so batch loads and
+   * since-replay reconciliation keep identical derived-state semantics.
+   */
+  private replayDerivedState(
+    chronologicalMessages: readonly MuxMessage[],
+    hasActiveStream: boolean,
+    opts?: { skipDerivedState?: boolean }
+  ): void {
     let shouldClearCompletedTodosOnIdleReplay = false;
     if (!opts?.skipDerivedState) {
       // Replay historical messages in order to reconstruct derived state
@@ -1301,6 +1325,164 @@ export class StreamingMessageAggregator {
     }
   }
 
+  /** Tools whose replayed outputs feed aggregator derived state (see processToolResult). */
+  private static readonly DERIVED_STATE_TOOL_NAMES = new Set([
+    "todo_write",
+    "propose_plan",
+    "status_set",
+    "agent_skill_read",
+    "review_pane_update",
+  ]);
+
+  private messageContributesDerivedState(message: MuxMessage): boolean {
+    if (message.metadata?.agentSkillSnapshot != null) {
+      return true;
+    }
+    return message.parts.some(
+      (part) =>
+        isDynamicToolPart(part) &&
+        part.state === "output-available" &&
+        StreamingMessageAggregator.DERIVED_STATE_TOOL_NAMES.has(part.toolName)
+    );
+  }
+
+  /**
+   * Reconcile a since-mode replay: the replayed rows are the authoritative suffix for
+   * historySequence >= requestedAnchorSequence.
+   *
+   * The server-issued cursor anchor can be older than the client's cached transcript
+   * (rows streamed live since the last caught-up sit above it), and server-side cursor
+   * validation only protects rows below the anchor. Rows in [anchor, client-max] can be
+   * deleted or rewritten server-side while the client is unsubscribed, so plain append
+   * semantics would retain them as stale ghosts. Here the replayed set wins: stale rows
+   * are removed, rewritten rows are replaced by their persisted forms, and the client
+   * converges exactly to persisted state.
+   */
+  reconcileSinceReplay(args: {
+    requestedAnchorSequence: number;
+    messages: MuxMessage[];
+    /**
+     * Server-confirmed active stream that matches the local stream context from when
+     * this reconnect's cursor was built. Kept as the richer local assembly: its
+     * persisted placeholder row has empty/partial parts and stream replay only
+     * re-sends deltas after the stream cursor, so hard-replacing it would lose
+     * already-rendered content.
+     */
+    preservedActiveStreamMessageId?: string;
+    hasActiveStream: boolean;
+  }): void {
+    const { requestedAnchorSequence, preservedActiveStreamMessageId, hasActiveStream } = args;
+    assert(
+      Number.isFinite(requestedAnchorSequence) && requestedAnchorSequence >= 0,
+      `reconcileSinceReplay requires a non-negative anchor, got ${requestedAnchorSequence}`
+    );
+
+    const replayed = args.messages.map(normalizeMessageRouteProvider);
+    const replayedIds = new Set(replayed.map((message) => message.id));
+
+    // Incremental derived-state replay cannot "unapply" a discarded todo_write /
+    // status_set / review pin, so track whether any discarded local row could have
+    // fed derived state and rebuild from the full window when one did.
+    let removedDerivedStateSource = false;
+    let deletedRows = false;
+
+    // 1) Delete stale suffix rows: any local row at/above the anchor that the server
+    // did not re-send was deleted or rewritten while the client was unsubscribed.
+    // Rows without a historySequence (optimistic sends awaiting ack) are never
+    // touched, nor is the preserved active-stream row.
+    for (const [messageId, existing] of Array.from(this.messages.entries())) {
+      const historySequence = existing.metadata?.historySequence;
+      if (historySequence === undefined || historySequence < requestedAnchorSequence) {
+        continue;
+      }
+      if (messageId === preservedActiveStreamMessageId || replayedIds.has(messageId)) {
+        continue;
+      }
+      removedDerivedStateSource ||= this.messageContributesDerivedState(existing);
+      this.deleteMessage(messageId);
+      deletedRows = true;
+    }
+
+    // 2) Apply replayed rows with replace-by-id semantics: persisted rows are
+    // authoritative for finalized turns, including rewrites with FEWER parts than the
+    // local compacted copy (so these must not go through addMessage's "prefer richer
+    // content" guard). Exceptions that keep the richer local copy:
+    // - the preserved active-stream row (see preservedActiveStreamMessageId doc), and
+    // - defensive: rows below the anchor (e.g. a stale disk partial), which have no
+    //   suffix authority and follow append-mode update semantics instead.
+    const applied: MuxMessage[] = [];
+    for (const incoming of replayed) {
+      const incomingSequence = incoming.metadata?.historySequence;
+      const belowAnchor =
+        incomingSequence === undefined || incomingSequence < requestedAnchorSequence;
+      const existing = this.messages.get(incoming.id);
+
+      if (existing && (incoming.id === preservedActiveStreamMessageId || belowAnchor)) {
+        const existingParts = Array.isArray(existing.parts) ? existing.parts.length : 0;
+        const incomingParts = Array.isArray(incoming.parts) ? incoming.parts.length : 0;
+        if (incomingParts < existingParts) {
+          continue;
+        }
+      }
+
+      if (existing) {
+        removedDerivedStateSource ||= this.messageContributesDerivedState(existing);
+      }
+      this.messages.set(incoming.id, incoming);
+      this.bumpMessageVersion(incoming.id);
+      this.displayedMessageCache.delete(incoming.id);
+      applied.push(incoming);
+    }
+
+    // Flush the whole-transcript cache before the derived rebuild: deleteMessage only
+    // evicts per-message caches, and rebuildDerivedStateFromWindow must see the
+    // post-mutation message set, not a stale getAllMessages() array.
+    this.invalidateCache();
+
+    // 3) Rebuild derived state deterministically from the post-reconcile message set
+    // when a discarded row could have contributed to it; otherwise replay just the
+    // applied rows incrementally (same semantics as append-mode loads).
+    if (removedDerivedStateSource) {
+      this.rebuildDerivedStateFromWindow(hasActiveStream);
+    } else {
+      const chronologicalApplied = [...applied].sort(
+        (a, b) => (a.metadata?.historySequence ?? 0) - (b.metadata?.historySequence ?? 0)
+      );
+      this.replayDerivedState(chronologicalApplied, hasActiveStream);
+    }
+
+    if (deletedRows) {
+      // Match handleDeleteMessage: deletions invalidate async last-user-prompt fallbacks.
+      this.historyEpoch++;
+    }
+  }
+
+  /**
+   * Deterministically rebuild message-derived state from the current replay window
+   * (rows at/above the server replay-window floor). Resets the derived stores first
+   * because incremental replay cannot "unapply" contributions from rows that
+   * reconciliation discarded. Scoped to the established window so
+   * loadOlderHistory-paginated rows (loaded with skipDerivedState) stay excluded,
+   * matching full-replay semantics.
+   */
+  private rebuildDerivedStateFromWindow(hasActiveStream: boolean): void {
+    this.loadedSkills.clear();
+    this.loadedSkillsCache = [];
+    this.skillLoadErrors.clear();
+    this.skillLoadErrorsCache = [];
+    this.currentTodos = [];
+    this.assistedReviewHunks = [];
+    this.agentStatus = undefined;
+    this.lastStatusUrl = undefined;
+
+    const windowFloor = this.establishedOldestHistorySequence ?? Number.NEGATIVE_INFINITY;
+    const windowRows = this.getAllMessages().filter((message) => {
+      const historySequence = message.metadata?.historySequence;
+      return historySequence !== undefined && historySequence >= windowFloor;
+    });
+    this.replayDerivedState(windowRows, hasActiveStream);
+  }
+
   setEstablishedOldestHistorySequence(sequence: number | null): void {
     this.establishedOldestHistorySequence = sequence;
   }
@@ -1317,69 +1499,33 @@ export class StreamingMessageAggregator {
   }
 
   /**
+   * Record the server-issued history cursor from a caught-up payload. Pass null when
+   * the server did not advertise a trustworthy cursor (e.g. replay failure), which
+   * forces the next reconnect to request a full replay.
+   */
+  setServerHistoryCursor(cursor: OnChatHistoryCursor | null): void {
+    this.lastServerHistoryCursor = cursor;
+  }
+
+  /**
    * Build a cursor for incremental onChat reconnection.
    * Returns undefined when we cannot safely represent the current state,
    * forcing a full replay.
+   *
+   * The history segment is the server-issued cursor reused verbatim (see
+   * lastServerHistoryCursor); the client-computed stream segment is advisory and
+   * clamped server-side.
    */
   getOnChatCursor(): OnChatCursor | undefined {
-    let maxHistorySequence = -1;
-    let maxHistoryMessageId: string | undefined;
-    let minHistorySequence = Number.POSITIVE_INFINITY;
-
-    for (const message of this.messages.values()) {
-      const historySequence = message.metadata?.historySequence;
-      if (historySequence === undefined) {
-        continue;
-      }
-
-      if (historySequence > maxHistorySequence) {
-        maxHistorySequence = historySequence;
-        maxHistoryMessageId = message.id;
-      }
-
-      if (historySequence < minHistorySequence) {
-        minHistorySequence = historySequence;
-      }
-    }
-
-    if (!maxHistoryMessageId || !Number.isFinite(minHistorySequence)) {
-      return undefined;
-    }
-
     if (this.activeStreams.size > 1) {
       // Defensive fallback: multiple active streams is anomalous, so force a full replay.
       return undefined;
     }
 
-    const allMessages = this.getAllMessages();
-    const establishedOldestHistorySequence = this.establishedOldestHistorySequence;
-    const fingerprintMessages =
-      establishedOldestHistorySequence != null
-        ? allMessages.filter(
-            (message) =>
-              (message.metadata?.historySequence ?? Number.POSITIVE_INFINITY) >=
-              establishedOldestHistorySequence
-          )
-        : allMessages;
-
-    // Scope fingerprint input to the established replay window. The server computes
-    // priorHistoryFingerprint from getHistoryFromLatestBoundary(skip=0), so client-
-    // paginated rows from older compaction epochs must be excluded to avoid false
-    // mismatches that force unnecessary full replay on reconnect.
-    const priorHistoryFingerprint = computePriorHistoryFingerprint(
-      fingerprintMessages,
-      maxHistorySequence
-    );
-    const oldestHistorySequence = establishedOldestHistorySequence ?? minHistorySequence;
-
-    const cursor: OnChatCursor = {
-      history: {
-        messageId: maxHistoryMessageId,
-        historySequence: maxHistorySequence,
-        oldestHistorySequence,
-        ...(priorHistoryFingerprint !== undefined ? { priorHistoryFingerprint } : {}),
-      },
-    };
+    const cursor: OnChatCursor = {};
+    if (this.lastServerHistoryCursor) {
+      cursor.history = this.lastServerHistoryCursor;
+    }
 
     if (this.activeStreams.size === 1) {
       const activeStreamEntry = this.activeStreams.entries().next().value;
@@ -1389,6 +1535,10 @@ export class StreamingMessageAggregator {
         messageId,
         lastTimestamp: context.lastServerTimestamp,
       };
+    }
+
+    if (!cursor.history && !cursor.stream) {
+      return undefined;
     }
 
     return cursor;
@@ -1952,6 +2102,9 @@ export class StreamingMessageAggregator {
     this.lastAbortReason = null;
     this.lastResponseCompletedAt = null;
     this.establishedOldestHistorySequence = null;
+    // A since cursor is only safe while rows below its anchor are present locally.
+    // Clearing the transcript invalidates that premise, so force a full reconnect.
+    this.lastServerHistoryCursor = null;
     this.invalidateCache();
   }
 

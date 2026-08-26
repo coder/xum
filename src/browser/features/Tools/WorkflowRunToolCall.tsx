@@ -265,6 +265,40 @@ function getWorkflowChildProgressSummary(run: WorkflowRunRecord | null): string 
   return `${view.status} · ${view.stats.done}/${view.stats.total} steps${phaseLabel}`;
 }
 
+/**
+ * Compact "what is the workflow doing right now" line for the card header: steps
+ * done/observed plus the running step title (or active phase when several steps
+ * run). The card auto-collapses while the Workflows tab owns the detail view, so
+ * without this the collapsed header reveals nothing about a run's current state.
+ * Totals are observed-so-far, not planned (see WorkflowPhaseView.total).
+ */
+export function getWorkflowHeaderProgressSummary(
+  run: WorkflowRunRecord | null | undefined
+): string | null {
+  if (run == null) {
+    return null;
+  }
+  const view = projectWorkflowRun(run);
+  const parts: string[] = [];
+  if (view.stats.total > 0) {
+    parts.push(`${view.stats.done}/${view.stats.total} steps`);
+  }
+  const runningSteps = view.steps.filter((step) => step.status === "running");
+  const activePhase = view.phases.find((phase) => phase.running) ?? view.phases.at(-1);
+  if (runningSteps.length === 1) {
+    parts.push(runningSteps[0].title);
+  } else if (activePhase != null && activePhase.label.length > 0) {
+    parts.push(
+      runningSteps.length > 1
+        ? `${activePhase.label} · ${runningSteps.length} running`
+        : activePhase.label
+    );
+  } else if (runningSteps.length > 1) {
+    parts.push(`${runningSteps.length} running`);
+  }
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
 function getTaskEventKey(event: WorkflowTaskEvent): string {
   return `task:${event.stepId}:${event.taskId}`;
 }
@@ -1216,6 +1250,10 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
   const events = run?.events ?? [];
   const displayRows = getWorkflowDisplayRows(events);
   const headerStatus = toToolStatus(displayStatus);
+  // Completed runs already read as done; mid-run (and stopped-early) cards get the
+  // live "current step / phase" header line instead of a bare status.
+  const headerProgressSummary =
+    displayStatus === "completed" ? null : getWorkflowHeaderProgressSummary(run);
   const workspaceStore = useWorkspaceStoreRaw();
   // The Workflows right-sidebar tab (gated on the dynamic-workflows experiment) is the primary
   // surface for run detail, so when it's available the in-chat card is redundant.
@@ -1549,7 +1587,18 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
         <ExpandIcon expanded={expanded}>▶</ExpandIcon>
         <ToolIcon toolName={toolName} />
         <WorkflowKindBadge />
-        <ToolName>{displayName}</ToolName>
+        {/* min-w-0 + truncate lets a long workflow name yield space instead of holding
+            its intrinsic width and starving the progress summary at narrow widths. */}
+        <ToolName className="min-w-0 truncate">{displayName}</ToolName>
+        {/* Collapsed-only: the expanded body already lists phases/steps, and duplicating
+            their text in the header would just add noise next to the event log.
+            grow + basis floor keeps the summary usable when the name is long (the name
+            truncates first) and fills leftover space otherwise. */}
+        {!expanded && headerProgressSummary != null && (
+          <span className="text-muted counter-nums min-w-0 grow basis-24 truncate text-[10px]">
+            {headerProgressSummary}
+          </span>
+        )}
         <StatusIndicator status={headerStatus}>{getStatusDisplay(headerStatus)}</StatusIndicator>
       </ToolHeader>
 

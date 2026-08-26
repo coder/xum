@@ -35,7 +35,6 @@ import {
   buildCompactionPrompt,
 } from "@/common/constants/ui";
 import { execFileAsync } from "@/node/utils/disposableExec";
-import { log } from "@/node/services/log";
 import { RuntimeConfigSchema } from "@/common/orpc/schemas";
 import type { OnChatMode, SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/types";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
@@ -164,8 +163,9 @@ type MetaRecord = Record<string, unknown>;
 type WorkspaceInfo = NonNullable<
   Awaited<ReturnType<ServerConnection["client"]["workspace"]["getInfo"]>>
 >;
-type WorkspaceActivityById = Awaited<
-  ReturnType<ServerConnection["client"]["workspace"]["activity"]["list"]>
+// NonNullable: the null read-failure signal is normalized to {} at the call site.
+type WorkspaceActivityById = NonNullable<
+  Awaited<ReturnType<ServerConnection["client"]["workspace"]["activity"]["list"]>>
 >;
 
 export class MuxAgent implements Agent {
@@ -442,22 +442,13 @@ export class MuxAgent implements Agent {
     const normalizedCwd = normalizeOptionalPath(params.cwd);
     const offset = parseSessionListCursor(params.cursor);
 
-    const [activeWorkspaces, archivedWorkspaces, workspaceActivity] = await Promise.all([
+    const [activeWorkspaces, archivedWorkspaces, workspaceActivityList] = await Promise.all([
       this.server.client.workspace.list({ archived: false }),
       this.server.client.workspace.list({ archived: true }),
-      // activity.list rejects on an unreadable/corrupt extensionMetadata.json
-      // so the renderer can keep last-known state instead of applying a bogus
-      // authoritative empty list. Here activity only refines recency
-      // sorting/updatedAt and there is no cached state to preserve, so a
-      // failure must not take down session listing for otherwise healthy
-      // sessions — degrade to an empty activity view instead.
-      this.server.client.workspace.activity
-        .list()
-        .catch((error: unknown): WorkspaceActivityById => {
-          log.error("[acp] Failed to list workspace activity; listing sessions without it", error);
-          return {};
-        }),
+      this.server.client.workspace.activity.list(),
     ]);
+    // null = backend activity read failure; session ordering degrades to metadata-only.
+    const workspaceActivity = workspaceActivityList ?? {};
 
     const allWorkspaces = dedupeWorkspacesById([...activeWorkspaces, ...archivedWorkspaces]);
     const filteredWorkspaces =

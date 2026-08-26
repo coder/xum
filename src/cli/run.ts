@@ -80,7 +80,7 @@ import { createRuntime, runFullInit } from "../node/runtime/runtimeFactory";
 import type { Runtime } from "../node/runtime/Runtime";
 import { execSync } from "child_process";
 import { getParseOptions } from "./argv";
-import { EXPERIMENT_IDS } from "../common/constants/experiments";
+import { EXPERIMENT_IDS, type ExperimentId } from "../common/constants/experiments";
 import { getErrorMessage } from "@/common/utils/errors";
 import { describeCliGoalStop, driveCliGoalUntilTerminal } from "./goalRunDriver";
 import {
@@ -264,13 +264,53 @@ function renderUnknown(value: unknown): string {
   }
 }
 
-const VALID_EXPERIMENT_IDS = new Set<string>(Object.values(EXPERIMENT_IDS));
+/**
+ * Experiment IDs `xum run` can actually forward, each mapped to its
+ * SendMessageOptions.experiments field. A single table (instead of ad-hoc
+ * `includes` checks) guarantees an ID accepted by `-e` cannot be silently
+ * dropped here — that previously swallowed `rlm-mode`, so PTC+RLM CLI runs
+ * degraded to the flat non-kernel PTC toolset while desktop honored the flag.
+ */
+const SEND_MESSAGE_EXPERIMENT_FIELDS = {
+  [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: "programmaticToolCalling",
+  [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE]: "programmaticToolCallingExclusive",
+  [EXPERIMENT_IDS.RLM]: "rlm",
+  [EXPERIMENT_IDS.DYNAMIC_WORKFLOWS]: "dynamicWorkflows",
+  // Deliberately absent (accepting them would be a silent no-op or worse,
+  // which is exactly what this table exists to prevent):
+  // - TIMELINE: AIService resolves the timeline experiment exclusively from
+  //   the backend ExperimentsService (the schema's `timeline` request field is
+  //   never read), and `xum run` wires no timeline service.
+  // - MEMORY: MemoryService derives its storage from the CLI's ephemeral
+  //   tempDir config root, so persistent memories under the user's Xum home
+  //   would be invisible and new writes deleted on process exit.
+  // - ADVISOR_TOOL: AIService only exposes the advisor tool when the config
+  //   has a non-empty advisorModelString, which the CLI's ephemeral config
+  //   never carries over.
+  [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: "workspaceHeartbeats",
+  [EXPERIMENT_IDS.TOOL_SEARCH]: "toolSearch",
+} as const satisfies Partial<
+  Record<ExperimentId, keyof NonNullable<SendMessageOptions["experiments"]>>
+>;
+
+function isSendMessageExperimentId(
+  value: string
+): value is keyof typeof SEND_MESSAGE_EXPERIMENT_FIELDS {
+  // Own-property check: `in` would also accept Object.prototype names like
+  // "constructor" or "toString", which have no mapping and would silently
+  // produce a garbage experiments field.
+  return Object.hasOwn(SEND_MESSAGE_EXPERIMENT_FIELDS, value);
+}
 
 function collectExperiments(value: string, previous: string[]): string[] {
   const experimentId = value.trim().toLowerCase();
-  if (!VALID_EXPERIMENT_IDS.has(experimentId)) {
+  // App-level experiments (e.g. agent-browser) have no send-options field and
+  // would be silent no-ops in a headless run, so reject them loudly.
+  if (!isSendMessageExperimentId(experimentId)) {
     throw new Error(
-      `Unknown experiment "${value}". Valid experiments: ${[...VALID_EXPERIMENT_IDS].join(", ")}`
+      `Unknown or unsupported experiment "${value}". Valid experiments: ${Object.keys(
+        SEND_MESSAGE_EXPERIMENT_FIELDS
+      ).join(", ")}`
     );
   }
   if (previous.includes(experimentId)) {
@@ -281,16 +321,25 @@ function collectExperiments(value: string, previous: string[]): string[] {
 
 /**
  * Convert experiment ID array to the experiments object expected by SendMessageOptions.
+ * Only requested experiments are set (to true); unspecified flags stay undefined so
+ * backend fallbacks apply, mirroring how the desktop renderer sends them.
  */
 function buildExperimentsObject(experimentIds: string[]): SendMessageOptions["experiments"] {
   if (experimentIds.length === 0) return undefined;
 
-  return {
-    programmaticToolCalling: experimentIds.includes("programmatic-tool-calling"),
-    programmaticToolCallingExclusive: experimentIds.includes("programmatic-tool-calling-exclusive"),
-    dynamicWorkflows: experimentIds.includes("dynamic-workflows"),
-    workspaceHeartbeats: experimentIds.includes(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS),
-  };
+  const experiments: NonNullable<SendMessageOptions["experiments"]> = {};
+  for (const experimentId of experimentIds) {
+    assert(isSendMessageExperimentId(experimentId), `Unmapped experiment id: ${experimentId}`);
+    experiments[SEND_MESSAGE_EXPERIMENT_FIELDS[experimentId]] = true;
+  }
+  // RLM is a sub-experiment of PTC: tool assembly only builds code_execution
+  // when a PTC flag is set, so rlm-mode alone would be silently inert. Imply
+  // the parent flag, mirroring the desktop where Settings nests RLM under the
+  // PTC toggle (RLM itself then forces the exclusive kernel posture).
+  if (experiments.rlm && experiments.programmaticToolCallingExclusive !== true) {
+    experiments.programmaticToolCalling = true;
+  }
+  return experiments;
 }
 
 interface MCPServerEntry {
