@@ -64,10 +64,11 @@ describe("WorkflowLongText", () => {
     expect(container.textContent).toContain("## Findings");
     fireEvent.click(getByLabelText("Show more of step — report"));
     // Expanded: the plain-source preview is replaced by MarkdownRenderer.
-    // Assert the mode switch itself (synchronous) rather than Streamdown's
-    // asynchronously flushed parse output, whose scheduling varies across
-    // bun/happy-dom versions and repeatedly timed out in CI.
+    // Assert only the component-owned mode switch (renderer container mounted,
+    // controls flipped) — anything about Streamdown's own output is unstable
+    // across bun/happy-dom versions: parse flushing is async in some (1s+
+    // waitFor timeouts) while others synchronously render the raw source first.
     expect(container.querySelector(".markdown-content")).not.toBeNull();
-    expect(container.textContent).not.toContain("## Findings");
+    expect(getByLabelText("Show less of step — report")).toBeTruthy();
   });
 });
