@@ -850,7 +850,7 @@ describe("WorkspaceService bash monitor wakes", () => {
         filter: "All checks|passed|ready",
         filterExclude: false,
         lines: [
-          "[monitor] process settled: exited (code 1) — task_await bash:checks-watch for the full report",
+          "[monitor] process settled: exited (code 1)",
           "❌ Unresolved review comments found!",
         ],
         totalMatches: 0,

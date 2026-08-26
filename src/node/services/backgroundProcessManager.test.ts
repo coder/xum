@@ -1043,9 +1043,7 @@ describe("BackgroundProcessManager", () => {
         const event = await eventPromise;
         expect(event.payload.terminal).toEqual({ status: "exited", exitCode: 3 });
         expect(event.payload.matchedThroughOffset).toBeUndefined();
-        expect(event.payload.lines).toEqual([
-          `[monitor] process settled: exited (code 3) — task_await bash:${result.processId} for the full report`,
-        ]);
+        expect(event.payload.lines).toEqual(["[monitor] process settled: exited (code 3)"]);
       });
 
       it("timeout auto-termination settles with a deterministic killed payload", async () => {
@@ -1245,6 +1243,8 @@ describe("BackgroundProcessManager", () => {
 
         expect(matchEvents).toHaveLength(1);
         expect(matchEvents[0].lines[0]).toBe("ERR final");
+        // The matched line also sits inside the final tail window; it must not render twice.
+        expect(matchEvents[0].lines.filter((line) => line === "ERR final")).toHaveLength(1);
         expect(matchEvents[0].terminal).toEqual({ status: "exited", exitCode: 0 });
         expect(stoppedEvents).toEqual([{ processId: result.processId, reason: "completed" }]);
       });
@@ -1269,9 +1269,7 @@ describe("BackgroundProcessManager", () => {
         const event = await eventPromise;
         expect(event.payload.terminal).toEqual({ status: "exited", exitCode: 1 });
         // Tail unavailable: the synthetic settle line alone still delivers.
-        expect(event.payload.lines).toEqual([
-          `[monitor] process settled: exited (code 1) — task_await bash:${result.processId} for the full report`,
-        ]);
+        expect(event.payload.lines).toEqual(["[monitor] process settled: exited (code 1)"]);
       });
 
       it("cancellation during the claimed settlement window wins (no terminal wake, one canceled stop)", async () => {

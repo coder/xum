@@ -670,12 +670,32 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         });
       }
     } else {
+      // No task_await instruction here: the durable line outlives the process registration (a
+      // recovered wake after a Xum restart would direct the agent at a not_found task ID), so
+      // awaitability guidance lives only in the prompt builder, which renders it conditionally.
+      // Downgraded builds keep actionability from their generic match-record closing guidance.
       const settleLine =
         `[monitor] process settled: ${terminal.status}` +
-        `${terminal.exitCode !== undefined ? ` (code ${terminal.exitCode})` : ""}` +
-        ` — task_await bash:${proc.id} for the full report`;
+        `${terminal.exitCode !== undefined ? ` (code ${terminal.exitCode})` : ""}`;
+      // A pending matched line that also falls inside the final tail window would render twice
+      // (once as a match, once in the tail), making one event look like repeated output. Both
+      // sides passed the same sanitize/truncate pipeline, so string equality identifies the
+      // overlap; remove one tail occurrence per included match.
+      let dedupedTail = tailLines;
+      if (includeMatched && tailLines.length > 0) {
+        const pendingCounts = new Map<string, number>();
+        for (const line of pendingLines) {
+          pendingCounts.set(line, (pendingCounts.get(line) ?? 0) + 1);
+        }
+        dedupedTail = tailLines.filter((line) => {
+          const count = pendingCounts.get(line);
+          if (count == null || count === 0) return true;
+          pendingCounts.set(line, count - 1);
+          return false;
+        });
+      }
       this.emitMonitorUpdate(proc, monitor, {
-        lines: [...(includeMatched ? pendingLines : []), settleLine, ...tailLines],
+        lines: [...(includeMatched ? pendingLines : []), settleLine, ...dedupedTail],
         droppedLines: includeMatched ? droppedLines : 0,
         ...(includeMatched ? { matchedThroughOffset: monitor.matchedThroughOffset } : {}),
         terminal,
