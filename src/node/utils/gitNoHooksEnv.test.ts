@@ -1,5 +1,5 @@
-import { describe, test, expect } from "bun:test";
-import { GIT_NO_HOOKS_ENV, gitNoHooksPrefix } from "./gitNoHooksEnv";
+import { afterEach, describe, test, expect } from "bun:test";
+import { GIT_NO_HOOKS_ENV, gitHooksAllowed, gitNoHooksPrefix } from "./gitNoHooksEnv";
 
 describe("GIT_NO_HOOKS_ENV", () => {
   test("disables git hooks via core.hooksPath=/dev/null", () => {
@@ -36,5 +36,33 @@ describe("gitNoHooksPrefix", () => {
     const prefix = gitNoHooksPrefix(undefined);
     expect(prefix).toContain("GIT_CONFIG_COUNT=1");
     expect(prefix).toEndWith(" ");
+  });
+});
+
+describe("gitHooksAllowed", () => {
+  const previousKillSwitch = process.env.MUX_DISABLE_PROJECT_AUTOMATION;
+
+  afterEach(() => {
+    if (previousKillSwitch === undefined) {
+      delete process.env.MUX_DISABLE_PROJECT_AUTOMATION;
+    } else {
+      process.env.MUX_DISABLE_PROJECT_AUTOMATION = previousKillSwitch;
+    }
+  });
+
+  test("hooks run only for trusted projects", () => {
+    delete process.env.MUX_DISABLE_PROJECT_AUTOMATION;
+    expect(gitHooksAllowed(true)).toBe(true);
+    expect(gitHooksAllowed(false)).toBe(false);
+    expect(gitHooksAllowed(undefined)).toBe(false);
+  });
+
+  test("the automation kill-switch neutralizes hooks even when trusted", () => {
+    process.env.MUX_DISABLE_PROJECT_AUTOMATION = "1";
+    // Dataset-planted .git/hooks must not execute during git operations
+    // (worktree add for task forks, bash-tool git commands) even though the
+    // project keeps config trust for delegation.
+    expect(gitHooksAllowed(true)).toBe(false);
+    expect(gitNoHooksPrefix(true)).toContain("core.hooksPath");
   });
 });

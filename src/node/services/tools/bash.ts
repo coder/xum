@@ -24,7 +24,7 @@ import { toBashTaskId } from "./taskId";
 import { migrateToBackground } from "@/node/services/backgroundProcessExecutor";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { getToolEnvPath } from "@/node/services/hooks";
-import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
+import { GIT_NO_HOOKS_ENV, gitHooksAllowed } from "@/node/utils/gitNoHooksEnv";
 import { getErrorMessage } from "@/common/utils/errors";
 import { emitChatEventBestEffort } from "./toolUtils";
 import type { BackgroundProcessMonitorConfig } from "@/node/services/backgroundProcessManager";
@@ -915,7 +915,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
       // Neutralize git hooks for untrusted projects — prevent repository-controlled
       // hooks from executing when the model runs git subcommands (for example,
       // `git commit` or `git am`) through this bash tool.
-      const hooksEnv = config.trusted !== true ? GIT_NO_HOOKS_ENV : {};
+      const hooksEnv = gitHooksAllowed(config.trusted) ? {} : GIT_NO_HOOKS_ENV;
 
       // On Windows, models sometimes emit cmd.exe-style `>nul` / `2>nul` redirections.
       // Since the bash tool runs via bash, `nul` becomes a real file in the workspace.

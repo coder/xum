@@ -1,8 +1,9 @@
 /**
  * Process-wide kill-switch for automatic repo-controlled automation:
  * .xum/init hooks, bash tool hooks (tool_env/tool_pre/tool_post),
- * project-local MCP servers (.xum/mcp.jsonc), and project plugin
- * containers (.xum/plugins hooks/commands/MCP).
+ * project-local MCP servers (.xum/mcp.jsonc), project plugin containers
+ * (.xum/plugins hooks/commands/MCP), and git hooks in trusted checkouts
+ * (gitHooksAllowed in gitNoHooksEnv.ts).
  *
  * Benchmark harnesses (benchmarks/terminal_bench/mux-run.sh) set this when
  * running dataset-controlled repos: the project needs config trust so
