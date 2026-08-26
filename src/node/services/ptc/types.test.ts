@@ -125,6 +125,21 @@ describe("retainExemptKernelRecordResult", () => {
         ],
       };
       expect(retainExemptKernelRecordResult("mcp__shots__take", unsupportedNested)).toBeUndefined();
+
+      // A raw {type:"media"} leaf OUTSIDE any nested content container does
+      // not exempt either (r20): the sanitizer and extractor only consume
+      // container shapes, so retaining for a bare leaf would persist base64
+      // nothing downstream budgets or rewrites.
+      const rawLeaf = {
+        type: "content",
+        value: [
+          {
+            type: "custom",
+            payload: { leaf: { type: "media", mediaType: "image/png", data: "aGVsbG8=" } },
+          },
+        ],
+      };
+      expect(retainExemptKernelRecordResult("mcp__shots__take", rawLeaf)).toBeUndefined();
     });
 
     it("rejects junk media types at validation instead of retaining them as supported", () => {

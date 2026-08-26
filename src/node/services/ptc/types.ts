@@ -507,34 +507,48 @@ export function isPersistenceCriticalRecordToolName(toolName: string): boolean {
  * any unsupported parts that ride along in an exempted container with bounded
  * placeholders at request time.
  *
- * The search recurses through non-media parts (r19): a supported image nested
- * inside a custom wrapper part must still exempt the container, or
- * captureRetained declines and the whole result collapses to a
- * __kernelBounded marker before request-time extraction ever sees a payload.
- * Retention stays bounded either way — sanitizeRetainedMediaContainer charges
- * every retained part its FULL serialized size (nested payloads included).
+ * The search recurses through non-media parts (r19), but only NESTED CONTENT
+ * CONTAINERS with an immediate supported media child count (r20): the capture
+ * sanitizer (isMediaContentContainer) and the request-time extractor both
+ * consume container shapes exclusively — bridged MCP results always arrive as
+ * containers (transformMCPResult) — so exempting for a raw {type:"media"}
+ * leaf outside any container would retain base64 that nothing downstream
+ * budgets or rewrites. Such leaves are guest-authored arbitrary JSON, the
+ * same class as any guest-returned string. Retention of exempted containers
+ * stays bounded — sanitizeRetainedMediaContainer charges every retained part
+ * its FULL serialized size (nested payloads included).
  */
 export function containsMediaContentPayload(result: unknown): boolean {
-  if (typeof result !== "object" || result === null) return false;
-  const container = result as { type?: unknown; value?: unknown };
-  if (container.type !== "content" || !Array.isArray(container.value)) return false;
-  return container.value.some((item: unknown) => containsSupportedMediaValue(item, 0));
+  if (!isContentContainerShape(result)) return false;
+  if (hasImmediateSupportedMedia(result)) return true;
+  return result.value.some((item: unknown) => containsNestedSupportedContainer(item, 0));
 }
 
-/** Bounded deep search for a supported media part inside arbitrary wrapper
- * values. Depth-capped like the sanitizer walk (guest values are JSON
- * round-tripped so cycles are unreachable; the cap fails CLOSED — a ladder
- * deeper than any plausible legitimate shape simply loses the exemption and
- * falls back to normal bounding). */
-function containsSupportedMediaValue(value: unknown, depth: number): boolean {
+function isContentContainerShape(value: unknown): value is { type: "content"; value: unknown[] } {
   if (typeof value !== "object" || value === null) return false;
-  const media = asMediaPart(value);
-  if (media !== null) {
-    return media.mediaType !== undefined && isSupportedAttachmentMediaType(media.mediaType);
-  }
+  const container = value as { type?: unknown; value?: unknown };
+  return container.type === "content" && Array.isArray(container.value);
+}
+
+/** Immediate children only: the shape the sanitizer and extractor consume. */
+function hasImmediateSupportedMedia(container: { value: unknown[] }): boolean {
+  return container.value.some((item: unknown) => {
+    const media = asMediaPart(item);
+    return media?.mediaType !== undefined && isSupportedAttachmentMediaType(media.mediaType);
+  });
+}
+
+/** Bounded deep search for a nested content container holding an immediate
+ * supported media part. Depth-capped like the sanitizer walk (guest values
+ * are JSON round-tripped so cycles are unreachable; the cap fails CLOSED — a
+ * ladder deeper than any plausible legitimate shape simply loses the
+ * exemption and falls back to normal bounding). */
+function containsNestedSupportedContainer(value: unknown, depth: number): boolean {
+  if (typeof value !== "object" || value === null) return false;
+  if (isContentContainerShape(value) && hasImmediateSupportedMedia(value)) return true;
   if (depth >= MAX_MEDIA_SANITIZE_DEPTH) return false;
   const children: unknown[] = Array.isArray(value)
     ? value
     : Object.values(value as Record<string, unknown>);
-  return children.some((child) => containsSupportedMediaValue(child, depth + 1));
+  return children.some((child) => containsNestedSupportedContainer(child, depth + 1));
 }
