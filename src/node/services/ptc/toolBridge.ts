@@ -23,7 +23,10 @@ import {
 import { isToolContentResult } from "@/common/utils/tools/toolContentResult";
 import { isSupportedAttachmentMediaType } from "@/common/utils/attachments/supportedAttachmentMediaTypes";
 import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
-import { isMediaPart, type ToolAttachmentPart } from "@/node/utils/messages/toolResultAttachments";
+import {
+  isMediaPart,
+  type ToolAttachmentPart,
+} from "@/common/utils/attachments/toolAttachmentParts";
 
 /**
  * Sandbox-facing stand-in for stripped media payloads. Keeps the advertised

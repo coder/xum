@@ -5,7 +5,7 @@
  * multi-tool workflows via code execution.
  */
 
-import type { ToolAttachmentPart } from "@/node/utils/messages/toolResultAttachments";
+import type { ToolAttachmentPart } from "@/common/utils/attachments/toolAttachmentParts";
 
 /**
  * Event emitted when a tool call starts within the sandbox.

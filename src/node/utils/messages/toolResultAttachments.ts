@@ -3,6 +3,7 @@ import {
   isDisplayOnlyFilePart,
   type DisplayOnlyFilePart,
 } from "@/common/utils/attachments/displayOnlyFileParts";
+import { isMediaPart, type AISDKMediaPart } from "@/common/utils/attachments/toolAttachmentParts";
 import { MAX_SVG_TEXT_CHARS, SVG_MEDIA_TYPE } from "@/common/constants/imageAttachments";
 import {
   isSupportedAttachmentMediaType,
@@ -18,19 +19,6 @@ export interface ExtractedToolAttachment {
   mediaType: string;
   filename?: string;
 }
-
-export interface AISDKMediaPart {
-  type: "media";
-  data: string;
-  mediaType: string;
-  filename?: string;
-}
-
-/**
- * Original attachment-carrying parts a tool result can produce: model
- * attachments (media) and user-preview-only files (display_file).
- */
-export type ToolAttachmentPart = AISDKMediaPart | DisplayOnlyFilePart;
 
 interface AISDKTextPart {
   type: "text";
@@ -68,20 +56,6 @@ function isContentContainer(value: unknown): value is AISDKContentContainer {
     value !== null &&
     (value as Record<string, unknown>).type === "content" &&
     Array.isArray((value as Record<string, unknown>).value)
-  );
-}
-
-export function isMediaPart(value: unknown): value is AISDKMediaPart {
-  if (typeof value !== "object" || value === null) {
-    return false;
-  }
-
-  const record = value as Record<string, unknown>;
-  return (
-    record.type === "media" &&
-    typeof record.data === "string" &&
-    typeof record.mediaType === "string" &&
-    (record.filename === undefined || typeof record.filename === "string")
   );
 }
 
