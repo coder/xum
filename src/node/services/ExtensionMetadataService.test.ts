@@ -587,4 +587,31 @@ describe("ExtensionMetadataService", () => {
     ).toBe(0);
     expect(await readFile(filePath, "utf-8")).toBe(rawContent);
   });
+
+  test("a missing main file with the quarantine sidecar present is not an empty state", async () => {
+    // Mid-quarantine window: the corrupt (or concurrently repaired) bytes
+    // were renamed to the sidecar and the empty replacement is not written
+    // yet. Strict readers must get a retryable failure — an authoritative {}
+    // returned here could not be retracted by the subsequent restore.
+    await writeFile(`${filePath}.corrupt`, "{not json");
+    // Main file intentionally absent (beforeEach never creates it).
+
+    let strictError: unknown = null;
+    try {
+      await service.getAllSnapshots({ throwOnError: true });
+    } catch (error) {
+      strictError = error;
+    }
+    expect(strictError).not.toBeNull();
+    // The failure is classified transient (errno-carrying), so no quarantine
+    // cascade: the main path stays absent rather than being reset to empty.
+    expect(await readFile(`${filePath}.corrupt`, "utf-8")).toBe("{not json");
+
+    // Lenient (writer) reads keep self-healing so mutations make progress.
+    expect((await service.getAllSnapshots()).size).toBe(0);
+
+    // Without the sidecar, a missing main file stays a healthy empty state.
+    await rm(`${filePath}.corrupt`);
+    expect((await service.getAllSnapshots({ throwOnError: true })).size).toBe(0);
+  });
 });

@@ -2607,6 +2607,21 @@ export class Config {
             // different value here would hand the UI an ID that findWorkspace cannot
             // resolve until the next reload.
             metadata.id = workspace.id ?? metadata.id;
+            // Strict callers make destructive "id is not known" decisions (the
+            // extension-metadata prune): metadata.json that parses but carries
+            // no usable id (e.g. `{}`, or a non-object like an array) resolves
+            // to an id-less entry here, and the workspace's REAL stable id —
+            // recorded nowhere else — would be classified as stale and its
+            // activity data permanently deleted. Successful JSON parsing does
+            // not establish identity; fail closed instead.
+            if (
+              options?.throwOnError &&
+              !(typeof metadata.id === "string" && metadata.id.length > 0)
+            ) {
+              throw new Error(
+                `Legacy workspace metadata at ${metadataPath} resolved without a usable id`
+              );
+            }
             metadata.name = workspace.name ?? metadata.name;
             metadata.createdAt = workspace.createdAt ?? metadata.createdAt;
             metadata.runtimeConfig = workspace.runtimeConfig ?? metadata.runtimeConfig;

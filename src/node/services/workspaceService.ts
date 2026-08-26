@@ -3903,25 +3903,27 @@ export class WorkspaceService extends EventEmitter {
     workspaceId: string,
     snapshot: WorkspaceActivitySnapshot | null
   ): void {
+    const activity = this.mergeCurrentActiveBashMonitorCount(
+      workspaceId,
+      this.mergeCachedActiveWorkflowRuns(
+        workspaceId,
+        this.overlayPendingGoal(workspaceId, snapshot)
+      )
+    );
     // A late in-flight producer (e.g. a stream-abort stop-status handler mid
     // todo read) can complete after removal deleted this workspace's
     // metadata entry. Its disk write is already blocked by the write
     // tombstone; suppress the broadcast too, or the renderer re-inserts the
     // removed id into its activity map after having processed the
-    // metadata-removal event. Null (clearing) emissions stay allowed.
-    if (snapshot !== null && this.extensionMetadata.isWorkspaceDeleted(workspaceId)) {
+    // metadata-removal event. Null (clearing) emissions stay allowed — the
+    // check runs on the MERGED payload (not the raw snapshot) because the
+    // workflow/bash-monitor cache overlays above can turn a null snapshot
+    // into a non-null activity from still-populated caches, which would
+    // re-insert the deleted id just the same.
+    if (activity !== null && this.extensionMetadata.isWorkspaceDeleted(workspaceId)) {
       return;
     }
-    this.emit("activity", {
-      workspaceId,
-      activity: this.mergeCurrentActiveBashMonitorCount(
-        workspaceId,
-        this.mergeCachedActiveWorkflowRuns(
-          workspaceId,
-          this.overlayPendingGoal(workspaceId, snapshot)
-        )
-      ),
-    });
+    this.emit("activity", { workspaceId, activity });
   }
 
   /**
@@ -12914,18 +12916,19 @@ export class WorkspaceService extends EventEmitter {
       if (prefetchedKnownIds != null) {
         workspaceIds = prefetchedKnownIds;
         // The prune enumerated config BEFORE the snapshot read above, so a
-        // workspace registered in between (whose first activity write is
-        // already in `snapshots`) would be missing here — and an
+        // workspace registered in between would be missing here — and an
         // authoritative list omitting it would clear its live-arrived
-        // renderer state with no retry. Re-admit snapshot ids that a fresh
-        // raw config view now knows (cheap sync read; on failure the
-        // prefetched view stands and the miss is a transient one).
+        // renderer state with no retry. Admit every id a fresh raw config
+        // view now knows, NOT just ids with a persisted snapshot: a
+        // concurrently registered workspace with workflow- or bash-monitor-
+        // only activity has no extensionMetadata entry, and its on-disk
+        // workflow runs are only discovered by the per-id probe below.
+        // (Cheap sync read; on failure the prefetched view stands and the
+        // miss is a transient one.)
         try {
           const refreshedConfigIds = this.config.readPersistedWorkspaceIdSuperset();
-          for (const workspaceId of snapshots.keys()) {
-            if (!workspaceIds.has(workspaceId) && refreshedConfigIds.has(workspaceId)) {
-              workspaceIds.add(workspaceId);
-            }
+          for (const workspaceId of refreshedConfigIds) {
+            workspaceIds.add(workspaceId);
           }
         } catch (error) {
           log.debug("Failed to refresh config ids for first-bootstrap scoping", { error });

@@ -3246,6 +3246,57 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("first bootstrap admits snapshotless ids registered after the prune enumerated config", async () => {
+    // A workspace another backend registers after the prune captured its id
+    // set may have workflow- or bash-monitor-only activity and therefore no
+    // extensionMetadata snapshot. Admission must come from the refreshed raw
+    // config view — filtering through snapshot keys would skip the per-id
+    // workflow probe entirely and return an authoritative list without it.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const lateWorkspaceId = "late-registered-workspace";
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      const realSuperset = config.readPersistedWorkspaceIdSuperset.bind(config);
+      let supersetCalls = 0;
+      const supersetSpy = spyOn(config, "readPersistedWorkspaceIdSuperset").mockImplementation(
+        () => {
+          supersetCalls += 1;
+          const ids = realSuperset();
+          // Calls 1 (pre-await baseline) and 2 (prune enumeration) see the
+          // pre-registration config; the refresh and the post-await
+          // revalidation see the concurrently registered workspace.
+          if (supersetCalls >= 3) {
+            ids.add(lateWorkspaceId);
+          }
+          return ids;
+        }
+      );
+      try {
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+        // Workflow-only activity: discoverable by the per-id probe, never a
+        // persisted snapshot.
+        await workspaceService.emitWorkflowRunActivity({
+          workspaceId: lateWorkspaceId,
+          runId: "late-run",
+          status: "running",
+        });
+
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList?.[lateWorkspaceId]?.activeWorkflowRunCount).toBe(1);
+      } finally {
+        supersetSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("suppresses activity emissions for removed workspaces", async () => {
     // A late in-flight producer completing after removal must not broadcast:
     // the renderer would re-insert the removed id into its activity map after
@@ -3283,6 +3334,18 @@ describe("WorkspaceService activity list scoping", () => {
       await workspaceService.updateAgentStatus(workspaceId, { emoji: "🛠️", message: "Late" });
       expect(events.length).toBe(1);
       // Clearing (null) emissions stay allowed for removed workspaces.
+      workspaceService.emitWorkspaceActivity(workspaceId, null);
+      expect(events.length).toBe(2);
+      // A late workflow-run producer can also fire after removal: its cache
+      // entry turns a null snapshot into a non-null merged payload, which
+      // must be suppressed exactly like a non-null snapshot emission — the
+      // tombstone check runs on the merged payload, not the raw snapshot.
+      await workspaceService.emitWorkflowRunActivity({
+        workspaceId,
+        runId: "late-run",
+        status: "running",
+      });
+      expect(events.length).toBe(2);
       workspaceService.emitWorkspaceActivity(workspaceId, null);
       expect(events.length).toBe(2);
     } finally {
@@ -3403,13 +3466,13 @@ describe("WorkspaceService activity list scoping", () => {
         expect(activityList).toEqual({});
         // The corrupt bytes were moved aside, not destroyed.
         expect(await fsPromises.readFile(`${metadataPath}.corrupt`, "utf-8")).toBe(corruptFile);
-        let mainFileExists = true;
-        try {
-          await fsPromises.access(metadataPath);
-        } catch {
-          mainFileExists = false;
-        }
-        expect(mainFileExists).toBe(false);
+        // Quarantine must leave a valid EMPTY main file behind (never a
+        // missing path): readers of a missing-main-plus-sidecar state treat
+        // it as a retryable mid-quarantine window, not authoritative empty.
+        expect(JSON.parse(await fsPromises.readFile(metadataPath, "utf-8"))).toEqual({
+          version: 1,
+          workspaces: {},
+        });
       } finally {
         await cleanup();
       }
@@ -3705,6 +3768,51 @@ describe("WorkspaceService activity list scoping", () => {
       expect((await extensionMetadata.getAllSnapshots()).has("legacy-stable-id")).toBe(true);
     } finally {
       await cleanup();
+    }
+  });
+
+  test("fails open when a legacy metadata.json parses without a usable id", async () => {
+    // Successful JSON parsing does not establish identity: `{}` (or an
+    // array) passes the parse but resolves an id-less entry, and the raw
+    // config has no id to contribute. Strict enumeration must fail closed
+    // exactly like the unparseable case above, or the prune classifies the
+    // real stable id's entries as stale and deletes them.
+    const idlessMetadataFiles = ["{}", "[]"];
+    for (const idlessMetadataFile of idlessMetadataFiles) {
+      const { config, historyService, cleanup } = await createTestHistoryService();
+      try {
+        const extensionMetadata = new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        );
+        await extensionMetadata.updateRecency("legacy-stable-id", 100);
+        const projectPath = path.join(config.rootDir, "project");
+        const workspacePath = path.join(projectPath, "legacy-ws");
+        await fsPromises.writeFile(
+          path.join(config.rootDir, "config.json"),
+          JSON.stringify({
+            projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
+          })
+        );
+        const legacySessionDir = config.getSessionDir(
+          config.generateLegacyId(projectPath, workspacePath)
+        );
+        await fsPromises.mkdir(legacySessionDir, { recursive: true });
+        await fsPromises.writeFile(
+          path.join(legacySessionDir, "metadata.json"),
+          idlessMetadataFile
+        );
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList?.["legacy-stable-id"]?.recency).toBe(100);
+        expect((await extensionMetadata.getAllSnapshots()).has("legacy-stable-id")).toBe(true);
+      } finally {
+        await cleanup();
+      }
     }
   });
 

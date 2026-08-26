@@ -1,5 +1,5 @@
 import { dirname } from "path";
-import { mkdir, readFile, access, rename, link, unlink, copyFile } from "fs/promises";
+import { mkdir, readFile, access, rename, link, unlink, copyFile, writeFile } from "fs/promises";
 import { constants } from "fs";
 import writeFileAtomic from "write-file-atomic";
 import {
@@ -208,7 +208,22 @@ export class ExtensionMetadataService {
       // writers can always make progress.
       if (typeof error === "object" && error != null && "code" in error) {
         if (error.code === "ENOENT") {
-          return { version: 1, workspaces: {} };
+          // A missing main file WITH the quarantine sidecar present is not a
+          // healthy empty state: it is the (rare) window where quarantine
+          // moved the file aside and has not yet written the empty
+          // replacement — the moved bytes may even be a concurrent writer's
+          // healthy repair awaiting restore. Strict readers must see a
+          // retryable failure (ENOENT carries an errno code, so callers
+          // classify it as transient), not an authoritative {} that a
+          // subsequent restore cannot retract. Lenient (writer) paths keep
+          // self-healing below so mutations always make progress.
+          const quarantined = await access(`${this.filePath}.corrupt`).then(
+            () => true,
+            () => false
+          );
+          if (!quarantined) {
+            return { version: 1, workspaces: {} };
+          }
         }
       }
       if (options?.throwOnError) {
@@ -647,6 +662,40 @@ export class ExtensionMetadataService {
         await unlink(quarantinePath).catch(() => undefined);
         return false;
       }
+      // Replace the quarantined main file with a valid EMPTY file instead of
+      // leaving the path missing: between the rename above and here, strict
+      // readers (this or another process) would otherwise observe ENOENT.
+      // A missing-main window is dangerous because load() treats plain
+      // ENOENT as a healthy empty state — combined with a concurrent writer
+      // repairing the file right before the rename, a reader in the gap
+      // could return an authoritative {} that a later restore cannot
+      // retract. With a real empty file the corrupt→empty transition is
+      // atomic (link/COPYFILE_EXCL below never overwrite a file a
+      // concurrent writer re-created first), and load()'s sidecar check
+      // turns any remaining missing-main window into a retryable failure
+      // instead of an empty read.
+      const emptyTmpPath = `${this.filePath}.empty.tmp`;
+      await writeFile(
+        emptyTmpPath,
+        JSON.stringify({ version: 1, workspaces: {} } satisfies ExtensionMetadataFile, null, 2),
+        "utf-8"
+      );
+      try {
+        await link(emptyTmpPath, this.filePath);
+      } catch (linkError) {
+        if (!ExtensionMetadataService.isErrnoCode(linkError, "EEXIST")) {
+          try {
+            await copyFile(emptyTmpPath, this.filePath, constants.COPYFILE_EXCL);
+          } catch (copyError) {
+            if (!ExtensionMetadataService.isErrnoCode(copyError, "EEXIST")) {
+              // Main path still missing: rethrow (retryable) so the caller's
+              // re-read hits the sidecar guard instead of reading ENOENT.
+              throw copyError;
+            }
+          }
+        }
+      }
+      await unlink(emptyTmpPath).catch(() => undefined);
       log.error(
         `Extension metadata file was corrupt; moved it to ${quarantinePath} and reset to empty`
       );
