@@ -48,6 +48,26 @@ describe("prepareRunSessionRootOverride", () => {
     expect((await fs.stat(overrideRoot)).mode & 0o777).toBe(0o700);
   });
 
+  test("rejects a symlinked override without chmodding its target", async () => {
+    const realConfigRoot = path.join(tempDir, "real-config");
+    const targetRoot = path.join(tempDir, "attacker-target");
+    const overrideRoot = path.join(tempDir, "run-session");
+    await fs.mkdir(targetRoot, { mode: 0o755 });
+    await fs.chmod(targetRoot, 0o755);
+    await fs.symlink(targetRoot, overrideRoot, "dir");
+
+    let error: unknown;
+    try {
+      await prepareRunSessionRootOverride({ XUM_RUN_SESSION_ROOT: overrideRoot }, realConfigRoot);
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    expect((await fs.stat(targetRoot)).mode & 0o777).toBe(0o755);
+    expect((await fs.lstat(overrideRoot)).isSymbolicLink()).toBe(true);
+  });
+
   test("rejects an override that canonically resolves to the real config root", async () => {
     const realConfigRoot = path.join(tempDir, "real-config");
     await fs.mkdir(realConfigRoot);
