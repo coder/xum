@@ -576,16 +576,19 @@ describe("BashMonitorWakeStore", () => {
     ]);
   });
 
-  test("a terminal merge rebinds the generation marker; match-only merges keep it", async () => {
-    // createdAt doubles as the drain gate's originNotAfterMs. A settling process is the record's
-    // live generation: keeping an old marker would make the gate reject the registered process
-    // (startTime > marker), falsely labeling its task ID not awaitable and disabling
-    // terminal-shown suppression. Match-only merges keep the originating marker so a dead
-    // generation's undelivered lines are never offset-gated against a newer instance.
+  test("a terminal merge stamps its own generation marker; createdAt stays the match origin", async () => {
+    // The terminal signal binds to the settling generation via terminalOriginAt so delivery
+    // gating and awaitability query the live process, while createdAt stays the originating
+    // instance's marker for the matched signal: offsets from different generations' output files
+    // are never comparable, so rebinding createdAt would let a newer instance's shown frontier
+    // falsely supersede an older instance's undelivered match. A match-only merge (re-arm)
+    // clears the terminal and its marker together.
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     const first = await store.enqueueOrMergePending(
       payload({ lines: ["ERROR old"], matchedThroughOffset: 50 })
     );
+    expect(first.terminalOriginAt).toBeUndefined();
+
     await new Promise((resolve) => setTimeout(resolve, 10));
     const settled = await store.enqueueOrMergePending(
       payload({
@@ -594,13 +597,16 @@ describe("BashMonitorWakeStore", () => {
         terminal: { status: "exited", exitCode: 0 },
       })
     );
-    expect(Date.parse(settled.createdAt)).toBeGreaterThan(Date.parse(first.createdAt));
+    expect(settled.createdAt).toBe(first.createdAt);
+    expect(settled.terminalOriginAt).toBeDefined();
+    expect(Date.parse(settled.terminalOriginAt ?? "")).toBeGreaterThan(Date.parse(first.createdAt));
 
-    await new Promise((resolve) => setTimeout(resolve, 10));
     const matchOnly = await store.enqueueOrMergePending(
       payload({ lines: ["ERROR new"], matchedThroughOffset: 90 })
     );
-    expect(matchOnly.createdAt).toBe(settled.createdAt);
+    expect(matchOnly.createdAt).toBe(first.createdAt);
+    expect(matchOnly.terminal).toBeUndefined();
+    expect(matchOnly.terminalOriginAt).toBeUndefined();
   });
 
   test("a tail line is preserved when its only duplicate falls in the evicted prefix", async () => {

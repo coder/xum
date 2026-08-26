@@ -748,12 +748,19 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    */
   private async readSettlementTailLines(proc: BackgroundProcess): Promise<string[]> {
     const fileSizeBytes = await proc.handle.getOutputFileSize();
-    const offset = computeTailStartOffset(fileSizeBytes, MONITOR_SETTLEMENT_TAIL_BYTES);
+    const windowStart = computeTailStartOffset(fileSizeBytes, MONITOR_SETTLEMENT_TAIL_BYTES);
+    // Exclude bytes the owner was already shown: an unfiltered read can consume the final lines
+    // while the process is still running, and repeating them after the settle marker as "new
+    // output" could retrigger work the agent already handled. The frontier always sits at the
+    // end of a complete line, so a frontier start begins exactly on a line boundary and its
+    // first segment is a real line (no fragment to drop).
+    const offset = Math.max(windowStart, proc.shownThroughOffset);
+    const startedAtLineBoundary = offset === proc.shownThroughOffset;
     const result = await proc.handle.readOutput(offset);
     // Re-enforce the byte bound on the returned content: a degraded size query above (see
     // boundTailContent) would otherwise let a large remote log flow into line processing whole.
     const bounded = boundTailContent(result.content, MONITOR_SETTLEMENT_TAIL_BYTES);
-    const startedMidLine = offset > 0 || bounded.startedMidContent;
+    const startedMidLine = (offset > 0 && !startedAtLineBoundary) || bounded.startedMidContent;
     const segments = bounded.content.split("\n");
     // A mid-file (or mid-content, after the byte cut) start almost certainly begins inside a
     // line; drop that partial fragment rather than presenting it as a complete output line.

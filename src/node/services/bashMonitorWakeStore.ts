@@ -118,6 +118,13 @@ export interface BashMonitorWakeRecord {
    * no undelivered matched output and must never be offset-suppressed.
    */
   terminal?: BashMonitorWakeTerminal;
+  /**
+   * Generation marker for the terminal signal (set when a terminal payload merges): the settling
+   * process's arrival time, which delivery gating and awaitability checks bind to. Absent on
+   * records whose terminal arrived at creation (createdAt is the marker) and on legacy rows.
+   * createdAt remains the matched signal's marker; see enqueueOrMergePending.
+   */
+  terminalOriginAt?: string;
   status: BashMonitorWakeStatus;
   createdAt: string;
   updatedAt: string;
@@ -150,6 +157,9 @@ const BashMonitorWakeRecordSchema = z
       })
       .optional()
       .catch(undefined),
+    // Same self-healing rule as `terminal`: malformed metadata degrades instead of dropping the
+    // durable wake. A missing marker falls back to createdAt at read time.
+    terminalOriginAt: z.string().optional().catch(undefined),
     status: z.enum(BASH_MONITOR_WAKE_STATUSES),
     createdAt: z.string().min(1),
     updatedAt: z.string().min(1),
@@ -469,16 +479,6 @@ export class BashMonitorWakeStore {
           ...(mergedMatchedThroughOffset != null
             ? { matchedThroughOffset: mergedMatchedThroughOffset }
             : {}),
-          // A terminal payload rebinds the record's generation marker (createdAt doubles as the
-          // drain gate's originNotAfterMs): the settling process is the record's live generation,
-          // and keeping an older createdAt would make getMonitorWakeDeliveryState reject the
-          // registered process (startTime > marker), falsely labeling its task ID no longer
-          // awaitable and disabling terminal-shown suppression. Same-generation settlements are
-          // unaffected (startTime <= old marker <= now), and matched-line fail-open survives: a
-          // cross-generation offset can only be too high, which over-delivers, never suppresses.
-          // Match-only merges keep the originating marker so a dead generation's undelivered
-          // lines are never offset-gated against a newer instance (comment above).
-          ...(payload.terminal != null ? { createdAt: now } : {}),
           updatedAt: now,
         };
         // Terminal state binds to a process *generation*, and a match-only payload can only come
@@ -490,8 +490,16 @@ export class BashMonitorWakeStore {
         // status the live process never reached) while the new monitor is still running.
         if (payload.terminal != null) {
           record.terminal = payload.terminal;
+          // The terminal signal carries its own generation marker: the settling process is the
+          // record's live generation, so delivery gating and awaitability must bind to it, while
+          // createdAt stays the originating instance's marker for the matched signal (offsets
+          // from different generations' output files are never comparable — rebinding createdAt
+          // would let a newer instance's shown frontier falsely supersede an older instance's
+          // undelivered match). Same-generation settlements are unaffected: startTime <= now.
+          record.terminalOriginAt = now;
         } else {
           delete record.terminal;
+          delete record.terminalOriginAt;
         }
         await this.write(record);
         return record;
@@ -823,6 +831,7 @@ export class BashMonitorWakeStore {
       }
       const cleared: BashMonitorWakeRecord = { ...record, updatedAt: new Date().toISOString() };
       delete cleared.terminal;
+      delete cleared.terminalOriginAt;
       await this.write(cleared);
     });
   }

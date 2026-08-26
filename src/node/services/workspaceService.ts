@@ -751,11 +751,18 @@ interface QueuedBashMonitorWakeCancellation {
    * Per-process signals a queued wake carries. A wake is retracted only when a shown event covers
    * every present signal: matched output via the shown offset (absent on terminal-only wakes,
    * vacuously covered), and settlement via the explicit terminal-shown flag (a filtered or
-   * zero-output post-exit read never advances the offset).
+   * zero-output post-exit read never advances the offset). Each signal carries its own
+   * generation bound: matched output binds to the record's originating createdAt while the
+   * terminal binds to the settling generation's terminalOriginAt, mirroring the drain gate.
    */
   matchedOutputByProcess: Map<
     string,
-    { matchedThroughOffset?: number; hasTerminal: boolean; originNotAfterMs: number }
+    {
+      matchedThroughOffset?: number;
+      matchedOriginNotAfterMs: number;
+      hasTerminal: boolean;
+      terminalOriginNotAfterMs: number;
+    }
   >;
 }
 
@@ -1927,17 +1934,22 @@ export class WorkspaceService extends EventEmitter {
     for (const [queueKey, cancellation] of this.queuedBashMonitorWakeKeysByProcess.get(
       processKey
     ) ?? []) {
-      // Process IDs are reusable across restarts. Match the existing delivery gate's createdAt
-      // generation bound so output from a newer process cannot supersede an older pending wake.
       const matchedOutput = cancellation.matchedOutputByProcess.get(processKey);
-      if (matchedOutput == null || payload.processStartTime > matchedOutput.originNotAfterMs) {
+      if (matchedOutput == null) {
         continue;
       }
-      // Two-signal coverage: retract only when the read showed everything the wake carries.
+      // Two-signal coverage with per-signal generation bounds (process IDs are reusable across
+      // restarts, mirroring the drain gate): a newer instance's shown frontier cannot cover an
+      // older instance's matched output, while the terminal is covered only by a read of the
+      // settling generation itself.
       const matchedCovered =
         matchedOutput.matchedThroughOffset == null ||
-        payload.shownThroughOffset >= matchedOutput.matchedThroughOffset;
-      const terminalCovered = !matchedOutput.hasTerminal || payload.terminalStatusShown;
+        (payload.processStartTime <= matchedOutput.matchedOriginNotAfterMs &&
+          payload.shownThroughOffset >= matchedOutput.matchedThroughOffset);
+      const terminalCovered =
+        !matchedOutput.hasTerminal ||
+        (payload.processStartTime <= matchedOutput.terminalOriginNotAfterMs &&
+          payload.terminalStatusShown);
       if (!matchedCovered || !terminalCovered) {
         continue;
       }
@@ -2493,9 +2505,16 @@ export class WorkspaceService extends EventEmitter {
         cancellation.matchedOutputByProcess.set(processKey, {
           ...(matchedThroughOffset != null ? { matchedThroughOffset } : {}),
           hasTerminal: (previous?.hasTerminal ?? false) || record.terminal != null,
-          originNotAfterMs: Math.min(
-            previous?.originNotAfterMs ?? Number.POSITIVE_INFINITY,
+          // Matched output keeps the OLDEST originating marker (fail-open: an older bound only
+          // rejects newer generations' reads); the terminal takes the NEWEST settling-generation
+          // marker so the live settling process's own read can cover it.
+          matchedOriginNotAfterMs: Math.min(
+            previous?.matchedOriginNotAfterMs ?? Number.POSITIVE_INFINITY,
             Date.parse(record.createdAt)
+          ),
+          terminalOriginNotAfterMs: Math.max(
+            previous?.terminalOriginNotAfterMs ?? Number.NEGATIVE_INFINITY,
+            Date.parse(record.terminalOriginAt ?? record.createdAt)
           ),
         });
       }
@@ -2799,31 +2818,56 @@ export class WorkspaceService extends EventEmitter {
               record.processId,
               Date.parse(record.createdAt)
             );
+            // The terminal signal binds to its own generation marker (terminalOriginAt): a
+            // re-armed generation's settlement is gated against the live settling process, while
+            // the matched signal stays bound to the originating createdAt — offsets from
+            // different generations' output files are never comparable, so a dead generation's
+            // undelivered match must fail open and deliver rather than be superseded by a newer
+            // instance's shown frontier.
+            const terminalMarker = record.terminalOriginAt ?? record.createdAt;
+            const terminalState =
+              record.terminal == null
+                ? undefined
+                : terminalMarker === record.createdAt
+                  ? state
+                  : await this.backgroundProcessManager.getMonitorWakeDeliveryState(
+                      record.processId,
+                      Date.parse(terminalMarker)
+                    );
             if (state?.status === "blocked") {
               this.scheduleBashMonitorWakeDrainAfterRead(ownerWorkspaceId, state.readSettled);
               continue;
             }
-            if (state?.status === "settled") {
-              const matchedShown =
-                record.matchedThroughOffset == null ||
-                state.shownThroughOffset >= record.matchedThroughOffset;
-              // Partial manager stubs may omit terminalStatusShown; undefined fails open.
-              const terminalShown = record.terminal == null || state.terminalStatusShown === true;
-              if (matchedShown && terminalShown) {
-                supersededByShown.push(record);
-                continue;
-              }
-              // Deliverable for its settlement signal only: the matched lines were already
-              // returned by an owner read, so the prompt flags them as consumed instead of
-              // presenting them as a fresh match condition.
-              if (record.terminal != null && record.matchedThroughOffset != null && matchedShown) {
-                promptContext.set(record.id, { matchedOutputAlreadyShown: true });
-              }
+            if (terminalState?.status === "blocked") {
+              this.scheduleBashMonitorWakeDrainAfterRead(
+                ownerWorkspaceId,
+                terminalState.readSettled
+              );
+              continue;
             }
-            // A null state means the originating process instance is no longer registered
-            // (Xum restarted after the settlement persisted, or the ID was reclaimed by a newer
-            // generation): task_await on this record's task ID cannot return its report.
-            if (state == null && record.terminal != null) {
+            const matchedShown =
+              record.matchedThroughOffset == null ||
+              (state?.status === "settled" &&
+                state.shownThroughOffset >= record.matchedThroughOffset);
+            // Partial manager stubs may omit terminalStatusShown; undefined fails open.
+            const terminalShown =
+              record.terminal == null ||
+              (terminalState?.status === "settled" && terminalState.terminalStatusShown === true);
+            if (matchedShown && terminalShown) {
+              supersededByShown.push(record);
+              continue;
+            }
+            // Deliverable for its settlement signal only: the matched lines were already
+            // returned by an owner read, so the prompt flags them as consumed instead of
+            // presenting them as a fresh match condition.
+            if (record.terminal != null && record.matchedThroughOffset != null && matchedShown) {
+              promptContext.set(record.id, { matchedOutputAlreadyShown: true });
+            }
+            // A null terminal-marker state means the settling process instance is no longer
+            // registered (Xum restarted after the settlement persisted, or the ID was reclaimed
+            // by a newer generation): task_await on this record's task ID cannot return its
+            // report.
+            if (record.terminal != null && terminalState == null) {
               promptContext.set(record.id, { taskAwaitable: false });
             }
           } else if (canQueryShownFrontier && record.matchedThroughOffset != null) {

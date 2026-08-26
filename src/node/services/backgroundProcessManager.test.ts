@@ -1407,6 +1407,45 @@ describe("BackgroundProcessManager", () => {
         expect(stoppedEvents).toHaveLength(0);
       });
 
+      it("excludes already-shown final lines from the settlement tail", async () => {
+        const eventPromise = waitForMonitorMatch(manager, 8_000);
+        const result = await manager.spawn(
+          runtime,
+          testWorkspaceId,
+          "printf 'alpha shown\\n'; sleep 0.5; printf 'omega new\\n'",
+          {
+            cwd: process.cwd(),
+            displayName: "settle-tail-shown-frontier",
+            monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
+          }
+        );
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+
+        // Owner unfiltered read consumes the first line while the process still runs, advancing
+        // the shown frontier past it.
+        const read = await manager.getOutput(
+          result.processId,
+          undefined,
+          false,
+          1,
+          undefined,
+          testWorkspaceId
+        );
+        expect(read.success).toBe(true);
+        if (!read.success) return;
+        expect(read.output).toContain("alpha shown");
+
+        const event = await eventPromise;
+        const tail = event.payload.tailLines ?? [];
+        // Already-shown bytes must not be re-presented as new post-settlement output.
+        expect(tail).not.toContain("alpha shown");
+        // The genuinely unseen final line survives (unless the read raced past it too).
+        if (!read.output.includes("omega new")) {
+          expect(tail).toContain("omega new");
+        }
+      });
+
       it("bounds oversized tail content and marks it mid-content (degraded size query)", () => {
         // A runtime handle's transient size-query failure degrades to 0, turning the tail read
         // into a full-file read; the post-read bound must re-cut to the final byte window and

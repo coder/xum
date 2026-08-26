@@ -1030,6 +1030,97 @@ describe("WorkspaceService bash monitor wakes", () => {
     }
   });
 
+  test("an old generation's undelivered match is not superseded by the settling generation's reads", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-cross-gen-match";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      // Generation 1 left an undelivered match; generation 2 reused the ID and settled, merging
+      // a terminal payload (terminalOriginAt = now). Rewrite createdAt to the old generation.
+      const seedWakeStore = new BashMonitorWakeStore(config);
+      await seedWakeStore.enqueueOrMergePending({
+        processId: "proc-gen",
+        taskId: "bash:proc-gen",
+        workspaceId,
+        filter: "ERR",
+        filterExclude: false,
+        lines: ["ERR gen1"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 50,
+      });
+      await seedWakeStore.enqueueOrMergePending({
+        processId: "proc-gen",
+        taskId: "bash:proc-gen",
+        workspaceId,
+        filter: "ERR",
+        filterExclude: false,
+        lines: ["[monitor] process settled: exited (code 0)"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        terminal: { status: "exited", exitCode: 0 },
+      });
+      const gen2Start = Date.now() - 1_000;
+      const recordFile = path.join(
+        config.getSessionDir(workspaceId),
+        "bash-monitor-wakes",
+        "proc-gen.json"
+      );
+      const raw = JSON.parse(await fsPromises.readFile(recordFile, "utf-8")) as Record<
+        string,
+        unknown
+      >;
+      raw.createdAt = "2026-01-01T00:00:00.000Z";
+      await fsPromises.writeFile(recordFile, JSON.stringify(raw), "utf-8");
+
+      // Generation 2 (started after gen1's marker) has shown a frontier past gen1's offset AND
+      // its terminal report. The matched signal must still fail open: gen2's file offsets are
+      // not comparable to gen1's, so the record delivers instead of being superseded.
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+        getMonitorWakeDeliveryState: mock((_processId: string, originNotAfterMs?: number) => {
+          if (originNotAfterMs != null && gen2Start > originNotAfterMs) {
+            return Promise.resolve(undefined);
+          }
+          return Promise.resolve({
+            status: "settled" as const,
+            shownThroughOffset: 100,
+            terminalStatusShown: true,
+          });
+        }),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        async (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          await args[3]?.onAccepted?.();
+          return Ok(undefined);
+        }
+      );
+
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      const prompt = sendSpy.mock.calls[0][1];
+      expect(prompt).toContain("ERR gen1");
+      expect(prompt).toContain("Status: exited (code 0)");
+      // The settling generation is registered, so its task ID stays awaitable.
+      expect(prompt).not.toContain("no longer awaitable");
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("re-arming a processId retracts a queued settlement wake and redelivers it rebuilt", async () => {
     const { config, cleanup } = await createTestHistoryService();
     try {
