@@ -3246,6 +3246,35 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("never prunes entries whose config entry is discarded by normalization", async () => {
+    // A parseable config entry that lenient normalization filters out (null
+    // project path): the workspace vanishes from the normalized view — and
+    // thus from the activity list, matching every other renderer surface —
+    // but its metadata entry must survive the prune (raw-superset guarantee).
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency("possibly-live", 100);
+      await fsPromises.writeFile(
+        path.join(config.rootDir, "config.json"),
+        JSON.stringify({
+          projects: [[null, { workspaces: [{ id: "possibly-live", path: "/tmp/x" }] }]],
+        })
+      );
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+      await workspaceService.getActivityList();
+      expect((await extensionMetadata.getAllSnapshots()).has("possibly-live")).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("prunes the extension metadata entry after a workspace is removed", async () => {
     const { historyService, cleanup } = await createTestHistoryService();
     const workspaceId = "remove-prunes-metadata";

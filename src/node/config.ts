@@ -1083,6 +1083,54 @@ export class Config {
     );
   }
 
+  /**
+   * Maximal superset of workspace ids present in the RAW persisted config,
+   * for destructive "id is not in config" decisions (extension-metadata
+   * pruning, orphan session-dir cleanup).
+   *
+   * loadConfigOrDefault's validation/normalization is LOSSY: entries it
+   * filters or discards (invalid project paths, malformed pairs, entries a
+   * migration rewrites) simply vanish from the normalized view, so a pruner
+   * keyed on that view would treat their live workspaces as removed and
+   * delete their data. This scan instead walks the raw `projects` subtree
+   * and collects every string `id` it can find, without judging validity —
+   * over-collection merely retains a stale entry a little longer, while
+   * under-collection destroys live data. Callers should union this with the
+   * normalized view (which contains ids created by in-memory migrations).
+   *
+   * Throws when the file exists but cannot be read/parsed or the root is not
+   * a plain object; a missing file resolves as an empty set (fresh install).
+   */
+  readPersistedWorkspaceIdSuperset(): Set<string> {
+    const ids = new Set<string>();
+    if (!fs.existsSync(this.configFile)) {
+      return ids;
+    }
+    const parsedValue: unknown = JSON.parse(fs.readFileSync(this.configFile, "utf-8"));
+    if (!parsedValue || typeof parsedValue !== "object" || Array.isArray(parsedValue)) {
+      throw new Error("Config root must be a JSON object");
+    }
+    const collect = (value: unknown): void => {
+      if (Array.isArray(value)) {
+        for (const entry of value) {
+          collect(entry);
+        }
+        return;
+      }
+      if (value !== null && typeof value === "object") {
+        const id = (value as { id?: unknown }).id;
+        if (typeof id === "string" && id.length > 0) {
+          ids.add(id);
+        }
+        for (const nested of Object.values(value)) {
+          collect(nested);
+        }
+      }
+    };
+    collect((parsedValue as { projects?: unknown }).projects);
+    return ids;
+  }
+
   loadConfigOrDefault(options?: { throwOnError?: boolean }): ProjectsConfig {
     // Read as a Buffer and hand the same snapshot to the failure handler: backing up via a
     // second read could preserve a concurrent writer's replacement instead of the bytes that

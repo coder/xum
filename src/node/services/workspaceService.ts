@@ -4683,6 +4683,13 @@ export class WorkspaceService extends EventEmitter {
     const config = this.config.loadConfigOrDefault({ throwOnError: true });
 
     const knownIds = new Set<string>(allMetadata.map((metadata) => metadata.id));
+    // Same rationale as the extension-metadata prune: normalization is lossy,
+    // and a live workspace whose config entry gets filtered (e.g. invalid
+    // project path) must not have its session data reaped as an orphan.
+    // Throws on unreadable/unparseable config, aborting this cleanup.
+    for (const persistedId of this.config.readPersistedWorkspaceIdSuperset()) {
+      knownIds.add(persistedId);
+    }
     // The config load-time migration (removeLegacyXumChatEntries) drops the
     // removed Chat with Xum workspace from config, which would make its
     // session dir look orphaned here. Preserve the transcript: a downgraded
@@ -12797,14 +12804,21 @@ export class WorkspaceService extends EventEmitter {
         // concurrently created workspace — even in another backend process —
         // cannot lose its just-written entry.
         //
-        // throwOnError: a corrupted/unreadable config.json otherwise resolves
-        // as the swallowed-failure EMPTY default, which this destructive
-        // prune cannot distinguish from a truly empty config — it would
-        // delete every entry. Throwing aborts the prune (caught below); a
-        // missing file still resolves as a healthy empty config. Same
-        // precedent as cleanupOrphanSessionDirs' internal strict read.
+        // Union of two views, both of which throw (aborting the prune, caught
+        // below) rather than resolving with a silently lossy id set:
+        // - the raw persisted superset covers entries loadConfigOrDefault's
+        //   validation/normalization would filter or discard (see
+        //   readPersistedWorkspaceIdSuperset), so a live workspace with a
+        //   malformed config entry is never treated as removed;
+        // - the strict normalized view covers ids produced by in-memory
+        //   config migrations that are not yet persisted verbatim.
+        // A missing config file resolves as a healthy empty set in both.
+        const knownIds = this.config.readPersistedWorkspaceIdSuperset();
         const allMetadata = await this.config.getAllWorkspaceMetadata({ throwOnError: true });
-        return new Set(allMetadata.map((metadata) => metadata.id));
+        for (const metadata of allMetadata) {
+          knownIds.add(metadata.id);
+        }
+        return knownIds;
       });
       if (prunedCount > 0) {
         log.info(`Pruned ${prunedCount} stale extension metadata entries`);

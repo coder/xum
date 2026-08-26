@@ -903,6 +903,34 @@ describe("Config", () => {
     });
   });
 
+  describe("readPersistedWorkspaceIdSuperset", () => {
+    it("collects ids from entries that lenient normalization discards", () => {
+      // `[null, ...]` fails the project-path filter and vanishes from the
+      // normalized view; the raw superset must still surface its workspace id
+      // so destructive callers never treat that live workspace as removed.
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [null, { workspaces: [{ id: "live-discarded", path: "/tmp/x" }] }],
+            ["/repo", { workspaces: [{ id: "live-normal", path: "/repo/ws", name: "ws" }] }],
+          ],
+        })
+      );
+      const superset = new Config(tempDir).readPersistedWorkspaceIdSuperset();
+      expect(superset.has("live-discarded")).toBe(true);
+      expect(superset.has("live-normal")).toBe(true);
+    });
+
+    it("resolves empty for a missing file and throws on unparseable content", () => {
+      expect(new Config(tempDir).readPersistedWorkspaceIdSuperset().size).toBe(0);
+      fs.writeFileSync(path.join(tempDir, "config.json"), "{not json");
+      expect(() => new Config(tempDir).readPersistedWorkspaceIdSuperset()).toThrow();
+      fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify(["array-root"]));
+      expect(() => new Config(tempDir).readPersistedWorkspaceIdSuperset()).toThrow();
+    });
+  });
+
   describe("legacy task variant compatibility", () => {
     it("loads variant children as ordinary sub-agents without destroying downgrade metadata", async () => {
       const configFile = path.join(tempDir, "config.json");
