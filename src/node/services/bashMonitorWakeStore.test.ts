@@ -559,6 +559,29 @@ describe("BashMonitorWakeStore", () => {
     expect(strandedGone).toBe(true);
   });
 
+  test("recovery keeps the newest of multiple stranded pending generations", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    // Two interrupted prune races stranded two distinct pending generations of the same
+    // reused id with no canonical file. Whichever leftover recovery visits first, the
+    // NEWER generation must end up canonical — a first-restored older generation must
+    // not make the newer one look EEXIST-superseded.
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR old gen"] }));
+    await fsPromises.rename(file, `${file}.prune-gen-old`);
+    // Distinct updatedAt millisecond so the reconciliation comparison is strict.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR new gen"] }));
+    await fsPromises.rename(file, `${file}.prune-gen-new`);
+
+    const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+    const pending = await fresh.listPending("owner-1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0].lines).toEqual(["ERROR new gen"]);
+    expect((await fresh.get("owner-1", "proc-1"))?.lines).toEqual(["ERROR new gen"]);
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".prune-"))).toHaveLength(0);
+  });
+
   test("a stranded prune file never clobbers a newer record at the original path", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload({ lines: ["ERROR old generation"] }));

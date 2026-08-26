@@ -882,8 +882,36 @@ export class BashMonitorWakeStore {
     for (const entry of [...classified.keys()]) {
       if (!seen.has(entry)) classified.delete(entry);
     }
-    records.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
-    return records;
+    // Dedupe by id keeping the newest updatedAt: recovering multiple stranded
+    // generations of one reused id in a single scan can surface the id twice (an older
+    // leftover restored first, then replaced by a newer one).
+    const newestById = new Map<string, BashMonitorWakeRecord>();
+    for (const record of records) {
+      const existing = newestById.get(record.id);
+      if (existing == null || Date.parse(record.updatedAt) >= Date.parse(existing.updatedAt)) {
+        newestById.set(record.id, record);
+      }
+    }
+    const deduped = [...newestById.values()];
+    deduped.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+    return deduped;
+  }
+
+  /**
+   * Read and parse the wake record at a path. Returns null when the file is missing
+   * (ENOENT) or its content is malformed; any other read failure PROPAGATES — callers
+   * publish these reads as authoritative pending state, and converting a transient
+   * error into "no record" would hide a durable wake from every retry path.
+   */
+  private async readRecordAt(filePath: string): Promise<BashMonitorWakeRecord | null> {
+    let raw: string;
+    try {
+      raw = await fsPromises.readFile(filePath, "utf-8");
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT")) return null;
+      throw error;
+    }
+    return this.parse(raw);
   }
 
   /**
@@ -966,7 +994,26 @@ export class BashMonitorWakeStore {
           // a silent null would leave a stranded pending wake undelivered all session.
           throw error;
         }
-        // EEXIST: a newer record owns the original path and supersedes the stranded one.
+        // EEXIST: something owns the canonical path — but with multiple instances, two
+        // interrupted prune races can strand DISTINCT pending generations of the same
+        // reused id, and a previously restored older generation may be what occupies
+        // the path. Reconcile deterministically by updatedAt instead of assuming
+        // supersession: a strictly newer pending leftover atomically replaces the
+        // canonical record; otherwise the canonical record wins and the leftover is
+        // dropped below as superseded.
+        const canonical = await this.readRecordAt(originalPath);
+        if (canonical == null) {
+          // Vanished (or unparseable) between the failed link and this read: keep the
+          // leftover so a later scan retries with a settled canonical state.
+          return null;
+        }
+        if (
+          parsed.status === "pending" &&
+          Date.parse(parsed.updatedAt) > Date.parse(canonical.updatedAt)
+        ) {
+          await fsPromises.rename(filePath, originalPath);
+          return parsed;
+        }
       }
       await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
       return restored && parsed.status === "pending" ? parsed : null;
@@ -1009,9 +1056,9 @@ export class BashMonitorWakeStore {
       } catch (error) {
         if (isErrnoWithCode(error, "ENOENT")) {
           // A concurrent recoverStrandedPruneFile consumed the trash (restored or swept
-          // it). Publish the canonical path's current state, mirroring the EEXIST branch.
-          const currentRaw = await fsPromises.readFile(filePath, "utf-8").catch(() => null);
-          const current = currentRaw == null ? null : this.parse(currentRaw);
+          // it). Publish the canonical path's current state, mirroring the EEXIST
+          // branch; readRecordAt propagates transient failures into caller retries.
+          const current = await this.readRecordAt(filePath);
           return current?.status === "pending" ? current : null;
         }
         // Cannot verify the captured inode — it may be a concurrently rewritten pending
@@ -1062,10 +1109,11 @@ export class BashMonitorWakeStore {
           // EEXIST: a newer record owns the canonical path and supersedes this capture.
           // Publish the canonical record's CURRENT pending state, never the discarded
           // capture — the newer write may carry newer output or even have canceled the
-          // wake, and a drain must not deliver durably-retired content.
+          // wake, and a drain must not deliver durably-retired content. readRecordAt
+          // propagates transient reread failures into caller retries rather than
+          // reporting a successful scan without the newer pending wake.
           await fsPromises.rm(trash, { force: true }).catch(() => undefined);
-          const currentRaw = await fsPromises.readFile(filePath, "utf-8").catch(() => null);
-          const current = currentRaw == null ? null : this.parse(currentRaw);
+          const current = await this.readRecordAt(filePath);
           return current?.status === "pending" ? current : null;
         }
       }

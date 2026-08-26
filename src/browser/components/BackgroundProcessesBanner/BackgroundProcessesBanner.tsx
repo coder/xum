@@ -112,19 +112,24 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                       {proc.displayName ?? truncateScript(proc.script)}
                     </div>
                     {proc.monitor && (
-                      <div className="text-muted truncate text-[10px]">
-                        watching /{proc.monitor.filter}/ · {proc.monitor.totalMatches} match
-                        {proc.monitor.totalMatches === 1 ? "" : "es"}
-                        {proc.monitor.stopped ? " · stopped" : ""}
+                      <>
+                        <div className="text-muted truncate text-[10px]">
+                          watching /{proc.monitor.filter}/ · {proc.monitor.totalMatches} match
+                          {proc.monitor.totalMatches === 1 ? "" : "es"}
+                          {proc.monitor.stopped ? " · stopped" : ""}
+                        </div>
+                        {/* Own non-truncating line: appended to the watching line above,
+                            a long filter would right-ellipsize this away on narrow
+                            widths — hiding the only explanation for an exited row. */}
                         {proc.monitor.pendingWakeKind != null && (
-                          <span className="text-secondary">
+                          <div className="text-secondary text-[10px]">
                             {/* monitor-lost wakes report a terminated watcher, not a match */}
                             {proc.monitor.pendingWakeKind === "match"
-                              ? " · match found — waking agent…"
-                              : " · monitor lost — waking agent…"}
-                          </span>
+                              ? "match found — waking agent…"
+                              : "monitor lost — waking agent…"}
+                          </div>
                         )}
-                      </div>
+                      </>
                     )}
                     {/* Rows synthesized from a durable pending wake (process gone after
                         restart) carry no real pid. */}
