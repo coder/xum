@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import math
 import os
-import secrets
 import shlex
 import tarfile
 import time
@@ -239,7 +239,6 @@ class MuxAgent(BaseInstalledAgent):
     _DEFAULT_RUN_LOG_DIR = "/logs/agent/command-0"
     _RUN_EXIT_CODE_NAME = "mux-run-exit-code.txt"
     _DEFAULT_RUN_SESSION_ROOT = "/tmp/mux-run-root"
-    _SESSIONS_ARCHIVE_SANDBOX_PREFIX = "/tmp/mux-sessions-"
     _SESSIONS_ARCHIVE_NAME = "mux-sessions.tar.gz"
     _SESSION_USAGE_SUMMARY_NAME = "mux-session-usage.json"
     # Telemetry collection bounds: dataset-controlled trials must not be able to
@@ -517,19 +516,16 @@ class MuxAgent(BaseInstalledAgent):
         ).strip() or self._DEFAULT_RUN_SESSION_ROOT
         archive_path = self.logs_dir / self._SESSIONS_ARCHIVE_NAME
         archive_path.unlink(missing_ok=True)
-        sandbox_archive_path = (
-            f"{self._SESSIONS_ARCHIVE_SANDBOX_PREFIX}{secrets.token_hex(8)}.tar.gz"
-        )
-        # Archive only the known telemetry files (not arbitrary session content a
-        # task could plant) and report the archive size for the download bound.
+        stream_limit = self._SESSIONS_ARCHIVE_MAX_BYTES + 1
+        # Stream only known telemetry files and cap raw archive bytes before
+        # base64 expansion so sandbox tasks cannot inflate the host transfer.
         script = (
-            "set -o pipefail\n"
             f"cd {shlex.quote(session_root)} || exit 1\n"
             "find . -type f \\( -name chat.jsonl -o -name chat-archive.jsonl "
             "-o -name session-usage.json -o -name run-stdout.jsonl "
             "-o -name run-stderr.log -o -name mux-tokens.json \\) -print0 "
-            f"| tar --null -czf {sandbox_archive_path} -T - || exit 1\n"
-            f"stat -c %s {sandbox_archive_path}\n"
+            "2>/dev/null | tar --null -czf - -T - 2>/dev/null "
+            f"| head -c {stream_limit} | base64 -w0\n"
         )
         # Telemetry collection is best-effort, but silent failures cost a full
         # benchmark run to notice: record every outcome to a diagnostic log.
@@ -549,35 +545,24 @@ class MuxAgent(BaseInstalledAgent):
                 user="root",
                 timeout_sec=120,
             )
+            encoded_archive = result.stdout or ""
             _diag(
                 f"archive exec rc={result.return_code} "
-                f"stdout={(result.stdout or '')[-500:]!r} "
+                f"encoded_bytes={len(encoded_archive.encode())} "
                 f"stderr={(result.stderr or '')[-500:]!r}"
             )
             if result.return_code != 0:
                 return  # Sessions dir may not exist if the agent crashed early
             try:
-                archive_bytes = int((result.stdout or "").strip().splitlines()[-1])
-            except (ValueError, IndexError):
-                _diag("archive size parse failed")
+                archive_data = base64.b64decode(encoded_archive, validate=True)
+            except Exception:
+                _diag("archive decode failed")
                 return
-            if archive_bytes > self._SESSIONS_ARCHIVE_MAX_BYTES:
-                _diag(f"archive too large: {archive_bytes} bytes")
+            if len(archive_data) > self._SESSIONS_ARCHIVE_MAX_BYTES:
+                _diag(f"streamed archive too large: {len(archive_data)} bytes")
                 return
-            await environment.download_file(sandbox_archive_path, archive_path)
-            local_archive_bytes = archive_path.stat().st_size
-            if (
-                local_archive_bytes > self._SESSIONS_ARCHIVE_MAX_BYTES
-                or local_archive_bytes > archive_bytes
-            ):
-                _diag(
-                    "downloaded archive too large: "
-                    f"local={local_archive_bytes} reported={archive_bytes} "
-                    f"limit={self._SESSIONS_ARCHIVE_MAX_BYTES}"
-                )
-                archive_path.unlink(missing_ok=True)
-                return
-            _diag(f"downloaded {local_archive_bytes} bytes")
+            archive_path.write_bytes(archive_data)
+            _diag(f"streamed {len(archive_data)} bytes")
         except Exception as exc:
             _diag(f"collection failed: {type(exc).__name__}: {exc}")
             archive_path.unlink(missing_ok=True)
@@ -590,6 +575,22 @@ class MuxAgent(BaseInstalledAgent):
             return value >= 0 and math.isfinite(value)
         except OverflowError:
             return False
+
+    @classmethod
+    def _has_usable_session_usage(cls, data: dict[str, Any]) -> bool:
+        by_model = data.get("byModel")
+        if not isinstance(by_model, dict):
+            return False
+        for usage in by_model.values():
+            if not isinstance(usage, dict):
+                continue
+            for bucket in ("input", "output", "reasoning", "cached", "cacheCreate"):
+                component = usage.get(bucket)
+                if not isinstance(component, dict):
+                    continue
+                if cls._is_valid_usage_number(component.get("tokens")):
+                    return True
+        return False
 
     def _summarize_session_usage(self) -> dict[str, Any] | None:
         """Aggregate token/cost buckets from session-usage.json files in the archive.
@@ -640,11 +641,15 @@ class MuxAgent(BaseInstalledAgent):
                         continue
                     session_id = parts[-2]
                     per_session[session_id] = data
-                    rolled_up = data.get("rolledUpFrom")
-                    if isinstance(rolled_up, dict):
-                        rolled_up_ids.update(rolled_up.keys())
         except Exception:
             return None  # Corrupt/partial archive — telemetry stays best-effort
+
+        for data in per_session.values():
+            if not self._has_usable_session_usage(data):
+                continue
+            rolled_up = data.get("rolledUpFrom")
+            if isinstance(rolled_up, dict):
+                rolled_up_ids.update(rolled_up.keys())
 
         totals: dict[str, Any] = {
             "input": 0,
@@ -711,7 +716,7 @@ class MuxAgent(BaseInstalledAgent):
     def populate_context_post_run(self, context: AgentContext) -> None:
         """Extract token usage and cost from the collected telemetry artifacts.
 
-        Prefers mux-tokens.json when it carries cost (the run-complete event was
+        Prefers mux-tokens.json when it carries valid cost (the run-complete event was
         observed); otherwise falls back to session-usage.json totals from the
         downloaded sessions archive, which survive stdout truncation and agent
         timeouts.
@@ -739,8 +744,11 @@ class MuxAgent(BaseInstalledAgent):
                 pass
 
         data: dict[str, Any] | None
-        if token_data is not None and token_data.get("cost_usd") is not None:
+        token_cost = token_data.get("cost_usd") if token_data is not None else None
+        if token_data is not None and self._is_valid_usage_number(token_cost):
             data = token_data
+        elif token_cost is not None and session_totals is not None:
+            data = session_totals
         elif session_totals is not None and (
             token_data is None
             or self._total_tokens(session_totals) >= self._total_tokens(token_data)
@@ -775,7 +783,8 @@ class MuxAgent(BaseInstalledAgent):
                 output_tokens if self._is_valid_usage_number(output_tokens) else 0
             )
             # cost_usd is computed by mux from model pricing
-            if data.get("cost_usd") is not None:
-                context.cost_usd = data["cost_usd"]
+            cost_usd = data.get("cost_usd")
+            if self._is_valid_usage_number(cost_usd):
+                context.cost_usd = cost_usd
         except Exception:
             pass  # Token/cost extraction is best-effort

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json
 import os
@@ -295,16 +296,13 @@ class _FakeEnvironment:
         command_dir: Path | None = None,
         delay_sec: float = 0,
         session_archive: bytes | None = None,
-        session_archive_reported_bytes: int | None = None,
         runner_exit_code: str | None = None,
     ) -> None:
         self.result = result
         self.command_dir = command_dir
         self.delay_sec = delay_sec
         self.session_archive = session_archive
-        self.session_archive_reported_bytes = session_archive_reported_bytes
         self.runner_exit_code = runner_exit_code
-        self.session_archive_source_path: str | None = None
         self.exec_commands: list[str] = []
         self.download_attempts: list[tuple[str, Path]] = []
 
@@ -312,21 +310,14 @@ class _FakeEnvironment:
         command = _kwargs.get("command")
         if isinstance(command, str):
             self.exec_commands.append(command)
-        archive_match = (
-            re.search(r"/tmp/mux-sessions-[0-9a-f]{16}\.tar\.gz", command)
-            if isinstance(command, str)
-            else None
-        )
-        if archive_match is not None:
-            self.session_archive_source_path = archive_match.group(0)
-            # Sessions-archive step: succeed only when the fake has one staged,
-            # reporting the archive size like the in-sandbox stat call does.
+        if isinstance(command, str) and "tar --null -czf - -T -" in command:
             if self.session_archive is None:
                 return _ExecResult(return_code=1)
-            archive_bytes = self.session_archive_reported_bytes
-            if archive_bytes is None:
-                archive_bytes = len(self.session_archive)
-            return _ExecResult(return_code=0, stdout=f"{archive_bytes}\n")
+            cap_match = re.search(r"head -c (\d+)", command)
+            assert cap_match is not None
+            archive_cap = int(cap_match.group(1))
+            encoded = base64.b64encode(self.session_archive[:archive_cap]).decode()
+            return _ExecResult(return_code=0, stdout=encoded)
         timeout_sec = _kwargs.get("timeout_sec")
         if self.delay_sec:
             if isinstance(timeout_sec, (int, float)) and timeout_sec < self.delay_sec:
@@ -344,10 +335,6 @@ class _FakeEnvironment:
 
     async def download_file(self, source_path: str, target_path: Path) -> None:
         self.download_attempts.append((source_path, target_path))
-        if source_path == self.session_archive_source_path:
-            assert self.session_archive is not None
-            target_path.write_bytes(self.session_archive)
-            return
         if source_path.endswith(f"/{MuxAgent._RUN_EXIT_CODE_NAME}"):
             if self.runner_exit_code is None:
                 raise FileNotFoundError(source_path)
@@ -616,7 +603,7 @@ def _usage_display(
     }
 
 
-def test_run_downloads_session_archive(
+def test_run_streams_session_archive_through_byte_cap(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
@@ -629,10 +616,14 @@ def test_run_downloads_session_archive(
 
     asyncio.run(agent.run("do the task", environment, context))
 
-    tar_commands = [c for c in environment.exec_commands if "/tmp/mux-sessions-" in c]
+    tar_commands = [
+        command
+        for command in environment.exec_commands
+        if "tar --null -czf - -T -" in command
+    ]
     assert len(tar_commands) == 1
-    # Only the known telemetry files are archived, from the run session root.
     assert "cd /tmp/mux-run-root" in tar_commands[0]
+    assert f"head -c {agent._SESSIONS_ARCHIVE_MAX_BYTES + 1}" in tar_commands[0]
     for expected in (
         "chat.jsonl",
         "chat-archive.jsonl",
@@ -642,12 +633,10 @@ def test_run_downloads_session_archive(
         "mux-tokens.json",
     ):
         assert expected in tar_commands[0]
-    assert environment.session_archive_source_path is not None
-    assert environment.session_archive_source_path.startswith("/tmp/mux-sessions-")
-    assert (
-        environment.session_archive_source_path,
-        tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME,
-    ) in environment.download_attempts
+    assert all(
+        not source_path.startswith("/tmp/mux-sessions-")
+        for source_path, _ in environment.download_attempts
+    )
     assert (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).is_file()
     summary = json.loads((tmp_path / MuxAgent._SESSION_USAGE_SUMMARY_NAME).read_text())
     assert summary == {
@@ -659,7 +648,6 @@ def test_run_downloads_session_archive(
         "cost_usd": pytest.approx(0.15),
         "sessions": 1,
     }
-    # mux-tokens.json carries cost, so it keeps precedence over session totals.
     assert getattr(context, "cost_usd") == 0.42
     assert getattr(context, "n_input_tokens") == 15
 
@@ -703,28 +691,7 @@ def test_populate_context_uses_session_usage_when_token_file_missing(
     assert not hasattr(context, "cost_usd")
 
 
-def test_run_skips_oversized_session_archive(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
-    monkeypatch.setattr(MuxAgent, "_SESSIONS_ARCHIVE_MAX_BYTES", 1)
-    agent = MuxAgent(logs_dir=tmp_path)
-    environment = _FakeEnvironment(
-        _ExecResult(return_code=0, stdout="out", stderr="err"),
-        session_archive=_sessions_archive_bytes({"ws-main": _usage_display()}),
-    )
-    context = SimpleNamespace()
-
-    asyncio.run(agent.run("do the task", environment, context))
-
-    assert not (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).exists()
-    assert all(
-        not source_path.startswith("/tmp/mux-sessions-")
-        for source_path, _ in environment.download_attempts
-    )
-
-
-def test_run_discards_oversized_archive_after_download(
+def test_run_rejects_oversized_streamed_session_archive(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
@@ -734,19 +701,17 @@ def test_run_discards_oversized_archive_after_download(
     environment = _FakeEnvironment(
         _ExecResult(return_code=0),
         session_archive=archive,
-        session_archive_reported_bytes=1,
     )
 
     asyncio.run(agent.run("do the task", environment, SimpleNamespace()))
 
-    assert environment.session_archive_source_path is not None
-    assert (
-        environment.session_archive_source_path,
-        tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME,
-    ) in environment.download_attempts
     assert not (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).exists()
+    assert all(
+        not source_path.startswith("/tmp/mux-sessions-")
+        for source_path, _ in environment.download_attempts
+    )
     diagnostic = (tmp_path / "mux-sessions-collect.log").read_text()
-    assert "downloaded archive too large" in diagnostic
+    assert "streamed archive too large" in diagnostic
 
 
 def test_populate_context_keeps_fresher_token_file_counts(
@@ -789,6 +754,44 @@ def test_populate_context_skips_non_finite_token_file_counts(
 
     assert getattr(context, "n_input_tokens") == 0
     assert getattr(context, "n_output_tokens") == 1000
+    assert not hasattr(context, "cost_usd")
+
+
+@pytest.mark.parametrize("cost_json", ["1e309", "-0.01", '"invalid"'])
+def test_populate_context_falls_back_from_invalid_stdout_cost(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cost_json: str
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    (tmp_path / "mux-tokens.json").write_text(
+        f'{{"input": 500, "output": 90, "cost_usd": {cost_json}}}'
+    )
+    (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).write_bytes(
+        _sessions_archive_bytes({"ws-main": _usage_display()})
+    )
+    context = SimpleNamespace()
+
+    agent.populate_context_post_run(context)
+
+    assert getattr(context, "n_input_tokens") == 115
+    assert getattr(context, "n_output_tokens") == 20
+    assert getattr(context, "cost_usd") == pytest.approx(0.15)
+
+
+def test_populate_context_leaves_invalid_stdout_cost_unset_without_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    (tmp_path / "mux-tokens.json").write_text(
+        '{"input": 7, "output": 11, "cost_usd": 1e309}'
+    )
+    context = SimpleNamespace()
+
+    agent.populate_context_post_run(context)
+
+    assert getattr(context, "n_input_tokens") == 7
+    assert getattr(context, "n_output_tokens") == 11
     assert not hasattr(context, "cost_usd")
 
 
@@ -910,6 +913,30 @@ def test_session_usage_skips_non_finite_cost_without_losing_valid_sessions(
     assert totals["sessions"] == 2
     assert totals["input"] == 14
     assert totals["cost_usd"] is None
+
+
+def test_session_usage_keeps_child_of_malformed_rollup_parent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    malformed_parent = {
+        "byModel": "corrupt",
+        "rolledUpFrom": {"ws-child": True},
+        "version": 1,
+    }
+    (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).write_bytes(
+        _sessions_archive_bytes(
+            {"ws-parent": malformed_parent, "ws-child": _usage_display()}
+        )
+    )
+
+    totals = agent._summarize_session_usage()
+
+    assert totals is not None
+    assert totals["sessions"] == 1
+    assert totals["input"] == 10
+    assert totals["cost_usd"] == pytest.approx(0.15)
 
 
 def test_session_usage_skips_rolled_up_children(
