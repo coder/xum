@@ -2070,6 +2070,13 @@ export class WorkspaceService extends EventEmitter {
     Promise<Set<string>>
   >();
   private readonly activeWorkflowRunIdsByWorkspace = new Map<string, Set<string>>();
+  // Workspaces where NONZERO workflow-run activity was actually observed
+  // (bootstrap probe, run-status event, or list read). This — not cache
+  // presence — is the zero-count tombstone signal: the activity list's own
+  // probe installs an (empty) cache for every scoped id, so cache existence
+  // would fabricate recency:0 entries for every idle config-known workspace
+  // from the second list on, re-bloating the payload this scoping trims.
+  private readonly workflowRunSeenWorkspaces = new Set<string>();
 
   // Debounce post-compaction metadata refreshes (file_edit_* can fire rapidly)
   private readonly postCompactionRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -3816,6 +3823,16 @@ export class WorkspaceService extends EventEmitter {
   }
 
   private async getActiveWorkflowRunIds(workspaceId: string): Promise<Set<string>> {
+    const activeRunIds = await this.resolveActiveWorkflowRunIds(workspaceId);
+    if (activeRunIds.size > 0) {
+      // A list- or event-delivered nonzero count is what makes a later zero
+      // meaningful as a tombstone (see workflowRunSeenWorkspaces).
+      this.workflowRunSeenWorkspaces.add(workspaceId);
+    }
+    return activeRunIds;
+  }
+
+  private async resolveActiveWorkflowRunIds(workspaceId: string): Promise<Set<string>> {
     assert(workspaceId.length > 0, "getActiveWorkflowRunIds requires workspaceId");
     // Bounded retry: evictWorkspaceActivityCaches (removal, or a tombstone
     // lifted for re-registration) can race an in-flight bootstrap. A waiter
@@ -3868,6 +3885,7 @@ export class WorkspaceService extends EventEmitter {
     const activeRunIds = await this.getActiveWorkflowRunIds(event.workspaceId);
     if (isActiveWorkflowRunStatus(event.status)) {
       activeRunIds.add(event.runId);
+      this.workflowRunSeenWorkspaces.add(event.workspaceId);
     } else {
       activeRunIds.delete(event.runId);
     }
@@ -12882,6 +12900,7 @@ export class WorkspaceService extends EventEmitter {
     this.activeWorkflowRunIdsByWorkspace.delete(workspaceId);
     this.activeWorkflowRunIdBootstrapsByWorkspace.delete(workspaceId);
     this.bashMonitorSeenWorkspaces.delete(workspaceId);
+    this.workflowRunSeenWorkspaces.delete(workspaceId);
   }
 
   /**
@@ -13043,6 +13062,9 @@ export class WorkspaceService extends EventEmitter {
           for (const workspaceId of this.bashMonitorSeenWorkspaces) {
             workspaceIds.add(workspaceId);
           }
+          for (const workspaceId of this.workflowRunSeenWorkspaces) {
+            workspaceIds.add(workspaceId);
+          }
         }
       }
 
@@ -13051,7 +13073,11 @@ export class WorkspaceService extends EventEmitter {
           workspaceIds,
           async (workspaceId): Promise<readonly [string, WorkspaceActivitySnapshot] | null> => {
             const snapshot = snapshots.get(workspaceId) ?? null;
-            const hadWorkflowActivityCache = this.activeWorkflowRunIdsByWorkspace.has(workspaceId);
+            // Nonzero-observation signal, NOT cache presence: the probe below
+            // installs an empty cache for every scoped id, which would turn
+            // every idle config-known workspace into a fabricated recency:0
+            // entry on the next list.
+            const hadWorkflowActivity = this.workflowRunSeenWorkspaces.has(workspaceId);
             // Bash-monitor counterpart of the workflow tombstone: a monitor that stopped
             // while the renderer was disconnected (or whose stop emit failed) must still
             // surface a zero-count entry here, otherwise the renderer's last-known
@@ -13071,7 +13097,7 @@ export class WorkspaceService extends EventEmitter {
             if (
               snapshot == null &&
               activeWorkflowRunCount === 0 &&
-              !hadWorkflowActivityCache &&
+              !hadWorkflowActivity &&
               activeBashMonitorCount === 0 &&
               !hadBashMonitorActivityCache
             ) {

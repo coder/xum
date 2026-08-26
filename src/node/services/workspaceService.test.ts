@@ -3213,6 +3213,43 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("repeat lists keep omitting idle workspaces after the first list installs caches", async () => {
+    // The first list's workflow probe installs an empty run cache for every
+    // scoped id. Cache initialization must not read as activity: treating it
+    // as the zero-count tombstone signal would emit a fabricated recency:0
+    // entry for every idle config-known workspace from the second list on,
+    // re-bloating exactly the payload this scoping trims.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "activity-scoping-idle";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+
+      const firstList = await workspaceService.getActivityList();
+      expect(firstList).not.toBeNull();
+      expect(firstList?.[workspaceId]).toBeUndefined();
+      const secondList = await workspaceService.getActivityList();
+      expect(secondList).not.toBeNull();
+      expect(secondList?.[workspaceId]).toBeUndefined();
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("first bootstrap reuses the prune's config enumeration for scoping", async () => {
     // getAllWorkspaceMetadata walks every workspace with per-workspace disk
     // probes; the latency-sensitive first bootstrap must not pay it twice.
