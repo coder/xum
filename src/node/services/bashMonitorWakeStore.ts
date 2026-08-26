@@ -790,12 +790,27 @@ export class BashMonitorWakeStore {
     for (const entry of entries) {
       const filePath = path.join(dir, entry);
       if (!entry.endsWith(".json")) {
+        const isPruneTrash = PRUNE_TRASH_SUFFIX_RE.test(entry);
+        const isTempWrite = TMP_WRITE_SUFFIX_RE.test(entry);
+        if (!isPruneTrash && !isTempWrite) continue;
+        // Non-regular artifact guard: recovery reads file contents, and readFile on a
+        // FIFO can block forever while EISDIR would fail every scan. ENOENT means a
+        // concurrent recover consumed it; transient stat failures propagate, matching
+        // the record-file policy above.
+        let artifactStat: Stats;
+        try {
+          artifactStat = await fsPromises.stat(filePath);
+        } catch (error) {
+          if (isErrnoWithCode(error, "ENOENT")) continue;
+          throw error;
+        }
+        if (!artifactStat.isFile()) continue;
         // A crash between pruneTerminalWakeFile's capture rename and its verify/restore
         // strands the captured inode as *.json.prune-*, and that inode may hold a
         // concurrently rewritten pending wake that neither scans nor delivery (both
         // address the original path) can see. Inspect stranded prune files and restore
         // pending content before any sweeping can touch it.
-        if (PRUNE_TRASH_SUFFIX_RE.test(entry)) {
+        if (isPruneTrash) {
           const rescued = await this.recoverStrandedPruneFile(
             ownerWorkspaceId,
             filePath,
@@ -805,19 +820,13 @@ export class BashMonitorWakeStore {
           continue;
         }
         // write() leaves *.json.tmp-* files behind only when the process crashed
-        // between writeFile and the commit rename. A COMPLETE temp record may then be
-        // the only durable copy of a wake (a brand-new wake has no canonical file at
-        // all), so orphan temps are parsed and restored rather than treated as
-        // disposable; incomplete ones sweep once old so crash leaks stay bounded.
-        if (TMP_WRITE_SUFFIX_RE.test(entry)) {
-          const rescued = await this.recoverOrphanTempFile(
-            ownerWorkspaceId,
-            filePath,
-            pruneBeforeMs
-          );
-          if (rescued != null) records.push(rescued);
-          continue;
-        }
+        // between writeFile and the commit rename (a rename failure observed by a live
+        // caller deletes its temp). A COMPLETE temp record may then be the only durable
+        // copy of a wake (a brand-new wake has no canonical file at all), so orphan
+        // temps are parsed and restored rather than treated as disposable; incomplete
+        // ones sweep once old so crash leaks stay bounded.
+        const rescued = await this.recoverOrphanTempFile(ownerWorkspaceId, filePath, pruneBeforeMs);
+        if (rescued != null) records.push(rescued);
         continue;
       }
       seen.add(entry);
@@ -933,6 +942,36 @@ export class BashMonitorWakeStore {
   }
 
   /**
+   * Like readRecordAt, but distinguishes an absent canonical file from a malformed one:
+   * recovery paths must quarantine malformed canonicals (or a valid stranded record is
+   * blocked forever) while treating absence as "safe to place". Transient errors throw.
+   */
+  private async readCanonicalState(
+    originalPath: string
+  ): Promise<
+    { kind: "absent" } | { kind: "malformed" } | { kind: "record"; record: BashMonitorWakeRecord }
+  > {
+    let raw: string;
+    try {
+      raw = await fsPromises.readFile(originalPath, "utf-8");
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT")) return { kind: "absent" };
+      throw error;
+    }
+    const record = this.parse(raw);
+    return record == null ? { kind: "malformed" } : { kind: "record", record };
+  }
+
+  /**
+   * Move a malformed canonical file aside as evidence. The suffix matches neither
+   * record nor trash/temp patterns, so quarantined files are never re-parsed or swept —
+   * the same keep-as-evidence policy applied to malformed files elsewhere.
+   */
+  private async quarantineMalformedCanonical(originalPath: string): Promise<void> {
+    await fsPromises.rename(originalPath, `${originalPath}.malformed-${randomUUID()}`);
+  }
+
+  /**
    * Best-effort lock key for a wake file name. Filenames are encodeURIComponent(id);
    * fall back to the raw stem for foreign files that do not round-trip (no writer
    * contends on those ids anyway).
@@ -1019,29 +1058,22 @@ export class BashMonitorWakeStore {
         // supersession: a strictly newer pending leftover atomically replaces the
         // canonical record; otherwise the canonical record wins and the leftover is
         // dropped below as superseded.
-        let canonicalRaw: string;
-        try {
-          canonicalRaw = await fsPromises.readFile(originalPath, "utf-8");
-        } catch (readError) {
-          if (isErrnoWithCode(readError, "ENOENT")) {
-            // Vanished between the failed link and this read: keep the leftover so a
-            // later scan retries with a settled canonical state.
-            return null;
-          }
-          throw readError;
+        const canonicalState = await this.readCanonicalState(originalPath);
+        if (canonicalState.kind === "absent") {
+          // Vanished between the failed link and this read: keep the leftover so a
+          // later scan retries with a settled canonical state.
+          return null;
         }
-        const canonical = this.parse(canonicalRaw);
-        if (canonical == null) {
+        if (canonicalState.kind === "malformed") {
           // A malformed canonical file would block this valid leftover FOREVER (every
           // scan repeats this dead end and the durable wake never delivers). Quarantine
-          // it aside as evidence — the suffix matches neither record nor trash/temp
-          // patterns, so it is never re-parsed or swept — and place the leftover.
+          // it aside as evidence and place the leftover.
           if (parsed.status !== "pending") {
             // Only a pending leftover justifies displacing evidence; terminal leftovers
             // wait for the age-gated sweep.
             return null;
           }
-          await fsPromises.rename(originalPath, `${originalPath}.malformed-${randomUUID()}`);
+          await this.quarantineMalformedCanonical(originalPath);
           try {
             await fsPromises.link(filePath, originalPath);
           } catch {
@@ -1051,6 +1083,7 @@ export class BashMonitorWakeStore {
           await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
           return parsed;
         }
+        const canonical = canonicalState.record;
         if (
           parsed.status === "pending" &&
           Date.parse(parsed.updatedAt) > Date.parse(canonical.updatedAt)
@@ -1087,37 +1120,84 @@ export class BashMonitorWakeStore {
     const marker = /^(.*\.json)\.tmp-[^.]+$/.exec(filePath);
     assert(marker != null, "recoverOrphanTempFile requires a *.json.tmp-* path");
     const originalPath = marker[1];
-    const stat = await fsPromises.stat(filePath).catch(() => null);
-    if (stat == null) return null; // vanished (live writer committed it)
-    if (stat.mtimeMs >= Date.now() - TEMP_RECOVERY_MIN_AGE_MS) {
-      // Possibly a live in-flight write: consuming it would make the writer's commit
-      // rename fail. Leave it; a crash orphan is revisited once it ages past the gate.
-      return null;
-    }
     const id = BashMonitorWakeStore.wakeIdFromFileStem(
       path.basename(originalPath).slice(0, -".json".length)
     );
     return this.locks.withLock(`${ownerWorkspaceId}:${id}`, async () => {
+      const stat = await fsPromises.stat(filePath).catch(() => null);
+      if (!stat?.isFile()) return null; // vanished (live writer committed) or non-regular
+      // Consuming (deleting) a fresh temp could break a LIVE writer whose commit rename
+      // is imminent; deletion therefore waits for this gate. Placement via link is safe
+      // at any age (see below), so freshness never delays making a wake visible.
+      const consumable = stat.mtimeMs < Date.now() - TEMP_RECOVERY_MIN_AGE_MS;
+      const old = stat.mtimeMs < pruneBeforeMs;
       const parsed = await this.readRecordAt(filePath);
       if (parsed == null) {
-        // Vanished, or an incomplete crashed write: disposable once old.
-        const leftoverStat = await fsPromises.stat(filePath).catch(() => null);
-        if (leftoverStat != null && leftoverStat.mtimeMs < pruneBeforeMs) {
-          await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
-        }
+        // Vanished, an incomplete crashed write, or a live writer mid-writeFile:
+        // disposable once old.
+        if (old) await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
         return null;
       }
-      const canonical = await this.readRecordAt(originalPath);
-      if (canonical == null) {
-        // No canonical record behind this complete write: place it (no-clobber; a
-        // malformed evidence file at the path simply keeps the temp for later).
+      const canonicalState = await this.readCanonicalState(originalPath);
+      if (canonicalState.kind !== "record") {
+        // The complete temp record may be the ONLY durable copy of this wake, and a
+        // restart within the freshness gate would otherwise leave it invisible with no
+        // re-drive (startup discovery succeeds empty and schedules nothing). Placing
+        // the SAME inode at the canonical path is exactly what the crashed commit
+        // rename would have done — and if the writer is alive after all, its rename of
+        // this inode onto the path becomes a harmless POSIX no-op. Fresh temp files are
+        // left in place for that possible live writer; consumable orphans are removed
+        // after placement. A malformed canonical is quarantined first (as evidence),
+        // or a valid pending temp would be blocked forever.
+        if (canonicalState.kind === "malformed") {
+          if (parsed.status !== "pending") return null; // evidence outranks stale terminals
+          await this.quarantineMalformedCanonical(originalPath);
+        }
         try {
           await fsPromises.link(filePath, originalPath);
         } catch {
-          return null;
+          return null; // claimed concurrently; re-reconcile next scan
         }
-        await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
+        if (consumable) {
+          await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
+        }
         return parsed.status === "pending" ? parsed : null;
+      }
+      const canonical = canonicalState.record;
+      if (!consumable) {
+        // Canonical record present and the temp may belong to a live in-flight write:
+        // the canonical record is authoritative until the temp ages past the gate.
+        return null;
+      }
+      if (
+        parsed.kind === "match" &&
+        parsed.status === "pending" &&
+        canonical.kind === "monitor-lost" &&
+        canonical.status !== "superseded"
+      ) {
+        // A crash stranded matched output, and restart recovery already wrote the
+        // monitor-lost notice for the same id BEFORE this temp was scanned — so the
+        // notice always carries the later updatedAt and a plain comparison would
+        // discard the matched lines forever. Mirror enqueueMonitorLost's upgrade
+        // instead: one pending record carrying both the lines and (when the notice is
+        // still undelivered) the lost-monitor marker. A superseded notice means the
+        // wake was canceled on purpose, so the stale lines die with it below.
+        const merged: BashMonitorWakeRecord =
+          canonical.status === "pending"
+            ? {
+                ...parsed,
+                kind: "monitor-lost",
+                ...(canonical.script != null ? { script: canonical.script } : {}),
+                updatedAt: new Date().toISOString(),
+              }
+            : {
+                // Notice already delivered: only the matched lines are still owed.
+                ...parsed,
+                updatedAt: new Date().toISOString(),
+              };
+        await this.write(merged);
+        await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
+        return merged;
       }
       if (Date.parse(parsed.updatedAt) > Date.parse(canonical.updatedAt)) {
         // The crashed write postdates the canonical record (an uncommitted merge or
@@ -1133,9 +1213,7 @@ export class BashMonitorWakeStore {
       }
       // Same-or-older than the canonical record: a stale uncommitted write, disposable
       // once old (the canonical record is authoritative).
-      if (stat.mtimeMs < pruneBeforeMs) {
-        await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
-      }
+      if (old) await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
       return null;
     });
   }
@@ -1183,10 +1261,12 @@ export class BashMonitorWakeStore {
       }
       throw error;
     }
-    const unchanged =
-      captured != null &&
-      captured.updatedAt === compared.updatedAt &&
-      captured.status === compared.status;
+    // Compare the FULL captured generation, not just timestamp and status: two
+    // instances updating within the same millisecond can produce a record with an
+    // identical updatedAt/status but different lines or counters, which must not be
+    // discarded as "unchanged". Both records come from the same zod schema, so key
+    // order — and therefore serialized equality — is deterministic.
+    const unchanged = captured != null && JSON.stringify(captured) === JSON.stringify(compared);
     if (!unchanged) {
       // The canonical record changed under us: restore it and keep the leftover.
       try {
@@ -1592,7 +1672,16 @@ export class BashMonitorWakeStore {
     const target = this.file(record.ownerWorkspaceId, record.id);
     const temp = `${target}.tmp-${randomUUID()}`;
     await fsPromises.writeFile(temp, JSON.stringify(record, null, 2), "utf-8");
-    await fsPromises.rename(temp, target);
+    try {
+      await fsPromises.rename(temp, target);
+    } catch (error) {
+      // The caller observes and reports this failure (e.g. a history clear returns an
+      // error and leaves the wake pending). The temp must not survive it: orphan-temp
+      // recovery would otherwise later "commit" an operation the caller was told never
+      // happened — silently canceling or rewriting the wake behind the caller's back.
+      await fsPromises.rm(temp, { force: true }).catch(() => undefined);
+      throw error;
+    }
     // Invalidate rather than update the classification cache: computing the new stat
     // signature here could race a concurrent rewrite by another instance and pair our
     // record with their signature. The next listPending re-reads this one file.
