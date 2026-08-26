@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/require-await */
 import * as crypto from "node:crypto";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { describe, expect, test } from "bun:test";
@@ -777,5 +778,54 @@ export default function workflow({ args }) {
         projectTrusted: false,
       })
     ).rejects.toThrow("Project trust is required");
+  });
+});
+
+describe("WorkflowService.getRunStatusForLiveness", () => {
+  test("maps only definitively-missing records to null and rethrows read failures", async () => {
+    using tmp = new DisposableTempDir("workflow-service-liveness");
+    const source = `export default function workflow() {
+  return { reportMarkdown: "done" };
+}
+`;
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    const service = new WorkflowService({
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        async runAgent() {
+          throw new Error("No agent steps expected");
+        },
+      },
+      generateRunId: () => "wfr_liveness",
+      runnerId: "runner-liveness",
+    });
+    await service.startWorkflow({
+      script: createScript(source),
+      workspaceId: "workspace-1",
+      projectTrusted: true,
+      args: {},
+    });
+
+    // Existing record: real status.
+    expect(
+      await service.getRunStatusForLiveness({ workspaceId: "workspace-1", runId: "wfr_liveness" })
+    ).toBe("completed");
+    // Definitively missing record / wrong owner: null (settled for that ref).
+    expect(
+      await service.getRunStatusForLiveness({ workspaceId: "workspace-1", runId: "wfr_absent" })
+    ).toBeNull();
+    expect(
+      await service.getRunStatusForLiveness({ workspaceId: "workspace-2", runId: "wfr_liveness" })
+    ).toBeNull();
+
+    // A transient read/parse failure must propagate (callers retry) instead of
+    // masquerading as a missing record — unlike getRun(), which maps it to null.
+    const runFile = path.join(tmp.path, "workflows", "wfr_liveness", "run.json");
+    await fs.writeFile(runFile, "{ not json", "utf-8");
+    await expect(
+      service.getRunStatusForLiveness({ workspaceId: "workspace-1", runId: "wfr_liveness" })
+    ).rejects.toThrow();
+    expect(await service.getRun({ workspaceId: "workspace-1", runId: "wfr_liveness" })).toBeNull();
   });
 });

@@ -1985,8 +1985,9 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) => {
           // Bulk nested-run liveness for the sub-agent tray: one renderer round trip
           // covers all candidates (owners may differ, so contexts resolve per owner).
-          // A ref whose context/read rejects is omitted so callers can distinguish
-          // transient failures from a definitively missing durable record.
+          // A ref whose context resolution or read rejects is omitted (transient);
+          // the liveness read maps only a definitively-missing durable record to a
+          // null status, so callers can tell "gone" from "retry later".
           const contexts = new Map<string, ReturnType<typeof resolveWorkflowContext>>();
           const resolveFor = (workspaceId: string) => {
             let resolved = contexts.get(workspaceId);
@@ -2000,11 +2001,11 @@ export const router = (authToken?: string) => {
             input.runs.map(async (ref) => {
               try {
                 const { service } = await resolveFor(ref.workspaceId);
-                const run = await service.getRun({
+                const status = await service.getRunStatusForLiveness({
                   workspaceId: ref.workspaceId,
                   runId: ref.runId,
                 });
-                return { runId: ref.runId, status: run?.status ?? null };
+                return { runId: ref.runId, status };
               } catch {
                 return null;
               }

@@ -4138,6 +4138,72 @@ describe("WorkspaceStore", () => {
       expect(authoritative).toBe(true);
       expect(store.getWorkspaceState(workspaceId).canInterrupt).toBe(true);
     });
+
+    it("resyncs after a reconnect bootstrap failure even when authority is already latched", async () => {
+      const workspaceId = "activity-reconnect-null-bootstrap";
+      const initialRecency = new Date("2024-01-07T00:00:00.000Z").getTime();
+      const snapshot: WorkspaceActivitySnapshot = {
+        recency: initialRecency,
+        streaming: true,
+        lastModel: "claude-sonnet-4",
+        lastThinkingLevel: "high",
+      };
+
+      resetStore();
+
+      let listCallCount = 0;
+      mockActivityList.mockImplementation(
+        (): Promise<Record<string, WorkspaceActivitySnapshot> | null> => {
+          listCallCount += 1;
+          if (listCallCount === 1) {
+            // First connection: authority latches.
+            return Promise.resolve({ [workspaceId]: snapshot });
+          }
+          if (listCallCount === 2) {
+            // Reconnect bootstrap: transient read failure.
+            return Promise.resolve(null);
+          }
+          // Reconnect retry: the workspace went idle while disconnected. The
+          // fresh subscription never replays this, so only the retry can resync.
+          return Promise.resolve({});
+        }
+      );
+
+      // eslint-disable-next-line require-yield
+      mockActivitySubscribe.mockImplementation(async function* (
+        _input?: void,
+        options?: { signal?: AbortSignal }
+      ): AsyncGenerator<WorkspaceActivityEvent, void, unknown> {
+        await waitForAbortSignal(options?.signal);
+      });
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
+      createAndAddWorkspace(
+        store,
+        workspaceId,
+        {
+          createdAt: "2020-01-01T00:00:00.000Z",
+        },
+        false
+      );
+
+      const seeded = await waitUntil(() => {
+        const state = store.getWorkspaceState(workspaceId);
+        return state.canInterrupt === true && store.isActivityAuthoritative();
+      });
+      expect(seeded).toBe(true);
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
+
+      const resynced = await waitUntil(
+        () => store.getWorkspaceState(workspaceId).canInterrupt === false,
+        5000
+      );
+      expect(resynced).toBe(true);
+      expect(listCallCount).toBeGreaterThanOrEqual(3);
+    });
   });
 
   describe("terminal activity", () => {

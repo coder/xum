@@ -3741,11 +3741,15 @@ export class WorkspaceStore {
 
   /**
    * Bootstrap repair for a null (read-failure) activity list: retries list()
-   * with the subscription backoff until a real list applies, authority was
-   * gained elsewhere (e.g. a reconnect attempt's own bootstrap), or the owning
-   * attempt/store aborts. Runs concurrently with the live delta stream, so
-   * workspaces that receive a delta while a read is in flight are skipped when
-   * the (older) response applies. Never throws, so callers may fire-and-forget.
+   * with the subscription backoff until a real list applies for this attempt or
+   * the owning attempt/store aborts. Deliberately NOT gated on the store-lifetime
+   * activityAuthoritative latch: after a reconnect, the fresh subscription does
+   * not replay state that changed while disconnected, so the reconnect attempt's
+   * failed bootstrap still needs its own successful list to resync (a stale
+   * attempt's retry is stopped by its attemptSignal instead). Runs concurrently
+   * with the live delta stream, so workspaces that receive a delta while a read
+   * is in flight are skipped when the (older) response applies. Never throws, so
+   * callers may fire-and-forget.
    */
   private async retryActivityBootstrapList(
     client: RouterClient<AppRouter>,
@@ -3753,39 +3757,46 @@ export class WorkspaceStore {
     attemptSignal: AbortSignal
   ): Promise<void> {
     let attempt = 0;
-    while (!signal.aborted && !attemptSignal.aborted && !this.activityAuthoritative) {
+    while (!signal.aborted && !attemptSignal.aborted) {
       await this.sleepWithAbort(calculateSubscriptionBackoffMs(attempt), signal);
       attempt++;
-      if (signal.aborted || attemptSignal.aborted || this.activityAuthoritative) {
+      if (signal.aborted || attemptSignal.aborted) {
         return;
       }
       // Live deltas that land while this read is in flight are newer than the
       // response and must win: record them so the apply below skips their ids.
-      this.activityDeltaTouchesDuringRetry = new Set();
+      const deltaTracker = new Set<string>();
+      this.activityDeltaTouchesDuringRetry = deltaTracker;
+      // Identity-guarded: a newer attempt's retry may have installed its own
+      // tracker while this stale read was still pending — never clear that one.
+      const releaseTracker = () => {
+        if (this.activityDeltaTouchesDuringRetry === deltaTracker) {
+          this.activityDeltaTouchesDuringRetry = null;
+        }
+      };
       let snapshots: Record<string, WorkspaceActivitySnapshot> | null = null;
       try {
         snapshots = await client.workspace.activity.list();
       } catch {
         // Transient transport failure: keep retrying; terminal subscription
         // failures are owned by the outer attempt loop.
-        this.activityDeltaTouchesDuringRetry = null;
+        releaseTracker();
         continue;
       }
       if (snapshots == null) {
-        this.activityDeltaTouchesDuringRetry = null;
+        releaseTracker();
         continue;
       }
       const appliedSnapshots = snapshots;
-      const deltaTouches = this.activityDeltaTouchesDuringRetry;
       queueMicrotask(() => {
-        // Cleared inside the microtask so delta microtasks already queued ahead
+        // Released inside the microtask so delta microtasks already queued ahead
         // of it still register; deltas queued after it run later and overwrite
         // the list values anyway (newest wins in both directions).
-        this.activityDeltaTouchesDuringRetry = null;
+        releaseTracker();
         if (signal.aborted || attemptSignal.aborted) {
           return;
         }
-        this.applyWorkspaceActivityList(appliedSnapshots, deltaTouches);
+        this.applyWorkspaceActivityList(appliedSnapshots, deltaTracker);
         this.markActivityHydrated(true);
       });
       return;

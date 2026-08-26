@@ -11,6 +11,7 @@ import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWor
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { getWorkflowCheckpointRetryEligibility } from "@/common/utils/workflowRetryEligibility";
+import { isErrnoWithCode } from "@/node/utils/fs";
 import { log } from "@/node/services/log";
 import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
 import { WORKFLOW_RUN_TASK_ID_PREFIX } from "@/node/services/tools/taskId";
@@ -218,6 +219,33 @@ export class WorkflowService {
       return run.workspaceId === input.workspaceId ? run : null;
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * Liveness read for the bulk run-status endpoint. Unlike getRun(), which maps
+   * every storage failure to null, only a definitively-missing record (ENOENT /
+   * ENOTDIR anywhere in the run's read path, or a workspace mismatch) maps to
+   * null here; transient read/parse failures propagate so callers can treat
+   * them as retryable instead of as a settled/missing run.
+   */
+  async getRunStatusForLiveness(input: {
+    workspaceId: string;
+    runId: string;
+  }): Promise<WorkflowRunStatus | null> {
+    assert(
+      input.workspaceId.length > 0,
+      "WorkflowService.getRunStatusForLiveness: workspaceId is required"
+    );
+    assert(input.runId.length > 0, "WorkflowService.getRunStatusForLiveness: runId is required");
+    try {
+      const run = await this.runStore.getRun(input.runId);
+      return run.workspaceId === input.workspaceId ? run.status : null;
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) {
+        return null;
+      }
+      throw error;
     }
   }
 
