@@ -1934,6 +1934,10 @@ export class WorkspaceService extends EventEmitter {
   // Explicit cancellation is a tombstone for late monitor-match handlers and queued wakes. It is
   // cleared when the same process ID is re-armed, which can happen after workspace cleanup.
   private readonly canceledBashMonitorKeys = new Set<string>();
+  // Settlement wakes whose wake-store write failed: the stopped listener consumes this to retain
+  // the armed-registry row as the restart-recovery breadcrumb (see handleBashMonitorMatch).
+  // Cleared on re-arm so a stale flag cannot retain a later generation's registry row.
+  private readonly failedBashSettlementPersistKeys = new Set<string>();
   private readonly queuedBashMonitorWakeKeysByProcess = new Map<
     string,
     Map<string, QueuedBashMonitorWakeCancellation>
@@ -2005,6 +2009,9 @@ export class WorkspaceService extends EventEmitter {
             this.canceledBashMonitorKeys.delete(
               this.bashMonitorProcessKey(payload.workspaceId, payload.processId)
             );
+            this.failedBashSettlementPersistKeys.delete(
+              this.bashMonitorProcessKey(payload.workspaceId, payload.processId)
+            );
             await this.bashMonitorRegistryStore.upsert(payload);
             await this.bashMonitorWakeStore.supersedePendingMonitorLost(
               payload.workspaceId,
@@ -2063,6 +2070,17 @@ export class WorkspaceService extends EventEmitter {
     this.bashMonitorHistoryLocks
       .withLock(workspaceId, () =>
         this.bashMonitorRegistryLocks.withLock(`${workspaceId}:${payload.processId}`, async () => {
+          // Consume the persist-failure flag under the lock (it is set inside the match
+          // handler's locked block, which this block queues behind). When the settlement wake
+          // failed to persist, the armed-registry row is the only remaining breadcrumb: retain
+          // it so restart recovery converts it into a monitor-lost wake instead of the
+          // settlement vanishing with neither a pending wake nor a registry record.
+          const settlementPersistFailed = this.failedBashSettlementPersistKeys.delete(
+            this.bashMonitorProcessKey(workspaceId, payload.processId)
+          );
+          if (settlementPersistFailed && payload.reason === "completed") {
+            return;
+          }
           await this.bashMonitorRegistryStore.remove(workspaceId, payload.processId);
           if (payload.reason === "canceled" && (trackedWakeCancellations?.size ?? 0) === 0) {
             // With no queued/preparing dispatch, cancellation can retire the wake directly.
@@ -2562,7 +2580,20 @@ export class WorkspaceService extends EventEmitter {
         this.bashMonitorRegistryLocks.withLock(processKey, async () => {
           if (this.canceledBashMonitorKeys.has(processKey)) return;
 
-          await this.bashMonitorWakeStore.enqueueOrMergePending(payload);
+          try {
+            await this.bashMonitorWakeStore.enqueueOrMergePending(payload);
+          } catch (error) {
+            if (payload.terminal != null) {
+              // The settlement wake was never persisted, and the monitor's retirement (queued
+              // behind this handler on the same locks) is about to delete the armed-registry
+              // row — losing BOTH the durable wake and the restart-recovery breadcrumb. Flag
+              // the failure INSIDE the locked block so the stopped listener reliably sees it
+              // and retains the registry row; startup recovery then converts that row into a
+              // monitor-lost wake instead of silence.
+              this.failedBashSettlementPersistKeys.add(processKey);
+            }
+            throw error;
+          }
           this.scheduleBashMonitorWakeDrain(payload.workspaceId);
         })
       );

@@ -1575,6 +1575,93 @@ describe("WorkspaceService bash monitor wakes", () => {
     }
   });
 
+  test("a failed settlement persist retains the registry row for restart recovery", async () => {
+    // If the wake-store write fails, the settlement retirement (queued behind the match handler
+    // on the same locks) would otherwise delete the armed-registry row too — losing both the
+    // durable wake and the restart-recovery breadcrumb, so the owner never learns the process
+    // settled.
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-persist-failure";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockResolvedValue(Ok(undefined));
+      const wakeStore = (
+        workspaceService as unknown as { bashMonitorWakeStore: BashMonitorWakeStore }
+      ).bashMonitorWakeStore;
+      const enqueueSpy = spyOn(wakeStore, "enqueueOrMergePending").mockImplementation(() =>
+        Promise.reject(new Error("injected wake-store write failure"))
+      );
+      const registryStore = new BashMonitorRegistryStore(config);
+
+      backgroundProcessManager.emit("monitor:armed", workspaceId, {
+        processId: "proc-persist-fail",
+        taskId: "bash:proc-persist-fail",
+        workspaceId,
+        filter: "READY",
+        filterExclude: false,
+        script: "watch.sh",
+        createdAt: new Date().toISOString(),
+      });
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-persist-fail",
+        taskId: "bash:proc-persist-fail",
+        workspaceId,
+        filter: "READY",
+        filterExclude: false,
+        lines: ["[monitor] process settled: exited (code 1)"],
+        totalMatches: 0,
+        timestamp: Date.now(),
+        terminal: { status: "exited", exitCode: 1 },
+      });
+      backgroundProcessManager.emit("monitor:stopped", workspaceId, {
+        processId: "proc-persist-fail",
+        reason: "completed",
+      });
+
+      await waitForCondition(() => enqueueSpy.mock.calls.length === 1);
+      // All three listener chains serialize on the per-workspace history lock; a probe queued
+      // behind them resolves only after the stopped listener finished its retention decision.
+      await (
+        workspaceService as unknown as {
+          bashMonitorHistoryLocks: {
+            withLock: (key: string, fn: () => Promise<void>) => Promise<void>;
+          };
+        }
+      ).bashMonitorHistoryLocks.withLock(workspaceId, () => Promise.resolve());
+
+      // The registry row survives as the restart-recovery breadcrumb (the next boot converts it
+      // into a monitor-lost wake), and no wake turn was sent for the lost settlement.
+      expect(await registryStore.listAll(workspaceId)).toHaveLength(1);
+      expect(sendSpy).not.toHaveBeenCalled();
+
+      // The flag is one-shot: a later stop without a persist failure retires the row normally.
+      backgroundProcessManager.emit("monitor:stopped", workspaceId, {
+        processId: "proc-persist-fail",
+        reason: "completed",
+      });
+      await waitForCondition(async () => (await registryStore.listAll(workspaceId)).length === 0);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("converts stale armed-monitor registry records into monitor-lost wakes at startup", async () => {
     const { config, cleanup } = await createTestHistoryService();
     try {
