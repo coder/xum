@@ -749,6 +749,77 @@ describe("BashMonitorWakeStore", () => {
     expect(pending.map((r) => r.lines).sort()).toEqual([["ERROR deferred"], ["ERROR visible"]]);
   });
 
+  test("a failed clear's rollback preserves the previous clear's tombstone", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    // A deferred pre-clear temp, invisible to the first clear's scan.
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR retired"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const temp = path.join(dir, "proc-1.json.tmp-crashed");
+    await fsPromises.rename(path.join(dir, "proc-1.json"), temp);
+    const nearGate = new Date(Date.now() - TEMP_RECOVERY_MIN_AGE_MS + 100);
+    await fsPromises.utimes(temp, nearGate, nearGate);
+    // Clear #1 commits, permanently retiring the deferred wake via its tombstone.
+    expect(await store.supersedeAllPending("owner-1")).toEqual([]);
+
+    // Clear #2 supersedes new output but then fails and is rolled back. The rollback
+    // must demote to clear #1's tombstone, not delete the file wholesale — otherwise
+    // the wake clear #1 permanently retired becomes deliverable again.
+    await store.enqueueOrMergePending(
+      payload({ processId: "proc-2", taskId: "bash:proc-2", lines: ["ERROR second"] })
+    );
+    const snapshots = await store.supersedeAllPending("owner-1");
+    expect(snapshots.map((r) => r.id)).toEqual(["proc-2"]);
+    await store.restorePendingSnapshots("owner-1", snapshots);
+
+    // Past the gate, recovery must still condemn the pre-clear-#1 temp.
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(temp, past, past);
+    const pending = await store.listPending("owner-1");
+    expect(pending.map((r) => r.lines)).toEqual([["ERROR second"]]);
+    expect(await store.get("owner-1", "proc-1")).toBeNull();
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
+  });
+
+  test("a failed supersede loop never demotes the standing tombstone", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR retired"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const temp = path.join(dir, "proc-1.json.tmp-crashed");
+    await fsPromises.rename(path.join(dir, "proc-1.json"), temp);
+    const nearGate = new Date(Date.now() - TEMP_RECOVERY_MIN_AGE_MS + 100);
+    await fsPromises.utimes(temp, nearGate, nearGate);
+    // Clear #1 commits its tombstone.
+    expect(await store.supersedeAllPending("owner-1")).toEqual([]);
+
+    // Clear #2 fails DURING the supersede loop — before its own tombstone was ever
+    // written. Its internal rollback must not demote clear #1's standing tombstone.
+    await store.enqueueOrMergePending(
+      payload({ processId: "proc-2", taskId: "bash:proc-2", lines: ["ERROR second"] })
+    );
+    const realRename = fsPromises.rename;
+    const renameSpy = spyOn(fsPromises, "rename").mockImplementation((from, to) =>
+      String(to).endsWith("proc-2.json")
+        ? Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
+        : realRename(from, to)
+    );
+    try {
+      await store.supersedeAllPending("owner-1");
+      expect.unreachable("expected supersedeAllPending to propagate the loop failure");
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("EIO");
+    } finally {
+      renameSpy.mockRestore();
+    }
+
+    // Clear #1's protection survived: the pre-clear-#1 temp stays condemned while the
+    // never-retired new wake stays pending.
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(temp, past, past);
+    const pending = await store.listPending("owner-1");
+    expect(pending.map((r) => r.lines)).toEqual([["ERROR second"]]);
+    expect(await store.get("owner-1", "proc-1")).toBeNull();
+  });
+
   test("deferred recovery delays are bounded for corrupt or future mtimes", () => {
     const now = Date.now();
     // Near the gate: fires just past it (epsilon), no spurious full-interval wait.

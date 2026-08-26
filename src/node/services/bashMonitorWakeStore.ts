@@ -605,16 +605,70 @@ export class BashMonitorWakeStore {
   private async writeClearedAt(ownerWorkspaceId: string, clearedAt: string): Promise<void> {
     const target = this.clearedAtFile(ownerWorkspaceId);
     await fsPromises.mkdir(path.dirname(target), { recursive: true });
+    // Carry the value being replaced: a ROLLBACK of this clear must restore the prior
+    // tombstone rather than deleting the file wholesale, or an older successful
+    // clear's protection would die with a newer failed one and let a pre-old-clear
+    // temp deliver permanently retired output. Only one level is needed — a clear
+    // becomes "previous" only after committing, and committed clears are never
+    // rolled back.
+    const previousClearedAtMs = await this.readClearedAtMs(ownerWorkspaceId);
+    await this.writeClearedAtFile(target, {
+      clearedAt,
+      ...(previousClearedAtMs != null
+        ? { previousClearedAt: new Date(previousClearedAtMs).toISOString() }
+        : {}),
+    });
+  }
+
+  private async writeClearedAtFile(
+    target: string,
+    record: { clearedAt: string; previousClearedAt?: string }
+  ): Promise<void> {
     // Atomic like write(): a torn tombstone must never be a file's settled content.
     // The temp name matches no artifact pattern either, so scans skip it too.
     const temp = `${target}.tmp-${randomUUID()}`;
-    await fsPromises.writeFile(temp, JSON.stringify({ clearedAt }), "utf-8");
+    await fsPromises.writeFile(temp, JSON.stringify(record), "utf-8");
     try {
       await fsPromises.rename(temp, target);
     } catch (error) {
       await fsPromises.rm(temp, { force: true }).catch(() => undefined);
       throw error;
     }
+  }
+
+  /**
+   * Roll the tombstone back by one clear: restore the previous clear's value when one
+   * exists, otherwise remove the file. Called only when the CURRENT tombstone belongs
+   * to the clear being rolled back (supersedeAllPending writes its tombstone last, so
+   * its own failure never promotes one). Failures PROPAGATE — a stale surviving
+   * tombstone would silently discard a revived wake's deferred temp.
+   */
+  private async rollbackClearedAt(ownerWorkspaceId: string): Promise<void> {
+    const target = this.clearedAtFile(ownerWorkspaceId);
+    let raw: string;
+    try {
+      raw = await fsPromises.readFile(target, "utf-8");
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT")) return; // nothing to roll back
+      throw error;
+    }
+    let previous: string | null = null;
+    try {
+      const parsed = JSON.parse(raw) as { previousClearedAt?: unknown };
+      previous =
+        typeof parsed.previousClearedAt === "string" &&
+        !Number.isNaN(Date.parse(parsed.previousClearedAt))
+          ? parsed.previousClearedAt
+          : null;
+    } catch {
+      // Malformed tombstones already provide no protection to preserve.
+      previous = null;
+    }
+    if (previous != null) {
+      await this.writeClearedAtFile(target, { clearedAt: previous });
+      return;
+    }
+    await fsPromises.rm(target, { force: true });
   }
 
   /** Epoch ms of the latest history clear, or null when none applies (absent or malformed). */
@@ -1838,7 +1892,11 @@ export class BashMonitorWakeStore {
       await this.writeClearedAt(ownerWorkspaceId, clearedAt);
       return pending;
     } catch (error) {
-      await this.restorePendingSnapshots(ownerWorkspaceId, staged);
+      // Records only — NOT the tombstone rollback in restorePendingSnapshots: the
+      // tombstone write above is the try block's last step, so on this path it was
+      // never promoted, and demoting here would strip the PREVIOUS clear's
+      // protection instead.
+      await this.restoreSnapshotRecords(ownerWorkspaceId, staged);
       throw error;
     }
   }
@@ -1847,11 +1905,19 @@ export class BashMonitorWakeStore {
     ownerWorkspaceId: string,
     snapshots: readonly BashMonitorWakeRecord[]
   ): Promise<void> {
-    // Rolling back a failed clear also rolls back its tombstone: the wakes below
-    // return to pending, so a sibling deferred temp must not stay condemned. Removal
-    // failures PROPAGATE — a stale surviving tombstone would silently discard that
-    // temp's output even though the clear never held.
-    await fsPromises.rm(this.clearedAtFile(ownerWorkspaceId), { force: true });
+    // Rolling back a clear also rolls back ITS tombstone — restoring the previous
+    // clear's value, never deleting the file wholesale: the wakes below return to
+    // pending, so a sibling deferred temp must not stay condemned by the rolled-back
+    // clear, while a pre-old-clear temp must stay condemned by the surviving older
+    // tombstone.
+    await this.rollbackClearedAt(ownerWorkspaceId);
+    await this.restoreSnapshotRecords(ownerWorkspaceId, snapshots);
+  }
+
+  private async restoreSnapshotRecords(
+    ownerWorkspaceId: string,
+    snapshots: readonly BashMonitorWakeRecord[]
+  ): Promise<void> {
     for (const snapshot of snapshots) {
       const key = `${ownerWorkspaceId}:${snapshot.id}`;
       await this.locks.withLock(key, async () => {
