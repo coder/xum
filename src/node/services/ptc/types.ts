@@ -515,7 +515,7 @@ function sanitizeMediaValueGraph(
  * size against the shared budget — mirroring sanitizeRetainedMediaContainer's
  * per-part handling so plucked parts cost the same as containered ones.
  */
-function sanitizeStandaloneMediaPart(value: object, budget: { remainingBytes: number }): unknown {
+function sanitizeStandaloneMediaPart(value: unknown, budget: { remainingBytes: number }): unknown {
   const media = asMediaPart(value);
   if (media === null) return value;
   if (media.mediaType === undefined || !isSupportedAttachmentMediaType(media.mediaType)) {
