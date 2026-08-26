@@ -3295,14 +3295,18 @@ export class WorkspaceStore {
     }
   }
 
-  private applyWorkspaceActivityList(snapshots: Record<string, WorkspaceActivitySnapshot>): void {
+  /** Returns whether the list was applied — {} is the backend's read-failure fallback. */
+  private applyWorkspaceActivityList(
+    snapshots: Record<string, WorkspaceActivitySnapshot>
+  ): boolean {
     const snapshotEntries = Object.entries(snapshots);
 
     // Defensive fallback: workspace.activity.list returns {} on backend read failures.
     // Preserve last-known snapshots instead of wiping sidebar activity state for all
-    // workspaces during a transient metadata read error.
+    // workspaces during a transient metadata read error. Callers must not treat the
+    // skipped application as authoritative activity data.
     if (snapshotEntries.length === 0) {
-      return;
+      return false;
     }
 
     const seenWorkspaceIds = new Set<string>();
@@ -3318,6 +3322,7 @@ export class WorkspaceStore {
       }
       this.applyWorkspaceActivitySnapshot(workspaceId, null);
     }
+    return true;
   }
 
   private applyTerminalActivity(
@@ -3647,8 +3652,10 @@ export class WorkspaceStore {
           if (signal.aborted || attemptController.signal.aborted) {
             return;
           }
-          this.applyWorkspaceActivityList(snapshots);
-          this.markActivityHydrated(true);
+          // An empty list is the backend's non-throwing read-failure fallback; it must
+          // not flip the authoritative flag (baseline consumers would misread it as
+          // "no activity anywhere"). The retry/subscription path delivers real data later.
+          this.markActivityHydrated(this.applyWorkspaceActivityList(snapshots));
         });
 
         // Start watchdog after bootstrap so slow list() doesn't trigger
