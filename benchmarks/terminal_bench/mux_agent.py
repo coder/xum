@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
+import secrets
 import shlex
 import tarfile
 import time
@@ -234,8 +236,10 @@ class MuxAgent(BaseInstalledAgent):
 
     _PROVIDERS_FILE_ENV_KEY = "MUX_PROVIDERS_FILE"
     _TOKEN_FILE_PATH = "/tmp/mux-tokens.json"
+    _DEFAULT_RUN_LOG_DIR = "/logs/agent/command-0"
+    _RUN_EXIT_CODE_NAME = "mux-run-exit-code.txt"
     _DEFAULT_RUN_SESSION_ROOT = "/tmp/mux-run-root"
-    _SESSIONS_ARCHIVE_SANDBOX_PATH = "/tmp/mux-sessions.tar.gz"
+    _SESSIONS_ARCHIVE_SANDBOX_PREFIX = "/tmp/mux-sessions-"
     _SESSIONS_ARCHIVE_NAME = "mux-sessions.tar.gz"
     _SESSION_USAGE_SUMMARY_NAME = "mux-session-usage.json"
     # Telemetry collection bounds: dataset-controlled trials must not be able to
@@ -405,6 +409,7 @@ class MuxAgent(BaseInstalledAgent):
     ) -> None:
         """Run agent commands, download token file, then populate context."""
         # Execute commands (from base class logic, but without calling populate_context)
+        command_result: tuple[int, int] | None = None
         failed_command: tuple[int, int] | None = None
         timeout_error: AgentTimeoutError | None = None
         for i, exec_input in enumerate(self.create_run_agent_commands(instruction)):
@@ -438,9 +443,43 @@ class MuxAgent(BaseInstalledAgent):
                 assert exec_input.timeout_sec is not None
                 timeout_error = self._agent_timeout_error(exec_input.timeout_sec)
                 break
+            command_result = (i, result.return_code)
             if result.return_code != 0:
-                failed_command = (i, result.return_code)
                 break
+
+        runner_exit_code: int | None = None
+        runner_exit_path = self.logs_dir / self._RUN_EXIT_CODE_NAME
+        runner_exit_path.unlink(missing_ok=True)
+        sandbox_log_dir = (
+            self._env.get("MUX_LOG_DIR") or self._DEFAULT_RUN_LOG_DIR
+        ).rstrip("/")
+        try:
+            # The sandbox already authors trusted telemetry in this harness;
+            # independent task verification remains the correctness boundary.
+            await environment.download_file(
+                f"{sandbox_log_dir}/{self._RUN_EXIT_CODE_NAME}", runner_exit_path
+            )
+            raw_exit_code = runner_exit_path.read_text()
+            if raw_exit_code.isdecimal() and len(raw_exit_code) <= 3:
+                parsed_exit_code = int(raw_exit_code)
+                if parsed_exit_code <= 255:
+                    runner_exit_code = parsed_exit_code
+        except Exception:
+            pass
+
+        if command_result is not None:
+            command_index, channel_return_code = command_result
+            effective_return_code = channel_return_code
+            if runner_exit_code is not None:
+                effective_return_code = runner_exit_code
+                if runner_exit_code != channel_return_code:
+                    command_dir = self.logs_dir / f"command-{command_index}"
+                    (command_dir / "transport-diagnostic.log").write_text(
+                        f"channel return code {channel_return_code} disagreed with "
+                        f"mux-run exit code {runner_exit_code}; using mux-run status\n"
+                    )
+            if effective_return_code != 0:
+                failed_command = (command_index, effective_return_code)
 
         # Download token file from container BEFORE populating context
         # Clear any stale token file first to avoid reading outdated data if download fails
@@ -478,6 +517,9 @@ class MuxAgent(BaseInstalledAgent):
         ).strip() or self._DEFAULT_RUN_SESSION_ROOT
         archive_path = self.logs_dir / self._SESSIONS_ARCHIVE_NAME
         archive_path.unlink(missing_ok=True)
+        sandbox_archive_path = (
+            f"{self._SESSIONS_ARCHIVE_SANDBOX_PREFIX}{secrets.token_hex(8)}.tar.gz"
+        )
         # Archive only the known telemetry files (not arbitrary session content a
         # task could plant) and report the archive size for the download bound.
         script = (
@@ -486,8 +528,8 @@ class MuxAgent(BaseInstalledAgent):
             "find . -type f \\( -name chat.jsonl -o -name chat-archive.jsonl "
             "-o -name session-usage.json -o -name run-stdout.jsonl "
             "-o -name run-stderr.log -o -name mux-tokens.json \\) -print0 "
-            f"| tar --null -czf {self._SESSIONS_ARCHIVE_SANDBOX_PATH} -T - || exit 1\n"
-            f"stat -c %s {self._SESSIONS_ARCHIVE_SANDBOX_PATH}\n"
+            f"| tar --null -czf {sandbox_archive_path} -T - || exit 1\n"
+            f"stat -c %s {sandbox_archive_path}\n"
         )
         # Telemetry collection is best-effort, but silent failures cost a full
         # benchmark run to notice: record every outcome to a diagnostic log.
@@ -522,13 +564,32 @@ class MuxAgent(BaseInstalledAgent):
             if archive_bytes > self._SESSIONS_ARCHIVE_MAX_BYTES:
                 _diag(f"archive too large: {archive_bytes} bytes")
                 return
-            await environment.download_file(
-                self._SESSIONS_ARCHIVE_SANDBOX_PATH, archive_path
-            )
-            _diag(f"downloaded {archive_bytes} bytes")
+            await environment.download_file(sandbox_archive_path, archive_path)
+            local_archive_bytes = archive_path.stat().st_size
+            if (
+                local_archive_bytes > self._SESSIONS_ARCHIVE_MAX_BYTES
+                or local_archive_bytes > archive_bytes
+            ):
+                _diag(
+                    "downloaded archive too large: "
+                    f"local={local_archive_bytes} reported={archive_bytes} "
+                    f"limit={self._SESSIONS_ARCHIVE_MAX_BYTES}"
+                )
+                archive_path.unlink(missing_ok=True)
+                return
+            _diag(f"downloaded {local_archive_bytes} bytes")
         except Exception as exc:
             _diag(f"collection failed: {type(exc).__name__}: {exc}")
             archive_path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _is_valid_usage_number(value: object) -> bool:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        try:
+            return value >= 0 and math.isfinite(value)
+        except OverflowError:
+            return False
 
     def _summarize_session_usage(self) -> dict[str, Any] | None:
         """Aggregate token/cost buckets from session-usage.json files in the archive.
@@ -621,14 +682,14 @@ class MuxAgent(BaseInstalledAgent):
                     if not isinstance(component, dict):
                         continue
                     tokens = component.get("tokens")
-                    if not isinstance(tokens, (int, float)):
-                        tokens = 0
-                    totals[key] += int(tokens)
+                    has_tokens = self._is_valid_usage_number(tokens)
+                    if has_tokens:
+                        totals[key] += int(tokens)
                     cost = component.get("cost_usd")
-                    if isinstance(cost, (int, float)):
+                    if self._is_valid_usage_number(cost):
                         cost_sum += cost
                         has_cost = True
-                    elif tokens > 0:
+                    elif has_tokens and tokens > 0:
                         # Nonzero usage without a price: reporting only the
                         # priced subset would misstate total cost.
                         has_unpriced_usage = True

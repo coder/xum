@@ -129,6 +129,7 @@ fi
 # Persist stdout/stderr there so partial agent output survives cancellation.
 MUX_LOG_DIR="${MUX_LOG_DIR:-/logs/agent/command-0}"
 mkdir -p "${MUX_LOG_DIR}"
+trap 'printf "%s" "$?" > "${MUX_LOG_DIR}/mux-run-exit-code.txt" 2>/dev/null || true' EXIT
 MUX_OUTPUT_FILE="${MUX_LOG_DIR}/stdout.txt"
 MUX_STDERR_FILE="${MUX_LOG_DIR}/stderr.txt"
 MUX_TOKEN_FILE="${MUX_TOKEN_FILE:-/tmp/mux-tokens.json}"

@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import os
+import re
 import subprocess
 import tarfile
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ class _RunnerSmokeResult:
     completed: subprocess.CompletedProcess[str]
     log_dir: Path
     token_file: Path
+    exit_code_file: Path
     timeout_marker: Path
     args_file: Path
 
@@ -120,6 +122,7 @@ exit 99
         completed=completed,
         log_dir=log_dir,
         token_file=token_file,
+        exit_code_file=log_dir / MuxAgent._RUN_EXIT_CODE_NAME,
         timeout_marker=timeout_marker,
         args_file=args_file,
     )
@@ -196,6 +199,7 @@ def test_mux_runner_scores_goal_mode_incomplete_exit(tmp_path: Path) -> None:
     result = _run_mux_runner_smoke(tmp_path, exit_code=3, goal_mode="1")
 
     assert result.completed.returncode == 0, result.completed.stderr
+    assert result.exit_code_file.read_text() == "0"
     assert "WARNING: mux goal run stopped incomplete" in result.completed.stderr
     args = result.args_file.read_text()
     assert "--goal" in args
@@ -225,6 +229,7 @@ def test_mux_runner_preserves_incomplete_exit_outside_goal_mode(tmp_path: Path) 
     result = _run_mux_runner_smoke(tmp_path, exit_code=3)
 
     assert result.completed.returncode == 3
+    assert result.exit_code_file.read_text() == "3"
     assert "mux agent session failed (exit 3)" in result.completed.stderr
     assert result.token_file.exists()
 
@@ -233,6 +238,7 @@ def test_mux_runner_preserves_fatal_exit(tmp_path: Path) -> None:
     result = _run_mux_runner_smoke(tmp_path, exit_code=1, goal_mode="1")
 
     assert result.completed.returncode == 1
+    assert result.exit_code_file.read_text() == "1"
     assert "mux agent session failed (exit 1)" in result.completed.stderr
     assert "WARNING: mux goal run stopped incomplete" not in result.completed.stderr
     assert json.loads(result.token_file.read_text()) == {
@@ -248,6 +254,7 @@ def test_mux_runner_leaves_timeout_to_harbor(tmp_path: Path) -> None:
     result = _run_mux_runner_smoke(tmp_path, exit_code=0, timeout_ms="1000")
 
     assert result.completed.returncode == 0, result.completed.stderr
+    assert result.exit_code_file.read_text() == "0"
     assert "Harbor remains timeout authority" in result.completed.stdout
     assert not result.timeout_marker.exists()
 
@@ -266,11 +273,16 @@ class _FakeEnvironment:
         command_dir: Path | None = None,
         delay_sec: float = 0,
         session_archive: bytes | None = None,
+        session_archive_reported_bytes: int | None = None,
+        runner_exit_code: str | None = None,
     ) -> None:
         self.result = result
         self.command_dir = command_dir
         self.delay_sec = delay_sec
         self.session_archive = session_archive
+        self.session_archive_reported_bytes = session_archive_reported_bytes
+        self.runner_exit_code = runner_exit_code
+        self.session_archive_source_path: str | None = None
         self.exec_commands: list[str] = []
         self.download_attempts: list[tuple[str, Path]] = []
 
@@ -278,15 +290,21 @@ class _FakeEnvironment:
         command = _kwargs.get("command")
         if isinstance(command, str):
             self.exec_commands.append(command)
-        if (
-            isinstance(command, str)
-            and MuxAgent._SESSIONS_ARCHIVE_SANDBOX_PATH in command
-        ):
+        archive_match = (
+            re.search(r"/tmp/mux-sessions-[0-9a-f]{16}\.tar\.gz", command)
+            if isinstance(command, str)
+            else None
+        )
+        if archive_match is not None:
+            self.session_archive_source_path = archive_match.group(0)
             # Sessions-archive step: succeed only when the fake has one staged,
             # reporting the archive size like the in-sandbox stat call does.
             if self.session_archive is None:
                 return _ExecResult(return_code=1)
-            return _ExecResult(return_code=0, stdout=f"{len(self.session_archive)}\n")
+            archive_bytes = self.session_archive_reported_bytes
+            if archive_bytes is None:
+                archive_bytes = len(self.session_archive)
+            return _ExecResult(return_code=0, stdout=f"{archive_bytes}\n")
         timeout_sec = _kwargs.get("timeout_sec")
         if self.delay_sec:
             if isinstance(timeout_sec, (int, float)) and timeout_sec < self.delay_sec:
@@ -304,10 +322,16 @@ class _FakeEnvironment:
 
     async def download_file(self, source_path: str, target_path: Path) -> None:
         self.download_attempts.append((source_path, target_path))
-        if source_path == MuxAgent._SESSIONS_ARCHIVE_SANDBOX_PATH:
+        if source_path == self.session_archive_source_path:
             assert self.session_archive is not None
             target_path.write_bytes(self.session_archive)
             return
+        if source_path.endswith(f"/{MuxAgent._RUN_EXIT_CODE_NAME}"):
+            if self.runner_exit_code is None:
+                raise FileNotFoundError(source_path)
+            target_path.write_text(self.runner_exit_code)
+            return
+        assert source_path == MuxAgent._TOKEN_FILE_PATH
         target_path.write_text(
             '{"input": 7, "output": 11, "cache_read": 5, "cache_write": 3, "cost_usd": 0.42}'
         )
@@ -331,12 +355,70 @@ def test_run_raises_after_preserving_logs_for_nonzero_exit(
     assert (command_dir / MuxAgent._COMMAND_STDOUT_NAME).read_text() == "out"
     assert (command_dir / MuxAgent._COMMAND_STDERR_NAME).read_text() == "err"
     assert environment.download_attempts == [
-        (agent._TOKEN_FILE_PATH, tmp_path / "mux-tokens.json")
+        (
+            f"{agent._DEFAULT_RUN_LOG_DIR}/{agent._RUN_EXIT_CODE_NAME}",
+            tmp_path / agent._RUN_EXIT_CODE_NAME,
+        ),
+        (agent._TOKEN_FILE_PATH, tmp_path / "mux-tokens.json"),
     ]
     # input(7) + cache_read(5) + cache_write(3): cache traffic counts as input
     assert getattr(context, "n_input_tokens") == 15
     assert getattr(context, "n_output_tokens") == 11
     assert getattr(context, "cost_usd") == 0.42
+
+
+def test_run_uses_runner_exit_code_over_channel_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    environment = _FakeEnvironment(
+        _ExecResult(return_code=1, stdout="truncated", stderr=""),
+        runner_exit_code="0",
+    )
+
+    asyncio.run(agent.run("do the task", environment, SimpleNamespace()))
+
+    diagnostic = tmp_path / "command-0" / "transport-diagnostic.log"
+    assert "channel return code 1 disagreed with mux-run exit code 0" in (
+        diagnostic.read_text()
+    )
+
+
+def test_run_uses_runner_exit_code_over_channel_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    environment = _FakeEnvironment(_ExecResult(return_code=0), runner_exit_code="1")
+
+    with pytest.raises(RuntimeError, match="exit 1"):
+        asyncio.run(agent.run("do the task", environment, SimpleNamespace()))
+
+
+def test_run_keeps_channel_failure_without_runner_exit_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    environment = _FakeEnvironment(_ExecResult(return_code=1))
+
+    with pytest.raises(RuntimeError, match="exit 1"):
+        asyncio.run(agent.run("do the task", environment, SimpleNamespace()))
+
+
+@pytest.mark.parametrize("runner_exit_code", ["", "garbage", "99999999999999999999"])
+def test_run_ignores_malformed_runner_exit_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, runner_exit_code: str
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    environment = _FakeEnvironment(
+        _ExecResult(return_code=1), runner_exit_code=runner_exit_code
+    )
+
+    with pytest.raises(RuntimeError, match="exit 1"):
+        asyncio.run(agent.run("do the task", environment, SimpleNamespace()))
 
 
 def test_run_timeout_surfaces_agent_timeout_error(
@@ -354,7 +436,11 @@ def test_run_timeout_surfaces_agent_timeout_error(
         asyncio.run(agent.run("do the task", environment, context))
 
     assert environment.download_attempts == [
-        (agent._TOKEN_FILE_PATH, tmp_path / "mux-tokens.json")
+        (
+            f"{agent._DEFAULT_RUN_LOG_DIR}/{agent._RUN_EXIT_CODE_NAME}",
+            tmp_path / agent._RUN_EXIT_CODE_NAME,
+        ),
+        (agent._TOKEN_FILE_PATH, tmp_path / "mux-tokens.json"),
     ]
     # input(7) + cache_read(5) + cache_write(3): cache traffic counts as input
     assert getattr(context, "n_input_tokens") == 15
@@ -472,7 +558,7 @@ def _sessions_archive_bytes(sessions: dict[str, dict]) -> bytes:
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
         for session_id, usage in sessions.items():
-            payload = json.dumps(usage).encode("utf-8")
+            payload = json.dumps(usage).replace("Infinity", "1e309").encode("utf-8")
             info = tarfile.TarInfo(f"sessions/{session_id}/session-usage.json")
             info.size = len(payload)
             archive.addfile(info, io.BytesIO(payload))
@@ -524,7 +610,7 @@ def test_run_downloads_session_archive(
     tar_commands = [
         c
         for c in environment.exec_commands
-        if MuxAgent._SESSIONS_ARCHIVE_SANDBOX_PATH in c
+        if "/tmp/mux-sessions-" in c
     ]
     assert len(tar_commands) == 1
     # Only the known telemetry files are archived, from the run session root.
@@ -538,8 +624,10 @@ def test_run_downloads_session_archive(
         "mux-tokens.json",
     ):
         assert expected in tar_commands[0]
+    assert environment.session_archive_source_path is not None
+    assert environment.session_archive_source_path.startswith("/tmp/mux-sessions-")
     assert (
-        MuxAgent._SESSIONS_ARCHIVE_SANDBOX_PATH,
+        environment.session_archive_source_path,
         tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME,
     ) in environment.download_attempts
     assert (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).is_file()
@@ -612,10 +700,35 @@ def test_run_skips_oversized_session_archive(
     asyncio.run(agent.run("do the task", environment, context))
 
     assert not (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).exists()
+    assert all(
+        not source_path.startswith("/tmp/mux-sessions-")
+        for source_path, _ in environment.download_attempts
+    )
+
+
+def test_run_discards_oversized_archive_after_download(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    archive = _sessions_archive_bytes({"ws-main": _usage_display()})
+    monkeypatch.setattr(MuxAgent, "_SESSIONS_ARCHIVE_MAX_BYTES", len(archive) - 1)
+    agent = MuxAgent(logs_dir=tmp_path)
+    environment = _FakeEnvironment(
+        _ExecResult(return_code=0),
+        session_archive=archive,
+        session_archive_reported_bytes=1,
+    )
+
+    asyncio.run(agent.run("do the task", environment, SimpleNamespace()))
+
+    assert environment.session_archive_source_path is not None
     assert (
-        MuxAgent._SESSIONS_ARCHIVE_SANDBOX_PATH,
+        environment.session_archive_source_path,
         tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME,
-    ) not in environment.download_attempts
+    ) in environment.download_attempts
+    assert not (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).exists()
+    diagnostic = (tmp_path / "mux-sessions-collect.log").read_text()
+    assert "downloaded archive too large" in diagnostic
 
 
 def test_populate_context_keeps_fresher_token_file_counts(
@@ -714,6 +827,53 @@ def test_session_usage_skips_malformed_entries(
     assert totals["sessions"] == 3
     assert totals["input"] == 10
     assert totals["output"] == 20 + 4
+
+
+def test_session_usage_skips_non_finite_tokens_without_losing_valid_sessions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    invalid_usage = {
+        "byModel": {
+            "m": {"input": {"tokens": float("inf"), "cost_usd": 0.5}}
+        },
+        "version": 1,
+    }
+    (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).write_bytes(
+        _sessions_archive_bytes(
+            {"ws-main": _usage_display(), "ws-non-finite": invalid_usage}
+        )
+    )
+
+    totals = agent._summarize_session_usage()
+
+    assert totals is not None
+    assert totals["sessions"] == 2
+    assert totals["input"] == 10
+
+
+def test_session_usage_skips_non_finite_cost_without_losing_valid_sessions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    invalid_usage = {
+        "byModel": {"m": {"input": {"tokens": 4, "cost_usd": float("inf")}}},
+        "version": 1,
+    }
+    (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).write_bytes(
+        _sessions_archive_bytes(
+            {"ws-main": _usage_display(), "ws-non-finite": invalid_usage}
+        )
+    )
+
+    totals = agent._summarize_session_usage()
+
+    assert totals is not None
+    assert totals["sessions"] == 2
+    assert totals["input"] == 14
+    assert totals["cost_usd"] is None
 
 
 def test_session_usage_skips_rolled_up_children(
