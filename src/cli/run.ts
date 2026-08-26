@@ -275,13 +275,18 @@ const SEND_MESSAGE_EXPERIMENT_FIELDS = {
   [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: "programmaticToolCalling",
   [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE]: "programmaticToolCallingExclusive",
   [EXPERIMENT_IDS.RLM]: "rlm",
-  [EXPERIMENT_IDS.ADVISOR_TOOL]: "advisorTool",
   [EXPERIMENT_IDS.DYNAMIC_WORKFLOWS]: "dynamicWorkflows",
-  [EXPERIMENT_IDS.MEMORY]: "memory",
-  // TIMELINE is deliberately absent: AIService resolves the timeline
-  // experiment exclusively from the backend ExperimentsService (the schema's
-  // `timeline` request field is never read), and `xum run` wires no timeline
-  // service — accepting `-e timeline` would be a silent no-op.
+  // Deliberately absent (accepting them would be a silent no-op or worse,
+  // which is exactly what this table exists to prevent):
+  // - TIMELINE: AIService resolves the timeline experiment exclusively from
+  //   the backend ExperimentsService (the schema's `timeline` request field is
+  //   never read), and `xum run` wires no timeline service.
+  // - MEMORY: MemoryService derives its storage from the CLI's ephemeral
+  //   tempDir config root, so persistent memories under the user's Xum home
+  //   would be invisible and new writes deleted on process exit.
+  // - ADVISOR_TOOL: AIService only exposes the advisor tool when the config
+  //   has a non-empty advisorModelString, which the CLI's ephemeral config
+  //   never carries over.
   [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: "workspaceHeartbeats",
   [EXPERIMENT_IDS.TOOL_SEARCH]: "toolSearch",
 } as const satisfies Partial<
