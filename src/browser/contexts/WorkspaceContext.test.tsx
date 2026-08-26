@@ -580,6 +580,42 @@ describe("WorkspaceContext", () => {
     );
   });
 
+  test("legacy shared aiSettings hydrate a custom active agent", async () => {
+    const workspaceId = "ws-agent-legacy-custom";
+
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createWorkspaceMetadata({
+              id: workspaceId,
+              agentId: "custom",
+              // Legacy metadata: shared settings only, no per-agent buckets.
+              aiSettings: { model: "openai:legacy-model", thinkingLevel: "low" },
+            }),
+          ]),
+      },
+      localStorage: {
+        [getAgentIdKey(workspaceId)]: JSON.stringify("custom"),
+        [getModelKey(workspaceId)]: JSON.stringify("openai:local-default"),
+      },
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
+
+    // Backend dispatch resolution treats legacy shared settings as a fallback
+    // for whichever agent is selected; the composer must agree instead of
+    // staying on the local default model.
+    expect(JSON.parse(globalThis.localStorage.getItem(getModelKey(workspaceId))!)).toBe(
+      "openai:legacy-model"
+    );
+    expect(JSON.parse(globalThis.localStorage.getItem(getThinkingLevelKey(workspaceId))!)).toBe(
+      "low"
+    );
+  });
+
   test("stale metadata does not clobber a pending local agent switch", async () => {
     const workspaceId = "ws-agent-pending";
     let emitMetadata:

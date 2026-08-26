@@ -430,7 +430,7 @@ describe("AgentContext", () => {
     expect(updateAgentAISettingsCalls).toHaveLength(1);
   });
 
-  test("failed persistence keeps the local agent selection", async () => {
+  test("rejected persistence reverts the local agent selection", async () => {
     const projectPath = "/tmp/project";
     const workspaceId = "main-workspace";
     mockAgentDefinitions = [EXEC_AGENT, PLAN_AGENT];
@@ -466,17 +466,73 @@ describe("AgentContext", () => {
         expect(resolveUpdateAgentAISettings).not.toBeNull();
       });
 
-      // ...and a rejected write keeps it: persistence is best-effort (the
-      // next send re-persists the selection), so only a toast surfaces.
-      resolveUpdateAgentAISettings?.({ success: false, error: "offline" });
+      // ...and a typed rejection reverts it: the backend refused the selection
+      // and kept the previous agent, and sends carrying the rejected selection
+      // are refused by the same gate before they can re-persist it, so no
+      // self-heal is coming.
+      resolveUpdateAgentAISettings?.({ success: false, error: "unpriced model" });
 
       await waitFor(() => {
-        expect(toasts).toEqual([{ workspaceId, message: "offline" }]);
+        expect(toasts).toEqual([{ workspaceId, message: "unpriced model" }]);
       });
-      expect(contextValue?.agentId).toBe("plan");
+      await waitFor(() => {
+        expect(contextValue?.agentId).toBe("exec");
+      });
       // The echo guard is released so backend agent updates apply again
       // (probing with a non-matching agent does not mutate the guard).
       expect(shouldApplyWorkspaceAgentIdFromBackend(workspaceId, "exec")).toBe(true);
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.AGENT_SWITCH_ERROR_TOAST, toastListener);
+    }
+  });
+
+  test("rejection does not revert a newer agent selection", async () => {
+    const projectPath = "/tmp/project";
+    const workspaceId = "main-workspace";
+    mockAgentDefinitions = [EXEC_AGENT, PLAN_AGENT, REVIEW_PROJECT_AGENT];
+    mockWorkspaceMetadata.set(workspaceId, {});
+    window.localStorage.setItem(getAgentIdKey(workspaceId), JSON.stringify("exec"));
+    deferUpdateAgentAISettings = true;
+
+    let contextValue: AgentContextValue | undefined;
+
+    renderAgentHarness({
+      workspaceId,
+      projectPath,
+      onChange: (value) => (contextValue = value),
+    });
+
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("exec");
+    });
+
+    const toasts: Array<{ workspaceId: string; message: string }> = [];
+    const toastListener = (event: Event) =>
+      toasts.push((event as CustomEvent<{ workspaceId: string; message: string }>).detail);
+    window.addEventListener(CUSTOM_EVENTS.AGENT_SWITCH_ERROR_TOAST, toastListener);
+
+    try {
+      contextValue?.setAgentId("plan");
+      await waitFor(() => {
+        expect(resolveUpdateAgentAISettings).not.toBeNull();
+      });
+      const rejectPlanSwitch = resolveUpdateAgentAISettings;
+      resolveUpdateAgentAISettings = null;
+
+      // The user moves on before the rejection lands; the newer choice wins
+      // over the revert.
+      contextValue?.setAgentId("review");
+      await waitFor(() => {
+        expect(contextValue?.agentId).toBe("review");
+      });
+
+      rejectPlanSwitch?.({ success: false, error: "unpriced model" });
+
+      // The toast proves the rejection handler (including any revert) ran.
+      await waitFor(() => {
+        expect(toasts).toHaveLength(1);
+      });
+      expect(contextValue?.agentId).toBe("review");
     } finally {
       window.removeEventListener(CUSTOM_EVENTS.AGENT_SWITCH_ERROR_TOAST, toastListener);
     }

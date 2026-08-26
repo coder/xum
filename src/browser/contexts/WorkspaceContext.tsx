@@ -198,12 +198,28 @@ function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadat
     }
   }
 
+  // Read after the backend agent-id seeding above so a metadata-driven agent
+  // selection applies before settings hydration keys off of it.
+  const activeAgentId = readPersistedState<string>(
+    getAgentIdKey(workspaceId),
+    WORKSPACE_DEFAULTS.agentId
+  );
+
+  // Legacy-only metadata predates per-agent buckets. Backend dispatch
+  // resolution (resolveNodeAgentAiSettings) treats the shared legacy blob as a
+  // fallback layer for whichever agent is selected — including custom agents —
+  // so synthesize a bucket for the active agent too, not just plan/exec.
+  // Otherwise a fresh client hydrating a legacy workspace with a custom active
+  // agent sits on the local default model while backend dispatches (heartbeats,
+  // continuations) keep resolving the legacy settings. Real per-agent buckets
+  // are never borrowed across agents.
   const aiByAgent =
     metadata.aiSettingsByAgent ??
     (metadata.aiSettings
       ? {
           plan: metadata.aiSettings,
           exec: metadata.aiSettings,
+          [activeAgentId]: metadata.aiSettings,
         }
       : undefined);
 
@@ -243,10 +259,6 @@ function seedWorkspaceLocalStorageFromBackend(metadata: FrontendWorkspaceMetadat
   }
 
   // Seed the active agent into the existing keys to avoid UI flash.
-  const activeAgentId = readPersistedState<string>(
-    getAgentIdKey(workspaceId),
-    WORKSPACE_DEFAULTS.agentId
-  );
   // Only hydrate from the ACTIVE agent's own bucket. Falling back to another
   // agent's bucket would overwrite the locally resolved settings of an agent
   // that has no persisted bucket yet (e.g. right after an agent-only switch),

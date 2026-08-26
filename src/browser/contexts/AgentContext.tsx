@@ -13,7 +13,11 @@ import {
 
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
-import { readPersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  readPersistedState,
+  updatePersistedState,
+  usePersistedState,
+} from "@/browser/hooks/usePersistedState";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import { matchesKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
@@ -28,6 +32,7 @@ import {
   GLOBAL_SCOPE_ID,
 } from "@/common/constants/storage";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
+import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import {
   resolveWorkspaceAiSettingsForAgent,
   type WorkspaceAISettingsCache,
@@ -165,10 +170,18 @@ function AgentProviderWithState(props: {
 
       // Persist workspace mode changes so the selection is remembered
       // per-workspace across clients, not just in this client's localStorage.
-      if (!api || !workspaceId || isCurrentAgentLocked || next == null || next === previous) {
+      if (
+        !api ||
+        !workspaceId ||
+        isCurrentAgentLocked ||
+        next == null ||
+        previous == null ||
+        next === previous
+      ) {
         return;
       }
       const nextAgentId: string = next;
+      const previousAgentId: string = previous;
 
       // Read the carried-over settings before WorkspaceModeAISync reacts to
       // the optimistic switch; they seed the resolver as the previously
@@ -205,9 +218,12 @@ function AgentProviderWithState(props: {
 
       // The local update above is authoritative for this client and the write
       // below is best-effort: every send carries the selection and re-persists
-      // it backend-side (maybePersistAISettingsFromOptions), so a failed or
-      // rejected write self-heals on the next send instead of triggering a
-      // local rollback.
+      // it backend-side (maybePersistAISettingsFromOptions), so a transport
+      // failure self-heals on the next send instead of triggering a local
+      // rollback. A typed rejection cannot self-heal that way: the backend
+      // evaluated and refused this selection (e.g. the budgeted-goal pricing
+      // gate) and the same gate refuses sends before they re-persist settings,
+      // so a rejection restores the pre-switch selection instead.
 
       // The picker closes on selection, so a rejected switch would otherwise
       // be silent (e.g. budgeted-goal pricing gate).
@@ -219,6 +235,34 @@ function AgentProviderWithState(props: {
               message.trim().length > 0 ? message : `Failed to switch to the ${nextAgentId} agent.`,
           })
         );
+      };
+
+      // Undo exactly what this switch wrote, and only while it is still in
+      // effect: any agent/model/thinking change the user made after the
+      // optimistic switch wins over the revert.
+      const revertRejectedSwitch = () => {
+        const currentAgentId = coerceAgentId(
+          readPersistedState<string | null>(getAgentIdKey(workspaceId), null)
+        );
+        if (currentAgentId !== nextAgentId) {
+          return;
+        }
+        // Restore settings before the agent id so WorkspaceModeAISync
+        // re-resolves the previous agent from pre-switch values instead of
+        // carrying over the rejected ones.
+        if (readPersistedState<string>(modelKey, getDefaultModel()) === resolvedModel) {
+          setWorkspaceModelWithOrigin(workspaceId, previousModel, "sync");
+        }
+        if (readPersistedState<ThinkingLevel>(thinkingKey, "off") === resolvedThinking) {
+          updatePersistedState(thinkingKey, previousThinking);
+        }
+        if (
+          readPersistedState<OpenAIReasoningMode>(reasoningKey, "standard") ===
+          resolvedReasoningMode
+        ) {
+          updatePersistedState(reasoningKey, previousReasoning);
+        }
+        setAgentIdRaw(previousAgentId);
       };
 
       markPendingWorkspaceAgentId(workspaceId, nextAgentId);
@@ -236,6 +280,7 @@ function AgentProviderWithState(props: {
         .then((result) => {
           if (!result.success) {
             notifySwitchRejected(typeof result.error === "string" ? result.error : "");
+            revertRejectedSwitch();
           }
           // Release the guard on every settled write: no-op writes (backend
           // already on this agent) and failed writes emit no metadata echo,
