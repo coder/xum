@@ -50,6 +50,32 @@ export function computeTailStartOffset(fileSizeBytes: number, tailBytes: number)
 }
 
 /**
+ * Enforce a byte bound on already-read tail content. Runtime-backed handles degrade a transient
+ * size-query failure to 0, which turns an offset-based tail read into a full-file read; the
+ * transfer has happened by then, but this cut keeps downstream line processing and the persisted
+ * wake bounded. `startedMidContent` reports whether the result begins inside the original content
+ * (callers drop the leading partial line, matching a mid-file read offset). A cut can split a
+ * multi-byte character; the resulting replacement char lands in that dropped partial line.
+ */
+export function boundTailContent(
+  content: string,
+  tailBytes: number
+): { content: string; startedMidContent: boolean } {
+  assert(
+    Number.isFinite(tailBytes) && tailBytes > 0,
+    `boundTailContent expected tailBytes > 0 (got ${tailBytes})`
+  );
+  const buf = Buffer.from(content, "utf8");
+  if (buf.length <= tailBytes) {
+    return { content, startedMidContent: false };
+  }
+  return {
+    content: buf.subarray(buf.length - tailBytes).toString(),
+    startedMidContent: true,
+  };
+}
+
+/**
  * Narrow a persisted meta.json spawn record to the fields the crash-orphan probe needs.
  * Records are written by this app but can be truncated by a crash mid-write; anything
  * malformed is treated as absent rather than trusted.
@@ -133,6 +159,13 @@ export interface MonitorMatchPayload {
   totalMatches: number;
   droppedLines?: number;
   timestamp: number;
+  /**
+   * Contextual output tail carried by settlement payloads, kept separate from `lines` so the
+   * wake store can dedupe it against already-persisted pending matches (a match flushed to disk
+   * while the owner was busy is absent from the in-memory pending lines but can still sit inside
+   * the final tail window).
+   */
+  tailLines?: string[];
   /**
    * File byte offset at the end of the last matched line, carried so the drain can re-check it
    * against the settled shown-frontier at delivery time. The emit-time suppression in
@@ -482,6 +515,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     monitor: BackgroundProcessMonitorState,
     update: {
       lines: string[];
+      tailLines?: string[];
       droppedLines: number;
       matchedThroughOffset?: number;
       terminal?: MonitorTerminalStatus;
@@ -495,6 +529,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       filter: monitor.filter,
       filterExclude: monitor.exclude,
       lines: update.lines,
+      ...(update.tailLines !== undefined ? { tailLines: update.tailLines } : {}),
       totalMatches: monitor.matchesCount,
       ...(update.droppedLines > 0 ? { droppedLines: update.droppedLines } : {}),
       timestamp: Date.now(),
@@ -677,25 +712,13 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       const settleLine =
         `[monitor] process settled: ${terminal.status}` +
         `${terminal.exitCode !== undefined ? ` (code ${terminal.exitCode})` : ""}`;
-      // A pending matched line that also falls inside the final tail window would render twice
-      // (once as a match, once in the tail), making one event look like repeated output. Both
-      // sides passed the same sanitize/truncate pipeline, so string equality identifies the
-      // overlap; remove one tail occurrence per included match.
-      let dedupedTail = tailLines;
-      if (includeMatched && tailLines.length > 0) {
-        const pendingCounts = new Map<string, number>();
-        for (const line of pendingLines) {
-          pendingCounts.set(line, (pendingCounts.get(line) ?? 0) + 1);
-        }
-        dedupedTail = tailLines.filter((line) => {
-          const count = pendingCounts.get(line);
-          if (count == null || count === 0) return true;
-          pendingCounts.set(line, count - 1);
-          return false;
-        });
-      }
+      // The tail travels separately from the event lines: a matched line inside the final tail
+      // window would otherwise render twice, and only the wake store can also see matches that
+      // were already flushed into a persisted pending record while the owner was busy. The store
+      // dedupes the tail against both before persisting one combined line list.
       this.emitMonitorUpdate(proc, monitor, {
-        lines: [...(includeMatched ? pendingLines : []), settleLine, ...dedupedTail],
+        lines: [...(includeMatched ? pendingLines : []), settleLine],
+        ...(tailLines.length > 0 ? { tailLines } : {}),
         droppedLines: includeMatched ? droppedLines : 0,
         ...(includeMatched ? { matchedThroughOffset: monitor.matchedThroughOffset } : {}),
         terminal,
@@ -717,10 +740,14 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     const fileSizeBytes = await proc.handle.getOutputFileSize();
     const offset = computeTailStartOffset(fileSizeBytes, MONITOR_SETTLEMENT_TAIL_BYTES);
     const result = await proc.handle.readOutput(offset);
-    const segments = result.content.split("\n");
-    // A mid-file start almost certainly begins inside a line; drop that partial fragment rather
-    // than presenting it as a complete output line.
-    const rawLines = offset > 0 ? segments.slice(1) : segments;
+    // Re-enforce the byte bound on the returned content: a degraded size query above (see
+    // boundTailContent) would otherwise let a large remote log flow into line processing whole.
+    const bounded = boundTailContent(result.content, MONITOR_SETTLEMENT_TAIL_BYTES);
+    const startedMidLine = offset > 0 || bounded.startedMidContent;
+    const segments = bounded.content.split("\n");
+    // A mid-file (or mid-content, after the byte cut) start almost certainly begins inside a
+    // line; drop that partial fragment rather than presenting it as a complete output line.
+    const rawLines = startedMidLine ? segments.slice(1) : segments;
     return rawLines
       .map((line) => this.sanitizeMonitorLine(line))
       .filter((line) => line.length > 0)

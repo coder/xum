@@ -48,6 +48,13 @@ export interface BashMonitorWakePayload {
   droppedLines?: number;
   timestamp: number;
   /**
+   * Contextual output tail from a settlement payload, kept separate from `lines` so it can be
+   * deduped against matched lines — both the payload's own and any already persisted on a pending
+   * record (a match flushed while the owner was busy still sits inside the tail window). The
+   * surviving tail is appended into the record's single `lines` list.
+   */
+  tailLines?: string[];
+  /**
    * File byte offset at the end of the last matched line; see BashMonitorWakeRecord. Present iff
    * the payload carries undelivered matched lines (settlement payloads whose lines are only the
    * synthetic settle line + output tail omit it).
@@ -194,6 +201,31 @@ function removeDeliveredLineOverlap(
   }
 
   return [...currentLines];
+}
+
+/**
+ * Remove one tail occurrence per matched-line occurrence in `baseLines`. A matched line inside
+ * the settlement tail window would otherwise render twice in one wake. Comparison happens on the
+ * store-sanitized form so it is insensitive to which sanitizer already ran on each side; genuine
+ * repeats beyond the matched occurrences survive (multiset, not set, removal).
+ */
+function removeTailDuplicates(
+  tailLines: readonly string[],
+  baseLines: readonly string[]
+): string[] {
+  if (tailLines.length === 0) return [];
+  const counts = new Map<string, number>();
+  for (const line of baseLines) {
+    const key = sanitizeBashMonitorWakeLine(line);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return tailLines.filter((line) => {
+    const key = sanitizeBashMonitorWakeLine(line);
+    const count = counts.get(key);
+    if (count == null || count === 0) return true;
+    counts.set(key, count - 1);
+    return false;
+  });
 }
 
 /**
@@ -387,14 +419,20 @@ export class BashMonitorWakeStore {
     return this.locks.withLock(key, async () => {
       const existing = await this.get(payload.workspaceId, id);
       const now = new Date().toISOString();
-      const bounded = boundLines(payload.lines);
       // Only merge into pending *match* records. A pending monitor-lost record describes a
       // dead previous generation of this processId; a new match means the ID was re-armed
       // by a live monitor (post-restart IDs are generated against an empty manager map, so
       // relaunching the same display_name reuses the ID). Replace the stale notice with a
       // fresh match record instead of mislabeling live output as lost-monitor output.
       if (existing?.status === "pending" && existing.kind === "match") {
-        const merged = boundLines([...existing.lines, ...payload.lines]);
+        // The settlement tail dedupes against BOTH the payload's own matched lines and the
+        // already-persisted pending ones: a match flushed to this record while the owner was busy
+        // is no longer in the emitter's memory yet still sits inside the final tail window.
+        const mergedTail = removeTailDuplicates(payload.tailLines ?? [], [
+          ...existing.lines,
+          ...payload.lines,
+        ]);
+        const merged = boundLines([...existing.lines, ...payload.lines, ...mergedTail]);
         // Offsets only grow (each match ends further into the append-only output file), so the
         // merged frontier is the newest match's end; Math.max is defensive against out-of-order
         // enqueues, and a legacy existing record with no offset falls back to the payload's. The
@@ -439,6 +477,10 @@ export class BashMonitorWakeStore {
         return record;
       }
 
+      const bounded = boundLines([
+        ...payload.lines,
+        ...removeTailDuplicates(payload.tailLines ?? [], payload.lines),
+      ]);
       const record: BashMonitorWakeRecord = {
         id,
         ownerWorkspaceId: payload.workspaceId,

@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { Ok } from "@/common/types/result";
 import {
   BackgroundProcessManager,
+  boundTailContent,
   computeTailStartOffset,
   parseSpawnRecordMeta,
   type BackgroundProcessMeta,
@@ -1018,12 +1019,15 @@ describe("BackgroundProcessManager", () => {
         // Terminal-only settlement: no undelivered matched output, so no offset signal that
         // could ever falsely suppress the wake (EOF == shown offset for unread output is fine).
         expect(payload.matchedThroughOffset).toBeUndefined();
-        // Synthetic settle line (downgrade fallback) + output tail with the actionable failure.
+        // Synthetic settle line (downgrade fallback) in lines; the actionable failure travels in
+        // the separate tail so the store can dedupe it against persisted matches.
         expect(
           payload.lines.some((line) => line.includes("process settled: exited (code 1)"))
         ).toBe(true);
         expect(
-          payload.lines.some((line) => line.includes("Unresolved review comments found"))
+          (payload.tailLines ?? []).some((line) =>
+            line.includes("Unresolved review comments found")
+          )
         ).toBe(true);
         // Durability ordering: the wake emit precedes registry deletion.
         expect(order).toEqual(["match", "stopped"]);
@@ -1243,10 +1247,30 @@ describe("BackgroundProcessManager", () => {
 
         expect(matchEvents).toHaveLength(1);
         expect(matchEvents[0].lines[0]).toBe("ERR final");
-        // The matched line also sits inside the final tail window; it must not render twice.
+        // The matched line appears once in lines; its tail-window duplicate travels separately
+        // and is deduped by the wake store before persistence.
         expect(matchEvents[0].lines.filter((line) => line === "ERR final")).toHaveLength(1);
         expect(matchEvents[0].terminal).toEqual({ status: "exited", exitCode: 0 });
         expect(stoppedEvents).toEqual([{ processId: result.processId, reason: "completed" }]);
+      });
+
+      it("bounds oversized tail content and marks it mid-content (degraded size query)", () => {
+        // A runtime handle's transient size-query failure degrades to 0, turning the tail read
+        // into a full-file read; the post-read bound must re-cut to the final byte window and
+        // report the mid-content start so the caller drops the leading partial line.
+        const oversized = `${"A".repeat(8192)}\nEND\n`;
+        const bounded = boundTailContent(oversized, 4096);
+        expect(Buffer.byteLength(bounded.content, "utf8")).toBe(4096);
+        expect(bounded.startedMidContent).toBe(true);
+        // The final complete lines survive at the end of the window.
+        expect(bounded.content.endsWith("\nEND\n")).toBe(true);
+
+        // Content already within the bound passes through untouched.
+        const small = "short\nEND\n";
+        expect(boundTailContent(small, 4096)).toEqual({
+          content: small,
+          startedMidContent: false,
+        });
       });
 
       it("still wakes when the settlement tail read fails", async () => {

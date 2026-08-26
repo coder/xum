@@ -533,6 +533,49 @@ describe("BashMonitorWakeStore", () => {
     expect(await store.listPending("owner-1")).toHaveLength(0);
   });
 
+  test("the settlement tail dedupes against the payload's own matched lines", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    const record = await store.enqueueOrMergePending(
+      payload({
+        lines: ["ERROR boom", "[monitor] process settled: exited (code 1)"],
+        matchedThroughOffset: 40,
+        tailLines: ["ERROR boom", "context line"],
+        terminal: { status: "exited", exitCode: 1 },
+      })
+    );
+
+    // One tail occurrence per matched occurrence is removed; the rest of the tail survives.
+    expect(record.lines).toEqual([
+      "ERROR boom",
+      "[monitor] process settled: exited (code 1)",
+      "context line",
+    ]);
+  });
+
+  test("the settlement tail dedupes against matches already flushed to the pending record", async () => {
+    // Owner busy: a match was flushed to disk (gone from the emitter's memory), then the process
+    // exits with that same line inside the final tail window. The merged record must not render
+    // the line twice.
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(
+      payload({ lines: ["ERROR flushed"], matchedThroughOffset: 50 })
+    );
+    const merged = await store.enqueueOrMergePending(
+      payload({
+        lines: ["[monitor] process settled: exited (code 2)"],
+        matchedThroughOffset: undefined,
+        tailLines: ["ERROR flushed", "final context"],
+        terminal: { status: "exited", exitCode: 2 },
+      })
+    );
+
+    expect(merged.lines).toEqual([
+      "ERROR flushed",
+      "[monitor] process settled: exited (code 2)",
+      "final context",
+    ]);
+  });
+
   test("a snapshot whose terminal was cleared by re-arm still transitions cleanly", async () => {
     // Race: a queued settlement wake is accepted just as the same processId is re-armed. The
     // cleared terminal is not undelivered content, so the accepted snapshot must fully
