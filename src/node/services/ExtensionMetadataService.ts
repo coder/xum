@@ -219,7 +219,18 @@ export class ExtensionMetadataService {
     } catch {
       return false;
     }
-    if (this.deletedWorkspaceIds.get(workspaceId) !== generationBefore) {
+    const generationAfter = this.deletedWorkspaceIds.get(workspaceId);
+    if (generationAfter === undefined) {
+      // Another path (activity bootstrap, reconcile) lifted the tombstone
+      // while the probe was in flight — the id is verifiably registered and
+      // no newer removal exists, so the write must PERSIST. Returning false
+      // here would hand the caller an unpersisted transient snapshot that
+      // WorkspaceService still broadcasts (the tombstone is gone), leaving
+      // renderer state ahead of disk until restart.
+      return true;
+    }
+    if (generationAfter !== generationBefore) {
+      // Republished mid-probe: a newer same-process removal wins.
       return false;
     }
     this.liftTombstone(workspaceId);
@@ -927,13 +938,17 @@ export class ExtensionMetadataService {
    * classifies it as non-quarantinable and load() refuses to self-heal it.
    */
   private static isUnsupportedVersion(parsed: unknown): boolean {
-    return (
-      typeof parsed === "object" &&
-      parsed !== null &&
-      !Array.isArray(parsed) &&
-      "version" in parsed &&
-      (parsed as { version?: unknown }).version !== 1
-    );
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return false;
+    }
+    const version = (parsed as { version?: unknown }).version;
+    // Only a structurally PLAUSIBLE forward version (a finite number other
+    // than 1) earns the non-destructive preservation path. A malformed value
+    // (null, string, object — corruption or a mangled manual edit) must
+    // classify as deterministic corruption instead: preserving it would
+    // leave every strict read and lenient writer failing forever on a file
+    // no build can ever read, rather than quarantining and self-healing.
+    return typeof version === "number" && Number.isFinite(version) && version !== 1;
   }
 
   private static unsupportedVersionError(): NodeJS.ErrnoException {
@@ -1287,6 +1302,24 @@ export class ExtensionMetadataService {
       // from the sidecar for the crash-leftover reason above.
       const target: unknown = main.workspaces[workspaceId];
       const sidecarEntry: unknown = entry;
+      if (
+        sidecarEntry !== null &&
+        typeof sidecarEntry === "object" &&
+        !Array.isArray(sidecarEntry) &&
+        (target === null || typeof target !== "object" || Array.isArray(target))
+      ) {
+        // Uncoercible main entry (null/primitive/array) shadowing a healthy
+        // sidecar entry: no field merge is possible, and the sidecar is
+        // consumed below — leaving the malformed value would permanently
+        // lose the only valid copy. Restore the sidecar entry (streaming
+        // cleared, same crash-leftover rule as sidecar-only entries).
+        main.workspaces[workspaceId] =
+          (sidecarEntry as { streaming?: unknown }).streaming === true
+            ? { ...entry, streaming: false }
+            : entry;
+        modified = true;
+        continue;
+      }
       if (
         target !== null &&
         typeof target === "object" &&

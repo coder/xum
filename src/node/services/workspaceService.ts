@@ -3814,28 +3814,47 @@ export class WorkspaceService extends EventEmitter {
 
   private async getActiveWorkflowRunIds(workspaceId: string): Promise<Set<string>> {
     assert(workspaceId.length > 0, "getActiveWorkflowRunIds requires workspaceId");
-    const cached = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
-    if (cached != null) {
-      const bootstrap = this.activeWorkflowRunIdBootstrapsByWorkspace.get(workspaceId);
-      if (bootstrap != null) {
-        await bootstrap;
+    // Bounded retry: evictWorkspaceActivityCaches (removal, or a tombstone
+    // lifted for re-registration) can race an in-flight bootstrap. A waiter
+    // that captured the pre-eviction Set would otherwise return the removed
+    // incarnation's runs — ghost counts with no future terminal event to
+    // clear them — so after every await the Set is re-verified as still the
+    // installed cache and the read restarts when it was evicted.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const cached = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
+      if (cached != null) {
+        const bootstrap = this.activeWorkflowRunIdBootstrapsByWorkspace.get(workspaceId);
+        if (bootstrap != null) {
+          await bootstrap;
+        }
+        if (this.activeWorkflowRunIdsByWorkspace.get(workspaceId) !== cached) {
+          continue;
+        }
+        return cached;
       }
-      return cached;
-    }
 
-    // Install the shared Set before awaiting disk so parallel workflow status events
-    // mutate the same cache instead of racing to replace each other after bootstrap.
-    const activeRunIds = new Set<string>();
-    this.activeWorkflowRunIdsByWorkspace.set(workspaceId, activeRunIds);
-    const bootstrap = this.populateActiveWorkflowRunIds(workspaceId, activeRunIds);
-    this.activeWorkflowRunIdBootstrapsByWorkspace.set(workspaceId, bootstrap);
-    try {
-      return await bootstrap;
-    } finally {
-      if (this.activeWorkflowRunIdBootstrapsByWorkspace.get(workspaceId) === bootstrap) {
-        this.activeWorkflowRunIdBootstrapsByWorkspace.delete(workspaceId);
+      // Install the shared Set before awaiting disk so parallel workflow status events
+      // mutate the same cache instead of racing to replace each other after bootstrap.
+      const activeRunIds = new Set<string>();
+      this.activeWorkflowRunIdsByWorkspace.set(workspaceId, activeRunIds);
+      const bootstrap = this.populateActiveWorkflowRunIds(workspaceId, activeRunIds);
+      this.activeWorkflowRunIdBootstrapsByWorkspace.set(workspaceId, bootstrap);
+      try {
+        await bootstrap;
+      } finally {
+        if (this.activeWorkflowRunIdBootstrapsByWorkspace.get(workspaceId) === bootstrap) {
+          this.activeWorkflowRunIdBootstrapsByWorkspace.delete(workspaceId);
+        }
       }
+      if (this.activeWorkflowRunIdsByWorkspace.get(workspaceId) !== activeRunIds) {
+        continue;
+      }
+      return activeRunIds;
     }
+    // Eviction churn exhausted the retries (pathological): probe disk once
+    // more DETACHED so the caller still gets current durable state without
+    // installing a cache that may itself be mid-eviction.
+    return this.populateActiveWorkflowRunIds(workspaceId, new Set<string>());
   }
 
   private async updateActiveWorkflowRunCount(event: {
@@ -13253,7 +13272,15 @@ export class WorkspaceService extends EventEmitter {
       // (it is backed by this process's EventEmitter, so cross-process
       // writes produce no delta). Merge in-scope additions from the fresh
       // re-read, subject to the same removal guards as retained entries.
-      if (freshSnapshots != null) {
+      // NOT gated on the snapshot re-read succeeding: config-proven late ids
+      // (workflow-only registrations) must be probed even when the metadata
+      // re-read transiently failed — the method still returns an
+      // authoritative (non-null) response in that case, and the
+      // process-local subscription can never supply the foreign workflow
+      // event, so skipping the probe would hide that activity until
+      // reconnect. Snapshot-derived candidates and snapshot guards simply
+      // degrade to the views that ARE available.
+      {
         // Merge scope: the (possibly stale) per-id scope PLUS fresh-snapshot
         // ids a fresh config-derived view proves registered — a workspace
         // registered and written between the scope reads and the fresh
@@ -13265,7 +13292,7 @@ export class WorkspaceService extends EventEmitter {
         // mid-list would stay absent until reconnect (the process-local
         // subscription cannot deliver the cross-process snapshot).
         const mergeCandidateIds = new Set(workspaceIds);
-        for (const workspaceId of freshSnapshots.keys()) {
+        for (const workspaceId of freshSnapshots?.keys() ?? []) {
           if (
             (freshConfigIds?.has(workspaceId) ?? false) ||
             (authoritativeIds?.has(workspaceId) ?? false)
@@ -13303,7 +13330,7 @@ export class WorkspaceService extends EventEmitter {
             // In-scope ids without a late snapshot were fully decided by the
             // per-id loop (probe + zero-tombstone logic); re-probing them
             // would only trigger the final re-reads below on every list.
-            (workspaceIds.has(workspaceId) && !freshSnapshots.has(workspaceId))
+            (workspaceIds.has(workspaceId) && !(freshSnapshots?.has(workspaceId) ?? false))
           ) {
             continue;
           }
@@ -13366,7 +13393,7 @@ export class WorkspaceService extends EventEmitter {
             const lateSnapshot =
               finalSnapshots != null
                 ? (finalSnapshots.get(workspaceId) ?? null)
-                : (freshSnapshots.get(workspaceId) ?? null);
+                : (freshSnapshots?.get(workspaceId) ?? null);
             if (
               // Nothing to contribute: no persisted snapshot and no live
               // counts (a workflow-only candidate legitimately has no
@@ -13381,7 +13408,7 @@ export class WorkspaceService extends EventEmitter {
               // only disappear through removal) — also covers legacy ids the
               // raw views cannot see.
               (finalSnapshots != null &&
-                freshSnapshots.has(workspaceId) &&
+                (freshSnapshots?.has(workspaceId) ?? false) &&
                 !finalSnapshots.has(workspaceId)) ||
               // Verifiably deregistered from the raw config during the
               // probes: the id was visible in an EARLIER raw view — the

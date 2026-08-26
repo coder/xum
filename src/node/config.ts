@@ -1190,7 +1190,31 @@ export class Config {
         }
       }
     };
-    collect((parsedValue as { projects?: unknown }).projects);
+    // The OUTER structure must be interpretable too, or the id set cannot be
+    // proven complete: a present non-array `projects`, a non-pair element, a
+    // non-object project config, or a project config with no workspaces key
+    // at all may be a mangled remnant of real registrations. Only an absent
+    // projects key is healthy emptiness (the strict loader accepts it).
+    const projects = (parsedValue as { projects?: unknown }).projects;
+    if (projects !== undefined) {
+      if (!Array.isArray(projects)) {
+        hasWorkspaceEntriesWithoutIds = true;
+      } else {
+        for (const pair of projects) {
+          const projectConfig: unknown = Array.isArray(pair) ? pair[1] : undefined;
+          if (
+            projectConfig === null ||
+            typeof projectConfig !== "object" ||
+            Array.isArray(projectConfig) ||
+            (projectConfig as { workspaces?: unknown }).workspaces === undefined
+          ) {
+            hasWorkspaceEntriesWithoutIds = true;
+            break;
+          }
+        }
+      }
+    }
+    collect(projects);
     return { ids, hasWorkspaceEntriesWithoutIds };
   }
 

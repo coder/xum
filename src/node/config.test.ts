@@ -1008,6 +1008,29 @@ describe("Config", () => {
         ids: new Set(),
         hasWorkspaceEntriesWithoutIds: false,
       });
+      // Malformed OUTER structure is incomplete evidence too: a mangled
+      // projects container / pair / project config may be the remnant of
+      // real registrations. Only an absent projects key is healthy empty.
+      for (const projects of [
+        null,
+        {},
+        "mangled",
+        [null],
+        ["not-a-pair"],
+        [["/repo", null]],
+        [["/repo", ["array-config"]]],
+        [["/repo", {}]], // project config with no workspaces key at all
+      ]) {
+        fs.writeFileSync(configPath, JSON.stringify({ projects }));
+        expect(
+          new Config(tempDir).readPersistedWorkspaceIdEvidence().hasWorkspaceEntriesWithoutIds
+        ).toBe(true);
+      }
+      fs.writeFileSync(configPath, JSON.stringify({ defaultProjectDir: "/tmp" }));
+      expect(new Config(tempDir).readPersistedWorkspaceIdEvidence()).toEqual({
+        ids: new Set(),
+        hasWorkspaceEntriesWithoutIds: false,
+      });
     });
   });
 

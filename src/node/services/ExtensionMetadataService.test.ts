@@ -996,6 +996,98 @@ describe("ExtensionMetadataService", () => {
     expect(sidecarGone).toBe(true);
   });
 
+  test("a malformed version value quarantines instead of masquerading as a newer schema", async () => {
+    // Only a structurally plausible forward version (finite number != 1)
+    // earns non-destructive preservation. Corruption that mangles the
+    // version field (null/string/object) must quarantine and self-heal —
+    // preserving it would fail every read and write forever on a file no
+    // build can read.
+    for (const version of [null, "two", {}]) {
+      await writeFile(
+        filePath,
+        JSON.stringify({ version, workspaces: { "ws-1": { recency: 1, streaming: false } } })
+      );
+      const restarted = new ExtensionMetadataService(filePath);
+      const snapshots = await restarted.getAllSnapshots({ throwOnError: true });
+      // Quarantined to empty (bytes preserved in the sidecar), not stuck.
+      expect(snapshots.size).toBe(0);
+      await rm(`${filePath}.corrupt`, { force: true });
+    }
+    // A plausible forward version stays preserved (non-destructive signal).
+    const newerFile = JSON.stringify({ version: 2, workspaces: {} });
+    await writeFile(filePath, newerFile);
+    const restarted = new ExtensionMetadataService(filePath);
+    let strictError: unknown = null;
+    try {
+      await restarted.getAllSnapshots({ throwOnError: true });
+    } catch (error) {
+      strictError = error;
+    }
+    expect(strictError).not.toBeNull();
+    expect(await readFile(filePath, "utf-8")).toBe(newerFile);
+  });
+
+  test("a write proceeds when another path lifts the tombstone mid-probe", async () => {
+    await service.updateRecency("ws-1", 100);
+    await service.deleteWorkspace("ws-1");
+    let resolveProbe: ((registered: boolean) => void) | null = null;
+    service.setRegistrationProbe(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveProbe = resolve;
+        })
+    );
+    const write = service.updateRecency("ws-1", 200);
+    expect(resolveProbe).not.toBeNull();
+    // The activity bootstrap clears the (re-registered) tombstone while the
+    // write's probe is still in flight.
+    service.clearTombstonesForRegisteredIds(new Set(["ws-1"]), service.getTombstonedIds());
+    expect(service.isWorkspaceDeleted("ws-1")).toBe(false);
+    resolveProbe!(true);
+    await write;
+    // The write must have PERSISTED: with the tombstone gone, the caller's
+    // snapshot is broadcast, and a transient (unpersisted) result would
+    // leave renderer state ahead of disk until restart.
+    expect((await service.getAllSnapshots()).get("ws-1")?.recency).toBe(200);
+  });
+
+  test("reconcile restores a healthy sidecar entry over an uncoercible main entry", async () => {
+    // The recreated main can carry a malformed value (null/primitive/array)
+    // under the same key as a healthy sidecar entry: the field merge cannot
+    // repair it, and the sidecar is consumed — leaving it would permanently
+    // lose the only valid copy.
+    await writeFile(
+      filePath,
+      JSON.stringify({ version: 1, workspaces: { "ws-1": null, "ws-2": 7 } })
+    );
+    await writeFile(
+      `${filePath}.corrupt`,
+      JSON.stringify({
+        version: 1,
+        workspaces: {
+          "ws-1": { recency: 42, streaming: true, lastModel: "m", lastThinkingLevel: null },
+          "ws-2": { recency: 43, streaming: false, lastModel: null, lastThinkingLevel: null },
+        },
+      })
+    );
+    const restarted = new ExtensionMetadataService(filePath);
+
+    const snapshots = await restarted.getAllSnapshots({ throwOnError: true });
+    expect(snapshots.get("ws-1")?.recency).toBe(42);
+    expect(snapshots.get("ws-2")?.recency).toBe(43);
+    const persisted = JSON.parse(await readFile(filePath, "utf-8")) as {
+      workspaces: Record<string, Record<string, unknown>>;
+    };
+    expect(persisted.workspaces["ws-1"]?.lastModel).toBe("m");
+    // Crash-leftover streaming stays cleared on restore.
+    expect(persisted.workspaces["ws-1"]?.streaming).toBe(false);
+    const sidecarGone = await readFile(`${filePath}.corrupt`, "utf-8").then(
+      () => false,
+      () => true
+    );
+    expect(sidecarGone).toBe(true);
+  });
+
   test("prune's re-registration spare keeps tombstones republished mid-recheck", async () => {
     // The recheck enumeration awaits disk; a same-process removal landing in
     // that window republishes the tombstone with a newer generation. The

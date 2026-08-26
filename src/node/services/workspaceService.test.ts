@@ -3857,6 +3857,59 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("a workflow bootstrap evicted mid-flight is retried instead of served detached", async () => {
+    // Cache eviction (removal / tombstone-lift revival) can race an
+    // in-flight bootstrap: waiters that captured the pre-eviction Set would
+    // return the removed incarnation's runs — ghost counts with no terminal
+    // event to clear them. The read must detect the eviction and re-probe.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const listStatusSnapshotsSpy = spyOn(WorkflowRunStore.prototype, "listRunStatusSnapshots");
+    try {
+      const workspaceId = "evicted-mid-bootstrap";
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+      });
+      const internals = workspaceService as unknown as {
+        getActiveWorkflowRunIds(id: string): Promise<Set<string>>;
+        evictWorkspaceActivityCaches(id: string): void;
+      };
+      const releaseFirstScan = createDeferred<void>();
+      let scanCalls = 0;
+      listStatusSnapshotsSpy.mockImplementation(async () => {
+        scanCalls += 1;
+        if (scanCalls === 1) {
+          // Old-incarnation bootstrap: parked, then reports a ghost run.
+          await releaseFirstScan.promise;
+          return [
+            {
+              id: "wfr_ghost",
+              workspaceId,
+              status: "running" as const,
+              createdAt: "2026-06-17T00:00:00.000Z",
+              updatedAt: "2026-06-17T00:00:00.000Z",
+            },
+          ];
+        }
+        // Post-revival probe: the new incarnation has no runs.
+        return [];
+      });
+
+      const read = internals.getActiveWorkflowRunIds(workspaceId);
+      // Removal + re-registration land while the bootstrap is parked.
+      internals.evictWorkspaceActivityCaches(workspaceId);
+      releaseFirstScan.resolve();
+      const runIds = await read;
+      expect(runIds.size).toBe(0);
+    } finally {
+      listStatusSnapshotsSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
   test("a re-registered id does not inherit workflow caches from its removed incarnation", async () => {
     // Workspace removal deletes session state without producing terminal
     // workflow events, and the process-local run cache was never evicted:
@@ -3899,6 +3952,78 @@ describe("WorkspaceService activity list scoping", () => {
       // No ghost count from the removed incarnation's cache: the revived id
       // re-probes disk (empty) and stays absent from the list.
       expect(activityList?.[workspaceId]).toBeUndefined();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("getActivityList bootstraps workflow-only late ids even when the metadata reread fails", async () => {
+    // The fresh raw config re-read can discover a workflow-only late
+    // registration while the metadata re-read transiently fails. The list
+    // still returns an authoritative (non-null) response, and the
+    // process-local subscription cannot supply the foreign workflow event —
+    // so the config-proven id must be probed regardless of the failed
+    // snapshot view.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "workflow-only-late-reread-fails";
+      const projectPath = path.join(config.rootDir, "project");
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      const realGetAllSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      let snapshotCalls = 0;
+      const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(
+        async (options?: { throwOnError?: boolean }) => {
+          snapshotCalls += 1;
+          if (snapshotCalls === 1) {
+            return realGetAllSnapshots(options);
+          }
+          if (snapshotCalls === 2) {
+            // Registration + workflow start land before the (failing)
+            // revalidation re-read.
+            await config.addWorkspace(projectPath, {
+              id: workspaceId,
+              name: workspaceId,
+              projectName: "project",
+              projectPath,
+              runtimeConfig: { type: "local" },
+            });
+            const runStore = new WorkflowRunStore({
+              sessionDir: config.getSessionDir(workspaceId),
+            });
+            await runStore.createRun({
+              id: "wfr_reread_fail",
+              workspaceId,
+              workflow: {
+                name: "demo",
+                description: "Demo workflow",
+                scope: "global" as const,
+                executable: true,
+              },
+              source: "export default function workflow() { return {}; }",
+              args: {},
+              now: "2026-06-17T00:00:00.000Z",
+            });
+          }
+          // Every re-read after the initial one fails transiently.
+          throw new Error("transient metadata read failure");
+        }
+      );
+      try {
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList).not.toBeNull();
+        expect(activityList?.[workspaceId]?.activeWorkflowRunCount).toBe(1);
+        expect(activityList?.[workspaceId]?.activeWorkflowRunIds).toEqual(["wfr_reread_fail"]);
+      } finally {
+        snapshotsSpy.mockRestore();
+      }
     } finally {
       await cleanup();
     }
