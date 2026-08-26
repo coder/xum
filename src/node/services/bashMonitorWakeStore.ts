@@ -214,8 +214,15 @@ function removeTailDuplicates(
   baseLines: readonly string[]
 ): string[] {
   if (tailLines.length === 0) return [];
+  // Only base occurrences guaranteed to survive the line cap may absorb a tail duplicate. The
+  // final record keeps the last MAX_WAKE_LINES of [base, tail], so at most (cap - tail length)
+  // trailing base lines are certain survivors; deduping against the soon-evicted prefix would
+  // remove the tail copy AND evict its "duplicate", losing the final output line entirely.
+  // Under-removal from the narrower window merely renders a benign duplicate.
+  const guaranteedSurvivors = Math.max(0, MAX_WAKE_LINES - tailLines.length);
+  const survivingBase = guaranteedSurvivors === 0 ? [] : baseLines.slice(-guaranteedSurvivors);
   const counts = new Map<string, number>();
-  for (const line of baseLines) {
+  for (const line of survivingBase) {
     const key = sanitizeBashMonitorWakeLine(line);
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }

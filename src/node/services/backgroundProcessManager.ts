@@ -647,8 +647,14 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
     // stdout/stderr redirection can lag exit-code observation by a tick (same redirect-lag sleep
     // the tail loop used before settlement centralized the final scan here).
+    //
+    // Every post-await guard below also rechecks shuttingDown: beginShutdown() can land while
+    // this helper sleeps or reads, after claimMonitorSettlement's own guard already passed.
+    // Emitting then would let WorkspaceService persist or queue a synthetic turn during
+    // ServiceContainer.dispose; returning instead leaves the armed registry record for the
+    // restart monitor-lost recovery (in-memory pending matches are lost, crash-equivalent).
     await new Promise((resolve) => setTimeout(resolve, monitor.pollIntervalMs));
-    if (monitor.stopped) return;
+    if (monitor.stopped || this.shuttingDown) return;
 
     // Final monitor scan: matches printed after the last poll (or sitting in the chunk the tail
     // loop read but deliberately did not process before claiming) accumulate under settlement
@@ -656,7 +662,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     try {
       const finalChunkStartOffset = monitor.lastReadOffset;
       const finalRead = await proc.handle.readOutput(finalChunkStartOffset);
-      if (monitor.stopped) return;
+      if (monitor.stopped || this.shuttingDown) return;
       if (finalRead.newOffset >= finalChunkStartOffset) {
         monitor.lastReadOffset = finalRead.newOffset;
         this.processMonitorContent(proc, finalRead.content, {
@@ -680,7 +686,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
           `BackgroundProcessManager: settlement tail read for ${proc.id} failed: ${getErrorMessage(error)}`
         );
       }
-      if (monitor.stopped) return;
+      if (monitor.stopped || this.shuttingDown) return;
     }
 
     const pendingLines = monitor.pendingLines;
@@ -841,6 +847,18 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   ): void {
     const monitor = proc.monitor;
     if (!monitor || monitor.stopped) return;
+
+    // Settlement accumulation still honors max_events: the cap silences wakes after N matches,
+    // so final-chunk matches beyond it must not swell the combined settlement payload or report
+    // totalMatches above the configured limit (the non-settled path can never exceed the cap
+    // because retirement below fires exactly at it).
+    if (
+      monitor.settled &&
+      monitor.maxEvents !== undefined &&
+      monitor.matchesCount >= monitor.maxEvents
+    ) {
+      return;
+    }
 
     const boundedLine = this.truncateMonitorLine(line);
     monitor.matchesCount++;

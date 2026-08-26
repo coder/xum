@@ -576,6 +576,31 @@ describe("BashMonitorWakeStore", () => {
     ]);
   });
 
+  test("a tail line is preserved when its only duplicate falls in the evicted prefix", async () => {
+    // Existing record at the 50-line cap whose OLDEST line matches the settlement tail's final
+    // output. Deduping against that soon-evicted occurrence would remove the tail copy and then
+    // evict the "duplicate", losing the line entirely; the survivor window prevents that.
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    const cappedLines = ["REPEAT", ...Array.from({ length: 49 }, (_, i) => `line ${i}`)];
+    await store.enqueueOrMergePending(payload({ lines: cappedLines, matchedThroughOffset: 500 }));
+    const merged = await store.enqueueOrMergePending(
+      payload({
+        lines: ["[monitor] process settled: exited (code 1)"],
+        matchedThroughOffset: undefined,
+        tailLines: ["REPEAT", "tail end"],
+        terminal: { status: "exited", exitCode: 1 },
+      })
+    );
+
+    // The tail's REPEAT survives bounding (near the end); the evicted-prefix copy is gone.
+    expect(merged.lines.slice(-3)).toEqual([
+      "[monitor] process settled: exited (code 1)",
+      "REPEAT",
+      "tail end",
+    ]);
+    expect(merged.lines).toHaveLength(50);
+  });
+
   test("a snapshot whose terminal was cleared by re-arm still transitions cleanly", async () => {
     // Race: a queued settlement wake is accepted just as the same processId is re-armed. The
     // cleared terminal is not undelivered content, so the accepted snapshot must fully

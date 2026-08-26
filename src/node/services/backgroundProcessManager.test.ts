@@ -1254,6 +1254,90 @@ describe("BackgroundProcessManager", () => {
         expect(stoppedEvents).toEqual([{ processId: result.processId, reason: "completed" }]);
       });
 
+      it("honors max_events while accumulating settlement matches", async () => {
+        const matchEvents: MonitorMatchPayload[] = [];
+        manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
+
+        // Three matching lines then immediate exit. Whether they process in the settlement scan
+        // (exit observed before the poll) or a pre-exit poll wins the race, the max_events cap
+        // must hold: at most one matched line ever persists and totalMatches never exceeds 1.
+        const result = await manager.spawn(
+          runtime,
+          testWorkspaceId,
+          "printf 'ERR one\\nERR two\\nERR three'",
+          {
+            cwd: process.cwd(),
+            displayName: "settle-max-events-cap",
+            monitor: {
+              filter: "ERR",
+              pattern: /ERR/,
+              exclude: false,
+              maxEvents: 1,
+              cooldownMs: 5_000,
+            },
+          }
+        );
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+
+        for (let attempt = 0; attempt < 80 && matchEvents.length === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        await new Promise((resolve) => setTimeout(resolve, 300));
+
+        const matchedLines = matchEvents.flatMap((event) =>
+          event.lines.filter((line) => line.startsWith("ERR"))
+        );
+        expect(matchedLines).toEqual(["ERR one"]);
+        expect(Math.max(...matchEvents.map((event) => event.totalMatches))).toBe(1);
+      });
+
+      it("abandons a claimed settlement when shutdown begins mid-flight", async () => {
+        const matchEvents: MonitorMatchPayload[] = [];
+        const stoppedEvents: MonitorStoppedPayload[] = [];
+        manager.on("monitor:match", (_workspaceId, payload) => matchEvents.push(payload));
+        manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+        const result = await manager.spawn(runtime, testWorkspaceId, "printf 'bye\\n'", {
+          cwd: process.cwd(),
+          displayName: "settle-shutdown-midflight",
+          monitor: { filter: "NEVER", pattern: /NEVER/, exclude: false, cooldownMs: 0 },
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+
+        const proc = await manager.getProcess(result.processId);
+        expect(proc).not.toBeNull();
+        if (proc == null) return;
+
+        // Hold the settlement helper inside its tail read so beginShutdown deterministically
+        // lands after the claim (claimMonitorSettlement's own shutdown guard is already past).
+        let releaseTail!: () => void;
+        const tailGate = new Promise<void>((resolve) => {
+          releaseTail = resolve;
+        });
+        let tailReadStarted!: () => void;
+        const tailReadStartedPromise = new Promise<void>((resolve) => {
+          tailReadStarted = resolve;
+        });
+        const realGetOutputFileSize = proc.handle.getOutputFileSize.bind(proc.handle);
+        spyOn(proc.handle, "getOutputFileSize").mockImplementation(async () => {
+          tailReadStarted();
+          await tailGate;
+          return realGetOutputFileSize();
+        });
+
+        await tailReadStartedPromise;
+        manager.beginShutdown();
+        releaseTail();
+        await new Promise((resolve) => setTimeout(resolve, 300));
+
+        // No settlement wake may be persisted or queued during ServiceContainer.dispose, and no
+        // monitor:stopped may erase the registry record the restart monitor-lost notice needs.
+        expect(matchEvents).toHaveLength(0);
+        expect(stoppedEvents).toHaveLength(0);
+      });
+
       it("bounds oversized tail content and marks it mid-content (degraded size query)", () => {
         // A runtime handle's transient size-query failure degrades to 0, turning the tail read
         // into a full-file read; the post-read bound must re-cut to the final byte window and
