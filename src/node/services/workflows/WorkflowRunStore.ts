@@ -1289,8 +1289,15 @@ async function readJsonLines<T>(
   let content: string;
   try {
     content = await fs.readFile(filePath, "utf-8");
-  } catch {
-    return [];
+  } catch (error) {
+    // A journal that does not exist yet is a normal state. Other IO failures
+    // must propagate: after a crash the newest status can live only in the
+    // journal, so swallowing e.g. EACCES here would let status reads act on a
+    // stale run.json and (in strict discovery) silently omit an active run.
+    if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) {
+      return [];
+    }
+    throw error;
   }
 
   const records: T[] = [];

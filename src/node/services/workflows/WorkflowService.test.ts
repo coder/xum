@@ -957,6 +957,19 @@ describe("WorkflowRunStore.listActiveRunSummaries", () => {
       } finally {
         await fs.chmod(runFile, 0o644);
       }
+
+      // Journal IO failures must reject too: after a crash the active status
+      // can exist only in events.jsonl, so a swallowed journal read error
+      // would fall back to a stale run.json status and silently omit the run.
+      const eventsFile = path.join(workflowsDir, "wfr_unreadable", "events.jsonl");
+      await fs.chmod(eventsFile, 0o000);
+      try {
+        await expect(
+          runStore.listActiveRunSummaries({ workspaceId: "workspace-1" })
+        ).rejects.toThrow();
+      } finally {
+        await fs.chmod(eventsFile, 0o644);
+      }
     }
   );
 
