@@ -6,7 +6,9 @@ import {
   createOmittedToolAttachmentText,
   createToolAttachmentSummaryText,
   extractAttachmentsFromToolOutput,
+  isSyntheticToolMediaPart,
   prepareExtractedToolAttachmentForProvider,
+  SYNTHETIC_TOOL_MEDIA_PART_METADATA,
   type ExtractedToolAttachment,
 } from "@/node/utils/messages/toolResultAttachments";
 
@@ -38,18 +40,25 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
     NonNullable<ReturnType<typeof extractAttachmentsFromToolOutput>>
   >();
   let totalAttachments = 0;
-  // Media parts already bound for the provider (user-attached images/files
-  // and prior synthetic parts) share the same per-request provider limits, so
-  // they consume the extraction allowance too (r31).
-  let existingMediaParts = 0;
+  // Existing media parts share the same per-request provider limits as new
+  // extractions (r31), but they split into two pools:
+  // - reserved: genuine user uploads (unmarked) — consume the allowance and
+  //   are never evicted.
+  // - synthetic tool media (marker from a prior history-level extraction) —
+  //   evictable oldest-first so a fresh screenshot from the current tool call
+  //   still reaches the model at saturation (r34).
+  let reservedMediaParts = 0;
+  const syntheticMediaParts: unknown[] = [];
   for (const message of messages) {
     if (!Array.isArray(message.content)) continue;
     for (const part of message.content) {
-      if (
-        (part as { type?: unknown }).type === "image" ||
-        (part as { type?: unknown }).type === "file"
-      ) {
-        existingMediaParts++;
+      const partType = (part as { type?: unknown }).type;
+      if (partType === "image" || partType === "file") {
+        if (isSyntheticToolMediaPart(part)) {
+          syntheticMediaParts.push(part);
+        } else {
+          reservedMediaParts++;
+        }
       }
     }
     if (message.role !== "assistant" && message.role !== "tool") continue;
@@ -66,15 +75,27 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
   // Request-wide cap (r28 security): capture bounds bytes and per-container
   // parts, not distinct records, so a looped bridged media tool could
   // otherwise fan out tens of thousands of synthetic provider parts.
-  // Chronologically OLDEST overflow is omitted behind a bounded placeholder.
-  const allowance = Math.max(0, MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST - existingMediaParts);
+  // Chronologically OLDEST tool media is dropped first: prior synthetic parts
+  // (all older — they were extracted from earlier turns' tool results) are
+  // evicted before new extractions are omitted behind bounded placeholders.
+  const budget = Math.max(0, MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST - reservedMediaParts);
+  const overBudget = Math.max(0, syntheticMediaParts.length + totalAttachments - budget);
+  // syntheticMediaParts is collected in message order, so a prefix slice is
+  // the chronologically oldest set.
+  const evictedSyntheticParts = new Set(
+    syntheticMediaParts.slice(0, Math.min(overBudget, syntheticMediaParts.length))
+  );
   const capState = {
-    omitRemaining: Math.max(0, totalAttachments - allowance),
+    omitRemaining: overBudget - evictedSyntheticParts.size,
   };
 
   const result: ModelMessage[] = [];
 
   for (const message of messages) {
+    if (message.role === "user" && Array.isArray(message.content)) {
+      result.push(evictSyntheticMediaParts(message, evictedSyntheticParts));
+      continue;
+    }
     if (message.role !== "assistant" && message.role !== "tool") {
       result.push(message);
       continue;
@@ -146,6 +167,40 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
   return result;
 }
 
+/**
+ * Replaces evicted synthetic tool-media parts in a user message with one
+ * bounded omission note (r34). Only parts identified by the pass-1 scan are
+ * touched; genuine user uploads never enter the evicted set.
+ */
+function evictSyntheticMediaParts(
+  message: Extract<ModelMessage, { role: "user" }>,
+  evictedSyntheticParts: ReadonlySet<unknown>
+): ModelMessage {
+  if (evictedSyntheticParts.size === 0 || !Array.isArray(message.content)) return message;
+  let evictedHere = 0;
+  for (const part of message.content) {
+    if (evictedSyntheticParts.has(part)) evictedHere++;
+  }
+  if (evictedHere === 0) return message;
+
+  const newContent: Array<TextPart | ImagePart | FilePart> = [];
+  let noteInserted = false;
+  for (const part of message.content) {
+    if (!evictedSyntheticParts.has(part)) {
+      newContent.push(part);
+      continue;
+    }
+    if (!noteInserted) {
+      noteInserted = true;
+      newContent.push({
+        type: "text",
+        text: createOmittedToolAttachmentText(evictedHere),
+      });
+    }
+  }
+  return { ...message, content: newContent };
+}
+
 async function createSyntheticUserMessage(
   keptAttachments: ExtractedToolAttachment[],
   omittedCount: number,
@@ -174,6 +229,9 @@ async function createSyntheticUserMessage(
         type: "image",
         image: preparedAttachment.data,
         mediaType: preparedAttachment.mediaType,
+        // Marks the part evictable under the request-wide media cap (r34) —
+        // matters when these messages re-enter the transform (replay).
+        providerOptions: SYNTHETIC_TOOL_MEDIA_PART_METADATA,
       });
       continue;
     }
@@ -182,6 +240,7 @@ async function createSyntheticUserMessage(
       type: "file",
       data: preparedAttachment.data,
       mediaType: preparedAttachment.mediaType,
+      providerOptions: SYNTHETIC_TOOL_MEDIA_PART_METADATA,
       ...(preparedAttachment.filename
         ? {
             filename: sanitizeAnthropicDocumentFilename(preparedAttachment.filename),

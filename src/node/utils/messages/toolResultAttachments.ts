@@ -621,6 +621,39 @@ export function createOmittedToolAttachmentText(omitted: number): string {
   return `[${omitted} extracted media attachment(s) omitted: request-wide cap of ${MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST} media parts reached; newest attachments are kept]`;
 }
 
+/**
+ * Part-level marker for synthetic tool-media parts (media extracted out of
+ * tool results into synthetic user messages). Stamped as UI-part
+ * providerMetadata, which convertToModelMessages forwards verbatim as
+ * ModelMessage part providerOptions; provider SDKs only read their own
+ * namespace, so the `mux` namespace passes through harmlessly.
+ *
+ * Why: the request-wide media cap must treat these parts as EVICTABLE
+ * (newest-first policy — the model usually needs its latest screenshot, not
+ * its oldest), unlike genuine user uploads which are reserved and never
+ * evicted (r34). Tool outputs cannot fabricate provider-bound image/file
+ * parts — only these transforms create them — so the marker is not spoofable
+ * through tool results.
+ */
+// Literal type keeps the constant assignable to both UI-part providerMetadata
+// (Record<string, Record<string, unknown>>) and ModelMessage part
+// providerOptions (JSONValue-constrained).
+export const SYNTHETIC_TOOL_MEDIA_PART_METADATA: { mux: { syntheticToolMedia: true } } = {
+  mux: { syntheticToolMedia: true },
+};
+
+/** Recognizes ModelMessage image/file parts carrying the synthetic tool-media marker. */
+export function isSyntheticToolMediaPart(part: unknown): boolean {
+  if (typeof part !== "object" || part === null) return false;
+  const record = part as { type?: unknown; providerOptions?: unknown };
+  if (record.type !== "image" && record.type !== "file") return false;
+  const providerOptions = record.providerOptions;
+  if (typeof providerOptions !== "object" || providerOptions === null) return false;
+  const muxNamespace = (providerOptions as Record<string, unknown>).mux;
+  if (typeof muxNamespace !== "object" || muxNamespace === null) return false;
+  return (muxNamespace as Record<string, unknown>).syntheticToolMedia === true;
+}
+
 const ATTACHMENT_PLACEHOLDER_PREFIX = "[Attachment attached";
 
 /** See coalesceAttachmentPlaceholders: replacement for every placeholder

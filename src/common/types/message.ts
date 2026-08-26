@@ -1029,6 +1029,14 @@ export interface MuxFilePart {
   mediaType: string; // IANA media type, e.g., "image/png", "application/pdf"
   url: string; // Data URL (e.g., "data:application/pdf;base64,...") or hosted URL
   filename?: string; // Optional filename
+  /**
+   * Part-level metadata convertToModelMessages forwards as FilePart.providerOptions.
+   * Used to mark request-only synthetic tool-media parts (see
+   * SYNTHETIC_TOOL_MEDIA_PART_METADATA in toolResultAttachments.ts) so per-step
+   * transforms can evict the oldest ones under the request-wide media cap
+   * instead of treating them like immutable user uploads (r34).
+   */
+  providerMetadata?: Record<string, Record<string, unknown>>;
 }
 
 // XumMessage extends UIMessage with our metadata and custom parts

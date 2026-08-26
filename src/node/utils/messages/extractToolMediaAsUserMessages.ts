@@ -8,6 +8,7 @@ import {
   createToolAttachmentSummaryText,
   extractAttachmentsFromToolOutput,
   prepareExtractedToolAttachmentForProvider,
+  SYNTHETIC_TOOL_MEDIA_PART_METADATA,
 } from "@/node/utils/messages/toolResultAttachments";
 
 /**
@@ -116,6 +117,10 @@ export async function extractToolMediaAsUserMessages(
           type: "file",
           mediaType: preparedAttachment.mediaType,
           url: createDataUrlForExtractedAttachment(preparedAttachment),
+          // Marks the part evictable under the request-wide media cap so a
+          // later step's fresh screenshot can displace it — genuine user
+          // uploads carry no marker and are never evicted (r34).
+          providerMetadata: SYNTHETIC_TOOL_MEDIA_PART_METADATA,
           ...(preparedAttachment.filename
             ? {
                 filename:
