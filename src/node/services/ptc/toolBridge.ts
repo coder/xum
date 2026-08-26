@@ -38,10 +38,9 @@ import {
 } from "./types";
 
 /**
- * Aggregate per-eval budget for attachment bytes stripped from bridged
- * results. Forwardable parts live host-side outside QuickJS memory accounting;
- * unsupported media is discarded but still consumes this budget so repeated
- * calls cannot retain unbounded bytes in nested-call records.
+ * Aggregate per-eval budget for serialized attachment parts stripped from
+ * bridged results. Forwardable parts live outside QuickJS memory accounting,
+ * and unsupported media still consumes the budget to bound repeated calls.
  */
 export const MAX_PENDING_ATTACHMENT_BYTES = 32 * 1024 * 1024;
 
@@ -494,17 +493,24 @@ export class ToolBridge {
       stub: string,
       carry: boolean
     ): T | { type: "text"; text: string } => {
-      if (pendingBytes + part.data.length > MAX_PENDING_ATTACHMENT_BYTES) {
-        return isMediaPart(part)
-          ? { type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB }
-          : { ...part, data: MEDIA_BUDGET_EXCEEDED_STUB };
+      const partBytes = Buffer.byteLength(JSON.stringify(part), "utf8");
+      if (pendingBytes + partBytes > MAX_PENDING_ATTACHMENT_BYTES) {
+        return { type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB };
       }
-      pendingBytes += part.data.length;
+      const stripped = isMediaPart(part)
+        ? { type: "text" as const, text: stub }
+        : { ...part, data: stub };
+      const strippedBytes = carry ? Buffer.byteLength(JSON.stringify(stripped), "utf8") : 0;
+      const retainedBytes = partBytes + strippedBytes;
+      if (pendingBytes + retainedBytes > MAX_PENDING_ATTACHMENT_BYTES) {
+        return { type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB };
+      }
+      pendingBytes += retainedBytes;
       this.pendingAttachmentBytes.set(runtime, pendingBytes);
       if (carry) {
         carriedParts.push(part);
       }
-      return isMediaPart(part) ? { type: "text", text: stub } : { ...part, data: stub };
+      return stripped;
     };
     const newValue = serialized.value.map((item) => {
       if (isMediaPart(item)) {

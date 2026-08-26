@@ -1,4 +1,8 @@
 import type { DisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
+import {
+  MAX_ATTACHMENT_MEDIA_TYPE_LENGTH,
+  normalizeAttachmentMediaType,
+} from "@/common/utils/attachments/supportedAttachmentMediaTypes";
 
 /** AI SDK media part shape tools emit for model-visible attachments. */
 export interface AISDKMediaPart {
@@ -30,7 +34,12 @@ export const MEDIA_DATA_STUB =
   "[base64 omitted: media is delivered to the model as an attachment on this code_execution result]";
 
 export function mediaUnsupportedStub(mediaType: string): string {
-  return `[media omitted: ${mediaType} is not supported as a model attachment]`;
+  const normalized = normalizeAttachmentMediaType(mediaType);
+  const bounded =
+    normalized.length > MAX_ATTACHMENT_MEDIA_TYPE_LENGTH
+      ? `${normalized.slice(0, MAX_ATTACHMENT_MEDIA_TYPE_LENGTH)}…`
+      : normalized;
+  return `[media omitted: ${bounded} is not supported as a model attachment]`;
 }
 
 export const DISPLAY_DATA_STUB =

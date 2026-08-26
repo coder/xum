@@ -29,7 +29,7 @@ const STAGED_EXTENSION_TO_MEDIA_TYPE: Record<string, string> = {
 };
 
 const DEFAULT_STAGED_MEDIA_TYPE = "application/octet-stream";
-const MAX_STAGED_MEDIA_TYPE_LENGTH = 100;
+export const MAX_ATTACHMENT_MEDIA_TYPE_LENGTH = 100;
 const MEDIA_TYPE_PATTERN = /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u;
 
 export function normalizeAttachmentMediaType(mediaType: string): string {
@@ -50,7 +50,10 @@ export function isSupportedAttachmentMediaType(mediaType: string): boolean {
   // Require a well-formed type/subtype within a plausible length — a bare
   // "image/" prefix check would qualify "image/" + megabytes of junk as a
   // supported attachment type.
-  if (normalized.length > MAX_STAGED_MEDIA_TYPE_LENGTH || !MEDIA_TYPE_PATTERN.test(normalized)) {
+  if (
+    normalized.length > MAX_ATTACHMENT_MEDIA_TYPE_LENGTH ||
+    !MEDIA_TYPE_PATTERN.test(normalized)
+  ) {
     return false;
   }
   return normalized.startsWith("image/") || normalized === PDF_MEDIA_TYPE;
@@ -79,7 +82,7 @@ function sanitizeStagedAttachmentMediaType(mediaType: string): string | null {
   const normalized = normalizeAttachmentMediaType(mediaType);
   if (
     normalized.length === 0 ||
-    normalized.length > MAX_STAGED_MEDIA_TYPE_LENGTH ||
+    normalized.length > MAX_ATTACHMENT_MEDIA_TYPE_LENGTH ||
     !MEDIA_TYPE_PATTERN.test(normalized)
   ) {
     return null;

@@ -904,10 +904,16 @@ describe("attachment part stripping", () => {
     expect(bridge.drainPendingAttachments(b.runtime)).toEqual([mediaPart]);
   });
 
-  it("caps aggregate carried media bytes per eval", async () => {
-    const bigData = "a".repeat(MAX_PENDING_ATTACHMENT_BYTES - 16);
+  it("counts supported media metadata toward the aggregate budget", async () => {
+    const bigData = "a".repeat(MAX_PENDING_ATTACHMENT_BYTES - 512);
     const bigPart = { type: "media", data: bigData, mediaType: "image/png" };
-    const smallPart = { type: "media", data: "b".repeat(64), mediaType: "application/pdf" };
+    const oversizedFilename = "x".repeat(1024);
+    const smallPart = {
+      type: "media",
+      data: "b",
+      mediaType: "application/pdf",
+      filename: oversizedFilename,
+    };
     const bridge = new ToolBridge({
       attach_file: createMockTool("attach_file", z.object({ path: z.string() }), (args) =>
         (args as { path: string }).path === "/big.png"
@@ -928,6 +934,7 @@ describe("attachment part stripping", () => {
       value: Array<{ type: string; text?: string }>;
     };
     expect(second.value[0]).toEqual({ type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB });
+    expect(JSON.stringify(second)).not.toContain(oversizedFilename);
 
     const drained = bridge.drainPendingAttachments(runtime);
     expect(drained).toHaveLength(1);
@@ -979,8 +986,25 @@ describe("attachment part stripping", () => {
     expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
   });
 
+  it("bounds unsupported media types in sandbox-visible placeholders", async () => {
+    const oversizedMediaType = `audio/${"x".repeat(4096)}`;
+    const bridge = new ToolBridge({
+      attach_file: createMockTool("attach_file", z.object({ path: z.string() }), () => ({
+        type: "content",
+        value: [{ type: "media", data: "", mediaType: oversizedMediaType }],
+      })),
+    });
+    const { captured, runtime } = registerCapturingXum(bridge);
+
+    const sandboxValue = await captured.xum.attach_file({ path: "/audio.bin" });
+    const serialized = JSON.stringify(sandboxValue);
+    expect(serialized.length).toBeLessThan(512);
+    expect(serialized).not.toContain("x".repeat(200));
+    expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
+  });
+
   it("counts discarded unsupported media against the aggregate budget", async () => {
-    const bigData = "a".repeat(MAX_PENDING_ATTACHMENT_BYTES - 16);
+    const bigData = "a".repeat(MAX_PENDING_ATTACHMENT_BYTES - 512);
     const bridge = new ToolBridge({
       attach_file: createMockTool("attach_file", z.object({ path: z.string() }), (args) =>
         (args as { path: string }).path === "/audio.bin"
@@ -990,7 +1014,7 @@ describe("attachment part stripping", () => {
             }
           : {
               type: "content",
-              value: [{ type: "media", data: "b".repeat(64), mediaType: "image/png" }],
+              value: [{ type: "media", data: "b".repeat(1024), mediaType: "image/png" }],
             }
       ),
     });
@@ -1043,8 +1067,9 @@ describe("attachment part stripping", () => {
     expect(bridge.drainPendingAttachments(runtime)).toEqual([displayPart]);
   });
 
-  it("display_file bytes share the aggregate attachment budget", async () => {
-    const bigData = "a".repeat(MAX_PENDING_ATTACHMENT_BYTES - 16);
+  it("counts display_file metadata toward the aggregate attachment budget", async () => {
+    const bigData = "a".repeat(MAX_PENDING_ATTACHMENT_BYTES - 512);
+    const oversizedMetadata = "x".repeat(1024);
     const bridge = new ToolBridge({
       attach_file: createMockTool("attach_file", z.object({ path: z.string() }), (args) =>
         (args as { path: string }).path === "/big.png"
@@ -1054,9 +1079,12 @@ describe("attachment part stripping", () => {
               value: [
                 {
                   type: "display_file",
-                  data: "b".repeat(64),
+                  data: "b",
                   mediaType: "text/markdown",
-                  providerOptions: { mux: { displayOnly: true, size: 48 } },
+                  providerOptions: {
+                    mux: { displayOnly: true, size: 1 },
+                    external: oversizedMetadata,
+                  },
                 },
               ],
             }
@@ -1068,9 +1096,10 @@ describe("attachment part stripping", () => {
     // The media part above nearly exhausted the shared budget: the display
     // part must be refused with the budget stub and not carried host-side.
     const second = (await captured.xum.attach_file({ path: "/notes.md" })) as {
-      value: Array<{ data: string }>;
+      value: Array<{ type: string; text?: string }>;
     };
-    expect(second.value[0].data).toBe(MEDIA_BUDGET_EXCEEDED_STUB);
+    expect(second.value[0]).toEqual({ type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB });
+    expect(JSON.stringify(second)).not.toContain(oversizedMetadata);
 
     const drained = bridge.drainPendingAttachments(runtime);
     expect(drained).toHaveLength(1);
