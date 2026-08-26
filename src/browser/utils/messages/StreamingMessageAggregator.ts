@@ -1434,6 +1434,11 @@ export class StreamingMessageAggregator {
       applied.push(incoming);
     }
 
+    // Flush the whole-transcript cache before the derived rebuild: deleteMessage only
+    // evicts per-message caches, and rebuildDerivedStateFromWindow must see the
+    // post-mutation message set, not a stale getAllMessages() array.
+    this.invalidateCache();
+
     // 3) Rebuild derived state deterministically from the post-reconcile message set
     // when a discarded row could have contributed to it; otherwise replay just the
     // applied rows incrementally (same semantics as append-mode loads).

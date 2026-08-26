@@ -5406,6 +5406,129 @@ describe("WorkspaceStore", () => {
       expect(clearedAbortReason).toBe(true);
     });
 
+    it("reuses the server-issued cursor verbatim on the next subscription", async () => {
+      const workspaceId = "cursor-reuse-workspace";
+      const serverCursor = {
+        messageId: "history-7",
+        historySequence: 7,
+        oldestHistorySequence: 3,
+        priorHistoryFingerprint: "0badf00d",
+      };
+      const firstSubscription = createReleaseGate();
+      const requestedModes: unknown[] = [];
+      let subscriptionCount = 0;
+
+      mockOnChat.mockImplementation(async function* (
+        input?: { workspaceId: string; mode?: unknown },
+        _options?: { signal?: AbortSignal }
+      ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
+        subscriptionCount += 1;
+        requestedModes.push(input?.mode);
+        if (subscriptionCount === 1) {
+          yield createHistoryMessageEvent("history-7", 7);
+          yield caughtUpEvent({ replay: "full", cursor: { history: serverCursor } });
+          await firstSubscription.wait;
+          return;
+        }
+        yield createHistoryMessageEvent("history-7", 7);
+        yield caughtUpEvent({ replay: "since", cursor: { history: serverCursor } });
+      });
+
+      createAndAddWorkspace(store, workspaceId);
+
+      const hydrated = await waitUntil(
+        () => store.getAggregator(workspaceId)?.getAllMessages().length === 1
+      );
+      expect(hydrated).toBe(true);
+      expect(requestedModes[0]).toBeUndefined();
+
+      firstSubscription.release();
+
+      const resubscribed = await waitUntil(() => subscriptionCount >= 2);
+      expect(resubscribed).toBe(true);
+      // The client must not recompute any cursor fields; the server-issued cursor is
+      // reused verbatim (fingerprint included).
+      expect(requestedModes[1]).toEqual({
+        type: "since",
+        cursor: { history: serverCursor },
+      });
+    });
+
+    it("forces a full resubscribe when caught-up carries no cursor", async () => {
+      const workspaceId = "cursor-missing-workspace";
+      const firstSubscription = createReleaseGate();
+      const requestedModes: unknown[] = [];
+      let subscriptionCount = 0;
+
+      mockOnChat.mockImplementation(async function* (
+        input?: { workspaceId: string; mode?: unknown },
+        _options?: { signal?: AbortSignal }
+      ): AsyncGenerator<WorkspaceChatMessage, void, unknown> {
+        subscriptionCount += 1;
+        requestedModes.push(input?.mode);
+        // Replay failures make the server omit the cursor from caught-up.
+        yield createHistoryMessageEvent("history-1", 1);
+        yield caughtUpEvent({ replay: "full" });
+        if (subscriptionCount === 1) {
+          await firstSubscription.wait;
+        }
+      });
+
+      createAndAddWorkspace(store, workspaceId);
+
+      const hydrated = await waitUntil(
+        () => store.getAggregator(workspaceId)?.getAllMessages().length === 1
+      );
+      expect(hydrated).toBe(true);
+
+      firstSubscription.release();
+
+      const resubscribed = await waitUntil(() => subscriptionCount >= 2);
+      expect(resubscribed).toBe(true);
+      expect(requestedModes[1]).toBeUndefined();
+    });
+
+    it("removes rows the server did not re-send from a since replay", async () => {
+      const workspaceId = "since-suffix-ghost-workspace";
+      const firstSubscription = createReleaseGate();
+      const getSubscriptionCount = mockChatReconnectScript((subscriptionCount) =>
+        subscriptionCount === 1
+          ? [
+              createHistoryMessageEvent("history-1", 1),
+              createHistoryMessageEvent("history-2", 2),
+              fullCaughtUpEvent(2, "history-2"),
+              Promise.resolve(),
+              // Row streamed live after caught-up: it sits above the stored anchor.
+              createHistoryMessageEvent("history-3", 3),
+              firstSubscription.wait,
+            ]
+          : [
+              // Server deleted history-3 while the client was unsubscribed, so the
+              // since replay re-sends only the anchor row.
+              createHistoryMessageEvent("history-2", 2),
+              sinceCaughtUpEvent(2, "history-2"),
+            ]
+      );
+
+      createAndAddWorkspace(store, workspaceId);
+
+      const seeded = await waitUntil(
+        () => store.getAggregator(workspaceId)?.getAllMessages().length === 3
+      );
+      expect(seeded).toBe(true);
+
+      firstSubscription.release();
+
+      const ghostRemoved = await waitUntil(() => {
+        const ids = store
+          .getAggregator(workspaceId)
+          ?.getAllMessages()
+          .map((message) => message.id);
+        return getSubscriptionCount() >= 2 && JSON.stringify(ids) === '["history-1","history-2"]';
+      });
+      expect(ghostRemoved).toBe(true);
+    });
+
     it("clears stale auto-retry status when full replay reconnect replaces history", async () => {
       const workspaceId = "task-created-workspace-auto-retry-reset";
       const firstSubscription = createReleaseGate();
