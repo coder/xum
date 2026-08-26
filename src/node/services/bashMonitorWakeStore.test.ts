@@ -2523,6 +2523,150 @@ describe("BashMonitorWakeStore", () => {
     expect(existsSync(sessionDir)).toBe(false);
   });
 
+  test("a tombstone removal resurrected by a concurrent heal reports the lost race", async () => {
+    const owner = new BashMonitorWakeStore(makeConfig(rootDir));
+    await owner.enqueueOrMergePending(payload({ lines: ["ERROR retired then resurrected"] }));
+    // Strictly order wake < cutoff (same-millisecond stamps fail toward delivery).
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await owner.supersedeAllPending("owner-1");
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const tombPath = path.join(dir, "cleared-at");
+    // The owner crashed: its staging ages past the grace window.
+    const stagedTomb = JSON.parse(await fsPromises.readFile(tombPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    await fsPromises.writeFile(
+      tombPath,
+      JSON.stringify({
+        ...stagedTomb,
+        stagedAt: new Date(Date.now() - STAGED_CLEAR_ROLLBACK_GRACE_MS - 60_000).toISOString(),
+      }),
+      "utf-8"
+    );
+    await owner.abandonWorkspaceClears("owner-1");
+    // A concurrent instance's heal consumes the rollback demotion's capture and
+    // republishes it at the canonical path between the capture rename and the
+    // removal's rm: unlike replacements, the removal branch has no no-clobber
+    // placement to lose, so it must VERIFY the removal stands.
+    const scan = new BashMonitorWakeStore(makeConfig(rootDir));
+    const realRm = fsPromises.rm;
+    const injected = { fired: false };
+    const rmSpy = spyOn(fsPromises, "rm").mockImplementation((async (
+      target: Parameters<typeof realRm>[0],
+      options?: Parameters<typeof realRm>[1]
+    ) => {
+      if (!injected.fired && String(target).includes("cleared-at.cas-")) {
+        injected.fired = true;
+        await fsPromises.link(String(target), tombPath);
+      }
+      return realRm(target, options);
+    }) as typeof fsPromises.rm);
+    try {
+      // Accepting the rollback would leave restored records pending under a standing
+      // staging: a record whose pre-clear updatedAt equals the cutoff would pass the
+      // strict pre-cutoff fence and deliver during the clear.
+      expect(await scan.listPending("owner-1")).toEqual([]);
+    } finally {
+      rmSpy.mockRestore();
+    }
+    expect(injected.fired).toBe(true);
+    expect((await scan.get("owner-1", "proc-1"))?.status).toBe("superseded");
+    const standing = JSON.parse(await fsPromises.readFile(tombPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    expect(standing.phase).toBe("staged");
+    // The resurrected staging is still beyond its grace window: the next scan
+    // completes the rollback cleanly (compensation and restore are idempotent).
+    expect((await scan.listPending("owner-1")).map((r) => r.lines)).toEqual([
+      ["ERROR retired then resurrected"],
+    ]);
+    expect((await scan.get("owner-1", "proc-1"))?.status).toBe("pending");
+    expect(existsSync(tombPath)).toBe(false);
+  });
+
+  test("records whose identity disagrees with their path are not published", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR real"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const realRaw = await fsPromises.readFile(path.join(dir, "proc-1.json"), "utf-8");
+    // A copied or moved artifact: syntactically valid record content whose id
+    // disagrees with the canonical path it sits at. Later transitions address the
+    // PARSED identity, so publishing it would leave THIS file pending forever while
+    // deliveries and writes target a different record.
+    const imposter = { ...(JSON.parse(realRaw) as BashMonitorWakeRecord), id: "proc-9" };
+    await fsPromises.writeFile(path.join(dir, "proc-2.json"), JSON.stringify(imposter), "utf-8");
+    // A record claiming a DIFFERENT workspace at this workspace's path: writes built
+    // from its fields would land in the foreign workspace's store.
+    const foreign = {
+      ...(JSON.parse(realRaw) as BashMonitorWakeRecord),
+      id: "proc-3",
+      ownerWorkspaceId: "owner-2",
+    };
+    await fsPromises.writeFile(path.join(dir, "proc-3.json"), JSON.stringify(foreign), "utf-8");
+
+    expect((await store.listPending("owner-1")).map((r) => r.id)).toEqual(["proc-1"]);
+    // Kept as evidence (like malformed canonicals), never served or deleted here.
+    const entries = await fsPromises.readdir(dir);
+    expect(entries).toContain("proc-2.json");
+    expect(entries).toContain("proc-3.json");
+  });
+
+  test("healing prefers the freshest staged capture at equal cutoffs", async () => {
+    // Two name pairs so that on any filesystem's directory iteration order at least
+    // one arm encounters the STALE capture first — the selection must be
+    // order-independent either way.
+    const arms = [
+      { owner: "owner-1", staleName: "cleared-at.cas-older", freshName: "cleared-at.cas-newer" },
+      { owner: "owner-2", staleName: "cleared-at.cas-stale", freshName: "cleared-at.cas-live" },
+    ];
+    for (const arm of arms) {
+      const store = new BashMonitorWakeStore(makeConfig(rootDir));
+      await store.enqueueOrMergePending(
+        payload({ workspaceId: arm.owner, lines: ["ERROR retired by live clear"] })
+      );
+      // Strictly order wake < cutoff (same-millisecond stamps fail toward delivery).
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await store.supersedeAllPending(arm.owner);
+      const dir = path.join(rootDir, "sessions", arm.owner, "bash-monitor-wakes");
+      const tombPath = path.join(dir, "cleared-at");
+      const stagedTomb = JSON.parse(await fsPromises.readFile(tombPath, "utf-8")) as Record<
+        string,
+        unknown
+      >;
+      await store.abandonWorkspaceClears(arm.owner);
+      // Concurrent heartbeat mutations crash and strand TWO captures of the SAME
+      // staged clear: equal cutoff, different liveness generations. The canonical
+      // path is empty. Directory iteration order must not decide which one heals
+      // back: the older capture sits beyond the rollback grace, so selecting it
+      // would let this scan roll back a clear whose owner is still live.
+      const staleStagedAt = new Date(
+        Date.now() - STAGED_CLEAR_ROLLBACK_GRACE_MS - 60_000
+      ).toISOString();
+      const freshStagedAt = new Date().toISOString();
+      await fsPromises.rm(tombPath);
+      await fsPromises.writeFile(
+        path.join(dir, arm.staleName),
+        JSON.stringify({ ...stagedTomb, stagedAt: staleStagedAt }),
+        "utf-8"
+      );
+      await fsPromises.writeFile(
+        path.join(dir, arm.freshName),
+        JSON.stringify({ ...stagedTomb, stagedAt: freshStagedAt }),
+        "utf-8"
+      );
+      const scan = new BashMonitorWakeStore(makeConfig(rootDir));
+      expect(await scan.listPending(arm.owner)).toEqual([]);
+      expect((await scan.get(arm.owner, "proc-1"))?.status).toBe("superseded");
+      const healed = JSON.parse(await fsPromises.readFile(tombPath, "utf-8")) as Record<
+        string,
+        unknown
+      >;
+      expect(healed.stagedAt).toBe(freshStagedAt);
+    }
+  });
+
   test("a directory squatting on a tombstone capture is quarantined instead of failing heals", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload({ lines: ["ERROR heals anyway"] }));

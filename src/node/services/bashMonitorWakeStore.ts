@@ -839,7 +839,35 @@ export class BashMonitorWakeStore {
       if (next == null) {
         // Removal failures PROPAGATE: a stranded capture would heal back as standing
         // protection (the safe direction), and the caller must know removal failed.
-        if (captured) await fsPromises.rm(capture, { force: true });
+        if (captured) {
+          await fsPromises.rm(capture, { force: true });
+          // Unlike replacements, removal has no no-clobber placement to lose: a
+          // concurrent instance's heal can consume the capture between the rename
+          // and the rm above and republish it at the target (its heartbeat then
+          // refreshing it). Verify the removal actually stands: a standing
+          // generation with the captured identity means the removal was
+          // resurrected — report the lost race so a crash-rollback caller never
+          // accepts a rollback whose staging still stands. A FOREIGN generation
+          // stands on its own (our removal landed, then someone published anew).
+          let standingRaw: string | null = null;
+          try {
+            standingRaw = await fsPromises.readFile(target, "utf-8");
+          } catch (error) {
+            if (!isErrnoWithCode(error, "ENOENT")) throw error;
+          }
+          if (standingRaw != null) {
+            const standing = BashMonitorWakeStore.parseTombstone(standingRaw);
+            if (
+              standing != null &&
+              current != null &&
+              (standing.clearId != null || current.clearId != null
+                ? standing.clearId === current.clearId
+                : JSON.stringify(standing) === JSON.stringify(current))
+            ) {
+              return false;
+            }
+          }
+        }
         return true;
       }
       const temp = `${target}.tmp-${randomUUID()}`;
@@ -935,7 +963,14 @@ export class BashMonitorWakeStore {
         // directory order must never decide that.
         (Date.parse(parsed.clearedAt) === Date.parse(newest.clearedAt) &&
           newest.phase === "staged" &&
-          parsed.phase !== "staged")
+          (parsed.phase !== "staged" ||
+            // Both STAGED at an equal cutoff: two captures of the SAME clear
+            // stranded by concurrent heartbeat mutations differ only in stagedAt
+            // (parseTombstone guarantees staged values carry one). Selecting the
+            // older liveness generation could put a LIVE clear's staging beyond its
+            // rollback grace, letting a foreign scan roll it back and restore wakes
+            // it retired; directory order must never decide that either.
+            Date.parse(parsed.stagedAt ?? "") > Date.parse(newest.stagedAt ?? "")))
       ) {
         newest = parsed;
         newestPath = leftoverPath;
@@ -1242,6 +1277,10 @@ export class BashMonitorWakeStore {
       await this.locks.withLock(`${ownerWorkspaceId}:${id}`, async () => {
         const record = await this.readRecordAt(filePath);
         if (record?.status !== "superseded" || record.supersededByClearId !== clearId) return;
+        // Identity gate: the write below targets the PARSED identity, so restoring a
+        // record whose id/owner disagrees with this path would overwrite an
+        // unrelated record or workspace (see recordIdentityMatches).
+        if (!BashMonitorWakeStore.recordIdentityMatches(record, ownerWorkspaceId, id)) return;
         const { supersededByClearId: _clearStamp, pendingUpdatedAtBeforeClear, ...rest } = record;
         const written: BashMonitorWakeRecord = {
           ...rest,
@@ -1504,6 +1543,22 @@ export class BashMonitorWakeStore {
     });
   }
 
+  /**
+   * Whether a parsed record's identity agrees with the location it was read from.
+   * Persisted corruption or a copied/moved file can leave a syntactically valid
+   * record whose id or owner disagrees with its path — later transitions address the
+   * PARSED identity (get()/write() build paths from record fields), so accepting it
+   * would leave the scanned file pending forever while deliveries and writes target
+   * a different record or workspace. Mismatches are treated like malformed content.
+   */
+  private static recordIdentityMatches(
+    record: BashMonitorWakeRecord,
+    ownerWorkspaceId: string,
+    id: string
+  ): boolean {
+    return record.id === id && record.ownerWorkspaceId === ownerWorkspaceId;
+  }
+
   async get(ownerWorkspaceId: string, id: string): Promise<BashMonitorWakeRecord | null> {
     let raw: string;
     try {
@@ -1512,7 +1567,14 @@ export class BashMonitorWakeStore {
       if (isErrnoWithCode(error, "ENOENT")) return null;
       throw error;
     }
-    return this.parse(raw);
+    const parsed = this.parse(raw);
+    if (
+      parsed != null &&
+      !BashMonitorWakeStore.recordIdentityMatches(parsed, ownerWorkspaceId, id)
+    ) {
+      return null;
+    }
+    return parsed;
   }
 
   async listPending(ownerWorkspaceId: string): Promise<BashMonitorWakeRecord[]> {
@@ -1680,7 +1742,23 @@ export class BashMonitorWakeStore {
         // hide a new one, so propagate and let caller retries re-read instead.
         throw error;
       }
-      const parsed = this.parse(raw);
+      let parsed = this.parse(raw);
+      if (
+        parsed != null &&
+        !BashMonitorWakeStore.recordIdentityMatches(
+          parsed,
+          ownerWorkspaceId,
+          BashMonitorWakeStore.wakeIdFromFileStem(entry.slice(0, -".json".length))
+        )
+      ) {
+        // Identity disagrees with the path (see recordIdentityMatches): treated like
+        // malformed content — kept as evidence, never served or transitioned.
+        log.debug("Ignoring bash monitor wake record whose identity disagrees with its path", {
+          ownerWorkspaceId,
+          entry,
+        });
+        parsed = null;
+      }
       const pending = parsed?.status === "pending" ? parsed : null;
       const prunable = parsed != null && parsed.status !== "pending";
       if (prunable && stat.mtimeMs < pruneBeforeMs) {
@@ -1988,7 +2066,16 @@ export class BashMonitorWakeStore {
         if (isErrnoWithCode(error, "ENOENT")) return null;
         throw error;
       }
-      const parsed = this.parse(raw);
+      const parsedRaw = this.parse(raw);
+      // Identity gate: a moved/corrupt leftover whose id or owner disagrees with the
+      // canonical path it would be restored to reads as malformed (kept as evidence
+      // until the age sweep) — restoring it would publish a record later transitions
+      // cannot address (see recordIdentityMatches).
+      const parsed =
+        parsedRaw != null &&
+        BashMonitorWakeStore.recordIdentityMatches(parsedRaw, ownerWorkspaceId, id)
+          ? parsedRaw
+          : null;
       if (parsed?.status !== "pending") {
         // A superseded record stamped by an UNRESOLVED staged clear is that clear's
         // only rollback source, and rollbackCrashedClearStaging restores canonical
@@ -2219,7 +2306,16 @@ export class BashMonitorWakeStore {
       if (!stat.isFile()) return null; // non-regular imposter
       const consumable = stat.mtimeMs < Date.now() - TEMP_RECOVERY_MIN_AGE_MS;
       const old = stat.mtimeMs < pruneBeforeMs;
-      const parsed = await this.readRecordAt(filePath);
+      const parsedRaw = await this.readRecordAt(filePath);
+      // Identity gate: a moved/corrupt artifact whose id or owner disagrees with the
+      // canonical path it would be restored to reads as malformed (swept once old) —
+      // placing it would publish a record later transitions cannot address (see
+      // recordIdentityMatches).
+      const parsed =
+        parsedRaw != null &&
+        BashMonitorWakeStore.recordIdentityMatches(parsedRaw, ownerWorkspaceId, id)
+          ? parsedRaw
+          : null;
       if (parsed == null) {
         // Vanished, an incomplete crashed write, or a live writer mid-writeFile:
         // disposable once old. A FRESH incomplete temp may be a live writeFile whose
