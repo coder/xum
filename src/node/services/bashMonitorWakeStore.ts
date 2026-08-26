@@ -77,6 +77,13 @@ export interface BashMonitorLostPayload {
   filter: string;
   filterExclude: boolean;
   script: string;
+  /**
+   * Arm time of the consumed registry row (generation marker). Distinguishes "the pending
+   * terminal wake IS this generation's settlement" (registry deletion lost to a crash) from a
+   * crash between a re-arm and clearStaleTerminalOnRearm's rewrite, where the terminal belongs
+   * to an older dead run and the re-armed monitor really was lost.
+   */
+  createdAt?: string;
 }
 
 export interface BashMonitorWakeRecord {
@@ -643,16 +650,33 @@ export class BashMonitorWakeStore {
         // A pending record that already carries settlement metadata means the process had
         // settled before shutdown (the wake persisted, but the crash lost the registry
         // deletion). The monitor was not "lost" — keep the more precise terminal wake as-is
-        // and let the caller consume the stale registry record.
+        // and let the caller consume the stale registry record. Bind that inference to the
+        // generation, though: a registry row armed strictly AFTER the terminal's marker means
+        // the crash landed between a re-arm and clearStaleTerminalOnRearm's rewrite — the
+        // terminal belongs to an older dead run while the re-armed monitor really was lost, so
+        // fall through to the lost upgrade. NaN-safe: a missing or malformed marker keeps the
+        // precise terminal wake (comparisons with NaN are false).
         if (existing.kind === "match" && existing.terminal != null) {
-          return null;
+          const terminalMarkerMs = Date.parse(existing.terminalOriginAt ?? existing.createdAt);
+          const armedAtMs = Date.parse(payload.createdAt ?? "");
+          if (!(armedAtMs > terminalMarkerMs)) return null;
         }
         const record: BashMonitorWakeRecord = {
           ...existing,
           kind: "monitor-lost",
           script: payload.script,
+          // Cross-generation fall-through: apply the re-arm preservation the crash preempted,
+          // so the lost notice cannot render the old run's settlement as the lost monitor's.
+          ...(existing.terminal != null
+            ? {
+                staleTerminal: existing.terminal,
+                lines: existing.lines.map(relabelStaleSettleLine),
+              }
+            : {}),
           updatedAt: now,
         };
+        delete record.terminal;
+        delete record.terminalOriginAt;
         await this.write(record);
         return record;
       }

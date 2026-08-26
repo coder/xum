@@ -746,6 +746,74 @@ describe("BashMonitorWakeStore", () => {
     expect(pending[0].script).toBeUndefined();
   });
 
+  test("enqueueMonitorLost keeps the precise terminal wake for a same-generation registry row", async () => {
+    // Registry row armed BEFORE the settle marker: the crash merely lost the registry deletion,
+    // so the pending terminal wake IS the consumed generation's settlement.
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(
+      payload({
+        lines: ["settled before shutdown"],
+        matchedThroughOffset: undefined,
+        terminal: { status: "exited", exitCode: 1 },
+      })
+    );
+
+    const result = await store.enqueueMonitorLost(
+      {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        ownerWorkspaceId: "owner-1",
+        filter: "ERROR",
+        filterExclude: false,
+        script: "watch.sh",
+        createdAt: new Date(Date.now() - 60_000).toISOString(),
+      },
+      TREAT_ALL_AS_STALE()
+    );
+
+    expect(result).toBeNull();
+    const pending = await store.listPending("owner-1");
+    expect(pending[0].kind).toBe("match");
+    expect(pending[0].terminal).toEqual({ status: "exited", exitCode: 1 });
+  });
+
+  test("enqueueMonitorLost upgrades when the consumed registry row postdates the terminal", async () => {
+    // Crash between a re-arm's registry write and clearStaleTerminalOnRearm's rewrite: the
+    // pending terminal belongs to a dead OLDER run, while the consumed (newer) registry row's
+    // monitor really was lost. The owner must get the lost notice, with the old settlement
+    // preserved as stale disposition rather than claiming the lost generation settled.
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(
+      payload({
+        lines: ["[monitor] process settled: exited (code 1)"],
+        matchedThroughOffset: undefined,
+        terminal: { status: "exited", exitCode: 1 },
+      })
+    );
+
+    const result = await store.enqueueMonitorLost(
+      {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        ownerWorkspaceId: "owner-1",
+        filter: "ERROR",
+        filterExclude: false,
+        script: "watch.sh",
+        createdAt: new Date(Date.now() + 60_000).toISOString(),
+      },
+      TREAT_ALL_AS_STALE()
+    );
+
+    expect(result).not.toBeNull();
+    const pending = await store.listPending("owner-1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0].kind).toBe("monitor-lost");
+    expect(pending[0].terminal).toBeUndefined();
+    expect(pending[0].staleTerminal).toEqual({ status: "exited", exitCode: 1 });
+    expect(pending[0].lines[0]).not.toContain("[monitor] process settled");
+    expect(pending[0].lines[0]).toContain("exited (code 1)");
+  });
+
   test("synthetic settle and tail lines survive a merge with a full pending-line cap", async () => {
     // boundLines keeps the newest 50 lines; the settlement payload appends its synthetic + tail
     // lines LAST, so they must survive a merge with up to 50 pending matched lines. This guards
