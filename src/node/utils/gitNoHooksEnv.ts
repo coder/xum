@@ -50,15 +50,21 @@ const GIT_EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 export function gitNoRepoAutomationEnv(): Record<string, string> {
   const env: Record<string, string> = {
     ...GIT_NO_HOOKS_ENV,
-    GIT_CONFIG_COUNT: "3",
+    GIT_CONFIG_COUNT: "5",
     GIT_CONFIG_KEY_1: "core.fsmonitor",
     GIT_CONFIG_VALUE_1: "false",
     // An empty credential.helper value resets the helper list.
     GIT_CONFIG_KEY_2: "credential.helper",
     GIT_CONFIG_VALUE_2: "",
+    GIT_CONFIG_KEY_3: "core.gitProxy",
+    GIT_CONFIG_VALUE_3: "none",
+    GIT_CONFIG_KEY_4: "core.askPass",
+    GIT_CONFIG_VALUE_4: "",
     GIT_ATTR_SOURCE: GIT_EMPTY_TREE_OID,
     // Environment beats repo-config core.sshCommand.
     GIT_SSH_COMMAND: "ssh",
+    // Exclude ext:: and unknown remote helpers while retaining standard transports.
+    GIT_ALLOW_PROTOCOL: "file:http:https:ssh:git",
   };
   for (const name of providerSecretEnvVarNames()) {
     env[name] = "";
@@ -72,18 +78,18 @@ export function gitNoRepoAutomationEnv(): Record<string, string> {
 }
 
 export const GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN =
-  "^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver)$";
+  "^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver|remote[.].*[.](uploadpack|receivepack|vcs))$";
 export const MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES = 256 * 1024;
 
 const REPO_AUTOMATION_CONFIG_KEY_REGEX =
-  /^(filter|diff|merge)[.](.+)[.](clean|smudge|process|required|command|textconv|driver)$/i;
+  /^(filter|diff|merge|remote)[.](.+)[.](clean|smudge|process|required|command|textconv|driver|uploadpack|receivepack|vcs)$/i;
 const MAX_REPO_AUTOMATION_DRIVERS = 128;
 
 function appendDisabledRepoAutomationDrivers(
   env: Record<string, string>,
   configKeys: Iterable<string>
 ): Record<string, string> {
-  const drivers = new Map<string, { kind: "filter" | "diff" | "merge"; name: string }>();
+  const drivers = new Map<string, { kind: "filter" | "diff" | "merge" | "remote"; name: string }>();
   let hasDiffExternal = false;
   for (const key of configKeys) {
     if (key.toLowerCase() === "diff.external") {
@@ -94,7 +100,7 @@ function appendDisabledRepoAutomationDrivers(
     if (match == null) {
       continue;
     }
-    const kind = match[1].toLowerCase() as "filter" | "diff" | "merge";
+    const kind = match[1].toLowerCase() as "filter" | "diff" | "merge" | "remote";
     const name = match[2];
     if (name.length > 512 || /[\0\r\n]/.test(name)) {
       throw new Error("Refusing git operation with an unsupported driver name");
@@ -131,7 +137,13 @@ function appendDisabledRepoAutomationDrivers(
               ["command", ""],
               ["textconv", ""],
             ] as const)
-          : ([["driver", ""]] as const);
+          : kind === "merge"
+            ? ([["driver", ""]] as const)
+            : ([
+                ["uploadpack", ""],
+                ["receivepack", ""],
+                ["vcs", ""],
+              ] as const);
     for (const [field, value] of fields) {
       env["GIT_CONFIG_KEY_" + configIndex] = kind + "." + name + "." + field;
       env["GIT_CONFIG_VALUE_" + configIndex] = value;

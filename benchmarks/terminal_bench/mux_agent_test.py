@@ -235,7 +235,7 @@ def test_mux_runner_scores_goal_mode_incomplete_exit(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "config_key",
-    ["merge.evil.driver", "diff.external"],
+    ["merge.evil.driver", "diff.external", "remote.origin.uploadpack"],
 )
 def test_mux_runner_rejects_git_driver_before_trust(
     tmp_path: Path, config_key: str

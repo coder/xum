@@ -79,7 +79,7 @@ cd "${MUX_APP_ROOT}"
 export XUM_DISABLE_PROJECT_AUTOMATION=1
 export MUX_DISABLE_PROJECT_AUTOMATION=1
 
-repo_driver_pattern='^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver)$'
+repo_driver_pattern='^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver|remote[.].*[.](uploadpack|receivepack|vcs)|core[.](sshcommand|gitproxy|askpass)|credential([.].*)?[.]helper)$'
 if git -C "${project_path}" config --name-only --includes --get-regexp "${repo_driver_pattern}" >/dev/null; then
   fatal "refusing to trust project with repo-controlled Git drivers"
 else

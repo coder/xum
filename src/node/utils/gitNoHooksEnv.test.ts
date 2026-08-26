@@ -35,7 +35,7 @@ describe("gitNoHooksPrefix", () => {
 
   test("returns env prefix when untrusted (false)", () => {
     const prefix = gitNoHooksPrefix(false);
-    expect(prefix).toContain("GIT_CONFIG_COUNT='3'");
+    expect(prefix).toContain("GIT_CONFIG_COUNT='5'");
     expect(prefix).toContain("core.hooksPath");
     expect(prefix).toContain("/dev/null");
     expect(prefix).toContain("GIT_CONFIG_PARAMETERS=");
@@ -44,7 +44,7 @@ describe("gitNoHooksPrefix", () => {
 
   test("returns env prefix when untrusted (undefined)", () => {
     const prefix = gitNoHooksPrefix(undefined);
-    expect(prefix).toContain("GIT_CONFIG_COUNT='3'");
+    expect(prefix).toContain("GIT_CONFIG_COUNT='5'");
     expect(prefix).toEndWith(" ");
   });
 });
@@ -53,19 +53,24 @@ describe("gitNoRepoAutomationEnv", () => {
   test("neutralizes every repo-controlled git execution vector", () => {
     const env = gitNoRepoAutomationEnv();
     // Hooks, fsmonitor, and credential helpers via env config entries.
-    expect(env.GIT_CONFIG_COUNT).toBe("3");
+    expect(env.GIT_CONFIG_COUNT).toBe("5");
     expect(env.GIT_CONFIG_KEY_0).toBe("core.hooksPath");
     expect(env.GIT_CONFIG_VALUE_0).toBe("/dev/null");
     expect(env.GIT_CONFIG_KEY_1).toBe("core.fsmonitor");
     expect(env.GIT_CONFIG_VALUE_1).toBe("false");
     expect(env.GIT_CONFIG_KEY_2).toBe("credential.helper");
     expect(env.GIT_CONFIG_VALUE_2).toBe("");
+    expect(env.GIT_CONFIG_KEY_3).toBe("core.gitProxy");
+    expect(env.GIT_CONFIG_VALUE_3).toBe("none");
+    expect(env.GIT_CONFIG_KEY_4).toBe("core.askPass");
+    expect(env.GIT_CONFIG_VALUE_4).toBe("");
     // Pointing the tracked attributes source at the empty tree suppresses
     // .gitattributes; the repo-aware builder below additionally overrides
     // drivers selected by highest-precedence .git/info/attributes.
     expect(env.GIT_ATTR_SOURCE).toBe("4b825dc642cb6eb9a060e54bf8d69288fbee4904");
     // Environment beats repo-config core.sshCommand.
     expect(env.GIT_SSH_COMMAND).toBe("ssh");
+    expect(env.GIT_ALLOW_PROTOCOL).toBe("file:http:https:ssh:git");
   });
 
   test("blanks provider secret env vars so leaked processes capture nothing", () => {
@@ -87,6 +92,9 @@ describe("gitNoRepoAutomationEnv", () => {
     expect(() => gitNoRepoAutomationEnvForFilterConfigKeys([`merge.${longName}.driver`])).toThrow(
       "unsupported driver name"
     );
+    expect(() =>
+      gitNoRepoAutomationEnvForFilterConfigKeys([`remote.${longName}.uploadpack`])
+    ).toThrow("unsupported driver name");
   });
 
   test("neutralizes filters selected by .git/info/attributes without mutating it", async () => {
@@ -202,6 +210,54 @@ describe("gitNoRepoAutomationEnv", () => {
       () => false
     );
     expect(markerExists).toBe(false);
+  });
+
+  test("neutralizes repo-configured upload-pack commands during fetch", async () => {
+    using tmp = new DisposableTempDir("git-upload-pack-automation-off");
+    const remote = path.join(tmp.path, "remote");
+    const repo = path.join(tmp.path, "repo");
+    const marker = path.join(tmp.path, "upload-pack-ran");
+    const helper = path.join(tmp.path, "upload-pack.sh");
+    await fs.mkdir(remote, { recursive: true });
+    await fs.mkdir(repo, { recursive: true });
+    await Bun.$`git init`.cwd(remote).quiet();
+    await Bun.$`git config user.email test@example.com`.cwd(remote).quiet();
+    await Bun.$`git config user.name Test`.cwd(remote).quiet();
+    await fs.writeFile(path.join(remote, "data.txt"), "payload\n", "utf-8");
+    await Bun.$`git add data.txt`.cwd(remote).quiet();
+    await Bun.$`git commit -m init`.cwd(remote).quiet();
+    await Bun.$`git init`.cwd(repo).quiet();
+    await Bun.$`git remote add origin ${remote}`.cwd(repo).quiet();
+    await fs.writeFile(
+      helper,
+      `#!/bin/sh\ntouch "${marker}"\nexec git-upload-pack "$@"\n`,
+      "utf-8"
+    );
+    await fs.chmod(helper, 0o755);
+    await Bun.$`git config remote.origin.uploadpack ${helper}`.cwd(repo).quiet();
+
+    await Bun.$`git fetch origin`.cwd(repo).quiet();
+    await fs.access(marker);
+    await fs.rm(marker);
+
+    const env = await gitNoRepoAutomationEnvForLocalRepo(repo);
+    await Bun.$`git fetch origin`
+      .cwd(repo)
+      .env({ ...process.env, ...env })
+      .quiet()
+      .nothrow();
+    const markerExists = await fs.access(marker).then(
+      () => true,
+      () => false
+    );
+    expect(markerExists).toBe(false);
+
+    const configKeys = Object.entries(env)
+      .filter(([key]) => key.startsWith("GIT_CONFIG_KEY_"))
+      .map(([, value]) => value);
+    expect(configKeys).toContain("remote.origin.uploadpack");
+    expect(configKeys).toContain("remote.origin.receivepack");
+    expect(configKeys).toContain("remote.origin.vcs");
   });
 });
 
