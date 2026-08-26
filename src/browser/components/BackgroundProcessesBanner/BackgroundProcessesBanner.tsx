@@ -139,9 +139,11 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                         {formatDuration(Date.now() - proc.startTime)}
                       </span>
                     )}
-                    {/* Rows synthesized from a durable pending wake (pid 0) have no manager
-                        entry behind them, so fetching output is guaranteed to fail. */}
-                    {proc.pid > 0 && (
+                    {/* Rows synthesized from a durable pending wake have no manager entry
+                        behind them, so fetching output is guaranteed to fail. Keyed on the
+                        explicit marker, not the pid: migrated processes also use pid 0 but
+                        remain fully queryable. */}
+                    {proc.synthesized !== true && (
                       <Tooltip>
                         <TooltipTrigger asChild>
                           <button

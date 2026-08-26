@@ -2095,6 +2095,10 @@ export class WorkspaceService extends EventEmitter {
               workspaceId,
               BashMonitorWakeStore.wakeId(payload.processId)
             );
+            // The manager's process-change emit can precede this disk transition, and an
+            // already-exited process produces no later change event, so subscribers need a
+            // nudge after the supersession is durable or the pending-wake label lingers.
+            this.notifyBashMonitorWakeStateChanged(workspaceId);
           }
         })
       )
@@ -13646,13 +13650,35 @@ export class WorkspaceService extends EventEmitter {
       });
       pendingWakes = [];
     }
-    const pendingWakeKindByProcessId = new Map(
-      pendingWakes.map((record) => [record.processId, record.kind] as const)
+    // Present monitor state derived purely from a durable wake record, for rows (or reused
+    // process IDs) that have no live monitor snapshot to decorate.
+    const monitorFromWakeRecord = (record: BashMonitorWakeRecord) => ({
+      filter: record.filter,
+      filter_exclude: record.filterExclude,
+      cooldown_ms: 0,
+      totalMatches: record.totalMatches,
+      droppedLines: record.droppedLines,
+      lastLines: record.lines,
+      stopped: true,
+      pendingWakeKind: record.kind,
+    });
+    const pendingWakeByProcessId = new Map(
+      pendingWakes.map((record) => [record.processId, record] as const)
     );
     const liveProcessIds = new Set(processes.map((p) => p.id));
     const rows: BackgroundProcessInfo[] = processes.map((p) => {
       const monitor = this.backgroundProcessManager.getMonitorSnapshot(p);
-      const pendingWakeKind = pendingWakeKindByProcessId.get(p.id);
+      const pendingWake = pendingWakeByProcessId.get(p.id);
+      // A restarted workspace can reuse a display-name-derived process ID while the prior
+      // generation's wake is still pending. Even when the new process carries no monitor,
+      // the durable wake must stay visible, so fall back to a record-derived snapshot.
+      const monitorPayload =
+        pendingWake != null
+          ? {
+              ...(monitor ?? monitorFromWakeRecord(pendingWake)),
+              pendingWakeKind: pendingWake.kind,
+            }
+          : monitor;
       return {
         id: p.id,
         pid: p.pid,
@@ -13660,9 +13686,7 @@ export class WorkspaceService extends EventEmitter {
         displayName: p.displayName,
         startTime: p.startTime,
         status: p.status,
-        ...(monitor != null
-          ? { monitor: pendingWakeKind != null ? { ...monitor, pendingWakeKind } : monitor }
-          : {}),
+        ...(monitorPayload != null ? { monitor: monitorPayload } : {}),
         exitCode: p.exitCode,
       };
     });
@@ -13675,22 +13699,15 @@ export class WorkspaceService extends EventEmitter {
       const startTime = Date.parse(record.createdAt);
       rows.push({
         id: record.processId,
-        // No live process behind this row; the renderer hides non-positive pids.
+        // No live process behind this row; `synthesized` (not the pid) tells the renderer
+        // that output/terminate actions cannot work.
         pid: 0,
         script: record.script ?? "",
         displayName: record.displayName,
+        synthesized: true,
         startTime: Number.isNaN(startTime) ? Date.now() : startTime,
         status: "exited",
-        monitor: {
-          filter: record.filter,
-          filter_exclude: record.filterExclude,
-          cooldown_ms: 0,
-          totalMatches: record.totalMatches,
-          droppedLines: record.droppedLines,
-          lastLines: record.lines,
-          stopped: true,
-          pendingWakeKind: record.kind,
-        },
+        monitor: monitorFromWakeRecord(record),
         exitCode: undefined,
       });
     }

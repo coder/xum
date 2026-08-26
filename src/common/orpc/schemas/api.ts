@@ -204,6 +204,12 @@ export const BackgroundProcessInfoSchema = z.object({
   pid: z.number(),
   script: z.string(),
   displayName: z.string().optional(),
+  /**
+   * True for rows synthesized from a durable pending wake with no manager entry behind
+   * them (e.g. after an app restart). Such rows have no queryable output or live process.
+   * Deliberately not inferred from pid: migrated manager-backed processes also use pid 0.
+   */
+  synthesized: z.boolean().optional(),
   startTime: z.number(),
   status: BackgroundProcessStatusSchema,
   monitor: BackgroundProcessMonitorInfoSchema.optional(),

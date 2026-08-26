@@ -526,14 +526,88 @@ describe("WorkspaceService bash monitor wakes", () => {
       expect(listing).toHaveLength(1);
       expect(listing[0].id).toBe("proc-restart-watcher");
       expect(listing[0].status).toBe("exited");
-      // Synthesized rows have no live process behind them.
+      // Synthesized rows have no live process behind them and must say so explicitly
+      // (the renderer keys unusable actions on the marker, not the placeholder pid).
       expect(listing[0].pid).toBe(0);
+      expect(listing[0].synthesized).toBe(true);
       expect(listing[0].monitor?.pendingWakeKind).toBe("match");
       expect(listing[0].monitor?.lastLines).toEqual(["WAKE: done"]);
 
       // Once delivered, the synthesized row must disappear entirely.
       expect(await wakeStore.markDeliveredSnapshot(workspaceId, record)).toBe(true);
       expect(await workspaceService.listBackgroundProcesses(workspaceId)).toHaveLength(0);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("listBackgroundProcesses keeps a pending wake visible on a reused monitorless process ID", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-reused-id-listing";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      // Post-restart: a relaunched command reuses the display-name-derived process ID but
+      // has no monitor, while the prior generation's match wake is still pending delivery.
+      const reusedProcess = {
+        id: "proc-reused",
+        pid: 5151,
+        script: "./watch.sh",
+        displayName: "Watcher",
+        startTime: Date.now() - 1_000,
+        status: "running" as const,
+        workspaceId,
+        isForeground: false,
+      };
+      const backgroundProcessManager = {
+        cleanup: mock(() => Promise.resolve()),
+        list: mock(() => Promise.resolve([reusedProcess])),
+        getMonitorSnapshot: mock(() => undefined),
+      } as unknown as BackgroundProcessManager;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      // Park every drain so the pending record stays undelivered while we assert on it.
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(true);
+      spyOn(workspaceService, "waitForIdleAndNoQueuedMessages").mockImplementation(
+        () => new Promise(() => undefined)
+      );
+
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: BashMonitorWakeStore;
+        }
+      ).bashMonitorWakeStore;
+      await wakeStore.enqueueOrMergePending({
+        processId: "proc-reused",
+        taskId: "bash:proc-reused",
+        workspaceId,
+        filter: "WAKE:",
+        filterExclude: false,
+        lines: ["WAKE: done"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 10,
+      });
+
+      const listing = await workspaceService.listBackgroundProcesses(workspaceId);
+      expect(listing).toHaveLength(1);
+      // The live (monitorless) row carries the wake via a record-derived snapshot instead
+      // of suppressing it; the row itself stays a real manager-backed process.
+      expect(listing[0].id).toBe("proc-reused");
+      expect(listing[0].status).toBe("running");
+      expect(listing[0].synthesized).toBeUndefined();
+      expect(listing[0].monitor?.pendingWakeKind).toBe("match");
     } finally {
       await cleanup();
     }
@@ -553,8 +627,10 @@ describe("WorkspaceService bash monitor wakes", () => {
         runtimeConfig: { type: "local" },
       });
 
+      const notifyWakeStateChanged = mock(() => undefined);
       const backgroundProcessManager = Object.assign(new EventEmitter(), {
         cleanup: mock(() => Promise.resolve()),
+        notifyMonitorWakeStateChanged: notifyWakeStateChanged,
       }) as unknown as BackgroundProcessManager & EventEmitter;
       const workspaceService = createWorkspaceServiceForTest({
         config,
@@ -588,6 +664,9 @@ describe("WorkspaceService bash monitor wakes", () => {
       await waitForCondition(() => markSupersededSpy.mock.calls.length > 0);
       await waitForCondition(async () => (await wakeStore.listPending(workspaceId)).length === 0);
       expect(sendSpy).not.toHaveBeenCalled();
+      // Cancellation retired the wake directly (no queued dispatch); subscribers must be
+      // nudged after the durable supersession or the pending-wake label lingers.
+      await waitForCondition(() => notifyWakeStateChanged.mock.calls.length > 0);
     } finally {
       await cleanup();
     }

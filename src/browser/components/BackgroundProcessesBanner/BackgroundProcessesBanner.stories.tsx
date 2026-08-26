@@ -174,6 +174,7 @@ export const MonitorLostWakePendingAfterRestart: AppStory = {
               pid: 0,
               script: "./watch_pr_checks.sh",
               displayName: "PR Checks Watcher",
+              synthesized: true,
               startTime: Date.now() - 90000,
               monitor: {
                 filter: "WAKE:",
