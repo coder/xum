@@ -48,6 +48,20 @@ export interface ExtensionMetadataStreamingUpdate {
 export class ExtensionMetadataService {
   private readonly filePath: string;
   private mutationQueue: Promise<void> = Promise.resolve();
+  /**
+   * Per-process write tombstones for removed workspaces. Workspace removal
+   * cannot drain every in-flight metadata producer (e.g. a stream-abort's
+   * fire-and-forget stop-status handler that is still reading todos when the
+   * entry is deleted), so late writers would silently recreate entries for
+   * removed workspaces and re-leak stale keys until the next process-start
+   * prune. Ids are added synchronously in deleteWorkspace/prune, so combined
+   * with the FIFO mutation queue there is no gap: a writer enqueued before
+   * the delete lands first and its entry is deleted; one enqueued after
+   * no-ops on this set. Workspace ids are never reused (generateStableId),
+   * so a tombstone never blocks a legitimate new workspace; recreations of
+   * legacy fixed-id workspaces happen in a different (downgraded) process.
+   */
+  private readonly deletedWorkspaceIds = new Set<string>();
 
   /**
    * Serialize all mutating operations on the shared metadata file.
@@ -101,6 +115,17 @@ export class ExtensionMetadataService {
     recency: number,
     mutate: (workspace: ExtensionMetadata) => void
   ): Promise<WorkspaceActivitySnapshot> {
+    // Late write for a removed workspace: compute the snapshot for the caller
+    // but never persist it, so the deleted entry cannot be resurrected.
+    if (this.deletedWorkspaceIds.has(workspaceId)) {
+      const transient = this.getOrCreateWorkspaceEntry(
+        { version: 1, workspaces: {} },
+        workspaceId,
+        recency
+      );
+      mutate(transient);
+      return toWorkspaceActivitySnapshot(transient);
+    }
     return this.withSerializedMutation(async () => {
       const data = await this.load();
       const workspace = this.getOrCreateWorkspaceEntry(data, workspaceId, recency);
@@ -268,6 +293,10 @@ export class ExtensionMetadataService {
     status: ExtensionAgentStatus | null,
     options: { skipIfRecencyAdvancedSince?: number | null; inputHash?: string | null } = {}
   ): Promise<WorkspaceActivitySnapshot | null> {
+    // See deletedWorkspaceIds: never resurrect a removed workspace's entry.
+    if (this.deletedWorkspaceIds.has(workspaceId)) {
+      return null;
+    }
     return this.withSerializedMutation(async () => {
       const data = await this.load();
       const existing = coerceExtensionMetadata(data.workspaces[workspaceId]);
@@ -375,6 +404,9 @@ export class ExtensionMetadataService {
    * Call this when a workspace is deleted.
    */
   async deleteWorkspace(workspaceId: string): Promise<void> {
+    // Synchronously, before the queued mutation: any writer enqueued from now
+    // on must see the tombstone (see deletedWorkspaceIds).
+    this.deletedWorkspaceIds.add(workspaceId);
     await this.withSerializedMutation(async () => {
       const data = await this.load();
 
@@ -422,6 +454,9 @@ export class ExtensionMetadataService {
       for (const workspaceId of Object.keys(data.workspaces)) {
         if (!knownWorkspaceIds.has(workspaceId)) {
           delete data.workspaces[workspaceId];
+          // Same guard as deleteWorkspace: a late writer must not resurrect
+          // an entry this pass just reclaimed.
+          this.deletedWorkspaceIds.add(workspaceId);
           prunedCount++;
         }
       }

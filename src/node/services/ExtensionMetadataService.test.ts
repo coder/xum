@@ -452,6 +452,41 @@ describe("ExtensionMetadataService", () => {
     expect(order).toEqual(["load", "fetch-known-ids"]);
   });
 
+  test("late writers cannot resurrect a deleted workspace entry", async () => {
+    // Removal cannot drain every in-flight metadata producer (e.g. a
+    // stream-abort's fire-and-forget stop-status write), so writes landing
+    // after deleteWorkspace must not recreate the entry on disk.
+    await service.updateRecency("removed-workspace", 100);
+    await service.deleteWorkspace("removed-workspace");
+
+    const lateStreaming = await service.setStreaming("removed-workspace", false, {
+      hasTodos: false,
+    });
+    // Callers still get a computed snapshot; it just is not persisted.
+    expect(lateStreaming.streaming).toBe(false);
+    await service.updateRecency("removed-workspace", 200);
+    await service.setTodoStatus("removed-workspace", { emoji: "x", message: "late" }, true);
+    expect(
+      await service.setSidebarStatus("removed-workspace", { emoji: "x", message: "late" })
+    ).toBeNull();
+
+    expect((await service.getAllSnapshots()).has("removed-workspace")).toBe(false);
+    const persisted = JSON.parse(await readFile(filePath, "utf-8")) as ExtensionMetadataFile;
+    expect(persisted.workspaces["removed-workspace"]).toBeUndefined();
+
+    // Unrelated workspaces keep writing normally.
+    await service.updateRecency("other-workspace", 300);
+    expect((await service.getAllSnapshots()).get("other-workspace")?.recency).toBe(300);
+  });
+
+  test("late writers cannot resurrect entries reclaimed by pruneMissingWorkspaces", async () => {
+    await service.updateRecency("stale-workspace", 100);
+    await service.pruneMissingWorkspaces(() => Promise.resolve(new Set<string>()));
+
+    await service.updateRecency("stale-workspace", 200);
+    expect((await service.getAllSnapshots()).has("stale-workspace")).toBe(false);
+  });
+
   test("pruneMissingWorkspaces does not rewrite the file when nothing is stale", async () => {
     // Compact (non-pretty) serialization: any rewrite through save() would
     // change the raw bytes, so byte-equality proves no write happened.
