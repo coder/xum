@@ -271,6 +271,20 @@ export interface WorkspaceSidebarState {
 type DerivedState = Record<string, number>;
 
 /**
+ * Per-attempt context for an onChat subscription. Carries the since-mode anchor the
+ * attempt's cursor requested (so caught-up reconciliation only ever sees its own
+ * attempt's anchor) plus an abort handle used to force a full resubscribe when a
+ * since caught-up arrives without a usable anchor.
+ */
+interface OnChatAttemptContext {
+  abort: () => void;
+  since?: {
+    requestedAnchorSequence: number;
+    localActiveStreamMessageId: string | undefined;
+  };
+}
+
+/**
  * Usage metadata extracted from API responses (no tokenization).
  * Updates instantly when usage metadata arrives.
  *
@@ -3908,6 +3922,15 @@ export class WorkspaceStore {
         const aggregator = this.aggregators.get(workspaceId);
         let mode: OnChatMode | undefined;
 
+        // Attempt-scoped reconnect context: since-replay reconciliation must only ever
+        // see the anchor from its own attempt's cursor. Routed through the same
+        // attempt-guarded event path as chat events (the abort checks below drop
+        // events from stale attempts), so a caught-up from a previous attempt can
+        // never consume a newer attempt's anchor.
+        const attemptContext: OnChatAttemptContext = {
+          abort: () => attemptController.abort(),
+        };
+
         if (aggregator) {
           const cursor = aggregator.getOnChatCursor();
           if (cursor?.history) {
@@ -3917,6 +3940,10 @@ export class WorkspaceStore {
                 history: cursor.history,
                 stream: cursor.stream,
               },
+            };
+            attemptContext.since = {
+              requestedAnchorSequence: cursor.history.historySequence,
+              localActiveStreamMessageId: cursor.stream?.messageId,
             };
           }
         }
@@ -3979,7 +4006,7 @@ export class WorkspaceStore {
             if (signal.aborted || attemptSignal.aborted) {
               return;
             }
-            this.handleChatMessage(workspaceId, data);
+            this.handleChatMessage(workspaceId, data, attemptContext);
           });
         }
 
@@ -4452,7 +4479,11 @@ export class WorkspaceStore {
     );
   }
 
-  private handleChatMessage(workspaceId: string, data: WorkspaceChatMessage): void {
+  private handleChatMessage(
+    workspaceId: string,
+    data: WorkspaceChatMessage,
+    attemptContext?: OnChatAttemptContext
+  ): void {
     // Aggregator must exist - workspaces are initialized in addWorkspace() before subscriptions run.
     const aggregator = this.assertGet(workspaceId);
 
@@ -4467,6 +4498,23 @@ export class WorkspaceStore {
         console.debug(
           `[WorkspaceStore] onChat replay downgraded to full for ${workspaceId}: ${data.downgradeReason}`
         );
+      }
+
+      // The server reports since only when this client requested it, so the attempt
+      // context must carry the requested anchor. If it is somehow missing, appending
+      // would let stale suffix rows survive and replace-mode would drop rows below the
+      // anchor — force a clean full resubscribe instead. The deferred reset behavior
+      // (resetChatStateForReplay runs only after the next attempt's iterator is
+      // established) keeps the current UI visible until the full replay lands.
+      const sinceContext = replay === "since" ? attemptContext?.since : undefined;
+      if (replay === "since" && !sinceContext) {
+        console.warn(
+          `[WorkspaceStore] since caught-up without an attempt anchor for ${workspaceId}; forcing full resubscribe`
+        );
+        aggregator.setServerHistoryCursor(null);
+        this.clearReplayBuffers(workspaceId);
+        attemptContext?.abort();
+        return;
       }
 
       // Check if there's an active stream in buffered events (reconnection scenario).
@@ -4535,7 +4583,26 @@ export class WorkspaceStore {
         transient.liveTaskIds.clear();
       }
 
-      if (transient.historicalMessages.length > 0) {
+      if (sinceContext) {
+        // Since replay: the replayed rows are the authoritative suffix for
+        // rows at/above the requested anchor. Preserve the richer local assembly of
+        // the active stream only when the server-confirmed stream matches the local
+        // stream the attempt's cursor was built from; otherwise replayed rows plus
+        // subsequently replayed stream events rebuild the stream message (stale local
+        // contexts were already cleared above).
+        const preservedActiveStreamMessageId =
+          serverActiveStreamMessageId !== undefined &&
+          serverActiveStreamMessageId === sinceContext.localActiveStreamMessageId
+            ? serverActiveStreamMessageId
+            : undefined;
+        aggregator.reconcileSinceReplay({
+          requestedAnchorSequence: sinceContext.requestedAnchorSequence,
+          messages: transient.historicalMessages,
+          preservedActiveStreamMessageId,
+          hasActiveStream,
+        });
+        transient.historicalMessages.length = 0;
+      } else if (transient.historicalMessages.length > 0) {
         const loadMode = replay === "full" ? "replace" : "append";
         aggregator.loadHistoricalMessages(transient.historicalMessages, hasActiveStream, {
           mode: loadMode,
@@ -4545,6 +4612,12 @@ export class WorkspaceStore {
         // Full replay can legitimately contain zero messages (e.g. compacted to empty).
         aggregator.loadHistoricalMessages([], hasActiveStream, { mode: "replace" });
       }
+
+      // Store the server-issued cursor for the next reconnect (full and since replays
+      // both refresh it). A caught-up without a cursor means the server could not
+      // advertise a trustworthy reconnect point (e.g. replay failure), so clear the
+      // stored cursor and let the next subscribe fall back to a full replay.
+      aggregator.setServerHistoryCursor(data.cursor?.history ?? null);
 
       // Mark that we're replaying buffered history (prevents O(N) scheduling)
       transient.replayingHistory = true;
@@ -4586,6 +4659,13 @@ export class WorkspaceStore {
       // Fall back to tokenization when no cache (or stale cache) exists.
       if (aggregator.getAllMessages().length > 0) {
         this.ensureConsumersCached(workspaceId, aggregator);
+      }
+
+      // The requested anchor is consumed by exactly one caught-up. A duplicate
+      // caught-up in the same attempt would be anomalous; dropping the anchor makes
+      // it hit the hard fallback above instead of reconciling against a stale anchor.
+      if (attemptContext) {
+        attemptContext.since = undefined;
       }
 
       return;

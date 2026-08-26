@@ -2163,7 +2163,7 @@ describe("StreamingMessageAggregator", () => {
       expect(remaining.map((m) => m.id)).toEqual(["boundary-2"]);
     });
 
-    test("updates reconnect cursor floor when a live compaction boundary arrives", () => {
+    test("keeps returning the stored server cursor when a live compaction boundary arrives", () => {
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
 
       // Simulate initial replay window starting at historySequence 40.
@@ -2182,8 +2182,16 @@ describe("StreamingMessageAggregator", () => {
         { mode: "replace" }
       );
 
+      const serverCursor = {
+        messageId: "history-41",
+        historySequence: 41,
+        oldestHistorySequence: 40,
+        priorHistoryFingerprint: "cafe1234",
+      };
+      aggregator.setServerHistoryCursor(serverCursor);
+
       const beforeCompactionCursor = aggregator.getOnChatCursor();
-      expect(beforeCompactionCursor?.history?.oldestHistorySequence).toBe(40);
+      expect(beforeCompactionCursor?.history).toEqual(serverCursor);
 
       const boundary = asChatMessage(
         createMuxMessage("boundary-60", "assistant", "Summary epoch 60", {
@@ -2196,8 +2204,11 @@ describe("StreamingMessageAggregator", () => {
       );
       aggregator.handleMessage(boundary);
 
+      // The cursor is reused verbatim: a live compaction makes it stale, and the
+      // server-side anchor validation downgrades the next reconnect to a (small)
+      // full replay of the fresh epoch instead of the client guessing a new cursor.
       const afterCompactionCursor = aggregator.getOnChatCursor();
-      expect(afterCompactionCursor?.history?.oldestHistorySequence).toBe(60);
+      expect(afterCompactionCursor?.history).toEqual(serverCursor);
     });
 
     test("keeps visible history when a live reset boundary arrives", () => {

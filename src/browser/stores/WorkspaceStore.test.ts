@@ -488,6 +488,19 @@ const sinceCaughtUpEvent = (
     cursor: { history: { messageId, historySequence }, ...(stream ? { stream } : {}) },
   });
 
+// Full replay caught-up carrying a server cursor, as the real server issues on every
+// non-empty replay. The client reuses this cursor verbatim, making the next
+// subscription a legitimate since request.
+const fullCaughtUpEvent = (
+  historySequence = 1,
+  messageId = `history-${historySequence}`,
+  stream?: { messageId: string; lastTimestamp: number }
+): WorkspaceChatMessage =>
+  caughtUpEvent({
+    replay: "full",
+    cursor: { history: { messageId, historySequence }, ...(stream ? { stream } : {}) },
+  });
+
 const streamEndEvent = (
   workspaceId: string,
   messageId: string,
@@ -1923,12 +1936,24 @@ describe("WorkspaceStore", () => {
         subscriptionCount += 1;
 
         if (subscriptionCount === 1) {
-          yield { type: "caught-up" };
+          // Server issues a reconnect cursor on every caught-up; the client reuses
+          // it verbatim, so the second subscription legitimately requests since.
+          yield {
+            type: "caught-up",
+            cursor: {
+              history: {
+                messageId: "reconnect-pending-start",
+                historySequence: 1,
+              },
+            },
+          };
           await Promise.resolve();
           yield createUserMessageEvent("reconnect-pending-start", "hello", 1, 1_000);
           return;
         }
 
+        // Since replay re-sends the cursor-boundary row before caught-up.
+        yield createUserMessageEvent("reconnect-pending-start", "hello", 1, 1_000);
         yield {
           type: "caught-up",
           replay: "since",
@@ -2035,11 +2060,14 @@ describe("WorkspaceStore", () => {
       const requestedModel = "openai:gpt-4o-mini";
       let subscriptionCount = 0;
 
+      // Empty-history caught-ups carry no cursor, so every resubscribe legitimately
+      // requests (and receives) a full replay; the server never reports since for a
+      // full request.
       mockChatStreamFor(workspaceId, function* () {
         subscriptionCount += 1;
         yield {
           type: "caught-up",
-          replay: subscriptionCount === 1 ? "full" : "since",
+          replay: "full",
         };
       });
 
@@ -5178,13 +5206,14 @@ describe("WorkspaceStore", () => {
       const getSubscriptionCount = mockChatReconnectScript((subscriptionCount) =>
         subscriptionCount === 1
           ? [
-              caughtUpEvent(),
+              createHistoryMessageEvent("history-1", 1),
+              fullCaughtUpEvent(),
               Promise.resolve(),
               bashOutputEvent(workspaceId, "call-bash-4", "stale-output\n"),
               taskCreatedEvent(workspaceId, "call-task-4", "child-workspace-4", 2),
               firstSubscription.wait,
             ]
-          : [sinceCaughtUpEvent()]
+          : [createHistoryMessageEvent("history-1", 1), sinceCaughtUpEvent()]
       );
 
       createAndAddWorkspace(store, workspaceId);
@@ -5216,7 +5245,13 @@ describe("WorkspaceStore", () => {
       const getSubscriptionCount = mockChatReconnectScript((subscriptionCount) =>
         subscriptionCount === 1
           ? [
-              caughtUpEvent(),
+              // Cursor anchored at the row the in-flight stream below will finalize,
+              // so the second subscription legitimately requests since.
+              caughtUpEvent({
+                cursor: {
+                  history: { messageId: "msg-old-stream-missing-local", historySequence: 1 },
+                },
+              }),
               Promise.resolve(),
               streamStartEvent(workspaceId, "msg-old-stream-missing-local", {
                 startTime: 1_000,
@@ -5236,7 +5271,9 @@ describe("WorkspaceStore", () => {
               firstSubscription.wait,
             ]
           : [
-              sinceCaughtUpEvent(1, "history-1", {
+              // Since replay re-sends the cursor-boundary row before caught-up.
+              createHistoryMessageEvent("msg-old-stream-missing-local", 1),
+              sinceCaughtUpEvent(1, "msg-old-stream-missing-local", {
                 messageId: "msg-new-stream-missing-local",
                 lastTimestamp: 2_000,
               }),
@@ -5273,9 +5310,11 @@ describe("WorkspaceStore", () => {
       const getSubscriptionCount = mockChatReconnectScript((subscriptionCount) =>
         subscriptionCount === 1
           ? [
-              caughtUpEvent(),
+              createHistoryMessageEvent("history-1", 1),
+              fullCaughtUpEvent(),
               Promise.resolve(),
               streamStartEvent(workspaceId, "msg-old-stream", {
+                historySequence: 2,
                 startTime: 1_000,
                 model: "claude-3-5-sonnet-20241022",
               }),
@@ -5286,6 +5325,8 @@ describe("WorkspaceStore", () => {
               firstSubscription.wait,
             ]
           : [
+              // Since replay re-sends the cursor-boundary row before caught-up.
+              createHistoryMessageEvent("history-1", 1),
               sinceCaughtUpEvent(1, "history-1", {
                 messageId: "msg-new-stream",
                 lastTimestamp: 2_000,
