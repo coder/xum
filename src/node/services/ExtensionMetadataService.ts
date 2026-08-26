@@ -186,54 +186,76 @@ export class ExtensionMetadataService {
     }
   }
 
+  /**
+   * Seam for load()'s missing-main handling (and deterministic TOCTOU tests):
+   * reports whether the quarantine sidecar currently exists.
+   */
+  private probeQuarantineSidecar(): Promise<boolean> {
+    return access(`${this.filePath}.corrupt`).then(
+      () => true,
+      () => false
+    );
+  }
+
   private async load(options?: { throwOnError?: boolean }): Promise<ExtensionMetadataFile> {
-    try {
-      const content = await readFile(this.filePath, "utf-8");
-      const parsed = JSON.parse(content) as ExtensionMetadataFile;
+    // Bounded because the ENOENT branch below re-reads: each retry only
+    // happens after a fresh ENOENT with no sidecar, so the loop converges.
+    const MAX_READ_ATTEMPTS = 3;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= MAX_READ_ATTEMPTS; attempt++) {
+      try {
+        const content = await readFile(this.filePath, "utf-8");
+        const parsed = JSON.parse(content) as ExtensionMetadataFile;
 
-      // Validate structure, including the workspaces container: a parseable
-      // file with e.g. an array or primitive `workspaces` would otherwise
-      // enumerate as zero entries and masquerade as an authoritative empty
-      // state in strict reads.
-      if (!ExtensionMetadataService.isValidMetadataFileShape(parsed)) {
-        throw new Error("Invalid extension metadata file structure");
-      }
+        // Validate structure, including the workspaces container: a parseable
+        // file with e.g. an array or primitive `workspaces` would otherwise
+        // enumerate as zero entries and masquerade as an authoritative empty
+        // state in strict reads.
+        if (!ExtensionMetadataService.isValidMetadataFileShape(parsed)) {
+          throw new Error("Invalid extension metadata file structure");
+        }
 
-      return parsed;
-    } catch (error) {
-      // Only a genuinely missing file is a healthy empty state. Other read
-      // failures (EACCES/ENOTDIR/EIO, parse or structure errors) must not
-      // masquerade as one: throwOnError lets read paths distinguish them
-      // from an authoritative empty state, while the default self-heals so
-      // writers can always make progress.
-      if (typeof error === "object" && error != null && "code" in error) {
-        if (error.code === "ENOENT") {
-          // A missing main file WITH the quarantine sidecar present is not a
-          // healthy empty state: it is the (rare) window where quarantine
-          // moved the file aside and has not yet written the empty
-          // replacement — the moved bytes may even be a concurrent writer's
-          // healthy repair awaiting restore. Strict readers must see a
-          // retryable failure (ENOENT carries an errno code, so callers
-          // classify it as transient; getAllSnapshots additionally resumes a
-          // crash-interrupted recovery from this signature), not an
-          // authoritative {} that a subsequent restore cannot retract.
-          // Lenient (writer) paths keep self-healing below so mutations
-          // always make progress.
-          const quarantined = await access(`${this.filePath}.corrupt`).then(
-            () => true,
-            () => false
-          );
-          if (!quarantined) {
-            return { version: 1, workspaces: {} };
-          }
+        return parsed;
+      } catch (error) {
+        // Only a genuinely missing file is a healthy empty state. Other read
+        // failures (EACCES/ENOTDIR/EIO, parse or structure errors) must not
+        // masquerade as one: throwOnError lets read paths distinguish them
+        // from an authoritative empty state, while the default self-heals so
+        // writers can always make progress.
+        lastError = error;
+        if (!ExtensionMetadataService.isErrnoCode(error, "ENOENT")) {
+          break;
+        }
+        // A missing main file WITH the quarantine sidecar present is not a
+        // healthy empty state: it is the (rare) window where quarantine
+        // moved the file aside and has not yet written the empty
+        // replacement — the moved bytes may even be a concurrent writer's
+        // healthy repair awaiting restore. Strict readers must see a
+        // retryable failure (ENOENT carries an errno code, so callers
+        // classify it as transient; getAllSnapshots additionally resumes a
+        // crash-interrupted recovery from this signature), not an
+        // authoritative {} that a subsequent restore cannot retract.
+        // Lenient (writer) paths keep self-healing below so mutations
+        // always make progress.
+        if (await this.probeQuarantineSidecar()) {
+          break;
+        }
+        // No sidecar either. With multiple instances the failed read may
+        // have raced another process's COMPLETED recovery — main restored
+        // (or reset to empty) and the sidecar already consumed — so the
+        // absent sidecar proves nothing about the earlier ENOENT. Re-read
+        // the main path instead of trusting the stale failure; only a file
+        // still missing on the final attempt is a healthy empty state.
+        if (attempt === MAX_READ_ATTEMPTS) {
+          return { version: 1, workspaces: {} };
         }
       }
-      if (options?.throwOnError) {
-        throw error;
-      }
-      log.error("Failed to load metadata:", error);
-      return { version: 1, workspaces: {} };
     }
+    if (options?.throwOnError) {
+      throw lastError;
+    }
+    log.error("Failed to load metadata:", lastError);
+    return { version: 1, workspaces: {} };
   }
 
   private async save(data: ExtensionMetadataFile): Promise<void> {

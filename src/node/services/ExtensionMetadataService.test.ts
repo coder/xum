@@ -606,6 +606,34 @@ describe("ExtensionMetadataService", () => {
     });
   });
 
+  test("an ENOENT read races a completed recovery in another process and re-reads", async () => {
+    // Post-recovery TOCTOU: our read hits ENOENT while another process holds
+    // the file mid-quarantine, and by the time we probe for the sidecar that
+    // process has already restored the healthy main file AND consumed the
+    // sidecar. The absent sidecar proves nothing about the stale ENOENT —
+    // load must re-read the main path instead of returning authoritative {}.
+    const healthy = {
+      version: 1,
+      workspaces: { "ws-1": { recency: 42, streaming: false } },
+    };
+    // Main file intentionally absent at first read (beforeEach never creates
+    // it). Simulate the other process's completed recovery at probe time.
+    const internals = service as unknown as {
+      probeQuarantineSidecar: () => Promise<boolean>;
+    };
+    const originalProbe = internals.probeQuarantineSidecar.bind(service);
+    internals.probeQuarantineSidecar = async () => {
+      // The concurrent process restored the healthy file and unlinked the
+      // sidecar before our probe ran.
+      await writeFile(filePath, JSON.stringify(healthy));
+      internals.probeQuarantineSidecar = originalProbe;
+      return false;
+    };
+
+    const snapshots = await service.getAllSnapshots({ throwOnError: true });
+    expect(snapshots.get("ws-1")?.recency).toBe(42);
+  });
+
   test("a strict read restores healthy bytes stranded in the sidecar by a crashed quarantine", async () => {
     // The crash can also strand a HEALTHY file in the sidecar: a concurrent
     // writer repaired the main file right before quarantine's rename moved
