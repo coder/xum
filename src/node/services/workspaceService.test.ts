@@ -4284,6 +4284,79 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("getActivityList drops retained entries removed during late workflow probes", async () => {
+    // The retained-entry filter runs before the late-candidate workflow
+    // probes await disk. A cross-process removal of an ALREADY-RETAINED
+    // workspace landing during those probes is invisible to every view the
+    // filter used — without the post-probe re-filter the removed id rides
+    // the response back into the renderer with no event to correct it.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const metadataPath = path.join(config.rootDir, "extensionMetadata.json");
+    const listStatusSnapshotsSpy = spyOn(WorkflowRunStore.prototype, "listRunStatusSnapshots");
+    try {
+      const retainedId = "retained-then-removed";
+      const lateId = "late-registered";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: retainedId,
+        name: retainedId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const extensionMetadata = new ExtensionMetadataService(metadataPath);
+      await extensionMetadata.updateRecency(retainedId, 555);
+      const realGetAllSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      let snapshotCalls = 0;
+      const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(
+        async (options?: { throwOnError?: boolean }) => {
+          snapshotCalls += 1;
+          if (snapshotCalls === 2) {
+            // Another backend registers a NEW workspace mid-list so the
+            // merge has a late candidate whose probe awaits disk.
+            await config.addWorkspace(projectPath, {
+              id: lateId,
+              name: lateId,
+              projectName: "project",
+              projectPath,
+              runtimeConfig: { type: "local" },
+            });
+            await extensionMetadata.updateRecency(lateId, 777);
+          }
+          return realGetAllSnapshots(options);
+        }
+      );
+      let probeCalls = 0;
+      listStatusSnapshotsSpy.mockImplementation(async () => {
+        probeCalls += 1;
+        if (probeCalls === 2) {
+          // The late candidate's probe is awaited: another backend removes
+          // the RETAINED workspace, deleting its persisted metadata entry
+          // unseen by this process's tombstones.
+          await new ExtensionMetadataService(metadataPath).deleteWorkspace(retainedId);
+        }
+        return [];
+      });
+      try {
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList).not.toBeNull();
+        expect(activityList?.[lateId]).toBeDefined();
+        expect(activityList?.[retainedId]).toBeUndefined();
+      } finally {
+        snapshotsSpy.mockRestore();
+      }
+    } finally {
+      listStatusSnapshotsSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
   test("getActivityList drops snapshotless legacy entries removed mid-list", async () => {
     // A legacy id-less config entry's stable id is resolved authoritatively
     // during enumeration and can never appear in the raw config-id baseline,

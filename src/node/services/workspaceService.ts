@@ -13361,12 +13361,16 @@ export class WorkspaceService extends EventEmitter {
           // set is the view that ADMITTED it, so only a fresh enumeration
           // can prove the removal. Modern deployments never pay this walk.
           let finalAuthoritativeIds: ReadonlySet<string> | null = null;
+          const isRawInvisible = (workspaceId: string): boolean =>
+            !(initialConfigIds?.has(workspaceId) ?? false) &&
+            !(freshConfigIds?.has(workspaceId) ?? false);
           if (
-            Array.from(probedWorkflowRunIds.keys()).some(
-              (workspaceId) =>
-                !(initialConfigIds?.has(workspaceId) ?? false) &&
-                !(freshConfigIds?.has(workspaceId) ?? false)
-            )
+            Array.from(probedWorkflowRunIds.keys()).some(isRawInvisible) ||
+            // Retained entries are re-filtered with the final views below
+            // (they were admitted before the probes awaited), and a
+            // raw-invisible retained id's removal is provable only through
+            // the same fresh enumeration.
+            Object.keys(activityById).some(isRawInvisible)
           ) {
             try {
               finalAuthoritativeIds = new Set(
@@ -13388,6 +13392,41 @@ export class WorkspaceService extends EventEmitter {
             finalConfigIds = this.config.readPersistedWorkspaceIdSuperset();
           } catch {
             finalConfigIds = null;
+          }
+          // The retained-entry filter above ran BEFORE the workflow probes,
+          // so a removal landing during those awaits is invisible to every
+          // view it used — the removed workspace would ride the response
+          // back into the renderer with no cross-process event to correct
+          // it. Re-apply the removal guards to retained entries with the
+          // post-probe views (final filtering must follow the last await).
+          // Removal guards only: zero-count tombstone entries legitimately
+          // have no snapshot and no live counts, so the probed candidates'
+          // emptiness check must not run here.
+          for (const workspaceId of Object.keys(activityById)) {
+            if (
+              this.extensionMetadata.isWorkspaceDeleted(workspaceId) ||
+              // Persisted snapshot vanished during the probes (metadata
+              // keys only disappear through removal) — also covers legacy
+              // ids the raw views cannot see.
+              (finalSnapshots != null &&
+                (snapshots.has(workspaceId) || (freshSnapshots?.has(workspaceId) ?? false)) &&
+                !finalSnapshots.has(workspaceId)) ||
+              // Verifiably deregistered from the raw config during the
+              // probes: visible in an earlier raw view, gone from the
+              // post-probe one.
+              (finalConfigIds != null &&
+                !finalConfigIds.has(workspaceId) &&
+                ((initialConfigIds?.has(workspaceId) ?? false) ||
+                  (freshConfigIds?.has(workspaceId) ?? false))) ||
+              // Raw-invisible retained ids: post-probe authoritative
+              // counterpart of the raw guard above.
+              (isRawInvisible(workspaceId) &&
+                !(finalConfigIds?.has(workspaceId) ?? false) &&
+                finalAuthoritativeIds != null &&
+                !finalAuthoritativeIds.has(workspaceId))
+            ) {
+              delete activityById[workspaceId];
+            }
           }
           for (const [workspaceId, activeWorkflowRunIds] of probedWorkflowRunIds) {
             const lateSnapshot =
