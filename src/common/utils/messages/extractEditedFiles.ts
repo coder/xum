@@ -368,6 +368,21 @@ export function extractEditedFileDiffs(messages: MuxMessage[]): FileEditDiff[] {
 }
 
 /**
+ * Bound one diff to MAX_FILE_CONTENT_SIZE and report whether it was cut.
+ * Every combineDiffs exit (single diff, apply-failure fallback, and the
+ * generated combined diff) applies the identical cap, so the slice and the
+ * truncated flag stay derived from one place and cannot drift apart.
+ */
+function boundedFileEditDiff(filePath: string, diff: string): FileEditDiff {
+  const truncated = diff.length > MAX_FILE_CONTENT_SIZE;
+  return {
+    path: filePath,
+    diff: truncated ? diff.slice(0, MAX_FILE_CONTENT_SIZE) : diff,
+    truncated,
+  };
+}
+
+/**
  * Combine multiple diffs for the same file into a single unified diff.
  * Applies diffs sequentially to reconstruct original→final transformation.
  */
@@ -376,13 +391,7 @@ function combineDiffs(filePath: string, diffs: string[]): FileEditDiff | null {
 
   // Single diff - no combination needed
   if (diffs.length === 1) {
-    const diff = diffs[0];
-    const truncated = diff.length > MAX_FILE_CONTENT_SIZE;
-    return {
-      path: filePath,
-      diff: truncated ? diff.slice(0, MAX_FILE_CONTENT_SIZE) : diff,
-      truncated,
-    };
+    return boundedFileEditDiff(filePath, diffs[0]);
   }
 
   // Multiple diffs - need to combine
@@ -395,24 +404,14 @@ function combineDiffs(filePath: string, diffs: string[]): FileEditDiff | null {
     const result = applyPatch(content, diff);
     if (result === false) {
       // Patch failed to apply - fall back to just using the last diff
-      const lastDiff = diffs[diffs.length - 1];
-      const truncated = lastDiff.length > MAX_FILE_CONTENT_SIZE;
-      return {
-        path: filePath,
-        diff: truncated ? lastDiff.slice(0, MAX_FILE_CONTENT_SIZE) : lastDiff,
-        truncated,
-      };
+      return boundedFileEditDiff(filePath, diffs[diffs.length - 1]);
     }
     content = result;
   }
 
   // Generate combined diff from original to final
-  const combinedDiff = createPatch(filePath, originalContent, content, "", "", { context: 3 });
-  const truncated = combinedDiff.length > MAX_FILE_CONTENT_SIZE;
-
-  return {
-    path: filePath,
-    diff: truncated ? combinedDiff.slice(0, MAX_FILE_CONTENT_SIZE) : combinedDiff,
-    truncated,
-  };
+  return boundedFileEditDiff(
+    filePath,
+    createPatch(filePath, originalContent, content, "", "", { context: 3 })
+  );
 }
