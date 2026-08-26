@@ -13,7 +13,7 @@ Xum wakes the owning workspace in these cases:
 
 - A background **task** or **workflow** reaches a terminal state (`completed`, `failed`, `interrupted`, or `error`).
 - A raw background `bash` process is launched with a `monitor` block and a complete output line matches the monitor regex.
-- A monitored `bash` process **settles** (exits, is killed, or hits its `timeout_secs`), even when no line ever matched — unless the monitor was launched with `wake_on_exit: false` or was already retired by `max_events`. The settlement wake carries the exit status and a bounded tail of recent output.
+- A monitored `bash` process **settles** (exits, is killed, or hits its `timeout_secs`), even when no line ever matched — unless the monitor was launched with `wake_on_exit: false`, was already retired by `max_events`, or the task was explicitly cancelled (`task_stop` / terminate without flush / workspace cleanup). The settlement wake carries the exit status and a bounded tail of recent output.
 
 Use `bash({ run_in_background: true, monitor: { filter: "FAILED|ERROR", max_events: 1 } })` for line-oriented shell output watchers such as dev servers, watch tests, and log tails. The process keeps running; Xum wakes the parent with the matched lines, and the parent should call `task_await` only if it needs surrounding/full output.
 
@@ -54,7 +54,7 @@ Rules for `bash.monitor`:
 
 - Keep the regex specific enough to avoid wake storms; use `max_events` for noisy logs.
 - Treat matched lines as a wake signal, not full context; call `task_await({ task_ids: ["bash:<id>"], timeout_secs: 0 })` only when you need surrounding output.
-- A monitored process always wakes the owner at settlement (exit, kill, timeout) even if the filter never matched, so a watcher script that dies unexpectedly cannot strand the agent. Pass `wake_on_exit: false` only when the exit itself is genuinely uninteresting. Monitors retired by `max_events` stop watching entirely and do not exit-wake.
+- A monitored process wakes the owner at settlement (exit, kill, timeout) even if the filter never matched, so a watcher script that dies unexpectedly cannot strand the agent. Pass `wake_on_exit: false` only when the exit itself is genuinely uninteresting. Monitors retired by `max_events` stop watching entirely and do not exit-wake, and explicit cancellation (`task_stop`, terminate without flush, workspace cleanup) deliberately produces no settlement wake — do not stop a task and then wait on its wake.
 - Do not use `bash.monitor` for GitHub checks, mergeability, review state, deploy APIs, or any state that requires polling separate commands. Use a background task/workflow monitor for those.
 
 ### Ad-hoc task monitor
