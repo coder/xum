@@ -534,6 +534,30 @@ describe("WorkspaceGoalService", () => {
     }
   });
 
+  test("a user Stop invalidates captured redispatch admissions", async () => {
+    // Codex security P2 (PRRT_kwDOPxxmWM6cSx0M): recordUserStoppedStream
+    // leaves an active goal's status and identity unchanged (it only bumps the
+    // stop generation; the acknowledgment gate lands later), so the pause/
+    // terminal/identity generation probes stay fresh across a Stop — a
+    // recovered goal-scoped follow-up whose admission was captured before the
+    // Stop could otherwise start an exec turn after it.
+    const created = await setGoalOk(service, { workspaceId, objective: "Stop admission" });
+    const admission = await service.buildGoalRedispatchAdmission(
+      workspaceId,
+      created.goalId,
+      GOAL_CONTINUATION_KIND
+    );
+    expect(admission.admissible).toBe(true);
+    if (!admission.admissible) {
+      throw new Error("expected admissible probe");
+    }
+    expect(admission.admissionStale()).toBe(false);
+
+    await service.recordUserStoppedStream(workspaceId);
+
+    expect(admission.admissionStale()).toBe(true);
+  });
+
   test("getGoal pauses a never-driven model-created goal on an unprocessed pre-goal row", async () => {
     // Codex security P2 (PRRT_kwDOPxxmWM6cSGrq): only explicit user activation
     // is consent. A model-published goal whose chat tail ends at a queue-raced

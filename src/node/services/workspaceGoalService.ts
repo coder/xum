@@ -1595,11 +1595,19 @@ export class WorkspaceGoalService {
     const pauseGenerationAtBuild = this.explicitPauseGenerations.get(workspaceId) ?? 0;
     const terminalGenerationAtBuild = this.terminalStatusGenerations.get(workspaceId) ?? 0;
     const identityGenerationAtBuild = this.goalIdentityGenerations.get(workspaceId) ?? 0;
+    // Codex security P2 (PRRT_kwDOPxxmWM6cSx0M): a user Stop leaves an active
+    // goal's status and identity untouched (recordUserStoppedStream only bumps
+    // the stop generation synchronously; the acknowledgment gate persists
+    // later), so the generation probes above stay fresh across it — a
+    // recovered goal-scoped follow-up admitted before the Stop could start an
+    // exec turn after it. Sample the stop generation with the others.
+    const userStopGenerationAtBuild = this.userStopGenerationsByWorkspace.get(workspaceId) ?? 0;
     const current = await this.readGoalFile(workspaceId);
     if (
       (this.explicitPauseGenerations.get(workspaceId) ?? 0) !== pauseGenerationAtBuild ||
       (this.terminalStatusGenerations.get(workspaceId) ?? 0) !== terminalGenerationAtBuild ||
       (this.goalIdentityGenerations.get(workspaceId) ?? 0) !== identityGenerationAtBuild ||
+      this.userStopLandedSince(workspaceId, userStopGenerationAtBuild) ||
       current?.goalId !== goalId ||
       current.requireUserAcknowledgmentSinceMs != null
     ) {
@@ -1626,7 +1634,8 @@ export class WorkspaceGoalService {
       admissionStale: () =>
         (this.explicitPauseGenerations.get(workspaceId) ?? 0) !== pauseGenerationAtBuild ||
         (this.terminalStatusGenerations.get(workspaceId) ?? 0) !== terminalGenerationAtBuild ||
-        (this.goalIdentityGenerations.get(workspaceId) ?? 0) !== identityGenerationAtBuild,
+        (this.goalIdentityGenerations.get(workspaceId) ?? 0) !== identityGenerationAtBuild ||
+        this.userStopLandedSince(workspaceId, userStopGenerationAtBuild),
     };
   }
 
