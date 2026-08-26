@@ -3322,35 +3322,46 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
-  test("getActivityList rejects when the metadata file is unreadable", async () => {
+  test("getActivityList rejects when the metadata file is unreadable or malformed", async () => {
     // ExtensionMetadataService.load self-heals a corrupt file into an empty
     // one by default; surfacing that here as an authoritative empty list
     // would make the renderer wipe every cached snapshot with no retry.
-    const { config, historyService, cleanup } = await createTestHistoryService();
-    try {
-      const metadataPath = path.join(config.rootDir, "extensionMetadata.json");
-      await fsPromises.writeFile(metadataPath, "{not json", "utf-8");
-      const extensionMetadata = new ExtensionMetadataService(metadataPath);
-      const workspaceService = createWorkspaceServiceForTest({
-        config,
-        historyService,
-        extensionMetadata,
-      });
-
-      // Lenient reads (writer paths) still self-heal.
-      expect((await extensionMetadata.getAllSnapshots()).size).toBe(0);
-
-      let rejected = false;
+    // Parseable-but-malformed workspaces containers enumerate as zero
+    // entries, so they must follow the same failure path.
+    const corruptFiles = [
+      "{not json",
+      JSON.stringify({ version: 2, workspaces: {} }),
+      JSON.stringify({ version: 1, workspaces: [] }),
+      JSON.stringify({ version: 1, workspaces: "bogus" }),
+      JSON.stringify({ version: 1, workspaces: null }),
+    ];
+    for (const corruptFile of corruptFiles) {
+      const { config, historyService, cleanup } = await createTestHistoryService();
       try {
-        await workspaceService.getActivityList();
-      } catch {
-        rejected = true;
+        const metadataPath = path.join(config.rootDir, "extensionMetadata.json");
+        await fsPromises.writeFile(metadataPath, corruptFile, "utf-8");
+        const extensionMetadata = new ExtensionMetadataService(metadataPath);
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+
+        // Lenient reads (writer paths) still self-heal.
+        expect((await extensionMetadata.getAllSnapshots()).size).toBe(0);
+
+        let rejected = false;
+        try {
+          await workspaceService.getActivityList();
+        } catch {
+          rejected = true;
+        }
+        expect(rejected).toBe(true);
+        // The self-healing prune path must not have rewritten (reset) the file.
+        expect(await fsPromises.readFile(metadataPath, "utf-8")).toBe(corruptFile);
+      } finally {
+        await cleanup();
       }
-      expect(rejected).toBe(true);
-      // The self-healing prune path must not have rewritten (reset) the file.
-      expect(await fsPromises.readFile(metadataPath, "utf-8")).toBe("{not json");
-    } finally {
-      await cleanup();
     }
   });
 
@@ -3474,7 +3485,8 @@ describe("WorkspaceService activity list scoping", () => {
         removeWorkspace: mock(() => Promise.resolve()),
         findWorkspace: mock(() => null),
         loadConfigOrDefault: mock(() => ({ projects: new Map() })),
-        // The discard verifies deregistration against these before deleting.
+        // The discard verifies deregistration against the persisted superset
+        // (and the findWorkspace mock above) before deleting.
         readPersistedWorkspaceIdSuperset: mock(() => new Set<string>()),
         getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
       };

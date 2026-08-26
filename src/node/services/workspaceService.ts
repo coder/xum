@@ -12770,31 +12770,6 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * Union of the raw persisted config id superset and the strict normalized
-   * metadata view:
-   * - the raw persisted superset covers entries loadConfigOrDefault's
-   *   validation/normalization would filter or discard (see
-   *   readPersistedWorkspaceIdSuperset), so a live workspace with a
-   *   malformed config entry is never treated as removed;
-   * - the strict normalized view covers ids produced by in-memory config
-   *   migrations that are not yet persisted verbatim.
-   * Both views throw rather than resolving with a silently lossy id set; a
-   * missing config file resolves as a healthy empty set in both.
-   */
-  private async readKnownWorkspaceIds(): Promise<{
-    knownIds: Set<string>;
-    normalizedIds: Set<string>;
-  }> {
-    const knownIds = this.config.readPersistedWorkspaceIdSuperset();
-    const allMetadata = await this.config.getAllWorkspaceMetadata({ throwOnError: true });
-    const normalizedIds = new Set(allMetadata.map((metadata) => metadata.id));
-    for (const workspaceId of normalizedIds) {
-      knownIds.add(workspaceId);
-    }
-    return { knownIds, normalizedIds };
-  }
-
-  /**
    * Best-effort removal of a deregistered workspace's activity/status entry
    * from extensionMetadata.json. Used by remove() and by rollback paths that
    * deregister via config.removeWorkspace directly (e.g. TaskService's failed
@@ -12813,8 +12788,16 @@ export class WorkspaceService extends EventEmitter {
       // activity writes. A failed verification (unreadable config) skips the
       // delete too; like a missed delete, the entry is reclaimed by a later
       // process start's prune, which re-checks against config.
-      const { knownIds } = await this.readKnownWorkspaceIds();
-      if (knownIds.has(workspaceId)) {
+      //
+      // Deliberately NOT getAllWorkspaceMetadata here: that walks every
+      // configured workspace with per-workspace fs probes — an O(n)
+      // traversal just to check one id. The raw persisted superset (which
+      // throws on an unreadable config, also making findWorkspace's lenient
+      // internal load safe below) covers entries normalization would drop,
+      // and the targeted findWorkspace lookup covers normalized/legacy ids
+      // (metadata.json / generated legacy ids) the raw scan cannot see.
+      const knownIds = this.config.readPersistedWorkspaceIdSuperset();
+      if (knownIds.has(workspaceId) || this.config.findWorkspace(workspaceId) != null) {
         log.debug("Skipping extension metadata discard: workspace still persisted in config", {
           workspaceId,
         });
@@ -12861,12 +12844,22 @@ export class WorkspaceService extends EventEmitter {
         // concurrently created workspace — even in another backend process —
         // cannot lose its just-written entry.
         //
-        // Union of two views (see readKnownWorkspaceIds), both of which throw
-        // (aborting the prune, caught below) rather than resolving with a
-        // silently lossy id set.
-        const views = await this.readKnownWorkspaceIds();
-        normalizedIds = views.normalizedIds;
-        return views.knownIds;
+        // Union of two views, both of which throw (aborting the prune, caught
+        // below) rather than resolving with a silently lossy id set:
+        // - the raw persisted superset covers entries loadConfigOrDefault's
+        //   validation/normalization would filter or discard (see
+        //   readPersistedWorkspaceIdSuperset), so a live workspace with a
+        //   malformed config entry is never treated as removed;
+        // - the strict normalized view covers ids produced by in-memory
+        //   config migrations that are not yet persisted verbatim.
+        // A missing config file resolves as a healthy empty set in both.
+        const knownIds = this.config.readPersistedWorkspaceIdSuperset();
+        const allMetadata = await this.config.getAllWorkspaceMetadata({ throwOnError: true });
+        normalizedIds = new Set(allMetadata.map((metadata) => metadata.id));
+        for (const workspaceId of normalizedIds) {
+          knownIds.add(workspaceId);
+        }
+        return knownIds;
       });
       if (prunedCount > 0) {
         log.info(`Pruned ${prunedCount} stale extension metadata entries`);

@@ -198,8 +198,17 @@ export class ExtensionMetadataService {
       const content = await readFile(this.filePath, "utf-8");
       const parsed = JSON.parse(content) as ExtensionMetadataFile;
 
-      // Validate structure
-      if (typeof parsed !== "object" || parsed.version !== 1) {
+      // Validate structure, including the workspaces container: a parseable
+      // file with e.g. an array or primitive `workspaces` would otherwise
+      // enumerate as zero entries and masquerade as an authoritative empty
+      // state in strict reads.
+      if (
+        typeof parsed !== "object" ||
+        parsed?.version !== 1 ||
+        typeof parsed.workspaces !== "object" ||
+        parsed.workspaces === null ||
+        Array.isArray(parsed.workspaces)
+      ) {
         throw new Error("Invalid extension metadata file structure");
       }
 
