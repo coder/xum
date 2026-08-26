@@ -1050,9 +1050,13 @@ export class BashMonitorWakeStore {
     const cas = `${originalPath}.prune-${randomUUID()}`;
     try {
       await fsPromises.rename(originalPath, cas);
-    } catch {
-      // Canonical vanished mid-swap: back off; the next scan re-reconciles.
-      return null;
+    } catch (error) {
+      // Canonical vanished mid-swap: back off; the next scan re-reconciles. Any other
+      // failure (EIO, EACCES) PROPAGATES — a silent null looks like a successful empty
+      // scan, and when the canonical record is terminal, startup discovery would then
+      // schedule neither a drain nor a retry for the still-stranded pending leftover.
+      if (isErrnoWithCode(error, "ENOENT")) return null;
+      throw error;
     }
     let captured: BashMonitorWakeRecord | null;
     try {
@@ -1085,8 +1089,24 @@ export class BashMonitorWakeStore {
     try {
       await fsPromises.link(leftoverPath, originalPath);
       placed = true;
-    } catch {
-      // Someone claimed the path mid-swap; keep the leftover for re-reconciliation.
+    } catch (error) {
+      if (!isErrnoWithCode(error, "EEXIST")) {
+        // Transient placement failure (EIO, ENOSPC, unsupported links): we hold the
+        // captured canonical record in `cas` and the path is empty. Restore the
+        // capture (no-clobber) and PROPAGATE so caller retries engage — deleting the
+        // capture here would leave the wake id with no canonical record at all, and a
+        // silent null would skip startup drain scheduling. The leftover stays for
+        // re-reconciliation either way.
+        try {
+          await fsPromises.link(cas, originalPath);
+          await fsPromises.rm(cas, { force: true }).catch(() => undefined);
+        } catch {
+          // A newer write claimed the path; the cas file heals as prune trash later.
+        }
+        throw error;
+      }
+      // EEXIST: another writer claimed the path mid-swap; it wins and the leftover is
+      // kept for re-reconciliation against it.
     }
     // The captured record is verifiably the older one we compared: safe to drop.
     await fsPromises.rm(cas, { force: true }).catch(() => undefined);

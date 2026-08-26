@@ -144,7 +144,16 @@ export const MonitorWakePendingAfterExit: AppStory = {
       }
     />
   ),
+  // The waking indicator sits on its own non-truncating line specifically so narrow
+  // rows cannot ellipsize it away; snapshot the phone width (alongside desktop) so the
+  // guarded condition is actually exercised.
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
   parameters: {
+    pixel: {
+      matrix: { viewports: ["phone", "desktop"] },
+    },
     docs: {
       description: {
         story:
@@ -193,7 +202,15 @@ export const MonitorLostWakePendingAfterRestart: AppStory = {
       }
     />
   ),
+  // Same phone-width coverage as MonitorWakePendingAfterExit: the lost-monitor label
+  // must stay visible on narrow rows too.
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
   parameters: {
+    pixel: {
+      matrix: { viewports: ["phone", "desktop"] },
+    },
     docs: {
       description: {
         story:

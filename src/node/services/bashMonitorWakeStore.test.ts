@@ -370,6 +370,98 @@ describe("BashMonitorWakeStore", () => {
     expect((await store.get("owner-1", "proc-1"))?.status).toBe("superseded");
   });
 
+  test("a failed CAS capture propagates instead of hiding the stranded generation", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR old"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    const canonicalRecord = JSON.parse(await fsPromises.readFile(file, "utf-8")) as {
+      updatedAt: string;
+      lines: string[];
+    };
+    const leftover = {
+      ...canonicalRecord,
+      lines: ["ERROR newer"],
+      updatedAt: new Date(Date.parse(canonicalRecord.updatedAt) + 1_000).toISOString(),
+    };
+    await fsPromises.writeFile(`${file}.prune-crashed`, JSON.stringify(leftover), "utf-8");
+
+    // The CAS capture rename fails transiently: the scan must reject (engaging caller
+    // retries), not report a successful result that hides the stranded generation.
+    const realRename = fsPromises.rename;
+    const renameSpy = spyOn(fsPromises, "rename").mockImplementation((from, to) =>
+      String(from) === file && String(to).includes(".prune-")
+        ? Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
+        : realRename(from, to)
+    );
+    try {
+      await store.listPending("owner-1");
+      expect.unreachable("expected listPending to propagate the CAS capture failure");
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("EIO");
+    } finally {
+      renameSpy.mockRestore();
+    }
+    // Nothing was lost; the next scan completes the swap and the newer generation wins.
+    const settled = await store.listPending("owner-1");
+    expect(settled).toHaveLength(1);
+    expect(settled[0].lines).toEqual(["ERROR newer"]);
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".prune-"))).toHaveLength(0);
+  });
+
+  test("a failed CAS placement restores the canonical record and propagates", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR old"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    const canonicalRecord = JSON.parse(await fsPromises.readFile(file, "utf-8")) as {
+      updatedAt: string;
+      lines: string[];
+    };
+    const leftoverPath = `${file}.prune-crashed`;
+    await fsPromises.writeFile(
+      leftoverPath,
+      JSON.stringify({
+        ...canonicalRecord,
+        lines: ["ERROR newer"],
+        updatedAt: new Date(Date.parse(canonicalRecord.updatedAt) + 1_000).toISOString(),
+      }),
+      "utf-8"
+    );
+
+    // The CAS verified its capture but placing the leftover fails transiently. The
+    // captured canonical record must be restored (the id would otherwise have NO
+    // canonical file at all) and the failure must propagate.
+    const realLink = fsPromises.link;
+    let leftoverLinkCalls = 0;
+    const linkSpy = spyOn(fsPromises, "link").mockImplementation((from, to) => {
+      if (String(from) === leftoverPath) {
+        leftoverLinkCalls += 1;
+        // Call 1 is recovery's optimistic restore (real EEXIST); call 2 is the CAS
+        // placement after capture — fail that one.
+        if (leftoverLinkCalls === 2) {
+          return Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }));
+        }
+      }
+      return realLink(from, to);
+    });
+    try {
+      await store.listPending("owner-1");
+      expect.unreachable("expected listPending to propagate the CAS placement failure");
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("EIO");
+    } finally {
+      linkSpy.mockRestore();
+    }
+    // The canonical record was restored, not deleted with the cas file.
+    expect((await store.get("owner-1", "proc-1"))?.lines).toEqual(["ERROR old"]);
+    // The next scan completes the swap.
+    const settled = await store.listPending("owner-1");
+    expect(settled).toHaveLength(1);
+    expect(settled[0].lines).toEqual(["ERROR newer"]);
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".prune-"))).toHaveLength(0);
+  });
+
   test("owner discovery fails open when a stranded leftover cannot be read", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload());
