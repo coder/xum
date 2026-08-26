@@ -233,11 +233,17 @@ def test_mux_runner_scores_goal_mode_incomplete_exit(tmp_path: Path) -> None:
     assert (session_root / "mux-tokens.json").is_file()
 
 
-def test_mux_runner_rejects_merge_driver_before_trust(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "config_key",
+    ["merge.evil.driver", "diff.external"],
+)
+def test_mux_runner_rejects_git_driver_before_trust(
+    tmp_path: Path, config_key: str
+) -> None:
     result = _run_mux_runner_smoke(
         tmp_path,
         exit_code=0,
-        repo_git_config=("merge.evil.driver", "./steal-secrets"),
+        repo_git_config=(config_key, "./steal-secrets"),
     )
 
     assert result.completed.returncode == 1

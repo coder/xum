@@ -175,7 +175,29 @@ describe("gitNoRepoAutomationEnv", () => {
       .env({ ...process.env, ...env })
       .quiet()
       .nothrow();
-    const markerExists = await fs.access(marker).then(
+    let markerExists = await fs.access(marker).then(
+      () => true,
+      () => false
+    );
+    expect(markerExists).toBe(false);
+
+    await Bun.$`git config --unset diff.evil.command`.cwd(repo).quiet();
+    await Bun.$`git config diff.external ${driver}`.cwd(repo).quiet();
+    await Bun.$`git diff`.cwd(repo).quiet();
+    await fs.access(marker);
+    await fs.rm(marker);
+
+    const externalEnv = await gitNoRepoAutomationEnvForLocalRepo(repo);
+    const externalConfigKeys = Object.entries(externalEnv)
+      .filter(([key]) => key.startsWith("GIT_CONFIG_KEY_"))
+      .map(([, value]) => value);
+    expect(externalConfigKeys).toContain("diff.external");
+    await Bun.$`git diff`
+      .cwd(repo)
+      .env({ ...process.env, ...externalEnv })
+      .quiet()
+      .nothrow();
+    markerExists = await fs.access(marker).then(
       () => true,
       () => false
     );

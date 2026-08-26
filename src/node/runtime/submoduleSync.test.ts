@@ -167,6 +167,80 @@ describe("syncLocalGitSubmodules", () => {
     }
   }, 30_000);
 
+  it("neutralizes filters from worktree-specific submodule git dirs", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "mux-submodule-worktree-filter-"));
+
+    try {
+      const submoduleRepo = path.join(tempRoot, "submodule-src");
+      const projectRepo = path.join(tempRoot, "project");
+      const workspacePath = path.join(tempRoot, "worktree");
+      await initGitRepo(submoduleRepo, { "SKILL.md": "payload\n" });
+      await initGitRepo(projectRepo, { "README.md": "hello\n" });
+      execFileSync(
+        "git",
+        ["-c", "protocol.file.allow=always", "submodule", "add", submoduleRepo, "vendor/docs"],
+        { cwd: projectRepo, stdio: "ignore" }
+      );
+      git(projectRepo, ["commit", "-m", "add submodule"]);
+      git(projectRepo, ["worktree", "add", "-b", "filter-worktree", workspacePath, "main"]);
+      execFileSync(
+        "git",
+        ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "--recursive"],
+        { cwd: workspacePath, stdio: "ignore" }
+      );
+
+      const submodulePath = path.join(workspacePath, "vendor", "docs");
+      await fs.writeFile(path.join(submoduleRepo, "SKILL.md"), "new payload\n", "utf-8");
+      git(submoduleRepo, ["add", "."]);
+      git(submoduleRepo, ["commit", "-m", "advance submodule"]);
+      const advancedSha = execFileSync("git", ["rev-parse", "HEAD"], {
+        cwd: submoduleRepo,
+        encoding: "utf-8",
+      }).trim();
+      git(submodulePath, ["fetch", "origin"]);
+      git(submodulePath, ["checkout", advancedSha]);
+
+      const gitDirOutput = execFileSync("git", ["rev-parse", "--git-dir"], {
+        cwd: submodulePath,
+        encoding: "utf-8",
+      }).trim();
+      const gitDir = path.resolve(submodulePath, gitDirOutput);
+      const marker = path.join(tempRoot, "smudge-ran");
+      const driver = path.join(tempRoot, "smudge.sh");
+      await fs.writeFile(driver, `#!/bin/sh\ntouch "${marker}"\ncat\n`, "utf-8");
+      await fs.chmod(driver, 0o755);
+      execFileSync("git", [
+        "config",
+        "--file",
+        path.join(gitDir, "config"),
+        "filter.evil.smudge",
+        driver,
+      ]);
+      execFileSync("git", [
+        "config",
+        "--file",
+        path.join(gitDir, "config"),
+        "filter.evil.required",
+        "true",
+      ]);
+      await fs.mkdir(path.join(gitDir, "info"), { recursive: true });
+      await fs.writeFile(path.join(gitDir, "info", "attributes"), "*.md filter=evil\n", "utf-8");
+
+      const { logger } = createInitLogger();
+      await syncLocalGitSubmodules({
+        workspacePath,
+        initLogger: logger,
+        env: { GIT_ALLOW_PROTOCOL: "file" },
+        trusted: false,
+      });
+
+      expect(await fs.readFile(path.join(submodulePath, "SKILL.md"), "utf-8")).toBe("payload\n");
+      expect(await pathExists(marker)).toBe(false);
+    } finally {
+      await fs.rm(tempRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("refuses to initialize submodules when project automation is off", async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "mux-submodule-no-init-"));
 

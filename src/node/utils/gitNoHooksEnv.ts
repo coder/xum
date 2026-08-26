@@ -70,7 +70,7 @@ export function gitNoRepoAutomationEnv(): Record<string, string> {
 }
 
 export const GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN =
-  "^(filter[.].*[.](clean|smudge|process|required)|diff[.].*[.](command|textconv)|merge[.].*[.]driver)$";
+  "^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver)$";
 export const MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES = 256 * 1024;
 
 const REPO_AUTOMATION_CONFIG_KEY_REGEX =
@@ -82,7 +82,12 @@ function appendDisabledRepoAutomationDrivers(
   configKeys: Iterable<string>
 ): Record<string, string> {
   const drivers = new Map<string, { kind: "filter" | "diff" | "merge"; name: string }>();
+  let hasDiffExternal = false;
   for (const key of configKeys) {
+    if (key.toLowerCase() === "diff.external") {
+      hasDiffExternal = true;
+      continue;
+    }
     const match = REPO_AUTOMATION_CONFIG_KEY_REGEX.exec(key);
     if (match == null) {
       continue;
@@ -103,6 +108,11 @@ function appendDisabledRepoAutomationDrivers(
   }
 
   let configIndex = Number.parseInt(env.GIT_CONFIG_COUNT ?? "0", 10);
+  if (hasDiffExternal) {
+    env["GIT_CONFIG_KEY_" + configIndex] = "diff.external";
+    env["GIT_CONFIG_VALUE_" + configIndex] = "";
+    configIndex += 1;
+  }
   for (const { kind, name } of [...drivers.values()].sort((a, b) =>
     (a.kind + "\0" + a.name).localeCompare(b.kind + "\0" + b.name)
   )) {

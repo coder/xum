@@ -97,12 +97,9 @@ emit_filter_keys() {
   git config --null --name-only --includes "$@" --get-regexp '^filter[.].*[.](clean|smudge|process|required)$' || [ "$?" -eq 1 ]
 }
 emit_filter_keys
-common_dir=$(git rev-parse --git-common-dir)
-if [ -d "$common_dir/modules" ]; then
-  find "$common_dir/modules" -type f -name config -print0 | while IFS= read -r -d '' config; do
-    emit_filter_keys --file "$config"
-  done
-fi
+git submodule foreach --quiet --recursive '
+  git config --null --name-only --includes --get-regexp "^filter[.].*[.](clean|smudge|process|required)$" || [ "$?" -eq 1 ]
+'
 `;
 
 async function discoverRuntimeGitFilterConfigKeys(
