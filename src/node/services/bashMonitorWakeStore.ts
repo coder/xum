@@ -999,10 +999,11 @@ export class BashMonitorWakeStore {
   }
 
   /**
-   * The effective clear tombstone, or null when none applies (absent or malformed).
-   * Transient failures PROPAGATE: guessing "no clear happened" could restore and
-   * deliver a retired wake. An absent canonical path falls back to crash-stranded
-   * captures so an interrupted mutation never silently drops protection.
+   * The effective clear tombstone, or null when none applies (absent, or malformed
+   * with no healable capture). Transient failures PROPAGATE: guessing "no clear
+   * happened" could restore and deliver a retired wake. An absent OR malformed
+   * canonical path falls back to crash-stranded captures so an interrupted mutation
+   * never silently drops protection.
    */
   private async readClearedAt(ownerWorkspaceId: string): Promise<ClearTombstone | null> {
     const target = this.clearedAtFile(ownerWorkspaceId);
@@ -1033,7 +1034,24 @@ export class BashMonitorWakeStore {
     }
     const tomb = BashMonitorWakeStore.parseTombstone(raw);
     if (tomb == null) {
-      log.debug("Ignoring malformed bash monitor wake clear tombstone", { ownerWorkspaceId });
+      // A malformed canonical can sit in FRONT of a valid crash-stranded .cas-
+      // capture: judging only the canonical would read as "no clear", ignoring a
+      // committed capture (pre-clear orphan temps restored into the cleared
+      // transcript) or a staged one (its clear-stamped records left superseded with
+      // no rollback path). Capture the malformed file into the .cas- namespace and
+      // let the heal below adjudicate — captured rather than judged in place because
+      // a concurrent mutation can replace the canonical with a VALID generation
+      // between the read above and this rename: a valid capture heals straight back
+      // as standing protection, while malformed bytes are swept by the heal.
+      log.debug("Quarantining malformed bash monitor wake clear tombstone", { ownerWorkspaceId });
+      try {
+        await fsPromises.rename(target, `${target}.cas-${randomUUID()}`);
+      } catch (error) {
+        // Concurrently consumed or replaced mid-read: the heal below still reports
+        // whatever protection stands. Other failures PROPAGATE (see the doc above).
+        if (!isErrnoWithCode(error, "ENOENT")) throw error;
+      }
+      return this.healClearedAtFromLeftovers(ownerWorkspaceId);
     }
     return tomb;
   }
@@ -1060,7 +1078,7 @@ export class BashMonitorWakeStore {
    * re-establishes the committed cutoff if a foreign rollback removed the staging.
    */
   async commitClear(ownerWorkspaceId: string, token: BashMonitorClearToken): Promise<void> {
-    await this.mutateClearedAt(ownerWorkspaceId, (current) => {
+    const applied = await this.mutateClearedAt(ownerWorkspaceId, (current) => {
       if (current == null) {
         return { clearedAt: token.clearedAt, clearId: token.clearId, phase: "committed" };
       }
@@ -1093,6 +1111,21 @@ export class BashMonitorWakeStore {
         previousClearedAt: current.clearedAt,
       };
     });
+    if (!applied) {
+      // The no-clobber placement lost to a generation published mid-mutation — which
+      // can be a foreign heal republishing this SAME staged tombstone, so the
+      // promotion may not have landed at all. Treating the lost race as success
+      // would disarm the heartbeat and drop the active-clear marker below while the
+      // clear is still durably STAGED with no retry left: once the grace window
+      // expired, a scan would judge the staging crashed, roll it back, and restore
+      // wakes this SUCCESSFUL history clear retired into the cleared transcript.
+      // Fail instead — the retry below re-drives the promotion against whatever
+      // generation now stands (a re-published staging promotes; a newer committed
+      // cutoff reads as already subsumed and converges).
+      throw new Error(
+        `Bash monitor clear tombstone promotion lost its no-clobber race for workspace ${ownerWorkspaceId}`
+      );
+    }
     // Deactivated only AFTER the promotion durably landed: this marker is what stops
     // the staged-clear grace scan from treating a slow-to-commit SUCCESSFUL clear as
     // crashed and restoring the wakes it retired. On failure it stays active (and the
