@@ -4051,6 +4051,27 @@ describe("WorkspaceStore", () => {
       expect(hydrated).toBe(true);
       expect(store.isActivityAuthoritative()).toBe(false);
     });
+
+    it("regains authority by retrying a transiently null bootstrap list", async () => {
+      resetStore();
+
+      let listCallCount = 0;
+      mockActivityList.mockImplementation(
+        (): Promise<Record<string, WorkspaceActivitySnapshot> | null> => {
+          listCallCount += 1;
+          // The subscription stays healthy the whole time, so only the
+          // background bootstrap retry can issue the second read.
+          return Promise.resolve(listCallCount === 1 ? null : {});
+        }
+      );
+
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any
+      store.setClient({ workspace: mockClient.workspace, terminal: mockClient.terminal } as any);
+
+      const authoritative = await waitUntil(() => store.isActivityAuthoritative(), 5000);
+      expect(authoritative).toBe(true);
+      expect(listCallCount).toBeGreaterThanOrEqual(2);
+    });
   });
 
   describe("terminal activity", () => {

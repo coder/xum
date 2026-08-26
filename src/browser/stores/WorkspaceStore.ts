@@ -3642,14 +3642,23 @@ export class WorkspaceStore {
             return;
           }
           // null is the backend's read-failure signal: keep last-known snapshots and
-          // stay non-authoritative (the retry/subscription path delivers real data
-          // later). A non-null list — including {} on an all-idle deployment — is
-          // authoritative.
+          // stay non-authoritative (the background retry below delivers the real
+          // list later). A non-null list — including {} on an all-idle deployment —
+          // is authoritative.
           if (snapshots != null) {
             this.applyWorkspaceActivityList(snapshots);
           }
           this.markActivityHydrated(snapshots != null);
         });
+
+        // A transiently-null bootstrap must not stay non-authoritative for the
+        // life of an otherwise healthy subscription: heartbeats keep the iterator
+        // alive indefinitely and events never confer authority, so another list
+        // read may never happen. Retry in the background (attempt-scoped) instead
+        // of blocking here, so live events keep flowing while the read heals.
+        if (snapshots == null) {
+          void this.retryActivityBootstrapList(client, signal, attemptController.signal);
+        }
 
         // Start watchdog after bootstrap so slow list() doesn't trigger
         // false-positive reconnects.
@@ -3714,6 +3723,47 @@ export class WorkspaceStore {
       if (signal.aborted) {
         return;
       }
+    }
+  }
+
+  /**
+   * Bootstrap repair for a null (read-failure) activity list: retries list()
+   * with the subscription backoff until a real list applies, authority was
+   * gained elsewhere (e.g. a reconnect attempt's own bootstrap), or the owning
+   * attempt/store aborts. Never throws, so callers may fire-and-forget.
+   */
+  private async retryActivityBootstrapList(
+    client: RouterClient<AppRouter>,
+    signal: AbortSignal,
+    attemptSignal: AbortSignal
+  ): Promise<void> {
+    let attempt = 0;
+    while (!signal.aborted && !attemptSignal.aborted && !this.activityAuthoritative) {
+      await this.sleepWithAbort(calculateSubscriptionBackoffMs(attempt), signal);
+      attempt++;
+      if (signal.aborted || attemptSignal.aborted || this.activityAuthoritative) {
+        return;
+      }
+      let snapshots: Record<string, WorkspaceActivitySnapshot> | null = null;
+      try {
+        snapshots = await client.workspace.activity.list();
+      } catch {
+        // Transient transport failure: keep retrying; terminal subscription
+        // failures are owned by the outer attempt loop.
+        continue;
+      }
+      if (snapshots == null) {
+        continue;
+      }
+      const appliedSnapshots = snapshots;
+      queueMicrotask(() => {
+        if (signal.aborted || attemptSignal.aborted) {
+          return;
+        }
+        this.applyWorkspaceActivityList(appliedSnapshots);
+        this.markActivityHydrated(true);
+      });
+      return;
     }
   }
 
