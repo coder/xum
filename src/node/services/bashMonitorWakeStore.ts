@@ -781,7 +781,18 @@ export class BashMonitorWakeStore {
         await fsPromises.rm(leftoverPath, { force: true }).catch(() => undefined);
         continue;
       }
-      if (newest == null || Date.parse(parsed.clearedAt) > Date.parse(newest.clearedAt)) {
+      if (
+        newest == null ||
+        Date.parse(parsed.clearedAt) > Date.parse(newest.clearedAt) ||
+        // On EQUAL cutoffs, committed outranks staged: a commit that crashed after
+        // publishing its committed value but before consuming its staged capture
+        // strands BOTH generations of one clear. Selecting the staged one would let
+        // the grace-window rollback restore wakes that the committed clear retired;
+        // directory order must never decide that.
+        (Date.parse(parsed.clearedAt) === Date.parse(newest.clearedAt) &&
+          newest.phase === "staged" &&
+          parsed.phase !== "staged")
+      ) {
         newest = parsed;
         newestPath = leftoverPath;
       }
@@ -819,6 +830,13 @@ export class BashMonitorWakeStore {
     try {
       const parsed = JSON.parse(raw) as Partial<ClearTombstone>;
       if (typeof parsed.clearedAt !== "string" || Number.isNaN(Date.parse(parsed.clearedAt))) {
+        return null;
+      }
+      if (parsed.phase != null && parsed.phase !== "staged" && parsed.phase !== "committed") {
+        // An unknown phase (corruption, or a newer build's state) must not silently
+        // take the committed path — only the exact "staged" value enters the hold, so
+        // anything else would permanently CONDEMN pre-clear temps. Malformed reads as
+        // "no clear": fail toward delivery.
         return null;
       }
       if (parsed.phase === "staged") {
@@ -869,7 +887,6 @@ export class BashMonitorWakeStore {
    * re-establishes the committed cutoff if a foreign rollback removed the staging.
    */
   async commitClear(ownerWorkspaceId: string, token: BashMonitorClearToken): Promise<void> {
-    this.activeClearIds.delete(token.clearId);
     await this.mutateClearedAt(ownerWorkspaceId, (current) => {
       if (current == null) {
         return { clearedAt: token.clearedAt, clearId: token.clearId, phase: "committed" };
@@ -880,7 +897,22 @@ export class BashMonitorWakeStore {
         return { ...rest, phase: "committed" };
       }
       // Monotonic: a newer (or equal) cutoff subsumes ours; never lower it.
-      if (Date.parse(current.clearedAt) >= Date.parse(token.clearedAt)) return "keep";
+      if (Date.parse(current.clearedAt) >= Date.parse(token.clearedAt)) {
+        // A newer STAGED generation may still ROLL BACK — and it can only demote to
+        // the predecessor it captured, which may predate this clear entirely (we
+        // stalled before our staging landed, so it never saw our cutoff). Record our
+        // COMMITTED cutoff as its rollback predecessor; otherwise this successful
+        // clear leaves no durable trace and a deferred wake predating it could
+        // recover into the cleared transcript after that rollback.
+        if (
+          current.phase === "staged" &&
+          (current.previousClearedAt == null ||
+            Date.parse(current.previousClearedAt) < Date.parse(token.clearedAt))
+        ) {
+          return { ...current, previousClearedAt: token.clearedAt };
+        }
+        return "keep";
+      }
       return {
         clearedAt: token.clearedAt,
         clearId: token.clearId,
@@ -888,6 +920,12 @@ export class BashMonitorWakeStore {
         previousClearedAt: current.clearedAt,
       };
     });
+    // Deactivated only AFTER the promotion durably landed: this marker is what stops
+    // the staged-clear grace scan from treating a slow-to-commit SUCCESSFUL clear as
+    // crashed and restoring the wakes it retired. On failure it stays active — the
+    // caller's retry (see WorkspaceService.scheduleBashMonitorClearCommitRetry)
+    // re-drives the promotion, and a process crash hands over to the grace scan.
+    this.activeClearIds.delete(token.clearId);
   }
 
   /**
@@ -1882,10 +1920,22 @@ export class BashMonitorWakeStore {
         const merged: BashMonitorWakeRecord =
           canonical.status === "pending"
             ? {
-                ...parsed,
-                kind: "monitor-lost",
-                ...(canonical.script != null ? { script: canonical.script } : {}),
-                updatedAt: new Date().toISOString(),
+                // Merge BOTH pending payloads: the canonical notice may itself carry
+                // undelivered matched lines from an earlier match generation, and
+                // building the replacement from the temp alone would permanently
+                // drop them from the wake prompt. The divergent merge keeps older
+                // lines first and preserves the lost-notice kind and relaunch
+                // script.
+                ...BashMonitorWakeStore.mergeDivergentPending(parsed, canonical),
+                // But pin the MATCH TEMP's lineage on the merged record: if the temp
+                // survives a failed cleanup below, the next scan must be able to
+                // PROVE the canonical subsumes it (createdAt identity + offset
+                // frontier) — under the notice's lineage it could re-merge or mint a
+                // fresh pending wake for already-delivered output.
+                createdAt: parsed.createdAt,
+                ...(canonical.createdAt !== parsed.createdAt && parsed.matchedThroughOffset != null
+                  ? { matchedThroughOffset: parsed.matchedThroughOffset }
+                  : {}),
               }
             : {
                 // Notice already delivered: only the matched lines are still owed.
@@ -2207,12 +2257,24 @@ export class BashMonitorWakeStore {
         if (current != null && Date.parse(current.clearedAt) >= Date.parse(clearedAt)) {
           return "keep";
         }
+        // The rollback predecessor must be a COMMITTED cutoff: inheriting a staged
+        // current's own cutoff would let OUR later rollback materialize it as
+        // committed, permanently retiring wakes for a clear that never succeeded. A
+        // staged current's committed predecessor carries forward instead; if its
+        // owner commits later, commitClear's monotonic branch inserts that cutoff
+        // into our previousClearedAt.
+        const committedPredecessor =
+          current == null
+            ? null
+            : current.phase === "staged"
+              ? (current.previousClearedAt ?? null)
+              : current.clearedAt;
         return {
           clearedAt,
           clearId,
           phase: "staged",
           stagedAt: new Date().toISOString(),
-          ...(current != null ? { previousClearedAt: current.clearedAt } : {}),
+          ...(committedPredecessor != null ? { previousClearedAt: committedPredecessor } : {}),
         };
       });
       return { snapshots: pending, clearedAt, clearId };

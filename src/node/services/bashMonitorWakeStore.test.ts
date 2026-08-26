@@ -1122,6 +1122,214 @@ describe("BashMonitorWakeStore", () => {
     expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
   });
 
+  test("an unknown tombstone phase reads as malformed instead of condemning wakes", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR nearly condemned"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const temp = path.join(dir, "proc-1.json.tmp-crashed");
+    await fsPromises.rename(path.join(dir, "proc-1.json"), temp);
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(temp, past, past);
+    // Corruption (or a newer build's state) produced a phase outside the supported
+    // enum. Only the exact "staged" value enters the hold path, so an unvalidated
+    // unknown phase would take the COMMITTED path and permanently delete the
+    // pre-clear wake.
+    await fsPromises.writeFile(
+      path.join(dir, "cleared-at"),
+      JSON.stringify({
+        clearedAt: new Date(Date.now() + 60_000).toISOString(),
+        clearId: "clear-x",
+        phase: "staging",
+        stagedAt: new Date().toISOString(),
+      }),
+      "utf-8"
+    );
+
+    const pending = await store.listPending("owner-1");
+    expect(pending.map((r) => r.lines)).toEqual([["ERROR nearly condemned"]]);
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
+  });
+
+  test("equal-cutoff healing prefers the committed generation over its staged capture", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR retired by commit"] }));
+    // The clear stages (the record is stamped superseded)...
+    const clear = await store.supersedeAllPending("owner-1");
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const tombPath = path.join(dir, "cleared-at");
+    const staged = JSON.parse(await fsPromises.readFile(tombPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    // ...and its COMMIT crashes between publishing the committed value and consuming
+    // the staged capture: BOTH generations of one clear survive as leftovers with
+    // identical clearedAt values, the staging old enough for the grace rollback.
+    await fsPromises.writeFile(
+      `${tombPath}.cas-a-staged`,
+      JSON.stringify({
+        ...staged,
+        stagedAt: new Date(Date.now() - STAGED_CLEAR_ROLLBACK_GRACE_MS - 60_000).toISOString(),
+      }),
+      "utf-8"
+    );
+    await fsPromises.writeFile(
+      `${tombPath}.cas-b-committed`,
+      JSON.stringify({ clearedAt: clear.clearedAt, clearId: clear.clearId, phase: "committed" }),
+      "utf-8"
+    );
+    await fsPromises.rm(tombPath, { force: true });
+
+    // Force enumeration to present the STAGED capture first: the tie must be decided
+    // by phase rank, never by directory order.
+    const rank = (e: string) =>
+      e.endsWith(".cas-a-staged") ? 0 : e.endsWith(".cas-b-committed") ? 1 : 2;
+    const realReaddir = fsPromises.readdir;
+    const readdirSpy = spyOn(fsPromises, "readdir").mockImplementation(((
+      p: Parameters<typeof realReaddir>[0]
+    ) =>
+      realReaddir(p).then((entries) =>
+        [...entries].sort((a, b) => rank(String(a)) - rank(String(b)))
+      )) as typeof fsPromises.readdir);
+    try {
+      // A fresh instance (the restarted app) heals the leftovers: selecting the
+      // staged generation would roll the clear back and resurrect the retired wake.
+      const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+      expect(await fresh.listPending("owner-1")).toEqual([]);
+      expect((await fresh.get("owner-1", "proc-1"))?.status).toBe("superseded");
+    } finally {
+      readdirSpy.mockRestore();
+    }
+  });
+
+  test("a failing promotion keeps the clear active so scans do not roll it back", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR retired"] }));
+    const clear = await store.supersedeAllPending("owner-1");
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const tombPath = path.join(dir, "cleared-at");
+    // The staging is old enough that a CRASHED clear would be rolled back...
+    const staged = JSON.parse(await fsPromises.readFile(tombPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    await fsPromises.writeFile(
+      tombPath,
+      JSON.stringify({
+        ...staged,
+        stagedAt: new Date(Date.now() - STAGED_CLEAR_ROLLBACK_GRACE_MS - 60_000).toISOString(),
+      }),
+      "utf-8"
+    );
+    // ...but this clear is NOT crashed: its history clear succeeded and only its
+    // tombstone promotion keeps failing (e.g. ENOSPC).
+    const realWriteFile = fsPromises.writeFile;
+    const writeSpy = spyOn(fsPromises, "writeFile").mockImplementation(((
+      target: Parameters<typeof realWriteFile>[0],
+      data: Parameters<typeof realWriteFile>[1]
+    ) =>
+      typeof target === "string" && target.includes("cleared-at.tmp-")
+        ? Promise.reject(Object.assign(new Error("ENOSPC: no space"), { code: "ENOSPC" }))
+        : realWriteFile(target, data, "utf-8")) as typeof fsPromises.writeFile);
+    try {
+      await store.commitClear("owner-1", clear);
+      expect.unreachable("expected commitClear to propagate the promotion failure");
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("ENOSPC");
+    } finally {
+      writeSpy.mockRestore();
+    }
+    // The clear stays ACTIVE while its promotion is being retried: scans must not
+    // treat the locally known successful clear as crashed and restore its wakes.
+    expect(await store.listPending("owner-1")).toEqual([]);
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("superseded");
+    // The retried promotion then lands durably.
+    await store.commitClear("owner-1", clear);
+    expect(await store.listPending("owner-1")).toEqual([]);
+    const tomb = JSON.parse(await fsPromises.readFile(tombPath, "utf-8")) as { phase?: string };
+    expect(tomb.phase).toBe("committed");
+  });
+
+  test("a committed clear survives a newer staged generation's rollback", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    // A wake crashes into a deferred temp inside the freshness gate...
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR pre-clear"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const temp = path.join(dir, "proc-1.json.tmp-crashed");
+    await fsPromises.rename(path.join(dir, "proc-1.json"), temp);
+    const nearGate = new Date(Date.now() - TEMP_RECOVERY_MIN_AGE_MS + 5_000);
+    await fsPromises.utimes(temp, nearGate, nearGate);
+    // Clear A captures its cutoff (past the wake) but stalls before its staging
+    // lands...
+    const clearA = await store.supersedeAllPending("owner-1");
+    // ...so clear B (another instance) stages a NEWER cutoff having never seen A's:
+    // B's tombstone records NO predecessor.
+    const clearB = {
+      clearId: "clear-b",
+      clearedAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    await fsPromises.writeFile(
+      path.join(dir, "cleared-at"),
+      JSON.stringify({
+        clearedAt: clearB.clearedAt,
+        clearId: clearB.clearId,
+        phase: "staged",
+        stagedAt: new Date().toISOString(),
+      }),
+      "utf-8"
+    );
+    // A's history clear SUCCEEDS and promotes; B's later fails and rolls back.
+    await store.commitClear("owner-1", clearA);
+    await store.restorePendingSnapshots("owner-1", [], clearB);
+
+    // B's rollback must demote to A's committed cutoff — not erase the tombstone —
+    // so the deferred pre-A wake stays condemned once past the gate.
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(temp, past, past);
+    expect(await store.listPending("owner-1")).toEqual([]);
+    expect(await store.get("owner-1", "proc-1")).toBeNull();
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
+  });
+
+  test("recovering a divergent match temp keeps the lost notice's undelivered lines", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    // A pending match generation crashes into a consumable temp...
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR matched output"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    const temp = `${file}.tmp-crashed`;
+    await fsPromises.rename(file, temp);
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(temp, past, past);
+    // ...while restart recovery already wrote a monitor-lost notice for the same id
+    // from a DIFFERENT lineage (offset subsumption unprovable) that still carries
+    // its OWN undelivered matched lines from an earlier generation.
+    const parsedTemp = JSON.parse(await fsPromises.readFile(temp, "utf-8")) as Record<
+      string,
+      unknown
+    > & { createdAt: string; updatedAt: string };
+    await fsPromises.writeFile(
+      file,
+      JSON.stringify({
+        ...parsedTemp,
+        kind: "monitor-lost",
+        script: "echo relaunch",
+        lines: ["ERROR earlier undelivered"],
+        createdAt: new Date(Date.parse(parsedTemp.createdAt) - 60_000).toISOString(),
+        updatedAt: new Date(Date.parse(parsedTemp.updatedAt) + 60_000).toISOString(),
+      }),
+      "utf-8"
+    );
+
+    // The merge must carry BOTH pending payloads: replacing the notice with the temp
+    // alone would permanently drop already-matched output from the wake prompt.
+    const pending = await store.listPending("owner-1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0].kind).toBe("monitor-lost");
+    expect(pending[0].script).toBe("echo relaunch");
+    expect(pending[0].lines).toEqual(["ERROR matched output", "ERROR earlier undelivered"]);
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
+  });
+
   test("deferred recovery delays are bounded for corrupt or future mtimes", () => {
     const now = Date.now();
     // Near the gate: fires just past it (epsilon), no spurious full-interval wait.
