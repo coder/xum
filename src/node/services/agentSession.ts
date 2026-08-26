@@ -1694,10 +1694,13 @@ export class AgentSession {
     // postdates the message's authoring: the user acted with the message
     // already pending, a genuine opt-in. Model-created goals carry no consent
     // stamp and fail closed into the visible, resumable pause below.
+    // Strict ordering (Codex P2 PRRT_kwDOPxxmWM6cS8Bu): millisecond timestamps
+    // cannot order same-millisecond events, so equality cannot prove the
+    // message was already pending at activation — it fails closed to pause.
     if (
       input.enqueuedAtMs != null &&
       goal?.lastUserActivationAtMs != null &&
-      goal.lastUserActivationAtMs >= input.enqueuedAtMs
+      goal.lastUserActivationAtMs > input.enqueuedAtMs
     ) {
       if (suspendedCandidate != null) {
         // The restore re-verifies goal identity + active status under the
@@ -6953,6 +6956,23 @@ export class AgentSession {
       log.warn("Discarding pending follow-up with malformed goal attribution", {
         workspaceId: this.workspaceId,
         summaryMessageId: lastMessage.id,
+      });
+      await this.clearPendingFollowUpFromSummary(lastMessage);
+      return false;
+    }
+
+    // Codex P1 (PRRT_kwDOPxxmWM6cS8Bq): pre-upgrade summaries persisted
+    // goalKind without any goalId field, so the durable admission
+    // revalidation below cannot scope them — goal A could be replaced while
+    // the summary sat at the tail, and redispatching its captured objective
+    // as an unscoped synthetic turn would do autonomous work charged to the
+    // current goal. Fail closed and discard; an active goal re-arms fresh,
+    // properly scoped continuations through the normal idle/stream-end paths.
+    if (persistedGoalKind != null && persistedGoalId == null) {
+      log.info("Discarding legacy goal follow-up without goal identity", {
+        workspaceId: this.workspaceId,
+        summaryMessageId: lastMessage.id,
+        goalKind: persistedGoalKind,
       });
       await this.clearPendingFollowUpFromSummary(lastMessage);
       return false;

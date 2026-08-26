@@ -502,6 +502,17 @@ export class WorkspaceGoalService {
    * misread as a fresh stop and falsely discard an unrelated in-flight setter.
    */
   private readonly userStopGenerationsByWorkspace = new Map<string, number>();
+  /**
+   * Stops whose acknowledgment write has not committed yet. Codex security P2
+   * (PRRT_kwDOPxxmWM6cS7qG): `recordUserStoppedStream` bumps the stop
+   * generation BEFORE awaiting the goal lock, so a redispatch admission built
+   * inside that window captures the post-Stop generation as its fresh
+   * baseline while reading the pre-Stop active record — and the later
+   * active→active acknowledgment write moves no generation. While a Stop is
+   * in flight, admissions must refuse outright; once the acknowledgment
+   * commits, the durable `requireUserAcknowledgmentSinceMs` gate takes over.
+   */
+  private readonly pendingStopAcknowledgmentCounts = new Map<string, number>();
   private recordedStreamStartedAtMsByWorkspace = new Map<string, number>();
   private lastGoalStreamStamps = new Map<string, GoalStreamStamp>();
   /**
@@ -826,9 +837,15 @@ export class WorkspaceGoalService {
       // turn that consumed it settled (see manualRowProcessed field doc). A
       // partial assistant row (crash mid-response) stays unprocessed so the
       // fail-closed pause + crash-recovery acknowledgment gates apply.
+      // Codex security P2 (PRRT_kwDOPxxmWM6cS8Bx): synthetic assistant
+      // artifacts (goal-cleared summaries, family-message payloads) are not
+      // the manual turn's settled response — only a real, completed assistant
+      // response proves the turn consumed the row.
       const followerRow = historyResult.data[index + 1];
       const manualRowProcessed =
-        followerRow?.role === "assistant" && followerRow.metadata?.partial !== true;
+        followerRow?.role === "assistant" &&
+        followerRow.metadata?.partial !== true &&
+        followerRow.metadata?.synthetic !== true;
       return {
         mode: "paused",
         pausedBy: "manual_user",
@@ -897,13 +914,15 @@ export class WorkspaceGoalService {
       // must still pause even when the dispatch-time auto-pause was lost to a
       // crash (persisted state stays self-healing). Explicit pause paths are
       // unaffected: they append a goal-pause-boundary row, which reconciles
-      // via the pause_boundary branch.
+      // via the pause_boundary branch. Strict ordering (Codex P2
+      // PRRT_kwDOPxxmWM6cS8Bu): same-millisecond equality cannot prove the
+      // row was pending at activation — it fails closed to pause.
       if (
         goal.lastContinuationFiredAtMs == null &&
         (chatTailMode.manualRowProcessed === true ||
           (chatTailMode.manualRowAuthoredAtMs != null &&
             goal.lastUserActivationAtMs != null &&
-            chatTailMode.manualRowAuthoredAtMs <= goal.lastUserActivationAtMs))
+            chatTailMode.manualRowAuthoredAtMs < goal.lastUserActivationAtMs))
       ) {
         return goal;
       }
@@ -1608,6 +1627,12 @@ export class WorkspaceGoalService {
       (this.terminalStatusGenerations.get(workspaceId) ?? 0) !== terminalGenerationAtBuild ||
       (this.goalIdentityGenerations.get(workspaceId) ?? 0) !== identityGenerationAtBuild ||
       this.userStopLandedSince(workspaceId, userStopGenerationAtBuild) ||
+      // Codex security P2 (PRRT_kwDOPxxmWM6cS7qG): a Stop whose acknowledgment
+      // write has not committed bumped the generation BEFORE this baseline was
+      // captured — the baseline is fresh and the record still reads pre-Stop.
+      // Refuse while the Stop is in flight; after commit the durable
+      // acknowledgment gate below covers new builds.
+      (this.pendingStopAcknowledgmentCounts.get(workspaceId) ?? 0) > 0 ||
       current?.goalId !== goalId ||
       current.requireUserAcknowledgmentSinceMs != null
     ) {
@@ -1635,7 +1660,8 @@ export class WorkspaceGoalService {
         (this.explicitPauseGenerations.get(workspaceId) ?? 0) !== pauseGenerationAtBuild ||
         (this.terminalStatusGenerations.get(workspaceId) ?? 0) !== terminalGenerationAtBuild ||
         (this.goalIdentityGenerations.get(workspaceId) ?? 0) !== identityGenerationAtBuild ||
-        this.userStopLandedSince(workspaceId, userStopGenerationAtBuild),
+        this.userStopLandedSince(workspaceId, userStopGenerationAtBuild) ||
+        (this.pendingStopAcknowledgmentCounts.get(workspaceId) ?? 0) > 0,
     };
   }
 
@@ -1797,6 +1823,30 @@ export class WorkspaceGoalService {
     // user did not intend (the stop was meant to discard the goal change).
     const hadPendingGoalMutation = this.pendingGoalMutations.delete(workspaceId);
 
+    // Armed in the same synchronous block as the generation bump above so no
+    // admission can observe the bumped generation without the latch (see
+    // pendingStopAcknowledgmentCounts).
+    this.pendingStopAcknowledgmentCounts.set(
+      workspaceId,
+      (this.pendingStopAcknowledgmentCounts.get(workspaceId) ?? 0) + 1
+    );
+    try {
+      await this.recordUserStoppedStreamLocked(workspaceId, stoppedAtMs, hadPendingGoalMutation);
+    } finally {
+      const remaining = (this.pendingStopAcknowledgmentCounts.get(workspaceId) ?? 1) - 1;
+      if (remaining <= 0) {
+        this.pendingStopAcknowledgmentCounts.delete(workspaceId);
+      } else {
+        this.pendingStopAcknowledgmentCounts.set(workspaceId, remaining);
+      }
+    }
+  }
+
+  private async recordUserStoppedStreamLocked(
+    workspaceId: string,
+    stoppedAtMs: number,
+    hadPendingGoalMutation: boolean
+  ): Promise<void> {
     await this.fileLocks.withLock(workspaceId, async () => {
       const current = await this.readGoalFile(workspaceId);
       if (current?.status !== "active" && current?.status !== "budget_limited") {

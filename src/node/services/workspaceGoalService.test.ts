@@ -534,6 +534,66 @@ describe("WorkspaceGoalService", () => {
     }
   });
 
+  test("a Stop in flight refuses redispatch admissions before its acknowledgment commits", async () => {
+    // Codex security P2 (PRRT_kwDOPxxmWM6cS7qG): recordUserStoppedStream bumps
+    // the stop generation BEFORE awaiting the goal lock, so an admission built
+    // in that window captures the post-Stop generation as its fresh baseline
+    // while readGoalFile still returns the pre-Stop active record (no
+    // acknowledgment gate yet). The later active→active acknowledgment write
+    // moves no generation — the in-flight Stop itself must refuse admission.
+    const created = await setGoalOk(service, { workspaceId, objective: "Stop latch" });
+    const svc = service as unknown as {
+      writeGoal: (workspaceId: string, goal: GoalRecordV1) => Promise<void>;
+    };
+    const realWriteGoal = svc.writeGoal.bind(service);
+    let releaseAck!: () => void;
+    const ackGate = new Promise<void>((resolve) => {
+      releaseAck = resolve;
+    });
+    const writeSpy = spyOn(svc, "writeGoal").mockImplementationOnce(
+      async (wsId: string, goal: GoalRecordV1) => {
+        await ackGate;
+        return realWriteGoal(wsId, goal);
+      }
+    );
+    try {
+      const stopPromise = service.recordUserStoppedStream(workspaceId);
+      const admission = await service.buildGoalRedispatchAdmission(
+        workspaceId,
+        created.goalId,
+        GOAL_CONTINUATION_KIND
+      );
+      expect(admission.admissible).toBe(false);
+      releaseAck();
+      await stopPromise;
+    } finally {
+      releaseAck();
+      writeSpy.mockRestore();
+    }
+  });
+
+  test("a synthetic assistant follower does not mark a manual row processed", async () => {
+    // Codex security P2 (PRRT_kwDOPxxmWM6cS8Bx): synthetic assistant artifacts
+    // (e.g. the goal-cleared summary appended by clearGoal auto-promotion) are
+    // not the manual turn's settled response. Treating one as proof that the
+    // intervention was processed would keep an auto-promoted goal active with
+    // its autonomous kickoff recoverable over an unprocessed intervention.
+    await appendUserHistoryMessage(historyService, workspaceId, "Stop this");
+    await appendAssistantHistoryMessage(historyService, workspaceId, "Goal cleared: summary", {
+      timestamp: Date.now(),
+      synthetic: true,
+    });
+    await setGoalOk(service, {
+      workspaceId,
+      objective: "Auto-promoted goal",
+      initiator: "model",
+    });
+
+    const reconciled = await service.getGoal(workspaceId);
+
+    expect(reconciled).toMatchObject({ status: "paused" });
+  });
+
   test("a user Stop invalidates captured redispatch admissions", async () => {
     // Codex security P2 (PRRT_kwDOPxxmWM6cSx0M): recordUserStoppedStream
     // leaves an active goal's status and identity unchanged (it only bumps the

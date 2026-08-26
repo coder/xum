@@ -606,9 +606,11 @@ describe("AgentSession goal safety hooks", () => {
     const workspaceId = "queued-predates-goal";
     const { session, goalService, cleanup } = await createSessionHarness(workspaceId);
     cleanups.push(cleanup);
-    const enqueuedAtMs = Date.now();
+    // Strictly earlier than the activation stamp: equality fails closed
+    // (Codex P2 PRRT_kwDOPxxmWM6cS8Bu).
+    const enqueuedAtMs = Date.now() - 10;
     const created = await setGoalOk(goalService, { workspaceId, objective: "Fresh goal" });
-    expect(created.createdAtMs).toBeGreaterThanOrEqual(enqueuedAtMs);
+    expect(created.createdAtMs).toBeGreaterThan(enqueuedAtMs);
 
     const result = await session.sendMessage("Queued before the goal existed", SEND_OPTIONS, {
       enqueuedAtMs,
@@ -616,6 +618,78 @@ describe("AgentSession goal safety hooks", () => {
 
     expect(result.success).toBe(true);
     expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "active" });
+    session.dispose();
+  });
+
+  test("same-millisecond activation and message authoring fail closed to pause", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cS8Bu): millisecond timestamps cannot order an
+    // activation against a message authored in the same millisecond, so
+    // equality cannot prove the message was already pending when the user
+    // activated — fail closed into the pause.
+    const workspaceId = "consent-equal-millisecond";
+    const { session, goalService, cleanup } = await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    const created = await setGoalOk(goalService, { workspaceId, objective: "Equal ms" });
+    if (created.lastUserActivationAtMs == null) {
+      throw new Error("expected a user-created goal to carry an activation stamp");
+    }
+
+    const result = await session.sendMessage("Same instant", SEND_OPTIONS, {
+      enqueuedAtMs: created.lastUserActivationAtMs,
+    });
+
+    expect(result.success).toBe(true);
+    expect(await goalService.getGoal(workspaceId)).toMatchObject({ status: "paused" });
+    session.dispose();
+  });
+
+  test("a legacy goal follow-up without goal identity is discarded", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cS8Bq): pre-upgrade compaction summaries
+    // persisted goalKind without any goalId field, so the durable admission
+    // revalidation cannot scope them — goal A could be replaced while the
+    // summary sat at the tail and its captured objective would redispatch as
+    // an unscoped synthetic turn charged to the current goal. Fail closed.
+    const workspaceId = "compaction-followup-legacy-unscoped";
+    const { session, goalService, historyService, cleanup } =
+      await createSessionHarness(workspaceId);
+    cleanups.push(cleanup);
+    await setGoalOk(goalService, { workspaceId, objective: "Current goal" });
+    const summary = createMuxMessage(
+      `summary-${crypto.randomUUID()}`,
+      "assistant",
+      "Compacted conversation.",
+      {
+        timestamp: Date.now(),
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: {
+            text: "Continue working on the goal.",
+            agentId: "exec",
+            model: "openai:gpt-4o",
+            agentInitiated: true,
+            goalKind: GOAL_CONTINUATION_KIND,
+          },
+        },
+      }
+    );
+    expect((await historyService.appendToHistory(workspaceId, summary)).success).toBe(true);
+
+    const sendSpy = spyOn(session, "sendMessage").mockImplementation(() =>
+      Promise.resolve(Ok(undefined))
+    );
+    const dispatched = await (
+      session as unknown as { dispatchPendingFollowUp: (id?: string) => Promise<boolean> }
+    ).dispatchPendingFollowUp();
+    sendSpy.mockRestore();
+
+    expect(dispatched).toBe(false);
+    expect(sendSpy).not.toHaveBeenCalled();
+    const tail = await historyService.getLastMessages(workspaceId, 1);
+    expect(tail.success).toBe(true);
+    if (tail.success) {
+      const meta = tail.data[0]?.metadata?.muxMetadata;
+      expect(meta && "pendingFollowUp" in meta ? meta.pendingFollowUp : undefined).toBeUndefined();
+    }
     session.dispose();
   });
 
@@ -655,12 +729,15 @@ describe("AgentSession goal safety hooks", () => {
     await setGoalOk(goalService, { workspaceId, objective: "Resumable goal" });
     await setGoalOk(goalService, { workspaceId, status: "paused", initiator: "user" });
     const enqueuedAtMs = Date.now();
+    // Strictly-later activation: equality fails closed (Codex P2
+    // PRRT_kwDOPxxmWM6cS8Bu), so step past the sampled millisecond.
+    await new Promise((resolve) => setTimeout(resolve, 2));
     const resumed = await setGoalOk(goalService, {
       workspaceId,
       status: "active",
       initiator: "user",
     });
-    expect(resumed.lastUserActivationAtMs).toBeGreaterThanOrEqual(enqueuedAtMs);
+    expect(resumed.lastUserActivationAtMs).toBeGreaterThan(enqueuedAtMs);
 
     const result = await session.sendMessage("Queued before the resume", SEND_OPTIONS, {
       enqueuedAtMs,
@@ -776,7 +853,9 @@ describe("AgentSession goal safety hooks", () => {
     const workspaceId = "pre-stop-send-keeps-gate";
     const { session, goalService, cleanup } = await createSessionHarness(workspaceId);
     cleanups.push(cleanup);
-    const enqueuedAtMs = Date.now();
+    // Strictly earlier than the activation stamp: equality fails closed
+    // (Codex P2 PRRT_kwDOPxxmWM6cS8Bu).
+    const enqueuedAtMs = Date.now() - 10;
     const created = await setGoalOk(goalService, { workspaceId, objective: "Fresh goal" });
     await goalService.recordUserStoppedStream(workspaceId, created.createdAtMs + 5_000);
 
@@ -801,9 +880,11 @@ describe("AgentSession goal safety hooks", () => {
     const { session, goalService, cleanup } = await createSessionHarness(workspaceId);
     cleanups.push(cleanup);
     const candidates = registerBusyKickoffConsumer(goalService);
-    const enqueuedAtMs = Date.now();
+    // Strictly earlier than the activation stamp: equality fails closed
+    // (Codex P2 PRRT_kwDOPxxmWM6cS8Bu).
+    const enqueuedAtMs = Date.now() - 10;
     const created = await setGoalOk(goalService, { workspaceId, objective: "Fresh goal" });
-    expect(created.createdAtMs).toBeGreaterThanOrEqual(enqueuedAtMs);
+    expect(created.createdAtMs).toBeGreaterThan(enqueuedAtMs);
     expect(candidates.has(workspaceId)).toBe(true);
 
     const result = await session.sendMessage("Queued before the goal existed", SEND_OPTIONS, {
