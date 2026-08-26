@@ -3323,12 +3323,12 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
-  test("getActivityList rejects when the metadata file is unreadable or malformed", async () => {
-    // ExtensionMetadataService.load self-heals a corrupt file into an empty
-    // one by default; surfacing that here as an authoritative empty list
-    // would make the renderer wipe every cached snapshot with no retry.
-    // Parseable-but-malformed workspaces containers enumerate as zero
-    // entries, so they must follow the same failure path.
+  test("getActivityList quarantines a deterministically corrupt metadata file", async () => {
+    // Parse/structure corruption fails identically on every retry, so a
+    // strict read that only rethrows would leave activity hydration broken
+    // across restarts until some unrelated writer replaced the file. The
+    // strict path quarantines the bytes (preserved for inspection, never
+    // silently deleted) and the resulting empty state is authoritative.
     const corruptFiles = [
       "{not json",
       JSON.stringify({ version: 2, workspaces: {} }),
@@ -3348,18 +3348,21 @@ describe("WorkspaceService activity list scoping", () => {
           extensionMetadata,
         });
 
-        // Lenient reads (writer paths) still self-heal.
+        // Lenient reads (writer paths) self-heal without quarantining.
         expect((await extensionMetadata.getAllSnapshots()).size).toBe(0);
-
-        let rejected = false;
-        try {
-          await workspaceService.getActivityList();
-        } catch {
-          rejected = true;
-        }
-        expect(rejected).toBe(true);
-        // The self-healing prune path must not have rewritten (reset) the file.
         expect(await fsPromises.readFile(metadataPath, "utf-8")).toBe(corruptFile);
+
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList).toEqual({});
+        // The corrupt bytes were moved aside, not destroyed.
+        expect(await fsPromises.readFile(`${metadataPath}.corrupt`, "utf-8")).toBe(corruptFile);
+        let mainFileExists = true;
+        try {
+          await fsPromises.access(metadataPath);
+        } catch {
+          mainFileExists = false;
+        }
+        expect(mainFileExists).toBe(false);
       } finally {
         await cleanup();
       }
@@ -3478,6 +3481,48 @@ describe("WorkspaceService activity list scoping", () => {
       const activityList = await workspaceService.getActivityList();
       expect(activityList[workspaceId]).toBeUndefined();
       // The in-process tombstone was NOT the mechanism here.
+      expect(extensionMetadata.isWorkspaceDeleted(workspaceId)).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("getActivityList drops entries another process deregistered from config mid-list", async () => {
+    // Covers entries without a persisted snapshot too: the metadata-file
+    // revalidation cannot see workflow/bash-monitor-only entries, so final
+    // membership is also re-checked against the shared config state.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "deregistered-by-other-process";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency(workspaceId, 100);
+      const readSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      spyOn(extensionMetadata, "getAllSnapshots").mockImplementationOnce(async (options) => {
+        const snapshots = await readSnapshots(options);
+        // Simulates another backend deregistering the workspace after this
+        // request read its snapshot view. The metadata entry stays behind, so
+        // only the fresh config membership check can catch it.
+        await config.removeWorkspace(workspaceId);
+        return snapshots;
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+
+      const activityList = await workspaceService.getActivityList();
+      expect(activityList[workspaceId]).toBeUndefined();
       expect(extensionMetadata.isWorkspaceDeleted(workspaceId)).toBe(false);
     } finally {
       await cleanup();

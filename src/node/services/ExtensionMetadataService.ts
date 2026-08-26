@@ -1,5 +1,5 @@
 import { dirname } from "path";
-import { mkdir, readFile, access } from "fs/promises";
+import { mkdir, readFile, access, rename } from "fs/promises";
 import { constants } from "fs";
 import writeFileAtomic from "write-file-atomic";
 import {
@@ -559,10 +559,60 @@ export class ExtensionMetadataService {
     });
   }
 
+  /**
+   * fs errors carry an errno `code` and may be transient (EACCES/EIO/...);
+   * anything readFile's content produced afterwards (JSON parse or structure
+   * validation errors) fails identically for the same bytes on every retry.
+   */
+  private static isDeterministicCorruption(error: unknown): boolean {
+    return !(typeof error === "object" && error != null && "code" in error);
+  }
+
+  /**
+   * Move a deterministically corrupt metadata file aside so strict readers
+   * stop failing on every retry across process restarts (nothing else
+   * repairs the file until some unrelated writer happens to replace it).
+   * The original bytes are preserved at a fixed `.corrupt` path for
+   * inspection rather than deleted; the fixed name keeps quarantine bounded.
+   * Serialized with writers, and corruption is re-verified inside the queue
+   * so a concurrently repaired (just-saved) file is never quarantined.
+   */
+  private async quarantineCorruptFile(): Promise<boolean> {
+    return this.withSerializedMutation(async () => {
+      try {
+        await this.load({ throwOnError: true });
+        return false; // Healed concurrently (or transiently unreadable before).
+      } catch (error) {
+        if (!ExtensionMetadataService.isDeterministicCorruption(error)) {
+          return false;
+        }
+        const quarantinePath = `${this.filePath}.corrupt`;
+        await rename(this.filePath, quarantinePath);
+        log.error(
+          `Extension metadata file was corrupt; moved it to ${quarantinePath} and reset to empty`
+        );
+        return true;
+      }
+    });
+  }
+
   async getAllSnapshots(options?: {
     throwOnError?: boolean;
   }): Promise<Map<string, WorkspaceActivitySnapshot>> {
-    const data = await this.load(options);
+    let data: ExtensionMetadataFile;
+    try {
+      data = await this.load(options);
+    } catch (error) {
+      // Strict reads must propagate transient failures (renderer keeps
+      // last-known state and retries), but deterministic corruption would
+      // fail every retry forever on an idle process. Quarantine the corrupt
+      // bytes and re-read: the post-quarantine empty state is authoritative.
+      if (!ExtensionMetadataService.isDeterministicCorruption(error)) {
+        throw error;
+      }
+      await this.quarantineCorruptFile();
+      data = await this.load(options);
+    }
     const map = new Map<string, WorkspaceActivitySnapshot>();
     for (const [workspaceId, entry] of Object.entries(data.workspaces)) {
       const snapshot = this.toSnapshot(entry);

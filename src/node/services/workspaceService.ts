@@ -12970,15 +12970,13 @@ export class WorkspaceService extends EventEmitter {
           }
         )
       );
-      // Cross-process counterpart of the in-process tombstone check below:
-      // with XUM_ALLOW_MULTIPLE_INSTANCES another backend can delete a
-      // workspace's metadata entry while this list computes, invisible to
-      // this process's deletedWorkspaceIds. Re-read the (post-prune bounded)
-      // file once and drop entries whose persisted snapshot vanished — keys
-      // only disappear through removal. Entries without a persisted snapshot
-      // (workflow/bash-monitor tombstones, in-memory overlays) are kept.
-      // Best-effort: an unreadable re-read skips this revalidation instead
-      // of failing an otherwise complete response.
+      // Cross-process counterparts of the in-process tombstone check below:
+      // with XUM_ALLOW_MULTIPLE_INSTANCES another backend can remove a
+      // workspace while this list computes, invisible to this process's
+      // deletedWorkspaceIds. Re-read the (post-prune bounded) metadata file
+      // and the raw persisted config id superset once. Best-effort: an
+      // unreadable re-read skips its revalidation instead of failing an
+      // otherwise complete response.
       let freshPersistedIds: ReadonlySet<string> | null = null;
       try {
         freshPersistedIds = new Set(
@@ -12987,6 +12985,33 @@ export class WorkspaceService extends EventEmitter {
       } catch {
         freshPersistedIds = null;
       }
+      let freshConfigIds: Set<string> | null = null;
+      try {
+        // Mirror the prune's union: raw superset (covers entries lenient
+        // normalization would filter) plus the strictly validated view
+        // (covers ids of normalized entries; cheap — no fs enrichment
+        // probes). The strict load throwing on structurally invalid configs
+        // keeps this revalidation exactly as fail-open as the initial
+        // scoping above: an untrustworthy config view skips it entirely.
+        freshConfigIds = this.config.readPersistedWorkspaceIdSuperset();
+        const strictConfig = this.config.loadConfigOrDefault({ throwOnError: true });
+        for (const [, project] of strictConfig.projects) {
+          for (const workspace of project.workspaces) {
+            if (workspace.id) {
+              freshConfigIds.add(workspace.id);
+            }
+          }
+        }
+      } catch {
+        freshConfigIds = null;
+      }
+      // Same guard-rails as discardExtensionMetadataEntry: the raw superset
+      // misses normalized/legacy ids, so ids absent from it get a targeted
+      // findWorkspace lookup before being treated as removed.
+      const isRemovedFromConfig = (workspaceId: string): boolean =>
+        freshConfigIds != null &&
+        !freshConfigIds.has(workspaceId) &&
+        this.config.findWorkspace(workspaceId) == null;
       return Object.fromEntries(
         entries.filter(
           (entry): entry is readonly [string, WorkspaceActivitySnapshot] =>
@@ -12997,11 +13022,17 @@ export class WorkspaceService extends EventEmitter {
             // suppression — a renderer that already processed the removal
             // event would re-insert the deleted id until the next reconnect.
             !this.extensionMetadata.isWorkspaceDeleted(entry[0]) &&
+            // Persisted snapshot vanished from the shared file mid-list
+            // (metadata keys only disappear through removal). Entries that
+            // never had a persisted snapshot are covered by the config check.
             !(
               freshPersistedIds != null &&
               snapshots.has(entry[0]) &&
               !freshPersistedIds.has(entry[0])
-            )
+            ) &&
+            // Deregistered from the shared config mid-list — also covers
+            // workflow/bash-monitor-only entries with no persisted snapshot.
+            !isRemovedFromConfig(entry[0])
         )
       );
     } catch (error) {
