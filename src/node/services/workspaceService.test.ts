@@ -3997,6 +3997,85 @@ describe("WorkspaceService bash monitor wakes", () => {
     }
   });
 
+  test("a failed accepted-history scan defers the drain instead of redelivering", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-verify-retry";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const seedStore = new BashMonitorWakeStore(config);
+      const record = await seedStore.enqueueOrMergePending({
+        processId: "proc-verify",
+        taskId: "bash:proc-verify",
+        workspaceId,
+        filter: "DONE",
+        filterExclude: false,
+        lines: ["DONE accepted"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 13,
+      });
+      // The synthetic turn already sits in accepted history; only the delivered
+      // transition is missing (crash window).
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("accepted-wake", "user", "Accepted monitor wake", {
+          synthetic: true,
+          muxMetadata: buildBashMonitorWakeMetadata([record]),
+        })
+      );
+      // History reads fail transiently (disk hiccup) during acceptance verification.
+      const realIterate = historyService.iterateFullHistory.bind(historyService);
+      const gate = { failHistoryReads: true };
+      const iterateSpy = spyOn(historyService, "iterateFullHistory").mockImplementation(
+        (...args: Parameters<typeof realIterate>) =>
+          gate.failHistoryReads
+            ? Promise.resolve(Err("injected transient history failure"))
+            : realIterate(...args)
+      );
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockResolvedValue(Ok(undefined));
+      const wakeStore = (
+        workspaceService as unknown as { bashMonitorWakeStore: BashMonitorWakeStore }
+      ).bashMonitorWakeStore;
+
+      await waitForCondition(() => iterateSpy.mock.calls.length > 0);
+      await drainPendingDispatches();
+      // Verification failure must NOT read as "not accepted": re-sending would
+      // duplicate the already-appended agent turn and any actions it takes.
+      expect(sendSpy).not.toHaveBeenCalled();
+      expect(await wakeStore.listPending(workspaceId)).toHaveLength(1);
+
+      // The scan succeeds on a later drain retry: the accepted wake reconciles to
+      // delivered without ever re-sending.
+      gate.failHistoryReads = false;
+      await waitForCondition(async () => (await wakeStore.listPending(workspaceId)).length === 0, {
+        timeoutMs: 5_000,
+      });
+      expect((await wakeStore.get(workspaceId, "proc-verify"))?.status).toBe("delivered");
+      expect(sendSpy).not.toHaveBeenCalled();
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("accepted history suppresses redelivery while wake-store reconciliation keeps failing", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     try {

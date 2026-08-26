@@ -2761,9 +2761,24 @@ export class WorkspaceService extends EventEmitter {
       (record) =>
         !this.cancelingBashMonitorWakeKeys.has(this.bashMonitorWakeKey(ownerWorkspaceId, record.id))
     );
-    const acceptedSnapshots =
-      (await this.findAcceptedBashMonitorWakeSnapshots(ownerWorkspaceId, pendingSnapshot)) ??
-      new Set<string>();
+    const acceptedSnapshots = await this.findAcceptedBashMonitorWakeSnapshots(
+      ownerWorkspaceId,
+      pendingSnapshot
+    );
+    if (acceptedSnapshots == null) {
+      // Verification FAILURE is not "not accepted": the synthetic turn may already
+      // sit in history with only its delivered transition missing (crash window, or
+      // a failed transition), and treating a transient history-read failure as an
+      // empty accepted set would append the same turn again — duplicating the agent
+      // turn and any actions it takes. Leave every record pending and retry the
+      // scan on the deduped drain retry timer.
+      if (pendingSnapshot.length === 0) return;
+      log.debug("Accepted-wake verification failed; deferring bash monitor wake drain", {
+        ownerWorkspaceId,
+      });
+      this.scheduleBashMonitorWakeDrainRetry(ownerWorkspaceId);
+      return;
+    }
     const pending: BashMonitorWakeRecord[] = [];
     // The drain can block on a full sendMessage turn below, so transitions applied in
     // this reconcile loop must notify before that await — not from the drain's finally.
