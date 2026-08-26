@@ -139,6 +139,14 @@ describe("xum trust CLI", () => {
     expect(await materializeResolvedTrust(realConfig, targetConfig, nested)).toBe(true);
     expect(targetConfig.loadConfigOrDefault().projects.get(nested)?.trusted).toBe(true);
 
+    // Worktree paths ending in whitespace must survive porcelain parsing
+    // verbatim: the -z NUL-delimited output is parsed without trimming, so
+    // the realpath comparison sees the genuine registered path.
+    const trailing = path.join(base, "wt-trailing ");
+    await Bun.$`git worktree add ${trailing} -b feature-trailing`.cwd(repo).quiet();
+    expect(await materializeResolvedTrust(realConfig, targetConfig, trailing)).toBe(true);
+    expect(targetConfig.loadConfigOrDefault().projects.get(trailing)?.trusted).toBe(true);
+
     // A crafted .git file pointing gitdir at the trusted repository must not
     // inherit its trust: the checkout is not registered as a linked worktree,
     // so treating it as one would let arbitrary directories run repo-controlled

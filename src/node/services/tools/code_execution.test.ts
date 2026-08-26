@@ -10,7 +10,8 @@ import {
   type MountRunner,
 } from "./code_execution";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
-import { ToolBridge, DISPLAY_DATA_STUB, MEDIA_DATA_STUB } from "@/node/services/ptc/toolBridge";
+import { ToolBridge } from "@/node/services/ptc/toolBridge";
+import { DISPLAY_DATA_STUB, MEDIA_DATA_STUB } from "@/common/utils/attachments/toolAttachmentParts";
 import type { Tool, ToolExecutionOptions } from "ai";
 import type { PTCEvent, PTCExecutionResult } from "@/node/services/ptc/types";
 import { z } from "zod";

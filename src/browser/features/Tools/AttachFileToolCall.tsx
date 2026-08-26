@@ -21,6 +21,7 @@ import {
 import { useToolExpansion, getStatusDisplay, type ToolStatus } from "./Shared/toolUtils";
 import { JsonHighlight } from "./Shared/HighlightedCode";
 import { redactToolResultAttachmentsForDisplay } from "./Shared/toolResultDisplay";
+import { DISPLAY_DATA_STUB, MEDIA_DATA_STUB } from "@/common/utils/attachments/toolAttachmentParts";
 import {
   ToolResultImages,
   extractImagesFromToolResult,
@@ -42,12 +43,26 @@ function extractDisplayFilesFromToolResult(result: unknown): DisplayOnlyFilePart
   return result.value.filter(isDisplayOnlyFilePart);
 }
 
+/**
+ * Nested-in-carrier results hold stub markers instead of bytes: the parent
+ * code_execution card renders the real attachment from its carrier, so a
+ * stub card here would duplicate it as a broken preview/download. Budget-
+ * exceeded stubs are NOT carried and must stay visible as evidence.
+ */
+function isCarriedStubData(data: string): boolean {
+  return data === MEDIA_DATA_STUB || data === DISPLAY_DATA_STUB;
+}
+
 export const AttachFileToolCall: React.FC<AttachFileToolCallProps> = (props) => {
   const { expanded, toggleExpanded } = useToolExpansion();
-  const displayFiles = extractDisplayFilesFromToolResult(props.result);
+  const displayFiles = extractDisplayFilesFromToolResult(props.result).filter(
+    (file) => !isCarriedStubData(file.data)
+  );
   const hasDisplayFiles = displayFiles.length > 0;
   const hasDetails = props.args !== undefined || props.result !== undefined;
-  const images = extractImagesFromToolResult(props.result);
+  const images = extractImagesFromToolResult(props.result).filter(
+    (image) => !isCarriedStubData(image.data)
+  );
   const hasImages = images.length > 0;
   // Media attachments the image gallery refuses to render (PDF, SVG) would
   // otherwise be invisible in the tool card; surface them as download cards.

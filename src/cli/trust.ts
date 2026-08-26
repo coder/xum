@@ -61,10 +61,16 @@ async function ensureDirectory(dirPath: string): Promise<void> {
   }
 }
 
+// git prints exactly one trailing newline after a path; strip only that
+// terminator, because the path itself may legitimately end in whitespace.
+function stripTrailingNewline(stdout: string): string {
+  return stdout.replace(/\r?\n$/, "");
+}
+
 export async function findGitRoot(cwd: string): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd });
-    const gitRoot = stdout.trim();
+    const gitRoot = stripTrailingNewline(stdout);
     return gitRoot.length > 0 ? gitRoot : null;
   } catch {
     return null;
@@ -86,7 +92,7 @@ export async function findMainRepoDir(projectDir: string): Promise<string | null
     const { stdout } = await execFileAsync("git", ["rev-parse", "--git-common-dir"], {
       cwd: projectDir,
     });
-    const commonDir = stdout.trim();
+    const commonDir = stripTrailingNewline(stdout);
     if (commonDir.length === 0) {
       return null;
     }
@@ -111,15 +117,18 @@ export async function findMainRepoDir(projectDir: string): Promise<string | null
 }
 
 async function isRegisteredWorktreeOf(mainRepoDir: string, projectDir: string): Promise<boolean> {
-  const { stdout } = await execFileAsync("git", ["worktree", "list", "--porcelain"], {
+  // -z terminates each porcelain record with NUL, so paths containing
+  // newlines or trailing whitespace survive parsing verbatim; trimming here
+  // previously rejected genuine worktrees whose paths end in whitespace.
+  const { stdout } = await execFileAsync("git", ["worktree", "list", "--porcelain", "-z"], {
     cwd: mainRepoDir,
   });
   const projectReal = await realpathOrResolve(projectDir);
-  for (const line of stdout.split("\n")) {
-    if (!line.startsWith("worktree ")) {
+  for (const record of stdout.split("\0")) {
+    if (!record.startsWith("worktree ")) {
       continue;
     }
-    const listed = line.slice("worktree ".length).trim();
+    const listed = record.slice("worktree ".length);
     if ((await realpathOrResolve(listed)) === projectReal) {
       return true;
     }

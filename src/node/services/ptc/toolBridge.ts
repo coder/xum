@@ -24,6 +24,9 @@ import { isToolContentResult } from "@/common/utils/tools/toolContentResult";
 import { isSupportedAttachmentMediaType } from "@/common/utils/attachments/supportedAttachmentMediaTypes";
 import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
 import {
+  DISPLAY_DATA_STUB,
+  MEDIA_BUDGET_EXCEEDED_STUB,
+  MEDIA_DATA_STUB,
   isMediaPart,
   type ToolAttachmentPart,
 } from "@/common/utils/attachments/toolAttachmentParts";
@@ -41,15 +44,6 @@ import {
  * files in a loop; excess media stays behind with a budget stub instead.
  */
 export const MAX_PENDING_ATTACHMENT_BYTES = 32 * 1024 * 1024;
-
-export const MEDIA_BUDGET_EXCEEDED_STUB =
-  "[media omitted: aggregate attachment budget for this code_execution call was exceeded; attach fewer or smaller files in one call]";
-
-export const MEDIA_DATA_STUB =
-  "[base64 omitted: media is delivered to the model as an attachment on this code_execution result]";
-
-export const DISPLAY_DATA_STUB =
-  "[base64 omitted: file is shown to the user on this code_execution result; its bytes are never sent to the model]";
 
 /**
  * Result shape of an AI SDK Schema's optional custom validator

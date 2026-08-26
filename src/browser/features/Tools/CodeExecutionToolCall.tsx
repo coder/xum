@@ -16,8 +16,9 @@ import type { CodeExecutionResult, NestedToolCall } from "./Shared/codeExecution
 import { cn } from "@/common/lib/utils";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { resolveCodeExecutionViewMode, type CodeExecutionViewMode } from "./codeExecutionViewMode";
-import { ToolResultImages, sanitizeImageData, type MediaContent } from "./Shared/ToolResultImages";
+import { ToolResultImages, sanitizeImageData } from "./Shared/ToolResultImages";
 import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
+import { isMediaPart } from "@/common/utils/attachments/toolAttachmentParts";
 import { DisplayOnlyFile, MediaAttachmentDownloadCard } from "./Shared/AttachmentCards";
 
 interface CodeExecutionToolCallProps {
@@ -112,10 +113,11 @@ export const CodeExecutionToolCall: React.FC<CodeExecutionToolCallProps> = ({
   // Carrier attachments from nested tool results, split by kind: images
   // render inline via ToolResultImages, media the gallery refuses (PDF, SVG)
   // gets download cards, and display-only files get preview/download cards.
-  const attachmentParts = result?.attachments ?? [];
-  const mediaAttachments = attachmentParts.filter(
-    (part): part is MediaContent => part.type === "media"
-  );
+  // Self-healing: history replays hand this renderer unvalidated results, so
+  // a non-array attachments value or malformed members must be filtered out
+  // rather than allowed to throw and brick the workspace.
+  const attachmentParts: unknown[] = Array.isArray(result?.attachments) ? result.attachments : [];
+  const mediaAttachments = attachmentParts.filter(isMediaPart);
   const displayAttachments = attachmentParts.filter(isDisplayOnlyFilePart);
   const attachmentsResult =
     mediaAttachments.length > 0 ? { type: "content" as const, value: mediaAttachments } : null;

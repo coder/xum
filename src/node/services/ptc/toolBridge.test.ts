@@ -3,14 +3,12 @@
  */
 
 import { describe, it, expect, mock } from "bun:test";
+import { ToolBridge, MAX_PENDING_ATTACHMENT_BYTES, type KernelBridgeOptions } from "./toolBridge";
 import {
-  ToolBridge,
   DISPLAY_DATA_STUB,
-  MAX_PENDING_ATTACHMENT_BYTES,
   MEDIA_BUDGET_EXCEEDED_STUB,
   MEDIA_DATA_STUB,
-  type KernelBridgeOptions,
-} from "./toolBridge";
+} from "@/common/utils/attachments/toolAttachmentParts";
 import { jsonSchema, type Tool } from "ai";
 import type { IJSRuntime, RuntimeLimits } from "./runtime";
 import type { PTCEvent, PTCExecutionResult } from "./types";

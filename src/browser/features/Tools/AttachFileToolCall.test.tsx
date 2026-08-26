@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import { createDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
+import { DISPLAY_DATA_STUB, MEDIA_DATA_STUB } from "@/common/utils/attachments/toolAttachmentParts";
 import { AttachFileToolCall } from "./AttachFileToolCall";
 
 describe("AttachFileToolCall", () => {
@@ -83,6 +84,49 @@ describe("AttachFileToolCall", () => {
     // no Blob/object URL is created.
     expect(downloadedBlobs).toHaveLength(0);
     expect(clickedAnchors[0].getAttribute("href")).toBe(`data:text/markdown;base64,${data}`);
+  });
+
+  test("suppresses carried stub attachments (bytes render on the parent carrier card)", () => {
+    const view = render(
+      <TooltipProvider>
+        <AttachFileToolCall
+          toolName="attach_file"
+          args={{ path: "board.png" }}
+          result={{
+            type: "content",
+            value: [
+              { type: "text", text: "[Attachment prepared: board.png]" },
+              {
+                type: "media",
+                data: MEDIA_DATA_STUB,
+                mediaType: "image/png",
+                filename: "board.png",
+              },
+              {
+                type: "media",
+                data: MEDIA_DATA_STUB,
+                mediaType: "application/pdf",
+                filename: "report.pdf",
+              },
+              {
+                type: "display_file",
+                data: DISPLAY_DATA_STUB,
+                mediaType: "text/markdown",
+                filename: "notes.md",
+                providerOptions: { mux: { displayOnly: true, size: 38 } },
+              },
+            ],
+          }}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+
+    // Stubbed parts are duplicates of the parent code_execution carrier
+    // render: no image gallery, no broken download card, no preview card.
+    expect(view.queryByRole("img")).toBeNull();
+    expect(view.queryByRole("button", { name: /Download/ })).toBeNull();
+    expect(view.queryByText(/Shown to the user only/)).toBeNull();
   });
 
   test("renders image attachments with a filename caption", () => {
