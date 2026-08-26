@@ -1,18 +1,22 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 import { TooltipProvider } from "@radix-ui/react-tooltip";
 import type { ReactNode } from "react";
 
 import { BackgroundBashProvider } from "@/browser/contexts/BackgroundBashContext";
+import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { NestedToolRenderer } from "./NestedToolRenderer";
 
-// BashToolCall requires the background-bash actions context.
+// BashToolCall requires the background-bash actions context; expanded generic
+// cards highlight JSON, which requires the theme context.
 function Providers(props: { children: ReactNode }) {
   return (
-    <TooltipProvider>
-      <BackgroundBashProvider workspaceId="ws-test">{props.children}</BackgroundBashProvider>
-    </TooltipProvider>
+    <ThemeProvider forcedTheme="dark">
+      <TooltipProvider>
+        <BackgroundBashProvider workspaceId="ws-test">{props.children}</BackgroundBashProvider>
+      </TooltipProvider>
+    </ThemeProvider>
   );
 }
 
@@ -48,23 +52,42 @@ describe("NestedToolRenderer", () => {
     expect(getByText("hook output")).toBeDefined();
   });
 
-  test("kernel-mode suppressed summaries render no duration or exit-code detail", () => {
+  test("reload-reconstructed kernel calls (no output) render no duration or exit-code detail", () => {
     const { queryByText, getByText } = render(
       <Providers>
         <NestedToolRenderer
           toolName="bash"
           input={{ script: "ls", display_name: "List", timeout_secs: 60 }}
+          output={undefined}
+          status="completed"
+        />
+      </Providers>
+    );
+
+    // Without a result there is no wall_duration_ms/exitCode: the card must
+    // not render "took —" or an empty exit-code pill.
+    expect(getByText(/timeout: 60s/)).toBeDefined();
+    expect(queryByText(/took/)).toBeNull();
+    expect(queryByText(/—/)).toBeNull();
+  });
+
+  test("real tool outputs matching the old synthetic summary shape are preserved", () => {
+    const { getByText } = render(
+      <Providers>
+        <NestedToolRenderer
+          toolName="my_custom_tool"
+          input={{ q: 1 }}
           output={{ suppressed: true, ok: true, bytes: 12345 }}
           status="completed"
         />
       </Providers>
     );
 
-    // The summary is not a BashToolResult: without stripping it, the card
-    // renders "took —" and an empty exit-code pill.
-    expect(getByText(/timeout: 60s/)).toBeDefined();
-    expect(queryByText(/took/)).toBeNull();
-    expect(queryByText(/—/)).toBeNull();
+    // {suppressed, ok, bytes} from an actual tool is ordinary output and must
+    // not be stripped as a reconstruction stand-in: the generic card still
+    // shows a Result section for it.
+    fireEvent.click(getByText("my_custom_tool"));
+    expect(getByText("Result")).toBeDefined();
   });
 
   test("reconstructed failure shape skips missing duration/exit-code fields", () => {
