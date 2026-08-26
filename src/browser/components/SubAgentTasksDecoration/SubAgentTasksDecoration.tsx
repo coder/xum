@@ -152,7 +152,10 @@ export interface ObservedWorkflowRunInfo {
    * True once the run id has appeared in some owner's activity set. Nested
    * (workflow-in-workflow) runs never do — the backend deliberately excludes runs
    * with `parentWorkflow` from workspace activity — so their liveness must be
-   * verified against the durable run record instead.
+   * verified against the durable run record instead. Top-level runs seeded by
+   * cold-mount discovery start false too: they flip as soon as activity reports
+   * them, and until then (e.g. while the activity bootstrap is unavailable) the
+   * same durable-record verification owns their liveness.
    */
   activityCovered: boolean;
 }
@@ -165,15 +168,16 @@ export interface ObservedWorkflowRunInfo {
  * for every run known to be alive but currently worker-less:
  *   - runs in some owner's activity set (`activeRunIds`), including on a cold
  *     mount mid-gap where nothing was ever observed;
- *   - observed nested runs, which activity never covers, until `isNestedRunDead`
- *     reports their durable record as settled.
+ *   - observed runs activity does not cover — nested runs (never in activity)
+ *     and top-level runs seeded while the activity bootstrap was unavailable —
+ *     until `isObservedRunDead` reports their durable record as settled.
  * `observed` (mutated: learn + prune) mirrors the ProjectSidebar's retention refs.
  */
 export function mergeActiveWorkflowGroups(
   current: readonly WorkflowAgentGroup[],
   activeRunIds: readonly string[],
   observed: Map<string, ObservedWorkflowRunInfo>,
-  isNestedRunDead: (runId: string) => boolean
+  isObservedRunDead: (runId: string) => boolean
 ): WorkflowAgentGroup[] {
   const activeIds = new Set(activeRunIds);
   const currentIds = new Set(current.map((group) => group.runId));
@@ -192,7 +196,7 @@ export function mergeActiveWorkflowGroups(
     if (currentIds.has(runId)) {
       continue;
     }
-    const dead = entry.activityCovered ? !activeIds.has(runId) : isNestedRunDead(runId);
+    const dead = entry.activityCovered ? !activeIds.has(runId) : isObservedRunDead(runId);
     if (dead) {
       observed.delete(runId);
     }
@@ -356,7 +360,7 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
   const observedWorkflowRunsRef = useRef<Map<string, ObservedWorkflowRunInfo>>(new Map());
   // Nested runs whose durable record was verified settled (or unreachable); their
   // synthesized gap groups must stop rendering. Reset entries when the run reappears.
-  const [deadNestedRunIds, setDeadNestedRunIds] = useState<ReadonlySet<string>>(
+  const [deadObservedRunIds, setDeadObservedRunIds] = useState<ReadonlySet<string>>(
     () => new Set<string>()
   );
   // Bumped when cold-mount discovery seeds the observed map (a ref mutation the
@@ -397,13 +401,13 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
     liveWorkflowGroups,
     activeRunIdsKey.length > 0 ? activeRunIdsKey.split("\u0000") : [],
     observedWorkflowRunsRef.current,
-    (runId) => deadNestedRunIds.has(runId)
+    (runId) => deadObservedRunIds.has(runId)
   );
   // A dead-marked nested run that reacquired live workers (checkpoint retry) is alive
   // again; clear its verdict. "Adjust state during render" pattern with a no-op guard.
   const liveRunIds = new Set(liveWorkflowGroups.map((group) => group.runId));
-  if ([...deadNestedRunIds].some((runId) => liveRunIds.has(runId))) {
-    setDeadNestedRunIds((previous) => {
+  if ([...deadObservedRunIds].some((runId) => liveRunIds.has(runId))) {
+    setDeadObservedRunIds((previous) => {
       const next = new Set(previous);
       let changed = false;
       for (const runId of liveRunIds) {
@@ -414,9 +418,13 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
   }
   // Cold-mount discovery: nested (parentWorkflow) runs never appear in workspace
   // activity, so a tray mounting during such a run's between-workers gap would
-  // hide it until its next worker spawns. One bulk read per owner-set change seeds
-  // the observed map (nested runs only — activity already covers top-level runs on
-  // cold mounts); the liveness poll below keeps seeded groups honest.
+  // hide it until its next worker spawns. One bulk read per owner-set change
+  // seeds the observed map. Top-level summaries are seeded too: normally the
+  // activity path covers them instantly (the merge flips them to
+  // activity-covered with no duplicate group), but when the activity bootstrap
+  // is unavailable (list() returning null replays no current state), the seed
+  // is the only way a cold tray learns about an already-active run. The
+  // liveness poll below keeps every seeded group honest either way.
   const ownerIdsKey = [props.workspaceId, ...descendantWorkspaceIds].join("\u0000");
   useEffect(() => {
     if (api == null) {
@@ -434,7 +442,7 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
           }
           let seeded = false;
           for (const summary of summaries) {
-            if (!summary.nested || observedWorkflowRunsRef.current.has(summary.runId)) {
+            if (observedWorkflowRunsRef.current.has(summary.runId)) {
               continue;
             }
             observedWorkflowRunsRef.current.set(summary.runId, {
@@ -470,10 +478,11 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
       }
     };
   }, [api, ownerIdsKey]);
-  // Nested gap groups carry no activity signal, so verify their durable run records
-  // (same source useWorkflowRunById polls) while any are on screen — one bulk IPC
-  // call per cycle. Settled, missing, or repeatedly unreachable runs are marked dead
-  // so their groups drop out.
+  // Observed gap groups carry no activity signal (nested runs never do;
+  // discovery-seeded top-level runs don't until activity reports them), so
+  // verify their durable run records (same source useWorkflowRunById polls)
+  // while any are on screen — one bulk IPC call per cycle. Settled, missing, or
+  // repeatedly unreachable runs are marked dead so their groups drop out.
   const nestedGapKey = workflowGroups
     .flatMap((group) => {
       const owner = group.ownerWorkspaceId;
@@ -505,7 +514,7 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
       if (runIds.length === 0) {
         return;
       }
-      setDeadNestedRunIds((previous) => {
+      setDeadObservedRunIds((previous) => {
         if (runIds.every((runId) => previous.has(runId))) {
           return previous;
         }

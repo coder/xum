@@ -101,6 +101,25 @@ describe("mergeActiveWorkflowGroups", () => {
     expect(mergeActiveWorkflowGroups([], [], observed, noneDead)).toHaveLength(0);
     expect(observed.size).toBe(0);
   });
+
+  test("keeps a discovery-seeded top-level run alive while activity is unavailable", () => {
+    // The activity bootstrap can be down (list() returning null replays no
+    // current state), so cold-mount discovery seeds the top-level run and the
+    // durable-record poll owns its liveness until activity reports it.
+    const observed = new Map<string, ObservedWorkflowRunInfo>([
+      ["run-top", { workflowName: "deploy", ownerWorkspaceId: "ws-1", activityCovered: false }],
+    ]);
+    const gap = mergeActiveWorkflowGroups([], [], observed, noneDead);
+    expect(gap).toHaveLength(1);
+    expect(gap[0]).toMatchObject({ runId: "run-top", workflowName: "deploy" });
+    // Activity recovers and reports the run: exactly one group (no duplicate)
+    // and the entry flips to activity-covered, handing activity its lifecycle.
+    expect(mergeActiveWorkflowGroups([], ["run-top"], observed, noneDead)).toHaveLength(1);
+    expect(observed.get("run-top")?.activityCovered).toBe(true);
+    // Activity later drops the run: it dies through the activity path even
+    // though the durable poll never flagged it.
+    expect(mergeActiveWorkflowGroups([], [], observed, noneDead)).toHaveLength(0);
+  });
 });
 
 describe("collectDescendantAgents", () => {
