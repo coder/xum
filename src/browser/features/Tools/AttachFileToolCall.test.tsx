@@ -86,6 +86,41 @@ describe("AttachFileToolCall", () => {
     expect(clickedAnchors[0].getAttribute("href")).toBe(`data:text/markdown;base64,${data}`);
   });
 
+  test("renders audio and video previews without native tooltips", () => {
+    const data = Buffer.from("preview-bytes").toString("base64");
+    const view = render(
+      <TooltipProvider>
+        <AttachFileToolCall
+          toolName="attach_file"
+          args={{ path: "preview.mp4" }}
+          result={{
+            type: "content",
+            value: [
+              createDisplayOnlyFilePart({
+                data,
+                mediaType: "audio/mpeg",
+                filename: "sample.mp3",
+                size: 13,
+              }),
+              createDisplayOnlyFilePart({
+                data,
+                mediaType: "video/mp4",
+                filename: "sample.mp4",
+                size: 13,
+              }),
+            ],
+          }}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+
+    expect(view.getByText("sample.mp3")).toBeTruthy();
+    expect(view.getByText("sample.mp4")).toBeTruthy();
+    expect(view.container.querySelector("audio")?.hasAttribute("title")).toBe(false);
+    expect(view.container.querySelector("video")?.hasAttribute("title")).toBe(false);
+  });
+
   test("suppresses carried stub attachments (bytes render on the parent carrier card)", () => {
     const view = render(
       <TooltipProvider>

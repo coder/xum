@@ -98,10 +98,10 @@ export const DisplayOnlyFile: React.FC<{ file: DisplayOnlyFilePart }> = (props) 
       </div>
 
       {dataUrl != null && baseMediaType.startsWith("video/") && (
-        <video controls src={dataUrl} title={label} className="max-h-80 max-w-full rounded" />
+        <video controls src={dataUrl} className="max-h-80 max-w-full rounded" />
       )}
       {dataUrl != null && baseMediaType.startsWith("audio/") && (
-        <audio controls src={dataUrl} title={label} className="w-full" />
+        <audio controls src={dataUrl} className="w-full" />
       )}
 
       {markdownPreview != null && (
