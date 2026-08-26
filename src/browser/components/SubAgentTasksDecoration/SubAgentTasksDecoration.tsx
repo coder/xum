@@ -8,10 +8,10 @@ import {
   Workflow,
 } from "lucide-react";
 
-import { useRef } from "react";
+import { useRef, useSyncExternalStore } from "react";
 
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
-import { useOptionalWorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
+import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { shortenWorkflowRunId } from "@/browser/components/ProjectSidebar/sidebarTaskGroups";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useRouter } from "@/browser/contexts/RouterContext";
@@ -54,6 +54,8 @@ export interface DescendantAgents {
   subAgents: DescendantSubAgent[];
   /** Workflow-owned descendants grouped per run, in first-encounter order. */
   workflowGroups: WorkflowAgentGroup[];
+  /** Every traversed descendant workspace id (workflow-run owners live here too). */
+  descendantWorkspaceIds: string[];
 }
 
 /**
@@ -121,44 +123,42 @@ export function collectDescendantAgents(
     }
   }
 
-  return { subAgents, workflowGroups };
+  visited.delete(parentWorkspaceId);
+  return { subAgents, workflowGroups, descendantWorkspaceIds: [...visited] };
 }
 
 /**
  * Sequential workflows delete each worker workspace once it reports, and the next
  * worker may not exist yet — during that gap a purely row-derived group list goes
  * empty and the run would vanish from the tray even though it is still active.
- * Retain the last-seen group for every run the owner still reports active (header
- * only: the retained workers' workspaces are deleted, so their rows must not
- * render), and drop entries as soon as the run leaves the active set. Mirrors the
- * ProjectSidebar's retainedWorkflowTaskGroupsRef lifecycle.
+ * Synthesize a header-only group (its workers' workspaces are deleted, so no rows)
+ * for every active run id with no live workers — including on a cold mount mid-gap.
+ * `runNames` caches display names learned from observed workers (mirroring the
+ * ProjectSidebar's workflowRunNamesRef) and is pruned once a run is neither active
+ * nor visible; never-observed runs fall back to the shortened run id.
  */
-export function mergeRetainedWorkflowGroups(
+export function mergeActiveWorkflowGroups(
   current: readonly WorkflowAgentGroup[],
   activeRunIds: readonly string[],
-  retained: Map<string, WorkflowAgentGroup>
+  runNames: Map<string, string>
 ): WorkflowAgentGroup[] {
   const activeIds = new Set(activeRunIds);
-  for (const group of current) {
-    if (activeIds.has(group.runId)) {
-      retained.set(group.runId, group);
-    }
-  }
-  for (const runId of retained.keys()) {
-    if (!activeIds.has(runId)) {
-      retained.delete(runId);
-    }
-  }
   const currentIds = new Set(current.map((group) => group.runId));
-  const merged = [...current];
-  // Seed from the active set, not just retained entries: a cold mount can land
-  // mid-gap (no live workers observed yet), and the run must still show. Runs never
-  // observed have no name; the header falls back to the shortened run id.
-  for (const runId of activeIds) {
-    if (currentIds.has(runId)) {
-      continue;
+  for (const group of current) {
+    if (group.workflowName != null) {
+      runNames.set(group.runId, group.workflowName);
     }
-    merged.push({ runId, workflowName: retained.get(runId)?.workflowName, workers: [] });
+  }
+  for (const runId of runNames.keys()) {
+    if (!activeIds.has(runId) && !currentIds.has(runId)) {
+      runNames.delete(runId);
+    }
+  }
+  const merged = [...current];
+  for (const runId of activeIds) {
+    if (!currentIds.has(runId)) {
+      merged.push({ runId, workflowName: runNames.get(runId), workers: [] });
+    }
   }
   return merged;
 }
@@ -259,16 +259,41 @@ export function SubAgentTasksDecoration(props: { workspaceId: string }) {
     getSubAgentTasksExpandedKey(props.workspaceId),
     false
   );
-  const sidebarState = useOptionalWorkspaceSidebarState(props.workspaceId);
-  const retainedWorkflowGroupsRef = useRef<Map<string, WorkflowAgentGroup>>(new Map());
-  const { subAgents, workflowGroups: liveWorkflowGroups } = collectDescendantAgents(
-    workspaceMetadata.values(),
-    props.workspaceId
-  );
-  const workflowGroups = mergeRetainedWorkflowGroups(
+  const workspaceStore = useWorkspaceStoreRaw();
+  const workflowRunNamesRef = useRef<Map<string, string>>(new Map());
+  const {
+    subAgents,
+    workflowGroups: liveWorkflowGroups,
+    descendantWorkspaceIds,
+  } = collectDescendantAgents(workspaceMetadata.values(), props.workspaceId);
+  // Union of active workflow run ids across this workspace AND its descendants: a run
+  // owned by a descendant sub-agent appears only in that descendant's workspace-scoped
+  // activity (never the root's), so reconciling against the root alone would drop a
+  // descendant-owned run during its between-workers gap. Snapshot is a joined string so
+  // useSyncExternalStore's Object.is comparison stays stable across recomputes.
+  const activeRunIdsKey = useSyncExternalStore(workspaceStore.subscribeDerived, () => {
+    const ids: string[] = [];
+    const seen = new Set<string>();
+    for (const ownerId of [props.workspaceId, ...descendantWorkspaceIds]) {
+      let ownerRunIds: readonly string[];
+      try {
+        ownerRunIds = workspaceStore.getWorkspaceSidebarState(ownerId).activeWorkflowRunIds ?? [];
+      } catch {
+        continue;
+      }
+      for (const runId of ownerRunIds) {
+        if (!seen.has(runId)) {
+          seen.add(runId);
+          ids.push(runId);
+        }
+      }
+    }
+    return ids.join("\u0000");
+  });
+  const workflowGroups = mergeActiveWorkflowGroups(
     liveWorkflowGroups,
-    sidebarState?.activeWorkflowRunIds ?? [],
-    retainedWorkflowGroupsRef.current
+    activeRunIdsKey.length > 0 ? activeRunIdsKey.split("\u0000") : [],
+    workflowRunNamesRef.current
   );
 
   if (subAgents.length === 0 && workflowGroups.length === 0) {

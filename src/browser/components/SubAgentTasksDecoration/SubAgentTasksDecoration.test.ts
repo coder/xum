@@ -6,7 +6,7 @@ import {
   collectDescendantAgents,
   getSubAgentStatusPresentation,
   isSubAgentActive,
-  mergeRetainedWorkflowGroups,
+  mergeActiveWorkflowGroups,
   type WorkflowAgentGroup,
 } from "./SubAgentTasksDecoration";
 
@@ -25,7 +25,7 @@ function workspace(
   };
 }
 
-describe("mergeRetainedWorkflowGroups", () => {
+describe("mergeActiveWorkflowGroups", () => {
   const group = (runId: string, workerIds: string[]): WorkflowAgentGroup => ({
     runId,
     workflowName: `wf-${runId}`,
@@ -33,44 +33,55 @@ describe("mergeRetainedWorkflowGroups", () => {
   });
 
   test("bridges the gap between sequential workers while the run stays active", () => {
-    const retained = new Map<string, WorkflowAgentGroup>();
-    // Step 1: a live worker exists.
-    const withWorker = mergeRetainedWorkflowGroups([group("run-1", ["w1"])], ["run-1"], retained);
+    const runNames = new Map<string, string>();
+    // Step 1: a live worker exists (its group teaches the display name).
+    const withWorker = mergeActiveWorkflowGroups([group("run-1", ["w1"])], ["run-1"], runNames);
     expect(withWorker).toHaveLength(1);
     expect(withWorker[0].workers).toHaveLength(1);
     // Gap: the worker was deleted, the next one does not exist yet.
-    const gap = mergeRetainedWorkflowGroups([], ["run-1"], retained);
-    expect(gap).toHaveLength(1);
-    expect(gap[0]).toEqual({ runId: "run-1", workflowName: "wf-run-1", workers: [] });
+    const gap = mergeActiveWorkflowGroups([], ["run-1"], runNames);
+    expect(gap).toEqual([{ runId: "run-1", workflowName: "wf-run-1", workers: [] }]);
   });
 
-  test("drops the retained group once the run leaves the active set", () => {
-    const retained = new Map<string, WorkflowAgentGroup>();
-    mergeRetainedWorkflowGroups([group("run-1", ["w1"])], ["run-1"], retained);
-    expect(mergeRetainedWorkflowGroups([], [], retained)).toHaveLength(0);
-    expect(retained.size).toBe(0);
+  test("drops the synthesized group and cached name once the run leaves the active set", () => {
+    const runNames = new Map<string, string>();
+    mergeActiveWorkflowGroups([group("run-1", ["w1"])], ["run-1"], runNames);
+    expect(mergeActiveWorkflowGroups([], [], runNames)).toHaveLength(0);
+    expect(runNames.size).toBe(0);
   });
 
-  test("live groups win over retained entries and are never duplicated", () => {
-    const retained = new Map<string, WorkflowAgentGroup>();
-    mergeRetainedWorkflowGroups([group("run-1", ["w1"])], ["run-1"], retained);
-    mergeRetainedWorkflowGroups([], ["run-1"], retained);
+  test("live groups win over synthesized entries and are never duplicated", () => {
+    const runNames = new Map<string, string>();
+    mergeActiveWorkflowGroups([group("run-1", ["w1"])], ["run-1"], runNames);
+    mergeActiveWorkflowGroups([], ["run-1"], runNames);
     // The next worker appeared: its live rows must render, exactly once.
-    const next = mergeRetainedWorkflowGroups([group("run-1", ["w2"])], ["run-1"], retained);
+    const next = mergeActiveWorkflowGroups([group("run-1", ["w2"])], ["run-1"], runNames);
     expect(next).toHaveLength(1);
     expect(next[0].workers.map((worker) => worker.workspace.id)).toEqual(["w2"]);
   });
 
   test("synthesizes a header-only group on a cold mount mid-gap (active run, nothing observed)", () => {
-    const merged = mergeRetainedWorkflowGroups([], ["run-cold"], new Map());
+    const merged = mergeActiveWorkflowGroups([], ["run-cold"], new Map());
     expect(merged).toEqual([{ runId: "run-cold", workflowName: undefined, workers: [] }]);
   });
 
-  test("passes through live groups whose run is not (yet) in the active set without retaining them", () => {
-    const retained = new Map<string, WorkflowAgentGroup>();
-    const merged = mergeRetainedWorkflowGroups([group("run-2", ["w1"])], [], retained);
+  test("bridges descendant-owned runs, which appear only in the descendant's active set", () => {
+    // The component unions active ids across root + descendants; the merge itself
+    // must treat a descendant-owned id exactly like a root-owned one.
+    const runNames = new Map<string, string>();
+    mergeActiveWorkflowGroups([group("run-nested", ["w1"])], ["run-nested"], runNames);
+    const gap = mergeActiveWorkflowGroups([], ["run-nested"], runNames);
+    expect(gap).toEqual([{ runId: "run-nested", workflowName: "wf-run-nested", workers: [] }]);
+  });
+
+  test("passes through live groups whose run is not (yet) in the active set, pruning names once gone", () => {
+    const runNames = new Map<string, string>();
+    const merged = mergeActiveWorkflowGroups([group("run-2", ["w1"])], [], runNames);
     expect(merged).toHaveLength(1);
-    expect(retained.size).toBe(0);
+    // Name retained while the group is visible, pruned once inactive and gone.
+    expect(runNames.get("run-2")).toBe("wf-run-2");
+    mergeActiveWorkflowGroups([], [], runNames);
+    expect(runNames.size).toBe(0);
   });
 });
 
