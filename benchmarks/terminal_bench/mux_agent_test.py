@@ -326,6 +326,7 @@ class _FakeEnvironment:
         delay_sec: float = 0,
         session_archive: bytes | None = None,
         runner_exit_code: str | None = None,
+        stale_runner_exit_code: str | None = None,
         preexisting_session_dirs: tuple[str, ...] = (),
         token_payload: str | None = None,
     ) -> None:
@@ -334,6 +335,7 @@ class _FakeEnvironment:
         self.delay_sec = delay_sec
         self.session_archive = session_archive
         self.runner_exit_code = runner_exit_code
+        self.stale_runner_exit_code = stale_runner_exit_code
         self.preexisting_session_dirs = preexisting_session_dirs
         self.token_payload = token_payload
         self.snapshot_requested = False
@@ -344,6 +346,13 @@ class _FakeEnvironment:
         command = _kwargs.get("command")
         if isinstance(command, str):
             self.exec_commands.append(command)
+        if (
+            isinstance(command, str)
+            and command.startswith("rm -f -- ")
+            and MuxAgent._RUN_EXIT_CODE_NAME in command
+        ):
+            self.stale_runner_exit_code = None
+            return _ExecResult(return_code=0)
         if (
             isinstance(command, str)
             and "find . -type f -name session-usage.json" in command
@@ -388,9 +397,10 @@ class _FakeEnvironment:
     async def download_file(self, source_path: str, target_path: Path) -> None:
         self.download_attempts.append((source_path, target_path))
         if source_path.endswith(f"/{MuxAgent._RUN_EXIT_CODE_NAME}"):
-            if self.runner_exit_code is None:
+            exit_code = self.runner_exit_code or self.stale_runner_exit_code
+            if exit_code is None:
                 raise FileNotFoundError(source_path)
-            target_path.write_text(self.runner_exit_code)
+            target_path.write_text(exit_code)
             return
         assert source_path == MuxAgent._TOKEN_FILE_PATH
         target_path.write_text(
@@ -455,6 +465,20 @@ def test_run_uses_runner_exit_code_over_channel_success(
     environment = _FakeEnvironment(_ExecResult(return_code=0), runner_exit_code="1")
 
     with pytest.raises(RuntimeError, match="exit 1"):
+        asyncio.run(agent.run("do the task", environment, SimpleNamespace()))
+
+
+def test_run_ignores_stale_runner_exit_code(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    environment = _FakeEnvironment(
+        _ExecResult(return_code=7),
+        stale_runner_exit_code="0",
+    )
+
+    with pytest.raises(RuntimeError, match="exit 7"):
         asyncio.run(agent.run("do the task", environment, SimpleNamespace()))
 
 
@@ -829,6 +853,26 @@ def test_populate_context_prefers_fresher_unpriced_stdout_counts(
     assert getattr(context, "n_input_tokens") == 500 + 800 + 40
     assert getattr(context, "n_output_tokens") == 90
     assert not hasattr(context, "cost_usd")
+
+
+def test_populate_context_rejects_priced_stdout_with_invalid_token_bucket(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    (tmp_path / "mux-tokens.json").write_text(
+        '{"input": 1e309, "output": 0, "cost_usd": 0.5}'
+    )
+    (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).write_bytes(
+        _sessions_archive_bytes({"ws-main": _usage_display()})
+    )
+    context = SimpleNamespace()
+
+    agent.populate_context_post_run(context)
+
+    assert getattr(context, "n_input_tokens") == 115
+    assert getattr(context, "n_output_tokens") == 20
+    assert getattr(context, "cost_usd") == pytest.approx(0.15)
 
 
 def test_populate_context_keeps_valid_fresher_non_finite_token_file_counts(

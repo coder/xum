@@ -409,6 +409,20 @@ class MuxAgent(BaseInstalledAgent):
     ) -> None:
         """Run agent commands, download token file, then populate context."""
         preexisting_session_dirs = await self._snapshot_session_usage_dirs(environment)
+        sandbox_log_dir = (
+            self._env.get("MUX_LOG_DIR") or self._DEFAULT_RUN_LOG_DIR
+        ).rstrip("/")
+        runner_exit_sandbox_path = f"{sandbox_log_dir}/{self._RUN_EXIT_CODE_NAME}"
+        runner_marker_cleared = False
+        try:
+            clear_result = await environment.exec(
+                command=f"rm -f -- {shlex.quote(runner_exit_sandbox_path)}",
+                user="root",
+                timeout_sec=30,
+            )
+            runner_marker_cleared = clear_result.return_code == 0
+        except Exception:
+            pass
 
         # Execute commands (from base class logic, but without calling populate_context)
         command_result: tuple[int, int] | None = None
@@ -452,22 +466,20 @@ class MuxAgent(BaseInstalledAgent):
         runner_exit_code: int | None = None
         runner_exit_path = self.logs_dir / self._RUN_EXIT_CODE_NAME
         runner_exit_path.unlink(missing_ok=True)
-        sandbox_log_dir = (
-            self._env.get("MUX_LOG_DIR") or self._DEFAULT_RUN_LOG_DIR
-        ).rstrip("/")
-        try:
-            # The sandbox already authors trusted telemetry in this harness;
-            # independent task verification remains the correctness boundary.
-            await environment.download_file(
-                f"{sandbox_log_dir}/{self._RUN_EXIT_CODE_NAME}", runner_exit_path
-            )
-            raw_exit_code = runner_exit_path.read_text()
-            if raw_exit_code.isdecimal() and len(raw_exit_code) <= 3:
-                parsed_exit_code = int(raw_exit_code)
-                if parsed_exit_code <= 255:
-                    runner_exit_code = parsed_exit_code
-        except Exception:
-            pass
+        if runner_marker_cleared:
+            try:
+                # The sandbox already authors trusted telemetry in this harness;
+                # independent task verification remains the correctness boundary.
+                await environment.download_file(
+                    runner_exit_sandbox_path, runner_exit_path
+                )
+                raw_exit_code = runner_exit_path.read_text()
+                if raw_exit_code.isdecimal() and len(raw_exit_code) <= 3:
+                    parsed_exit_code = int(raw_exit_code)
+                    if parsed_exit_code <= 255:
+                        runner_exit_code = parsed_exit_code
+            except Exception:
+                pass
 
         if command_result is not None:
             command_index, channel_return_code = command_result
@@ -769,6 +781,13 @@ class MuxAgent(BaseInstalledAgent):
         return totals
 
     @classmethod
+    def _has_valid_token_buckets(cls, data: dict[str, Any]) -> bool:
+        for key in ("input", "output", "reasoning", "cache_read", "cache_write"):
+            if key in data and not cls._is_valid_token_count(data[key]):
+                return False
+        return True
+
+    @classmethod
     def _total_tokens(cls, data: dict[str, Any]) -> int:
         total = 0
         for key in ("input", "output", "reasoning", "cache_read", "cache_write"):
@@ -809,7 +828,11 @@ class MuxAgent(BaseInstalledAgent):
 
         data: dict[str, Any] | None
         token_cost = token_data.get("cost_usd") if token_data is not None else None
-        if token_data is not None and self._is_valid_usage_number(token_cost):
+        if (
+            token_data is not None
+            and self._is_valid_usage_number(token_cost)
+            and self._has_valid_token_buckets(token_data)
+        ):
             data = token_data
         elif session_totals is not None and (
             token_data is None
