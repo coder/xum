@@ -390,6 +390,101 @@ describe("WorkspaceService bash monitor wakes", () => {
     }
   });
 
+  test("a partially failed delivered batch still notifies subscribers immediately", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-partial-batch";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const notifyWakeStateChanged = mock(() => undefined);
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+        notifyMonitorWakeStateChanged: notifyWakeStateChanged,
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      // Park drains until both wakes are durably pending so one drain batches them.
+      let deferDrains = true;
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockImplementation(
+        () => deferDrains
+      );
+      spyOn(workspaceService, "waitForIdleAndNoQueuedMessages").mockImplementation(
+        () => new Promise(() => undefined)
+      );
+      // The delivered transition of an EARLIER record must reach subscribers even when a
+      // LATER record's transition throws: the wake turn keeps streaming, so without the
+      // notify the banner would claim "waking agent…" until the whole send returned.
+      let notifyDeltaDuringAccepted = -1;
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        async (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          const before = notifyWakeStateChanged.mock.calls.length;
+          try {
+            await args[3]?.onAccepted?.();
+          } catch {
+            // The partial transition failure propagates to the drain; the stream goes on.
+          }
+          notifyDeltaDuringAccepted = notifyWakeStateChanged.mock.calls.length - before;
+          return Ok(undefined);
+        }
+      );
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: BashMonitorWakeStore;
+        }
+      ).bashMonitorWakeStore;
+      const emitMatch = (processId: string) => {
+        backgroundProcessManager.emit("monitor:match", workspaceId, {
+          processId,
+          taskId: `bash:${processId}`,
+          workspaceId,
+          filter: "FAILED",
+          filterExclude: false,
+          lines: [`FAILED ${processId}`],
+          totalMatches: 1,
+          timestamp: Date.now(),
+        });
+      };
+      emitMatch("proc-a");
+      emitMatch("proc-b");
+      await waitForCondition(async () => (await wakeStore.listPending(workspaceId)).length === 2);
+
+      const realMarkDelivered = wakeStore.markDeliveredSnapshot.bind(wakeStore);
+      let deliveredCalls = 0;
+      const markSpy = spyOn(wakeStore, "markDeliveredSnapshot").mockImplementation(
+        (ownerWorkspaceId, snapshot) => {
+          deliveredCalls += 1;
+          if (deliveredCalls === 2) {
+            return Promise.reject(new Error("transient transition failure"));
+          }
+          return realMarkDelivered(ownerWorkspaceId, snapshot);
+        }
+      );
+      deferDrains = false;
+      emitMatch("proc-c"); // schedules the drain that batches all three records
+
+      await waitForCondition(() => notifyDeltaDuringAccepted >= 0);
+      // Without the finally, the second record's failure would skip the notify entirely
+      // (delta 0) and only the drain's trailing safety-net emit would run post-stream.
+      expect(deliveredCalls).toBeGreaterThanOrEqual(2);
+      expect(notifyDeltaDuringAccepted).toBeGreaterThanOrEqual(1);
+      expect(sendSpy).toHaveBeenCalled();
+      markSpy.mockRestore();
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("listBackgroundProcesses surfaces the pending wake kind until the monitor wake is delivered", async () => {
     const { config, cleanup } = await createTestHistoryService();
     try {

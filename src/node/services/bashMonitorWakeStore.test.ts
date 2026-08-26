@@ -451,6 +451,51 @@ describe("BashMonitorWakeStore", () => {
     expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".prune-"))).toHaveLength(0);
   });
 
+  test("an unverifiable prune capture is restored and the failure propagates", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload());
+    await store.markDelivered("owner-1", "proc-1");
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    const past = new Date(Date.now() - TERMINAL_WAKE_RETENTION_MS - 60_000);
+    await fsPromises.utimes(file, past, past);
+
+    // A concurrent rewrite lands during the capture rename, and then the captured inode
+    // cannot be read. The helper must not report a successful empty scan: startup owner
+    // discovery would skip scheduling this owner's drain for a possibly-pending wake.
+    const other = new BashMonitorWakeStore(makeConfig(rootDir));
+    const realRename = fsPromises.rename;
+    let injected = false;
+    const renameSpy = spyOn(fsPromises, "rename").mockImplementation(async (from, to) => {
+      if (!injected && String(from) === file && String(to).includes(".prune-")) {
+        injected = true;
+        await other.enqueueOrMergePending(payload({ lines: ["ERROR rearmed"] }));
+      }
+      return realRename(from, to);
+    });
+    const realReadFile = fsPromises.readFile;
+    const readSpy = spyOn(fsPromises, "readFile").mockImplementation(((
+      target: Parameters<typeof fsPromises.readFile>[0],
+      options: Parameters<typeof fsPromises.readFile>[1]
+    ) =>
+      typeof target === "string" && target.includes(".json.prune-")
+        ? Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
+        : realReadFile(target, options)) as unknown as typeof fsPromises.readFile);
+    try {
+      await store.listPending("owner-1");
+      expect.unreachable("expected listPending to propagate the capture read failure");
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("EIO");
+    } finally {
+      renameSpy.mockRestore();
+      readSpy.mockRestore();
+    }
+    // The unverifiable capture was restored to the canonical path fail-safe, so the
+    // concurrently rewritten pending wake was never lost or stranded.
+    expect((await store.listPending("owner-1")).map((r) => r.lines)).toEqual([["ERROR rearmed"]]);
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".prune-"))).toHaveLength(0);
+  });
+
   test("pruning keeps a freshly superseded record captured from a concurrent rewrite", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload());

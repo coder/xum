@@ -2827,16 +2827,21 @@ export class WorkspaceService extends EventEmitter {
       resolve: (record: BashMonitorWakeRecord) => Promise<boolean>
     ): Promise<void> => {
       let hasUnresolvedMergedMatches = false;
-      for (const record of records) {
-        if (!(await resolve(record))) {
-          hasUnresolvedMergedMatches = true;
+      try {
+        for (const record of records) {
+          if (!(await resolve(record))) {
+            hasUnresolvedMergedMatches = true;
+          }
         }
+      } finally {
+        // Notify as soon as durable transitions land — even when a later record's
+        // transition throws after an earlier one already succeeded (observers must track
+        // partial durable updates). The accepted-send path runs this while the drain is
+        // still awaiting the full sendMessage turn, so deferring to the drain's finally
+        // would keep "waking agent…" on screen for the whole wake-triggered stream even
+        // though the wake was already delivered.
+        this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
       }
-      // Notify as soon as the durable transition lands. The accepted-send path runs this
-      // while the drain is still awaiting the full sendMessage turn, so deferring to the
-      // drain's finally would keep "waking agent…" on screen for the whole wake-triggered
-      // stream even though the wake was already delivered.
-      this.notifyBashMonitorWakeStateChanged(ownerWorkspaceId);
       if (hasUnresolvedMergedMatches) {
         this.scheduleBashMonitorWakeDrainAfterIdle(ownerWorkspaceId);
       }

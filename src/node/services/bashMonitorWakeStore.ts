@@ -1003,11 +1003,36 @@ export class BashMonitorWakeStore {
         if (isErrnoWithCode(error, "ENOENT")) return null;
         throw error;
       }
-      const raw = await fsPromises.readFile(trash, "utf-8").catch(() => null);
-      const parsed = raw == null ? null : this.parse(raw);
+      let raw: string;
+      try {
+        raw = await fsPromises.readFile(trash, "utf-8");
+      } catch (error) {
+        if (isErrnoWithCode(error, "ENOENT")) {
+          // A concurrent recoverStrandedPruneFile consumed the trash (restored or swept
+          // it). Publish the canonical path's current state, mirroring the EEXIST branch.
+          const currentRaw = await fsPromises.readFile(filePath, "utf-8").catch(() => null);
+          const current = currentRaw == null ? null : this.parse(currentRaw);
+          return current?.status === "pending" ? current : null;
+        }
+        // Cannot verify the captured inode — it may be a concurrently rewritten pending
+        // wake. Restore it fail-safe (link never clobbers a newer record) and PROPAGATE
+        // so caller retries engage; silently restoring with an empty result would skip
+        // startup drain scheduling for a possibly-pending wake. A failed restore keeps
+        // the trash for recoverStrandedPruneFile to retry.
+        let relinked = false;
+        try {
+          await fsPromises.link(trash, filePath);
+          relinked = true;
+        } catch {
+          // Keep the trash; a later scan recovers it.
+        }
+        if (relinked) await fsPromises.rm(trash, { force: true }).catch(() => undefined);
+        throw error;
+      }
+      const parsed = this.parse(raw);
       let restore: boolean;
       if (parsed == null || parsed.status === "pending") {
-        // Not verifiably terminal (raced rewrite, or a read/parse hiccup just now).
+        // Not verifiably terminal (raced rewrite, or unparseable content just now).
         restore = true;
       } else {
         // Terminal content still needs its age re-verified against the CAPTURED inode:
