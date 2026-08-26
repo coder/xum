@@ -966,6 +966,84 @@ describe("WorkspaceService bash monitor wakes", () => {
     }
   });
 
+  test("a history clear is refused once workspace removal has begun", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-clear-vs-removal";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+        notifyMonitorWakeStateChanged: mock(() => undefined),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(true);
+      spyOn(workspaceService, "waitForIdleAndNoQueuedMessages").mockImplementation(
+        () => new Promise(() => undefined)
+      );
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: BashMonitorWakeStore;
+        }
+      ).bashMonitorWakeStore;
+      await wakeStore.enqueueOrMergePending({
+        processId: "proc-removal-race",
+        taskId: "bash:proc-removal-race",
+        workspaceId,
+        filter: "WAKE:",
+        filterExclude: false,
+        lines: ["WAKE: racing removal"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 10,
+      });
+      // Removal has begun (removeUnlocked sets the flag before its history-lock
+      // barrier and session deletion). A clear admitted after this point would
+      // stage a tombstone and stamp records — writes whose mkdir can recreate the
+      // deleted session directory and leak a cleared-at file into a future
+      // workspace reusing the ID.
+      (workspaceService as unknown as { removingWorkspaces: Set<string> }).removingWorkspaces.add(
+        workspaceId
+      );
+
+      const clearHistory = (
+        workspaceService as unknown as {
+          clearHistoryWithRetiredBashMonitorWakes: (
+            workspaceId: string,
+            clear: () => Promise<Result<void>>,
+            options?: { discardUnacceptedOnSuccess?: boolean }
+          ) => Promise<Result<void>>;
+        }
+      ).clearHistoryWithRetiredBashMonitorWakes.bind(workspaceService);
+      const result = await clearHistory(workspaceId, () => Promise.resolve(Ok(undefined)), {
+        discardUnacceptedOnSuccess: true,
+      });
+      expect(result.success).toBe(false);
+      // The refused clear touched nothing: no retirement, no staged tombstone.
+      expect((await wakeStore.get(workspaceId, "proc-removal-race"))?.status).toBe("pending");
+      const tombPath = path.join(
+        config.getSessionDir(workspaceId),
+        "bash-monitor-wakes",
+        "cleared-at"
+      );
+      expect(existsSync(tombPath)).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("listBackgroundProcesses keeps a pending wake visible on a reused monitorless process ID", async () => {
     const { config, cleanup } = await createTestHistoryService();
     try {

@@ -6495,6 +6495,17 @@ export class WorkspaceService extends EventEmitter {
         });
       }
 
+      // Wait out any in-flight bash-monitor history clear, then disarm surviving
+      // clear writers BEFORE deleting the session directory. A commit-failed clear
+      // intentionally keeps its staged heartbeat armed for cross-instance liveness,
+      // and both that heartbeat and a late tombstone promotion drive
+      // mutateClearedAt, whose mkdir would recreate the directory after deletion.
+      // New clears are refused by the removingWorkspaces guard (set above),
+      // promotion retries re-check it when they fire, and this barrier covers the
+      // one transaction that may already hold the lock.
+      await this.bashMonitorHistoryLocks.withLock(workspaceId, () => Promise.resolve());
+      this.bashMonitorWakeStore.abandonWorkspaceClears(workspaceId);
+
       // Remove session data
       const sessionDir = this.config.getSessionDir(workspaceId);
       // r66: identifies THIS removal attempt in the durable tombstone so the
@@ -12379,6 +12390,14 @@ export class WorkspaceService extends EventEmitter {
     clear: () => Promise<Result<T>>,
     options?: { discardUnacceptedOnSuccess?: boolean }
   ): Promise<Result<T>> {
+    // Removal deletes the session directory: a clear admitted after removal begins
+    // would stage a tombstone and stamp records — writes whose mkdir can recreate
+    // the deleted directory and leak a cleared-at file into a future workspace
+    // reusing the ID. removeUnlocked sets the flag before its history-lock barrier,
+    // so checking under this lock is race-free.
+    if (this.removingWorkspaces.has(workspaceId)) {
+      return Err("Cannot clear history while the workspace is being removed.");
+    }
     const pending = await this.bashMonitorWakeStore.listPending(workspaceId);
     const acceptedBefore = await this.findAcceptedBashMonitorWakeSnapshots(workspaceId, pending);
     if (acceptedBefore == null) {

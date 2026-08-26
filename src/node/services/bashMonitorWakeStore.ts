@@ -643,8 +643,13 @@ export class BashMonitorWakeStore {
   private readonly stagedClearRefreshIntervalMs: number;
 
   // Liveness heartbeats for in-flight staged clears (see
-  // STAGED_CLEAR_REFRESH_INTERVAL_MS), keyed by clearId.
-  private readonly stagedClearRefreshTimers = new Map<string, NodeJS.Timeout>();
+  // STAGED_CLEAR_REFRESH_INTERVAL_MS), keyed by clearId. The owner is retained so
+  // workspace removal can disarm a workspace's surviving heartbeats wholesale (see
+  // abandonWorkspaceClears).
+  private readonly stagedClearRefreshTimers = new Map<
+    string,
+    { timer: NodeJS.Timeout; ownerWorkspaceId: string }
+  >();
 
   private armStagedClearRefresh(ownerWorkspaceId: string, clearId: string): void {
     this.disarmStagedClearRefresh(clearId);
@@ -662,13 +667,32 @@ export class BashMonitorWakeStore {
     // Never hold process shutdown open: a staging orphaned by shutdown is exactly
     // what the grace scan reconciles.
     timer.unref();
-    this.stagedClearRefreshTimers.set(clearId, timer);
+    this.stagedClearRefreshTimers.set(clearId, { timer, ownerWorkspaceId });
   }
 
   private disarmStagedClearRefresh(clearId: string): void {
-    const timer = this.stagedClearRefreshTimers.get(clearId);
-    if (timer != null) clearInterval(timer);
+    const entry = this.stagedClearRefreshTimers.get(clearId);
+    if (entry != null) clearInterval(entry.timer);
     this.stagedClearRefreshTimers.delete(clearId);
+  }
+
+  /**
+   * Disarm every staged-clear heartbeat a workspace owns and drop its active-clear
+   * markers. Called by workspace removal AFTER its history-lock barrier has waited
+   * out in-flight clear transactions: a commit-failed clear intentionally keeps its
+   * heartbeat armed for cross-instance liveness (see commitClear), and that
+   * heartbeat's mutateClearedAt would mkdir the session directory back into
+   * existence after removal deletes it. Dropping activeClearIds also lets a staging
+   * that survives a failed removal be grace-rolled-back (fail toward delivery)
+   * instead of being held forever by a marker whose owner will never settle it.
+   */
+  abandonWorkspaceClears(ownerWorkspaceId: string): void {
+    for (const [clearId, entry] of this.stagedClearRefreshTimers) {
+      if (entry.ownerWorkspaceId !== ownerWorkspaceId) continue;
+      clearInterval(entry.timer);
+      this.stagedClearRefreshTimers.delete(clearId);
+      this.activeClearIds.delete(clearId);
+    }
   }
 
   private scheduleDeferredTempRecovery(
@@ -989,6 +1013,21 @@ export class BashMonitorWakeStore {
       log.debug("Ignoring malformed bash monitor wake clear tombstone", { ownerWorkspaceId });
     }
     return tomb;
+  }
+
+  /**
+   * Whether a clearId identifies a clear transaction that has neither committed nor
+   * rolled back: in flight in this process (activeClearIds), or durably STAGED on
+   * disk (another instance's live clear, or a commit-failed clear whose promotion is
+   * still retrying).
+   */
+  private async isUnresolvedStagedClear(
+    ownerWorkspaceId: string,
+    clearId: string
+  ): Promise<boolean> {
+    if (this.activeClearIds.has(clearId)) return true;
+    const tomb = await this.readClearedAt(ownerWorkspaceId);
+    return tomb?.phase === "staged" && tomb.clearId === clearId;
   }
 
   /**
@@ -2287,6 +2326,21 @@ export class BashMonitorWakeStore {
       if (parsed == null || parsed.status === "pending") {
         // Not verifiably terminal (raced rewrite, or unparseable content just now).
         restore = true;
+      } else if (
+        parsed.status === "superseded" &&
+        parsed.supersededByClearId != null &&
+        (await this.isUnresolvedStagedClear(ownerWorkspaceId, parsed.supersededByClearId))
+      ) {
+        // Owned by a clear that has neither committed nor rolled back: this record is
+        // that clear's ONLY rollback source (restores rewrite the canonical record).
+        // A clear staged longer than the retention window — a long history clear, or
+        // a promotion retrying past transient failures — would otherwise have its
+        // stamped records pruned as ordinary old terminal records, and a subsequent
+        // rollback would find nothing to restore: wakes permanently lost for a
+        // history clear that never happened. Held until the transaction settles:
+        // commit makes the record ordinary terminal (prunable next scan), rollback
+        // flips it back to pending.
+        restore = true;
       } else {
         // Terminal content still needs its age re-verified against the CAPTURED inode:
         // the prune decision came from an earlier stat, and a concurrent writer may have
@@ -2377,22 +2431,19 @@ export class BashMonitorWakeStore {
     const clearedAt = new Date().toISOString();
     const clearId = randomUUID();
     this.activeClearIds.add(clearId);
-    const pending = await this.listPending(ownerWorkspaceId);
     const staged: BashMonitorWakeRecord[] = [];
+    let stagingLanded = false;
     try {
-      for (const record of pending) {
-        // Snapshots list only what was ACTUALLY retired: a record that changed past
-        // the cutoff stays pending, and restoring it on rollback would be wrong (its
-        // restore would clobber the newer merged generation back to the snapshot).
-        if (await this.supersedeForClear(ownerWorkspaceId, record, clearId)) {
-          staged.push(record);
-        }
-      }
+      const pending = await this.listPending(ownerWorkspaceId);
       // Durable STAGED tombstone for wakes this clear could NOT see: a crash-orphaned
       // temp inside the freshness gate is invisible to the listPending above, and
       // without the tombstone its deferred re-drive would later restore and deliver a
-      // pre-clear wake into the cleared transcript. Written only after every visible
-      // wake retired; a failure here fails the clear (snapshots restored below).
+      // pre-clear wake into the cleared transcript. Published BEFORE any record is
+      // stamped: a crash mid-stamping then leaves this tombstone as the durable trace
+      // through which rollbackCrashedClearStaging discovers and restores the stamped
+      // records — stamping first would strand clear-stamped records with no tombstone
+      // on disk for any recovery to find, permanently losing wakes for a history
+      // clear that never ran.
       // Monotonic: a newer concurrent cutoff is never lowered — this clear's own
       // rollback then finds a foreign identity and correctly leaves it alone.
       let decidedToStage = false;
@@ -2443,19 +2494,32 @@ export class BashMonitorWakeStore {
           "A concurrent history clear owns the wake tombstone; retry after it settles"
         );
       }
+      stagingLanded = true;
       this.armStagedClearRefresh(ownerWorkspaceId, clearId);
+      for (const record of pending) {
+        // Snapshots list only what was ACTUALLY retired: a record that changed past
+        // the cutoff stays pending, and restoring it on rollback would be wrong (its
+        // restore would clobber the newer merged generation back to the snapshot).
+        if (await this.supersedeForClear(ownerWorkspaceId, record, clearId)) {
+          staged.push(record);
+        }
+      }
       // Snapshots are the records ACTUALLY retired (see the loop above) — a record
       // that changed past the cutoff stayed pending and must not be reported as
       // retired, restored on rollback, or counted by acceptance bookkeeping.
       return { snapshots: staged, clearedAt, clearId };
     } catch (error) {
-      // Records only — NOT the tombstone rollback in restorePendingSnapshots: the
-      // tombstone write above is the try block's last step, so on this path it was
-      // never promoted (or never landed at all), and demoting here would strip the
-      // PREVIOUS clear's protection instead.
       this.disarmStagedClearRefresh(clearId);
       this.activeClearIds.delete(clearId);
+      // Records first, tombstone second — the same order as restorePendingSnapshots,
+      // so a crash mid-rollback leaves the staged tombstone for the grace scan to
+      // resume from. The tombstone demotes only when OUR staging landed: on a staging
+      // that never landed (or was refused), demoting would strip the PREVIOUS clear's
+      // protection instead.
       await this.restoreSnapshotRecords(ownerWorkspaceId, staged);
+      if (stagingLanded) {
+        await this.rollbackClearTombstone(ownerWorkspaceId, clearId);
+      }
       throw error;
     }
   }
@@ -2477,8 +2541,12 @@ export class BashMonitorWakeStore {
       // lock, and the clear's cutoff explicitly intends mid-clear output to survive.
       // A changed generation stays pending — its pre-cutoff lines may then redeliver
       // (the documented lesser failure) instead of the post-cutoff output being
-      // permanently discarded by a clear that never saw it.
-      if (record.updatedAt !== snapshot.updatedAt) return false;
+      // permanently discarded by a clear that never saw it. Compared as the FULL
+      // generation, not updatedAt alone: a merge can land within the same
+      // millisecond, leaving the timestamp unchanged while lines and counters differ
+      // (replaceCanonicalIfUnchanged documents the same possibility). Both sides are
+      // parses of the same writer's serialized bytes, so key order is stable.
+      if (JSON.stringify(record) !== JSON.stringify(snapshot)) return false;
       await this.write({
         ...this.withTerminalStatus(record, "superseded"),
         supersededByClearId: clearId,

@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -1459,6 +1460,40 @@ describe("BashMonitorWakeStore", () => {
     await store.commitClear("owner-1", clear);
   });
 
+  test("abandoning a workspace's clears stops its heartbeat from recreating the directory", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir), {
+      stagedClearRefreshIntervalMs: 25,
+    });
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR retired"] }));
+    const clear = await store.supersedeAllPending("owner-1");
+    // The promotion fails (ENOSPC): commitClear intentionally leaves the heartbeat
+    // armed for cross-instance liveness while promotion retries continue.
+    const realWriteFile = fsPromises.writeFile;
+    const writeSpy = spyOn(fsPromises, "writeFile").mockImplementation(((
+      target: Parameters<typeof realWriteFile>[0],
+      data: Parameters<typeof realWriteFile>[1]
+    ) =>
+      typeof target === "string" && target.includes("cleared-at.tmp-")
+        ? Promise.reject(Object.assign(new Error("ENOSPC: no space"), { code: "ENOSPC" }))
+        : realWriteFile(target, data, "utf-8")) as typeof fsPromises.writeFile);
+    try {
+      await store.commitClear("owner-1", clear);
+      expect.unreachable("expected commitClear to propagate the promotion failure");
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("ENOSPC");
+    } finally {
+      writeSpy.mockRestore();
+    }
+    // Workspace removal abandons the clear writers, then deletes the session
+    // directory. Without the abandon, the still-armed heartbeat's mutateClearedAt
+    // would mkdir the directory straight back into existence.
+    store.abandonWorkspaceClears("owner-1");
+    const sessionDir = path.join(rootDir, "sessions", "owner-1");
+    await fsPromises.rm(sessionDir, { recursive: true, force: true });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(existsSync(sessionDir)).toBe(false);
+  });
+
   test("a newer re-armed match replaces a stale canonical lost notice", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     const notice = await store.enqueueMonitorLost(
@@ -1585,6 +1620,144 @@ describe("BashMonitorWakeStore", () => {
     // Committing the clear still leaves the merged record deliverable.
     await store.commitClear("owner-1", clear);
     expect((await store.get("owner-1", "proc-1"))?.status).toBe("pending");
+  });
+
+  test("a same-millisecond merge with an unchanged updatedAt survives the supersede", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR before cutoff"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    // Another instance merges NEW matched output between the clear's snapshot and its
+    // per-record stamp — landing in the SAME millisecond, so updatedAt stays
+    // byte-identical while lines and counters differ (the CAS replacement documents
+    // identical timestamps with different content as possible).
+    const getSpy = spyOn(store, "get").mockImplementation(async (owner: string, id: string) => {
+      getSpy.mockRestore();
+      const raw = JSON.parse(await fsPromises.readFile(file, "utf-8")) as Record<
+        string,
+        unknown
+      > & { lines: string[] };
+      await fsPromises.writeFile(
+        file,
+        JSON.stringify({
+          ...raw,
+          lines: [...raw.lines, "ERROR same instant"],
+          totalMatches: 2,
+          matchedThroughOffset: 20,
+        }),
+        "utf-8"
+      );
+      return store.get(owner, id);
+    });
+
+    const clear = await store.supersedeAllPending("owner-1");
+    // A timestamp-only generation check misses this merge and would retire the
+    // record, permanently discarding output the clear never saw.
+    expect(clear.snapshots).toEqual([]);
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("pending");
+    expect((await store.listPending("owner-1")).map((r) => r.lines)).toEqual([
+      ["ERROR before cutoff", "ERROR same instant"],
+    ]);
+    await store.commitClear("owner-1", clear);
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("pending");
+  });
+
+  test("the staged tombstone lands durably before any record is stamped for the clear", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR first"] }));
+    await store.enqueueOrMergePending(
+      payload({ processId: "proc-2", taskId: "bash:proc-2", lines: ["ERROR second"] })
+    );
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const tombPath = path.join(dir, "cleared-at");
+    // Observe the on-disk tombstone at the instant each record stamp is written: a
+    // hard crash immediately after ANY stamp leaves restart recovery only the
+    // tombstone to discover stamped records through (rollbackCrashedClearStaging).
+    // Stamping before the staging lands would make a crash in that window
+    // permanently lose wakes for a history clear that never ran.
+    const observed: Array<string | null> = [];
+    const realWriteFile = fsPromises.writeFile;
+    const writeSpy = spyOn(fsPromises, "writeFile").mockImplementation((async (
+      target: Parameters<typeof realWriteFile>[0],
+      data: Parameters<typeof realWriteFile>[1]
+    ) => {
+      if (typeof data === "string" && data.includes("supersededByClearId")) {
+        observed.push(await fsPromises.readFile(tombPath, "utf-8").catch(() => null));
+      }
+      return realWriteFile(target, data, "utf-8");
+    }) as typeof fsPromises.writeFile);
+    let clearId: string;
+    try {
+      const clear = await store.supersedeAllPending("owner-1");
+      clearId = clear.clearId;
+      await store.commitClear("owner-1", clear);
+    } finally {
+      writeSpy.mockRestore();
+    }
+    expect(observed).toHaveLength(2);
+    for (const tombRaw of observed) {
+      expect(tombRaw).not.toBeNull();
+      const tomb = JSON.parse(tombRaw!) as { clearId?: string; phase?: string };
+      expect(tomb.clearId).toBe(clearId);
+      expect(tomb.phase).toBe("staged");
+    }
+  });
+
+  test("a stamping failure after staging rolls the staged tombstone back", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR survives abort"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    // The record stamp fails (EIO) AFTER the staged tombstone landed: the aborted
+    // clear must demote its own staging — leaving it standing would hold deferred
+    // pre-clear temps for a clear that already failed until the grace scan.
+    const realWriteFile = fsPromises.writeFile;
+    const writeSpy = spyOn(fsPromises, "writeFile").mockImplementation(((
+      target: Parameters<typeof realWriteFile>[0],
+      data: Parameters<typeof realWriteFile>[1]
+    ) =>
+      typeof data === "string" && data.includes("supersededByClearId")
+        ? Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
+        : realWriteFile(target, data, "utf-8")) as typeof fsPromises.writeFile);
+    try {
+      await store.supersedeAllPending("owner-1");
+      expect.unreachable("expected the record stamp failure to propagate");
+    } catch (error) {
+      expect((error as NodeJS.ErrnoException).code).toBe("EIO");
+    } finally {
+      writeSpy.mockRestore();
+    }
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("pending");
+    expect((await store.listPending("owner-1")).map((r) => r.lines)).toEqual([
+      ["ERROR survives abort"],
+    ]);
+    expect((await fsPromises.readdir(dir)).some((e) => e.startsWith("cleared-at"))).toBe(false);
+  });
+
+  test("terminal pruning spares records owned by an unresolved staged clear", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR long clear"] }));
+    const clear = await store.supersedeAllPending("owner-1");
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    // The clear outlives the retention window (a long history clear, or a promotion
+    // retrying past transient failures): the stamped record ages past
+    // TERMINAL_WAKE_RETENTION_MS while the tombstone stays staged.
+    const past = new Date(Date.now() - TERMINAL_WAKE_RETENTION_MS - 60_000);
+    await fsPromises.utimes(file, past, past);
+
+    // ANOTHER instance's scan (no in-memory active-clear marker) must not prune the
+    // record: it is the staged clear's ONLY rollback source — restore rewrites the
+    // canonical record, so pruning it here would permanently lose the wake if the
+    // clear subsequently fails.
+    const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+    expect(await fresh.listPending("owner-1")).toEqual([]);
+    expect((await fresh.get("owner-1", "proc-1"))?.status).toBe("superseded");
+
+    // The clear then fails and rolls back: the held record restores and delivers.
+    await store.restorePendingSnapshots("owner-1", clear.snapshots, clear);
+    expect((await store.listPending("owner-1")).map((r) => r.lines)).toEqual([
+      ["ERROR long clear"],
+    ]);
   });
 
   test("a directory squatting on a tombstone capture is quarantined instead of failing heals", async () => {
