@@ -12340,7 +12340,7 @@ export class WorkspaceService extends EventEmitter {
 
   private async retirePendingBashMonitorWakesBeforeHistoryClear(
     workspaceId: string
-  ): Promise<Result<BashMonitorWakeRecord[]>> {
+  ): Promise<Result<{ snapshots: BashMonitorWakeRecord[]; clearedAt: string }>> {
     try {
       return Ok(await this.bashMonitorWakeStore.supersedeAllPending(workspaceId));
     } catch (error) {
@@ -12380,7 +12380,8 @@ export class WorkspaceService extends EventEmitter {
     // background-bash subscribers need explicit nudges to drop (and, after a restore,
     // re-show) pending-wake rows; nothing else re-emits for already-exited processes.
     this.notifyBashMonitorWakeStateChanged(workspaceId);
-    const staged = retireResult.data;
+    const staged = retireResult.data.snapshots;
+    const retiredClearedAt = retireResult.data.clearedAt;
     const restoreSnapshots = async (includeUnaccepted: boolean): Promise<void> => {
       const acceptedAfter = await this.findAcceptedBashMonitorWakeSnapshots(workspaceId, staged);
       const restorable = staged.filter((record) => {
@@ -12391,7 +12392,11 @@ export class WorkspaceService extends EventEmitter {
         );
       });
       try {
-        await this.bashMonitorWakeStore.restorePendingSnapshots(workspaceId, restorable);
+        await this.bashMonitorWakeStore.restorePendingSnapshots(
+          workspaceId,
+          restorable,
+          retiredClearedAt
+        );
       } finally {
         // Notify even when restoration throws partway: earlier records in the pass are
         // already durably pending again, and without a nudge subscribers would keep the

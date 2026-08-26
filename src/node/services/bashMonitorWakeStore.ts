@@ -637,13 +637,20 @@ export class BashMonitorWakeStore {
   }
 
   /**
-   * Roll the tombstone back by one clear: restore the previous clear's value when one
-   * exists, otherwise remove the file. Called only when the CURRENT tombstone belongs
-   * to the clear being rolled back (supersedeAllPending writes its tombstone last, so
-   * its own failure never promotes one). Failures PROPAGATE — a stale surviving
-   * tombstone would silently discard a revived wake's deferred temp.
+   * Roll back exactly ONE clear's tombstone, identified by the clearedAt it wrote:
+   * restore the previous clear's value when one exists, otherwise remove the file. The
+   * identity check matters with multiple instances — another instance may have
+   * committed a NEWER clear since, and demoting its tombstone would revive deferred
+   * wakes that newer clear legitimately retired; a current generation that is not the
+   * one being rolled back is left untouched. (supersedeAllPending writes its tombstone
+   * last, so its own failure path never promotes one and never calls this.) Failures
+   * PROPAGATE — a stale surviving tombstone would silently discard a revived wake's
+   * deferred temp.
    */
-  private async rollbackClearedAt(ownerWorkspaceId: string): Promise<void> {
+  private async rollbackClearedAt(
+    ownerWorkspaceId: string,
+    expectedClearedAt: string
+  ): Promise<void> {
     const target = this.clearedAtFile(ownerWorkspaceId);
     let raw: string;
     try {
@@ -652,9 +659,11 @@ export class BashMonitorWakeStore {
       if (isErrnoWithCode(error, "ENOENT")) return; // nothing to roll back
       throw error;
     }
+    let current: string | null = null;
     let previous: string | null = null;
     try {
-      const parsed = JSON.parse(raw) as { previousClearedAt?: unknown };
+      const parsed = JSON.parse(raw) as { clearedAt?: unknown; previousClearedAt?: unknown };
+      current = typeof parsed.clearedAt === "string" ? parsed.clearedAt : null;
       previous =
         typeof parsed.previousClearedAt === "string" &&
         !Number.isNaN(Date.parse(parsed.previousClearedAt))
@@ -662,7 +671,12 @@ export class BashMonitorWakeStore {
           : null;
     } catch {
       // Malformed tombstones already provide no protection to preserve.
+      current = null;
       previous = null;
+    }
+    if (current != null && current !== expectedClearedAt) {
+      // A different clear owns the current tombstone: not ours to roll back.
+      return;
     }
     if (previous != null) {
       await this.writeClearedAtFile(target, { clearedAt: previous });
@@ -1216,6 +1230,11 @@ export class BashMonitorWakeStore {
     canonical: BashMonitorWakeRecord,
     other: BashMonitorWakeRecord
   ): boolean {
+    // Subsumption must preserve NON-OUTPUT state too: a monitor-lost record carries
+    // the termination notice and relaunch script, so a plain match can never subsume
+    // it no matter what offsets say — discarding it would hand the agent matched
+    // output without revealing the task is no longer awaitable.
+    if (other.kind === "monitor-lost" && canonical.kind !== "monitor-lost") return false;
     return (
       canonical.createdAt === other.createdAt &&
       canonical.matchedThroughOffset != null &&
@@ -1389,10 +1408,24 @@ export class BashMonitorWakeStore {
             await fsPromises.rm(filePath, { force: true });
             return canonical;
           }
-          if (parsed.kind === "monitor-lost" && canonical.kind === "match") {
-            // A fresh match proves this id was re-armed by a LIVE monitor, so the
-            // captured lost notice is stale (mirrors enqueueOrMergePending's rule of
-            // replacing stale notices rather than mislabeling live output).
+          if (BashMonitorWakeStore.pendingSubsumes(parsed, canonical)) {
+            // REVERSE subsumption: the leftover already carries the canonical
+            // generation (same lineage, frontier at/past it — e.g. a captured
+            // monitor-lost upgrade restored after its older match generation).
+            // Replace instead of merging, which would duplicate the older lines.
+            return this.replaceCanonicalIfUnchanged(filePath, originalPath, parsed, canonical);
+          }
+          if (
+            parsed.kind === "monitor-lost" &&
+            canonical.kind === "match" &&
+            Date.parse(canonical.updatedAt) > Date.parse(parsed.updatedAt)
+          ) {
+            // A match STRICTLY NEWER than the captured lost notice proves this id was
+            // re-armed by a LIVE monitor, so the notice is stale (mirrors
+            // enqueueOrMergePending's rule of replacing stale notices rather than
+            // mislabeling live output). Without the timestamp guard this would also
+            // swallow a cross-lineage lost notice that postdates the match; that case
+            // falls through to the merge, which preserves the notice and script.
             await fsPromises.rm(filePath, { force: true });
             return canonical;
           }
@@ -1873,9 +1906,12 @@ export class BashMonitorWakeStore {
     return ownerWorkspaceIds;
   }
 
-  async supersedeAllPending(ownerWorkspaceId: string): Promise<BashMonitorWakeRecord[]> {
+  async supersedeAllPending(
+    ownerWorkspaceId: string
+  ): Promise<{ snapshots: BashMonitorWakeRecord[]; clearedAt: string }> {
     // Captured BEFORE the scan: the tombstone below retires only wakes stamped before
-    // the clear began, so output enqueued mid-clear survives it.
+    // the clear began, so output enqueued mid-clear survives it. Returned so a later
+    // rollback can identify exactly this clear's tombstone (see rollbackClearedAt).
     const clearedAt = new Date().toISOString();
     const pending = await this.listPending(ownerWorkspaceId);
     const staged: BashMonitorWakeRecord[] = [];
@@ -1890,7 +1926,7 @@ export class BashMonitorWakeStore {
       // pre-clear wake into the cleared transcript. Written only after every visible
       // wake retired; a failure here fails the clear (snapshots restored below).
       await this.writeClearedAt(ownerWorkspaceId, clearedAt);
-      return pending;
+      return { snapshots: pending, clearedAt };
     } catch (error) {
       // Records only — NOT the tombstone rollback in restorePendingSnapshots: the
       // tombstone write above is the try block's last step, so on this path it was
@@ -1903,14 +1939,16 @@ export class BashMonitorWakeStore {
 
   async restorePendingSnapshots(
     ownerWorkspaceId: string,
-    snapshots: readonly BashMonitorWakeRecord[]
+    snapshots: readonly BashMonitorWakeRecord[],
+    clearedAt: string
   ): Promise<void> {
-    // Rolling back a clear also rolls back ITS tombstone — restoring the previous
-    // clear's value, never deleting the file wholesale: the wakes below return to
-    // pending, so a sibling deferred temp must not stay condemned by the rolled-back
-    // clear, while a pre-old-clear temp must stay condemned by the surviving older
-    // tombstone.
-    await this.rollbackClearedAt(ownerWorkspaceId);
+    // Rolling back a clear also rolls back ITS tombstone (identified by the clearedAt
+    // that supersedeAllPending returned) — restoring the previous clear's value, never
+    // deleting the file wholesale, and never touching a newer clear's tombstone: the
+    // wakes below return to pending, so a sibling deferred temp must not stay
+    // condemned by the rolled-back clear, while temps retired by OTHER clears must
+    // stay condemned.
+    await this.rollbackClearedAt(ownerWorkspaceId, clearedAt);
     await this.restoreSnapshotRecords(ownerWorkspaceId, snapshots);
   }
 

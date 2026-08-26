@@ -715,7 +715,7 @@ describe("BashMonitorWakeStore", () => {
     });
     // The clear cannot see the deferred temp (freshness gate), so nothing pending is
     // retired — but its durable tombstone condemns the invisible pre-clear wake.
-    expect(await store.supersedeAllPending("owner-1")).toEqual([]);
+    expect((await store.supersedeAllPending("owner-1")).snapshots).toEqual([]);
     expect(await due).toBe("owner-1");
     // The re-driven scan discards the pre-clear temp instead of restoring and
     // delivering it into the freshly cleared transcript.
@@ -739,11 +739,11 @@ describe("BashMonitorWakeStore", () => {
     const due = new Promise<string>((resolve) => {
       store.onDeferredTempRecoveryDue = resolve;
     });
-    const snapshots = await store.supersedeAllPending("owner-1");
+    const { snapshots, clearedAt } = await store.supersedeAllPending("owner-1");
     expect(snapshots.map((r) => r.id)).toEqual(["proc-1"]);
     // The clear later fails and is rolled back: the tombstone must not keep
     // condemning the deferred temp's wake after its siblings return to pending.
-    await store.restorePendingSnapshots("owner-1", snapshots);
+    await store.restorePendingSnapshots("owner-1", snapshots, clearedAt);
     expect(await due).toBe("owner-1");
     const pending = await store.listPending("owner-1");
     expect(pending.map((r) => r.lines).sort()).toEqual([["ERROR deferred"], ["ERROR visible"]]);
@@ -759,7 +759,7 @@ describe("BashMonitorWakeStore", () => {
     const nearGate = new Date(Date.now() - TEMP_RECOVERY_MIN_AGE_MS + 100);
     await fsPromises.utimes(temp, nearGate, nearGate);
     // Clear #1 commits, permanently retiring the deferred wake via its tombstone.
-    expect(await store.supersedeAllPending("owner-1")).toEqual([]);
+    expect((await store.supersedeAllPending("owner-1")).snapshots).toEqual([]);
 
     // Clear #2 supersedes new output but then fails and is rolled back. The rollback
     // must demote to clear #1's tombstone, not delete the file wholesale — otherwise
@@ -767,9 +767,9 @@ describe("BashMonitorWakeStore", () => {
     await store.enqueueOrMergePending(
       payload({ processId: "proc-2", taskId: "bash:proc-2", lines: ["ERROR second"] })
     );
-    const snapshots = await store.supersedeAllPending("owner-1");
+    const { snapshots, clearedAt } = await store.supersedeAllPending("owner-1");
     expect(snapshots.map((r) => r.id)).toEqual(["proc-2"]);
-    await store.restorePendingSnapshots("owner-1", snapshots);
+    await store.restorePendingSnapshots("owner-1", snapshots, clearedAt);
 
     // Past the gate, recovery must still condemn the pre-clear-#1 temp.
     const past = new Date(Date.now() - 10 * 60 * 1000);
@@ -789,7 +789,7 @@ describe("BashMonitorWakeStore", () => {
     const nearGate = new Date(Date.now() - TEMP_RECOVERY_MIN_AGE_MS + 100);
     await fsPromises.utimes(temp, nearGate, nearGate);
     // Clear #1 commits its tombstone.
-    expect(await store.supersedeAllPending("owner-1")).toEqual([]);
+    expect((await store.supersedeAllPending("owner-1")).snapshots).toEqual([]);
 
     // Clear #2 fails DURING the supersede loop — before its own tombstone was ever
     // written. Its internal rollback must not demote clear #1's standing tombstone.
@@ -818,6 +818,98 @@ describe("BashMonitorWakeStore", () => {
     const pending = await store.listPending("owner-1");
     expect(pending.map((r) => r.lines)).toEqual([["ERROR second"]]);
     expect(await store.get("owner-1", "proc-1")).toBeNull();
+  });
+
+  test("a subsuming leftover replaces the canonical record instead of duplicating lines", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    // Canonical is an OLDER committed generation; the captured leftover is the same
+    // lineage with a frontier past it (a crashed later merge). Merging would report
+    // the older line twice; the leftover must replace the canonical record instead.
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR one"], matchedThroughOffset: 100 }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    const canonicalRecord = JSON.parse(await fsPromises.readFile(file, "utf-8")) as {
+      updatedAt: string;
+      lines: string[];
+    };
+    await fsPromises.writeFile(
+      `${file}.prune-crashed`,
+      JSON.stringify({
+        ...canonicalRecord,
+        lines: ["ERROR one", "ERROR two"],
+        matchedThroughOffset: 150,
+        totalMatches: 2,
+        updatedAt: new Date(Date.parse(canonicalRecord.updatedAt) + 1_000).toISOString(),
+      }),
+      "utf-8"
+    );
+
+    const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+    const pending = await fresh.listPending("owner-1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0].lines).toEqual(["ERROR one", "ERROR two"]);
+    expect((await fresh.get("owner-1", "proc-1"))?.lines).toEqual(["ERROR one", "ERROR two"]);
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".prune-"))).toHaveLength(0);
+  });
+
+  test("a match record never subsumes its monitor-lost upgrade", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    // The canonical path holds the OLDER match generation; the captured leftover is
+    // its later same-lineage monitor-lost upgrade (same offsets). Offset evidence
+    // alone would call the match a superset — dropping the termination notice and
+    // relaunch script the agent needs.
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR out"], matchedThroughOffset: 100 }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    const canonicalRecord = JSON.parse(await fsPromises.readFile(file, "utf-8")) as {
+      updatedAt: string;
+    };
+    await fsPromises.writeFile(
+      `${file}.prune-crashed`,
+      JSON.stringify({
+        ...canonicalRecord,
+        kind: "monitor-lost",
+        script: "./watch.sh",
+        updatedAt: new Date(Date.parse(canonicalRecord.updatedAt) + 1_000).toISOString(),
+      }),
+      "utf-8"
+    );
+
+    const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+    const pending = await fresh.listPending("owner-1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0].kind).toBe("monitor-lost");
+    expect(pending[0].script).toBe("./watch.sh");
+    // Replaced, not merged: the shared lines appear once.
+    expect(pending[0].lines).toEqual(["ERROR out"]);
+    const settled = await fresh.get("owner-1", "proc-1");
+    expect(settled?.kind).toBe("monitor-lost");
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".prune-"))).toHaveLength(0);
+  });
+
+  test("a stale rollback leaves a newer clear's tombstone untouched", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    // Clear A publishes its tombstone first.
+    const clearA = await store.supersedeAllPending("owner-1");
+    // A wake arrives AFTER clear A and crashes into a deferred temp...
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR between clears"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const temp = path.join(dir, "proc-1.json.tmp-crashed");
+    await fsPromises.rename(path.join(dir, "proc-1.json"), temp);
+    const nearGate = new Date(Date.now() - TEMP_RECOVERY_MIN_AGE_MS + 100);
+    await fsPromises.utimes(temp, nearGate, nearGate);
+    // ...and clear B then commits, retiring it via B's tombstone.
+    await store.supersedeAllPending("owner-1");
+
+    // Clear A's history operation later fails and rolls back. It must not demote B's
+    // tombstone — the wake between the two clears was retired by B, not A.
+    await store.restorePendingSnapshots("owner-1", clearA.snapshots, clearA.clearedAt);
+
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(temp, past, past);
+    expect(await store.listPending("owner-1")).toEqual([]);
+    expect(await store.get("owner-1", "proc-1")).toBeNull();
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
   });
 
   test("deferred recovery delays are bounded for corrupt or future mtimes", () => {
@@ -1476,7 +1568,7 @@ describe("BashMonitorWakeStore", () => {
     expect(current?.lines).toEqual(["ERROR fresh"]);
     // The record is still restorable: a failed history clear can roll it back to pending.
     expect(freshPending).not.toBeNull();
-    await store.restorePendingSnapshots("owner-1", [freshPending!]);
+    await store.restorePendingSnapshots("owner-1", [freshPending!], new Date().toISOString());
     expect((await store.get("owner-1", "proc-1"))?.status).toBe("pending");
   });
 
