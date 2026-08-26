@@ -630,22 +630,28 @@ const COALESCED_PLACEHOLDER_STUB = { type: "text", text: "[attachment placeholde
 
 /**
  * Coalesce per-item attachment placeholders inside a rewritten tool output.
- * Applied only to outputs whose attachments were (partly) omitted by the
- * request-wide media cap: each media item still leaves a per-item
- * `[Attachment attached: …]` text part behind, so a flooded transcript could
- * carry tens of thousands of placeholder parts (megabytes of provider JSON)
- * even after the attachment cap (r29 security). Coalescing is GLOBAL across
- * the whole output, not per-array (r30): one small image per nested record
- * leaves singleton placeholders in separate `value` arrays, so run-based
- * coalescing would preserve every one of them. The FIRST placeholder becomes
- * a bounded summary carrying the total; later ones are dropped from arrays
- * and stubbed in non-array positions. A single placeholder stays individual.
- * The walk mirrors extraction's shapes and depth bound — the value was
- * already rebuilt (and depth-bounded) by extraction.
+ * Each media item leaves a per-item `[Attachment attached: …]` text part
+ * behind, so a flooded transcript could carry tens of thousands of
+ * placeholder parts (megabytes of provider JSON) even after the request-wide
+ * attachment cap (r29 security). Coalescing engages when placeholders EXCEED
+ * the attachments actually emitted for the output (r31): cap omission and
+ * same-payload dedup (`pushUnique` collapses repeats into one attachment
+ * while every occurrence still leaves a placeholder) both produce excess;
+ * normal outputs whose placeholders match their attachments 1:1 stay
+ * individual. Coalescing is GLOBAL across the whole output, not per-array
+ * (r30): one small image per nested record leaves singleton placeholders in
+ * separate `value` arrays, so run-based coalescing would preserve every one.
+ * The FIRST placeholder becomes a bounded summary carrying the total; later
+ * ones are dropped from arrays and stubbed in non-array positions. The walk
+ * mirrors extraction's shapes and depth bound — the value was already
+ * rebuilt (and depth-bounded) by extraction.
  */
-export function coalesceAttachmentPlaceholders(output: unknown): unknown {
+export function coalesceAttachmentPlaceholders(
+  output: unknown,
+  keptAttachmentCount: number
+): unknown {
   const total = countAttachmentPlaceholders(output, 0);
-  if (total <= 1) return output;
+  if (total <= 1 || total <= keptAttachmentCount) return output;
   const state = { total, replacedSummary: false };
   return coalescePlaceholderWalk(output, 0, state);
 }
@@ -717,7 +723,7 @@ function coalescePlaceholderWalk(
 function buildCoalescedPlaceholderSummary(total: number): { type: "text"; text: string } {
   return {
     type: "text",
-    text: `[${total} attachments attached from tool output (per-item placeholders coalesced: request-wide media cap reached)]`,
+    text: `[${total} attachments attached from tool output (per-item placeholders coalesced)]`,
   };
 }
 

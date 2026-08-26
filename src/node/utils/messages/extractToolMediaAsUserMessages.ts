@@ -38,7 +38,16 @@ export async function extractToolMediaAsUserMessages(
     NonNullable<ReturnType<typeof extractAttachmentsFromToolOutput>>
   >();
   let totalAttachments = 0;
+  // Media parts already bound for the provider (user-attached images/PDFs and
+  // prior synthetic file parts) share the same per-request provider limits,
+  // so they consume the extraction allowance too (r31): 50 existing images
+  // plus a full 64-part extraction allowance would exceed a ~100-image
+  // provider cap the constant is sized to stay below.
+  let existingMediaParts = 0;
   for (const message of messages) {
+    for (const part of message.parts) {
+      if (part.type === "file") existingMediaParts++;
+    }
     if (message.role !== "assistant") continue;
     for (const part of message.parts) {
       if (part.type !== "dynamic-tool" || part.state !== "output-available") continue;
@@ -55,7 +64,8 @@ export async function extractToolMediaAsUserMessages(
   // fan out tens of thousands of synthetic provider parts that every later
   // request re-processes (r28 security). Chronologically OLDEST overflow is
   // omitted (replaced with one bounded placeholder per synthetic message).
-  let omitRemaining = Math.max(0, totalAttachments - MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST);
+  const allowance = Math.max(0, MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST - existingMediaParts);
+  let omitRemaining = Math.max(0, totalAttachments - allowance);
 
   const result: MuxMessage[] = [];
 
@@ -126,13 +136,15 @@ export async function extractToolMediaAsUserMessages(
       extractedUserParts = [...extractedUserParts, ...nextExtractedUserParts];
       newParts.push({
         ...part,
-        // Omitted attachments also leave per-item placeholders behind in the
-        // rewritten output; coalesce them so a flooded transcript cannot keep
-        // megabytes of placeholder JSON in every request (r29 security).
-        output:
-          omittedHere > 0
-            ? coalesceAttachmentPlaceholders(extracted.newOutput)
-            : extracted.newOutput,
+        // Excess per-item placeholders (cap omission OR same-payload dedup —
+        // r31) are coalesced so a flooded transcript cannot keep megabytes of
+        // placeholder JSON in every request (r29 security). The helper
+        // returns the output unchanged when placeholders match the emitted
+        // attachments 1:1.
+        output: coalesceAttachmentPlaceholders(
+          extracted.newOutput,
+          extracted.attachments.length - omittedHere
+        ),
       });
     }
 

@@ -730,7 +730,9 @@ describe("extractToolMediaAsUserMessages", () => {
     }
     const outputText = JSON.stringify(toolPart.output);
     expect(outputText).not.toContain(base64);
-    expect(outputText).toContain("[Attachment attached:");
+    // The dedup leaves 2 placeholders for 1 emitted attachment, so the
+    // excess coalesces into one bounded summary (r31).
+    expect(outputText).toContain("2 attachments attached from tool output");
     // Identical leaf in args and outer result dedupes into ONE attachment.
     const fileParts = rewritten[1].parts.filter((part) => part.type === "file");
     expect(fileParts).toHaveLength(1);
@@ -1041,6 +1043,115 @@ describe("extractToolMediaAsUserMessages", () => {
     expect(syntheticJson).toContain(`rec-${total - 1}`);
     expect(syntheticJson).not.toContain("rec-00");
     expect(syntheticJson).not.toContain("rec-01");
+  });
+
+  it("coalesces placeholders when dedup leaves excess without any cap omission", async () => {
+    // pushUnique collapses repeated payloads into ONE attachment while every
+    // occurrence still leaves a placeholder: with omission at zero, the
+    // omitted-count trigger alone would keep every per-item placeholder in
+    // provider JSON (r31). Coalescing keys off placeholder count vs emitted
+    // attachments instead.
+    const svgData = Buffer.from(
+      '<svg xmlns="http://www.w3.org/2000/svg"><title>dedup-marker</title></svg>'
+    ).toString("base64");
+    const toolCalls = Array.from({ length: 5 }, () => ({
+      toolName: "mcp__shots__take",
+      args: {},
+      result: {
+        type: "content",
+        value: [{ type: "media", mediaType: "image/svg+xml", data: svgData }],
+      },
+    }));
+    const input: MuxMessage[] = [
+      {
+        id: "a1",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call1",
+            toolName: "code_execution",
+            input: { code: "..." },
+            state: "output-available",
+            output: { success: true, toolCalls },
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    const toolPart = rewritten[0].parts[0];
+    expect(toolPart.type).toBe("dynamic-tool");
+    if (toolPart.type === "dynamic-tool" && toolPart.state === "output-available") {
+      const outputJson = JSON.stringify(toolPart.output);
+      expect(outputJson).not.toContain("[Attachment attached");
+      expect(outputJson).toContain("5 attachments attached from tool output");
+    }
+    // Dedup emitted exactly one attachment.
+    const syntheticJson = JSON.stringify(rewritten[1].parts);
+    expect(syntheticJson).toContain("[Attached 1 attachment(s) from tool output]");
+    expect(syntheticJson.split("dedup-marker").length - 1).toBe(1);
+  });
+
+  it("counts existing conversation media parts against the extraction allowance", async () => {
+    // messagePipeline runs this transform after ordinary attachments are
+    // already in the request, and providers cap TOTAL media parts: existing
+    // images must consume the extraction allowance or 50 user images plus a
+    // full 64-part extraction would exceed a ~100-image provider limit (r31).
+    const svg = (i: number) =>
+      Buffer.from(
+        `<svg xmlns="http://www.w3.org/2000/svg"><title>marker-${String(i).padStart(2, "0")}</title></svg>`
+      ).toString("base64");
+    const existingFileParts = Array.from(
+      { length: MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST - 1 },
+      (_, i) =>
+        ({
+          type: "file",
+          mediaType: "image/png",
+          url: `data:image/png;base64,QUJD${i}`,
+        }) as const
+    );
+    const input: MuxMessage[] = [
+      {
+        id: "u1",
+        role: "user",
+        parts: [{ type: "text", text: "attached images" }, ...existingFileParts],
+        metadata: { timestamp: 1 },
+      },
+      {
+        id: "a1",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call1",
+            toolName: "mcp__shots__take",
+            input: {},
+            state: "output-available",
+            output: {
+              type: "content",
+              value: [0, 1, 2].map((i) => ({
+                type: "media",
+                mediaType: "image/svg+xml",
+                data: svg(i),
+              })),
+            },
+          },
+        ],
+        metadata: { timestamp: 2 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    expect(rewritten).toHaveLength(3);
+    const syntheticJson = JSON.stringify(rewritten[2].parts);
+    // Allowance is 1 (cap minus existing parts): the two oldest extracted
+    // attachments are omitted, the newest survives.
+    expect(syntheticJson).toContain("2 extracted media attachment(s) omitted");
+    expect(syntheticJson).not.toContain("marker-00");
+    expect(syntheticJson).not.toContain("marker-01");
+    expect(syntheticJson).toContain("marker-02");
   });
 
   it("keeps over-depth replacements schema-valid inside content containers", async () => {

@@ -38,9 +38,21 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
     NonNullable<ReturnType<typeof extractAttachmentsFromToolOutput>>
   >();
   let totalAttachments = 0;
+  // Media parts already bound for the provider (user-attached images/files
+  // and prior synthetic parts) share the same per-request provider limits, so
+  // they consume the extraction allowance too (r31).
+  let existingMediaParts = 0;
   for (const message of messages) {
-    if (message.role !== "assistant" && message.role !== "tool") continue;
     if (!Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (
+        (part as { type?: unknown }).type === "image" ||
+        (part as { type?: unknown }).type === "file"
+      ) {
+        existingMediaParts++;
+      }
+    }
+    if (message.role !== "assistant" && message.role !== "tool") continue;
     for (const part of message.content) {
       if (part.type !== "tool-result") continue;
       const extracted = extractAttachmentsFromToolOutput(part.output as unknown);
@@ -55,8 +67,9 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
   // parts, not distinct records, so a looped bridged media tool could
   // otherwise fan out tens of thousands of synthetic provider parts.
   // Chronologically OLDEST overflow is omitted behind a bounded placeholder.
+  const allowance = Math.max(0, MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST - existingMediaParts);
   const capState = {
-    omitRemaining: Math.max(0, totalAttachments - MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST),
+    omitRemaining: Math.max(0, totalAttachments - allowance),
   };
 
   const result: ModelMessage[] = [];
@@ -98,9 +111,13 @@ export async function extractToolMediaAsUserMessagesFromModelMessages(
 
       return {
         ...part,
-        output: (omittedHere > 0
-          ? coalesceAttachmentPlaceholders(extracted.newOutput)
-          : extracted.newOutput) as ToolResultOutput,
+        // Excess per-item placeholders (cap omission OR same-payload dedup —
+        // r31) are coalesced; unchanged when placeholders match emitted
+        // attachments 1:1.
+        output: coalesceAttachmentPlaceholders(
+          extracted.newOutput,
+          extracted.attachments.length - omittedHere
+        ) as ToolResultOutput,
       };
     });
 
