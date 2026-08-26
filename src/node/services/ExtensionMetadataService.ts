@@ -651,22 +651,32 @@ export class ExtensionMetadataService {
    */
   clearTombstonesForRegisteredIds(
     registeredIds: ReadonlySet<string>,
-    eligibleIds: ReadonlySet<string>
+    eligibleIds: ReadonlyMap<string, number>
   ): void {
-    for (const workspaceId of eligibleIds) {
-      if (registeredIds.has(workspaceId)) {
+    for (const [workspaceId, generation] of eligibleIds) {
+      // Generation compare (see recheckTombstonedRegistration): a same-
+      // process removal can republish the tombstone while the caller's
+      // registration evidence was being gathered — the stale positive must
+      // clear only the exact tombstone the snapshot captured, never the
+      // newer removal's.
+      if (
+        registeredIds.has(workspaceId) &&
+        this.deletedWorkspaceIds.get(workspaceId) === generation
+      ) {
         this.deletedWorkspaceIds.delete(workspaceId);
       }
     }
   }
 
   /**
-   * Snapshot of the ids currently write-tombstoned in this process. Capture
-   * it before gathering registration evidence and pass it back to
-   * clearTombstonesForRegisteredIds as the set of clearable tombstones.
+   * Snapshot of the ids currently write-tombstoned in this process, with
+   * their generations. Capture it before gathering registration evidence and
+   * pass it back to clearTombstonesForRegisteredIds as the set of clearable
+   * tombstones — the generation lets the clear skip tombstones republished
+   * after the snapshot.
    */
-  getTombstonedIds(): ReadonlySet<string> {
-    return new Set(this.deletedWorkspaceIds.keys());
+  getTombstonedIds(): ReadonlyMap<string, number> {
+    return new Map(this.deletedWorkspaceIds);
   }
 
   /**

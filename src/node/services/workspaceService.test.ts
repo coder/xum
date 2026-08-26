@@ -143,7 +143,7 @@ const mockInitStateManager: Partial<InitStateManager> = {
 const mockExtensionMetadataService: Partial<ExtensionMetadataService> = {
   isWorkspaceDeleted: mock(() => false),
   clearTombstonesForRegisteredIds: mock(() => undefined),
-  getTombstonedIds: mock((): ReadonlySet<string> => new Set()),
+  getTombstonedIds: mock((): ReadonlyMap<string, number> => new Map()),
   setStreaming: mock(() =>
     Promise.resolve({
       recency: Date.now(),

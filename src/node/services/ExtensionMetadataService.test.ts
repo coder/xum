@@ -1160,6 +1160,14 @@ describe("ExtensionMetadataService", () => {
     await service.deleteWorkspace("ws-1");
     service.clearTombstonesForRegisteredIds(new Set(["ws-1"]), preEvidence);
     expect(service.isWorkspaceDeleted("ws-1")).toBe(true);
+    // A tombstone REPUBLISHED while the evidence was being gathered must
+    // also survive: the snapshot carries the old generation, so the stale
+    // positive clears only the exact tombstone it captured.
+    const staleGenerationEvidence = service.getTombstonedIds();
+    await service.updateRecency("ws-1", 150); // suppressed (still tombstoned)
+    await service.deleteWorkspace("ws-1"); // republish: newer generation
+    service.clearTombstonesForRegisteredIds(new Set(["ws-1"]), staleGenerationEvidence);
+    expect(service.isWorkspaceDeleted("ws-1")).toBe(true);
     // The next bootstrap snapshots the tombstone before its evidence reads,
     // so a genuinely re-registered id is cleared then.
     service.clearTombstonesForRegisteredIds(new Set(["ws-1"]), service.getTombstonedIds());
