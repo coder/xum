@@ -20,7 +20,9 @@ const GITMODULES_PROBE_TIMEOUT_SECS = 10;
 const GITMODULES_PROBE_MISSING_EXIT_CODE = 2;
 const GITMODULES_PROBE_INVALID_EXIT_CODE = 3;
 const SUBMODULE_SYNC_COMMAND = "git submodule sync --recursive";
-const SUBMODULE_UPDATE_COMMAND = "git submodule update --init --recursive";
+// Command-line --checkout overrides repo-configured
+// submodule.<name>.update=!command strategies.
+const SUBMODULE_UPDATE_COMMAND = "git submodule update --init --recursive --checkout";
 
 interface BaseSubmoduleSyncArgs {
   workspacePath: string;

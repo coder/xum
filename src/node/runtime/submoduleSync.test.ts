@@ -130,6 +130,23 @@ describe("syncLocalGitSubmodules", () => {
       await fs.mkdir(path.dirname(workspacePath), { recursive: true });
       git(projectRepo, ["worktree", "add", "-b", "feature-submodule", workspacePath, "main"]);
 
+      // Repo config can set submodule.<name>.update=!command. The explicit
+      // --checkout mode must override it so materialization never executes
+      // dataset-controlled update commands.
+      const customUpdateMarker = path.join(tempRoot, "custom-update-ran");
+      const customUpdate = path.join(tempRoot, "custom-update.sh");
+      await fs.writeFile(
+        customUpdate,
+        `#!/bin/sh\nprintf ran > "${customUpdateMarker}"\n`,
+        "utf-8"
+      );
+      await fs.chmod(customUpdate, 0o755);
+      git(workspacePath, [
+        "config",
+        "submodule..mux/skills/kalshi-docs.update",
+        `!${customUpdate}`,
+      ]);
+
       const skillFilePath = path.join(workspacePath, ".mux", "skills", "kalshi-docs", "SKILL.md");
       expect(await pathExists(skillFilePath)).toBe(false);
 
@@ -143,6 +160,7 @@ describe("syncLocalGitSubmodules", () => {
 
       expect(await pathExists(skillFilePath)).toBe(true);
       expect(await fs.readFile(skillFilePath, "utf-8")).toContain("Kalshi docs");
+      expect(await pathExists(customUpdateMarker)).toBe(false);
       expect(steps).toEqual(["Initializing git submodules...", "Git submodules ready"]);
     } finally {
       await fs.rm(tempRoot, { recursive: true, force: true });
@@ -196,7 +214,7 @@ describe("syncRuntimeGitSubmodules", () => {
     expect(runtime.calls[1]?.command).toContain("emit_filter_keys");
     expect(runtime.calls.slice(2).map((call) => call.command)).toEqual([
       "git submodule sync --recursive",
-      "git submodule update --init --recursive",
+      "git submodule update --init --recursive --checkout",
     ]);
     expect(runtime.calls.map((call) => call.cwd)).toEqual([
       "/remote/workspace",

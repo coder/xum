@@ -132,16 +132,23 @@ export class WorktreeManager {
       const localBranches = await listLocalBranches(projectPath);
       const branchExists = localBranches.includes(branchName);
 
-      // Fetch origin before creating worktree (best-effort)
-      // This ensures new branches start from the latest origin state
-      const fetchedOrigin = skipRemoteSync
-        ? false
-        : await this.fetchOriginTrunk(projectPath, trunkBranch, initLogger, noHooksEnv);
+      // Remote configuration can select executable upload-pack/helper
+      // commands. When repo automation is disallowed, stay entirely on local
+      // refs instead of executing any repo-configured fetch behavior.
+      const remoteSyncAllowed = !skipRemoteSync && gitHooksAllowed(params.trusted);
+      if (!skipRemoteSync && !remoteSyncAllowed) {
+        initLogger.logStep(
+          "Skipping origin fetch while project automation is disabled; using local state."
+        );
+      }
+      const fetchedOrigin = remoteSyncAllowed
+        ? await this.fetchOriginTrunk(projectPath, trunkBranch, initLogger, noHooksEnv)
+        : false;
 
       // Determine best base for new branches: use origin if local can fast-forward to it,
       // otherwise preserve local state (user may have unpushed work)
       const shouldUseOrigin =
-        !skipRemoteSync &&
+        remoteSyncAllowed &&
         fetchedOrigin &&
         (await this.canFastForwardToOrigin(
           projectPath,

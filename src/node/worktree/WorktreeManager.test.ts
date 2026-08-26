@@ -2,7 +2,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as os from "os";
 import * as path from "path";
 import * as fsPromises from "fs/promises";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import * as disposableExec from "@/node/utils/disposableExec";
 import type { InitLogger } from "@/node/runtime/Runtime";
 import * as submoduleSync from "@/node/runtime/submoduleSync";
@@ -162,6 +162,60 @@ describe("WorktreeManager.createWorkspace", () => {
       20_000
     );
   }
+  it("skips repo-configured upload-pack commands when project automation is disabled", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    const marker = path.join(fixture.rootDir, "upload-pack-ran");
+    const uploadPack = path.join(fixture.rootDir, "upload-pack.sh");
+    const previous = process.env.XUM_DISABLE_PROJECT_AUTOMATION;
+
+    try {
+      await fsPromises.writeFile(
+        uploadPack,
+        `#!/bin/sh\nprintf ran > "${marker}"\nexit 1\n`,
+        "utf-8"
+      );
+      await fsPromises.chmod(uploadPack, 0o755);
+      execFileSync("git", ["remote", "add", "origin", "."], {
+        cwd: fixture.projectPath,
+        stdio: "ignore",
+      });
+      execFileSync("git", ["config", "remote.origin.uploadpack", uploadPack], {
+        cwd: fixture.projectPath,
+        stdio: "ignore",
+      });
+      process.env.XUM_DISABLE_PROJECT_AUTOMATION = "1";
+      const steps: string[] = [];
+
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: "feature-no-upload-pack",
+        trunkBranch: "main",
+        trusted: true,
+        initLogger: {
+          ...fixture.initLogger,
+          logStep: (message) => steps.push(message),
+        },
+      });
+
+      expect(result.success).toBe(true);
+      expect(steps).toContain(
+        "Skipping origin fetch while project automation is disabled; using local state."
+      );
+      const uploadPackRan = await fsPromises.access(marker).then(
+        () => true,
+        () => false
+      );
+      expect(uploadPackRan).toBe(false);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.XUM_DISABLE_PROJECT_AUTOMATION;
+      } else {
+        process.env.XUM_DISABLE_PROJECT_AUTOMATION = previous;
+      }
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
   it("uses a sanitized directory for slash branch names and persists the mapping", async () => {
     const fixture = await createWorktreeManagerFixture();
     const branchName = "feature/foo";
