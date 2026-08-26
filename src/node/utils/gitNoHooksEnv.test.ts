@@ -7,6 +7,7 @@ import {
   gitHooksAllowed,
   gitNoHooksPrefix,
   gitNoRepoAutomationEnv,
+  gitNoRepoAutomationEnvForFilterConfigKeys,
   gitNoRepoAutomationEnvForLocalRepo,
 } from "./gitNoHooksEnv";
 
@@ -73,6 +74,13 @@ describe("gitNoRepoAutomationEnv", () => {
     expect(env.OPENAI_API_KEY).toBe("");
     expect(env.AWS_SECRET_ACCESS_KEY).toBe("");
     expect(env.AWS_BEARER_TOKEN_BEDROCK).toBe("");
+  });
+
+  test("rejects filter driver names that cannot be overridden safely", () => {
+    const longName = "a".repeat(513);
+    expect(() => gitNoRepoAutomationEnvForFilterConfigKeys([`filter.${longName}.smudge`])).toThrow(
+      "unsupported filter driver name"
+    );
   });
 
   test("neutralizes filters selected by .git/info/attributes without mutating it", async () => {

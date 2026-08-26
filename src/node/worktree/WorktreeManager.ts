@@ -91,12 +91,15 @@ export class WorktreeManager {
     trusted?: boolean;
   }): Promise<WorkspaceCreationResult> {
     const { projectPath, branchName, trunkBranch, initLogger } = params;
-    // Disable git hooks for untrusted projects (prevents post-checkout execution)
-    const noHooksEnv = await this.getGitExecOptions(
-      projectPath,
-      params.trusted,
-      params.abortSignal
-    );
+    // Disable git hooks for untrusted projects (prevents post-checkout execution).
+    // Filter discovery is fail-closed, but creation callers consume a
+    // structured result, so translate preflight failures at this boundary.
+    let noHooksEnv: GitExecOptions;
+    try {
+      noHooksEnv = await this.getGitExecOptions(projectPath, params.trusted, params.abortSignal);
+    } catch (error) {
+      return { success: false, error: getErrorMessage(error) };
+    }
     const workspaceName = params.directoryName ?? branchName;
     const workspacePath =
       params.workspacePathOverride ?? this.getWorkspacePath(projectPath, workspaceName);

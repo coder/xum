@@ -20,14 +20,14 @@ const GITMODULES_PROBE_TIMEOUT_SECS = 10;
 const GITMODULES_PROBE_MISSING_EXIT_CODE = 2;
 const GITMODULES_PROBE_INVALID_EXIT_CODE = 3;
 const SUBMODULE_SYNC_COMMAND = "git submodule sync --recursive";
+const SUBMODULE_STATUS_COMMAND = "git submodule status --recursive";
 // Command-line --checkout overrides repo-configured
 // submodule.<name>.update=!command strategies.
 const SUBMODULE_UPDATE_COMMAND = "git submodule update --init --recursive --checkout";
-// Automation-off updates must not fetch: when a gitlink commit is missing, the
-// implicit fetch honors remote.<name>.uploadpack from the pre-seeded
-// .git/modules/<name>/config, and git has no env override for upload-pack.
-// Local objects are the only trusted source; missing commits fail closed.
-const SUBMODULE_UPDATE_NO_FETCH_COMMAND = `${SUBMODULE_UPDATE_COMMAND} --no-fetch`;
+// Automation-off updates must neither initialize nor fetch. --no-fetch alone
+// still permits --init to clone dataset-controlled URLs; requiring initialized
+// submodules first and omitting --init keeps materialization on local objects.
+const SUBMODULE_UPDATE_NO_FETCH_COMMAND = "git submodule update --recursive --checkout --no-fetch";
 
 interface BaseSubmoduleSyncArgs {
   workspacePath: string;
@@ -121,6 +121,24 @@ async function discoverRuntimeGitFilterConfigKeys(
   return result.stdout.split("\0");
 }
 
+async function assertSubmodulesInitialized(
+  args: RuntimeSubmoduleSyncArgs,
+  env: Record<string, string>
+): Promise<void> {
+  const result = await execBuffered(args.runtime, SUBMODULE_STATUS_COMMAND, {
+    cwd: args.workspacePath,
+    timeout: GITMODULES_PROBE_TIMEOUT_SECS,
+    abortSignal: args.abortSignal,
+    env,
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(result.stderr || result.stdout || "git submodule status failed");
+  }
+  if (result.stdout.split("\n").some((line) => line.startsWith("-"))) {
+    throw new Error("Refusing to initialize git submodules while project automation is disabled");
+  }
+}
+
 async function runSubmoduleMaterialization(args: RuntimeSubmoduleSyncArgs): Promise<void> {
   const hooksAllowed = gitHooksAllowed(args.trusted);
   const filterConfigKeys = hooksAllowed
@@ -131,6 +149,9 @@ async function runSubmoduleMaterialization(args: RuntimeSubmoduleSyncArgs): Prom
     trusted: args.trusted,
     filterConfigKeys,
   });
+  if (!hooksAllowed) {
+    await assertSubmodulesInitialized(args, env);
+  }
 
   // Skills, docs, and other workspace-managed files can live inside submodules.
   // Materialize them before init hooks or downstream runtime setup so later discovery

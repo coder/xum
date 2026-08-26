@@ -38,10 +38,10 @@ import {
  * undefined; the note explains where the real bytes went.
  */
 /**
- * Aggregate per-eval budget for media bytes carried out of bridged results.
- * The pending array lives host-side (outside QuickJS memory accounting), so
- * guest code must not be able to grow it without bound by re-attaching large
- * files in a loop; excess media stays behind with a budget stub instead.
+ * Aggregate per-eval budget for attachment bytes stripped from bridged
+ * results. Forwardable parts live host-side outside QuickJS memory accounting;
+ * unsupported media is discarded but still consumes this budget so repeated
+ * calls cannot retain unbounded bytes in nested-call records.
  */
 export const MAX_PENDING_ATTACHMENT_BYTES = 32 * 1024 * 1024;
 
@@ -180,6 +180,9 @@ export class ToolBridge {
    * sharing this bridge cannot claim each other's parts (ephemeral runtimes
    * are per-call; persistent mounts serialize evals under the scope lock). */
   private readonly pendingAttachments = new WeakMap<IJSRuntime, ToolAttachmentPart[]>();
+  /** Aggregate stripped-media bytes per runtime/eval, including unsupported
+   * media that is discarded rather than forwarded to the provider. */
+  private readonly pendingAttachmentBytes = new WeakMap<IJSRuntime, number>();
 
   constructor(tools: Record<string, Tool>, grants?: CapabilityGrants) {
     this.bridgeableTools = new Map();
@@ -251,6 +254,7 @@ export class ToolBridge {
     // point: stale attachments from a crashed/aborted prior eval on this
     // runtime must not leak into the next eval's drain.
     this.pendingAttachments.delete(runtime);
+    this.pendingAttachmentBytes.delete(runtime);
     // Kernel mode bounds record/event capture at creation (host memory and
     // streamed-to-history events); ephemeral registrations keep full records
     // (the byte-identical supplement contract). Post-eval compaction still
@@ -451,11 +455,10 @@ export class ToolBridge {
    * are useless as sandbox values: guests cannot see pixels, and the base64
    * would bloat vars, result handles, model-visible records, and the
    * host-side nested-call records/events (which sit outside QuickJS memory
-   * accounting). Strip them per-runtime so code_execution can re-attach the
-   * originals on its own result: the request path lifts media into real
-   * model attachments (extractToolMediaAsUserMessages) and the tool-call
-   * card renders both kinds from the carrier. Each stripped part keeps its
-   * declared shape with `data` swapped for a stub.
+   * accounting). Strip them per-runtime; supported model media and
+   * display-only files are carried onto code_execution's result, while
+   * unsupported media is discarded. Every stripped part keeps its declared
+   * shape with `data` swapped for a stub and shares the aggregate budget.
    */
   private stripAttachmentParts(runtime: IJSRuntime, serialized: unknown): unknown {
     if (!isToolContentResult(serialized)) {
@@ -463,24 +466,27 @@ export class ToolBridge {
     }
     const carriedParts: ToolAttachmentPart[] = [];
     const pending = this.pendingAttachments.get(runtime) ?? [];
-    let pendingBytes = pending.reduce((sum, part) => sum + part.data.length, 0);
+    let pendingBytes = this.pendingAttachmentBytes.get(runtime) ?? 0;
     let changed = false;
-    const carry = <T extends ToolAttachmentPart>(part: T, stub: string): T => {
+    const strip = <T extends ToolAttachmentPart>(part: T, stub: string, carry: boolean): T => {
       if (pendingBytes + part.data.length > MAX_PENDING_ATTACHMENT_BYTES) {
         return { ...part, data: MEDIA_BUDGET_EXCEEDED_STUB };
       }
       pendingBytes += part.data.length;
-      carriedParts.push(part);
+      this.pendingAttachmentBytes.set(runtime, pendingBytes);
+      if (carry) {
+        carriedParts.push(part);
+      }
       return { ...part, data: stub };
     };
     const newValue = serialized.value.map((item) => {
-      if (isMediaPart(item) && isSupportedAttachmentMediaType(item.mediaType)) {
+      if (isMediaPart(item)) {
         changed = true;
-        return carry(item, MEDIA_DATA_STUB);
+        return strip(item, MEDIA_DATA_STUB, isSupportedAttachmentMediaType(item.mediaType));
       }
       if (isDisplayOnlyFilePart(item)) {
         changed = true;
-        return carry(item, DISPLAY_DATA_STUB);
+        return strip(item, DISPLAY_DATA_STUB, true);
       }
       return item;
     });
@@ -495,13 +501,14 @@ export class ToolBridge {
   }
 
   /**
-   * Drain attachment parts stripped from bridged results on this runtime.
-   * register() clears stale entries before each eval, so a post-eval drain
-   * yields exactly that eval's attachments.
+   * Drain forwardable attachment parts stripped from bridged results on this
+   * runtime. register() clears stale entries before each eval, so a post-eval
+   * drain yields exactly that eval's supported media and display-only files.
    */
   drainPendingAttachments(runtime: IJSRuntime): ToolAttachmentPart[] {
     const pending = this.pendingAttachments.get(runtime) ?? [];
     this.pendingAttachments.delete(runtime);
+    this.pendingAttachmentBytes.delete(runtime);
     return pending;
   }
 

@@ -80,9 +80,12 @@ function appendDisabledFilterDrivers(
   const filterNames = new Set<string>();
   for (const key of configKeys) {
     const match = FILTER_CONFIG_KEY_REGEX.exec(key);
-    const name = match?.[1];
-    if (name == null || name.length === 0 || name.length > 512 || /[\0\r\n]/.test(name)) {
+    if (match == null) {
       continue;
+    }
+    const name = match[1];
+    if (name.length > 512 || /[\0\r\n]/.test(name)) {
+      throw new Error("Refusing git operation with an unsupported filter driver name");
     }
     filterNames.add(name);
     if (filterNames.size > MAX_FILTER_DRIVERS) {

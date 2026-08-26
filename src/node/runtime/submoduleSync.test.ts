@@ -167,6 +167,49 @@ describe("syncLocalGitSubmodules", () => {
     }
   }, 30_000);
 
+  it("refuses to initialize submodules when project automation is off", async () => {
+    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "mux-submodule-no-init-"));
+
+    try {
+      const submoduleRepo = path.join(tempRoot, "submodule-src");
+      const projectRepo = path.join(tempRoot, "project");
+      await initGitRepo(submoduleRepo, { "SKILL.md": "payload\n" });
+      await initGitRepo(projectRepo, { "README.md": "hello\n" });
+
+      execFileSync(
+        "git",
+        ["-c", "protocol.file.allow=always", "submodule", "add", submoduleRepo, "vendor/docs"],
+        { cwd: projectRepo, stdio: "ignore" }
+      );
+      git(projectRepo, ["commit", "-m", "add submodule"]);
+      git(projectRepo, ["submodule", "deinit", "-f", "vendor/docs"]);
+      await fs.rm(path.join(projectRepo, ".git", "modules", "vendor", "docs"), {
+        recursive: true,
+        force: true,
+      });
+
+      const { logger } = createInitLogger();
+      let errorMessage = "";
+      try {
+        await syncLocalGitSubmodules({
+          workspacePath: projectRepo,
+          initLogger: logger,
+          env: { GIT_ALLOW_PROTOCOL: "file" },
+          trusted: false,
+        });
+      } catch (error) {
+        errorMessage = error instanceof Error ? error.message : String(error);
+      }
+
+      expect(errorMessage).toContain(
+        "Refusing to initialize git submodules while project automation is disabled"
+      );
+      expect(await pathExists(path.join(projectRepo, "vendor", "docs", "SKILL.md"))).toBe(false);
+    } finally {
+      await fs.rm(tempRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("does not fetch through pre-seeded upload-pack config when automation is off", async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "mux-submodule-nofetch-"));
 
@@ -268,6 +311,7 @@ describe("syncRuntimeGitSubmodules", () => {
     const runtime = new RecordingRuntime([
       { stdout: "present", exitCode: 0 },
       { stdout: "filter.evil.smudge\0filter.evil.required\0", exitCode: 0 },
+      { stdout: " 0123456789abcdef vendor/docs", exitCode: 0 },
       { exitCode: 0 },
       { exitCode: 0 },
     ]) as unknown as Runtime & RecordingRuntime;
@@ -284,10 +328,12 @@ describe("syncRuntimeGitSubmodules", () => {
     expect(runtime.calls[0]?.command).toContain("if [ -f .gitmodules ]");
     expect(runtime.calls[1]?.command).toContain("emit_filter_keys");
     expect(runtime.calls.slice(2).map((call) => call.command)).toEqual([
+      "git submodule status --recursive",
       "git submodule sync --recursive",
-      "git submodule update --init --recursive --checkout --no-fetch",
+      "git submodule update --recursive --checkout --no-fetch",
     ]);
     expect(runtime.calls.map((call) => call.cwd)).toEqual([
+      "/remote/workspace",
       "/remote/workspace",
       "/remote/workspace",
       "/remote/workspace",
@@ -310,6 +356,31 @@ describe("syncRuntimeGitSubmodules", () => {
       GIT_CONFIG_VALUE_6: "false",
     });
     expect(steps).toEqual(["Initializing git submodules...", "Git submodules ready"]);
+  });
+
+  it("stops before sync when an automation-off runtime submodule is uninitialized", async () => {
+    const runtime = new RecordingRuntime([
+      { stdout: "present", exitCode: 0 },
+      { stdout: "", exitCode: 0 },
+      { stdout: "-0123456789abcdef vendor/docs", exitCode: 0 },
+    ]) as unknown as Runtime & RecordingRuntime;
+    const { logger, steps } = createInitLogger();
+
+    let errorMessage = "";
+    try {
+      await syncRuntimeGitSubmodules({
+        runtime,
+        workspacePath: "/remote/workspace",
+        initLogger: logger,
+        trusted: false,
+      });
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : String(error);
+    }
+
+    expect(errorMessage).toContain("Refusing to initialize git submodules");
+    expect(runtime.calls.map((call) => call.command)).toHaveLength(3);
+    expect(steps).toEqual([]);
   });
 
   it("skips runtime sync when .gitmodules is absent", async () => {

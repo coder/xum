@@ -914,7 +914,7 @@ describe("attachment part stripping", () => {
     expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
   });
 
-  it("leaves non-content results and unsupported media untouched", async () => {
+  it("leaves non-content results unchanged but strips unsupported media", async () => {
     const bashResult = { success: true, output: "plain output" };
     const unsupportedMedia = {
       type: "content",
@@ -931,7 +931,44 @@ describe("attachment part stripping", () => {
     const { captured, runtime } = registerCapturingXum(bridge);
 
     expect(await captured.xum.bash({ script: "true" })).toEqual(bashResult);
-    expect(await captured.xum.attach_file({ path: "/x.bin" })).toEqual(unsupportedMedia);
+    const sandboxValue = (await captured.xum.attach_file({ path: "/x.bin" })) as {
+      value: Array<{ type: string; data: string; mediaType: string }>;
+    };
+    expect(sandboxValue.value[0]).toEqual({
+      type: "media",
+      data: MEDIA_DATA_STUB,
+      mediaType: "application/x-custom",
+    });
+    // Unsupported media is discarded rather than forwarded to the provider.
+    expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
+  });
+
+  it("counts discarded unsupported media against the aggregate budget", async () => {
+    const bigData = "a".repeat(MAX_PENDING_ATTACHMENT_BYTES - 16);
+    const bridge = new ToolBridge({
+      attach_file: createMockTool("attach_file", z.object({ path: z.string() }), (args) =>
+        (args as { path: string }).path === "/audio.bin"
+          ? {
+              type: "content",
+              value: [{ type: "media", data: bigData, mediaType: "audio/wav" }],
+            }
+          : {
+              type: "content",
+              value: [{ type: "media", data: "b".repeat(64), mediaType: "image/png" }],
+            }
+      ),
+    });
+    const { captured, runtime } = registerCapturingXum(bridge);
+
+    const unsupported = (await captured.xum.attach_file({ path: "/audio.bin" })) as {
+      value: Array<{ data: string }>;
+    };
+    expect(unsupported.value[0].data).toBe(MEDIA_DATA_STUB);
+
+    const supported = (await captured.xum.attach_file({ path: "/image.png" })) as {
+      value: Array<{ data: string }>;
+    };
+    expect(supported.value[0].data).toBe(MEDIA_BUDGET_EXCEEDED_STUB);
     expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
   });
 

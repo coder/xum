@@ -162,6 +162,29 @@ describe("WorktreeManager.createWorkspace", () => {
       20_000
     );
   }
+  it("returns a structured failure when git preflight cannot inspect the repository", async () => {
+    const fixture = await createWorktreeManagerFixture();
+
+    try {
+      await fsPromises.rm(fixture.projectPath, { recursive: true, force: true });
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: "feature-missing-repo",
+        trunkBranch: "main",
+        initLogger: fixture.initLogger,
+        trusted: false,
+      });
+
+      expect(result.success).toBe(false);
+      if (result.success) {
+        throw new Error("Expected createWorkspace to fail");
+      }
+      expect(result.error).toContain("Failed to inspect repository checkout filters");
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
   it("skips repo-configured upload-pack commands when project automation is disabled", async () => {
     const fixture = await createWorktreeManagerFixture();
     const marker = path.join(fixture.rootDir, "upload-pack-ran");
