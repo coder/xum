@@ -245,6 +245,18 @@ describe("retainExemptKernelRecordResult", () => {
       ).toBeUndefined();
     });
 
+    it("exempts media below arbitrarily deep wrappers (no depth cap)", () => {
+      // The retention sanitizer walks iteratively without a depth bound
+      // (r25); the exemption predicate must match (r26), or deep-wrapped
+      // media would be compacted away before request-time extraction — which
+      // is also unbounded over wrappers — could attach it.
+      let deep: unknown = { type: "media", mediaType: "image/png", data: "aGVsbG8=" };
+      for (let i = 0; i < 300; i++) deep = { next: deep };
+      const retained = retainExemptKernelRecordResult("mcp__shots__take", deep);
+      expect(retained).toBeDefined();
+      expect(JSON.stringify(retained)).toContain("aGVsbG8=");
+    });
+
     it("rejects junk media types at validation instead of retaining them as supported", () => {
       // transformMCPResult copies server-controlled MIME types unchanged; an
       // "image/" + megabytes string must fail isSupportedAttachmentMediaType
@@ -484,6 +496,18 @@ describe("retainPersistenceCriticalArgsFields", () => {
     // beats recording a truncated (wrong) attribution.
     expect(
       retainPersistenceCriticalArgsFields("file_edit_insert", { path: "p".repeat(5_000) })
+    ).toBeUndefined();
+  });
+
+  it("bounds retained paths by serialized bytes, not UTF-16 code units", () => {
+    // 2000 three-byte code points sit under a 4096 code-unit count but
+    // serialize to ~6 KB, and JSON escaping expands lone surrogates 6x — a
+    // code-unit cap would merge ~24 KiB onto the 2 KiB args marker (r26).
+    expect(
+      retainPersistenceCriticalArgsFields("file_edit_insert", { path: "\u96EA".repeat(2_000) })
+    ).toBeUndefined();
+    expect(
+      retainPersistenceCriticalArgsFields("file_edit_insert", { path: "\uD800".repeat(1_000) })
     ).toBeUndefined();
   });
 });

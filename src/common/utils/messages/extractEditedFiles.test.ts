@@ -254,6 +254,30 @@ describe("nested PTC edit records (exclusive posture)", () => {
     expect(extractEditedFilePaths(messages)).toEqual(["/kernel.ts"]);
     expect(extractEditedFileDiffs(messages)).toEqual([]);
   });
+
+  it("marks the combined diff truncated when a result-less edit's diff did not survive", () => {
+    // A kernel execution that exhausts the retained-result budget compacts a
+    // later successful edit to a result-less {ok: true} record: the earlier
+    // retained diff no longer describes the final file content, so the
+    // surviving combined diff must not present itself as complete (round 26).
+    const earlierDiff = makeDiff("/kernel.ts", "old", "mid");
+    const messages: MuxMessage[] = [
+      createCodeExecutionMessage([
+        {
+          toolName: "file_edit_replace_string",
+          args: { path: "/kernel.ts" },
+          result: { success: true, diff: earlierDiff },
+        },
+        { toolName: "file_edit_replace_string", args: { path: "/kernel.ts" }, ok: true, bytes: 9 },
+      ]),
+    ];
+
+    const diffs = extractEditedFileDiffs(messages);
+    expect(diffs).toHaveLength(1);
+    expect(diffs[0].path).toBe("/kernel.ts");
+    expect(diffs[0].diff).toBe(earlierDiff);
+    expect(diffs[0].truncated).toBe(true);
+  });
 });
 
 describe("extractEditedFilePaths", () => {

@@ -86,10 +86,13 @@ export const KERNEL_RETAINED_EXECUTION_BUDGET_BYTES = 4 * KERNEL_RETAINED_MEDIA_
 export const KERNEL_SANITIZED_MEDIA_VALUE_MAX_BYTES = 2 * KERNEL_RETAINED_MEDIA_BUDGET_BYTES;
 
 /**
- * Max chars of a validated tool-arg file path preserved on a __kernelBounded
- * args marker (see retainPersistenceCriticalArgsFields). Covers Linux
- * PATH_MAX (4096); longer strings cannot be real paths of successful edits,
- * so they are dropped rather than truncated (a truncated path would
- * misattribute the record to a nonexistent file).
+ * Max serialized-JSON UTF-8 bytes of a validated tool-arg file path preserved
+ * on a __kernelBounded args marker (see retainPersistenceCriticalArgsFields).
+ * Covers Linux PATH_MAX (4096 bytes); longer strings cannot be real paths of
+ * successful edits, so they are dropped rather than truncated (a truncated
+ * path would misattribute the record to a nonexistent file). Measured in
+ * serialized bytes rather than UTF-16 code units (r26): JSON escaping can
+ * expand a 4096-code-unit multibyte/lone-surrogate string to ~24 KiB, far
+ * past the 2 KiB args marker this field merges onto.
  */
-export const KERNEL_RETAINED_PATH_MAX_CHARS = 4096;
+export const KERNEL_RETAINED_PATH_MAX_BYTES = 4096;

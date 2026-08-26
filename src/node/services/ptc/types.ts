@@ -15,7 +15,7 @@ import {
   KERNEL_RETAINED_CONTAINER_MAX_PARTS,
   KERNEL_RETAINED_MEDIA_BUDGET_BYTES,
   KERNEL_SANITIZED_MEDIA_VALUE_MAX_BYTES,
-  KERNEL_RETAINED_PATH_MAX_CHARS,
+  KERNEL_RETAINED_PATH_MAX_BYTES,
 } from "@/constants/kernelOutput";
 
 /**
@@ -439,14 +439,6 @@ export function sanitizeMediaRecordCapture(
 }
 
 /**
- * Recursion depth cap for the media value-graph walk. JSON persistence
- * tolerates deeper nesting, but a guest-built ladder past this depth is not a
- * plausible legitimate return shape — fail CLOSED (bounded placeholder) so
- * depth can never be used to smuggle an unsanitized container past the walk.
- */
-const MAX_MEDIA_SANITIZE_DEPTH = 256;
-
-/**
  * Tool-name-free form of sanitizeMediaRecordCapture for values that are not
  * nested tool records: the classic execution's outer return value and console
  * args also persist into the code_execution history row (see
@@ -644,7 +636,15 @@ export function retainPersistenceCriticalArgsFields(
 ): Record<string, unknown> | undefined {
   if (!isPersistenceCriticalRecordToolName(toolName)) return undefined;
   const path = extractToolFilePath(args);
-  if (path === undefined || path.length > KERNEL_RETAINED_PATH_MAX_CHARS) return undefined;
+  if (path === undefined) return undefined;
+  // Bound by SERIALIZED bytes, not UTF-16 code units (r26): JSON escaping can
+  // expand a code-unit-capped multibyte/lone-surrogate string ~6x (to ~24
+  // KiB), and this field merges onto a 2 KiB args marker — repeated oversized
+  // records would persist and stream far past the advertised per-record cap.
+  const serializedBytes = serializedJsonByteLength(path);
+  if (serializedBytes === undefined || serializedBytes > KERNEL_RETAINED_PATH_MAX_BYTES) {
+    return undefined;
+  }
   return { path };
 }
 
@@ -665,7 +665,7 @@ export function isPersistenceCriticalRecordToolName(toolName: string): boolean {
  * any unsupported parts that ride along in an exempted container with bounded
  * placeholders at request time.
  *
- * The search recurses through wrappers and non-media parts (r19) and accepts
+ * The search walks through wrappers and non-media parts (r19) and accepts
  * the exact shapes the capture sanitizer bounds and the request-time
  * extractor consumes: content containers with an immediate supported media
  * child, and standalone supported media leaves (r24 — r20 restricted the
@@ -677,21 +677,35 @@ export function isPersistenceCriticalRecordToolName(toolName: string): boolean {
  * walk before the record is kept.
  */
 export function containsMediaContentPayload(result: unknown): boolean {
-  return containsExtractableMediaValue(result, 0);
-}
-
-function containsExtractableMediaValue(value: unknown, depth: number): boolean {
-  if (typeof value !== "object" || value === null) return false;
-  const media = asMediaPart(value);
-  if (media !== null) {
-    return media.mediaType !== undefined && isSupportedAttachmentMediaType(media.mediaType);
+  // Iterative, unbounded scan aligned with sanitizeMediaValueGraph (r26): the
+  // retention sanitizer preserves media below ANY wrapper depth, so a
+  // depth-capped predicate here would decline the exemption for payloads the
+  // bounded retention walk can handle — kernel compaction would then drop an
+  // extractable result before request-time extraction could attach it. The
+  // visited set keeps shared subtrees linear and terminates cycle back-edges.
+  const stack: unknown[] = [result];
+  const visited = new Set<object>();
+  while (stack.length > 0) {
+    const value = stack.pop();
+    if (typeof value !== "object" || value === null) continue;
+    if (visited.has(value)) continue;
+    visited.add(value);
+    const media = asMediaPart(value);
+    if (media !== null) {
+      if (media.mediaType !== undefined && isSupportedAttachmentMediaType(media.mediaType)) {
+        return true;
+      }
+      // Media leaves are terminal for the sanitizer/extractor — their fields
+      // are never scanned for deeper payloads.
+      continue;
+    }
+    if (isContentContainerShape(value) && hasImmediateSupportedMedia(value)) return true;
+    const children: unknown[] = Array.isArray(value)
+      ? value
+      : Object.values(value as Record<string, unknown>);
+    for (const child of children) stack.push(child);
   }
-  if (isContentContainerShape(value) && hasImmediateSupportedMedia(value)) return true;
-  if (depth >= MAX_MEDIA_SANITIZE_DEPTH) return false;
-  const children: unknown[] = Array.isArray(value)
-    ? value
-    : Object.values(value as Record<string, unknown>);
-  return children.some((child) => containsExtractableMediaValue(child, depth + 1));
+  return false;
 }
 
 function isContentContainerShape(value: unknown): value is { type: "content"; value: unknown[] } {

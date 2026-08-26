@@ -303,14 +303,21 @@ export function extractEditedFileDiffs(messages: MuxMessage[]): FileEditDiff[] {
 
       if (part.toolName === "code_execution") {
         // Classic PTC records retain the full nested result (including the
-        // diff); kernel-compacted records surface path-only edits and are
-        // skipped here (no diff contents survive compaction of the record).
+        // diff); kernel-compacted records surface path-only edits whose diff
+        // contents did not survive compaction.
         for (const record of collectNestedEditRecords(part.output)) {
           if (record.diffTruncated === true) {
             captureTruncatedPaths.add(record.filePath);
           }
           if (record.diff !== undefined && record.diff.length > 0) {
             addDiff(record.filePath, record.diff);
+          } else if (record.diff === undefined) {
+            // A successful result-less (kernel-compacted) edit landed without
+            // any retained diff: diffs from the file's OTHER retained edits no
+            // longer describe the final content, so any surviving combined
+            // diff must surface as incomplete rather than complete-looking
+            // (r26 — mirrors the dropped-bounded-diff diffTruncated signal).
+            captureTruncatedPaths.add(record.filePath);
           }
         }
         continue;
