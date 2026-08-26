@@ -4461,6 +4461,14 @@ export class WorkspaceStore {
     if (isCaughtUpMessage(data)) {
       const replay = data.replay ?? "full";
 
+      if (data.downgradeReason !== undefined) {
+        // Dev observability: a requested since reconnect was downgraded to a full
+        // replay server-side. Silent downgrades previously hid full re-transfers.
+        console.debug(
+          `[WorkspaceStore] onChat replay downgraded to full for ${workspaceId}: ${data.downgradeReason}`
+        );
+      }
+
       // Check if there's an active stream in buffered events (reconnection scenario).
       const pendingEvents = transient.pendingStreamEvents;
       const hasActiveStream = getBufferedActiveStreamStart(pendingEvents) !== null;

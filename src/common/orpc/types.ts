@@ -39,6 +39,7 @@ export type WorkspaceChatMessage = z.infer<typeof schemas.WorkspaceChatMessageSc
 export type CaughtUpMessage = z.infer<typeof schemas.CaughtUpMessageSchema>;
 export type OnChatCursor = z.infer<typeof OnChatCursorSchema>;
 export type OnChatMode = z.infer<typeof OnChatModeSchema>;
+export type OnChatDowngradeReason = z.infer<typeof schemas.OnChatDowngradeReasonSchema>;
 export type StreamErrorMessage = z.infer<typeof schemas.StreamErrorMessageSchema>;
 export type DeleteMessage = z.infer<typeof schemas.DeleteMessageSchema>;
 export type GoalBudgetLimitedEvent = z.infer<typeof schemas.GoalBudgetLimitedEventSchema>;

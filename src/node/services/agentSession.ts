@@ -25,6 +25,7 @@ import type {
   FilePart,
   OnChatMode,
   OnChatCursor,
+  OnChatDowngradeReason,
   ProvidersConfigMap,
   StreamErrorMessage,
 } from "@/common/orpc/types";
@@ -2428,6 +2429,12 @@ export class AgentSession {
     let replayMode: "full" | "since" | "live" = "full";
     let hasOlderHistory: boolean | undefined;
     let serverCursor: OnChatCursor | undefined;
+    // Silent since→full downgrades caused full-history re-transfers on nearly every
+    // workspace switch-back for months. Keep every downgrade observable: classified
+    // reason on the caught-up payload plus a log line with row counts.
+    let downgradeReason: OnChatDowngradeReason | undefined;
+    let epochRowCount: number | undefined;
+    let sentRowCount = 0;
     let emittedReplayMessages = false;
 
     const emitReplayMessage = (message: WorkspaceChatMessage): void => {
@@ -2546,8 +2553,13 @@ export class AgentSession {
       let sinceHistorySequence: number | undefined;
       let afterTimestamp: number | undefined;
 
+      if (!historyResult.success && mode?.type === "since") {
+        downgradeReason = "history-read-failed";
+      }
+
       if (historyResult.success) {
         const history = historyResult.data;
+        epochRowCount = history.length;
 
         // Cursor-based replay: only use incremental mode when all provided cursor segments are valid.
         const historyCursor = mode?.type === "since" ? mode.cursor.history : undefined;
@@ -2599,6 +2611,13 @@ export class AgentSession {
 
           if (matchedHistoryCursor && oldestHistoryMatches && priorHistoryMatches) {
             sinceHistorySequence = historyCursor.historySequence;
+          } else {
+            // Classify by the first failing predicate so downgrades are diagnosable.
+            downgradeReason = !matchedHistoryCursor
+              ? "cursor-row-missing"
+              : !oldestHistoryMatches
+                ? "oldest-mismatch"
+                : "fingerprint-mismatch";
           }
         }
 
@@ -2663,6 +2682,7 @@ export class AgentSession {
           }
 
           // Add type: "message" for discriminated union (messages from chat.jsonl don't have it)
+          sentRowCount += 1;
           emitReplayMessage({ ...message, type: "message" });
         }
 
@@ -2727,6 +2747,9 @@ export class AgentSession {
       if (replayMode !== "full" && !emittedReplayMessages && !emittedReplayStreamEvents) {
         replayMode = "full";
       }
+      if (mode?.type === "since" && replayMode === "full") {
+        downgradeReason ??= "history-read-failed";
+      }
 
       // Replay failed, so do not advertise a trustworthy reconnect cursor.
       serverCursor = undefined;
@@ -2766,6 +2789,18 @@ export class AgentSession {
         });
       }
 
+      // Surface since→full downgrades (and replay shape in general) in logs. Row counts
+      // only — no JSON.stringify byte accounting on this hot path.
+      const wasDowngraded = mode?.type === "since" && replayMode === "full";
+      log.debug("onChat replay", {
+        workspaceId: this.workspaceId,
+        requestedMode: mode?.type ?? "full",
+        replayMode,
+        ...(wasDowngraded && downgradeReason !== undefined ? { downgradeReason } : {}),
+        epochRowCount,
+        sentRowCount,
+      });
+
       // Send caught-up after ALL historical data (including init events)
       // This signals frontend that replay is complete and future events are real-time
       listener({
@@ -2773,6 +2808,7 @@ export class AgentSession {
         message: {
           type: "caught-up",
           replay: replayMode,
+          ...(wasDowngraded && downgradeReason !== undefined ? { downgradeReason } : {}),
           ...(hasOlderHistory !== undefined ? { hasOlderHistory } : {}),
           cursor: serverCursor,
         },
