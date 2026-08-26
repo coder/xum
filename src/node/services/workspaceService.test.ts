@@ -892,6 +892,80 @@ describe("WorkspaceService bash monitor wakes", () => {
     }
   });
 
+  test("a pending clear-promotion retry does not recreate a removed workspace's session data", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-clear-commit-removed";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+        notifyMonitorWakeStateChanged: mock(() => undefined),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      spyOn(workspaceService, "hasPendingQueuedOrPreparingTurn").mockReturnValue(true);
+      spyOn(workspaceService, "waitForIdleAndNoQueuedMessages").mockImplementation(
+        () => new Promise(() => undefined)
+      );
+      const wakeStore = (
+        workspaceService as unknown as {
+          bashMonitorWakeStore: BashMonitorWakeStore;
+        }
+      ).bashMonitorWakeStore;
+      await wakeStore.enqueueOrMergePending({
+        processId: "proc-removed",
+        taskId: "bash:proc-removed",
+        workspaceId,
+        filter: "WAKE:",
+        filterExclude: false,
+        lines: ["WAKE: retired"],
+        totalMatches: 1,
+        timestamp: Date.now(),
+        matchedThroughOffset: 10,
+      });
+      const clearHistory = (
+        workspaceService as unknown as {
+          clearHistoryWithRetiredBashMonitorWakes: (
+            workspaceId: string,
+            clear: () => Promise<Result<void>>,
+            options?: { discardUnacceptedOnSuccess?: boolean }
+          ) => Promise<Result<void>>;
+        }
+      ).clearHistoryWithRetiredBashMonitorWakes.bind(workspaceService);
+      // The promotion fails once, scheduling the background retry.
+      const commitSpy = spyOn(wakeStore, "commitClear").mockImplementationOnce(() =>
+        Promise.reject(new Error("EIO: tombstone write failed"))
+      );
+      const result = await clearHistory(workspaceId, () => Promise.resolve(Ok(undefined)), {
+        discardUnacceptedOnSuccess: true,
+      });
+      expect(result.success).toBe(true);
+      expect(commitSpy).toHaveBeenCalledTimes(1);
+      // The workspace is removed (and its session data deleted) BEFORE the retry
+      // fires; the retried commitClear's tombstone mutation must not mkdir the
+      // session directory back into existence for a removed workspace.
+      await config.removeWorkspace(workspaceId);
+      const sessionDir = config.getSessionDir(workspaceId);
+      await fsPromises.rm(sessionDir, { recursive: true, force: true });
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      expect(existsSync(sessionDir)).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("listBackgroundProcesses keeps a pending wake visible on a reused monitorless process ID", async () => {
     const { config, cleanup } = await createTestHistoryService();
     try {

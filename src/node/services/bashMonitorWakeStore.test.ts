@@ -1387,6 +1387,174 @@ describe("BashMonitorWakeStore", () => {
     expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
   });
 
+  test("staging that cannot land durably aborts the clear and restores its records", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR must survive"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    // Another instance's clear B already owns the tombstone with a NEWER staged
+    // cutoff, so OUR staging can never land under the monotonic rule.
+    await fsPromises.writeFile(
+      path.join(dir, "cleared-at"),
+      JSON.stringify({
+        clearedAt: new Date(Date.now() + 60_000).toISOString(),
+        clearId: "clear-b",
+        phase: "staged",
+        stagedAt: new Date().toISOString(),
+      }),
+      "utf-8"
+    );
+
+    // Reporting success would leave no durable trace of OUR clear's identity: after
+    // a double crash, restart rollback only restores records stamped with the
+    // standing tombstone's clearId, stranding ours superseded forever. The clear
+    // must abort and restore its stamped records instead.
+    try {
+      await store.supersedeAllPending("owner-1");
+      expect.unreachable("expected supersedeAllPending to abort under a foreign staging");
+    } catch (error) {
+      expect((error as Error).message).toContain("concurrent history clear");
+    }
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("pending");
+    expect((await store.listPending("owner-1")).map((r) => r.lines)).toEqual([
+      ["ERROR must survive"],
+    ]);
+  });
+
+  test("a live clear's heartbeat keeps its staging inside the rollback grace", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir), {
+      stagedClearRefreshIntervalMs: 25,
+    });
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR retired"] }));
+    const clear = await store.supersedeAllPending("owner-1");
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const tombPath = path.join(dir, "cleared-at");
+    // Age the staging past the grace window (as wall-clock time would during a long
+    // history clear).
+    const staged = JSON.parse(await fsPromises.readFile(tombPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    await fsPromises.writeFile(
+      tombPath,
+      JSON.stringify({
+        ...staged,
+        stagedAt: new Date(Date.now() - STAGED_CLEAR_ROLLBACK_GRACE_MS - 60_000).toISOString(),
+      }),
+      "utf-8"
+    );
+    // The owner's heartbeat refreshes stagedAt, so ANOTHER instance (which cannot
+    // see the in-memory active marker) keeps holding instead of misreading the
+    // still-running clear as crashed and resurrecting its retired wakes.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const fresh = new BashMonitorWakeStore(makeConfig(rootDir));
+    expect(await fresh.listPending("owner-1")).toEqual([]);
+    expect((await fresh.get("owner-1", "proc-1"))?.status).toBe("superseded");
+    // Settle the clear so the heartbeat stops.
+    await store.commitClear("owner-1", clear);
+  });
+
+  test("a newer re-armed match replaces a stale canonical lost notice", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    const notice = await store.enqueueMonitorLost(
+      {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        ownerWorkspaceId: "owner-1",
+        filter: "ERROR",
+        filterExclude: false,
+        script: "./watch.sh",
+      },
+      TREAT_ALL_AS_STALE()
+    );
+    expect(notice).not.toBeNull();
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    // A stranded prune capture holds a NEWER re-armed match generation of the same
+    // id (different lineage, so offset subsumption is unprovable).
+    const reArmed: Record<string, unknown> = {
+      ...notice,
+      kind: "match",
+      lines: ["ERROR re-armed output"],
+      totalMatches: 1,
+      matchedThroughOffset: 10,
+      createdAt: new Date(Date.parse(notice!.createdAt) + 1_000).toISOString(),
+      updatedAt: new Date(Date.parse(notice!.updatedAt) + 5_000).toISOString(),
+    };
+    delete reArmed.script;
+    await fsPromises.writeFile(
+      path.join(dir, "proc-1.json.prune-crashed"),
+      JSON.stringify(reArmed),
+      "utf-8"
+    );
+
+    // The strictly newer match proves the id was re-armed AFTER the notice was
+    // written: the stale notice is replaced, not merged — merging would keep
+    // claiming the newly running task was terminated.
+    const pending = await store.listPending("owner-1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0].kind).toBe("match");
+    expect(pending[0].script).toBeUndefined();
+    expect(pending[0].lines).toEqual(["ERROR re-armed output"]);
+  });
+
+  test("a rescued pending generation is revalidated against later artifacts in the same scan", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR stale rescue"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const file = path.join(dir, "proc-1.json");
+    // A crashed prune stranded the PENDING generation aside...
+    const raw = JSON.parse(await fsPromises.readFile(file, "utf-8")) as Record<string, unknown> & {
+      updatedAt: string;
+    };
+    await fsPromises.rename(file, path.join(dir, "proc-1.json.prune-a"));
+    // ...and a crashed write stranded a NEWER TERMINAL generation (the wake was
+    // superseded after the prune capture) with no canonical file left at all.
+    await fsPromises.writeFile(
+      path.join(dir, "proc-1.json.tmp-b"),
+      JSON.stringify({
+        ...raw,
+        status: "superseded",
+        updatedAt: new Date(Date.parse(raw.updatedAt) + 5_000).toISOString(),
+      }),
+      "utf-8"
+    );
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(path.join(dir, "proc-1.json.tmp-b"), past, past);
+
+    // Force the pending rescue to be processed FIRST so the terminal generation
+    // supersedes it later within the SAME scan.
+    const rank = (e: string) => (e.endsWith(".prune-a") ? 0 : e.endsWith(".tmp-b") ? 1 : 2);
+    const realReaddir = fsPromises.readdir;
+    const readdirSpy = spyOn(fsPromises, "readdir").mockImplementation(((
+      p: Parameters<typeof realReaddir>[0]
+    ) =>
+      realReaddir(p).then((entries) =>
+        [...entries].sort((a, b) => rank(String(a)) - rank(String(b)))
+      )) as typeof fsPromises.readdir);
+    try {
+      // The scan must serve the FINAL canonical generation (terminal), never the
+      // obsolete pending intermediate it rescued earlier in the same pass.
+      expect(await store.listPending("owner-1")).toEqual([]);
+      expect((await store.get("owner-1", "proc-1"))?.status).toBe("superseded");
+    } finally {
+      readdirSpy.mockRestore();
+    }
+  });
+
+  test("a directory squatting on the tombstone path is quarantined instead of failing scans", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR still delivered"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    // Corruption left a DIRECTORY at the tombstone path: readFile would fail every
+    // scan with EISDIR, permanently blocking valid pending wakes.
+    await fsPromises.mkdir(path.join(dir, "cleared-at"));
+
+    const pending = await store.listPending("owner-1");
+    expect(pending.map((r) => r.lines)).toEqual([["ERROR still delivered"]]);
+    const entries = await fsPromises.readdir(dir);
+    expect(entries).not.toContain("cleared-at");
+    expect(entries.some((e) => e.startsWith("cleared-at.malformed-"))).toBe(true);
+  });
+
   test("deferred recovery delays are bounded for corrupt or future mtimes", () => {
     const now = Date.now();
     // Near the gate: fires just past it (epsilon), no spurious full-interval wait.

@@ -5975,6 +5975,15 @@ export class WorkspaceService extends EventEmitter {
       return Ok(undefined);
     }
     this.removingWorkspaces.add(workspaceId);
+    // Cancel pending clear-promotion retries before any session data is deleted:
+    // their commitClear would otherwise recreate the session directory (mkdir in the
+    // tombstone mutation) after removal deletes it.
+    for (const [key, timer] of this.bashMonitorClearCommitRetryTimers) {
+      if (key.startsWith(`${workspaceId}:`)) {
+        clearTimeout(timer);
+        this.bashMonitorClearCommitRetryTimers.delete(key);
+      }
+    }
     let timelineClosed = false;
     let removedFromConfig = false;
 
@@ -12464,6 +12473,16 @@ export class WorkspaceService extends EventEmitter {
     if (this.bashMonitorClearCommitRetryTimers.has(key)) return;
     const timer = setTimeout(() => {
       this.bashMonitorClearCommitRetryTimers.delete(key);
+      // A removed (or mid-removal) workspace must never have its session directory
+      // recreated by a late promotion: the tombstone mutation's mkdir would
+      // resurrect deleted session data and could leak a cleared-at file into a
+      // future workspace reusing the ID.
+      if (
+        this.removingWorkspaces.has(workspaceId) ||
+        this.config.findWorkspace(workspaceId) == null
+      ) {
+        return;
+      }
       this.bashMonitorWakeStore.commitClear(workspaceId, clearToken).catch((error: unknown) => {
         log.debug("Bash monitor clear tombstone promotion retry failed", { workspaceId, error });
         this.scheduleBashMonitorClearCommitRetry(workspaceId, clearToken);
