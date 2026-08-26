@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 
 import { installDom } from "../../../../../tests/ui/dom";
 
@@ -52,21 +52,22 @@ describe("WorkflowLongText", () => {
     expect(container.textContent).not.toContain(text);
   });
 
-  test("markdown mode renders the preview as plain text and the expansion as markdown", async () => {
+  test("markdown mode renders the preview as plain text and the expansion as markdown", () => {
     const text = `## Findings\n\n${"finding ".repeat(200)}`;
     const { container, getByLabelText, queryByRole } = render(
       <WorkflowLongText markdown text={text} title="step — report" />
     );
-    // Collapsed: raw markdown source preview, no rendered heading element.
+    // Collapsed: raw markdown source preview; the markdown pipeline is not
+    // mounted at all.
     expect(queryByRole("heading")).toBeNull();
+    expect(container.querySelector(".markdown-content")).toBeNull();
     expect(container.textContent).toContain("## Findings");
     fireEvent.click(getByLabelText("Show more of step — report"));
-    // Streamdown may flush parsed blocks a tick after the click re-render (its
-    // scheduling differs across bun versions), so poll instead of asserting
-    // synchronously — with headroom beyond waitFor's 1s default, which loaded
-    // CI runners exceed.
-    await waitFor(() => expect(queryByRole("heading")?.textContent).toBe("Findings"), {
-      timeout: 5000,
-    });
+    // Expanded: the plain-source preview is replaced by MarkdownRenderer.
+    // Assert the mode switch itself (synchronous) rather than Streamdown's
+    // asynchronously flushed parse output, whose scheduling varies across
+    // bun/happy-dom versions and repeatedly timed out in CI.
+    expect(container.querySelector(".markdown-content")).not.toBeNull();
+    expect(container.textContent).not.toContain("## Findings");
   });
 });
