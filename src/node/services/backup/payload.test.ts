@@ -9,6 +9,7 @@ import { execFileAsync } from "@/node/utils/disposableExec";
 import {
   BACKUP_SCHEMA_VERSION,
   BackupCommandApprovalRequiredError,
+  BackupCredentialDetectedError,
   assertBackupCommandsApproved,
   MAX_BACKUP_DIRECTORY_COUNT,
   MAX_BACKUP_FILE_BYTES,
@@ -215,7 +216,7 @@ describe("backup payload", () => {
     });
   });
 
-  it("keeps MCP commands and URLs while redacting literal header values", async () => {
+  it("redacts credential-bearing URLs and literal header values while keeping plain commands", async () => {
     await writeFixtureFile(
       muxRoot,
       "mcp.jsonc",
@@ -256,18 +257,156 @@ describe("backup payload", () => {
 
     expect(mcp.servers.api.headers.Authorization).toBe(REDACTED_BACKUP_VALUE);
     expect(mcp.servers.api.headers.Secret).toEqual({ secret: "MCP_SECRET" });
-    expect(mcp.servers.api.url).toBe(
-      "https://user:password@example.com/mcp?token=literal&clientSecret=camel2&X-Amz-Signature=deadbeefcafe&mode=fast"
-    );
+    expect(mcp.servers.api.url).toBe(REDACTED_BACKUP_VALUE);
     expect(mcp.servers.plain.url).toBe("https://example.com/mcp?mode=fast");
     expect(mcp.servers.objectCommand.command).toBe("npx object-mcp --root /workspace");
     expect(mcp.servers.bareCommand).toBe("bare-mcp --verbose");
     const text = payloadFileText(payload, "mcp.jsonc");
     expect(text).not.toContain("commentsecret");
+    expect(text).not.toContain("user:password");
     const destination = path.join(tempDir, "redacted-payload");
     await writeBackupPayload(destination, payload);
     expect((await readBackupPayload(destination)).redactions).toEqual(payload.redactions);
-    expect(payload.redactions).toEqual(["servers.api.headers.Authorization"]);
+    expect(payload.redactions).toEqual(["servers.api.url", "servers.api.headers.Authorization"]);
+  });
+
+  it("redacts inline env-style credentials in command strings into the manifest", async () => {
+    const token = "glsa_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_00000000";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          grafana: {
+            command: `GRAFANA_URL=https://grafana.example ORG_ID="1 2" GRAFANA_SERVICE_ACCOUNT_TOKEN=${token} mcp-grafana --transport stdio`,
+          },
+          bare: "FOO_TOKEN=hunter2 bare-mcp --verbose",
+        },
+      })
+    );
+
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const text = payloadFileText(payload, "mcp.jsonc");
+    expect(text).not.toContain(token);
+    expect(text).not.toContain("hunter2");
+    const mcp = jsonc.parse(text) as { servers: { grafana: { command: string }; bare: string } };
+    expect(mcp.servers.grafana.command).toBe(
+      `GRAFANA_URL=${REDACTED_BACKUP_VALUE} ORG_ID=${REDACTED_BACKUP_VALUE} GRAFANA_SERVICE_ACCOUNT_TOKEN=${REDACTED_BACKUP_VALUE} mcp-grafana --transport stdio`
+    );
+    expect(mcp.servers.bare).toBe(`FOO_TOKEN=${REDACTED_BACKUP_VALUE} bare-mcp --verbose`);
+    expect(payload.manifest.mcpRedactions).toEqual([
+      ["servers", "grafana", "command"],
+      ["servers", "bare"],
+    ]);
+
+    // The published checksum must verify against the redacted bytes as written.
+    const destination = path.join(tempDir, "command-redacted-payload");
+    await writeBackupPayload(destination, payload);
+    const written = await fs.readFile(path.join(destination, "mcp.jsonc"), "utf-8");
+    expect(written).not.toContain(token);
+    const entry = payload.manifest.files.find((file) => file.path === "mcp.jsonc");
+    expect(entry?.sha256).toBe(sha256Hex(written));
+    expect((await readBackupPayload(destination)).redactions).toEqual(payload.redactions);
+  });
+
+  it("restores an inline-redacted command from the local config and drops it elsewhere", async () => {
+    const command = "FOO_TOKEN=hunter2 notes-mcp --verbose";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { notes: { command } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+
+    const restored = jsonc.parse(
+      (
+        await resolveRestoredContent(
+          muxRoot,
+          payloadFile(payload, "mcp.jsonc"),
+          payload.manifest.mcpRedactions
+        )
+      ).toString("utf-8")
+    ) as { servers: { notes: { command: string } } };
+    expect(restored.servers.notes.command).toBe(command);
+
+    // A machine without the local command must not gain one the backup cannot carry.
+    const otherRoot = path.join(tempDir, "other-root");
+    await fs.mkdir(otherRoot);
+    const elsewhere = jsonc.parse(
+      (
+        await resolveRestoredContent(
+          otherRoot,
+          payloadFile(payload, "mcp.jsonc"),
+          payload.manifest.mcpRedactions
+        )
+      ).toString("utf-8")
+    ) as { servers: Record<string, unknown> };
+    expect(elsewhere.servers.notes).toBeUndefined();
+  });
+
+  it("blocks the export outright when a credential pattern survives redaction", async () => {
+    const token = "glsa_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_00000000";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      // As a plain argument rather than an env assignment, so redaction does not classify it.
+      JSON.stringify({ servers: { grafana: { command: `mcp-grafana --token ${token}` } } })
+    );
+
+    // reportSecrets covers only the reviewable scan; the credential backstop has no override.
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+    expect((blocked as BackupCredentialDetectedError).files).toEqual(["mcp.jsonc"]);
+
+    // The local safety snapshot never leaves the machine and stays exempt.
+    const snapshot = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      keepLocalSecrets: true,
+      reportSecrets: true,
+    });
+    expect(payloadFileText(snapshot, "mcp.jsonc")).toContain(token);
+  });
+
+  it("redacts identically when the settings root is a legacy .mux directory", async () => {
+    const legacyRoot = path.join(tempDir, ".mux");
+    await fs.mkdir(legacyRoot);
+    await writeFixtureFile(
+      legacyRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: "TOKEN=hunter2 mcp-grafana" } } })
+    );
+
+    const payload = await createBackupPayload({
+      muxRoot: legacyRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: ".mux",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(`TOKEN=${REDACTED_BACKUP_VALUE} mcp-grafana`);
+    expect(payload.manifest.mcpRedactions).toEqual([["servers", "grafana", "command"]]);
+    expect(payload.manifest.sourceLabel).toBe(".mux");
   });
 
   it("does not create manifests above the MCP redaction limit", async () => {
@@ -2444,7 +2583,7 @@ describe("backup payload", () => {
     }
   });
 
-  it("gates credential-bearing MCP URLs without rewriting them", async () => {
+  it("redacts credential-bearing MCP URLs whole-value", async () => {
     const urls = [
       "https://user:hunter2@example.com/mcp",
       "https:token@example.com/mcp",
@@ -2473,27 +2612,18 @@ describe("backup payload", () => {
         "mcp.jsonc",
         JSON.stringify({ servers: { private: { url } } })
       );
-      const blocked = await captureRejection(
-        createBackupPayload({
-          muxRoot,
-          muxVersion: "1.2.3",
-          sourceLabel: "test-host",
-        })
-      );
-      expect((blocked as Error).message).toContain("mcp.jsonc");
-
+      // No reportSecrets: with the credential redacted there is nothing left to approve.
       const payload = await createBackupPayload({
         muxRoot,
         muxVersion: "1.2.3",
         sourceLabel: "test-host",
-        reportSecrets: true,
       });
       const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
         servers: { private: { url: string } };
       };
-      expect(exported.servers.private.url).toBe(url);
-      expect(scanBackupFilesForSecrets(payload.files)).toEqual(["mcp.jsonc"]);
-      expect(payload.redactions).toEqual([]);
+      expect(exported.servers.private.url).toBe(REDACTED_BACKUP_VALUE);
+      expect(scanBackupFilesForSecrets(payload.files)).toEqual([]);
+      expect(payload.redactions).toEqual(["servers.private.url"]);
     }
   });
 

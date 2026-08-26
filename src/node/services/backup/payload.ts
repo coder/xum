@@ -67,13 +67,27 @@ function isForbiddenBasename(name: string): boolean {
 function isHiddenName(name: string): boolean {
   return name.startsWith(".");
 }
-const SECRET_PATTERNS = [
+/**
+ * Formats issued only as live credentials. A match aborts the export outright, with no
+ * user override: redaction is the primary mechanism, so a surviving match means either a
+ * shape redaction does not classify (a token passed as a command argument) or a redaction
+ * defect, and neither is something a backup should publish.
+ */
+const CREDENTIAL_TOKEN_PATTERNS = [
   /\bsk-[A-Za-z0-9_-]{16,}\b/,
   /\bghp_[A-Za-z0-9]{20,}\b/,
+  /\bgho_[A-Za-z0-9]{20,}\b/,
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,
+  /\bglsa_[A-Za-z0-9_]{20,}\b/,
+  /\blin_api_[A-Za-z0-9]{16,}\b/,
+  /\bntn_[A-Za-z0-9]{16,}\b/,
   /\bAKIA[0-9A-Z]{16}\b/,
+  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/,
+] as const;
+
+const SECRET_PATTERNS = [
+  ...CREDENTIAL_TOKEN_PATTERNS,
   /\bAIza[A-Za-z0-9_-]{35,}/,
-  /\bxoxb-[A-Za-z0-9-]{10,}\b/,
   /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
 ] as const;
 
@@ -125,6 +139,21 @@ export interface RestoreBackupPayloadOptions {
   muxRoot: string;
   payload: BackupPayload;
   approvedCommandTokens?: readonly string[];
+}
+
+/**
+ * No secretApproval digest on purpose: unlike the reviewable secret scan, this block has no
+ * user override, so the UI shows it as a hard failure instead of offering approval.
+ */
+export class BackupCredentialDetectedError extends Error {
+  readonly code = "SECRET_DETECTED";
+
+  constructor(readonly files: string[]) {
+    super(
+      `Backup blocked: values matching known credential formats were found in ${files.join(", ")}. Remove the credentials from the local files, then back up again.`
+    );
+    this.name = "BackupCredentialDetectedError";
+  }
 }
 
 export class BackupCommandApprovalRequiredError extends Error {
@@ -1055,6 +1084,10 @@ function isUnsupportedServerMap(value: unknown): boolean {
  * value is a credential, and `{ "API_KEY": "hunter2" }` is not something a scanner can catch.
  * Restore puts the local value back at that exact path, so a field only Xum ignores is not
  * lost from a machine that already has it.
+ *
+ * `command` and `url` pass the type check but can still carry credentials in-band, so the
+ * projection additionally redacts env-style assignment values in commands and whole urls
+ * with credential components.
  */
 const PORTABLE_SERVER_FIELDS: Record<string, (value: unknown) => boolean> = {
   command: (value) => typeof value === "string",
@@ -1098,6 +1131,22 @@ function valueHasRedactionAtPath(
   return typeof value === "string" && containsRedaction(value);
 }
 
+/**
+ * `NAME=value` assignments in a command string are how stdio servers get credentials
+ * (`GRAFANA_SERVICE_ACCOUNT_TOKEN=... mcp-grafana`), and nothing here can say which values
+ * are secret, so every assignment value is replaced. Matched anywhere in the string, not
+ * just before the program name, so `env NAME=value cmd` and trailing `KEY=value` arguments
+ * are covered too. Restore puts the whole local command back at that path.
+ */
+const COMMAND_ENV_ASSIGNMENT = /(^|\s)([A-Za-z_][A-Za-z0-9_]*=)("[^"]*"|'[^']*'|\S+)/g;
+
+function redactCommandEnvAssignments(command: string): string {
+  return command.replace(
+    COMMAND_ENV_ASSIGNMENT,
+    (_match, lead: string, name: string) => `${lead}${name}${REDACTED_BACKUP_VALUE}`
+  );
+}
+
 function redactMcpConfig(content: Buffer): {
   content: Buffer;
   redactionPaths: BackupRedactionPath[];
@@ -1109,6 +1158,13 @@ function redactMcpConfig(content: Buffer): {
 
   function redact(jsonPath: jsonc.JSONPath): void {
     edits.push({ path: jsonPath, value: REDACTED_BACKUP_VALUE });
+    redactionPaths.push([...jsonPath]);
+  }
+
+  function redactCommand(jsonPath: jsonc.JSONPath, command: string): void {
+    const redacted = redactCommandEnvAssignments(command);
+    if (redacted === command) return;
+    edits.push({ path: jsonPath, value: redacted });
     redactionPaths.push([...jsonPath]);
   }
 
@@ -1148,7 +1204,10 @@ function redactMcpConfig(content: Buffer): {
   for (const serverName of objectKeyNames(tree, ["servers"])) {
     const rawServer = readOwn(serverRecord, serverName);
     // A bare string entry is the stdio command itself (`McpConfigService.normalizeEntry`).
-    if (typeof rawServer === "string") continue;
+    if (typeof rawServer === "string") {
+      redactCommand(["servers", serverName], rawServer);
+      continue;
+    }
     const server = readRecord(rawServer);
     if (!server) {
       redact(["servers", serverName]);
@@ -1164,7 +1223,17 @@ function redactMcpConfig(content: Buffer): {
       if (isPortableField) {
         // Read as the wrong type, `normalizeEntry` ignores it, which makes it another place
         // to hide a value nobody reads.
-        if (!isPortableField(value)) redact(fieldPath);
+        if (!isPortableField(value)) {
+          redact(fieldPath);
+          continue;
+        }
+        if (field === "command" && typeof value === "string") redactCommand(fieldPath, value);
+        // Whole-value, not in-string: the userinfo/parameter detection deliberately covers
+        // malformed and percent-encoded spellings a partial rewrite could misparse and leave
+        // the credential in. Restore puts the local url back at this path.
+        if (field === "url" && typeof value === "string" && urlHasCredentialComponents(value)) {
+          redact(fieldPath);
+        }
         continue;
       }
       if (field === "headers") {
@@ -1386,6 +1455,20 @@ export async function createBackupPayload(
   assertBackupFileCount(files.length);
   assertBackupPathComplexity(files.map((file) => file.path));
   files.sort((a, b) => a.path.localeCompare(b.path));
+
+  // Backstop behind the redaction above, not the primary mechanism: a credential-format
+  // match in the finished payload always aborts, with no reportSecrets override. The local
+  // safety snapshot keeps secrets by design and never leaves the machine, so it is exempt.
+  if (options.keepLocalSecrets !== true) {
+    const leakedFiles = files
+      .filter((file) => {
+        const content = file.content.toString("utf-8");
+        return CREDENTIAL_TOKEN_PATTERNS.some((pattern) => pattern.test(content));
+      })
+      .map((file) => file.path)
+      .sort();
+    if (leakedFiles.length > 0) throw new BackupCredentialDetectedError(leakedFiles);
+  }
 
   if (options.reportSecrets !== true) {
     const secretFiles = scanBackupFilesForSecrets(files);

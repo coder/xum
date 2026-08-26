@@ -369,6 +369,7 @@ describe("BackupSection", () => {
         code: "SECRET_DETECTED",
         message: "Potential secrets were found in the backup payload: AGENTS.md",
         files: ["AGENTS.md"],
+        secretApproval: "digest-preview",
       },
     });
 
@@ -380,6 +381,26 @@ describe("BackupSection", () => {
 
     fireEvent.keyDown(window, { key: "o", code: "KeyO", ctrlKey: true, altKey: true });
     await waitFor(() => expect(override.getAttribute("data-state")).toBe("checked"));
+  });
+
+  test("offers no override for a credential block that carries no approval digest", async () => {
+    const { client, view } = renderBackupSection();
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    jest.spyOn(client.backup, "push").mockResolvedValueOnce({
+      success: false,
+      error: {
+        code: "SECRET_DETECTED",
+        message:
+          "Backup blocked: values matching known credential formats were found in mcp.jsonc.",
+        files: ["mcp.jsonc"],
+      },
+    });
+    fireEvent.click(canvas.getByRole("button", { name: "Back up now" }));
+
+    await canvas.findByText(/Backup blocked/i);
+    expect(canvas.queryByRole("checkbox", { name: "Override secret scan" })).toBeNull();
   });
 
   test("sends the approved digest and resets when the blocked payload changes", async () => {
@@ -440,7 +461,12 @@ describe("BackupSection", () => {
 
     const push = jest.spyOn(client.backup, "push").mockResolvedValueOnce({
       success: false,
-      error: { code: "SECRET_DETECTED", message: "Potential secrets", files: ["AGENTS.md"] },
+      error: {
+        code: "SECRET_DETECTED",
+        message: "Potential secrets",
+        files: ["AGENTS.md"],
+        secretApproval: "digest-agents",
+      },
     });
     fireEvent.click(canvas.getByRole("button", { name: "Back up now" }));
 
