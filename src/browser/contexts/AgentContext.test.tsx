@@ -9,7 +9,12 @@ import { GlobalWindow } from "happy-dom";
 import { useWorkspaceStoreRaw as getWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { shouldApplyWorkspaceAgentIdFromBackend } from "@/browser/utils/workspaceAiSettingsSync";
-import { GLOBAL_SCOPE_ID, getAgentIdKey, getProjectScopeId } from "@/common/constants/storage";
+import {
+  GLOBAL_SCOPE_ID,
+  getAgentIdKey,
+  getProjectScopeId,
+  getWorkspaceAISettingsByAgentKey,
+} from "@/common/constants/storage";
 import { requireTestModule } from "@/browser/testUtils";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -179,7 +184,12 @@ function Harness(props: HarnessProps) {
 
 function createWorkspaceMetadata(
   workspaceId: string,
-  overrides: { parentWorkspaceId?: string; agentId?: string; agentType?: string } = {}
+  overrides: {
+    parentWorkspaceId?: string;
+    agentId?: string;
+    agentType?: string;
+    aiSettingsByAgent?: FrontendWorkspaceMetadata["aiSettingsByAgent"];
+  } = {}
 ): FrontendWorkspaceMetadata {
   return {
     id: workspaceId,
@@ -190,6 +200,38 @@ function createWorkspaceMetadata(
     createdAt: "2025-01-01T00:00:00.000Z",
     runtimeConfig: { type: "local", srcBaseDir: "/tmp/.mux/src" },
     ...overrides,
+  };
+}
+
+interface WorkspaceMetadataEvent {
+  workspaceId: string;
+  metadata: FrontendWorkspaceMetadata | null;
+}
+
+// Push-based onMetadata channel so tests can deliver backend echoes mid-flight.
+let emitWorkspaceMetadata: ((event: WorkspaceMetadataEvent) => void) | null = null;
+
+function createWorkspaceMetadataIterable(): AsyncIterable<WorkspaceMetadataEvent> {
+  const queue: WorkspaceMetadataEvent[] = [];
+  let notify: (() => void) | null = null;
+  emitWorkspaceMetadata = (event) => {
+    queue.push(event);
+    notify?.();
+  };
+  return {
+    [Symbol.asyncIterator](): AsyncIterator<WorkspaceMetadataEvent> {
+      return {
+        next: async () => {
+          while (queue.length === 0) {
+            await new Promise<void>((resolve) => {
+              notify = resolve;
+            });
+            notify = null;
+          }
+          return { done: false, value: queue.shift()! };
+        },
+      };
+    },
   };
 }
 
@@ -215,7 +257,7 @@ function createApiClient(): APIClient {
     },
     workspace: {
       list: () => Promise.resolve(workspaceMetadata),
-      onMetadata: () => Promise.resolve(createEmptyAsyncIterable()),
+      onMetadata: () => Promise.resolve(createWorkspaceMetadataIterable()),
       onChat: () => Promise.resolve(createEmptyAsyncIterable()),
       getSessionUsage: () => Promise.resolve(undefined),
       activity: {
@@ -284,6 +326,7 @@ describe("AgentContext", () => {
     updateAgentAISettingsCalls = [];
     deferUpdateAgentAISettings = false;
     resolveUpdateAgentAISettings = null;
+    emitWorkspaceMetadata = null;
 
     originalWindow = globalThis.window;
     originalDocument = globalThis.document;
@@ -590,6 +633,69 @@ describe("AgentContext", () => {
 
     await waitFor(() => {
       expect(contextValue?.agentId).toBe("exec");
+    });
+  });
+
+  test("rejection rollback uses fresh backend metadata from a mid-flight echo", async () => {
+    const projectPath = "/tmp/project";
+    const workspaceId = "main-workspace";
+    mockAgentDefinitions = [EXEC_AGENT, PLAN_AGENT, REVIEW_PROJECT_AGENT];
+    mockWorkspaceMetadata.set(workspaceId, { agentId: "exec" });
+    window.localStorage.setItem(getAgentIdKey(workspaceId), JSON.stringify("exec"));
+    deferUpdateAgentAISettings = true;
+
+    let contextValue: AgentContextValue | undefined;
+
+    renderAgentHarness({
+      workspaceId,
+      projectPath,
+      onChange: (value) => (contextValue = value),
+    });
+
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("exec");
+    });
+
+    // exec→plan is accepted by the backend.
+    contextValue?.setAgentId("plan");
+    await waitFor(() => {
+      expect(resolveUpdateAgentAISettings).not.toBeNull();
+    });
+    const acceptPlanSwitch = getDeferredUpdateResolver();
+    resolveUpdateAgentAISettings = null;
+
+    // plan→review goes in flight BEFORE the acceptance echo arrives, so its
+    // render-time closure still sees the pre-echo backend state (exec).
+    contextValue?.setAgentId("review");
+    await waitFor(() => {
+      expect(resolveUpdateAgentAISettings).not.toBeNull();
+    });
+    const rejectReviewSwitch = getDeferredUpdateResolver();
+
+    acceptPlanSwitch?.({ success: true, data: undefined });
+
+    // Backend echo for the accepted switch lands mid-flight; the distinctive
+    // bucket makes the metadata flush observable.
+    emitWorkspaceMetadata?.({
+      workspaceId,
+      metadata: createWorkspaceMetadata(workspaceId, {
+        agentId: "plan",
+        aiSettingsByAgent: { plan: { model: "openai:echoed-plan", thinkingLevel: "low" } },
+      }),
+    });
+    await waitFor(() => {
+      const raw = window.localStorage.getItem(getWorkspaceAISettingsByAgentKey(workspaceId));
+      const cache =
+        raw == null ? null : (JSON.parse(raw) as Partial<Record<string, { model?: string }>>);
+      expect(cache?.plan?.model).toBe("openai:echoed-plan");
+    });
+
+    rejectReviewSwitch?.({ success: false, error: "unpriced model" });
+
+    // The rollback reads metadata at settle time: it restores the accepted
+    // plan agent, not the stale render-time exec baseline.
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("plan");
     });
   });
 

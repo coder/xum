@@ -7,7 +7,7 @@ import {
   getReasoningModeKey,
   getThinkingLevelKey,
 } from "@/common/constants/storage";
-import { normalizeAgentId } from "@/common/utils/agentIds";
+import { normalizeAgentId, resolvePersistedAgentId } from "@/common/utils/agentIds";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 
@@ -142,13 +142,14 @@ export function shouldApplyWorkspaceAgentIdFromBackend(
  * whereas a typed rejection cannot self-heal because the same gate refuses
  * subsequent sends before they re-persist settings.
  *
- * The restore target prefers the backend's authoritative agent id over the
- * locally captured pre-switch agent: with chained optimistic switches (A→B→C
- * where both writes are rejected), the last switch's captured "previous" is
- * the also-rejected B while the backend still stores A. Captured pre-switch
- * settings only apply when the restore target IS the captured agent; a
- * different target's agent-id write triggers the normal explicit-switch
- * resolution (WorkspaceModeAISync), which hydrates that agent's own bucket.
+ * The restore target prefers the backend's authoritative agent id (from
+ * fresh workspace metadata read at settle time, resolved through the legacy
+ * agentType compat path) over the locally captured pre-switch agent: with
+ * chained or overlapping optimistic switches, a captured "previous" can
+ * itself be a rejected or superseded agent while the backend stores another.
+ * Settings restore from the restore target's own metadata bucket (or the
+ * legacy shared blob, matching backend dispatch fallback), else from the
+ * captured pre-switch values when the target IS the captured agent.
  *
  * Only state the rejected switch itself wrote is undone: newer user changes
  * (a different agent, or edited model/thinking/reasoning) always win.
@@ -163,8 +164,8 @@ export function revertRejectedAgentSwitch(args: {
     thinkingLevel: ThinkingLevel;
     reasoningMode: OpenAIReasoningMode;
   };
-  /** Authoritative backend agent id at rejection time, when known. */
-  backendAgentId?: string | null;
+  /** Fresh workspace metadata at settle time (authoritative backend state). */
+  backendMetadata?: FrontendWorkspaceMetadata | null;
 }): void {
   const agentKey = getAgentIdKey(args.workspaceId);
   const rawCurrent = readPersistedState<string | null>(agentKey, null);
@@ -177,24 +178,46 @@ export function revertRejectedAgentSwitch(args: {
   }
 
   const previousAgentId = normalizeAgentId(args.previous.agentId);
+  const backendResolved = resolvePersistedAgentId(args.backendMetadata ?? undefined, "");
   const restoreAgentId =
-    typeof args.backendAgentId === "string" && args.backendAgentId.trim().length > 0
-      ? normalizeAgentId(args.backendAgentId)
-      : previousAgentId;
+    backendResolved.length > 0 ? normalizeAgentId(backendResolved) : previousAgentId;
+
+  // Authoritative settings for the restore target: its modern bucket, else the
+  // legacy shared blob (the same fallback backend dispatch resolution uses),
+  // else the captured pre-switch values when the target IS the captured agent.
+  // This runs even when no agent-id write is needed: the backend may already
+  // store the rejected agent id while the rejected SETTINGS came from a
+  // divergent carried-over selection.
+  const backendBucket =
+    args.backendMetadata?.aiSettingsByAgent?.[restoreAgentId] ?? args.backendMetadata?.aiSettings;
+  const restore = backendBucket
+    ? {
+        model: backendBucket.model,
+        thinkingLevel: backendBucket.thinkingLevel,
+        reasoningMode: backendBucket.reasoningMode ?? ("standard" as const),
+      }
+    : restoreAgentId === previousAgentId
+      ? {
+          model: args.previous.model,
+          thinkingLevel: args.previous.thinkingLevel,
+          reasoningMode: args.previous.reasoningMode,
+        }
+      : null;
 
   // Restore settings before the agent id so explicit-switch resolution runs
-  // against pre-switch values instead of the rejected ones.
-  if (restoreAgentId === previousAgentId) {
+  // against restored values instead of the rejected ones. Per-key guard: only
+  // undo state the rejected switch itself wrote, so newer user changes win.
+  if (restore) {
     if (
       readPersistedState<string | null>(getModelKey(args.workspaceId), null) === args.applied.model
     ) {
-      setWorkspaceModelWithOrigin(args.workspaceId, args.previous.model, "sync");
+      setWorkspaceModelWithOrigin(args.workspaceId, restore.model, "sync");
     }
     if (
       readPersistedState<ThinkingLevel | null>(getThinkingLevelKey(args.workspaceId), null) ===
       args.applied.thinkingLevel
     ) {
-      updatePersistedState(getThinkingLevelKey(args.workspaceId), args.previous.thinkingLevel);
+      updatePersistedState(getThinkingLevelKey(args.workspaceId), restore.thinkingLevel);
     }
     if (
       readPersistedState<OpenAIReasoningMode | null>(
@@ -202,7 +225,7 @@ export function revertRejectedAgentSwitch(args: {
         null
       ) === args.applied.reasoningMode
     ) {
-      updatePersistedState(getReasoningModeKey(args.workspaceId), args.previous.reasoningMode);
+      updatePersistedState(getReasoningModeKey(args.workspaceId), restore.reasoningMode);
     }
   }
 

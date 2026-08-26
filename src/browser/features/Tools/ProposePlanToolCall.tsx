@@ -51,7 +51,6 @@ import {
 } from "@/common/constants/storage";
 import { getDefaultModel } from "@/browser/hooks/useModelsFromSettings";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { resolvePersistedAgentId } from "@/common/utils/agentIds";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import {
@@ -206,12 +205,14 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     : undefined;
   const runtimeConfig = workspaceMetadata?.runtimeConfig;
 
-  // Authoritative restore baseline for typed send rejections: a pending
-  // picker switch may itself be rejected, so the captured pre-action agent is
-  // not necessarily what the backend stores. Resolved through the legacy
-  // compat resolver (agentType-only metadata), like metadata seeding.
-  const resolvedBackendAgentId = resolvePersistedAgentId(workspaceMetadata, "");
-  const backendAgentId = resolvedBackendAgentId.length > 0 ? resolvedBackendAgentId : null;
+  // Fresh authoritative metadata for rejection rollbacks (see
+  // revertRejectedAgentSwitch): read at settle time via a ref so an in-flight
+  // picker write that lands mid-action cannot leave a stale baseline in the
+  // send handler's closure.
+  const workspaceMetadataRef = useRef(workspaceMetadata);
+  useEffect(() => {
+    workspaceMetadataRef.current = workspaceMetadata;
+  });
 
   // Fresh content from disk for the latest plan (external edit detection)
   // Only use cache for completed tools (page reload case) - not for in-flight tools
@@ -560,7 +561,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
             thinkingLevel: existingThinking,
             reasoningMode: existingReasoning,
           },
-          backendAgentId,
+          backendMetadata: workspaceMetadataRef.current,
         }),
     };
   };

@@ -37,11 +37,7 @@ import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking
 import { getErrorMessage } from "@/common/utils/errors";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { sortAgentsStable } from "@/browser/utils/agents";
-import {
-  normalizeAgentId,
-  resolvePersistedAgentId,
-  resolveRemovedBuiltinAgentId,
-} from "@/common/utils/agentIds";
+import { normalizeAgentId, resolveRemovedBuiltinAgentId } from "@/common/utils/agentIds";
 import {
   clearPendingWorkspaceAgentId,
   markPendingWorkspaceAgentId,
@@ -146,13 +142,15 @@ function AgentProviderWithState(props: {
   // is locked, so local changes must never be written back.
   const isCurrentAgentLocked = currentMeta?.parentWorkspaceId != null;
 
-  // Authoritative restore baseline for rejected switches: with chained
-  // rejected switches, a captured "previous" can itself be a rejected agent,
-  // while the backend still stores the last accepted one. Resolved through
-  // the legacy compat resolver (agentType-only metadata), like metadata
-  // seeding.
-  const resolvedBackendAgentId = resolvePersistedAgentId(currentMeta, "");
-  const backendAgentId = resolvedBackendAgentId.length > 0 ? resolvedBackendAgentId : null;
+  // Fresh authoritative metadata for rejection rollbacks, read at settle time
+  // via a ref: an accepted A→B write can update backend metadata while a
+  // later B→C switch is in flight, and C's rejection must restore B, not a
+  // render-time snapshot of A. (The pending guard may suppress B's
+  // localStorage echo, but the metadata map itself stays current.)
+  const currentMetaRef = useRef(currentMeta);
+  useEffect(() => {
+    currentMetaRef.current = currentMeta;
+  });
 
   const workspaceId = props.workspaceId;
 
@@ -261,7 +259,7 @@ function AgentProviderWithState(props: {
             thinkingLevel: previousThinking,
             reasoningMode: previousReasoning,
           },
-          backendAgentId,
+          backendMetadata: currentMetaRef.current,
         });
       };
 
@@ -297,7 +295,6 @@ function AgentProviderWithState(props: {
     [
       agents,
       api,
-      backendAgentId,
       globalDefaultAgentId,
       isCurrentAgentLocked,
       isProjectScope,

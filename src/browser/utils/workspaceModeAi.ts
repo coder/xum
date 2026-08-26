@@ -92,25 +92,31 @@ export function resolveWorkspaceAiSettingsForAgent(args: {
     args.useWorkspaceByAgentFallback && typeof workspaceOverride?.model === "string"
       ? workspaceOverride.model
       : undefined;
-  const inheritedModelCandidate =
-    workspaceOverrideModel ??
-    (typeof args.existingModel === "string" ? args.existingModel : undefined) ??
-    "";
-  const inheritedModel = inheritedModelCandidate.trim();
+  const overrideModel = workspaceOverrideModel?.trim();
+  const existingModel = (typeof args.existingModel === "string" ? args.existingModel : "").trim();
+  // The workspace's own saved bucket wins on explicit switches, matching
+  // backend dispatch and ACP resolution (bucket → configured/base-chain
+  // defaults → current workspace value): persisting a switch must not
+  // overwrite the workspace's last-used settings with a global default.
   const resolvedModel =
-    configuredModel && configuredModel.length > 0
-      ? configuredModel
-      : inheritedModel.length > 0
-        ? inheritedModel
-        : args.fallbackModel;
+    overrideModel && overrideModel.length > 0
+      ? overrideModel
+      : configuredModel && configuredModel.length > 0
+        ? configuredModel
+        : existingModel.length > 0
+          ? existingModel
+          : args.fallbackModel;
 
   // Persisted workspace settings can be stale/corrupt; re-validate inherited values
   // so mode sync keeps self-healing behavior instead of propagating invalid options.
   const workspaceOverrideThinking = args.useWorkspaceByAgentFallback
     ? coerceThinkingLevel(workspaceOverride?.thinkingLevel)
     : undefined;
-  const inheritedThinking = workspaceOverrideThinking ?? coerceThinkingLevel(args.existingThinking);
-  const resolvedThinking = configuredDefaults.thinkingLevel ?? inheritedThinking ?? "off";
+  const resolvedThinking =
+    workspaceOverrideThinking ??
+    configuredDefaults.thinkingLevel ??
+    coerceThinkingLevel(args.existingThinking) ??
+    "off";
 
   // An existing per-agent bucket owns the reasoning choice outright (matching
   // targetWorkspaceBucketToLayer): a configured Pro default must not re-inject

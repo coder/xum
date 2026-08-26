@@ -57,6 +57,28 @@ describe("resolveWorkspaceAiSettingsForAgent", () => {
     });
   });
 
+  test("a saved workspace bucket beats configured defaults on explicit switches", () => {
+    const result = resolveWorkspaceAiSettingsForAgent({
+      agentId: "exec",
+      agentAiDefaults: {
+        exec: { modelString: "openai:configured-default", thinkingLevel: "medium" },
+      },
+      workspaceByAgent: {
+        exec: { model: "anthropic:workspace-bucket", thinkingLevel: "high" },
+      },
+      useWorkspaceByAgentFallback: true,
+      fallbackModel: "openai:gpt-5.2-mini",
+      existingModel: "anthropic:claude-opus-4-6",
+      existingThinking: "off",
+    });
+
+    // Matches backend dispatch/ACP layering: the workspace's own bucket
+    // precedes configured defaults, so switching away and back cannot
+    // overwrite the workspace's last-used settings with a global default.
+    expect(result.resolvedModel).toBe("anthropic:workspace-bucket");
+    expect(result.resolvedThinking).toBe("high");
+  });
+
   test("ignores workspace-by-agent fallback when disabled", () => {
     const result = resolveWorkspaceAiSettingsForAgent({
       agentId: "exec",
