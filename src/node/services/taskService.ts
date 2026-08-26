@@ -8797,6 +8797,36 @@ export class TaskService implements AgentTaskIntegration {
     return this.listDescendantAgentTaskIdsFromIndex(index, workspaceId).length > 0;
   }
 
+  /**
+   * List all descendant agent task IDs sorted deepest-first so callers can
+   * cascade-remove children before their parents without tripping the orphan guard.
+   */
+  listDescendantAgentTaskIdsDeepestFirst(workspaceId: string): string[] {
+    assert(
+      workspaceId.length > 0,
+      "listDescendantAgentTaskIdsDeepestFirst: workspaceId must be non-empty"
+    );
+
+    const cfg = this.config.loadConfigOrDefault();
+    const index = this.buildAgentTaskIndex(cfg);
+    const ids = this.listDescendantAgentTaskIdsFromIndex(index, workspaceId);
+
+    // Sort by depth (deepest first) so leaf children are removed before their parents.
+    // Ties are broken by insertion order (stable sort).
+    const depthById = new Map<string, number>();
+    for (const id of ids) {
+      let depth = 0;
+      let current: string | undefined = id;
+      while (current != null && current !== workspaceId) {
+        depth++;
+        current = index.parentById.get(current);
+      }
+      depthById.set(id, depth);
+    }
+
+    return ids.sort((a, b) => (depthById.get(b) ?? 0) - (depthById.get(a) ?? 0));
+  }
+
   hasActiveDescendantAgentTasksForWorkspace(workspaceId: string): boolean {
     assert(
       workspaceId.length > 0,

@@ -642,7 +642,7 @@ type WorkspaceDevToolsCleanup = Pick<DevToolsService, "hasWorkspaceData" | "remo
 const POST_COMPACTION_METADATA_REFRESH_DEBOUNCE_MS = 100;
 
 const DESCENDANT_WORKSPACE_REMOVE_ERROR =
-  "This workspace has descendant sub-agent workspaces. Remove those descendants deepest-first before removing their parent.";
+  "This workspace has active descendant sub-agent workspaces. Stop them before removing their parent.";
 const ACTIVE_DESCENDANT_ARCHIVE_ERROR =
   "This workspace has active descendant sub-agents. Stop them before archiving their parent.";
 const MULTI_PROJECT_WORKSPACES_DISABLED_ERROR = "Multi-project workspaces experiment is disabled";
@@ -5549,8 +5549,24 @@ export class WorkspaceService extends EventEmitter implements WorkspaceHost {
 
     // Try to remove from runtime (filesystem)
     try {
-      if (this.agentTaskIntegration?.hasDescendantAgentTasks(workspaceId) === true) {
+      // Block deletion when active descendants are still running — the user must
+      // stop them first. Inactive (reported/interrupted) descendants are cascade-removed
+      // deepest-first so persistent sub-agents don't permanently block parent deletion.
+      if (
+        this.agentTaskIntegration?.hasActiveDescendantAgentTasksForWorkspace(workspaceId) === true
+      ) {
         return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
+      }
+
+      const descendantIds =
+        this.agentTaskIntegration?.listDescendantAgentTaskIdsDeepestFirst(workspaceId) ?? [];
+      for (const descendantId of descendantIds) {
+        const childResult = await this.removeUnlocked(descendantId, true);
+        if (!childResult.success) {
+          return Err(
+            `Failed to cascade-remove descendant workspace ${descendantId}: ${childResult.error}`
+          );
+        }
       }
 
       // Stop any active stream before deleting metadata/config to avoid tool calls racing with removal.

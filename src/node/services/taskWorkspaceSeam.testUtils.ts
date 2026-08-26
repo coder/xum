@@ -65,6 +65,7 @@ export function makeAgentTaskIntegrationFake(
       operation(),
     hasDescendantAgentTasks: () => false,
     hasActiveDescendantAgentTasksForWorkspace: () => false,
+    listDescendantAgentTaskIdsDeepestFirst: () => [],
     hasActiveTopLevelWorkflowRunsForWorkspace: () => Promise.resolve(false),
     getAgentTaskStatus: () => undefined,
     resetAutoResumeCount: () => undefined,
