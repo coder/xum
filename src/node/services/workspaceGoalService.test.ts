@@ -476,6 +476,64 @@ describe("WorkspaceGoalService", () => {
     expect(reconciled).toMatchObject({ status: "active" });
   });
 
+  test("a paused write invalidates captured redispatch admissions before publication completes", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cSREI): the explicit-pause generation must
+    // bump at the durable write commit, not after snapshot/preview
+    // publication — a captured continuation's admission probe re-checked
+    // during the publication awaits (before setGoal returns and arms the
+    // finalization hold) must already read stale, or an autonomous turn could
+    // be admitted against the committed Pause.
+    const created = await setGoalOk(service, { workspaceId, objective: "Pause admission" });
+    const admission = await service.buildGoalRedispatchAdmission(
+      workspaceId,
+      created.goalId,
+      GOAL_CONTINUATION_KIND
+    );
+    expect(admission.admissible).toBe(true);
+    if (!admission.admissible) {
+      throw new Error("expected admissible probe");
+    }
+    expect(admission.admissionStale()).toBe(false);
+
+    // Block publication so the paused record is durable while setGoal is
+    // still awaiting inside its locked persistence.
+    let releasePublication!: () => void;
+    const publicationGate = new Promise<void>((resolve) => {
+      releasePublication = resolve;
+    });
+    const pushSnapshotSpy = spyOn(
+      service as unknown as { pushSnapshot: (workspaceId: string, goal: unknown) => Promise<void> },
+      "pushSnapshot"
+    ).mockImplementation(async () => {
+      await publicationGate;
+    });
+    try {
+      const pausePromise = service.setGoal({
+        workspaceId,
+        status: "paused",
+        initiator: "user",
+      });
+      const goalPath = path.join(config.getSessionDir(workspaceId), "goal.json");
+      await waitForCondition(async () => {
+        try {
+          const raw = JSON.parse(await fs.readFile(goalPath, "utf-8")) as { status?: string };
+          return raw.status === "paused";
+        } catch {
+          return false;
+        }
+      });
+      // The durable pause has committed but publication (and the finalization
+      // hold arming) has not — the captured probe must already be stale.
+      expect(admission.admissionStale()).toBe(true);
+      releasePublication();
+      const paused = await pausePromise;
+      expect(paused.success).toBe(true);
+    } finally {
+      releasePublication();
+      pushSnapshotSpy.mockRestore();
+    }
+  });
+
   test("getGoal pauses a never-driven model-created goal on an unprocessed pre-goal row", async () => {
     // Codex security P2 (PRRT_kwDOPxxmWM6cSGrq): only explicit user activation
     // is consent. A model-published goal whose chat tail ends at a queue-raced

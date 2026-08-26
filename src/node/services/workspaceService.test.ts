@@ -6358,13 +6358,27 @@ describe("WorkspaceService sendMessage status clearing", () => {
         }),
         getPendingGoalSnapshot: mock(() => null),
       } as unknown as WorkspaceGoalService);
-      // Ref object: closure assignments to a `let` are invisible to TS
-      // control-flow narrowing at the later assertion site.
-      const probeDuringSessionSend: { value: boolean | null } = { value: null };
-      fakeSession.sendMessage.mockImplementationOnce(() => {
-        probeDuringSessionSend.value = probe!();
-        return Promise.resolve(Ok(undefined));
-      });
+      // Ref objects: closure assignments to a `let` are invisible to TS
+      // control-flow narrowing at the later assertion sites.
+      const probeBeforeAdmission: { value: boolean | null } = { value: null };
+      const probeAfterAdmission: { value: boolean | null } = { value: null };
+      fakeSession.sendMessage.mockImplementationOnce(
+        (
+          _message: unknown,
+          _options: unknown,
+          internal?: { onTurnAdmissionCommitted?: () => void }
+        ) => {
+          // Codex P2 (PRRT_kwDOPxxmWM6cSRkH): the reservation must survive the
+          // session's admission awaits (the idle gap before the busy claim)...
+          probeBeforeAdmission.value = probe!();
+          internal?.onTurnAdmissionCommitted?.();
+          // ...and release the moment the turn synchronously claims PREPARING,
+          // so a follow-up redispatched from within this very turn (on-send
+          // compaction completion) does not veto itself.
+          probeAfterAdmission.value = probe!();
+          return Promise.resolve(Ok(undefined));
+        }
+      );
 
       const sendPromise = workspaceService.sendMessage("test-workspace", "manual message", {
         model: "openai:gpt-4o-mini",
@@ -6373,12 +6387,53 @@ describe("WorkspaceService sendMessage status clearing", () => {
       await waitForCondition(() => pricingStarted);
       expect(probe!()).toBe(true);
 
-      // Once the send reaches the session handoff its reservation releases:
-      // a follow-up redispatched from within that turn must not see it.
       releasePricing();
       const result = await sendPromise;
       expect(result.success).toBe(true);
-      expect(probeDuringSessionSend.value).toBe(false);
+      expect(probeBeforeAdmission.value).toBe(true);
+      expect(probeAfterAdmission.value).toBe(false);
+      // Fully settled: no residual reservation leaks.
+      expect(probe!()).toBe(false);
+    } finally {
+      realSession.dispose();
+    }
+  });
+
+  test("holds the preflight reservation through resumeStream session admission", async () => {
+    // Codex P1 (PRRT_kwDOPxxmWM6cSREO): AgentSession.resumeStream runs its own
+    // async admission (a second pricing gate) during which the session still
+    // reports idle. Releasing the reservation before that await let follow-up
+    // recovery admit a recovered synthetic turn that then ran concurrently
+    // with the resumed stream — the reservation must survive until the session
+    // call settles.
+    fakeSession.isBusy.mockReturnValue(false);
+    const realSession = (
+      workspaceService as unknown as { createSession: (workspaceId: string) => AgentSession }
+    ).createSession("test-workspace");
+    // The shared fixture aiService omits stopStream; disposal needs it.
+    (
+      realSession as unknown as { aiService: { stopStream?: () => Promise<unknown> } }
+    ).aiService.stopStream = () => Promise.resolve(Ok(undefined));
+    const probe = (realSession as unknown as { hasExternalSendPreflight?: () => boolean })
+      .hasExternalSendPreflight;
+    expect(probe).toBeDefined();
+    try {
+      workspaceService.setWorkspaceGoalService({
+        assertPricedModelForBudgetedGoal: mock(() => Promise.resolve(Ok(undefined))),
+        getPendingGoalSnapshot: mock(() => null),
+      } as unknown as WorkspaceGoalService);
+      const probeDuringResume: { value: boolean | null } = { value: null };
+      fakeSession.resumeStream.mockImplementationOnce(() => {
+        probeDuringResume.value = probe!();
+        return Promise.resolve(Ok({ started: true }));
+      });
+
+      const result = await workspaceService.resumeStream("test-workspace", {
+        model: "openai:gpt-4o-mini",
+        agentId: "exec",
+      });
+      expect(result.success).toBe(true);
+      expect(probeDuringResume.value).toBe(true);
       // Fully settled: no residual reservation leaks.
       expect(probe!()).toBe(false);
     } finally {

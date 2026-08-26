@@ -1147,6 +1147,22 @@ export class WorkspaceGoalService {
         (this.terminalStatusGenerations.get(workspaceId) ?? 0) + 1
       );
     }
+    // See explicitPauseGenerations: also bumped at the write commit point
+    // (Codex P1 PRRT_kwDOPxxmWM6cSREI). persistGoalMutationLocked awaits
+    // snapshot/preview publication AFTER the durable paused write and before
+    // setGoalImmediately arms the finalization hold — a captured
+    // continuation's admissionStale probe would otherwise still read the
+    // pre-pause generation during that publication window and admit an
+    // autonomous turn against the committed Pause. Restore/reconciliation
+    // writes of paused records bump too; consumers compare generations for
+    // inequality, so extra bumps only cause conservative staleness refusals
+    // that retry.
+    if (goal.status === "paused") {
+      this.explicitPauseGenerations.set(
+        workspaceId,
+        (this.explicitPauseGenerations.get(workspaceId) ?? 0) + 1
+      );
+    }
     // See goalIdentityGenerations: identity changes (replacement, revival,
     // first write of the process) invalidate captured dispatch admissions.
     if (this.lastWrittenGoalIds.get(workspaceId) !== goal.goalId) {

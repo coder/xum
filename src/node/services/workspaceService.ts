@@ -11113,11 +11113,17 @@ export class WorkspaceService extends EventEmitter {
         claimedAutoTitle = true;
       }
 
-      // Handoff: from here the send is the session's own admission problem —
-      // release the probe reservation so a follow-up redispatched from within
-      // this very turn (on-send compaction completion) does not veto itself.
-      sessionInvisiblePreflight.release();
+      // Handoff: the session releases the probe reservation the moment the
+      // turn synchronously claims PREPARING (onTurnAdmissionCommitted), so a
+      // follow-up redispatched from within this very turn (on-send compaction
+      // completion) does not veto itself — while the admission awaits between
+      // here and the busy claim stay covered. Codex P2 (PRRT_kwDOPxxmWM6cSRkH):
+      // releasing at the handoff itself left AgentSession's
+      // cancelBeforeAcceptance yield observable as idle, letting follow-up
+      // recovery admit an exec turn ahead of the accepted manual send. Refusal
+      // paths never fire the callback; the scoped disposal releases on return.
       const result = await session.sendMessage(message, continuationSendState.options, {
+        onTurnAdmissionCommitted: () => sessionInvisiblePreflight.release(),
         synthetic: internal?.synthetic,
         agentInitiated: internal?.agentInitiated,
         goalKind: internal?.goalKind,
@@ -11362,10 +11368,18 @@ export class WorkspaceService extends EventEmitter {
         });
       }
 
-      sessionInvisiblePreflight.release();
+      // Codex P1 (PRRT_kwDOPxxmWM6cSREO): resumeStream runs its own async
+      // admission (a second pricing gate) during which the session still
+      // reports idle — releasing the reservation before that await let
+      // follow-up recovery admit a recovered synthetic turn that then ran
+      // concurrently with the resumed stream. Hold the reservation until the
+      // session call settles: resumeStream returns once the stream has
+      // started (or refused), so no follow-up redispatched from within the
+      // resumed turn itself can observe the reservation and self-veto.
       const result = await session.resumeStream(normalizedOptions, {
         agentInitiated: internal?.agentInitiated,
       });
+      sessionInvisiblePreflight.release();
       if (!result.success) {
         log.error("resumeStream handler: session returned error", {
           workspaceId,

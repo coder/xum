@@ -2857,11 +2857,24 @@ export class AgentSession {
       cancelSignal?: AbortSignal;
       /**
        * For queue-dispatched sends: when the user last added to the queued
-       * entry. Goal safety uses it to skip auto-pausing a goal created AFTER
-       * the message was typed (queued while the goal-creating turn streamed) —
-       * the user cannot have been intervening against a goal they had not seen.
+       * entry. Goal safety compares it against the goal's explicit
+       * user-activation consent stamp — a message the user visibly left
+       * pending while activating the goal must not auto-pause it (Codex
+       * security P2 PRRT_kwDOPxxmWM6cSGrq: creation time alone is not
+       * consent).
        */
       enqueuedAtMs?: number;
+      /**
+       * Codex P2 (PRRT_kwDOPxxmWM6cSRkH): fired synchronously the moment this
+       * turn claims PREPARING (isBusy() becomes true). WorkspaceService keeps
+       * its session-invisible preflight reservation armed until this fires so
+       * follow-up recovery cannot observe the idle gap between the service
+       * handoff and the busy claim (cancelBeforeAcceptance and the other
+       * admission awaits yield) and admit a synthetic turn ahead of the
+       * accepted manual send. Refusal paths never fire it — the service's
+       * scoped disposal releases the reservation when the call returns.
+       */
+      onTurnAdmissionCommitted?: () => void;
       /**
        * Synthetic assistant rows persisted immediately before this turn's user
        * row (family-message payloads). Persisting them inside turn admission —
@@ -3903,6 +3916,9 @@ export class AgentSession {
     this.activePreparedTurnAbortController = preparedTurnAbortController;
     this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(optionsForStream.muxMetadata);
     this.setTurnPhase(TurnPhase.PREPARING);
+    // From this synchronous point isBusy() reports the turn — release the
+    // service-side preflight reservation (see onTurnAdmissionCommitted doc).
+    internal?.onTurnAdmissionCommitted?.();
 
     const startPreparedStream = async (): Promise<Result<void, SendMessageError>> => {
       try {
