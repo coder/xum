@@ -29,6 +29,7 @@ import {
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
+import type { SuppressedKernelResult } from "@/browser/features/Tools/Shared/codeExecutionTypes";
 
 /**
  * Check if a tool result indicates success (for tools that return { success: boolean })
@@ -540,14 +541,21 @@ function reconstructCodeExecutionNestedCalls(part: DynamicToolPart): NestedToolC
       output:
         record.result ??
         (typeof record.error === "string"
-          ? { error: record.error }
+          ? // success:false matches the failure shape tool cards and
+            // isFailedToolOutput already understand, so the error stays
+            // visible (e.g. bash's ErrorBox) after reload.
+            { success: false, error: record.error }
           : typeof record.bytes === "number" && typeof record.ok === "boolean"
             ? // RLM kernel-mode compact record (r12): the full nested result
               // never persists in the tool output — degraded detail after
-              // reload is expected. Surface the summary so the card still
-              // renders something meaningful. Live streaming keeps full
-              // detail via part.nestedCalls, which takes precedence here.
-              { suppressed: true, ok: record.ok, bytes: record.bytes }
+              // reload is expected. Surface the summary so the status still
+              // reflects ok/failure. Live streaming keeps full detail via
+              // part.nestedCalls, which takes precedence here.
+              ({
+                suppressed: true,
+                ok: record.ok,
+                bytes: record.bytes,
+              } satisfies SuppressedKernelResult)
             : undefined),
       state: "output-available",
       timestamp: part.timestamp,

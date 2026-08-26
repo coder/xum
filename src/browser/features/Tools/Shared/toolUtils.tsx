@@ -6,6 +6,7 @@ import {
   type UseStickyExpandOptions,
 } from "@/browser/features/Messages/useStickyExpand";
 import { LoadingDots } from "./ToolPrimitives";
+import { isSuppressedKernelResult } from "./codeExecutionTypes";
 
 /**
  * Shared utilities and hooks for tool components
@@ -182,6 +183,8 @@ export function isToolErrorResult(val: unknown): val is ToolErrorResult {
  */
 export function isFailedToolOutput(output: unknown): boolean {
   if (!output || typeof output !== "object") return false;
+  // Kernel-mode compact summaries carry success as `ok` (the result itself is suppressed).
+  if (isSuppressedKernelResult(output)) return !output.ok;
   if ("success" in output && (output as { success: unknown }).success === false) return true;
   if ("error" in output) return true;
   return false;

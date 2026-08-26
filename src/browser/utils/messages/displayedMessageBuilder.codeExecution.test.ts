@@ -52,7 +52,8 @@ describe("buildDisplayedMessagesForMessage code_execution nested-call reconstruc
     ]);
     expect(row.nestedCalls).toHaveLength(2);
     expect(row.nestedCalls?.[0]?.output).toEqual({ suppressed: true, ok: true, bytes: 12345 });
-    // Failure detail stays visible on reload.
-    expect(row.nestedCalls?.[1]?.output).toEqual({ error: "boom" });
+    // Failure detail stays visible on reload, in the failure shape tool
+    // cards already understand.
+    expect(row.nestedCalls?.[1]?.output).toEqual({ success: false, error: "boom" });
   });
 });

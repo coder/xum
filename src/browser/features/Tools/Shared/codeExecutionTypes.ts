@@ -44,3 +44,24 @@ export interface NestedToolCall {
   failed?: boolean;
   timestamp?: number;
 }
+
+/**
+ * Reload-time stand-in for an RLM kernel-mode compact record whose real
+ * result was suppressed (displayedMessageBuilder reconstructs this shape from
+ * {ok, bytes}). It is NOT a tool result: specialized tool cards must not read
+ * tool fields from it (e.g. bash's exitCode), or they render placeholder
+ * garbage like an empty exit-code pill.
+ */
+export interface SuppressedKernelResult {
+  suppressed: true;
+  ok: boolean;
+  bytes: number;
+}
+
+export function isSuppressedKernelResult(value: unknown): value is SuppressedKernelResult {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    record.suppressed === true && typeof record.ok === "boolean" && typeof record.bytes === "number"
+  );
+}
