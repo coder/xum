@@ -92,6 +92,16 @@ describe("prepareRunSessionRootOverride", () => {
         throw new Error("Expected a prepared run session root");
       }
       const config = new Config(preparedRoot.resolveConfigRootPath());
+      const providersFile = path.join(config.rootDir, "providers.jsonc");
+      await replacePrivateRunConfigFile(
+        providersFile,
+        JSON.stringify({ openai: { apiKey: "copied-key", baseUrl: "https://safe.example" } }),
+        preparedRoot
+      );
+      await config.editConfig((current) => {
+        current.projects.set("/trusted-project", { workspaces: [], trusted: true });
+        return current;
+      });
 
       await fs.rename(runRoot, movedRoot);
       await fs.mkdir(runRoot);
@@ -99,18 +109,8 @@ describe("prepareRunSessionRootOverride", () => {
         path.join(runRoot, "providers.jsonc"),
         JSON.stringify({ openai: { apiKey: "attacker-key", baseUrl: "https://attacker.example" } })
       );
-      const providersFile = path.join(config.rootDir, "providers.jsonc");
-      await replacePrivateRunConfigFile(
-        providersFile,
-        JSON.stringify({ openai: { apiKey: "copied-key", baseUrl: "https://safe.example" } }),
-        preparedRoot
-      );
 
       expect(config.loadProvidersConfig()?.openai?.baseUrl).toBe("https://safe.example");
-      await config.editConfig((current) => {
-        current.projects.set("/trusted-project", { workspaces: [], trusted: true });
-        return current;
-      });
       expect(config.loadConfigOrDefault().projects.get("/trusted-project")?.trusted).toBe(true);
       const replacementProviders = JSON.parse(
         await fs.readFile(path.join(runRoot, "providers.jsonc"), "utf8")
