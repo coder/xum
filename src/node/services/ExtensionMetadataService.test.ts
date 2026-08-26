@@ -939,6 +939,78 @@ describe("ExtensionMetadataService", () => {
     expect(sidecarGone).toBe(true);
   });
 
+  test("an unprobeable sidecar during resumed recovery keeps the strict read retryable", async () => {
+    // The once-per-process leftover check found the sidecar, but the
+    // re-probe INSIDE the queued recovery transiently fails (EACCES/EIO
+    // class): reporting it absent would accept the recreated partial main
+    // and never look at the sidecar again for the process lifetime. The
+    // failure must propagate (latch reset) so a later read reconciles.
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-new": { recency: 300, streaming: false } },
+      })
+    );
+    await writeFile(
+      `${filePath}.corrupt`,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-other": { recency: 42, streaming: false } },
+      })
+    );
+    const restarted = new ExtensionMetadataService(filePath);
+    const internals = restarted as unknown as {
+      probeQuarantineSidecar: () => Promise<boolean>;
+    };
+    const originalProbe = internals.probeQuarantineSidecar.bind(restarted);
+    let probeCalls = 0;
+    internals.probeQuarantineSidecar = async () => {
+      probeCalls += 1;
+      if (probeCalls === 2) {
+        // Second probe = the one inside resumeQuarantineRecovery's queue.
+        internals.probeQuarantineSidecar = originalProbe;
+        const error = new Error("probe blocked") as NodeJS.ErrnoException;
+        error.code = "EACCES";
+        throw error;
+      }
+      return originalProbe();
+    };
+
+    let strictError: unknown = null;
+    try {
+      await restarted.getAllSnapshots({ throwOnError: true });
+    } catch (error) {
+      strictError = error;
+    }
+    expect((strictError as NodeJS.ErrnoException | null)?.code).toBe("EACCES");
+    // Latch was reset: the retry probes again and reconciles the sidecar.
+    const snapshots = await restarted.getAllSnapshots({ throwOnError: true });
+    expect(snapshots.get("ws-new")?.recency).toBe(300);
+    expect(snapshots.get("ws-other")?.recency).toBe(42);
+  });
+
+  test("a registration probe clears a stale tombstone and lets the write persist", async () => {
+    await service.updateRecency("ws-1", 100);
+    await service.deleteWorkspace("ws-1");
+    // No probe wired: tombstones stay strictly write-suppressing.
+    await service.updateRecency("ws-1", 200);
+    expect((await service.getAllSnapshots()).has("ws-1")).toBe(false);
+    // Probe reporting the id NOT registered: still suppressed.
+    let registered = false;
+    service.setRegistrationProbe(() => Promise.resolve(registered));
+    await service.updateRecency("ws-1", 300);
+    expect((await service.getAllSnapshots()).has("ws-1")).toBe(false);
+    expect(service.isWorkspaceDeleted("ws-1")).toBe(true);
+    // Re-registered (e.g. by a downgraded concurrent backend): the write
+    // must persist without waiting for an activity bootstrap, and the
+    // tombstone lifts so broadcasts resume too.
+    registered = true;
+    await service.updateRecency("ws-1", 400);
+    expect((await service.getAllSnapshots()).get("ws-1")?.recency).toBe(400);
+    expect(service.isWorkspaceDeleted("ws-1")).toBe(false);
+  });
+
   test("clearTombstonesForRegisteredIds only clears tombstones the evidence postdates", async () => {
     await service.updateRecency("ws-1", 100);
     // Evidence snapshot captured BEFORE the removal: a tombstone published

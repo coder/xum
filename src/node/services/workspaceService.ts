@@ -13060,10 +13060,19 @@ export class WorkspaceService extends EventEmitter {
       // fresh evidence if the id really is re-registered.
       const clearableTombstoneIds = this.extensionMetadata.getTombstonedIds();
       let freshConfigIds: ReadonlySet<string> | null = null;
+      // Whether the fresh raw view is COMPLETE registration evidence: id-less
+      // legacy entries register raw-invisibly (their stable id lives in
+      // session metadata.json), so their presence — or an unreadable raw
+      // view — forces the authoritative enumeration below for admission and
+      // removal decisions the raw comparison cannot make.
+      let freshConfigHasRawInvisibleEntries = false;
       try {
-        freshConfigIds = this.config.readPersistedWorkspaceIdSuperset();
+        const evidence = this.config.readPersistedWorkspaceIdEvidence();
+        freshConfigIds = evidence.ids;
+        freshConfigHasRawInvisibleEntries = evidence.hasWorkspaceEntriesWithoutIds;
       } catch {
         freshConfigIds = null;
+        freshConfigHasRawInvisibleEntries = true;
       }
       // Like-for-like raw-superset comparison only: an id that WAS persisted
       // in config before the awaits and is gone from the fresh raw view was
@@ -13111,7 +13120,13 @@ export class WorkspaceService extends EventEmitter {
       if (
         initialConfigIds != null &&
         (entries.some((entry) => entry != null && !initialConfigIds.has(entry[0])) ||
-          hasRawInvisibleLateSnapshotId)
+          hasRawInvisibleLateSnapshotId ||
+          // Third trigger: id-less legacy entries exist, so a downgraded
+          // backend may have registered a raw-invisible workspace with
+          // workflow-only activity (no snapshot) mid-list — only the
+          // enumeration can discover it for the merge admission below.
+          // Modern deployments (every id inline) never pay this walk.
+          freshConfigHasRawInvisibleEntries)
       ) {
         try {
           authoritativeIds = new Set(
@@ -13213,11 +13228,14 @@ export class WorkspaceService extends EventEmitter {
         // Workflow-only late registrations: a workspace registered after the
         // scope reads can have active workflow runs but no metadata snapshot
         // at all, so admission cannot come from fresh-snapshot keys alone —
-        // every fresh raw id outside the stale per-id scope is a candidate.
-        // Ids with neither a snapshot nor live activity cost one workflow
-        // probe and are dropped by the emptiness check below.
-        if (freshConfigIds != null) {
-          for (const workspaceId of freshConfigIds) {
+        // every fresh config-derived id outside the stale per-id scope is a
+        // candidate. The authoritative enumeration contributes the ids the
+        // raw view can never carry (id-less legacy registrations by a
+        // downgraded backend). Ids with neither a snapshot nor live activity
+        // cost one workflow probe and are dropped by the emptiness check
+        // below.
+        for (const lateIdSource of [freshConfigIds, authoritativeIds]) {
+          for (const workspaceId of lateIdSource ?? []) {
             if (!workspaceIds.has(workspaceId)) {
               mergeCandidateIds.add(workspaceId);
             }
@@ -13260,6 +13278,36 @@ export class WorkspaceService extends EventEmitter {
           } catch {
             finalSnapshots = null;
           }
+          // Post-probe authoritative recheck, only when a probed candidate is
+          // raw-invisible (in no raw view): the raw deregistration guard
+          // below is blind to a legacy workspace removed during the probes,
+          // and in the normal gap between config deregistration and metadata
+          // cleanup its snapshot still exists — the pre-probe authoritative
+          // set is the view that ADMITTED it, so only a fresh enumeration
+          // can prove the removal. Modern deployments never pay this walk.
+          let finalAuthoritativeIds: ReadonlySet<string> | null = null;
+          if (
+            Array.from(probedWorkflowRunIds.keys()).some(
+              (workspaceId) =>
+                !(initialConfigIds?.has(workspaceId) ?? false) &&
+                !(freshConfigIds?.has(workspaceId) ?? false)
+            )
+          ) {
+            try {
+              finalAuthoritativeIds = new Set(
+                (await this.config.getAllWorkspaceMetadata({ throwOnError: true })).map(
+                  (metadata) => metadata.id
+                )
+              );
+            } catch (error) {
+              log.debug("Failed to re-enumerate authoritative ids after workflow probes", {
+                error,
+              });
+              finalAuthoritativeIds = null;
+            }
+          }
+          // Read last (synchronous), after every await above, so the raw
+          // deregistration guard sees the freshest possible view.
           let finalConfigIds: ReadonlySet<string> | null = null;
           try {
             finalConfigIds = this.config.readPersistedWorkspaceIdSuperset();
@@ -13298,7 +13346,16 @@ export class WorkspaceService extends EventEmitter {
               (finalConfigIds != null &&
                 !finalConfigIds.has(workspaceId) &&
                 ((initialConfigIds?.has(workspaceId) ?? false) ||
-                  (freshConfigIds?.has(workspaceId) ?? false)))
+                  (freshConfigIds?.has(workspaceId) ?? false))) ||
+              // Raw-invisible candidates: post-probe authoritative
+              // counterpart of the raw guard above — a legacy workspace
+              // deregistered during the probes is invisible to every raw
+              // view, and its snapshot may outlive the deregistration.
+              (!(initialConfigIds?.has(workspaceId) ?? false) &&
+                !(freshConfigIds?.has(workspaceId) ?? false) &&
+                !(finalConfigIds?.has(workspaceId) ?? false) &&
+                finalAuthoritativeIds != null &&
+                !finalAuthoritativeIds.has(workspaceId))
             ) {
               continue;
             }

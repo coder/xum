@@ -77,6 +77,20 @@ export class ExtensionMetadataService {
   private checkedLeftoverQuarantineSidecar = false;
 
   /**
+   * Optional registration probe for writes hitting a tombstoned id (see
+   * recheckTombstonedRegistration). Wired by the owner that can read the
+   * shared config (coreServices); absent in bare constructions, where
+   * tombstones stay strictly write-suppressing. Must answer with CURRENT
+   * registration evidence or throw — a stale positive would resurrect a
+   * removed workspace's entry.
+   */
+  private registrationProbe: ((workspaceId: string) => Promise<boolean>) | null = null;
+
+  setRegistrationProbe(probe: (workspaceId: string) => Promise<boolean>): void {
+    this.registrationProbe = probe;
+  }
+
+  /**
    * Serialize all mutating operations on the shared metadata file.
    * Prevents cross-workspace read-modify-write races since all workspaces
    * share a single extensionMetadata.json file.
@@ -141,12 +155,46 @@ export class ExtensionMetadataService {
     return toWorkspaceActivitySnapshot(transient);
   }
 
+  /**
+   * A write arrived for a tombstoned id: decide whether the tombstone is
+   * stale. Tombstones are process-local removal knowledge and the shared
+   * config is the authority — a downgraded concurrent backend can
+   * legitimately re-register a deterministic legacy id this process pruned,
+   * and the renderer only calls the activity bootstrap (which also clears
+   * stale tombstones) when its subscription needs repair, so a healthy
+   * long-lived process would otherwise suppress the revived workspace's
+   * writes and broadcasts indefinitely. The probe reads registration
+   * evidence NOW, strictly after the tombstone was published, so clearing on
+   * a positive answer is sound (same ordering contract as
+   * clearTombstonesForRegisteredIds). A negative, missing, or failing probe
+   * keeps the tombstone: suppression self-heals on a later successful probe
+   * or bootstrap, while a wrongly persisted write would resurrect a removed
+   * workspace's entry on disk.
+   */
+  private async recheckTombstonedRegistration(workspaceId: string): Promise<boolean> {
+    if (this.registrationProbe == null) {
+      return false;
+    }
+    try {
+      if (!(await this.registrationProbe(workspaceId))) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+    this.deletedWorkspaceIds.delete(workspaceId);
+    return true;
+  }
+
   private async mutateWorkspaceSnapshot(
     workspaceId: string,
     recency: number,
     mutate: (workspace: ExtensionMetadata) => void
   ): Promise<WorkspaceActivitySnapshot> {
-    if (this.deletedWorkspaceIds.has(workspaceId)) {
+    if (
+      this.deletedWorkspaceIds.has(workspaceId) &&
+      !(await this.recheckTombstonedRegistration(workspaceId))
+    ) {
       return this.buildTransientSnapshot(workspaceId, recency, mutate);
     }
     return this.withSerializedMutation(async () => {
@@ -154,7 +202,10 @@ export class ExtensionMetadataService {
       // tombstones only while its queued mutation runs, so a writer that
       // passed the pre-queue check and enqueued behind the prune must not
       // recreate an entry the prune just reclaimed.
-      if (this.deletedWorkspaceIds.has(workspaceId)) {
+      if (
+        this.deletedWorkspaceIds.has(workspaceId) &&
+        !(await this.recheckTombstonedRegistration(workspaceId))
+      ) {
         return this.buildTransientSnapshot(workspaceId, recency, mutate);
       }
       const data = await this.load();
@@ -419,13 +470,21 @@ export class ExtensionMetadataService {
     options: { skipIfRecencyAdvancedSince?: number | null; inputHash?: string | null } = {}
   ): Promise<WorkspaceActivitySnapshot | null> {
     // See deletedWorkspaceIds: never resurrect a removed workspace's entry.
-    if (this.deletedWorkspaceIds.has(workspaceId)) {
+    // A stale tombstone (id re-registered by a concurrent backend) is
+    // cleared via the registration recheck, same as mutateWorkspaceSnapshot.
+    if (
+      this.deletedWorkspaceIds.has(workspaceId) &&
+      !(await this.recheckTombstonedRegistration(workspaceId))
+    ) {
       return null;
     }
     return this.withSerializedMutation(async () => {
       // Re-check inside the queue (see mutateWorkspaceSnapshot): tombstones
       // published by an already-enqueued prune must be honored here too.
-      if (this.deletedWorkspaceIds.has(workspaceId)) {
+      if (
+        this.deletedWorkspaceIds.has(workspaceId) &&
+        !(await this.recheckTombstonedRegistration(workspaceId))
+      ) {
         return null;
       }
       const data = await this.load();
@@ -909,13 +968,13 @@ export class ExtensionMetadataService {
   private async resumeQuarantineRecovery(): Promise<void> {
     await this.withSerializedMutation(async () => {
       // Re-check inside the queue: a concurrent writer save or a sibling
-      // strict read may already have recovered the main path.
+      // strict read may already have recovered the main path. Probe with
+      // ENOENT-only absence semantics: a transiently unprobeable sidecar
+      // (EACCES/EIO) must propagate — reporting it absent would let the
+      // caller accept a recreated partial main and (for the once-per-process
+      // getAllSnapshots check) never look at the sidecar again.
       const quarantinePath = `${this.filePath}.corrupt`;
-      const sidecarExists = await access(quarantinePath).then(
-        () => true,
-        () => false
-      );
-      if (!sidecarExists) {
+      if (!(await this.probeQuarantineSidecar())) {
         return;
       }
       const mainExists = await access(this.filePath).then(

@@ -98,6 +98,27 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     providerService.getConfig()
   );
   const extensionMetadata = new ExtensionMetadataService(extensionMetadataPath);
+  // Write tombstones are process-local removal knowledge; the shared config
+  // is the authority (with XUM_ALLOW_MULTIPLE_INSTANCES a downgraded backend
+  // can legitimately re-register a deterministic legacy id this process
+  // pruned). Without this probe, a tombstoned id that becomes active again
+  // would have every metadata write and broadcast suppressed until an
+  // activity bootstrap happens to run. Raw view first (cheap; complete when
+  // every persisted entry carries an inline id); only id-less legacy entries
+  // require the authoritative enumeration. Throws propagate: unknowable
+  // registration keeps the tombstone.
+  extensionMetadata.setRegistrationProbe(async (workspaceId) => {
+    const evidence = config.readPersistedWorkspaceIdEvidence();
+    if (evidence.ids.has(workspaceId)) {
+      return true;
+    }
+    if (!evidence.hasWorkspaceEntriesWithoutIds) {
+      return false;
+    }
+    return (await config.getAllWorkspaceMetadata({ throwOnError: true })).some(
+      (metadata) => metadata.id === workspaceId
+    );
+  });
   const workspaceGoalService = new WorkspaceGoalService(
     config,
     historyService,

@@ -3856,6 +3856,145 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("getActivityList bootstraps workflow-only legacy workspaces registered mid-list", async () => {
+    // Combined raw-invisible + snapshotless case: a downgraded backend
+    // registers an id-less legacy workspace mid-list and starts a workflow
+    // WITHOUT writing extension metadata. The stable id appears in neither
+    // the fresh raw view nor the fresh snapshots, so discovery must come
+    // from the authoritative enumeration triggered by the raw evidence's
+    // id-less-entry signal.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const stableId = "late-legacy-workflow-only";
+      const projectPath = path.join(config.rootDir, "project");
+      const workspacePath = path.join(projectPath, "legacy-ws");
+      const configPath = path.join(config.rootDir, "config.json");
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      const realGetAllSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      let snapshotCalls = 0;
+      const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(
+        async (options?: { throwOnError?: boolean }) => {
+          snapshotCalls += 1;
+          if (snapshotCalls === 2) {
+            await fsPromises.writeFile(
+              configPath,
+              JSON.stringify({
+                projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
+              })
+            );
+            const legacySessionDir = config.getSessionDir(
+              config.generateLegacyId(projectPath, workspacePath)
+            );
+            await fsPromises.mkdir(legacySessionDir, { recursive: true });
+            await fsPromises.writeFile(
+              path.join(legacySessionDir, "metadata.json"),
+              JSON.stringify({ id: stableId, name: "legacy-ws" })
+            );
+            const runStore = new WorkflowRunStore({
+              sessionDir: config.getSessionDir(stableId),
+            });
+            await runStore.createRun({
+              id: "wfr_legacy_only",
+              workspaceId: stableId,
+              workflow: {
+                name: "demo",
+                description: "Demo workflow",
+                scope: "global" as const,
+                executable: true,
+              },
+              source: "export default function workflow() { return {}; }",
+              args: {},
+              now: "2026-06-17T00:00:00.000Z",
+            });
+          }
+          return realGetAllSnapshots(options);
+        }
+      );
+      try {
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList?.[stableId]?.activeWorkflowRunCount).toBe(1);
+        expect(activityList?.[stableId]?.activeWorkflowRunIds).toEqual(["wfr_legacy_only"]);
+      } finally {
+        snapshotsSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("getActivityList drops legacy additions deregistered during the workflow probe", async () => {
+    // A raw-invisible legacy workspace admitted mid-list and deregistered
+    // while the workflow probe awaits: every raw view is blind to it and its
+    // metadata snapshot survives the deregistration gap, so only the
+    // post-probe authoritative re-enumeration can prove the removal.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const listStatusSnapshotsSpy = spyOn(WorkflowRunStore.prototype, "listRunStatusSnapshots");
+    try {
+      const stableId = "late-legacy-then-removed";
+      const projectPath = path.join(config.rootDir, "project");
+      const workspacePath = path.join(projectPath, "legacy-ws");
+      const configPath = path.join(config.rootDir, "config.json");
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      const realGetAllSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      let snapshotCalls = 0;
+      const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(
+        async (options?: { throwOnError?: boolean }) => {
+          snapshotCalls += 1;
+          if (snapshotCalls === 2) {
+            await fsPromises.writeFile(
+              configPath,
+              JSON.stringify({
+                projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
+              })
+            );
+            const legacySessionDir = config.getSessionDir(
+              config.generateLegacyId(projectPath, workspacePath)
+            );
+            await fsPromises.mkdir(legacySessionDir, { recursive: true });
+            await fsPromises.writeFile(
+              path.join(legacySessionDir, "metadata.json"),
+              JSON.stringify({ id: stableId, name: "legacy-ws" })
+            );
+            await extensionMetadata.updateRecency(stableId, 999);
+          }
+          return realGetAllSnapshots(options);
+        }
+      );
+      listStatusSnapshotsSpy.mockImplementation(async () => {
+        // Another backend deregisters the legacy workspace mid-probe; its
+        // metadata snapshot intentionally survives (cleanup gap).
+        await fsPromises.writeFile(configPath, JSON.stringify({ projects: [] }));
+        return [];
+      });
+      try {
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList).not.toBeNull();
+        expect(activityList?.[stableId]).toBeUndefined();
+      } finally {
+        snapshotsSpy.mockRestore();
+      }
+    } finally {
+      listStatusSnapshotsSpy.mockRestore();
+      await cleanup();
+    }
+  });
+
   test("getActivityList drops late additions deregistered during the workflow probe", async () => {
     // A workspace registered AFTER the initial raw baseline and removed
     // while the workflow probe awaits sits in the normal gap between config
