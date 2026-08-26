@@ -650,74 +650,149 @@ export function coalesceAttachmentPlaceholders(
   output: unknown,
   keptAttachmentCount: number
 ): unknown {
-  const total = countAttachmentPlaceholders(output, 0);
+  const total = countAttachmentPlaceholders(output);
   if (total <= 1 || total <= keptAttachmentCount) return output;
   const state = { total, replacedSummary: false };
-  return coalescePlaceholderWalk(output, 0, state);
+  return coalescePlaceholderWalk(output, state);
 }
 
-function countAttachmentPlaceholders(value: unknown, depth: number): number {
-  if (depth > MAX_NESTED_TOOL_EXTRACTION_DEPTH) return 0;
-  if (isAttachmentPlaceholderPart(value)) return 1;
-  if (Array.isArray(value)) {
-    let count = 0;
-    for (const item of value) count += countAttachmentPlaceholders(item, depth + 1);
-    return count;
-  }
-  if (typeof value === "object" && value !== null) {
-    let count = 0;
-    for (const child of Object.values(value as Record<string, unknown>)) {
-      count += countAttachmentPlaceholders(child, depth + 1);
+/**
+ * Iterative, unbounded count (r32 security): extraction deliberately creates
+ * placeholders at ARBITRARY generic wrapper depth (its wrapper walk is
+ * iterative), so a depth-capped recursion here would see none of a
+ * deep-wrapped placeholder flood and leave the multi-megabyte rewritten
+ * output unchanged. The visited set keeps shared subtrees linear and
+ * terminates cycle back-edges.
+ */
+function countAttachmentPlaceholders(root: unknown): number {
+  let count = 0;
+  const stack: unknown[] = [root];
+  const visited = new Set<object>();
+  while (stack.length > 0) {
+    const value = stack.pop();
+    if (typeof value !== "object" || value === null) continue;
+    if (visited.has(value)) continue;
+    visited.add(value);
+    if (isAttachmentPlaceholderPart(value)) {
+      count++;
+      continue;
     }
-    return count;
+    const children: unknown[] = Array.isArray(value)
+      ? value
+      : Object.values(value as Record<string, unknown>);
+    for (const child of children) stack.push(child);
   }
-  return 0;
+  return count;
 }
 
+/**
+ * Iterative post-order copy-on-write rebuild replacing/dropping attachment
+ * placeholders (see coalesceAttachmentPlaceholders). Unbounded over generic
+ * wrappers for the same reason as the counter above (r32). Shared subtrees
+ * are processed once via the memo; in-stack back-edges (impossible for
+ * extraction-rebuilt JSON, cheap to guard) pass through unchanged.
+ */
 function coalescePlaceholderWalk(
-  value: unknown,
-  depth: number,
+  root: unknown,
   state: { total: number; replacedSummary: boolean }
 ): unknown {
-  if (depth > MAX_NESTED_TOOL_EXTRACTION_DEPTH) return value;
-  if (isAttachmentPlaceholderPart(value)) {
-    // Non-array position (e.g. a nested record's whole result): cannot be
-    // dropped structurally, so stub it after the first summary.
-    if (!state.replacedSummary) {
-      state.replacedSummary = true;
-      return buildCoalescedPlaceholderSummary(state.total);
-    }
-    return COALESCED_PLACEHOLDER_STUB;
+  if (typeof root !== "object" || root === null) return root;
+  if (isAttachmentPlaceholderPart(root)) {
+    state.replacedSummary = true;
+    return buildCoalescedPlaceholderSummary(state.total);
   }
-  if (Array.isArray(value)) {
-    const next: unknown[] = [];
-    let changed = false;
-    for (const item of value) {
-      if (isAttachmentPlaceholderPart(item)) {
-        changed = true;
+
+  interface Frame {
+    source: object;
+    /** null for arrays; object keys otherwise. */
+    keys: string[] | null;
+    children: unknown[];
+    index: number;
+    results: unknown[];
+    changed: boolean;
+  }
+  const makeFrame = (source: Record<string, unknown> | unknown[]): Frame => {
+    if (Array.isArray(source)) {
+      return { source, keys: null, children: source, index: 0, results: [], changed: false };
+    }
+    const keys = Object.keys(source);
+    return {
+      source,
+      keys,
+      children: keys.map((key) => source[key]),
+      index: 0,
+      results: [],
+      changed: false,
+    };
+  };
+  const memo = new Map<object, unknown>();
+  const inStack = new Set<object>();
+  const stack: Frame[] = [makeFrame(root as Record<string, unknown> | unknown[])];
+  inStack.add(root);
+  let rootResult: unknown = root;
+
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    if (frame.index < frame.children.length) {
+      const child = frame.children[frame.index];
+      frame.index++;
+      if (isAttachmentPlaceholderPart(child)) {
+        frame.changed = true;
         if (!state.replacedSummary) {
           state.replacedSummary = true;
-          next.push(buildCoalescedPlaceholderSummary(state.total));
+          frame.results.push(buildCoalescedPlaceholderSummary(state.total));
+        } else if (frame.keys !== null) {
+          // Non-array position (e.g. a nested record's whole result): cannot
+          // be dropped structurally, so stub it after the first summary.
+          frame.results.push(COALESCED_PLACEHOLDER_STUB);
         }
-        // Later placeholders are dropped from arrays entirely.
+        // Array positions: later placeholders are dropped entirely.
         continue;
       }
-      const walked = coalescePlaceholderWalk(item, depth + 1, state);
-      if (walked !== item) changed = true;
-      next.push(walked);
+      if (typeof child !== "object" || child === null) {
+        frame.results.push(child);
+        continue;
+      }
+      if (memo.has(child)) {
+        const remembered = memo.get(child);
+        if (remembered !== child) frame.changed = true;
+        frame.results.push(remembered);
+        continue;
+      }
+      if (inStack.has(child)) {
+        frame.results.push(child);
+        continue;
+      }
+      stack.push(makeFrame(child as Record<string, unknown> | unknown[]));
+      inStack.add(child);
+      continue;
     }
-    return changed ? next : value;
+
+    // Frame complete: rebuild copy-on-write.
+    stack.pop();
+    inStack.delete(frame.source);
+    let result: unknown;
+    if (!frame.changed) {
+      result = frame.source;
+    } else if (frame.keys === null) {
+      result = frame.results;
+    } else {
+      const rebuilt: Record<string, unknown> = {};
+      for (let i = 0; i < frame.keys.length; i++) {
+        rebuilt[frame.keys[i]] = frame.results[i];
+      }
+      result = rebuilt;
+    }
+    memo.set(frame.source, result);
+    if (stack.length === 0) {
+      rootResult = result;
+    } else {
+      const parent = stack[stack.length - 1];
+      if (result !== frame.source) parent.changed = true;
+      parent.results.push(result);
+    }
   }
-  if (typeof value === "object" && value !== null) {
-    let changed = false;
-    const entries = Object.entries(value as Record<string, unknown>).map(([key, child]) => {
-      const walked = coalescePlaceholderWalk(child, depth + 1, state);
-      if (walked !== child) changed = true;
-      return [key, walked] as const;
-    });
-    return changed ? Object.fromEntries(entries) : value;
-  }
-  return value;
+  return rootResult;
 }
 
 function buildCoalescedPlaceholderSummary(total: number): { type: "text"; text: string } {

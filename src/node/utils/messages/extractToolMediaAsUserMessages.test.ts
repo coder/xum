@@ -1094,6 +1094,57 @@ describe("extractToolMediaAsUserMessages", () => {
     expect(syntheticJson.split("dedup-marker").length - 1).toBe(1);
   });
 
+  it("coalesces placeholder floods below deep generic wrappers", async () => {
+    // Extraction rewrites media at ANY wrapper depth (its wrapper walk is
+    // iterative), so the coalescer must be unbounded too (r32 security): a
+    // depth-capped counter saw no placeholders below 64 generic wrappers and
+    // left a multi-hundred-KB placeholder flood intact in provider JSON.
+    const svg = (i: number) =>
+      Buffer.from(
+        `<svg xmlns="http://www.w3.org/2000/svg"><title>deep-${String(i).padStart(2, "0")}</title></svg>`
+      ).toString("base64");
+    const total = MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST + 2;
+    const leaves = Array.from({ length: total }, (_, i) => ({
+      type: "media",
+      mediaType: "image/svg+xml",
+      data: svg(i),
+    }));
+    let deep: unknown = { leaves };
+    for (let i = 0; i < 70; i++) deep = { wrap: deep };
+    const input: MuxMessage[] = [
+      {
+        id: "a1",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call1",
+            toolName: "mcp__shots__take",
+            input: {},
+            state: "output-available",
+            output: deep,
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessages(input);
+    expect(rewritten).toHaveLength(2);
+    const toolPart = rewritten[0].parts[0];
+    expect(toolPart.type).toBe("dynamic-tool");
+    if (toolPart.type === "dynamic-tool" && toolPart.state === "output-available") {
+      const outputJson = JSON.stringify(toolPart.output);
+      expect(outputJson).not.toContain("[Attachment attached");
+      expect(outputJson).toContain(`${total} attachments attached from tool output`);
+    }
+    // The newest attachments survive the cap; the two oldest were omitted.
+    const syntheticJson = JSON.stringify(rewritten[1].parts);
+    expect(syntheticJson).toContain("2 extracted media attachment(s) omitted");
+    expect(syntheticJson).not.toContain("deep-00");
+    expect(syntheticJson).toContain(`deep-${total - 1}`);
+  });
+
   it("counts existing conversation media parts against the extraction allowance", async () => {
     // messagePipeline runs this transform after ordinary attachments are
     // already in the request, and providers cap TOTAL media parts: existing
