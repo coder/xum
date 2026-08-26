@@ -3272,6 +3272,9 @@ describe("WorkspaceService activity list scoping", () => {
       await workspaceService.updateAgentStatus(workspaceId, { emoji: "🛠️", message: "Working" });
       expect(events.length).toBe(1);
 
+      // Discard verifies deregistration against persisted config, so remove
+      // the workspace first (mirroring the real removal flow).
+      await config.removeWorkspace(workspaceId);
       await workspaceService.discardExtensionMetadataEntry(workspaceId);
       // Simulates the producer that was already in flight when removal ran.
       await workspaceService.updateAgentStatus(workspaceId, { emoji: "🛠️", message: "Late" });
@@ -3279,6 +3282,73 @@ describe("WorkspaceService activity list scoping", () => {
       // Clearing (null) emissions stay allowed for removed workspaces.
       workspaceService.emitWorkspaceActivity(workspaceId, null);
       expect(events.length).toBe(2);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("discardExtensionMetadataEntry keeps the entry when the workspace is still persisted", async () => {
+    // saveConfig swallows write failures, so config.removeWorkspace can
+    // resolve while the workspace is still persisted in config.json.
+    // Discarding then would write-tombstone a live id and suppress all of
+    // its future activity writes for the rest of the process.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "discard-still-persisted";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency(workspaceId, 100);
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+
+      await workspaceService.discardExtensionMetadataEntry(workspaceId);
+
+      expect((await extensionMetadata.getAllSnapshots()).has(workspaceId)).toBe(true);
+      expect(extensionMetadata.isWorkspaceDeleted(workspaceId)).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("getActivityList rejects when the metadata file is unreadable", async () => {
+    // ExtensionMetadataService.load self-heals a corrupt file into an empty
+    // one by default; surfacing that here as an authoritative empty list
+    // would make the renderer wipe every cached snapshot with no retry.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const metadataPath = path.join(config.rootDir, "extensionMetadata.json");
+      await fsPromises.writeFile(metadataPath, "{not json", "utf-8");
+      const extensionMetadata = new ExtensionMetadataService(metadataPath);
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+
+      // Lenient reads (writer paths) still self-heal.
+      expect((await extensionMetadata.getAllSnapshots()).size).toBe(0);
+
+      let rejected = false;
+      try {
+        await workspaceService.getActivityList();
+      } catch {
+        rejected = true;
+      }
+      expect(rejected).toBe(true);
+      // The self-healing prune path must not have rewritten (reset) the file.
+      expect(await fsPromises.readFile(metadataPath, "utf-8")).toBe("{not json");
     } finally {
       await cleanup();
     }
@@ -3404,6 +3474,9 @@ describe("WorkspaceService activity list scoping", () => {
         removeWorkspace: mock(() => Promise.resolve()),
         findWorkspace: mock(() => null),
         loadConfigOrDefault: mock(() => ({ projects: new Map() })),
+        // The discard verifies deregistration against these before deleting.
+        readPersistedWorkspaceIdSuperset: mock(() => new Set<string>()),
+        getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
       };
       const workspaceService = createWorkspaceServiceForTest({
         config: mockConfig,

@@ -12770,6 +12770,31 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
+   * Union of the raw persisted config id superset and the strict normalized
+   * metadata view:
+   * - the raw persisted superset covers entries loadConfigOrDefault's
+   *   validation/normalization would filter or discard (see
+   *   readPersistedWorkspaceIdSuperset), so a live workspace with a
+   *   malformed config entry is never treated as removed;
+   * - the strict normalized view covers ids produced by in-memory config
+   *   migrations that are not yet persisted verbatim.
+   * Both views throw rather than resolving with a silently lossy id set; a
+   * missing config file resolves as a healthy empty set in both.
+   */
+  private async readKnownWorkspaceIds(): Promise<{
+    knownIds: Set<string>;
+    normalizedIds: Set<string>;
+  }> {
+    const knownIds = this.config.readPersistedWorkspaceIdSuperset();
+    const allMetadata = await this.config.getAllWorkspaceMetadata({ throwOnError: true });
+    const normalizedIds = new Set(allMetadata.map((metadata) => metadata.id));
+    for (const workspaceId of normalizedIds) {
+      knownIds.add(workspaceId);
+    }
+    return { knownIds, normalizedIds };
+  }
+
+  /**
    * Best-effort removal of a deregistered workspace's activity/status entry
    * from extensionMetadata.json. Used by remove() and by rollback paths that
    * deregister via config.removeWorkspace directly (e.g. TaskService's failed
@@ -12780,6 +12805,21 @@ export class WorkspaceService extends EventEmitter {
    */
   async discardExtensionMetadataEntry(workspaceId: string): Promise<void> {
     try {
+      // Deleting also write-tombstones the id for the rest of this process,
+      // so verify deregistration actually landed before publishing it:
+      // saveConfig swallows write failures, meaning config.removeWorkspace
+      // can resolve while the workspace is still persisted in config.json —
+      // tombstoning a still-live id would suppress all of its future
+      // activity writes. A failed verification (unreadable config) skips the
+      // delete too; like a missed delete, the entry is reclaimed by a later
+      // process start's prune, which re-checks against config.
+      const { knownIds } = await this.readKnownWorkspaceIds();
+      if (knownIds.has(workspaceId)) {
+        log.debug("Skipping extension metadata discard: workspace still persisted in config", {
+          workspaceId,
+        });
+        return;
+      }
       await this.extensionMetadata.deleteWorkspace(workspaceId);
     } catch (error) {
       log.debug("Failed to prune extension metadata after workspace deregistration", {
@@ -12821,22 +12861,12 @@ export class WorkspaceService extends EventEmitter {
         // concurrently created workspace — even in another backend process —
         // cannot lose its just-written entry.
         //
-        // Union of two views, both of which throw (aborting the prune, caught
-        // below) rather than resolving with a silently lossy id set:
-        // - the raw persisted superset covers entries loadConfigOrDefault's
-        //   validation/normalization would filter or discard (see
-        //   readPersistedWorkspaceIdSuperset), so a live workspace with a
-        //   malformed config entry is never treated as removed;
-        // - the strict normalized view covers ids produced by in-memory
-        //   config migrations that are not yet persisted verbatim.
-        // A missing config file resolves as a healthy empty set in both.
-        const knownIds = this.config.readPersistedWorkspaceIdSuperset();
-        const allMetadata = await this.config.getAllWorkspaceMetadata({ throwOnError: true });
-        normalizedIds = new Set(allMetadata.map((metadata) => metadata.id));
-        for (const workspaceId of normalizedIds) {
-          knownIds.add(workspaceId);
-        }
-        return knownIds;
+        // Union of two views (see readKnownWorkspaceIds), both of which throw
+        // (aborting the prune, caught below) rather than resolving with a
+        // silently lossy id set.
+        const views = await this.readKnownWorkspaceIds();
+        normalizedIds = views.normalizedIds;
+        return views.knownIds;
       });
       if (prunedCount > 0) {
         log.info(`Pruned ${prunedCount} stale extension metadata entries`);
@@ -12853,7 +12883,13 @@ export class WorkspaceService extends EventEmitter {
       // On the first bootstrap the prune already enumerated the config; reuse
       // that id set instead of paying the per-workspace disk walk twice.
       const prefetchedKnownIds = await this.pruneStaleExtensionMetadataOnce();
-      const snapshots = await this.extensionMetadata.getAllSnapshots();
+      // throwOnError: the default load self-heals an unreadable/malformed
+      // metadata file into an empty one, which this list would then present
+      // as an authoritative "no activity anywhere" answer — the renderer
+      // applies that by wiping every cached streaming/status/goal snapshot
+      // with no retry (the subscription stays connected). Rejecting instead
+      // keeps last-known renderer state and lets the bootstrap loop retry.
+      const snapshots = await this.extensionMetadata.getAllSnapshots({ throwOnError: true });
       // Scope the list to config-known workspaces. extensionMetadata.json was
       // historically never pruned, so long-lived deployments accumulate stale
       // entries for removed workspaces/sub-agents by the thousands (issue

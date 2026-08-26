@@ -186,10 +186,11 @@ export class ExtensionMetadataService {
     }
   }
 
-  private async load(): Promise<ExtensionMetadataFile> {
+  private async load(options?: { throwOnError?: boolean }): Promise<ExtensionMetadataFile> {
     try {
       await access(this.filePath, constants.F_OK);
     } catch {
+      // A missing file is a healthy empty state in both modes.
       return { version: 1, workspaces: {} };
     }
 
@@ -199,12 +200,17 @@ export class ExtensionMetadataService {
 
       // Validate structure
       if (typeof parsed !== "object" || parsed.version !== 1) {
-        log.error("Invalid metadata file, resetting");
-        return { version: 1, workspaces: {} };
+        throw new Error("Invalid extension metadata file structure");
       }
 
       return parsed;
     } catch (error) {
+      // throwOnError lets read paths distinguish "file exists but is
+      // unreadable/malformed" from an authoritative empty state; the default
+      // self-heals so writers can always make progress.
+      if (options?.throwOnError) {
+        throw error;
+      }
       log.error("Failed to load metadata:", error);
       return { version: 1, workspaces: {} };
     }
@@ -544,8 +550,10 @@ export class ExtensionMetadataService {
     });
   }
 
-  async getAllSnapshots(): Promise<Map<string, WorkspaceActivitySnapshot>> {
-    const data = await this.load();
+  async getAllSnapshots(options?: {
+    throwOnError?: boolean;
+  }): Promise<Map<string, WorkspaceActivitySnapshot>> {
+    const data = await this.load(options);
     const map = new Map<string, WorkspaceActivitySnapshot>();
     for (const [workspaceId, entry] of Object.entries(data.workspaces)) {
       const snapshot = this.toSnapshot(entry);
