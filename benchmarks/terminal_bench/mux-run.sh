@@ -67,6 +67,7 @@ resolve_project_path() {
 
 command -v bun >/dev/null 2>&1 || fatal "bun is not installed"
 command -v git >/dev/null 2>&1 || fatal "git is not installed"
+command -v timeout >/dev/null 2>&1 || fatal "timeout is not installed"
 project_path=$(resolve_project_path)
 
 log "starting mux agent session for ${project_path}"
@@ -80,10 +81,13 @@ export XUM_DISABLE_PROJECT_AUTOMATION=1
 export MUX_DISABLE_PROJECT_AUTOMATION=1
 
 repo_driver_pattern='^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver|remote[.].*[.](uploadpack|receivepack|vcs)|core[.](sshcommand|gitproxy|askpass)|credential([.].*)?[.]helper|commit[.]gpgsign|tag[.]gpgsign|gpg([.].*)?[.]program)$'
-if git -C "${project_path}" config --name-only --includes --get-regexp "${repo_driver_pattern}" >/dev/null; then
+if timeout 15s git -C "${project_path}" config --name-only --includes --get-regexp "${repo_driver_pattern}" >/dev/null; then
   fatal "refusing to trust project with repo-controlled Git drivers"
 else
   git_config_status=$?
+  if [[ "${git_config_status}" -eq 124 ]]; then
+    fatal "timed out inspecting repository automation drivers"
+  fi
   if [[ "${git_config_status}" -ne 1 ]]; then
     fatal "failed to inspect repository automation drivers"
   fi

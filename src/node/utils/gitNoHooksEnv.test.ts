@@ -91,6 +91,8 @@ describe("gitNoRepoAutomationEnv", () => {
     expect(env.OPENAI_API_KEY).toBe("");
     expect(env.AWS_SECRET_ACCESS_KEY).toBe("");
     expect(env.AWS_BEARER_TOKEN_BEDROCK).toBe("");
+    expect(env.XUM_RUN_SESSION_ROOT).toBe("");
+    expect(env.MUX_RUN_SESSION_ROOT).toBe("");
   });
 
   test("rejects filter driver names that cannot be overridden safely", () => {

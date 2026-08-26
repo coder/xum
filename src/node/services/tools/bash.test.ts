@@ -1706,6 +1706,36 @@ describe("remote bash git hardening", () => {
     );
     expect(callCount).toBe(2);
   });
+
+  it("blanks run-session roots inherited by local Bash", async () => {
+    const previousXumRoot = process.env.XUM_RUN_SESSION_ROOT;
+    const previousMuxRoot = process.env.MUX_RUN_SESSION_ROOT;
+    process.env.XUM_RUN_SESSION_ROOT = "/tmp/xum-session";
+    process.env.MUX_RUN_SESSION_ROOT = "/tmp/mux-session";
+
+    try {
+      const config = createTestToolConfig(process.cwd());
+      config.trusted = false;
+      const tool = createBashTool(config);
+      const result = (await tool.execute!(
+        {
+          script: 'printf "%s|%s" "$XUM_RUN_SESSION_ROOT" "$MUX_RUN_SESSION_ROOT"',
+          timeout_secs: 5,
+          run_in_background: false,
+          display_name: "test",
+        },
+        mockToolCallOptions
+      )) as BashToolResult;
+
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.output).toBe("|");
+    } finally {
+      if (previousXumRoot == null) delete process.env.XUM_RUN_SESSION_ROOT;
+      else process.env.XUM_RUN_SESSION_ROOT = previousXumRoot;
+      if (previousMuxRoot == null) delete process.env.MUX_RUN_SESSION_ROOT;
+      else process.env.MUX_RUN_SESSION_ROOT = previousMuxRoot;
+    }
+  });
 });
 
 describe("xumEnv environment variables", () => {

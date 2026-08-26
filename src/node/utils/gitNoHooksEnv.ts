@@ -86,6 +86,8 @@ export function gitNoRepoAutomationEnv(): Record<string, string> {
   // export them); blank them alongside the provider secrets.
   env.XUM_ROOT = "";
   env.MUX_ROOT = "";
+  env.XUM_RUN_SESSION_ROOT = "";
+  env.MUX_RUN_SESSION_ROOT = "";
   return env;
 }
 

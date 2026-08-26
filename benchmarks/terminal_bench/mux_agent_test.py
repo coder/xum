@@ -53,6 +53,7 @@ def _run_mux_runner_smoke(
     goal_mode: str | None = None,
     timeout_ms: str | None = None,
     repo_git_config: tuple[str, str] | None = None,
+    pretrust_git_timeout: bool = False,
 ) -> _RunnerSmokeResult:
     app_root = tmp_path / "app"
     project_path = tmp_path / "project"
@@ -91,6 +92,13 @@ exit "${FAKE_MUX_EXIT_CODE}"
         fake_bin / "timeout",
         """#!/usr/bin/env bash
 set -euo pipefail
+if [[ "${1:-}" == "15s" ]]; then
+  if [[ "${FAKE_PRETRUST_GIT_TIMEOUT:-0}" == "1" ]]; then
+    exit 124
+  fi
+  shift
+  exec "$@"
+fi
 printf 'timeout invoked\n' >"${FAKE_TIMEOUT_MARKER}"
 exit 99
 """,
@@ -103,6 +111,7 @@ exit 99
             "FAKE_BUN_ARGS_FILE": str(args_file),
             "FAKE_MUX_EXIT_CODE": str(exit_code),
             "FAKE_TIMEOUT_MARKER": str(timeout_marker),
+            "FAKE_PRETRUST_GIT_TIMEOUT": "1" if pretrust_git_timeout else "0",
             "MUX_APP_ROOT": str(app_root),
             "MUX_LOG_DIR": str(log_dir),
             "MUX_PROJECT_PATH": str(project_path),
@@ -250,6 +259,20 @@ def test_mux_runner_rejects_git_driver_before_trust(
     assert (
         "refusing to trust project with repo-controlled Git drivers"
         in result.completed.stderr
+    )
+    assert not Path(f"{result.args_file}.trust").exists()
+
+
+def test_mux_runner_refuses_trust_when_git_inspection_times_out(tmp_path: Path) -> None:
+    result = _run_mux_runner_smoke(
+        tmp_path,
+        exit_code=0,
+        pretrust_git_timeout=True,
+    )
+
+    assert result.completed.returncode == 1
+    assert (
+        "timed out inspecting repository automation drivers" in result.completed.stderr
     )
     assert not Path(f"{result.args_file}.trust").exists()
 
