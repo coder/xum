@@ -475,6 +475,52 @@ describe("BashMonitorWakeStore", () => {
     expect(pending[0].terminal).toEqual({ status: "exited", exitCode: 7 });
   });
 
+  test("a match-only merge clears a stale terminal from a re-armed process ID", async () => {
+    // Same-generation matches always precede the settlement emit, so a match arriving after
+    // terminal was recorded means the display-name-derived ID was re-armed by a live process
+    // (post-restart). The merged record must not render/gate as settled.
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(
+      payload({
+        lines: ["[monitor] process settled: exited (code 1)"],
+        matchedThroughOffset: undefined,
+        terminal: { status: "exited", exitCode: 1 },
+      })
+    );
+    const merged = await store.enqueueOrMergePending(
+      payload({ lines: ["ERROR from new generation"], matchedThroughOffset: 40 })
+    );
+
+    expect(merged.terminal).toBeUndefined();
+    expect(merged.lines).toEqual([
+      "[monitor] process settled: exited (code 1)",
+      "ERROR from new generation",
+    ]);
+    expect(merged.matchedThroughOffset).toBe(40);
+  });
+
+  test("a malformed persisted terminal degrades to no metadata instead of dropping the wake", async () => {
+    const config = makeConfig(rootDir);
+    const store = new BashMonitorWakeStore(config);
+    const record = await store.enqueueOrMergePending(
+      payload({ lines: ["[monitor] process settled: exited (code 1)"] })
+    );
+    const file = path.join(
+      config.getSessionDir("owner-1"),
+      "bash-monitor-wakes",
+      `${encodeURIComponent(record.processId)}.json`
+    );
+    const raw = JSON.parse(await fsPromises.readFile(file, "utf-8")) as Record<string, unknown>;
+    raw.terminal = { status: "not-a-real-status" };
+    await fsPromises.writeFile(file, JSON.stringify(raw), "utf-8");
+
+    const pending = await store.listPending("owner-1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0].terminal).toBeUndefined();
+    // The durable lines still deliver, so the degraded wake stays actionable.
+    expect(pending[0].lines).toEqual(["[monitor] process settled: exited (code 1)"]);
+  });
+
   test("enqueueMonitorLost skips the upgrade when the pending record already carries terminal", async () => {
     // Crash between wake persistence and registry deletion: recovery must not obscure the more
     // precise settlement fact with a "monitor lost" notice.

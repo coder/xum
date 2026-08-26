@@ -132,12 +132,17 @@ const BashMonitorWakeRecordSchema = z
     totalMatches: z.number().int().nonnegative(),
     droppedLines: z.number().int().nonnegative(),
     matchedThroughOffset: z.number().int().nonnegative().optional(),
+    // `.catch(undefined)`: a malformed terminal value (truncated edit, future shape change) must
+    // degrade to "no terminal metadata" instead of failing the whole record and silently dropping
+    // a durable wake forever (self-healing rule). The synthetic settlement line already stored in
+    // `lines` keeps the delivered wake actionable without it.
     terminal: z
       .object({
         status: z.enum(["exited", "killed", "failed"]),
         exitCode: z.number().int().optional(),
       })
-      .optional(),
+      .optional()
+      .catch(undefined),
     status: z.enum(BASH_MONITOR_WAKE_STATUSES),
     createdAt: z.string().min(1),
     updatedAt: z.string().min(1),
@@ -374,11 +379,20 @@ export class BashMonitorWakeStore {
           ...(mergedMatchedThroughOffset != null
             ? { matchedThroughOffset: mergedMatchedThroughOffset }
             : {}),
-          // A settlement payload overwrites terminal (process-ID reuse: a re-armed monitor's
-          // settlement supersedes the previous instance's); match-only payloads preserve it.
-          ...(payload.terminal != null ? { terminal: payload.terminal } : {}),
           updatedAt: now,
         };
+        // Terminal state binds to a process *generation*, and a match-only payload can only come
+        // from a live monitor: same-generation matches always precede the settlement emit (the
+        // settlement claim suspends further flushes), so a match arriving after `terminal` was
+        // recorded means the display-name-derived ID was re-armed by a new live process after a
+        // restart. A settlement payload overwrites the stale terminal; a match-only payload must
+        // clear it, or the merged record renders as already settled (and gets gated on a terminal
+        // status the live process never reached) while the new monitor is still running.
+        if (payload.terminal != null) {
+          record.terminal = payload.terminal;
+        } else {
+          delete record.terminal;
+        }
         await this.write(record);
         return record;
       }

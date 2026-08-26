@@ -1764,7 +1764,7 @@ const BashMonitorSchema = z
       .boolean()
       .nullish()
       .describe(
-        "Also wake when the monitored process settles (exit, kill, timeout), even if no line ever matched. Defaults to true."
+        "Also wake when the monitored process settles (exit, kill, timeout), even if no line ever matched. Explicit cancellation (task_stop, terminate without flush, workspace cleanup) and max_events retirement produce no settlement wake. Defaults to true."
       ),
   })
   .strict();

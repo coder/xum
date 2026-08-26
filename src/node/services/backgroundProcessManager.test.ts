@@ -1379,6 +1379,58 @@ describe("BackgroundProcessManager", () => {
         expect(shownEvents[0].shownThroughOffset).toBe(0);
         expect(shownEvents[0].terminalStatusShown).toBe(true);
       });
+
+      it("a cross-workspace consumer read leaves the owner's wake suppression state untouched", async () => {
+        const shownEvents: OutputShownPayload[] = [];
+        manager.on("output:shown", (_workspaceId, payload) => shownEvents.push(payload));
+
+        const result = await manager.spawn(runtime, testWorkspaceId, "printf 'data\\n'", {
+          cwd: process.cwd(),
+          displayName: "terminal-shown-ancestor",
+        });
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+
+        let proc = await manager.getProcess(result.processId);
+        for (let attempt = 0; attempt < 80; attempt++) {
+          proc = await manager.getProcess(result.processId);
+          if (proc?.status !== "running") break;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+
+        // task_await lets an ancestor workspace await a descendant agent's bash task. That report
+        // goes to the ancestor, not the owning agent, so it must not mark the terminal status or
+        // shown frontier (either would suppress the owner's wake while its agent stays idle).
+        const ancestorRead = await manager.getOutput(
+          result.processId,
+          undefined,
+          false,
+          1,
+          undefined,
+          "ancestor-workspace",
+          "task_await"
+        );
+        expect(ancestorRead.success).toBe(true);
+        if (ancestorRead.success) expect(ancestorRead.status).toBe("exited");
+        expect(proc?.terminalStatusShownToAgent).toBe(false);
+        expect(proc?.shownThroughOffset).toBe(0);
+        expect(shownEvents).toHaveLength(0);
+
+        // The owner's own read still marks the terminal status shown and emits the retraction.
+        const ownerRead = await manager.getOutput(
+          result.processId,
+          undefined,
+          false,
+          1,
+          undefined,
+          testWorkspaceId,
+          "task_await"
+        );
+        expect(ownerRead.success).toBe(true);
+        expect(proc?.terminalStatusShownToAgent).toBe(true);
+        expect(shownEvents).toHaveLength(1);
+        expect(shownEvents[0].terminalStatusShown).toBe(true);
+      });
     });
   });
 

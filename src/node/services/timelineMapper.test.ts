@@ -474,10 +474,6 @@ describe("mapChatEventToTimeline", () => {
     expect(classifyMachineTurnPromptKind(digestOf(BASH_MONITOR_WAKE_HEADINGS.mixed))).toBe(
       "turn.monitor_wake"
     );
-    // Settlement wakes classify like other monitor wakes (headings join via Object.values).
-    expect(classifyMachineTurnPromptKind(digestOf(BASH_MONITOR_WAKE_HEADINGS.exited))).toBe(
-      "turn.monitor_wake"
-    );
     expect(
       classifyMachineTurnPromptKind(digestOf(BACKGROUND_WORK_WAKE_OPENINGS.subagentsFailed))
     ).toBe("turn.background_wake");

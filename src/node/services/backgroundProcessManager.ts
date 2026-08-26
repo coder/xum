@@ -1727,11 +1727,19 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     const shownThroughOffsetBeforeRead = proc.shownThroughOffset;
     const terminalStatusShownBeforeRead = proc.terminalStatusShownToAgent;
 
+    // Wake suppression must track what the OWNER workspace's agent saw: task_await lets an
+    // ancestor workspace read a descendant agent's bash task, and marking the frontier or
+    // terminal status shown on such a cross-workspace read would suppress the owner's wake even
+    // though the owning agent never saw the report (it would stay idle instead of resuming).
+    // A missing workspaceId (internal/test callers; both model-visible tools pass one) counts as
+    // the owner: over-marking there can only suppress, so default to the historical behavior.
+    const consumerIsOwner = workspaceId == null || workspaceId === proc.workspaceId;
+
     // A read that reports a terminal status has shown the settlement to the agent — filtered or
     // not (status/exitCode are never filtered out of tool results, and the exit drain above
     // returned all remaining output). getOutput's only callers are model-visible (task_await and
     // bash_output); UI previews go through peekOutput/list, which never mark.
-    if (currentStatus !== "running") {
+    if (currentStatus !== "running" && consumerIsOwner) {
       proc.terminalStatusShownToAgent = true;
     }
 
@@ -1746,7 +1754,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // and those skipped lines were never shown to the agent. Advancing across that gap would let a
     // wake for filtered-out output be wrongly suppressed, so only advance when this read's content
     // is contiguous with the frontier. A gap pins the frontier low (safe: it can only over-wake).
-    if (!filter) {
+    if (!filter && consumerIsOwner) {
       const shownRegionStart = readStartOffset - Buffer.byteLength(previousBuffer, "utf8");
       if (shownRegionStart <= proc.shownThroughOffset) {
         const shownThrough =
