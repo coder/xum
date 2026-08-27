@@ -4832,6 +4832,32 @@ describe("buildBashMonitorWakePrompt", () => {
     expect(prompt).toContain('task_await({ task_ids: ["bash:proc-failed"], timeout_secs: 0 })');
   });
 
+  test("runtime monitor failures omit task_await when the process generation is gone", () => {
+    const record: BashMonitorWakeRecord = {
+      id: "proc-failed",
+      ownerWorkspaceId: "owner-1",
+      processId: "proc-failed",
+      taskId: "bash:proc-failed",
+      filter: "ERROR",
+      filterExclude: false,
+      kind: "monitor-lost",
+      script: "run-thing --watch",
+      lostReason: "runtime-failure",
+      lines: [],
+      totalMatches: 0,
+      droppedLines: 0,
+      status: "pending",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const context = new Map([[record.id, { taskAwaitable: false }]]);
+    const prompt = buildBashMonitorWakePrompt([record], context);
+
+    expect(prompt).toContain("no longer awaitable; Xum restarted or this process ID was reused");
+    expect(prompt).not.toContain("task_await(");
+    expect(prompt).toContain("no retrievable report for that process generation");
+  });
+
   const terminalRecordBase = {
     ownerWorkspaceId: "owner-1",
     filter: "READY",
@@ -4926,6 +4952,35 @@ describe("buildBashMonitorWakePrompt", () => {
 
     expect(prompt.startsWith("A background bash monitor matched output.")).toBe(true);
     expect(prompt).toContain("Status: exited (code 2)");
+  });
+
+  test("runtime failures mixed with matches keep the mixed heading", () => {
+    const prompt = buildBashMonitorWakePrompt([
+      {
+        ...terminalRecordBase,
+        id: "proc-match",
+        processId: "proc-match",
+        taskId: "bash:proc-match",
+        kind: "match",
+        lines: ["READY"],
+      },
+      {
+        ...terminalRecordBase,
+        id: "proc-failed",
+        processId: "proc-failed",
+        taskId: "bash:proc-failed",
+        kind: "monitor-lost",
+        script: "run-thing --watch",
+        lostReason: "runtime-failure",
+        lines: [],
+      },
+    ]);
+
+    expect(
+      prompt.startsWith(
+        "Background bash monitor updates (including monitors lost to a Xum restart)."
+      )
+    ).toBe(true);
   });
 
   test("terminal records mixed with lost records keep the mixed heading", () => {

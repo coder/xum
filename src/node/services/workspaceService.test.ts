@@ -3165,6 +3165,7 @@ describe("WorkspaceService bash monitor wakes", () => {
 
       const backgroundProcessManager = Object.assign(new EventEmitter(), {
         cleanup: mock(() => Promise.resolve()),
+        getProcess: mock(() => Promise.resolve({ workspaceId, startTime: 0 })),
       }) as unknown as BackgroundProcessManager & EventEmitter;
       const workspaceService = createWorkspaceServiceForTest({
         config,
@@ -3209,6 +3210,61 @@ describe("WorkspaceService bash monitor wakes", () => {
         },
       });
       expect(await registryStore.listAll(workspaceId)).toHaveLength(0);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("marks a runtime-failure wake unawaitable after its process generation is gone", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-runtime-failure-unawaitable";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const wakeStore = new BashMonitorWakeStore(config);
+      await wakeStore.enqueueMonitorLost(
+        {
+          processId: "proc-gone",
+          taskId: "bash:proc-gone",
+          ownerWorkspaceId: workspaceId,
+          filter: "ERROR",
+          filterExclude: false,
+          script: "run-thing --watch",
+          lostReason: "runtime-failure",
+          failureMessage: "SSH connection closed",
+        },
+        Number.MAX_SAFE_INTEGER
+      );
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+        getProcess: mock(() => Promise.resolve(null)),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        async (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          await args[3]?.onAccepted?.();
+          return Ok(undefined);
+        }
+      );
+
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      const prompt = sendSpy.mock.calls[0][1];
+      expect(prompt).toContain("no longer awaitable; Xum restarted or this process ID was reused");
+      expect(prompt).not.toContain("task_await(");
+      expect(prompt).toContain("no retrievable report for that process generation");
     } finally {
       await cleanup();
     }

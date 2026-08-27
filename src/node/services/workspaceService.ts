@@ -2948,9 +2948,27 @@ export class WorkspaceService extends EventEmitter {
         typeof this.backgroundProcessManager.getMonitorWakeDeliveryState === "function";
       const canQueryShownFrontier =
         typeof this.backgroundProcessManager.getSettledShownThroughOffset === "function";
+      const canQueryProcess = typeof this.backgroundProcessManager.getProcess === "function";
       const supersededByShown: BashMonitorWakeRecord[] = [];
       const promptContext = new Map<string, BashMonitorWakePromptContext>();
       for (const record of pending) {
+        if (
+          record.kind === "monitor-lost" &&
+          record.lostReason === "runtime-failure" &&
+          canQueryProcess
+        ) {
+          const process = await this.backgroundProcessManager.getProcess(record.processId);
+          const wakeCreatedAt = Date.parse(record.createdAt);
+          // The task ID is safe only while it still names the process generation whose monitor failed.
+          if (
+            process?.workspaceId !== ownerWorkspaceId ||
+            !Number.isFinite(wakeCreatedAt) ||
+            process.startTime > wakeCreatedAt
+          ) {
+            promptContext.set(record.id, { taskAwaitable: false });
+          }
+        }
+
         // A match record carries up to two independent signals, each with its own shown-condition:
         // matched output (matchedThroughOffset; shown when the offset frontier covers it) and
         // settlement (terminal; shown only when the agent was returned the terminal status —

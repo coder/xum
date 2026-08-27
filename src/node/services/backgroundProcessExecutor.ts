@@ -297,6 +297,10 @@ export async function spawnProcess(
  * This handle provides lifecycle management via execBuffered commands.
  */
 class RuntimeBackgroundHandle implements BackgroundHandle {
+  private lastMonitorProbeFailure?: {
+    operation: "readOutput" | "getExitCode";
+    message: string;
+  };
   private terminated = false;
 
   constructor(
@@ -305,6 +309,23 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     public readonly outputDir: string,
     private readonly quotePath: (p: string) => string
   ) {}
+
+  private clearMonitorProbeFailure(): void {
+    this.lastMonitorProbeFailure = undefined;
+  }
+
+  private recordMonitorProbeFailure(
+    operation: "readOutput" | "getExitCode",
+    error: unknown
+  ): Error | null {
+    const message = errorMsg(error);
+    const previous = this.lastMonitorProbeFailure;
+    this.lastMonitorProbeFailure = { operation, message };
+    if (previous == null || previous.operation === operation) return null;
+    return new Error(
+      `Background process monitor probes failed (${previous.operation}: ${previous.message}; ${operation}: ${message})`
+    );
+  }
 
   /**
    * Get the exit code from the exit_code file.
@@ -318,9 +339,12 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
         `cat ${exitCodePath} 2>/dev/null || echo ""`,
         { cwd: FALLBACK_CWD, timeout: 10 }
       );
+      this.clearMonitorProbeFailure();
       return parseExitCode(result.stdout);
     } catch (error) {
       log.debug(`RuntimeBackgroundHandle.getExitCode: Error: ${errorMsg(error)}`);
+      const monitorFailure = this.recordMonitorProbeFailure("getExitCode", error);
+      if (monitorFailure != null) throw monitorFailure;
       return null;
     }
   }
@@ -377,16 +401,19 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     }
   }
 
+  private async readOutputFileSize(): Promise<number> {
+    const filePath = this.quotePath(`${this.outputDir}/${OUTPUT_FILENAME}`);
+    const sizeResult = await execBuffered(
+      this.runtime,
+      `wc -c < ${filePath} 2>/dev/null || echo 0`,
+      { cwd: FALLBACK_CWD, timeout: 10 }
+    );
+    return parseInt(sizeResult.stdout.trim(), 10) || 0;
+  }
+
   async getOutputFileSize(): Promise<number> {
     try {
-      const filePath = this.quotePath(`${this.outputDir}/${OUTPUT_FILENAME}`);
-      const sizeResult = await execBuffered(
-        this.runtime,
-        `wc -c < ${filePath} 2>/dev/null || echo 0`,
-        { cwd: FALLBACK_CWD, timeout: 10 }
-      );
-
-      return parseInt(sizeResult.stdout.trim(), 10) || 0;
+      return await this.readOutputFileSize();
     } catch (error) {
       log.debug(`RuntimeBackgroundHandle.getOutputFileSize: Error: ${errorMsg(error)}`);
       return 0;
@@ -400,9 +427,10 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
   async readOutput(offset: number): Promise<{ content: string; newOffset: number }> {
     try {
       const filePath = this.quotePath(`${this.outputDir}/${OUTPUT_FILENAME}`);
-      const fileSize = await this.getOutputFileSize();
+      const fileSize = await this.readOutputFileSize();
 
       if (offset >= fileSize) {
+        this.clearMonitorProbeFailure();
         return { content: "", newOffset: offset };
       }
 
@@ -414,12 +442,15 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
         { cwd: FALLBACK_CWD, timeout: 30 }
       );
 
+      this.clearMonitorProbeFailure();
       return {
         content: readResult.stdout,
         newOffset: offset + Buffer.byteLength(readResult.stdout),
       };
     } catch (error) {
       log.debug(`RuntimeBackgroundHandle.readOutput: Error: ${errorMsg(error)}`);
+      const monitorFailure = this.recordMonitorProbeFailure("readOutput", error);
+      if (monitorFailure != null) throw monitorFailure;
       return { content: "", newOffset: offset };
     }
   }

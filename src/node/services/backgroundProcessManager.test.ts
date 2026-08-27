@@ -32,7 +32,11 @@ import type { BashToolResult, BashOutputToolResult } from "@/common/types/tools"
  */
 function createRemoteLikeRuntime(
   base: LocalRuntime,
-  options?: { throwOnSpawn?: { value: boolean } }
+  options?: {
+    throwOnSpawn?: { value: boolean };
+    outputProbeFailure?: { value: boolean; calls: number };
+    exitProbeFailure?: { value: boolean; calls: number };
+  }
 ): Runtime {
   return new Proxy({} as Runtime, {
     get(_target, prop) {
@@ -40,6 +44,21 @@ function createRemoteLikeRuntime(
         return (command: string, opts: never) => {
           if (options?.throwOnSpawn?.value === true && command.includes("output.log")) {
             throw new Error("SSH channel error after dispatch");
+          }
+          if (
+            options?.outputProbeFailure?.value === true &&
+            (command.includes("wc -c <") || command.includes("tail -c +"))
+          ) {
+            options.outputProbeFailure.calls += 1;
+            throw new Error("SSH output probe failed");
+          }
+          if (
+            options?.exitProbeFailure?.value === true &&
+            command.includes("cat ") &&
+            command.includes("exit_code")
+          ) {
+            options.exitProbeFailure.calls += 1;
+            throw new Error("SSH exit probe failed");
           }
           return base.exec(command, opts);
         };
@@ -399,6 +418,54 @@ describe("BackgroundProcessManager", () => {
         reason: "failed",
         failureMessage: "read failure",
       });
+    });
+
+    it("retires a real runtime monitor only after both transport probes fail", async () => {
+      const outputProbeFailure = { value: false, calls: 0 };
+      const exitProbeFailure = { value: false, calls: 0 };
+      const remoteRuntime = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), {
+        outputProbeFailure,
+        exitProbeFailure,
+      });
+      const stoppedEvents: MonitorStoppedPayload[] = [];
+      manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+      const result = await manager.spawn(remoteRuntime, testWorkspaceId, "sleep 10", {
+        cwd: process.cwd(),
+        displayName: "monitor-transport-failure",
+        monitor: {
+          filter: "NEVER_MATCHES",
+          pattern: /NEVER_MATCHES/,
+          exclude: false,
+          cooldownMs: 0,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      try {
+        outputProbeFailure.value = true;
+        for (let attempt = 0; attempt < 40 && outputProbeFailure.calls === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        expect(outputProbeFailure.calls).toBeGreaterThan(0);
+        expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(1);
+
+        exitProbeFailure.value = true;
+        for (let attempt = 0; attempt < 40 && stoppedEvents.length === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        expect(exitProbeFailure.calls).toBeGreaterThan(0);
+        expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(0);
+        const stoppedEvent = stoppedEvents.find(
+          (event) => event.processId === result.processId && event.reason === "failed"
+        );
+        expect(stoppedEvent).toBeDefined();
+        expect(stoppedEvent?.failureMessage).toContain("Background process monitor probes failed");
+      } finally {
+        outputProbeFailure.value = false;
+        exitProbeFailure.value = false;
+      }
     });
 
     describe("armed/stopped registry events", () => {

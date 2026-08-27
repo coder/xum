@@ -518,7 +518,10 @@ export function buildBashMonitorWakePrompt(
           record.failureMessage != null
             ? ` Failure: ${sanitizeBashMonitorWakeLine(record.failureMessage)}`
             : "";
-        return `Process: ${displayName}\nTask ID: ${record.taskId}\n${monitorLine}\nStatus: The monitor failed at runtime and will produce no further wakes; the process may still be running.${failure}\nScript:\n${script}${matchedOutput}`;
+        const taskIdSuffix = isAwaitable(record)
+          ? ""
+          : " (no longer awaitable; Xum restarted or this process ID was reused)";
+        return `Process: ${displayName}\nTask ID: ${record.taskId}${taskIdSuffix}\n${monitorLine}\nStatus: The monitor failed at runtime and will produce no further wakes; the process may still be running.${failure}\nScript:\n${script}${matchedOutput}`;
       }
       return `Process: ${displayName}\nTask ID: ${record.taskId} (no longer awaitable — process was terminated)\n${monitorLine}\nStatus: Xum restarted. This background process was terminated (or orphaned if Xum crashed) and its monitor is no longer active; it will produce no further wakes.\nScript:\n${script}${matchedOutput}`;
     }
@@ -576,7 +579,7 @@ export function buildBashMonitorWakePrompt(
         : BASH_MONITOR_WAKE_HEADINGS.matched
       : restartLostRecords.length === records.length
         ? BASH_MONITOR_WAKE_HEADINGS.lost
-        : runtimeLostRecords.length > 0 && restartLostRecords.length === 0
+        : runtimeLostRecords.length === records.length
           ? BASH_MONITOR_WAKE_HEADINGS.failed
           : BASH_MONITOR_WAKE_HEADINGS.mixed;
 
@@ -611,11 +614,19 @@ export function buildBashMonitorWakePrompt(
     }
   }
   if (runtimeLostRecords.length > 0) {
-    const taskIds = [...new Set(runtimeLostRecords.map((record) => record.taskId))];
-    const taskAwaitExample = `task_await({ task_ids: [${taskIds.map((id) => JSON.stringify(id)).join(", ")}], timeout_secs: 0 })`;
-    closingParts.push(
-      `Use \`${taskAwaitExample}\` to inspect current output, then re-arm a new monitor if more wakes are needed.`
-    );
+    const awaitableRuntimeFailures = runtimeLostRecords.filter(isAwaitable);
+    if (awaitableRuntimeFailures.length > 0) {
+      const taskIds = [...new Set(awaitableRuntimeFailures.map((record) => record.taskId))];
+      const taskAwaitExample = `task_await({ task_ids: [${taskIds.map((id) => JSON.stringify(id)).join(", ")}], timeout_secs: 0 })`;
+      closingParts.push(
+        `Use \`${taskAwaitExample}\` to inspect current output, then re-arm a new monitor if more wakes are needed.`
+      );
+    }
+    if (awaitableRuntimeFailures.length < runtimeLostRecords.length) {
+      closingParts.push(
+        "Runtime-failure task IDs marked no longer awaitable have no retrievable report for that process generation."
+      );
+    }
   }
   if (restartLostRecords.length > 0) {
     closingParts.push(
