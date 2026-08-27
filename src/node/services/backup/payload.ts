@@ -1887,8 +1887,8 @@ const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   {
     name: /^(?:php[0-9.]*|php-win)$/,
     evalWord: /^-[nq]*[rRBE]/,
-    attachedScriptFile: /^(?:--file=|-f)(.+)$/,
-    separateScriptFileOption: /^(?:-f|--file)$/,
+    attachedScriptFile: /^(?:--file=|--process-file=|-[fF])(.+)$/,
+    separateScriptFileOption: /^(?:-[fF]|--file|--process-file)$/,
   },
   // make evaluates recipes from an explicit makefile through a shell, and --eval/-E
   // evaluates the option operand as makefile syntax; plain target launchers stay portable.

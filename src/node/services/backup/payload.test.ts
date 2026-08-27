@@ -1720,6 +1720,9 @@ describe("backup payload", () => {
     ["R separate file option", "R -f ~/.xum/skills/launch.txt"],
     ["PHP attached file option", "php --file=/home/alice/.xum/skills/launch.mdx"],
     ["PHP separate file option", "php -f ~/.mux/memory/global/launch.markdown"],
+    ["PHP process-file option", "php -F/home/alice/.xum/skills/launch.txt"],
+    ["PHP long process-file option", "php --process-file=~/.xum/skills/launch.txt"],
+    ["PHP separate process-file option", "php --process-file ~/.xum/skills/launch.txt"],
     ["Deno", "deno run --config deno.json 'C:\\Users\\me\\.xum\\skills\\launch.mdx'"],
   ] as const) {
     it(`localizes ${name} execution of auto-published documents`, async () => {
@@ -2001,6 +2004,8 @@ describe("backup payload", () => {
       "R --file=/tmp/server.R ~/.xum/skills/argument.txt",
       "R -f /tmp/server.R ~/.xum/skills/argument.txt",
       "php --file=/tmp/server.php ~/.xum/skills/argument.txt",
+      "php -F/tmp/process.php ~/.xum/skills/argument.txt",
+      "php --process-file /tmp/process.php ~/.xum/skills/argument.txt",
       "npx notes-mcp --port 8080",
       "npm exec notes-mcp -- --port 8080",
       "npm --prefix /tmp install exec -c",
