@@ -117,6 +117,21 @@ function hasDigitBearingSkToken(text: string): boolean {
 const EXAMPLE_ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE";
 
 /**
+ * Case-insensitive equality of two UTF-16 units without allocating per-character
+ * lowercase strings, which dominated the synchronous scan of a size-capped payload.
+ * ASCII folds arithmetically; only a non-ASCII unit pays for string folding (which
+ * also catches cross-plane pairs like U+212A KELVIN SIGN and `k`).
+ */
+function sameFoldedUnit(a: number, b: number): boolean {
+  if (a === b) return true;
+  const foldedA = a >= 65 && a <= 90 ? a + 32 : a;
+  const foldedB = b >= 65 && b <= 90 ? b + 32 : b;
+  if (foldedA === foldedB) return true;
+  if (a < 128 && b < 128) return false;
+  return String.fromCharCode(a).toLowerCase() === String.fromCharCode(b).toLowerCase();
+}
+
+/**
  * A run of one repeated character (case-insensitive) is documentation spelling, never
  * issued-token entropy (`ghp_xxxxxxxx...`), so those spellings stay in the reviewable
  * scan instead of the no-override block. Replaced with a space like the example key,
@@ -131,11 +146,10 @@ function stripPlaceholderRuns(text: string): string {
   let keptFrom = 0;
   let i = 0;
   while (i < text.length) {
-    const anchor = text[i] ?? "";
+    const anchor = text.charCodeAt(i);
     let end = i + 1;
-    if (!"\n\r\u2028\u2029".includes(anchor)) {
-      const folded = anchor.toLowerCase();
-      while (end < text.length && text[end]?.toLowerCase() === folded) end += 1;
+    if (anchor !== 10 && anchor !== 13 && anchor !== 0x2028 && anchor !== 0x2029) {
+      while (end < text.length && sameFoldedUnit(anchor, text.charCodeAt(end))) end += 1;
     }
     if (end - i >= 16) {
       result += text.slice(keptFrom, i) + " ";
@@ -143,7 +157,7 @@ function stripPlaceholderRuns(text: string): string {
     }
     i = end;
   }
-  return result + text.slice(keptFrom);
+  return keptFrom === 0 ? text : result + text.slice(keptFrom);
 }
 
 function matchesCredentialToken(text: string): boolean {
@@ -1754,14 +1768,17 @@ const SHELL_REPARSE_EXECUTABLE_NAMES = new Set([
  * is per-interpreter knowledge this table owns, unlike arbitrary programs' options.
  */
 const LANGUAGE_INTERPRETERS: Array<{ name: RegExp; evalWord: RegExp }> = [
-  { name: /^python[0-9.]*$/, evalWord: /^-[A-Za-z0-9]*c/ },
+  // Windows spellings count alongside the Unix names: the `py`/`pyw` launcher and the
+  // windowed `pythonw`/`rubyw`/`wperl`/`php-win` builds run the same evaluation
+  // grammars under different executable names.
+  { name: /^(?:py|pyw|pythonw?[0-9.]*)$/, evalWord: /^-[A-Za-z0-9]*c/ },
   { name: /^(?:node|nodejs)$/, evalWord: /^(?:--eval|--print|-[A-Za-z0-9]*[ep])/ },
   { name: /^bun$/, evalWord: /^(?:--eval|--print|-[A-Za-z0-9]*[ep])/ },
   { name: /^deno$/, evalWord: /^eval$/ },
-  { name: /^perl[0-9.]*$/, evalWord: /^-[A-Za-z0-9]*[eE]/ },
-  { name: /^ruby[0-9.]*$/, evalWord: /^-[A-Za-z0-9]*e/ },
+  { name: /^w?perl[0-9.]*$/, evalWord: /^-[A-Za-z0-9]*[eE]/ },
+  { name: /^rubyw?[0-9.]*$/, evalWord: /^-[A-Za-z0-9]*e/ },
   // -r/-R run code; -B/-E execute begin/end code blocks around per-line runs.
-  { name: /^php[0-9.]*$/, evalWord: /^-[A-Za-z0-9]*[rRBE]/ },
+  { name: /^(?:php[0-9.]*|php-win)$/, evalWord: /^-[A-Za-z0-9]*[rRBE]/ },
 ];
 
 /**
@@ -1791,6 +1808,11 @@ const SHELL_STATE_WORDS = new Set([
   // `shopt -so allexport` flips the same allexport state `set -a` does, and
   // `shopt -s expand_aliases` opens alias rewriting of later lines.
   "shopt",
+  // With inherited SHELLOPTS=history, `history -s` stores its arguments as one entry
+  // and `fc -s` reparses the stored command, expanding what the first parse kept
+  // quoted (`history -s 'mcp${IFS}--token${IFS}ghp_a\\b'; fc -s`).
+  "history",
+  "fc",
   // `source`/`.` run a file in this shell with the remaining words as positionals
   // (`source ./launch ghp_aaa bbb` can join them into one runtime token). A bare `.`
   // argument (the cwd) localizes with it: keywords like `do` make command-position
@@ -2585,8 +2607,11 @@ export async function createBackupPayload(
         const content = file.content.toString("utf-8");
         // NUL-stripping reassembles ASCII tokens out of UTF-16 text, which decodes to
         // interleaved NUL characters here; text published as prose has no business
-        // holding NULs, so this manufactures no match from ordinary content.
-        const targets = [content, content.replaceAll("\u0000", ""), file.path];
+        // holding NULs, so this manufactures no match from ordinary content. NUL-free
+        // content strips to itself, so the second scan pass runs only when NULs exist
+        // rather than doubling the synchronous scan of a size-capped payload.
+        const targets = [content, file.path];
+        if (content.includes("\u0000")) targets.push(content.replaceAll("\u0000", ""));
         // Shell-normalized variants catch a token split by quoting or an expansion
         // (`--token ghp_123\456...`, `ghp_...$9...`): the shell removes both on
         // execution, and the published text reconstructs the same credential.

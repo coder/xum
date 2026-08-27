@@ -122,6 +122,19 @@ export const CREDENTIAL_URL_PARAMETER_NAMES: ReadonlySet<string> = new Set([
   "xamzsignature",
 ]);
 
+/**
+ * Signed-URL families qualify the credential word with a provider prefix
+ * (`X-Goog-Signature`, `X-Amz-Credential`, `x-oss-security-token`), so these
+ * unambiguous words match as name suffixes rather than enumerating providers.
+ */
+const CREDENTIAL_NAME_SUFFIXES = [
+  "accesskeyid",
+  "credential",
+  "secretaccesskey",
+  "securitytoken",
+  "signature",
+] as const;
+
 function parametersContainCredential(
   parameters: URLSearchParams,
   names: ReadonlySet<string>
@@ -133,6 +146,7 @@ function parametersContainCredential(
     // Header-style spellings prefix the same names with `x` (`x-api-key`,
     // `X-Auth-Token`), so one stripped leading `x` matches the whole class.
     if (normalizedName.startsWith("x") && names.has(normalizedName.slice(1))) return true;
+    if (CREDENTIAL_NAME_SUFFIXES.some((suffix) => normalizedName.endsWith(suffix))) return true;
   }
   return false;
 }

@@ -1769,12 +1769,25 @@ describe("backup payload", () => {
       // options whose separate argument looks like a script operand.
       "python3 -u -c 'x'",
       'python3 -W ignore -c \'__import__("os").system("mcp"+chr(32)+"--token"+chr(32)+"ghp_Abcdef1234"+"Klmno56789")\'',
+      // The Windows launchers and windowed variants run the same evaluation grammars
+      // under different executable names.
+      'py.exe -c \'__import__("os").system("mcp"+chr(32)+"--token"+chr(32)+"ghp_Abcdef1234"+"Klmno56789")\'',
+      "pyw -c 'x'",
+      "pythonw -c 'x'",
+      "rubyw -e 'x'",
+      "wperl -e 'x'",
+      "php-win.exe -r 'x'",
       "node -e \"require('child_process').spawnSync('mcp',['--token','ghp_Abcdef1234'+'Klmno56789'])\"",
       'deno eval \'const_t="ghp_Abcdef1234"+"Klmno56789"\'',
       // Perl and Ruby cluster the numeric `-0[octal]` switch before the eval
       // letter, so digits count as cluster characters alongside letters.
       'perl -0e \'exec("mcp","--token","ghp_Abcdef1234"."Klmno56789")\'',
       'ruby -0e \'exec("mcp","--token","ghp_Abcdef1234"+"Klmno56789")\'',
+      // `history -s` stores its arguments as one entry and `fc -s` reparses the
+      // stored command with inherited SHELLOPTS=history, expanding what the first
+      // parse kept quoted.
+      "history -s 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'; fc -s",
+      "fc -s",
       // PHP executes -r/-R run code and -B/-E begin/end code operands alike.
       'php -B \'system("mcp".chr(32)."--token".chr(32)."ghp_Abcdef1234"."Klmno56789");\'',
       'php8.3 -E \'system("mcp".chr(32)."--token".chr(32)."ghp_Abcdef1234"."Klmno56789");\'',
@@ -4330,6 +4343,10 @@ describe("backup payload", () => {
       "https://mcp.example.com/mcp?sessionToken=hunter2",
       "https://mcp.example.com/mcp?code=review",
       "https://mcp.example.com/mcp?X-Amz-Signature=deadbeef",
+      // Provider-prefixed signed-URL families qualify the credential word
+      // (X-Goog-Signature, x-oss-credential); one stripped leading x cannot reach them.
+      "https://storage.googleapis.com/bucket/backup?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=svc%40proj.iam.gserviceaccount.com%2F20260827%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Signature=deadbeefcafe0123",
+      "https://oss.example.com/mcp?x-oss-security-token=hunter2",
       "https://mcp.example.com/callback?code=oauth-code",
       "https://mcp.example.com/mcp#access_token=fragtoken",
       "https://mcp.example.com/mcp#callback?api_key=fragment-secret",
