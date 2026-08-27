@@ -5530,6 +5530,50 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("getActivityList fails closed when no raw baseline can be established", async () => {
+    // If every raw baseline read fails transiently while the strict scoping
+    // enumeration succeeds, both cross-process removal guards would stay
+    // disabled on a response the renderer applies as authoritative — a
+    // workspace another backend deregisters during the probes would ride
+    // back with no event to correct it. The list must fail (null → renderer
+    // keeps last-known state and retries) instead of serving guardless
+    // authoritative data; only the fail-open scope (config unreadable) may
+    // do that, and there the enumeration fails too.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "baseline-unavailable";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency(workspaceId, 111);
+      const supersetSpy = spyOn(config, "readPersistedWorkspaceIdSuperset").mockImplementation(
+        () => {
+          throw new Error("persistent raw read failure");
+        }
+      );
+      try {
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+        expect(await workspaceService.getActivityList()).toBeNull();
+      } finally {
+        supersetSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("first bootstrap reuses the prune's config enumeration for scoping", async () => {
     // getAllWorkspaceMetadata walks every workspace with per-workspace disk
     // probes; the latency-sensitive first bootstrap must not pay it twice.

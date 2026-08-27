@@ -1005,6 +1005,21 @@ export class ExtensionMetadataService {
         }
       }
       const quarantinePath = `${this.filePath}.corrupt`;
+      // A crash-stranded sidecar may already occupy the quarantine path —
+      // typically the full healthy snapshot, with the corrupt main being a
+      // later re-corruption of a recreated file. On POSIX, rename() would
+      // silently REPLACE those bytes, and recovery would then reset the
+      // canonical file to empty, permanently destroying the recoverable
+      // data. Move the corrupt main aside as the bounded fixed-name
+      // leftover instead (same name the newer-schema swap uses; keeps the
+      // latest superseded file) and complete the EXISTING sidecar's
+      // recovery: healthy bytes restore to the canonical path, corrupt
+      // sidecar bytes reset it to empty exactly as before. A failing probe
+      // propagates so the read stays retryable on unknowable evidence.
+      if (await this.probeQuarantineSidecar()) {
+        await rename(this.filePath, `${this.filePath}.recreated`);
+        return this.completeQuarantineRecovery(quarantinePath);
+      }
       await rename(this.filePath, quarantinePath);
       return this.completeQuarantineRecovery(quarantinePath);
     });

@@ -13474,6 +13474,10 @@ export class WorkspaceService extends EventEmitter {
       // WITHOUT a snapshot still flow through the tombstone logic below —
       // scoping only drops ids that are not in config at all.
       let workspaceIds: Set<string>;
+      // Whether scoping ended up on the fail-open legacy union (config
+      // unreadable): only that availability path may serve a response with
+      // the cross-process removal guards disabled.
+      let scopedFailOpen = false;
       if (prefetchedKnownIds != null) {
         workspaceIds = prefetchedKnownIds;
         // The prune enumerated config BEFORE the snapshot read above, so a
@@ -13505,6 +13509,7 @@ export class WorkspaceService extends EventEmitter {
           // from live ones, and dropping live entries would strand renderer
           // activity state. Fall back to the legacy unscoped union.
           log.debug("Failed to scope activity list to known workspaces", { error });
+          scopedFailOpen = true;
           workspaceIds = new Set(snapshots.keys());
           for (const workspaceId of this.activeWorkflowRunIdsByWorkspace.keys()) {
             workspaceIds.add(workspaceId);
@@ -13530,7 +13535,18 @@ export class WorkspaceService extends EventEmitter {
       if (initialConfigIds == null) {
         try {
           initialConfigIds = this.config.readPersistedWorkspaceIdSuperset();
-        } catch {
+        } catch (error) {
+          // Authoritative scope but NO raw baseline even on retry: both
+          // cross-process removal guards would silently stay disabled on a
+          // response the renderer applies as authoritative — a workspace
+          // another backend deregisters during the probes below would ride
+          // back with no event to correct it. Fail the list instead (null →
+          // renderer keeps last-known state and retries). The fail-open
+          // scope keeps its availability contract: config is unreadable
+          // there by definition, and no baseline exists by design.
+          if (!scopedFailOpen) {
+            throw error;
+          }
           initialConfigIds = null;
         }
       }

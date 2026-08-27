@@ -905,6 +905,34 @@ describe("ExtensionMetadataService", () => {
     expect(snapshots.get("ws-partial")?.recency).toBe(300);
   });
 
+  test("quarantine preserves an existing healthy sidecar instead of clobbering it", async () => {
+    // Crash strands the full snapshot at .corrupt; another backend recreates
+    // the main file, which later becomes corrupt too. The next strict read's
+    // quarantine must not rename() over the healthy sidecar (POSIX rename
+    // replaces silently) — recovery would then reset the canonical file to
+    // empty and permanently destroy every stranded entry. The corrupt main
+    // moves aside as the bounded fixed-name leftover instead and the healthy
+    // sidecar restores.
+    await writeFile(
+      `${filePath}.corrupt`,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-stranded": { recency: 700, streaming: false } },
+      })
+    );
+    await writeFile(filePath, "{corrupt json");
+
+    const snapshots = await service.getAllSnapshots({ throwOnError: true });
+    expect(snapshots.get("ws-stranded")?.recency).toBe(700);
+    // Corrupt main preserved as the bounded leftover; sidecar consumed.
+    expect(await readFile(`${filePath}.recreated`, "utf-8")).toBe("{corrupt json");
+    const sidecarGone = await readFile(`${filePath}.corrupt`, "utf-8").then(
+      () => false,
+      () => true
+    );
+    expect(sidecarGone).toBe(true);
+  });
+
   test("a strict snapshot read propagates a failed sidecar reconcile instead of the partial main", async () => {
     // Live emissions read per-workspace snapshots after the subscription
     // bootstraps. With a sidecar stranded next to a recreated partial main
