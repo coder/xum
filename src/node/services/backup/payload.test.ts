@@ -1611,7 +1611,9 @@ describe("backup payload", () => {
       "printf ghp_aaaaaaaaaa | mcp-server",
       "printf -v TOKEN %s%s ghp_aaaaaaaaaa bbbbbbbbbb; export TOKEN; mcp",
       // Inherited SHELLOPTS=allexport exports a printf-built value without any
-      // explicit state-changing word in the command.
+      // explicit state-changing word in the command. Bash accepts both separated
+      // and attached variable-option spellings.
+      "printf -vTOKEN %s%s ghp_aaaaaaaaaa bbbbbbbbbb; mcp",
       "printf -v TOKEN %s%s ghp_aaaaaaaaaa bbbbbbbbbb; mcp",
       "set -a; printf -v TOKEN %s ghp_aaaaaaaaaabbbbbbbbbb; mcp",
       // Trap actions are reparsed when the signal fires; first-parse quotes can hide

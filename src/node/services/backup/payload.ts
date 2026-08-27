@@ -1607,7 +1607,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
     const unquoted = unquoteShellWord(word);
     // With allexport inherited through SHELLOPTS, `printf -v` exports the variable it
     // builds even when this command contains no explicit export/set/shopt word.
-    if (pendingPrintfVariableOption && unquoted === "-v") return true;
+    if (pendingPrintfVariableOption && unquoted.startsWith("-v")) return true;
     pendingPrintfVariableOption = unquoted === "printf";
     // `eval` concatenates its arguments and reparses the result, dissolving one more
     // layer of quoting than any single-pass scan models (`ghp_a\\\\b` reaches the
