@@ -144,7 +144,7 @@ function foldClassId(code: number): number {
  * Case-insensitive equality of two UTF-16 units without allocating per-character
  * lowercase strings, which dominated the synchronous scan of a size-capped payload.
  * ASCII folds arithmetically; only a non-ASCII unit pays for a cached fold-class
- * lookup (which also catches cross-plane pairs like U+212A KELVIN SIGN and `k`).
+ * lookup (which also catches case-equivalent units like U+212A KELVIN SIGN and `k`).
  */
 function sameFoldedUnit(a: number, b: number): boolean {
   if (a === b) return true;
@@ -1594,6 +1594,16 @@ function isSplitStringOption(unquoted: string): boolean {
   );
 }
 
+/** GNU env's -u/--unset and -C/--chdir take a separate value in these spellings. */
+function envOptionTakesSeparateValue(unquoted: string): boolean {
+  if (unquoted === "-u" || unquoted === "-C") return true;
+  const abbreviation = /^--([A-Za-z-]+)$/.exec(unquoted)?.[1];
+  return (
+    abbreviation !== undefined &&
+    ("unset".startsWith(abbreviation) || "chdir".startsWith(abbreviation))
+  );
+}
+
 /** Exactly one replaced assignment, nothing else riding along in the same word. */
 const CONSUMED_ASSIGNMENT = new RegExp(`^${ASSIGNMENT_NAME}${REDACTED_BACKUP_VALUE}$`);
 
@@ -1813,7 +1823,11 @@ const LANGUAGE_INTERPRETERS: Array<{ name: RegExp; evalWord: RegExp }> = [
     name: /^bun$/,
     evalWord: /^(?:--eval|--print|--import|--loader|--experimental-loader|-[A-Za-z0-9]*[ep])/,
   },
+  // npx keeps ordinary package launchers portable; only its call operand is reparsed
+  // through a shell. npm needs its `exec` subcommand tracked separately below.
+  { name: /^npx$/, evalWord: /^(?:-c|--call(?:=|$))/ },
   { name: /^deno$/, evalWord: /^eval$/ },
+  { name: /^(?:r|rscript)$/, evalWord: /^(?:-e|--expression(?:=|$))/ },
   { name: /^w?perl[0-9.]*$/, evalWord: /^-[A-Za-z0-9]*[eE]/ },
   { name: /^rubyw?[0-9.]*$/, evalWord: /^-[A-Za-z0-9]*e/ },
   // -r/-R run code; -B/-E execute begin/end code blocks around per-line runs.
@@ -1869,6 +1883,10 @@ const SHELL_STATE_WORDS = new Set([
 function hasDisguisedAssignment(redacted: string): boolean {
   let operandsOnly = false;
   let pendingPrintfVariableOption = false;
+  let sawEnv = false;
+  let pendingEnvOptionValue = false;
+  let pendingNpmSubcommand = false;
+  let pendingNpmExecOptions = false;
   let evalOperandAmbiguous = false;
   // A Set of the static table's RegExp instances: repeated interpreter words cannot
   // grow it past the table size, keeping this lookup linear in command length.
@@ -1882,6 +1900,32 @@ function hasDisguisedAssignment(redacted: string): boolean {
     if (hasActiveBraceExpansion(activeWordProjection(word))) return true;
     if (hasNondeterministicGlob(word)) return true;
     const unquoted = unquoteShellWord(word);
+    // GNU env reparses its split-string value even without an assignment or literal
+    // whitespace, so this runs before the assignment-only exit below. Stop tracking at
+    // its command operand: the target program may use -S for an ordinary option.
+    if (sawEnv) {
+      if (pendingEnvOptionValue) {
+        pendingEnvOptionValue = false;
+      } else if (isSplitStringOption(unquoted)) {
+        return true;
+      } else if (envOptionTakesSeparateValue(unquoted)) {
+        pendingEnvOptionValue = true;
+      } else if (!unquoted.startsWith("-")) {
+        sawEnv = false;
+      }
+    }
+    if (pendingNpmExecOptions) {
+      if (/^(?:-c|--call(?:=|$))/.test(unquoted)) return true;
+      if (!unquoted.startsWith("-")) pendingNpmExecOptions = false;
+    }
+    if (pendingNpmSubcommand) {
+      if (unquoted === "exec" || unquoted === "x") {
+        pendingNpmSubcommand = false;
+        pendingNpmExecOptions = true;
+      } else if (!unquoted.startsWith("-")) {
+        pendingNpmSubcommand = false;
+      }
+    }
     // With allexport inherited through SHELLOPTS, `printf -v` exports the variable it
     // builds even when this command contains no explicit export/set/shopt word.
     if (pendingPrintfVariableOption && unquoted.startsWith("-v")) return true;
@@ -1901,6 +1945,8 @@ function hasDisguisedAssignment(redacted: string): boolean {
       .slice(Math.max(unquoted.lastIndexOf("/"), unquoted.lastIndexOf("\\")) + 1)
       .toLowerCase()
       .replace(/\.exe$/, "");
+    if (executable === "env") sawEnv = true;
+    if (executable === "npm") pendingNpmSubcommand = true;
     if (SHELL_INTERPRETER_NAMES.has(executable)) return true;
     if (PROGRAM_OPERAND_INTERPRETER_NAMES.has(executable)) return true;
     if (SHELL_REPARSE_EXECUTABLE_NAMES.has(executable)) return true;
@@ -1945,8 +1991,6 @@ function hasDisguisedAssignment(redacted: string): boolean {
     if (unquoted.startsWith("=")) return true;
     // A quote-mangled `NAME=` spelling (`TOKEN\\=x`, `'TOKEN'=x`) for `env`/`eval`.
     if (ASSIGNMENT_START.test(unquoted)) return true;
-    // A split-string option with its value attached (`-STOKEN=x`, `--s=TOKEN=x`).
-    if (isSplitStringOption(unquoted)) return true;
     // An option value can embed a whole assignment for the target program
     // (`systemd-run --setenv=TOKEN=x`, `--env=TOKEN=x`): a second `=` past the
     // option's own separator marks one. Plain long-option flag values

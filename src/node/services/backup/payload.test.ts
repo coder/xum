@@ -1654,7 +1654,7 @@ describe("backup payload", () => {
     // The run stripper must stay linear: a backreference regex exhausts V8's call
     // stack near 4 MiB and rejected size-valid files before scanning them. The
     // alternating U+212A KELVIN SIGN/k spelling forces every comparison through the
-    // non-ASCII fold path, which must treat the cross-plane pair as one run without
+    // non-ASCII fold path, which must treat the case-equivalent pair as one run without
     // allocating per character.
     for (const content of ["x".repeat(4 * 1024 * 1024), "\u212Ak".repeat(2 * 1024 * 1024)]) {
       await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", content);
@@ -1667,6 +1667,37 @@ describe("backup payload", () => {
       expect(payloadFileText(payload, "skills/demo/SKILL.md")).toBe(content);
     }
   });
+
+  for (const [name, command] of [
+    ["npx call operands", "npx -c 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'"],
+    ["npm exec call operands", "npm exec -c 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'"],
+    [
+      "Rscript expression operands",
+      `Rscript -e 'system(paste0("mcp",intToUtf8(32),"--token",intToUtf8(32),"ghp_Abcdef1234","Klmno56789"))'`,
+    ],
+    [
+      "GNU env split strings without assignments",
+      `env -S'mcp\\_--token\\_ghp_Abcdef1234""Klmno56789'`,
+    ],
+  ] as const) {
+    it(`localizes ${name}`, async () => {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+    });
+  }
 
   it("localizes commands that write files through active redirection", async () => {
     // A write redirection lets the command assemble a credential file the scans
@@ -1832,6 +1863,11 @@ describe("backup payload", () => {
       // the interpreter: server.py receives -c, Rails receives -e.
       "python3 server.py -c settings.toml",
       "ruby app.rb -e production",
+      "Rscript server.R --port 8080",
+      "npx notes-mcp --port 8080",
+      "npm exec notes-mcp -- --port 8080",
+      "mcp-server -Ssettings.toml",
+      "env -u TOKEN mcp-server -Ssettings.toml",
     ]) {
       await writeFixtureFile(
         muxRoot,
