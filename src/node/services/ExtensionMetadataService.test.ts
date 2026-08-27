@@ -1192,6 +1192,88 @@ describe("ExtensionMetadataService", () => {
     expect(leftovers).toEqual([]);
   });
 
+  test("stranded leftover merge orders by write generation, not recency alone", async () => {
+    // recency is a user-interaction timestamp that status/goal writers
+    // deliberately preserve: a newer status write captured in the stranded
+    // copy can share its recency with the older restored main and must
+    // still win via the per-entry write generation — and the reverse copy
+    // (older generation, equal recency) must lose.
+    const entry = (writeGeneration: number, message: string) => ({
+      recency: 500,
+      streaming: false,
+      writeGeneration,
+      lastModel: null,
+      lastThinkingLevel: null,
+      agentStatus: null,
+      lastStatusUrl: null,
+      todoStatus: { emoji: "s", message },
+    });
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        workspaces: {
+          "ws-status": entry(3, "old status"),
+          "ws-keep": entry(5, "current status"),
+        },
+      })
+    );
+    await writeFile(
+      `${filePath}.recreated-31337-0ddba11`,
+      JSON.stringify({
+        version: 1,
+        workspaces: {
+          "ws-status": entry(7, "newer status"),
+          "ws-keep": entry(2, "stale status"),
+        },
+      })
+    );
+    const snapshots = await service.getAllSnapshots();
+    expect(snapshots.get("ws-status")?.todoStatus?.message).toBe("newer status");
+    expect(snapshots.get("ws-keep")?.todoStatus?.message).toBe("current status");
+  });
+
+  test("persisted mutations advance the per-entry write generation", async () => {
+    // The durable ordering contract behind the merge above: metadata
+    // mutations advance the generation even when they preserve recency, so
+    // cross-copy ordering never regresses to the recency tiebreak for
+    // entries written by this build.
+    await service.updateRecency("ws-gen", 100);
+    await service.setTodoStatus("ws-gen", { emoji: "s", message: "working" }, true);
+    const raw = JSON.parse(await readFile(filePath, "utf-8")) as {
+      workspaces: Record<string, { writeGeneration?: number; recency: number }>;
+    };
+    expect(raw.workspaces["ws-gen"].writeGeneration).toBe(2);
+    expect(raw.workspaces["ws-gen"].recency).toBe(100);
+  });
+
+  test("stranded entries for foreign-removed workspaces are not resurrected", async () => {
+    // The stranded snapshot predates the current main: an entry missing
+    // from the main may have been REMOVED by another backend after the
+    // file was stranded (local tombstones cannot know). Adoption requires
+    // registration evidence — a probed-unregistered id is dropped instead
+    // of resurrected, while registered ids still recover.
+    service.setRegistrationProbe((workspaceId) => Promise.resolve(workspaceId !== "ws-removed"));
+    await service.updateRecency("ws-live", 100);
+    await writeFile(
+      `${filePath}.recreated-1234-abcd12`,
+      JSON.stringify({
+        version: 1,
+        workspaces: {
+          "ws-removed": { recency: 900, streaming: false },
+          "ws-created": { recency: 800, streaming: false },
+        },
+      })
+    );
+    const snapshots = await service.getAllSnapshots();
+    expect(snapshots.has("ws-removed")).toBe(false);
+    expect(snapshots.get("ws-created")?.recency).toBe(800);
+    expect(snapshots.get("ws-live")?.recency).toBe(100);
+    // Consumed on evidence, not left for an endless retry loop.
+    const stranded = (await readdir(tempDir)).filter((name) => name.includes(".recreated-"));
+    expect(stranded).toEqual([]);
+  });
+
   test("a corrupt stranded in-flight leftover is finalized, not merged", async () => {
     // Corrupt stranded bytes are exactly the validated-corrupt main their
     // owner moved aside: the scan keeps them as the bounded fixed-name

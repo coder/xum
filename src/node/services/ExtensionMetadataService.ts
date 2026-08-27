@@ -144,6 +144,23 @@ export class ExtensionMetadataService {
   }
 
   /**
+   * In-memory suppression for a CROSS-PROCESS removal proven by the
+   * activity list's config-corroborated guards. The foreign backend's
+   * removal cannot publish a tombstone in this process, so without one a
+   * late local producer (workflow-run or bash-monitor completion) would
+   * repopulate the just-evicted caches and emitWorkspaceActivity — whose
+   * isWorkspaceDeleted check only knows local removals — would broadcast
+   * the removed incarnation's activity right after an authoritative list
+   * dropped it. Reuses the standard tombstone lifecycle, so suppression
+   * ends exactly on fresh registration evidence: writes re-probe via
+   * recheckTombstonedRegistration and later lists clear it via
+   * clearTombstonesForRegisteredIds when the id is genuinely re-registered.
+   */
+  suppressForeignRemoval(workspaceId: string): void {
+    this.publishTombstone(workspaceId);
+  }
+
+  /**
    * Single exit point for clearing a tombstone (re-registration revival).
    * Notifies the owner so process-local activity caches bootstrapped for the
    * REMOVED incarnation (active workflow-run ids, bash-monitor seen set) are
@@ -341,9 +358,20 @@ export class ExtensionMetadataService {
       const data = await this.load();
       const workspace = this.getOrCreateWorkspaceEntry(data, workspaceId, recency);
       mutate(workspace);
+      // Every persisted mutation advances the write generation: `recency`
+      // is a user-interaction timestamp (status/goal/streaming writers
+      // deliberately preserve it), so recovery merges cannot order metadata
+      // copies by recency alone — see recoverStrandedRecreatedLeftover.
+      workspace.writeGeneration = ExtensionMetadataService.nextWriteGeneration(workspace);
       await this.save(data);
       return toWorkspaceActivitySnapshot(workspace);
     });
+  }
+
+  private static nextWriteGeneration(entry: ExtensionMetadata): number {
+    return typeof entry.writeGeneration === "number" && Number.isFinite(entry.writeGeneration)
+      ? entry.writeGeneration + 1
+      : 1;
   }
 
   constructor(filePath?: string) {
@@ -838,6 +866,9 @@ export class ExtensionMetadataService {
         delete workspace.todoStatus;
         delete workspace.sidebarStatusInputHash;
       }
+      // Same write-generation contract as mutateWorkspaceSnapshot: this
+      // writer persists a mutation while deliberately preserving recency.
+      workspace.writeGeneration = ExtensionMetadataService.nextWriteGeneration(workspace);
       data.workspaces[workspaceId] = workspace;
       await this.save(data);
       return toWorkspaceActivitySnapshot(workspace);
@@ -1491,37 +1522,79 @@ export class ExtensionMetadataService {
       await this.finalizeRecreatedLeftover(claimPath);
       return;
     }
-    // Same tombstone revalidation contract as the sidecar reconcile:
-    // resolve probes BEFORE reading the main file (probes await config, and
-    // holding a pre-probe main snapshot across those awaits would let the
-    // save below clobber a concurrent backend's newer write). Without a
-    // probe the local removal knowledge stands; a FAILING probe propagates
-    // (retryable — the claim stays discoverable) rather than consuming the
-    // stranded bytes on unknowable evidence.
-    for (const workspaceId of Object.keys(parsed.workspaces)) {
-      if (!this.deletedWorkspaceIds.has(workspaceId) || this.registrationProbe == null) {
-        continue;
-      }
-      const generationBefore = this.deletedWorkspaceIds.get(workspaceId);
-      const registered = await this.registrationProbe(workspaceId);
-      if (registered && this.deletedWorkspaceIds.get(workspaceId) === generationBefore) {
-        this.liftTombstone(workspaceId);
-      }
-    }
-    let main: ExtensionMetadataFile;
+    // Preliminary main read, only to bound the probe set below: which
+    // candidate ids are MISSING from the current main. Never saved.
+    let preliminary: ExtensionMetadataFile;
     try {
-      const mainParsed = JSON.parse(await readFile(this.filePath, "utf-8")) as unknown;
-      if (!ExtensionMetadataService.isValidMetadataFileShape(mainParsed)) {
+      const preliminaryParsed = JSON.parse(await readFile(this.filePath, "utf-8")) as unknown;
+      if (!ExtensionMetadataService.isValidMetadataFileShape(preliminaryParsed)) {
         // Corrupt or newer-schema main: leave the claim for a later pass
         // (it stays under the scanned prefix) rather than merging across
         // schemas.
         return;
       }
-      main = mainParsed;
+      preliminary = preliminaryParsed;
     } catch (readError) {
       if (ExtensionMetadataService.isErrnoCode(readError, "ENOENT")) {
         // Missing-main window: the resumable sidecar recovery owns the
         // path right now; the claim stays discoverable for the next pass.
+        return;
+      }
+      if (!ExtensionMetadataService.isDeterministicCorruption(readError)) {
+        throw readError;
+      }
+      return;
+    }
+    // Registration evidence, resolved BEFORE the mergeable main read below
+    // (probes await config, and holding a pre-probe main snapshot across
+    // those awaits would let the save clobber a concurrent backend's newer
+    // write). Two decisions share the probe:
+    // - tombstoned ids follow the sidecar reconcile's lift-or-suppress
+    //   generation contract;
+    // - ids MISSING from the main are adopted only with registration
+    //   evidence: the stranded snapshot predates the current main, so a
+    //   missing entry may mean another backend REMOVED the workspace after
+    //   the file was stranded — the local tombstones cannot know — and
+    //   restoring it would resurrect deleted metadata indefinitely (an
+    //   unscoped older build exposes it, and a re-registered deterministic
+    //   legacy id would inherit the stale goal/status).
+    // Without a wired probe, missing-target adoption stays fail-open (the
+    // sidecar reconcile's sidecar-only adoption contract; dropping is
+    // destructive and production always wires the probe). A FAILING probe
+    // propagates (claim retained, retryable) rather than consuming the
+    // stranded bytes on unknowable evidence.
+    const registrationEvidence = new Map<string, boolean>();
+    for (const workspaceId of Object.keys(parsed.workspaces)) {
+      const tombstoned = this.deletedWorkspaceIds.has(workspaceId);
+      if (this.registrationProbe == null) {
+        registrationEvidence.set(workspaceId, !tombstoned);
+        continue;
+      }
+      if (!tombstoned && workspaceId in preliminary.workspaces) {
+        // No decision needs evidence: the target exists and no local
+        // tombstone stands.
+        continue;
+      }
+      const generationBefore = this.deletedWorkspaceIds.get(workspaceId);
+      const registered = await this.registrationProbe(workspaceId);
+      if (
+        tombstoned &&
+        registered &&
+        this.deletedWorkspaceIds.get(workspaceId) === generationBefore
+      ) {
+        this.liftTombstone(workspaceId);
+      }
+      registrationEvidence.set(workspaceId, registered);
+    }
+    let main: ExtensionMetadataFile;
+    try {
+      const mainParsed = JSON.parse(await readFile(this.filePath, "utf-8")) as unknown;
+      if (!ExtensionMetadataService.isValidMetadataFileShape(mainParsed)) {
+        return;
+      }
+      main = mainParsed;
+    } catch (readError) {
+      if (ExtensionMetadataService.isErrnoCode(readError, "ENOENT")) {
         return;
       }
       if (!ExtensionMetadataService.isDeterministicCorruption(readError)) {
@@ -1544,20 +1617,50 @@ export class ExtensionMetadataService {
         // Unorderable candidate: keep the main entry (fail closed).
         continue;
       }
+      if (!(workspaceId in main.workspaces)) {
+        const registered = registrationEvidence.get(workspaceId);
+        if (registered === undefined) {
+          // The entry vanished between the preliminary read and this one
+          // (deleted during the probes), so no evidence was gathered for
+          // it. Abort the pass without saving or consuming: the claim
+          // stays discoverable and the next scan probes the id. Earlier
+          // candidates' merges replay idempotently.
+          return;
+        }
+        if (!registered) {
+          // Proven removed: do not resurrect the deleted entry.
+          continue;
+        }
+      }
       const target: unknown = main.workspaces[workspaceId];
-      const targetRecency =
-        target !== null && typeof target === "object" && !Array.isArray(target)
-          ? (target as { recency?: unknown }).recency
-          : undefined;
+      const targetIsObject =
+        target !== null && typeof target === "object" && !Array.isArray(target);
+      const targetRecency = targetIsObject ? (target as { recency?: unknown }).recency : undefined;
+      const targetGeneration = targetIsObject
+        ? (target as { writeGeneration?: unknown }).writeGeneration
+        : undefined;
+      const candidateGeneration = (entry as { writeGeneration?: unknown }).writeGeneration;
       // Entry-level newest-wins, NOT the sidecar reconcile's main-wins
       // field merge: the stranded bytes are a complete healthy main
       // snapshot whose age relative to the CURRENT main is unknowable per
       // field (the current main may be an older sidecar restore plus newer
-      // writes). Every mutation flows through mutateWorkspaceSnapshot with
-      // a fresh recency, so per-entry recency totally orders the two
-      // copies; requiring STRICTLY newer makes crash replay a no-op and
-      // can never re-fill a field a same-or-newer write cleared to null.
-      if (typeof targetRecency === "number" && targetRecency >= candidateRecency) {
+      // writes). Ordering uses the per-entry writeGeneration (advanced by
+      // EVERY persisted mutation) when both copies carry distinct ones —
+      // recency alone cannot order metadata changes because status/goal/
+      // streaming writers deliberately preserve it, so an equal-recency
+      // newer status must not be dropped. When generations are missing
+      // (bytes written by a build without them) or equal (concurrent
+      // bumps from the same base), the recency comparison is the best
+      // remaining order. Both gates require STRICTLY newer, so crash
+      // replay is a no-op and can never re-fill a field a same-or-newer
+      // write cleared to null.
+      const candidateNewer =
+        typeof candidateGeneration === "number" &&
+        typeof targetGeneration === "number" &&
+        candidateGeneration !== targetGeneration
+          ? candidateGeneration > targetGeneration
+          : !(typeof targetRecency === "number" && targetRecency >= candidateRecency);
+      if (!candidateNewer) {
         continue;
       }
       // Cross-process crash leftover rule (same as sidecar-only entries): a

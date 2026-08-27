@@ -13849,6 +13849,13 @@ export class WorkspaceService extends EventEmitter {
             // serve the REMOVED incarnation's cached runs as ghost activity
             // instead of probing the recreated session.
             this.evictWorkspaceActivityCaches(workspaceId);
+            // Eviction alone cannot stop a LATE local producer (workflow-run
+            // or bash-monitor completion) from repopulating the caches and
+            // re-emitting the removed incarnation's activity right after
+            // this authoritative response dropped it — publish a local
+            // tombstone so emits and writes stay suppressed until fresh
+            // config evidence proves a revival.
+            this.extensionMetadata.suppressForeignRemoval(workspaceId);
             return false;
           }
           return true;
@@ -14060,8 +14067,10 @@ export class WorkspaceService extends EventEmitter {
             if (foreignRemoved) {
               // Cross-process removals publish no local tombstone, so the
               // tombstone-cleared eviction listener never fires — see the
-              // mid-list filter above.
+              // mid-list filter above (including the late-producer
+              // suppression rationale).
               this.evictWorkspaceActivityCaches(workspaceId);
+              this.extensionMetadata.suppressForeignRemoval(workspaceId);
               delete activityById[workspaceId];
             } else if (this.extensionMetadata.isWorkspaceDeleted(workspaceId)) {
               delete activityById[workspaceId];
@@ -14126,11 +14135,12 @@ export class WorkspaceService extends EventEmitter {
                 (scopeEnumerationIds?.has(workspaceId) ?? false) &&
                 !finalAuthoritativeIds.has(workspaceId));
             if (lateForeignRemoved) {
-              // Same cross-process eviction rationale as the mid-list
-              // filter: no local tombstone means no listener-driven
-              // eviction, and the probes above may have installed caches
-              // for the removed incarnation.
+              // Same cross-process eviction + late-producer suppression
+              // rationale as the mid-list filter: no local tombstone means
+              // no listener-driven eviction, and the probes above may have
+              // installed caches for the removed incarnation.
               this.evictWorkspaceActivityCaches(workspaceId);
+              this.extensionMetadata.suppressForeignRemoval(workspaceId);
               continue;
             }
             if (

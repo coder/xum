@@ -7472,8 +7472,17 @@ describe("WorkspaceService activity list scoping", () => {
       const activityList = await workspaceService.getActivityList();
       expect(activityList).not.toBeNull();
       expect(activityList?.[workspaceId]).toBeUndefined();
-      // The in-process tombstone was NOT the mechanism here.
-      expect(extensionMetadata.isWorkspaceDeleted(workspaceId)).toBe(false);
+      // The removal was detected from foreign evidence — and retained as a
+      // local tombstone: cache eviction alone cannot stop a LATE local
+      // producer (workflow-run/bash-monitor completion) from re-emitting
+      // the removed incarnation's activity right after this authoritative
+      // response dropped it, because emitWorkspaceActivity's
+      // isWorkspaceDeleted check only knows local removals.
+      expect(extensionMetadata.isWorkspaceDeleted(workspaceId)).toBe(true);
+      // A late producer's write stays unpersisted (transient) instead of
+      // recreating the removed entry on disk.
+      await extensionMetadata.updateRecency(workspaceId, 200);
+      expect((await extensionMetadata.getAllSnapshots()).has(workspaceId)).toBe(false);
     } finally {
       await cleanup();
     }
@@ -7516,7 +7525,10 @@ describe("WorkspaceService activity list scoping", () => {
       const activityList = await workspaceService.getActivityList();
       expect(activityList).not.toBeNull();
       expect(activityList?.[workspaceId]).toBeUndefined();
-      expect(extensionMetadata.isWorkspaceDeleted(workspaceId)).toBe(false);
+      // Foreign removals proven by the list guards publish a local
+      // tombstone (late-producer suppression — see the metadata-removal
+      // test above).
+      expect(extensionMetadata.isWorkspaceDeleted(workspaceId)).toBe(true);
     } finally {
       await cleanup();
     }
