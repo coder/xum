@@ -918,6 +918,13 @@ describe("Config", () => {
       // incomplete — strict mode must not vouch "authoritatively empty" for
       // it (the prune would delete every snapshot of that project).
       ["missing workspaces key", { projects: [["/repo", {}]] }],
+      // The lenient path-filter silently drops the WHOLE project for empty
+      // or non-string keys, and an id-less legacy workspace inside it is
+      // raw-invisible too (its stable id lives only in session
+      // metadata.json) — strict mode must fail closed rather than hand the
+      // prune an id set missing that workspace.
+      ["null project key", { projects: [[null, { workspaces: [] }]] }],
+      ["empty-string project key", { projects: [["", { workspaces: [] }]] }],
     ];
 
     for (const [label, shape] of invalidShapes) {

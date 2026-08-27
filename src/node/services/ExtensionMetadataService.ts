@@ -358,13 +358,13 @@ export class ExtensionMetadataService {
       // fail closed by leaving the file rather than unlinking blind.
       return;
     }
-    let current: QuarantineSidecarToken | null;
-    try {
-      current = await ExtensionMetadataService.statQuarantineToken(quarantinePath);
-    } catch {
-      // Unprobeable: leave the sidecar (retryable) rather than guessing.
-      return;
-    }
+    // Non-ENOENT probe failures propagate (retryable): reporting success
+    // with the sidecar retained would let the caller proceed — e.g. the
+    // one-time prune deletes stale entries from the main file, the next
+    // snapshot read re-merges them from the retained sidecar and consumes
+    // it, and with the prune latch already set the resurrected entries
+    // stay indefinitely. statQuarantineToken maps ENOENT to null below.
+    const current = await ExtensionMetadataService.statQuarantineToken(quarantinePath);
     if (current == null) {
       return; // Already consumed by a concurrent recovery.
     }
@@ -1118,6 +1118,53 @@ export class ExtensionMetadataService {
       // propagates so the read stays retryable on unknowable evidence.
       if (await this.probeQuarantineSidecar()) {
         await this.moveMainAsideAsRecreatedLeftover();
+        // Same cross-process race completeQuarantineRecovery closes for the
+        // rename-to-.corrupt branch: another backend's atomic save can land
+        // a NEWER healthy main between the in-queue corruption check above
+        // and the move — nothing ever reads the leftover, so the newer
+        // update would be silently lost while the OLDER sidecar restores.
+        // Re-validate what actually got moved; when it turns out healthy
+        // (or a preserved newer schema), restore it to the vacant main path
+        // and merge the existing sidecar into it via the recreated-main
+        // reconcile. Transient read failures propagate (retryable) — only
+        // deterministic corruption proceeds to the sidecar-restore path.
+        const leftoverPath = `${this.filePath}.recreated`;
+        let movedRaw: unknown;
+        let movedParses = true;
+        try {
+          movedRaw = JSON.parse(await readFile(leftoverPath, "utf-8")) as unknown;
+        } catch (readError) {
+          if (!ExtensionMetadataService.isDeterministicCorruption(readError)) {
+            throw readError;
+          }
+          movedParses = false;
+        }
+        if (
+          movedParses &&
+          (ExtensionMetadataService.isValidMetadataFileShape(movedRaw) ||
+            ExtensionMetadataService.isUnsupportedVersion(movedRaw))
+        ) {
+          // Restore without overwriting a file yet another writer re-created
+          // at the main path (EEXIST): the reconcile below merges the
+          // sidecar into whichever file now owns the path.
+          try {
+            await link(leftoverPath, this.filePath);
+          } catch (linkError) {
+            if (!ExtensionMetadataService.isErrnoCode(linkError, "EEXIST")) {
+              try {
+                await copyFile(leftoverPath, this.filePath, constants.COPYFILE_EXCL);
+              } catch (copyError) {
+                if (!ExtensionMetadataService.isErrnoCode(copyError, "EEXIST")) {
+                  // Main path missing with the raced bytes only in the
+                  // leftover: rethrow (retryable) rather than letting the
+                  // sidecar restore over the vacant path and orphan them.
+                  throw copyError;
+                }
+              }
+            }
+          }
+          return this.reconcileRecreatedMainWithSidecar(quarantinePath);
+        }
         return this.completeQuarantineRecovery(quarantinePath);
       }
       await rename(this.filePath, quarantinePath);

@@ -1032,6 +1032,113 @@ describe("ExtensionMetadataService", () => {
     expect(await readFile(`${filePath}.recreated`, "utf-8")).toBe("{corrupt json");
   });
 
+  test("a healthy main raced into the quarantine move-aside is restored and merged, not lost", async () => {
+    // Multi-instance race: the in-queue corruption check sees a corrupt main
+    // and an existing healthy sidecar, then another backend's atomic save
+    // lands a NEWER healthy main before the move-aside. Nothing ever reads
+    // the .recreated leftover, so without revalidating the moved bytes the
+    // newer update would be silently lost while the OLDER sidecar restores.
+    await writeFile(
+      `${filePath}.corrupt`,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-old": { recency: 700, streaming: false } },
+      })
+    );
+    await writeFile(filePath, "{corrupt json");
+    const internals = service as unknown as {
+      moveMainAsideAsRecreatedLeftover: () => Promise<void>;
+    };
+    const realMove = internals.moveMainAsideAsRecreatedLeftover.bind(service);
+    internals.moveMainAsideAsRecreatedLeftover = async () => {
+      // The concurrent backend's save landing inside the race window.
+      await writeFile(
+        filePath,
+        JSON.stringify({
+          version: 1,
+          workspaces: { "ws-new": { recency: 900, streaming: false } },
+        })
+      );
+      internals.moveMainAsideAsRecreatedLeftover = realMove;
+      return realMove();
+    };
+    try {
+      const snapshots = await service.getAllSnapshots({ throwOnError: true });
+      expect(snapshots.get("ws-new")?.recency).toBe(900);
+      expect(snapshots.get("ws-old")?.recency).toBe(700);
+    } finally {
+      internals.moveMainAsideAsRecreatedLeftover = realMove;
+    }
+    const sidecarGone = await readFile(`${filePath}.corrupt`, "utf-8").then(
+      () => false,
+      () => true
+    );
+    expect(sidecarGone).toBe(true);
+  });
+
+  test("a failing sidecar token probe during consumption propagates instead of reporting success", async () => {
+    // consumeQuarantineSidecar's post-merge stat() guards which sidecar
+    // generation gets unlinked. If a transient EACCES/EIO there were
+    // swallowed as success, the caller would proceed — e.g. the one-time
+    // prune deletes stale entries, the NEXT snapshot read re-merges them
+    // from the retained sidecar and consumes it, and with the prune latch
+    // already set the resurrected entries stay indefinitely. It must
+    // propagate (retryable) instead.
+    await writeFile(
+      `${filePath}.corrupt`,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-stranded": { recency: 700, streaming: false } },
+      })
+    );
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-live": { recency: 900, streaming: false } },
+      })
+    );
+    const statics = ExtensionMetadataService as unknown as {
+      statQuarantineToken: (quarantinePath: string) => Promise<unknown>;
+    };
+    const realStat = statics.statQuarantineToken.bind(ExtensionMetadataService);
+    // Call #1 captures the reconcile's generation token (real); call #2 is
+    // the consumption-time identity probe this test degrades.
+    let statCalls = 0;
+    statics.statQuarantineToken = async (quarantinePath: string) => {
+      statCalls += 1;
+      if (statCalls === 2) {
+        const error = new Error("EACCES: permission denied, stat") as NodeJS.ErrnoException;
+        error.code = "EACCES";
+        throw error;
+      }
+      return realStat(quarantinePath);
+    };
+    try {
+      let strictRejected = false;
+      try {
+        await service.getAllSnapshots({ throwOnError: true });
+      } catch {
+        strictRejected = true;
+      }
+      expect(strictRejected).toBe(true);
+      // Sidecar retained for the retry: never consumed on unverifiable identity.
+      expect(await readFile(`${filePath}.corrupt`, "utf-8")).toContain("ws-stranded");
+    } finally {
+      statics.statQuarantineToken = realStat;
+    }
+    // Retry with the probe healthy: the re-merge is idempotent and
+    // consumption completes.
+    const snapshots = await service.getAllSnapshots({ throwOnError: true });
+    expect(snapshots.get("ws-stranded")?.recency).toBe(700);
+    expect(snapshots.get("ws-live")?.recency).toBe(900);
+    const sidecarGone = await readFile(`${filePath}.corrupt`, "utf-8").then(
+      () => false,
+      () => true
+    );
+    expect(sidecarGone).toBe(true);
+  });
+
   test("a strict snapshot read propagates a failed sidecar reconcile instead of the partial main", async () => {
     // Live emissions read per-workspace snapshots after the subscription
     // bootstraps. With a sidecar stranded next to a recreated partial main

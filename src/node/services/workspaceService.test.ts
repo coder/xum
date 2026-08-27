@@ -5639,23 +5639,29 @@ describe("WorkspaceService activity list scoping", () => {
     try {
       const workspaceId = "raw-only-live";
       const projectPath = path.join(config.rootDir, "project");
-      // A null project path survives the raw id scan but is dropped by the
-      // normalized enumeration, keeping the id out of the per-id scope.
       // Migration flags pre-seeded: without them the first load schedules an
       // async settings-migration persist that rewrites config.json through
-      // the parsed view — which DROPS the null-path project — deregistering
-      // this raw-only id mid-test whenever the persist happens to land
-      // before the second list's raw reads (observed flake).
+      // the parsed view mid-test whenever it happens to land before the
+      // second list's raw reads (observed flake).
       await fsPromises.writeFile(
         path.join(config.rootDir, "config.json"),
         JSON.stringify({
           projects: [
-            [null, { workspaces: [{ id: workspaceId, path: path.join(projectPath, "ws") }] }],
+            [
+              projectPath,
+              { workspaces: [{ id: workspaceId, path: path.join(projectPath, "ws") }] },
+            ],
           ],
           taskSettings: { preserveSubagentsUntilArchive: true },
           migrations: { persistentSubagentsDefaulted: true, defaultModelFallbacksSeeded: true },
         })
       );
+      // Raw-visible but enumeration-invisible: the strict normalized
+      // enumeration resolves no ids while the raw persisted view carries the
+      // inline id, keeping it out of the per-id scope so it takes the
+      // late-candidate path. (Strict loads now reject the previously used
+      // malformed-project-key vehicle, so divergence is modeled directly.)
+      const enumerateSpy = spyOn(config, "getAllWorkspaceMetadata").mockResolvedValue([]);
       const extensionMetadata = new ExtensionMetadataService(
         path.join(config.rootDir, "extensionMetadata.json")
       );
@@ -5688,6 +5694,7 @@ describe("WorkspaceService activity list scoping", () => {
         expect(secondList?.[workspaceId]?.recency).toBe(42);
       } finally {
         snapshotsSpy.mockRestore();
+        enumerateSpy.mockRestore();
       }
     } finally {
       await cleanup();
@@ -7407,7 +7414,10 @@ describe("WorkspaceService activity list scoping", () => {
     // A parseable config entry that lenient normalization filters out (null
     // project path): the workspace vanishes from the normalized view — and
     // thus from the activity list, matching every other renderer surface —
-    // but its metadata entry must survive the prune (raw-superset guarantee).
+    // but its metadata entry must survive the prune. Two guards enforce it:
+    // strict loads reject the malformed project key outright (aborting the
+    // prune, fail closed), and the raw-superset union spares the inline id
+    // even if enumeration were to succeed.
     const { config, historyService, cleanup } = await createTestHistoryService();
     try {
       const extensionMetadata = new ExtensionMetadataService(

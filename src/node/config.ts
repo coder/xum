@@ -1429,6 +1429,19 @@ export class Config {
             if (!Array.isArray(pair)) {
               throw new Error("Config projects entries must be [path, config] pairs");
             }
+            const projectKey: unknown = pair[0];
+            // The lenient normalization below silently drops the WHOLE
+            // project when its key is empty or non-string ("Filtering out
+            // project with invalid path"), and an id-less legacy workspace
+            // inside it is raw-invisible too (its stable id lives only in
+            // session metadata.json, which only the normalized enumeration
+            // resolves). Accepting the pair here would hand destructive
+            // strict callers an authoritative id set missing every one of
+            // that project's workspaces — the startup prune would then
+            // permanently delete their recency/goal/status snapshots.
+            if (typeof projectKey !== "string" || projectKey.length === 0) {
+              throw new Error("Config project entries must have a non-empty string path");
+            }
             const projectConfig: unknown = pair[1];
             // Arrays pass typeof "object": lenient normalization would turn
             // an array-valued project config into a project with no
