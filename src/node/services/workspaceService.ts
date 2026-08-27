@@ -2000,7 +2000,8 @@ export class WorkspaceService extends EventEmitter {
   private readonly bashMonitorRegistryLocks = new MutexMap<string>();
   private async convertRuntimeFailureMonitorToWake(
     workspaceId: string,
-    payload: MonitorStoppedPayload
+    payload: MonitorStoppedPayload,
+    onWakePersisted: () => void
   ): Promise<boolean> {
     const consume = () =>
       this.bashMonitorRegistryStore.consumeIfArmedBefore(
@@ -2015,8 +2016,10 @@ export class WorkspaceService extends EventEmitter {
             ...(payload.failedOperations != null
               ? { failedOperations: payload.failedOperations }
               : {}),
+            ...(payload.failedMatch ?? {}),
           };
           await this.bashMonitorWakeStore.enqueueMonitorLost(lostPayload, Number.MAX_SAFE_INTEGER);
+          onWakePersisted();
         }
       );
 
@@ -2038,11 +2041,21 @@ export class WorkspaceService extends EventEmitter {
     workspaceId: string,
     payload: MonitorStoppedPayload
   ): Promise<boolean> {
+    let wakePersisted = false;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        return await this.convertRuntimeFailureMonitorToWake(workspaceId, payload);
+        return await this.convertRuntimeFailureMonitorToWake(workspaceId, payload, () => {
+          wakePersisted = true;
+        });
       } catch (error) {
-        if (attempt === 1) throw error;
+        if (attempt === 1) {
+          log.error("Failed to finish runtime-failure monitor persistence", {
+            workspaceId,
+            processId: payload.processId,
+            error,
+          });
+          return wakePersisted;
+        }
         log.warn("Retrying runtime-failure monitor wake persistence", {
           workspaceId,
           processId: payload.processId,
@@ -2050,7 +2063,7 @@ export class WorkspaceService extends EventEmitter {
         });
       }
     }
-    return false;
+    return wakePersisted;
   }
 
   private readonly bashMonitorArmedListener = (
@@ -3038,7 +3051,7 @@ export class WorkspaceService extends EventEmitter {
               error,
             });
           }
-          const wakeCreatedAt = Date.parse(record.createdAt);
+          const wakeCreatedAt = Date.parse(record.monitorArmedAt ?? record.createdAt);
           // The task ID is safe only while it still names the process generation whose monitor failed.
           if (
             process?.workspaceId !== ownerWorkspaceId ||

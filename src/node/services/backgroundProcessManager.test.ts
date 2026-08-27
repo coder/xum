@@ -95,15 +95,6 @@ async function expectProbeCallNotToThrow(action: () => Promise<unknown>): Promis
   expect(await captureProbeError(action)).toBeNull();
 }
 
-async function expectProbeCallToThrow(
-  action: () => Promise<unknown>,
-  messageFragment: string
-): Promise<void> {
-  const error = await captureProbeError(action);
-  expect(error).not.toBeNull();
-  expect(error?.message).toContain(messageFragment);
-}
-
 function waitForMonitorMatch(
   manager: BackgroundProcessManager,
   timeoutMs = 2_000
@@ -318,99 +309,40 @@ describe("BackgroundProcessManager", () => {
       return result.handle;
     }
 
-    it("escalates the third consecutive nonzero readOutput failure", async () => {
+    it("keeps repeated readOutput transport failures fail-open outside monitor polling", async () => {
       const outputProbeFailure = { value: true, calls: 0, exitCode: 255 };
       const handle = await spawnRuntimeProbeHandle({ outputProbeFailure });
 
       try {
-        for (let attempt = 0; attempt < 2; attempt++) {
+        for (let attempt = 0; attempt < 4; attempt++) {
           await expectProbeCallNotToThrow(() => handle.readOutput(0));
-          expect(await handle.getExitCode()).toBeNull();
         }
-        await expectProbeCallToThrow(
-          () => handle.readOutput(0),
-          "readOutput: readOutput file-size probe exited with code 255"
-        );
       } finally {
         outputProbeFailure.value = false;
       }
     });
 
-    it("escalates the third consecutive nonzero getExitCode failure", async () => {
+    it("keeps repeated getExitCode transport failures fail-open outside monitor polling", async () => {
       const exitProbeFailure = { value: true, calls: 0, exitCode: 255 };
       const handle = await spawnRuntimeProbeHandle({ exitProbeFailure });
 
       try {
-        for (let attempt = 0; attempt < 2; attempt++) {
-          await expectProbeCallNotToThrow(() => handle.getExitCode());
-          await handle.readOutput(0);
+        for (let attempt = 0; attempt < 4; attempt++) {
+          expect(await handle.getExitCode()).toBeNull();
         }
-        await expectProbeCallToThrow(
-          () => handle.getExitCode(),
-          "getExitCode: getExitCode exited with code 255"
-        );
       } finally {
         exitProbeFailure.value = false;
       }
     });
 
-    it("an empty-output read success resets consecutive readOutput failures", async () => {
+    it("keeps simultaneous transport failures fail-open outside monitor polling", async () => {
       const outputProbeFailure = { value: true, calls: 0 };
-      const handle = await spawnRuntimeProbeHandle({ outputProbeFailure });
-
-      try {
-        await expectProbeCallNotToThrow(() => handle.readOutput(0));
-        await expectProbeCallNotToThrow(() => handle.readOutput(0));
-        outputProbeFailure.value = false;
-        expect(await handle.readOutput(0)).toEqual({ content: "", newOffset: 0 });
-
-        outputProbeFailure.value = true;
-        await expectProbeCallNotToThrow(() => handle.readOutput(0));
-        await expectProbeCallNotToThrow(() => handle.readOutput(0));
-        await expectProbeCallToThrow(() => handle.readOutput(0), "3 consecutive times");
-      } finally {
-        outputProbeFailure.value = false;
-      }
-    });
-
-    it("own-probe recoveries prevent transient failures from accumulating", async () => {
-      const outputProbeFailure = { value: true, calls: 0 };
-      const exitProbeFailure = { value: false, calls: 0 };
-      const handle = await spawnRuntimeProbeHandle({ outputProbeFailure, exitProbeFailure });
-
-      try {
-        await expectProbeCallNotToThrow(() => handle.readOutput(0));
-        outputProbeFailure.value = false;
-        await handle.readOutput(0);
-
-        exitProbeFailure.value = true;
-        await expectProbeCallNotToThrow(() => handle.getExitCode());
-        exitProbeFailure.value = false;
-        expect(await handle.getExitCode()).toBeNull();
-
-        outputProbeFailure.value = true;
-        await expectProbeCallNotToThrow(() => handle.readOutput(0));
-        outputProbeFailure.value = false;
-        await handle.readOutput(0);
-      } finally {
-        outputProbeFailure.value = false;
-        exitProbeFailure.value = false;
-      }
-    });
-
-    it("retires when both probe failures remain active without own-probe recovery", async () => {
-      const outputProbeFailure = { value: true, calls: 0 };
-      const exitProbeFailure = { value: false, calls: 0 };
+      const exitProbeFailure = { value: true, calls: 0 };
       const handle = await spawnRuntimeProbeHandle({ outputProbeFailure, exitProbeFailure });
 
       try {
         await expectProbeCallNotToThrow(() => handle.readOutput(0));
         expect(await handle.getExitCode()).toBeNull();
-        exitProbeFailure.value = true;
-        await expectProbeCallToThrow(
-          () => handle.getExitCode(),
-          "Background process monitor probes failed"
-        );
       } finally {
         outputProbeFailure.value = false;
         exitProbeFailure.value = false;
@@ -549,11 +481,9 @@ describe("BackgroundProcessManager", () => {
       const stoppedEvents: MonitorStoppedPayload[] = [];
       manager.on("change", (wsId) => changedWorkspaceIds.push(wsId));
       manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
-      // Simulate a runtime read failure (e.g. dropped SSH connection) inside the tail loop.
-      // Reject per-call (not mockRejectedValue) so no eagerly-created rejected promise
-      // sits unhandled before the tail loop consumes it.
-      spyOn(proc.handle, "readOutput").mockImplementation(() =>
-        Promise.reject(new Error("read failure"))
+      // Simulate a runtime read failure inside the monitor-only probe path.
+      spyOn(proc.handle, "readOutputForMonitor").mockImplementation(() =>
+        Promise.resolve({ success: false, error: "read failure" })
       );
 
       for (let attempt = 0; attempt < 40; attempt++) {
@@ -568,7 +498,8 @@ describe("BackgroundProcessManager", () => {
       const stoppedEvent = stoppedEvents.find(
         (event) => event.processId === result.processId && event.reason === "failed"
       );
-      expect(stoppedEvent?.failureMessage).toBe("read failure");
+      expect(stoppedEvent?.failureMessage).toContain("3 consecutive times");
+      expect(stoppedEvent?.failureMessage).toContain("read failure");
       expect(stoppedEvent?.armMetadata).toMatchObject({
         processId: result.processId,
         taskId: `bash:${result.processId}`,
@@ -584,20 +515,25 @@ describe("BackgroundProcessManager", () => {
       const stoppedEvents: MonitorStoppedPayload[] = [];
       manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
 
-      const result = await manager.spawn(remoteRuntime, testWorkspaceId, "sleep 10", {
+      const result = await manager.spawn(remoteRuntime, testWorkspaceId, "echo READY; sleep 10", {
         cwd: process.cwd(),
         displayName: "monitor-persistent-output-failure",
         monitor: {
-          filter: "NEVER_MATCHES",
-          pattern: /NEVER_MATCHES/,
+          filter: "READY",
+          pattern: /READY/,
           exclude: false,
-          cooldownMs: 0,
+          cooldownMs: 10_000,
         },
       });
       expect(result.success).toBe(true);
       if (!result.success) return;
 
       try {
+        for (let attempt = 0; attempt < 40; attempt++) {
+          const proc = manager.peekProcess(result.processId);
+          if (proc != null && manager.getMonitorSnapshot(proc)?.totalMatches === 1) break;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
         outputProbeFailure.value = true;
         for (let attempt = 0; attempt < 60 && stoppedEvents.length === 0; attempt++) {
           await new Promise((resolve) => setTimeout(resolve, 50));
@@ -611,9 +547,60 @@ describe("BackgroundProcessManager", () => {
         expect(stoppedEvent?.failureMessage).toContain("3 consecutive times");
         expect(stoppedEvent?.failedOperations).toEqual(["readOutput"]);
         expect(stoppedEvent?.armMetadata?.processId).toBe(result.processId);
+        expect(stoppedEvent?.failedMatch).toMatchObject({
+          lines: ["READY"],
+          totalMatches: 1,
+        });
       } finally {
         outputProbeFailure.value = false;
       }
+    });
+
+    it("resets consecutive output failures after an output probe succeeds", async () => {
+      const stoppedEvents: MonitorStoppedPayload[] = [];
+      manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+      const result = await manager.spawn(runtime, testWorkspaceId, "sleep 10", {
+        cwd: process.cwd(),
+        displayName: "monitor-output-probe-recovery",
+        monitor: {
+          filter: "NEVER_MATCHES",
+          pattern: /NEVER_MATCHES/,
+          exclude: false,
+          cooldownMs: 0,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      const proc = manager.peekProcess(result.processId);
+      expect(proc).not.toBeNull();
+      if (proc == null) return;
+
+      let probeCalls = 0;
+      let persistentlyFail = false;
+      spyOn(proc.handle, "readOutputForMonitor").mockImplementation((offset) => {
+        probeCalls++;
+        if (persistentlyFail || probeCalls <= 2 || (probeCalls >= 4 && probeCalls <= 5)) {
+          return Promise.resolve({ success: false, error: "read failure" });
+        }
+        return Promise.resolve({ success: true, value: { content: "", newOffset: offset } });
+      });
+
+      for (let attempt = 0; attempt < 40 && probeCalls < 6; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(probeCalls).toBeGreaterThanOrEqual(6);
+      expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(1);
+
+      const callsBeforePersistentFailure = probeCalls;
+      persistentlyFail = true;
+      for (let attempt = 0; attempt < 40 && stoppedEvents.length === 0; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      expect(probeCalls - callsBeforePersistentFailure).toBeGreaterThanOrEqual(3);
+      expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(0);
+      expect(stoppedEvents[0]?.failedOperations).toEqual(["readOutput"]);
     });
 
     it("keeps task output readable after exit-probe failure retires the monitor", async () => {
@@ -652,6 +639,11 @@ describe("BackgroundProcessManager", () => {
           (event) => event.processId === result.processId && event.reason === "failed"
         );
         expect(stoppedEvent?.failedOperations).toEqual(["getExitCode"]);
+        expect((await manager.getProcess(result.processId))?.id).toBe(result.processId);
+        expect((await manager.list(testWorkspaceId)).map((proc) => proc.id)).toContain(
+          result.processId
+        );
+        expect(await manager.list(testWorkspaceId2)).toEqual([]);
 
         const output = await manager.getOutput(result.processId, undefined, undefined, 0);
         expect(output.success).toBe(true);

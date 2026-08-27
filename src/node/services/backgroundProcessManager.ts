@@ -1,7 +1,11 @@
 import type { Dirent } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as nodePath from "node:path";
-import type { Runtime, BackgroundHandle } from "@/node/runtime/Runtime";
+import type {
+  Runtime,
+  BackgroundHandle,
+  BackgroundMonitorProbeResult,
+} from "@/node/runtime/Runtime";
 import {
   spawnProcess,
   localBgWorkspaceDir,
@@ -10,7 +14,6 @@ import {
   BG_META_FILENAME,
   BG_EXIT_CODE_FILENAME,
   BG_OUTPUT_SUBDIR,
-  isBackgroundMonitorProbeError,
 } from "./backgroundProcessExecutor";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { BASH_MONITOR_SETTLE_LINE_PREFIX } from "./bashMonitorWakeStore";
@@ -212,7 +215,14 @@ export interface MonitorArmedPayload {
   createdAt: string;
 }
 
-/** Emitted when a monitor retires normally (not during shutdown); deletes its registry record. */
+/** Matched output that must survive failed monitor retirement. */
+export interface MonitorFailedMatchPayload {
+  lines: string[];
+  totalMatches: number;
+  droppedLines: number;
+  matchedThroughOffset?: number;
+}
+
 export interface MonitorStoppedPayload {
   processId: string;
   /** Explicit cancellation discards pending matches; failed retirement needs a durable lost wake. */
@@ -220,6 +230,25 @@ export interface MonitorStoppedPayload {
   failureMessage?: string;
   failedOperations?: BashMonitorFailedOperation[];
   armMetadata?: MonitorArmedPayload;
+  failedMatch?: MonitorFailedMatchPayload;
+}
+
+// One or two misses can be transient; three means that capability cannot serve the monitor.
+const MAX_CONSECUTIVE_MONITOR_PROBE_FAILURES = 3;
+
+interface MonitorProbeFailureState {
+  consecutiveFailures: number;
+  message: string;
+}
+
+class MonitorPollingFailure extends Error {
+  constructor(
+    message: string,
+    readonly failedOperations: readonly BashMonitorFailedOperation[]
+  ) {
+    super(message);
+    this.name = "MonitorPollingFailure";
+  }
 }
 
 export interface BackgroundProcessMonitorState extends BackgroundProcessMonitorConfig {
@@ -243,7 +272,7 @@ export interface BackgroundProcessMonitorState extends BackgroundProcessMonitorC
   pollIntervalMs: number;
   incompleteLineBuffer: string;
   stopped: boolean;
-  failedOperations?: BashMonitorFailedOperation[];
+  probeFailures: Partial<Record<BashMonitorFailedOperation, MonitorProbeFailureState>>;
   /**
    * Settlement claim latch. Set synchronously (single-threaded event loop makes the plain flag
    * race-safe) by claimMonitorSettlement; once held, normal flush/stop triggers are suspended
@@ -450,6 +479,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       matchedThroughOffset: 0,
       incompleteLineBuffer: "",
       stopped: false,
+      probeFailures: {},
       settled: false,
       pollIntervalMs: options.pollIntervalMs,
     };
@@ -581,10 +611,18 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     const monitor = proc.monitor;
     if (!monitor || monitor.stopped) return;
 
+    const failedMatch: MonitorFailedMatchPayload | undefined =
+      failure != null
+        ? {
+            lines: [...monitor.pendingLines],
+            totalMatches: monitor.matchesCount,
+            droppedLines: monitor.droppedLines,
+            ...(monitor.pendingLines.length > 0
+              ? { matchedThroughOffset: monitor.matchedThroughOffset }
+              : {}),
+          }
+        : undefined;
     monitor.stopped = true;
-    if (failure?.failedOperations != null) {
-      monitor.failedOperations = failure.failedOperations;
-    }
     if (monitor.flushTimer) {
       clearTimeout(monitor.flushTimer);
       monitor.flushTimer = undefined;
@@ -611,6 +649,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
                 ? { failedOperations: failure.failedOperations }
                 : {}),
               armMetadata: monitor.armMetadata,
+              ...(failedMatch != null ? { failedMatch } : {}),
             }
           : {}),
       });
@@ -1007,6 +1046,107 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     }
   }
 
+  private recordMonitorProbeSuccess(
+    monitor: BackgroundProcessMonitorState,
+    operation: BashMonitorFailedOperation
+  ): void {
+    delete monitor.probeFailures[operation];
+  }
+
+  private recordMonitorProbeFailure(
+    monitor: BackgroundProcessMonitorState,
+    operation: BashMonitorFailedOperation,
+    message: string
+  ): MonitorPollingFailure | null {
+    const previous = monitor.probeFailures[operation];
+    const current: MonitorProbeFailureState = {
+      consecutiveFailures: (previous?.consecutiveFailures ?? 0) + 1,
+      message,
+    };
+    monitor.probeFailures[operation] = current;
+
+    const otherOperation: BashMonitorFailedOperation =
+      operation === "readOutput" ? "getExitCode" : "readOutput";
+    const otherFailure = monitor.probeFailures[otherOperation];
+    if (otherFailure != null) {
+      return new MonitorPollingFailure(
+        `Background process monitor probes failed (${operation}: ${message}; ${otherOperation}: ${otherFailure.message})`,
+        [operation, otherOperation]
+      );
+    }
+    if (current.consecutiveFailures >= MAX_CONSECUTIVE_MONITOR_PROBE_FAILURES) {
+      return new MonitorPollingFailure(
+        `Background process monitor probe failed ${current.consecutiveFailures} consecutive times (${operation}: ${message})`,
+        [operation]
+      );
+    }
+    return null;
+  }
+
+  private async runMonitorProbe<T>(
+    monitor: BackgroundProcessMonitorState,
+    operation: BashMonitorFailedOperation,
+    probe: () => Promise<BackgroundMonitorProbeResult<T>>,
+    fallback: T
+  ): Promise<T> {
+    let result: BackgroundMonitorProbeResult<T>;
+    try {
+      result = await probe();
+    } catch (error) {
+      result = { success: false, error: getErrorMessage(error) };
+    }
+    if (result.success) {
+      this.recordMonitorProbeSuccess(monitor, operation);
+      return result.value;
+    }
+    const failure = this.recordMonitorProbeFailure(monitor, operation, result.error);
+    if (failure != null) throw failure;
+    return fallback;
+  }
+
+  private readOutputForMonitor(
+    proc: BackgroundProcess,
+    monitor: BackgroundProcessMonitorState,
+    offset: number
+  ): Promise<{ content: string; newOffset: number }> {
+    const probe = proc.handle.readOutputForMonitor?.bind(proc.handle);
+    return this.runMonitorProbe(
+      monitor,
+      "readOutput",
+      probe != null
+        ? () => probe(offset)
+        : async () => {
+            try {
+              return { success: true, value: await proc.handle.readOutput(offset) };
+            } catch (error) {
+              return { success: false, error: getErrorMessage(error) };
+            }
+          },
+      { content: "", newOffset: offset }
+    );
+  }
+
+  private getExitCodeForMonitor(
+    proc: BackgroundProcess,
+    monitor: BackgroundProcessMonitorState
+  ): Promise<number | null> {
+    const probe = proc.handle.getExitCodeForMonitor?.bind(proc.handle);
+    return this.runMonitorProbe(
+      monitor,
+      "getExitCode",
+      probe != null
+        ? () => probe()
+        : async () => {
+            try {
+              return { success: true, value: await proc.handle.getExitCode() };
+            } catch (error) {
+              return { success: false, error: getErrorMessage(error) };
+            }
+          },
+      null
+    );
+  }
+
   private startMonitorTail(proc: BackgroundProcess): void {
     void this.monitorTailLoop(proc.id).catch((error: unknown) => {
       const current = this.processes.get(proc.id);
@@ -1015,7 +1155,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         // no-op, so this failure wake is the only lifecycle notice even if the process exits later.
         this.stopMonitor(current, true, "failed", {
           message: getErrorMessage(error),
-          ...(isBackgroundMonitorProbeError(error)
+          ...(error instanceof MonitorPollingFailure
             ? { failedOperations: [...error.failedOperations] }
             : {}),
         });
@@ -1033,7 +1173,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       if (!proc || !monitor || monitor.stopped || monitor.settled) return;
 
       const chunkStartOffset = monitor.lastReadOffset;
-      const read = await proc.handle.readOutput(chunkStartOffset);
+      const read = await this.readOutputForMonitor(proc, monitor, chunkStartOffset);
       // A settlement claim (e.g. a timeout terminate) during the await owns every remaining
       // byte; leave lastReadOffset untouched so its final scan re-reads this chunk.
       if (monitor.stopped || monitor.settled) return;
@@ -1046,7 +1186,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // Check for exit BEFORE processing the just-read chunk: a matching line in the very chunk
       // that accompanies the exit must coalesce into the single settlement payload instead of
       // triggering a cooldown_ms=0 emit or maxEvents retirement ahead of it.
-      const exitCode = await proc.handle.getExitCode();
+      const exitCode = await this.getExitCodeForMonitor(proc, monitor);
       if (monitor.stopped || monitor.settled) return;
 
       if (exitCode !== null) {
@@ -1671,15 +1811,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       return { success: false, error: "filter_exclude requires filter to be set" };
     }
 
-    const existingProc = this.peekProcess(processId);
-    if (!existingProc) {
-      return { success: false, error: `Process not found: ${processId}` };
-    }
-    const proc =
-      existingProc.monitor?.stopped === true &&
-      existingProc.monitor.failedOperations?.includes("getExitCode") === true
-        ? existingProc
-        : await this.getProcess(processId);
+    const proc = await this.getProcess(processId);
     if (!proc) {
       return { success: false, error: `Process not found: ${processId}` };
     }
@@ -1745,12 +1877,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // Update read position
       proc.outputBytesRead = result.newOffset;
 
-      // An exit-probe failure must not block task_await from returning still-readable output.
-      const refreshedProc =
-        proc.monitor?.stopped === true &&
-        proc.monitor.failedOperations?.includes("getExitCode") === true
-          ? proc
-          : await this.getProcess(processId);
+      // Refresh process status
+      const refreshedProc = await this.getProcess(processId);
       currentStatus = refreshedProc?.status ?? proc.status;
 
       // Line-buffered filtering: prepend incomplete line from previous call

@@ -4077,6 +4077,11 @@ describe("BashMonitorWakeStore", () => {
         lostReason: "runtime-failure",
         failureMessage: "read failed",
         failedOperations: ["readOutput"],
+        createdAt: "2026-02-01T00:00:00.000Z",
+        lines: ["ERROR captured before failure"],
+        totalMatches: 2,
+        droppedLines: 1,
+        matchedThroughOffset: 42,
       },
       TREAT_ALL_AS_STALE()
     );
@@ -4085,6 +4090,84 @@ describe("BashMonitorWakeStore", () => {
     expect(pending[0].lostReason).toBe("runtime-failure");
     expect(pending[0].failureMessage).toBe("read failed");
     expect(pending[0].failedOperations).toEqual(["readOutput"]);
+    expect(pending[0].monitorArmedAt).toBe("2026-02-01T00:00:00.000Z");
+    expect(pending[0].lines).toEqual(["ERROR captured before failure"]);
+    expect(pending[0].totalMatches).toBe(2);
+    expect(pending[0].droppedLines).toBe(1);
+    expect(pending[0].matchedThroughOffset).toBe(42);
+  });
+
+  test("a runtime failure replaces a pending monitor-lost row from an older generation", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueMonitorLost(
+      {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        ownerWorkspaceId: "owner-1",
+        displayName: "Old Watch",
+        filter: "OLD",
+        filterExclude: false,
+        script: "old-script",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        lines: ["OLD matched line"],
+        totalMatches: 8,
+        droppedLines: 2,
+      },
+      TREAT_ALL_AS_STALE()
+    );
+
+    await store.enqueueMonitorLost(
+      {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        ownerWorkspaceId: "owner-1",
+        displayName: "New Watch",
+        filter: "NEW",
+        filterExclude: true,
+        script: "new-script",
+        createdAt: "2026-02-01T00:00:00.000Z",
+        lostReason: "runtime-failure",
+        failedOperations: ["readOutput"],
+        lines: ["NEW matched line"],
+        totalMatches: 1,
+      },
+      TREAT_ALL_AS_STALE()
+    );
+
+    const pending = await store.listPending("owner-1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({
+      displayName: "New Watch",
+      filter: "NEW",
+      filterExclude: true,
+      script: "new-script",
+      monitorArmedAt: "2026-02-01T00:00:00.000Z",
+      lines: ["NEW matched line"],
+      totalMatches: 1,
+      droppedLines: 0,
+      failedOperations: ["readOutput"],
+    });
+  });
+
+  test("same-generation delivered monitor-lost rows are not re-enqueued", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    const payload = {
+      processId: "proc-1",
+      taskId: "bash:proc-1",
+      ownerWorkspaceId: "owner-1",
+      filter: "ERROR",
+      filterExclude: false,
+      script: "watch-script",
+      createdAt: "2026-02-01T00:00:00.000Z",
+      lostReason: "runtime-failure" as const,
+    };
+    const original = await store.enqueueMonitorLost(payload, TREAT_ALL_AS_STALE());
+    expect(original).not.toBeNull();
+    await store.markDelivered("owner-1", "proc-1");
+
+    const duplicate = await store.enqueueMonitorLost(payload, TREAT_ALL_AS_STALE());
+    expect(duplicate?.status).toBe("delivered");
+    expect(await store.listPending("owner-1")).toHaveLength(0);
   });
 
   test("enqueueOrMergePending replaces a pending monitor-lost record instead of merging", async () => {

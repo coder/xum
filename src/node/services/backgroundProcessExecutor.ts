@@ -12,7 +12,12 @@
  * Works identically for local and SSH runtimes.
  */
 
-import type { Runtime, BackgroundHandle, ExecStream } from "@/node/runtime/Runtime";
+import type {
+  Runtime,
+  BackgroundHandle,
+  BackgroundMonitorProbeResult,
+  ExecStream,
+} from "@/node/runtime/Runtime";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { log } from "./log";
@@ -30,7 +35,6 @@ import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { toPosixPath } from "@/node/utils/paths";
 import { getErrorMessage } from "@/common/utils/errors";
-import type { BashMonitorFailedOperation } from "@/common/types/message";
 
 /**
  * Quote a path for shell commands.
@@ -290,39 +294,6 @@ export async function spawnProcess(
   }
 }
 
-export class BackgroundMonitorProbeError extends Error {
-  readonly failedOperations: readonly BashMonitorFailedOperation[];
-
-  constructor(message: string, failedOperations: readonly BashMonitorFailedOperation[]) {
-    super(message);
-    this.name = "BackgroundMonitorProbeError";
-    this.failedOperations = [...new Set(failedOperations)];
-  }
-}
-
-export function isBackgroundMonitorProbeError(
-  error: unknown
-): error is BackgroundMonitorProbeError {
-  if (error instanceof BackgroundMonitorProbeError) return true;
-  if (typeof error !== "object" || error == null) return false;
-  const candidate = error as { name?: unknown; failedOperations?: unknown };
-  return (
-    candidate.name === "BackgroundMonitorProbeError" &&
-    Array.isArray(candidate.failedOperations) &&
-    candidate.failedOperations.every(
-      (operation) => operation === "readOutput" || operation === "getExitCode"
-    )
-  );
-}
-
-// One or two misses can be transient; three means that capability cannot serve the monitor.
-const MAX_CONSECUTIVE_MONITOR_PROBE_FAILURES = 3;
-
-interface MonitorProbeFailure {
-  consecutiveFailures: number;
-  message: string;
-}
-
 /**
  * Unified handle to a background process.
  * Uses runtime.exec for all operations, working identically for local and SSH.
@@ -331,9 +302,6 @@ interface MonitorProbeFailure {
  * This handle provides lifecycle management via execBuffered commands.
  */
 class RuntimeBackgroundHandle implements BackgroundHandle {
-  private readonly monitorProbeFailures: Partial<
-    Record<BashMonitorFailedOperation, MonitorProbeFailure>
-  > = {};
   private terminated = false;
 
   constructor(
@@ -343,44 +311,30 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     private readonly quotePath: (p: string) => string
   ) {}
 
-  private recordMonitorProbeSuccess(operation: BashMonitorFailedOperation): void {
-    delete this.monitorProbeFailures[operation];
-  }
-
   private assertMonitorProbeSucceeded(operation: string, exitCode: number): void {
     if (exitCode !== 0) {
       throw new Error(`${operation} exited with code ${exitCode}`);
     }
   }
 
-  private recordMonitorProbeFailure(
-    operation: BashMonitorFailedOperation,
-    error: unknown
-  ): Error | null {
-    const message = errorMsg(error);
-    const previous = this.monitorProbeFailures[operation];
-    const current: MonitorProbeFailure = {
-      consecutiveFailures: (previous?.consecutiveFailures ?? 0) + 1,
-      message,
-    };
-    this.monitorProbeFailures[operation] = current;
+  private async probeForMonitor<T>(
+    probe: () => Promise<T>
+  ): Promise<BackgroundMonitorProbeResult<T>> {
+    try {
+      return { success: true, value: await probe() };
+    } catch (error) {
+      return { success: false, error: errorMsg(error) };
+    }
+  }
 
-    const otherOperation: BashMonitorFailedOperation =
-      operation === "readOutput" ? "getExitCode" : "readOutput";
-    const otherFailure = this.monitorProbeFailures[otherOperation];
-    if (otherFailure != null) {
-      return new BackgroundMonitorProbeError(
-        `Background process monitor probes failed (${operation}: ${message}; ${otherOperation}: ${otherFailure.message})`,
-        [operation, otherOperation]
-      );
-    }
-    if (current.consecutiveFailures >= MAX_CONSECUTIVE_MONITOR_PROBE_FAILURES) {
-      return new BackgroundMonitorProbeError(
-        `Background process monitor probe failed ${current.consecutiveFailures} consecutive times (${operation}: ${message})`,
-        [operation]
-      );
-    }
-    return null;
+  private async getExitCodeStrict(): Promise<number | null> {
+    const exitCodePath = this.quotePath(`${this.outputDir}/${EXIT_CODE_FILENAME}`);
+    const result = await execBuffered(this.runtime, `cat ${exitCodePath} 2>/dev/null || echo ""`, {
+      cwd: FALLBACK_CWD,
+      timeout: 10,
+    });
+    this.assertMonitorProbeSucceeded("getExitCode", result.exitCode);
+    return parseExitCode(result.stdout);
   }
 
   /**
@@ -389,21 +343,15 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
    */
   async getExitCode(): Promise<number | null> {
     try {
-      const exitCodePath = this.quotePath(`${this.outputDir}/${EXIT_CODE_FILENAME}`);
-      const result = await execBuffered(
-        this.runtime,
-        `cat ${exitCodePath} 2>/dev/null || echo ""`,
-        { cwd: FALLBACK_CWD, timeout: 10 }
-      );
-      this.assertMonitorProbeSucceeded("getExitCode", result.exitCode);
-      this.recordMonitorProbeSuccess("getExitCode");
-      return parseExitCode(result.stdout);
+      return await this.getExitCodeStrict();
     } catch (error) {
       log.debug(`RuntimeBackgroundHandle.getExitCode: Error: ${errorMsg(error)}`);
-      const monitorFailure = this.recordMonitorProbeFailure("getExitCode", error);
-      if (monitorFailure != null) throw monitorFailure;
       return null;
     }
+  }
+
+  getExitCodeForMonitor(): Promise<BackgroundMonitorProbeResult<number | null>> {
+    return this.probeForMonitor(() => this.getExitCodeStrict());
   }
 
   /**
@@ -478,40 +426,46 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     }
   }
 
+  private async readOutputStrict(offset: number): Promise<{ content: string; newOffset: number }> {
+    const filePath = this.quotePath(`${this.outputDir}/${OUTPUT_FILENAME}`);
+    const fileSize = await this.readOutputFileSize();
+
+    if (offset >= fileSize) {
+      return { content: "", newOffset: offset };
+    }
+
+    // Read from offset to end of file using tail -c (faster than dd bs=1)
+    // tail -c +N means "start at byte N" (1-indexed)
+    const readResult = await execBuffered(
+      this.runtime,
+      `tail -c +${offset + 1} ${filePath} 2>/dev/null`,
+      { cwd: FALLBACK_CWD, timeout: 30 }
+    );
+    this.assertMonitorProbeSucceeded("readOutput tail probe", readResult.exitCode);
+
+    return {
+      content: readResult.stdout,
+      newOffset: offset + Buffer.byteLength(readResult.stdout),
+    };
+  }
+
   /**
    * Read output from output.log at the given byte offset.
    * Uses tail -c to read from offset - works on both Linux and macOS.
    */
   async readOutput(offset: number): Promise<{ content: string; newOffset: number }> {
     try {
-      const filePath = this.quotePath(`${this.outputDir}/${OUTPUT_FILENAME}`);
-      const fileSize = await this.readOutputFileSize();
-
-      if (offset >= fileSize) {
-        this.recordMonitorProbeSuccess("readOutput");
-        return { content: "", newOffset: offset };
-      }
-
-      // Read from offset to end of file using tail -c (faster than dd bs=1)
-      // tail -c +N means "start at byte N" (1-indexed)
-      const readResult = await execBuffered(
-        this.runtime,
-        `tail -c +${offset + 1} ${filePath} 2>/dev/null`,
-        { cwd: FALLBACK_CWD, timeout: 30 }
-      );
-      this.assertMonitorProbeSucceeded("readOutput tail probe", readResult.exitCode);
-
-      this.recordMonitorProbeSuccess("readOutput");
-      return {
-        content: readResult.stdout,
-        newOffset: offset + Buffer.byteLength(readResult.stdout),
-      };
+      return await this.readOutputStrict(offset);
     } catch (error) {
       log.debug(`RuntimeBackgroundHandle.readOutput: Error: ${errorMsg(error)}`);
-      const monitorFailure = this.recordMonitorProbeFailure("readOutput", error);
-      if (monitorFailure != null) throw monitorFailure;
       return { content: "", newOffset: offset };
     }
+  }
+
+  readOutputForMonitor(
+    offset: number
+  ): Promise<BackgroundMonitorProbeResult<{ content: string; newOffset: number }>> {
+    return this.probeForMonitor(() => this.readOutputStrict(offset));
   }
 }
 

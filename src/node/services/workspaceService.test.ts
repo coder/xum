@@ -3422,6 +3422,160 @@ describe("WorkspaceService bash monitor wakes", () => {
     }
   });
 
+  test("delivers a durable runtime-failure wake when registry removal keeps failing", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-runtime-failure-remove-fail";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+        peekProcess: mock(() => ({ workspaceId, startTime: 0 })),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      const registryStore = (
+        workspaceService as unknown as { bashMonitorRegistryStore: BashMonitorRegistryStore }
+      ).bashMonitorRegistryStore;
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        async (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          await args[3]?.onAccepted?.();
+          return Ok(undefined);
+        }
+      );
+      const armMetadata = {
+        processId: "proc-failed",
+        taskId: "bash:proc-failed",
+        workspaceId,
+        filter: "ERROR",
+        filterExclude: false,
+        script: "run-thing --watch",
+        createdAt: new Date().toISOString(),
+      };
+      backgroundProcessManager.emit("monitor:armed", workspaceId, armMetadata);
+      await waitForCondition(async () => (await registryStore.listAll(workspaceId)).length === 1);
+
+      const consumeSpy = spyOn(registryStore, "consumeIfArmedBefore").mockImplementation(
+        async (ownerWorkspaceId, processId, _cutoffMs, beforeRemove) => {
+          const record = (await registryStore.listAll(ownerWorkspaceId)).find(
+            (candidate) => candidate.processId === processId
+          );
+          if (record != null) await beforeRemove?.(record);
+          throw new Error("registry removal failed");
+        }
+      );
+      backgroundProcessManager.emit("monitor:stopped", workspaceId, {
+        processId: "proc-failed",
+        reason: "failed",
+        failureMessage: "exit probe failed",
+        failedOperations: ["getExitCode"],
+        armMetadata,
+      });
+
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      expect(consumeSpy).toHaveBeenCalledTimes(2);
+      expect(sendSpy.mock.calls[0][1]).toContain("exit probe failed");
+      expect(await registryStore.listAll(workspaceId)).toHaveLength(1);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("preserves matched lines when match persistence fails before runtime retirement", async () => {
+    const { config, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "bash-monitor-runtime-failure-match-fallback";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      });
+
+      const backgroundProcessManager = Object.assign(new EventEmitter(), {
+        cleanup: mock(() => Promise.resolve()),
+      }) as unknown as BackgroundProcessManager & EventEmitter;
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        backgroundProcessManager,
+        aiService: createMockAIService({ isStreaming: mock(() => false) }),
+      });
+      const wakeStore = (
+        workspaceService as unknown as { bashMonitorWakeStore: BashMonitorWakeStore }
+      ).bashMonitorWakeStore;
+      // Lazy rejection: an eager mockRejectedValueOnce promise sits unconsumed across the
+      // emit+lock ticks and trips bun's unhandled-rejection detector before the handler awaits it.
+      const matchPersistSpy = spyOn(wakeStore, "enqueueOrMergePending").mockImplementationOnce(() =>
+        Promise.reject(new Error("match wake write failed"))
+      );
+      const sendSpy = spyOn(workspaceService, "sendMessage").mockImplementation(
+        async (...args: Parameters<WorkspaceService["sendMessage"]>) => {
+          await args[3]?.onAccepted?.();
+          return Ok(undefined);
+        }
+      );
+      const armMetadata = {
+        processId: "proc-failed",
+        taskId: "bash:proc-failed",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        script: "run-tests --watch",
+        createdAt: new Date().toISOString(),
+      };
+      backgroundProcessManager.emit("monitor:armed", workspaceId, armMetadata);
+      const registryStore = new BashMonitorRegistryStore(config);
+      await waitForCondition(async () => (await registryStore.listAll(workspaceId)).length === 1);
+
+      backgroundProcessManager.emit("monitor:match", workspaceId, {
+        processId: "proc-failed",
+        taskId: "bash:proc-failed",
+        workspaceId,
+        filter: "FAILED",
+        filterExclude: false,
+        lines: ["FAILED captured trigger"],
+        totalMatches: 1,
+        droppedLines: 0,
+        timestamp: Date.now(),
+        matchedThroughOffset: 24,
+      });
+      backgroundProcessManager.emit("monitor:stopped", workspaceId, {
+        processId: "proc-failed",
+        reason: "failed",
+        failureMessage: "output probe failed",
+        failedOperations: ["readOutput"],
+        armMetadata,
+        failedMatch: {
+          lines: ["FAILED captured trigger"],
+          totalMatches: 1,
+          droppedLines: 0,
+          matchedThroughOffset: 24,
+        },
+      });
+
+      await waitForCondition(() => sendSpy.mock.calls.length === 1);
+      expect(matchPersistSpy).toHaveBeenCalledTimes(1);
+      expect(sendSpy.mock.calls[0][1]).toContain("FAILED captured trigger");
+      expect(sendSpy.mock.calls[0][1]).toContain("Matched output before monitor retirement");
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("keeps the armed registry row when runtime-failure wake persistence fails", async () => {
     const { config, cleanup } = await createTestHistoryService();
     try {

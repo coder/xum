@@ -160,6 +160,10 @@ export interface BashMonitorLostPayload {
   lostReason?: BashMonitorLostReason;
   failureMessage?: string;
   failedOperations?: BashMonitorFailedOperation[];
+  lines?: string[];
+  totalMatches?: number;
+  droppedLines?: number;
+  matchedThroughOffset?: number;
 }
 
 export interface BashMonitorWakeRecord {
@@ -177,6 +181,7 @@ export interface BashMonitorWakeRecord {
   lostReason?: BashMonitorLostReason;
   failureMessage?: string;
   failedOperations?: BashMonitorFailedOperation[];
+  monitorArmedAt?: string;
   lines: string[];
   totalMatches: number;
   droppedLines: number;
@@ -281,6 +286,7 @@ const BashMonitorWakeRecordSchema = z
       .array(z.enum(["readOutput", "getExitCode"]))
       .optional()
       .catch(undefined),
+    monitorArmedAt: z.string().optional(),
     lines: z.array(z.string()),
     totalMatches: z.number().int().nonnegative(),
     droppedLines: z.number().int().nonnegative(),
@@ -1625,7 +1631,52 @@ export class BashMonitorWakeStore {
     return this.locks.withLock(key, async () => {
       const existing = await this.get(payload.ownerWorkspaceId, id);
       const now = new Date().toISOString();
+      const createRecord = (): BashMonitorWakeRecord => {
+        const bounded = boundLines(payload.lines ?? []);
+        return {
+          id,
+          ownerWorkspaceId: payload.ownerWorkspaceId,
+          processId: payload.processId,
+          taskId: payload.taskId,
+          ...(payload.displayName != null ? { displayName: payload.displayName } : {}),
+          filter: payload.filter,
+          filterExclude: payload.filterExclude,
+          kind: "monitor-lost",
+          script: payload.script,
+          lostReason: payload.lostReason ?? "restart",
+          ...(payload.failureMessage != null ? { failureMessage: payload.failureMessage } : {}),
+          ...(payload.failedOperations != null
+            ? { failedOperations: payload.failedOperations }
+            : {}),
+          ...(payload.createdAt != null ? { monitorArmedAt: payload.createdAt } : {}),
+          lines: bounded.lines,
+          totalMatches: payload.totalMatches ?? 0,
+          droppedLines: (payload.droppedLines ?? 0) + bounded.droppedLines,
+          ...(payload.matchedThroughOffset != null
+            ? { matchedThroughOffset: payload.matchedThroughOffset }
+            : {}),
+          status: "pending",
+          createdAt: now,
+          updatedAt: now,
+        };
+      };
+      if (
+        existing?.kind === "monitor-lost" &&
+        existing.status !== "pending" &&
+        payload.createdAt != null &&
+        existing.monitorArmedAt === payload.createdAt
+      ) {
+        return existing;
+      }
       if (existing?.status === "pending") {
+        if (
+          existing.kind === "monitor-lost" &&
+          (payload.createdAt == null || existing.monitorArmedAt !== payload.createdAt)
+        ) {
+          const record = createRecord();
+          await this.write(record);
+          return record;
+        }
         // Post-boot activity on the pending record means the process is alive again;
         // leave the live match wake untouched and write no lost notice.
         if (existing.kind === "match" && Date.parse(existing.updatedAt) >= staleBefore) {
@@ -1652,6 +1703,7 @@ export class BashMonitorWakeStore {
           lostReason: payload.lostReason ?? "restart",
           failureMessage: payload.failureMessage,
           failedOperations: payload.failedOperations,
+          ...(payload.createdAt != null ? { monitorArmedAt: payload.createdAt } : {}),
           // Cross-generation fall-through: apply the re-arm preservation the crash preempted,
           // so the lost notice cannot render the old run's settlement as the lost monitor's.
           ...(existing.terminal != null
@@ -1668,26 +1720,7 @@ export class BashMonitorWakeStore {
         return record;
       }
 
-      const record: BashMonitorWakeRecord = {
-        id,
-        ownerWorkspaceId: payload.ownerWorkspaceId,
-        processId: payload.processId,
-        taskId: payload.taskId,
-        ...(payload.displayName != null ? { displayName: payload.displayName } : {}),
-        filter: payload.filter,
-        filterExclude: payload.filterExclude,
-        kind: "monitor-lost",
-        script: payload.script,
-        lostReason: payload.lostReason ?? "restart",
-        ...(payload.failureMessage != null ? { failureMessage: payload.failureMessage } : {}),
-        ...(payload.failedOperations != null ? { failedOperations: payload.failedOperations } : {}),
-        lines: [],
-        totalMatches: 0,
-        droppedLines: 0,
-        status: "pending",
-        createdAt: now,
-        updatedAt: now,
-      };
+      const record = createRecord();
       await this.write(record);
       return record;
     });
