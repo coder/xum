@@ -144,14 +144,12 @@ export async function recordAgentWorkflowRunReference(input: {
   const filePath = referencesPath(input.workspaceSessionDir);
 
   await referenceFileLocks.withLock(filePath, async () => {
-    let existing: AgentWorkflowRunReference[];
-    try {
-      existing = await readAgentWorkflowRunReferences(input.workspaceSessionDir);
-    } catch {
-      // Recording must survive an unreadable file: the atomic rewrite below replaces it, and
-      // failing here would leave the new run without any sidecar entry, stranding its wake.
-      existing = [];
-    }
+    // A read failure propagates instead of being treated as empty: the atomic rewrite below
+    // would otherwise replace valid-but-momentarily-unreadable contents with only this run,
+    // destroying every other active run's sole durable provenance. The failed record is
+    // retryable (workflow_resume re-records), while parse corruption still self-heals to
+    // empty inside readAgentWorkflowRunReferences because rereading cannot repair it.
+    const existing = await readAgentWorkflowRunReferences(input.workspaceSessionDir);
     const byRunId = new Map(existing.map((reference) => [reference.runId, reference]));
     // Clamp like parseReferences: never persist a future-dated timestamp.
     const createdAtMs = Math.min(input.createdAtMs ?? Date.now(), Date.now());

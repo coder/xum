@@ -57,6 +57,7 @@ import {
   WORKFLOW_RESULT_METADATA_TYPE,
   WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE,
   WORKFLOW_TRIGGER_DISPLAY_METADATA_TYPE,
+  buildWorkflowResultContextMessage,
 } from "@/common/utils/workflowRunMessages";
 import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRunReferences";
 import { getPlanFilePath } from "@/common/utils/planStorage";
@@ -6194,6 +6195,152 @@ describe("WorkspaceService workflow invocation events", () => {
       // reference so the stale result cannot inject into the fresh conversation.
       const clearResult = await workspaceService.truncateHistory(workspaceId, 1.0);
       expect(clearResult.success).toBe(true);
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("retires kernel workflow run references even when a later post-clear step fails", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-retire-early";
+    const runId = "wfr_currentness_retire_early";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-retire-early",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: 1_150,
+        afterBoundaryMessageId: null,
+      });
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user", "user", "never mind, answer something else", {
+          timestamp: 1_200,
+        })
+      );
+
+      // The truncation commits, then a later post-clear step fails. Retirement must already
+      // have happened, or the stale null-snapshot reference survives the committed clear and
+      // reads current against the emptied history.
+      const sessionAccessor = workspaceService as unknown as {
+        getOrCreateSession(id: string): { clearPostCompactionState(): Promise<void> };
+      };
+      const session = sessionAccessor.getOrCreateSession(workspaceId);
+      const carryoverSpy = spyOn(session, "clearPostCompactionState").mockImplementationOnce(() =>
+        Promise.reject(new Error("carryover discard failed"))
+      );
+      try {
+        const clearResult = await workspaceService.truncateHistory(workspaceId, 1.0);
+        expect(clearResult.success).toBe(false);
+      } finally {
+        carryoverSpy.mockRestore();
+      }
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a delivered coalesced workflow result consumes the kernel run's currentness", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-coalesced";
+    const runId = "wfr_currentness_coalesced";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-coalesced",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: 1_150,
+        afterBoundaryMessageId: null,
+      });
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
+
+      // Another run's payload quoting nothing about this run must not count as consumption.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage(
+          "coalesced-other",
+          "user",
+          buildWorkflowResultContextMessage({
+            rawCommand: "workflow_run other.js",
+            name: "other.js",
+            runId: "wfr_currentness_other",
+            status: "completed",
+            result: { reportMarkdown: "other done" },
+            run: null,
+          }),
+          { timestamp: 1_250, synthetic: true }
+        )
+      );
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
+
+      // The drain's synthetic coalesced prompt carries no workflow-result metadata. After a
+      // crash between durable acceptance and the outbox delivery mark, this row is the only
+      // evidence the result already reached history; it must read as consumption or restart
+      // recovery injects the same terminal result again.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage(
+          "coalesced-result",
+          "user",
+          buildWorkflowResultContextMessage({
+            rawCommand: "workflow_run research.js",
+            name: "research.js",
+            runId,
+            status: "completed",
+            result: { reportMarkdown: "done" },
+            run: null,
+          }),
+          { timestamp: 1_300, synthetic: true }
+        )
+      );
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
       workspaceService.disposeSession(workspaceId);
     } finally {

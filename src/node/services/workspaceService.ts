@@ -204,6 +204,7 @@ import {
 } from "@/node/services/workflows/workflowArchiveAdmission";
 import {
   WORKFLOW_RESULT_METADATA_TYPE,
+  textContainsWorkflowResultPayload,
   WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE,
   WORKFLOW_TRIGGER_DISPLAY_METADATA_TYPE,
   buildWorkflowRunCardMessage,
@@ -472,6 +473,23 @@ function isWorkflowResultContinuationMessage(message: MuxMessage, runId: string)
   return (
     message.metadata?.muxMetadata?.type === WORKFLOW_RESULT_METADATA_TYPE &&
     message.metadata.muxMetadata.runId === runId
+  );
+}
+
+/**
+ * The terminal-attention drain delivers workflow results as one synthetic user prompt that may
+ * coalesce several runs, so it carries no per-run workflow-result metadata. If a crash lands
+ * between the send's durable acceptance and the outbox delivery mark, restart recovery drains
+ * the notification again; recognizing the accepted row as consumption is what suppresses the
+ * replay. Only synthetic rows qualify: a manual user message is a supersession boundary and is
+ * classified before this check runs.
+ */
+function isCoalescedWorkflowResultMessage(message: MuxMessage, runId: string): boolean {
+  if (message.role !== "user" || message.metadata?.synthetic !== true) {
+    return false;
+  }
+  return message.parts.some(
+    (part) => part.type === "text" && textContainsWorkflowResultPayload(part.text, runId)
   );
 }
 
@@ -11059,6 +11077,7 @@ export class WorkspaceService extends EventEmitter {
           }
           if (
             isWorkflowResultContinuationMessage(message, runId) ||
+            isCoalescedWorkflowResultMessage(message, runId) ||
             isTerminalWorkflowTaskAwaitResultMessage(message, runId) ||
             isTerminalWorkflowToolResultMessage(message, runId)
           ) {
@@ -12901,6 +12920,22 @@ export class WorkspaceService extends EventEmitter {
     // admitted afterwards (their content references the discarded context).
     if (isFullClear) {
       this.advanceContextMutationEpoch(workspaceId);
+      // Kernel workflow run references belong to the cleared conversation: a verified-empty
+      // (null) boundary snapshot recorded before the clear is indistinguishable from one
+      // recorded after it, so a surviving reference could inject a pre-clear workflow result
+      // into the fresh conversation. Retire them immediately after the truncation commits,
+      // before any later post-clear step that can fail and return early (goal acknowledgment,
+      // carryover discard), or the stale reference would survive the committed clear. A
+      // post-clear resume re-records provenance.
+      try {
+        await clearAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
+      } catch (error) {
+        return Err(
+          `History was cleared, but stale workflow run references could not be retired ` +
+            `(${getErrorMessage(error)}). A finished background workflow may re-inject its ` +
+            `result into the cleared conversation; retry once the session storage is writable.`
+        );
+      }
     }
     // r43: a fork's settled branch-summary registration stays consumable
     // until the first send; its row was just deleted, so drop the
@@ -12957,20 +12992,6 @@ export class WorkspaceService extends EventEmitter {
           `History was cleared, but the persisted post-compaction carryover could not be ` +
             `durably discarded (${getErrorMessage(error)}). Pre-clear read/skill context may ` +
             `be re-injected after a restart; retry once the session storage is writable.`
-        );
-      }
-      // Kernel workflow run references belong to the cleared conversation: a verified-empty
-      // (null) boundary snapshot recorded before the clear is indistinguishable from one
-      // recorded after it, so a surviving reference could inject a pre-clear workflow result
-      // into the fresh conversation. Retire them with the transcript (a post-clear resume
-      // re-records provenance), durably like the carryover discard above.
-      try {
-        await clearAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
-      } catch (error) {
-        return Err(
-          `History was cleared, but stale workflow run references could not be retired ` +
-            `(${getErrorMessage(error)}). A finished background workflow may re-inject its ` +
-            `result into the cleared conversation; retry once the session storage is writable.`
         );
       }
       // The persistent RLM sandbox holds context DERIVED from the cleared

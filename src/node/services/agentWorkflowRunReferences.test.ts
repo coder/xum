@@ -158,6 +158,38 @@ describe("agent workflow run references", () => {
     }
   });
 
+  test("record propagates a sidecar read failure instead of clobbering existing references", async () => {
+    const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
+    try {
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir,
+        runId: "wfr_existing",
+        createdAtMs: 1_000,
+      });
+      const filePath = path.join(workspaceSessionDir, "agent-workflow-runs.json");
+      // Unreadable file, writable directory: the atomic rewrite could replace contents it
+      // never saw, destroying every other run's only durable provenance.
+      await fs.chmod(filePath, 0o000);
+      let recordError: unknown;
+      try {
+        await recordAgentWorkflowRunReference({
+          workspaceSessionDir,
+          runId: "wfr_new",
+          createdAtMs: 2_000,
+        });
+      } catch (error: unknown) {
+        recordError = error;
+      } finally {
+        await fs.chmod(filePath, 0o600);
+      }
+      expect(String(recordError)).toContain("EACCES");
+      const references = await readAgentWorkflowRunReferences(workspaceSessionDir);
+      expect(references.map((reference) => reference.runId)).toEqual(["wfr_existing"]);
+    } finally {
+      await fs.rm(workspaceSessionDir, { recursive: true, force: true });
+    }
+  });
+
   test("self-heals unparseable file contents to empty", async () => {
     const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
     try {
