@@ -491,9 +491,10 @@ export class ExtensionMetadataService {
    * emissions).
    */
   private async reconcileLeftoverSidecarIfPresent(): Promise<boolean> {
+    let reconciledSidecar = false;
     if (await this.probeQuarantineSidecar()) {
       await this.resumeQuarantineRecovery();
-      return true;
+      reconciledSidecar = true;
     }
     // A crash between consumeQuarantineSidecar's mismatch claim and its
     // reconcile strands an unreconciled foreign generation at a unique
@@ -501,12 +502,16 @@ export class ExtensionMetadataService {
     // stranded claims by prefix (one readdir next to the full-file read the
     // caller already does); an unreadable directory propagates so the read
     // stays retryable rather than vouching for a possibly partial main.
+    // Runs even when the fixed sidecar was just processed: a
+    // deterministically corrupt sidecar is intentionally RETAINED by its
+    // reconcile, and returning early on it would starve stranded-claim
+    // recovery indefinitely (recency/goal/status hidden in the claim).
     const dirNames = await readdir(dirname(this.filePath));
     const claimNames = dirNames.filter((name) =>
       name.startsWith(`${basename(this.filePath)}${ExtensionMetadataService.CLAIM_INFIX}`)
     );
     if (claimNames.length === 0) {
-      return false;
+      return reconciledSidecar;
     }
     await this.withSerializedMutation(async () => {
       for (const claimName of claimNames) {
@@ -1513,6 +1518,22 @@ export class ExtensionMetadataService {
     let sidecarParsed: unknown;
     try {
       sidecarParsed = JSON.parse(await readFile(quarantinePath, "utf-8")) as unknown;
+      // Bind the token to the bytes just read: another recovery can consume
+      // the captured generation and install a NEWER one at the fixed path
+      // between the stat and the read. Proceeding would merge the new bytes
+      // under the OLD token — the consume then claims the new generation,
+      // sees the token mismatch, and replays the same bytes a second time,
+      // re-filling fields another backend explicitly cleared to null in
+      // between (the null-fill merge is not idempotent across clears).
+      // On mismatch leave the file for its own recovery pass (next read).
+      const postReadToken = await ExtensionMetadataService.statQuarantineToken(quarantinePath);
+      if (
+        sidecarToken == null ||
+        postReadToken == null ||
+        !ExtensionMetadataService.tokensMatch(sidecarToken, postReadToken)
+      ) {
+        return false;
+      }
     } catch (readError) {
       // Sidecar gone: a concurrent recovery consumed it and the recreated
       // main is all there is — nothing left to reconcile.

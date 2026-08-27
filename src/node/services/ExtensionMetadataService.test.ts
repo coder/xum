@@ -1152,12 +1152,13 @@ describe("ExtensionMetadataService", () => {
       statQuarantineToken: (quarantinePath: string) => Promise<unknown>;
     };
     const realStat = statics.statQuarantineToken.bind(ExtensionMetadataService);
-    // Call #1 captures the reconcile's generation token (real); call #2 is
-    // the consumption-time identity probe this test degrades.
+    // Call #1 captures the reconcile's generation token, call #2 binds the
+    // token to the read bytes (both real); call #3 is the consumption-time
+    // identity probe this test degrades.
     let statCalls = 0;
     statics.statQuarantineToken = async (quarantinePath: string) => {
       statCalls += 1;
-      if (statCalls === 2) {
+      if (statCalls === 3) {
         const error = new Error("EACCES: permission denied, stat") as NodeJS.ErrnoException;
         error.code = "EACCES";
         throw error;
@@ -1230,6 +1231,82 @@ describe("ExtensionMetadataService", () => {
     expect(snapshots.has("ws-reclaimed")).toBe(false);
     expect(snapshots.get("ws-live")?.recency).toBe(900);
     expect((await readdir(tempDir)).filter((n) => n.includes(".corrupt-claim-"))).toEqual([]);
+  });
+
+  test("a retained corrupt sidecar does not starve stranded claim recovery", async () => {
+    // A deterministically corrupt sidecar is intentionally retained by its
+    // reconcile. If the leftover pass returned early on it, a stranded
+    // mismatched claim (unreconciled foreign generation) would never be
+    // discovered — its recency/goal/status hidden indefinitely.
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-live": { recency: 900, streaming: false } },
+      })
+    );
+    await writeFile(`${filePath}.corrupt`, "{corrupt sidecar");
+    await writeFile(
+      `${filePath}.corrupt-claim-99-99-99-123-foreign`,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-claim": { recency: 700, streaming: false } },
+      })
+    );
+    const snapshots = await service.getAllSnapshots({ throwOnError: true });
+    expect(snapshots.get("ws-claim")?.recency).toBe(700);
+    expect(snapshots.get("ws-live")?.recency).toBe(900);
+    // Corrupt sidecar intentionally retained (for inspection); claim consumed.
+    expect(await readFile(`${filePath}.corrupt`, "utf-8")).toBe("{corrupt sidecar");
+    expect((await readdir(tempDir)).filter((n) => n.includes(".corrupt-claim-"))).toEqual([]);
+  });
+
+  test("a sidecar swapped between stat and read is not merged under the stale token", async () => {
+    // Another recovery consumes the captured generation and installs a NEW
+    // one at the fixed path between this reconcile's stat and read. Merging
+    // the new bytes under the old token would double-apply them (the
+    // consume claims the new generation, sees the mismatch, and replays),
+    // re-filling fields another backend explicitly cleared to null in
+    // between. The post-read binding must abort instead.
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-live": { recency: 900, streaming: false } },
+      })
+    );
+    await writeFile(
+      `${filePath}.corrupt`,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-stranded": { recency: 700, streaming: false } },
+      })
+    );
+    const statics = ExtensionMetadataService as unknown as {
+      statQuarantineToken(p: string): Promise<unknown>;
+    };
+    const realStat = statics.statQuarantineToken.bind(ExtensionMetadataService);
+    let statCalls = 0;
+    statics.statQuarantineToken = async (p: string) => {
+      statCalls += 1;
+      if (statCalls === 1) {
+        // The capture observed a generation that was then consumed by
+        // another recovery, which installed the CURRENT file before our
+        // read.
+        return { ino: 1n, mtimeNs: 2n, size: 3n };
+      }
+      return realStat(p);
+    };
+    try {
+      const snapshots = await service.getAllSnapshots({ throwOnError: true });
+      // Not merged under the stale token; left for its own recovery pass.
+      expect(snapshots.has("ws-stranded")).toBe(false);
+      expect(await readFile(`${filePath}.corrupt`, "utf-8")).toContain("ws-stranded");
+    } finally {
+      statics.statQuarantineToken = realStat;
+    }
+    const healed = await service.getAllSnapshots({ throwOnError: true });
+    expect(healed.get("ws-stranded")?.recency).toBe(700);
   });
 
   test("stranded claims that do not match their embedded token are replayed", async () => {

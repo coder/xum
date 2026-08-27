@@ -1176,49 +1176,24 @@ export class Config {
       const id = (value as { id?: unknown }).id;
       return typeof id === "string" && id.length > 0;
     };
-    // Collect ids ONLY from direct entries of `workspaces` arrays — never
-    // from arbitrary nested objects. Workspace entries carry nested id-bearing
-    // objects (e.g. taskPendingGuidance items) whose ids can reference OTHER
-    // (including removed) workspaces; a whole-subtree scan would report those
-    // as registered, corrupting registration evidence (aborted deletions,
-    // lifted tombstones, ghost activity probes) and unbounding the activity
+    // Collect ids ONLY from the direct entries of `projects[*][1].workspaces`
+    // — never from arbitrary nested objects. Workspace entries carry nested
+    // id-bearing objects (e.g. taskPendingGuidance items) and can even carry
+    // nested `workspaces`-keyed fields written by other builds; ids found
+    // there can reference OTHER (including removed) workspaces, and treating
+    // them as registered corrupts registration evidence (aborted deletions,
+    // lifted tombstones, ghost activity probes) and unbounds the activity
     // scope. Under-collection stays safe: any workspaces container whose
     // entries cannot be verified (id-less entry, non-array container) flips
     // the incompleteness flag, routing callers to the strict enumeration.
-    const collect = (value: unknown): void => {
-      if (Array.isArray(value)) {
-        for (const entry of value) {
-          collect(entry);
-        }
-        return;
-      }
-      if (value !== null && typeof value === "object") {
-        const workspaces = (value as { workspaces?: unknown }).workspaces;
-        if (Array.isArray(workspaces)) {
-          for (const entry of workspaces) {
-            if (hasInlineStringId(entry)) {
-              ids.add((entry as { id: string }).id);
-            } else {
-              hasWorkspaceEntriesWithoutIds = true;
-            }
-          }
-        } else if (workspaces !== undefined) {
-          // A PRESENT workspaces container in any non-array shape (object,
-          // null, primitive) is uninterpretable evidence — the original
-          // entries may have been mangled, so the raw id set cannot be
-          // proven complete. Only an absent key means "no entries here".
-          hasWorkspaceEntriesWithoutIds = true;
-        }
-        for (const nested of Object.values(value)) {
-          collect(nested);
-        }
-      }
-    };
+    //
     // The OUTER structure must be interpretable too, or the id set cannot be
     // proven complete: a present non-array `projects`, a non-pair element, a
     // non-object project config, or a project config with no workspaces key
     // at all may be a mangled remnant of real registrations. Only an absent
     // projects key is healthy emptiness (the strict loader accepts it).
+    // A malformed sibling project only flips the flag — ids from the
+    // remaining well-formed projects are still collected.
     const projects = (parsedValue as { projects?: unknown }).projects;
     if (projects !== undefined) {
       if (!Array.isArray(projects)) {
@@ -1229,16 +1204,29 @@ export class Config {
           if (
             projectConfig === null ||
             typeof projectConfig !== "object" ||
-            Array.isArray(projectConfig) ||
-            (projectConfig as { workspaces?: unknown }).workspaces === undefined
+            Array.isArray(projectConfig)
           ) {
             hasWorkspaceEntriesWithoutIds = true;
-            break;
+            continue;
+          }
+          const workspaces = (projectConfig as { workspaces?: unknown }).workspaces;
+          if (!Array.isArray(workspaces)) {
+            // A missing key or a PRESENT container in any non-array shape is
+            // uninterpretable evidence — the original entries may have been
+            // mangled, so the raw id set cannot be proven complete.
+            hasWorkspaceEntriesWithoutIds = true;
+            continue;
+          }
+          for (const entry of workspaces) {
+            if (hasInlineStringId(entry)) {
+              ids.add((entry as { id: string }).id);
+            } else {
+              hasWorkspaceEntriesWithoutIds = true;
+            }
           }
         }
       }
     }
-    collect(projects);
     return { ids, hasWorkspaceEntriesWithoutIds };
   }
 

@@ -1023,6 +1023,37 @@ describe("Config", () => {
   });
 
   describe("readPersistedWorkspaceIdSuperset", () => {
+    it("ignores nested workspaces arrays inside workspace entries", () => {
+      // Workspace entries (and unknown newer-build extension objects) can
+      // carry nested `workspaces`-keyed fields whose ids reference OTHER —
+      // including removed — workspaces. Treating them as registered would
+      // lift removed ids' tombstones and recreate stale metadata
+      // indefinitely; only `projects[*][1].workspaces` direct entries are
+      // registration evidence.
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [
+              "/repo",
+              {
+                workspaces: [
+                  {
+                    id: "real-ws",
+                    path: "/repo/ws",
+                    workspaces: [{ id: "phantom-ws", path: "/x" }],
+                  },
+                ],
+              },
+            ],
+          ],
+        })
+      );
+      const evidence = new Config(tempDir).readPersistedWorkspaceIdEvidence();
+      expect([...evidence.ids]).toEqual(["real-ws"]);
+      expect(evidence.hasWorkspaceEntriesWithoutIds).toBe(false);
+    });
+
     it("collects ids from entries that lenient normalization discards", () => {
       // `[null, ...]` fails the project-path filter and vanishes from the
       // normalized view; the raw superset must still surface its workspace id

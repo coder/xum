@@ -5898,6 +5898,69 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("foreign removals observed mid-list evict process-local activity caches", async () => {
+    // A cross-process removal publishes no local tombstone, so the
+    // tombstone-cleared eviction listener never fires. Without eviction at
+    // the removal guards, the removed incarnation's workflow caches survive
+    // — and a downgraded backend re-registering the same deterministic
+    // legacy id would then be served ghost runs instead of a fresh probe.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "foreign-removed-evict";
+      const projectPath = path.join(config.rootDir, "project");
+      const configPath = path.join(config.rootDir, "config.json");
+      const configFor = (ids: string[]): string =>
+        JSON.stringify({
+          projects: [
+            [
+              projectPath,
+              { workspaces: ids.map((id) => ({ id, path: path.join(projectPath, id) })) },
+            ],
+          ],
+          taskSettings: { preserveSubagentsUntilArchive: true },
+          migrations: { persistentSubagentsDefaulted: true, defaultModelFallbacksSeeded: true },
+        });
+      await fsPromises.writeFile(configPath, configFor([workspaceId]));
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency(workspaceId, 42);
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+      const first = await workspaceService.getActivityList();
+      expect(first?.[workspaceId]?.recency).toBe(42);
+      const internals = workspaceService as unknown as {
+        activeWorkflowRunIdsByWorkspace: Map<string, ReadonlySet<string>>;
+      };
+      expect(internals.activeWorkflowRunIdsByWorkspace.has(workspaceId)).toBe(true);
+      // Another backend removes the workspace between the second list's
+      // initial and fresh raw reads (its metadata cleanup may lag).
+      const realGetAllSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      let snapshotCalls = 0;
+      const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(
+        async (options?: { throwOnError?: boolean }) => {
+          snapshotCalls += 1;
+          if (snapshotCalls === 2) {
+            await fsPromises.writeFile(configPath, configFor([]));
+          }
+          return realGetAllSnapshots(options);
+        }
+      );
+      try {
+        const second = await workspaceService.getActivityList();
+        expect(second?.[workspaceId]).toBeUndefined();
+        expect(internals.activeWorkflowRunIdsByWorkspace.has(workspaceId)).toBe(false);
+      } finally {
+        snapshotsSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("first bootstrap reuses the prune's config enumeration for scoping", async () => {
     // getAllWorkspaceMetadata walks every workspace with per-workspace disk
     // probes; the latency-sensitive first bootstrap must not pay it twice.

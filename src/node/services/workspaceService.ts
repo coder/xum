@@ -13778,30 +13778,45 @@ export class WorkspaceService extends EventEmitter {
         );
       }
       const activityById = Object.fromEntries(
-        entries.filter(
-          (entry): entry is readonly [string, WorkspaceActivitySnapshot] =>
-            entry != null &&
-            // Revalidate after the per-workspace awaits above: a workspace
-            // removed while this list was computing would otherwise ride the
-            // delayed response past emitWorkspaceActivity's tombstone
-            // suppression — a renderer that already processed the removal
-            // event would re-insert the deleted id until the next reconnect.
-            !this.extensionMetadata.isWorkspaceDeleted(entry[0]) &&
+        entries.filter((entry): entry is readonly [string, WorkspaceActivitySnapshot] => {
+          if (entry == null) {
+            return false;
+          }
+          const workspaceId = entry[0];
+          // Revalidate after the per-workspace awaits above: a workspace
+          // removed while this list was computing would otherwise ride the
+          // delayed response past emitWorkspaceActivity's tombstone
+          // suppression — a renderer that already processed the removal
+          // event would re-insert the deleted id until the next reconnect.
+          if (this.extensionMetadata.isWorkspaceDeleted(workspaceId)) {
+            return false;
+          }
+          const foreignRemoved =
             // Persisted snapshot vanished from the shared file mid-list
             // (metadata keys only disappear through removal). Entries that
             // never had a persisted snapshot are covered by the config check.
-            !(
-              freshPersistedIds != null &&
-              snapshots.has(entry[0]) &&
-              !freshPersistedIds.has(entry[0])
-            ) &&
+            (freshPersistedIds != null &&
+              snapshots.has(workspaceId) &&
+              !freshPersistedIds.has(workspaceId)) ||
             // Deregistered from the shared config mid-list — also covers
             // workflow/bash-monitor-only entries with no persisted snapshot.
-            !isRemovedFromConfig(entry[0]) &&
+            isRemovedFromConfig(workspaceId) ||
             // Raw-invisible (legacy stable) ids: authoritative-lookup
             // counterpart of the raw-superset comparison above.
-            !isRemovedPerAuthoritativeIdentity(entry[0])
-        )
+            isRemovedPerAuthoritativeIdentity(workspaceId);
+          if (foreignRemoved) {
+            // A cross-process removal publishes no local tombstone, so the
+            // tombstone-cleared eviction listener never fires for it. Stale
+            // workflow-run/monitor caches would then survive the removal —
+            // and if a downgraded backend re-registers the same
+            // deterministic legacy id later, getActiveWorkflowRunIds would
+            // serve the REMOVED incarnation's cached runs as ghost activity
+            // instead of probing the recreated session.
+            this.evictWorkspaceActivityCaches(workspaceId);
+            return false;
+          }
+          return true;
+        })
       );
       // Addition-side counterpart of the fresh re-read: another backend can
       // register a workspace AND persist its first activity after this
@@ -13968,8 +13983,7 @@ export class WorkspaceService extends EventEmitter {
           // have no snapshot and no live counts, so the probed candidates'
           // emptiness check must not run here.
           for (const workspaceId of Object.keys(activityById)) {
-            if (
-              this.extensionMetadata.isWorkspaceDeleted(workspaceId) ||
+            const foreignRemoved =
               // Persisted snapshot vanished during the probes (metadata
               // keys only disappear through removal) — also covers legacy
               // ids the raw views cannot see.
@@ -13997,8 +14011,14 @@ export class WorkspaceService extends EventEmitter {
               (finalConfigIds == null &&
                 finalAuthoritativeIds != null &&
                 (scopeEnumerationIds?.has(workspaceId) ?? false) &&
-                !finalAuthoritativeIds.has(workspaceId))
-            ) {
+                !finalAuthoritativeIds.has(workspaceId));
+            if (foreignRemoved) {
+              // Cross-process removals publish no local tombstone, so the
+              // tombstone-cleared eviction listener never fires — see the
+              // mid-list filter above.
+              this.evictWorkspaceActivityCaches(workspaceId);
+              delete activityById[workspaceId];
+            } else if (this.extensionMetadata.isWorkspaceDeleted(workspaceId)) {
               delete activityById[workspaceId];
             }
           }
@@ -14015,14 +14035,7 @@ export class WorkspaceService extends EventEmitter {
                 : freshSnapshots != null
                   ? (freshSnapshots.get(workspaceId) ?? null)
                   : (snapshots.get(workspaceId) ?? null);
-            if (
-              // Nothing to contribute: no persisted snapshot and no live
-              // counts (a workflow-only candidate legitimately has no
-              // snapshot, so its absence alone is not removal evidence).
-              (lateSnapshot == null &&
-                activeWorkflowRunIds.size === 0 &&
-                this.getActiveBashMonitorCount(workspaceId) === 0) ||
-              this.extensionMetadata.isWorkspaceDeleted(workspaceId) ||
+            const lateForeignRemoved =
               isRemovedFromConfig(workspaceId) ||
               isRemovedPerAuthoritativeIdentity(workspaceId) ||
               // Persisted snapshot vanished during the probes (metadata keys
@@ -14059,7 +14072,24 @@ export class WorkspaceService extends EventEmitter {
               (finalConfigIds == null &&
                 finalAuthoritativeIds != null &&
                 (scopeEnumerationIds?.has(workspaceId) ?? false) &&
-                !finalAuthoritativeIds.has(workspaceId))
+                !finalAuthoritativeIds.has(workspaceId));
+            if (lateForeignRemoved) {
+              // Same cross-process eviction rationale as the mid-list
+              // filter: no local tombstone means no listener-driven
+              // eviction, and the probes above may have installed caches
+              // for the removed incarnation.
+              this.evictWorkspaceActivityCaches(workspaceId);
+              continue;
+            }
+            if (
+              // Nothing to contribute: no persisted snapshot and no live
+              // counts (a workflow-only candidate legitimately has no
+              // snapshot, so its absence alone is not removal evidence) —
+              // never removal proof, so no cache eviction.
+              (lateSnapshot == null &&
+                activeWorkflowRunIds.size === 0 &&
+                this.getActiveBashMonitorCount(workspaceId) === 0) ||
+              this.extensionMetadata.isWorkspaceDeleted(workspaceId)
             ) {
               continue;
             }
