@@ -50,8 +50,9 @@ function collectFlatSectionRows(
 /**
  * Resolve the pinned block containing `meta`, mirroring the sidebar renderer:
  * multi-project rows form one flat block; regular rows partition by their
- * effective section. Returns null when the workspace is not a rendered pinned
- * row (unpinned, or missing from the sorted map).
+ * effective section. In flat sidebar mode all pinned roots instead form one
+ * unified block across projects. Returns null when the workspace is not a
+ * rendered pinned row (unpinned, or missing from the sorted map).
  */
 export function locatePinnedBlock(
   meta: FrontendWorkspaceMetadata,

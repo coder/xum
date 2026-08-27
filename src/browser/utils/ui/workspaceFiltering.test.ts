@@ -631,10 +631,6 @@ describe("buildSortedWorkspacesByProject", () => {
 
 describe("buildSortedWorkspacesFlat", () => {
   it("sorts all workspace kinds globally and keeps children under their parent", () => {
-    const projects = new Map<string, ProjectConfig>([
-      ["/project/a", { workspaces: [{ path: "/a/pinned-late", id: "pinned-late" }] }],
-      ["/project/b", { workspaces: [{ path: "/b/pinned-early", id: "pinned-early" }] }],
-    ]);
     const parent = {
       ...createWorkspace("parent", "/project/a"),
       projects: [
@@ -666,7 +662,7 @@ describe("buildSortedWorkspacesFlat", () => {
       ["recent", createWorkspace("recent", "/project/b")],
     ]);
 
-    const result = buildSortedWorkspacesFlat(projects, metadata, {
+    const result = buildSortedWorkspacesFlat([...metadata.values()], {
       parent: 300,
       child: 1,
       scratch: 200,

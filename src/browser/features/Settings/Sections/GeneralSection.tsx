@@ -979,8 +979,8 @@ export function GeneralSection() {
             </div>
           )}
 
-          <div className="flex items-center justify-between py-3">
-            <div className="flex-1 pr-4">
+          <div className="flex items-center justify-between">
+            <div>
               <div className="text-foreground text-sm">API Debug Logs</div>
               <div className="text-muted mt-0.5 text-xs">
                 Record the full input and output of every AI API call

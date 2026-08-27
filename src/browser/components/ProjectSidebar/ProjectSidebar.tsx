@@ -534,10 +534,6 @@ function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
   );
 }
 
-function GroupedSidebarSection(props: { enabled: boolean; children: React.ReactNode }) {
-  return props.enabled ? <div>{props.children}</div> : null;
-}
-
 // Custom drag layer to show a semi-transparent preview and enforce grabbing cursor
 interface ProjectDragItem {
   type: "PROJECT";
@@ -1744,14 +1740,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const isWorkflowRunActive = (workspaceId: string, runId: string): boolean =>
     getActiveWorkflowRunIds(workspaceId).includes(runId);
   const allSidebarWorkspaces = Array.from(sortedWorkspacesByProject.values()).flat();
-  const flatWorkspaceMetadata = new Map(
-    allSidebarWorkspaces.map((workspace) => [workspace.id, workspace] as const)
-  );
-  const flatWorkspaces = buildSortedWorkspacesFlat(
-    userProjects,
-    flatWorkspaceMetadata,
-    workspaceRecency
-  );
+  const flatWorkspaces = flatSidebarEnabled
+    ? buildSortedWorkspacesFlat(allSidebarWorkspaces, workspaceRecency)
+    : [];
   const flatRowsForDisplay = hideSubAgentRows
     ? excludeSubAgentRows(flatWorkspaces)
     : flatWorkspaces;
@@ -1886,6 +1877,13 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     .flatMap(([projectPath, drafts]) => drafts.map((draft) => ({ projectPath, draft })))
     .sort((a, b) => b.draft.createdAt - a.draft.createdAt);
   const groupedProjectPaths = flatSidebarEnabled ? [] : sortedProjectPaths;
+  const getProjectBadge = (projectPath: string): { name: string; color: string } => {
+    const config = userProjects.get(projectPath);
+    return {
+      name: config?.displayName ?? getProjectFallbackLabel(projectPath),
+      color: resolveSectionColor(config?.color),
+    };
+  };
   const getFlatProjectBadge = (
     workspace: FrontendWorkspaceMetadata
   ): { name: string; color: string } | undefined => {
@@ -1893,20 +1891,10 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     if (isMultiProject(workspace)) {
       return { name: "Multi-project", color: resolveSectionColor(undefined) };
     }
-    const config = userProjects.get(workspace.projectPath);
-    return {
-      name: config?.displayName ?? getProjectFallbackLabel(workspace.projectPath),
-      color: resolveSectionColor(config?.color),
-    };
+    return getProjectBadge(workspace.projectPath);
   };
-  const getFlatDraftBadge = (projectPath: string): { name: string; color: string } | undefined => {
-    if (projectPath === SCRATCH_PROJECT_CONFIG_KEY) return undefined;
-    const config = userProjects.get(projectPath);
-    return {
-      name: config?.displayName ?? getProjectFallbackLabel(projectPath),
-      color: resolveSectionColor(config?.color),
-    };
-  };
+  const getFlatDraftBadge = (projectPath: string): { name: string; color: string } | undefined =>
+    projectPath === SCRATCH_PROJECT_CONFIG_KEY ? undefined : getProjectBadge(projectPath);
 
   const handleReorder = useCallback(
     (draggedPath: string, targetPath: string) => {
@@ -2223,119 +2211,124 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                 viewportClassName="overflow-x-hidden"
               >
                 {flatSidebarEnabled && flatSidebarContent}
-                <GroupedSidebarSection enabled={!flatSidebarEnabled}>
-                  <div className={PROJECT_ITEM_BASE_CLASS}>
-                    <button
-                      onClick={() => toggleProject(SCRATCH_SIDEBAR_SECTION_ID)}
-                      aria-label={`${isScratchSectionExpanded ? "Collapse" : "Expand"} scratch chats`}
-                      className={PROJECT_TOGGLE_BUTTON_CLASSES}
-                    >
-                      <ChevronRight
-                        className="h-4 w-4 transition-transform duration-200"
-                        style={{
-                          transform: isScratchSectionExpanded ? "rotate(90deg)" : "rotate(0deg)",
-                        }}
-                      />
-                    </button>
-                    <div className="flex min-w-0 flex-1 items-center pr-1">
-                      <span className="text-foreground truncate text-sm font-medium">Chats</span>
-                      {(scratchWorkspaces.length > 0 || scratchDrafts.length > 0) && (
-                        <span className="text-muted ml-2 text-xs">
-                          ({topLevelScratchWorkspaces.length + scratchDrafts.length})
-                        </span>
-                      )}
-                    </div>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <button
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            handleAddScratchWorkspace();
+                {!flatSidebarEnabled && (
+                  <div>
+                    <div className={PROJECT_ITEM_BASE_CLASS}>
+                      <button
+                        onClick={() => toggleProject(SCRATCH_SIDEBAR_SECTION_ID)}
+                        aria-label={`${isScratchSectionExpanded ? "Collapse" : "Expand"} scratch chats`}
+                        className={PROJECT_TOGGLE_BUTTON_CLASSES}
+                      >
+                        <ChevronRight
+                          className="h-4 w-4 transition-transform duration-200"
+                          style={{
+                            transform: isScratchSectionExpanded ? "rotate(90deg)" : "rotate(0deg)",
                           }}
-                          aria-label="New scratch chat"
-                          className="text-content-secondary hover:bg-hover hover:border-border-light flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent"
-                        >
-                          <Plus className="h-3.5 w-3.5" />
-                        </button>
-                      </TooltipTrigger>
-                      <TooltipContent>New scratch chat</TooltipContent>
-                    </Tooltip>
-                  </div>
-                  {isScratchSectionExpanded && (
-                    <div className="pt-1 pb-1">
-                      {scratchDrafts.map((draft, index) => {
-                        const isSelected =
-                          pendingNewWorkspaceProject === SCRATCH_PROJECT_CONFIG_KEY &&
-                          pendingNewWorkspaceDraftId === draft.draftId;
-                        return (
-                          <DraftAgentListItemWrapper
-                            key={draft.draftId}
-                            projectPath={SCRATCH_PROJECT_CONFIG_KEY}
-                            draftId={draft.draftId}
-                            draftNumber={index + 1}
-                            isSelected={isSelected}
-                            onVisibilityChange={(isVisible) => {
-                              handleDraftVisibilityChange(
-                                SCRATCH_PROJECT_CONFIG_KEY,
-                                draft.draftId,
-                                isVisible
-                              );
+                        />
+                      </button>
+                      <div className="flex min-w-0 flex-1 items-center pr-1">
+                        <span className="text-foreground truncate text-sm font-medium">Chats</span>
+                        {(scratchWorkspaces.length > 0 || scratchDrafts.length > 0) && (
+                          <span className="text-muted ml-2 text-xs">
+                            ({topLevelScratchWorkspaces.length + scratchDrafts.length})
+                          </span>
+                        )}
+                      </div>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <button
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              handleAddScratchWorkspace();
                             }}
-                            onOpen={() =>
-                              handleOpenWorkspaceDraft(SCRATCH_PROJECT_CONFIG_KEY, draft.draftId)
-                            }
-                            onDelete={() => {
-                              if (isSelected) {
-                                navigateToProject(SCRATCH_PROJECT_CONFIG_KEY);
-                              }
-                              deleteWorkspaceDraft(SCRATCH_PROJECT_CONFIG_KEY, draft.draftId);
-                            }}
-                          />
-                        );
-                      })}
-                      {visibleScratchWorkspaces.map((metadata) => {
-                        const rowRenderMeta = scratchRowMetaByWorkspaceId.get(metadata.id);
-                        return (
-                          <AgentListItem
-                            key={metadata.id}
-                            metadata={metadata}
-                            projectPath={metadata.projectPath}
-                            projectName={metadata.projectName}
-                            isSelected={selectedWorkspace?.workspaceId === metadata.id}
-                            isArchiving={archivingWorkspaceIds.has(metadata.id)}
-                            isRemoving={
-                              removingWorkspaceIds.has(metadata.id) || metadata.isRemoving === true
-                            }
-                            onSelectWorkspace={handleSelectWorkspace}
-                            onForkWorkspace={handleForkWorkspace}
-                            onArchiveWorkspace={handleArchiveWorkspace}
-                            onCancelCreation={handleCancelWorkspaceCreation}
-                            depth={
-                              rowRenderMeta?.depth ?? scratchDepthByWorkspaceId[metadata.id] ?? 0
-                            }
-                            pinnedReorderGroup={SCRATCH_PINNED_REORDER_GROUP}
-                            onPinnedReorderDrop={handlePinnedReorderDrop}
-                            rowRenderMeta={rowRenderMeta}
-                            isWorkspaceLiveActive={isWorkspaceLiveActive(metadata.id)}
-                            delegatedActivity={delegatedActivityByWorkspaceId.get(metadata.id)}
-                            hiddenSubAgentsSummary={getHiddenSubAgentsSummary(metadata.id)}
-                            getWorkflowRunName={getWorkflowRunName}
-                            completedChildrenExpanded={expandedCompletedParentIds.has(metadata.id)}
-                            onToggleCompletedChildren={toggleCompletedChildrenExpansion}
-                          />
-                        );
-                      })}
-                      {scratchWorkspaces.length === 0 && scratchDrafts.length === 0 && (
-                        <button
-                          onClick={handleAddScratchWorkspace}
-                          className="text-muted hover:bg-hover mx-2 w-[calc(100%-1rem)] rounded px-2 py-2 text-left text-xs"
-                        >
-                          Start a scratch chat
-                        </button>
-                      )}
+                            aria-label="New scratch chat"
+                            className="text-content-secondary hover:bg-hover hover:border-border-light flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent"
+                          >
+                            <Plus className="h-3.5 w-3.5" />
+                          </button>
+                        </TooltipTrigger>
+                        <TooltipContent>New scratch chat</TooltipContent>
+                      </Tooltip>
                     </div>
-                  )}
-                </GroupedSidebarSection>
+                    {isScratchSectionExpanded && (
+                      <div className="pt-1 pb-1">
+                        {scratchDrafts.map((draft, index) => {
+                          const isSelected =
+                            pendingNewWorkspaceProject === SCRATCH_PROJECT_CONFIG_KEY &&
+                            pendingNewWorkspaceDraftId === draft.draftId;
+                          return (
+                            <DraftAgentListItemWrapper
+                              key={draft.draftId}
+                              projectPath={SCRATCH_PROJECT_CONFIG_KEY}
+                              draftId={draft.draftId}
+                              draftNumber={index + 1}
+                              isSelected={isSelected}
+                              onVisibilityChange={(isVisible) => {
+                                handleDraftVisibilityChange(
+                                  SCRATCH_PROJECT_CONFIG_KEY,
+                                  draft.draftId,
+                                  isVisible
+                                );
+                              }}
+                              onOpen={() =>
+                                handleOpenWorkspaceDraft(SCRATCH_PROJECT_CONFIG_KEY, draft.draftId)
+                              }
+                              onDelete={() => {
+                                if (isSelected) {
+                                  navigateToProject(SCRATCH_PROJECT_CONFIG_KEY);
+                                }
+                                deleteWorkspaceDraft(SCRATCH_PROJECT_CONFIG_KEY, draft.draftId);
+                              }}
+                            />
+                          );
+                        })}
+                        {visibleScratchWorkspaces.map((metadata) => {
+                          const rowRenderMeta = scratchRowMetaByWorkspaceId.get(metadata.id);
+                          return (
+                            <AgentListItem
+                              key={metadata.id}
+                              metadata={metadata}
+                              projectPath={metadata.projectPath}
+                              projectName={metadata.projectName}
+                              isSelected={selectedWorkspace?.workspaceId === metadata.id}
+                              isArchiving={archivingWorkspaceIds.has(metadata.id)}
+                              isRemoving={
+                                removingWorkspaceIds.has(metadata.id) ||
+                                metadata.isRemoving === true
+                              }
+                              onSelectWorkspace={handleSelectWorkspace}
+                              onForkWorkspace={handleForkWorkspace}
+                              onArchiveWorkspace={handleArchiveWorkspace}
+                              onCancelCreation={handleCancelWorkspaceCreation}
+                              depth={
+                                rowRenderMeta?.depth ?? scratchDepthByWorkspaceId[metadata.id] ?? 0
+                              }
+                              pinnedReorderGroup={SCRATCH_PINNED_REORDER_GROUP}
+                              onPinnedReorderDrop={handlePinnedReorderDrop}
+                              rowRenderMeta={rowRenderMeta}
+                              isWorkspaceLiveActive={isWorkspaceLiveActive(metadata.id)}
+                              delegatedActivity={delegatedActivityByWorkspaceId.get(metadata.id)}
+                              hiddenSubAgentsSummary={getHiddenSubAgentsSummary(metadata.id)}
+                              getWorkflowRunName={getWorkflowRunName}
+                              completedChildrenExpanded={expandedCompletedParentIds.has(
+                                metadata.id
+                              )}
+                              onToggleCompletedChildren={toggleCompletedChildrenExpansion}
+                            />
+                          );
+                        })}
+                        {scratchWorkspaces.length === 0 && scratchDrafts.length === 0 && (
+                          <button
+                            onClick={handleAddScratchWorkspace}
+                            className="text-muted hover:bg-hover mx-2 w-[calc(100%-1rem)] rounded px-2 py-2 text-left text-xs"
+                          >
+                            Start a scratch chat
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 {!flatSidebarEnabled && multiProjectWorkspaces.length > 0 && (
                   <div>

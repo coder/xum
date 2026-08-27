@@ -1020,32 +1020,12 @@ export function buildSortedWorkspacesByProject(
 
 /** Build one globally sorted workspace tree for the optional flat sidebar. */
 export function buildSortedWorkspacesFlat(
-  projects: Map<string, ProjectConfig>,
-  workspaceMetadata: Map<string, FrontendWorkspaceMetadata>,
+  workspaces: FrontendWorkspaceMetadata[],
   workspaceRecency: Record<string, number>
 ): FrontendWorkspaceMetadata[] {
-  const workspaces: FrontendWorkspaceMetadata[] = [];
-  const includedIds = new Set<string>();
-
-  for (const config of projects.values()) {
-    for (const workspace of config.workspaces) {
-      if (!workspace.id || includedIds.has(workspace.id)) continue;
-      const metadata = workspaceMetadata.get(workspace.id);
-      if (metadata) {
-        workspaces.push(metadata);
-        includedIds.add(workspace.id);
-      }
-    }
-  }
-
-  for (const [id, metadata] of workspaceMetadata) {
-    if (!includedIds.has(id)) {
-      workspaces.push(metadata);
-    }
-  }
-
-  sortWorkspaceRows(workspaces, workspaceRecency);
-  return flattenWorkspaceTree(workspaces);
+  const rows = [...workspaces];
+  sortWorkspaceRows(rows, workspaceRecency);
+  return flattenWorkspaceTree(rows);
 }
 
 /**

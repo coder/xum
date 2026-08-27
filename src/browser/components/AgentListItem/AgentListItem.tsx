@@ -491,6 +491,19 @@ function DraftAgentListItemInner(props: DraftAgentListItemProps) {
           >
             {draft.title}
           </span>
+          {props.projectBadge && (
+            <span
+              data-testid={`workspace-project-badge-draft-${draft.draftId}`}
+              className="max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
+              style={{
+                backgroundColor: `${props.projectBadge.color}20`,
+                color: props.projectBadge.color,
+                borderColor: `${props.projectBadge.color}40`,
+              }}
+            >
+              {props.projectBadge.name}
+            </span>
+          )}
         </div>
         {hasPromptPreview && (
           <span
