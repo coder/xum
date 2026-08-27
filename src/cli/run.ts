@@ -88,6 +88,7 @@ import {
 } from "../common/constants/experiments";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
+  createRunConfig,
   prepareRunSessionRootOverride,
   replacePrivateRunConfigFile,
   type PreparedRunSessionRoot,
@@ -496,16 +497,14 @@ async function main(): Promise<number> {
     process.exit(1);
   }
 
-  // Create ephemeral temp dir for session data (auto-cleaned on exit)
+  // Create the private run config root and default session storage.
   using tempDir = new DisposableTempDir("mux-run");
 
-  // Use real config for providers, but the run-scoped root for session data.
+  // Read credentials from the real config, then copy them into the private run config.
   const realConfig = new Config();
 
-  // Session data root: the ephemeral temp dir by default. Benchmark/CI
-  // harnesses can pin it (XUM_RUN_SESSION_ROOT / MUX_RUN_SESSION_ROOT) to
-  // collect chat.jsonl and session-usage.json after the process exits; an
-  // override root is left in place on exit.
+  // Session telemetry uses the private root by default. Benchmark/CI harnesses can pin it
+  // to collect chat.jsonl and session-usage.json after the process exits.
   let sessionRootOverride: PreparedRunSessionRoot | undefined;
   try {
     sessionRootOverride = await prepareRunSessionRootOverride(process.env, realConfig.rootDir);
@@ -514,8 +513,7 @@ async function main(): Promise<number> {
     return 1;
   }
   await using preparedSessionRoot = sessionRootOverride;
-  const sessionRoot = preparedSessionRoot?.resolveConfigRootPath() ?? tempDir.path;
-  const config = new Config(sessionRoot);
+  const config = await createRunConfig(tempDir.path, preparedSessionRoot);
 
   // Copy providers and secrets from real config to ephemeral config
   const existingProviders = realConfig.loadProvidersConfig();
@@ -524,8 +522,7 @@ async function main(): Promise<number> {
     providersFile,
     hasAnyConfiguredProvider(existingProviders)
       ? JSON.stringify(existingProviders, null, 2)
-      : undefined,
-    preparedSessionRoot
+      : undefined
   );
 
   // Copy secrets so tools/MCP servers get project secrets (e.g., GH_TOKEN)
@@ -533,8 +530,7 @@ async function main(): Promise<number> {
   const secretsFile = path.join(config.rootDir, "secrets.json");
   await replacePrivateRunConfigFile(
     secretsFile,
-    Object.keys(existingSecrets).length > 0 ? JSON.stringify(existingSecrets, null, 2) : undefined,
-    preparedSessionRoot
+    Object.keys(existingSecrets).length > 0 ? JSON.stringify(existingSecrets, null, 2) : undefined
   );
 
   // Copy only project trust metadata so AIService can read trust flags.

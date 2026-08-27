@@ -3,7 +3,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Config } from "@/node/config";
-import { prepareRunSessionRootOverride, replacePrivateRunConfigFile } from "./runSessionRoot";
+import {
+  createRunConfig,
+  prepareRunSessionRootOverride,
+  replacePrivateRunConfigFile,
+} from "./runSessionRoot";
 
 describe("prepareRunSessionRootOverride", () => {
   let tempDir: string;
@@ -37,6 +41,47 @@ describe("prepareRunSessionRootOverride", () => {
     } finally {
       process.umask(previousUmask);
     }
+  });
+
+  test("keeps private config out of a pinned telemetry root", async () => {
+    const realConfigRoot = path.join(tempDir, "real-config");
+    const telemetryRoot = path.join(tempDir, "telemetry-root");
+    const privateConfigRoot = path.join(tempDir, "private-config");
+    await fs.mkdir(privateConfigRoot);
+    await using preparedRoot = await prepareRunSessionRootOverride(
+      { MUX_RUN_SESSION_ROOT: telemetryRoot },
+      realConfigRoot
+    );
+    const config = await createRunConfig(privateConfigRoot, preparedRoot);
+
+    await replacePrivateRunConfigFile(
+      path.join(config.rootDir, "providers.jsonc"),
+      JSON.stringify({ openai: { apiKey: "provider-key" } })
+    );
+    await replacePrivateRunConfigFile(
+      path.join(config.rootDir, "secrets.json"),
+      JSON.stringify({ token: "secret-value" })
+    );
+    const sessionDir = config.getSessionDir("workspace-1");
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.writeFile(path.join(sessionDir, "chat.jsonl"), "chat");
+    await fs.writeFile(path.join(sessionDir, "session-usage.json"), "usage");
+
+    const telemetryFiles = await fs.readdir(telemetryRoot);
+    expect(telemetryFiles).not.toContain("providers.jsonc");
+    expect(telemetryFiles).not.toContain("secrets.json");
+    expect(await fs.readFile(path.join(privateConfigRoot, "providers.jsonc"), "utf8")).toContain(
+      "provider-key"
+    );
+    expect(await fs.readFile(path.join(privateConfigRoot, "secrets.json"), "utf8")).toContain(
+      "secret-value"
+    );
+    expect(
+      await fs.readFile(path.join(telemetryRoot, "sessions/workspace-1/chat.jsonl"), "utf8")
+    ).toBe("chat");
+    expect(
+      await fs.readFile(path.join(telemetryRoot, "sessions/workspace-1/session-usage.json"), "utf8")
+    ).toBe("usage");
   });
 
   test("rejects symlinked credential files without overwriting their targets", async () => {

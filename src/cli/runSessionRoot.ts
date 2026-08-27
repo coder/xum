@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import * as path from "node:path";
 import { isErrnoWithCode } from "@/node/utils/fs";
+import { Config } from "@/node/config";
 
 type RunSessionRootEnv = Readonly<Record<string, string | undefined>>;
 
@@ -136,6 +137,25 @@ export async function prepareRunSessionRootOverride(
   }
 
   return preparedRoot;
+}
+
+export async function createRunConfig(
+  privateConfigRoot: string,
+  preparedSessionRoot?: PreparedRunSessionRoot
+): Promise<Config> {
+  const config = new Config(privateConfigRoot);
+  if (preparedSessionRoot === undefined) {
+    return config;
+  }
+
+  const pinnedSessionsDir = path.join(preparedSessionRoot.resolveConfigRootPath(), "sessions");
+  await fs.mkdir(pinnedSessionsDir, { recursive: true, mode: 0o700 });
+  const sessionsStat = await fs.lstat(pinnedSessionsDir);
+  assertDirectoryNotSymlinked(pinnedSessionsDir, sessionsStat);
+  assertSessionRootOwner(pinnedSessionsDir, sessionsStat, {});
+  await fs.chmod(pinnedSessionsDir, 0o700);
+  await fs.symlink(pinnedSessionsDir, config.sessionsDir, "dir");
+  return config;
 }
 
 export async function replacePrivateRunConfigFile(
