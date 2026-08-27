@@ -202,14 +202,14 @@ describe("resolveWorkspaceAiSettingsForAgent", () => {
     expect(result?.resolvedThinking).toBe("high");
   });
 
-  test("ignores workspace-by-agent fallback when disabled", () => {
+  test("ignores workspace buckets during creation sync", () => {
     const result = resolveWorkspaceAiSettingsForAgent({
       agentId: "exec",
       agentAiDefaults: {},
       workspaceByAgent: {
         exec: { model: "openai:gpt-5.2", thinkingLevel: "medium" },
       },
-      useWorkspaceByAgentFallback: false,
+      mode: "creation-sync",
       fallbackModel: "openai:gpt-5.2-mini",
       existingModel: "anthropic:claude-opus-4-6",
       existingThinking: "off",
@@ -424,21 +424,31 @@ describe("resolveWorkspaceAiSettingsForAgent", () => {
     expect(result.resolvedReasoningMode).toBe("pro");
   });
 
-  test("inherits the workspace's current pro mode during background sync", () => {
+  test("a hydrated bucket owns background sync over configured defaults", () => {
     const result = resolveWorkspaceAiSettingsForAgent({
       agentId: "exec",
-      agentAiDefaults: {},
+      agentAiDefaults: {
+        exec: {
+          modelString: "anthropic:claude-haiku-4-5",
+          thinkingLevel: "off",
+          reasoningMode: "pro",
+        },
+      },
       workspaceByAgent: {
-        exec: { model: "openai:gpt-5.6-sol", thinkingLevel: "medium", reasoningMode: "standard" },
+        exec: { model: "openai:gpt-5.6-sol", thinkingLevel: "medium" },
       },
       useWorkspaceByAgentFallback: false,
       fallbackModel: "openai:gpt-5.2-mini",
-      existingModel: "openai:gpt-5.6-sol",
+      existingModel: "anthropic:claude-haiku-4-5",
       existingThinking: "off",
       existingReasoningMode: "pro",
     });
 
-    expect(result.resolvedReasoningMode).toBe("pro");
+    expect(result).toEqual({
+      resolvedModel: "openai:gpt-5.6-sol",
+      resolvedThinking: "medium",
+      resolvedReasoningMode: "standard",
+    });
   });
 
   test("defaults legacy per-agent entries without reasoningMode to standard on explicit switches", () => {

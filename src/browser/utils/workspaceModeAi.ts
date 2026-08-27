@@ -194,7 +194,7 @@ export function resolveWorkspaceAiSettingsForAgent(
     targetAgentId: normalizedAgentId,
     profile: "interactive",
     targetWorkspaceSettings:
-      mode === "explicit-switch" && workspaceOverride != null
+      mode !== "creation-sync" && workspaceOverride != null
         ? targetWorkspaceBucketToLayer(workspaceOverride)
         : undefined,
     agentAiDefaults: args.agentAiDefaults,
@@ -208,12 +208,7 @@ export function resolveWorkspaceAiSettingsForAgent(
     defaultModel: args.fallbackModel,
   });
 
-  // A hydrated per-agent bucket owns the active background runtime. Descriptor
-  // arrival must not reinterpret an absent reasoning value as a new default.
-  const resolvedReasoningMode =
-    workspaceOverride != null && mode === "background-sync"
-      ? (coerceOpenAIReasoningMode(args.existingReasoningMode) ?? "standard")
-      : (resolved.selected.reasoningMode ?? "standard");
+  const resolvedReasoningMode = resolved.selected.reasoningMode ?? "standard";
 
   return {
     resolvedModel: resolved.selected.model,

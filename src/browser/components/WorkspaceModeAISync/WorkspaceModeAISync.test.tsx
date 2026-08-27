@@ -131,7 +131,7 @@ describe("WorkspaceModeAISync", () => {
     expect(consumeWorkspaceModelChange(workspaceId, planModel)).toBe("agent");
   });
 
-  test("prefers configured agent defaults over workspace-by-agent overrides", async () => {
+  test("prefers a hydrated workspace bucket over configured agent defaults", async () => {
     const workspaceId = nextWorkspaceId();
 
     const configuredModel = "anthropic:claude-haiku-4-5";
@@ -152,8 +152,8 @@ describe("WorkspaceModeAISync", () => {
     renderSync({ workspaceId, agentId: "exec" });
 
     await waitFor(() => {
-      expect(readPersistedState(getModelKey(workspaceId), "")).toBe(configuredModel);
-      expect(readPersistedState(getThinkingLevelKey(workspaceId), "high")).toBe(configuredThinking);
+      expect(readPersistedState(getModelKey(workspaceId), "")).toBe(workspaceModel);
+      expect(readPersistedState(getThinkingLevelKey(workspaceId), "off")).toBe(workspaceThinking);
     });
   });
 
@@ -287,7 +287,7 @@ describe("WorkspaceModeAISync", () => {
     });
   });
 
-  test("ignores workspace-by-agent values when settings are inherit", async () => {
+  test("restores a hydrated workspace bucket when settings inherit", async () => {
     const workspaceId = nextWorkspaceId();
 
     const existingModel = "anthropic:claude-sonnet-4-5";
@@ -305,8 +305,8 @@ describe("WorkspaceModeAISync", () => {
     renderSync({ workspaceId, agentId: "exec" });
 
     await waitFor(() => {
-      expect(readPersistedState(getModelKey(workspaceId), "")).toBe(existingModel);
-      expect(readPersistedState(getThinkingLevelKey(workspaceId), "off")).toBe(existingThinking);
+      expect(readPersistedState(getModelKey(workspaceId), "")).toBe("openai:gpt-5.2");
+      expect(readPersistedState(getThinkingLevelKey(workspaceId), "off")).toBe("medium");
     });
   });
 
@@ -345,7 +345,7 @@ describe("WorkspaceModeAISync", () => {
     expect(consumeWorkspaceModelChange(workspaceId, execWorkspaceModel)).toBe("agent");
   });
 
-  test("ignores same-agent workspace overrides when agent defaults are missing", async () => {
+  test("restores a hydrated custom-agent bucket during background sync", async () => {
     const workspaceId = nextWorkspaceId();
 
     const existingModel = "anthropic:claude-sonnet-4-5";
@@ -364,8 +364,8 @@ describe("WorkspaceModeAISync", () => {
     renderSync({ workspaceId, agentId: "custom" });
 
     await waitFor(() => {
-      expect(readPersistedState(getModelKey(workspaceId), "")).toBe(existingModel);
-      expect(readPersistedState(getThinkingLevelKey(workspaceId), "off")).toBe(existingThinking);
+      expect(readPersistedState(getModelKey(workspaceId), "")).toBe("openai:gpt-5.2-pro");
+      expect(readPersistedState(getThinkingLevelKey(workspaceId), "off")).toBe("medium");
     });
   });
 

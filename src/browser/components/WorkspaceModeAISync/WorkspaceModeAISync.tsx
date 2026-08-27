@@ -54,9 +54,8 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
     prevAgentIdRef.current = normalizedAgentId;
     prevWorkspaceIdRef.current = workspaceId;
 
-    // Read at call time rather than subscribing: this cache only feeds explicit agent
-    // switches, yet every model/thinking/pro-mode change rewrites it, so a subscription
-    // would re-run this effect and re-apply the mode default over the user's own pick.
+    // Read at call time rather than subscribing: every model/thinking/pro-mode change
+    // rewrites this cache, so a subscription would re-run the effect on its own updates.
     const workspaceByAgent = readPersistedState<WorkspaceAISettingsCache>(
       getWorkspaceAISettingsByAgentKey(workspaceId),
       {}
