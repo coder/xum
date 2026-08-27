@@ -1073,10 +1073,37 @@ interface JsoncEditSpan {
 }
 
 /**
- * Plans one text span per replacement and one merged span per deletion run, all against
- * a single parse. Returns undefined for any batch it cannot place exactly (a missing
- * node, a segment/container type mismatch, overlapping spans), handing those to the
- * sequential path instead of guessing.
+ * Finds the separator comma inside the trivia between two sibling nodes, skipping
+ * comments whose text may itself contain commas. Undefined when the gap holds anything
+ * other than whitespace, comments, and at most one comma, sending the batch to the
+ * sequential path.
+ */
+function findSeparatorCommaOffset(gapText: string): number | undefined {
+  let i = 0;
+  while (i < gapText.length) {
+    const character = gapText[i] ?? "";
+    if (character === ",") return i;
+    if (character === "/" && gapText[i + 1] === "/") {
+      while (i < gapText.length && gapText[i] !== "\n") i += 1;
+      continue;
+    }
+    if (character === "/" && gapText[i + 1] === "*") {
+      const end = gapText.indexOf("*/", i + 2);
+      if (end < 0) return undefined;
+      i = end + 2;
+      continue;
+    }
+    if (!/\s/.test(character)) return undefined;
+    i += 1;
+  }
+  return undefined;
+}
+
+/**
+ * Plans one text span per replacement plus per-node and per-comma spans for deletions,
+ * all against a single parse. Returns undefined for any batch it cannot place exactly
+ * (a missing node, a segment/container type mismatch, an unrecognizable separator gap,
+ * overlapping spans), handing those to the sequential path instead of guessing.
  */
 function planJsoncEditSpans(
   text: string,
@@ -1123,37 +1150,39 @@ function planJsoncEditSpans(
       if (index < 0 || index >= children.length || deleted.has(index)) return undefined;
       deleted.add(index);
     }
-    if (deleted.size === children.length) {
-      // Empty the container: everything between its delimiters goes.
-      spans.push({ offset: parent.offset + 1, length: parent.length - 2, content: "" });
-      continue;
+    // Exactly the child nodes and their separator commas go; comments and other
+    // trivia in the gaps survive, so a comment attached to a retained neighbor is
+    // not swallowed when the entry after it is deleted.
+    let lastKept = -1;
+    for (let i = 0; i < children.length; i += 1) {
+      if (!deleted.has(i)) lastKept = i;
     }
-    for (let start = 0; start < children.length; start += 1) {
-      if (!deleted.has(start)) continue;
-      let end = start;
-      while (end + 1 < children.length && deleted.has(end + 1)) end += 1;
-      const first = children[start];
-      const last = children[end];
-      const follower = children[end + 1];
-      if (first === undefined || last === undefined) return undefined;
-      if (follower !== undefined) {
-        // A kept entry follows: the run's span ends where it begins, taking the
-        // run's separators with it and leaving the follower's own separator intact.
-        spans.push({ offset: first.offset, length: follower.offset - first.offset, content: "" });
-      } else {
-        // The run reaches the container's end, so a kept entry precedes it (the
-        // all-deleted case returned above): start after that entry, taking the
-        // separator between them.
-        const previous = children[start - 1];
-        if (previous === undefined) return undefined;
-        const previousEnd = previous.offset + previous.length;
-        spans.push({
-          offset: previousEnd,
-          length: last.offset + last.length - previousEnd,
-          content: "",
-        });
+    for (const index of deleted) {
+      const child = children[index];
+      if (child === undefined) return undefined;
+      spans.push({ offset: child.offset, length: child.length, content: "" });
+    }
+    for (let i = 0; i < children.length - 1; i += 1) {
+      // The comma right after a kept child with a later kept sibling still separates
+      // them; every other comma belonged to a deleted entry.
+      if (!deleted.has(i) && i < lastKept) continue;
+      const current = children[i];
+      const next = children[i + 1];
+      if (current === undefined || next === undefined) return undefined;
+      const gapStart = current.offset + current.length;
+      const commaOffset = findSeparatorCommaOffset(text.slice(gapStart, next.offset));
+      if (commaOffset === undefined) return undefined;
+      spans.push({ offset: gapStart + commaOffset, length: 1, content: "" });
+    }
+    const lastChild = children[children.length - 1];
+    if (lastChild !== undefined && deleted.has(children.length - 1)) {
+      // A JSONC trailing comma after a deleted final entry would dangle; it goes too.
+      const gapStart = lastChild.offset + lastChild.length;
+      const gapEnd = parent.offset + parent.length - 1;
+      const commaOffset = findSeparatorCommaOffset(text.slice(gapStart, gapEnd));
+      if (commaOffset !== undefined) {
+        spans.push({ offset: gapStart + commaOffset, length: 1, content: "" });
       }
-      start = end;
     }
   }
   spans.sort((a, b) => a.offset - b.offset);

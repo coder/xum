@@ -2886,6 +2886,59 @@ describe("backup payload", () => {
     expect(restored.servers.remote.headers).toBeUndefined();
   });
 
+  it("keeps a retained neighbor's comment when restore deletes a final property", async () => {
+    // Deletion spans must take exactly the node and its separator: a hand-authored
+    // backup can attach a comment to the kept command, and dropping the redacted url
+    // on a fresh device must not swallow it.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          grafana: { command: "npx grafana-mcp", url: "https://user:hunter2@example.com/mcp" },
+        },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(payload.manifest.mcpRedactions).toEqual([["servers", "grafana", "url"]]);
+    const commented = [
+      "{",
+      '  "servers": {',
+      '    "grafana": {',
+      '      "command": "npx grafana-mcp", // command rationale',
+      `      "url": "${REDACTED_BACKUP_VALUE}"`,
+      "    }",
+      "  }",
+      "}",
+      "",
+    ].join("\n");
+    const crafted = withPayloadFileText(payload, "mcp.jsonc", commented);
+    const fresh = path.join(tempDir, "comment-keeping-root");
+    await fs.mkdir(fresh, { recursive: true });
+    const approvals = await collectMcpCommandApprovals(
+      fresh,
+      crafted.files,
+      crafted.manifest.mcpRedactions
+    );
+    await restoreBackupPayload({
+      muxRoot: fresh,
+      payload: crafted,
+      approvedCommandTokens: approvals.map((approval) => approval.token),
+    });
+    const restoredText = await fs.readFile(path.join(fresh, "mcp.jsonc"), "utf-8");
+    expect(restoredText).toContain("// command rationale");
+    const restored = jsonc.parse(restoredText) as {
+      servers: { grafana: { command: string; url?: string } };
+    };
+    expect(restored.servers.grafana.command).toBe("npx grafana-mcp");
+    expect(restored.servers.grafana.url).toBeUndefined();
+  });
+
   it("round-trips literal redaction-marker MCP commands", async () => {
     for (const [index, server] of [
       REDACTED_BACKUP_VALUE,
