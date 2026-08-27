@@ -118,6 +118,6 @@ jobs:
           FAILED_RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           bunx mux@next run \
-            --model anthropic:claude-opus-5 \
+            --model anthropic:claude-opus-5-1 \
             --thinking xhigh \
             < .github/prompts/auto-cleanup-fixup.md

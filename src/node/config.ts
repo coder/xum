@@ -24,6 +24,7 @@ import type {
 import {
   DEFAULT_MODEL_FALLBACKS,
   LEGACY_DEFAULT_MODEL_FALLBACKS,
+  SUPERSEDED_DEFAULT_MODEL_FALLBACKS,
   sanitizeModelFallbacks,
 } from "@/common/utils/ai/modelFallbacks";
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
@@ -560,6 +561,32 @@ function normalizeConfigMigrations(value: unknown): AppConfigMigrations {
     }
   }
   return migrations;
+}
+
+/**
+ * True when a raw on-disk fallback entry deep-equals a shipped default chain:
+ * an object whose only key is `models`, holding exactly the default's model
+ * strings in order. Used by the one-time Opus 5.1 target migration to tell
+ * "still the shipped default" apart from user-edited entries.
+ */
+function isExactDefaultFallbackChain(
+  entry: unknown,
+  defaultEntry: ModelFallbacks[string]
+): boolean {
+  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+    return false;
+  }
+  const record = entry as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (keys.length !== 1 || keys[0] !== "models") {
+    return false;
+  }
+  const models = record.models;
+  return (
+    Array.isArray(models) &&
+    models.length === defaultEntry.models.length &&
+    defaultEntry.models.every((model, index) => models[index] === model)
+  );
 }
 
 function parseOptionalPort(value: unknown): number | undefined {
@@ -1415,6 +1442,45 @@ export class Config {
           configModified = true;
         }
 
+        // One-time chain-TARGET migration for the Opus 5.1 promotion. Unlike
+        // the key-gap seeds above (new source keys), promoting OPUS only moved
+        // the target of an existing default chain (Fable 5.1 → Opus 5 became
+        // Fable 5.1 → Opus 5.1), and already-seeded configs would keep the
+        // stale target forever. A chain that still deep-equals the superseded
+        // shipped default is provably untouched (or indistinguishable from it),
+        // so it moves to the current default exactly once; anything else —
+        // edited chains, enabled/triggers customization, deletions, and
+        // non-canonically keyed entries — is user intent and is never touched.
+        // Runs after the seed pass so freshly seeded chains (already on the
+        // new target) are no-ops, and stays idempotent if an old build strips
+        // the flag: migrated or edited chains no longer match the superseded
+        // shape.
+        const migrationsBeforeTargetMigration = normalizeConfigMigrations(parsed.migrations);
+        if (migrationsBeforeTargetMigration.defaultModelFallbacksSeededOpus51 !== true) {
+          const rawFallbacks =
+            typeof parsed.modelFallbacks === "object" &&
+            parsed.modelFallbacks !== null &&
+            !Array.isArray(parsed.modelFallbacks)
+              ? (parsed.modelFallbacks as Record<string, unknown>)
+              : {};
+          const migratedDefaults = Object.fromEntries(
+            Object.entries(SUPERSEDED_DEFAULT_MODEL_FALLBACKS)
+              .filter(([sourceModel, superseded]) =>
+                isExactDefaultFallbackChain(rawFallbacks[sourceModel], superseded)
+              )
+              .map(([sourceModel]) => [sourceModel, DEFAULT_MODEL_FALLBACKS[sourceModel]])
+          );
+          if (Object.keys(migratedDefaults).length > 0) {
+            const rawParsed: Record<string, unknown> = parsed;
+            rawParsed.modelFallbacks = { ...rawFallbacks, ...migratedDefaults };
+          }
+          parsed.migrations = {
+            ...migrationsBeforeTargetMigration,
+            defaultModelFallbacksSeededOpus51: true,
+          };
+          configModified = true;
+        }
+
         const modelFallbacks = normalizeModelFallbacks(parsed.modelFallbacks);
 
         const defaultModel = normalizeOptionalModelString(parsed.defaultModel);
@@ -1595,6 +1661,7 @@ export class Config {
       migrations: {
         defaultModelFallbacksSeeded: true,
         defaultModelFallbacksSeededFable51: true,
+        defaultModelFallbacksSeededOpus51: true,
         persistentSubagentsDefaulted: true,
       },
     };

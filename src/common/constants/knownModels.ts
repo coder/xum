@@ -56,15 +56,15 @@ const MODEL_DEFINITIONS = {
     // approximate counting; real usage can run ~1.0-1.3x higher.
     tokenizerOverride: "anthropic/claude-opus-4.5",
   },
-  // Claude Opus 5 - released July 24, 2026. Successor to Opus 4.8 at the same pricing
-  // ($5/M input, $25/M output). API id `claude-opus-5`; Opus 4.8 stays usable as the
-  // custom model string `anthropic:claude-opus-4-8`.
+  // Claude Opus 5.1 - successor to Opus 5 (released July 24, 2026) at unchanged pricing
+  // ($5/M input, $25/M output). API id `claude-opus-5-1`; Opus 5 stays usable as the
+  // custom model string `anthropic:claude-opus-5`.
   OPUS: {
     provider: "anthropic",
-    providerModelId: "claude-opus-5",
+    providerModelId: "claude-opus-5-1",
     aliases: ["opus"],
     warm: true,
-    // Opus 5 uses the newer Opus 4.7+ tokenizer (~30% more tokens for the same text),
+    // Opus 5.1 uses the newer Opus 4.7+ tokenizer (~30% more tokens for the same text),
     // which isn't published upstream; reuse Opus 4.5 for approximate counting. Real
     // usage can run ~1.0-1.3x higher than this estimate (same situation as FABLE above).
     tokenizerOverride: "anthropic/claude-opus-4.5",
@@ -280,6 +280,7 @@ export const MODEL_ABBREVIATIONS: Record<string, string> = Object.fromEntries(
 // lookup does not fall back to the generic per-provider tokenizer.
 const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
   "anthropic:claude-fable-5": "anthropic/claude-opus-4.5",
+  "anthropic:claude-opus-5": "anthropic/claude-opus-4.5",
   "anthropic:claude-opus-4-8": "anthropic/claude-opus-4.5",
 };
 
