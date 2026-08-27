@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import tarfile
 from dataclasses import dataclass
@@ -55,6 +56,8 @@ def _run_mux_runner_smoke(
     timeout_ms: str | None = None,
     repo_git_config: tuple[str, str] | None = None,
     pretrust_git_timeout: bool = False,
+    fake_tee_exit_code: int | None = None,
+    emit_run_complete: bool = True,
 ) -> _RunnerSmokeResult:
     app_root = tmp_path / "app"
     project_path = tmp_path / "project"
@@ -85,10 +88,22 @@ if [[ "${1:-}" == "src/cli/trust.ts" ]]; then
 fi
 printf '%s\n' "$*" >"${FAKE_BUN_ARGS_FILE}"
 cat >/dev/null
-printf '{"type":"run-complete","usage":{"inputTokens":7,"outputTokens":11,"cachedTokens":5,"cacheCreateTokens":3},"cost_usd":0.42}\n'
+if [[ "${FAKE_BUN_SKIP_RUN_COMPLETE:-0}" != "1" ]]; then
+  printf '{"type":"run-complete","usage":{"inputTokens":7,"outputTokens":11,"cachedTokens":5,"cacheCreateTokens":3},"cost_usd":0.42}\n'
+fi
 exit "${FAKE_MUX_EXIT_CODE}"
 """,
     )
+    if fake_tee_exit_code is not None:
+        real_tee = shutil.which("tee")
+        assert real_tee is not None
+        _write_executable(
+            fake_bin / "tee",
+            f"""#!/usr/bin/env bash
+"{real_tee}" "$@"
+exit "${{FAKE_TEE_EXIT_CODE}}"
+""",
+        )
     _write_executable(
         fake_bin / "timeout",
         """#!/usr/bin/env bash
@@ -125,6 +140,10 @@ exit 99
         env["MUX_RUN_AS_GOAL"] = goal_mode
     if timeout_ms is not None:
         env["MUX_TIMEOUT_MS"] = timeout_ms
+    if fake_tee_exit_code is not None:
+        env["FAKE_TEE_EXIT_CODE"] = str(fake_tee_exit_code)
+    if not emit_run_complete:
+        env["FAKE_BUN_SKIP_RUN_COMPLETE"] = "1"
 
     runner_path = _repo_root() / "benchmarks/terminal_bench/mux-run.sh"
     completed = subprocess.run(
@@ -317,6 +336,30 @@ def test_mux_runner_persists_failure_marker_to_collected_stderr(tmp_path: Path) 
     assert marker in (result.log_dir / "stderr.txt").read_text()
     session_root = result.log_dir.parents[2] / "session-root"
     assert marker in (session_root / "run-stderr.log").read_text()
+
+
+def test_mux_runner_downgrades_tee_failure_after_run_complete(tmp_path: Path) -> None:
+    """A dropped exec-channel stdout reader fails tee with EPIPE after the run
+    finished; the complete collected file must keep the trial scoreable."""
+    result = _run_mux_runner_smoke(tmp_path, exit_code=0, fake_tee_exit_code=1)
+
+    assert result.completed.returncode == 0, result.completed.stderr
+    assert result.exit_code_file.read_text() == "0"
+    stderr_file = (result.log_dir / "stderr.txt").read_text()
+    assert "stdout tee failed (exit 1) after run-complete" in stderr_file
+    assert "failed to capture mux stdout" not in stderr_file
+
+
+def test_mux_runner_keeps_tee_failure_without_run_complete(tmp_path: Path) -> None:
+    result = _run_mux_runner_smoke(
+        tmp_path, exit_code=0, fake_tee_exit_code=1, emit_run_complete=False
+    )
+
+    assert result.completed.returncode == 1
+    assert (
+        "failed to capture mux stdout (exit 1)"
+        in (result.log_dir / "stderr.txt").read_text()
+    )
 
 
 def test_mux_runner_leaves_timeout_to_harbor(tmp_path: Path) -> None:

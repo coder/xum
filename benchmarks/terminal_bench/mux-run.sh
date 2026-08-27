@@ -275,6 +275,17 @@ if [[ "${mux_status}" -ne 0 ]]; then
   exit "${mux_status}"
 fi
 
+# tee also feeds the exec channel; remote transports can drop their stdout
+# reader (EPIPE) after the run finished, failing tee while the collected file
+# is complete. The file is authoritative: when mux exited cleanly and the
+# terminal run-complete event landed in it, keep the run's real outcome
+# instead of voiding the trial.
+if [[ "${tee_status}" -ne 0 && "${mux_status}" -eq 0 ]] \
+  && tail -c 65536 "${MUX_OUTPUT_FILE}" 2>/dev/null | grep -q '^{"type":"run-complete"'; then
+  report_status_line "[mux-run] WARNING: stdout tee failed (exit ${tee_status}) after run-complete; treating as transport artifact"
+  tee_status=0
+fi
+
 if [[ "${tee_status}" -ne 0 ]]; then
   report_status_line "[mux-run] ERROR: failed to capture mux stdout (exit ${tee_status})"
   exit "${tee_status}"
