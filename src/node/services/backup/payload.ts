@@ -1316,6 +1316,16 @@ function hasDisguisedAssignment(redacted: string): boolean {
     if (ASSIGNMENT_START.test(unquoted)) return true;
     // A split-string option with its value attached (`-STOKEN=x`, `--s=TOKEN=x`).
     if (isSplitStringOption(unquoted)) return true;
+    // An option value can embed a whole assignment for the target program
+    // (`systemd-run --setenv=TOKEN=x`, `--env=TOKEN=x`): a second `=` past the
+    // option's own separator marks one. Plain flag values (`--transport=stdio`)
+    // carry no inner `=` and stay published.
+    if (
+      unquoted.startsWith("-") &&
+      ASSIGNMENT_START.test(unquoted.slice(unquoted.indexOf("=") + 1))
+    ) {
+      return true;
+    }
     // `=` mixed with quoting or expansion machinery: some other grammar's assignment
     // (`$env:TOKEN=x`, `python -c 'os.environ["TOKEN"]="x"'` fragments).
     if (/['"\\$]/.test(word)) return true;

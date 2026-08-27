@@ -390,6 +390,14 @@ describe("backup payload", () => {
         "mcp-grafana --token ghp_12345678901234567{8..8}90123456789012345678",
         REDACTED_BACKUP_VALUE,
       ],
+      // An option value can embed a whole assignment for the target program.
+      ["systemd-run --setenv=TOKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      ["docker run --env=TOKEN=hunter2 mcp-image", REDACTED_BACKUP_VALUE],
+      // A plain flag value has no inner assignment and stays published.
+      [
+        "mcp-run --transport=stdio TOKEN=hunter2",
+        `mcp-run --transport=stdio TOKEN=${REDACTED_BACKUP_VALUE}`,
+      ],
       // After an option terminator, even an option-looking word is an env operand,
       // and the terminator itself may arrive through quote removal.
       ["env -- --evil=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
