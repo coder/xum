@@ -265,22 +265,32 @@ export class ExtensionMetadataService {
     // queued deletion may run before the caller's queued write, which would
     // then recreate the removed entry).
     const generationBefore = this.deletedWorkspaceIds.get(workspaceId);
+    let probeRegistered = false;
     try {
-      if (!(await this.registrationProbe(workspaceId))) {
-        return false;
-      }
+      probeRegistered = await this.registrationProbe(workspaceId);
     } catch {
-      return false;
+      probeRegistered = false;
     }
     const generationAfter = this.deletedWorkspaceIds.get(workspaceId);
     if (generationAfter === undefined) {
       // Another path (activity bootstrap, reconcile) lifted the tombstone
-      // while the probe was in flight — the id is verifiably registered and
-      // no newer removal exists, so the write must PERSIST. Returning false
-      // here would hand the caller an unpersisted transient snapshot that
-      // WorkspaceService still broadcasts (the tombstone is gone), leaving
-      // renderer state ahead of disk until restart.
+      // while the probe was in flight, on registration evidence that
+      // postdates the tombstone. The write must PERSIST regardless of THIS
+      // probe's outcome (negative and failing probes included): once the
+      // tombstone is gone, broadcasts are un-suppressed and every later
+      // write persists normally — suppressing only this in-flight write
+      // would hand the caller an unpersisted transient snapshot that
+      // WorkspaceService still broadcasts, leaving renderer recency/goal/
+      // status ahead of disk until restart. A genuinely newer same-process
+      // removal republishes a tombstone, which the caller's in-queue
+      // re-check still honors.
       return true;
+    }
+    if (!probeRegistered) {
+      // Negative or failing probe with the tombstone still standing: keep
+      // suppressing. Emits stay suppressed by the same tombstone, so no
+      // transient state can reach the renderer.
+      return false;
     }
     if (generationAfter !== generationBefore) {
       // Republished mid-probe: a newer same-process removal wins.

@@ -1540,6 +1540,30 @@ describe("ExtensionMetadataService", () => {
     expect(service.isWorkspaceDeleted("ws-legacy")).toBe(true);
   });
 
+  test("a write persists when the tombstone is lifted mid-probe despite a negative probe", async () => {
+    // The registration probe and a concurrent activity bootstrap race: the
+    // bootstrap proves re-registration and lifts the tombstone while this
+    // write's own probe resolves negative (stale evidence) or fails. Once
+    // the tombstone is gone, broadcasts are un-suppressed — suppressing
+    // only this in-flight write would broadcast an unpersisted transient
+    // snapshot, leaving renderer state ahead of disk until restart. The
+    // write must persist.
+    await service.updateRecency("ws-revived", 100);
+    service.setRegistrationProbe(() => Promise.resolve(false));
+    await service.deleteWorkspace("ws-revived");
+    expect(service.isWorkspaceDeleted("ws-revived")).toBe(true);
+    service.setRegistrationProbe(() => {
+      // Concurrent bootstrap lifts the tombstone while the probe is in
+      // flight, on registration evidence of its own.
+      service.clearTombstonesForRegisteredIds(new Set(["ws-revived"]), service.getTombstonedIds());
+      return Promise.resolve(false); // This probe's own (stale) negative outcome.
+    });
+    const snapshot = await service.updateRecency("ws-revived", 500);
+    expect(snapshot.recency).toBe(500);
+    expect((await service.getAllSnapshots()).get("ws-revived")?.recency).toBe(500);
+    expect(service.isWorkspaceDeleted("ws-revived")).toBe(false);
+  });
+
   test("live snapshot reads reconcile a stranded sidecar too", async () => {
     // After the activity subscription bootstraps, live metadata/workflow
     // emissions read via getSnapshot — a healthy subscription never issues
