@@ -30,6 +30,7 @@ function parseReferences(value: unknown): AgentWorkflowRunReference[] {
   }
 
   const parsed: AgentWorkflowRunReference[] = [];
+  const now = Date.now();
   for (const reference of references) {
     if (reference == null || typeof reference !== "object") {
       continue;
@@ -41,7 +42,10 @@ function parseReferences(value: unknown): AgentWorkflowRunReference[] {
     if (typeof record.createdAtMs !== "number" || !Number.isFinite(record.createdAtMs)) {
       continue;
     }
-    parsed.push({ runId: record.runId, createdAtMs: record.createdAtMs });
+    // Self-heal implausible future timestamps (clock correction, corruption): a future-dated
+    // reference would otherwise outrank every later user/reset boundary in supersession
+    // comparisons until wall time catches up.
+    parsed.push({ runId: record.runId, createdAtMs: Math.min(record.createdAtMs, now) });
   }
   return parsed;
 }
@@ -71,7 +75,8 @@ export async function recordAgentWorkflowRunReference(input: {
   await referenceFileLocks.withLock(filePath, async () => {
     const existing = await readAgentWorkflowRunReferences(input.workspaceSessionDir);
     const byRunId = new Map(existing.map((reference) => [reference.runId, reference]));
-    const createdAtMs = input.createdAtMs ?? Date.now();
+    // Clamp like parseReferences: never persist a future-dated timestamp.
+    const createdAtMs = Math.min(input.createdAtMs ?? Date.now(), Date.now());
     const previous = byRunId.get(input.runId);
     byRunId.set(input.runId, {
       runId: input.runId,

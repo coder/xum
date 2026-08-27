@@ -10937,7 +10937,7 @@ export class WorkspaceService extends EventEmitter {
     assert(runId.length > 0, "isWorkflowInvocationCurrent requires runId");
 
     let outcome: "invocation" | "consumed" | "superseded" | null = null;
-    let supersededAtMs: number | null = null;
+    let boundaryAtMs: number | null = null;
     const historyResult = await this.historyService.iterateFullHistory(
       workspaceId,
       "backward",
@@ -10946,7 +10946,7 @@ export class WorkspaceService extends EventEmitter {
           if (isManualUserSupersessionMessage(message) || isResetBoundaryMessage(message)) {
             outcome = "superseded";
             const timestamp = message.metadata?.timestamp;
-            supersededAtMs = typeof timestamp === "number" ? timestamp : null;
+            boundaryAtMs = typeof timestamp === "number" ? timestamp : null;
             return false;
           }
           if (
@@ -10955,6 +10955,8 @@ export class WorkspaceService extends EventEmitter {
             isTerminalWorkflowToolResultMessage(message, runId)
           ) {
             outcome = "consumed";
+            const timestamp = message.metadata?.timestamp;
+            boundaryAtMs = typeof timestamp === "number" ? timestamp : null;
             return false;
           }
           if (isWorkflowInvocationMessage(message, runId)) {
@@ -10977,18 +10979,16 @@ export class WorkspaceService extends EventEmitter {
     if (outcome === "invocation") {
       return true;
     }
-    if (outcome === "consumed") {
-      return false;
-    }
 
     // Kernel-launched runs (mux.workflow_run / mux.workflow_resume inside code_execution) leave
     // no recognizable invocation part in history, so the backward walk above stops at the prior
-    // real user message and would wrongly treat the run as superseded, silently dropping its
-    // notify_on_terminal wake. Their durable provenance is the agent-workflow-runs sidecar: a
-    // reference recorded after the latest supersession boundary counts as the current
-    // invocation. A boundary without a durable timestamp fails safe to superseded, mirroring
-    // TaskService.listAgentReferencedWorkflowRunIds.
-    if (outcome === "superseded" && supersededAtMs === null) {
+    // real user message (or, after a delivered result, at that consumed terminal message) and
+    // would wrongly drop the run's notify_on_terminal wake. Their durable provenance is the
+    // agent-workflow-runs sidecar: a reference recorded after that boundary counts as the
+    // current invocation. For a consumed boundary that means a background resume/retry issued
+    // after the prior result was delivered. A boundary without a durable timestamp fails safe
+    // to not-current, mirroring TaskService.listAgentReferencedWorkflowRunIds.
+    if (outcome !== null && boundaryAtMs === null) {
       return false;
     }
     const references = await readAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
@@ -10996,7 +10996,7 @@ export class WorkspaceService extends EventEmitter {
     if (reference == null) {
       return false;
     }
-    return supersededAtMs === null || reference.createdAtMs > supersededAtMs;
+    return boundaryAtMs === null || reference.createdAtMs > boundaryAtMs;
   }
 
   /**

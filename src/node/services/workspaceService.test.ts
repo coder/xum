@@ -6016,6 +6016,15 @@ describe("WorkspaceService workflow invocation events", () => {
         })
       );
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
+
+      // A kernel background resume issued after the delivered result re-records the reference,
+      // so the retried run's next terminal wake must count as current again.
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: 1_350,
+      });
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
       workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();

@@ -32,6 +32,24 @@ describe("agent workflow run references", () => {
     }
   });
 
+  test("clamps future-dated createdAtMs to the current time", async () => {
+    const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
+    try {
+      const runId = "wfr_future";
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir,
+        runId,
+        createdAtMs: Date.now() + 86_400_000,
+      });
+
+      const references = await readAgentWorkflowRunReferences(workspaceSessionDir);
+      expect(references).toHaveLength(1);
+      expect(references[0]?.createdAtMs).toBeLessThanOrEqual(Date.now());
+    } finally {
+      await fs.rm(workspaceSessionDir, { recursive: true, force: true });
+    }
+  });
+
   test("keeps the newest createdAtMs across re-records", async () => {
     const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
     try {
