@@ -1867,6 +1867,7 @@ const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   // through a shell. npm needs its `exec` subcommand tracked separately below.
   { name: /^npx$/, evalWord: /^(?:-c$|--call(?:=|$))/ },
   { name: /^deno$/, evalWord: /^eval$/ },
+  { name: /^(?:lua|luajit)[0-9.]*$/, evalWord: /^-e/ },
   // Tcl-family launchers execute a positional script but have no inline-eval option
   // needed here; auto-published script operands still localize through the shared check.
   { name: /^(?:tclsh|wish|expectk?|jimsh)[0-9.]*$/ },
@@ -1944,7 +1945,7 @@ const SHELL_STATE_WORDS = new Set([
  * about the rest of that word.
  */
 function hasDisguisedAssignment(redacted: string): boolean {
-  let operandsOnly = false;
+  let envOperandsOnly = false;
   let pendingPrintfVariableOption = false;
   let sawEnv = false;
   let pendingEnvOptionValue = false;
@@ -1980,6 +1981,19 @@ function hasDisguisedAssignment(redacted: string): boolean {
       const autoPublished = isAutoPublishedScriptOperand(unquoted);
       clearInterpreterTracking();
       if (autoPublished) return true;
+    }
+    // A bare dash is a script operand for interpreters; double dash ends their option
+    // parsing. Handle both before eval matching so the following dash-led filename or
+    // argument is never mistaken for an evaluator. They also terminate env options,
+    // npm exec call options, and git rebase options at this parse level.
+    if (unquoted === "-" || unquoted === "--") {
+      clearInterpreterTracking();
+      envOperandsOnly ||= sawEnv;
+      sawEnv = false;
+      pendingEnvOptionValue = false;
+      pendingNpmExecOptions = false;
+      pendingGitRebaseOptions = false;
+      continue;
     }
     // GNU env reparses its split-string value even without an assignment or literal
     // whitespace, so this runs before the assignment-only exit below. Stop tracking at
@@ -2108,21 +2122,13 @@ function hasDisguisedAssignment(redacted: string): boolean {
         clearInterpreterTracking();
       }
     }
-    // Option terminators end option parsing: past one even a dash-led word is an
-    // operand, so `env -- --evil=x` sets an environment entry despite the option look.
-    // GNU `env` documents `[-]` as a terminator too, and the consumer sees the word
-    // after quote removal, so `"--"` and `\-\-` spellings count as well.
-    if (unquoted === "-" || unquoted === "--") {
-      operandsOnly = true;
-      continue;
-    }
     // A quoted region spanning whitespace is a script or argument string some
     // interpreter re-parses on its own terms (`sh -c '...'`, `powershell -Command
     // '$env:TOKEN=...; ...'`, `csh -c 'setenv TOKEN ...'`, `env -S'...'`); what that
     // grammar treats as an assignment is not decidable here.
     if (/\s/.test(unquoted)) return true;
     if (!word.includes("=")) continue;
-    if (operandsOnly) return true;
+    if (envOperandsOnly) return true;
     // GNU `env` reads a bare `=value` word as an assignment operand too.
     if (unquoted.startsWith("=")) return true;
     // A quote-mangled `NAME=` spelling (`TOKEN\\=x`, `'TOKEN'=x`) for `env`/`eval`.
