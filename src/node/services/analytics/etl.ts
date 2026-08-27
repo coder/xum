@@ -884,20 +884,20 @@ const CORRUPT_IDENTIFIER_MAX_LENGTH = 1024;
  *    IDs are short hex; migrated legacy IDs are
  *    `${projectBasename}-${workspaceBasename}` (config.generateLegacyId),
  *    each basename bounded by the filesystem's NAME_MAX (255 bytes), so 511
- *    is the construction ceiling. Agent IDs/types also derive from basenames.
+ *    is the construction ceiling. Agent IDs also derive from basenames.
  *    CORRUPT_IDENTIFIER_MAX_LENGTH doubles that ceiling for headroom.
+ *    agent_type is excluded: legacy workspace metadata and rollup entries
+ *    accept unbounded agent-type strings, so length there is not evidence.
  *
  * 2. Workspace identity unknown to ingest_watermarks. A concatenation of two
  *    or more workspace IDs can never equal a real workspace ID, no matter how
- *    small the corrupted batch, while every legitimate row's workspace gets a
- *    watermark by the end of the ingest/rebuild pass that wrote it (sweeps
- *    run after those passes complete). If a crash lands between the event
- *    write and the watermark write, deleting the orphans is still safe: the
- *    missing watermark makes the next syncCheck re-ingest that workspace from
- *    disk in full. The exception is a workspace whose ingest FAILED in the
- *    current pass (a poison record makes every retry throw before the
- *    watermark write): callers pass those IDs as preserveWorkspaceIds so the
- *    sweep does not delete a failing workspace's real rows after every sync.
+ *    small the corrupted batch. This evidence is only safe at init, before
+ *    any ingest of the session (prior-session rows either have watermarks or
+ *    are orphans the first syncCheck re-ingests from disk), or right after a
+ *    rebuild that reports the workspaces whose ingest failed before their
+ *    watermark write via preserveWorkspaceIds. Running it after ordinary
+ *    ingests deletes real rows of workspaces whose ingest keeps failing on a
+ *    poison record, so callers must not sweep there.
  *    delegation_rollups joins on parent_workspace_id only;
  *    child_workspace_id may legitimately reference a removed child workspace.
  */
@@ -925,7 +925,6 @@ export async function deleteCorruptAnalyticsRows(
     DELETE FROM delegation_rollups
     WHERE LENGTH(parent_workspace_id) > ${CORRUPT_IDENTIFIER_MAX_LENGTH}
        OR LENGTH(child_workspace_id) > ${CORRUPT_IDENTIFIER_MAX_LENGTH}
-       OR LENGTH(agent_type) > ${CORRUPT_IDENTIFIER_MAX_LENGTH}
        OR (NOT EXISTS (
          SELECT 1 FROM ingest_watermarks w
          WHERE w.workspace_id = delegation_rollups.parent_workspace_id

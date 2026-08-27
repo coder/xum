@@ -154,33 +154,18 @@ async function handleInit(data: InitData): Promise<void> {
 }
 
 /**
- * Workspaces whose most recent ingest failed before their watermark write.
- * Missing-watermark evidence must skip them in EVERY sweep (not just the one
- * after the failing pass) until a successful ingest writes their watermark;
- * otherwise routine activity elsewhere (e.g. handleIngest for another
- * workspace) re-deletes the failing workspace's real rows. Worker-lifetime
- * only: after a restart the init sweep intentionally deletes orphans, and the
- * first syncCheck re-ingests them from disk.
- */
-const failedIngestExemptions = new Set<string>();
-
-/** A rebuild re-evaluates every workspace on disk, so its failure set replaces the accumulated one. */
-function replaceFailedIngestExemptions(failedWorkspaceIds: ReadonlySet<string>): void {
-  failedIngestExemptions.clear();
-  for (const workspaceId of failedWorkspaceIds) {
-    failedIngestExemptions.add(workspaceId);
-  }
-}
-
-/**
  * Delete corruption-class rows and log when anything was actually removed.
  * Best-effort: a failed sweep must never reject init (which would cache a
- * worker error and disable analytics until restart) or fail an
- * otherwise-successful ingest, so errors are logged and swallowed.
+ * worker error and disable analytics until restart), so errors are logged
+ * and swallowed. Runs only at init and after rebuilds: missing-watermark
+ * evidence is unsafe after ordinary ingests (see deleteCorruptAnalyticsRows).
  */
-async function sweepCorruptRows(context: string): Promise<void> {
+async function sweepCorruptRows(
+  context: string,
+  preserveWorkspaceIds?: ReadonlySet<string>
+): Promise<void> {
   try {
-    const deleted = await deleteCorruptAnalyticsRows(getConn(), failedIngestExemptions);
+    const deleted = await deleteCorruptAnalyticsRows(getConn(), preserveWorkspaceIds);
     if (deleted > 0) {
       log.info(`[analytics-worker] Deleted ${deleted} corrupt analytics row(s) (${context})`);
     }
@@ -193,14 +178,7 @@ async function handleIngest(data: IngestData): Promise<void> {
   assert(data.workspaceId.trim().length > 0, "ingest requires workspaceId");
   assert(data.sessionDir.trim().length > 0, "ingest requires sessionDir");
 
-  try {
-    await ingestWorkspace(getConn(), data.workspaceId, data.sessionDir, data.meta ?? {});
-    failedIngestExemptions.delete(data.workspaceId);
-  } catch (error) {
-    failedIngestExemptions.add(data.workspaceId);
-    throw error;
-  }
-  await sweepCorruptRows("ingest");
+  await ingestWorkspace(getConn(), data.workspaceId, data.sessionDir, data.meta ?? {});
 }
 
 async function handleRebuildAll(data: RebuildAllData): Promise<{ workspacesIngested: number }> {
@@ -213,18 +191,16 @@ async function handleRebuildAll(data: RebuildAllData): Promise<{ workspacesInges
   }
 
   const result = await rebuildAll(getConn(), data.sessionsDir, data.workspaceMetaById ?? {});
+  await sweepCorruptRows("rebuildAll", result.failedWorkspaceIds);
   // A completed rebuild priced everything with the current tables; refresh the
   // fingerprint so the next sync check does not schedule a redundant rebuild.
   await storePricingFingerprint(getConn());
-  replaceFailedIngestExemptions(result.failedWorkspaceIds);
-  await sweepCorruptRows("rebuildAll");
   return { workspacesIngested: result.workspacesIngested };
 }
 
 async function handleClearWorkspace(data: ClearWorkspaceData): Promise<void> {
   assert(data.workspaceId.trim().length > 0, "clearWorkspace requires workspaceId");
   await clearWorkspaceAnalyticsState(getConn(), data.workspaceId);
-  failedIngestExemptions.delete(data.workspaceId);
 }
 
 async function handleQuery(data: QueryData): Promise<unknown> {
@@ -437,11 +413,10 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
       data.sessionsDir,
       data.workspaceMetaById
     );
+    await sweepCorruptRows("syncCheck full_rebuild", failedWorkspaceIds);
     if (pricingFingerprintChanged) {
       await storePricingFingerprint(getConn());
     }
-    replaceFailedIngestExemptions(failedWorkspaceIds);
-    await sweepCorruptRows("syncCheck full_rebuild");
     await checkpointIfNeeded(plan.action, workspacesIngested, 0);
 
     const elapsedMs = Math.round(performance.now() - syncStartMs);
@@ -480,10 +455,8 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
 
     try {
       await ingestWorkspace(getConn(), workspaceId, discoveredWorkspace.sessionDir, workspaceMeta);
-      failedIngestExemptions.delete(workspaceId);
       workspacesIngested += 1;
     } catch (error) {
-      failedIngestExemptions.add(workspaceId);
       process.stderr.write(
         `[analytics-worker] Failed to ingest workspace during sync check (${workspaceId}): ${getErrorMessage(error)}\n`
       );
@@ -494,7 +467,6 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
   for (const workspaceId of plan.workspaceIdsToPurge) {
     try {
       await clearWorkspaceAnalyticsState(getConn(), workspaceId);
-      failedIngestExemptions.delete(workspaceId);
       workspacesPurged += 1;
     } catch (error) {
       process.stderr.write(
@@ -503,7 +475,6 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
     }
   }
 
-  await sweepCorruptRows("syncCheck incremental");
   await checkpointIfNeeded(plan.action, workspacesIngested, workspacesPurged);
 
   const elapsedMs = Math.round(performance.now() - syncStartMs);

@@ -1772,4 +1772,19 @@ describe("deleteCorruptAnalyticsRows", () => {
     // A later pass without the exemption treats the same rows as orphans.
     expect(await deleteCorruptAnalyticsRows(conn)).toBe(2);
   });
+
+  test("keeps rollups whose legacy agent_type is arbitrarily long", async () => {
+    const conn = await createTestConn();
+    await seedWatermark(conn, "parent-legacy");
+
+    // Legacy metadata and rollup entries accept unbounded agent types, so
+    // agent_type length alone is never corruption evidence.
+    await conn.run(
+      `INSERT INTO delegation_rollups (parent_workspace_id, child_workspace_id, agent_type, model)
+       VALUES (?, ?, ?, ?)`,
+      ["parent-legacy", "child-a", "t".repeat(2000), "openai:gpt-5.6-sol"]
+    );
+
+    expect(await deleteCorruptAnalyticsRows(conn)).toBe(0);
+  });
 });
