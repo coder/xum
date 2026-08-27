@@ -964,6 +964,8 @@ function AppInner() {
         sortedWorkspacesByProject,
         userProjects,
         readPersistedState(SIDEBAR_FLAT_MODE_KEY, false)
+          ? { multiProjectEnabled: multiProjectWorkspacesEnabled }
+          : false
       );
       if (order) void reorderPinnedWorkspaces(order);
     },
@@ -972,6 +974,7 @@ function AppInner() {
       workspaceMetadata,
       sortedWorkspacesByProject,
       userProjects,
+      multiProjectWorkspacesEnabled,
       reorderPinnedWorkspaces,
     ]
   );

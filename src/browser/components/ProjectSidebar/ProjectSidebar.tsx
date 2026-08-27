@@ -1987,7 +1987,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         targetMeta,
         sortedWorkspacesByProject,
         userProjects,
-        flatSidebarEnabled
+        flatSidebarEnabled ? { multiProjectEnabled: multiProjectWorkspacesEnabled } : false
       );
       if (!block) return;
       const order = computePinnedDropOrder(block, draggedId, targetId, edge);
@@ -1998,6 +1998,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       sortedWorkspacesByProject,
       userProjects,
       flatSidebarEnabled,
+      multiProjectWorkspacesEnabled,
       reorderPinnedWorkspaces,
     ]
   );
@@ -2018,7 +2019,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         direction,
         sortedWorkspacesByProject,
         userProjects,
-        flatSidebarEnabled
+        flatSidebarEnabled ? { multiProjectEnabled: multiProjectWorkspacesEnabled } : false
       );
       if (order) void reorderPinnedWorkspaces(order);
       return true;
@@ -2028,6 +2029,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       sortedWorkspacesByProject,
       userProjects,
       flatSidebarEnabled,
+      multiProjectWorkspacesEnabled,
       reorderPinnedWorkspaces,
     ]
   );
