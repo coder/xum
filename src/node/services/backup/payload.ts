@@ -1217,20 +1217,32 @@ function unquoteShellWord(word: string): string {
 /** GNU `env -S`/`--split-string` re-splits its attached value into assignments. */
 const SPLIT_STRING_OPTION = /^-[A-Za-z]*S|^--split-string/;
 
+/** Exactly one replaced assignment, nothing else riding along in the same word. */
+const CONSUMED_ASSIGNMENT = new RegExp(`^${ASSIGNMENT_NAME}${REDACTED_BACKUP_VALUE}$`);
+
 /**
  * Words that hand a downstream consumer an assignment the shell itself does not see,
- * neither decidable here: a quote-mangled `NAME=` spelling for `env`/`eval`
- * (`TOKEN\\=x`, `'TOKEN'=x`, `"TOKEN=a b"`), or a split-string option with its value
- * attached. A word already holding a marker was consumed by the replacement above
- * (`A="B=1"` cannot fire), which also covers assignments quoting embeds mid-word after
- * a space, since the replacement matches boundaries in the raw text.
+ * none of them decidable here. Only a word that is exactly one consumed assignment is
+ * exempt (`A="B=1"` cannot fire); a marker merely inside a larger word proves nothing
+ * about the rest of that word.
  */
 function hasDisguisedAssignment(redacted: string): boolean {
   for (const word of redacted.match(SHELL_WORD) ?? []) {
-    if (word.includes(REDACTED_BACKUP_VALUE) || !word.includes("=")) continue;
+    if (CONSUMED_ASSIGNMENT.test(word)) continue;
     const unquoted = unquoteShellWord(word);
+    // A quoted region spanning whitespace is a script or argument string some
+    // interpreter re-parses on its own terms (`sh -c '...'`, `powershell -Command
+    // '$env:TOKEN=...; ...'`, `csh -c 'setenv TOKEN ...'`, `env -S'...'`); what that
+    // grammar treats as an assignment is not decidable here.
+    if (/\s/.test(unquoted)) return true;
+    if (!word.includes("=")) continue;
+    // A quote-mangled `NAME=` spelling (`TOKEN\\=x`, `'TOKEN'=x`) for `env`/`eval`.
     if (ASSIGNMENT_START.test(unquoted)) return true;
+    // A split-string option with its value attached (`-STOKEN=x`).
     if (SPLIT_STRING_OPTION.test(unquoted)) return true;
+    // `=` mixed with quoting or expansion machinery: some other grammar's assignment
+    // (`$env:TOKEN=x`, `python -c 'os.environ["TOKEN"]="x"'` fragments).
+    if (/['"\\$]/.test(word)) return true;
   }
   return false;
 }

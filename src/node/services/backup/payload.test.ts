@@ -386,8 +386,13 @@ describe("backup payload", () => {
       // ANSI-C and locale quoting hand env-style consumers their inner text.
       ["env $'TOKEN=hunter2' mcp-server", REDACTED_BACKUP_VALUE],
       ['env $"TOKEN=hunter2" mcp-server', REDACTED_BACKUP_VALUE],
-      // Boundaries match in the raw text, so a quote-embedded assignment still redacts.
-      ["sh -c 'exec TOKEN=hunter2 mcp'", `sh -c 'exec TOKEN=${REDACTED_BACKUP_VALUE} mcp'`],
+      // A quoted script string is re-parsed by its interpreter, whatever the grammar.
+      ["powershell -Command '$env:TOKEN=\"hunter2\"; mcp-server'", REDACTED_BACKUP_VALUE],
+      ["sh -c 'exec TOKEN=hunter2 mcp'", REDACTED_BACKUP_VALUE],
+      // A consumed assignment inside a larger script word must not exempt the rest.
+      ["sh -c 'A=1 $env:TOKEN=hunter2 mcp'", REDACTED_BACKUP_VALUE],
+      ["csh -c 'setenv TOKEN hunter2; mcp'", REDACTED_BACKUP_VALUE],
+      ["pwsh -c $env:TOKEN=hunter2;mcp-server", REDACTED_BACKUP_VALUE],
       // GNU env re-splits a split-string value into assignments.
       ["env --split-string='TOKEN=hunter2 mcp-server'", REDACTED_BACKUP_VALUE],
       ["env -S'TOKEN=hunter2 mcp-server'", REDACTED_BACKUP_VALUE],
