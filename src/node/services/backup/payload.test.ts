@@ -740,6 +740,169 @@ describe("backup payload", () => {
     expect((blocked as BackupCredentialDetectedError).files).toEqual(["mcp.jsonc"]);
   });
 
+  it("consumes Bash-only word breaks so a NBSP-joined value cannot leak its tail", async () => {
+    // JS `\s` counts NBSP as whitespace, but Bash keeps it inside the word: the
+    // assignment's runtime value runs through it, so the tail must not stay published.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: "TOKEN=public\u00a0hunter2 mcp-server" } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(`TOKEN=${REDACTED_BACKUP_VALUE} mcp-server`);
+  });
+
+  it("keeps always-set special parameters from manufacturing a credential block", async () => {
+    // Under `bash -c`, $0 is the shell name: the fragments never join at runtime, and
+    // the published `$` keeps the run broken for the scan, so creation must succeed.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: "mcp --pattern ghp_aaaaaaaaaa$0bbbbbbbbbb" } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(payloadFileText(payload, "mcp.jsonc")).toContain("ghp_aaaaaaaaaa$0bbbbbbbbbb");
+  });
+
+  it("stops the credential scan at a Bash comment but resumes on the next line", async () => {
+    // Bash discards everything from an unquoted `#` word to the newline, so the
+    // quote-separated prose there can never join into a runtime token.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: 'mcp-server # ghp_aaaaaaaaaa"bbbbbbbbbb"' } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe('mcp-server # ghp_aaaaaaaaaa"bbbbbbbbbb"');
+
+    // Past the newline execution resumes, so the same splice there still blocks.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          grafana: { command: 'mcp-server # note\nmcp2 --pattern ghp_aaaaaaaaaa"bbbbbbbbbb"' },
+        },
+      })
+    );
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+  });
+
+  it("decodes published MCP urls once before the credential backstop", async () => {
+    // A single URL parse yields the contiguous token from `%61`, so the encoded
+    // spelling publishes the same credential the literal one is blocked for.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { url: "https://example.com/mcp?value=ghp_%61aaaaaaaaaaaaaaaaaaa" } },
+      })
+    );
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+
+    // One pass only: a double-encoded `%2561` reaches every client as the literal `%61`.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          grafana: { url: "https://example.com/mcp?value=ghp_%2561aaaaaaaaaaaaaaaaaaa" },
+        },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(payloadFileText(payload, "mcp.jsonc")).toContain("ghp_%2561");
+  });
+
+  it("collapses deterministic globs so a bracketed spelling cannot hide a token", async () => {
+    // `[b]` matches only `b` and `?` exactly one character: pathname expansion can hand
+    // the process the contiguous token, and the published text collapses the same way
+    // for any reader.
+    for (const command of [
+      "mcp --pattern ghp_aaaaaaaaaa[b]aaaaaaaaa",
+      "mcp --pattern ghp_aaaaaaaaaa?aaaaaaaaa",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const blocked = await captureRejection(
+        createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        })
+      );
+      expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+    }
+
+    // Quoting suppresses pathname expansion, so the same spelling stays publishable.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: "mcp --pattern 'ghp_aaaaaaaaaa[b]aaaaaaaaa'" } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(payloadFileText(payload, "mcp.jsonc")).toContain("ghp_aaaaaaaaaa[b]aaaaaaaaa");
+  });
+
   it("keeps the documented AWS example key reviewable instead of hard-blocking", async () => {
     await writeFixtureFile(
       muxRoot,

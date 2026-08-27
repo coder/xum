@@ -1176,14 +1176,18 @@ function valueHasRedactionAtPath(
 // are literal, so braces travel inside names and values, where a replaced marker
 // distributes safely through any expansion (`TOK{A,B}=x` becomes `TOKA=x TOKB=x`).
 const SHELL_WORD_BREAK = ";&|<>()`";
+// Only space, tab, and newline delimit words for Bash. JS `\s` would also break on NBSP
+// and its other Unicode cousins, which Bash keeps inside the word: an assignment value
+// would end early there, publishing the rest of the runtime value as its own word.
+const SHELL_BLANK = " \\t\\n";
 // Any non-option word up to an unquoted `=` is an assignment name: GNU `env` accepts
 // arbitrary `NAME=VALUE` operands (`TOKEN:NAME=x`, `TOKEN+=x`), and Bash's identifier
 // rule is just the narrow case. Quoting, `$`, and `=` end a name; a leading dash is an
 // option word (`--transport=stdio`), which stays published.
-const ASSIGNMENT_NAME = `[^-\\s\\\\'"$=${SHELL_WORD_BREAK}][^\\s\\\\'"$=${SHELL_WORD_BREAK}]*=`;
-const ASSIGNMENT_VALUE = `(?:\\\\[\\s\\S]|'[^']*'|"(?:\\\\[\\s\\S]|[^"\\\\])*"|[^\\s\\\\'"${SHELL_WORD_BREAK}]+)+`;
+const ASSIGNMENT_NAME = `[^-${SHELL_BLANK}\\\\'"$=${SHELL_WORD_BREAK}][^${SHELL_BLANK}\\\\'"$=${SHELL_WORD_BREAK}]*=`;
+const ASSIGNMENT_VALUE = `(?:\\\\[\\s\\S]|'[^']*'|"(?:\\\\[\\s\\S]|[^"\\\\])*"|[^${SHELL_BLANK}\\\\'"${SHELL_WORD_BREAK}]+)+`;
 const COMMAND_ENV_ASSIGNMENT = new RegExp(
-  `(^|[\\s${SHELL_WORD_BREAK}])(${ASSIGNMENT_NAME})(${ASSIGNMENT_VALUE})`,
+  `(^|[${SHELL_BLANK}${SHELL_WORD_BREAK}])(${ASSIGNMENT_NAME})(${ASSIGNMENT_VALUE})`,
   "g"
 );
 
@@ -1193,19 +1197,25 @@ const COMMAND_ENV_ASSIGNMENT = new RegExp(
  * `=`. Either way the value's true extent is unknowable, e.g. an unterminated quote.
  */
 const UNCONSUMED_ASSIGNMENT = new RegExp(
-  `(^|[\\s${SHELL_WORD_BREAK}])${ASSIGNMENT_NAME}` +
-    `(?!${REDACTED_BACKUP_VALUE}(?=[\\s${SHELL_WORD_BREAK}]|$))(?=[^\\s${SHELL_WORD_BREAK}])`
+  `(^|[${SHELL_BLANK}${SHELL_WORD_BREAK}])${ASSIGNMENT_NAME}` +
+    `(?!${REDACTED_BACKUP_VALUE}(?=[${SHELL_BLANK}${SHELL_WORD_BREAK}]|$))(?=[^${SHELL_BLANK}${SHELL_WORD_BREAK}])`
 );
 
 /** One whole shell word, however its quoted and escaped segments interleave. */
 const SHELL_WORD = new RegExp(
-  `(?:\\\\[\\s\\S]|'[^']*'|"(?:\\\\[\\s\\S]|[^"\\\\])*"|[^\\s\\\\'"${SHELL_WORD_BREAK}])+`,
+  `(?:\\\\[\\s\\S]|'[^']*'|"(?:\\\\[\\s\\S]|[^"\\\\])*"|[^${SHELL_BLANK}\\\\'"${SHELL_WORD_BREAK}])+`,
   "g"
 );
 const ASSIGNMENT_START = new RegExp(`^${ASSIGNMENT_NAME}`);
 
-/** A parameter expansion an unset variable turns into nothing at runtime. */
-const SIMPLE_EXPANSION = /^\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?!$-])/;
+/**
+ * A parameter expansion that can turn into nothing at runtime: an unset variable, a
+ * positional this runtime never passes, or `$@`/`$*`/`$!` in a fresh shell. The specials
+ * Bash always fills under `-c` ($0, $?, $#, $$, $-) stay literal instead: their `$`
+ * spelling already breaks a token run for the scan, and deleting a value the runtime
+ * inserts would manufacture no-override matches from fragments that never join.
+ */
+const SIMPLE_EXPANSION = /^\$(?:[A-Za-z_][A-Za-z0-9_]*|[1-9@*!])/;
 
 /**
  * Bash-accurate quote removal, in both directions on purpose: under-stripping would hide
@@ -1215,7 +1225,7 @@ const SIMPLE_EXPANSION = /^\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?!$-])/;
  * the contexts where the shell expands them, so a single-quoted or escaped dollar stays
  * the literal the process receives.
  */
-function unquoteShellWord(word: string, stripExpansions = false): string {
+function unquoteShellWord(word: string, stripExpansions = false, collapseGlobs = false): string {
   let result = "";
   let i = 0;
   while (i < word.length) {
@@ -1283,10 +1293,60 @@ function unquoteShellWord(word: string, stripExpansions = false): string {
       i = j + 1;
       continue;
     }
+    if (collapseGlobs) {
+      // Pathname expansion is live in this unquoted context. A single-member class is
+      // deterministic (`[8]` can only produce `8`), and any reader collapses the
+      // published spelling the same way, so scan what it yields. `?` scans as a
+      // representative member and `*` as its empty match for the same reason.
+      if (char === "[" && word[i + 2] === "]" && !"!^".includes(word[i + 1] ?? "")) {
+        result += word[i + 1];
+        i += 3;
+        continue;
+      }
+      if (char === "?") {
+        result += "0";
+        i += 1;
+        continue;
+      }
+      if (char === "*") {
+        i += 1;
+        continue;
+      }
+    }
     result += char;
     i += 1;
   }
   return result;
+}
+
+/**
+ * The words Bash would execute: an unquoted `#` opening a word after a blank (or the
+ * string start) discards the rest of that line before quote removal even applies, so
+ * scanning a comment would manufacture no-override matches from prose the process never
+ * sees. Text past the newline is live again and re-tokenized from scratch, because a
+ * quoted word begun inside the comment must not swallow it.
+ */
+function executedShellWords(text: string): string[] {
+  const words: string[] = [];
+  let rest: string | undefined = text;
+  while (rest !== undefined) {
+    const current: string = rest;
+    rest = undefined;
+    for (const match of current.matchAll(SHELL_WORD)) {
+      const start = match.index;
+      const before = start === 0 ? "" : (current[start - 1] ?? "");
+      if (
+        match[0].startsWith("#") &&
+        (start === 0 || before === " " || before === "\t" || before === "\n")
+      ) {
+        const lineEnd = current.indexOf("\n", start);
+        if (lineEnd !== -1) rest = current.slice(lineEnd + 1);
+        break;
+      }
+      words.push(match[0]);
+    }
+  }
+  return words;
 }
 
 /**
@@ -1733,15 +1793,25 @@ export async function createBackupPayload(
         // other strings (tool names, urls, prose) can legitimately hold quote-separated
         // token-like fragments, and this block has no override.
         if (file.path === "mcp.jsonc") {
-          for (const text of collectCommandStrings(jsonc.parse(content))) {
+          const parsedMcp: unknown = jsonc.parse(content);
+          for (const text of collectCommandStrings(parsedMcp)) {
             // Word-by-word, with real quoting rules: raw character stripping would
             // join fragments the shell keeps apart (a backslash inside single quotes
             // survives execution) and manufacture a match from a harmless command.
-            const words = text.match(SHELL_WORD) ?? [];
+            const words = executedShellWords(text);
             targets.push(words.map((word) => unquoteShellWord(word)).join(" "));
             // A simple parameter expansion that is unset at runtime vanishes
             // (`ghp_...$9123...`), splicing the fragments around it into one token.
             targets.push(words.map((word) => unquoteShellWord(word, true)).join(" "));
+            // Pathname expansion can hand the process a token a deterministic glob
+            // spelling hides, and the published text collapses the same way for any
+            // reader.
+            targets.push(words.map((word) => unquoteShellWord(word, true, true)).join(" "));
+          }
+          // A standard URL parse hands any reader the decoded value, so a published
+          // url is scanned as what it decodes to, not just its encoded spelling.
+          for (const url of collectUrlStrings(parsedMcp)) {
+            targets.push(percentDecodeOnce(url));
           }
         }
         return targets.some(matchesCredentialToken);
@@ -2750,6 +2820,28 @@ function collectCommandStrings(root: unknown): string[] {
     if (typeof command === "string") commands.push(command);
   }
   return commands;
+}
+
+function collectUrlStrings(root: unknown): string[] {
+  const servers = readRecord(readRecord(root)?.servers);
+  if (!servers) return [];
+  const urls: string[] = [];
+  for (const value of Object.values(servers)) {
+    const url = readRecord(value)?.url;
+    if (typeof url === "string") urls.push(url);
+  }
+  return urls;
+}
+
+/**
+ * One decoding pass, never a loop: a double-encoded `%2561` reaches a client as the
+ * literal `%61` a single standard parse yields, and repeated decoding would manufacture
+ * blocks from spellings no consumer resolves to the credential.
+ */
+function percentDecodeOnce(text: string): string {
+  return text.replace(/%([0-9a-fA-F]{2})/g, (_match, hex: string) =>
+    String.fromCharCode(Number.parseInt(hex, 16))
+  );
 }
 
 /**
