@@ -64,7 +64,7 @@ import {
 } from "@/browser/utils/rightSidebarLayout";
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { isWorkspaceArchived } from "@/common/utils/archive";
-import { nextMonotonicPinnedAtIso, reassignPinnedTimestamps } from "@/common/utils/pin";
+import { appendPinnedTimestamp, reassignPinnedTimestamps } from "@/common/utils/pin";
 import { shouldApplyWorkspaceAiSettingsFromBackend } from "@/browser/utils/workspaceAiSettingsSync";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import { findAdjacentWorkspaceId } from "@/browser/utils/ui/workspaceDomNav";
@@ -1509,33 +1509,44 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
     async (workspaceId: string, pinned: boolean): Promise<{ success: boolean; error?: string }> => {
       if (!api) return { success: false, error: "API not connected" };
 
-      let previousPinnedAt: string | undefined;
-      let applied = false;
+      let previousPinnedAtById: Map<string, string | undefined> | null = null;
       setWorkspaceMetadata((prev) => {
         const meta = prev.get(workspaceId);
         if (!meta || Boolean(meta.pinnedAt) === pinned) return prev;
-        previousPinnedAt = meta.pinnedAt;
-        applied = true;
+        const touched = new Map<string, string | undefined>([[workspaceId, meta.pinnedAt]]);
+        const next = new Map(prev);
         // Mirror the server's global append-only ordering (all projects, not
-        // just this one) so the flat sidebar's unified pinned block shows the
-        // row where the authoritative metadata will keep it.
+        // just this one), including its write-path healing of corrupted pin
+        // timestamps, so every row sits where authoritative metadata will
+        // keep it.
         let optimisticPinnedAt: string | undefined;
         if (pinned) {
-          optimisticPinnedAt = nextMonotonicPinnedAtIso(
-            Array.from(prev.values(), (other) => other.pinnedAt)
+          const { changed, pinnedAt } = appendPinnedTimestamp(
+            [...prev.values()]
+              .filter((other) => other.pinnedAt)
+              .map((other) => ({ id: other.id, pinnedAt: other.pinnedAt }))
           );
+          for (const [id, healedPinnedAt] of changed) {
+            const other = next.get(id);
+            if (!other) continue;
+            touched.set(id, other.pinnedAt);
+            next.set(id, { ...other, pinnedAt: healedPinnedAt });
+          }
+          optimisticPinnedAt = pinnedAt;
         }
-        const next = new Map(prev);
         next.set(workspaceId, { ...meta, pinnedAt: optimisticPinnedAt });
+        previousPinnedAtById = touched;
         return next;
       });
       const revert = () => {
-        if (!applied) return;
+        const touched: Map<string, string | undefined> | null = previousPinnedAtById;
+        if (!touched) return;
         setWorkspaceMetadata((prev) => {
-          const meta = prev.get(workspaceId);
-          if (!meta) return prev;
           const next = new Map(prev);
-          next.set(workspaceId, { ...meta, pinnedAt: previousPinnedAt });
+          for (const [id, priorPinnedAt] of touched) {
+            const meta = next.get(id);
+            if (meta) next.set(id, { ...meta, pinnedAt: priorPinnedAt });
+          }
           return next;
         });
       };

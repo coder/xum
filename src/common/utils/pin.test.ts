@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 
 import {
+  appendPinnedTimestamp,
   comparePinnedOrder,
   nextMonotonicPinnedAtIso,
   reassignPinnedTimestamps,
@@ -46,6 +47,36 @@ describe("nextMonotonicPinnedAtIso", () => {
       Date.parse("2026-01-02T00:00:00.000Z")
     );
     expect(iso).toBe("2026-01-03T00:00:00.001Z");
+  });
+});
+
+describe("appendPinnedTimestamp", () => {
+  it("mints max+1ms without touching existing pins", () => {
+    const { changed, pinnedAt } = appendPinnedTimestamp(
+      [{ id: "a", pinnedAt: "2026-01-03T00:00:00.000Z" }],
+      Date.parse("2026-01-01T00:00:00.000Z")
+    );
+    expect(changed.size).toBe(0);
+    expect(pinnedAt).toBe("2026-01-03T00:00:00.001Z");
+  });
+
+  it("renumbers all pins when the sane key range saturates, keeping keys unique and ordered", () => {
+    const saneMax = new Date(8_640_000_000_000_000 - 1).toISOString();
+    const nowMs = Date.parse("2026-01-01T00:00:00.000Z");
+    const { changed, pinnedAt } = appendPinnedTimestamp(
+      [
+        { id: "old", pinnedAt: "2026-01-01T00:00:00.000Z" },
+        { id: "capped", pinnedAt: saneMax },
+      ],
+      nowMs
+    );
+    // The new pin gets a strictly greatest unique key and existing pins are
+    // renumbered below it in their current visual order.
+    expect(pinnedAt).toBe(new Date(nowMs).toISOString());
+    expect(changed.get("old")).toBe(new Date(nowMs - 2).toISOString());
+    expect(changed.get("capped")).toBe(new Date(nowMs - 1).toISOString());
+    const keys = [changed.get("old"), changed.get("capped"), pinnedAt];
+    expect(new Set(keys).size).toBe(3);
   });
 });
 

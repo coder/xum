@@ -14,7 +14,7 @@ import { isWorkspaceArchived } from "@/common/utils/archive";
 import {
   comparePinnedOrder,
   isWorkspacePinned,
-  nextMonotonicPinnedAtIso,
+  appendPinnedTimestamp,
   reassignPinnedTimestamps,
 } from "@/common/utils/pin";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
@@ -8063,6 +8063,7 @@ export class WorkspaceService extends EventEmitter {
       const { projectPath, workspacePath } = workspace;
 
       let updated = false;
+      const healedIds: string[] = [];
       let validationError: string | undefined;
       await this.config.editConfig((config) => {
         const projectConfig = config.projects.get(projectPath);
@@ -8094,13 +8095,28 @@ export class WorkspaceService extends EventEmitter {
           if (workspaceEntry.pinnedAt) {
             return config;
           }
-          // Server-generated global monotonic timestamp; see nextMonotonicPinnedAtIso
-          // for the ordering and corrupted-timestamp rationale.
-          workspaceEntry.pinnedAt = nextMonotonicPinnedAtIso(
-            Array.from(config.projects.values()).flatMap((project) =>
-              project.workspaces.map((entry) => entry.pinnedAt)
-            )
+          // Server-generated global monotonic timestamp, plus write-path
+          // healing when corrupted state saturates the sane key range; see
+          // appendPinnedTimestamp.
+          const pinnedEntries = Array.from(config.projects.values()).flatMap((project) =>
+            project.workspaces
+              .filter((entry) => entry.pinnedAt)
+              .map((entry) => ({ id: entry.id, pinnedAt: entry.pinnedAt }))
           );
+          const { changed, pinnedAt } = appendPinnedTimestamp(pinnedEntries);
+          if (changed.size > 0) {
+            for (const project of config.projects.values()) {
+              for (const entry of project.workspaces) {
+                if (!entry.id) continue;
+                const healedPinnedAt = changed.get(entry.id);
+                if (healedPinnedAt !== undefined) {
+                  entry.pinnedAt = healedPinnedAt;
+                  healedIds.push(entry.id);
+                }
+              }
+            }
+          }
+          workspaceEntry.pinnedAt = pinnedAt;
           updated = true;
         } else if (workspaceEntry.pinnedAt) {
           delete workspaceEntry.pinnedAt;
@@ -8114,6 +8130,9 @@ export class WorkspaceService extends EventEmitter {
         return Err(validationError);
       }
 
+      if (healedIds.length > 0) {
+        await this.emitCurrentWorkspaceMetadataBatch(healedIds);
+      }
       if (updated) {
         await this.emitCurrentWorkspaceMetadata(workspaceId);
       }

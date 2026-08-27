@@ -87,6 +87,48 @@ export function nextMonotonicPinnedAtIso(
 }
 
 /**
+ * Ordering key for a newly pinned chat plus any write-path healing. Normally
+ * mints max+1ms (see nextMonotonicPinnedAtIso) and changes nothing else. When
+ * the successor saturates at the sane cap (reachable only through corrupted
+ * persisted state), no strictly-greater sane key exists, so every currently
+ * pinned entry is renumbered compactly below nowMs in its current visual
+ * order: ordering keys stay unique, append order survives, and future pins
+ * regain their full headroom (write-path self-healing).
+ */
+export function appendPinnedTimestamp(
+  pinned: ReadonlyArray<{ id?: string; pinnedAt?: string }>,
+  nowMs: number = Date.now()
+): { changed: Map<string, string>; pinnedAt: string } {
+  const pinnedAt = nextMonotonicPinnedAtIso(
+    pinned.map((entry) => entry.pinnedAt),
+    nowMs
+  );
+  if (!pinned.some((entry) => entry.pinnedAt === pinnedAt)) {
+    return { changed: new Map(), pinnedAt };
+  }
+  const order = pinned.filter((entry) => entry.pinnedAt).sort(comparePinnedOrderLoose);
+  const changed = new Map<string, string>();
+  order.forEach((entry, index) => {
+    const iso = new Date(nowMs - order.length + index).toISOString();
+    if (entry.id !== undefined && entry.pinnedAt !== iso) {
+      changed.set(entry.id, iso);
+    }
+  });
+  return { changed, pinnedAt: new Date(nowMs).toISOString() };
+}
+
+/** comparePinnedOrder for entries whose id may be missing (config rows). */
+function comparePinnedOrderLoose(
+  a: { id?: string; pinnedAt?: string },
+  b: { id?: string; pinnedAt?: string }
+): number {
+  return comparePinnedOrder(
+    { id: a.id ?? "", pinnedAt: a.pinnedAt },
+    { id: b.id ?? "", pinnedAt: b.pinnedAt }
+  );
+}
+
+/**
  * Stable pinned-block comparator: pinnedAt ascending (new pins append at the
  * bottom of the pinned block), workspace id as deterministic tie-breaker.
  * Shared by frontend sorting and the backend reorder path so both derive the

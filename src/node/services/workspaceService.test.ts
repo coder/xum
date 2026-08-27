@@ -13354,6 +13354,28 @@ describe("WorkspaceService setPinned", () => {
     expect(new Date(pinnedAt ?? "").getTime()).toBeLessThan(Date.now() + 60_000);
   });
 
+  test("pinning heals a saturated boundary timestamp so keys stay unique", async () => {
+    // An existing pin at the sane cap has no strictly-greater sane successor;
+    // the write path renumbers pins instead of minting a duplicate key.
+    const saneMax = new Date(8_640_000_000_000_000 - 1).toISOString();
+    const other = getEntry(otherRootId);
+    if (!other) throw new Error("fixture missing otherRootId");
+    other.pinnedAt = saneMax;
+
+    const result = await workspaceService.setPinned(rootId, true);
+    expect(result.success).toBe(true);
+    const rootPinnedAt = getEntry(rootId)?.pinnedAt;
+    const otherPinnedAt = getEntry(otherRootId)?.pinnedAt;
+    expect(rootPinnedAt).toBeDefined();
+    expect(otherPinnedAt).toBeDefined();
+    expect(rootPinnedAt).not.toBe(otherPinnedAt);
+    // The healed pin sorts before the new pin and both are near-now values.
+    expect(new Date(otherPinnedAt ?? "").getTime()).toBeLessThan(
+      new Date(rootPinnedAt ?? "").getTime()
+    );
+    expect(new Date(rootPinnedAt ?? "").getTime()).toBeLessThan(Date.now() + 60_000);
+  });
+
   test("pin-when-pinned and unpin-when-unpinned are no-ops without event churn", async () => {
     const first = await workspaceService.setPinned(rootId, true);
     expect(first.success).toBe(true);
