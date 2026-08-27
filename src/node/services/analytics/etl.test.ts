@@ -95,6 +95,7 @@ function makeAssistantLine(
     providerMetadata?: Record<string, unknown>;
     toolModelUsages?: unknown[];
     modelFallback?: unknown;
+    partial?: boolean;
   } = {}
 ): string {
   return JSON.stringify({
@@ -114,6 +115,7 @@ function makeAssistantLine(
       ...(opts.providerMetadata != null ? { providerMetadata: opts.providerMetadata } : {}),
       ...(opts.toolModelUsages != null ? { toolModelUsages: opts.toolModelUsages } : {}),
       ...(opts.modelFallback != null ? { modelFallback: opts.modelFallback } : {}),
+      ...(opts.partial != null ? { partial: opts.partial } : {}),
     },
   });
 }
@@ -656,6 +658,15 @@ describe("appendEvents", () => {
           refusedModels: ["anthropic:fable-1", "  "],
         },
       }),
+      // ModelFallbackRecord invariant violation: the requested model must be
+      // the first refused entry, so a mismatched chain is corrupted history.
+      makeAssistantLine({
+        sequence: 6,
+        modelFallback: {
+          requestedModel: "anthropic:fable-1",
+          refusedModels: ["anthropic:other-model"],
+        },
+      }),
     ]);
 
     await ingestWorkspace(conn, workspaceId, sessionDir, {});
@@ -665,11 +676,88 @@ describe("appendEvents", () => {
       "SELECT requested_model, refused_models_json FROM events WHERE workspace_id = ?",
       [workspaceId]
     );
-    expect(rows).toHaveLength(5);
+    expect(rows).toHaveLength(6);
     for (const row of rows) {
       expect(row.requested_model).toBeNull();
       expect(row.refused_models_json).toBeNull();
     }
+  });
+
+  test("interrupted (partial) fallback turns do not count as answered downgrades", async () => {
+    const conn = await createTestConn();
+    const sessionDir = await createTempSessionDir();
+    const workspaceId = "ws-downgrade-partial";
+
+    await writeChatJsonl(sessionDir, [
+      makeUserLine(),
+      // Valid downgrade record, but the turn committed as an interrupted
+      // partial: billed attempt, not an answered downgrade.
+      makeAssistantLine({
+        model: "openai:gpt-4",
+        partial: true,
+        modelFallback: {
+          requestedModel: "anthropic:fable-1",
+          refusedModels: ["anthropic:fable-1"],
+        },
+      }),
+    ]);
+
+    await ingestWorkspace(conn, workspaceId, sessionDir, {});
+
+    const rows = await queryRows(
+      conn,
+      "SELECT model, requested_model, refused_models_json FROM events WHERE workspace_id = ?",
+      [workspaceId]
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].model).toBe("openai:gpt-4"); // usage still ingested
+    expect(rows[0].requested_model).toBeNull();
+    expect(rows[0].refused_models_json).toBeNull();
+  });
+
+  test("events.model uses the shared attribution key for coder and gateway identities", async () => {
+    const conn = await createTestConn();
+    const sessionDir = await createTempSessionDir();
+    const workspaceId = "ws-attribution-key";
+
+    await writeChatJsonl(sessionDir, [
+      makeUserLine(),
+      // Coder route: answered main row and tool row must key by the pinned
+      // metadata identity so they group with headless sidecar rows (which
+      // recordHeadlessUsageLocked already writes canonically).
+      makeAssistantLine({
+        sequence: 1,
+        model: "coder:prod/claude-opus-4-5",
+        metadataModel: "anthropic:claude-opus-4-5",
+        toolModelUsages: [
+          {
+            toolName: "model_fallback_refusal",
+            timestamp: 1_700_000_000_025,
+            model: "coder:prod/claude-opus-4-5",
+            metadataModel: "anthropic:claude-opus-4-5",
+            usage: { inputTokens: 5, outputTokens: 0, totalTokens: 5 },
+          },
+        ],
+      }),
+      // Gateway route canonicalizes; coder without a pinned identity keeps
+      // its raw (only durable) key.
+      makeAssistantLine({ sequence: 2, model: "mux-gateway:anthropic/claude-opus-4-5" }),
+      makeAssistantLine({ sequence: 3, model: "coder:unmapped/some-model" }),
+    ]);
+
+    await ingestWorkspace(conn, workspaceId, sessionDir, {});
+
+    const rows = await queryRows(
+      conn,
+      "SELECT model, tool_name FROM events WHERE workspace_id = ? ORDER BY model, tool_name NULLS FIRST",
+      [workspaceId]
+    );
+    expect(rows.map((row) => [row.model, row.tool_name])).toEqual([
+      ["anthropic:claude-opus-4-5", null],
+      ["anthropic:claude-opus-4-5", null],
+      ["anthropic:claude-opus-4-5", "model_fallback_refusal"],
+      ["coder:unmapped/some-model", null],
+    ]);
   });
 
   test("emits one assistant row plus one row per tool model usage with inherited context", async () => {

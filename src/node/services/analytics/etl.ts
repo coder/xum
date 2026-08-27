@@ -6,6 +6,7 @@ import * as path from "node:path";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { DuckDBAppender, DuckDBDateValue, type DuckDBConnection } from "@duckdb/node-api";
 import { EventRowSchema, type EventRow } from "@/common/orpc/schemas/analytics";
+import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { getErrorMessage } from "@/common/utils/errors";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import modelsData from "@/common/utils/tokens/models.json";
@@ -381,7 +382,7 @@ function buildIngestEventRow(params: {
       parent_workspace_id: params.inheritedContext.workspaceMeta.parentWorkspaceId ?? null,
       agent_id: params.inheritedContext.agentId,
       timestamp: params.timestamp,
-      model: params.model,
+      model: analyticsAttributionModel(params.model, params.metadataModel),
       tool_name: params.toolName,
       thinking_level: params.inheritedContext.thinkingLevel,
       input_tokens: displayUsage.input.tokens,
@@ -528,7 +529,40 @@ function parseModelFallback(rawModelFallback: unknown): {
     refusedModels.push(refusedModel);
   }
 
+  // ModelFallbackRecord invariant: the requested model is always the first
+  // refused entry (the writer canonicalizes both with the same helper). A
+  // mismatch means corrupted history — reject the record rather than report
+  // an A→answered downgrade while the stored chain claims B refused.
+  if (refusedModels[0] !== requestedModel) {
+    return MALFORMED;
+  }
+
   return { requestedModel, refusedModelsJson: JSON.stringify(refusedModels) };
+}
+
+/**
+ * Analytics attribution key for events.model, mirroring
+ * SessionUsageService.recordHeadlessUsageLocked (and StreamManager's
+ * usageAttributionModel): Coder identities use the record-time pinned
+ * metadata identity — the raw coder: string is a mutable instance route the
+ * ETL cannot re-resolve — and every other identity canonicalizes gateway
+ * strings. Without one shared key, answered main rows, refusal hop rows, and
+ * headless sidecar rows would split a single configured model across several
+ * buckets in GROUP BY model queries (e.g. coder:prod/opus vs anthropic:opus).
+ * Coder rows without a persisted metadataModel keep the raw identity — it is
+ * their only durable key.
+ */
+function analyticsAttributionModel(
+  model: string | null,
+  metadataModel: string | undefined
+): string | null {
+  if (model === null) {
+    return null;
+  }
+  if (model.startsWith("coder:")) {
+    return metadataModel ?? model;
+  }
+  return normalizeToCanonical(model);
 }
 
 function parseCreatedAtTimestamp(value: unknown): number | null {
@@ -766,7 +800,12 @@ function extractIngestEvents(params: {
   if (usage) {
     // Downgrade metadata rides the main turn row only (tool rows stay null):
     // the `model` column is the answering model, requested_model the original.
-    const modelFallback = parseModelFallback(metadata.modelFallback);
+    // Interrupted fallback turns commit with partial: true — they are billed
+    // attempts but not answered downgrades, so the columns stay null there.
+    const modelFallback =
+      metadata.partial === true
+        ? { requestedModel: null, refusedModelsJson: null }
+        : parseModelFallback(metadata.modelFallback);
     const parentRow = buildIngestEventRow({
       inheritedContext,
       model: toOptionalString(metadata.model) ?? null,
@@ -1917,8 +1956,11 @@ const ETL_SEMANTICS_META_KEY = "etl_semantics_version";
  *
  * refusal-analytics-v1: requested_model / refused_models_json columns from
  * metadata.modelFallback.
+ * refusal-analytics-v2: events.model keyed by analyticsAttributionModel,
+ * downgrade columns gated on non-partial turns, strict modelFallback chain
+ * validation.
  */
-export const CURRENT_ETL_SEMANTICS_VERSION = "refusal-analytics-v1";
+export const CURRENT_ETL_SEMANTICS_VERSION = "refusal-analytics-v2";
 
 export async function readStoredEtlSemanticsVersion(
   conn: DuckDBConnection
