@@ -932,7 +932,7 @@ export class BashMonitorWakeStore {
       // namespace so scans stop tripping over it.
       let leftoverStat: Stats;
       try {
-        leftoverStat = await fsPromises.stat(leftoverPath);
+        leftoverStat = await fsPromises.lstat(leftoverPath);
       } catch (error) {
         if (isErrnoWithCode(error, "ENOENT")) continue; // concurrently consumed
         throw error;
@@ -1132,7 +1132,7 @@ export class BashMonitorWakeStore {
     // aside as evidence and continue as if the tombstone were malformed.
     let stat: Stats;
     try {
-      stat = await fsPromises.stat(target);
+      stat = await fsPromises.lstat(target);
     } catch (error) {
       if (!isErrnoWithCode(error, "ENOENT")) throw error;
       return this.healClearedAtFromLeftovers(ownerWorkspaceId);
@@ -1347,8 +1347,16 @@ export class BashMonitorWakeStore {
         if (record?.status !== "superseded" || record.supersededByClearId !== clearId) return;
         // Identity gate: the write below targets the PARSED identity, so restoring a
         // record whose id/owner disagrees with this path would overwrite an
-        // unrelated record or workspace (see recordIdentityMatches).
-        if (!BashMonitorWakeStore.recordIdentityMatches(record, ownerWorkspaceId, id)) return;
+        // unrelated record or workspace (see recordIdentityMatchesEntry).
+        if (
+          !BashMonitorWakeStore.recordIdentityMatchesEntry(
+            record,
+            ownerWorkspaceId,
+            entry.slice(0, -".json".length)
+          )
+        ) {
+          return;
+        }
         const { supersededByClearId: _clearStamp, pendingUpdatedAtBeforeClear, ...rest } = record;
         const written: BashMonitorWakeRecord = {
           ...rest,
@@ -1627,6 +1635,22 @@ export class BashMonitorWakeStore {
     return record.id === id && record.ownerWorkspaceId === ownerWorkspaceId;
   }
 
+  /**
+   * Entry-name flavor of recordIdentityMatches for scans, comparing the RAW filename
+   * stem against the canonical encoding of the record id (exactly what file() would
+   * name it). Decoding the stem instead would accept noncanonical percent-encoding
+   * aliases — %70roc-1.json decodes to proc-1 — publishing a wake whose every later
+   * transition (get/write build paths via encodeURIComponent) targets the canonical
+   * name, leaving the alias pending forever.
+   */
+  private static recordIdentityMatchesEntry(
+    record: BashMonitorWakeRecord,
+    ownerWorkspaceId: string,
+    stem: string
+  ): boolean {
+    return encodeURIComponent(record.id) === stem && record.ownerWorkspaceId === ownerWorkspaceId;
+  }
+
   async get(ownerWorkspaceId: string, id: string): Promise<BashMonitorWakeRecord | null> {
     let raw: string;
     try {
@@ -1691,7 +1715,7 @@ export class BashMonitorWakeStore {
       // the record-file policy below.
       let artifactStat: Stats;
       try {
-        artifactStat = await fsPromises.stat(filePath);
+        artifactStat = await fsPromises.lstat(filePath);
       } catch (error) {
         if (isErrnoWithCode(error, "ENOENT")) continue;
         throw error;
@@ -1740,21 +1764,26 @@ export class BashMonitorWakeStore {
     // rollback leaves pending are folded into the record pass: one restored from an
     // artifact rescued this very scan has no canonical entry in the readdir snapshot
     // above. The entries check keeps this off the hot path — tombstone artifacts
-    // exist only around clears and crashes. The effective tombstone is then read
-    // (post-rollback) for the pre-cutoff canonical check at the end of this scan.
-    let tomb: ClearTombstone | null = null;
+    // exist only around clears and crashes (a staging published after the snapshot
+    // cannot be grace-expired yet, so gating the ROLLBACK on the snapshot is safe).
     if (entries.some((e) => e === "cleared-at" || e.startsWith("cleared-at.cas-"))) {
       for (const entry of await this.rollbackCrashedClearStaging(ownerWorkspaceId)) {
         if (!recordEntries.includes(entry)) recordEntries.push(entry);
       }
-      tomb = await this.readClearedAt(ownerWorkspaceId);
     }
+    // The effective tombstone for the pre-cutoff canonical check at the end of this
+    // scan is read UNCONDITIONALLY (post-rollback), never gated on the readdir
+    // snapshot above: a clear can publish its tombstone after the snapshot was
+    // taken, and a crash-stalled writer can then land a pre-cutoff pending
+    // generation over an already-snapshotted entry mid-scan — served without the
+    // fence, a drain would deliver output that clear is holding or has retired.
+    const tomb = await this.readClearedAt(ownerWorkspaceId);
     for (const entry of recordEntries) {
       const filePath = path.join(dir, entry);
       seen.add(entry);
       let stat: Stats;
       try {
-        stat = await fsPromises.stat(filePath);
+        stat = await fsPromises.lstat(filePath);
       } catch (error) {
         if (isErrnoWithCode(error, "ENOENT")) {
           // Deleted between readdir and stat: legitimately gone.
@@ -1813,10 +1842,10 @@ export class BashMonitorWakeStore {
       let parsed = this.parse(raw);
       if (
         parsed != null &&
-        !BashMonitorWakeStore.recordIdentityMatches(
+        !BashMonitorWakeStore.recordIdentityMatchesEntry(
           parsed,
           ownerWorkspaceId,
-          BashMonitorWakeStore.wakeIdFromFileStem(entry.slice(0, -".json".length))
+          entry.slice(0, -".json".length)
         )
       ) {
         // Identity disagrees with the path (see recordIdentityMatches): treated like
@@ -1947,10 +1976,14 @@ export class BashMonitorWakeStore {
     // corruption would fail every scan with EISDIR, and a FIFO would block reads
     // forever, stranding every other wake in the workspace. Classify as MALFORMED so
     // the quarantine (which re-verifies whatever it captures) parks it as evidence
-    // and the caller can place its durable artifact.
+    // and the caller can place its durable artifact. lstat (never follows): a
+    // DANGLING SYMLINK would stat as ENOENT and classify the occupied pathname as
+    // "absent" — the recovery link then loops on EEXIST forever, never delivering
+    // the artifact. Symlinks have no legitimate writer here, so any symlink is
+    // corruption and reads as malformed.
     let stat: Stats;
     try {
-      stat = await fsPromises.stat(originalPath);
+      stat = await fsPromises.lstat(originalPath);
     } catch (error) {
       if (isErrnoWithCode(error, "ENOENT")) return { kind: "absent" };
       throw error;
@@ -2009,7 +2042,7 @@ export class BashMonitorWakeStore {
     // prune-trash name the artifact loop's isFile guard would merely skip it forever.
     let capturedStat: Stats;
     try {
-      capturedStat = await fsPromises.stat(capture);
+      capturedStat = await fsPromises.lstat(capture);
     } catch (error) {
       // Vanished: a concurrent recover consumed the capture, so the path is free.
       if (isErrnoWithCode(error, "ENOENT")) return { kind: "cleared" };
@@ -2196,10 +2229,14 @@ export class BashMonitorWakeStore {
       // Identity gate: a moved/corrupt leftover whose id or owner disagrees with the
       // canonical path it would be restored to reads as malformed (kept as evidence
       // until the age sweep) — restoring it would publish a record later transitions
-      // cannot address (see recordIdentityMatches).
+      // cannot address (see recordIdentityMatchesEntry).
       const parsed =
         parsedRaw != null &&
-        BashMonitorWakeStore.recordIdentityMatches(parsedRaw, ownerWorkspaceId, id)
+        BashMonitorWakeStore.recordIdentityMatchesEntry(
+          parsedRaw,
+          ownerWorkspaceId,
+          path.basename(originalPath).slice(0, -".json".length)
+        )
           ? parsedRaw
           : null;
       if (parsed?.status !== "pending") {
@@ -2216,7 +2253,7 @@ export class BashMonitorWakeStore {
         if (!heldForStagedClear) {
           // Old terminal and malformed content was already destined for pruning; sweep it
           // once old (the age gate keeps a live prune's in-flight trash out of reach).
-          const leftoverStat = await fsPromises.stat(filePath).catch(() => null);
+          const leftoverStat = await fsPromises.lstat(filePath).catch(() => null);
           if (leftoverStat != null && leftoverStat.mtimeMs < pruneBeforeMs) {
             await fsPromises.rm(filePath, { force: true }).catch(() => undefined);
             return null;
@@ -2424,7 +2461,7 @@ export class BashMonitorWakeStore {
     return this.locks.withLock(`${ownerWorkspaceId}:${id}`, async () => {
       let stat: Stats;
       try {
-        stat = await fsPromises.stat(filePath);
+        stat = await fsPromises.lstat(filePath);
       } catch (error) {
         // Vanished (live writer committed): nothing to do. Any other failure (EIO,
         // EACCES) PROPAGATES — the temp may be the ONLY durable copy after a crash,
@@ -2440,10 +2477,14 @@ export class BashMonitorWakeStore {
       // Identity gate: a moved/corrupt artifact whose id or owner disagrees with the
       // canonical path it would be restored to reads as malformed (swept once old) —
       // placing it would publish a record later transitions cannot address (see
-      // recordIdentityMatches).
+      // recordIdentityMatchesEntry).
       const parsed =
         parsedRaw != null &&
-        BashMonitorWakeStore.recordIdentityMatches(parsedRaw, ownerWorkspaceId, id)
+        BashMonitorWakeStore.recordIdentityMatchesEntry(
+          parsedRaw,
+          ownerWorkspaceId,
+          path.basename(originalPath).slice(0, -".json".length)
+        )
           ? parsedRaw
           : null;
       if (parsed == null) {

@@ -13851,13 +13851,18 @@ export class WorkspaceService extends EventEmitter {
     // A wake whose only event is process settlement (terminal-only wakeOnExit, or an
     // earlier run's preserved settlement) still has kind "match" in the durable
     // record; labeling it "match" in the UI would report a match the filter never
-    // produced. Coalesced records with real matches keep the match label.
+    // produced. Coalesced records with real UNDELIVERED matches keep the match label
+    // — judged by the matched frontier (matchedThroughOffset), mirroring the prompt
+    // builder's terminal-only test: totalMatches is the monitor's CUMULATIVE counter,
+    // so a settlement enqueued after an earlier match wake was already delivered
+    // carries a nonzero count while only settlement is actually pending.
     const pendingWakeKindOf = (
       record: BashMonitorWakeRecord
     ): "match" | "monitor-lost" | "settled" =>
       record.kind === "monitor-lost"
         ? "monitor-lost"
-        : record.totalMatches === 0 && (record.terminal != null || record.staleTerminal != null)
+        : (record.terminal != null || record.staleTerminal != null) &&
+            record.matchedThroughOffset == null
           ? "settled"
           : "match";
     // Present monitor state derived purely from a durable wake record, for rows (or reused

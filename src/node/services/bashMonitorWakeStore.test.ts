@@ -1096,9 +1096,9 @@ describe("BashMonitorWakeStore", () => {
     // Another instance's clear B begins a tombstone mutation mid-scan: by the time
     // the temp is inspected, B has CAPTURED the canonical (cleared-at is absent; only
     // B's .cas- capture of the OLD generation remains on disk)...
-    const realStat = fsPromises.stat;
+    const realStat = fsPromises.lstat;
     let capturedByB = false;
-    const statSpy = spyOn(fsPromises, "stat").mockImplementation((async (
+    const statSpy = spyOn(fsPromises, "lstat").mockImplementation((async (
       p: Parameters<typeof realStat>[0]
     ) => {
       if (!capturedByB && String(p) === temp) {
@@ -1106,7 +1106,7 @@ describe("BashMonitorWakeStore", () => {
         await fsPromises.rename(tombPath, `${tombPath}.cas-instance-b`);
       }
       return realStat(p);
-    }) as typeof fsPromises.stat);
+    }) as typeof fsPromises.lstat);
     // ...and B publishes its NEWER cutoff exactly when the healing read tries to link
     // the stale capture back, losing the race.
     const realLink = fsPromises.link;
@@ -2805,6 +2805,95 @@ describe("BashMonitorWakeStore", () => {
     expect((await fsPromises.stat(canonicalPath)).isFile()).toBe(true);
   });
 
+  test("a dangling canonical symlink cannot wedge artifact recovery", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR behind a dangling symlink"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const canonicalPath = path.join(dir, "proc-1.json");
+    // The wake's ONLY durable copy crashes into a temp (aged past the freshness
+    // gate)...
+    const temp = `${canonicalPath}.tmp-crashed`;
+    await fsPromises.rename(canonicalPath, temp);
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(temp, past, past);
+    // ...while corruption leaves a DANGLING SYMLINK at the canonical path. A
+    // following stat reports ENOENT ("absent"), the recovery link then hits EEXIST
+    // against the occupied pathname, and every scan repeats that dead end — the sole
+    // pending artifact never delivers.
+    await fsPromises.symlink(path.join(dir, "does-not-exist"), canonicalPath);
+
+    expect((await store.listPending("owner-1")).map((r) => r.lines)).toEqual([
+      ["ERROR behind a dangling symlink"],
+    ]);
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("pending");
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
+    // The symlink is parked as evidence; a regular record file stands at the
+    // canonical path again.
+    expect((await fsPromises.lstat(canonicalPath)).isFile()).toBe(true);
+  });
+
+  test("the pre-cutoff fence reads the tombstone beyond the scan's directory snapshot", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR retired by mid-scan clear"] }));
+    // Strictly order wake < cutoff (same-millisecond stamps fail toward delivery).
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const tombPath = path.join(dir, "cleared-at");
+    await fsPromises.writeFile(
+      tombPath,
+      JSON.stringify({
+        clearedAt: new Date().toISOString(),
+        clearId: "clear-mid-scan",
+        phase: "committed",
+      }),
+      "utf-8"
+    );
+    // A clear commits AFTER this scan's readdir snapshot: simulated by filtering the
+    // tombstone out of readdir results, exactly what a scan that raced the clear's
+    // publish would have seen. Tombstone discovery must not be tied to that stale
+    // snapshot — served anyway, the pre-cutoff pending record would let a drain
+    // deliver output the clear retired.
+    const realReaddir = fsPromises.readdir;
+    const readdirSpy = spyOn(fsPromises, "readdir").mockImplementation((async (
+      target: Parameters<typeof realReaddir>[0],
+      options?: unknown
+    ) => {
+      const result = await (realReaddir as (t: unknown, o?: unknown) => Promise<unknown>)(
+        target,
+        options
+      );
+      if (Array.isArray(result)) {
+        return (result as unknown[]).filter(
+          (e) => typeof e !== "string" || !e.startsWith("cleared-at")
+        );
+      }
+      return result;
+    }) as typeof fsPromises.readdir);
+    try {
+      expect(await store.listPending("owner-1")).toEqual([]);
+    } finally {
+      readdirSpy.mockRestore();
+    }
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("superseded");
+  });
+
+  test("noncanonical percent-encoded filename aliases are not published", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR aliased"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const raw = await fsPromises.readFile(path.join(dir, "proc-1.json"), "utf-8");
+    await fsPromises.rm(path.join(dir, "proc-1.json"));
+    // Corruption re-names the valid record with an ALTERNATE percent encoding of the
+    // same ID: decoding the stem matches, but every later transition (get/write
+    // build paths via encodeURIComponent) targets the canonical proc-1.json name —
+    // published, the alias would stay pending forever with nothing able to settle it.
+    await fsPromises.writeFile(path.join(dir, "%70roc-1.json"), raw, "utf-8");
+
+    expect(await store.listPending("owner-1")).toEqual([]);
+    // Kept as evidence, never served.
+    expect(await fsPromises.readdir(dir)).toContain("%70roc-1.json");
+  });
+
   test("a directory squatting on a tombstone capture is quarantined instead of failing heals", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload({ lines: ["ERROR heals anyway"] }));
@@ -2861,14 +2950,14 @@ describe("BashMonitorWakeStore", () => {
     // The artifact guard's first stat succeeds; the recovery-internal second stat
     // fails transiently. Swallowing it would turn the scan into a successful empty
     // result that schedules neither a drain nor the deferred-recovery timer.
-    const realStat = fsPromises.stat;
+    const realStat = fsPromises.lstat;
     let tempStats = 0;
-    const statSpy = spyOn(fsPromises, "stat").mockImplementation(((
+    const statSpy = spyOn(fsPromises, "lstat").mockImplementation(((
       p: Parameters<typeof realStat>[0]
     ) =>
       String(p) === temp && ++tempStats === 2
         ? Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
-        : realStat(p)) as typeof fsPromises.stat);
+        : realStat(p)) as typeof fsPromises.lstat);
     try {
       await store.listPending("owner-1");
       expect.unreachable("expected listPending to propagate the stat failure");
@@ -3662,13 +3751,13 @@ describe("BashMonitorWakeStore", () => {
     // concurrent supersession by another instance, and drains treat this listing as
     // delivery authority — a served stale pending could deliver a canceled wake.
     const file = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes", "proc-1.json");
-    const realStat = fsPromises.stat;
-    const statSpy = spyOn(fsPromises, "stat").mockImplementation(((
-      target: Parameters<typeof fsPromises.stat>[0]
+    const realStat = fsPromises.lstat;
+    const statSpy = spyOn(fsPromises, "lstat").mockImplementation(((
+      target: Parameters<typeof fsPromises.lstat>[0]
     ) =>
       String(target) === file
         ? Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
-        : realStat(target)) as unknown as typeof fsPromises.stat);
+        : realStat(target)) as unknown as typeof fsPromises.lstat);
     try {
       await store.listPending("owner-1");
       expect.unreachable("expected listPending to propagate the stat failure");
@@ -3782,13 +3871,13 @@ describe("BashMonitorWakeStore", () => {
     // Cold cache: this instance has never classified the file, so a partial result would
     // silently omit a pending wake. Callers keep their last good snapshot on a throw.
     const coldStore = new BashMonitorWakeStore(makeConfig(rootDir));
-    const realStat = fsPromises.stat;
-    const statSpy = spyOn(fsPromises, "stat").mockImplementation(((
-      target: Parameters<typeof fsPromises.stat>[0]
+    const realStat = fsPromises.lstat;
+    const statSpy = spyOn(fsPromises, "lstat").mockImplementation(((
+      target: Parameters<typeof fsPromises.lstat>[0]
     ) =>
       String(target).endsWith("proc-1.json")
         ? Promise.reject(Object.assign(new Error("EIO: i/o error"), { code: "EIO" }))
-        : realStat(target)) as unknown as typeof fsPromises.stat);
+        : realStat(target)) as unknown as typeof fsPromises.lstat);
     try {
       await coldStore.listPending("owner-1");
       expect.unreachable("expected listPending to propagate the stat failure");
