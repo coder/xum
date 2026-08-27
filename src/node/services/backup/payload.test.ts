@@ -1781,8 +1781,8 @@ describe("backup payload", () => {
       // Preload options and executable data URLs evaluate inline module code; the URL
       // rule also covers runners such as deno whose subcommand ends option tracking.
       `node --import 'data:text/javascript,import{spawnSync}from"node:child_process";spawnSync("mcp",["--token","ghp_Abcdef1234"+"Klmno56789"])' server.js`,
-      `node --loader='data:text/javascript,import{spawnSync}from"node:child_process";spawnSync("mcp",["--token","ghp_Abcdef1234"+"Klmno56789"])' server.js`,
-      `deno run 'data:text/javascript,new Deno.Command("mcp",{args:["--token","ghp_Abcdef1234"+"Klmno56789"]}).outputSync()'`,
+      `node --loader=data:text/javascript,import%7BspawnSync%7Dfrom%22node%3Achild_process%22%3BspawnSync%28%22mcp%22%2C%5B%22--token%22%2C%22ghp_Abcdef1234%22%2B%22Klmno56789%22%5D%29 server.js`,
+      `deno run 'data:text/javascript,new(Deno.Command)("mcp",{args:["--token","ghp_Abcdef1234"+"Klmno56789"]}).outputSync()'`,
       'deno eval \'const_t="ghp_Abcdef1234"+"Klmno56789"\'',
       // Perl and Ruby cluster the numeric `-0[octal]` switch before the eval
       // letter, so digits count as cluster characters alongside letters.
