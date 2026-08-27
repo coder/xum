@@ -7,6 +7,8 @@ interface NestedToolsContainerProps {
   calls: NestedToolCall[];
   /** When true, incomplete tools show as interrupted instead of executing */
   parentInterrupted?: boolean;
+  workspaceId?: string;
+  toolCallTimestamp?: number;
 }
 
 /**
@@ -16,6 +18,8 @@ interface NestedToolsContainerProps {
 export const NestedToolsContainer: React.FC<NestedToolsContainerProps> = ({
   calls,
   parentInterrupted,
+  workspaceId,
+  toolCallTimestamp,
 }) => {
   if (calls.length === 0) return null;
 
@@ -35,6 +39,9 @@ export const NestedToolsContainer: React.FC<NestedToolsContainerProps> = ({
             input={call.input}
             output={call.state === "output-available" ? call.output : undefined}
             status={status}
+            workspaceId={workspaceId}
+            toolCallId={call.toolCallId}
+            toolCallTimestamp={call.timestamp ?? toolCallTimestamp}
           />
         );
       })}

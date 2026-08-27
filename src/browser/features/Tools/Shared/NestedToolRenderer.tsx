@@ -9,6 +9,9 @@ interface NestedToolRendererProps {
   input: unknown;
   output?: unknown;
   status: ToolStatus;
+  workspaceId?: string;
+  toolCallId?: string;
+  toolCallTimestamp?: number;
 }
 
 /**
@@ -20,6 +23,9 @@ export const NestedToolRenderer: React.FC<NestedToolRendererProps> = ({
   input,
   output,
   status,
+  workspaceId,
+  toolCallId,
+  toolCallTimestamp,
 }) => {
   const ToolComponent = getToolComponent(toolName, input);
   const hookOutput = extractHookOutput(output);
@@ -29,7 +35,15 @@ export const NestedToolRenderer: React.FC<NestedToolRendererProps> = ({
     <>
       {/* ToolNameProvider lets useStickyExpand key the auto-expand preference by tool name. */}
       <ToolNameProvider toolName={toolName}>
-        <ToolComponent args={input} result={output} status={status} toolName={toolName} />
+        <ToolComponent
+          args={input}
+          result={output}
+          status={status}
+          toolName={toolName}
+          workspaceId={workspaceId}
+          toolCallId={toolCallId}
+          toolCallTimestamp={toolCallTimestamp}
+        />
       </ToolNameProvider>
       {hookOutput && <HookOutputDisplay output={hookOutput} durationMs={hookDuration} />}
     </>

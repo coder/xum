@@ -18,6 +18,12 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
 import { WorkflowTimeline } from "@/browser/features/RightSidebar/Workflows/WorkflowTimeline";
 import { projectWorkflowRun } from "@/browser/features/RightSidebar/Workflows/projectWorkflowRun";
+import {
+  formatWorkflowCost,
+  formatWorkflowDuration,
+  formatWorkflowTokens,
+} from "@/browser/features/RightSidebar/Workflows/workflowDisplay";
+import { useWorkflowRunLiveSnapshot } from "@/browser/features/RightSidebar/Workflows/useWorkflowRuns";
 import { useWorkflowRunById } from "@/browser/hooks/useWorkflowRunById";
 import {
   isActiveWorkflowChildEventStatus,
@@ -268,8 +274,8 @@ function getWorkflowChildProgressSummary(run: WorkflowRunRecord | null): string 
 /**
  * Compact "what is the workflow doing right now" line for the card header: steps
  * done/observed plus the running step title (or active phase when several steps
- * run). The card auto-collapses while the Workflows tab owns the detail view, so
- * without this the collapsed header reveals nothing about a run's current state.
+ * run). Manually collapsed active cards keep this summary visible so progress remains
+ * scannable without reopening the full timeline.
  * Totals are observed-so-far, not planned (see WorkflowPhaseView.total).
  */
 export function getWorkflowHeaderProgressSummary(
@@ -524,7 +530,34 @@ function WorkflowDisclosureSection(props: {
   title: string;
   children: React.ReactNode;
   className?: string;
+  unmountCollapsed?: boolean;
+  onOpen?: () => void;
 }) {
+  const [open, setOpen] = useState(false);
+  if (props.unmountCollapsed) {
+    return (
+      <div className={`group mb-2 ${props.className ?? ""}`}>
+        <button
+          type="button"
+          aria-expanded={open}
+          className="text-muted hover:text-foreground flex cursor-pointer list-none items-center gap-2 text-[10px] tracking-wide uppercase"
+          onClick={() => {
+            const nextOpen = !open;
+            setOpen(nextOpen);
+            if (nextOpen) {
+              props.onOpen?.();
+            }
+          }}
+        >
+          <span className={open ? "rotate-90 transition-transform" : "transition-transform"}>
+            ▶
+          </span>
+          <span>{props.title}</span>
+        </button>
+        {open && <div className="mt-1">{props.children}</div>}
+      </div>
+    );
+  }
   return (
     <details className={`group mb-2 ${props.className ?? ""}`}>
       <summary className="text-muted hover:text-foreground flex cursor-pointer list-none items-center gap-2 text-[10px] tracking-wide uppercase [&::-webkit-details-marker]:hidden">
@@ -1233,6 +1266,7 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
   });
   const runId = selectedRun.runId;
   const run = selectedRun.run;
+  const workflowWorkspaceId = run?.workspaceId ?? workspaceId;
   const hasRefreshedRunSnapshot =
     refreshedRun != null && refreshedRun.id === runId && run === refreshedRun;
   // workflow_resume can return a fresh dispatch status while intentionally omitting a stale
@@ -1255,8 +1289,8 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
   const headerProgressSummary =
     displayStatus === "completed" ? null : getWorkflowHeaderProgressSummary(run);
   const workspaceStore = useWorkspaceStoreRaw();
-  // The Workflows right-sidebar tab (gated on the dynamic-workflows experiment) is the primary
-  // surface for run detail, so when it's available the in-chat card is redundant.
+  // Active runs stay visible in the transcript as a live surface. The Workflows tab remains the
+  // broader detail and history surface once a run settles.
   const workflowsTabEnabled = useExperimentValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
   const {
     expanded,
@@ -1264,22 +1298,33 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
     toggleExpanded,
     markInteracted: markExpansionInteracted,
   } = useAutoCollapsingToolExpansion(true, {
-    // With the Workflows tab available (dynamic-workflows experiment on), auto-collapse the
-    // in-chat card for ANY status — the tab is the primary detail surface. Without the tab,
-    // preserve the prior behavior of auto-collapsing only completed runs (which can carry large
-    // reports/event logs). But never auto-collapse a tool-error card: pre-run failures (invalid
-    // args / unresolved script path) create no durable run, so the Workflows tab has nothing to
-    // show and the failure reason lives only here. Manual expansion always wins, per run.
-    autoCollapsed: (workflowsTabEnabled || displayStatus === "completed") && errorResult == null,
+    // Active runs are a live transcript surface even when the Workflows tab is available. Once a
+    // run settles, the experiment restores the compact history presentation. Without the tab, only
+    // completed runs collapse. Tool errors always stay open because no durable run may exist.
+    autoCollapsed:
+      errorResult == null &&
+      !parentRunActive &&
+      (workflowsTabEnabled || displayStatus === "completed"),
     resetKey: runId,
   });
 
   const [actionError, setActionError] = useState<string | null>(null);
   const resumeOrRetryPendingForRun =
     runId != null && (resumingRunId === runId || workflowControlInFlightRunId === runId);
+  const liveSubscriptionEnabled =
+    typeof apiState?.api?.workflows.subscribe === "function" &&
+    workflowWorkspaceId != null &&
+    runId != null &&
+    (shouldRefreshWorkflow(displayStatus) ||
+      resumingRunId === runId ||
+      workflowControlInFlightRunId === runId);
+  const liveSnapshot = useWorkflowRunLiveSnapshot({
+    workspaceId: workflowWorkspaceId,
+    runId,
+    enabled: liveSubscriptionEnabled,
+  });
   const displayWorkflow = run?.workflow;
   const runSource = getWorkflowRunSource(run);
-  const workflowWorkspaceId = run?.workspaceId ?? workspaceId;
   // workflow_resume cards only know the run ID until a snapshot loads; prefer the real
   // workflow name once available.
   const displayName = displayWorkflow?.name ?? getWorkflowRunDisplayName(args);
@@ -1368,6 +1413,23 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
       setResumingRunId(null);
     }
   }, [resumingRunId, run, runId]);
+
+  useEffect(() => {
+    const nextRun = liveSnapshot.run;
+    if (nextRun == null) {
+      return;
+    }
+    setRefreshedRun((current) => getNewestWorkflowRunSnapshot(current, nextRun));
+    if (
+      !shouldKeepWorkflowControlPolling({
+        action: "retryFromCheckpoint",
+        run: nextRun,
+        baselineSequence: displayEventSequence,
+      })
+    ) {
+      setResumingRunId(null);
+    }
+  }, [displayEventSequence, liveSnapshot.run]);
 
   useEffect(() => {
     if (registerCommandSource == null || runId == null || run?.workspaceId == null) {
@@ -1542,7 +1604,8 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
       apiState?.api == null ||
       runId == null ||
       run?.workspaceId == null ||
-      (!shouldRefreshWorkflow(displayStatus) && resumingRunId !== runId)
+      (!shouldRefreshWorkflow(displayStatus) && resumingRunId !== runId) ||
+      (liveSubscriptionEnabled && !liveSnapshot.failed)
     ) {
       return;
     }
@@ -1579,10 +1642,81 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
       ignore = true;
       window.clearInterval(interval);
     };
-  }, [apiState?.api, displayEventSequence, displayStatus, resumingRunId, run?.workspaceId, runId]);
+  }, [
+    apiState?.api,
+    displayEventSequence,
+    displayStatus,
+    liveSnapshot.failed,
+    liveSubscriptionEnabled,
+    resumingRunId,
+    run?.workspaceId,
+    runId,
+  ]);
+
+  const workflowView = run != null ? projectWorkflowRun(run) : null;
+  const hasProjectedTimeline =
+    workflowView != null && (workflowView.phases.length > 0 || workflowView.steps.length > 0);
+  const eventLog =
+    displayRows.length > 0 ? (
+      <div className="border-border bg-background/20 max-h-[220px] overflow-y-auto rounded border">
+        <ol className="divide-border/60 divide-y">
+          {displayRows.map((row, index) => {
+            if (row.kind === "task") {
+              return (
+                <WorkflowTaskRow
+                  key={getDisplayRowKey(row)}
+                  row={row}
+                  displayIndex={index + 1}
+                  steps={run?.steps ?? []}
+                  onNavigate={(taskId) => workspaceStore.navigateToWorkspace(taskId)}
+                  onOpenReport={() => {
+                    markExpansionInteracted();
+                  }}
+                  onInspectStructuredOutput={() => {
+                    markExpansionInteracted();
+                  }}
+                />
+              );
+            }
+            if (row.kind === "workflow") {
+              return (
+                <WorkflowChildRunRow
+                  key={getDisplayRowKey(row)}
+                  row={row}
+                  displayIndex={index + 1}
+                  workspaceId={workflowWorkspaceId}
+                  parentRunActive={parentRunActive}
+                  depth={0}
+                />
+              );
+            }
+            if (row.kind === "patch") {
+              return (
+                <WorkflowEventRow
+                  key={getDisplayRowKey(row)}
+                  event={row.latestEvent}
+                  tooltipEvent={row.firstEvent}
+                  detailOverride={getWorkflowMergedRowDetail(row)}
+                  displayIndex={index + 1}
+                  steps={run?.steps ?? []}
+                />
+              );
+            }
+            return (
+              <WorkflowEventRow
+                key={getDisplayRowKey(row)}
+                event={row.event}
+                displayIndex={index + 1}
+                steps={run?.steps ?? []}
+              />
+            );
+          })}
+        </ol>
+      </div>
+    ) : null;
 
   return (
-    <ToolContainer expanded={expanded}>
+    <ToolContainer expanded={expanded} className="@container">
       <ToolHeader onClick={toggleExpanded}>
         <ExpandIcon expanded={expanded}>▶</ExpandIcon>
         <ToolIcon toolName={toolName} />
@@ -1672,66 +1806,44 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
 
           {actionError && <ErrorBox className="mb-2">{actionError}</ErrorBox>}
 
-          {displayRows.length > 0 && (
-            <WorkflowSection title={`Workflow events (${displayRows.length})`}>
-              <div className="border-border bg-background/20 max-h-[220px] overflow-y-auto rounded border">
-                <ol className="divide-border/60 divide-y">
-                  {displayRows.map((row, index) => {
-                    if (row.kind === "task") {
-                      return (
-                        <WorkflowTaskRow
-                          key={getDisplayRowKey(row)}
-                          row={row}
-                          displayIndex={index + 1}
-                          steps={run?.steps ?? []}
-                          onNavigate={(taskId) => workspaceStore.navigateToWorkspace(taskId)}
-                          onOpenReport={() => {
-                            markExpansionInteracted();
-                          }}
-                          onInspectStructuredOutput={() => {
-                            markExpansionInteracted();
-                          }}
-                        />
-                      );
-                    }
-                    if (row.kind === "workflow") {
-                      return (
-                        <WorkflowChildRunRow
-                          key={getDisplayRowKey(row)}
-                          row={row}
-                          displayIndex={index + 1}
-                          workspaceId={run?.workspaceId ?? workspaceId}
-                          parentRunActive={parentRunActive}
-                          depth={0}
-                        />
-                      );
-                    }
-                    if (row.kind === "patch") {
-                      return (
-                        <WorkflowEventRow
-                          key={getDisplayRowKey(row)}
-                          event={row.latestEvent}
-                          tooltipEvent={row.firstEvent}
-                          detailOverride={getWorkflowMergedRowDetail(row)}
-                          displayIndex={index + 1}
-                          steps={run?.steps ?? []}
-                        />
-                      );
-                    }
-                    return (
-                      <WorkflowEventRow
-                        key={getDisplayRowKey(row)}
-                        event={row.event}
-                        displayIndex={index + 1}
-                        steps={run?.steps ?? []}
-                      />
-                    );
-                  })}
-                </ol>
+          {hasProjectedTimeline && workflowView != null ? (
+            <>
+              <div className="border-border bg-background/20 counter-nums mb-3 grid grid-cols-2 gap-x-3 gap-y-1 rounded border px-2 py-1.5 text-[10px] @sm:grid-cols-4">
+                <span>
+                  {workflowView.stats.done}/{workflowView.stats.total} steps
+                </span>
+                <span>{formatWorkflowDuration(workflowView.stats.elapsedMs)}</span>
+                <span>{formatWorkflowTokens(workflowView.stats.usage?.tokens)} tokens</span>
+                <span>{formatWorkflowCost(workflowView.stats.usage?.costUsd)}</span>
               </div>
-            </WorkflowSection>
+              <div
+                className="max-h-[400px] overflow-y-auto pr-1"
+                onClickCapture={markExpansionInteracted}
+              >
+                <WorkflowTimeline
+                  view={workflowView}
+                  workspaceId={workflowWorkspaceId}
+                  showFinalReport={false}
+                />
+              </div>
+              {eventLog != null && (
+                <WorkflowDisclosureSection
+                  title="Event log"
+                  className="mt-2"
+                  unmountCollapsed
+                  onOpen={markExpansionInteracted}
+                >
+                  {eventLog}
+                </WorkflowDisclosureSection>
+              )}
+            </>
+          ) : (
+            eventLog != null && (
+              <WorkflowSection title={`Workflow events (${displayRows.length})`}>
+                {eventLog}
+              </WorkflowSection>
+            )
           )}
-
           {structuredOutput !== undefined && (
             <WorkflowDisclosureSection title="Structured output" className="mt-2">
               <WorkflowJsonBlock value={structuredOutput} className="max-h-[220px]" />

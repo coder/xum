@@ -458,6 +458,40 @@ export const RunningBackgroundWithRun: Story = {
   },
 };
 
+export const LiveRunningTimeline: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    pixel: { matrix: { viewports: ["phone"] } },
+  },
+  render: (args) => (
+    <div data-testid="live-workflow-card" style={{ width: 360 }}>
+      <WorkflowRunToolCall {...args} />
+    </div>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await fireEvent.click(await canvas.findByText("implementation"));
+    await canvas.findByText("Summarize source 16");
+    await canvas.findByText("extract-claims");
+    const container = canvas.getByTestId("live-workflow-card");
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+    );
+    if (container.scrollWidth > container.clientWidth + 1) {
+      throw new Error(
+        `Workflow card overflowed its ${container.clientWidth}px container by ` +
+          `${container.scrollWidth - container.clientWidth}px`
+      );
+    }
+  },
+  args: {
+    ...taskActionsProps,
+    status: "executing",
+  },
+};
+
 /**
  * Narrow-container regression: a long workflow name must truncate instead of
  * starving the collapsed header's progress summary. No API provider, so the
