@@ -918,13 +918,13 @@ describe("backup payload", () => {
   });
 
   it("collapses deterministic globs so a bracketed spelling cannot hide a token", async () => {
-    // `[b]` matches only `b`: pathname expansion can hand the process the contiguous
+    // `[8]` matches only `8`: pathname expansion can hand the process the contiguous
     // token, and the published text collapses the same way for any reader.
     await writeFixtureFile(
       muxRoot,
       "mcp.jsonc",
       JSON.stringify({
-        servers: { grafana: { command: "mcp --pattern ghp_aaaaaaaaaa[b]aaaaaaaaa" } },
+        servers: { grafana: { command: "mcp --pattern ghp_aaaaaaaaaa[8]aaaaaaaaa" } },
       })
     );
     const blocked = await captureRejection(
@@ -936,6 +936,27 @@ describe("backup payload", () => {
       })
     );
     expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+
+    // A letter member is not deterministic: inherited nocaseglob makes `[P]` match a
+    // lowercase `p` file, so the runtime token differs from any textual collapse and
+    // the command goes machine-local instead.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: "mcp --token gh[P]_1234567890abcdefghijklmnopqrstuvwxyz" } },
+      })
+    );
+    const localized = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const localizedMcp = jsonc.parse(payloadFileText(localized, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(localizedMcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
 
     // Quoting suppresses pathname expansion, so the same spelling stays publishable.
     await writeFixtureFile(

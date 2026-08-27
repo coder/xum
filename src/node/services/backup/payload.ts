@@ -1306,14 +1306,18 @@ function unquoteShellWord(word: string, stripExpansions = false, collapseGlobs =
       continue;
     }
     if (collapseGlobs) {
-      // Pathname expansion is live in this unquoted context. A single-member class is
-      // deterministic (`[8]` can only produce `8`), and any reader collapses the
-      // published spelling the same way, so scan what it yields. Nondeterministic
-      // wildcards never reach this scan: redaction localizes their whole command.
-      if (char === "[" && word[i + 2] === "]" && !"!^]\\'\"".includes(word[i + 1] ?? "")) {
-        result += word[i + 1];
-        i += 3;
-        continue;
+      // Pathname expansion is live in this unquoted context. A single caseless
+      // member is deterministic (`[8]` can only produce `8`), and any reader
+      // collapses the published spelling the same way, so scan what it yields.
+      // Letter members and nondeterministic wildcards never reach this scan:
+      // redaction localizes their whole command (nocaseglob makes letters casefold).
+      if (char === "[" && word[i + 2] === "]") {
+        const member = word[i + 1] ?? "";
+        if (!"!^]\\'\"".includes(member) && !/[A-Za-z]/.test(member)) {
+          result += member;
+          i += 3;
+          continue;
+        }
       }
     }
     result += char;
@@ -1450,7 +1454,11 @@ function hasNondeterministicGlob(word: string): boolean {
     }
     if (char === "?" || char === "*") return true;
     if (char === "[") {
-      if (word[i + 2] === "]" && !"!^]\\'\"".includes(word[i + 1] ?? "")) {
+      // A letter member is only deterministic case-sensitively; with nocaseglob
+      // inherited via BASHOPTS, `[P]` matches a lowercase `p` file, so letters
+      // localize and only caseless members (digits, symbols) collapse.
+      const member = word[i + 1] ?? "";
+      if (word[i + 2] === "]" && !"!^]\\'\"".includes(member) && !/[A-Za-z]/.test(member)) {
         i += 3;
         continue;
       }
