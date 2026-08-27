@@ -83,7 +83,8 @@ const CREDENTIAL_TOKEN_PATTERNS = [
   /\bgl(?:pat|dt|rt|soat|ptt|cbt|oas|ffct|imt|agent)-[A-Za-z0-9_-]{20,}\b/,
   /\blin_api_[A-Za-z0-9]{16,}\b/,
   /\bntn_[A-Za-z0-9]{16,}\b/,
-  /\bAKIA[0-9A-Z]{16}\b/,
+  // AWS long-term (AKIA) and temporary-session (ASIA) access-key IDs.
+  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/,
   // Slack workspace (xox?-) and app-level (xapp-) issued tokens.
   /\bx(?:ox[baprs]|app)-[A-Za-z0-9-]{10,}\b/,
   // Stripe live secret and restricted keys. Test-mode keys stay reviewable:
@@ -1531,6 +1532,14 @@ const SHELL_INTERPRETER_NAMES = new Set([
 ]);
 
 /**
+ * awk-family executables evaluate a program operand by default, with no `-c`/`-e`
+ * marker to distinguish it from a file launcher. Localize the invocation as soon as
+ * its exact normalized executable name appears; the portability cost of `awk -f` is
+ * preferable to parsing each awk implementation's option grammar and failing open.
+ */
+const PROGRAM_OPERAND_INTERPRETER_NAMES = new Set(["awk", "gawk", "mawk", "nawk", "goawk"]);
+
+/**
  * Language interpreters whose script-evaluation spellings reparse an operand under the
  * language's own grammar, where quoted fragments concatenate into one runtime value
  * (`python3 -c '..."ghp_a"+"b"...'`, `node -e "...'ghp_a'+'b'..."`, `deno eval ...`).
@@ -1613,6 +1622,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
       .toLowerCase()
       .replace(/\.exe$/, "");
     if (SHELL_INTERPRETER_NAMES.has(executable)) return true;
+    if (PROGRAM_OPERAND_INTERPRETER_NAMES.has(executable)) return true;
     // An evaluation word after a language interpreter hands that grammar a script.
     if (pendingEvalWords.some((pattern) => pattern.test(unquoted))) return true;
     const language = LANGUAGE_INTERPRETERS.find((entry) => entry.name.test(executable));

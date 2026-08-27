@@ -1631,6 +1631,9 @@ describe("backup payload", () => {
       "'C:\\Tools\\PWSH.EXE' -c 'printf${IFS}%s${IFS}ghp_Abcdef1234\\Klmno56789'",
       // Language interpreters concatenate fragments under their own grammar when a
       // script-evaluation option is present.
+      // awk-family executables evaluate their first program operand without an
+      // explicit eval option.
+      'awk \'BEGIN{system("mcp"sprintf("%c",32)"--token"sprintf("%c",32)"ghp_Abcdef1234""Klmno56789")}\'',
       'python3 -c \'__import__("os").environ.update({"T":"ghp_Abcdef1234"+"Klmno56789"})\'',
       "node -e \"require('child_process').spawnSync('mcp',['--token','ghp_Abcdef1234'+'Klmno56789'])\"",
       'deno eval \'const_t="ghp_Abcdef1234"+"Klmno56789"\'',
@@ -1760,6 +1763,23 @@ describe("backup payload", () => {
       servers: { grafana: { command: string } };
     };
     expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("blocks temporary AWS access-key IDs without an override", async () => {
+    // Temporary credentials use ASIA rather than the long-term AKIA prefix; the
+    // accompanying secret and session token have no dependable issued prefix.
+    const accessKeyId = ["ASIA", "1234567890ABCDEF"].join("");
+    await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", `AWS_ACCESS_KEY_ID=${accessKeyId}\n`);
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+    expect((blocked as BackupCredentialDetectedError).files).toEqual(["skills/demo/SKILL.md"]);
   });
 
   it("keeps the documented AWS example key reviewable instead of hard-blocking", async () => {
