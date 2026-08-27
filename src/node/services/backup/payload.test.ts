@@ -383,6 +383,9 @@ describe("backup payload", () => {
       ["eval 'TOKEN+=hunter2 mcp'", REDACTED_BACKUP_VALUE],
       // An array value leaves a bare assignment word behind, which fails closed.
       ["TOKEN=(a hunter2) mcp-server", REDACTED_BACKUP_VALUE],
+      // ANSI-C and locale quoting hand env-style consumers their inner text.
+      ["env $'TOKEN=hunter2' mcp-server", REDACTED_BACKUP_VALUE],
+      ['env $"TOKEN=hunter2" mcp-server', REDACTED_BACKUP_VALUE],
     ];
     for (const [command, expected] of cases) {
       await expectCommandRedaction(command, expected);

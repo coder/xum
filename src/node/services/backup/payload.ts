@@ -1178,6 +1178,11 @@ function unquoteShellWord(word: string): string {
   let i = 0;
   while (i < word.length) {
     const char = word[i];
+    // ANSI-C ($'...') and locale ($"...") quoting hand the consumer their inner text.
+    if (char === "$" && (word[i + 1] === "'" || word[i + 1] === '"')) {
+      i += 1;
+      continue;
+    }
     if (char === "\\") {
       result += word[i + 1] ?? "";
       i += 2;
