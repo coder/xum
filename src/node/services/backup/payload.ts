@@ -1981,9 +1981,14 @@ export async function createBackupPayload(
             targets.push(words.map((word) => unquoteShellWord(word, true, true)).join(" "));
           }
           // A standard URL parse hands any reader the decoded value, so a published
-          // url is scanned as what it decodes to, not just its encoded spelling.
+          // url is scanned as what it decodes to, not just its encoded spelling. The
+          // WHATWG parser deletes embedded tab and newline separators before anything
+          // else, so they are removed first: `ghp_aaa\tbbb` reaches the client as the
+          // contiguous token. Separator removal cannot hide a match, because no token
+          // charset contains them.
           for (const url of collectUrlStrings(parsedMcp)) {
-            targets.push(percentDecodeOnce(url));
+            const canonical = url.replaceAll("\t", "").replaceAll("\n", "").replaceAll("\r", "");
+            targets.push(percentDecodeOnce(canonical));
           }
         }
         return targets.some(matchesCredentialToken);

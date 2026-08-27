@@ -1162,6 +1162,29 @@ describe("backup payload", () => {
     expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
   });
 
+  it("removes URL tab and newline separators before the credential backstop", async () => {
+    // The WHATWG parser deletes embedded tab/newline before parsing, so a client's
+    // `new URL(config.url)` reconstructs the contiguous token the raw text splits.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          grafana: { url: "https://example.com/mcp?value=ghp_aaaaaaaaaa\tb2c3d4e5f6" },
+        },
+      })
+    );
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+  });
+
   it("keeps the documented AWS example key reviewable instead of hard-blocking", async () => {
     await writeFixtureFile(
       muxRoot,
