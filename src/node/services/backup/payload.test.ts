@@ -1622,16 +1622,18 @@ describe("backup payload", () => {
     }
   });
 
-  it("localizes a server's command when its config env installs startup hooks", async () => {
-    // server.env merges over the inherited environment at spawn, so one entry can hook
-    // its own shell on a clean machine; only that server's command goes local.
+  it("publishes a portable command despite startup hooks in the ignored config env field", async () => {
+    // McpConfigService.normalizeEntry drops env from stdio entries, so a config-level
+    // BASH_ENV never reaches the spawn; localizing the command for it would only make a
+    // fresh-device restore drop the whole server. The env value itself stays redacted
+    // like every other ignored field.
+    const portable = "mcp-server --port 8080";
     await writeFixtureFile(
       muxRoot,
       "mcp.jsonc",
       JSON.stringify({
         servers: {
-          hooked: { command: "mcp-server --port 8080", env: { BASH_ENV: "./startup.sh" } },
-          clean: { command: "other-server --flag value" },
+          hooked: { command: portable, env: { BASH_ENV: "./startup.sh" } },
         },
       })
     );
@@ -1642,10 +1644,10 @@ describe("backup payload", () => {
       reportSecrets: true,
     });
     const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
-      servers: { hooked: { command: string }; clean: { command: string } };
+      servers: { hooked: { command: string; env: string } };
     };
-    expect(mcp.servers.hooked.command).toBe(REDACTED_BACKUP_VALUE);
-    expect(mcp.servers.clean.command).toBe("other-server --flag value");
+    expect(mcp.servers.hooked.command).toBe(portable);
+    expect(mcp.servers.hooked.env).toBe(REDACTED_BACKUP_VALUE);
   });
 
   it("localizes commands that write files through active redirection", async () => {
@@ -1726,6 +1728,9 @@ describe("backup payload", () => {
       // awk-family executables evaluate their first program operand without an
       // explicit eval option.
       'awk \'BEGIN{system("mcp"sprintf("%c",32)"--token"sprintf("%c",32)"ghp_Abcdef1234""Klmno56789")}\'',
+      // GNU sed evaluates its first non-option operand as a program whose `e`
+      // command hands the script text to a shell.
+      "sed '1eexec${IFS}mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789' /etc/hostname",
       'python3 -c \'__import__("os").environ.update({"T":"ghp_Abcdef1234"+"Klmno56789"})\'',
       "node -e \"require('child_process').spawnSync('mcp',['--token','ghp_Abcdef1234'+'Klmno56789'])\"",
       'deno eval \'const_t="ghp_Abcdef1234"+"Klmno56789"\'',

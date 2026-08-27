@@ -1532,12 +1532,22 @@ const SHELL_INTERPRETER_NAMES = new Set([
 ]);
 
 /**
- * awk-family executables evaluate a program operand by default, with no `-c`/`-e`
- * marker to distinguish it from a file launcher. Localize the invocation as soon as
- * its exact normalized executable name appears; the portability cost of `awk -f` is
- * preferable to parsing each awk implementation's option grammar and failing open.
+ * Executables that evaluate a program operand by default, with no `-c`/`-e` marker to
+ * distinguish it from a file launcher: awk runs its first operand as a program, and
+ * GNU sed's `e` command hands script text from the same positional slot to a shell.
+ * Localize the invocation as soon as its exact normalized executable name appears; the
+ * portability cost of `awk -f`/`sed -f` is preferable to parsing each implementation's
+ * option grammar and failing open.
  */
-const PROGRAM_OPERAND_INTERPRETER_NAMES = new Set(["awk", "gawk", "mawk", "nawk", "goawk"]);
+const PROGRAM_OPERAND_INTERPRETER_NAMES = new Set([
+  "awk",
+  "gawk",
+  "mawk",
+  "nawk",
+  "goawk",
+  "sed",
+  "gsed",
+]);
 
 /**
  * Language interpreters whose script-evaluation spellings reparse an operand under the
@@ -1994,7 +2004,11 @@ function redactCommandEnvAssignments(command: string): string {
  * analyzer above relies on stop binding. The stdio launch inherits this process's
  * environment (mcpServerManager passes commands to `runtime.exec`, a `bash -c`), so
  * while a hook is present commands go machine-local without being analyzed at all.
- * An empty `BASH_ENV` sources nothing and is inert.
+ * An empty `BASH_ENV` sources nothing and is inert. Only the inherited process
+ * environment gates this: a server entry's own `env` field is dropped by
+ * `McpConfigService.normalizeEntry` before spawn, so it must not localize an otherwise
+ * portable command (a fresh-device restore would drop the whole server over a field
+ * the runtime never reads).
  */
 function isBashStartupHookVariable(name: string, value: unknown): boolean {
   if (name.startsWith("BASH_FUNC_")) return true;
@@ -2020,13 +2034,9 @@ function redactMcpConfig(content: Buffer): {
     isBashStartupHookVariable(name, value)
   );
 
-  function redactCommand(
-    jsonPath: jsonc.JSONPath,
-    command: string,
-    serverStartupHooks = false
-  ): void {
+  function redactCommand(jsonPath: jsonc.JSONPath, command: string): void {
     let redacted: string;
-    if (ambientStartupHooks || serverStartupHooks || command.length > analysisBudget) {
+    if (ambientStartupHooks || command.length > analysisBudget) {
       redacted = REDACTED_BACKUP_VALUE;
     } else {
       analysisBudget -= command.length;
@@ -2083,15 +2093,6 @@ function redactMcpConfig(content: Buffer): {
       continue;
     }
 
-    // Config env merges over the inherited environment at spawn, so a server entry can
-    // hook its own shell even when this process's environment is clean.
-    const serverEnv = readRecord(readOwn(server, "env"));
-    const serverStartupHooks =
-      serverEnv !== undefined &&
-      objectKeyNames(tree, ["servers", serverName, "env"]).some((name) =>
-        isBashStartupHookVariable(name, readOwn(serverEnv, name))
-      );
-
     for (const field of objectKeyNames(tree, ["servers", serverName])) {
       const fieldPath: jsonc.JSONPath = ["servers", serverName, field];
       const value = readOwn(server, field);
@@ -2105,8 +2106,7 @@ function redactMcpConfig(content: Buffer): {
           redact(fieldPath);
           continue;
         }
-        if (field === "command" && typeof value === "string")
-          redactCommand(fieldPath, value, serverStartupHooks);
+        if (field === "command" && typeof value === "string") redactCommand(fieldPath, value);
         // Whole-value, not in-string: the userinfo/parameter detection deliberately covers
         // malformed and percent-encoded spellings a partial rewrite could misparse and leave
         // the credential in. Restore puts the local url back at this path.
