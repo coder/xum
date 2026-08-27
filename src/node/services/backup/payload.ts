@@ -1635,7 +1635,9 @@ const SHELL_STATE_WORDS = new Set([
 function hasDisguisedAssignment(redacted: string): boolean {
   let operandsOnly = false;
   let pendingPrintfVariableOption = false;
-  const pendingEvalWords: RegExp[] = [];
+  // A Set of the static table's RegExp instances: repeated interpreter words cannot
+  // grow it past the table size, keeping this lookup linear in command length.
+  const pendingEvalWords = new Set<RegExp>();
   for (const word of redacted.match(SHELL_WORD) ?? []) {
     if (CONSUMED_ASSIGNMENT.test(word)) continue;
     // Bash expands neither syntax from quoted or escaped text (`--config
@@ -1665,9 +1667,11 @@ function hasDisguisedAssignment(redacted: string): boolean {
     if (PROGRAM_OPERAND_INTERPRETER_NAMES.has(executable)) return true;
     if (SHELL_REPARSE_EXECUTABLE_NAMES.has(executable)) return true;
     // An evaluation word after a language interpreter hands that grammar a script.
-    if (pendingEvalWords.some((pattern) => pattern.test(unquoted))) return true;
+    for (const pattern of pendingEvalWords) {
+      if (pattern.test(unquoted)) return true;
+    }
     const language = LANGUAGE_INTERPRETERS.find((entry) => entry.name.test(executable));
-    if (language) pendingEvalWords.push(language.evalWord);
+    if (language) pendingEvalWords.add(language.evalWord);
     // Option terminators end option parsing: past one even a dash-led word is an
     // operand, so `env -- --evil=x` sets an environment entry despite the option look.
     // GNU `env` documents `[-]` as a terminator too, and the consumer sees the word
@@ -2039,7 +2043,11 @@ function redactCommandEnvAssignments(command: string): string {
  * environment gates this: a server entry's own `env` field is dropped by
  * `McpConfigService.normalizeEntry` before spawn, so it must not localize an otherwise
  * portable command (a fresh-device restore would drop the whole server over a field
- * the runtime never reads).
+ * the runtime never reads). This covers only startup hooks visible in the exporting
+ * process environment: off-host runtime startup state (container images, remote SSH
+ * hosts) is not observable to settings backup export, and treating it as an input
+ * would force localizing every command; neutralizing those shells belongs to the
+ * runtime spawn paths.
  */
 function isBashStartupHookVariable(name: string, value: unknown): boolean {
   if (name.startsWith("BASH_FUNC_")) return true;
