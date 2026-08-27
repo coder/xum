@@ -1742,6 +1742,8 @@ describe("backup payload", () => {
       // Windows spellings: .exe suffix, backslash paths, case-insensitive names.
       "bash.exe -c 'printf${IFS}%s${IFS}ghp_Abcdef1234\\Klmno56789'",
       "'C:\\Tools\\PWSH.EXE' -c 'printf${IFS}%s${IFS}ghp_Abcdef1234\\Klmno56789'",
+      // cmd.exe's /c parse consumes carets Git Bash preserves, joining fragments.
+      "cmd.exe //d //c mcp --token ghp_Abcdefghij12345678^KlmnoPqrst98765432",
       // Language interpreters concatenate fragments under their own grammar when a
       // script-evaluation option is present.
       // awk-family executables evaluate their first program operand without an

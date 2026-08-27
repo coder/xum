@@ -1665,6 +1665,8 @@ const SHELL_INTERPRETER_NAMES = new Set([
   "tcsh",
   "fish",
   "busybox",
+  // cmd.exe reparses its /c operand, consuming carets that split fragments upstream.
+  "cmd",
   "pwsh",
   "powershell",
 ]);
