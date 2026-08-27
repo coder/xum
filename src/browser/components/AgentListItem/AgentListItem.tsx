@@ -37,7 +37,7 @@ import {
   type VisualState,
 } from "./StatusDot";
 
-import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
+import { Tooltip, TooltipTrigger, TooltipContent, TooltipIfPresent } from "../Tooltip/Tooltip";
 import { Popover, PopoverContent, PopoverTrigger, PopoverAnchor } from "../Popover/Popover";
 import { PositionedMenu, PositionedMenuItem } from "../PositionedMenu/PositionedMenu";
 import {
@@ -498,20 +498,24 @@ function DraftAgentListItemInner(props: DraftAgentListItemProps) {
             {draft.title}
           </span>
           {props.projectBadgeName != null && (
-            <span
-              data-testid={`workspace-project-badge-draft-${draft.draftId}`}
-              className="text-secondary max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
-              style={
-                props.projectBadgeColor != null
-                  ? {
-                      backgroundColor: `${props.projectBadgeColor}20`,
-                      borderColor: `${props.projectBadgeColor}40`,
-                    }
-                  : undefined
-              }
-            >
-              {props.projectBadgeName}
-            </span>
+            // The badge width cap can truncate hierarchical "Parent / Sub"
+            // names, so the shared tooltip keeps the full label reachable.
+            <TooltipIfPresent tooltip={props.projectBadgeName}>
+              <span
+                data-testid={`workspace-project-badge-draft-${draft.draftId}`}
+                className="text-secondary max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
+                style={
+                  props.projectBadgeColor != null
+                    ? {
+                        backgroundColor: `${props.projectBadgeColor}20`,
+                        borderColor: `${props.projectBadgeColor}40`,
+                      }
+                    : undefined
+                }
+              >
+                {props.projectBadgeName}
+              </span>
+            </TooltipIfPresent>
           )}
         </div>
         {hasPromptPreview && (
@@ -1349,20 +1353,24 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                   {suppressGroupMemberTitle ? memberOnlyLabel : workspaceTitle}
                 </span>
                 {props.projectBadgeName != null && (
-                  <span
-                    data-testid={`workspace-project-badge-${workspaceId}`}
-                    className="text-secondary max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
-                    style={
-                      props.projectBadgeColor != null
-                        ? {
-                            backgroundColor: `${props.projectBadgeColor}20`,
-                            borderColor: `${props.projectBadgeColor}40`,
-                          }
-                        : undefined
-                    }
-                  >
-                    {props.projectBadgeName}
-                  </span>
+                  // The badge width cap can truncate hierarchical "Parent / Sub"
+                  // names, so the shared tooltip keeps the full label reachable.
+                  <TooltipIfPresent tooltip={props.projectBadgeName}>
+                    <span
+                      data-testid={`workspace-project-badge-${workspaceId}`}
+                      className="text-secondary max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
+                      style={
+                        props.projectBadgeColor != null
+                          ? {
+                              backgroundColor: `${props.projectBadgeColor}20`,
+                              borderColor: `${props.projectBadgeColor}40`,
+                            }
+                          : undefined
+                      }
+                    >
+                      {props.projectBadgeName}
+                    </span>
+                  </TooltipIfPresent>
                 )}
                 {groupLabel && !suppressGroupMemberTitle && (
                   <span

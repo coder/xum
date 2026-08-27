@@ -141,6 +141,14 @@ function installAgentListItemTestDoubles() {
   spyOn(TooltipModule, "TooltipContent").mockImplementation(((props: { children: ReactNode }) => (
     <>{props.children}</>
   )) as unknown as typeof TooltipModule.TooltipContent);
+  spyOn(TooltipModule, "TooltipIfPresent").mockImplementation(((props: {
+    children: ReactNode;
+    tooltip?: string;
+  }) => (
+    <span data-testid="badge-tooltip" data-tooltip-content={props.tooltip}>
+      {props.children}
+    </span>
+  )) as unknown as typeof TooltipModule.TooltipIfPresent);
   spyOn(WorkspaceStatusIndicatorModule, "WorkspaceStatusIndicator").mockImplementation(((props: {
     workspaceId: string;
   }) => (
@@ -275,6 +283,7 @@ function renderWorkspaceItem(
     completedChildrenExpanded?: boolean;
     onToggleCompletedChildren?: (workspaceId: string) => void;
     onSelectWorkspace?: (selection: WorkspaceSelection) => void;
+    projectBadgeName?: string;
   } = {}
 ) {
   const metadata = options.metadata ?? createMetadata();
@@ -283,6 +292,7 @@ function renderWorkspaceItem(
       metadata={metadata}
       projectPath={metadata.projectPath}
       projectName={metadata.projectName}
+      projectBadgeName={options.projectBadgeName}
       isSelected={options.isSelected ?? false}
       isArchiving={options.isArchiving}
       depth={options.depth ?? options.rowRenderMeta?.depth}
@@ -336,6 +346,17 @@ describe("AgentListItem", () => {
     cleanupDom?.();
     cleanupDom = null;
     mock.restore();
+  });
+
+  test("exposes the full project badge label through the shared tooltip", () => {
+    // The badge's width cap end-truncates hierarchical "Parent / Sub" names,
+    // so the shared tooltip wrapper must carry the full label.
+    const badgeName = "Parent Project With A Long Name / Frontend";
+    const { view } = renderWorkspaceItem({ projectBadgeName: badgeName });
+
+    const badge = view.getByTestId(`workspace-project-badge-${TEST_WORKSPACE_ID}`);
+    const tooltip = badge.closest('[data-testid="badge-tooltip"]');
+    expect(tooltip?.getAttribute("data-tooltip-content")).toBe(badgeName);
   });
 
   test("suppresses best-of member titles that repeat the group header (D8)", () => {
