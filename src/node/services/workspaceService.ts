@@ -10936,17 +10936,63 @@ export class WorkspaceService extends EventEmitter {
     assert(workspaceId.length > 0, "isWorkflowInvocationCurrent requires workspaceId");
     assert(runId.length > 0, "isWorkflowInvocationCurrent requires runId");
 
-    let outcome: "invocation" | "consumed" | "superseded" | null = null;
-    let boundaryAtMs: number | null = null;
+    const decision = await this.findWorkflowInvocationDecisionRow(workspaceId, runId);
+    if (decision.status === "error") {
+      return false;
+    }
+    if (decision.status === "found" && decision.outcome === "invocation") {
+      return true;
+    }
+
+    // Kernel-launched runs (mux.workflow_run / mux.workflow_resume inside code_execution) leave
+    // no recognizable invocation part in history, so the backward walk above stops at the prior
+    // real user message (or, after a delivered result, at that consumed terminal message) and
+    // would wrongly drop the run's notify_on_terminal wake. Their durable provenance is the
+    // agent-workflow-runs sidecar, which snapshots the ID of the decision row that was newest
+    // at record time: the run is current exactly when that row is still the newest decision row.
+    // Row identity, not wall-clock ordering, so a backward clock correction can neither strand
+    // a legitimate wake nor let a pre-supersession reference outrank a newer boundary. For a
+    // consumed boundary, equality means a background resume/retry was recorded after the prior
+    // result was delivered. A decision-free history fails safe to not-current, because a full
+    // clear (truncateHistory) removes every row WITHOUT appending a reset boundary while
+    // leaving the sidecar intact — a surviving reference must not inject a workflow result into
+    // the freshly cleared conversation. Legacy references without a boundary snapshot fail safe
+    // the same way.
+    if (decision.status === "none") {
+      return false;
+    }
+    const references = await readAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
+    const reference = references.find((candidate) => candidate.runId === runId);
+    if (reference?.afterBoundaryMessageId == null) {
+      return false;
+    }
+    return reference.afterBoundaryMessageId === decision.messageId;
+  }
+
+  /**
+   * The newest invocation-decision row for this run: a manual user/reset supersession, a
+   * consumed terminal result for the run, or a direct invocation part. Shared by
+   * isWorkflowInvocationCurrent and the sidecar record path so both sides of the identity
+   * comparison classify rows identically.
+   */
+  private async findWorkflowInvocationDecisionRow(
+    workspaceId: string,
+    runId: string
+  ): Promise<
+    | { status: "found"; outcome: "invocation" | "consumed" | "superseded"; messageId: string }
+    | { status: "none" }
+    | { status: "error" }
+  > {
+    const state: {
+      found: { outcome: "invocation" | "consumed" | "superseded"; messageId: string } | null;
+    } = { found: null };
     const historyResult = await this.historyService.iterateFullHistory(
       workspaceId,
       "backward",
       (messages) => {
         for (const message of messages) {
           if (isManualUserSupersessionMessage(message) || isResetBoundaryMessage(message)) {
-            outcome = "superseded";
-            const timestamp = message.metadata?.timestamp;
-            boundaryAtMs = typeof timestamp === "number" ? timestamp : null;
+            state.found = { outcome: "superseded", messageId: message.id };
             return false;
           }
           if (
@@ -10954,13 +11000,11 @@ export class WorkspaceService extends EventEmitter {
             isTerminalWorkflowTaskAwaitResultMessage(message, runId) ||
             isTerminalWorkflowToolResultMessage(message, runId)
           ) {
-            outcome = "consumed";
-            const timestamp = message.metadata?.timestamp;
-            boundaryAtMs = typeof timestamp === "number" ? timestamp : null;
+            state.found = { outcome: "consumed", messageId: message.id };
             return false;
           }
           if (isWorkflowInvocationMessage(message, runId)) {
-            outcome = "invocation";
+            state.found = { outcome: "invocation", messageId: message.id };
             return false;
           }
         }
@@ -10973,34 +11017,27 @@ export class WorkspaceService extends EventEmitter {
         runId,
         error: historyResult.error,
       });
-      return false;
+      return { status: "error" };
     }
+    return state.found != null
+      ? { status: "found", outcome: state.found.outcome, messageId: state.found.messageId }
+      : { status: "none" };
+  }
 
-    if (outcome === "invocation") {
-      return true;
-    }
-
-    // Kernel-launched runs (mux.workflow_run / mux.workflow_resume inside code_execution) leave
-    // no recognizable invocation part in history, so the backward walk above stops at the prior
-    // real user message (or, after a delivered result, at that consumed terminal message) and
-    // would wrongly drop the run's notify_on_terminal wake. Their durable provenance is the
-    // agent-workflow-runs sidecar: a reference recorded after that boundary counts as the
-    // current invocation. For a consumed boundary that means a background resume/retry issued
-    // after the prior result was delivered. The fallback requires a datable boundary: an
-    // undatable boundary fails safe to not-current (mirroring
-    // TaskService.listAgentReferencedWorkflowRunIds), and so does a decision-free history,
-    // because a full clear (truncateHistory) removes every row WITHOUT appending a reset
-    // boundary while leaving the sidecar intact — a surviving reference must not inject a
-    // workflow result into the freshly cleared conversation.
-    if (boundaryAtMs === null) {
-      return false;
-    }
-    const references = await readAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
-    const reference = references.find((candidate) => candidate.runId === runId);
-    if (reference == null) {
-      return false;
-    }
-    return reference.createdAtMs > boundaryAtMs;
+  /**
+   * Boundary snapshot for the agent-workflow-runs sidecar: the message ID of the newest
+   * invocation-decision row for this run, or null when history has none. Recorded at
+   * background launch/resume so isWorkflowInvocationCurrent can compare row identity instead
+   * of wall-clock timestamps, which clock corrections can reorder.
+   */
+  async getWorkflowInvocationBoundaryMessageId(
+    workspaceId: string,
+    runId: string
+  ): Promise<string | null> {
+    assert(workspaceId.length > 0, "getWorkflowInvocationBoundaryMessageId requires workspaceId");
+    assert(runId.length > 0, "getWorkflowInvocationBoundaryMessageId requires runId");
+    const decision = await this.findWorkflowInvocationDecisionRow(workspaceId, runId);
+    return decision.status === "found" ? decision.messageId : null;
   }
 
   /**

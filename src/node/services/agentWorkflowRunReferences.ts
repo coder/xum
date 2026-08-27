@@ -9,6 +9,14 @@ import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 export interface AgentWorkflowRunReference {
   runId: string;
   createdAtMs: number;
+  /**
+   * Message ID of the newest invocation-decision row (manual user/reset supersession, consumed
+   * terminal result for this run, or direct invocation part) at record time; null when history
+   * had none. Row identity, not wall clock: currentness compares this against the row the
+   * history walk stops at, so a backward clock correction cannot reorder the comparison.
+   * Absent on legacy entries, which fail safe to not-current.
+   */
+  afterBoundaryMessageId?: string | null;
 }
 
 const AGENT_WORKFLOW_RUN_REFERENCES_FILE = "agent-workflow-runs.json";
@@ -55,12 +63,23 @@ function parseReferences(value: unknown): AgentWorkflowRunReference[] {
     if (record.createdAtMs > now + MAX_FUTURE_SKEW_MS) {
       continue;
     }
+    const boundaryRaw = record.afterBoundaryMessageId;
+    const afterBoundaryMessageId =
+      typeof boundaryRaw === "string" && boundaryRaw.length > 0
+        ? boundaryRaw
+        : boundaryRaw === null
+          ? null
+          : undefined;
     // Collapse corrupted duplicate entries to the newest sane timestamp so order-sensitive
     // consumers cannot pick a stale duplicate and declare a legitimately re-recorded run
-    // superseded.
+    // superseded. The chosen record is kept wholesale, including its boundary snapshot.
     const existing = parsedByRunId.get(record.runId);
     if (existing == null || record.createdAtMs > existing.createdAtMs) {
-      parsedByRunId.set(record.runId, { runId: record.runId, createdAtMs: record.createdAtMs });
+      parsedByRunId.set(record.runId, {
+        runId: record.runId,
+        createdAtMs: record.createdAtMs,
+        ...(afterBoundaryMessageId !== undefined ? { afterBoundaryMessageId } : {}),
+      });
     }
   }
   return Array.from(parsedByRunId.values());
@@ -84,6 +103,7 @@ export async function recordAgentWorkflowRunReference(input: {
   workspaceSessionDir: string;
   runId: string;
   createdAtMs?: number;
+  afterBoundaryMessageId?: string | null;
 }): Promise<void> {
   assert(input.runId.length > 0, "agent workflow reference requires runId");
   const filePath = referencesPath(input.workspaceSessionDir);
@@ -98,8 +118,13 @@ export async function recordAgentWorkflowRunReference(input: {
       runId: input.runId,
       // Latest record wins: workflow_resume re-records the reference, and a resume issued after
       // a manual user message must re-establish provenance for supersession-timestamp
-      // comparisons (isWorkflowInvocationCurrent, listAgentReferencedWorkflowRunIds).
+      // comparisons (listAgentReferencedWorkflowRunIds).
       createdAtMs: previous ? Math.max(previous.createdAtMs, createdAtMs) : createdAtMs,
+      // The new record event defines currentness provenance wholesale; a caller without
+      // boundary knowledge produces a legacy-style entry that fails safe to not-current.
+      ...(input.afterBoundaryMessageId !== undefined
+        ? { afterBoundaryMessageId: input.afterBoundaryMessageId }
+        : {}),
     });
 
     await fs.mkdir(path.dirname(filePath), { recursive: true });

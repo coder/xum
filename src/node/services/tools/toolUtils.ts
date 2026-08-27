@@ -98,7 +98,22 @@ export async function recordBackgroundWorkflowRunReference(
   }
 
   try {
-    await recordAgentWorkflowRunReference({ workspaceSessionDir, runId, createdAtMs });
+    // Snapshot which invocation-decision row is newest at launch so the terminal-wake
+    // currentness check compares row identity instead of wall-clock order, which clock
+    // corrections can reorder (see WorkspaceService.isWorkflowInvocationCurrent).
+    const afterBoundaryMessageId =
+      config.workspaceId != null
+        ? ((await config.taskService?.getWorkflowInvocationBoundaryMessageId?.(
+            config.workspaceId,
+            runId
+          )) ?? null)
+        : null;
+    await recordAgentWorkflowRunReference({
+      workspaceSessionDir,
+      runId,
+      createdAtMs,
+      afterBoundaryMessageId,
+    });
   } catch (error: unknown) {
     log.warn("Failed to record agent workflow run reference", {
       runId,

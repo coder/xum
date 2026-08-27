@@ -5981,6 +5981,7 @@ describe("WorkspaceService workflow invocation events", () => {
         workspaceSessionDir: config.getSessionDir(workspaceId),
         runId,
         createdAtMs: 1_150,
+        afterBoundaryMessageId: "manual-user",
       });
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
 
@@ -5999,6 +6000,7 @@ describe("WorkspaceService workflow invocation events", () => {
         workspaceSessionDir: config.getSessionDir(workspaceId),
         runId,
         createdAtMs: 1_250,
+        afterBoundaryMessageId: "manual-user-2",
       });
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
 
@@ -6023,6 +6025,7 @@ describe("WorkspaceService workflow invocation events", () => {
         workspaceSessionDir: config.getSessionDir(workspaceId),
         runId,
         createdAtMs: 1_350,
+        afterBoundaryMessageId: "workflow-result",
       });
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
       workspaceService.disposeSession(workspaceId);
@@ -6066,8 +6069,113 @@ describe("WorkspaceService workflow invocation events", () => {
         workspaceSessionDir: config.getSessionDir(workspaceId),
         runId,
         createdAtMs: 1_150,
+        afterBoundaryMessageId: "manual-user",
       });
 
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("decides sidecar currentness by boundary identity, not wall-clock order", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-clock";
+    const runId = "wfr_currentness_clock";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-clock",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user", "user", "run the audit workflow", { timestamp: 1_000 })
+      );
+      // A backward clock correction after recording makes the reference timestamp future-dated
+      // relative to every later history row; identity comparison must still deliver the wake.
+      const skewedCreatedAtMs = Date.now() + 30 * 60_000;
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: skewedCreatedAtMs,
+        afterBoundaryMessageId: "manual-user",
+      });
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
+
+      // A user message written after the correction has a smaller timestamp than the reference;
+      // wall-clock ordering would keep the stale reference current, identity must not.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user-2", "user", "never mind, answer something else", {
+          timestamp: 1_200,
+        })
+      );
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("fails safe for legacy sidecar references without a boundary snapshot", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-legacy";
+    const runId = "wfr_currentness_legacy";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-legacy",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user", "user", "run the audit workflow", { timestamp: 1_000 })
+      );
+      // Entries written before boundary snapshots existed carry only a timestamp; without an
+      // orderable identity they must not count as the current invocation.
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: 1_150,
+      });
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
       workspaceService.disposeSession(workspaceId);
     } finally {

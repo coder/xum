@@ -13,6 +13,7 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
 import { TestTempDir, createTestToolConfig, writeProjectSkill } from "./testHelpers";
 import { readAgentWorkflowRunReferences } from "@/node/services/agentWorkflowRunReferences";
+import type { TaskService } from "@/node/services/taskService";
 import type { WorkflowRunAttachedEvent } from "@/common/types/stream";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 
@@ -650,9 +651,11 @@ describe("workflow_run tool", () => {
       result: null,
     }));
     const getRun = mock(async () => null);
+    const getWorkflowInvocationBoundaryMessageId = mock(async () => "boundary-row-1");
     const tool = createWorkflowRunTool({
       ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
       trusted: true,
+      taskService: { getWorkflowInvocationBoundaryMessageId } as unknown as TaskService,
       workflowService: {
         startWorkflow,
         startWorkflowInBackground,
@@ -665,8 +668,18 @@ describe("workflow_run tool", () => {
       mockToolCallOptions
     );
 
+    // The reference must persist the invocation-boundary snapshot: currentness compares row
+    // identity, so a reference recorded without it fails safe and the wake is dropped.
     const references = await readAgentWorkflowRunReferences(tempDir.path);
-    expect(references.map((reference) => reference.runId)).toContain("wfr_background");
+    expect(references).toHaveLength(1);
+    expect(references[0]).toMatchObject({
+      runId: "wfr_background",
+      afterBoundaryMessageId: "boundary-row-1",
+    });
+    expect(getWorkflowInvocationBoundaryMessageId).toHaveBeenCalledWith(
+      "workspace-1",
+      "wfr_background"
+    );
 
     expect(startWorkflowInBackground).toHaveBeenCalledWith(
       expect.objectContaining({

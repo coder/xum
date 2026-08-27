@@ -7730,6 +7730,17 @@ export class TaskService {
     );
   }
 
+  /**
+   * Tool-path access to the invocation-boundary snapshot recorded into the
+   * agent-workflow-runs sidecar (see recordBackgroundWorkflowRunReference).
+   */
+  async getWorkflowInvocationBoundaryMessageId(
+    workspaceId: string,
+    runId: string
+  ): Promise<string | null> {
+    return this.workspaceService.getWorkflowInvocationBoundaryMessageId(workspaceId, runId);
+  }
+
   async markWorkflowRunTerminalAttentionConsumed(params: {
     ownerWorkspaceId: string;
     runId: string;
