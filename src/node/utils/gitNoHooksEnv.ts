@@ -50,7 +50,7 @@ const GIT_EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 export function gitNoRepoAutomationEnv(): Record<string, string> {
   const env: Record<string, string> = {
     ...GIT_NO_HOOKS_ENV,
-    GIT_CONFIG_COUNT: "25",
+    GIT_CONFIG_COUNT: "32",
     GIT_CONFIG_KEY_1: "core.fsmonitor",
     GIT_CONFIG_VALUE_1: "false",
     // An empty credential.helper value resets the helper list.
@@ -100,6 +100,20 @@ export function gitNoRepoAutomationEnv(): Record<string, string> {
     GIT_CONFIG_VALUE_23: "",
     GIT_CONFIG_KEY_24: "uploadpack.packObjectsHook",
     GIT_CONFIG_VALUE_24: "",
+    GIT_CONFIG_KEY_25: "diff.tool",
+    GIT_CONFIG_VALUE_25: "",
+    GIT_CONFIG_KEY_26: "diff.guitool",
+    GIT_CONFIG_VALUE_26: "",
+    GIT_CONFIG_KEY_27: "merge.tool",
+    GIT_CONFIG_VALUE_27: "",
+    GIT_CONFIG_KEY_28: "merge.guitool",
+    GIT_CONFIG_VALUE_28: "",
+    GIT_CONFIG_KEY_29: "core.attributesFile",
+    GIT_CONFIG_VALUE_29: "",
+    GIT_CONFIG_KEY_30: "instaweb.modulePath",
+    GIT_CONFIG_VALUE_30: "",
+    GIT_CONFIG_KEY_31: "help.browser",
+    GIT_CONFIG_VALUE_31: "",
     GIT_ATTR_SOURCE: GIT_EMPTY_TREE_OID,
     // Environment beats repo-config core.sshCommand.
     GIT_SSH_COMMAND: "ssh",
@@ -125,7 +139,7 @@ export function gitNoRepoAutomationEnv(): Record<string, string> {
 }
 
 export const GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN =
-  "^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver|remote[.].*[.](uploadpack|receivepack|vcs|proxy)|alias[.].*|pager[.].*|browser[.].*[.](cmd|path)|difftool[.].*[.](cmd|path)|mergetool[.].*[.](cmd|path)|guitool[.].*[.]cmd|man[.].*[.](cmd|path)|sendemail[.].*[.](ccCmd|headerCmd|toCmd)|submodule[.].*[.]update|hook[.].*[.]command)$";
+  "^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver|remote[.].*[.](uploadpack|receivepack|vcs|proxy)|alias[.].*|pager[.].*|browser[.].*[.](cmd|path)|difftool[.].*[.](cmd|path)|mergetool[.].*[.](cmd|path)|guitool[.].*[.]cmd|man[.].*[.](cmd|path)|sendemail[.].*[.](ccCmd|headerCmd|toCmd)|submodule[.].*[.]update|hook[.].*[.]command|trailer[.].*[.](cmd|command)|tar[.].*[.]command)$";
 export const MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES = 256 * 1024;
 const GIT_UNREPRESENTABLE_LOCAL_CONFIG_KEY_PATTERN =
   "^(includeif[.].*[.]path|gc[.]recentobjectshook|uploadpack[.]packobjectshook)$";
@@ -160,7 +174,7 @@ function appendDisabledRepoAutomationDrivers(
       continue;
     }
     if (key.toLowerCase().startsWith("alias.")) {
-      if (value.startsWith("!")) exactKeys.add(key);
+      if (/^alias[.].*[.]command$/i.test(key) || value.startsWith("!")) exactKeys.add(key);
       if (drivers.size + exactKeys.size > MAX_REPO_AUTOMATION_DRIVERS) {
         throw new Error(
           "Refusing git operation with more than " +
@@ -171,7 +185,7 @@ function appendDisabledRepoAutomationDrivers(
       continue;
     }
     if (
-      /^(pager[.]|browser[.].*[.](cmd|path)$|difftool[.].*[.](cmd|path)$|mergetool[.].*[.](cmd|path)$|guitool[.].*[.]cmd$|man[.].*[.](cmd|path)$|sendemail[.].*[.](cccmd|headercmd|tocmd)$|hook[.].*[.]command$)/i.test(
+      /^(pager[.]|browser[.].*[.](cmd|path)$|difftool[.].*[.](cmd|path)$|mergetool[.].*[.](cmd|path)$|guitool[.].*[.]cmd$|man[.].*[.](cmd|path)$|sendemail[.].*[.](cccmd|headercmd|tocmd)$|hook[.].*[.]command$|trailer[.].*[.](cmd|command)$|tar[.].*[.]command$)/i.test(
         key
       )
     ) {

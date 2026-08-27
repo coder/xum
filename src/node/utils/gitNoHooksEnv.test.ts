@@ -36,7 +36,7 @@ describe("gitNoHooksPrefix", () => {
 
   test("returns env prefix when untrusted (false)", () => {
     const prefix = gitNoHooksPrefix(false);
-    expect(prefix).toContain("GIT_CONFIG_COUNT='25'");
+    expect(prefix).toContain("GIT_CONFIG_COUNT='32'");
     expect(prefix).toContain("core.hooksPath");
     expect(prefix).toContain("/dev/null");
     expect(prefix).toContain("GIT_CONFIG_PARAMETERS=");
@@ -45,7 +45,7 @@ describe("gitNoHooksPrefix", () => {
 
   test("returns env prefix when untrusted (undefined)", () => {
     const prefix = gitNoHooksPrefix(undefined);
-    expect(prefix).toContain("GIT_CONFIG_COUNT='25'");
+    expect(prefix).toContain("GIT_CONFIG_COUNT='32'");
     expect(prefix).toEndWith(" ");
   });
 });
@@ -54,7 +54,7 @@ describe("gitNoRepoAutomationEnv", () => {
   test("neutralizes every repo-controlled git execution vector", () => {
     const env = gitNoRepoAutomationEnv();
     // Hooks, fsmonitor, and credential helpers via env config entries.
-    expect(env.GIT_CONFIG_COUNT).toBe("25");
+    expect(env.GIT_CONFIG_COUNT).toBe("32");
     expect(env.GIT_CONFIG_KEY_0).toBe("core.hooksPath");
     expect(env.GIT_CONFIG_VALUE_0).toBe("/dev/null");
     expect(env.GIT_CONFIG_KEY_1).toBe("core.fsmonitor");
@@ -88,6 +88,12 @@ describe("gitNoRepoAutomationEnv", () => {
     expect(env.GIT_CONFIG_VALUE_23).toBe("");
     expect(env.GIT_CONFIG_KEY_24).toBe("uploadpack.packObjectsHook");
     expect(env.GIT_CONFIG_VALUE_24).toBe("");
+    expect(env.GIT_CONFIG_KEY_29).toBe("core.attributesFile");
+    expect(env.GIT_CONFIG_VALUE_29).toBe("");
+    expect(env.GIT_CONFIG_KEY_30).toBe("instaweb.modulePath");
+    expect(env.GIT_CONFIG_VALUE_30).toBe("");
+    expect(env.GIT_CONFIG_KEY_31).toBe("help.browser");
+    expect(env.GIT_CONFIG_VALUE_31).toBe("");
     // Pointing the tracked attributes source at the empty tree suppresses
     // .gitattributes; the repo-aware builder below additionally overrides
     // drivers selected by highest-precedence .git/info/attributes.
@@ -688,6 +694,66 @@ describe("gitNoRepoAutomationEnv", () => {
 
     const env = await gitNoRepoAutomationEnvForLocalRepo(repo);
     await Bun.$`git submodule update --force`
+      .cwd(repo)
+      .env({ ...process.env, ...env })
+      .quiet()
+      .nothrow();
+    const markerExists = await fs.access(marker).then(
+      () => true,
+      () => false
+    );
+    expect(markerExists).toBe(false);
+  });
+
+  test("neutralizes custom tar format commands", async () => {
+    using tmp = new DisposableTempDir("git-tar-command-automation-off");
+    const repo = path.join(tmp.path, "repo");
+    const marker = path.join(tmp.path, "tar-command-ran");
+    const helper = path.join(tmp.path, "tar-command.sh");
+    await fs.mkdir(repo, { recursive: true });
+    await Bun.$`git init`.cwd(repo).quiet();
+    await Bun.$`git config user.email test@example.com`.cwd(repo).quiet();
+    await Bun.$`git config user.name Test`.cwd(repo).quiet();
+    await Bun.$`git commit --allow-empty -m init`.cwd(repo).quiet();
+    await fs.writeFile(helper, `#!/bin/sh\ntouch "${marker}"\ncat\n`, "utf-8");
+    await fs.chmod(helper, 0o755);
+    await Bun.$`git config tar.evil.command ${helper}`.cwd(repo).quiet();
+
+    await Bun.$`git archive --format=evil HEAD`.cwd(repo).quiet().nothrow();
+    await fs.access(marker);
+    await fs.rm(marker);
+
+    const env = await gitNoRepoAutomationEnvForLocalRepo(repo);
+    await Bun.$`git archive --format=evil HEAD`
+      .cwd(repo)
+      .env({ ...process.env, ...env })
+      .quiet()
+      .nothrow();
+    const markerExists = await fs.access(marker).then(
+      () => true,
+      () => false
+    );
+    expect(markerExists).toBe(false);
+  });
+
+  test("neutralizes trailer command configuration", async () => {
+    using tmp = new DisposableTempDir("git-trailer-command-automation-off");
+    const repo = path.join(tmp.path, "repo");
+    const marker = path.join(tmp.path, "trailer-command-ran");
+    const helper = path.join(tmp.path, "trailer-command.sh");
+    await fs.mkdir(repo, { recursive: true });
+    await Bun.$`git init`.cwd(repo).quiet();
+    await fs.writeFile(path.join(repo, "message.txt"), "subject\n", "utf-8");
+    await fs.writeFile(helper, `#!/bin/sh\ntouch "${marker}"\nprintf 'value\n'\n`, "utf-8");
+    await fs.chmod(helper, 0o755);
+    await Bun.$`git config trailer.evil.command ${helper}`.cwd(repo).quiet();
+
+    await Bun.$`git interpret-trailers --trailer evil message.txt`.cwd(repo).quiet();
+    await fs.access(marker);
+    await fs.rm(marker);
+
+    const env = await gitNoRepoAutomationEnvForLocalRepo(repo);
+    await Bun.$`git interpret-trailers --trailer evil message.txt`
       .cwd(repo)
       .env({ ...process.env, ...env })
       .quiet()
