@@ -1140,8 +1140,15 @@ function valueHasRedactionAtPath(
  * quoted segments included, so an escape cannot carry part of the value past the
  * replacement. Restore puts the whole local command back at that path.
  */
-const COMMAND_ENV_ASSIGNMENT =
-  /(^|\s)([A-Za-z_][A-Za-z0-9_]*=)((?:\\[\s\S]|'[^']*'|"(?:\\[\s\S]|[^"\\])*"|[^\s\\'"]+)+)/g;
+// The shell ends a word at these without whitespace, so an assignment can directly follow
+// one (`bootstrap;TOKEN=... mcp`) and an unquoted value ends at the next one.
+const SHELL_WORD_BREAK = ";&|<>(){}`";
+const ASSIGNMENT_NAME = "[A-Za-z_][A-Za-z0-9_]*=";
+const ASSIGNMENT_VALUE = `(?:\\\\[\\s\\S]|'[^']*'|"(?:\\\\[\\s\\S]|[^"\\\\])*"|[^\\s\\\\'"${SHELL_WORD_BREAK}]+)+`;
+const COMMAND_ENV_ASSIGNMENT = new RegExp(
+  `(^|[\\s${SHELL_WORD_BREAK}])(${ASSIGNMENT_NAME})(${ASSIGNMENT_VALUE})`,
+  "g"
+);
 
 /**
  * An assignment value the word grammar could not fully consume: after replacement its
@@ -1149,8 +1156,17 @@ const COMMAND_ENV_ASSIGNMENT =
  * `=`. Either way the value's true extent is unknowable, e.g. an unterminated quote.
  */
 const UNCONSUMED_ASSIGNMENT = new RegExp(
-  `(^|\\s)[A-Za-z_][A-Za-z0-9_]*=(?!${REDACTED_BACKUP_VALUE}(?=\\s|$))(?=\\S)`
+  `(^|[\\s${SHELL_WORD_BREAK}])${ASSIGNMENT_NAME}` +
+    `(?!${REDACTED_BACKUP_VALUE}(?=[\\s${SHELL_WORD_BREAK}]|$))(?=[^\\s${SHELL_WORD_BREAK}])`
 );
+
+/**
+ * To the shell a quote-led `NAME=` is word content, not an assignment, but `eval`- and
+ * `docker -e`-style consumers still read it as one, and where its value ends inside a
+ * quoted context is not decidable here. Tested against the replaced text so a consumed
+ * quoted value (`A="B=1"`) cannot fire it.
+ */
+const QUOTED_ASSIGNMENT = new RegExp(`['"]${ASSIGNMENT_NAME}`);
 
 /** `$(`, `\``, and `${` splice one word across whitespace the grammar cannot see past. */
 const SHELL_EXPANSION = /\$\(|\$\{|`/;
@@ -1161,10 +1177,12 @@ function redactCommandEnvAssignments(command: string): string {
     (_match, lead: string, name: string) => `${lead}${name}${REDACTED_BACKUP_VALUE}`
   );
   // When an assignment's boundaries cannot be trusted, no partial rewrite can be either,
-  // so the whole command goes local and restore puts the exact text back. Checked even
-  // when nothing was replaced: an unconsumable value means the replacement never ran.
+  // so the whole command goes local and restore puts the exact text back. The residue and
+  // quote-led checks run even when nothing was replaced: an unconsumable or quote-led
+  // value means the replacement never saw it.
   if (
     UNCONSUMED_ASSIGNMENT.test(redacted) ||
+    QUOTED_ASSIGNMENT.test(redacted) ||
     (redacted !== command && SHELL_EXPANSION.test(command))
   ) {
     return REDACTED_BACKUP_VALUE;

@@ -314,6 +314,25 @@ describe("backup payload", () => {
     expect((await readBackupPayload(destination)).redactions).toEqual(payload.redactions);
   });
 
+  async function expectCommandRedaction(command: string, expected: string): Promise<void> {
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { notes: { command } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const text = payloadFileText(payload, "mcp.jsonc");
+    expect(text).not.toContain("hunter2");
+    const mcp = jsonc.parse(text) as { servers: { notes: { command: string } } };
+    expect(mcp.servers.notes.command).toBe(expected);
+    expect(payload.manifest.mcpRedactions).toEqual([["servers", "notes", "command"]]);
+  }
+
   it("consumes a whole shell word per assignment and localizes unparseable commands", async () => {
     const cases: Array<[string, string]> = [
       // An escaped space extends the word, so the credential's second half is inside it.
@@ -329,22 +348,31 @@ describe("backup payload", () => {
       ["TOKEN=${X:-abc hunter2} notes-mcp", REDACTED_BACKUP_VALUE],
     ];
     for (const [command, expected] of cases) {
-      await writeFixtureFile(
-        muxRoot,
-        "mcp.jsonc",
-        JSON.stringify({ servers: { notes: { command } } })
-      );
-      const payload = await createBackupPayload({
-        muxRoot,
-        muxVersion: "1.2.3",
-        sourceLabel: "test-host",
-        reportSecrets: true,
-      });
-      const text = payloadFileText(payload, "mcp.jsonc");
-      expect(text).not.toContain("hunter2");
-      const mcp = jsonc.parse(text) as { servers: { notes: { command: string } } };
-      expect(mcp.servers.notes.command).toBe(expected);
-      expect(payload.manifest.mcpRedactions).toEqual([["servers", "notes", "command"]]);
+      await expectCommandRedaction(command, expected);
+    }
+  });
+
+  it("recognizes assignments after shell operators and fails closed inside quotes", async () => {
+    const cases: Array<[string, string]> = [
+      // Control operators end the previous word without whitespace.
+      ["bootstrap;TOKEN=hunter2 mcp-server", `bootstrap;TOKEN=${REDACTED_BACKUP_VALUE} mcp-server`],
+      ["mcp-a&&TOKEN=hunter2 mcp-b", `mcp-a&&TOKEN=${REDACTED_BACKUP_VALUE} mcp-b`],
+      ["mcp-a|TOKEN=hunter2 mcp-b", `mcp-a|TOKEN=${REDACTED_BACKUP_VALUE} mcp-b`],
+      ["(TOKEN=hunter2 mcp-server)", `(TOKEN=${REDACTED_BACKUP_VALUE} mcp-server)`],
+      // An unquoted value ends at an operator, and the assignment after it still redacts.
+      [
+        "A=1;B=hunter2 mcp-server",
+        `A=${REDACTED_BACKUP_VALUE};B=${REDACTED_BACKUP_VALUE} mcp-server`,
+      ],
+      // Substitution around an assignment localizes the whole command.
+      ["mcp-a `TOKEN=hunter2 leak`", REDACTED_BACKUP_VALUE],
+      ["mcp-run ${X=hunter2}", REDACTED_BACKUP_VALUE],
+      // A quote-led assignment is a word to the shell, but eval-style consumers read it.
+      ['run-mcp "TOKEN=a hunter2"', REDACTED_BACKUP_VALUE],
+      ["eval 'TOKEN=hunter2 mcp'", REDACTED_BACKUP_VALUE],
+    ];
+    for (const [command, expected] of cases) {
+      await expectCommandRedaction(command, expected);
     }
   });
 
