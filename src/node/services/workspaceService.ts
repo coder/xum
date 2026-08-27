@@ -10568,7 +10568,15 @@ export class WorkspaceService extends EventEmitter {
 
       // Compute namedWorkspacePath for frontend metadata
       const namedWorkspacePath = targetRuntime.getWorkspacePath(foundProjectPath, resolvedName);
-      const sourceAgentId = resolvePersistedAgentId(sourceMetadata, "");
+      // Fork setup can take long enough for the source selection to change. Snapshot
+      // persisted settings immediately before registering the fork, not before cloning.
+      const latestSourceMetadataResult =
+        await this.aiService.getWorkspaceMetadata(sourceWorkspaceId);
+      const latestSourceMetadata =
+        latestSourceMetadataResult.success && latestSourceMetadataResult.data.kind !== "scratch"
+          ? latestSourceMetadataResult.data
+          : sourceMetadata;
+      const sourceAgentId = resolvePersistedAgentId(latestSourceMetadata, "");
 
       const metadata: FrontendWorkspaceMetadata = {
         id: newWorkspaceId,
@@ -10581,12 +10589,12 @@ export class WorkspaceService extends EventEmitter {
         namedWorkspacePath,
         // Persist the source selection so other clients and background continuations hydrate the fork identically.
         ...(sourceAgentId === "" ? {} : { agentId: sourceAgentId }),
-        ...(sourceMetadata.aiSettingsByAgent == null
+        ...(latestSourceMetadata.aiSettingsByAgent == null
           ? {}
-          : { aiSettingsByAgent: { ...sourceMetadata.aiSettingsByAgent } }),
-        ...(sourceMetadata.aiSettings == null
+          : { aiSettingsByAgent: { ...latestSourceMetadata.aiSettingsByAgent } }),
+        ...(latestSourceMetadata.aiSettings == null
           ? {}
-          : { aiSettings: { ...sourceMetadata.aiSettings } }),
+          : { aiSettings: { ...latestSourceMetadata.aiSettings } }),
         // Preserve sub-project cwd/prompt context when forking via /fork.
         subProjectPath: sourceMetadata.subProjectPath,
         // Forks with a continue message stay pending until the first accepted user send

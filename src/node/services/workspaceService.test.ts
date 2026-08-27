@@ -17224,7 +17224,7 @@ describe("WorkspaceService fork", () => {
     }
   });
 
-  test("forks inherit persisted agent settings while normalizing legacy fork families", async () => {
+  test("forks inherit the latest persisted agent settings after setup", async () => {
     const sourceWorkspaceId = "source-workspace";
     const newWorkspaceId = "forked-workspace";
     const sourceProjectPath = path.join(tempDir, "project");
@@ -17243,6 +17243,21 @@ describe("WorkspaceService fork", () => {
       },
       aiSettings: { model: "google:gemini-2.5-pro", thinkingLevel: "low" },
     };
+    const latestAgentId = "exec";
+    const latestAiSettingsByAgent = {
+      exec: { model: "openai:gpt-5.3-codex", thinkingLevel: "xhigh" as const },
+    };
+    const latestAiSettings = {
+      model: "anthropic:claude-opus-4-6",
+      thinkingLevel: "high" as const,
+    };
+    const latestSourceMetadata: FrontendWorkspaceMetadata = {
+      ...sourceMetadata,
+      agentId: latestAgentId,
+      aiSettingsByAgent: latestAiSettingsByAgent,
+      aiSettings: latestAiSettings,
+    };
+    let metadataReads = 0;
     const forkedWorkspacePath = path.join(sourceProjectPath, "feature-1");
 
     await fsPromises.mkdir(sourceProjectPath, { recursive: true });
@@ -17258,7 +17273,9 @@ describe("WorkspaceService fork", () => {
 
     const mockAIService = {
       isStreaming: mock(() => false),
-      getWorkspaceMetadata: mock(() => Promise.resolve(Ok(sourceMetadata))),
+      getWorkspaceMetadata: mock(() =>
+        Promise.resolve(Ok(metadataReads++ === 0 ? sourceMetadata : latestSourceMetadata))
+      ),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
       on: mock(() => {}),
       // eslint-disable-next-line @typescript-eslint/no-empty-function
@@ -17329,17 +17346,17 @@ describe("WorkspaceService fork", () => {
       expect(result.data.metadata.name).toBe("feature-1");
       expect(result.data.metadata.forkFamilyBaseName).toBe("Feature");
       expect(result.data.metadata.namedWorkspacePath).toBe(forkedWorkspacePath);
-      expect(result.data.metadata.agentId).toBe("researcher");
-      expect(result.data.metadata.aiSettingsByAgent).toEqual(sourceMetadata.aiSettingsByAgent);
-      expect(result.data.metadata.aiSettings).toEqual(sourceMetadata.aiSettings);
+      expect(result.data.metadata.agentId).toBe(latestAgentId);
+      expect(result.data.metadata.aiSettingsByAgent).toEqual(latestAiSettingsByAgent);
+      expect(result.data.metadata.aiSettings).toEqual(latestAiSettings);
 
       const persistedMetadata = (await config.getAllWorkspaceMetadata()).find(
         (workspace) => workspace.id === newWorkspaceId
       );
       expect(persistedMetadata).toMatchObject({
-        agentId: "researcher",
-        aiSettingsByAgent: sourceMetadata.aiSettingsByAgent,
-        aiSettings: sourceMetadata.aiSettings,
+        agentId: latestAgentId,
+        aiSettingsByAgent: latestAiSettingsByAgent,
+        aiSettings: latestAiSettings,
       });
     } finally {
       orchestrateForkSpy.mockRestore();
