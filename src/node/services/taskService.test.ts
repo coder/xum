@@ -6292,6 +6292,69 @@ describe("TaskService", () => {
     expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(1);
   });
 
+  test("deferred terminal wake-up retries on the bounded timer", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_terminal_defer_retry";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendNextEvent(runId, {
+      type: "result",
+      at: "2026-06-19T00:00:02.000Z",
+      result: { reportMarkdown: "Workflow finished", structuredOutput: { ok: true } },
+    });
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    // The first drain sees a transient storage fault that clears before the retry fires. An
+    // already-idle owner produces no other drain trigger, so only the bounded retry delivers.
+    let currentnessCalls = 0;
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => {
+        currentnessCalls += 1;
+        return Promise.resolve(currentnessCalls === 1 ? "indeterminate" : "current");
+      });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    (
+      taskService as unknown as { terminalAttentionDeferRetryDelayMs: number }
+    ).terminalAttentionDeferRetryDelayMs = 10;
+
+    await taskService.enqueueWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "completed",
+    });
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    // Real timers: poll until the armed retry fires and the follow-up drain delivers.
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline && sendMessage.mock.calls.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      await flushTerminalAttentionDrains(taskService);
+    }
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
+  });
+
   test("initialize replays and clears persisted pending task guidance", async () => {
     const config = await createTestConfig(rootDir);
     const projectPath = path.join(rootDir, "repo");

@@ -63,13 +63,24 @@ function parseReferences(value: unknown): AgentWorkflowRunReference[] {
     if (record.createdAtMs > now + MAX_FUTURE_SKEW_MS) {
       continue;
     }
+    const hasBoundary = "afterBoundaryMessageId" in record;
     const boundaryRaw = record.afterBoundaryMessageId;
-    const afterBoundaryMessageId =
-      typeof boundaryRaw === "string" && boundaryRaw.length > 0
+    // A present-but-invalid snapshot ("" or a non-string) is corruption, not a legacy record:
+    // migrating it into the wall-clock fallback could let a stale reference outrank a newer
+    // boundary within the tolerated clock skew. Reject the entry; absence stays reserved for
+    // records that genuinely predate the field.
+    if (
+      hasBoundary &&
+      boundaryRaw !== null &&
+      (typeof boundaryRaw !== "string" || boundaryRaw.length === 0)
+    ) {
+      continue;
+    }
+    const afterBoundaryMessageId = hasBoundary
+      ? typeof boundaryRaw === "string"
         ? boundaryRaw
-        : boundaryRaw === null
-          ? null
-          : undefined;
+        : null
+      : undefined;
     // Collapse corrupted duplicate entries to the newest sane timestamp so order-sensitive
     // consumers cannot pick a stale duplicate and declare a legitimately re-recorded run
     // superseded. The chosen record is kept wholesale, including its boundary snapshot.
@@ -88,13 +99,23 @@ function parseReferences(value: unknown): AgentWorkflowRunReference[] {
 export async function readAgentWorkflowRunReferences(
   workspaceSessionDir: string
 ): Promise<AgentWorkflowRunReference[]> {
+  let raw: string;
   try {
-    const raw = await fs.readFile(referencesPath(workspaceSessionDir), "utf-8");
-    return parseReferences(JSON.parse(raw) as unknown);
+    raw = await fs.readFile(referencesPath(workspaceSessionDir), "utf-8");
   } catch (error: unknown) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
       return [];
     }
+    // For kernel-launched runs this file is the only durable invocation evidence, and callers
+    // deciding wake delivery must distinguish "no reference" from "cannot know right now":
+    // flattening a transient read failure into [] would let the terminal drain tombstone the
+    // run's wake. Corrupted contents below stay self-healing because rereading cannot repair
+    // them, while a failed read can succeed later.
+    throw error;
+  }
+  try {
+    return parseReferences(JSON.parse(raw) as unknown);
+  } catch {
     return [];
   }
 }
@@ -109,7 +130,14 @@ export async function recordAgentWorkflowRunReference(input: {
   const filePath = referencesPath(input.workspaceSessionDir);
 
   await referenceFileLocks.withLock(filePath, async () => {
-    const existing = await readAgentWorkflowRunReferences(input.workspaceSessionDir);
+    let existing: AgentWorkflowRunReference[];
+    try {
+      existing = await readAgentWorkflowRunReferences(input.workspaceSessionDir);
+    } catch {
+      // Recording must survive an unreadable file: the atomic rewrite below replaces it, and
+      // failing here would leave the new run without any sidecar entry, stranding its wake.
+      existing = [];
+    }
     const byRunId = new Map(existing.map((reference) => [reference.runId, reference]));
     // Clamp like parseReferences: never persist a future-dated timestamp.
     const createdAtMs = Math.min(input.createdAtMs ?? Date.now(), Date.now());

@@ -862,6 +862,11 @@ function isWorkspaceBusyIdleOnlySend(error: unknown): boolean {
 const REMOVED_AGENT_TASKS_DIR = "removed-agent-tasks";
 const COMPLETED_REPORT_CACHE_MAX_ENTRIES = 128;
 
+// Retry cadence for terminal-attention drains deferred by indeterminate workflow currentness
+// (unreadable history/sidecar). There is no deterministic "storage recovered" signal, so a
+// bounded timer is the re-trigger; each retry that defers again arms the next one.
+const TERMINAL_ATTENTION_DEFER_RETRY_DELAY_MS = 30_000;
+
 /** Maximum consecutive auto-resumes before stopping. Prevents infinite loops when descendants are stuck. */
 // Task-recovery paths must stay deterministic and editing-capable even when
 // workspace/default agent preferences evolve (e.g., auto router defaults).
@@ -1538,6 +1543,13 @@ export class TaskService {
   // tests and shutdown can await them; drains are idempotent and re-triggered on owner idle events.
   private readonly pendingTerminalAttentionDrainsByOwner = new Map<string, Promise<void>>();
   private readonly pendingTerminalAttentionDrains = new Set<Promise<void>>();
+  // One armed defer-retry timer per owner (see scheduleTerminalAttentionDeferRetry). The delay
+  // is a field, not a constant, so tests can shrink it without waiting out the real backoff.
+  private readonly terminalAttentionDeferRetryTimers = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
+  private terminalAttentionDeferRetryDelayMs = TERMINAL_ATTENTION_DEFER_RETRY_DELAY_MS;
   private readonly pendingWaitersByTaskId = new Map<string, PendingTaskWaiter[]>();
   private readonly pendingStartWaitersByTaskId = new Map<string, PendingTaskStartWaiter[]>();
   // Tracks workspaces currently blocked in a foreground wait (e.g. a task tool call awaiting
@@ -1690,7 +1702,13 @@ export class TaskService {
     }
 
     const runIds = new Set<string>();
-    const references = await readAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
+    let references: Awaited<ReturnType<typeof readAgentWorkflowRunReferences>> = [];
+    try {
+      references = await readAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
+    } catch (error: unknown) {
+      // Rediscovery is non-destructive and re-runs on the next listing; skip this pass.
+      log.warn("Failed to read agent workflow run references", { workspaceId, error });
+    }
     for (const reference of references) {
       // If the latest user/reset supersession has no durable timestamp, fail safe: only trust
       // workflow provenance re-established by current/post-supersession assistant output below.
@@ -7872,6 +7890,24 @@ export class TaskService {
     this.pendingTerminalAttentionDrains.add(promise);
   }
 
+  /**
+   * A deferred (indeterminate) terminal wake has no deterministic "storage recovered" signal
+   * to re-trigger the drain, and an idle-wait would resolve immediately on an already-idle
+   * owner and busy-loop while the fault persists. Retry on a bounded timer instead, one armed
+   * timer per owner; each retry that defers again arms the next one.
+   */
+  private scheduleTerminalAttentionDeferRetry(ownerWorkspaceId: string): void {
+    if (this.terminalAttentionDeferRetryTimers.has(ownerWorkspaceId)) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.terminalAttentionDeferRetryTimers.delete(ownerWorkspaceId);
+      this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
+    }, this.terminalAttentionDeferRetryDelayMs);
+    timer.unref?.();
+    this.terminalAttentionDeferRetryTimers.set(ownerWorkspaceId, timer);
+  }
+
   private scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId: string): void {
     const promise = this.workspaceService
       .waitForIdleAndNoQueuedMessages(ownerWorkspaceId)
@@ -8259,15 +8295,14 @@ export class TaskService {
         notification.sourceId
       );
       if (workflowPrompt.outcome === "defer") {
-        // Currentness was indeterminate (history unreadable): keep the notification pending so
-        // the next drain trigger (a later terminal event, idle scheduling, or startup recovery)
-        // retries it, rather than permanently dropping the wake. No active reschedule here: an
-        // idle-wait resolves immediately on an idle owner and would busy-loop while the fault
-        // persists.
+        // Currentness was indeterminate (history or sidecar unreadable): keep the notification
+        // pending rather than permanently dropping the wake, and arm a bounded retry, because an
+        // already-idle owner produces no further drain trigger on its own.
         log.warn("Deferring workflow terminal attention; history unavailable", {
           ownerWorkspaceId,
           runId: notification.sourceId,
         });
+        this.scheduleTerminalAttentionDeferRetry(ownerWorkspaceId);
         continue;
       }
       if (workflowPrompt.outcome === "superseded") {

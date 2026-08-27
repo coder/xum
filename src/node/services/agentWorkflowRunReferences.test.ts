@@ -114,6 +114,61 @@ describe("agent workflow run references", () => {
     }
   });
 
+  test("rejects entries with a present-but-invalid boundary snapshot", async () => {
+    const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
+    try {
+      // "" and non-string values are corruption, not legacy records: migrating them into the
+      // wall-clock fallback could outrank a newer boundary during tolerated clock skew.
+      await fs.writeFile(
+        path.join(workspaceSessionDir, "agent-workflow-runs.json"),
+        JSON.stringify({
+          references: [
+            { runId: "wfr_empty_boundary", createdAtMs: 1_000, afterBoundaryMessageId: "" },
+            { runId: "wfr_numeric_boundary", createdAtMs: 1_000, afterBoundaryMessageId: 42 },
+            { runId: "wfr_valid_boundary", createdAtMs: 1_000, afterBoundaryMessageId: "row-1" },
+            { runId: "wfr_null_boundary", createdAtMs: 1_000, afterBoundaryMessageId: null },
+          ],
+        })
+      );
+
+      const references = await readAgentWorkflowRunReferences(workspaceSessionDir);
+      expect(new Set(references.map((reference) => reference.runId))).toEqual(
+        new Set(["wfr_valid_boundary", "wfr_null_boundary"])
+      );
+    } finally {
+      await fs.rm(workspaceSessionDir, { recursive: true, force: true });
+    }
+  });
+
+  test("propagates non-ENOENT read failures instead of flattening them to empty", async () => {
+    const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
+    try {
+      // A directory at the file path fails reads with EISDIR. Callers deciding wake delivery
+      // must observe the failure rather than "no references".
+      await fs.mkdir(path.join(workspaceSessionDir, "agent-workflow-runs.json"));
+      let readError: unknown;
+      try {
+        await readAgentWorkflowRunReferences(workspaceSessionDir);
+      } catch (error: unknown) {
+        readError = error;
+      }
+      expect(String(readError)).toContain("EISDIR");
+    } finally {
+      await fs.rm(workspaceSessionDir, { recursive: true, force: true });
+    }
+  });
+
+  test("self-heals unparseable file contents to empty", async () => {
+    const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
+    try {
+      // Unlike a failed read, corrupted contents cannot be repaired by rereading.
+      await fs.writeFile(path.join(workspaceSessionDir, "agent-workflow-runs.json"), "{not json");
+      expect(await readAgentWorkflowRunReferences(workspaceSessionDir)).toEqual([]);
+    } finally {
+      await fs.rm(workspaceSessionDir, { recursive: true, force: true });
+    }
+  });
+
   test("clamps future-dated createdAtMs to the current time", async () => {
     const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
     try {

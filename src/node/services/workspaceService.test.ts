@@ -6335,6 +6335,75 @@ describe("WorkspaceService workflow invocation events", () => {
     }
   });
 
+  test("treats an unreadable sidecar as indeterminate, not superseded", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-sidecar-error";
+    const runId = "wfr_currentness_sidecar_error";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-sidecar-error",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user", "user", "run the audit workflow", { timestamp: 1_000 })
+      );
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: 1_150,
+        afterBoundaryMessageId: "manual-user",
+      });
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
+
+      // The sidecar is the only invocation evidence for kernel-launched runs: an unreadable
+      // file must read as "cannot know right now", not "no reference", or the drain would
+      // tombstone the wake on a transient storage fault.
+      const sidecarPath = path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json");
+      await fsPromises.rm(sidecarPath);
+      await fsPromises.mkdir(sidecarPath);
+      try {
+        expect(await workspaceService.getWorkflowInvocationCurrentness(workspaceId, runId)).toBe(
+          "indeterminate"
+        );
+        expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
+      } finally {
+        await fsPromises.rmdir(sidecarPath);
+      }
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: 1_150,
+        afterBoundaryMessageId: "manual-user",
+      });
+      expect(await workspaceService.getWorkflowInvocationCurrentness(workspaceId, runId)).toBe(
+        "current"
+      );
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test.each(["workflow_run", "workflow_resume"] as const)(
     "treats terminal %s output as a consumed workflow result",
     async (toolName) => {

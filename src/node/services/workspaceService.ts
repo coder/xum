@@ -3,7 +3,10 @@ import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { EventEmitter } from "events";
 import * as path from "path";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
-import { readAgentWorkflowRunReferences } from "@/node/services/agentWorkflowRunReferences";
+import {
+  readAgentWorkflowRunReferences,
+  type AgentWorkflowRunReference,
+} from "@/node/services/agentWorkflowRunReferences";
 import * as fsPromises from "fs/promises";
 import assert from "@/common/utils/assert";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
@@ -10969,7 +10972,20 @@ export class WorkspaceService extends EventEmitter {
     // consumed boundary, equality means a background resume/retry was recorded after the prior
     // result was delivered. References without a boundary snapshot (pre-upgrade entries,
     // record-time read failures) take a wall-clock migration fallback below.
-    const references = await readAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
+    let references: AgentWorkflowRunReference[];
+    try {
+      references = await readAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
+    } catch (error: unknown) {
+      // The sidecar is the only invocation evidence a kernel-launched run has, so an
+      // unreadable file is "cannot know right now", not "no reference": defer wake decisions
+      // exactly like an unreadable history.
+      log.warn("Could not read workflow run references for currentness", {
+        workspaceId,
+        runId,
+        error,
+      });
+      return "indeterminate";
+    }
     const reference = references.find((candidate) => candidate.runId === runId);
     if (decision.status === "none") {
       // A decision-free history is current only for a reference whose snapshot verified an
