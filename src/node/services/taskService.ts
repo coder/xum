@@ -8232,6 +8232,11 @@ export class TaskService {
         notification.sourceId
       );
       if (workflowPrompt == null) {
+        // Dropping a notify_on_terminal wake strands the run's owner; keep the drop diagnosable.
+        log.warn("Dropping superseded workflow terminal attention", {
+          ownerWorkspaceId,
+          runId: notification.sourceId,
+        });
         await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, notification.id);
         continue;
       }

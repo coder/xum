@@ -3,6 +3,7 @@ import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { EventEmitter } from "events";
 import * as path from "path";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
+import { readAgentWorkflowRunReferences } from "@/node/services/agentWorkflowRunReferences";
 import * as fsPromises from "fs/promises";
 import assert from "@/common/utils/assert";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
@@ -10935,21 +10936,17 @@ export class WorkspaceService extends EventEmitter {
     assert(workspaceId.length > 0, "isWorkflowInvocationCurrent requires workspaceId");
     assert(runId.length > 0, "isWorkflowInvocationCurrent requires runId");
 
-    let current = false;
-    let foundDecision = false;
+    let outcome: "invocation" | "consumed" | "superseded" | null = null;
+    let supersededAtMs: number | null = null;
     const historyResult = await this.historyService.iterateFullHistory(
       workspaceId,
       "backward",
       (messages) => {
         for (const message of messages) {
-          if (isManualUserSupersessionMessage(message)) {
-            current = false;
-            foundDecision = true;
-            return false;
-          }
-          if (isResetBoundaryMessage(message)) {
-            current = false;
-            foundDecision = true;
+          if (isManualUserSupersessionMessage(message) || isResetBoundaryMessage(message)) {
+            outcome = "superseded";
+            const timestamp = message.metadata?.timestamp;
+            supersededAtMs = typeof timestamp === "number" ? timestamp : null;
             return false;
           }
           if (
@@ -10957,13 +10954,11 @@ export class WorkspaceService extends EventEmitter {
             isTerminalWorkflowTaskAwaitResultMessage(message, runId) ||
             isTerminalWorkflowToolResultMessage(message, runId)
           ) {
-            current = false;
-            foundDecision = true;
+            outcome = "consumed";
             return false;
           }
           if (isWorkflowInvocationMessage(message, runId)) {
-            current = true;
-            foundDecision = true;
+            outcome = "invocation";
             return false;
           }
         }
@@ -10979,7 +10974,29 @@ export class WorkspaceService extends EventEmitter {
       return false;
     }
 
-    return foundDecision && current;
+    if (outcome === "invocation") {
+      return true;
+    }
+    if (outcome === "consumed") {
+      return false;
+    }
+
+    // Kernel-launched runs (mux.workflow_run / mux.workflow_resume inside code_execution) leave
+    // no recognizable invocation part in history, so the backward walk above stops at the prior
+    // real user message and would wrongly treat the run as superseded, silently dropping its
+    // notify_on_terminal wake. Their durable provenance is the agent-workflow-runs sidecar: a
+    // reference recorded after the latest supersession boundary counts as the current
+    // invocation. A boundary without a durable timestamp fails safe to superseded, mirroring
+    // TaskService.listAgentReferencedWorkflowRunIds.
+    if (outcome === "superseded" && supersededAtMs === null) {
+      return false;
+    }
+    const references = await readAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
+    const reference = references.find((candidate) => candidate.runId === runId);
+    if (reference == null) {
+      return false;
+    }
+    return supersededAtMs === null || reference.createdAtMs > supersededAtMs;
   }
 
   /**

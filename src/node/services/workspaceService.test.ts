@@ -54,9 +54,11 @@ import type { SendMessageOptions, WorkspaceChatMessage } from "@/common/orpc/typ
 import { createMuxMessage } from "@/common/types/message";
 import { buildStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import {
+  WORKFLOW_RESULT_METADATA_TYPE,
   WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE,
   WORKFLOW_TRIGGER_DISPLAY_METADATA_TYPE,
 } from "@/common/utils/workflowRunMessages";
+import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRunReferences";
 import { getPlanFilePath } from "@/common/utils/planStorage";
 import * as todoStorageModule from "@/node/services/todos/todoStorage";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
@@ -5918,6 +5920,102 @@ describe("WorkspaceService workflow invocation events", () => {
       );
 
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("counts a kernel-launched run recorded in the sidecar as the current invocation", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-kernel";
+    const runId = "wfr_currentness_kernel";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-kernel",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      // mux.workflow_run inside code_execution leaves no workflow_run tool part in history; the
+      // agent-workflow-runs sidecar reference is the only durable invocation evidence.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user", "user", "run the audit workflow", { timestamp: 1_000 })
+      );
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("assistant-kernel-launch", "assistant", "", { timestamp: 1_100 }, [
+          {
+            type: "dynamic-tool",
+            toolCallId: "code-exec-1",
+            toolName: "code_execution",
+            state: "output-available",
+            input: { code: "return xum.workflow_run({ script_path: './workflows/demo.js' })" },
+            output: { success: true, result: { status: "running", runId } },
+          },
+        ])
+      );
+
+      // The nested runId in the code_execution output alone is not invocation evidence.
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
+
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: 1_150,
+      });
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
+
+      // A newer manual user message supersedes the sidecar reference.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user-2", "user", "never mind, answer something else", {
+          timestamp: 1_200,
+        })
+      );
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
+
+      // A kernel workflow_resume re-records the reference after the supersession and
+      // re-establishes provenance (latest record wins).
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: 1_250,
+      });
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
+
+      // Once the terminal result was delivered, the sidecar must not resurrect the invocation.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("workflow-result", "user", "The workflow below has finished.", {
+          timestamp: 1_300,
+          synthetic: true,
+          muxMetadata: {
+            type: WORKFLOW_RESULT_METADATA_TYPE,
+            rawCommand: "workflow_run ./workflows/demo.js",
+            runId,
+          },
+        })
+      );
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
       workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();

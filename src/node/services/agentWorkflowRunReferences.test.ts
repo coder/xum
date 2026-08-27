@@ -31,4 +31,18 @@ describe("agent workflow run references", () => {
       await fs.rm(workspaceSessionDir, { recursive: true, force: true });
     }
   });
+
+  test("keeps the newest createdAtMs across re-records", async () => {
+    const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
+    try {
+      const runId = "wfr_re_recorded";
+      await recordAgentWorkflowRunReference({ workspaceSessionDir, runId, createdAtMs: 2_000 });
+      await recordAgentWorkflowRunReference({ workspaceSessionDir, runId, createdAtMs: 1_000 });
+
+      const references = await readAgentWorkflowRunReferences(workspaceSessionDir);
+      expect(references).toEqual([{ runId, createdAtMs: 2_000 }]);
+    } finally {
+      await fs.rm(workspaceSessionDir, { recursive: true, force: true });
+    }
+  });
 });

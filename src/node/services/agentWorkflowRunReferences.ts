@@ -75,7 +75,10 @@ export async function recordAgentWorkflowRunReference(input: {
     const previous = byRunId.get(input.runId);
     byRunId.set(input.runId, {
       runId: input.runId,
-      createdAtMs: previous ? Math.min(previous.createdAtMs, createdAtMs) : createdAtMs,
+      // Latest record wins: workflow_resume re-records the reference, and a resume issued after
+      // a manual user message must re-establish provenance for supersession-timestamp
+      // comparisons (isWorkflowInvocationCurrent, listAgentReferencedWorkflowRunIds).
+      createdAtMs: previous ? Math.max(previous.createdAtMs, createdAtMs) : createdAtMs,
     });
 
     await fs.mkdir(path.dirname(filePath), { recursive: true });
