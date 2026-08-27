@@ -13328,6 +13328,26 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
+   * Strict authoritative enumeration for destructive/identity decisions:
+   * every primary workspace id PLUS legacy alias identities (a second
+   * resolvable compatibility file findWorkspace still vouches for — see
+   * Config.getAllWorkspaceMetadata's legacyAliasIds). Known-id sets built
+   * without the aliases would prune or drop live alias-keyed activity.
+   */
+  private async enumerateAuthoritativeWorkspaceIds(): Promise<Set<string>> {
+    const legacyAliasIds = new Set<string>();
+    const ids = new Set(
+      (await this.config.getAllWorkspaceMetadata({ throwOnError: true, legacyAliasIds })).map(
+        (metadata) => metadata.id
+      )
+    );
+    for (const aliasId of legacyAliasIds) {
+      ids.add(aliasId);
+    }
+    return ids;
+  }
+
+  /**
    * Evict process-local activity caches for a removed (or removed-then-
    * revived) workspace id. The caches re-bootstrap from disk on next access;
    * an in-flight bootstrap keeps populating its orphaned Set harmlessly.
@@ -13382,8 +13402,7 @@ export class WorkspaceService extends EventEmitter {
           //   config migrations that are not yet persisted verbatim.
           // A missing config file resolves as a healthy empty set in both.
           const knownIds = this.config.readPersistedWorkspaceIdSuperset();
-          const allMetadata = await this.config.getAllWorkspaceMetadata({ throwOnError: true });
-          normalizedIds = new Set(allMetadata.map((metadata) => metadata.id));
+          normalizedIds = await this.enumerateAuthoritativeWorkspaceIds();
           for (const workspaceId of normalizedIds) {
             knownIds.add(workspaceId);
           }
@@ -13405,9 +13424,8 @@ export class WorkspaceService extends EventEmitter {
           if (!evidence.hasWorkspaceEntriesWithoutIds) {
             return evidence.ids;
           }
-          const allMetadata = await this.config.getAllWorkspaceMetadata({ throwOnError: true });
-          for (const metadata of allMetadata) {
-            evidence.ids.add(metadata.id);
+          for (const workspaceId of await this.enumerateAuthoritativeWorkspaceIds()) {
+            evidence.ids.add(workspaceId);
           }
           return evidence.ids;
         }
@@ -13481,11 +13499,7 @@ export class WorkspaceService extends EventEmitter {
           // throwOnError so a corrupted config.json actually reaches the
           // fail-open fallback below instead of silently resolving as the
           // empty default and dropping every live entry from the list.
-          workspaceIds = new Set(
-            (await this.config.getAllWorkspaceMetadata({ throwOnError: true })).map(
-              (metadata) => metadata.id
-            )
-          );
+          workspaceIds = await this.enumerateAuthoritativeWorkspaceIds();
         } catch (error) {
           // Fail open: without the config view, stale ids cannot be told apart
           // from live ones, and dropping live entries would strand renderer
@@ -13671,11 +13685,7 @@ export class WorkspaceService extends EventEmitter {
           freshConfigHasRawInvisibleEntries)
       ) {
         try {
-          authoritativeIds = new Set(
-            (await this.config.getAllWorkspaceMetadata({ throwOnError: true })).map(
-              (metadata) => metadata.id
-            )
-          );
+          authoritativeIds = await this.enumerateAuthoritativeWorkspaceIds();
         } catch (error) {
           log.debug("Failed to enumerate authoritative ids for removal revalidation", { error });
           authoritativeIds = null;
@@ -13867,11 +13877,7 @@ export class WorkspaceService extends EventEmitter {
             Object.keys(activityById).some(isRawInvisible)
           ) {
             try {
-              finalAuthoritativeIds = new Set(
-                (await this.config.getAllWorkspaceMetadata({ throwOnError: true })).map(
-                  (metadata) => metadata.id
-                )
-              );
+              finalAuthoritativeIds = await this.enumerateAuthoritativeWorkspaceIds();
             } catch (error) {
               log.debug("Failed to re-enumerate authoritative ids after workflow probes", {
                 error,

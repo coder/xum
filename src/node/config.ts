@@ -2494,6 +2494,18 @@ export class Config {
      * fresh install), matching loadConfigOrDefault.
      */
     throwOnError?: boolean;
+    /**
+     * Out-parameter collecting ADDITIONAL stable ids that findWorkspace()
+     * can resolve for id-less legacy entries but that are not the returned
+     * entry's primary id: when both compatibility files
+     * (sessions/<basename>/metadata.json and
+     * sessions/<generated-legacy-id>/metadata.json) exist with different
+     * ids, only the first becomes the metadata entry, yet the second
+     * identity remains registered for targeted lookups. Destructive callers
+     * building "known id" sets must include these aliases or they would
+     * delete activity data findWorkspace still vouches for.
+     */
+    legacyAliasIds?: Set<string>;
   }): Promise<FrontendWorkspaceMetadata[]> {
     const config = this.loadConfigOrDefault({ throwOnError: options?.throwOnError });
     const workspaceMetadata: FrontendWorkspaceMetadata[] = [];
@@ -2678,12 +2690,13 @@ export class Config {
 
           let metadataPath = "";
           let legacyMetadataRaw: string | undefined;
-          for (const candidateId of [workspaceBasename, legacyId]) {
+          const candidateIds =
+            workspaceBasename === legacyId ? [workspaceBasename] : [workspaceBasename, legacyId];
+          for (const candidateId of candidateIds) {
             const candidatePath = path.join(this.getSessionDir(candidateId), "metadata.json");
+            let candidateRaw: string | undefined;
             try {
-              legacyMetadataRaw = fs.readFileSync(candidatePath, "utf-8");
-              metadataPath = candidatePath;
-              break;
+              candidateRaw = fs.readFileSync(candidatePath, "utf-8");
             } catch (readError) {
               // Missing is normal (most entries never had a legacy
               // metadata.json). Any other failure means the workspace's
@@ -2693,6 +2706,39 @@ export class Config {
               if (!isEnoentError(readError)) {
                 throw readError;
               }
+              continue;
+            }
+            if (legacyMetadataRaw === undefined) {
+              legacyMetadataRaw = candidateRaw;
+              metadataPath = candidatePath;
+              continue;
+            }
+            // A SECOND resolvable compatibility file: findWorkspace() tries
+            // every candidate, so its id stays registered for targeted
+            // lookups even though only the first file becomes the metadata
+            // entry. Surface it through the legacyAliasIds out-parameter so
+            // destructive known-id sets retain it. findWorkspace consults
+            // candidate files only for id-less entries; for a partially
+            // migrated entry (inline id, no name) the alias is
+            // over-inclusive, which errs toward retention, never deletion.
+            // A corrupt or id-less second file leaves the alias identity
+            // unknowable — fail closed in strict mode, mirroring the
+            // primary lookup guards.
+            let aliasMetadata: WorkspaceMetadata | undefined;
+            try {
+              aliasMetadata = JSON.parse(candidateRaw) as WorkspaceMetadata;
+            } catch (parseError) {
+              if (options?.throwOnError) {
+                throw parseError;
+              }
+            }
+            const aliasId = aliasMetadata?.id;
+            if (typeof aliasId === "string" && aliasId.length > 0) {
+              options?.legacyAliasIds?.add(aliasId);
+            } else if (aliasMetadata !== undefined && options?.throwOnError) {
+              throw new Error(
+                `Legacy workspace metadata at ${candidatePath} resolved without a usable id`
+              );
             }
           }
           if (legacyMetadataRaw !== undefined) {

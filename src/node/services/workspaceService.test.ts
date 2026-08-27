@@ -5477,6 +5477,59 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("prune spares both legacy identities when compatibility files disagree", async () => {
+    // An id-less legacy entry can have BOTH supported session layouts with
+    // different stable ids (stale basename-side file + live generated-legacy
+    // metadata). findWorkspace resolves either id, so the one-time prune must
+    // spare extension-metadata entries under both — classifying the second
+    // identity as stale would delete activity findWorkspace still vouches
+    // for.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const projectPath = path.join(config.rootDir, "project");
+      const workspacePath = path.join(projectPath, "old-ws");
+      await fsPromises.writeFile(
+        path.join(config.rootDir, "config.json"),
+        JSON.stringify({ projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]] })
+      );
+      const basenameSessionDir = config.getSessionDir("old-ws");
+      await fsPromises.mkdir(basenameSessionDir, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(basenameSessionDir, "metadata.json"),
+        JSON.stringify({ id: "basename-stable-id", name: "old-ws" })
+      );
+      const legacySessionDir = config.getSessionDir(
+        config.generateLegacyId(projectPath, workspacePath)
+      );
+      await fsPromises.mkdir(legacySessionDir, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(legacySessionDir, "metadata.json"),
+        JSON.stringify({ id: "generated-live-id", name: "old-ws" })
+      );
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency("basename-stable-id", 100);
+      await extensionMetadata.updateRecency("generated-live-id", 200);
+      await extensionMetadata.updateRecency("truly-stale-id", 300);
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+
+      const activityList = await workspaceService.getActivityList();
+      expect(activityList).not.toBeNull();
+
+      const snapshots = await extensionMetadata.getAllSnapshots();
+      expect(snapshots.get("basename-stable-id")?.recency).toBe(100);
+      expect(snapshots.get("generated-live-id")?.recency).toBe(200);
+      expect(snapshots.has("truly-stale-id")).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("first bootstrap reuses the prune's config enumeration for scoping", async () => {
     // getAllWorkspaceMetadata walks every workspace with per-workspace disk
     // probes; the latency-sensitive first bootstrap must not pay it twice.

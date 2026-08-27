@@ -115,9 +115,14 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     if (!evidence.hasWorkspaceEntriesWithoutIds) {
       return false;
     }
-    return (await config.getAllWorkspaceMetadata({ throwOnError: true })).some(
-      (metadata) => metadata.id === workspaceId
-    );
+    // Alias ids: a second resolvable compatibility file's identity stays
+    // registered for findWorkspace even though it is not any entry's
+    // primary id — refusing its writes/deletions requires knowing it here.
+    const legacyAliasIds = new Set<string>();
+    const registered = (
+      await config.getAllWorkspaceMetadata({ throwOnError: true, legacyAliasIds })
+    ).some((metadata) => metadata.id === workspaceId);
+    return registered || legacyAliasIds.has(workspaceId);
   });
   const workspaceGoalService = new WorkspaceGoalService(
     config,

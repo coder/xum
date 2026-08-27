@@ -3251,6 +3251,48 @@ describe("Config", () => {
       const allMetadata = await config.getAllWorkspaceMetadata({ throwOnError: true });
       expect(allMetadata.map((metadata) => metadata.id)).toContain("stable-basename-id");
     });
+
+    it("surfaces the second resolvable compatibility file's id as a legacy alias", async () => {
+      // Both supported layouts exist with DIFFERENT ids (e.g. a stale
+      // basename-side file next to the live generated-legacy metadata).
+      // findWorkspace resolves either id, so destructive known-id sets must
+      // retain both — the enumeration returns the first candidate as the
+      // entry and reports the second through the legacyAliasIds
+      // out-parameter.
+      const projectPath = "/fake/project";
+      const workspaceName = "aliased-feature";
+      const workspacePath = path.join(config.srcDir, "project", workspaceName);
+      fs.mkdirSync(workspacePath, { recursive: true });
+
+      const basenameSessionDir = config.getSessionDir(workspaceName);
+      fs.mkdirSync(basenameSessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(basenameSessionDir, "metadata.json"),
+        JSON.stringify({ id: "stale-basename-id", name: workspaceName })
+      );
+      const legacyId = config.generateLegacyId(projectPath, workspacePath);
+      const legacySessionDir = config.getSessionDir(legacyId);
+      fs.mkdirSync(legacySessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(legacySessionDir, "metadata.json"),
+        JSON.stringify({ id: "live-generated-id", name: workspaceName })
+      );
+
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [{ path: workspacePath }],
+        });
+        return cfg;
+      });
+
+      const legacyAliasIds = new Set<string>();
+      const allMetadata = await config.getAllWorkspaceMetadata({
+        throwOnError: true,
+        legacyAliasIds,
+      });
+      expect(allMetadata.map((metadata) => metadata.id)).toContain("stale-basename-id");
+      expect(legacyAliasIds.has("live-generated-id")).toBe(true);
+    });
   });
 
   describe("transcriptOnly derivation", () => {
