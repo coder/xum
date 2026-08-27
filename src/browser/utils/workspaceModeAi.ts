@@ -123,6 +123,28 @@ export function hasWorkspaceAiTargetDescriptor(
   return agents.some((agent) => normalizeAgentId(agent.id) === normalizedAgentId);
 }
 
+interface CreationWorkspaceAiSyncState {
+  isExplicitAgentSwitch: boolean;
+  mode: "creation-sync" | "background-sync";
+}
+
+export function getCreationWorkspaceAiSyncState(args: {
+  previousAgentId: string | null;
+  previousScopeId: string | null;
+  agentId: string;
+  scopeId: string;
+}): CreationWorkspaceAiSyncState {
+  const hasPriorSelection = args.previousAgentId !== null && args.previousScopeId === args.scopeId;
+  const isExplicitAgentSwitch = hasPriorSelection && args.previousAgentId !== args.agentId;
+
+  return {
+    isExplicitAgentSwitch,
+    // Definition defaults seed the initial selection and explicit switches only.
+    // Later descriptor arrival must preserve any model the user already selected.
+    mode: !hasPriorSelection || isExplicitAgentSwitch ? "creation-sync" : "background-sync",
+  };
+}
+
 // Keep agent -> model/thinking precedence in one place so explicit switches,
 // background sync, and workspace creation agree on descriptor availability.
 export function resolveWorkspaceAiSettingsForAgent(

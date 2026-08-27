@@ -59,7 +59,10 @@ import {
   sendWorkspaceMessage,
   updateWorkspaceAgentAISettings,
 } from "@/browser/utils/workspaceAiSettingsSync";
-import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
+import {
+  getCreationWorkspaceAiSyncState,
+  resolveWorkspaceAiSettingsForAgent,
+} from "@/browser/utils/workspaceModeAi";
 import {
   getModelKey,
   getReasoningModeKey,
@@ -1281,10 +1284,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
     const normalizedAgentId = normalizeAgentId(agentId, "exec");
 
-    const isExplicitAgentSwitch =
-      prevCreationAgentIdRef.current !== null &&
-      prevCreationScopeIdRef.current === scopeId &&
-      prevCreationAgentIdRef.current !== normalizedAgentId;
+    const { isExplicitAgentSwitch, mode } = getCreationWorkspaceAiSyncState({
+      previousAgentId: prevCreationAgentIdRef.current,
+      previousScopeId: prevCreationScopeIdRef.current,
+      agentId: normalizedAgentId,
+      scopeId,
+    });
 
     // Update refs for the next run (even if no model changes).
     prevCreationAgentIdRef.current = normalizedAgentId;
@@ -1311,7 +1316,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       existingThinking,
       existingReasoningMode: existingReasoning,
       agents,
-      mode: "creation-sync",
+      mode,
     });
 
     if (existingModel !== resolvedModel) {

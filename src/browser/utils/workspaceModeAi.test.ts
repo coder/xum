@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { AgentAncestorDescriptor } from "@/common/utils/ai/agentAncestorLayers";
-import { resolveWorkspaceAiSettingsForAgent } from "./workspaceModeAi";
+import {
+  getCreationWorkspaceAiSyncState,
+  resolveWorkspaceAiSettingsForAgent,
+} from "./workspaceModeAi";
 
 describe("resolveWorkspaceAiSettingsForAgent", () => {
   test("uses global agent defaults when configured", () => {
@@ -478,6 +481,45 @@ describe("resolveWorkspaceAiSettingsForAgent", () => {
     expect(result).toEqual({
       resolvedModel: "openai:gpt-5.2",
       resolvedThinking: "off",
+      resolvedReasoningMode: "standard",
+    });
+  });
+
+  test("preserves a creation model chosen before descriptors arrive", () => {
+    const initial = getCreationWorkspaceAiSyncState({
+      previousAgentId: null,
+      previousScopeId: null,
+      agentId: "exec",
+      scopeId: "project:/repo",
+    });
+    const descriptorArrival = getCreationWorkspaceAiSyncState({
+      previousAgentId: "exec",
+      previousScopeId: "project:/repo",
+      agentId: "exec",
+      scopeId: "project:/repo",
+    });
+
+    expect(initial.mode).toBe("creation-sync");
+    expect(descriptorArrival.mode).toBe("background-sync");
+
+    const result = resolveWorkspaceAiSettingsForAgent({
+      agentId: "exec",
+      agentAiDefaults: {},
+      fallbackModel: "openai:gpt-5.2",
+      existingModel: "anthropic:claude-opus-4-6",
+      existingThinking: "high",
+      agents: [
+        {
+          id: "exec",
+          ownAiDefaults: { model: "openai:gpt-5.3-codex", thinkingLevel: "off" },
+        },
+      ],
+      mode: descriptorArrival.mode,
+    });
+
+    expect(result).toEqual({
+      resolvedModel: "anthropic:claude-opus-4-6",
+      resolvedThinking: "high",
       resolvedReasoningMode: "standard",
     });
   });
