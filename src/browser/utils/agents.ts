@@ -4,6 +4,10 @@ import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 // Only includes agents that are uiSelectable by default.
 const BUILTIN_AGENT_ORDER: readonly string[] = ["exec", "plan"];
 
+export function isBuiltInSelectableAgentId(agentId: string): boolean {
+  return BUILTIN_AGENT_ORDER.includes(agentId);
+}
+
 /**
  * Sort agents with stable ordering: built-ins first (exec, plan),
  * then custom agents alphabetically by name.

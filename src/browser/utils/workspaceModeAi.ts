@@ -1,4 +1,5 @@
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import { isBuiltInSelectableAgentId } from "@/browser/utils/agents";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { targetWorkspaceBucketToLayer, type AiSettingSource } from "@/common/types/agentAiSettings";
 import {
@@ -170,7 +171,8 @@ export function resolveWorkspaceAiSettingsForAgent(
   if (
     mode === "explicit-switch" &&
     args.agents != null &&
-    !hasWorkspaceAiTargetDescriptor(normalizedAgentId, args.agents)
+    !hasWorkspaceAiTargetDescriptor(normalizedAgentId, args.agents) &&
+    !isBuiltInSelectableAgentId(normalizedAgentId)
   ) {
     return null;
   }

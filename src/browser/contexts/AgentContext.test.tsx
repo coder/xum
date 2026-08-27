@@ -28,6 +28,7 @@ import type * as RouterContextModule from "./RouterContext";
 import type * as WorkspaceContextModule from "./WorkspaceContext";
 
 let mockAgentDefinitions: AgentDefinitionDescriptor[] = [];
+let rejectAgentDefinitions = false;
 let mockWorkspaceMetadata = new Map<
   string,
   { parentWorkspaceId?: string; agentId?: string; agentType?: string }
@@ -270,7 +271,10 @@ function createApiClient(): APIClient {
 
   return {
     agents: {
-      list: () => Promise.resolve(mockAgentDefinitions),
+      list: () =>
+        rejectAgentDefinitions
+          ? Promise.reject(new Error("agent definitions unavailable"))
+          : Promise.resolve(mockAgentDefinitions),
     },
     workspace: {
       list: () => Promise.resolve(workspaceMetadata),
@@ -346,6 +350,7 @@ describe("AgentContext", () => {
   beforeEach(async () => {
     isolatedModuleDir = await importIsolatedAgentModules();
     mockAgentDefinitions = [];
+    rejectAgentDefinitions = false;
     mockWorkspaceMetadata = new Map();
     updateAgentAISettingsCalls = [];
     deferUpdateAgentAISettings = false;
@@ -464,6 +469,37 @@ describe("AgentContext", () => {
 
     await waitFor(() => {
       expect(contextValue?.agentId).toBe("review");
+    });
+  });
+
+  test("built-in workspace switching survives agent descriptor load failure", async () => {
+    const projectPath = "/tmp/project";
+    const workspaceId = "main-workspace";
+    rejectAgentDefinitions = true;
+    mockWorkspaceMetadata.set(workspaceId, {});
+    window.localStorage.setItem(getAgentIdKey(workspaceId), JSON.stringify("exec"));
+
+    let contextValue: AgentContextValue | undefined;
+    renderAgentHarness({
+      workspaceId,
+      projectPath,
+      onChange: (value) => (contextValue = value),
+    });
+
+    await waitFor(() => {
+      expect(contextValue?.loadFailed).toBe(true);
+    });
+
+    contextValue?.setAgentId("plan");
+
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("plan");
+    });
+    expect(updateAgentAISettingsCalls).toHaveLength(1);
+    expect(updateAgentAISettingsCalls[0]).toMatchObject({
+      workspaceId,
+      agentId: "plan",
+      persistSelectedAgentId: true,
     });
   });
 
