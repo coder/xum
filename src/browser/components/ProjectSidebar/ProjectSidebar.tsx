@@ -1955,6 +1955,22 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       color: resolveSectionColor(config?.color),
     };
   };
+  // Flat mode drops the section headers that used to convey sub-project
+  // scope, so rows scoped to a valid sub-project badge with its identity
+  // instead of the parent's. Stale references (deleted sections) fall back
+  // to the parent badge, mirroring getDraftSectionId's validation.
+  const resolveSubProjectBadge = (
+    parentProjectPath: string,
+    subProjectPath: string | null | undefined
+  ): { name: string; color: string } | undefined => {
+    if (typeof subProjectPath !== "string") return undefined;
+    const config = userProjects.get(subProjectPath);
+    if (config?.parentProjectPath !== parentProjectPath) return undefined;
+    return {
+      name: getProjectDisplayName(subProjectPath, config),
+      color: resolveSectionColor(config.color),
+    };
+  };
   const getFlatProjectBadge = (
     workspace: FrontendWorkspaceMetadata
   ): { name: string; color: string } | undefined => {
@@ -1962,10 +1978,18 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     if (isMultiProject(workspace)) {
       return { name: "Multi-project", color: resolveSectionColor(undefined) };
     }
-    return getProjectBadge(workspace.projectPath);
+    return (
+      resolveSubProjectBadge(workspace.projectPath, workspace.subProjectPath) ??
+      getProjectBadge(workspace.projectPath)
+    );
   };
-  const getFlatDraftBadge = (projectPath: string): { name: string; color: string } | undefined =>
-    projectPath === SCRATCH_PROJECT_CONFIG_KEY ? undefined : getProjectBadge(projectPath);
+  const getFlatDraftBadge = (
+    projectPath: string,
+    subProjectPath: string | null | undefined
+  ): { name: string; color: string } | undefined =>
+    projectPath === SCRATCH_PROJECT_CONFIG_KEY
+      ? undefined
+      : (resolveSubProjectBadge(projectPath, subProjectPath) ?? getProjectBadge(projectPath));
 
   const handleReorder = useCallback(
     (draggedPath: string, targetPath: string) => {
@@ -2552,7 +2576,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         const isSelected =
           pendingNewWorkspaceProject === projectPath &&
           pendingNewWorkspaceDraftId === draft.draftId;
-        const draftBadge = getFlatDraftBadge(projectPath);
+        const draftBadge = getFlatDraftBadge(projectPath, draft.subProjectPath);
         return (
           <DraftAgentListItemWrapper
             key={draft.draftId}

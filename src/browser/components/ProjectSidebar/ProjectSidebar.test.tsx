@@ -1019,6 +1019,53 @@ describe("ProjectSidebar flat chat list", () => {
     expect(sectionProps?.workspaceCount).toBe(0);
   });
 
+  test("badges flat rows with their sub-project identity, falling back when stale", () => {
+    const sectionScoped = {
+      ...createWorkspace("in-section", { title: "Scoped chat" }),
+      projects: singleProjectRefs,
+      subProjectPath: "/projects/demo-project/features",
+    };
+    const staleScoped = {
+      ...createWorkspace("stale-section", { title: "Stale chat" }),
+      projects: singleProjectRefs,
+      subProjectPath: "/projects/demo-project/deleted",
+    };
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        ["/projects/demo-project", { displayName: "Demo", workspaces: [] }],
+        [
+          "/projects/demo-project/features",
+          {
+            displayName: "Features",
+            parentProjectPath: "/projects/demo-project",
+            workspaces: [],
+          },
+        ],
+      ]),
+    });
+    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={
+          new Map([["/projects/demo-project", [sectionScoped, staleScoped]]])
+        }
+        workspaceRecency={{ "in-section": Date.now(), "stale-section": Date.now() }}
+      />
+    );
+
+    // A valid sub-project reference badges with the sub-project's identity;
+    // a stale (deleted) reference falls back to the parent project badge.
+    expect(
+      within(view.getByTestId(agentItemTestId("in-section"))).getByText("Features")
+    ).toBeTruthy();
+    expect(
+      within(view.getByTestId(agentItemTestId("stale-section"))).getByText("Demo")
+    ).toBeTruthy();
+  });
+
   test("coalesces best-of children into a task group in the flat list", () => {
     const parentWorkspace = {
       ...createWorkspace("parent", { title: "Parent workspace" }),
