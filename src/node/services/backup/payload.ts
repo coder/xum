@@ -1218,14 +1218,11 @@ const SHELL_WORD = new RegExp(
 const ASSIGNMENT_START = new RegExp(`^${ASSIGNMENT_NAME}`);
 
 /**
- * A parameter expansion that can turn into nothing at runtime: an unset variable. No
- * plain `$NAME` can gain a value mid-command without an assignment the redaction
- * already rewrites, so deletion models its only dangerous runtime faithfully. Every
- * special parameter is a carrier instead: positionals and `$@`/`$*`/`$!` because the
- * command string can populate them first (`set -- p`, `&`), and the always-set ones
- * ($0, $?, $#, $$, $-) because their expansions produce token-charset output
- * (`ghp_...$#` runs with a trailing `0`) that completes a credential no textual scan
- * of the spelling reconstructs.
+ * A parameter expansion that can turn into nothing at runtime: an unset variable.
+ * Deleting it models the vanish-splice (`ghp_aaa$NOPE"bbb"` joins around the expansion
+ * the quote boundary ends). Redaction localizes every command holding an active
+ * expansion before anything publishes, so this deletion survives only as the
+ * backstop's independent model of that splice over the finished payload.
  */
 const SIMPLE_EXPANSION = /^\$[A-Za-z_][A-Za-z0-9_]*/;
 
@@ -1548,8 +1545,12 @@ function hasDisguisedAssignment(redacted: string): boolean {
 /**
  * The undecidable constructs, detected only where the shell parses them. An expansion
  * body can carry arbitrary bytes into one runtime word (`TOKEN$(printf =hunter2)`,
- * `$'TOKEN\x3d...'`, legacy arithmetic `TOKEN$[0]=...`), and `$!` depends on
- * execution state, so any of them makes assignment detection undecidable. A
+ * `$'TOKEN\x3d...'`, legacy arithmetic `TOKEN$[0]=...`), and every parameter
+ * expansion depends on execution state the words cannot show: the command itself can
+ * fill `$1` (`set -- p`) or a plain `$X` with no assignment word to rewrite
+ * (`for X in p`, `printf -v X p`), so `gh$X'_'...` runs as a contiguous credential
+ * no scan of the spelling reconstructs. Any of them makes assignment detection
+ * undecidable. A
  * here-document or here-string feeds the consumer a body under document rules the word
  * scans would misread. Process substitution passes bytes by file, ambiguous once an
  * assignment matched. Single-quoted, escaped, and commented spellings are inert
@@ -1585,7 +1586,7 @@ function findActiveShellConstructs(command: string): {
           continue;
         }
         if (command[j] === "`") found.carrier = true;
-        if (command[j] === "$" && "({[!0123456789@*#?$-".includes(command[j + 1] ?? "")) {
+        if (command[j] === "$" && /[({[!0-9@*#?$A-Za-z_-]/.test(command[j + 1] ?? "")) {
           found.carrier = true;
         }
         j += 1;
@@ -1608,7 +1609,7 @@ function findActiveShellConstructs(command: string): {
       continue;
     }
     if (char === "$") {
-      if ("({['\"!0123456789@*#?$-".includes(command[i + 1] ?? "")) found.carrier = true;
+      if (/[({['"!0-9@*#?$A-Za-z_-]/.test(command[i + 1] ?? "")) found.carrier = true;
       i += 1;
       wordStart = false;
       continue;
@@ -2059,8 +2060,10 @@ export async function createBackupPayload(
             // survives execution) and manufacture a match from a harmless command.
             const words = executedShellWords(text);
             targets.push(words.map((word) => unquoteShellWord(word)).join(" "));
-            // A simple parameter expansion that is unset at runtime vanishes
-            // (`ghp_...$9123...`), splicing the fragments around it into one token.
+            // A simple parameter expansion that is unset at runtime vanishes,
+            // splicing the fragments around it into one token. Redaction localizes
+            // active expansions before publication; this pass is the backstop's own
+            // model of the same splice, independent of that layer.
             targets.push(words.map((word) => unquoteShellWord(word, true)).join(" "));
             // Pathname expansion can hand the process a token a deterministic glob
             // spelling hides, and the published text collapses the same way for any
