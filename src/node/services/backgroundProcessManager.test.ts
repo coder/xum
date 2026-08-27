@@ -375,7 +375,9 @@ describe("BackgroundProcessManager", () => {
       expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(1);
 
       const changedWorkspaceIds: string[] = [];
+      const stoppedEvents: MonitorStoppedPayload[] = [];
       manager.on("change", (wsId) => changedWorkspaceIds.push(wsId));
+      manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
       // Simulate a runtime read failure (e.g. dropped SSH connection) inside the tail loop.
       // Reject per-call (not mockRejectedValue) so no eagerly-created rejected promise
       // sits unhandled before the tail loop consumes it.
@@ -392,6 +394,11 @@ describe("BackgroundProcessManager", () => {
       // activity consumers (sidebar watching indicator) can clear.
       expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(0);
       expect(changedWorkspaceIds).toContain(testWorkspaceId);
+      expect(stoppedEvents).toContainEqual({
+        processId: result.processId,
+        reason: "failed",
+        failureMessage: "read failure",
+      });
     });
 
     describe("armed/stopped registry events", () => {
@@ -484,7 +491,7 @@ describe("BackgroundProcessManager", () => {
         });
         expect(terminated.success).toBe(true);
         if (!terminated.success) return;
-        await manager.terminate(terminated.processId);
+        await manager.terminate(terminated.processId, { monitorDisposition: "discard" });
         expect(events.stopped).toContainEqual({
           workspaceId: testWorkspaceId,
           payload: { processId: terminated.processId, reason: "canceled" },
@@ -584,7 +591,7 @@ describe("BackgroundProcessManager", () => {
       }
       expect(proc?.monitor?.pendingLines).toEqual(["FAILED pending"]);
 
-      await manager.terminate(result.processId);
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
       await new Promise((resolve) => setTimeout(resolve, 50));
 
       expect(matches).toHaveLength(0);
@@ -670,7 +677,7 @@ describe("BackgroundProcessManager", () => {
       expect(proc?.outputBytesRead ?? 0).toBeGreaterThanOrEqual(proc?.monitor?.lastReadOffset ?? 0);
 
       // Force the deferred flush. The cursor has caught up, so it must drop instead of waking.
-      await manager.terminate(result.processId);
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
       expect(matchCount).toBe(0);
 
       manager.off("monitor:match", handler);
@@ -759,7 +766,7 @@ describe("BackgroundProcessManager", () => {
       if (output.success) expect(output.output).toContain("ERR foo");
 
       // The agent has been shown through the matched line, so the deferred flush must drop.
-      await manager.terminate(result.processId);
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
       expect(matchCount).toBe(0);
 
       manager.off("monitor:match", handler);
@@ -891,7 +898,7 @@ describe("BackgroundProcessManager", () => {
       // The delivery gate therefore still treats the filtered-out ERR line as unshown.
       expect(await manager.getSettledShownThroughOffset(result.processId)).toBe(0);
 
-      await manager.terminate(result.processId);
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
     });
 
     it("strips ANSI before matching and emitting matched lines", async () => {
@@ -1116,7 +1123,7 @@ describe("BackgroundProcessManager", () => {
         expect(result.success).toBe(true);
         if (!result.success) return;
 
-        await manager.terminate(result.processId);
+        await manager.terminate(result.processId, { monitorDisposition: "discard" });
         await new Promise((resolve) => setTimeout(resolve, 400));
 
         expect(matchEvents).toHaveLength(0);
@@ -1551,7 +1558,7 @@ describe("BackgroundProcessManager", () => {
 
         await tailReadStartedPromise;
         // Explicit cancel (task_stop path) while the settlement helper awaits the tail read.
-        await manager.terminate(result.processId);
+        await manager.terminate(result.processId, { monitorDisposition: "discard" });
         releaseTail();
         await new Promise((resolve) => setTimeout(resolve, 300));
 
@@ -1800,7 +1807,7 @@ describe("BackgroundProcessManager", () => {
       expect(Date.now() - start).toBeLessThan(500);
       expect(settled).toBe(0);
 
-      await manager.terminate(result.processId);
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
       await filteredRead;
     });
 
@@ -1856,7 +1863,7 @@ describe("BackgroundProcessManager", () => {
       // No origin bound -> unconditional frontier, preserving the legacy-record fail path.
       expect(await manager.getSettledShownThroughOffset(result.processId)).toBe(0);
 
-      await manager.terminate(result.processId);
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
     });
   });
 
@@ -1926,7 +1933,9 @@ describe("BackgroundProcessManager", () => {
       });
 
       if (spawnResult.success) {
-        const terminateResult = await manager.terminate(spawnResult.processId);
+        const terminateResult = await manager.terminate(spawnResult.processId, {
+          monitorDisposition: "discard",
+        });
         expect(terminateResult.success).toBe(true);
 
         const proc = await manager.getProcess(spawnResult.processId);
@@ -1935,7 +1944,7 @@ describe("BackgroundProcessManager", () => {
     });
 
     it("should return error for non-existent process", async () => {
-      const result = await manager.terminate("bg-nonexistent");
+      const result = await manager.terminate("bg-nonexistent", { monitorDisposition: "discard" });
       expect(result.success).toBe(false);
     });
 
@@ -1946,10 +1955,14 @@ describe("BackgroundProcessManager", () => {
       });
 
       if (spawnResult.success) {
-        const result1 = await manager.terminate(spawnResult.processId);
+        const result1 = await manager.terminate(spawnResult.processId, {
+          monitorDisposition: "discard",
+        });
         expect(result1.success).toBe(true);
 
-        const result2 = await manager.terminate(spawnResult.processId);
+        const result2 = await manager.terminate(spawnResult.processId, {
+          monitorDisposition: "discard",
+        });
         expect(result2.success).toBe(true);
       }
     });
@@ -1971,7 +1984,9 @@ describe("BackgroundProcessManager", () => {
       expect(spawnResult.success).toBe(true);
       if (!spawnResult.success) return;
 
-      const terminateResult = await manager.terminate(spawnResult.processId);
+      const terminateResult = await manager.terminate(spawnResult.processId, {
+        monitorDisposition: "discard",
+      });
       expect(terminateResult.success).toBe(true);
 
       // Wait briefly for the trap to write the sentinel file.
@@ -2114,7 +2129,7 @@ describe("BackgroundProcessManager", () => {
 
       if (result.success) {
         // Terminate it
-        await manager.terminate(result.processId);
+        await manager.terminate(result.processId, { monitorDisposition: "discard" });
 
         // Status should be "killed", not "exited"
         const proc = await manager.getProcess(result.processId);
@@ -2131,7 +2146,7 @@ describe("BackgroundProcessManager", () => {
 
       if (result.success) {
         // Terminate it (sends SIGTERM, then SIGKILL after 2s)
-        await manager.terminate(result.processId);
+        await manager.terminate(result.processId, { monitorDisposition: "discard" });
 
         const proc = await manager.getProcess(result.processId);
         expect(proc).not.toBeNull();
@@ -2166,7 +2181,7 @@ describe("BackgroundProcessManager", () => {
       expect(procBefore?.status).toBe("running");
 
       // Terminate - this should kill both parent and child via process group
-      await manager.terminate(result.processId);
+      await manager.terminate(result.processId, { monitorDisposition: "discard" });
 
       // Verify parent is killed
       const procAfter = await manager.getProcess(result.processId);

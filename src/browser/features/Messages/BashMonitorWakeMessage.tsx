@@ -40,11 +40,19 @@ function summarizeRecords(records: BashMonitorWakeDisplayRecord[]): string {
   if (records.length === 1) {
     const record = records[0];
     return record.kind === "monitor-lost"
-      ? `${record.displayName} monitor stopped after restart`
+      ? record.lostReason === "runtime-failure"
+        ? `${record.displayName} monitor failed`
+        : `${record.displayName} monitor stopped after restart`
       : summarizeTerminal(record);
   }
 
   const matchRecords = records.filter((record) => record.kind === "match");
+  const runtimeFailureRecords = records.filter(
+    (record) => record.kind === "monitor-lost" && record.lostReason === "runtime-failure"
+  );
+  const restartLostRecords = records.filter(
+    (record) => record.kind === "monitor-lost" && record.lostReason !== "runtime-failure"
+  );
   if (matchRecords.length === records.length) {
     if (matchRecords.every((record) => settlementOf(record) != null)) {
       return `${records.length} background processes finished`;
@@ -54,7 +62,10 @@ function summarizeRecords(records: BashMonitorWakeDisplayRecord[]): string {
     }
     return `${records.length} background monitors matched`;
   }
-  if (matchRecords.length === 0) {
+  if (runtimeFailureRecords.length === records.length) {
+    return `${records.length} background monitors failed`;
+  }
+  if (restartLostRecords.length === records.length) {
     return `${records.length} background monitors stopped after restart`;
   }
   return `${records.length} background monitor updates`;

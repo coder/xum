@@ -2077,6 +2077,28 @@ export class WorkspaceService extends EventEmitter {
     this.bashMonitorHistoryLocks
       .withLock(workspaceId, () =>
         this.bashMonitorRegistryLocks.withLock(`${workspaceId}:${payload.processId}`, async () => {
+          if (payload.reason === "failed") {
+            const consumed = await this.bashMonitorRegistryStore.consumeIfArmedBefore(
+              workspaceId,
+              payload.processId,
+              Number.MAX_SAFE_INTEGER,
+              async (record) => {
+                await this.bashMonitorWakeStore.enqueueMonitorLost(
+                  {
+                    ...record,
+                    lostReason: "runtime-failure",
+                    ...(payload.failureMessage != null
+                      ? { failureMessage: payload.failureMessage }
+                      : {}),
+                  },
+                  Number.MAX_SAFE_INTEGER
+                );
+              }
+            );
+            if (consumed != null) this.scheduleBashMonitorWakeDrain(workspaceId);
+            return;
+          }
+
           // Consume the persist-failure flag under the lock (it is set inside the match
           // handler's locked block, which this block queues behind). When the settlement wake
           // failed to persist, the armed-registry row is the only remaining breadcrumb: retain
@@ -2428,18 +2450,22 @@ export class WorkspaceService extends EventEmitter {
             // Defensive: monitors armed after this service was constructed belong to the
             // live manager; its own retirement events maintain their registry records.
             if (Date.parse(record.createdAt) >= this.constructedAtMs) continue;
-            // Consume-then-enqueue runs under the same workspace + per-key locks as live lifecycle
-            // listeners, so destructive clears cannot lose or resurrect recovered monitor notices.
+            // Persist-then-remove runs under the same workspace + per-key locks as live lifecycle
+            // listeners, so a failed wake write leaves the stale registry row available to retry.
             await this.bashMonitorRegistryLocks.withLock(
               `${ownerWorkspaceId}:${record.processId}`,
               async () => {
-                const consumed = await this.bashMonitorRegistryStore.consumeIfArmedBefore(
+                await this.bashMonitorRegistryStore.consumeIfArmedBefore(
                   ownerWorkspaceId,
                   record.processId,
-                  this.constructedAtMs
+                  this.constructedAtMs,
+                  async (consumed) => {
+                    await this.bashMonitorWakeStore.enqueueMonitorLost(
+                      consumed,
+                      this.constructedAtMs
+                    );
+                  }
                 );
-                if (consumed == null) return;
-                await this.bashMonitorWakeStore.enqueueMonitorLost(consumed, this.constructedAtMs);
               }
             );
           }
@@ -13961,7 +13987,9 @@ export class WorkspaceService extends EventEmitter {
       return Err(`Process ${processId} does not belong to workspace ${workspaceId}`);
     }
 
-    const result = await this.backgroundProcessManager.terminate(processId);
+    const result = await this.backgroundProcessManager.terminate(processId, {
+      monitorDisposition: "discard",
+    });
     if (!result.success) {
       return Err(result.error);
     }

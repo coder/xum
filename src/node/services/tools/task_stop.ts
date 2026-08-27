@@ -147,8 +147,12 @@ export const createTaskStopTool: ToolFactory = (config: ToolConfiguration) => {
                   return { status: "invalid_scope" as const, taskId };
                 }
 
-                const terminateResult =
-                  await config.backgroundProcessManager.terminate(maybeProcessId);
+                const terminateResult = await config.backgroundProcessManager.terminate(
+                  maybeProcessId,
+                  {
+                    monitorDisposition: "discard",
+                  }
+                );
                 if (!terminateResult.success) {
                   return { status: "error" as const, taskId, error: terminateResult.error };
                 }

@@ -553,6 +553,29 @@ This is a condition-driven wake-up. Continue from this event.`;
     expect(queryByText("auto")).toBeNull();
   });
 
+  test("distinguishes runtime monitor failure from restart loss", () => {
+    const message = createWakeMessage();
+    if (message.type !== "user") throw new Error("expected user message");
+    message.bashMonitorWake = {
+      records: [
+        {
+          kind: "monitor-lost",
+          lostReason: "runtime-failure",
+          displayName: "Checks Watch",
+          filter: "All checks|passed|ready",
+          filterExclude: false,
+        },
+      ],
+    };
+    const { getByText } = render(
+      <TooltipProvider>
+        <MessageRenderer message={message} />
+      </TooltipProvider>
+    );
+
+    expect(getByText("Checks Watch monitor failed")).toBeDefined();
+  });
+
   test("summarizes a settlement wake with the terminal status", () => {
     const message = createWakeMessage();
     if (message.type !== "user") throw new Error("expected user message");

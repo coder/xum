@@ -4008,6 +4008,40 @@ describe("BashMonitorWakeStore", () => {
     expect(pending[0].kind).toBe("match");
   });
 
+  test("legacy monitor-lost records without lostReason default to restart", async () => {
+    const config = makeConfig(rootDir);
+    const store = new BashMonitorWakeStore(config);
+    const dir = path.join(config.getSessionDir("owner-1"), "bash-monitor-wakes");
+    await fsPromises.mkdir(dir, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(dir, "proc-legacy-lost.json"),
+      JSON.stringify({
+        id: "proc-legacy-lost",
+        ownerWorkspaceId: "owner-1",
+        processId: "proc-legacy-lost",
+        taskId: "bash:proc-legacy-lost",
+        filter: "ERROR",
+        filterExclude: false,
+        kind: "monitor-lost",
+        script: "echo hi",
+        lines: [],
+        totalMatches: 0,
+        droppedLines: 0,
+        status: "pending",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      }),
+      "utf-8"
+    );
+
+    const pending = await store.listPending("owner-1");
+    expect(pending[0].lostReason).toBeUndefined();
+    expect(buildBashMonitorWakePrompt(pending)).toStartWith(
+      "Xum restarted and background bash monitors were lost."
+    );
+    expect(buildBashMonitorWakeMetadata(pending).records[0].lostReason).toBe("restart");
+  });
+
   test("enqueueMonitorLost creates a pending monitor-lost record with the script", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueMonitorLost(
@@ -4025,8 +4059,30 @@ describe("BashMonitorWakeStore", () => {
     const pending = await store.listPending("owner-1");
     expect(pending).toHaveLength(1);
     expect(pending[0].kind).toBe("monitor-lost");
+    expect(pending[0].lostReason).toBe("restart");
     expect(pending[0].script).toBe("while true; do echo tick; sleep 5; done");
     expect(pending[0].lines).toEqual([]);
+  });
+
+  test("enqueueMonitorLost persists runtime failure details", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueMonitorLost(
+      {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        ownerWorkspaceId: "owner-1",
+        filter: "ERROR",
+        filterExclude: false,
+        script: "run-thing --watch",
+        lostReason: "runtime-failure",
+        failureMessage: "read failed",
+      },
+      TREAT_ALL_AS_STALE()
+    );
+
+    const pending = await store.listPending("owner-1");
+    expect(pending[0].lostReason).toBe("runtime-failure");
+    expect(pending[0].failureMessage).toBe("read failed");
   });
 
   test("enqueueOrMergePending replaces a pending monitor-lost record instead of merging", async () => {
@@ -4749,6 +4805,33 @@ describe("buildBashMonitorWakePrompt", () => {
     expect(prompt).toContain("> late line");
   });
 
+  test("runtime monitor failures stay awaitable and use the failure heading", () => {
+    const prompt = buildBashMonitorWakePrompt([
+      {
+        id: "proc-failed",
+        ownerWorkspaceId: "owner-1",
+        processId: "proc-failed",
+        taskId: "bash:proc-failed",
+        filter: "ERROR",
+        filterExclude: false,
+        kind: "monitor-lost",
+        script: "run-thing --watch",
+        lostReason: "runtime-failure",
+        failureMessage: "read failure",
+        lines: [],
+        totalMatches: 0,
+        droppedLines: 0,
+        status: "pending",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+
+    expect(prompt).toStartWith("A background bash monitor failed at runtime.");
+    expect(prompt).toContain("the process may still be running. Failure: read failure");
+    expect(prompt).toContain('task_await({ task_ids: ["bash:proc-failed"], timeout_secs: 0 })');
+  });
+
   const terminalRecordBase = {
     ownerWorkspaceId: "owner-1",
     filter: "READY",
@@ -4876,6 +4959,31 @@ describe("buildBashMonitorWakePrompt", () => {
 });
 
 describe("buildBashMonitorWakeMetadata", () => {
+  test("carries monitor loss reason per record", () => {
+    const metadata = buildBashMonitorWakeMetadata([
+      {
+        id: "proc-failed",
+        ownerWorkspaceId: "owner-1",
+        processId: "proc-failed",
+        taskId: "bash:proc-failed",
+        displayName: "Checks Watch",
+        filter: "READY",
+        filterExclude: false,
+        kind: "monitor-lost",
+        script: "run-thing --watch",
+        lostReason: "runtime-failure",
+        lines: [],
+        totalMatches: 0,
+        droppedLines: 0,
+        status: "pending",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+
+    expect(metadata.records[0].lostReason).toBe("runtime-failure");
+  });
+
   test("carries terminal settlement metadata per record", () => {
     const metadata = buildBashMonitorWakeMetadata([
       {

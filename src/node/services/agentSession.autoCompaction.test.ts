@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 
 import type {
@@ -49,11 +49,13 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
     const workspaceId = "ws-auto-compaction-snapshot-deferral";
 
     const streamMessage = mock((_history: MuxMessage[]) => Promise.resolve(Ok(undefined)));
-    const { session, historyService, events } = await createSessionHarness({
-      workspaceId,
-      streamMessage: streamMessage as unknown as AIService["streamMessage"],
-      captureEvents: true,
-    });
+    const { session, historyService, events, backgroundProcessManager } =
+      await createSessionHarness({
+        workspaceId,
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        captureEvents: true,
+      });
+    const cleanupSpy = spyOn(backgroundProcessManager, "cleanup");
 
     const syntheticSnapshot = createMuxMessage(
       "file-snapshot-1",
@@ -127,6 +129,7 @@ describe("AgentSession on-send auto-compaction snapshot deferral", () => {
         message.id === "file-snapshot-1"
     );
     expect(emittedSnapshot).toBe(false);
+    expect(cleanupSpy).not.toHaveBeenCalled();
 
     session.dispose();
   });

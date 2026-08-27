@@ -4033,17 +4033,8 @@ export class AgentSession {
           );
           return Ok(undefined);
         }
-        // If this is a compaction request, terminate background processes first.
-        // They won't be included in the summary, so continuing with orphaned processes would be confusing.
-        const isCompactionStreamRequest = isCompactionRequest || autoCompactionMessage !== null;
-        if (isCompactionStreamRequest && !this.keepBackgroundProcesses) {
-          await this.backgroundProcessManager.cleanup(this.workspaceId);
-
-          if (this.disposed) {
-            return Ok(undefined);
-          }
-        }
-
+        // Background processes are workspace-scoped, not context-scoped. Compaction must preserve
+        // processes, monitors, and queued wakes so a waiting agent is not stranded.
         // Note: Follow-up content for compaction is now stored on the summary message
         // and dispatched via dispatchPendingFollowUp() after compaction completes.
         // This provides crash safety - the follow-up survives app restarts.

@@ -213,8 +213,9 @@ export interface MonitorArmedPayload {
 /** Emitted when a monitor retires normally (not during shutdown); deletes its registry record. */
 export interface MonitorStoppedPayload {
   processId: string;
-  /** Explicit cancellation discards pending matches; missing/normal retirement preserves them. */
-  reason?: "completed" | "canceled";
+  /** Explicit cancellation discards pending matches; failed retirement needs a durable lost wake. */
+  reason?: "completed" | "canceled" | "failed";
+  failureMessage?: string;
 }
 
 export interface BackgroundProcessMonitorState extends BackgroundProcessMonitorConfig {
@@ -567,7 +568,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   private stopMonitor(
     proc: BackgroundProcess,
     flushPending: boolean,
-    reason: NonNullable<MonitorStoppedPayload["reason"]> = "completed"
+    reason: NonNullable<MonitorStoppedPayload["reason"]> = "completed",
+    failureMessage?: string
   ): void {
     const monitor = proc.monitor;
     if (!monitor || monitor.stopped) return;
@@ -589,7 +591,11 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // this process, so its armed-registry record must go. During shutdown the record must
     // survive so the next startup can deliver the "monitor lost" notice.
     if (!this.shuttingDown) {
-      this.emit("monitor:stopped", proc.workspaceId, { processId: proc.id, reason });
+      this.emit("monitor:stopped", proc.workspaceId, {
+        processId: proc.id,
+        reason,
+        ...(failureMessage != null ? { failureMessage } : {}),
+      });
     }
     // Armed -> stopped is workspace-visible state (sidebar "watching" indicator), and not
     // every stop path also changes process status or flushes a match (e.g. maxEvents
@@ -987,12 +993,11 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     void this.monitorTailLoop(proc.id).catch((error: unknown) => {
       const current = this.processes.get(proc.id);
       if (current?.monitor && !current.monitor.stopped) {
-        // Route through stopMonitor so the retirement also clears any pending flush timer,
-        // emits "monitor:stopped" (registry cleanup), and broadcasts the change event so
-        // activity consumers see the armed-monitor count drop. No flush: the loop failed.
-        this.stopMonitor(current, false);
+        // No observer remains after this loop rejects. Stopping also makes later settlement claims
+        // no-op, so this failure wake is the only lifecycle notice even if the process exits later.
+        this.stopMonitor(current, true, "failed", getErrorMessage(error));
       }
-      log.debug(
+      log.warn(
         `BackgroundProcessManager: monitor tail for ${proc.id} failed: ${getErrorMessage(error)}`
       );
     });
@@ -2348,10 +2353,10 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    */
   async terminate(
     processId: string,
-    options?: { monitorDisposition?: "discard" | "flush" }
+    options: { monitorDisposition: "discard" | "flush" }
   ): Promise<{ success: true } | { success: false; error: string }> {
     log.debug(`BackgroundProcessManager.terminate(${processId}) called`);
-    const shouldFlushMonitor = options?.monitorDisposition === "flush";
+    const shouldFlushMonitor = options.monitorDisposition === "flush";
 
     // Get process from Map
     const proc = this.processes.get(processId);
@@ -2478,7 +2483,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     );
 
     // Terminate all running processes
-    await Promise.all(matching.map((p) => this.terminate(p.id)));
+    await Promise.all(matching.map((p) => this.terminate(p.id, { monitorDisposition: "discard" })));
 
     // Remove from memory (output dirs left on disk for OS/workspace cleanup)
     // All per-process state (outputBytesRead, outputLock) is stored in the

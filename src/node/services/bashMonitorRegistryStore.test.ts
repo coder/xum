@@ -122,6 +122,25 @@ describe("BashMonitorRegistryStore", () => {
     expect(await store.consumeIfArmedBefore("owner-1", "proc-missing", cutoffMs)).toBeNull();
   });
 
+  test("keeps a stale record when the pre-remove callback fails", async () => {
+    const store = new BashMonitorRegistryStore(makeConfig(rootDir));
+    const cutoffMs = Date.parse("2026-06-01T00:00:00.000Z");
+    await store.upsert(armedPayload({ createdAt: "2026-01-01T00:00:00.000Z" }));
+
+    let rejection: unknown;
+    try {
+      await store.consumeIfArmedBefore("owner-1", "proc-1", cutoffMs, () =>
+        Promise.reject(new Error("wake persistence failed"))
+      );
+    } catch (error) {
+      rejection = error;
+    }
+    expect(rejection).toBeInstanceOf(Error);
+    if (!(rejection instanceof Error)) throw new Error("expected callback rejection");
+    expect(rejection.message).toBe("wake persistence failed");
+    expect(await store.listAll("owner-1")).toHaveLength(1);
+  });
+
   test("bounds persisted script length", async () => {
     const store = new BashMonitorRegistryStore(makeConfig(rootDir));
     await store.upsert(armedPayload({ script: "x".repeat(10_000) }));

@@ -563,6 +563,8 @@ export interface BashMonitorWakeDisplayRecord {
   /** Persisted wake snapshot version; paired with processId for accepted-delivery recovery. */
   wakeUpdatedAt?: string;
   kind: "match" | "monitor-lost";
+  /** Missing on legacy monitor-lost records, which represent restart losses. */
+  lostReason?: "restart" | "runtime-failure";
   displayName: string;
   filter: string;
   filterExclude: boolean;

@@ -127,11 +127,14 @@ export class BashMonitorRegistryStore {
    * conversion into a wake. Re-reading + deleting under the same per-key lock as
    * upsert() guarantees callers only ever act on a stale (pre-boot) record: a live
    * replacement is left untouched and never produces a false monitor-lost wake.
+   * The callback runs while the record is still locked and durable. If it rejects,
+   * the registry row remains so recovery can retry without silently losing the monitor.
    */
   async consumeIfArmedBefore(
     ownerWorkspaceId: string,
     processId: string,
-    cutoffMs: number
+    cutoffMs: number,
+    beforeRemove?: (record: BashMonitorRegistryRecord) => Promise<void>
   ): Promise<BashMonitorRegistryRecord | null> {
     assert(ownerWorkspaceId.trim().length > 0, "consumeIfArmedBefore requires ownerWorkspaceId");
     assert(processId.trim().length > 0, "consumeIfArmedBefore requires processId");
@@ -149,6 +152,7 @@ export class BashMonitorRegistryStore {
       }
       const current = this.parse(raw);
       if (current != null && Date.parse(current.createdAt) >= cutoffMs) return null;
+      if (current != null) await beforeRemove?.(current);
       // Malformed records are deleted as dead weight but yield null (nothing to enqueue).
       await fsPromises.rm(file, { force: true });
       return current;
