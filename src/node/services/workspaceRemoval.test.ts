@@ -8,6 +8,7 @@ import {
   targetMutationLockFilePath,
   withTargetMutationLock,
 } from "@/node/services/refinement/targetMutationLocks";
+import { scheduleAgentWorkflowRunReferenceRecordRetry } from "@/node/services/agentWorkflowRunReferences";
 import { acquireProcessFileLock, getProcessBirth } from "@/node/utils/concurrency/fileLock";
 import {
   healRemovalTombstonesForRegisteredWorkspaces,
@@ -21,6 +22,39 @@ import {
 } from "./workspaceRemoval";
 
 describe("workspaceRemoval", () => {
+  test("removal cancels pending sidecar record retries so they cannot recreate the session dir", async () => {
+    using tmp = new DisposableTempDir("workspace-removal-sidecar");
+    const rootDir = path.join(tmp.path, "xum-home");
+    const workspaceId = "ws-removal-sidecar";
+    const sessionDir = path.join(rootDir, "sessions", workspaceId);
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+
+    // A detached provenance retry armed before removal; on fire it would mkdir the session
+    // directory back into existence after the deletion below.
+    scheduleAgentWorkflowRunReferenceRecordRetry({
+      workspaceSessionDir: sessionDir,
+      runId: "wfr_removal_race",
+      createdAtMs: 1_000,
+      afterBoundaryMessageId: null,
+      retryDelaysMs: [100],
+    });
+
+    await removeSessionDirUnderMemoryLocks({
+      rootDir,
+      sessionDir,
+      workspaceId,
+      attemptId: "test-attempt-sidecar",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 350));
+
+    expect(
+      await fsPromises.access(sessionDir).then(
+        () => true,
+        () => false
+      )
+    ).toBe(false);
+  });
+
   test("deletion waits for a live memory writer, then tombstones and deletes (r61)", async () => {
     using tmp = new DisposableTempDir("workspace-removal-test");
     const rootDir = path.join(tmp.path, "xum-home");

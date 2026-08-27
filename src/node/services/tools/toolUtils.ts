@@ -8,8 +8,12 @@ import type { WorkflowRunAttachedEvent } from "@/common/types/stream";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import {
+  SIDECAR_MAINTENANCE_RETRY_DELAYS_MS,
   recordAgentWorkflowRunReference,
+  registerSidecarMaintenanceTimer,
   scheduleAgentWorkflowRunReferenceRecordRetry,
+  takeSidecarMaintenanceTimer,
+  trackSidecarMaintenanceWrite,
 } from "@/node/services/agentWorkflowRunReferences";
 import { log } from "@/node/services/log";
 import type { TaskService } from "@/node/services/taskService";
@@ -83,6 +87,65 @@ export async function emitWorkflowRunAttachedEvent(input: {
 }
 
 /**
+ * Repair a missing boundary snapshot in the background. A kernel launch from a decision-free
+ * history whose record-time boundary read failed persists a boundary-less entry, but the
+ * decision-free currentness branch accepts only an explicit verified-empty (null) snapshot,
+ * so without repair the run's terminal wake is permanently superseded once storage recovers.
+ * Rows never disappear outside a full clear (which retires the sidecar), so a history still
+ * verified-empty at repair time was also empty at launch and null is faithful launch
+ * provenance; a decision row seen at repair time may postdate the launch, so persisting it
+ * would overclaim currentness and the entry stays boundary-less (fail safe).
+ */
+function scheduleBoundarySnapshotRepair(input: {
+  workspaceSessionDir: string;
+  runId: string;
+  createdAtMs: number;
+  getBoundary: () => Promise<string | null>;
+  retryDelaysMs?: readonly number[] | null;
+  attempt?: number;
+}): void {
+  const retryDelaysMs = input.retryDelaysMs ?? SIDECAR_MAINTENANCE_RETRY_DELAYS_MS;
+  const attempt = input.attempt ?? 0;
+  const delayMs = retryDelaysMs[attempt];
+  if (delayMs == null) {
+    log.error("Giving up on workflow boundary snapshot repair after retries", {
+      runId: input.runId,
+      attempts: attempt,
+    });
+    return;
+  }
+  const key = `boundary:${input.runId}`;
+  const timer = setTimeout(() => {
+    if (!takeSidecarMaintenanceTimer(input.workspaceSessionDir, key, timer)) {
+      return;
+    }
+    const work = (async () => {
+      const boundary = await input.getBoundary();
+      if (boundary !== null) {
+        return;
+      }
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: input.workspaceSessionDir,
+        runId: input.runId,
+        createdAtMs: input.createdAtMs,
+        afterBoundaryMessageId: null,
+        onlyIfBoundaryAbsent: true,
+      });
+    })().catch((error: unknown) => {
+      log.warn("Workflow boundary snapshot repair failed", {
+        runId: input.runId,
+        attempt: attempt + 1,
+        error: getErrorMessage(error),
+      });
+      scheduleBoundarySnapshotRepair({ ...input, attempt: attempt + 1 });
+    });
+    trackSidecarMaintenanceWrite(input.workspaceSessionDir, work);
+  }, delayMs);
+  timer.unref?.();
+  registerSidecarMaintenanceTimer(input.workspaceSessionDir, key, timer);
+}
+
+/**
  * Persist agent provenance for a workflow run that outlives the current turn (background
  * start/resume, or a foreground run that backgrounded itself). TaskService reads these
  * references back so the run stays rediscoverable and its terminal result re-engages the agent.
@@ -121,6 +184,18 @@ export async function recordBackgroundWorkflowRunReference(
         runId,
         error: getErrorMessage(error),
       });
+      const workspaceId = config.workspaceId;
+      const getBoundaryMessageId =
+        taskService?.getWorkflowInvocationBoundaryMessageId?.bind(taskService);
+      if (workspaceId != null && getBoundaryMessageId != null) {
+        scheduleBoundarySnapshotRepair({
+          workspaceSessionDir,
+          runId,
+          createdAtMs,
+          getBoundary: () => getBoundaryMessageId(workspaceId, runId),
+          retryDelaysMs,
+        });
+      }
     }
   }
 

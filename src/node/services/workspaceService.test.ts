@@ -6302,12 +6302,18 @@ describe("WorkspaceService workflow invocation events", () => {
       };
       const session = sessionAccessor.getOrCreateSession(workspaceId);
       const emitSpy = spyOn(session, "emitChatEvent");
-      // A directory at the sidecar path makes retirement fail. Retirement runs BEFORE the
-      // truncation, so the failure must abort the whole clear: the transcript survives, the
-      // renderer sees no deletion, and no crash window exists in which the transcript is gone
-      // while the sidecar lives on.
-      const sidecarPath = path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json");
-      await fsPromises.mkdir(sidecarPath);
+      // A read-only session directory makes retirement fail (a directory at the sidecar path
+      // now self-heals instead). Retirement runs BEFORE the truncation, so the failure must
+      // abort the whole clear: the transcript survives, the renderer sees no deletion, and no
+      // crash window exists in which the transcript is gone while the sidecar lives on.
+      const sessionDir = config.getSessionDir(workspaceId);
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: sessionDir,
+        runId: "wfr_retirement_blocked",
+        createdAtMs: 1_150,
+        afterBoundaryMessageId: "manual-user",
+      });
+      await fsPromises.chmod(sessionDir, 0o555);
       try {
         const clearResult = await workspaceService.truncateHistory(workspaceId, 1.0);
         expect(clearResult.success).toBe(false);
@@ -6324,7 +6330,7 @@ describe("WorkspaceService workflow invocation events", () => {
         }
       } finally {
         emitSpy.mockRestore();
-        await fsPromises.rmdir(sidecarPath);
+        await fsPromises.chmod(sessionDir, 0o755);
       }
       workspaceService.disposeSession(workspaceId);
     } finally {
@@ -6408,6 +6414,58 @@ describe("WorkspaceService workflow invocation events", () => {
         )
       );
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a corrupt sidecar directory self-heals during a full clear", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-selfheal";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-selfheal",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user", "user", "hello", { timestamp: 1_000 })
+      );
+      // A directory at the known sidecar path is corruption (reads fail with EISDIR). The
+      // full clear must remove it and succeed, not fail identically on every retry and leave
+      // the workspace impossible to clear without manual session-storage repair.
+      const sidecarPath = path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json");
+      await fsPromises.mkdir(sidecarPath);
+      await fsPromises.writeFile(path.join(sidecarPath, "junk.txt"), "junk");
+
+      const clearResult = await workspaceService.truncateHistory(workspaceId, 1.0);
+      expect(clearResult.success).toBe(true);
+      expect(
+        await fsPromises.access(sidecarPath).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
       workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();

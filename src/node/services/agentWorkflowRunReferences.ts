@@ -29,24 +29,101 @@ const MAX_FUTURE_SKEW_MS = 60 * 60_000;
 
 const referenceFileLocks = new MutexMap<string>();
 
-// Detached record retries keyed by sidecar path and runId so lifecycle events can govern them:
-// a full clear cancels the path's retries so a stale retry cannot resurrect a retired
-// reference, and a retry only ever fills absence (onlyIfAbsent), so it cannot overwrite newer
-// provenance recorded by a later dispatch or workflow_resume.
-const pendingRecordRetryTimersByPath = new Map<
+// Detached sidecar maintenance (record retries, boundary-snapshot repairs) keyed by sidecar
+// path and a per-run key so lifecycle events can govern it: a full clear or workspace removal
+// cancels the path's timers and drains in-flight writes, so stale maintenance can neither
+// resurrect a retired reference nor recreate a deleted session directory, and maintenance
+// writes only ever fill gaps (onlyIfAbsent / onlyIfBoundaryAbsent), so they cannot overwrite
+// newer provenance recorded by a later dispatch or workflow_resume.
+const pendingSidecarMaintenanceTimersByPath = new Map<
   string,
   Map<string, ReturnType<typeof setTimeout>>
 >();
+const inFlightSidecarMaintenanceByPath = new Map<string, Set<Promise<unknown>>>();
 
-function cancelPendingRecordRetries(filePath: string): void {
-  const byRunId = pendingRecordRetryTimersByPath.get(filePath);
-  if (byRunId == null) {
-    return;
+/** Arm a maintenance timer; a newer schedule for the same key supersedes the older timer. */
+export function registerSidecarMaintenanceTimer(
+  workspaceSessionDir: string,
+  key: string,
+  timer: ReturnType<typeof setTimeout>
+): void {
+  const filePath = referencesPath(workspaceSessionDir);
+  let byKey = pendingSidecarMaintenanceTimersByPath.get(filePath);
+  if (byKey == null) {
+    byKey = new Map();
+    pendingSidecarMaintenanceTimersByPath.set(filePath, byKey);
   }
-  for (const timer of byRunId.values()) {
-    clearTimeout(timer);
+  const previous = byKey.get(key);
+  if (previous != null) {
+    clearTimeout(previous);
   }
-  pendingRecordRetryTimersByPath.delete(filePath);
+  byKey.set(key, timer);
+}
+
+/**
+ * Consume a fired maintenance timer. clearTimeout cannot stop a callback Node already
+ * dequeued, so registry identity is the authoritative cancellation signal: a
+ * cancelled-but-raced callback sees a mismatch and must abort.
+ */
+export function takeSidecarMaintenanceTimer(
+  workspaceSessionDir: string,
+  key: string,
+  timer: ReturnType<typeof setTimeout>
+): boolean {
+  const filePath = referencesPath(workspaceSessionDir);
+  const byKey = pendingSidecarMaintenanceTimersByPath.get(filePath);
+  if (byKey?.get(key) !== timer) {
+    return false;
+  }
+  byKey.delete(key);
+  if (byKey.size === 0) {
+    pendingSidecarMaintenanceTimersByPath.delete(filePath);
+  }
+  return true;
+}
+
+/** Track a maintenance write so cancelAgentWorkflowRunReferenceMaintenance can drain it. */
+export function trackSidecarMaintenanceWrite(
+  workspaceSessionDir: string,
+  work: Promise<unknown>
+): void {
+  const filePath = referencesPath(workspaceSessionDir);
+  let inFlight = inFlightSidecarMaintenanceByPath.get(filePath);
+  if (inFlight == null) {
+    inFlight = new Set();
+    inFlightSidecarMaintenanceByPath.set(filePath, inFlight);
+  }
+  inFlight.add(work);
+  const remove = () => {
+    inFlight.delete(work);
+    if (inFlight.size === 0) {
+      inFlightSidecarMaintenanceByPath.delete(filePath);
+    }
+  };
+  work.then(remove, remove);
+}
+
+/**
+ * Cancel this sidecar's pending maintenance timers and drain writes already past their
+ * identity check, so a full clear or workspace removal cannot race a recreation of the file
+ * or the session directory it is about to delete. Must run BEFORE taking the sidecar file
+ * lock: an in-flight write acquires that same lock, so draining inside it would deadlock.
+ */
+export async function cancelAgentWorkflowRunReferenceMaintenance(
+  workspaceSessionDir: string
+): Promise<void> {
+  const filePath = referencesPath(workspaceSessionDir);
+  const byKey = pendingSidecarMaintenanceTimersByPath.get(filePath);
+  if (byKey != null) {
+    for (const timer of byKey.values()) {
+      clearTimeout(timer);
+    }
+    pendingSidecarMaintenanceTimersByPath.delete(filePath);
+  }
+  const inFlight = inFlightSidecarMaintenanceByPath.get(filePath);
+  if (inFlight != null && inFlight.size > 0) {
+    await Promise.allSettled([...inFlight]);
+  }
 }
 
 function referencesPath(workspaceSessionDir: string): string {
@@ -151,9 +228,12 @@ export async function readAgentWorkflowRunReferences(
  */
 export async function clearAgentWorkflowRunReferences(workspaceSessionDir: string): Promise<void> {
   const filePath = referencesPath(workspaceSessionDir);
+  await cancelAgentWorkflowRunReferenceMaintenance(workspaceSessionDir);
   await referenceFileLocks.withLock(filePath, async () => {
-    cancelPendingRecordRetries(filePath);
-    await fs.rm(filePath, { force: true });
+    // recursive: a directory at this known sidecar path is corruption (it also fails reads
+    // with EISDIR), and force alone refuses to remove directories, which would fail every
+    // subsequent full clear identically. Removing it self-heals the workspace.
+    await fs.rm(filePath, { force: true, recursive: true });
   });
 }
 
@@ -164,6 +244,12 @@ export async function recordAgentWorkflowRunReference(input: {
   afterBoundaryMessageId?: string | null;
   /** Fill-absence mode for detached retries: an existing entry (any newer record) wins. */
   onlyIfAbsent?: boolean;
+  /**
+   * Boundary-repair mode: only patch an entry that exists and still lacks a boundary
+   * snapshot. A missing entry means the reference was retired (clear/removal) and must not be
+   * resurrected; a present boundary means newer provenance already landed.
+   */
+  onlyIfBoundaryAbsent?: boolean;
 }): Promise<void> {
   assert(input.runId.length > 0, "agent workflow reference requires runId");
   const filePath = referencesPath(input.workspaceSessionDir);
@@ -180,6 +266,12 @@ export async function recordAgentWorkflowRunReference(input: {
     const createdAtMs = Math.min(input.createdAtMs ?? Date.now(), Date.now());
     const previous = byRunId.get(input.runId);
     if (input.onlyIfAbsent === true && previous != null) {
+      return;
+    }
+    if (
+      input.onlyIfBoundaryAbsent === true &&
+      (previous == null || previous.afterBoundaryMessageId !== undefined)
+    ) {
       return;
     }
     byRunId.set(input.runId, {
@@ -203,8 +295,8 @@ export async function recordAgentWorkflowRunReference(input: {
   });
 }
 
-// Delays for detached record retries; see scheduleAgentWorkflowRunReferenceRecordRetry.
-const RECORD_REFERENCE_RETRY_DELAYS_MS: readonly number[] = [1_000, 10_000, 60_000];
+// Delays for detached sidecar maintenance (record retries, boundary-snapshot repairs).
+export const SIDECAR_MAINTENANCE_RETRY_DELAYS_MS: readonly number[] = [1_000, 10_000, 60_000];
 
 /**
  * Retry a failed provenance record in the background. The launching tool has already returned
@@ -221,7 +313,7 @@ export function scheduleAgentWorkflowRunReferenceRecordRetry(input: {
   retryDelaysMs?: readonly number[] | null;
   attempt?: number;
 }): void {
-  const retryDelaysMs = input.retryDelaysMs ?? RECORD_REFERENCE_RETRY_DELAYS_MS;
+  const retryDelaysMs = input.retryDelaysMs ?? SIDECAR_MAINTENANCE_RETRY_DELAYS_MS;
   const attempt = input.attempt ?? 0;
   const delayMs = retryDelaysMs[attempt];
   if (delayMs == null) {
@@ -231,21 +323,14 @@ export function scheduleAgentWorkflowRunReferenceRecordRetry(input: {
     });
     return;
   }
-  const filePath = referencesPath(input.workspaceSessionDir);
+  const key = `record:${input.runId}`;
   const timer = setTimeout(() => {
-    const byRunId = pendingRecordRetryTimersByPath.get(filePath);
-    // clearTimeout cannot stop a callback Node already dequeued; registry identity is the
-    // authoritative cancellation signal, so a cancelled-but-raced retry aborts here.
-    if (byRunId?.get(input.runId) !== timer) {
+    if (!takeSidecarMaintenanceTimer(input.workspaceSessionDir, key, timer)) {
       return;
-    }
-    byRunId.delete(input.runId);
-    if (byRunId.size === 0) {
-      pendingRecordRetryTimersByPath.delete(filePath);
     }
     // Detached by design: the launching tool already returned, so only this chain can finish
     // the write. Failures reschedule until the bounded delays are exhausted.
-    void recordAgentWorkflowRunReference({
+    const work = recordAgentWorkflowRunReference({
       workspaceSessionDir: input.workspaceSessionDir,
       runId: input.runId,
       createdAtMs: input.createdAtMs,
@@ -261,16 +346,8 @@ export function scheduleAgentWorkflowRunReferenceRecordRetry(input: {
       });
       scheduleAgentWorkflowRunReferenceRecordRetry({ ...input, attempt: attempt + 1 });
     });
+    trackSidecarMaintenanceWrite(input.workspaceSessionDir, work);
   }, delayMs);
   timer.unref?.();
-  let byRunId = pendingRecordRetryTimersByPath.get(filePath);
-  if (byRunId == null) {
-    byRunId = new Map();
-    pendingRecordRetryTimersByPath.set(filePath, byRunId);
-  }
-  const previousTimer = byRunId.get(input.runId);
-  if (previousTimer != null) {
-    clearTimeout(previousTimer);
-  }
-  byRunId.set(input.runId, timer);
+  registerSidecarMaintenanceTimer(input.workspaceSessionDir, key, timer);
 }
