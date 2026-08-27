@@ -4368,6 +4368,144 @@ describe("BashMonitorWakeStore", () => {
     expect(pending[0].totalMatches).toBe(1);
   });
 
+  test("enqueueMonitorLost merges carried failed-match lines into a same-generation pending match", async () => {
+    // Runtime-probe retirement can carry the FINAL flush whose monitor:match persistence
+    // failed. With an earlier flush already pending, the conversion must merge like the
+    // successful flush would have, not keep only the older lines.
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    const armedAt = new Date(Date.now() - 60_000).toISOString();
+    await store.enqueueOrMergePending(
+      payload({ lines: ["ERROR one"], totalMatches: 1, matchedThroughOffset: 10 })
+    );
+
+    await store.enqueueMonitorLost(
+      {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        ownerWorkspaceId: "owner-1",
+        filter: "ERROR",
+        filterExclude: false,
+        script: "watch.sh",
+        lostReason: "runtime-failure",
+        createdAt: armedAt,
+        lines: ["ERROR final"],
+        totalMatches: 2,
+        droppedLines: 3,
+        matchedThroughOffset: 50,
+      },
+      Number.MAX_SAFE_INTEGER
+    );
+
+    const pending = await store.listPending("owner-1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0].kind).toBe("monitor-lost");
+    expect(pending[0].lines).toEqual(["ERROR one", "ERROR final"]);
+    expect(pending[0].totalMatches).toBe(2);
+    expect(pending[0].droppedLines).toBe(3);
+    expect(pending[0].matchedThroughOffset).toBe(50);
+  });
+
+  test("enqueueMonitorLost does not re-append failed-match lines the flush already persisted", async () => {
+    // When the final flush DID persist before retirement, the pending record's frontier
+    // already covers the carried payload; appending again would duplicate the lines.
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    const armedAt = new Date(Date.now() - 60_000).toISOString();
+    await store.enqueueOrMergePending(
+      payload({ lines: ["ERROR one", "ERROR final"], totalMatches: 2, matchedThroughOffset: 50 })
+    );
+
+    await store.enqueueMonitorLost(
+      {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        ownerWorkspaceId: "owner-1",
+        filter: "ERROR",
+        filterExclude: false,
+        script: "watch.sh",
+        lostReason: "runtime-failure",
+        createdAt: armedAt,
+        lines: ["ERROR final"],
+        totalMatches: 2,
+        matchedThroughOffset: 50,
+      },
+      Number.MAX_SAFE_INTEGER
+    );
+
+    const pending = await store.listPending("owner-1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0].lines).toEqual(["ERROR one", "ERROR final"]);
+    expect(pending[0].droppedLines).toBe(0);
+  });
+
+  test("a retried lost conversion cannot double-merge the carried failed match", async () => {
+    // convertRuntimeFailureMonitorToWake retries when registry cleanup fails after the wake
+    // persisted; the second enqueue sees its own monitor-lost record and must be a no-op merge.
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    const armedAt = new Date(Date.now() - 60_000).toISOString();
+    await store.enqueueOrMergePending(
+      payload({ lines: ["ERROR one"], totalMatches: 1, matchedThroughOffset: 10 })
+    );
+    const lostPayload = {
+      processId: "proc-1",
+      taskId: "bash:proc-1",
+      ownerWorkspaceId: "owner-1",
+      filter: "ERROR",
+      filterExclude: false,
+      script: "watch.sh",
+      lostReason: "runtime-failure" as const,
+      createdAt: armedAt,
+      lines: ["ERROR final"],
+      totalMatches: 2,
+      droppedLines: 3,
+      matchedThroughOffset: 50,
+    };
+    await store.enqueueMonitorLost(lostPayload, Number.MAX_SAFE_INTEGER);
+    await store.enqueueMonitorLost(lostPayload, Number.MAX_SAFE_INTEGER);
+
+    const pending = await store.listPending("owner-1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0].lines).toEqual(["ERROR one", "ERROR final"]);
+    expect(pending[0].droppedLines).toBe(3);
+  });
+
+  test("the stale-terminal upgrade appends carried failed-match lines after the relabeled settle", async () => {
+    // Reaching the stale-terminal fall-through means the new generation's flush never
+    // persisted, so the carried lines are always fresh and belong after the old run's story.
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(
+      payload({
+        lines: ["[monitor] process settled: exited (code 1)"],
+        matchedThroughOffset: undefined,
+        terminal: { status: "exited", exitCode: 1 },
+      })
+    );
+
+    await store.enqueueMonitorLost(
+      {
+        processId: "proc-1",
+        taskId: "bash:proc-1",
+        ownerWorkspaceId: "owner-1",
+        filter: "ERROR",
+        filterExclude: false,
+        script: "watch.sh",
+        lostReason: "runtime-failure",
+        createdAt: new Date(Date.now() + 60_000).toISOString(),
+        lines: ["ERROR new-gen"],
+        totalMatches: 1,
+        matchedThroughOffset: 5,
+      },
+      Number.MAX_SAFE_INTEGER
+    );
+
+    const pending = await store.listPending("owner-1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0].kind).toBe("monitor-lost");
+    expect(pending[0].staleTerminal).toEqual({ status: "exited", exitCode: 1 });
+    expect(pending[0].lines).toHaveLength(2);
+    expect(pending[0].lines[0]).not.toContain("[monitor] process settled");
+    expect(pending[0].lines[1]).toBe("ERROR new-gen");
+  });
+
   test("enqueueMonitorLost refuses to upgrade a match record updated at/after the cutoff", async () => {
     // A pending match record touched after boot was produced (or merged into) by a live
     // re-armed monitor; writing a lost notice over it would mislabel live output as dead.

@@ -1719,6 +1719,29 @@ export class BashMonitorWakeStore {
           await this.write(record);
           return record;
         }
+        // A carried failedMatch (final flush whose monitor:match persistence failed) must
+        // merge into the pending record like the successful flush would have; keeping only
+        // the existing record would silently drop the newest matched lines from the failure
+        // prompt. Offset evidence dedupes it: when the final flush DID persist (or a prior
+        // conversion attempt already merged it and the caller retried), the record's frontier
+        // has advanced to the payload's, so appending again would duplicate the lines.
+        // Cross-generation offsets are incomparable, but reaching the stale-terminal branch
+        // means the new generation's flush never persisted (a successful merge clears
+        // `terminal`), so those lines are always fresh there.
+        const failedLines = payload.lines ?? [];
+        const mergeFailedMatch =
+          failedLines.length > 0 &&
+          (existing.terminal != null ||
+            existing.matchedThroughOffset == null ||
+            payload.matchedThroughOffset == null ||
+            payload.matchedThroughOffset > existing.matchedThroughOffset);
+        // Cross-generation fall-through: apply the re-arm preservation the crash preempted,
+        // so the lost notice cannot render the old run's settlement as the lost monitor's.
+        const baseLines =
+          existing.terminal != null ? existing.lines.map(relabelStaleSettleLine) : existing.lines;
+        const merged = mergeFailedMatch
+          ? boundLines([...baseLines, ...failedLines])
+          : { lines: baseLines, droppedLines: 0 };
         const record: BashMonitorWakeRecord = {
           ...existing,
           kind: "monitor-lost",
@@ -1727,14 +1750,27 @@ export class BashMonitorWakeStore {
           failureMessage: payload.failureMessage,
           failedOperations: payload.failedOperations,
           ...(payload.createdAt != null ? { monitorArmedAt: payload.createdAt } : {}),
-          // Cross-generation fall-through: apply the re-arm preservation the crash preempted,
-          // so the lost notice cannot render the old run's settlement as the lost monitor's.
-          ...(existing.terminal != null
+          lines: merged.lines,
+          ...(mergeFailedMatch
             ? {
-                staleTerminal: existing.terminal,
-                lines: existing.lines.map(relabelStaleSettleLine),
+                totalMatches: payload.totalMatches ?? existing.totalMatches,
+                droppedLines:
+                  existing.droppedLines + (payload.droppedLines ?? 0) + merged.droppedLines,
               }
             : {}),
+          // Same-generation frontiers are comparable, so the merged frontier advances to the
+          // newest match (mirrors enqueueOrMergePending). The stale-terminal branch keeps the
+          // old run's offset/createdAt binding: a generation-mismatched frontier fails the
+          // drain's shown check, so the whole record (including the appended lines) delivers.
+          ...(mergeFailedMatch && existing.terminal == null && payload.matchedThroughOffset != null
+            ? {
+                matchedThroughOffset: Math.max(
+                  existing.matchedThroughOffset ?? 0,
+                  payload.matchedThroughOffset
+                ),
+              }
+            : {}),
+          ...(existing.terminal != null ? { staleTerminal: existing.terminal } : {}),
           updatedAt: now,
         };
         delete record.terminal;
