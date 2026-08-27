@@ -1707,6 +1707,10 @@ describe("backup payload", () => {
     ["Python", "python3 ~/.xum/skills/launch.txt"],
     ["Node", "node /home/user/.xum/agents/launch.md"],
     ["Rscript", "Rscript ~/.mux/memory/global/launch.markdown"],
+    ["R attached file option", "R --file=/home/alice/.xum/skills/launch.txt"],
+    ["R separate file option", "R -f ~/.xum/skills/launch.txt"],
+    ["PHP attached file option", "php --file=/home/alice/.xum/skills/launch.mdx"],
+    ["PHP separate file option", "php -f ~/.mux/memory/global/launch.markdown"],
     ["Deno", "deno run --config deno.json 'C:\\Users\\me\\.xum\\skills\\launch.mdx'"],
   ] as const) {
     it(`localizes ${name} execution of auto-published documents`, async () => {
@@ -1971,6 +1975,9 @@ describe("backup payload", () => {
       "ruby -Ivendor app.rb",
       "php -cvendor/php.ini server.php",
       "Rscript server.R --port 8080",
+      "R --file=/tmp/server.R ~/.xum/skills/argument.txt",
+      "R -f /tmp/server.R ~/.xum/skills/argument.txt",
+      "php --file=/tmp/server.php ~/.xum/skills/argument.txt",
       "npx notes-mcp --port 8080",
       "npm exec notes-mcp -- --port 8080",
       "npm --prefix /tmp install exec -c",

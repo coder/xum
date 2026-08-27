@@ -1840,7 +1840,14 @@ const SHELL_REPARSE_EXECUTABLE_NAMES = new Set([
  * numeric `-0[octal]` switch before the eval letter (`-0e`). Which letters evaluate
  * is per-interpreter knowledge this table owns, unlike arbitrary programs' options.
  */
-const LANGUAGE_INTERPRETERS: Array<{ name: RegExp; evalWord: RegExp }> = [
+interface LanguageInterpreter {
+  name: RegExp;
+  evalWord: RegExp;
+  attachedScriptFile?: RegExp;
+  separateScriptFileOption?: RegExp;
+}
+
+const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   // Windows spellings count alongside the Unix names: the `py`/`pyw` launcher and the
   // windowed `pythonw`/`rubyw`/`wperl`/`php-win` builds run the same evaluation
   // grammars under different executable names. Short eval flags can follow only flags
@@ -1860,14 +1867,25 @@ const LANGUAGE_INTERPRETERS: Array<{ name: RegExp; evalWord: RegExp }> = [
   // through a shell. npm needs its `exec` subcommand tracked separately below.
   { name: /^npx$/, evalWord: /^(?:-c$|--call(?:=|$))/ },
   { name: /^deno$/, evalWord: /^eval$/ },
-  { name: /^(?:r|rscript)$/, evalWord: /^(?:-e$|--expression(?:=|$))/ },
+  {
+    name: /^r$/,
+    evalWord: /^(?:-e$|--expression(?:=|$))/,
+    attachedScriptFile: /^(?:--file=|-f)(.+)$/,
+    separateScriptFileOption: /^-f$/,
+  },
+  { name: /^rscript$/, evalWord: /^(?:-e$|--expression(?:=|$))/ },
   {
     name: /^w?perl[0-9.]*$/,
     evalWord: /^-(?:(?:0(?:x[0-9A-Fa-f]+|[0-7]*))|l[0-7]*|[acfnpsStTuUvVwWX])*[eE]/,
   },
   { name: /^rubyw?[0-9.]*$/, evalWord: /^-(?:(?:0[0-7]*|W[0-2]?)|[acdlnpsvwy])*e/ },
   // -r/-R run code; -B/-E execute begin/end code blocks around per-line runs.
-  { name: /^(?:php[0-9.]*|php-win)$/, evalWord: /^-[nq]*[rRBE]/ },
+  {
+    name: /^(?:php[0-9.]*|php-win)$/,
+    evalWord: /^-[nq]*[rRBE]/,
+    attachedScriptFile: /^(?:--file=|-f)(.+)$/,
+    separateScriptFileOption: /^(?:-f|--file)$/,
+  },
   // make evaluates recipes from an explicit makefile through a shell, and --eval/-E
   // evaluates the option operand as makefile syntax; plain target launchers stay portable.
   {
@@ -1935,10 +1953,17 @@ function hasDisguisedAssignment(redacted: string): boolean {
   let pendingGitRebaseOptions = false;
   let pendingDenoSubcommand = false;
   let pendingDenoRunScript = false;
+  let pendingScriptFileOperand = false;
   let evalOperandAmbiguous = false;
-  // A Set of the static table's RegExp instances: repeated interpreter words cannot
-  // grow it past the table size, keeping this lookup linear in command length.
-  const pendingEvalWords = new Set<RegExp>();
+  // Static table entries keep the pending set bounded, so repeated interpreter words
+  // cannot make these checks superlinear in command length.
+  const pendingLanguages = new Set<LanguageInterpreter>();
+
+  function clearInterpreterTracking(): void {
+    pendingLanguages.clear();
+    pendingScriptFileOperand = false;
+    evalOperandAmbiguous = false;
+  }
   for (const word of redacted.match(SHELL_WORD) ?? []) {
     if (CONSUMED_ASSIGNMENT.test(word)) continue;
     // Bash expands neither syntax from quoted or escaped text (`--config
@@ -1948,6 +1973,11 @@ function hasDisguisedAssignment(redacted: string): boolean {
     if (hasActiveBraceExpansion(activeWordProjection(word))) return true;
     if (hasNondeterministicGlob(word)) return true;
     const unquoted = unquoteShellWord(word);
+    if (pendingScriptFileOperand) {
+      const autoPublished = isAutoPublishedScriptOperand(unquoted);
+      clearInterpreterTracking();
+      if (autoPublished) return true;
+    }
     // GNU env reparses its split-string value even without an assignment or literal
     // whitespace, so this runs before the assignment-only exit below. Stop tracking at
     // its command operand: the target program may use -S for an ordinary option.
@@ -2032,15 +2062,31 @@ function hasDisguisedAssignment(redacted: string): boolean {
     if (SHELL_INTERPRETER_NAMES.has(executable)) return true;
     if (PROGRAM_OPERAND_INTERPRETER_NAMES.has(executable)) return true;
     if (SHELL_REPARSE_EXECUTABLE_NAMES.has(executable)) return true;
-    // An evaluation word after a language interpreter hands that grammar a script.
-    for (const pattern of pendingEvalWords) {
-      if (pattern.test(unquoted)) return true;
+    // Attached/separate R/PHP file options name the same script boundary as a
+    // positional operand, but their leading dash would otherwise look merely
+    // ambiguous. Either form ends tracking so later script arguments are not mistaken
+    // for code; an automatically published script localizes first.
+    let attachedScriptBoundary = false;
+    for (const pending of pendingLanguages) {
+      const script = pending.attachedScriptFile?.exec(unquoted)?.[1];
+      if (script !== undefined) {
+        if (isAutoPublishedScriptOperand(script)) return true;
+        attachedScriptBoundary = true;
+        break;
+      }
+      if (pending.separateScriptFileOption?.test(unquoted) === true) {
+        pendingScriptFileOperand = true;
+      }
+      // An evaluation word after a language interpreter hands that grammar a script.
+      if (pending.evalWord.test(unquoted)) return true;
     }
+    if (attachedScriptBoundary) clearInterpreterTracking();
+
     const language = LANGUAGE_INTERPRETERS.find((entry) => entry.name.test(executable));
     if (language) {
-      pendingEvalWords.add(language.evalWord);
+      pendingLanguages.add(language);
       evalOperandAmbiguous = false;
-    } else if (pendingEvalWords.size > 0) {
+    } else if (pendingLanguages.size > 0) {
       if (unquoted.startsWith("-")) {
         // An interpreter option may take a separate argument this scan cannot pair
         // (`python3 -W ignore -c x`), so from here a non-option word no longer
@@ -2056,7 +2102,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
         // operand: later dash-led words belong to that program (`python3 server.py
         // -c settings.toml` hands -c to server.py), so eval tracking ends here and
         // the file launchers this table intends to preserve stay portable.
-        pendingEvalWords.clear();
+        clearInterpreterTracking();
       }
     }
     // Option terminators end option parsing: past one even a dash-led word is an
