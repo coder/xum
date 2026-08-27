@@ -29,7 +29,6 @@ export interface EvalConfig {
   id: string;
   experiments: {
     programmaticToolCalling: boolean;
-    programmaticToolCallingExclusive?: boolean;
     rlm: boolean;
   };
   /** Optional prompting lever, sent as additionalSystemInstructions. */
@@ -236,13 +235,13 @@ export const CONFIGS: EvalConfig[] = [
     id: "flat-bash",
     experiments: { programmaticToolCalling: false, rlm: false },
   },
+  // PTC is exclusive-only (supplement mode measured ~2x flat tokens/cost and
+  // was removed): this measures the exclusive code_execution toolset without
+  // the persistent kernel.
   {
     id: "ptc-only",
     experiments: { programmaticToolCalling: true, rlm: false },
   },
-  // RLM is exclusive-only (supplement-mode RLM measured ~2x flat tokens/cost
-  // and was removed): the rlm flag alone yields the kernel-first exclusive
-  // toolset. The explicit exclusive flag is redundant but harmless.
   {
     id: "rlm-excl",
     experiments: { programmaticToolCalling: true, rlm: true },

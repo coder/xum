@@ -24,6 +24,10 @@ import {
 import { log } from "@/node/services/log";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import { assert } from "@/common/utils/assert";
+import {
+  DISABLE_PROJECT_AUTOMATION_ENV,
+  projectAutomationDisabled,
+} from "@/node/utils/projectAutomation";
 
 /**
  * Check whether the init hook should be skipped and log the reason.
@@ -46,6 +50,10 @@ export function shouldSkipInitHook(
       "Skipping .xum/init hook (project not trusted — should not reach here in normal flow)"
     );
     initLogger.logStep("Skipping .xum/init hook (project not trusted)");
+    return true;
+  }
+  if (projectAutomationDisabled()) {
+    initLogger.logStep(`Skipping .xum/init hook (${DISABLE_PROJECT_AUTOMATION_ENV}=1)`);
     return true;
   }
   return false;

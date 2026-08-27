@@ -95,6 +95,34 @@ describe("TOOL_DEFINITIONS", () => {
     }
   });
 
+  it("accepts workspace task args with an agent id", () => {
+    const parsed = TaskToolArgsSchema.safeParse({
+      kind: "workspace",
+      agentId: "plan",
+      prompt: "Plan a small change",
+      title: "Plan dogfood",
+    });
+
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.agentId).toBe("plan");
+    }
+  });
+
+  it("still rejects subagent_type for workspace tasks", () => {
+    const parsed = TaskToolArgsSchema.safeParse({
+      kind: "workspace",
+      subagent_type: "plan",
+      prompt: "Plan a small change",
+      title: "Plan dogfood",
+    });
+
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) {
+      expect(parsed.error.issues[0]?.path).toEqual(["subagent_type"]);
+    }
+  });
+
   it("rejects workspace task fanout until workspace handles support it", () => {
     expect(
       TaskToolArgsSchema.safeParse({

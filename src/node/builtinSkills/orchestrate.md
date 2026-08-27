@@ -121,7 +121,7 @@ Example dependency chain (schema download → generation):
 
 ## Background readiness monitors
 
-For PR/CI readiness that can continue after your turn ends, prefer bounded monitor tasks over parent-side polling. Read `background-monitors`, then launch independent monitors with `task({ run_in_background: true })` for CI/checks, mergeability, review arrival, or deployment health. Each monitor should poll internally with a deadline and call `agent_report` only on convergence, failure, state transition, or timeout. Use `bash({ run_in_background: true, monitor: ... })` only for line-oriented shell output watchers (dev-server logs, watch tests, compiler errors), not for GitHub/API polling.
+For PR/CI readiness that can continue after your turn ends, prefer bounded monitor tasks over parent-side polling. Read `background-monitors`, then launch independent monitors with `task({ run_in_background: true })` for CI/checks, mergeability, review arrival, or deployment health. Each monitor should poll internally with a deadline and call `agent_report` only on convergence, failure, state transition, or timeout. Use `bash({ run_in_background: true, monitor: ... })` only for line-oriented shell output watchers (dev-server logs, watch tests, compiler errors), not for GitHub/API polling; a monitored bash also wakes the owner when the process settles (exit, kill, timeout) unless `wake_on_exit: false`, the monitor was retired by `max_events`, or the task was explicitly cancelled via `task_stop`.
 
 ## Gate loop (verification)
 

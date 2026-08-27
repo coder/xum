@@ -1,3 +1,5 @@
+import { ERROR_MESSAGE_CLAMP_MAX_CHARS } from "@/constants/errors";
+
 /**
  * Extract a string message from an unknown error value.
  * Handles Error objects and other thrown values consistently.
@@ -48,4 +50,25 @@ export function getErrorMessage(error: unknown): string {
     current = current.cause;
   }
   return msg;
+}
+
+/**
+ * Clamp a pathologically long error message before it is persisted, sent over
+ * IPC, or rendered. Some AI SDK errors embed entire request payloads in their
+ * message: AI_TypeValidationError (surfaced via getErrorMessage's cause walk)
+ * includes the full JSON-serialized prompt, easily hundreds of KB. Keeps the
+ * head (error type + summary) and the tail (the actionable validation detail
+ * usually trails the payload dump).
+ */
+export function clampErrorMessage(
+  message: string,
+  maxChars: number = ERROR_MESSAGE_CLAMP_MAX_CHARS
+): string {
+  if (message.length <= maxChars) {
+    return message;
+  }
+  const tailChars = Math.floor(maxChars / 4);
+  const headChars = maxChars - tailChars;
+  const omitted = message.length - headChars - tailChars;
+  return `${message.slice(0, headChars)}\n… [${omitted} chars omitted] …\n${message.slice(message.length - tailChars)}`;
 }

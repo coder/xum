@@ -178,16 +178,35 @@ export const WorkspaceConfigSchema = z.object({
       "Initial prompt for a queued agent task (persisted only until the task actually starts).",
   }),
   taskExperiments: z
-    .object({
-      programmaticToolCalling: z.boolean().optional(),
-      programmaticToolCallingExclusive: z.boolean().optional(),
-      // RLM mode is stamped at spawn so child sessions keep RLM-gated features
-      // (persistent sandbox kernel, family messaging tools) across app restarts
-      // without depending on live frontend experiment state.
-      rlm: z.boolean().optional(),
-      advisorTool: z.boolean().optional(),
-      dynamicWorkflows: z.boolean().optional(),
-    })
+    .preprocess(
+      // Legacy alias: tasks stamped by builds where "PTC Exclusive Mode" was a
+      // separate experiment may carry only programmaticToolCallingExclusive.
+      // The merged PTC experiment activates exactly that posture, so the flag
+      // must map onto programmaticToolCalling on resumption instead of being
+      // stripped (which would silently drop PTC and make rlm inert). `true`
+      // wins over an explicit programmaticToolCalling: false because the old
+      // exclusive flag activated the posture regardless of the supplement flag.
+      (value) =>
+        typeof value === "object" &&
+        value !== null &&
+        (value as Record<string, unknown>).programmaticToolCallingExclusive === true
+          ? { ...value, programmaticToolCalling: true }
+          : value,
+      z.object({
+        programmaticToolCalling: z.boolean().optional(),
+        // Downgrade-compat mirror (see toPersistedTaskExperiments): retained
+        // through parsing and stamped alongside programmaticToolCalling so a
+        // downgraded build resumes the task in its exclusive posture instead
+        // of reading bare PTC as the removed (~2x cost) supplement mode.
+        programmaticToolCallingExclusive: z.boolean().optional(),
+        // RLM mode is stamped at spawn so child sessions keep RLM-gated features
+        // (persistent sandbox kernel, family messaging tools) across app restarts
+        // without depending on live frontend experiment state.
+        rlm: z.boolean().optional(),
+        advisorTool: z.boolean().optional(),
+        dynamicWorkflows: z.boolean().optional(),
+      })
+    )
     .optional()
     .meta({
       description: "Experiments inherited from parent for restart-safe resumptions.",

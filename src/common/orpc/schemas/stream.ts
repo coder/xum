@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { AgentIdSchema } from "./agentDefinition";
+import { AgentDefinitionScopeSchema, AgentIdSchema } from "./agentDefinition";
 import { OpenAIReasoningModeSchema, ThinkingLevelSchema } from "../../types/thinking";
 import { AgentModeSchema } from "../../types/mode";
 import { ChatUsageDisplaySchema } from "./chatStats";
@@ -64,10 +64,27 @@ export const OnChatModeSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("live") }),
 ]);
 
+/**
+ * Why a requested since-mode replay was downgraded to full replay.
+ * Ordered by check precedence: the first failing predicate wins.
+ */
+export const OnChatDowngradeReasonSchema = z.enum([
+  "cursor-row-missing",
+  "oldest-mismatch",
+  "fingerprint-mismatch",
+  "history-read-failed",
+]);
+
 export const CaughtUpMessageSchema = z.object({
   type: z.literal("caught-up"),
   /** Which replay strategy the server actually used. */
   replay: z.enum(["full", "since", "live"]).optional(),
+  /**
+   * Present only when the client requested since-mode and the server downgraded to
+   * full replay. Silent downgrades defeat incremental reconnects, so this must stay
+   * observable to clients and tests.
+   */
+  downgradeReason: OnChatDowngradeReasonSchema.optional(),
   /**
    * Authoritative pagination signal for full replays.
    * Omitted for since/live replays so the client can preserve existing pagination state.
@@ -738,21 +755,39 @@ export const ToolPolicySchema = z.array(ToolPolicyFilterSchema).meta({
 // Unknown keys (e.g. `goals` from older persisted send-options written
 // before the Goals experiment graduated to GA) are stripped by Zod's
 // default behavior, so we do not need to retain a deprecated field.
-export const ExperimentsSchema = z.object({
-  programmaticToolCalling: z.boolean().optional(),
-  programmaticToolCallingExclusive: z.boolean().optional(),
-  /**
-   * RLM mode (sub-experiment of Programmatic Tool Calling): persistent
-   * sandbox kernel for code_execution. Inert unless a PTC flag is also on.
-   */
-  rlm: z.boolean().optional(),
-  advisorTool: z.boolean().optional(),
-  dynamicWorkflows: z.boolean().optional(),
-  memory: z.boolean().optional(),
-  timeline: z.boolean().optional(),
-  workspaceHeartbeats: z.boolean().optional(),
-  toolSearch: z.boolean().optional(),
-});
+export const ExperimentsSchema = z.preprocess(
+  // Legacy alias: startup-retry snapshots persisted by builds where "PTC
+  // Exclusive Mode" was a separate experiment may carry only the exclusive
+  // flag; the merged PTC experiment activates exactly that posture (`true`
+  // wins over an explicit programmaticToolCalling: false).
+  (value) =>
+    typeof value === "object" &&
+    value !== null &&
+    (value as Record<string, unknown>).programmaticToolCallingExclusive === true
+      ? { ...value, programmaticToolCalling: true }
+      : value,
+  z.object({
+    programmaticToolCalling: z.boolean().optional(),
+    /**
+     * Downgrade-compat mirror (see withLegacyPtcExclusiveMirror): retained
+     * through parsing and stamped alongside programmaticToolCalling in
+     * persisted startup-retry snapshots so a downgraded build resumes in the
+     * exclusive posture instead of supplement mode.
+     */
+    programmaticToolCallingExclusive: z.boolean().optional(),
+    /**
+     * RLM mode (sub-experiment of Programmatic Tool Calling): persistent
+     * sandbox kernel for code_execution. Inert unless a PTC flag is also on.
+     */
+    rlm: z.boolean().optional(),
+    advisorTool: z.boolean().optional(),
+    dynamicWorkflows: z.boolean().optional(),
+    memory: z.boolean().optional(),
+    timeline: z.boolean().optional(),
+    workspaceHeartbeats: z.boolean().optional(),
+    toolSearch: z.boolean().optional(),
+  })
+);
 
 /**
  * `steer` is accepted for older clients, but the backend treats every manual
@@ -800,6 +835,49 @@ export const SendMessageOptionsSchema = z.object({
    * iterating on agent files - a broken agent in the worktree won't affect message sending.
    */
   disableWorkspaceAgents: z.boolean().optional(),
+  /**
+   * When truthy, a top-level send whose agentId cannot be resolved (or is hidden or
+   * disabled) at stream time fails loudly instead of silently falling back to exec.
+   * Workspace-turn launches with explicit agent overrides set this: pre-dispatch
+   * validation races init hooks and user edits, so stream-time resolution — which
+   * runs after initialization completes — is the last sound gate against running
+   * a different agent than the caller asked for. The object form additionally pins
+   * the validated definition's provenance: if the id resolves from a different
+   * scope than launch validation saw (e.g. a validated project shadow vanished and
+   * a global/built-in definition with the same id took over), the send fails
+   * instead of running a different prompt/tool policy. A single field (rather than
+   * a sibling flag) so every option-preservation path copies it verbatim.
+   */
+  strictAgentResolution: z
+    .union([
+      z.boolean(),
+      z.object({
+        expectedScope: AgentDefinitionScopeSchema,
+        /**
+         * Exact source identity from AgentDefinitionPackage.source ("built-in" or the
+         * discovery root). Scope alone collapses distinct candidates (project files
+         * and project plugins both report "project"), so this pins the definition
+         * itself when known.
+         */
+        expectedSource: z.string().optional(),
+        /**
+         * Provenance of the full resolved base chain (leaf first), pinned because
+         * stream-time inheritance resolution reloads every base independently — a
+         * vanished base shadow must not silently swap a different definition into
+         * the chain's prompt/tool policy.
+         */
+        expectedChain: z
+          .array(
+            z.object({
+              id: AgentIdSchema,
+              scope: AgentDefinitionScopeSchema,
+              source: z.string().optional(),
+            })
+          )
+          .optional(),
+      }),
+    ])
+    .optional(),
   /**
    * Desktop/app-only capability: expose set_goal so an agent can create a
    * continuation-backed goal for its current parent workspace. Headless callers

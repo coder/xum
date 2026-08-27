@@ -32,6 +32,8 @@ export interface NodeAgentDefinitionContext {
   runtime: Runtime;
   workspacePath: string;
   workspaceId: string;
+  /** agent-plugins experiment: also resolve definitions contributed by Agent Plugins. */
+  includeAgentPlugins?: boolean;
 }
 
 export interface ResolveNodeAgentAiSettingsParams {
@@ -134,7 +136,8 @@ async function loadDefinitionLayers(
     const agentDefinition = await readAgentDefinition(
       context.runtime,
       context.workspacePath,
-      agentId
+      agentId,
+      { includeAgentPlugins: context.includeAgentPlugins }
     );
     const chain = await resolveAgentInheritanceChain({
       runtime: context.runtime,
@@ -142,6 +145,7 @@ async function loadDefinitionLayers(
       agentId: agentDefinition.id,
       agentDefinition,
       workspaceId: context.workspaceId,
+      includeAgentPlugins: context.includeAgentPlugins,
     });
 
     return collectDefinitionLayers(agentId, chain);

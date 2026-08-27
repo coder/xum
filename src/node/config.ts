@@ -649,12 +649,36 @@ function normalizePersistedWorkspace(
     };
   const hasLegacyWorkflowSchedule = Object.hasOwn(persisted, "workflowSchedule");
   const hasBestOf = Object.hasOwn(persisted, "bestOf");
-  if (!hasLegacyWorkflowSchedule && !hasBestOf) {
+  // Legacy alias: tasks stamped by builds where "PTC Exclusive Mode" was a
+  // separate experiment may carry only programmaticToolCallingExclusive. The
+  // merged PTC experiment activates exactly that posture, so resumed tasks
+  // must read it as programmaticToolCalling (`true` wins over an explicit
+  // false, matching the schema preprocess and backend feature-flag alias).
+  // This is the runtime path: loadConfigOrDefault does not parse workspaces
+  // through WorkspaceConfigSchema, so the schema-level alias alone never runs
+  // here. The legacy key is retained for downgrade compatibility.
+  const taskExperiments =
+    typeof persisted.taskExperiments === "object" && persisted.taskExperiments !== null
+      ? (persisted.taskExperiments as Record<string, unknown>)
+      : undefined;
+  const hasLegacyPtcExclusive =
+    taskExperiments?.programmaticToolCallingExclusive === true &&
+    taskExperiments.programmaticToolCalling !== true;
+  if (!hasLegacyWorkflowSchedule && !hasBestOf && !hasLegacyPtcExclusive) {
     return workspace;
   }
 
   const nextWorkspace = { ...persisted };
   delete nextWorkspace.workflowSchedule;
+
+  if (hasLegacyPtcExclusive) {
+    // Spreading the typed field copies ALL persisted keys at runtime —
+    // including the legacy one, which stays for downgrade compatibility.
+    nextWorkspace.taskExperiments = {
+      ...persisted.taskExperiments,
+      programmaticToolCalling: true,
+    };
+  }
 
   if (hasBestOf) {
     const bestOf = normalizeWorkspaceBestOf(persisted.bestOf);

@@ -7,6 +7,7 @@ import {
   listProjectMetadataRelativePaths,
 } from "@/common/compat/legacyMux";
 import { getErrorMessage } from "@/common/utils/errors";
+import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { log } from "@/node/services/log";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import { isMutationEpochUnreadable, readContainerMutationState } from "./journals";
@@ -417,7 +418,12 @@ export function computeAgentPluginContainers(args: {
   projectTrusted: boolean;
 }): AgentPluginContainer[] {
   const containers: AgentPluginContainer[] = [];
-  if (args.projectRoot !== undefined && args.projectTrusted && path.isAbsolute(args.projectRoot)) {
+  // projectAutomationDisabled: benchmark harness kill-switch: dataset repos
+  // must not contribute plugin containers (hooks.js tool middleware, plugin
+  // MCP, slash commands) even when trusted for delegation; global containers
+  // below stay active. Mirrors the init/tool_env/project-MCP gating.
+  const projectTrusted = args.projectTrusted && !projectAutomationDisabled();
+  if (args.projectRoot !== undefined && projectTrusted && path.isAbsolute(args.projectRoot)) {
     containers.push(
       ...listProjectMetadataRelativePaths("plugins").map((relativePath) => ({
         path: path.join(args.projectRoot!, relativePath),

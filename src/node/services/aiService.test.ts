@@ -268,7 +268,7 @@ function resolvedAgentResultFor(
       agentDiscoveryRuntime: new LocalRuntime(metadata.projectPath),
       agentDiscoveryPath: metadata.projectPath,
       isSubagentWorkspace: false,
-      agentInheritanceChain: [{ id: "exec", tools: { add: [".*"] } }],
+      agentInheritanceChain: [{ id: "exec", scope: "built-in", tools: { add: [".*"] } }],
       agentIsPlanLike: false,
       effectiveMode: "exec",
       taskSettings: DEFAULT_TASK_SETTINGS,

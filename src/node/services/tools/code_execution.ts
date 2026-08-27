@@ -32,6 +32,12 @@ import {
 } from "@/constants/resultHandles";
 import { KERNEL_COMPACT_ARGS_CAP_BYTES, KERNEL_CONSOLE_CAP_BYTES } from "@/constants/kernelOutput";
 import { sliceUtf8Bytes } from "@/common/utils/sliceUtf8Bytes";
+import {
+  containsMediaContentPayload,
+  isKernelRecordResultExempt,
+  sanitizeCapturedMediaValue,
+} from "@/node/services/ptc/types";
+import { jsonSafeClone } from "@/common/utils/jsonSafeClone";
 
 // Default limits
 const DEFAULT_MEMORY_BYTES = 64 * 1024 * 1024; // 64MB
@@ -69,40 +75,12 @@ export type MountRunner = (
   fn: (mount: SandboxMount) => Promise<PTCExecutionResult>
 ) => Promise<PTCExecutionResult>;
 
-/**
- * Late-bound dispatch state for a created code_execution instance. execute()
- * reads bridge + mount runner from here at CALL time (not closure-capture
- * time) so retargetCodeExecutionTool can swing an already-created instance —
- * and any middleware wrapper delegating to it, even through a captured
- * `execute` function reference — onto a fresh bridge/mount.
- */
-interface RetargetableState {
+/** Dispatch state (bridge + mount runner + file loader) for a created code_execution instance. */
+interface DispatchState {
   toolBridge: ToolBridge;
   withMount: MountRunner | undefined;
   /** Host file loader backing mux.load (kernel mode only); see KernelBridgeOptions. */
   loadFile: KernelFileLoader | undefined;
-}
-
-const retargetableStates = new WeakMap<object, RetargetableState>();
-
-/**
- * Point `target` (an instance returned by createCodeExecutionTool) at the
- * bridge + mount runner of `donor` (another such instance). Used when a
- * request.assemble hook wrapped/replaced code_execution while also editing
- * other bridgeable tools: the wrapper delegates to the PRE-hook instance,
- * which must dispatch through the rebuilt post-hook bridge instead of the
- * stale one. Returns false when either tool was not created by this factory.
- */
-export function retargetCodeExecutionTool(target: Tool, donor: Tool): boolean {
-  const targetState = retargetableStates.get(target);
-  const donorState = retargetableStates.get(donor);
-  if (targetState === undefined || donorState === undefined) {
-    return false;
-  }
-  targetState.toolBridge = donorState.toolBridge;
-  targetState.withMount = donorState.withMount;
-  targetState.loadFile = donorState.loadFile;
-  return true;
 }
 
 /** Model-visible replacement for an offloaded oversized value. */
@@ -307,6 +285,10 @@ async function offloadOversizedReturnValue(
  * touches the record), and the model needs the key/shape it just created.
  * When the kernel load is inactive, a bridged tool that happens to be named
  * "load" gets no exception (its records are ordinary and must not leak).
+ *
+ * Exception: exempt records (agent_skill_read, file_edit_*, media-bearing
+ * results — see isKernelRecordResultExempt) keep their result for
+ * post-compaction persistence extractors and request-time media extraction.
  */
 function compactKernelToolCallRecords(result: PTCExecutionResult, loadActive: boolean): void {
   result.toolCalls = result.toolCalls.map((record) => {
@@ -319,6 +301,38 @@ function compactKernelToolCallRecords(result: PTCExecutionResult, loadActive: bo
     // messages echo guest paths verbatim (ENAMETOOLONG), so bound both like
     // every other record.
     if (loadActive && record.toolName === "load") {
+      return {
+        ...record,
+        args: boundCompactRecordArgs(record.args),
+        ...(record.error !== undefined ? { error: boundCompactRecordError(record.error) } : {}),
+      };
+    }
+    // A result already replaced by a __kernelBounded marker at capture
+    // (execution-wide retained budget exhausted) carries no extractable
+    // payload: the name-based persistence exemption below would keep the
+    // marker as the record's result, and edit extractors would then see a
+    // result without success:true and drop the record's PATH attribution
+    // too. Compact it normally instead — the result-less {ok, bytes} summary
+    // keeps crash-safe edited-file tracking and reports the honest size.
+    const captureBounded =
+      typeof record.result === "object" &&
+      record.result !== null &&
+      (record.result as { __kernelBounded?: boolean }).__kernelBounded === true &&
+      // The boolean is unnamespaced, so a bridged server's result can carry
+      // its own __kernelBounded field alongside real media. A GENUINE runtime
+      // marker ({__kernelBounded, bytes, preview}) never contains extractable
+      // media, so the media exemption takes priority — otherwise a retained,
+      // sanitized media payload would be compacted away and the model would
+      // never receive the attachment (r27).
+      !containsMediaContentPayload(record.result);
+    // Exempt records also keep their result (see isKernelRecordResultExempt;
+    // creation-time capture bounding applies the same predicate, so the full
+    // payload actually reaches this point): persistence extractors mine
+    // nested file_edit_* diffs and agent_skill_read snapshots out of history
+    // after compaction, and media containers from bridged MCP tools must
+    // reach request-time attachment extraction or RLM users could never see
+    // bridged screenshots/images.
+    if (!captureBounded && isKernelRecordResultExempt(record.toolName, record.result)) {
       return {
         ...record,
         args: boundCompactRecordArgs(record.args),
@@ -486,7 +500,7 @@ export async function createCodeExecutionTool(
   options?: CodeExecutionToolOptions
 ): Promise<Tool> {
   const bridgeableTools = toolBridge.getBridgeableTools();
-  const state: RetargetableState = { toolBridge, withMount, loadFile: options?.loadFile };
+  const state: DispatchState = { toolBridge, withMount, loadFile: options?.loadFile };
 
   // Kernel mode = persistent mount available (RLM experiment, or the
   // XUM_SANDBOX_PERSISTENT_MOUNTS dev override that rides the same path).
@@ -580,13 +594,9 @@ ${xumTypes}
     ): Promise<PTCExecutionResult> => {
       const execStartTime = Date.now();
 
-      // Late-bound dispatch: snapshot the CURRENT bridge + mount runner as a
-      // pair so a retarget (see retargetCodeExecutionTool) lands atomically —
-      // the whole call uses either the old pair or the new pair, never a mix.
       const { toolBridge: activeBridge, withMount: activeMount, loadFile: activeLoadFile } = state;
 
-      // Mirrors the creation-time loadEnabled gate against the ACTIVE bridge
-      // (a retarget may have narrowed file_read away).
+      // Mirrors the creation-time loadEnabled gate.
       const loadActive =
         activeLoadFile !== undefined && activeBridge.getBridgeableToolNames().includes("file_read");
 
@@ -684,6 +694,36 @@ ${xumTypes}
           if (mount?.lifetime === "persistent") {
             compactKernelToolCallRecords(result, loadActive);
             capKernelConsoleOutput(result);
+          } else {
+            // Classic executions have no offload stage, so a guest that
+            // RETURNS a bridged media container assigns the raw multi-image
+            // payload directly to the outer result, which persists into this
+            // record's history row — the capture sanitizer only covers nested
+            // tool-call records and console args, and request-time attachment
+            // extraction rewrites only the provider copy, never
+            // partial.json/chat.jsonl. Budget it at the same boundary, using
+            // the SAME execution allowance as the nested records (r29): a
+            // fresh per-value budget would retain the payload twice (record +
+            // outer result), doubling the intended media bound. Kernel mode
+            // is excluded on purpose: its outer result feeds vars-handle
+            // offloading, which must store full fidelity for the guest.
+            result.result = sanitizeCapturedMediaValue(
+              result.result,
+              runtime.classicCaptureBudgetFor?.(result.toolCalls)
+            );
+          }
+
+          // Nested tools that produced attachments (e.g. attach_file) had
+          // their media/display-file bytes stripped from sandbox-visible
+          // values by the bridge; re-attach the originals on this result so
+          // the request path delivers media to the model as real attachments
+          // (extractToolMediaAsUserMessages) and the UI renders both kinds
+          // from the carrier. Drain even for failed evals: received parts are
+          // still valid, and leaving them pending would let them leak into a
+          // later eval on this runtime.
+          const attachmentParts = activeBridge.drainPendingAttachments(runtime);
+          if (attachmentParts.length > 0) {
+            result.attachments = attachmentParts;
           }
 
           // RLM return-value offloading BEFORE the vars snapshot below, so the
@@ -848,7 +888,17 @@ ${xumTypes}
               }
             }
           }
-          return result;
+          // Guest values arrive via ctx.dump() and can contain undefined (e.g.
+          // console.log(undefined) or a returned {a: undefined}) or other
+          // non-JSON values. Persistence JSON-normalizes them on reload, but
+          // the LIVE object is embedded verbatim in the next step's
+          // tool-result message, where the AI SDK's ModelMessage validation
+          // rejects it and kills the stream (AI_InvalidPromptError) — while
+          // the retry, rebuilt from rehydrated history, succeeds. Clone into
+          // the exact JSON shape persistence produces so live and rehydrated
+          // behavior are identical. Must stay the LAST step: the snapshot-
+          // conflict rewrites above reintroduce undefined fields.
+          return jsonSafeClone(result) as PTCExecutionResult;
         } finally {
           // A late abort of THIS call's signal must not poison a reused runtime.
           abortSignal?.removeEventListener("abort", onAbort);
@@ -873,6 +923,5 @@ ${xumTypes}
       }
     },
   });
-  retargetableStates.set(codeExecutionTool, state);
   return codeExecutionTool;
 }

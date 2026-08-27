@@ -75,7 +75,8 @@ import { secretsToRecord } from "@/common/types/secrets";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { roundToBase2 } from "@/common/telemetry/utils";
-import { createAsyncEventQueue } from "@/common/utils/asyncEventIterator";
+import { createAsyncEventQueue, createLatestValueQueue } from "@/common/utils/asyncEventIterator";
+import { createCoalescedReader } from "@/common/utils/coalescedReader";
 import { withQueueHeartbeat } from "@/common/utils/withQueueHeartbeat";
 import {
   DEFAULT_LAYOUT_PRESETS_CONFIG,
@@ -117,6 +118,7 @@ import * as path from "node:path";
 
 import type { DevToolsEvent } from "@/common/types/devtools";
 import type { WorkflowRunStreamEvent } from "@/common/types/workflow";
+import type { WorkflowRunLivenessEntry } from "@/common/orpc/schemas/api";
 import type { MuxMessage } from "@/common/types/message";
 import { coerceThinkingLevel } from "@/common/types/thinking";
 import { normalizeLegacyMuxMetadata } from "@/node/utils/messages/legacy";
@@ -402,6 +404,25 @@ async function resolveWorkspaceAgentPluginsMcpContext(
 
 function isTrustedProjectPath(context: ORPCContext, projectPath?: string | null): boolean {
   return isProjectTrusted(context.config, projectPath);
+}
+
+/**
+ * SECURITY: the workflow liveness/discovery handlers construct per-owner
+ * session paths straight from config.getSessionDir(workspaceId) without the
+ * workspace-metadata lookup resolveWorkflowContext performs, so an owner ID
+ * must be a single path segment — separators or dot segments could otherwise
+ * escape the sessions root via path.join. Unsafe IDs cannot name a real
+ * workspace, so callers skip them rather than erroring.
+ */
+export function isPathSafeWorkspaceId(workspaceId: string): boolean {
+  return (
+    workspaceId.length > 0 &&
+    workspaceId !== "." &&
+    workspaceId !== ".." &&
+    !workspaceId.includes("/") &&
+    !workspaceId.includes("\\") &&
+    path.basename(workspaceId) === workspaceId
+  );
 }
 
 function assertDynamicWorkflowsEnabled(context: ORPCContext): void {
@@ -1996,6 +2017,76 @@ export const router = (authToken?: string) => {
         .handler(async ({ context, input }) => {
           const { service } = await resolveWorkflowContext(context, input.workspaceId);
           return service.getRun({ workspaceId: input.workspaceId, runId: input.runId });
+        }),
+      getRunStatuses: t
+        .input(schemas.workflows.getRunStatuses.input)
+        .output(schemas.workflows.getRunStatuses.output)
+        .handler(async ({ context, input }) => {
+          // Bulk nested-run liveness for the sub-agent tray: one renderer round
+          // trip covers all candidates. Reads go straight to each owner's run
+          // store (plain host-side session state) instead of through
+          // resolveWorkflowContext, which waits on workspace initialization — one
+          // stuck provisioning owner must not stall verification for the rest.
+          // A ref whose read rejects is omitted (transient); the store maps only
+          // a definitively-missing durable record to a null status, so callers
+          // can tell "gone" from "retry later". With the workflows experiment
+          // off there are no runs to verify — empty, not an error.
+          if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
+            return [];
+          }
+          const stores = new Map<string, WorkflowRunStore>();
+          const storeFor = (workspaceId: string) => {
+            let store = stores.get(workspaceId);
+            if (store == null) {
+              store = new WorkflowRunStore({
+                sessionDir: context.config.getSessionDir(workspaceId),
+              });
+              stores.set(workspaceId, store);
+            }
+            return store;
+          };
+          const entries = await Promise.all(
+            input.runs.map(async (ref) => {
+              if (!isPathSafeWorkspaceId(ref.workspaceId)) {
+                return null;
+              }
+              try {
+                const status = await storeFor(ref.workspaceId).getRunStatusForLiveness({
+                  workspaceId: ref.workspaceId,
+                  runId: ref.runId,
+                });
+                return { runId: ref.runId, status };
+              } catch {
+                return null;
+              }
+            })
+          );
+          return entries.filter((entry): entry is WorkflowRunLivenessEntry => entry != null);
+        }),
+      listActiveRuns: t
+        .input(schemas.workflows.listActiveRuns.input)
+        .output(schemas.workflows.listActiveRuns.output)
+        .handler(async ({ context, input }) => {
+          // Cold-mount discovery for the tray. Same no-initialization-wait rule
+          // as getRunStatuses above, and strict per owner: a deleted workspace's
+          // missing session dir reads as empty, but a transient store failure
+          // rejects the whole call so the tray retries instead of caching "no
+          // active runs" for the rest of a nested run's worker gap. With the
+          // workflows experiment off there is nothing to discover — empty, not
+          // an error the tray would uselessly retry.
+          if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS)) {
+            return [];
+          }
+          const results = await Promise.all(
+            input.workspaceIds.filter(isPathSafeWorkspaceId).map(async (workspaceId) => {
+              const runStore = new WorkflowRunStore({
+                sessionDir: context.config.getSessionDir(workspaceId),
+              });
+              const summaries = await runStore.listActiveRunSummaries({ workspaceId });
+              return summaries.map((summary) => ({ workspaceId, ...summary }));
+            })
+          );
+          return results.flat();
         }),
       interrupt: t
         .input(schemas.workflows.interrupt.input)
@@ -3636,6 +3727,12 @@ export const router = (authToken?: string) => {
             context.mcpServerManager.forgetProjectTrust(removedPath);
           }
           return Ok(undefined);
+        }),
+      getRemovalBlockers: t
+        .input(schemas.projects.getRemovalBlockers.input)
+        .output(schemas.projects.getRemovalBlockers.output)
+        .handler(({ context, input }) => {
+          return context.projectService.getRemovalBlockers(input.projectPath);
         }),
       secrets: {
         get: t
@@ -5425,7 +5522,11 @@ export const router = (authToken?: string) => {
               foregroundToolCallIds: service.getForegroundToolCallIds(workspaceId),
             });
 
-            const queue = createAsyncEventQueue<Awaited<ReturnType<typeof getState>>>();
+            // Latest-value queue, not FIFO: each pushed value is a FULL state snapshot,
+            // so an unconsumed older snapshot is disposable. A FIFO would retain every
+            // snapshot a slow ORPC consumer has not yet serialized — unbounded memory
+            // and stale intermediate UI replays under sustained monitor output.
+            const queue = createLatestValueQueue<Awaited<ReturnType<typeof getState>>>();
 
             const onAbort = () => {
               queue.end();
@@ -5435,21 +5536,64 @@ export const router = (authToken?: string) => {
               signal.addEventListener("abort", onAbort, { once: true });
             }
 
+            // Coalesce event-driven reads: a monitor with cooldown_ms 0 can emit one
+            // change per matching output line, and reading full state once per event
+            // would launch an unbounded backlog of manager refreshes while only the
+            // latest state matters. The reader also serializes reads (overlapping
+            // getState() calls could resolve out of order and publish a stale
+            // pre-persistence snapshot over a newer one) and retries failed reads —
+            // a change event may be the only signal an exited process ever emits, so
+            // dropping it would leave the renderer stale with no reconnect.
+            // Bootstrap failures FAIL OPEN: if the very first read keeps failing (e.g.
+            // a remote status probe is down), endless silent retries would leave the
+            // subscriber without any signal — BackgroundBashStore could never run its
+            // error path that marks workspace state known, blocking the chat view's
+            // first-paint barrier indefinitely. Surface the first pre-snapshot failure
+            // as a subscription error instead; once a snapshot has been delivered the
+            // reader's silent retry loop takes over (the renderer has state to show).
+            // Boxed (not bare `let`s) so the reader closure's writes stay visible to
+            // the generator body: TS flow analysis keeps a captured let narrowed to
+            // its initial null in this scope, so `throw bootstrap.error` would be
+            // rejected as throwing a non-Error.
+            const bootstrap = { delivered: false, error: null as Error | null };
+            const reader = createCoalescedReader({
+              read: async () => {
+                let state: Awaited<ReturnType<typeof getState>>;
+                try {
+                  state = await getState();
+                } catch (error) {
+                  if (!bootstrap.delivered) {
+                    bootstrap.error =
+                      error instanceof Error ? error : new Error(getErrorMessage(error));
+                    queue.end();
+                    return;
+                  }
+                  throw error;
+                }
+                bootstrap.delivered = true;
+                queue.push(state);
+              },
+              retryDelayMs: 1_000,
+            });
             const onChange = (changedWorkspaceId: string) => {
-              if (changedWorkspaceId === workspaceId) {
-                void getState().then(queue.push);
-              }
+              if (changedWorkspaceId === workspaceId) reader.trigger();
             };
 
             service.onBackgroundBashChange(onChange);
 
             try {
-              // Emit initial state immediately
-              yield await getState();
+              // Bootstrap through the SAME serialized reader as event-driven reads. A
+              // separate `yield await getState()` can race an onChange-triggered read:
+              // the event read's snapshot waits in the queue while the slower bootstrap
+              // yields a NEWER snapshot first, and consuming the queued older value then
+              // regresses the renderer with no later event to repair it.
+              reader.trigger();
               yield* queue.iterate();
+              if (bootstrap.error != null) throw bootstrap.error;
             } finally {
               signal?.removeEventListener("abort", onAbort);
               queue.end();
+              reader.stop();
               service.offBackgroundBashChange(onChange);
             }
           }),

@@ -60,7 +60,12 @@ const MuxToolPartBase = z.object({
 export const NestedToolCallSchema = z.object({
   toolCallId: z.string(),
   toolName: z.string(),
-  input: z.unknown(),
+  // Optional: kernel guests can invoke a capability with zero arguments
+  // (mux.tool()), and JSON.stringify drops the resulting `input: undefined`
+  // key on persist. Requiring the key here made onChat replay of such
+  // persisted rows fail oRPC output validation and permanently brick
+  // workspace fetch (one corrupt row killed the whole subscription).
+  input: z.unknown().optional(),
   output: z.unknown().optional(),
   state: z.enum(["input-available", "output-available", "output-redacted"]),
   failed: z.boolean().optional(),

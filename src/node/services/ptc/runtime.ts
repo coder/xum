@@ -5,7 +5,12 @@
  * but designed to allow future migration to libbun or other runtimes.
  */
 
-import type { PTCEvent, PTCExecutionResult } from "./types";
+import type {
+  CaptureSanitizerBudget,
+  PTCEvent,
+  PTCExecutionResult,
+  PTCToolCallRecord,
+} from "./types";
 
 /**
  * Resource limits for sandbox execution.
@@ -88,9 +93,34 @@ export interface IJSRuntime extends Disposable {
    * cannot protect host memory or the session history that streamed events
    * land in: a guest looping `xum.tool({big: vars.large})` would otherwise
    * retain and emit every full payload. Pass undefined to disable (ephemeral
-   * mode keeps full records — the byte-identical supplement contract).
+   * mode keeps full records — the non-RLM inline-results contract).
    */
   setKernelRecordBounds(bounds: KernelRecordBounds | undefined): void;
+
+  /**
+   * Sanitize results captured into records/events at CREATION time in ALL
+   * modes (classic + kernel). Unlike setKernelRecordBounds this never bounds
+   * ordinary results — the non-RLM inline-results contract keeps them inline —
+   * it exists for media containers, whose aggregate base64 must be budgeted
+   * before events/records persist into session history (request-time
+   * attachment extraction rewrites only the provider copy, never
+   * partial.json/chat.jsonl). The guest-visible value is never sanitized.
+   * Pass undefined to disable.
+   */
+  setCaptureResultSanitizer(
+    sanitizer:
+      | ((toolName: string, result: unknown, budget?: CaptureSanitizerBudget) => unknown)
+      | undefined
+  ): void;
+
+  /**
+   * Shared per-execution capture-sanitizer budget for a classic (non-kernel)
+   * execution's record array. The outer return value persists into the same
+   * history row as the nested records, so it must draw from the SAME
+   * allowance (r29) — sanitizing it against a fresh per-value budget would
+   * let one execution retain roughly twice the intended media bound.
+   */
+  classicCaptureBudgetFor?(toolCalls: PTCToolCallRecord[]): CaptureSanitizerBudget;
 
   /**
    * Route late guest-continuation execution through a host-provided gate.
@@ -139,6 +169,23 @@ export interface KernelRecordBounds {
   argsCapBytes: number;
   /** Max serialized bytes of `result` kept in a record/event. */
   resultCapBytes: number;
+  /**
+   * Capture-time retain override for records that must keep (a possibly
+   * sanitized form of) their full result — persistence-critical tools and
+   * extractable media containers (see retainExemptKernelRecordResult):
+   * post-eval compaction and request-time extractors need the payload.
+   * Returns the value to retain in the record, or undefined to apply normal
+   * result bounding. Args and errors stay bounded regardless.
+   */
+  captureRetained?: (toolName: string, result: unknown) => unknown;
+  /**
+   * Attribution fields merged onto a __kernelBounded ARGS marker when
+   * bounding replaces the args of a record (see
+   * retainPersistenceCriticalArgsFields): post-compaction extractors need the
+   * validated file path of an oversized file_edit_* call to attribute its
+   * retained diff. Marker fields win on key collisions.
+   */
+  captureArgsRetained?: (toolName: string, args: unknown) => Record<string, unknown> | undefined;
 }
 
 /**

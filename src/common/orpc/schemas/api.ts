@@ -35,6 +35,7 @@ import {
   GoalSetInputSchema,
 } from "./goal";
 import { ProjectConfigSchema } from "./project";
+import { ProjectWorkspaceCountsSchema } from "@/common/utils/projectRemoval";
 import {
   MemoryChangeEventSchema,
   MemoryConsolidationRecordSchema,
@@ -188,6 +189,16 @@ export const BackgroundProcessMonitorInfoSchema = z.object({
   droppedLines: z.number(),
   lastLines: z.array(z.string()),
   stopped: z.boolean(),
+  /**
+   * Set when a monitor wake is durably queued but its synthetic wake turn has not been
+   * delivered yet. Without this, a one-shot watcher that matched and exited looks like a
+   * lost wake in the UI (nothing running, no visible pending delivery). Carries the wake
+   * kind so the UI does not claim a "match" for monitor-lost restart notices.
+   */
+  // "settled": the wake reports only process settlement (a monitored process that
+  // exited without ever matching, or an earlier run's preserved settlement) — never
+  // labeled as a match the filter did not produce.
+  pendingWakeKind: z.enum(["match", "monitor-lost", "settled"]).optional(),
 });
 
 // Background process info (for UI display)
@@ -196,6 +207,12 @@ export const BackgroundProcessInfoSchema = z.object({
   pid: z.number(),
   script: z.string(),
   displayName: z.string().optional(),
+  /**
+   * True for rows synthesized from a durable pending wake with no manager entry behind
+   * them (e.g. after an app restart). Such rows have no queryable output or live process.
+   * Deliberately not inferred from pid: migrated manager-backed processes also use pid 0.
+   */
+  synthesized: z.boolean().optional(),
   startTime: z.number(),
   status: BackgroundProcessStatusSchema,
   monitor: BackgroundProcessMonitorInfoSchema.optional(),
@@ -754,6 +771,12 @@ export const projects = {
   remove: {
     input: z.object({ projectPath: z.string(), force: z.boolean().nullish() }).passthrough(),
     output: ResultSchema(z.void(), ProjectRemoveErrorSchema),
+  },
+  // Read-only preflight for the delete confirmation dialog: projects.list no
+  // longer embeds archived workspaces, so blocker counts come from the backend.
+  getRemovalBlockers: {
+    input: z.object({ projectPath: z.string() }),
+    output: ProjectWorkspaceCountsSchema,
   },
   list: {
     input: z.void(),
@@ -1795,7 +1818,8 @@ export const workspace = {
   activity: {
     list: {
       input: z.void(),
-      output: z.record(z.string(), WorkspaceActivitySnapshotSchema),
+      // null signals a backend read failure; {} is a legitimate all-idle result.
+      output: z.record(z.string(), WorkspaceActivitySnapshotSchema).nullable(),
     },
     subscribe: {
       input: z.void(),
@@ -2144,6 +2168,27 @@ export const agentSkills = {
 };
 
 // Workflows
+
+// Shared wire shapes for the sub-agent tray's run-liveness/discovery endpoints:
+// the renderer imports these types so contract changes propagate through one
+// definition instead of drifting across manually repeated object shapes.
+export const WorkflowRunLivenessEntrySchema = z.object({
+  runId: WorkflowRunIdSchema,
+  // null = no durable record for this ref (settled); failed reads are omitted upstream.
+  status: WorkflowRunStatusSchema.nullable(),
+});
+export type WorkflowRunLivenessEntry = z.infer<typeof WorkflowRunLivenessEntrySchema>;
+
+export const WorkflowActiveRunSummarySchema = z.object({
+  /** Workspace whose durable run store owns the run. */
+  workspaceId: z.string(),
+  runId: WorkflowRunIdSchema,
+  workflowName: z.string().nullable(),
+  /** Nested (workflow-in-workflow) runs are absent from workspace activity. */
+  nested: z.boolean(),
+});
+export type WorkflowActiveRunSummary = z.infer<typeof WorkflowActiveRunSummarySchema>;
+
 export const workflows = {
   listRuns: {
     input: z.object({ workspaceId: z.string().min(1) }).strict(),
@@ -2152,6 +2197,27 @@ export const workflows = {
   getRun: {
     input: z.object({ workspaceId: z.string().min(1), runId: WorkflowRunIdSchema }).strict(),
     output: WorkflowRunRecordSchema.nullable(),
+  },
+  // Bulk liveness lookup: one renderer round trip covers runs owned by different
+  // workspaces. status null = no durable record; a ref whose read failed is omitted
+  // from the output so callers can tell transient errors from a settled/missing run.
+  getRunStatuses: {
+    input: z
+      .object({
+        runs: z.array(
+          z.object({ workspaceId: z.string().min(1), runId: WorkflowRunIdSchema }).strict()
+        ),
+      })
+      .strict(),
+    output: z.array(WorkflowRunLivenessEntrySchema),
+  },
+  // Cold-mount discovery for the sub-agent tray: nested (parentWorkflow) runs are
+  // deliberately absent from workspace activity, so a tray mounting during such a
+  // run's between-workers gap needs one bulk read to find active runs across the
+  // candidate owner workspaces.
+  listActiveRuns: {
+    input: z.object({ workspaceIds: z.array(z.string().min(1)) }).strict(),
+    output: z.array(WorkflowActiveRunSummarySchema),
   },
   interrupt: {
     input: z.object({ workspaceId: z.string().min(1), runId: WorkflowRunIdSchema }).strict(),

@@ -321,6 +321,7 @@ export function buildTaskToolDescription(runtimeMode: RuntimeMode | undefined): 
     "\n\nIMPORTANT: Whether a sub-agent can see uncommitted changes depends on the runtime. " +
     `${getTaskRuntimeVisibilityGuidance(runtimeMode)} ` +
     "\n\nProvide agentId (preferred) or subagent_type, prompt, title, run_in_background, and optional n. For sub-agents, use title as a short, friendly reusable role name (for example, Reviewer or Simplicity Auditor), not a task summary. For kind=workspace, use a normal work-specific chat title. " +
+    'For kind=workspace, agentId optionally selects the agent mode for the launched turn (for example "plan"); it defaults to exec, and internal agents are not eligible. ' +
     "Use n only when you want several agents to try the same prompt independently. Omit it for a single task, and prefer non-interfering sub-agents for grouped runs (for example read-only agents like explore). " +
     `\n\nA terminal report makes the child inactive but leaves its workspace persistent. Keep each parent's direct standalone bench small and role-based: aim for at most ${SUBAGENT_REUSABLE_BENCH_TARGET} and keep it below ${SUBAGENT_REUSABLE_BENCH_EXCLUSIVE_LIMIT}; deliberate grouped n runs are temporary exceptions. Before spawning standalone work, prefer reawakening a known inactive child when its context or expertise fits, and retitle it if its reusable responsibility changes. At the target, add a role only for a genuinely distinct responsibility and prune an inactive overlapping or least-useful role before reaching the limit. Reawakening preserves the child's checkout, so for repository-dependent work, reuse it only when that snapshot is appropriate or instruct the child to verify and synchronize before acting; otherwise spawn a new child. Stop active work with task_stop; use irreversible task_remove for consumed grouped candidates, bench consolidation, explicit user requests, or clearly obsolete context—not routine end-of-turn cleanup. ` +
     "\n\nWhen the user explicitly asks for best-of-n work, the parent should begin with light preliminary analysis to extract shared context, constraints, or evaluation criteria that would otherwise be duplicated across children. " +
@@ -379,11 +380,13 @@ function refineTaskToolAgentArgs(
   const hasSubagentType = typeof args.subagent_type === "string" && args.subagent_type.length > 0;
 
   if (kind === "workspace") {
-    if (hasAgentId || hasSubagentType) {
+    // Workspace tasks accept agentId (agent mode for the launched turn, e.g. "plan") but keep
+    // rejecting the deprecated sub-agent alias subagent_type.
+    if (hasSubagentType) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        message: "Workspace tasks do not accept agentId or subagent_type",
-        path: ["agentId"],
+        message: "Workspace tasks do not accept subagent_type",
+        path: ["subagent_type"],
       });
     }
     if (args.n != null) {
@@ -1541,6 +1544,13 @@ export const WorkflowRunToolArgsSchema = z
         "Defaults to false. Prefer foreground mode for a single workflow; when the returned status is completed, the result is available directly. " +
           "Set true only when you will start another workflow/task or do independent work while it runs. If workflow_run returns status=running or status=backgrounded, await the returned runId with task_await before using the result."
       ),
+    allow_concurrent: z
+      .boolean()
+      .nullish()
+      .describe(
+        "Pass true only to intentionally start another active run of the same script in this workspace. " +
+          "By default workflow_run refuses when the same script already has an active (pending/running/backgrounded) run and reports that run so you can task_await or workflow_resume it instead of duplicating it."
+      ),
   })
   .strict()
   .superRefine((args, ctx) => {
@@ -1753,7 +1763,16 @@ const BashMonitorSchema = z
       .int()
       .positive()
       .nullish()
-      .describe("Stop monitoring after this many matching lines; the process keeps running."),
+      .describe(
+        "Stop monitoring after this many matching lines; the process keeps running. " +
+          "A monitor retired this way also stops watching for process settlement (no exit wake)."
+      ),
+    wake_on_exit: z
+      .boolean()
+      .nullish()
+      .describe(
+        "Also wake when the monitored process settles (exit, kill, timeout), even if no line ever matched. Explicit cancellation (task_stop, terminate without flush, workspace cleanup) and max_events retirement produce no settlement wake. Defaults to true."
+      ),
   })
   .strict();
 
@@ -1821,13 +1840,13 @@ export const TOOL_DEFINITIONS = {
                 "Process persists until timeout_secs expires, terminated, or workspace is removed." +
                 "\\n\\nFor long-running tasks like builds or compilations, prefer background mode to continue productive work in parallel. " +
                 "Without a monitor, raw background bash does not automatically wake the parent workspace when it prints output or exits. " +
-                "With monitor, matching complete output lines wake this workspace, including after your current response; use task_await only if you need surrounding/full output. " +
+                "With monitor, matching complete output lines wake this workspace, including after your current response, and the workspace is also woken when the process settles (exit, kill, timeout) unless wake_on_exit is false, the monitor was retired by max_events, or the task was explicitly cancelled (task_stop / terminate); use task_await only if you need surrounding/full output. " +
                 "Before finishing, terminate monitored tasks that are no longer relevant so stale output cannot trigger a follow-up turn. " +
                 "Do not call task_await in the same parallel tool-call batch; wait for the returned taskId first. " +
                 "When you actually need the output, read it with task_await; do not poll task_await just because the process is still running."
             ),
           monitor: BashMonitorSchema.nullish().describe(
-            "Wake-on-match monitor. Valid only with run_in_background=true. Matching complete output lines wake this workspace without polling, even after the current response; terminate it before finishing if future wakes are no longer useful."
+            "Wake-on-match monitor. Valid only with run_in_background=true. Matching complete output lines wake this workspace without polling, even after the current response, and the workspace also wakes when the monitored process settles (exit, kill, timeout) unless wake_on_exit is false, the monitor was retired by max_events, or the task was explicitly cancelled (task_stop / terminate); terminate it before finishing if future wakes are no longer useful."
           ),
           display_name: z
             .string()
@@ -2458,6 +2477,7 @@ export const TOOL_DEFINITIONS = {
     // Prefer foreground workflows so callers do not waste a turn polling when no other work can proceed.
     description:
       "Start a durable workflow run from exactly one launch source: script_path for a JavaScript file/skill workflow, or script_source for compact one-off inline workflow source. Workflows coordinate delegated agent tasks and preserve run state for replay/resume. " +
+      "An active run of the same script in this workspace blocks a duplicate start unless allow_concurrent=true; reattach to the reported run with task_await or workflow_resume instead of relaunching it. " +
       "Prefer script_path for reusable, reviewable, shared, slash/CLI-invokable, or skill-packaged workflows; use script_source for one-off conductors whose exact source should be snapshotted into the durable run. " +
       "When a skill, instruction block, or plan describes a multi-phase, looping, or multi-agent process in prose and ships no packaged workflow script, prefer codifying that process as a one-off script_source workflow over executing every phase in-context: " +
       "the conductor follows the documented phases more faithfully and gains durable checkpoints, resume, and fresh delegated context per phase. " +
@@ -2963,6 +2983,8 @@ const BashToolMonitorResultSchema = z
     filter_exclude: z.boolean(),
     cooldown_ms: z.number(),
     max_events: z.number().optional(),
+    // Optional (not required) so persisted results written before this field existed still parse.
+    wake_on_exit: z.boolean().optional(),
   })
   .strict();
 

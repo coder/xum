@@ -1899,7 +1899,9 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
     key: "sub-agent-tasks",
     // Durable sub-agents live with their parent chat instead of relying only on nested sidebar rows.
     // The decoration is collapsed by default, so inactive task history is available without noise.
-    node: <SubAgentTasksDecoration workspaceId={props.workspaceId} />,
+    // Keyed by workspace: ChatPane stays mounted across workspace switches, and the decoration
+    // retains observed workflow-run refs that must never leak into another chat's tray.
+    node: <SubAgentTasksDecoration key={props.workspaceId} workspaceId={props.workspaceId} />,
   });
   addDecorationEntry({
     key: "background-processes",

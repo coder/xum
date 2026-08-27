@@ -248,6 +248,42 @@ describe("xum CLI", () => {
       expect(result.output).toContain("Invalid mode");
     });
 
+    test("app-level experiment without a send-options field shows error", async () => {
+      // agent-browser is a real experiment ID, but it has no
+      // SendMessageOptions.experiments field, so a headless run would silently
+      // ignore it. The CLI must reject it loudly instead.
+      const result = await runRunDirect(["-e", "agent-browser", "test message"]);
+      expect(result.exitCode).toBe(1);
+      expect(result.output).toContain('Unknown or unsupported experiment "agent-browser"');
+    });
+
+    test("Object.prototype property names are rejected as experiments", async () => {
+      // The validity check must be an own-property lookup: `in` would accept
+      // "constructor"/"toString" via the prototype chain and then build a
+      // garbage experiments field from the inherited function.
+      const result = await runRunDirect(["-e", "constructor", "test message"]);
+      expect(result.exitCode).toBe(1);
+      expect(result.output).toContain('Unknown or unsupported experiment "constructor"');
+    });
+
+    test("rlm-mode experiment is accepted", async () => {
+      // Regression: rlm-mode parsed fine but was silently dropped when building
+      // SendMessageOptions.experiments, so PTC+RLM CLI runs degraded to the
+      // non-kernel PTC toolset. Use a nonexistent dir so the run fails AFTER
+      // experiment parsing without starting a session.
+      const result = await runRunDirect([
+        "-e",
+        "rlm-mode",
+        "-e",
+        "programmatic-tool-calling",
+        "--dir",
+        "/nonexistent/path/that/does/not/exist",
+        "test message",
+      ]);
+      expect(result.exitCode).toBe(1);
+      expect(result.output).not.toContain("Unknown or unsupported experiment");
+    });
+
     test("nonexistent directory shows error", async () => {
       const result = await runRunDirect([
         "--dir",

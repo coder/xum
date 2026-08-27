@@ -112,6 +112,54 @@ describe("ExtensionMetadataService", () => {
     expect(snapshots.get("workspace-todos")?.hasTodos).toBe(false);
   });
 
+  test("setSidebarStatus round-trips the dedup input hash and clears it with the status", async () => {
+    const status = { emoji: "🛠️", message: "Editing source" };
+
+    const snapshot = await service.setSidebarStatus("ws-hash", status, { inputHash: "hash-1" });
+    expect(await service.getSidebarStatusInputHash("ws-hash")).toBe("hash-1");
+    // Backend-only field: must not leak into the IPC snapshot shape.
+    expect(snapshot).not.toHaveProperty("sidebarStatusInputHash");
+
+    // A status written without a hash invalidates any stale one.
+    await service.setSidebarStatus("ws-hash", status);
+    expect(await service.getSidebarStatusInputHash("ws-hash")).toBeNull();
+
+    await service.setSidebarStatus("ws-hash", status, { inputHash: "hash-2" });
+    await service.setSidebarStatus("ws-hash", null);
+    expect(await service.getSidebarStatusInputHash("ws-hash")).toBeNull();
+  });
+
+  test("a todo-path clear orphans the hash and the reader treats it as absent", async () => {
+    await service.setSidebarStatus(
+      "ws-hash",
+      { emoji: "🛠️", message: "Editing source" },
+      { inputHash: "hash-1" }
+    );
+    expect(await service.getSidebarStatusInputHash("ws-hash")).toBe("hash-1");
+
+    // setTodoStatus clears the shared todoStatus slot without touching the
+    // hash; the reader must not hand back a hash with no status behind it.
+    await service.setTodoStatus("ws-hash", null, false);
+    expect(await service.getSidebarStatusInputHash("ws-hash")).toBeNull();
+  });
+
+  test("sidebar status input hash survives unrelated metadata mutations", async () => {
+    // Mutators round-trip entries through coerceExtensionMetadata; dropping
+    // the hash there would silently reintroduce regenerate-on-restart after
+    // any recency/streaming/todo write.
+    await service.setSidebarStatus(
+      "ws-hash",
+      { emoji: "🛠️", message: "Editing source" },
+      { inputHash: "hash-1" }
+    );
+
+    await service.updateRecency("ws-hash", 500);
+    await service.setStreaming("ws-hash", true, { model: "anthropic:claude-haiku-4-5" });
+    await service.setTodoStatus("ws-hash", { emoji: "🔄", message: "Running checks" }, true);
+
+    expect(await service.getSidebarStatusInputHash("ws-hash")).toBe("hash-1");
+  });
+
   test("concurrent cross-workspace mutations preserve both workspace entries", async () => {
     const restoreLoad = addLoadDelay(service, 20);
     try {

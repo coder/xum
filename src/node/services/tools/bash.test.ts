@@ -1,5 +1,6 @@
 import { describe, it, expect } from "bun:test";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
 import { buildBashToolDescription, createBashTool } from "./bash";
 import type { BashOutputEvent } from "@/common/types/stream";
 import type { ProjectRef } from "@/common/types/workspace";
@@ -30,6 +31,22 @@ import { BackgroundProcessManager } from "@/node/services/backgroundProcessManag
 // Helper to create bash tool with test configuration
 // Returns both tool and disposable temp directory
 // Use with: using testEnv = createTestBashTool();
+function createExecStream(stdout: string, exitCode = 0): ExecStream {
+  const encoder = new TextEncoder();
+  return {
+    stdout: new ReadableStream({
+      start(controller) {
+        if (stdout.length > 0) controller.enqueue(encoder.encode(stdout));
+        controller.close();
+      },
+    }),
+    stderr: new ReadableStream({ start: (controller) => controller.close() }),
+    stdin: new WritableStream(),
+    exitCode: Promise.resolve(exitCode),
+    duration: Promise.resolve(0),
+  };
+}
+
 function createTestBashTool() {
   const tempDir = new TestTempDir("test-bash");
   const config = createTestToolConfig(process.cwd());
@@ -1608,6 +1625,126 @@ describe("zombie process cleanup", () => {
     // This is the regression test - without checking abort signal in consumeStream(),
     // the tool hangs until the streams close (which can take a long time)
     expect(duration).toBeLessThan(2000);
+  });
+});
+
+describe("remote bash git hardening", () => {
+  it("discovers remote drivers and keeps provider secrets blanked", async () => {
+    const calls: Array<{ command: string; options: ExecOptions }> = [];
+    const runtime = {
+      exec(command: string, options: ExecOptions): Promise<ExecStream> {
+        calls.push({ command, options });
+        if (command.includes("rev-parse --git-dir"))
+          return Promise.resolve(createExecStream(".git\n"));
+        if (command.includes("includeif[.]")) return Promise.resolve(createExecStream(""));
+        if (options.cwd === "/remote/workspace/project-a") {
+          return Promise.resolve(createExecStream("", 1));
+        }
+        if (options.cwd === "/remote/workspace/project-b") {
+          return Promise.resolve(
+            createExecStream(
+              "filter.evil.smudge\ncat\0filter.evil.required\ntrue\0alias.evil\n!steal\0"
+            )
+          );
+        }
+        return Promise.resolve(createExecStream("done\n"));
+      },
+    } as unknown as Runtime;
+    const config = createTestToolConfig("/remote/workspace");
+    config.runtime = runtime;
+    config.trusted = false;
+    config.projects = [
+      { projectName: "project-a", projectPath: "/remote/project-a" },
+      { projectName: "project-b", projectPath: "/remote/project-b" },
+    ];
+    config.secrets = { ANTHROPIC_API_KEY: "secret" };
+    const tool = createBashTool(config);
+
+    const result = (await tool.execute!(
+      {
+        script: "git checkout -- data.txt",
+        timeout_secs: 5,
+        run_in_background: false,
+        display_name: "test",
+      },
+      mockToolCallOptions
+    )) as BashToolResult;
+
+    expect(result.success).toBe(true);
+    expect(calls).toHaveLength(7);
+    expect(calls[0]?.options.cwd).toBe("/remote/workspace/project-a");
+    expect(calls[3]?.options.cwd).toBe("/remote/workspace/project-b");
+    expect(calls[6]?.options.env?.ANTHROPIC_API_KEY).toBe("");
+    expect(Object.values(calls[6]?.options.env ?? {})).toContain("filter.evil.smudge");
+    expect(Object.values(calls[6]?.options.env ?? {})).toContain("alias.evil");
+  });
+
+  it("fails closed when remote driver discovery fails", async () => {
+    let callCount = 0;
+    const runtime = {
+      exec(): Promise<ExecStream> {
+        const exitCodes = [0, 0, 1, 0, 2];
+        const exitCode = exitCodes[callCount] ?? 2;
+        callCount += 1;
+        return Promise.resolve(createExecStream("", exitCode));
+      },
+    } as unknown as Runtime;
+    const config = createTestToolConfig("/remote/workspace");
+    config.runtime = runtime;
+    config.trusted = false;
+    config.projects = [
+      { projectName: "project-a", projectPath: "/remote/project-a" },
+      { projectName: "project-b", projectPath: "/remote/project-b" },
+    ];
+    const tool = createBashTool(config);
+
+    let rejection: unknown;
+    try {
+      await tool.execute!(
+        {
+          script: "echo should-not-run",
+          timeout_secs: 5,
+          run_in_background: false,
+          display_name: "test",
+        },
+        mockToolCallOptions
+      );
+    } catch (error) {
+      rejection = error;
+    }
+    expect(rejection).toBeInstanceOf(Error);
+    expect((rejection as Error).message).toContain("Failed to inspect repository");
+    expect(callCount).toBe(5);
+  });
+
+  it("blanks run-session roots inherited by local Bash", async () => {
+    const previousXumRoot = process.env.XUM_RUN_SESSION_ROOT;
+    const previousMuxRoot = process.env.MUX_RUN_SESSION_ROOT;
+    process.env.XUM_RUN_SESSION_ROOT = "/tmp/xum-session";
+    process.env.MUX_RUN_SESSION_ROOT = "/tmp/mux-session";
+
+    try {
+      const config = createTestToolConfig(process.cwd());
+      config.trusted = false;
+      const tool = createBashTool(config);
+      const result = (await tool.execute!(
+        {
+          script: 'printf "%s|%s" "$XUM_RUN_SESSION_ROOT" "$MUX_RUN_SESSION_ROOT"',
+          timeout_secs: 5,
+          run_in_background: false,
+          display_name: "test",
+        },
+        mockToolCallOptions
+      )) as BashToolResult;
+
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.output).toBe("|");
+    } finally {
+      if (previousXumRoot == null) delete process.env.XUM_RUN_SESSION_ROOT;
+      else process.env.XUM_RUN_SESSION_ROOT = previousXumRoot;
+      if (previousMuxRoot == null) delete process.env.MUX_RUN_SESSION_ROOT;
+      else process.env.MUX_RUN_SESSION_ROOT = previousMuxRoot;
+    }
   });
 });
 

@@ -5,6 +5,7 @@ import * as os from "os";
 import { Config } from "@/node/config";
 import { MCPConfigService } from "./mcpConfigService";
 import { MCPServerManager } from "./mcpServerManager";
+import { DISABLE_PROJECT_AUTOMATION_ENV } from "@/node/utils/projectAutomation";
 import type { WorkspaceMCPOverrides } from "@/common/types/mcp";
 
 describe("MCPConfigService", () => {
@@ -109,6 +110,38 @@ describe("MCPConfigService", () => {
     expect(await configService.listServers(projectPath, false)).toEqual({
       "global-only": { transport: "stdio", command: "global-only", disabled: false },
     });
+  });
+
+  test("project-automation kill-switch ignores repo overrides even when trusted", async () => {
+    await configService.addServer("global-only", {
+      transport: "stdio",
+      command: "global-only",
+    });
+
+    const projectPath = path.join(tempDir, "repo-automation-disabled");
+    await fs.mkdir(path.join(projectPath, ".xum"), { recursive: true });
+    await fs.writeFile(
+      path.join(projectPath, ".xum", "mcp.jsonc"),
+      JSON.stringify({ servers: { "repo-only": "repo-only" } }),
+      "utf-8"
+    );
+
+    const prev = process.env[DISABLE_PROJECT_AUTOMATION_ENV];
+    process.env[DISABLE_PROJECT_AUTOMATION_ENV] = "1";
+    try {
+      // Trust stays (delegation depends on it) but repo-configured MCP
+      // servers must not load: they would run dataset code with provider
+      // credentials in the environment.
+      expect(await configService.listServers(projectPath, true)).toEqual({
+        "global-only": { transport: "stdio", command: "global-only", disabled: false },
+      });
+    } finally {
+      if (prev === undefined) {
+        delete process.env[DISABLE_PROJECT_AUTOMATION_ENV];
+      } else {
+        process.env[DISABLE_PROJECT_AUTOMATION_ENV] = prev;
+      }
+    }
   });
 });
 

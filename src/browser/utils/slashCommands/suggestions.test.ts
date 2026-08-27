@@ -22,8 +22,8 @@ describe("resolveSlashCommandExperimentValue", () => {
     ).toBe(true);
   });
 
-  it("requires a PTC parent flag for rlm-mode", () => {
-    // The backend refuses /refine unless RLM AND a PTC flag are on, so the
+  it("requires the PTC parent flag for rlm-mode", () => {
+    // The backend refuses /refine unless RLM AND PTC are on, so the
     // sub-flag alone must not surface the command.
     expect(
       resolveSlashCommandExperimentValue(EXPERIMENT_IDS.RLM, {
@@ -36,14 +36,6 @@ describe("resolveSlashCommandExperimentValue", () => {
         workspaceHeartbeats: false,
         rlm: true,
         programmaticToolCalling: true,
-      })
-    ).toBe(true);
-    // Exclusive mode alone is a valid PTC parent too.
-    expect(
-      resolveSlashCommandExperimentValue(EXPERIMENT_IDS.RLM, {
-        workspaceHeartbeats: false,
-        rlm: true,
-        programmaticToolCallingExclusive: true,
       })
     ).toBe(true);
   });

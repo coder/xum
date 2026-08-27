@@ -22,6 +22,7 @@ import {
   getDraftScopeId,
 } from "@/common/constants/storage";
 import { getErrorMessage } from "@/common/utils/errors";
+import type { ProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { getFirstTopLevelProjectPath } from "@/common/utils/subProjects";
@@ -79,6 +80,11 @@ export interface ProjectContext {
   refreshProjects: () => Promise<void>;
   addProject: (normalizedPath: string, projectConfig: ProjectConfig) => void;
   removeProject: (path: string, options?: { force?: boolean }) => Promise<ProjectRemoveResult>;
+  /**
+   * Read-only removal preflight (no pruning/deletion side effects). Needed by
+   * the delete confirmation because projects.list excludes archived workspaces.
+   */
+  getRemovalBlockers: (path: string) => Promise<ProjectWorkspaceCounts>;
 
   // Project creation modal
   projectCreateInitialPath?: string;
@@ -606,6 +612,14 @@ export function ProjectProvider(props: { children: ReactNode }) {
       refreshProjects,
       addProject,
       removeProject,
+      // Inline (not useCallback-wrapped): `api` is already a dependency of
+      // this provider value memo, mirroring the other inline actions below.
+      getRemovalBlockers: async (path: string): Promise<ProjectWorkspaceCounts> => {
+        if (!api) {
+          throw new Error("API not connected");
+        }
+        return api.projects.getRemovalBlockers({ projectPath: path });
+      },
       projectCreateInitialPath,
       isProjectCreateModalOpen,
       openProjectCreateModal: (options?: { initialPath?: string }) => {

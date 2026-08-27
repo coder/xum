@@ -504,6 +504,29 @@ describe("computeAgentPluginContainers", () => {
     expect(relative.every((c) => c.scope === "global")).toBe(true);
   });
 
+  test("excludes project containers when project automation is disabled", () => {
+    const previous = process.env.MUX_DISABLE_PROJECT_AUTOMATION;
+    process.env.MUX_DISABLE_PROJECT_AUTOMATION = "1";
+    try {
+      const containers = computeAgentPluginContainers({
+        xumHome: "/home/u/.mux",
+        projectRoot: "/repo",
+        projectTrusted: true,
+      });
+      // Dataset-controlled plugin containers must be inert under the
+      // benchmark kill-switch even when the project is trusted; global
+      // containers stay active.
+      expect(containers.length).toBeGreaterThan(0);
+      expect(containers.every((c) => c.scope === "global")).toBe(true);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.MUX_DISABLE_PROJECT_AUTOMATION;
+      } else {
+        process.env.MUX_DISABLE_PROJECT_AUTOMATION = previous;
+      }
+    }
+  });
+
   test("always includes the xumHome global container", () => {
     const containers = computeAgentPluginContainers({
       xumHome: "/home/u/.mux",

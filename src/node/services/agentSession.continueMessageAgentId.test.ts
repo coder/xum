@@ -204,6 +204,37 @@ describe("AgentSession continue-message agentId fallback", () => {
     expect(dispatchedInternal?.synthetic).toBe(true);
   });
 
+  test("dispatchPendingFollowUp aliases legacy exclusive-PTC experiments", async () => {
+    // An older build can persist {programmaticToolCalling: false,
+    // programmaticToolCallingExclusive: true}; dispatch copies raw persisted
+    // JSON into the next send, and the explicit false would otherwise win
+    // over backend overrides while the removed legacy field is ignored —
+    // silently downgrading the crash-safe follow-up to PTC-off (and making
+    // its rlm flag inert).
+    let dispatchedOptions: SendOptions | undefined;
+    const { internals } = await createSession([
+      compactionSummaryMessage("summary-legacy-ptc", {
+        text: "continue after compaction",
+        model: "openai:gpt-4o",
+        agentId: "exec",
+        experiments: {
+          programmaticToolCalling: false,
+          programmaticToolCallingExclusive: true,
+          rlm: true,
+        },
+      }),
+    ]);
+    internals.sendMessage = mock((_message: string, options?: SendOptions) => {
+      dispatchedOptions = options;
+      return Promise.resolve({ success: true as const });
+    });
+
+    await internals.dispatchPendingFollowUp();
+
+    expect(dispatchedOptions?.experiments?.programmaticToolCalling).toBe(true);
+    expect(dispatchedOptions?.experiments?.rlm).toBe(true);
+  });
+
   test("dispatchPendingFollowUp preserves agent-initiated attribution", async () => {
     let dispatchedInternal: { synthetic?: boolean; agentInitiated?: boolean } | undefined;
     const { internals } = await createSession([
@@ -229,6 +260,29 @@ describe("AgentSession continue-message agentId fallback", () => {
 
     expect(dispatchedInternal).toMatchObject({ synthetic: true, agentInitiated: true });
     expect(internals.lastAutoRetryResumeRequest?.agentInitiated).toBe(true);
+  });
+
+  test("dispatchPendingFollowUp forwards strictAgentResolution to the resumed turn", async () => {
+    let dispatchedOptions: SendOptions | undefined;
+    const { internals } = await createSession([
+      compactionSummaryMessage("summary-strict", {
+        text: "continue delegated work",
+        model: "openai:gpt-4o",
+        agentId: "plan",
+        strictAgentResolution: true,
+      }),
+    ]);
+    internals.sendMessage = mock((_message: string, options?: SendOptions) => {
+      dispatchedOptions = options;
+      return Promise.resolve({ success: true as const });
+    });
+
+    await internals.dispatchPendingFollowUp();
+
+    // The requested agent may have been removed/hidden/disabled while compaction ran;
+    // the resumed turn must stay loud instead of silently falling back to exec.
+    expect(dispatchedOptions?.agentId).toBe("plan");
+    expect(dispatchedOptions?.strictAgentResolution).toBe(true);
   });
 
   test("dispatchPendingFollowUp skips idle-only follow-ups when queued user input exists", async () => {
@@ -267,6 +321,33 @@ describe("AgentSession continue-message agentId fallback", () => {
       { model: "openai:gpt-4o", agentId: "exec" },
       { synthetic: false }
     );
+
+    const dispatched = await internals.dispatchPendingFollowUp();
+
+    expect(dispatched).toBe(false);
+    expect(internals.sendMessage).not.toHaveBeenCalled();
+
+    const historyResult = await historyService.getLastMessages("ws", 10);
+    expect(historyResult.success).toBe(true);
+    if (!historyResult.success) {
+      throw new Error(`Expected history read to succeed: ${historyResult.error}`);
+    }
+    expect(historyResult.data.map((message) => message.id)).toEqual(["before-reset"]);
+  });
+
+  test("dispatchPendingFollowUp rolls back heartbeat boundaries when a service send is in preflight", async () => {
+    // Codex P2 (PRRT_kwDOPxxmWM6cRi_N): a manual service-level send still in
+    // preflight is user contention too — the heartbeat reset boundary must be
+    // rolled back (as for queued input), not left in history with the
+    // follow-up silently cleared.
+    const earlierMessage = createMuxMessage("before-reset", "assistant", "Earlier context");
+    const { session, historyService, internals } = await createSession([
+      earlierMessage,
+      heartbeatBoundaryMessage(),
+    ]);
+    internals.sendMessage = mock(() => Promise.resolve({ success: true as const }));
+    (session as unknown as { hasExternalSendPreflight?: () => boolean }).hasExternalSendPreflight =
+      () => true;
 
     const dispatched = await internals.dispatchPendingFollowUp();
 
