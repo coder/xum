@@ -6360,6 +6360,84 @@ describe("TaskService", () => {
     expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
   });
 
+  test("workflow wakes restore the caller tool policy from the newest manual row", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const restrictedPolicy = [{ regex_match: "^bash$", action: "disable" as const }];
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const createRun = async (runId: string) => {
+      await runStore.createRun({
+        id: runId,
+        workspaceId: parentId,
+        workflow: {
+          name: "research",
+          description: "Research workflow",
+          scope: "built-in",
+          executable: true,
+        },
+        source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+        args: {},
+        attentionPolicy: "notify_on_terminal",
+        now: "2026-06-19T00:00:00.000Z",
+      });
+      await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+      await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+    };
+    await createRun("wfr_policy_restore");
+    await createRun("wfr_policy_lifted");
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+
+    // The launch turn disabled bash; a later synthetic row (an earlier wake) defines no
+    // policy and must be skipped. Omitting the policy on the wake would let workflow output
+    // regain the disabled tool at a time the workflow chooses.
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual-restricted", "user", "run the audit", {
+        timestamp: 1_000,
+        toolPolicy: restrictedPolicy,
+      })
+    );
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("earlier-wake", "user", "results delivered", {
+        timestamp: 1_100,
+        synthetic: true,
+      })
+    );
+    await taskService.enqueueWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId: "wfr_policy_restore",
+      status: "completed",
+    });
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[2] as Record<string, unknown>).toMatchObject({
+      toolPolicy: restrictedPolicy,
+    });
+
+    // A newer manual row without a policy means the caller lifted it: no restoration.
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual-unrestricted", "user", "carry on", { timestamp: 1_200 })
+    );
+    await taskService.enqueueWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId: "wfr_policy_lifted",
+      status: "completed",
+    });
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    const liftedOptions = sendMessage.mock.calls[1]?.[2] as { toolPolicy?: unknown };
+    expect(liftedOptions.toolPolicy).toBeUndefined();
+  });
+
   test("drain sends carry a staleness probe that trips after a full clear", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);

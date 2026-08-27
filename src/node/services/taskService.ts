@@ -188,6 +188,7 @@ import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibil
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
 import { isSSHRuntime, isWorktreeRuntime } from "@/common/types/runtime";
@@ -7913,6 +7914,34 @@ export class TaskService {
     this.terminalAttentionDeferRetryTimers.set(ownerWorkspaceId, timer);
   }
 
+  /**
+   * Caller tool policy to restore on a terminal-attention wake. The newest manual user row
+   * carries the conversation's persisted caller policy; synthetic rows without one (earlier
+   * wakes, heartbeat scaffolding) do not define policy and are skipped. Throws when history
+   * is unreadable so the caller can fail closed instead of waking with unrestricted tools.
+   */
+  private async resolveTerminalWakeCallerToolPolicy(
+    ownerWorkspaceId: string
+  ): Promise<ToolPolicy | undefined> {
+    const historyResult = await this.historyService.getLastMessages(ownerWorkspaceId, 50);
+    if (!historyResult.success) {
+      throw new Error(`history unavailable: ${historyResult.error}`);
+    }
+    for (let i = historyResult.data.length - 1; i >= 0; i--) {
+      const message = historyResult.data[i];
+      if (message?.role !== "user") {
+        continue;
+      }
+      if (message.metadata?.toolPolicy != null) {
+        return message.metadata.toolPolicy;
+      }
+      if (message.metadata?.synthetic !== true) {
+        return undefined;
+      }
+    }
+    return undefined;
+  }
+
   private scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId: string): void {
     const promise = this.workspaceService
       .waitForIdleAndNoQueuedMessages(ownerWorkspaceId)
@@ -8369,11 +8398,30 @@ export class TaskService {
     const workspaceTurnMuxMetadata =
       await this.getActiveWorkspaceTurnMuxMetadataForWorkspace(ownerWorkspaceId);
 
+    // Security: restore the conversation's active caller tool policy on the wake. The ordinary
+    // in-stream workflow continuation carries the live turn's effectiveToolPolicy; this
+    // synthetic send starts a fresh turn, and omitting the policy would let a workflow wake
+    // regain tools the caller disabled (with attacker-influenced workflow output choosing the
+    // timing). The agent-level policy recomposes from agentId at send resolution.
+    let wakeToolPolicy: ToolPolicy | undefined;
+    try {
+      wakeToolPolicy = await this.resolveTerminalWakeCallerToolPolicy(ownerWorkspaceId);
+    } catch (error: unknown) {
+      // Fail closed: an unknown policy must not fall back to unrestricted tools.
+      log.warn("Deferring terminal wake; caller tool policy unavailable", {
+        ownerWorkspaceId,
+        error,
+      });
+      this.scheduleTerminalAttentionDeferRetry(ownerWorkspaceId);
+      return;
+    }
+
     const sendOptions = {
       model: resumeOptions.model,
       agentId: resumeOptions.agentId,
       thinkingLevel: resumeOptions.thinkingLevel,
       reasoningMode: resumeOptions.reasoningMode,
+      ...(wakeToolPolicy != null ? { toolPolicy: wakeToolPolicy } : {}),
       ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     };
     if (prompt.length === 0) {
