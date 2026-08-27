@@ -2678,20 +2678,26 @@ export class Config {
 
           // LEGACY FORMAT: Fall back to reading metadata.json.
           // findWorkspace resolves an id-less entry's stable id from EITHER
-          // sessions/<workspace-basename>/metadata.json (old layout, checked
-          // first there) or sessions/<generated-legacy-id>/metadata.json.
-          // Enumerate the same candidates in the same order: destructive
-          // callers (the extension-metadata prune) classify ids as stale
-          // against THIS enumeration, so a basename-backed stable id that
-          // findWorkspace can resolve but this walk cannot would be deleted
-          // as unknown.
+          // sessions/<generated-legacy-id>/metadata.json or
+          // sessions/<workspace-basename>/metadata.json (old layout).
+          // Enumerate BOTH candidates: destructive callers (the
+          // extension-metadata prune) classify ids as stale against this
+          // enumeration, so a stable id that findWorkspace can resolve but
+          // this walk cannot would be deleted as unknown.
+          // The generated-legacy record stays CANONICAL when both exist:
+          // this walk's primary id feeds the read-time config migration, and
+          // it historically consulted only the generated-legacy file — making
+          // a (potentially stale) basename-side file primary would rewrite
+          // the workspace's persisted stable id on upgrade and orphan its
+          // session history. The basename id is surfaced as an alias below;
+          // it becomes primary only when it is the sole surviving record.
           const legacyId = this.generateLegacyId(projectPath, workspace.path);
           let metadataFound = false;
 
           let metadataPath = "";
           let legacyMetadataRaw: string | undefined;
           const candidateIds =
-            workspaceBasename === legacyId ? [workspaceBasename] : [workspaceBasename, legacyId];
+            workspaceBasename === legacyId ? [legacyId] : [legacyId, workspaceBasename];
           for (const candidateId of candidateIds) {
             const candidatePath = path.join(this.getSessionDir(candidateId), "metadata.json");
             let candidateRaw: string | undefined;

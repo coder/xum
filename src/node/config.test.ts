@@ -3256,9 +3256,11 @@ describe("Config", () => {
       // Both supported layouts exist with DIFFERENT ids (e.g. a stale
       // basename-side file next to the live generated-legacy metadata).
       // findWorkspace resolves either id, so destructive known-id sets must
-      // retain both — the enumeration returns the first candidate as the
-      // entry and reports the second through the legacyAliasIds
-      // out-parameter.
+      // retain both — the GENERATED-LEGACY record stays canonical (its id
+      // feeds the read-time config migration; a stale basename-side primary
+      // would rewrite the persisted stable id on upgrade and orphan session
+      // history) while the basename id is reported through the
+      // legacyAliasIds out-parameter.
       const projectPath = "/fake/project";
       const workspaceName = "aliased-feature";
       const workspacePath = path.join(config.srcDir, "project", workspaceName);
@@ -3290,8 +3292,16 @@ describe("Config", () => {
         throwOnError: true,
         legacyAliasIds,
       });
-      expect(allMetadata.map((metadata) => metadata.id)).toContain("stale-basename-id");
-      expect(legacyAliasIds.has("live-generated-id")).toBe(true);
+      expect(allMetadata.map((metadata) => metadata.id)).toContain("live-generated-id");
+      expect(legacyAliasIds.has("stale-basename-id")).toBe(true);
+      // The read-time migration must persist the CANONICAL id — a stale
+      // basename-side id here would change the workspace's stable identity
+      // on upgrade and make its session history appear missing.
+      const persisted = config
+        .loadConfigOrDefault()
+        .projects.get(projectPath)
+        ?.workspaces.find((workspace) => workspace.path === workspacePath);
+      expect(persisted?.id).toBe("live-generated-id");
     });
   });
 
