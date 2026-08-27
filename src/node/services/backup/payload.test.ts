@@ -399,6 +399,7 @@ describe("backup payload", () => {
       ["env -STOKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
       // Expansion bodies can smuggle assignment bytes past every lexical check.
       ["env TOKEN$(printf =hunter2) mcp-server", REDACTED_BACKUP_VALUE],
+      ["env TOKEN$[0]=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
       ["env $'TOKEN\\x3dhunter2' mcp-server", REDACTED_BACKUP_VALUE],
       ["mcp-run ${X:-hunter2}", REDACTED_BACKUP_VALUE],
     ];
@@ -532,6 +533,31 @@ describe("backup payload", () => {
       reportSecrets: true,
     });
     expect(payloadFileText(snapshot, "mcp.jsonc")).toContain(token);
+  });
+
+  it("blocks the export when a credential format appears in a published path", async () => {
+    const token = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    await writeFixtureFile(muxRoot, `skills/${token}/SKILL.md`, "docs only\n");
+
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+    expect((blocked as BackupCredentialDetectedError).files).toEqual([`skills/${token}/SKILL.md`]);
+
+    const snapshot = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      keepLocalSecrets: true,
+      reportSecrets: true,
+    });
+    expect(snapshot.files.some((file) => file.path.includes(token))).toBe(true);
   });
 
   it("redacts identically when the settings root is a legacy .mux directory", async () => {

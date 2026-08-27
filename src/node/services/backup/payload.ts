@@ -1249,10 +1249,11 @@ function hasDisguisedAssignment(redacted: string): boolean {
 
 /**
  * An expansion body can carry arbitrary bytes into one runtime word (`TOKEN$(printf
- * =hunter2)`, `$'TOKEN\x3d...'`), so its mere presence makes assignment detection
- * undecidable, whether or not the grammar matched an assignment elsewhere.
+ * =hunter2)`, `$'TOKEN\x3d...'`, legacy arithmetic `TOKEN$[0]=...`), so its mere
+ * presence makes assignment detection undecidable, whether or not the grammar matched
+ * an assignment elsewhere.
  */
-const CARRIER_EXPANSION = /\$\(|\$\{|\$'|\$"|`/;
+const CARRIER_EXPANSION = /\$\(|\$\{|\$\[|\$'|\$"|`/;
 
 /** Process substitution passes bytes by file, ambiguous once an assignment matched. */
 const PROCESS_SUBSTITUTION = /<\(|>\(/;
@@ -1597,8 +1598,12 @@ export async function createBackupPayload(
   if (options.keepLocalSecrets !== true) {
     const leakedFiles = files
       .filter((file) => {
+        // The path publishes alongside the content, and recursive collections take
+        // whatever a directory entry happens to be named.
         const content = file.content.toString("utf-8");
-        return CREDENTIAL_TOKEN_PATTERNS.some((pattern) => pattern.test(content));
+        return CREDENTIAL_TOKEN_PATTERNS.some(
+          (pattern) => pattern.test(content) || pattern.test(file.path)
+        );
       })
       .map((file) => file.path)
       .sort();
