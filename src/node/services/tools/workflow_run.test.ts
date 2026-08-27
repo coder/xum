@@ -979,4 +979,119 @@ describe("workflow_run duplicate guard", () => {
     await firstLaunch;
     expect(startWorkflow).toHaveBeenCalledTimes(1);
   });
+
+  test("serializes overlapping launches across equivalent path spellings", async () => {
+    using tempDir = new TestTempDir("test-workflow-run-duplicate");
+    const scriptPath = await writeWorkflowScript(tempDir.path);
+    const runs: WorkflowRunRecord[] = [];
+    const pendingListGates: Array<() => void> = [];
+    let listRunsCalls = 0;
+    const listRuns = async () => {
+      listRunsCalls += 1;
+      await new Promise<void>((resolve) => {
+        pendingListGates.push(resolve);
+      });
+      return [...runs];
+    };
+    const startWorkflow = mock(
+      async (input: {
+        onRunCreated?: (event: {
+          runId: string;
+          status: "pending";
+          result: null;
+          run: unknown;
+        }) => Promise<void> | void;
+      }) => {
+        const record = activeRunRecordFor(scriptPath, "wfr_first");
+        runs.push(record);
+        await input.onRunCreated?.({
+          runId: record.id,
+          status: "pending",
+          result: null,
+          run: record,
+        });
+        return { runId: record.id, status: "completed" as const, result: null };
+      }
+    );
+    const tool = createWorkflowRunTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      trusted: true,
+      workflowService: { listRuns, startWorkflow, getRun: completedGetRun },
+    });
+
+    const settle = async () => new Promise((resolve) => setTimeout(resolve, 25));
+    const firstLaunch = Promise.resolve(
+      tool.execute!(
+        { script_path: scriptPath, script_source: null, args: {}, run_in_background: false },
+        mockToolCallOptions
+      )
+    );
+    await settle();
+    expect(listRunsCalls).toBe(1);
+    // Same file, different spelling: must queue on the same admission gate instead of
+    // racing its own duplicate check before the first launch persists a run.
+    const secondLaunch = Promise.resolve(
+      tool.execute!(
+        {
+          script_path: scriptPath.replace(/^\.\//, ""),
+          script_source: null,
+          args: {},
+          run_in_background: false,
+        },
+        mockToolCallOptions
+      )
+    );
+    await settle();
+    expect(listRunsCalls).toBe(1);
+    pendingListGates.shift()!();
+    await settle();
+    pendingListGates.shift()?.();
+    await expect(secondLaunch).rejects.toThrow(/already has an active run/);
+    await firstLaunch;
+    expect(startWorkflow).toHaveBeenCalledTimes(1);
+  });
+
+  test("matches a legacy inline run that omits workflow.sourceKind", async () => {
+    using tempDir = new TestTempDir("test-workflow-run-duplicate");
+    const inlineSource = "export default function workflow() { return 42; }\n";
+    const resolved = await resolveWorkflowScript({
+      scriptSource: inlineSource,
+      runtime: new LocalRuntime(tempDir.path),
+      workspacePath: tempDir.path,
+      projectTrusted: true,
+    });
+    // Legacy descriptor shape: no sourceKind/sourceHash/canonicalScriptPath on the workflow;
+    // only the run-level sourceHash identifies the source.
+    const legacyInlineRun = createWorkflowRunRecord({
+      id: "wfr_legacy_inline",
+      status: "running",
+      sourceHash: resolved.sourceHash,
+      workflow: {
+        name: "inline",
+        description: "Inline workflow",
+        scope: "project",
+        executable: true,
+      },
+    });
+    const startWorkflow = completedStart();
+    const tool = createWorkflowRunTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      trusted: true,
+      workflowService: {
+        listRuns: async () => [legacyInlineRun],
+        startWorkflow,
+        getRun: completedGetRun,
+      },
+    });
+
+    await expect(
+      Promise.resolve(
+        tool.execute!(
+          { script_path: null, script_source: inlineSource, args: {}, run_in_background: false },
+          mockToolCallOptions
+        )
+      )
+    ).rejects.toThrow(/already has an active run/);
+    expect(startWorkflow).not.toHaveBeenCalled();
+  });
 });

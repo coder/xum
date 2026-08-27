@@ -78,10 +78,17 @@ async function acquireScriptAdmission(key: string): Promise<() => void> {
 }
 
 function scriptIdentityKey(workspaceId: string, script: ResolvedWorkflowScript): string {
+  // Workspace files key on the physical resolved path so equivalent spellings of the same
+  // file ("./x.js" vs "x.js") contend on one admission gate; skill/plugin canonical paths
+  // are already spelling-independent.
+  const pathIdentity =
+    script.sourceKind === "workspace-file"
+      ? (script.resolvedPath ?? script.canonicalScriptPath)
+      : script.canonicalScriptPath;
   const identity =
     script.sourceKind === "inline"
       ? `inline\u0000${script.sourceHash}`
-      : `path\u0000${script.canonicalScriptPath}`;
+      : `path\u0000${pathIdentity}`;
   return `${workspaceId}\u0000${identity}`;
 }
 
@@ -89,8 +96,8 @@ function scriptIdentityKey(workspaceId: string, script: ResolvedWorkflowScript):
  * Same-script identity is the canonical identity persisted at run creation: source hash for
  * inline scripts, canonical script path otherwise. Plain path spellings are normalized so
  * "./x.js" and "x.js" match; alternate identities for the same file (symlinks, copies) are
- * deliberately not chased. A missed match only costs the agent one turn against the run list,
- * while chasing aliases would require filesystem probing on every launch.
+ * deliberately not chased: that would need filesystem probing on every launch, and a missed
+ * match for an exotic alias merely degrades to the pre-guard duplicate behavior.
  */
 function hasSameCanonicalScript(
   run: WorkflowRunRecord,
@@ -99,9 +106,10 @@ function hasSameCanonicalScript(
   workspacePath: string
 ): boolean {
   if (script.sourceKind === "inline" || run.workflow.sourceKind === "inline") {
+    // Match inline launches by source hash alone: legacy records may omit the optional
+    // workflow.sourceKind, and identical source is the same workflow either way.
     return (
       script.sourceKind === "inline" &&
-      run.workflow.sourceKind === "inline" &&
       (run.workflow.sourceHash ?? run.sourceHash) === script.sourceHash
     );
   }
