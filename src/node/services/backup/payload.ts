@@ -121,12 +121,33 @@ const EXAMPLE_ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE";
  * issued-token entropy (`ghp_xxxxxxxx...`), so those spellings stay in the reviewable
  * scan instead of the no-override block. Replaced with a space like the example key,
  * so the removal cannot splice neighbors into a match, and a real token padded with an
- * obvious run still matches on what remains.
+ * obvious run still matches on what remains. One linear pass rather than
+ * `/(.)\1{15,}/gi`: V8 exhausts its call stack evaluating that backreference across a
+ * multi-megabyte single-character run, rejecting a size-valid file before it is
+ * scanned. Line terminators never join runs, matching the dot the regex used.
  */
-const PLACEHOLDER_RUN = /(.)\1{15,}/gi;
+function stripPlaceholderRuns(text: string): string {
+  let result = "";
+  let keptFrom = 0;
+  let i = 0;
+  while (i < text.length) {
+    const anchor = text[i] ?? "";
+    let end = i + 1;
+    if (!"\n\r\u2028\u2029".includes(anchor)) {
+      const folded = anchor.toLowerCase();
+      while (end < text.length && text[end]?.toLowerCase() === folded) end += 1;
+    }
+    if (end - i >= 16) {
+      result += text.slice(keptFrom, i) + " ";
+      keptFrom = end;
+    }
+    i = end;
+  }
+  return result + text.slice(keptFrom);
+}
 
 function matchesCredentialToken(text: string): boolean {
-  const scannable = text.replaceAll(EXAMPLE_ACCESS_KEY, " ").replace(PLACEHOLDER_RUN, " ");
+  const scannable = stripPlaceholderRuns(text.replaceAll(EXAMPLE_ACCESS_KEY, " "));
   return (
     CREDENTIAL_TOKEN_PATTERNS.some((pattern) => pattern.test(scannable)) ||
     hasDigitBearingSkToken(scannable)
@@ -1726,6 +1747,9 @@ const SHELL_STATE_WORDS = new Set([
   // lines are read, after first-parse quotes have hidden what joins inside it.
   "mapfile",
   "readarray",
+  // `read` builds a variable from input bytes with backslash joining unless -r, and
+  // inherited allexport exports what it builds.
+  "read",
   "export",
   "declare",
   "typeset",

@@ -1650,6 +1650,19 @@ describe("backup payload", () => {
     expect(mcp.servers.hooked.env).toBe(REDACTED_BACKUP_VALUE);
   });
 
+  it("scans a file holding a multi-megabyte repeated-character run", async () => {
+    // The run stripper must stay linear: a backreference regex exhausts V8's call
+    // stack near 4 MiB and rejected size-valid files before scanning them.
+    await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", "x".repeat(4 * 1024 * 1024));
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(payloadFileText(payload, "skills/demo/SKILL.md").length).toBe(4 * 1024 * 1024);
+  });
+
   it("localizes commands that write files through active redirection", async () => {
     // A write redirection lets the command assemble a credential file the scans
     // cannot model (`printf a >f; printf b >>f`), so any active `>` goes
@@ -1714,6 +1727,9 @@ describe("backup payload", () => {
       // `mapfile -C` evaluates its callback text as a command when lines are read;
       // a plain `<` read redirection is otherwise portable.
       "mapfile -C 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789;:' -c 1 </etc/hostname",
+      // `read` populates a variable from an ordinary input redirection with backslash
+      // joining unless -r, and inherited allexport exports what it builds.
+      "read TOKEN <./config.txt; mcp",
       // `shopt -so allexport` flips the same allexport state `set -a` does.
       "shopt -so allexport; printf -v TOKEN %s%s ghp_aaaaaaaaaa bbbbbbbbbb; mcp",
       // `source` and `.` run a file in this shell with fragments as positionals.
