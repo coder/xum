@@ -280,7 +280,7 @@ const BashMonitorWakeRecordSchema = z
     filterExclude: z.boolean(),
     kind: z.enum(BASH_MONITOR_WAKE_KINDS).default("match"),
     script: z.string().optional(),
-    lostReason: z.enum(["restart", "runtime-failure"]).optional(),
+    lostReason: z.enum(["restart", "runtime-failure"]).optional().catch(undefined),
     failureMessage: z.string().optional(),
     failedOperations: z
       .array(z.enum(["readOutput", "getExitCode"]))

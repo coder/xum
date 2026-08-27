@@ -556,6 +556,51 @@ describe("BackgroundProcessManager", () => {
       }
     });
 
+    it("suppresses already-shown matches from the failed stop payload", async () => {
+      const stoppedEvents: MonitorStoppedPayload[] = [];
+      manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+      const outputProbeFailure = { value: false, calls: 0 };
+      const remoteRuntime = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), {
+        outputProbeFailure,
+      });
+      const result = await manager.spawn(remoteRuntime, testWorkspaceId, "echo READY; sleep 10", {
+        cwd: process.cwd(),
+        displayName: "monitor-shown-failed-match",
+        monitor: {
+          filter: "READY",
+          pattern: /READY/,
+          exclude: false,
+          cooldownMs: 10_000,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      try {
+        for (let attempt = 0; attempt < 40; attempt++) {
+          const proc = manager.peekProcess(result.processId);
+          if (proc != null && manager.getMonitorSnapshot(proc)?.totalMatches === 1) break;
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        // An unfiltered read advances the shown frontier past the matched line before the failure.
+        const output = await manager.getOutput(result.processId, undefined, false, 1);
+        expect(output.success).toBe(true);
+        outputProbeFailure.value = true;
+        for (let attempt = 0; attempt < 60 && stoppedEvents.length === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        const stoppedEvent = stoppedEvents.find(
+          (event) => event.processId === result.processId && event.reason === "failed"
+        );
+        expect(stoppedEvent).toBeDefined();
+        expect(stoppedEvent?.failedMatch).toMatchObject({ lines: [], totalMatches: 1 });
+        expect(stoppedEvent?.failedMatch?.matchedThroughOffset).toBeUndefined();
+      } finally {
+        outputProbeFailure.value = false;
+      }
+    });
+
     it("resets consecutive output failures after an output probe succeeds", async () => {
       const stoppedEvents: MonitorStoppedPayload[] = [];
       manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));

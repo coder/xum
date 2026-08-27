@@ -611,13 +611,17 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     const monitor = proc.monitor;
     if (!monitor || monitor.stopped) return;
 
+    // Same shown-frontier gate as the normal flush: matches an unfiltered read already delivered
+    // must not resurface as fresh output through the failure wake.
+    const failedMatchHasUnshownLines =
+      monitor.pendingLines.length > 0 && proc.shownThroughOffset < monitor.matchedThroughOffset;
     const failedMatch: MonitorFailedMatchPayload | undefined =
       failure != null
         ? {
-            lines: [...monitor.pendingLines],
+            lines: failedMatchHasUnshownLines ? [...monitor.pendingLines] : [],
             totalMatches: monitor.matchesCount,
-            droppedLines: monitor.droppedLines,
-            ...(monitor.pendingLines.length > 0
+            droppedLines: failedMatchHasUnshownLines ? monitor.droppedLines : 0,
+            ...(failedMatchHasUnshownLines
               ? { matchedThroughOffset: monitor.matchedThroughOffset }
               : {}),
           }

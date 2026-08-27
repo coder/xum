@@ -4042,6 +4042,39 @@ describe("BashMonitorWakeStore", () => {
     expect(buildBashMonitorWakeMetadata(pending).records[0].lostReason).toBe("restart");
   });
 
+  test("malformed lostReason values degrade to restart instead of dropping the record", async () => {
+    const config = makeConfig(rootDir);
+    const store = new BashMonitorWakeStore(config);
+    const dir = path.join(config.getSessionDir("owner-1"), "bash-monitor-wakes");
+    await fsPromises.mkdir(dir, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(dir, "proc-future-lost.json"),
+      JSON.stringify({
+        id: "proc-future-lost",
+        ownerWorkspaceId: "owner-1",
+        processId: "proc-future-lost",
+        taskId: "bash:proc-future-lost",
+        filter: "ERROR",
+        filterExclude: false,
+        kind: "monitor-lost",
+        script: "echo hi",
+        lostReason: "reason-from-a-newer-build",
+        lines: [],
+        totalMatches: 0,
+        droppedLines: 0,
+        status: "pending",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      }),
+      "utf-8"
+    );
+
+    const pending = await store.listPending("owner-1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0].lostReason).toBeUndefined();
+    expect(buildBashMonitorWakeMetadata(pending).records[0].lostReason).toBe("restart");
+  });
+
   test("enqueueMonitorLost creates a pending monitor-lost record with the script", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueMonitorLost(
