@@ -27,10 +27,25 @@ export const MODEL_FALLBACK_CHAIN_LIMIT = 3;
 export const DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
   [KNOWN_MODELS.FABLE.id]: { models: [KNOWN_MODELS.OPUS.id] },
 };
+
+/**
+ * Legacy default chain for the pre-5.1 fable id, seeded alongside
+ * DEFAULT_MODEL_FALLBACKS whenever the original seed pass runs (fresh installs
+ * and configs that never completed it). Those configs mark
+ * defaultModelFallbacksSeeded, so a downgrade to a build whose FABLE is
+ * Fable 5 would skip its own seed; carrying this chain keeps the old build's
+ * refusal fallback intact.
+ */
+export const LEGACY_DEFAULT_MODEL_FALLBACKS: ModelFallbacks = {
+  "anthropic:claude-fable-5": { models: [KNOWN_MODELS.OPUS.id] },
+};
 // Deep-freeze: entries are spread by reference into live configs (fresh-install
 // defaults, seed merge). Accidental in-place mutation must crash fast instead
 // of silently corrupting the process-wide default.
-for (const entry of Object.values(Object.freeze(DEFAULT_MODEL_FALLBACKS))) {
+for (const entry of [
+  ...Object.values(Object.freeze(DEFAULT_MODEL_FALLBACKS)),
+  ...Object.values(Object.freeze(LEGACY_DEFAULT_MODEL_FALLBACKS)),
+]) {
   Object.freeze(entry);
   Object.freeze(entry.models);
 }

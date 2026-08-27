@@ -21,7 +21,11 @@ import type {
   ModelFallbacks,
   ProvidersConfig as CanonicalProvidersConfig,
 } from "@/common/config/schemas";
-import { DEFAULT_MODEL_FALLBACKS, sanitizeModelFallbacks } from "@/common/utils/ai/modelFallbacks";
+import {
+  DEFAULT_MODEL_FALLBACKS,
+  LEGACY_DEFAULT_MODEL_FALLBACKS,
+  sanitizeModelFallbacks,
+} from "@/common/utils/ai/modelFallbacks";
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
 import { normalizeUserPreferences } from "@/common/config/schemas/userPreferences";
 import { SettingsBackupSchema } from "@/common/config/schemas/settingsBackup";
@@ -1384,8 +1388,15 @@ export class Config {
           const existingCanonicalKeys = new Set(
             Object.keys(rawFallbacks).map((key) => normalizeToCanonical(key).trim())
           );
+          // Completing the original seed pass claims defaultModelFallbacksSeeded,
+          // which downgraded builds trust for their own (pre-5.1) default keys;
+          // seed those legacy chains too so a downgrade keeps refusal fallback.
+          const seedDefaults =
+            migrationsBeforeSeed.defaultModelFallbacksSeeded !== true
+              ? { ...LEGACY_DEFAULT_MODEL_FALLBACKS, ...DEFAULT_MODEL_FALLBACKS }
+              : DEFAULT_MODEL_FALLBACKS;
           const missingDefaults = Object.fromEntries(
-            Object.entries(DEFAULT_MODEL_FALLBACKS).filter(
+            Object.entries(seedDefaults).filter(
               ([sourceModel]) => !existingCanonicalKeys.has(sourceModel)
             )
           );
@@ -1580,7 +1591,7 @@ export class Config {
       // Fresh installs get the default refusal-fallback chains immediately; the
       // migration flag rides along so the first save locks in seed-once
       // semantics (later loads never re-apply the defaults).
-      modelFallbacks: { ...DEFAULT_MODEL_FALLBACKS },
+      modelFallbacks: { ...LEGACY_DEFAULT_MODEL_FALLBACKS, ...DEFAULT_MODEL_FALLBACKS },
       migrations: {
         defaultModelFallbacksSeeded: true,
         defaultModelFallbacksSeededFable51: true,
