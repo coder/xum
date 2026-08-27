@@ -306,7 +306,8 @@ export function combineGitNoRepoAutomationEnvs(
 export async function gitNoRepoAutomationEnvForRuntimeRepo(
   runtime: Runtime,
   repoPath: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  allowNonRepository = false
 ): Promise<Record<string, string>> {
   const baseEnv = gitNoRepoAutomationEnv();
   const prefix = `${gitEnvPrefix(baseEnv)}LC_ALL=C `;
@@ -316,7 +317,7 @@ export async function gitNoRepoAutomationEnvForRuntimeRepo(
     abortSignal: signal,
     maxOutputBytes: 1024,
   });
-  if (repoResult.exitCode === 128) return baseEnv;
+  if (repoResult.exitCode === 128 && allowNonRepository) return baseEnv;
   if (repoResult.exitCode !== 0) {
     throw new Error(repoResult.stderr.trim() || "Failed to inspect repository");
   }
@@ -402,7 +403,8 @@ function isNoMatchingConfigError(error: unknown): boolean {
  */
 export async function gitNoRepoAutomationEnvForLocalRepo(
   repoPath: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  allowNonRepository = false
 ): Promise<Record<string, string>> {
   const baseEnv = gitNoRepoAutomationEnv();
   try {
@@ -419,11 +421,12 @@ export async function gitNoRepoAutomationEnvForLocalRepo(
       typeof error === "object" &&
       error !== null &&
       "code" in error &&
-      (error as { code?: unknown }).code === 128
+      (error as { code?: unknown }).code === 128 &&
+      allowNonRepository
     ) {
       return baseEnv;
     }
-    throw new Error("Failed to inspect repository", { cause: error });
+    throw new Error("Failed to inspect repository automation drivers", { cause: error });
   }
 
   const scopes: Array<"--local" | "--worktree"> = ["--local"];

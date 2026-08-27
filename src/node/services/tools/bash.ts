@@ -935,9 +935,14 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
         for (const repoPath of repoPaths) {
           repoEnvs.push(
             config.runtime instanceof LocalBaseRuntime
-              ? await gitNoRepoAutomationEnvForLocalRepo(repoPath, abortSignal)
+              ? await gitNoRepoAutomationEnvForLocalRepo(repoPath, abortSignal, true)
               : config.runtime != null
-                ? await gitNoRepoAutomationEnvForRuntimeRepo(config.runtime, repoPath, abortSignal)
+                ? await gitNoRepoAutomationEnvForRuntimeRepo(
+                    config.runtime,
+                    repoPath,
+                    abortSignal,
+                    true
+                  )
                 : gitNoRepoAutomationEnv()
           );
         }
