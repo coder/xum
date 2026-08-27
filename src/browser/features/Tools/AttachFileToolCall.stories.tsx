@@ -19,6 +19,7 @@ const samplePng =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
 const sampleBytes = "ZGlzcGxheS1vbmx5IGZpbGU=";
 const longDisplayMediaType = `application/${"x".repeat(160)}`;
+const longDownloadMediaType = `image/${"y".repeat(80)}`;
 
 function createAttachFileResult(file: ReturnType<typeof createDisplayOnlyFilePart>) {
   return {
@@ -186,14 +187,24 @@ export const LongMetadataPhone: Story = {
         <AttachFileToolCall
           toolName="attach_file"
           args={{ path: "notes.bin" }}
-          result={createAttachFileResult(
-            createDisplayOnlyFilePart({
-              data: sampleBytes,
-              mediaType: longDisplayMediaType,
-              filename: "notes.bin",
-              size: 17,
-            })
-          )}
+          result={{
+            type: "content",
+            value: [
+              { type: "text", text: "[Attachment prepared: narrow metadata]" },
+              createDisplayOnlyFilePart({
+                data: sampleBytes,
+                mediaType: longDisplayMediaType,
+                filename: "notes.bin",
+                size: 17,
+              }),
+              {
+                type: "media",
+                data: sampleBytes,
+                mediaType: longDownloadMediaType,
+                filename: "diagram.bin",
+              },
+            ],
+          }}
           status="completed"
         />
       </div>
@@ -201,13 +212,18 @@ export const LongMetadataPhone: Story = {
   ),
   play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
     const canvas = within(canvasElement);
-    const mediaType = await canvas.findByText(longDisplayMediaType);
-    const card = mediaType.parentElement?.parentElement;
-    if (card == null) throw new Error("Display-only attachment card was not rendered");
+    const mediaTypes = await Promise.all([
+      canvas.findByText(longDisplayMediaType),
+      canvas.findByText(longDownloadMediaType),
+    ]);
 
     await waitFor(() => {
-      if (mediaType.getBoundingClientRect().right > card.getBoundingClientRect().right + 1) {
-        throw new Error("Display-only media type overflows the attachment card");
+      for (const mediaType of mediaTypes) {
+        const card = mediaType.parentElement?.parentElement;
+        if (card == null) throw new Error("Attachment card was not rendered");
+        if (mediaType.getBoundingClientRect().right > card.getBoundingClientRect().right + 1) {
+          throw new Error("Media type overflows the attachment card");
+        }
       }
     });
   },

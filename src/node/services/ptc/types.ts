@@ -5,7 +5,11 @@
  * multi-tool workflows via code execution.
  */
 
-import type { ToolAttachmentPart } from "@/common/utils/attachments/toolAttachmentParts";
+import type {
+  CodeExecutionConsoleRecord,
+  CodeExecutionResult,
+  CodeExecutionToolCallRecord,
+} from "@/common/types/codeExecution";
 import { FILE_EDIT_TOOL_NAMES } from "@/common/types/tools";
 import { isSupportedAttachmentMediaType } from "@/common/utils/attachments/supportedAttachmentMediaTypes";
 import { getToolOutputUiOnly } from "@/common/utils/tools/toolOutputUiOnly";
@@ -56,63 +60,9 @@ export interface PTCConsoleEvent {
 
 export type PTCEvent = PTCToolCallStartEvent | PTCToolCallEndEvent | PTCConsoleEvent;
 
-/**
- * Record of a tool call made during execution.
- */
-export interface PTCToolCallRecord {
-  toolName: string;
-  args: unknown;
-  result?: unknown;
-  error?: string;
-  duration_ms: number;
-  /**
-   * Kernel-mode (RLM persistent mount) compact-record fields: nested results
-   * never enter the model context, so `result` is dropped and replaced by
-   * `ok` (did the call succeed) plus `bytes` (serialized size of the
-   * suppressed result). The guest already received the full value during
-   * execution; its channels for surfacing data are the return value, console
-   * output, and `vars`. Absent in ephemeral/RLM-off records, which keep full
-   * inline results (the non-RLM inline-results contract).
-   */
-  ok?: boolean;
-  bytes?: number;
-}
-
-/**
- * Record of console output during execution.
- */
-export interface PTCConsoleRecord {
-  level: "log" | "warn" | "error";
-  args: unknown[];
-  timestamp: number;
-}
-
-/**
- * Result of executing code in the PTC sandbox.
- */
-export interface PTCExecutionResult {
-  success: boolean;
-  /** Final return value from the code (if success) */
-  result?: unknown;
-  /** Error message (if !success) */
-  error?: string;
-  /** Tool calls made during execution (for partial results on failure) */
-  toolCalls: PTCToolCallRecord[];
-  /** Console output captured during execution */
-  consoleOutput: PTCConsoleRecord[];
-  /** Total execution time in milliseconds */
-  duration_ms: number;
-  /**
-   * Original attachment parts from nested tool results (e.g. attach_file):
-   * model media plus display-only files. The ToolBridge strips these out of
-   * sandbox-visible values (guests cannot use pixels, and base64 would bloat
-   * vars/records and host-side nested-call records) and code_execution
-   * re-attaches them here. The request path delivers media to the model as
-   * real attachments (extractToolMediaAsUserMessages); display_file parts
-   * are user-preview-only and render from this carrier in the UI.
-   */
-  attachments?: ToolAttachmentPart[];
-}
+export type PTCToolCallRecord = CodeExecutionToolCallRecord;
+export type PTCConsoleRecord = CodeExecutionConsoleRecord;
+export type PTCExecutionResult = CodeExecutionResult;
 
 /**
  * Nested records whose FULL result must survive kernel-mode capture bounding

@@ -145,10 +145,12 @@ export const MediaAttachmentDownloadCard: React.FC<{ media: MediaContent }> = (p
 
   return (
     <div className="border-border-light bg-dark mt-2 max-w-xl rounded border p-3">
-      <div className="mb-2 flex items-center gap-2 text-sm text-[var(--color-subtle)]">
+      <div className="mb-2 flex min-w-0 items-center gap-2 text-sm text-[var(--color-subtle)]">
         <FileText className="h-4 w-4 shrink-0" />
-        <span className="truncate font-medium text-[var(--color-text)]">{label}</span>
-        <span className="counter-nums text-xs">{baseMediaType}</span>
+        <span className="min-w-0 flex-1 truncate font-medium text-[var(--color-text)]">
+          {label}
+        </span>
+        <span className="counter-nums max-w-[40%] min-w-0 truncate text-xs">{baseMediaType}</span>
       </div>
       <div className="flex items-center gap-2 text-xs text-[var(--color-subtle)]">
         <span>Attached for the model; inline preview is not available for this file type.</span>

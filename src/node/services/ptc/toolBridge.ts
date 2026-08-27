@@ -15,6 +15,7 @@ import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import { KERNEL_COMPACT_ARGS_CAP_BYTES } from "@/constants/kernelOutput";
 import { RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES } from "@/constants/resultHandles";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST } from "@/common/constants/imageAttachments";
 import {
   FULL_GRANTS,
   isBridgeToolGranted,
@@ -38,9 +39,9 @@ import {
 } from "./types";
 
 /**
- * Aggregate per-eval budget for serialized attachment parts stripped from
- * bridged results. Forwardable parts live outside QuickJS memory accounting,
- * and unsupported media still consumes the budget to bound repeated calls.
+ * Aggregate per-eval limits for attachment parts stripped from bridged results.
+ * Forwardable parts live outside QuickJS memory accounting, and unsupported
+ * media still consumes the byte budget to bound repeated calls.
  */
 export const MAX_PENDING_ATTACHMENT_BYTES = 32 * 1024 * 1024;
 
@@ -493,6 +494,12 @@ export class ToolBridge {
       stub: string,
       carry: boolean
     ): T | { type: "text"; text: string } => {
+      if (
+        carry &&
+        pending.length + carriedParts.length >= MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST
+      ) {
+        return { type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB };
+      }
       const partBytes = Buffer.byteLength(JSON.stringify(part), "utf8");
       if (pendingBytes + partBytes > MAX_PENDING_ATTACHMENT_BYTES) {
         return { type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB };
@@ -532,7 +539,9 @@ export class ToolBridge {
       return serialized;
     }
     if (carriedParts.length > 0) {
-      pending.push(...carriedParts);
+      for (const part of carriedParts) {
+        pending.push(part);
+      }
       this.pendingAttachments.set(runtime, pending);
     }
     return { type: "content", value: newValue };

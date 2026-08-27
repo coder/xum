@@ -3,6 +3,7 @@
  */
 
 import { describe, it, expect, mock } from "bun:test";
+import { MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST } from "@/common/constants/imageAttachments";
 import { ToolBridge, MAX_PENDING_ATTACHMENT_BYTES, type KernelBridgeOptions } from "./toolBridge";
 import {
   DISPLAY_DATA_STUB,
@@ -939,6 +940,34 @@ describe("attachment part stripping", () => {
     const drained = bridge.drainPendingAttachments(runtime);
     expect(drained).toHaveLength(1);
     expect(drained[0].data).toBe(bigData);
+  });
+
+  it("caps carried attachment parts per execution", async () => {
+    const total = MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST + 2;
+    const parts = Array.from({ length: total }, (_, index) => ({
+      type: "media",
+      data: "data-" + index,
+      mediaType: "image/png",
+    }));
+    const bridge = new ToolBridge({
+      attach_file: createMockTool("attach_file", z.object({ path: z.string() }), () => ({
+        type: "content",
+        value: parts,
+      })),
+    });
+    const { captured, runtime } = registerCapturingXum(bridge);
+
+    const sandboxValue = (await captured.xum.attach_file({ path: "/many" })) as {
+      value: Array<{ type: string; text?: string }>;
+    };
+    expect(sandboxValue.value).toHaveLength(total);
+    expect(sandboxValue.value.slice(MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST)).toEqual([
+      { type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB },
+      { type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB },
+    ]);
+    expect(bridge.drainPendingAttachments(runtime)).toHaveLength(
+      MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST
+    );
   });
 
   it("register clears stale pending attachments for that runtime", async () => {
