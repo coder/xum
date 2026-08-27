@@ -8129,11 +8129,15 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * Reorder the pinned block of one project bucket. `workspaceIds` is the full
-   * desired pinned order for that bucket as the client sees it. Defensive
-   * contract: unknown/unpinned ids are dropped, currently-pinned ids omitted
-   * from the input keep their relative order and are appended, so concurrent
-   * pin/unpin from other clients is absorbed instead of erroring.
+   * Reorder a pinned block. `workspaceIds` is the full desired pinned order
+   * for that block as the client sees it: one project bucket in grouped mode,
+   * or the unified cross-project block in flat sidebar mode. The reorder
+   * scope is the union of config buckets referenced by the input ids, so a
+   * grouped drag never disturbs other buckets while a flat drag re-deals the
+   * whole unified block. Defensive contract: unknown/unpinned ids are
+   * dropped, currently-pinned ids omitted from the input keep their relative
+   * order and are appended, so concurrent pin/unpin from other clients is
+   * absorbed instead of erroring.
    *
    * Persistence model: pinnedAt is an ordering key, so reordering re-deals the
    * existing pool of pinnedAt timestamps onto the new order (see
@@ -8142,30 +8146,34 @@ export class WorkspaceService extends EventEmitter {
    */
   async reorderPinned(workspaceIds: string[]): Promise<Result<void>> {
     try {
-      // Derive the config bucket from the first resolvable id so clients never
-      // need internal bucket keys (e.g. the multi-project bucket). Nothing
-      // resolvable means the client acted on stale state: a benign no-op.
-      // Const (not narrowed let) so the editConfig closure sees type string.
-      const projectPath = workspaceIds
-        .map((id) => this.config.findWorkspace(id)?.projectPath)
-        .find((path) => path !== undefined);
-      if (projectPath === undefined) {
+      // Resolve buckets from the ids so clients never need internal bucket
+      // keys (e.g. the multi-project bucket). Nothing resolvable means the
+      // client acted on stale state: a benign no-op.
+      const projectPaths = new Set<string>();
+      for (const id of workspaceIds) {
+        const path = this.config.findWorkspace(id)?.projectPath;
+        if (path !== undefined) {
+          projectPaths.add(path);
+        }
+      }
+      if (projectPaths.size === 0) {
         return Ok(undefined);
       }
 
       const changedIds: string[] = [];
       await this.config.editConfig((config) => {
-        const projectConfig = config.projects.get(projectPath);
-        if (!projectConfig) {
-          return config;
-        }
+        const bucketConfigs = [...projectPaths]
+          .map((path) => config.projects.get(path))
+          .filter((bucket) => bucket !== undefined);
 
-        // Current pinned roots of the bucket, in effective pin order.
+        // Current pinned roots across the referenced buckets, in effective pin order.
         const pinnedEntries: Array<{ id: string; pinnedAt: string }> = [];
-        for (const entry of projectConfig.workspaces) {
-          if (!entry.id || !entry.pinnedAt) continue;
-          if (!isWorkspacePinned(entry)) continue;
-          pinnedEntries.push({ id: entry.id, pinnedAt: entry.pinnedAt });
+        for (const bucket of bucketConfigs) {
+          for (const entry of bucket.workspaces) {
+            if (!entry.id || !entry.pinnedAt) continue;
+            if (!isWorkspacePinned(entry)) continue;
+            pinnedEntries.push({ id: entry.id, pinnedAt: entry.pinnedAt });
+          }
         }
         if (pinnedEntries.length < 2) {
           return config;
@@ -8198,12 +8206,14 @@ export class WorkspaceService extends EventEmitter {
           pinnedEntries.map((entry) => [entry.id, entry.pinnedAt])
         );
         const changes = reassignPinnedTimestamps(desiredOrder, currentPinnedAtById);
-        for (const entry of projectConfig.workspaces) {
-          if (!entry.id) continue;
-          const nextPinnedAt = changes.get(entry.id);
-          if (nextPinnedAt !== undefined) {
-            entry.pinnedAt = nextPinnedAt;
-            changedIds.push(entry.id);
+        for (const bucket of bucketConfigs) {
+          for (const entry of bucket.workspaces) {
+            if (!entry.id) continue;
+            const nextPinnedAt = changes.get(entry.id);
+            if (nextPinnedAt !== undefined) {
+              entry.pinnedAt = nextPinnedAt;
+              changedIds.push(entry.id);
+            }
           }
         }
         return config;

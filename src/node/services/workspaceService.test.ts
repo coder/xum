@@ -13614,6 +13614,126 @@ describe("WorkspaceService reorderPinned", () => {
   });
 });
 
+describe("WorkspaceService reorderPinned across projects", () => {
+  const projectA = "/tmp/project-a";
+  const projectB = "/tmp/project-b";
+  const idA1 = "ws-a1";
+  const idA2 = "ws-a2";
+  const idB1 = "ws-b1";
+  const idB2 = "ws-b2";
+
+  let workspaceService: WorkspaceService;
+  let configState: ProjectsConfig;
+  let historyService: HistoryService;
+  let cleanupHistory: () => Promise<void>;
+
+  const findEntry = (id: string) => {
+    for (const [projectPath, project] of configState.projects) {
+      const entry = project.workspaces.find((w) => w.id === id);
+      if (entry) return { projectPath, entry };
+    }
+    return undefined;
+  };
+
+  /** Pinned ids across all projects in effective order (pinnedAt asc), as the flat sidebar sorts them. */
+  const globalPinnedOrder = () =>
+    [...configState.projects.values()]
+      .flatMap((project) => project.workspaces)
+      .filter((w) => w.id && w.pinnedAt && !w.parentWorkspaceId && !w.archivedAt)
+      .sort((a, b) => Date.parse(a.pinnedAt ?? "") - Date.parse(b.pinnedAt ?? ""))
+      .map((w) => w.id);
+
+  beforeEach(async () => {
+    // Interleaved global pin order: a1, b1, a2, b2.
+    configState = {
+      projects: new Map([
+        [
+          projectA,
+          {
+            workspaces: [
+              { path: `${projectA}/${idA1}`, id: idA1, pinnedAt: "2026-01-01T00:00:00.000Z" },
+              { path: `${projectA}/${idA2}`, id: idA2, pinnedAt: "2026-01-01T00:00:20.000Z" },
+            ],
+          },
+        ],
+        [
+          projectB,
+          {
+            workspaces: [
+              { path: `${projectB}/${idB1}`, id: idB1, pinnedAt: "2026-01-01T00:00:10.000Z" },
+              { path: `${projectB}/${idB2}`, id: idB2, pinnedAt: "2026-01-01T00:00:30.000Z" },
+            ],
+          },
+        ],
+      ]),
+    };
+
+    ({ historyService, cleanup: cleanupHistory } = await createTestHistoryService());
+
+    const mockConfig: Partial<Config> = {
+      srcDir: "/tmp/src",
+      getSessionDir: mock(() => "/tmp/test/sessions"),
+      findWorkspace: mock((id: string) => {
+        const found = findEntry(id);
+        if (!found) return null;
+        return {
+          projectPath: found.projectPath,
+          workspacePath: found.entry.path,
+          parentWorkspaceId: found.entry.parentWorkspaceId,
+        };
+      }),
+      editConfig: mock((fn: (config: ProjectsConfig) => ProjectsConfig) => {
+        configState = fn(configState);
+        return Promise.resolve();
+      }),
+      getAllWorkspaceMetadata: mock(() => Promise.resolve([])),
+      loadConfigOrDefault: mock(() => configState),
+    };
+
+    workspaceService = createWorkspaceServiceForTest({
+      config: mockConfig,
+      historyService,
+    });
+  });
+
+  afterEach(async () => {
+    await cleanupHistory();
+  });
+
+  test("persists a flat-mode reorder spanning project buckets", async () => {
+    const maxBefore = Math.max(
+      ...[idA1, idA2, idB1, idB2].map((id) => Date.parse(findEntry(id)?.entry.pinnedAt ?? ""))
+    );
+
+    // Drag b1 above a1 in the unified pinned block.
+    const result = await workspaceService.reorderPinned([idB1, idA1, idA2, idB2]);
+    expect(result.success).toBe(true);
+    expect(globalPinnedOrder()).toEqual([idB1, idA1, idA2, idB2]);
+
+    // The timestamp pool is re-dealt, not inflated.
+    const maxAfter = Math.max(
+      ...[idA1, idA2, idB1, idB2].map((id) => Date.parse(findEntry(id)?.entry.pinnedAt ?? ""))
+    );
+    expect(maxAfter).toBe(maxBefore);
+  });
+
+  test("grouped-mode reorder of one bucket leaves other buckets' timestamps untouched", async () => {
+    const b1Before = findEntry(idB1)?.entry.pinnedAt;
+    const b2Before = findEntry(idB2)?.entry.pinnedAt;
+
+    const result = await workspaceService.reorderPinned([idA2, idA1]);
+    expect(result.success).toBe(true);
+
+    // Project A flipped within its own timestamp pool.
+    const a1 = Date.parse(findEntry(idA1)?.entry.pinnedAt ?? "");
+    const a2 = Date.parse(findEntry(idA2)?.entry.pinnedAt ?? "");
+    expect(a2).toBeLessThan(a1);
+    // Project B was not referenced, so its entries are byte-identical.
+    expect(findEntry(idB1)?.entry.pinnedAt).toBe(b1Before);
+    expect(findEntry(idB2)?.entry.pinnedAt).toBe(b2Before);
+  });
+});
+
 describe("WorkspaceService archive lifecycle hooks", () => {
   const workspaceId = "ws-archive";
   const projectPath = "/tmp/project";
