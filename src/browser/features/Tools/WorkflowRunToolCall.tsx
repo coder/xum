@@ -1315,6 +1315,10 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
     typeof apiState?.api?.workflows.subscribe === "function" &&
     workflowWorkspaceId != null &&
     runId != null &&
+    // The workflows.subscribe feed deliberately omits nested (parentWorkflow) runs, so a card
+    // whose snapshot is confirmed nested must keep the getRun poller instead of freezing on a
+    // healthy stream that will never yield its run.
+    run?.parentWorkflow == null &&
     (shouldRefreshWorkflow(displayStatus) ||
       resumingRunId === runId ||
       workflowControlInFlightRunId === runId);

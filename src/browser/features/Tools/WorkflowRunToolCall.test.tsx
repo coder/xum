@@ -2735,6 +2735,102 @@ describe("WorkflowRunToolCall", () => {
     await Promise.resolve();
     expect(subscribe).not.toHaveBeenCalled();
   });
+
+  test("keeps polling nested runs the subscription feed omits", async () => {
+    const parentWorkflow = {
+      runId: "wfr_parent",
+      stepId: "spawn-child",
+      inputHash: "sha256:child",
+      depth: 1,
+    };
+    const nestedRun = {
+      ...createTimelineRun({ id: "wfr_nested_child" }),
+      parentWorkflow,
+    };
+    const updatedNestedRun = {
+      ...createTimelineRun({
+        id: nestedRun.id,
+        stepTitle: "Verify sources",
+        updatedAt: "2026-05-29T00:00:03.000Z",
+      }),
+      parentWorkflow,
+    };
+    const subscribe = mock(async () => createWorkflowSubscription().iterator);
+    const getRun = mock(async () => updatedNestedRun);
+    const view = render(
+      <APIHarness client={{ workflows: { subscribe, getRun } }}>
+        {withStickyToolProviders(
+          <WorkflowRunToolCall
+            args={{ script_path: TEST_WORKFLOW_SCRIPT_PATH, run_in_background: true }}
+            status="executing"
+            workspaceId={TEST_WORKSPACE_ID}
+            result={{ status: "running", runId: nestedRun.id, result: null, run: nestedRun }}
+          />
+        )}
+      </APIHarness>
+    );
+
+    await waitFor(() => expect(getRun).toHaveBeenCalled());
+    fireEvent.click(view.getByText("Research"));
+    await waitFor(() => expect(view.getByText("Verify sources")).toBeTruthy());
+    expect(subscribe).not.toHaveBeenCalled();
+  });
+
+  test("shares one workspace subscription across concurrent workflow cards", async () => {
+    const firstRun = createTimelineRun({ id: "wfr_shared_first", stepTitle: "First initial" });
+    const secondRun = createTimelineRun({ id: "wfr_shared_second", stepTitle: "Second initial" });
+    const stream = createWorkflowSubscription();
+    const subscribe = mock(async () => stream.iterator);
+    const view = render(
+      <APIHarness client={{ workflows: { subscribe } }}>
+        {withStickyToolProviders(
+          <>
+            <WorkflowRunToolCall
+              args={{ script_path: TEST_WORKFLOW_SCRIPT_PATH, run_in_background: true }}
+              status="executing"
+              workspaceId={TEST_WORKSPACE_ID}
+              result={{ status: "running", runId: firstRun.id, result: null, run: firstRun }}
+            />
+            <WorkflowRunToolCall
+              args={{ script_path: TEST_WORKFLOW_SCRIPT_PATH, run_in_background: true }}
+              status="executing"
+              workspaceId={TEST_WORKSPACE_ID}
+              result={{ status: "running", runId: secondRun.id, result: null, run: secondRun }}
+            />
+          </>
+        )}
+      </APIHarness>
+    );
+
+    await waitFor(() => expect(subscribe).toHaveBeenCalled());
+    for (const phase of view.getAllByText("Research")) {
+      fireEvent.click(phase);
+    }
+    expect(view.getByText("First initial")).toBeTruthy();
+    expect(view.getByText("Second initial")).toBeTruthy();
+
+    stream.emit({
+      type: "run-changed",
+      run: createTimelineRun({
+        id: firstRun.id,
+        stepTitle: "First updated",
+        updatedAt: "2026-05-29T00:00:03.000Z",
+      }),
+    });
+    stream.emit({
+      type: "run-changed",
+      run: createTimelineRun({
+        id: secondRun.id,
+        stepTitle: "Second updated",
+        updatedAt: "2026-05-29T00:00:03.000Z",
+      }),
+    });
+
+    await waitFor(() => expect(view.getByText("First updated")).toBeTruthy());
+    await waitFor(() => expect(view.getByText("Second updated")).toBeTruthy());
+    expect(subscribe).toHaveBeenCalledTimes(1);
+  });
+
   test("keeps the newest workflow refresh snapshot when polls resolve out of order", async () => {
     const originalSetInterval = globalThis.window.setInterval;
     const originalClearInterval = globalThis.window.clearInterval;
