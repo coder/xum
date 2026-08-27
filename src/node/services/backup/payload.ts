@@ -1218,13 +1218,15 @@ const SHELL_WORD = new RegExp(
 const ASSIGNMENT_START = new RegExp(`^${ASSIGNMENT_NAME}`);
 
 /**
- * A parameter expansion that can turn into nothing at runtime: an unset variable, a
- * positional this runtime never passes, or `$@`/`$*`/`$!` in a fresh shell. The specials
- * Bash always fills under `-c` ($0, $?, $#, $$, $-) stay literal instead: their `$`
- * spelling already breaks a token run for the scan, and deleting a value the runtime
- * inserts would manufacture no-override matches from fragments that never join.
+ * A parameter expansion that can turn into nothing at runtime: an unset variable. No
+ * plain `$NAME` can gain a value mid-command without an assignment the redaction
+ * already rewrites. The specials Bash always fills under `-c` ($0, $?, $#, $$, $-)
+ * stay literal instead: their `$` spelling already breaks a token run for the scan,
+ * and deleting a value the runtime inserts would manufacture no-override matches from
+ * fragments that never join. Positionals and `$@`/`$*`/`$!` are carriers, because the
+ * same command string can populate them first (`set -- p`, `&`).
  */
-const SIMPLE_EXPANSION = /^\$(?:[A-Za-z_][A-Za-z0-9_]*|[1-9@*!])/;
+const SIMPLE_EXPANSION = /^\$[A-Za-z_][A-Za-z0-9_]*/;
 
 /**
  * Bash-accurate quote removal, in both directions on purpose: under-stripping would hide
@@ -1582,7 +1584,9 @@ function findActiveShellConstructs(command: string): {
           continue;
         }
         if (command[j] === "`") found.carrier = true;
-        if (command[j] === "$" && "({[!".includes(command[j + 1] ?? "")) found.carrier = true;
+        if (command[j] === "$" && "({[!123456789@*".includes(command[j + 1] ?? "")) {
+          found.carrier = true;
+        }
         j += 1;
       }
       i = j + 1;
@@ -1603,7 +1607,7 @@ function findActiveShellConstructs(command: string): {
       continue;
     }
     if (char === "$") {
-      if ("({['\"!".includes(command[i + 1] ?? "")) found.carrier = true;
+      if ("({['\"!123456789@*".includes(command[i + 1] ?? "")) found.carrier = true;
       i += 1;
       wordStart = false;
       continue;

@@ -697,8 +697,8 @@ describe("backup payload", () => {
       expect(payloadFileText(payload, "mcp.jsonc")).toContain("ghp_aaaaaaaaaa");
     }
 
-    // A positional expansion ends at one character, so its empty expansion joins
-    // the digit tail back onto the prefix inside active double quotes.
+    // A positional stays active inside double quotes, and the command itself could
+    // populate it first, so that spelling goes machine-local instead of publishing.
     await writeFixtureFile(
       muxRoot,
       "mcp.jsonc",
@@ -706,25 +706,27 @@ describe("backup payload", () => {
         servers: { grafana: { command: 'mcp --pattern "ghp_aaaaaaaaaa$912345678901234567890"' } },
       })
     );
-    const blocked = await captureRejection(
-      createBackupPayload({
-        muxRoot,
-        muxVersion: "1.2.3",
-        sourceLabel: "test-host",
-        reportSecrets: true,
-      })
-    );
-    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
   });
 
   it("blocks the export when an empty expansion splices a known credential token", async () => {
-    // Bash expands the unset positional to nothing, joining the fragments.
+    // Bash expands the unset variable to nothing, joining the fragments across the
+    // quote boundary that ends its name.
     await writeFixtureFile(
       muxRoot,
       "mcp.jsonc",
       JSON.stringify({
         servers: {
-          grafana: { command: "mcp-grafana --token ghp_1234567890$912345678901234567890" },
+          grafana: { command: 'mcp-grafana --token ghp_1234567890$NOPE"12345678901234567890"' },
         },
       })
     );
@@ -1262,6 +1264,30 @@ describe("backup payload", () => {
     expect(redactedMcp.servers.grafana.command).toBe(
       `TOKEN=${REDACTED_BACKUP_VALUE} mcp-server # NOTE=keep`
     );
+  });
+
+  it("localizes positional expansions the command itself can populate", async () => {
+    // `set -- p` fills $1 before the expansion runs, so the runtime argument carries
+    // the contiguous token while every textual scan of the spelling misses it.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          grafana: { command: "set -- p; mcp --token gh$1_1234567890abcdefghijklmnopqrstuvwxyz" },
+        },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
   });
 
   it("keeps the documented AWS example key reviewable instead of hard-blocking", async () => {
