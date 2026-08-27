@@ -1511,25 +1511,29 @@ describe("backup payload", () => {
   });
 
   it("blocks GitLab tokens in collected files without an override", async () => {
-    // `glpat-` is an issued-only prefix like `ghp_`; a generically named collected
-    // file must not publish one just because no path-based gate covers it. Assembled
-    // at runtime so this source file never holds a contiguous token-shaped string,
-    // which GitHub push protection would itself refuse.
-    await writeFixtureFile(
-      muxRoot,
-      "skills/demo/SKILL.md",
-      ["token: glpat-", "K3vQ9rT2wY7bN4mJ6hL8", "\n"].join("")
-    );
-    const blocked = await captureRejection(
-      createBackupPayload({
+    // GitLab issued-only prefixes cover more than the PAT: CI job, OAuth app,
+    // feature-flag, mail, and agent tokens are issued the same way, and a generically
+    // named collected file must not publish any of them just because no path-based
+    // gate covers it. Assembled at runtime so this source file never holds a
+    // contiguous token-shaped string, which GitHub push protection would itself
+    // refuse.
+    for (const prefix of ["glpat-", "glcbt-", "gloas-", "glffct-", "glimt-", "glagent-"]) {
+      await writeFixtureFile(
         muxRoot,
-        muxVersion: "1.2.3",
-        sourceLabel: "test-host",
-        reportSecrets: true,
-      })
-    );
-    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
-    expect((blocked as BackupCredentialDetectedError).files).toEqual(["skills/demo/SKILL.md"]);
+        "skills/demo/SKILL.md",
+        ["token: ", prefix, "K3vQ9rT2wY7bN4mJ6hL8", "\n"].join("")
+      );
+      const blocked = await captureRejection(
+        createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        })
+      );
+      expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+      expect((blocked as BackupCredentialDetectedError).files).toEqual(["skills/demo/SKILL.md"]);
+    }
   });
 
   it("localizes commands that write files through active redirection", async () => {
@@ -1585,6 +1589,8 @@ describe("backup payload", () => {
       "printf ghp_aaaaaaaaaa | mcp-server",
       "printf -v TOKEN %s%s ghp_aaaaaaaaaa bbbbbbbbbb; export TOKEN; mcp",
       "set -a; printf -v TOKEN %s ghp_aaaaaaaaaabbbbbbbbbb; mcp",
+      // `shopt -so allexport` flips the same allexport state `set -a` does.
+      "shopt -so allexport; printf -v TOKEN %s%s ghp_aaaaaaaaaa bbbbbbbbbb; mcp",
     ]) {
       await writeFixtureFile(
         muxRoot,

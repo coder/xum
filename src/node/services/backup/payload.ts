@@ -78,8 +78,9 @@ const CREDENTIAL_TOKEN_PATTERNS = [
   /\bgh[opusr]_[A-Za-z0-9]{20,}\b/,
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,
   /\bglsa_[A-Za-z0-9_]{20,}\b/,
-  // GitLab issued prefixes: personal, deploy, runner, service-account, trigger tokens.
-  /\bgl(?:pat|dt|rt|soat|ptt)-[A-Za-z0-9_-]{20,}\b/,
+  // GitLab issued prefixes: personal, deploy, runner, service-account, trigger,
+  // CI job, OAuth app, feature-flag, incoming-mail, and cluster-agent tokens.
+  /\bgl(?:pat|dt|rt|soat|ptt|cbt|oas|ffct|imt|agent)-[A-Za-z0-9_-]{20,}\b/,
   /\blin_api_[A-Za-z0-9]{16,}\b/,
   /\bntn_[A-Za-z0-9]{16,}\b/,
   /\bAKIA[0-9A-Z]{16}\b/,
@@ -1501,6 +1502,9 @@ const SHELL_STATE_WORDS = new Set([
   "readonly",
   "local",
   "set",
+  // `shopt -so allexport` flips the same allexport state `set -a` does, and
+  // `shopt -s expand_aliases` opens alias rewriting of later lines.
+  "shopt",
 ]);
 
 /**
