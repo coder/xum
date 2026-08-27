@@ -3092,6 +3092,82 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                             </Tooltip>
                           </DraggableProjectItem>
 
+                          {/* Flat mode keeps sub-project management reachable:
+                              the same SectionHeader controls (scoped new chat,
+                              rename, color, delete) render as compact rows with
+                              nothing nested beneath them. */}
+                          {flatSidebarEnabled &&
+                            getSubProjectsForParent(projectPath, userProjects).map(
+                              ([subProjectPath, subProjectConfig]) => {
+                                const sectionRows = topLevelProjectWorkspaces.filter(
+                                  (workspace) => workspace.subProjectPath === subProjectPath
+                                );
+                                const shouldAutoEditSection =
+                                  autoEditingSection?.projectPath === projectPath &&
+                                  autoEditingSection?.sectionId === subProjectPath;
+                                return (
+                                  <div key={subProjectPath} className="pl-4">
+                                    <SectionHeader
+                                      section={{
+                                        id: subProjectPath,
+                                        name: getProjectDisplayName(
+                                          subProjectPath,
+                                          subProjectConfig
+                                        ),
+                                        color: subProjectConfig.color,
+                                      }}
+                                      isExpanded={false}
+                                      workspaceCount={sectionRows.length}
+                                      hasAttention={sectionRows.some(
+                                        (workspace) =>
+                                          workspaceAttentionById.get(workspace.id) === true
+                                      )}
+                                      onAddWorkspace={() => {
+                                        handleAddWorkspace(projectPath, subProjectPath);
+                                      }}
+                                      onRename={(name) => {
+                                        if (shouldAutoEditSection) {
+                                          setAutoEditingSection(null);
+                                        }
+                                        void updateDisplayName(subProjectPath, name);
+                                      }}
+                                      onChangeColor={(color) => {
+                                        void updateProjectColor(subProjectPath, color);
+                                      }}
+                                      autoStartEditing={shouldAutoEditSection}
+                                      onAutoCreateAbandon={
+                                        shouldAutoEditSection
+                                          ? () => {
+                                              void (async () => {
+                                                setAutoEditingSection(null);
+                                                await handleRemoveSection(
+                                                  projectPath,
+                                                  subProjectPath
+                                                );
+                                              })();
+                                            }
+                                          : undefined
+                                      }
+                                      onAutoCreateRenameCancel={
+                                        shouldAutoEditSection
+                                          ? () => {
+                                              setAutoEditingSection(null);
+                                            }
+                                          : undefined
+                                      }
+                                      onDelete={(anchorEl) => {
+                                        void handleRemoveSection(
+                                          projectPath,
+                                          subProjectPath,
+                                          anchorEl
+                                        );
+                                      }}
+                                    />
+                                  </div>
+                                );
+                              }
+                            )}
+
                           {!flatSidebarEnabled && isExpanded && (
                             <div
                               id={workspaceListId}

@@ -971,6 +971,54 @@ describe("ProjectSidebar flat chat list", () => {
     expect(view.getAllByTestId(agentItemTestId("solo"))).toHaveLength(1);
   });
 
+  test("keeps sub-project management reachable in flat mode", () => {
+    const workspace = {
+      ...createWorkspace("solo-sub", { title: "Solo chat" }),
+      projects: singleProjectRefs,
+    };
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        ["/projects/demo-project", { workspaces: [] }],
+        [
+          "/projects/demo-project/features",
+          {
+            displayName: "Features",
+            parentProjectPath: "/projects/demo-project",
+            workspaces: [],
+          },
+        ],
+      ]),
+    });
+    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [workspace]]])}
+        workspaceRecency={{ "solo-sub": Date.now() }}
+      />
+    );
+
+    // SectionHeader is stubbed in this suite, so assert the management row's
+    // contract via its props: the flat row keeps the scoped controls but has
+    // no expansion toggle (nothing nests under it in flat mode).
+    expect(view.getByLabelText("Create workspace in demo-project")).toBeTruthy();
+    const sectionHeaderCalls = (
+      SectionHeaderModule.SectionHeader as unknown as {
+        mock: {
+          calls: Array<[Parameters<typeof SectionHeaderModule.SectionHeader>[0]]>;
+        };
+      }
+    ).mock.calls;
+    const sectionProps = sectionHeaderCalls
+      .map(([props]) => props)
+      .find((props) => props.section.id === "/projects/demo-project/features");
+    expect(sectionProps?.section.name).toBe("Features");
+    expect(sectionProps?.onToggleExpand).toBeUndefined();
+    expect(sectionProps?.workspaceCount).toBe(0);
+  });
+
   test("coalesces best-of children into a task group in the flat list", () => {
     const parentWorkspace = {
       ...createWorkspace("parent", { title: "Parent workspace" }),
