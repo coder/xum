@@ -1699,6 +1699,56 @@ describe("backup payload", () => {
     });
   }
 
+  it("localizes runtime preload modules", async () => {
+    for (const command of [
+      "node --require /home/user/.xum/skills/launch.txt server.js",
+      "node -r/home/user/.xum/skills/launch.txt server.js",
+      "bun --preload /home/user/.xum/skills/launch.txt server.ts",
+      "bun --require=/home/user/.xum/skills/launch.txt server.ts",
+      "bun -r/home/user/.xum/skills/launch.txt server.ts",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+  });
+
+  it("localizes git shell callback modes", async () => {
+    for (const command of [
+      "git submodule --quiet foreach 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
+      "git rebase --exec 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789' HEAD~1",
+      "git filter-branch --tree-filter 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789' -- --all",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+  });
+
   it("localizes makefile-driven launchers", async () => {
     for (const command of [
       "make -f /home/user/.xum/skills/launch.txt",
@@ -1888,8 +1938,6 @@ describe("backup payload", () => {
       "python3 server.py -c settings.toml",
       "perl -Ivendor server.pl",
       "python3 -Wsource server.py",
-      "node -rvendor server.js",
-      "bun -rvendor server.ts",
       "ruby app.rb -e production",
       "ruby -Ivendor app.rb",
       "php -cvendor/php.ini server.php",
@@ -1898,6 +1946,9 @@ describe("backup payload", () => {
       "npm exec notes-mcp -- --port 8080",
       "mcp-server -Ssettings.toml",
       "env -u TOKEN mcp-server -Ssettings.toml",
+      "git status",
+      "git -C /tmp status",
+      "git submodule status",
     ]) {
       await writeFixtureFile(
         muxRoot,

@@ -1604,6 +1604,11 @@ function envOptionTakesSeparateValue(unquoted: string): boolean {
   );
 }
 
+/** Git global options whose following word is a value, not the subcommand. */
+function gitOptionTakesSeparateValue(unquoted: string): boolean {
+  return /^(?:-[cC]|--(?:git-dir|work-tree|namespace|super-prefix|config-env))$/.test(unquoted);
+}
+
 /** Exactly one replaced assignment, nothing else riding along in the same word. */
 const CONSUMED_ASSIGNMENT = new RegExp(`^${ASSIGNMENT_NAME}${REDACTED_BACKUP_VALUE}$`);
 
@@ -1818,11 +1823,13 @@ const LANGUAGE_INTERPRETERS: Array<{ name: RegExp; evalWord: RegExp }> = [
   { name: /^(?:py|pyw|pythonw?[0-9.]*)$/, evalWord: /^-[bBdEhiIOPqRsuSvVx]*c/ },
   {
     name: /^(?:node|nodejs)$/,
-    evalWord: /^(?:--eval|--print|--import|--loader|--experimental-loader|-[ep])/,
+    evalWord:
+      /^(?:(?:--eval|--print|--import|--loader|--experimental-loader|--require)(?:=|$)|-[epr])/,
   },
   {
     name: /^bun$/,
-    evalWord: /^(?:--eval|--print|--import|--loader|--experimental-loader|-[ep])/,
+    evalWord:
+      /^(?:(?:--eval|--print|--import|--loader|--experimental-loader|--preload|--require)(?:=|$)|-[epr])/,
   },
   // npx keeps ordinary package launchers portable; only its call operand is reparsed
   // through a shell. npm needs its `exec` subcommand tracked separately below.
@@ -1897,6 +1904,10 @@ function hasDisguisedAssignment(redacted: string): boolean {
   let pendingEnvOptionValue = false;
   let pendingNpmSubcommand = false;
   let pendingNpmExecOptions = false;
+  let pendingGitSubcommand = false;
+  let pendingGitOptionValue = false;
+  let pendingGitSubmoduleAction = false;
+  let pendingGitRebaseOptions = false;
   let evalOperandAmbiguous = false;
   // A Set of the static table's RegExp instances: repeated interpreter words cannot
   // grow it past the table size, keeping this lookup linear in command length.
@@ -1922,6 +1933,27 @@ function hasDisguisedAssignment(redacted: string): boolean {
         pendingEnvOptionValue = true;
       } else if (!unquoted.startsWith("-")) {
         sawEnv = false;
+      }
+    }
+    if (pendingGitSubmoduleAction) {
+      if (unquoted === "foreach") return true;
+      if (!unquoted.startsWith("-")) pendingGitSubmoduleAction = false;
+    }
+    if (pendingGitRebaseOptions && /^(?:-x|--exec(?:=|$))/.test(unquoted)) return true;
+    if (pendingGitSubcommand) {
+      if (pendingGitOptionValue) {
+        pendingGitOptionValue = false;
+      } else if (gitOptionTakesSeparateValue(unquoted)) {
+        pendingGitOptionValue = true;
+      } else if (!unquoted.startsWith("-")) {
+        pendingGitSubcommand = false;
+        if (unquoted === "submodule") {
+          pendingGitSubmoduleAction = true;
+        } else if (unquoted === "rebase") {
+          pendingGitRebaseOptions = true;
+        } else if (unquoted === "filter-branch") {
+          return true;
+        }
       }
     }
     if (pendingNpmExecOptions) {
@@ -1957,6 +1989,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
       .replace(/\.exe$/, "");
     if (executable === "env") sawEnv = true;
     if (executable === "npm") pendingNpmSubcommand = true;
+    if (executable === "git") pendingGitSubcommand = true;
     if (SHELL_INTERPRETER_NAMES.has(executable)) return true;
     if (PROGRAM_OPERAND_INTERPRETER_NAMES.has(executable)) return true;
     if (SHELL_REPARSE_EXECUTABLE_NAMES.has(executable)) return true;
