@@ -1813,25 +1813,35 @@ const SHELL_REPARSE_EXECUTABLE_NAMES = new Set([
 const LANGUAGE_INTERPRETERS: Array<{ name: RegExp; evalWord: RegExp }> = [
   // Windows spellings count alongside the Unix names: the `py`/`pyw` launcher and the
   // windowed `pythonw`/`rubyw`/`wperl`/`php-win` builds run the same evaluation
-  // grammars under different executable names.
-  { name: /^(?:py|pyw|pythonw?[0-9.]*)$/, evalWord: /^-[A-Za-z0-9]*c/ },
+  // grammars under different executable names. Short eval flags can follow only flags
+  // that consume no attached operand: `-Bc` evaluates, while `-Wsource` does not.
+  { name: /^(?:py|pyw|pythonw?[0-9.]*)$/, evalWord: /^-[bBdEhiIOPqRsuSvVx]*c/ },
   {
     name: /^(?:node|nodejs)$/,
-    evalWord: /^(?:--eval|--print|--import|--loader|--experimental-loader|-[A-Za-z0-9]*[ep])/,
+    evalWord: /^(?:--eval|--print|--import|--loader|--experimental-loader|-[ep])/,
   },
   {
     name: /^bun$/,
-    evalWord: /^(?:--eval|--print|--import|--loader|--experimental-loader|-[A-Za-z0-9]*[ep])/,
+    evalWord: /^(?:--eval|--print|--import|--loader|--experimental-loader|-[ep])/,
   },
   // npx keeps ordinary package launchers portable; only its call operand is reparsed
   // through a shell. npm needs its `exec` subcommand tracked separately below.
-  { name: /^npx$/, evalWord: /^(?:-c|--call(?:=|$))/ },
+  { name: /^npx$/, evalWord: /^(?:-c$|--call(?:=|$))/ },
   { name: /^deno$/, evalWord: /^eval$/ },
-  { name: /^(?:r|rscript)$/, evalWord: /^(?:-e|--expression(?:=|$))/ },
-  { name: /^w?perl[0-9.]*$/, evalWord: /^-[A-Za-z0-9]*[eE]/ },
-  { name: /^rubyw?[0-9.]*$/, evalWord: /^-[A-Za-z0-9]*e/ },
+  { name: /^(?:r|rscript)$/, evalWord: /^(?:-e$|--expression(?:=|$))/ },
+  {
+    name: /^w?perl[0-9.]*$/,
+    evalWord: /^-(?:(?:0(?:x[0-9A-Fa-f]+|[0-7]*))|l[0-7]*|[acfnpsStTuUvVwWX])*[eE]/,
+  },
+  { name: /^rubyw?[0-9.]*$/, evalWord: /^-(?:(?:0[0-7]*|W[0-2]?)|[acdlnpsvwy])*e/ },
   // -r/-R run code; -B/-E execute begin/end code blocks around per-line runs.
-  { name: /^(?:php[0-9.]*|php-win)$/, evalWord: /^-[A-Za-z0-9]*[rRBE]/ },
+  { name: /^(?:php[0-9.]*|php-win)$/, evalWord: /^-[nq]*[rRBE]/ },
+  // make evaluates recipes from an explicit makefile through a shell, and --eval/-E
+  // evaluates the option operand as makefile syntax; plain target launchers stay portable.
+  {
+    name: /^(?:g?make|mingw(?:32|64)-make)$/,
+    evalWord: /^(?:-f|--file(?:=|$)|--makefile(?:=|$)|-E|--eval(?:=|$))/,
+  },
 ];
 
 /**

@@ -1699,6 +1699,30 @@ describe("backup payload", () => {
     });
   }
 
+  it("localizes makefile-driven launchers", async () => {
+    for (const command of [
+      "make -f /home/user/.xum/skills/launch.txt",
+      "gmake --file=/home/user/.xum/skills/launch.txt",
+      "make --eval='run:;mcp --token ghp_Abcdef1234'",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+  });
+
   it("localizes commands that write files through active redirection", async () => {
     // A write redirection lets the command assemble a credential file the scans
     // cannot model (`printf a >f; printf b >>f`), so any active `>` goes
@@ -1862,7 +1886,13 @@ describe("backup payload", () => {
       // Dash-led words after the script/module operand belong to that program, not
       // the interpreter: server.py receives -c, Rails receives -e.
       "python3 server.py -c settings.toml",
+      "perl -Ivendor server.pl",
+      "python3 -Wsource server.py",
+      "node -rvendor server.js",
+      "bun -rvendor server.ts",
       "ruby app.rb -e production",
+      "ruby -Ivendor app.rb",
+      "php -cvendor/php.ini server.php",
       "Rscript server.R --port 8080",
       "npx notes-mcp --port 8080",
       "npm exec notes-mcp -- --port 8080",
