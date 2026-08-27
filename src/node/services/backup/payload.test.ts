@@ -385,8 +385,11 @@ describe("backup payload", () => {
       ["env {TOK,EN}=hunter2 mcp-server", `env {TOK,EN}=${REDACTED_BACKUP_VALUE} mcp-server`],
       ["env TOK{A,B}=hunter2 mcp-server", `env TOK{A,B}=${REDACTED_BACKUP_VALUE} mcp-server`],
       ["TOKEN=public{hunter2} mcp-server", `TOKEN=${REDACTED_BACKUP_VALUE} mcp-server`],
-      // After POSIX `--`, even an option-looking word is an env assignment operand.
+      // After an option terminator, even an option-looking word is an env operand,
+      // and the terminator itself may arrive through quote removal.
       ["env -- --evil=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      ["env - --evil=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      ['env "--" --evil=hunter2 mcp-server', REDACTED_BACKUP_VALUE],
       // Append assignments set an unset name and export the same way.
       ["TOKEN+=hunter2 mcp-server", `TOKEN+=${REDACTED_BACKUP_VALUE} mcp-server`],
       ["mcp-a;TOKEN+=hunter2 mcp-b", `mcp-a;TOKEN+=${REDACTED_BACKUP_VALUE} mcp-b`],
@@ -563,6 +566,17 @@ describe("backup payload", () => {
     );
     expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
     expect((blocked as BackupCredentialDetectedError).files).toEqual(["mcp.jsonc"]);
+  });
+
+  it("does not manufacture credentials from quote-separated documentation text", async () => {
+    // Only command content is shell input; prose keeps its bytes as written.
+    await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", 'ghp_aaaaaaaaaa"bbbbbbbbbb\n');
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+    });
+    expect(payload.files.some((file) => file.path === "skills/demo/SKILL.md")).toBe(true);
   });
 
   it("blocks the export when a credential format appears in a published path", async () => {

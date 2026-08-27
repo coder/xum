@@ -1235,14 +1235,16 @@ const CONSUMED_ASSIGNMENT = new RegExp(`^${ASSIGNMENT_NAME}${REDACTED_BACKUP_VAL
 function hasDisguisedAssignment(redacted: string): boolean {
   let operandsOnly = false;
   for (const word of redacted.match(SHELL_WORD) ?? []) {
-    // POSIX `--` ends option parsing: past it even a dash-led word is an operand, so
-    // `env -- --evil=x` sets an environment entry despite the option look.
-    if (word === "--") {
+    if (CONSUMED_ASSIGNMENT.test(word)) continue;
+    const unquoted = unquoteShellWord(word);
+    // Option terminators end option parsing: past one even a dash-led word is an
+    // operand, so `env -- --evil=x` sets an environment entry despite the option look.
+    // GNU `env` documents `[-]` as a terminator too, and the consumer sees the word
+    // after quote removal, so `"--"` and `\-\-` spellings count as well.
+    if (unquoted === "-" || unquoted === "--") {
       operandsOnly = true;
       continue;
     }
-    if (CONSUMED_ASSIGNMENT.test(word)) continue;
-    const unquoted = unquoteShellWord(word);
     // A quoted region spanning whitespace is a script or argument string some
     // interpreter re-parses on its own terms (`sh -c '...'`, `powershell -Command
     // '$env:TOKEN=...; ...'`, `csh -c 'setenv TOKEN ...'`, `env -S'...'`); what that
@@ -1615,13 +1617,17 @@ export async function createBackupPayload(
     const leakedFiles = files
       .filter((file) => {
         // The path publishes alongside the content, and recursive collections take
-        // whatever a directory entry happens to be named. The stripped variant catches a
-        // token split by shell quoting (`--token ghp_123\456...`): the shell removes the
-        // quoting on execution, and the published text reconstructs the same credential.
+        // whatever a directory entry happens to be named.
         const content = file.content.toString("utf-8");
-        const stripped = content.replace(/[\\'"]/g, "");
-        return CREDENTIAL_TOKEN_PATTERNS.some(
-          (pattern) => pattern.test(content) || pattern.test(stripped) || pattern.test(file.path)
+        const targets = [content, file.path];
+        // The stripped variant catches a token split by shell quoting (`--token
+        // ghp_123\456...`): the shell removes the quoting on execution, and the published
+        // text reconstructs the same credential. Only command content is shell input;
+        // prose can legitimately hold quote-separated token-like fragments, and this
+        // block has no override.
+        if (file.path === "mcp.jsonc") targets.push(content.replace(/[\\'"]/g, ""));
+        return CREDENTIAL_TOKEN_PATTERNS.some((pattern) =>
+          targets.some((target) => pattern.test(target))
         );
       })
       .map((file) => file.path)
