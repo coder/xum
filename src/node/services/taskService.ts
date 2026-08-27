@@ -8288,6 +8288,13 @@ export class TaskService {
         isPersistentChildContinuation ? record.workspaceId : notification.sourceId
       );
     }
+    // Workflow prompts are validated against history well before the send is admitted; a full
+    // clear in that window truncates history and retires the sidecar, so the send must refuse
+    // (admissionStale) rather than inject the stale result into the freshly cleared
+    // conversation. A refused send leaves the notifications pending for the next drain.
+    const admissionEpoch = this.workspaceService.getContextMutationEpoch(ownerWorkspaceId);
+    const sendAdmissionStale = () =>
+      this.workspaceService.getContextMutationEpoch(ownerWorkspaceId) !== admissionEpoch;
     const workflowNotifications = pending.filter(
       (notification) => notification.sourceKind === "workflow_run"
     );
@@ -8394,7 +8401,13 @@ export class TaskService {
       prompt,
       sendOptions,
       // Synthetic, idle-only auto-resume — same flags as the active-work auto-resume path.
-      { skipAutoResumeReset: true, synthetic: true, agentInitiated: true, requireIdle: true }
+      {
+        skipAutoResumeReset: true,
+        synthetic: true,
+        agentInitiated: true,
+        requireIdle: true,
+        admissionStale: sendAdmissionStale,
+      }
     );
 
     if (!sendResult.success && isWorkspaceBusyIdleOnlySend(sendResult.error)) {
@@ -8416,6 +8429,7 @@ export class TaskService {
             skipAutoResumeReset: true,
             synthetic: true,
             agentInitiated: true,
+            admissionStale: sendAdmissionStale,
             onCanceled: () => {
               this.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
             },

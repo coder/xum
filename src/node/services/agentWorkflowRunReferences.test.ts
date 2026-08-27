@@ -5,8 +5,10 @@ import * as path from "node:path";
 import { describe, expect, test } from "bun:test";
 
 import {
+  clearAgentWorkflowRunReferences,
   readAgentWorkflowRunReferences,
   recordAgentWorkflowRunReference,
+  scheduleAgentWorkflowRunReferenceRecordRetry,
 } from "@/node/services/agentWorkflowRunReferences";
 
 describe("agent workflow run references", () => {
@@ -185,6 +187,56 @@ describe("agent workflow run references", () => {
       expect(String(recordError)).toContain("EACCES");
       const references = await readAgentWorkflowRunReferences(workspaceSessionDir);
       expect(references.map((reference) => reference.runId)).toEqual(["wfr_existing"]);
+    } finally {
+      await fs.rm(workspaceSessionDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a pending record retry never overwrites newer provenance", async () => {
+    const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
+    try {
+      // The retry carries the stale launch-time snapshot; a workflow_resume records newer
+      // provenance before the timer fires. Fill-absence semantics must let the newer record win.
+      scheduleAgentWorkflowRunReferenceRecordRetry({
+        workspaceSessionDir,
+        runId: "wfr_lifecycle",
+        createdAtMs: 1_000,
+        afterBoundaryMessageId: "stale-row",
+        retryDelaysMs: [150],
+      });
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir,
+        runId: "wfr_lifecycle",
+        createdAtMs: 2_000,
+        afterBoundaryMessageId: "resume-row",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const references = await readAgentWorkflowRunReferences(workspaceSessionDir);
+      expect(references).toHaveLength(1);
+      expect(references[0]).toMatchObject({
+        runId: "wfr_lifecycle",
+        afterBoundaryMessageId: "resume-row",
+      });
+    } finally {
+      await fs.rm(workspaceSessionDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a full history clear cancels pending record retries", async () => {
+    const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
+    try {
+      // A stale detached retry must not resurrect a reference the clear retired; against the
+      // then decision-free history it would read current and inject the pre-clear result.
+      scheduleAgentWorkflowRunReferenceRecordRetry({
+        workspaceSessionDir,
+        runId: "wfr_cleared",
+        createdAtMs: 1_000,
+        afterBoundaryMessageId: null,
+        retryDelaysMs: [100],
+      });
+      await clearAgentWorkflowRunReferences(workspaceSessionDir);
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      expect(await readAgentWorkflowRunReferences(workspaceSessionDir)).toEqual([]);
     } finally {
       await fs.rm(workspaceSessionDir, { recursive: true, force: true });
     }

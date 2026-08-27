@@ -7,7 +7,10 @@ import { WorkflowRunRecordSchema } from "@/common/orpc/schemas";
 import type { WorkflowRunAttachedEvent } from "@/common/types/stream";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
-import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRunReferences";
+import {
+  recordAgentWorkflowRunReference,
+  scheduleAgentWorkflowRunReferenceRecordRetry,
+} from "@/node/services/agentWorkflowRunReferences";
 import { log } from "@/node/services/log";
 import type { TaskService } from "@/node/services/taskService";
 
@@ -79,51 +82,6 @@ export async function emitWorkflowRunAttachedEvent(input: {
   await input.config.emitChatEvent(event);
 }
 
-// Bounded background retries for a transiently unreadable sidecar. The only natural re-record
-// sites are a new dispatch and workflow_resume, which an untouched active run never hits, so
-// giving up after one failed write would permanently supersede the run's terminal wake once
-// storage recovers. Retries reuse the launch-time boundary snapshot: provenance describes the
-// launch, not the retry moment.
-const RECORD_REFERENCE_RETRY_DELAYS_MS: readonly number[] = [1_000, 10_000, 60_000];
-
-function scheduleRecordReferenceRetry(input: {
-  workspaceSessionDir: string;
-  runId: string;
-  createdAtMs: number;
-  afterBoundaryMessageId: string | null | undefined;
-  retryDelaysMs: readonly number[];
-  attempt: number;
-}): void {
-  const delayMs = input.retryDelaysMs[input.attempt];
-  if (delayMs == null) {
-    log.error("Giving up on agent workflow run reference record after retries", {
-      runId: input.runId,
-      attempts: input.attempt,
-    });
-    return;
-  }
-  const timer = setTimeout(() => {
-    // Detached by design: the launching tool already returned, so only this chain can finish
-    // the write. Failures reschedule until the bounded delays are exhausted.
-    void recordAgentWorkflowRunReference({
-      workspaceSessionDir: input.workspaceSessionDir,
-      runId: input.runId,
-      createdAtMs: input.createdAtMs,
-      ...(input.afterBoundaryMessageId !== undefined
-        ? { afterBoundaryMessageId: input.afterBoundaryMessageId }
-        : {}),
-    }).catch((error: unknown) => {
-      log.warn("Agent workflow run reference record retry failed", {
-        runId: input.runId,
-        attempt: input.attempt + 1,
-        error: getErrorMessage(error),
-      });
-      scheduleRecordReferenceRetry({ ...input, attempt: input.attempt + 1 });
-    });
-  }, delayMs);
-  timer.unref?.();
-}
-
 /**
  * Persist agent provenance for a workflow run that outlives the current turn (background
  * start/resume, or a foreground run that backgrounded itself). TaskService reads these
@@ -178,13 +136,12 @@ export async function recordBackgroundWorkflowRunReference(
       runId,
       error: getErrorMessage(error),
     });
-    scheduleRecordReferenceRetry({
+    scheduleAgentWorkflowRunReferenceRecordRetry({
       workspaceSessionDir,
       runId,
       createdAtMs,
-      afterBoundaryMessageId,
-      retryDelaysMs: retryDelaysMs ?? RECORD_REFERENCE_RETRY_DELAYS_MS,
-      attempt: 0,
+      retryDelaysMs,
+      ...(afterBoundaryMessageId !== undefined ? { afterBoundaryMessageId } : {}),
     });
   }
 }

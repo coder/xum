@@ -5,6 +5,7 @@ import writeFileAtomic from "write-file-atomic";
 
 import assert from "@/common/utils/assert";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { log } from "@/node/services/log";
 
 export interface AgentWorkflowRunReference {
   runId: string;
@@ -27,6 +28,26 @@ const AGENT_WORKFLOW_RUN_REFERENCES_FILE = "agent-workflow-runs.json";
 const MAX_FUTURE_SKEW_MS = 60 * 60_000;
 
 const referenceFileLocks = new MutexMap<string>();
+
+// Detached record retries keyed by sidecar path and runId so lifecycle events can govern them:
+// a full clear cancels the path's retries so a stale retry cannot resurrect a retired
+// reference, and a retry only ever fills absence (onlyIfAbsent), so it cannot overwrite newer
+// provenance recorded by a later dispatch or workflow_resume.
+const pendingRecordRetryTimersByPath = new Map<
+  string,
+  Map<string, ReturnType<typeof setTimeout>>
+>();
+
+function cancelPendingRecordRetries(filePath: string): void {
+  const byRunId = pendingRecordRetryTimersByPath.get(filePath);
+  if (byRunId == null) {
+    return;
+  }
+  for (const timer of byRunId.values()) {
+    clearTimeout(timer);
+  }
+  pendingRecordRetryTimersByPath.delete(filePath);
+}
 
 function referencesPath(workspaceSessionDir: string): string {
   assert(workspaceSessionDir.length > 0, "agent workflow references require session dir");
@@ -125,11 +146,13 @@ export async function readAgentWorkflowRunReferences(
  * appending a reset boundary, which makes a verified-empty (null) boundary snapshot recorded
  * before the clear indistinguishable from one recorded after it; retiring the references with
  * the transcript keeps pre-clear workflow results out of the fresh conversation. A post-clear
- * workflow_resume re-records provenance.
+ * workflow_resume re-records provenance. Pending record retries are cancelled first so a stale
+ * detached retry cannot recreate a retired reference.
  */
 export async function clearAgentWorkflowRunReferences(workspaceSessionDir: string): Promise<void> {
   const filePath = referencesPath(workspaceSessionDir);
   await referenceFileLocks.withLock(filePath, async () => {
+    cancelPendingRecordRetries(filePath);
     await fs.rm(filePath, { force: true });
   });
 }
@@ -139,6 +162,8 @@ export async function recordAgentWorkflowRunReference(input: {
   runId: string;
   createdAtMs?: number;
   afterBoundaryMessageId?: string | null;
+  /** Fill-absence mode for detached retries: an existing entry (any newer record) wins. */
+  onlyIfAbsent?: boolean;
 }): Promise<void> {
   assert(input.runId.length > 0, "agent workflow reference requires runId");
   const filePath = referencesPath(input.workspaceSessionDir);
@@ -154,6 +179,9 @@ export async function recordAgentWorkflowRunReference(input: {
     // Clamp like parseReferences: never persist a future-dated timestamp.
     const createdAtMs = Math.min(input.createdAtMs ?? Date.now(), Date.now());
     const previous = byRunId.get(input.runId);
+    if (input.onlyIfAbsent === true && previous != null) {
+      return;
+    }
     byRunId.set(input.runId, {
       runId: input.runId,
       // Latest record wins: workflow_resume re-records the reference, and a resume issued after
@@ -173,4 +201,76 @@ export async function recordAgentWorkflowRunReference(input: {
       JSON.stringify({ references: Array.from(byRunId.values()) }, null, 2)
     );
   });
+}
+
+// Delays for detached record retries; see scheduleAgentWorkflowRunReferenceRecordRetry.
+const RECORD_REFERENCE_RETRY_DELAYS_MS: readonly number[] = [1_000, 10_000, 60_000];
+
+/**
+ * Retry a failed provenance record in the background. The launching tool has already returned
+ * and an untouched active run never hits a natural re-record site, so a single failed write
+ * would permanently supersede the run's terminal wake once storage recovers. Retries reuse the
+ * launch-time boundary snapshot, only fill absence (a later successful record wins), and are
+ * cancelled by a full history clear.
+ */
+export function scheduleAgentWorkflowRunReferenceRecordRetry(input: {
+  workspaceSessionDir: string;
+  runId: string;
+  createdAtMs: number;
+  afterBoundaryMessageId?: string | null;
+  retryDelaysMs?: readonly number[] | null;
+  attempt?: number;
+}): void {
+  const retryDelaysMs = input.retryDelaysMs ?? RECORD_REFERENCE_RETRY_DELAYS_MS;
+  const attempt = input.attempt ?? 0;
+  const delayMs = retryDelaysMs[attempt];
+  if (delayMs == null) {
+    log.error("Giving up on agent workflow run reference record after retries", {
+      runId: input.runId,
+      attempts: attempt,
+    });
+    return;
+  }
+  const filePath = referencesPath(input.workspaceSessionDir);
+  const timer = setTimeout(() => {
+    const byRunId = pendingRecordRetryTimersByPath.get(filePath);
+    // clearTimeout cannot stop a callback Node already dequeued; registry identity is the
+    // authoritative cancellation signal, so a cancelled-but-raced retry aborts here.
+    if (byRunId?.get(input.runId) !== timer) {
+      return;
+    }
+    byRunId.delete(input.runId);
+    if (byRunId.size === 0) {
+      pendingRecordRetryTimersByPath.delete(filePath);
+    }
+    // Detached by design: the launching tool already returned, so only this chain can finish
+    // the write. Failures reschedule until the bounded delays are exhausted.
+    void recordAgentWorkflowRunReference({
+      workspaceSessionDir: input.workspaceSessionDir,
+      runId: input.runId,
+      createdAtMs: input.createdAtMs,
+      onlyIfAbsent: true,
+      ...(input.afterBoundaryMessageId !== undefined
+        ? { afterBoundaryMessageId: input.afterBoundaryMessageId }
+        : {}),
+    }).catch((error: unknown) => {
+      log.warn("Agent workflow run reference record retry failed", {
+        runId: input.runId,
+        attempt: attempt + 1,
+        error,
+      });
+      scheduleAgentWorkflowRunReferenceRecordRetry({ ...input, attempt: attempt + 1 });
+    });
+  }, delayMs);
+  timer.unref?.();
+  let byRunId = pendingRecordRetryTimersByPath.get(filePath);
+  if (byRunId == null) {
+    byRunId = new Map();
+    pendingRecordRetryTimersByPath.set(filePath, byRunId);
+  }
+  const previousTimer = byRunId.get(input.runId);
+  if (previousTimer != null) {
+    clearTimeout(previousTimer);
+  }
+  byRunId.set(input.runId, timer);
 }

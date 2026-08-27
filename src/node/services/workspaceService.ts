@@ -3806,6 +3806,14 @@ export class WorkspaceService extends EventEmitter {
     }
   }
 
+  /**
+   * Current context-mutation epoch (see contextMutationEpochs). Lets the terminal-attention
+   * drain refuse a send whose workflow prompt was validated before a full clear committed.
+   */
+  getContextMutationEpoch(workspaceId: string): number {
+    return this.contextMutationEpochs.get(workspaceId) ?? 0;
+  }
+
   /** r41: mark a context-discarding mutation as durably committed (see contextMutationEpochs). */
   private advanceContextMutationEpoch(workspaceId: string): void {
     this.contextMutationEpochs.set(
@@ -12902,6 +12910,23 @@ export class WorkspaceService extends EventEmitter {
         );
       }
     }
+    // Kernel workflow run references belong to the transcript being discarded: a verified-empty
+    // (null) boundary snapshot recorded before the clear is indistinguishable from one recorded
+    // after it. Retire them durably BEFORE the truncation (like the r41 retry discard above) so
+    // no crash window exists in which the transcript is gone but the sidecar survives; a crash
+    // here can only lose a wake for a still-intact conversation, never inject a pre-clear
+    // result into the cleared one. A post-clear resume re-records provenance, and pending
+    // record retries are cancelled with the sidecar.
+    if (isFullClear) {
+      try {
+        await clearAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
+      } catch (error) {
+        return Err(
+          `Cannot clear history: stale workflow run references could not be retired ` +
+            `(${getErrorMessage(error)}); retry once the session storage is writable.`
+        );
+      }
+    }
     if (effectivePercentage > 0) {
       session?.clearUsageState();
     }
@@ -12918,47 +12943,8 @@ export class WorkspaceService extends EventEmitter {
 
     // r41: the discard is durable — sends that entered before it must not be
     // admitted afterwards (their content references the discarded context).
-    // The truncation is committed: any early error return below must first emit the deletion,
-    // or the renderer keeps showing a transcript that no longer exists on disk (the original
-    // deletedSequences cannot be recovered by a retry).
-    const deletedSequences = truncateResult.data;
-    let deletionsEmitted = false;
-    const emitDeletedSequences = () => {
-      if (deletionsEmitted || deletedSequences.length === 0) {
-        return;
-      }
-      deletionsEmitted = true;
-      const deleteMessage: DeleteMessage = {
-        type: "delete",
-        historySequences: deletedSequences,
-      };
-      // Emit through the session so ORPC subscriptions receive the event
-      if (session) {
-        session.emitChatEvent(deleteMessage);
-      } else {
-        // Fallback to direct emit (legacy path)
-        this.emit("chat", { workspaceId, message: deleteMessage });
-      }
-    };
     if (isFullClear) {
       this.advanceContextMutationEpoch(workspaceId);
-      // Kernel workflow run references belong to the cleared conversation: a verified-empty
-      // (null) boundary snapshot recorded before the clear is indistinguishable from one
-      // recorded after it, so a surviving reference could inject a pre-clear workflow result
-      // into the fresh conversation. Retire them immediately after the truncation commits,
-      // before any later post-clear step that can fail and return early (goal acknowledgment,
-      // carryover discard), or the stale reference would survive the committed clear. A
-      // post-clear resume re-records provenance.
-      try {
-        await clearAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
-      } catch (error) {
-        emitDeletedSequences();
-        return Err(
-          `History was cleared, but stale workflow run references could not be retired ` +
-            `(${getErrorMessage(error)}). A finished background workflow may re-inject its ` +
-            `result into the cleared conversation; retry once the session storage is writable.`
-        );
-      }
     }
     // r43: a fork's settled branch-summary registration stays consumable
     // until the first send; its row was just deleted, so drop the
@@ -12975,7 +12961,20 @@ export class WorkspaceService extends EventEmitter {
       await clearPendingBranchSummary(workspaceId);
     }
 
-    emitDeletedSequences();
+    const deletedSequences = truncateResult.data;
+    if (deletedSequences.length > 0) {
+      const deleteMessage: DeleteMessage = {
+        type: "delete",
+        historySequences: deletedSequences,
+      };
+      // Emit through the session so ORPC subscriptions receive the event
+      if (session) {
+        session.emitChatEvent(deleteMessage);
+      } else {
+        // Fallback to direct emit (legacy path)
+        this.emit("chat", { workspaceId, message: deleteMessage });
+      }
+    }
 
     // On full clear, also delete plan file and clear file change tracking
     if (isFullClear) {

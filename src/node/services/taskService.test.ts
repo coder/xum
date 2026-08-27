@@ -554,6 +554,7 @@ function createWorkspaceServiceMocks(
     isExperimentEnabled: ReturnType<typeof mock>;
     emitChatEvent: ReturnType<typeof mock>;
     isWorkflowInvocationCurrent: ReturnType<typeof mock>;
+    getContextMutationEpoch: ReturnType<typeof mock>;
     create: ReturnType<typeof mock>;
     countQueuedAgentPeerMessages: ReturnType<typeof mock>;
   }>
@@ -591,6 +592,7 @@ function createWorkspaceServiceMocks(
   isExperimentEnabled: ReturnType<typeof mock>;
   emitChatEvent: ReturnType<typeof mock>;
   isWorkflowInvocationCurrent: ReturnType<typeof mock>;
+  getContextMutationEpoch: ReturnType<typeof mock>;
   create: ReturnType<typeof mock>;
 } {
   const sendMessage =
@@ -660,6 +662,7 @@ function createWorkspaceServiceMocks(
   const updateAgentStatus =
     overrides?.updateAgentStatus ?? mock((): Promise<void> => Promise.resolve());
   const isExperimentEnabled = overrides?.isExperimentEnabled ?? mock(() => false);
+  const getContextMutationEpoch = overrides?.getContextMutationEpoch ?? mock(() => 0);
   const emitChatEvent =
     overrides?.emitChatEvent ??
     mock((_workspaceId: string, _message: WorkspaceChatMessage) => undefined);
@@ -736,6 +739,7 @@ function createWorkspaceServiceMocks(
       isExperimentEnabled,
       emitChatEvent,
       isWorkflowInvocationCurrent,
+      getContextMutationEpoch,
       getWorkflowInvocationCurrentness,
       countQueuedAgentPeerMessages,
     } as unknown as WorkspaceService,
@@ -772,6 +776,7 @@ function createWorkspaceServiceMocks(
     isExperimentEnabled,
     emitChatEvent,
     isWorkflowInvocationCurrent,
+    getContextMutationEpoch,
   };
 }
 
@@ -6353,6 +6358,56 @@ describe("TaskService", () => {
     }
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
+  });
+
+  test("drain sends carry a staleness probe that trips after a full clear", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_admission_stale";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    // The prompt is validated against history before the send is admitted; a full clear in
+    // that window advances the context-mutation epoch. The probe handed to sendMessage must
+    // observe the live epoch so admission can refuse the stale prompt.
+    let epoch = 1;
+    const { workspaceService } = createWorkspaceServiceMocks({
+      sendMessage,
+      getContextMutationEpoch: mock(() => epoch),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    await taskService.enqueueWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "completed",
+    });
+    await flushTerminalAttentionDrains(taskService);
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const internal = sendMessage.mock.calls[0]?.[3] as { admissionStale?: () => boolean };
+    expect(typeof internal.admissionStale).toBe("function");
+    expect(internal.admissionStale?.()).toBe(false);
+    epoch = 2;
+    expect(internal.admissionStale?.()).toBe(true);
   });
 
   test("initialize replays and clears persisted pending task guidance", async () => {

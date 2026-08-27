@@ -6266,7 +6266,7 @@ describe("WorkspaceService workflow invocation events", () => {
     }
   });
 
-  test("a failed reference retirement still emits the committed clear to the renderer", async () => {
+  test("a failed reference retirement aborts the clear before deleting history", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const workspaceId = "workflow-currentness-retire-emit";
     const projectPath = path.join(config.rootDir, "project");
@@ -6302,7 +6302,10 @@ describe("WorkspaceService workflow invocation events", () => {
       };
       const session = sessionAccessor.getOrCreateSession(workspaceId);
       const emitSpy = spyOn(session, "emitChatEvent");
-      // A directory at the sidecar path makes retirement fail after the truncation committed.
+      // A directory at the sidecar path makes retirement fail. Retirement runs BEFORE the
+      // truncation, so the failure must abort the whole clear: the transcript survives, the
+      // renderer sees no deletion, and no crash window exists in which the transcript is gone
+      // while the sidecar lives on.
       const sidecarPath = path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json");
       await fsPromises.mkdir(sidecarPath);
       try {
@@ -6311,12 +6314,14 @@ describe("WorkspaceService workflow invocation events", () => {
         if (!clearResult.success) {
           expect(clearResult.error).toContain("workflow run references");
         }
-        // The transcript is already gone on disk and the deleted sequences cannot be recovered
-        // by a retry; the renderer must learn about the deletion even though the cleanup error
-        // aborts the remaining post-clear steps.
         expect(
           emitSpy.mock.calls.some((call) => (call[0] as { type?: string }).type === "delete")
-        ).toBe(true);
+        ).toBe(false);
+        const survivingHistory = await historyService.getHistoryFromLatestBoundary(workspaceId);
+        expect(survivingHistory.success).toBe(true);
+        if (survivingHistory.success) {
+          expect(survivingHistory.data).toHaveLength(1);
+        }
       } finally {
         emitSpy.mockRestore();
         await fsPromises.rmdir(sidecarPath);
