@@ -2066,6 +2066,10 @@ function redactMcpConfig(content: Buffer): {
   function redact(jsonPath: jsonc.JSONPath): void {
     edits.push({ path: jsonPath, value: REDACTED_BACKUP_VALUE });
     redactionPaths.push([...jsonPath]);
+    // Queue-time, not only in finish(): each queued edit costs a full-document
+    // jsonc.modify pass there, so an over-limit config must be rejected before it can
+    // buy edit-count x document-size synchronous work with a guaranteed-refused payload.
+    assertBackupMcpRedactionCount(redactionPaths.length);
   }
 
   let analysisBudget = MAX_TOTAL_ANALYZED_COMMAND_LENGTH;
@@ -2084,6 +2088,7 @@ function redactMcpConfig(content: Buffer): {
     if (redacted === command) return;
     edits.push({ path: jsonPath, value: redacted });
     redactionPaths.push([...jsonPath]);
+    assertBackupMcpRedactionCount(redactionPaths.length);
   }
 
   function finish(): { content: Buffer; redactionPaths: BackupRedactionPath[] } {
