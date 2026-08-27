@@ -6004,6 +6004,86 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("first bootstrap scope keeps raw-registered ids the normalized view cannot see", async () => {
+    // A duplicate project path key (e.g. a trailing-slash variant) shadows
+    // the earlier pair in the normalized view — its workspace is registered
+    // and raw-visible (spared by the prune) yet absent from every strict
+    // enumeration. The first-bootstrap scope must come from the prune's
+    // FULL raw-plus-normalized union, not the enumeration alone: when the
+    // later raw refreshes fail transiently, an enumeration-only scope would
+    // serve an authoritative response omitting the live workspace, clearing
+    // its renderer activity state with no event to correct it.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const shadowedId = "raw-only-shadowed-ws";
+      const winnerId = "normalized-winner-ws";
+      const projectPath = path.join(config.rootDir, "project");
+      await fsPromises.writeFile(
+        path.join(config.rootDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            // Map construction keeps the LAST duplicate key: the first pair
+            // (trailing-slash variant of the same path) is dropped from the
+            // normalized view with its workspace, while the raw id scan
+            // still collects it.
+            [
+              `${projectPath}/`,
+              { workspaces: [{ id: shadowedId, path: path.join(projectPath, "shadowed") }] },
+            ],
+            [
+              projectPath,
+              { workspaces: [{ id: winnerId, path: path.join(projectPath, "winner") }] },
+            ],
+          ],
+          taskSettings: { preserveSubagentsUntilArchive: true },
+          migrations: { persistentSubagentsDefaulted: true, defaultModelFallbacksSeeded: true },
+        })
+      );
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency(shadowedId, 42);
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+      // Every raw config read AFTER the prune's successful one fails
+      // transiently (the finding's window: the id was already loaded, and
+      // only the discarded return kept it out of scope).
+      const internals = workspaceService as unknown as {
+        pruneStaleExtensionMetadataOnce(): Promise<unknown>;
+      };
+      const realPrune = internals.pruneStaleExtensionMetadataOnce.bind(workspaceService);
+      let failRawReads = false;
+      internals.pruneStaleExtensionMetadataOnce = async () => {
+        const prefetched = await realPrune();
+        failRawReads = true;
+        return prefetched;
+      };
+      const realEvidence = config.readPersistedWorkspaceIdEvidence.bind(config);
+      const evidenceSpy = spyOn(config, "readPersistedWorkspaceIdEvidence").mockImplementation(
+        () => {
+          if (failRawReads) {
+            throw new Error("transient config read failure");
+          }
+          return realEvidence();
+        }
+      );
+      try {
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList).not.toBeNull();
+        expect(activityList?.[shadowedId]?.recency).toBe(42);
+        // Its snapshot was spared by the prune too, not merely re-admitted.
+        expect((await extensionMetadata.getAllSnapshots()).has(shadowedId)).toBe(true);
+      } finally {
+        evidenceSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("first bootstrap admits snapshotless ids registered after the prune enumerated config", async () => {
     // A workspace another backend registers after the prune captured its id
     // set may have workflow- or bash-monitor-only activity and therefore no

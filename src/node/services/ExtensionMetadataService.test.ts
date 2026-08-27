@@ -1097,7 +1097,7 @@ describe("ExtensionMetadataService", () => {
     );
     await writeFile(filePath, "{corrupt json");
     const internals = service as unknown as {
-      moveMainAsideAsRecreatedLeftover: () => Promise<void>;
+      moveMainAsideAsRecreatedLeftover: () => Promise<string>;
     };
     const realMove = internals.moveMainAsideAsRecreatedLeftover.bind(service);
     internals.moveMainAsideAsRecreatedLeftover = async () => {
@@ -1124,6 +1124,45 @@ describe("ExtensionMetadataService", () => {
       () => true
     );
     expect(sidecarGone).toBe(true);
+    // The restored bytes were never superseded: the in-flight moved-aside
+    // file is dropped after the restore rather than finalized (or stranded)
+    // as a leftover.
+    const strayLeftovers = (await readdir(tempDir)).filter((name) => name.includes(".recreated"));
+    expect(strayLeftovers).toEqual([]);
+  });
+
+  test("recovery never touches another process's in-flight moved-aside main", async () => {
+    // Another backend is mid-recovery for the same sidecar: it moved a
+    // raced HEALTHY main aside and has not yet re-validated it. Under the
+    // old fixed-name protocol those bytes lived at `.recreated`, where THIS
+    // process's recovery would unlink them before the owner could restore
+    // them — both recoveries would then restore the OLDER sidecar,
+    // permanently losing the newer update. In-flight bytes now live under
+    // a unique per-invocation name that no other recovery may touch; only
+    // proven-superseded bytes are finalized to the shared fixed name.
+    const foreignInflight = `${filePath}.recreated-99999-f0e1d2c3`;
+    await writeFile(
+      foreignInflight,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-newer": { recency: 900, streaming: false } },
+      })
+    );
+    await writeFile(
+      `${filePath}.corrupt`,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-old": { recency: 100, streaming: false } },
+      })
+    );
+    await writeFile(filePath, "{corrupt json");
+    const healed = await service.getAllSnapshots({ throwOnError: true });
+    // This process's recovery completed: sidecar restored, corrupt main
+    // finalized as the bounded fixed-name leftover.
+    expect(healed.get("ws-old")?.recency).toBe(100);
+    expect(await readFile(`${filePath}.recreated`, "utf-8")).toBe("{corrupt json");
+    // The foreign backend's in-flight bytes stay restorable by their owner.
+    expect(await readFile(foreignInflight, "utf-8")).toContain("ws-newer");
   });
 
   test("a failing sidecar token probe during consumption propagates instead of reporting success", async () => {

@@ -1278,7 +1278,7 @@ export class ExtensionMetadataService {
       // sidecar bytes reset it to empty exactly as before. A failing probe
       // propagates so the read stays retryable on unknowable evidence.
       if (await this.probeQuarantineSidecar()) {
-        await this.moveMainAsideAsRecreatedLeftover();
+        const inflightLeftoverPath = await this.moveMainAsideAsRecreatedLeftover();
         // Same cross-process race completeQuarantineRecovery closes for the
         // rename-to-.corrupt branch: another backend's atomic save can land
         // a NEWER healthy main between the in-queue corruption check above
@@ -1287,13 +1287,14 @@ export class ExtensionMetadataService {
         // Re-validate what actually got moved; when it turns out healthy
         // (or a preserved newer schema), restore it to the vacant main path
         // and merge the existing sidecar into it via the recreated-main
-        // reconcile. Transient read failures propagate (retryable) — only
+        // reconcile. Transient read failures propagate (retryable) with the
+        // in-flight file left in place — finalizing UNVERIFIED bytes could
+        // bury a raced healthy save as the superseded leftover. Only
         // deterministic corruption proceeds to the sidecar-restore path.
-        const leftoverPath = `${this.filePath}.recreated`;
         let movedRaw: unknown;
         let movedParses = true;
         try {
-          movedRaw = JSON.parse(await readFile(leftoverPath, "utf-8")) as unknown;
+          movedRaw = JSON.parse(await readFile(inflightLeftoverPath, "utf-8")) as unknown;
         } catch (readError) {
           if (!ExtensionMetadataService.isDeterministicCorruption(readError)) {
             throw readError;
@@ -1308,24 +1309,49 @@ export class ExtensionMetadataService {
           // Restore without overwriting a file yet another writer re-created
           // at the main path (EEXIST): the reconcile below merges the
           // sidecar into whichever file now owns the path.
+          let restored = true;
           try {
-            await link(leftoverPath, this.filePath);
+            await link(inflightLeftoverPath, this.filePath);
           } catch (linkError) {
-            if (!ExtensionMetadataService.isErrnoCode(linkError, "EEXIST")) {
+            if (ExtensionMetadataService.isErrnoCode(linkError, "EEXIST")) {
+              restored = false;
+            } else {
               try {
-                await copyFile(leftoverPath, this.filePath, constants.COPYFILE_EXCL);
+                await copyFile(inflightLeftoverPath, this.filePath, constants.COPYFILE_EXCL);
               } catch (copyError) {
                 if (!ExtensionMetadataService.isErrnoCode(copyError, "EEXIST")) {
                   // Main path missing with the raced bytes only in the
-                  // leftover: rethrow (retryable) rather than letting the
-                  // sidecar restore over the vacant path and orphan them.
+                  // in-flight file: rethrow (retryable) rather than letting
+                  // the sidecar restore over the vacant path and orphan them.
                   throw copyError;
                 }
+                restored = false;
               }
             }
           }
+          if (restored) {
+            // Restored to the main path: the in-flight file is a duplicate
+            // hard link of the live main, not a superseded leftover — drop
+            // it. Non-ENOENT failures propagate (retryable); the retried
+            // read finds the main healthy and at worst strands the
+            // harmless duplicate.
+            try {
+              await unlink(inflightLeftoverPath);
+            } catch (unlinkError) {
+              if (!ExtensionMetadataService.isErrnoCode(unlinkError, "ENOENT")) {
+                throw unlinkError;
+              }
+            }
+          } else {
+            // Yet another writer re-created the main path first: the moved
+            // bytes are superseded — keep them as the bounded leftover.
+            await this.finalizeRecreatedLeftover(inflightLeftoverPath);
+          }
           return this.reconcileRecreatedMainWithSidecar(quarantinePath);
         }
+        // Deterministically corrupt moved bytes: proven superseded — keep
+        // them as the bounded fixed-name leftover.
+        await this.finalizeRecreatedLeftover(inflightLeftoverPath);
         return this.completeQuarantineRecovery(quarantinePath);
       }
       await rename(this.filePath, quarantinePath);
@@ -1334,18 +1360,42 @@ export class ExtensionMetadataService {
   }
 
   /**
-   * Move the current main file aside as the bounded fixed-name `.recreated`
-   * leftover ("keeps the latest superseded file"). A stale leftover from an
-   * earlier recovery is unlinked first: POSIX rename() replaces the
-   * destination silently, but Windows rename onto an existing file is not
-   * reliably a replace (it can fail with EPERM/EEXIST), which would fail
-   * every strict activity read's recovery until the user removed the
-   * leftover by hand. A crash between the unlink and the rename only loses
-   * the STALE leftover; the main file stays in place and the recovery
-   * remains resumable. Non-ENOENT unlink failures propagate (retryable) —
-   * the rename would fail on the occupied destination anyway.
+   * Move the current main file aside to an in-flight uniquely named
+   * `.recreated-<pid>-<uuid>` path and return that path. In-flight
+   * moved-aside bytes must never live at the shared fixed-name `.recreated`
+   * leftover: the mutation queue is process-local, so two backends can both
+   * pass the corrupt-main validation for the same sidecar, and if process A
+   * had moved a concurrently saved HEALTHY main to the fixed name, process
+   * B's finalize would unlink A's only copy before A could re-validate and
+   * restore it — both recoveries would then restore the OLDER sidecar,
+   * permanently losing the newer update. Callers finalize via
+   * finalizeRecreatedLeftover once the moved bytes are proven superseded,
+   * or unlink the in-flight file once they are restored. A crash
+   * mid-recovery strands at most one uniquely named file per crash; no
+   * automated cleanup — liveness cannot be probed, and folding a live
+   * process's in-flight file into the fixed name would reintroduce the
+   * destroyed-restore race this unique naming exists to close.
    */
-  private async moveMainAsideAsRecreatedLeftover(): Promise<void> {
+  private async moveMainAsideAsRecreatedLeftover(): Promise<string> {
+    const inflightPath = `${this.filePath}.recreated-${process.pid}-${randomUUID()}`;
+    await rename(this.filePath, inflightPath);
+    return inflightPath;
+  }
+
+  /**
+   * Install proven-superseded moved-aside bytes as the bounded fixed-name
+   * `.recreated` leftover ("keeps the latest superseded file"). Replacing
+   * the fixed name is safe: with every in-flight move under a unique name
+   * (see moveMainAsideAsRecreatedLeftover), the fixed name only ever holds
+   * FINALIZED superseded bytes that no recovery will re-read. The prior
+   * leftover is unlinked first because Windows rename onto an existing file
+   * is not reliably a replace (it can fail with EPERM/EEXIST), which would
+   * fail every strict activity read's recovery until the user removed the
+   * leftover by hand. A crash between the unlink and the rename only loses
+   * the OLDER finalized leftover. Non-ENOENT unlink failures propagate
+   * (retryable) — the rename would fail on the occupied destination anyway.
+   */
+  private async finalizeRecreatedLeftover(inflightPath: string): Promise<void> {
     const leftoverPath = `${this.filePath}.recreated`;
     try {
       await unlink(leftoverPath);
@@ -1354,7 +1404,7 @@ export class ExtensionMetadataService {
         throw unlinkError;
       }
     }
-    await rename(this.filePath, leftoverPath);
+    await rename(inflightPath, leftoverPath);
   }
 
   /**
@@ -1591,10 +1641,14 @@ export class ExtensionMetadataService {
       // (upgrade↔downgrade preservation; this build's readers then see the
       // same non-destructive retryable unsupported-version signal as any
       // downgrade overlap) and preserve the recreated file as a bounded
-      // fixed-name leftover. A crash between the two steps leaves the
+      // fixed-name leftover. A crash between any of the steps leaves the
       // resumable missing-main + sidecar state, which restores the
-      // unsupported sidecar via completeQuarantineRecovery.
-      await this.moveMainAsideAsRecreatedLeftover();
+      // unsupported sidecar via completeQuarantineRecovery. The moved bytes
+      // are superseded BY DECISION (the newer schema wins), so they finalize
+      // to the fixed leftover name immediately — no re-validation pass ever
+      // re-reads them.
+      const inflightLeftoverPath = await this.moveMainAsideAsRecreatedLeftover();
+      await this.finalizeRecreatedLeftover(inflightLeftoverPath);
       try {
         await link(quarantinePath, this.filePath);
       } catch (linkError) {

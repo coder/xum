@@ -13369,13 +13369,26 @@ export class WorkspaceService extends EventEmitter {
    */
   private prunedStaleExtensionMetadata = false;
   /**
-   * Returns the config-known (normalized-view) workspace ids captured during
-   * the prune so the first activity bootstrap can reuse them for scoping —
+   * Returns the config-known workspace ids captured during the prune so the
+   * first activity bootstrap can reuse them for scoping —
    * getAllWorkspaceMetadata walks every workspace with per-workspace disk
    * probes, which large deployments should not pay twice in the
-   * latency-sensitive bootstrap. Null when the prune was skipped or failed.
+   * latency-sensitive bootstrap. `knownIds` is the FULL raw-plus-normalized
+   * union the prune spared from deletion: scoping to anything narrower (the
+   * normalized view alone) would drop raw-registered ids the normalized
+   * view cannot see (e.g. a project pair shadowed by a duplicate path key),
+   * and if the bootstrap's later raw refreshes then failed transiently, the
+   * authoritative response would omit a live workspace whose id this READ
+   * already loaded successfully — clearing its renderer state with no event
+   * to correct it. `enumeratedIds` is what the strict enumeration itself
+   * vouched for (see scopeEnumerationIds: only those ids may treat
+   * enumeration absence as removal evidence). Null when the prune was
+   * skipped or failed.
    */
-  private async pruneStaleExtensionMetadataOnce(): Promise<Set<string> | null> {
+  private async pruneStaleExtensionMetadataOnce(): Promise<{
+    knownIds: Set<string>;
+    enumeratedIds: ReadonlySet<string>;
+  } | null> {
     if (this.prunedStaleExtensionMetadata) {
       return null;
     }
@@ -13384,7 +13397,7 @@ export class WorkspaceService extends EventEmitter {
     // than on every read.
     this.prunedStaleExtensionMetadata = true;
     try {
-      let normalizedIds: Set<string> | null = null;
+      let prunedScope: { knownIds: Set<string>; enumeratedIds: ReadonlySet<string> } | null = null;
       const prunedCount = await this.extensionMetadata.pruneMissingWorkspaces(
         async () => {
           // Invoked inside the file's serialized mutation AFTER the file load,
@@ -13402,10 +13415,11 @@ export class WorkspaceService extends EventEmitter {
           //   config migrations that are not yet persisted verbatim.
           // A missing config file resolves as a healthy empty set in both.
           const knownIds = this.config.readPersistedWorkspaceIdSuperset();
-          normalizedIds = await this.enumerateAuthoritativeWorkspaceIds();
-          for (const workspaceId of normalizedIds) {
+          const enumeratedIds = await this.enumerateAuthoritativeWorkspaceIds();
+          for (const workspaceId of enumeratedIds) {
             knownIds.add(workspaceId);
           }
+          prunedScope = { knownIds, enumeratedIds };
           return knownIds;
         },
         async () => {
@@ -13433,7 +13447,7 @@ export class WorkspaceService extends EventEmitter {
       if (prunedCount > 0) {
         log.info(`Pruned ${prunedCount} stale extension metadata entries`);
       }
-      return normalizedIds;
+      return prunedScope;
     } catch (error) {
       log.debug("Failed to prune stale extension metadata entries", { error });
       return null;
@@ -13456,7 +13470,7 @@ export class WorkspaceService extends EventEmitter {
       } catch {
         initialConfigIds = null;
       }
-      const prefetchedKnownIds = await this.pruneStaleExtensionMetadataOnce();
+      const prefetchedScope = await this.pruneStaleExtensionMetadataOnce();
       // throwOnError: the default load self-heals an unreadable/malformed
       // metadata file into an empty one, which this list would then present
       // as an authoritative "no activity anywhere" answer — the renderer
@@ -13485,9 +13499,15 @@ export class WorkspaceService extends EventEmitter {
       // (invalid project path) are legitimately absent from every
       // enumeration and must not read that absence as removal.
       let scopeEnumerationIds: ReadonlySet<string> | null = null;
-      if (prefetchedKnownIds != null) {
-        scopeEnumerationIds = new Set(prefetchedKnownIds);
-        workspaceIds = prefetchedKnownIds;
+      if (prefetchedScope != null) {
+        scopeEnumerationIds = prefetchedScope.enumeratedIds;
+        // Scope to the FULL known-id union the prune spared (raw +
+        // normalized), not the enumeration alone: a raw-registered id the
+        // normalized view cannot see was already loaded successfully by the
+        // prune's raw read, and relying solely on the refresh below to
+        // re-admit it would let a transient refresh failure turn into an
+        // authoritative response that omits the live workspace.
+        workspaceIds = prefetchedScope.knownIds;
         // The prune enumerated config BEFORE the snapshot read above, so a
         // workspace registered in between would be missing here — and an
         // authoritative list omitting it would clear its live-arrived
