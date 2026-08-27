@@ -472,7 +472,9 @@ export const LiveRunningTimeline: Story = {
   ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await fireEvent.click(await canvas.findByText("implementation"));
+    // "implementation" is both the workflow name (header + script card spans) and the
+    // phase label; only the phase disclosure is a button, so query by role.
+    await fireEvent.click(await canvas.findByRole("button", { name: /implementation/ }));
     await canvas.findByText("Summarize source 16");
     await canvas.findByText("extract-claims");
     const container = canvas.getByTestId("live-workflow-card");
