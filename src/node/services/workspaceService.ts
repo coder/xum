@@ -4,6 +4,7 @@ import { EventEmitter } from "events";
 import * as path from "path";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import {
+  clearAgentWorkflowRunReferences,
   readAgentWorkflowRunReferences,
   type AgentWorkflowRunReference,
 } from "@/node/services/agentWorkflowRunReferences";
@@ -12956,6 +12957,20 @@ export class WorkspaceService extends EventEmitter {
           `History was cleared, but the persisted post-compaction carryover could not be ` +
             `durably discarded (${getErrorMessage(error)}). Pre-clear read/skill context may ` +
             `be re-injected after a restart; retry once the session storage is writable.`
+        );
+      }
+      // Kernel workflow run references belong to the cleared conversation: a verified-empty
+      // (null) boundary snapshot recorded before the clear is indistinguishable from one
+      // recorded after it, so a surviving reference could inject a pre-clear workflow result
+      // into the fresh conversation. Retire them with the transcript (a post-clear resume
+      // re-records provenance), durably like the carryover discard above.
+      try {
+        await clearAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
+      } catch (error) {
+        return Err(
+          `History was cleared, but stale workflow run references could not be retired ` +
+            `(${getErrorMessage(error)}). A finished background workflow may re-inject its ` +
+            `result into the cleared conversation; retry once the session storage is writable.`
         );
       }
       // The persistent RLM sandbox holds context DERIVED from the cleared

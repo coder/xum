@@ -120,6 +120,20 @@ export async function readAgentWorkflowRunReferences(
   }
 }
 
+/**
+ * Retire every reference for this workspace. A full history clear removes all rows without
+ * appending a reset boundary, which makes a verified-empty (null) boundary snapshot recorded
+ * before the clear indistinguishable from one recorded after it; retiring the references with
+ * the transcript keeps pre-clear workflow results out of the fresh conversation. A post-clear
+ * workflow_resume re-records provenance.
+ */
+export async function clearAgentWorkflowRunReferences(workspaceSessionDir: string): Promise<void> {
+  const filePath = referencesPath(workspaceSessionDir);
+  await referenceFileLocks.withLock(filePath, async () => {
+    await fs.rm(filePath, { force: true });
+  });
+}
+
 export async function recordAgentWorkflowRunReference(input: {
   workspaceSessionDir: string;
   runId: string;

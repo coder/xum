@@ -6144,6 +6144,63 @@ describe("WorkspaceService workflow invocation events", () => {
     }
   });
 
+  test("retires kernel workflow run references on a full history clear", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-retire";
+    const runId = "wfr_currentness_retire";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-retire",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      // Launched from a decision-free history: the verified-empty snapshot delivers.
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: 1_150,
+        afterBoundaryMessageId: null,
+      });
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
+
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user", "user", "never mind, answer something else", {
+          timestamp: 1_200,
+        })
+      );
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
+
+      // A full clear returns history to decision-free, making the pre-clear null snapshot
+      // indistinguishable from a fresh empty-history launch; the clear must retire the
+      // reference so the stale result cannot inject into the fresh conversation.
+      const clearResult = await workspaceService.truncateHistory(workspaceId, 1.0);
+      expect(clearResult.success).toBe(true);
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("decides sidecar currentness by boundary identity, not wall-clock order", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const workspaceId = "workflow-currentness-clock";
