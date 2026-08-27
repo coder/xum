@@ -1009,6 +1009,29 @@ describe("ExtensionMetadataService", () => {
     expect(sidecarGone).toBe(true);
   });
 
+  test("recovery replaces a stale .recreated leftover from an earlier pass", async () => {
+    // A second recovery cycle can find the fixed-name leftover already
+    // occupied by an earlier pass. The move-aside must replace it portably
+    // (unlink first — Windows rename onto an existing file is not reliably
+    // a replace), keeping the LATEST superseded file: a recovery that fails
+    // on the occupied destination would keep every strict read failing
+    // until the leftover was removed by hand.
+    await writeFile(`${filePath}.recreated`, "stale leftover from an earlier recovery");
+    await writeFile(
+      `${filePath}.corrupt`,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-stranded": { recency: 700, streaming: false } },
+      })
+    );
+    await writeFile(filePath, "{corrupt json");
+
+    const snapshots = await service.getAllSnapshots({ throwOnError: true });
+    expect(snapshots.get("ws-stranded")?.recency).toBe(700);
+    // The leftover now holds the LATEST superseded file, not the stale one.
+    expect(await readFile(`${filePath}.recreated`, "utf-8")).toBe("{corrupt json");
+  });
+
   test("a strict snapshot read propagates a failed sidecar reconcile instead of the partial main", async () => {
     // Live emissions read per-workspace snapshots after the subscription
     // bootstraps. With a sidecar stranded next to a recreated partial main

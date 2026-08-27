@@ -1117,12 +1117,36 @@ export class ExtensionMetadataService {
       // sidecar bytes reset it to empty exactly as before. A failing probe
       // propagates so the read stays retryable on unknowable evidence.
       if (await this.probeQuarantineSidecar()) {
-        await rename(this.filePath, `${this.filePath}.recreated`);
+        await this.moveMainAsideAsRecreatedLeftover();
         return this.completeQuarantineRecovery(quarantinePath);
       }
       await rename(this.filePath, quarantinePath);
       return this.completeQuarantineRecovery(quarantinePath);
     });
+  }
+
+  /**
+   * Move the current main file aside as the bounded fixed-name `.recreated`
+   * leftover ("keeps the latest superseded file"). A stale leftover from an
+   * earlier recovery is unlinked first: POSIX rename() replaces the
+   * destination silently, but Windows rename onto an existing file is not
+   * reliably a replace (it can fail with EPERM/EEXIST), which would fail
+   * every strict activity read's recovery until the user removed the
+   * leftover by hand. A crash between the unlink and the rename only loses
+   * the STALE leftover; the main file stays in place and the recovery
+   * remains resumable. Non-ENOENT unlink failures propagate (retryable) —
+   * the rename would fail on the occupied destination anyway.
+   */
+  private async moveMainAsideAsRecreatedLeftover(): Promise<void> {
+    const leftoverPath = `${this.filePath}.recreated`;
+    try {
+      await unlink(leftoverPath);
+    } catch (unlinkError) {
+      if (!ExtensionMetadataService.isErrnoCode(unlinkError, "ENOENT")) {
+        throw unlinkError;
+      }
+    }
+    await rename(this.filePath, leftoverPath);
   }
 
   /**
@@ -1329,7 +1353,7 @@ export class ExtensionMetadataService {
       // fixed-name leftover. A crash between the two steps leaves the
       // resumable missing-main + sidecar state, which restores the
       // unsupported sidecar via completeQuarantineRecovery.
-      await rename(this.filePath, `${this.filePath}.recreated`);
+      await this.moveMainAsideAsRecreatedLeftover();
       try {
         await link(quarantinePath, this.filePath);
       } catch (linkError) {

@@ -5641,12 +5641,19 @@ describe("WorkspaceService activity list scoping", () => {
       const projectPath = path.join(config.rootDir, "project");
       // A null project path survives the raw id scan but is dropped by the
       // normalized enumeration, keeping the id out of the per-id scope.
+      // Migration flags pre-seeded: without them the first load schedules an
+      // async settings-migration persist that rewrites config.json through
+      // the parsed view — which DROPS the null-path project — deregistering
+      // this raw-only id mid-test whenever the persist happens to land
+      // before the second list's raw reads (observed flake).
       await fsPromises.writeFile(
         path.join(config.rootDir, "config.json"),
         JSON.stringify({
           projects: [
             [null, { workspaces: [{ id: workspaceId, path: path.join(projectPath, "ws") }] }],
           ],
+          taskSettings: { preserveSubagentsUntilArchive: true },
+          migrations: { persistentSubagentsDefaulted: true, defaultModelFallbacksSeeded: true },
         })
       );
       const extensionMetadata = new ExtensionMetadataService(
@@ -5719,6 +5726,13 @@ describe("WorkspaceService activity list scoping", () => {
               },
             ],
           ],
+          // Migration flags pre-seeded: without them the first load schedules
+          // an async settings-migration persist that rewrites config.json
+          // through the parsed view — attaching the resolved legacy id inline
+          // — which would make this entry raw-VISIBLE mid-test and skip the
+          // mid-list enumeration whenever the persist lands first.
+          taskSettings: { preserveSubagentsUntilArchive: true },
+          migrations: { persistentSubagentsDefaulted: true, defaultModelFallbacksSeeded: true },
         })
       );
       const legacyStableId = "legacy-stable-mid-enum";
