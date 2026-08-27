@@ -7309,6 +7309,71 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("drops retained legacy entries removed during the mid-list identity scan", async () => {
+    // An id-less legacy workspace is retained on the strength of the
+    // mid-list authoritative enumeration — which can observe the stable id
+    // right before another backend deregisters it and deletes its metadata
+    // later in the same await. Raw config scans can never see the stable
+    // id and the fresh snapshot re-read predates the removal, so with zero
+    // late candidates nothing else re-reads: the final revalidation must
+    // run for retained raw-invisible ids too, or the deleted workspace
+    // rides every authoritative response until reconnect.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const stableId = "legacy-retained-stable-id";
+      const projectPath = path.join(config.rootDir, "project");
+      const workspacePath = path.join(projectPath, "legacy-ws");
+      const configPath = path.join(config.rootDir, "config.json");
+      await fsPromises.writeFile(
+        configPath,
+        JSON.stringify({
+          projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
+        })
+      );
+      const legacySessionDir = config.getSessionDir(
+        config.generateLegacyId(projectPath, workspacePath)
+      );
+      await fsPromises.mkdir(legacySessionDir, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(legacySessionDir, "metadata.json"),
+        JSON.stringify({ id: stableId, name: "legacy-ws" })
+      );
+      const metadataPath = path.join(config.rootDir, "extensionMetadata.json");
+      const extensionMetadata = new ExtensionMetadataService(metadataPath);
+      // Persisted snapshot: the entry is RETAINED by the per-id loop, so
+      // the late-candidate merge has nothing to probe.
+      await extensionMetadata.updateRecency(stableId, 321);
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+      const internals = workspaceService as unknown as {
+        enumerateAuthoritativeWorkspaceIds(): Promise<Set<string>>;
+      };
+      const realEnumerate = internals.enumerateAuthoritativeWorkspaceIds.bind(workspaceService);
+      let enumerateCalls = 0;
+      internals.enumerateAuthoritativeWorkspaceIds = async () => {
+        enumerateCalls += 1;
+        const ids = await realEnumerate();
+        if (enumerateCalls === 2) {
+          // The removal lands INSIDE the mid-list enumeration await, after
+          // the enumeration observed the id: config deregistration first
+          // (the real removal write order), then the metadata deletion by
+          // another backend (no local tombstone).
+          await fsPromises.writeFile(configPath, JSON.stringify({ projects: [] }));
+          await new ExtensionMetadataService(metadataPath).deleteWorkspace(stableId);
+        }
+        return ids;
+      };
+      const activityList = await workspaceService.getActivityList();
+      expect(activityList).not.toBeNull();
+      expect(activityList?.[stableId]).toBeUndefined();
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("getActivityList quarantines a deterministically corrupt metadata file", async () => {
     // Parse/structure corruption fails identically on every retry, so a
     // strict read that only rethrows would leave activity hydration broken

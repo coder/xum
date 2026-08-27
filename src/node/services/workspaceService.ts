@@ -13934,7 +13934,21 @@ export class WorkspaceService extends EventEmitter {
           }
           probedWorkflowRunIds.set(workspaceId, await this.getActiveWorkflowRunIds(workspaceId));
         }
-        if (probedWorkflowRunIds.size > 0) {
+        const isRawInvisible = (workspaceId: string): boolean =>
+          !(initialConfigIds?.has(workspaceId) ?? false) &&
+          !(freshConfigIds?.has(workspaceId) ?? false);
+        // The final revalidation must ALSO run when a retained entry is
+        // raw-invisible even with zero late candidates: the mid-list
+        // authoritative enumeration can observe a legacy stable id right
+        // before another backend deregisters it and deletes its metadata
+        // later in the same await. Every view the retained filter used
+        // (pre-enumeration freshSnapshots, raw scans blind to stable ids,
+        // the stale enumeration itself) then still shows the workspace, and
+        // with no candidates to probe nothing else would re-read — the
+        // deleted workspace would ride every authoritative response
+        // indefinitely because cross-process removals emit no local event.
+        // Modern deployments (all ids raw-visible) never pay this path.
+        if (probedWorkflowRunIds.size > 0 || Object.keys(activityById).some(isRawInvisible)) {
           // Final post-probe views: the probes awaited disk, so a removal
           // landing during them is invisible to every view captured above —
           // inserting on those alone would ride the deleted id back into the
@@ -13959,9 +13973,6 @@ export class WorkspaceService extends EventEmitter {
           // set is the view that ADMITTED it, so only a fresh enumeration
           // can prove the removal. Modern deployments never pay this walk.
           let finalAuthoritativeIds: ReadonlySet<string> | null = null;
-          const isRawInvisible = (workspaceId: string): boolean =>
-            !(initialConfigIds?.has(workspaceId) ?? false) &&
-            !(freshConfigIds?.has(workspaceId) ?? false);
           let finalConfigIds: ReadonlySet<string> | null = null;
           try {
             finalConfigIds = this.config.readPersistedWorkspaceIdSuperset();

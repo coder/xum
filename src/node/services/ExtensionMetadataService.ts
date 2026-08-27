@@ -1394,11 +1394,16 @@ export class ExtensionMetadataService {
                 throw unlinkError;
               }
             }
-          } else {
-            // Yet another writer re-created the main path first: the moved
-            // bytes are superseded — keep them as the bounded leftover.
-            await this.finalizeRecreatedLeftover(inflightLeftoverPath);
           }
+          // EEXIST (restored === false) does NOT prove the main-path owner
+          // is newer than the moved bytes: a competing recovery can restore
+          // the OLDER sidecar to the vacant main path first (and consume
+          // the sidecar, making the reconcile below a no-op). Finalizing
+          // the valid moved bytes to the fixed leftover would exclude them
+          // from stranded-file discovery and silently drop the newer
+          // recency/goal/status — leave them at the unique in-flight name
+          // instead: the stranded-leftover scan merges them by write
+          // generation/recency against whatever now owns the main path.
           return this.reconcileRecreatedMainWithSidecar(quarantinePath);
         }
         // Deterministically corrupt moved bytes: proven superseded — keep
@@ -1924,10 +1929,42 @@ export class ExtensionMetadataService {
       // downgrade overlap) and preserve the recreated file as a bounded
       // fixed-name leftover. A crash between any of the steps leaves the
       // resumable missing-main + sidecar state, which restores the
-      // unsupported sidecar via completeQuarantineRecovery. The moved bytes
-      // are superseded BY DECISION (the newer schema wins), so they finalize
-      // to the fixed leftover name immediately — no re-validation pass ever
-      // re-reads them.
+      // unsupported sidecar via completeQuarantineRecovery.
+      //
+      // Inspect the canonical bytes FIRST: during multi-version overlap the
+      // canonical path may itself hold an unsupported file whose version is
+      // same-or-newer than the sidecar's (e.g. a v3 writer recreated it
+      // while a v2 sidecar remained). This build cannot order or merge
+      // foreign schemas beyond their version numbers, so swapping blindly
+      // would park the possibly-newer canonical copy at the unscanned
+      // fixed leftover and restore older data over it. Keep the canonical
+      // file in place and RETAIN the sidecar for a build that understands
+      // both schemas (same retention precedent as a deterministically
+      // corrupt sidecar: one no-op reconcile per read while the overlap
+      // lasts). A transiently unreadable canonical propagates (retryable);
+      // a missing or corrupt canonical proceeds with the swap exactly as
+      // before.
+      let canonicalParsed: unknown = null;
+      try {
+        canonicalParsed = JSON.parse(await readFile(this.filePath, "utf-8")) as unknown;
+      } catch (canonicalReadError) {
+        if (
+          !ExtensionMetadataService.isErrnoCode(canonicalReadError, "ENOENT") &&
+          !ExtensionMetadataService.isDeterministicCorruption(canonicalReadError)
+        ) {
+          throw canonicalReadError;
+        }
+      }
+      if (
+        ExtensionMetadataService.isUnsupportedVersion(canonicalParsed) &&
+        (canonicalParsed as { version: number }).version >=
+          (sidecarParsed as { version: number }).version
+      ) {
+        return false;
+      }
+      // The moved bytes are superseded BY DECISION (the newer schema wins),
+      // so they finalize to the fixed leftover name immediately — no
+      // re-validation pass ever re-reads them.
       const inflightLeftoverPath = await this.moveMainAsideAsRecreatedLeftover();
       await this.finalizeRecreatedLeftover(inflightLeftoverPath);
       try {

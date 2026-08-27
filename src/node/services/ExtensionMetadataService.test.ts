@@ -1192,6 +1192,87 @@ describe("ExtensionMetadataService", () => {
     expect(leftovers).toEqual([]);
   });
 
+  test("a raced healthy main losing the restore collision is merged, not parked", async () => {
+    // EEXIST during the restore does not prove the main-path owner is
+    // newer: a competing recovery can restore the OLDER sidecar to the
+    // vacant main path first and consume the sidecar. The valid moved
+    // bytes must stay at their unique in-flight name so the
+    // stranded-leftover scan merges them — finalizing them to the fixed
+    // (unscanned) leftover would silently drop the newer update.
+    const sidecarPath = `${filePath}.corrupt`;
+    const olderRestored = JSON.stringify({
+      version: 1,
+      workspaces: { "ws-old": { recency: 100, streaming: false } },
+    });
+    await writeFile(sidecarPath, olderRestored);
+    await writeFile(filePath, "{corrupt json");
+    const internals = service as unknown as {
+      moveMainAsideAsRecreatedLeftover: () => Promise<string>;
+    };
+    const realMove = internals.moveMainAsideAsRecreatedLeftover.bind(service);
+    internals.moveMainAsideAsRecreatedLeftover = async () => {
+      // The raced newer save lands before the move-aside…
+      await writeFile(
+        filePath,
+        JSON.stringify({
+          version: 1,
+          workspaces: { "ws-new": { recency: 900, streaming: false } },
+        })
+      );
+      internals.moveMainAsideAsRecreatedLeftover = realMove;
+      const inflightPath = await realMove();
+      // …and the competing recovery restores the older sidecar to the
+      // vacant main path and consumes it before this recovery's restore.
+      await writeFile(filePath, olderRestored);
+      await rm(sidecarPath);
+      return inflightPath;
+    };
+    try {
+      const snapshots = await service.getAllSnapshots({ throwOnError: true });
+      expect(snapshots.get("ws-old")?.recency).toBe(100);
+      expect(snapshots.get("ws-new")?.recency).toBe(900);
+    } finally {
+      internals.moveMainAsideAsRecreatedLeftover = realMove;
+    }
+    const stranded = (await readdir(tempDir)).filter((name) => name.includes(".recreated-"));
+    expect(stranded).toEqual([]);
+  });
+
+  test("an unsupported sidecar never displaces a same-or-newer unsupported canonical file", async () => {
+    // Multi-version overlap: a v3 writer re-created the canonical file
+    // while an older v2 sidecar remained. A v1 build cannot order or merge
+    // foreign schemas, so it must keep the canonical copy in place and
+    // retain the sidecar for a build that understands both — not park v3
+    // at the unscanned fixed leftover and restore older v2 data over it.
+    const v3Main = JSON.stringify({ version: 3, workspaces: {}, futureField: true });
+    const v2Sidecar = JSON.stringify({ version: 2, workspaces: {} });
+    await writeFile(filePath, v3Main);
+    await writeFile(`${filePath}.corrupt`, v2Sidecar);
+    await service.getSnapshot("any", { throwOnError: true }).catch(() => null);
+    expect(await readFile(filePath, "utf-8")).toBe(v3Main);
+    expect(await readFile(`${filePath}.corrupt`, "utf-8")).toBe(v2Sidecar);
+    const leftovers = (await readdir(tempDir)).filter((name) => name.includes(".recreated"));
+    expect(leftovers).toEqual([]);
+  });
+
+  test("a strictly newer unsupported sidecar still replaces an older unsupported canonical file", async () => {
+    // Guard for the inverse direction: the version comparison must not
+    // block the legitimate upgrade-preservation swap when the sidecar
+    // schema is strictly newer than the canonical one.
+    const v2Main = JSON.stringify({ version: 2, workspaces: {} });
+    const v3Sidecar = JSON.stringify({ version: 3, workspaces: {} });
+    await writeFile(filePath, v2Main);
+    await writeFile(`${filePath}.corrupt`, v3Sidecar);
+    await service.getSnapshot("any", { throwOnError: true }).catch(() => null);
+    expect(await readFile(filePath, "utf-8")).toBe(v3Sidecar);
+    expect(await readFile(`${filePath}.recreated`, "utf-8")).toBe(v2Main);
+    const sidecarGone = await readFile(`${filePath}.corrupt`, "utf-8").then(
+      () => false,
+      () => true
+    );
+    expect(sidecarGone).toBe(true);
+  });
+
   test("stranded leftover merge orders by write generation, not recency alone", async () => {
     // recency is a user-interaction timestamp that status/goal writers
     // deliberately preserve: a newer status write captured in the stranded
