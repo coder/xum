@@ -106,6 +106,48 @@ export MUX_RUN_SESSION_ROOT
 mkdir -p "${MUX_RUN_SESSION_ROOT}"
 
 repo_driver_pattern='^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|tool|guitool|.*[.](command|textconv))|merge[.](tool|guitool|.*[.]driver)|remote[.].*[.](uploadpack|receivepack|vcs|proxy)|core[.](sshcommand|gitproxy|askpass|editor|alternaterefscommand|fsmonitor|hookspath|pager|attributesfile)|sequence[.]editor|credential([.].*)?[.]helper|commit[.]gpgsign|tag[.]gpgsign|gpg([.].*)?[.]program|gpg[.]ssh[.]defaultkeycommand|interactive[.]difffilter|pager[.].*|browser[.].*[.](cmd|path)|web[.]browser|help[.]browser|man[.](viewer|.*[.](cmd|path))|difftool[.].*[.](cmd|path)|mergetool[.].*[.](cmd|path)|guitool[.].*[.]cmd|instaweb[.].*|sendemail([.].*)?|uploadpack[.]packobjectshook|hook[.].*[.]command|trailer[.].*[.](cmd|command)|tar[.].*[.]command|alias[.].*[.]command)$'
+raw_config_file=$(mktemp "${MUX_LOG_DIR}/git-config-raw.XXXXXX") || fatal "failed to inspect repository automation drivers"
+if timeout 15s git -C "${project_path}" config -z --no-includes --name-only --list >"${raw_config_file}"; then
+  :
+else
+  git_config_status=$?
+  rm -f "${raw_config_file}"
+  if [[ "${git_config_status}" -eq 124 ]]; then
+    fatal "timed out inspecting repository automation drivers"
+  fi
+  fatal "failed to inspect repository automation drivers"
+fi
+
+if python3 - "${raw_config_file}" <<'PY'
+import sys
+
+for key_bytes in open(sys.argv[1], "rb").read().split(b"\0"):
+    if not key_bytes:
+        continue
+    try:
+        key = key_bytes.decode("ascii").lower()
+    except UnicodeDecodeError:
+        raise SystemExit(2)
+    if key == "include.path" or (
+        key.startswith("includeif.") and key.endswith(".path")
+    ):
+        raise SystemExit(1)
+PY
+then
+  include_scan_status=0
+else
+  include_scan_status=$?
+fi
+rm -f "${raw_config_file}"
+if [[ "${include_scan_status}" -eq 2 ]]; then
+  fatal "refusing to trust project with non-ASCII Git config names"
+fi
+if [[ "${include_scan_status}" -eq 1 ]]; then
+  fatal "refusing to trust project with Git config includes"
+fi
+if [[ "${include_scan_status}" -ne 0 ]]; then
+  fatal "failed to inspect repository automation drivers"
+fi
 config_dump_file=$(mktemp "${MUX_LOG_DIR}/git-config.XXXXXX") || fatal "failed to inspect repository automation drivers"
 if timeout 15s git -C "${project_path}" config -z --includes --list >"${config_dump_file}"; then
   :

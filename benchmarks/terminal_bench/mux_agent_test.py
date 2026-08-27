@@ -400,6 +400,24 @@ def test_mux_runner_allows_non_shell_alias(tmp_path: Path) -> None:
     assert Path(f"{result.args_file}.trust").exists()
 
 
+@pytest.mark.parametrize(
+    "config_key",
+    ["include.path", "includeIf.onbranch:other.path"],
+)
+def test_mux_runner_rejects_git_config_includes(
+    tmp_path: Path, config_key: str
+) -> None:
+    result = _run_mux_runner_smoke(
+        tmp_path,
+        exit_code=0,
+        repo_git_config=(config_key, "../hidden-config"),
+    )
+
+    assert result.completed.returncode == 1
+    assert "Git config includes" in result.completed.stderr
+    assert not Path(f"{result.args_file}.trust").exists()
+
+
 def test_mux_runner_rejects_non_ascii_git_config_name(tmp_path: Path) -> None:
     result = _run_mux_runner_smoke(
         tmp_path,
@@ -535,6 +553,24 @@ class _ExecResult:
     return_code: int
     stdout: str = ""
     stderr: str = ""
+
+
+class _LocalShellEnvironment:
+    async def exec(self, **kwargs: object) -> _ExecResult:
+        command = kwargs.get("command")
+        assert isinstance(command, str)
+        completed = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return _ExecResult(
+            return_code=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
 
 
 class _FakeEnvironment:
@@ -1023,6 +1059,35 @@ def test_run_excludes_preexisting_session_directories(
     assert getattr(context, "n_input_tokens") == 115
     assert getattr(context, "n_output_tokens") == 20
     assert getattr(context, "cost_usd") == pytest.approx(0.15)
+
+
+def test_session_archive_skips_hard_linked_telemetry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    session_root = tmp_path / "session-root"
+    good_session = session_root / "sessions/good"
+    linked_session = session_root / "sessions/linked"
+    good_session.mkdir(parents=True)
+    linked_session.mkdir(parents=True)
+    good_usage = json.dumps(_usage_display())
+    (good_session / "session-usage.json").write_text(good_usage)
+    credential_file = tmp_path / "providers.jsonc"
+    credential_file.write_text('{"secret":"provider-key"}')
+    os.link(credential_file, linked_session / "session-usage.json")
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    monkeypatch.setenv("MUX_RUN_SESSION_ROOT", str(session_root))
+    agent = MuxAgent(logs_dir=tmp_path / "logs")
+    agent.logs_dir.mkdir()
+
+    asyncio.run(agent._download_session_artifacts(_LocalShellEnvironment(), ()))
+
+    archive_path = agent.logs_dir / MuxAgent._SESSIONS_ARCHIVE_NAME
+    with tarfile.open(archive_path, "r:gz") as archive:
+        names = archive.getnames()
+    assert "./sessions/good/session-usage.json" in names
+    assert "./sessions/linked/session-usage.json" not in names
+    diagnostic = (agent.logs_dir / "mux-sessions-collect.log").read_text()
+    assert "skipped linked telemetry files" in diagnostic
 
 
 def test_populate_context_prefers_priced_session_when_not_older(

@@ -581,11 +581,16 @@ class MuxAgent(BaseInstalledAgent):
         archive_path = self.logs_dir / self._SESSIONS_ARCHIVE_NAME
         archive_path.unlink(missing_ok=True)
         stream_limit = self._SESSIONS_ARCHIVE_MAX_BYTES + 1
-        telemetry_source = (
-            "find . -type f \\( -name chat.jsonl -o -name chat-archive.jsonl "
+        telemetry_match = (
+            "\\( -name chat.jsonl -o -name chat-archive.jsonl "
             "-o -name session-usage.json -o -name run-stdout.jsonl "
-            "-o -name run-stderr.log -o -name mux-tokens.json \\) -print0 "
-            "2>/dev/null"
+            "-o -name run-stderr.log -o -name mux-tokens.json \\)"
+        )
+        telemetry_source = (
+            f"if find . -type f {telemetry_match} ! -links 1 -print -quit "
+            "2>/dev/null | grep -q .; then "
+            "printf 'skipped linked telemetry files\n' >&2; fi\n"
+            f"find . -type f {telemetry_match} -links 1 -print0 2>/dev/null"
         )
         if preexisting_session_dirs:
             excluded_patterns = "|".join(
