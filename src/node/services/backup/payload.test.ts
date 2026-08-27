@@ -406,8 +406,11 @@ describe("backup payload", () => {
       ["sh -c 'A=1 $env:TOKEN=hunter2 mcp'", REDACTED_BACKUP_VALUE],
       ["csh -c 'setenv TOKEN hunter2; mcp'", REDACTED_BACKUP_VALUE],
       ["pwsh -c $env:TOKEN=hunter2;mcp-server", REDACTED_BACKUP_VALUE],
-      // GNU env re-splits a split-string value into assignments.
+      // GNU env re-splits a split-string value into assignments, under any unique
+      // long-option abbreviation.
       ["env --split-string='TOKEN=hunter2 mcp-server'", REDACTED_BACKUP_VALUE],
+      ["env --s=TOKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      ["env --split=TOKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
       ["env -S'TOKEN=hunter2 mcp-server'", REDACTED_BACKUP_VALUE],
       ["env -STOKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
       // Expansion bodies can smuggle assignment bytes past every lexical check.
@@ -577,6 +580,25 @@ describe("backup payload", () => {
       sourceLabel: "test-host",
     });
     expect(payload.files.some((file) => file.path === "skills/demo/SKILL.md")).toBe(true);
+  });
+
+  it("blocks the export when a UTF-16 document carries a credential token", async () => {
+    const token = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    await fs.mkdir(path.join(muxRoot, "skills", "demo"), { recursive: true });
+    await fs.writeFile(
+      path.join(muxRoot, "skills", "demo", "SKILL.md"),
+      Buffer.from(`docs with ${token}\n`, "utf16le")
+    );
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+    expect((blocked as BackupCredentialDetectedError).files).toEqual(["skills/demo/SKILL.md"]);
   });
 
   it("blocks the export when a credential format appears in a published path", async () => {

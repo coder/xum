@@ -1220,8 +1220,18 @@ function unquoteShellWord(word: string): string {
   return result;
 }
 
-/** GNU `env -S`/`--split-string` re-splits its attached value into assignments. */
-const SPLIT_STRING_OPTION = /^-[A-Za-z]*S|^--split-string/;
+/**
+ * GNU `env -S`/`--split-string` re-splits its attached value into assignments, and GNU
+ * getopt accepts any unique long-option abbreviation. No other `env` long option starts
+ * with `s`, so every `--s...` prefix spelling (`--s=`, `--split=`) resolves to it.
+ */
+function isSplitStringOption(unquoted: string): boolean {
+  if (/^-[A-Za-z]*S/.test(unquoted)) return true;
+  const abbreviation = /^--([A-Za-z-]*)=/.exec(unquoted);
+  return (
+    abbreviation !== null && abbreviation[1] !== "" && "split-string".startsWith(abbreviation[1])
+  );
+}
 
 /** Exactly one replaced assignment, nothing else riding along in the same word. */
 const CONSUMED_ASSIGNMENT = new RegExp(`^${ASSIGNMENT_NAME}${REDACTED_BACKUP_VALUE}$`);
@@ -1256,8 +1266,8 @@ function hasDisguisedAssignment(redacted: string): boolean {
     if (unquoted.startsWith("=")) return true;
     // A quote-mangled `NAME=` spelling (`TOKEN\\=x`, `'TOKEN'=x`) for `env`/`eval`.
     if (ASSIGNMENT_START.test(unquoted)) return true;
-    // A split-string option with its value attached (`-STOKEN=x`).
-    if (SPLIT_STRING_OPTION.test(unquoted)) return true;
+    // A split-string option with its value attached (`-STOKEN=x`, `--s=TOKEN=x`).
+    if (isSplitStringOption(unquoted)) return true;
     // `=` mixed with quoting or expansion machinery: some other grammar's assignment
     // (`$env:TOKEN=x`, `python -c 'os.environ["TOKEN"]="x"'` fragments).
     if (/['"\\$]/.test(word)) return true;
@@ -1619,7 +1629,10 @@ export async function createBackupPayload(
         // The path publishes alongside the content, and recursive collections take
         // whatever a directory entry happens to be named.
         const content = file.content.toString("utf-8");
-        const targets = [content, file.path];
+        // NUL-stripping reassembles ASCII tokens out of UTF-16 text, which decodes to
+        // interleaved NUL characters here; text published as prose has no business
+        // holding NULs, so this manufactures no match from ordinary content.
+        const targets = [content, content.replaceAll("\u0000", ""), file.path];
         // The stripped variant catches a token split by shell quoting (`--token
         // ghp_123\456...`): the shell removes the quoting on execution, and the published
         // text reconstructs the same credential. Only command content is shell input;
