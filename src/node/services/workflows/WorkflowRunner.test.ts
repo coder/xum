@@ -369,7 +369,7 @@ describe("WorkflowRunner", () => {
       expect.objectContaining({
         id: "verify",
         agentId: "exec",
-        modelString: "anthropic:claude-fable-5",
+        modelString: "anthropic:claude-fable-5-1",
         thinkingLevel: "high",
       }),
     ]);

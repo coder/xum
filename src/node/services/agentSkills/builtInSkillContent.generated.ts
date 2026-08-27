@@ -3850,7 +3850,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "| Model                  | ID                            | Aliases                                                      | Default |",
       "| ---------------------- | ----------------------------- | ------------------------------------------------------------ | ------- |",
-      "| Fable 5                | anthropic:claude-fable-5      | `fable`                                                      |         |",
+      "| Fable 5.1              | anthropic:claude-fable-5-1    | `fable`                                                      |         |",
       "| Mythos 5               | anthropic:claude-mythos-5     | `mythos`                                                     |         |",
       "| Opus 5                 | anthropic:claude-opus-5       | `opus`                                                       | ✓       |",
       "| Sonnet 5               | anthropic:claude-sonnet-5     | `sonnet`                                                     |         |",
