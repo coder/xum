@@ -490,6 +490,10 @@ function createByteBudget() {
 
 type ByteBudget = ReturnType<typeof createByteBudget>;
 
+function takeBackupFileBytes(budget: ByteBudget, files: readonly BackupFile[]): void {
+  for (const file of files) budget(file.path, file.content.length);
+}
+
 /**
  * Two paths collide when the filesystem cannot tell them apart, so the comparison has to fold
  * the same things a filesystem does. Case is the obvious one, and macOS also normalizes: NFC
@@ -1772,8 +1776,14 @@ const LANGUAGE_INTERPRETERS: Array<{ name: RegExp; evalWord: RegExp }> = [
   // windowed `pythonw`/`rubyw`/`wperl`/`php-win` builds run the same evaluation
   // grammars under different executable names.
   { name: /^(?:py|pyw|pythonw?[0-9.]*)$/, evalWord: /^-[A-Za-z0-9]*c/ },
-  { name: /^(?:node|nodejs)$/, evalWord: /^(?:--eval|--print|-[A-Za-z0-9]*[ep])/ },
-  { name: /^bun$/, evalWord: /^(?:--eval|--print|-[A-Za-z0-9]*[ep])/ },
+  {
+    name: /^(?:node|nodejs)$/,
+    evalWord: /^(?:--eval|--print|--import|--loader|--experimental-loader|-[A-Za-z0-9]*[ep])/,
+  },
+  {
+    name: /^bun$/,
+    evalWord: /^(?:--eval|--print|--import|--loader|--experimental-loader|-[A-Za-z0-9]*[ep])/,
+  },
   { name: /^deno$/, evalWord: /^eval$/ },
   { name: /^w?perl[0-9.]*$/, evalWord: /^-[A-Za-z0-9]*[eE]/ },
   { name: /^rubyw?[0-9.]*$/, evalWord: /^-[A-Za-z0-9]*e/ },
@@ -1855,6 +1865,9 @@ function hasDisguisedAssignment(redacted: string): boolean {
     // no `=` or `$` in the text (`printf -v TOKEN ...; export TOKEN`), and `set`
     // reaches the same end through `-a` or the positional parameters.
     if (SHELL_STATE_WORDS.has(unquoted)) return true;
+    // Executable-MIME data URLs are inline modules even when a runner subcommand
+    // prevents interpreter option tracking from reaching them.
+    if (/^data:[^,]*(?:javascript|ecmascript|typescript)/i.test(unquoted)) return true;
     const executable = unquoted
       .slice(Math.max(unquoted.lastIndexOf("/"), unquoted.lastIndexOf("\\")) + 1)
       .toLowerCase()
@@ -2589,6 +2602,8 @@ export async function createBackupPayload(
     path: "preferences.json",
     content: serializeBackupPreferences(options.preferences),
   });
+  const assembledBudget = createByteBudget();
+  takeBackupFileBytes(assembledBudget, files);
   // Count and complexity only: this payload may be a local snapshot, whose names keep
   // current-filesystem forms that portable validation would refuse. Collection already
   // validated each name under local rules; publication re-checks with portable rules.
@@ -2737,7 +2752,7 @@ function assertPayloadWithinLimits(files: readonly BackupFile[], manifestJson: s
   // cannot be one that every later read rejects.
   const budget = createByteBudget();
   budget(BACKUP_MANIFEST_FILE, Buffer.byteLength(manifestJson, "utf-8"));
-  for (const file of files) budget(file.path, file.content.length);
+  takeBackupFileBytes(budget, files);
 }
 
 export async function writeBackupPayload(

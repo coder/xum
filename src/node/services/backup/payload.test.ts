@@ -1778,6 +1778,11 @@ describe("backup payload", () => {
       "wperl -e 'x'",
       "php-win.exe -r 'x'",
       "node -e \"require('child_process').spawnSync('mcp',['--token','ghp_Abcdef1234'+'Klmno56789'])\"",
+      // Preload options and executable data URLs evaluate inline module code; the URL
+      // rule also covers runners such as deno whose subcommand ends option tracking.
+      `node --import 'data:text/javascript,import{spawnSync}from"node:child_process";spawnSync("mcp",["--token","ghp_Abcdef1234"+"Klmno56789"])' server.js`,
+      `node --loader='data:text/javascript,import{spawnSync}from"node:child_process";spawnSync("mcp",["--token","ghp_Abcdef1234"+"Klmno56789"])' server.js`,
+      `deno run 'data:text/javascript,new Deno.Command("mcp",{args:["--token","ghp_Abcdef1234"+"Klmno56789"]}).outputSync()'`,
       'deno eval \'const_t="ghp_Abcdef1234"+"Klmno56789"\'',
       // Perl and Ruby cluster the numeric `-0[octal]` switch before the eval
       // letter, so digits count as cluster characters alongside letters.
@@ -2621,22 +2626,19 @@ describe("backup payload", () => {
 
   it("refuses to publish generated content that exceeds the limits", async () => {
     await writeFixtureFile(muxRoot, "AGENTS.md", "small\n");
-    const payload = await createBackupPayload({
-      muxRoot,
-      muxVersion: "1.2.3",
-      sourceLabel: "test-host",
-      preferences: {
-        appearance: {
-          terminalFontConfig: { fontFamily: "x".repeat(MAX_BACKUP_FILE_BYTES), fontSize: 12 },
-        },
-      },
-    });
-
-    // Collection budgets bound what is read, and preferences are generated after it, so a
-    // published payload has to be checked once it is assembled.
     const oversized = await captureRejection(
-      writeBackupPayload(path.join(tempDir, "generated-payload"), payload)
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        preferences: {
+          appearance: {
+            terminalFontConfig: { fontFamily: "x".repeat(MAX_BACKUP_FILE_BYTES), fontSize: 12 },
+          },
+        },
+      })
     );
+
     expect((oversized as Error).message).toContain("'preferences.json' is larger");
   });
 
