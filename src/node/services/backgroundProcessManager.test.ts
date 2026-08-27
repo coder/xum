@@ -565,10 +565,14 @@ describe("BackgroundProcessManager", () => {
       // activity consumers (sidebar watching indicator) can clear.
       expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(0);
       expect(changedWorkspaceIds).toContain(testWorkspaceId);
-      expect(stoppedEvents).toContainEqual({
+      const stoppedEvent = stoppedEvents.find(
+        (event) => event.processId === result.processId && event.reason === "failed"
+      );
+      expect(stoppedEvent?.failureMessage).toBe("read failure");
+      expect(stoppedEvent?.armMetadata).toMatchObject({
         processId: result.processId,
-        reason: "failed",
-        failureMessage: "read failure",
+        taskId: `bash:${result.processId}`,
+        filter: "NEVER_MATCHES",
       });
     });
 
@@ -605,8 +609,55 @@ describe("BackgroundProcessManager", () => {
         );
         expect(stoppedEvent).toBeDefined();
         expect(stoppedEvent?.failureMessage).toContain("3 consecutive times");
+        expect(stoppedEvent?.failedOperations).toEqual(["readOutput"]);
+        expect(stoppedEvent?.armMetadata?.processId).toBe(result.processId);
       } finally {
         outputProbeFailure.value = false;
+      }
+    });
+
+    it("keeps task output readable after exit-probe failure retires the monitor", async () => {
+      const exitProbeFailure = { value: false, calls: 0 };
+      const remoteRuntime = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), {
+        exitProbeFailure,
+      });
+      const stoppedEvents: MonitorStoppedPayload[] = [];
+      manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+      const result = await manager.spawn(
+        remoteRuntime,
+        testWorkspaceId,
+        "echo readable-output; sleep 10",
+        {
+          cwd: process.cwd(),
+          displayName: "monitor-exit-probe-failure",
+          monitor: {
+            filter: "NEVER_MATCHES",
+            pattern: /NEVER_MATCHES/,
+            exclude: false,
+            cooldownMs: 0,
+          },
+        }
+      );
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      try {
+        exitProbeFailure.value = true;
+        for (let attempt = 0; attempt < 60 && stoppedEvents.length === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        expect(manager.getActiveMonitorCount(testWorkspaceId)).toBe(0);
+        const stoppedEvent = stoppedEvents.find(
+          (event) => event.processId === result.processId && event.reason === "failed"
+        );
+        expect(stoppedEvent?.failedOperations).toEqual(["getExitCode"]);
+
+        const output = await manager.getOutput(result.processId, undefined, undefined, 0);
+        expect(output.success).toBe(true);
+        if (output.success) expect(output.output).toContain("readable-output");
+      } finally {
+        exitProbeFailure.value = false;
       }
     });
 
@@ -652,6 +703,10 @@ describe("BackgroundProcessManager", () => {
         );
         expect(stoppedEvent).toBeDefined();
         expect(stoppedEvent?.failureMessage).toContain("Background process monitor probes failed");
+        expect([...(stoppedEvent?.failedOperations ?? [])].sort()).toEqual([
+          "getExitCode",
+          "readOutput",
+        ]);
       } finally {
         outputProbeFailure.value = false;
         exitProbeFailure.value = false;
@@ -700,6 +755,10 @@ describe("BackgroundProcessManager", () => {
         );
         expect(stoppedEvent).toBeDefined();
         expect(stoppedEvent?.failureMessage).toContain("exited with code 255");
+        expect([...(stoppedEvent?.failedOperations ?? [])].sort()).toEqual([
+          "getExitCode",
+          "readOutput",
+        ]);
       } finally {
         outputProbeFailure.value = false;
         exitProbeFailure.value = false;

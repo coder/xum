@@ -30,6 +30,7 @@ import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
 import { toPosixPath } from "@/node/utils/paths";
 import { getErrorMessage } from "@/common/utils/errors";
+import type { BashMonitorFailedOperation } from "@/common/types/message";
 
 /**
  * Quote a path for shell commands.
@@ -289,14 +290,30 @@ export async function spawnProcess(
   }
 }
 
-/**
- * Unified handle to a background process.
- * Uses runtime.exec for all operations, working identically for local and SSH.
- *
- * Output files (output.log, exit_code) are on the runtime's filesystem.
- * This handle provides lifecycle management via execBuffered commands.
- */
-type MonitorProbeOperation = "readOutput" | "getExitCode";
+export class BackgroundMonitorProbeError extends Error {
+  readonly failedOperations: readonly BashMonitorFailedOperation[];
+
+  constructor(message: string, failedOperations: readonly BashMonitorFailedOperation[]) {
+    super(message);
+    this.name = "BackgroundMonitorProbeError";
+    this.failedOperations = [...new Set(failedOperations)];
+  }
+}
+
+export function isBackgroundMonitorProbeError(
+  error: unknown
+): error is BackgroundMonitorProbeError {
+  if (error instanceof BackgroundMonitorProbeError) return true;
+  if (typeof error !== "object" || error == null) return false;
+  const candidate = error as { name?: unknown; failedOperations?: unknown };
+  return (
+    candidate.name === "BackgroundMonitorProbeError" &&
+    Array.isArray(candidate.failedOperations) &&
+    candidate.failedOperations.every(
+      (operation) => operation === "readOutput" || operation === "getExitCode"
+    )
+  );
+}
 
 // One or two misses can be transient; three means that capability cannot serve the monitor.
 const MAX_CONSECUTIVE_MONITOR_PROBE_FAILURES = 3;
@@ -306,9 +323,16 @@ interface MonitorProbeFailure {
   message: string;
 }
 
+/**
+ * Unified handle to a background process.
+ * Uses runtime.exec for all operations, working identically for local and SSH.
+ *
+ * Output files (output.log, exit_code) are on the runtime's filesystem.
+ * This handle provides lifecycle management via execBuffered commands.
+ */
 class RuntimeBackgroundHandle implements BackgroundHandle {
   private readonly monitorProbeFailures: Partial<
-    Record<MonitorProbeOperation, MonitorProbeFailure>
+    Record<BashMonitorFailedOperation, MonitorProbeFailure>
   > = {};
   private terminated = false;
 
@@ -319,7 +343,7 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     private readonly quotePath: (p: string) => string
   ) {}
 
-  private recordMonitorProbeSuccess(operation: MonitorProbeOperation): void {
+  private recordMonitorProbeSuccess(operation: BashMonitorFailedOperation): void {
     delete this.monitorProbeFailures[operation];
   }
 
@@ -330,7 +354,7 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
   }
 
   private recordMonitorProbeFailure(
-    operation: MonitorProbeOperation,
+    operation: BashMonitorFailedOperation,
     error: unknown
   ): Error | null {
     const message = errorMsg(error);
@@ -341,17 +365,19 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     };
     this.monitorProbeFailures[operation] = current;
 
-    const otherOperation: MonitorProbeOperation =
+    const otherOperation: BashMonitorFailedOperation =
       operation === "readOutput" ? "getExitCode" : "readOutput";
     const otherFailure = this.monitorProbeFailures[otherOperation];
     if (otherFailure != null) {
-      return new Error(
-        `Background process monitor probes failed (${operation}: ${message}; ${otherOperation}: ${otherFailure.message})`
+      return new BackgroundMonitorProbeError(
+        `Background process monitor probes failed (${operation}: ${message}; ${otherOperation}: ${otherFailure.message})`,
+        [operation, otherOperation]
       );
     }
     if (current.consecutiveFailures >= MAX_CONSECUTIVE_MONITOR_PROBE_FAILURES) {
-      return new Error(
-        `Background process monitor probe failed ${current.consecutiveFailures} consecutive times (${operation}: ${message})`
+      return new BackgroundMonitorProbeError(
+        `Background process monitor probe failed ${current.consecutiveFailures} consecutive times (${operation}: ${message})`,
+        [operation]
       );
     }
     return null;

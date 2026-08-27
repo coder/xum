@@ -299,6 +299,7 @@ import {
   buildBashMonitorWakeMetadata,
   buildBashMonitorWakePrompt,
   type BashMonitorClearToken,
+  type BashMonitorLostPayload,
   type BashMonitorWakePromptContext,
   type BashMonitorWakeRecord,
 } from "@/node/services/bashMonitorWakeStore";
@@ -1997,6 +1998,61 @@ export class WorkspaceService extends EventEmitter {
   private readonly bashMonitorHistoryLocks = new MutexMap<string>();
   private readonly bashMonitorRecoveryPromise: Promise<void>;
   private readonly bashMonitorRegistryLocks = new MutexMap<string>();
+  private async convertRuntimeFailureMonitorToWake(
+    workspaceId: string,
+    payload: MonitorStoppedPayload
+  ): Promise<boolean> {
+    const consume = () =>
+      this.bashMonitorRegistryStore.consumeIfArmedBefore(
+        workspaceId,
+        payload.processId,
+        Number.MAX_SAFE_INTEGER,
+        async (record) => {
+          const lostPayload: BashMonitorLostPayload = {
+            ...record,
+            lostReason: "runtime-failure",
+            ...(payload.failureMessage != null ? { failureMessage: payload.failureMessage } : {}),
+            ...(payload.failedOperations != null
+              ? { failedOperations: payload.failedOperations }
+              : {}),
+          };
+          await this.bashMonitorWakeStore.enqueueMonitorLost(lostPayload, Number.MAX_SAFE_INTEGER);
+        }
+      );
+
+    let consumed = await consume();
+    if (consumed != null) return true;
+    if (
+      payload.armMetadata?.workspaceId !== workspaceId ||
+      payload.armMetadata.processId !== payload.processId
+    ) {
+      return false;
+    }
+
+    await this.bashMonitorRegistryStore.upsert(payload.armMetadata);
+    consumed = await consume();
+    return consumed != null;
+  }
+
+  private async convertRuntimeFailureMonitorToWakeWithRetry(
+    workspaceId: string,
+    payload: MonitorStoppedPayload
+  ): Promise<boolean> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await this.convertRuntimeFailureMonitorToWake(workspaceId, payload);
+      } catch (error) {
+        if (attempt === 1) throw error;
+        log.warn("Retrying runtime-failure monitor wake persistence", {
+          workspaceId,
+          processId: payload.processId,
+          error,
+        });
+      }
+    }
+    return false;
+  }
+
   private readonly bashMonitorArmedListener = (
     _workspaceId: string,
     payload: MonitorArmedPayload
@@ -2078,24 +2134,11 @@ export class WorkspaceService extends EventEmitter {
       .withLock(workspaceId, () =>
         this.bashMonitorRegistryLocks.withLock(`${workspaceId}:${payload.processId}`, async () => {
           if (payload.reason === "failed") {
-            const consumed = await this.bashMonitorRegistryStore.consumeIfArmedBefore(
+            const converted = await this.convertRuntimeFailureMonitorToWakeWithRetry(
               workspaceId,
-              payload.processId,
-              Number.MAX_SAFE_INTEGER,
-              async (record) => {
-                await this.bashMonitorWakeStore.enqueueMonitorLost(
-                  {
-                    ...record,
-                    lostReason: "runtime-failure",
-                    ...(payload.failureMessage != null
-                      ? { failureMessage: payload.failureMessage }
-                      : {}),
-                  },
-                  Number.MAX_SAFE_INTEGER
-                );
-              }
+              payload
             );
-            if (consumed != null) this.scheduleBashMonitorWakeDrain(workspaceId);
+            if (converted) this.scheduleBashMonitorWakeDrain(workspaceId);
             return;
           }
 
@@ -2442,37 +2485,67 @@ export class WorkspaceService extends EventEmitter {
    * pending "monitor-lost" wakes *before* scheduling drains, so the existing drain
    * machinery delivers the termination notice (merged with any undelivered match lines).
    */
-  private async recoverBashMonitorStateAfterRestart(): Promise<void> {
+  private async recoverBashMonitorRegistryPass(): Promise<boolean> {
+    let retryNeeded = false;
+    let ownerWorkspaceIds: string[];
     try {
-      for (const ownerWorkspaceId of await this.bashMonitorRegistryStore.listOwnerWorkspaceIds()) {
+      ownerWorkspaceIds = await this.bashMonitorRegistryStore.listOwnerWorkspaceIds();
+    } catch (error) {
+      log.warn("Failed to list stale bash monitor registry records", { error });
+      return true;
+    }
+
+    for (const ownerWorkspaceId of ownerWorkspaceIds) {
+      try {
         await this.bashMonitorHistoryLocks.withLock(ownerWorkspaceId, async () => {
-          for (const record of await this.bashMonitorRegistryStore.listAll(ownerWorkspaceId)) {
+          const records = await this.bashMonitorRegistryStore.listAll(ownerWorkspaceId);
+          for (const record of records) {
             // Defensive: monitors armed after this service was constructed belong to the
             // live manager; its own retirement events maintain their registry records.
             if (Date.parse(record.createdAt) >= this.constructedAtMs) continue;
-            // Persist-then-remove runs under the same workspace + per-key locks as live lifecycle
-            // listeners, so a failed wake write leaves the stale registry row available to retry.
-            await this.bashMonitorRegistryLocks.withLock(
-              `${ownerWorkspaceId}:${record.processId}`,
-              async () => {
-                await this.bashMonitorRegistryStore.consumeIfArmedBefore(
-                  ownerWorkspaceId,
-                  record.processId,
-                  this.constructedAtMs,
-                  async (consumed) => {
-                    await this.bashMonitorWakeStore.enqueueMonitorLost(
-                      consumed,
-                      this.constructedAtMs
-                    );
-                  }
-                );
-              }
-            );
+            try {
+              // Persist-then-remove keeps the stale row available when the wake write fails.
+              await this.bashMonitorRegistryLocks.withLock(
+                `${ownerWorkspaceId}:${record.processId}`,
+                async () => {
+                  await this.bashMonitorRegistryStore.consumeIfArmedBefore(
+                    ownerWorkspaceId,
+                    record.processId,
+                    this.constructedAtMs,
+                    async (consumed) => {
+                      await this.bashMonitorWakeStore.enqueueMonitorLost(
+                        consumed,
+                        this.constructedAtMs
+                      );
+                    }
+                  );
+                }
+              );
+            } catch (error) {
+              retryNeeded = true;
+              log.warn("Failed to convert stale bash monitor registry record", {
+                ownerWorkspaceId,
+                processId: record.processId,
+                error,
+              });
+            }
           }
         });
+      } catch (error) {
+        retryNeeded = true;
+        log.warn("Failed to scan stale bash monitor registry owner", {
+          ownerWorkspaceId,
+          error,
+        });
       }
-    } catch (error) {
-      log.debug("Failed to convert stale bash monitor registry records into wakes", { error });
+    }
+    return retryNeeded;
+  }
+
+  private async recoverBashMonitorStateAfterRestart(): Promise<void> {
+    const retryNeeded = await this.recoverBashMonitorRegistryPass();
+    if (retryNeeded) {
+      await this.recoverBashMonitorRegistryPass();
     }
     await this.schedulePersistedBashMonitorWakeDrains();
   }
@@ -2948,16 +3021,23 @@ export class WorkspaceService extends EventEmitter {
         typeof this.backgroundProcessManager.getMonitorWakeDeliveryState === "function";
       const canQueryShownFrontier =
         typeof this.backgroundProcessManager.getSettledShownThroughOffset === "function";
-      const canQueryProcess = typeof this.backgroundProcessManager.getProcess === "function";
+      const canPeekProcess = typeof this.backgroundProcessManager.peekProcess === "function";
       const supersededByShown: BashMonitorWakeRecord[] = [];
       const promptContext = new Map<string, BashMonitorWakePromptContext>();
       for (const record of pending) {
-        if (
-          record.kind === "monitor-lost" &&
-          record.lostReason === "runtime-failure" &&
-          canQueryProcess
-        ) {
-          const process = await this.backgroundProcessManager.getProcess(record.processId);
+        if (record.kind === "monitor-lost" && record.lostReason === "runtime-failure") {
+          let process: ReturnType<BackgroundProcessManager["peekProcess"]> = null;
+          try {
+            if (canPeekProcess) {
+              process = this.backgroundProcessManager.peekProcess(record.processId);
+            }
+          } catch (error) {
+            log.debug("Failed to inspect runtime-failure process generation", {
+              ownerWorkspaceId,
+              processId: record.processId,
+              error,
+            });
+          }
           const wakeCreatedAt = Date.parse(record.createdAt);
           // The task ID is safe only while it still names the process generation whose monitor failed.
           if (

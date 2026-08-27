@@ -552,6 +552,8 @@ export interface DisplayStatus {
   message: string;
 }
 
+export type BashMonitorFailedOperation = "readOutput" | "getExitCode";
+
 /**
  * Compact per-record summary attached to bash monitor wake turns so the
  * transcript can render a small card (process + filter) while keeping the full
