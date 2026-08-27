@@ -611,7 +611,12 @@ export function buildBashMonitorWakePrompt(
         ? BASH_MONITOR_WAKE_HEADINGS.lost
         : runtimeLostRecords.length === records.length
           ? BASH_MONITOR_WAKE_HEADINGS.failed
-          : BASH_MONITOR_WAKE_HEADINGS.mixed;
+          : // The restart-claiming mixed heading is only truthful when the batch actually
+            // contains a restart loss; runtime failures mixed with live updates would
+            // otherwise assert a restart that never happened.
+            restartLostRecords.length > 0
+            ? BASH_MONITOR_WAKE_HEADINGS.mixed
+            : BASH_MONITOR_WAKE_HEADINGS.mixedRuntimeFailure;
 
   const closingParts = ["This is a condition-driven wake-up. Continue from this event."];
   // Stale-terminal records are excluded from BOTH task_await suggestion lists: their content is

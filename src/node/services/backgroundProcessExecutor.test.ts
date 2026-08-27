@@ -5,7 +5,7 @@ import * as path from "path";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { BackgroundHandle } from "@/node/runtime/Runtime";
 import { shellQuote } from "@/node/runtime/backgroundCommands";
-import { spawnProcess } from "./backgroundProcessExecutor";
+import { BG_EXIT_CODE_FILENAME, spawnProcess } from "./backgroundProcessExecutor";
 
 class ExecPathMappingRuntime extends LocalRuntime {
   constructor(
@@ -110,5 +110,30 @@ describe("spawnProcess", () => {
 
     expect(await waitForExit(result.handle)).toBe(0);
     expect((await fs.readFile(outFile, "utf8")).trim()).toBe(execDir);
+  });
+
+  it("fails the strict exit probe when the exit marker is a dangling symlink", async () => {
+    const hostDir = await fs.mkdtemp(path.join(os.tmpdir(), "bg-dangling-marker-"));
+    cleanupDirs.push(hostDir);
+    const result = await spawnProcess(new LocalRuntime(hostDir), "echo hi", {
+      cwd: hostDir,
+      workspaceId: `dangling-marker-${Date.now()}`,
+      processId: "dangling",
+    });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    handles.push(result.handle);
+    cleanupDirs.push(result.outputDir);
+    expect(await waitForExit(result.handle)).toBe(0);
+
+    const markerPath = path.join(result.outputDir, BG_EXIT_CODE_FILENAME);
+    await fs.rm(markerPath);
+    await fs.symlink(path.join(result.outputDir, "missing-target"), markerPath);
+
+    // -e follows the link and reports the occupied path as absent; the strict probe must
+    // fail (feeding monitor retirement) rather than report a still-running process forever.
+    const probe = await result.handle.getExitCodeForMonitor?.();
+    expect(probe?.success).toBe(false);
   });
 });

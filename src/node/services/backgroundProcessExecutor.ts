@@ -329,11 +329,13 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
 
   private async getExitCodeStrict(): Promise<number | null> {
     const exitCodePath = this.quotePath(`${this.outputDir}/${EXIT_CODE_FILENAME}`);
-    // Absent marker means still running (exit 0, empty); any other cat failure (unreadable,
-    // replaced by a directory) must surface so the strict probe can count it.
+    // Absent marker means still running (exit 0, empty). File operators other than -h/-L
+    // follow symlinks, so a dangling-symlink marker reads as absent to -e; require -L to
+    // also fail before declaring absence, letting cat surface the dangling link (like any
+    // other unreadable/replaced marker) as a probe failure instead of "running" forever.
     const result = await execBuffered(
       this.runtime,
-      `[ ! -e ${exitCodePath} ] || cat ${exitCodePath} 2>/dev/null`,
+      `{ [ ! -e ${exitCodePath} ] && [ ! -L ${exitCodePath} ]; } || cat ${exitCodePath} 2>/dev/null`,
       {
         cwd: FALLBACK_CWD,
         timeout: 10,
