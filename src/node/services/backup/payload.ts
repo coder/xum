@@ -1143,8 +1143,11 @@ function valueHasRedactionAtPath(
 // The shell ends a word at these without whitespace, so an assignment can directly follow
 // one (`bootstrap;TOKEN=... mcp`) and an unquoted value ends at the next one.
 const SHELL_WORD_BREAK = ";&|<>(){}`";
-// `+?=`: Bash `NAME+=value` appends, or plainly sets an unset name, and exports the same way.
-const ASSIGNMENT_NAME = "[A-Za-z_][A-Za-z0-9_]*\\+?=";
+// Beyond Bash identifiers: GNU `env` accepts any `NAME=VALUE` operand (`TOKEN-NAME=x`),
+// so names admit dots and interior dashes. A leading dash stays excluded, keeping option
+// words (`--transport=stdio`, `-Dfoo.bar=x`) published. `+?=`: Bash `NAME+=value`
+// appends, or plainly sets an unset name, and exports the same way.
+const ASSIGNMENT_NAME = "[A-Za-z0-9_.][A-Za-z0-9_.-]*\\+?=";
 const ASSIGNMENT_VALUE = `(?:\\\\[\\s\\S]|'[^']*'|"(?:\\\\[\\s\\S]|[^"\\\\])*"|[^\\s\\\\'"${SHELL_WORD_BREAK}]+)+`;
 const COMMAND_ENV_ASSIGNMENT = new RegExp(
   `(^|[\\s${SHELL_WORD_BREAK}])(${ASSIGNMENT_NAME})(${ASSIGNMENT_VALUE})`,
@@ -1236,6 +1239,9 @@ function hasDisguisedAssignment(redacted: string): boolean {
     // grammar treats as an assignment is not decidable here.
     if (/\s/.test(unquoted)) return true;
     if (!word.includes("=")) continue;
+    // A leading `=` is the tail of an assignment some expansion spliced apart
+    // (`env {TOK,EN}=x` breaks at the braces and leaves `=x`).
+    if (unquoted.startsWith("=")) return true;
     // A quote-mangled `NAME=` spelling (`TOKEN\\=x`, `'TOKEN'=x`) for `env`/`eval`.
     if (ASSIGNMENT_START.test(unquoted)) return true;
     // A split-string option with its value attached (`-STOKEN=x`).
@@ -1599,10 +1605,13 @@ export async function createBackupPayload(
     const leakedFiles = files
       .filter((file) => {
         // The path publishes alongside the content, and recursive collections take
-        // whatever a directory entry happens to be named.
+        // whatever a directory entry happens to be named. The stripped variant catches a
+        // token split by shell quoting (`--token ghp_123\456...`): the shell removes the
+        // quoting on execution, and the published text reconstructs the same credential.
         const content = file.content.toString("utf-8");
+        const stripped = content.replace(/[\\'"]/g, "");
         return CREDENTIAL_TOKEN_PATTERNS.some(
-          (pattern) => pattern.test(content) || pattern.test(file.path)
+          (pattern) => pattern.test(content) || pattern.test(stripped) || pattern.test(file.path)
         );
       })
       .map((file) => file.path)

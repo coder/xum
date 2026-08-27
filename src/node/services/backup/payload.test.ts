@@ -377,6 +377,11 @@ describe("backup payload", () => {
       // Process substitution is an expansion, wherever it appears.
       ["TOKEN=<(printf hunter2) mcp-server", REDACTED_BACKUP_VALUE],
       ["FOO=1 mcp-server <(printf hunter2)", REDACTED_BACKUP_VALUE],
+      // GNU env operand names are not limited to shell identifiers.
+      ["env TOKEN-NAME=hunter2 mcp-server", `env TOKEN-NAME=${REDACTED_BACKUP_VALUE} mcp-server`],
+      // Brace expansion splices assignment fragments across word breaks.
+      ["env {TOK,EN}=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      ["env TOK{A,B}=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
       // Append assignments set an unset name and export the same way.
       ["TOKEN+=hunter2 mcp-server", `TOKEN+=${REDACTED_BACKUP_VALUE} mcp-server`],
       ["mcp-a;TOKEN+=hunter2 mcp-b", `mcp-a;TOKEN+=${REDACTED_BACKUP_VALUE} mcp-b`],
@@ -533,6 +538,26 @@ describe("backup payload", () => {
       reportSecrets: true,
     });
     expect(payloadFileText(snapshot, "mcp.jsonc")).toContain(token);
+  });
+
+  it("blocks the export when shell quoting splits a known credential token", async () => {
+    // Bash removes the backslash at execution, handing the server one contiguous token.
+    const brokenToken = "ghp_aaaaaaaaaaaaaaaaaa\\aaaaaaaaaaaaaaaaaa";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: `mcp-grafana --token ${brokenToken}` } } })
+    );
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+    expect((blocked as BackupCredentialDetectedError).files).toEqual(["mcp.jsonc"]);
   });
 
   it("blocks the export when a credential format appears in a published path", async () => {
