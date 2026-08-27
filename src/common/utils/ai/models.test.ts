@@ -159,12 +159,18 @@ describe("Anthropic 1M context classification", () => {
     expect(hasNative1MContext("anthropic:claude-sonnet-4-6")).toBe(true);
   });
 
-  it("treats Sonnet 5 as a native 1M model", () => {
+  it("treats Sonnet 5 / Sonnet 5.1 as native 1M models", () => {
     expect(getAnthropic1MContextMode("anthropic:claude-sonnet-5")).toBe("native");
     expect(getAnthropic1MContextMode("anthropic:claude-sonnet-5-20260630")).toBe("native");
     expect(getAnthropic1MContextMode("mux-gateway:anthropic/claude-sonnet-5")).toBe("native");
     expect(supports1MContext("anthropic:claude-sonnet-5")).toBe(false);
     expect(hasNative1MContext("anthropic:claude-sonnet-5")).toBe(true);
+    // The claude-sonnet-5 pattern only tolerates date suffixes, so 5.1 needs
+    // its own pattern (same trap as claude-fable-5-1).
+    expect(getAnthropic1MContextMode("anthropic:claude-sonnet-5-1")).toBe("native");
+    expect(getAnthropic1MContextMode("mux-gateway:anthropic/claude-sonnet-5-1")).toBe("native");
+    expect(supports1MContext("anthropic:claude-sonnet-5-1")).toBe(false);
+    expect(hasNative1MContext("anthropic:claude-sonnet-5-1")).toBe(true);
   });
 
   it("treats Mythos-class Fable 5 / Fable 5.1 / Mythos 5 as native 1M models", () => {

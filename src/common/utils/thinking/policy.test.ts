@@ -532,7 +532,7 @@ describe("getThinkingPolicyForModel", () => {
     expect(getDefaultMinimumThinkingLevel("openai:team-sol")).toBe("off");
   });
 
-  test("returns all 6 levels for Sonnet 5 (native xhigh)", () => {
+  test("returns all 6 levels for Sonnet 5 / Sonnet 5.1 (native xhigh)", () => {
     // Sonnet 5 introduced the native xhigh effort level for the Sonnet tier, so it exposes
     // all 6 levels (unlike Sonnet 4.6, which maps xhigh -> "max" and stops at 5).
     expect(getThinkingPolicyForModel("anthropic:claude-sonnet-5")).toEqual([
@@ -543,6 +543,17 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
       "max",
     ]);
+    // Sonnet 5.1 rides the same Sonnet 5+ wildcard matcher. Unlike Mythos-class
+    // models, the Sonnet tier keeps "off" (disabled thinking stays accepted).
+    expect(getThinkingPolicyForModel("anthropic:claude-sonnet-5-1")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(enforceThinkingPolicy("anthropic:claude-sonnet-5-1", "off")).toBe("off");
     expect(getThinkingPolicyForModel("anthropic:claude-sonnet-5-20260630")).toEqual([
       "off",
       "low",
