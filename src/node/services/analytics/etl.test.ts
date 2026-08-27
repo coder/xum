@@ -640,6 +640,22 @@ describe("appendEvents", () => {
         sequence: 3,
         modelFallback: { requestedModel: "anthropic:fable-1", refusedModels: [17, null] },
       }),
+      // Partially malformed arrays are rejected wholesale: dropping bad hops
+      // would emit a truncated chain that reads as valid history.
+      makeAssistantLine({
+        sequence: 4,
+        modelFallback: {
+          requestedModel: "anthropic:fable-1",
+          refusedModels: ["anthropic:fable-1", 42],
+        },
+      }),
+      makeAssistantLine({
+        sequence: 5,
+        modelFallback: {
+          requestedModel: "anthropic:fable-1",
+          refusedModels: ["anthropic:fable-1", "  "],
+        },
+      }),
     ]);
 
     await ingestWorkspace(conn, workspaceId, sessionDir, {});
@@ -649,7 +665,7 @@ describe("appendEvents", () => {
       "SELECT requested_model, refused_models_json FROM events WHERE workspace_id = ?",
       [workspaceId]
     );
-    expect(rows).toHaveLength(3);
+    expect(rows).toHaveLength(5);
     for (const row of rows) {
       expect(row.requested_model).toBeNull();
       expect(row.refused_models_json).toBeNull();

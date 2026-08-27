@@ -1661,23 +1661,29 @@ export class StreamManager extends EventEmitter {
       return;
     }
     const workspaceLog = this.getWorkspaceLogger(workspaceId, streamInfo);
-    // Ledger key for Coder identities: the stream's PINNED record-time
-    // metadata identity (streamInfo.metadataModel), NOT a live re-resolution
-    // of the raw model. A catalog refresh can remove/retag the instance while
-    // the turn is active; re-resolving here would key the ledger differently
-    // from the pricing identity createDisplayUsage just used, and repricing
-    // would later change or strip the row. Non-Coder models keep the
-    // canonical key: their metadata identity can be a mappedToModel alias
-    // target — a pricing identity, deliberately not the ledger bucket.
-    const ledgerModel =
-      model.startsWith("coder:") && streamInfo?.metadataModel
-        ? streamInfo.metadataModel
-        : normalizeUsageModelKey(model, this.getProvidersConfig());
+    const ledgerModel = this.usageAttributionModel(model, streamInfo?.metadataModel);
     try {
       await this.sessionUsageService.recordUsage(workspaceId as string, ledgerModel, messageUsage);
     } catch (error) {
       (logLevel === "error" ? workspaceLog.error : workspaceLog.warn)(logMessage, { error });
     }
+  }
+
+  /**
+   * Usage-attribution key, mirroring SessionUsageService.recordHeadlessUsageLocked.
+   * Coder identities keep the stream's PINNED record-time metadata identity
+   * (streamInfo.metadataModel), NOT a live re-resolution of the raw model: a
+   * catalog refresh can remove/retag the instance while the turn is active,
+   * and re-resolving would key the ledger differently from the pricing
+   * identity createDisplayUsage used, so repricing would later change or
+   * strip the row. Non-Coder models resolve to the canonical usage key —
+   * their metadata identity can be a mappedToModel alias target (a pricing
+   * identity, deliberately not the attribution bucket).
+   */
+  private usageAttributionModel(model: string, metadataModel: string | undefined): string {
+    return model.startsWith("coder:") && metadataModel
+      ? metadataModel
+      : normalizeUsageModelKey(model, this.getProvidersConfig());
   }
 
   private buildStreamRequestConfig(
@@ -2591,10 +2597,17 @@ export class StreamManager extends EventEmitter {
     // still real refused attempts: record an explicit all-zero entry so
     // analytics counts the refusal, but skip the session ledger below — no
     // zero-cost noise in the costs UI.
+    //
+    // The persisted entry carries the ATTRIBUTION key, not the raw stream
+    // identity: sidecar refused_stream rows are keyed by
+    // recordHeadlessUsageLocked's canonical model, so a raw gateway/Coder
+    // identity here (e.g. mux-gateway:openai/gpt-5 vs openai:gpt-5) would
+    // split one model across two analytics buckets when queries group
+    // committed hop rows and sidecar rows together.
     streamInfo.toolModelUsages.push({
       toolName: MODEL_FALLBACK_REFUSAL_TOOL_NAME,
       timestamp: Date.now(),
-      model: refusedModel,
+      model: this.usageAttributionModel(refusedModel, streamInfo.metadataModel),
       metadataModel: streamInfo.metadataModel,
       usage: usage ?? zeroTokenUsage(),
       ...(providerMetadata ? { providerMetadata } : {}),

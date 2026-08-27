@@ -806,6 +806,51 @@ describe("StreamManager - refusal usage attribution", () => {
     expect(recordUsage).not.toHaveBeenCalled();
   });
 
+  test("refused attempt entries persist the attribution key, not the raw gateway identity", async () => {
+    // Sidecar refused_stream rows are keyed by recordHeadlessUsageLocked's
+    // canonical model; a raw mux-gateway identity on committed hop rows would
+    // split one model across two analytics buckets in the refusal queries.
+    const recordUsage = mock((_workspaceId: string, _model: string, _usage: unknown) =>
+      Promise.resolve(undefined)
+    );
+    const sessionUsageService = { recordUsage } as unknown as SessionUsageService;
+    const streamManager = new StreamManager(historyService, sessionUsageService);
+    const tryFallback = Reflect.get(streamManager, "tryModelFallbackAfterRefusal") as (
+      workspaceId: string,
+      streamInfo: Record<string, unknown>,
+      refusalFinishReason: string
+    ) => Promise<{ kind: string }>;
+    expect(typeof tryFallback).toBe("function");
+
+    const toolModelUsages: Array<{ toolName: string; model: string }> = [];
+    const streamInfo = {
+      model: "mux-gateway:anthropic/claude-opus-4-5",
+      metadataModel: "anthropic:claude-opus-4-5",
+      cumulativeUsage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+      cumulativeProviderMetadata: { anthropic: {} },
+      startTime: Date.now(),
+      initialMetadata: undefined,
+      parts: [],
+      toolModelUsages,
+      abortController: { signal: { aborted: false } },
+      softInterrupt: { pending: false },
+      modelFallback: {
+        options: { chain: [], prepare: mock(() => Promise.reject(new Error("unused"))) },
+        requestedModel: "mux-gateway:anthropic/claude-opus-4-5",
+        refusedModels: [],
+        original: { maxOutputTokens: undefined },
+      },
+    };
+
+    const outcome = await tryFallback.call(streamManager, "ws-gateway-hop", streamInfo, "refusal");
+    expect(outcome.kind).toBe("terminal");
+    expect(toolModelUsages).toHaveLength(1);
+    expect(toolModelUsages[0]).toMatchObject({
+      toolName: "model_fallback_refusal",
+      model: "anthropic:claude-opus-4-5",
+    });
+  });
+
   test("sidecar flatten labels refusal hops refused_stream and keeps the drop reason for other usage", async () => {
     const recordHeadlessUsage = mock(
       (

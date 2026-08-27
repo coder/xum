@@ -498,23 +498,34 @@ function toOptionalString(value: unknown): string | undefined {
 /**
  * Parse metadata.modelFallback (ModelFallbackRecord: { requestedModel,
  * refusedModels }) into the events downgrade columns. Populated only when
- * requestedModel is a non-empty string AND refusedModels is a non-empty
- * string array; malformed records yield nulls (the row is still ingested).
+ * requestedModel is a non-empty string AND refusedModels is a non-empty array
+ * whose EVERY entry is a trimmed non-empty string; any malformed record or
+ * entry yields nulls for both columns (the row is still ingested). Partially
+ * valid arrays are rejected wholesale — silently dropping bad hops would emit
+ * a truncated chain that reads as valid history.
  */
 function parseModelFallback(rawModelFallback: unknown): {
   requestedModel: string | null;
   refusedModelsJson: string | null;
 } {
+  const MALFORMED = { requestedModel: null, refusedModelsJson: null };
   if (!isRecord(rawModelFallback)) {
-    return { requestedModel: null, refusedModelsJson: null };
+    return MALFORMED;
   }
 
   const requestedModel = toOptionalString(rawModelFallback.requestedModel);
-  const refusedModels = Array.isArray(rawModelFallback.refusedModels)
-    ? rawModelFallback.refusedModels.filter((entry): entry is string => typeof entry === "string")
-    : [];
-  if (!requestedModel || refusedModels.length === 0) {
-    return { requestedModel: null, refusedModelsJson: null };
+  const rawRefusedModels = rawModelFallback.refusedModels;
+  if (!requestedModel || !Array.isArray(rawRefusedModels) || rawRefusedModels.length === 0) {
+    return MALFORMED;
+  }
+
+  const refusedModels: string[] = [];
+  for (const entry of rawRefusedModels) {
+    const refusedModel = toOptionalString(entry);
+    if (!refusedModel) {
+      return MALFORMED;
+    }
+    refusedModels.push(refusedModel);
   }
 
   return { requestedModel, refusedModelsJson: JSON.stringify(refusedModels) };
