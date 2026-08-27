@@ -1237,6 +1237,14 @@ function isSplitStringOption(unquoted: string): boolean {
 const CONSUMED_ASSIGNMENT = new RegExp(`^${ASSIGNMENT_NAME}${REDACTED_BACKUP_VALUE}$`);
 
 /**
+ * A brace group holding `,` or `..` expands, and expansion output can reassemble a
+ * credential from fragments no scanner recognizes (`ghp_...{8..8}...`). Literal braces
+ * (`{hunter2}`) do not expand and stay inside the word the ordinary rules cover. A
+ * consumed assignment is exempt: its braces expand into copies of the marker.
+ */
+const BRACE_EXPANSION = /\{[^{}]*(?:,|\.\.)[^{}]*\}/;
+
+/**
  * Words that hand a downstream consumer an assignment the shell itself does not see,
  * none of them decidable here. Only a word that is exactly one consumed assignment is
  * exempt (`A="B=1"` cannot fire); a marker merely inside a larger word proves nothing
@@ -1246,6 +1254,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
   let operandsOnly = false;
   for (const word of redacted.match(SHELL_WORD) ?? []) {
     if (CONSUMED_ASSIGNMENT.test(word)) continue;
+    if (BRACE_EXPANSION.test(word)) return true;
     const unquoted = unquoteShellWord(word);
     // Option terminators end option parsing: past one even a dash-led word is an
     // operand, so `env -- --evil=x` sets an environment entry despite the option look.

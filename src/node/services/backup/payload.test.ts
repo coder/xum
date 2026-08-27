@@ -385,6 +385,11 @@ describe("backup payload", () => {
       ["env {TOK,EN}=hunter2 mcp-server", `env {TOK,EN}=${REDACTED_BACKUP_VALUE} mcp-server`],
       ["env TOK{A,B}=hunter2 mcp-server", `env TOK{A,B}=${REDACTED_BACKUP_VALUE} mcp-server`],
       ["TOKEN=public{hunter2} mcp-server", `TOKEN=${REDACTED_BACKUP_VALUE} mcp-server`],
+      // Expansion braces in any unconsumed word can reassemble a credential.
+      [
+        "mcp-grafana --token ghp_12345678901234567{8..8}90123456789012345678",
+        REDACTED_BACKUP_VALUE,
+      ],
       // After an option terminator, even an option-looking word is an env operand,
       // and the terminator itself may arrive through quote removal.
       ["env -- --evil=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
