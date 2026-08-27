@@ -109,7 +109,10 @@ async function discoverRuntimeGitFilterConfigKeys(
     cwd: args.workspacePath,
     timeout: GITMODULES_PROBE_TIMEOUT_SECS,
     abortSignal: args.abortSignal,
-    env: buildGitExecutionEnv({ env: args.env, trusted: args.trusted }),
+    env: {
+      ...buildGitExecutionEnv({ env: args.env, trusted: args.trusted }),
+      LC_ALL: "C",
+    },
     maxOutputBytes: 256 * 1024,
   });
   if (result.exitCode !== 0) {

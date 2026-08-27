@@ -35,7 +35,7 @@ describe("gitNoHooksPrefix", () => {
 
   test("returns env prefix when untrusted (false)", () => {
     const prefix = gitNoHooksPrefix(false);
-    expect(prefix).toContain("GIT_CONFIG_COUNT='11'");
+    expect(prefix).toContain("GIT_CONFIG_COUNT='12'");
     expect(prefix).toContain("core.hooksPath");
     expect(prefix).toContain("/dev/null");
     expect(prefix).toContain("GIT_CONFIG_PARAMETERS=");
@@ -44,7 +44,7 @@ describe("gitNoHooksPrefix", () => {
 
   test("returns env prefix when untrusted (undefined)", () => {
     const prefix = gitNoHooksPrefix(undefined);
-    expect(prefix).toContain("GIT_CONFIG_COUNT='11'");
+    expect(prefix).toContain("GIT_CONFIG_COUNT='12'");
     expect(prefix).toEndWith(" ");
   });
 });
@@ -53,7 +53,7 @@ describe("gitNoRepoAutomationEnv", () => {
   test("neutralizes every repo-controlled git execution vector", () => {
     const env = gitNoRepoAutomationEnv();
     // Hooks, fsmonitor, and credential helpers via env config entries.
-    expect(env.GIT_CONFIG_COUNT).toBe("11");
+    expect(env.GIT_CONFIG_COUNT).toBe("12");
     expect(env.GIT_CONFIG_KEY_0).toBe("core.hooksPath");
     expect(env.GIT_CONFIG_VALUE_0).toBe("/dev/null");
     expect(env.GIT_CONFIG_KEY_1).toBe("core.fsmonitor");
@@ -76,6 +76,8 @@ describe("gitNoRepoAutomationEnv", () => {
     expect(env.GIT_CONFIG_VALUE_9).toBe("");
     expect(env.GIT_CONFIG_KEY_10).toBe("gpg.ssh.program");
     expect(env.GIT_CONFIG_VALUE_10).toBe("");
+    expect(env.GIT_CONFIG_KEY_11).toBe("core.alternateRefsCommand");
+    expect(env.GIT_CONFIG_VALUE_11).toBe("");
     // Pointing the tracked attributes source at the empty tree suppresses
     // .gitattributes; the repo-aware builder below additionally overrides
     // drivers selected by highest-precedence .git/info/attributes.
@@ -360,6 +362,97 @@ describe("gitNoRepoAutomationEnv", () => {
       else process.env.GIT_SEQUENCE_EDITOR = previousSequenceEditor;
     }
     expect(exitCode).not.toBe(0);
+    const markerExists = await fs.access(marker).then(
+      () => true,
+      () => false
+    );
+    expect(markerExists).toBe(false);
+  });
+
+  test("fails closed on non-UTF-8 filter driver names", async () => {
+    using tmp = new DisposableTempDir("git-filter-non-utf8");
+    const repo = path.join(tmp.path, "repo");
+    const marker = path.join(tmp.path, "filter-ran");
+    const driver = path.join(tmp.path, "smudge.sh");
+    const driverName = Buffer.from([0x62, 0x61, 0x64, 0xff]);
+    await fs.mkdir(repo, { recursive: true });
+    await Bun.$`git init`.cwd(repo).quiet();
+    await Bun.$`git config user.email test@example.com`.cwd(repo).quiet();
+    await Bun.$`git config user.name Test`.cwd(repo).quiet();
+    await fs.writeFile(path.join(repo, "data.txt"), "payload\n", "utf-8");
+    await Bun.$`git add data.txt`.cwd(repo).quiet();
+    await Bun.$`git commit -m init`.cwd(repo).quiet();
+    await fs.writeFile(driver, `#!/bin/sh\ntouch "${marker}"\ncat\n`, "utf-8");
+    await fs.chmod(driver, 0o755);
+    await fs.appendFile(
+      path.join(repo, ".git", "config"),
+      Buffer.concat([
+        Buffer.from('\n[filter "'),
+        driverName,
+        Buffer.from('"]\n\tsmudge = ' + driver + "\n\trequired = true\n"),
+      ])
+    );
+    await fs.writeFile(
+      path.join(repo, ".git", "info", "attributes"),
+      Buffer.concat([Buffer.from("*.txt filter="), driverName, Buffer.from("\n")])
+    );
+    await fs.rm(path.join(repo, "data.txt"));
+
+    await Bun.$`git checkout -- data.txt`
+      .cwd(repo)
+      .env({ ...process.env, ...gitNoRepoAutomationEnv(), LC_ALL: "C" })
+      .quiet();
+    await fs.access(marker);
+
+    const previousLocale = process.env.LC_ALL;
+    process.env.LC_ALL = "C.UTF-8";
+    let rejection: unknown;
+    try {
+      await gitNoRepoAutomationEnvForLocalRepo(repo);
+    } catch (error) {
+      rejection = error;
+    } finally {
+      if (previousLocale == null) delete process.env.LC_ALL;
+      else process.env.LC_ALL = previousLocale;
+    }
+    expect(rejection).toBeInstanceOf(Error);
+    expect((rejection as Error).message).toContain(
+      "Failed to inspect repository automation drivers"
+    );
+  });
+
+  test("neutralizes core.alternateRefsCommand during alternate traversal", async () => {
+    using tmp = new DisposableTempDir("git-alternate-refs-automation-off");
+    const alternate = path.join(tmp.path, "alternate");
+    const remote = path.join(tmp.path, "remote");
+    const marker = path.join(tmp.path, "alternate-refs-ran");
+    const helper = path.join(tmp.path, "alternate-refs.sh");
+    for (const repo of [alternate, remote]) await fs.mkdir(repo, { recursive: true });
+    for (const repo of [alternate, remote]) {
+      await Bun.$`git init`.cwd(repo).quiet();
+      await Bun.$`git config user.email test@example.com`.cwd(repo).quiet();
+      await Bun.$`git config user.name Test`.cwd(repo).quiet();
+      await fs.writeFile(path.join(repo, "data.txt"), "payload\n", "utf-8");
+      await Bun.$`git add data.txt`.cwd(repo).quiet();
+      await Bun.$`git commit -m init`.cwd(repo).quiet();
+    }
+    await fs.writeFile(
+      path.join(remote, ".git", "objects", "info", "alternates"),
+      path.join(alternate, ".git", "objects") + "\n",
+      "utf-8"
+    );
+    await fs.writeFile(helper, `#!/bin/sh\ntouch "${marker}"\nexit 0\n`, "utf-8");
+    await fs.chmod(helper, 0o755);
+    await Bun.$`git config core.alternateRefsCommand ${helper}`.cwd(remote).quiet();
+    await Bun.$`git rev-list --alternate-refs`.cwd(remote).quiet().nothrow();
+    await fs.access(marker);
+    await fs.rm(marker);
+
+    await Bun.$`git rev-list --alternate-refs`
+      .cwd(remote)
+      .env({ ...process.env, ...gitNoRepoAutomationEnv() })
+      .quiet()
+      .nothrow();
     const markerExists = await fs.access(marker).then(
       () => true,
       () => false

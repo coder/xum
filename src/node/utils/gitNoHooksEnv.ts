@@ -50,7 +50,7 @@ const GIT_EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 export function gitNoRepoAutomationEnv(): Record<string, string> {
   const env: Record<string, string> = {
     ...GIT_NO_HOOKS_ENV,
-    GIT_CONFIG_COUNT: "11",
+    GIT_CONFIG_COUNT: "12",
     GIT_CONFIG_KEY_1: "core.fsmonitor",
     GIT_CONFIG_VALUE_1: "false",
     // An empty credential.helper value resets the helper list.
@@ -72,6 +72,8 @@ export function gitNoRepoAutomationEnv(): Record<string, string> {
     GIT_CONFIG_VALUE_9: "",
     GIT_CONFIG_KEY_10: "gpg.ssh.program",
     GIT_CONFIG_VALUE_10: "",
+    GIT_CONFIG_KEY_11: "core.alternateRefsCommand",
+    GIT_CONFIG_VALUE_11: "",
     GIT_ATTR_SOURCE: GIT_EMPTY_TREE_OID,
     // Environment beats repo-config core.sshCommand.
     GIT_SSH_COMMAND: "ssh",
@@ -118,7 +120,7 @@ function appendDisabledRepoAutomationDrivers(
     }
     const kind = match[1].toLowerCase() as "filter" | "diff" | "merge" | "remote";
     const name = match[2];
-    if (name.length > 512 || /[\0\r\n]/.test(name)) {
+    if (name.length > 512 || /[\0\r\n\uFFFD]/.test(name)) {
       throw new Error("Refusing git operation with an unsupported driver name");
     }
     drivers.set(kind + "\0" + name, { kind, name });
@@ -204,7 +206,7 @@ export async function gitNoRepoAutomationEnvForRuntimeRepo(
   const baseEnv = gitNoRepoAutomationEnv();
   const result = await execBuffered(
     runtime,
-    `${gitEnvPrefix(baseEnv)}git config --null --name-only --includes --get-regexp ${shellQuote(
+    `${gitEnvPrefix(baseEnv)}LC_ALL=C git config --null --name-only --includes --get-regexp ${shellQuote(
       GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN
     )}`,
     {
@@ -267,7 +269,7 @@ export async function gitNoRepoAutomationEnvForLocalRepo(
         GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN,
       ],
       {
-        env: baseEnv,
+        env: { ...baseEnv, LC_ALL: "C" },
         signal,
         timeoutMs: 10_000,
         maxOutputBytes: MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES,
