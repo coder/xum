@@ -1195,13 +1195,18 @@ const SHELL_WORD = new RegExp(
 );
 const ASSIGNMENT_START = new RegExp(`^${ASSIGNMENT_NAME}`);
 
+/** A parameter expansion an unset variable turns into nothing at runtime. */
+const SIMPLE_EXPANSION = /^\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?!$-])/;
+
 /**
  * Bash-accurate quote removal, in both directions on purpose: under-stripping would hide
  * disguised assignments, while over-stripping would join quoted fragments the shell
  * keeps apart and manufacture no-override credential matches (`'ghp_aa\\bb'` keeps its
- * backslash at runtime).
+ * backslash at runtime). `stripExpansions` deletes simple parameter expansions only in
+ * the contexts where the shell expands them, so a single-quoted or escaped dollar stays
+ * the literal the process receives.
  */
-function unquoteShellWord(word: string): string {
+function unquoteShellWord(word: string, stripExpansions = false): string {
   let result = "";
   let i = 0;
   while (i < word.length) {
@@ -1210,6 +1215,13 @@ function unquoteShellWord(word: string): string {
     if (char === "$" && (word[i + 1] === "'" || word[i + 1] === '"')) {
       i += 1;
       continue;
+    }
+    if (char === "$" && stripExpansions) {
+      const expansion = SIMPLE_EXPANSION.exec(word.slice(i));
+      if (expansion) {
+        i += expansion[0].length;
+        continue;
+      }
     }
     if (char === "\\") {
       // A line continuation disappears entirely.
@@ -1230,6 +1242,14 @@ function unquoteShellWord(word: string): string {
     if (char === '"') {
       let j = i + 1;
       while (j < word.length && word[j] !== '"') {
+        // Expansions stay active inside double quotes.
+        if (word[j] === "$" && stripExpansions) {
+          const expansion = SIMPLE_EXPANSION.exec(word.slice(j));
+          if (expansion) {
+            j += expansion[0].length;
+            continue;
+          }
+        }
         if (word[j] === "\\") {
           const next = word[j + 1] ?? "";
           // Inside double quotes the shell unescapes only these; any other
@@ -1703,11 +1723,11 @@ export async function createBackupPayload(
             // Word-by-word, with real quoting rules: raw character stripping would
             // join fragments the shell keeps apart (a backslash inside single quotes
             // survives execution) and manufacture a match from a harmless command.
-            const joined = (text.match(SHELL_WORD) ?? []).map(unquoteShellWord).join(" ");
-            targets.push(joined);
+            const words = text.match(SHELL_WORD) ?? [];
+            targets.push(words.map((word) => unquoteShellWord(word)).join(" "));
             // A simple parameter expansion that is unset at runtime vanishes
             // (`ghp_...$9123...`), splicing the fragments around it into one token.
-            targets.push(joined.replace(/\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?!$-])/g, ""));
+            targets.push(words.map((word) => unquoteShellWord(word, true)).join(" "));
           }
         }
         return targets.some(matchesCredentialToken);

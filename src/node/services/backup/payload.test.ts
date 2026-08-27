@@ -646,6 +646,52 @@ describe("backup payload", () => {
     }
   });
 
+  it("keeps inert dollar literals from manufacturing tokens while active ones splice", async () => {
+    // Single-quoted and escaped dollars reach the process literally, and even an
+    // active `$NAME` swallows the letters behind it into the variable name, so none
+    // of these can reassemble a token at runtime.
+    const inert = [
+      "mcp --pattern 'ghp_aaaaaaaaaa$NAMEbbbbbbbbbb'",
+      "mcp --pattern ghp_aaaaaaaaaa\\$NAMEbbbbbbbbbb",
+      'mcp --pattern "ghp_aaaaaaaaaa$NAMEbbbbbbbbbb"',
+      "mcp --pattern 'ghp_aaaaaaaaaa$912345678901234567890'",
+      "mcp --pattern ghp_aaaaaaaaaa\\$912345678901234567890",
+    ];
+    for (const command of inert) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      expect(payloadFileText(payload, "mcp.jsonc")).toContain("ghp_aaaaaaaaaa");
+    }
+
+    // A positional expansion ends at one character, so its empty expansion joins
+    // the digit tail back onto the prefix inside active double quotes.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: 'mcp --pattern "ghp_aaaaaaaaaa$912345678901234567890"' } },
+      })
+    );
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+  });
+
   it("blocks the export when an empty expansion splices a known credential token", async () => {
     // Bash expands the unset positional to nothing, joining the fragments.
     await writeFixtureFile(
