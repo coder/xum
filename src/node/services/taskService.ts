@@ -8813,11 +8813,14 @@ export class TaskService implements AgentTaskIntegration {
 
     // Sort by depth (deepest first) so leaf children are removed before their parents.
     // Ties are broken by insertion order (stable sort).
+    // Cap the parent-chain walk at ids.length to avoid hanging on corrupted
+    // parentWorkspaceId cycles (depth can never exceed the descendant count).
+    const maxDepth = ids.length;
     const depthById = new Map<string, number>();
     for (const id of ids) {
       let depth = 0;
       let current: string | undefined = id;
-      while (current != null && current !== workspaceId) {
+      while (current != null && current !== workspaceId && depth < maxDepth) {
         depth++;
         current = index.parentById.get(current);
       }
