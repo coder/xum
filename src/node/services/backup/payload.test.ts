@@ -379,9 +379,14 @@ describe("backup payload", () => {
       ["FOO=1 mcp-server <(printf hunter2)", REDACTED_BACKUP_VALUE],
       // GNU env operand names are not limited to shell identifiers.
       ["env TOKEN-NAME=hunter2 mcp-server", `env TOKEN-NAME=${REDACTED_BACKUP_VALUE} mcp-server`],
-      // Brace expansion splices assignment fragments across word breaks.
-      ["env {TOK,EN}=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
-      ["env TOK{A,B}=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      ["env TOKEN:NAME=hunter2 mcp-server", `env TOKEN:NAME=${REDACTED_BACKUP_VALUE} mcp-server`],
+      ["env =hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      // Braces stay inside the word, so the marker distributes through any expansion.
+      ["env {TOK,EN}=hunter2 mcp-server", `env {TOK,EN}=${REDACTED_BACKUP_VALUE} mcp-server`],
+      ["env TOK{A,B}=hunter2 mcp-server", `env TOK{A,B}=${REDACTED_BACKUP_VALUE} mcp-server`],
+      ["TOKEN=public{hunter2} mcp-server", `TOKEN=${REDACTED_BACKUP_VALUE} mcp-server`],
+      // After POSIX `--`, even an option-looking word is an env assignment operand.
+      ["env -- --evil=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
       // Append assignments set an unset name and export the same way.
       ["TOKEN+=hunter2 mcp-server", `TOKEN+=${REDACTED_BACKUP_VALUE} mcp-server`],
       ["mcp-a;TOKEN+=hunter2 mcp-b", `mcp-a;TOKEN+=${REDACTED_BACKUP_VALUE} mcp-b`],

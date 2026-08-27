@@ -1141,13 +1141,16 @@ function valueHasRedactionAtPath(
  * replacement. Restore puts the whole local command back at that path.
  */
 // The shell ends a word at these without whitespace, so an assignment can directly follow
-// one (`bootstrap;TOKEN=... mcp`) and an unquoted value ends at the next one.
-const SHELL_WORD_BREAK = ";&|<>(){}`";
-// Beyond Bash identifiers: GNU `env` accepts any `NAME=VALUE` operand (`TOKEN-NAME=x`),
-// so names admit dots and interior dashes. A leading dash stays excluded, keeping option
-// words (`--transport=stdio`, `-Dfoo.bar=x`) published. `+?=`: Bash `NAME+=value`
-// appends, or plainly sets an unset name, and exports the same way.
-const ASSIGNMENT_NAME = "[A-Za-z0-9_.][A-Za-z0-9_.-]*\\+?=";
+// one (`bootstrap;TOKEN=... mcp`) and an unquoted value ends at the next one. Braces are
+// deliberately absent: brace expansion happens within one word and non-expanding braces
+// are literal, so braces travel inside names and values, where a replaced marker
+// distributes safely through any expansion (`TOK{A,B}=x` becomes `TOKA=x TOKB=x`).
+const SHELL_WORD_BREAK = ";&|<>()`";
+// Any non-option word up to an unquoted `=` is an assignment name: GNU `env` accepts
+// arbitrary `NAME=VALUE` operands (`TOKEN:NAME=x`, `TOKEN+=x`), and Bash's identifier
+// rule is just the narrow case. Quoting, `$`, and `=` end a name; a leading dash is an
+// option word (`--transport=stdio`), which stays published.
+const ASSIGNMENT_NAME = `[^-\\s\\\\'"$=${SHELL_WORD_BREAK}][^\\s\\\\'"$=${SHELL_WORD_BREAK}]*=`;
 const ASSIGNMENT_VALUE = `(?:\\\\[\\s\\S]|'[^']*'|"(?:\\\\[\\s\\S]|[^"\\\\])*"|[^\\s\\\\'"${SHELL_WORD_BREAK}]+)+`;
 const COMMAND_ENV_ASSIGNMENT = new RegExp(
   `(^|[\\s${SHELL_WORD_BREAK}])(${ASSIGNMENT_NAME})(${ASSIGNMENT_VALUE})`,
@@ -1230,7 +1233,14 @@ const CONSUMED_ASSIGNMENT = new RegExp(`^${ASSIGNMENT_NAME}${REDACTED_BACKUP_VAL
  * about the rest of that word.
  */
 function hasDisguisedAssignment(redacted: string): boolean {
+  let operandsOnly = false;
   for (const word of redacted.match(SHELL_WORD) ?? []) {
+    // POSIX `--` ends option parsing: past it even a dash-led word is an operand, so
+    // `env -- --evil=x` sets an environment entry despite the option look.
+    if (word === "--") {
+      operandsOnly = true;
+      continue;
+    }
     if (CONSUMED_ASSIGNMENT.test(word)) continue;
     const unquoted = unquoteShellWord(word);
     // A quoted region spanning whitespace is a script or argument string some
@@ -1239,8 +1249,8 @@ function hasDisguisedAssignment(redacted: string): boolean {
     // grammar treats as an assignment is not decidable here.
     if (/\s/.test(unquoted)) return true;
     if (!word.includes("=")) continue;
-    // A leading `=` is the tail of an assignment some expansion spliced apart
-    // (`env {TOK,EN}=x` breaks at the braces and leaves `=x`).
+    if (operandsOnly) return true;
+    // GNU `env` reads a bare `=value` word as an assignment operand too.
     if (unquoted.startsWith("=")) return true;
     // A quote-mangled `NAME=` spelling (`TOKEN\\=x`, `'TOKEN'=x`) for `env`/`eval`.
     if (ASSIGNMENT_START.test(unquoted)) return true;
