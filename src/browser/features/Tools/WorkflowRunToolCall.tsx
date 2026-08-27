@@ -1808,7 +1808,11 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
 
           {hasProjectedTimeline && workflowView != null ? (
             <>
-              <div className="border-border bg-background/20 counter-nums mb-3 grid grid-cols-2 gap-x-3 gap-y-1 rounded border px-2 py-1.5 text-[10px] @sm:grid-cols-4">
+              <div
+                className={`border-border bg-background/20 counter-nums mb-3 grid grid-cols-2 gap-x-3 gap-y-1 rounded border px-2 py-1.5 text-[10px] ${
+                  workflowView.stats.usage != null ? "@sm:grid-cols-4" : ""
+                }`}
+              >
                 <span>
                   {workflowView.stats.done}/{workflowView.stats.total} steps
                 </span>
