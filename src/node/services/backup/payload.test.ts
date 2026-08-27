@@ -357,7 +357,8 @@ describe("backup payload", () => {
       // Control operators end the previous word without whitespace.
       ["bootstrap;TOKEN=hunter2 mcp-server", `bootstrap;TOKEN=${REDACTED_BACKUP_VALUE} mcp-server`],
       ["mcp-a&&TOKEN=hunter2 mcp-b", `mcp-a&&TOKEN=${REDACTED_BACKUP_VALUE} mcp-b`],
-      ["mcp-a|TOKEN=hunter2 mcp-b", `mcp-a|TOKEN=${REDACTED_BACKUP_VALUE} mcp-b`],
+      // A pipe moves bytes between stages, so the whole command goes machine-local.
+      ["mcp-a|TOKEN=hunter2 mcp-b", REDACTED_BACKUP_VALUE],
       ["(TOKEN=hunter2 mcp-server)", `(TOKEN=${REDACTED_BACKUP_VALUE} mcp-server)`],
       // An unquoted value ends at an operator, and the assignment after it still redacts.
       [
@@ -1572,6 +1573,75 @@ describe("backup payload", () => {
       servers: { grafana: { command: string } };
     };
     expect(mcp.servers.grafana.command).toBe(portable);
+  });
+
+  it("localizes pipelines and shell-built environment credentials", async () => {
+    // A pipe hands one stage's bytes to the next (`read` can turn published
+    // fragments into an exported variable), and `printf -v` plus `export` builds a
+    // credential in the environment with no `=`, `$`, or redirection in sight; both
+    // channels go machine-local.
+    for (const command of [
+      "exec 3<&0; { printf ghp_aaaaaaaaaa; printf bbbbbbbbbb; } | { read -r TOKEN; export TOKEN; mcp <&3; }",
+      "printf ghp_aaaaaaaaaa | mcp-server",
+      "printf -v TOKEN %s%s ghp_aaaaaaaaaa bbbbbbbbbb; export TOKEN; mcp",
+      "set -a; printf -v TOKEN %s ghp_aaaaaaaaaabbbbbbbbbb; mcp",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+
+    // `||` is a control operator: no bytes flow between its sides.
+    const portable = "mcp-a || mcp-b";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: portable } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(portable);
+  });
+
+  it("blocks every issued GitHub token prefix without an override", async () => {
+    // App user (ghu_), installation (ghs_), and refresh (ghr_) tokens are issued-only
+    // like ghp_/gho_; a collected documentation file must not publish any of them.
+    for (const prefix of ["ghu_", "ghs_", "ghr_"]) {
+      await writeFixtureFile(
+        muxRoot,
+        "skills/demo/SKILL.md",
+        `token: ${prefix}K3vQ9rT2wY7bN4mJ6hL8cD1f\n`
+      );
+      const blocked = await captureRejection(
+        createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        })
+      );
+      expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+      expect((blocked as BackupCredentialDetectedError).files).toEqual(["skills/demo/SKILL.md"]);
+    }
   });
 
   it("localizes an oversized command without parsing it", async () => {

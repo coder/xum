@@ -74,8 +74,8 @@ function isHiddenName(name: string): boolean {
  * defect, and neither is something a backup should publish.
  */
 const CREDENTIAL_TOKEN_PATTERNS = [
-  /\bghp_[A-Za-z0-9]{20,}\b/,
-  /\bgho_[A-Za-z0-9]{20,}\b/,
+  // GitHub issued prefixes: personal, OAuth, App user, installation, refresh tokens.
+  /\bgh[opusr]_[A-Za-z0-9]{20,}\b/,
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,
   /\bglsa_[A-Za-z0-9_]{20,}\b/,
   // GitLab issued prefixes: personal, deploy, runner, service-account, trigger tokens.
@@ -1488,6 +1488,22 @@ function hasActiveBraceExpansion(active: string): boolean {
 }
 
 /**
+ * Builtins that rewrite shell state the word scans cannot follow: `eval` reparses its
+ * concatenated arguments, and the others give a shell-built value environment or
+ * parameter visibility without any `=` or `$` spelling. Matched on quote-removed
+ * words, so a binary that merely contains the letters (`evaluate`) stays an argument.
+ */
+const SHELL_STATE_WORDS = new Set([
+  "eval",
+  "export",
+  "declare",
+  "typeset",
+  "readonly",
+  "local",
+  "set",
+]);
+
+/**
  * Words that hand a downstream consumer an assignment the shell itself does not see,
  * none of them decidable here. Only a word that is exactly one consumed assignment is
  * exempt (`A="B=1"` cannot fire); a marker merely inside a larger word proves nothing
@@ -1507,8 +1523,11 @@ function hasDisguisedAssignment(redacted: string): boolean {
     // `eval` concatenates its arguments and reparses the result, dissolving one more
     // layer of quoting than any single-pass scan models (`ghp_a\\\\b` reaches the
     // process as `ghp_ab`), wherever the word sits: even mid-command it still names
-    // the builtin to some consumer (`env eval ...`, `bash -c 'eval ...'`).
-    if (unquoted === "eval") return true;
+    // the builtin to some consumer (`env eval ...`, `bash -c 'eval ...'`). The
+    // export-family builtins move a shell-built variable into the environment with
+    // no `=` or `$` in the text (`printf -v TOKEN ...; export TOKEN`), and `set`
+    // reaches the same end through `-a` or the positional parameters.
+    if (SHELL_STATE_WORDS.has(unquoted)) return true;
     // Option terminators end option parsing: past one even a dash-led word is an
     // operand, so `env -- --evil=x` sets an environment entry despite the option look.
     // GNU `env` documents `[-]` as a terminator too, and the consumer sees the word
@@ -1565,7 +1584,9 @@ function hasDisguisedAssignment(redacted: string): boolean {
  * consumer a file whose bytes the command chooses (`--token-file <(printf a;printf b)`,
  * `printf a >f; printf b >>f`), assignment or not, so both localize; program-internal
  * writes (`tee`) are per-program knowledge no shell-syntax scan can model, the same
- * boundary drawn for option semantics. With `extglob` inherited via BASHOPTS, `?( *( +( @( !(` open one
+ * boundary drawn for option semantics. A pipe moves one stage's bytes into the next
+ * (`printf a | { read -r T; export T; ... }`), so pipes localize too, while `||` and
+ * `&&` carry no data and stay portable. With `extglob` inherited via BASHOPTS, `?( *( +( @( !(` open one
  * pathname pattern whose file match can complete a credential, undecidable like any
  * glob. Single-quoted, escaped, and commented spellings are inert
  * (`--pattern '$(date)'` is a literal argument a raw-string test would localize), while
@@ -1576,8 +1597,15 @@ function findActiveShellConstructs(command: string): {
   heredoc: boolean;
   processSubstitution: boolean;
   redirection: boolean;
+  pipeline: boolean;
 } {
-  const found = { carrier: false, heredoc: false, processSubstitution: false, redirection: false };
+  const found = {
+    carrier: false,
+    heredoc: false,
+    processSubstitution: false,
+    redirection: false,
+    pipeline: false,
+  };
   let i = 0;
   let wordStart = true;
   // The previous character as Bash sees it, or "" when that character was quoted or
@@ -1655,6 +1683,22 @@ function findActiveShellConstructs(command: string): {
       // Any write redirection lets the command assemble a file whose bytes the scans
       // cannot model (`printf a >f; printf b >>f; mcp --token-file f`).
       found.redirection = true;
+      i += 1;
+      wordStart = true;
+      prevActive = char;
+      continue;
+    }
+    if (char === "|") {
+      // `||` is a control operator with no data flow, but a pipe (`|`, `|&`) hands one
+      // stage's bytes to the next, where `read` can turn published fragments into an
+      // exported variable.
+      if (command[i + 1] === "|") {
+        i += 2;
+        wordStart = true;
+        prevActive = char;
+        continue;
+      }
+      found.pipeline = true;
       i += 1;
       wordStart = true;
       prevActive = char;
@@ -1819,7 +1863,8 @@ function redactCommandEnvAssignments(command: string): string {
     constructs.carrier ||
     constructs.heredoc ||
     constructs.processSubstitution ||
-    constructs.redirection
+    constructs.redirection ||
+    constructs.pipeline
   ) {
     return REDACTED_BACKUP_VALUE;
   }
