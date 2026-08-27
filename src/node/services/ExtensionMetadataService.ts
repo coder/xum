@@ -363,15 +363,32 @@ export class ExtensionMetadataService {
       // deliberately preserve it), so recovery merges cannot order metadata
       // copies by recency alone — see recoverStrandedRecreatedLeftover.
       workspace.writeGeneration = ExtensionMetadataService.nextWriteGeneration(workspace);
+      // (The stamp is epoch-ms so the stranded-leftover merge can order a
+      // generation-carrying entry against a generation-LESS copy via the
+      // stranded file's mtime — see nextWriteGeneration.)
       await this.save(data);
       return toWorkspaceActivitySnapshot(workspace);
     });
   }
 
+  /**
+   * Next per-entry write stamp: wall-clock epoch milliseconds, floored to
+   * strictly exceed the previous stamp (same-millisecond mutations and
+   * backward clock steps stay monotonic per entry). A plain counter would
+   * order two generation-carrying copies just as well, but the stranded-
+   * leftover merge must also order a generation-carrying entry against a
+   * generation-LESS copy (written by a pre-generation or downgraded build):
+   * with a wall-clock stamp it can compare the entry's last write time
+   * against the stranded FILE's mtime — same host, same clock — and prove
+   * the generation-carrying write postdates every byte of the stranded
+   * snapshot. See recoverStrandedRecreatedLeftover's ordering comment.
+   */
   private static nextWriteGeneration(entry: ExtensionMetadata): number {
-    return typeof entry.writeGeneration === "number" && Number.isFinite(entry.writeGeneration)
-      ? entry.writeGeneration + 1
-      : 1;
+    const previous =
+      typeof entry.writeGeneration === "number" && Number.isFinite(entry.writeGeneration)
+        ? entry.writeGeneration
+        : 0;
+    return Math.max(Date.now(), previous + 1);
   }
 
   constructor(filePath?: string) {
@@ -1527,6 +1544,13 @@ export class ExtensionMetadataService {
       await this.finalizeRecreatedLeftover(claimPath);
       return;
     }
+    // Upper bound on the write time of EVERY entry in the stranded
+    // snapshot: rename() preserves mtime, so the claim file still carries
+    // the owner's last save time. The equal-recency ordering below compares
+    // generation-carrying entries (epoch-ms stamps) against it. Stat
+    // failures on the process-unique claim are transient: propagate
+    // (retryable; the claim stays discoverable).
+    const strandedMtimeMs = (await stat(claimPath)).mtimeMs;
     // Preliminary main read, only to bound the probe set below: which
     // candidate ids are MISSING from the current main. Never saved.
     let preliminary: ExtensionMetadataFile;
@@ -1655,22 +1679,33 @@ export class ExtensionMetadataService {
       //   order metadata changes because status/goal/streaming writers
       //   deliberately preserve it);
       // - strict recency otherwise;
-      // - at EQUAL recency, the generation-LESS side wins. A downgraded
+      // - at EQUAL recency with a generation-carrying TARGET facing a
+      //   generation-LESS candidate, the stranded file's mtime decides: the
+      //   stamp is epoch-ms (see nextWriteGeneration) and rename preserves
+      //   mtime, so a target stamp strictly above strandedMtimeMs proves
+      //   the target's write postdates every byte of the stranded snapshot
+      //   (e.g. this build mutated goal/status AFTER a pre-generation main
+      //   was stranded) — keep the target; no later mutation is guaranteed
+      //   to repair a wrong overwrite. Otherwise the order is genuinely
+      //   unknowable and the generation-less candidate wins: a downgraded
       //   build's writers drop writeGeneration from the entry they mutate,
-      //   so a generation-less copy facing a generation-carrying one may be
-      //   that build's LATER goal/status write whose only surviving copy is
-      //   here — dropping it (and unlinking the claim) would lose the
-      //   downgrade's update permanently (upgrade↔downgrade preservation),
-      //   while wrongly preferring an ancient pre-generation copy only
-      //   resurrects stale metadata that the next status write or
-      //   regeneration self-heals. The same preference keeps a
-      //   generation-less TARGET against a generation-carrying candidate.
-      //   Ties with no generation information keep the target, so crash
-      //   replay of an already-merged claim stays a no-op (after adopting a
-      //   generation-less candidate the main entry is generation-less too);
-      //   the replay window can re-adopt over an interleaved same-recency
-      //   local write, but it is bounded by the claim's lifetime (crash
-      //   between merge and unlink) and self-heals like any stale status.
+      //   so the candidate may be that build's LATER goal/status write
+      //   whose only surviving copy is here — dropping it (and unlinking
+      //   the claim) would lose the downgrade's update permanently
+      //   (upgrade↔downgrade preservation), while wrongly preferring an
+      //   ancient copy only resurrects stale metadata that the next status
+      //   write or regeneration self-heals. Coarse-mtime filesystems only
+      //   widen the ambiguous branch, never the destructive one. A
+      //   generation-less TARGET keeps against a generation-carrying
+      //   candidate for the same downgrade-preservation reason (the main
+      //   path is also the actively-written copy the next local mutation
+      //   lands on). Ties with no generation information keep the target,
+      //   so crash replay of an already-merged claim stays a no-op (after
+      //   adopting a generation-less candidate the main entry is
+      //   generation-less too); the replay window can re-adopt over an
+      //   interleaved same-recency local write, but it is bounded by the
+      //   claim's lifetime (crash between merge and unlink) and self-heals
+      //   like any stale status.
       const candidateNewer =
         typeof candidateGeneration === "number" &&
         typeof targetGeneration === "number" &&
@@ -1680,7 +1715,9 @@ export class ExtensionMetadataService {
             ? true
             : targetRecency !== candidateRecency
               ? candidateRecency > targetRecency
-              : typeof targetGeneration === "number" && typeof candidateGeneration !== "number";
+              : typeof targetGeneration === "number" &&
+                typeof candidateGeneration !== "number" &&
+                targetGeneration <= strandedMtimeMs;
       if (!candidateNewer) {
         continue;
       }

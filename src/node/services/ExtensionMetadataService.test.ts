@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, utimes, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import * as path from "path";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
@@ -1317,8 +1317,10 @@ describe("ExtensionMetadataService", () => {
   test("equal-recency stranded entries from generation-less builds are preserved", async () => {
     // A downgraded build's writers drop writeGeneration when mutating an
     // entry, and its later goal/status write can share recency with an
-    // older generation-carrying copy restored by recovery. The
-    // generation-less side must win the equal-recency tie in BOTH
+    // older generation-carrying copy restored by recovery. When the
+    // generation-carrying stamp does NOT postdate the stranded file's
+    // mtime (here: legacy counter-sized stamps far below any mtime), the
+    // order is unknowable and the generation-less side must win in BOTH
     // positions — as the stranded candidate (or the downgrade's update is
     // permanently lost when the claim is consumed) and as the target (a
     // stale generation-carrying stranded copy must not displace it).
@@ -1357,18 +1359,63 @@ describe("ExtensionMetadataService", () => {
     expect(snapshots.get("ws-target")?.todoStatus?.message).toBe("downgrade status");
   });
 
+  test("an equal-recency generation-less stranded copy does not revert a later local write", async () => {
+    // The decidable side of the equal-recency tie: a pre-generation main
+    // (no writeGeneration anywhere — e.g. written before the upgrade to
+    // this build) is stranded, and THIS build then mutates the entry's
+    // goal/status, preserving recency but stamping an epoch-ms
+    // writeGeneration that postdates the stranded file's mtime. The merge
+    // must keep the newer local write — no later mutation is guaranteed to
+    // repair a wrong overwrite — instead of blindly preferring the
+    // generation-less candidate.
+    await service.updateRecency("ws-fresh", 500);
+    await service.setTodoStatus("ws-fresh", { emoji: "s", message: "current status" }, true);
+    const strandedPath = `${filePath}.recreated-8642-deadbea7`;
+    await writeFile(
+      strandedPath,
+      JSON.stringify({
+        version: 1,
+        workspaces: {
+          "ws-fresh": {
+            recency: 500,
+            streaming: false,
+            todoStatus: { emoji: "s", message: "stale pre-upgrade status" },
+          },
+        },
+      })
+    );
+    // Backdate the stranded file's mtime below the mutation stamps above
+    // (rename preserves mtime in production; writeFile here stamps "now",
+    // which could tie with the mutation's stamp at ms granularity).
+    const past = new Date(Date.now() - 60_000);
+    await utimes(strandedPath, past, past);
+    const snapshots = await service.getAllSnapshots();
+    expect(snapshots.get("ws-fresh")?.todoStatus?.message).toBe("current status");
+    // Consumed, not retried forever.
+    const stranded = (await readdir(tempDir)).filter((name) => name.includes(".recreated-"));
+    expect(stranded).toEqual([]);
+  });
+
   test("persisted mutations advance the per-entry write generation", async () => {
     // The durable ordering contract behind the merge above: metadata
-    // mutations advance the generation even when they preserve recency, so
+    // mutations advance the generation even when they preserve recency (so
     // cross-copy ordering never regresses to the recency tiebreak for
-    // entries written by this build.
-    await service.updateRecency("ws-gen", 100);
-    await service.setTodoStatus("ws-gen", { emoji: "s", message: "working" }, true);
-    const raw = JSON.parse(await readFile(filePath, "utf-8")) as {
-      workspaces: Record<string, { writeGeneration?: number; recency: number }>;
+    // entries written by this build), and the stamp is wall-clock epoch-ms
+    // so recovery can order it against a stranded file's mtime.
+    const readGeneration = async () => {
+      const raw = JSON.parse(await readFile(filePath, "utf-8")) as {
+        workspaces: Record<string, { writeGeneration?: number; recency: number }>;
+      };
+      return raw.workspaces["ws-gen"];
     };
-    expect(raw.workspaces["ws-gen"].writeGeneration).toBe(2);
-    expect(raw.workspaces["ws-gen"].recency).toBe(100);
+    const before = Date.now();
+    await service.updateRecency("ws-gen", 100);
+    const first = await readGeneration();
+    await service.setTodoStatus("ws-gen", { emoji: "s", message: "working" }, true);
+    const second = await readGeneration();
+    expect(first.writeGeneration).toBeGreaterThanOrEqual(before);
+    expect(second.writeGeneration).toBeGreaterThan(first.writeGeneration ?? 0);
+    expect(second.recency).toBe(100);
   });
 
   test("stranded entries for foreign-removed workspaces are not resurrected", async () => {
