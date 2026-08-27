@@ -1609,6 +1609,11 @@ function gitOptionTakesSeparateValue(unquoted: string): boolean {
   return /^(?:-[cC]|--(?:git-dir|work-tree|namespace|super-prefix|config-env))$/.test(unquoted);
 }
 
+/** Git config options whose following word is an option value, not the key. */
+function gitConfigOptionTakesSeparateValue(unquoted: string): boolean {
+  return /^(?:-[ft]|--(?:file|blob|type|comment|default))$/.test(unquoted);
+}
+
 /**
  * Documentation is the only thing a recursive collection publishes without asking.
  * An interpreter that executes one of these files can reconstruct a credential across
@@ -1955,6 +1960,9 @@ function hasDisguisedAssignment(redacted: string): boolean {
   let pendingGitOptionValue = false;
   let pendingGitSubmoduleAction = false;
   let pendingGitRebaseOptions = false;
+  let pendingGitConfigKey = false;
+  let pendingGitConfigOptionValue = false;
+  let pendingGitAliasValue = false;
   let pendingDenoSubcommand = false;
   let pendingDenoRunScript = false;
   let pendingScriptFileOperand = false;
@@ -2009,6 +2017,20 @@ function hasDisguisedAssignment(redacted: string): boolean {
         sawEnv = false;
       }
     }
+    if (pendingGitAliasValue) {
+      pendingGitAliasValue = false;
+      if (unquoted.startsWith("!")) return true;
+    }
+    if (pendingGitConfigKey) {
+      if (pendingGitConfigOptionValue) {
+        pendingGitConfigOptionValue = false;
+      } else if (gitConfigOptionTakesSeparateValue(unquoted)) {
+        pendingGitConfigOptionValue = true;
+      } else if (!unquoted.startsWith("-")) {
+        pendingGitConfigKey = false;
+        if (/^alias\.[^.]+$/i.test(unquoted)) pendingGitAliasValue = true;
+      }
+    }
     if (pendingGitSubmoduleAction) {
       if (unquoted === "foreach") return true;
       if (!unquoted.startsWith("-")) pendingGitSubmoduleAction = false;
@@ -2021,7 +2043,9 @@ function hasDisguisedAssignment(redacted: string): boolean {
         pendingGitOptionValue = true;
       } else if (!unquoted.startsWith("-")) {
         pendingGitSubcommand = false;
-        if (unquoted === "submodule") {
+        if (unquoted === "config") {
+          pendingGitConfigKey = true;
+        } else if (unquoted === "submodule") {
           pendingGitSubmoduleAction = true;
         } else if (unquoted === "rebase") {
           pendingGitRebaseOptions = true;

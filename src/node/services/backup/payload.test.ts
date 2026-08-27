@@ -1771,6 +1771,29 @@ describe("backup payload", () => {
     }
   });
 
+  it("localizes Git shell aliases installed through config", async () => {
+    for (const command of [
+      "git config alias.x '!mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'; git x",
+      "git config --global --add alias.launch '!mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+  });
+
   it("localizes git shell callback modes", async () => {
     for (const command of [
       "git submodule --quiet foreach 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
@@ -2017,6 +2040,8 @@ describe("backup payload", () => {
       "git status",
       "git -C /tmp status",
       "git submodule status",
+      "git config alias.co checkout",
+      "git config --get alias.co",
     ]) {
       await writeFixtureFile(
         muxRoot,
