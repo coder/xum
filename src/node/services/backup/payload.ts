@@ -1298,7 +1298,7 @@ function unquoteShellWord(word: string, stripExpansions = false, collapseGlobs =
       // deterministic (`[8]` can only produce `8`), and any reader collapses the
       // published spelling the same way, so scan what it yields. Nondeterministic
       // wildcards never reach this scan: redaction localizes their whole command.
-      if (char === "[" && word[i + 2] === "]" && !"!^".includes(word[i + 1] ?? "")) {
+      if (char === "[" && word[i + 2] === "]" && !"!^]\\'\"".includes(word[i + 1] ?? "")) {
         result += word[i + 1];
         i += 3;
         continue;
@@ -1402,13 +1402,50 @@ function activeWordProjection(word: string): string {
 }
 
 /**
- * A glob whose output depends on the working directory: `?`, `*`, and any class with
- * more than one member (ranges and negations included) expand against whatever files
- * exist, so a wildcard inside a known token prefix (`gh?_...`) can hand the process a
- * credential no textual scan reconstructs. Only the single-member class is
- * deterministic, and the scan collapses that one instead.
+ * A glob whose output depends on the working directory: `?`, `*`, and any class other
+ * than `[c]` with one plain literal member expand against whatever files exist, so a
+ * wildcard inside a known token prefix (`gh?_...`) can hand the process a credential no
+ * textual scan reconstructs. Escaped, quoted, negated, and `]` members are excluded
+ * from the deterministic form: the projection cannot represent them faithfully, and
+ * only the plain `[c]` spelling is what the scan's collapse pass reproduces. A single
+ * quote-aware pass rather than a regex, because a regex restarts its `]` search at
+ * every bracket of a long literal `[` run, going quadratic on input an 8 MB mcp.jsonc
+ * can deliver to this synchronous scan. Unmatched `[` stays literal for Bash but
+ * localizes here, one more undecidable-cheap case.
  */
-const NONDETERMINISTIC_GLOB = /[?*]|\[[^\]]{2,}\]/;
+function hasNondeterministicGlob(word: string): boolean {
+  let i = 0;
+  while (i < word.length) {
+    const char = word[i];
+    if (char === "\\") {
+      i += 2;
+      continue;
+    }
+    if (char === "'") {
+      const end = word.indexOf("'", i + 1);
+      i = end === -1 ? word.length : end + 1;
+      continue;
+    }
+    if (char === '"') {
+      let j = i + 1;
+      while (j < word.length && word[j] !== '"') {
+        j += word[j] === "\\" ? 2 : 1;
+      }
+      i = j + 1;
+      continue;
+    }
+    if (char === "?" || char === "*") return true;
+    if (char === "[") {
+      if (word[i + 2] === "]" && !"!^]\\'\"".includes(word[i + 1] ?? "")) {
+        i += 3;
+        continue;
+      }
+      return true;
+    }
+    i += 1;
+  }
+  return false;
+}
 
 /**
  * A brace group holding `,` or `..` expands, and expansion output can reassemble a
@@ -1428,11 +1465,12 @@ function hasDisguisedAssignment(redacted: string): boolean {
   let operandsOnly = false;
   for (const word of redacted.match(SHELL_WORD) ?? []) {
     if (CONSUMED_ASSIGNMENT.test(word)) continue;
-    // Both tests run on the active projection: Bash expands neither syntax from
-    // quoted or escaped text (`--config '{"a":1,"b":2}'` stays a literal argument).
-    const active = activeWordProjection(word);
-    if (BRACE_EXPANSION.test(active)) return true;
-    if (NONDETERMINISTIC_GLOB.test(active)) return true;
+    // Bash expands neither syntax from quoted or escaped text (`--config
+    // '{"a":1,"b":2}'` stays a literal argument). The brace test runs on the active
+    // projection; the glob analyzer is quote-aware itself and needs the raw word to
+    // tell `[\p]` (escaped member) from `[p]`.
+    if (BRACE_EXPANSION.test(activeWordProjection(word))) return true;
+    if (hasNondeterministicGlob(word)) return true;
     const unquoted = unquoteShellWord(word);
     // Option terminators end option parsing: past one even a dash-led word is an
     // operand, so `env -- --evil=x` sets an environment entry despite the option look.
@@ -1489,6 +1527,14 @@ const CARRIER_EXPANSION = /\$\(|\$\{|\$\[|\$'|\$"|\$!|`/;
 /** Process substitution passes bytes by file, ambiguous once an assignment matched. */
 const PROCESS_SUBSTITUTION = /<\(|>\(/;
 
+/**
+ * A here-document or here-string feeds the consumer a body whose text follows document
+ * rules, not word rules: quotes stay literal while expansions still run for an unquoted
+ * delimiter. The word-based scans would misread either direction, so the construct is
+ * one more script-input spelling that goes machine-local wholesale.
+ */
+const HEREDOC_REDIRECT = "<<";
+
 function redactCommandEnvAssignments(command: string): string {
   const redacted = command.replace(
     COMMAND_ENV_ASSIGNMENT,
@@ -1502,6 +1548,7 @@ function redactCommandEnvAssignments(command: string): string {
     UNCONSUMED_ASSIGNMENT.test(redacted) ||
     hasDisguisedAssignment(redacted) ||
     CARRIER_EXPANSION.test(command) ||
+    command.includes(HEREDOC_REDIRECT) ||
     (redacted !== command && PROCESS_SUBSTITUTION.test(command))
   ) {
     return REDACTED_BACKUP_VALUE;

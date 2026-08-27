@@ -948,6 +948,78 @@ describe("backup payload", () => {
     }
   });
 
+  it("localizes an escaped class member the collapse pass cannot reproduce", async () => {
+    // Bash still expands `[\\p]` against matching files, but the scan's deterministic
+    // collapse only reproduces the plain `[c]` spelling, so this form goes machine-local.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          grafana: {
+            command: "mcp --pattern gh[\\p]_12345678901234567890123456789012345678",
+          },
+        },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("classifies a long literal bracket run in linear time as machine-local", async () => {
+    // A regex restarting its `]` search at every bracket goes quadratic on this input;
+    // the analyzer must classify it in one pass and localize the unmatched brackets.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: `mcp --pattern ${"[".repeat(4096)}` } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("localizes here-documents instead of scanning their bodies as words", async () => {
+    // The body's quotes reach the consumer literally, so word-rule quote removal would
+    // manufacture a no-override match from prose; machine-local keeps both sides right.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          grafana: { command: 'cat <<EOF\nghp_aaaaaaaaaa"bbbbbbbbbb"\nEOF' },
+        },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
   it("recognizes comments opened by a word break, not only by whitespace", async () => {
     // Bash comments start at any word boundary (`cmd;# ...`), and where the grammar
     // needed a word instead it errors without executing, so the prose cannot run.
