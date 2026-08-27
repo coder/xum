@@ -1868,9 +1868,9 @@ const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   { name: /^npx$/, evalWord: /^(?:-c$|--call(?:=|$))/ },
   { name: /^deno$/, evalWord: /^eval$/ },
   { name: /^(?:lua|luajit)[0-9.]*$/, evalWord: /^-e/ },
-  // Tcl-family launchers execute a positional script but have no inline-eval option
-  // needed here; auto-published script operands still localize through the shared check.
-  { name: /^(?:tclsh|wish|expectk?|jimsh)[0-9.]*$/ },
+  // These launchers execute a positional script but need no inline-eval matcher here;
+  // auto-published script operands still localize through the shared check.
+  { name: /^(?:jshell|tclsh|wish|expectk?|jimsh)[0-9.]*$/ },
   {
     name: /^r$/,
     evalWord: /^(?:-e$|--expression(?:=|$))/,
