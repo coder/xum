@@ -105,23 +105,43 @@ MUX_RUN_SESSION_ROOT="${MUX_RUN_SESSION_ROOT:-/tmp/mux-run-root}"
 export MUX_RUN_SESSION_ROOT
 mkdir -p "${MUX_RUN_SESSION_ROOT}"
 
-repo_driver_pattern='^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|tool|guitool|.*[.](command|textconv))|merge[.](tool|guitool|.*[.]driver)|remote[.].*[.](uploadpack|receivepack|vcs|proxy)|core[.](sshcommand|gitproxy|askpass|editor|alternaterefscommand|fsmonitor|hookspath|pager|attributesfile)|sequence[.]editor|credential([.].*)?[.]helper|commit[.]gpgsign|tag[.]gpgsign|gpg([.].*)?[.]program|gpg[.]ssh[.]defaultkeycommand|interactive[.]difffilter|pager[.].*|browser[.].*[.](cmd|path)|web[.]browser|help[.]browser|man[.](viewer|.*[.](cmd|path))|difftool[.].*[.](cmd|path)|mergetool[.].*[.](cmd|path)|guitool[.].*[.]cmd|instaweb[.].*|sendemail([.].*)?|uploadpack[.]packobjectshook|hook[.].*[.]command|trailer[.].*[.](cmd|command)|tar[.].*[.]command|alias[.].*[.]command)$'
-raw_config_file=$(mktemp "${MUX_LOG_DIR}/git-config-raw.XXXXXX") || fatal "failed to inspect repository automation drivers"
-if timeout 15s git -C "${project_path}" config -z --no-includes --name-only --list >"${raw_config_file}"; then
-  :
-else
-  git_config_status=$?
-  rm -f "${raw_config_file}"
-  if [[ "${git_config_status}" -eq 124 ]]; then
+repo_driver_pattern='^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|tool|guitool|.*[.](command|textconv))|merge[.](tool|guitool|.*[.]driver)|remote[.].*[.](uploadpack|receivepack|vcs|proxy)|core[.](sshcommand|gitproxy|askpass|editor|alternaterefscommand|fsmonitor|hookspath|pager|attributesfile)|sequence[.]editor|credential([.].*)?[.]helper|commit[.]gpgsign|tag[.]gpgsign|gpg([.].*)?[.]program|gpg[.]ssh[.]defaultkeycommand|gc[.]recentobjectshook|interactive[.]difffilter|pager[.].*|browser[.].*[.](cmd|path)|web[.]browser|help[.]browser|man[.](viewer|.*[.](cmd|path))|difftool[.].*[.](cmd|path)|mergetool[.].*[.](cmd|path)|guitool[.].*[.]cmd|instaweb[.].*|sendemail([.].*)?|uploadpack[.]packobjectshook|hook[.].*[.]command|trailer[.].*[.](cmd|command)|tar[.].*[.]command|alias[.].*[.]command)$'
+MAX_GIT_CONFIG_OUTPUT_BYTES=$((256 * 1024))
+
+capture_git_config() {
+  local target=$1
+  shift
+  local config_bytes
+  local pipeline_status
+  set +e
+  set +o pipefail
+  timeout 15s git -C "${project_path}" config -z "$@" \
+    | head -c "$((MAX_GIT_CONFIG_OUTPUT_BYTES + 1))" >"${target}"
+  pipeline_status=("${PIPESTATUS[@]}")
+  set -o pipefail
+  set -e
+  config_bytes=$(wc -c <"${target}")
+  if ((config_bytes > MAX_GIT_CONFIG_OUTPUT_BYTES)); then
+    fatal "Git config output exceeds limit"
+  fi
+  if [[ "${pipeline_status[0]}" -eq 124 ]]; then
     fatal "timed out inspecting repository automation drivers"
   fi
-  fatal "failed to inspect repository automation drivers"
-fi
+  if [[ "${pipeline_status[0]}" -ne 0 || "${pipeline_status[1]}" -ne 0 ]]; then
+    fatal "failed to inspect repository automation drivers"
+  fi
+}
+raw_config_file=$(mktemp "${MUX_LOG_DIR}/git-config-raw.XXXXXX") || fatal "failed to inspect repository automation drivers"
+capture_git_config "${raw_config_file}" --no-includes --name-only --list
 
-if python3 - "${raw_config_file}" <<'PY'
+if python3 - "${raw_config_file}" "${MAX_GIT_CONFIG_OUTPUT_BYTES}" <<'PY'
 import sys
 
-for key_bytes in open(sys.argv[1], "rb").read().split(b"\0"):
+with open(sys.argv[1], "rb") as config_file:
+    data = config_file.read(int(sys.argv[2]) + 1)
+if len(data) > int(sys.argv[2]):
+    raise SystemExit(5)
+for key_bytes in data.split(b"\0"):
     if not key_bytes:
         continue
     try:
@@ -145,26 +165,23 @@ fi
 if [[ "${include_scan_status}" -eq 1 ]]; then
   fatal "refusing to trust project with Git config includes"
 fi
+if [[ "${include_scan_status}" -eq 5 ]]; then
+  fatal "Git config output exceeds limit"
+fi
 if [[ "${include_scan_status}" -ne 0 ]]; then
   fatal "failed to inspect repository automation drivers"
 fi
 config_dump_file=$(mktemp "${MUX_LOG_DIR}/git-config.XXXXXX") || fatal "failed to inspect repository automation drivers"
-if timeout 15s git -C "${project_path}" config -z --includes --list >"${config_dump_file}"; then
-  :
-else
-  git_config_status=$?
-  rm -f "${config_dump_file}"
-  if [[ "${git_config_status}" -eq 124 ]]; then
-    fatal "timed out inspecting repository automation drivers"
-  fi
-  fatal "failed to inspect repository automation drivers"
-fi
+capture_git_config "${config_dump_file}" --includes --list
 
-if python3 - "${config_dump_file}" "${repo_driver_pattern}" <<'PY'
+if python3 - "${config_dump_file}" "${repo_driver_pattern}" "${MAX_GIT_CONFIG_OUTPUT_BYTES}" <<'PY'
 import re
 import sys
 
-data = open(sys.argv[1], "rb").read()
+with open(sys.argv[1], "rb") as config_file:
+    data = config_file.read(int(sys.argv[3]) + 1)
+if len(data) > int(sys.argv[3]):
+    raise SystemExit(5)
 dangerous = re.compile(sys.argv[2])
 for record in data.split(b"\0"):
     if not record:
@@ -203,6 +220,9 @@ if [[ "${config_match_status}" -eq 1 ]]; then
 fi
 if [[ "${config_match_status}" -eq 4 ]]; then
   fatal "refusing to trust project with unsupported Git command config values"
+fi
+if [[ "${config_match_status}" -eq 5 ]]; then
+  fatal "Git config output exceeds limit"
 fi
 if [[ "${config_match_status}" -ne 0 ]]; then
   fatal "failed to inspect repository automation drivers"

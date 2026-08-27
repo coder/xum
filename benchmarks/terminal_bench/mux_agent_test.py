@@ -312,6 +312,7 @@ def test_mux_runner_scores_goal_mode_incomplete_exit(tmp_path: Path) -> None:
         "remote.origin.uploadpack",
         "gpg.program",
         "gpg.ssh.defaultKeyCommand",
+        "gc.recentObjectsHook",
         "core.editor",
         "core.fsmonitor",
         "core.pager",
@@ -415,6 +416,18 @@ def test_mux_runner_rejects_git_config_includes(
 
     assert result.completed.returncode == 1
     assert "Git config includes" in result.completed.stderr
+    assert not Path(f"{result.args_file}.trust").exists()
+
+
+def test_mux_runner_rejects_oversized_git_config(tmp_path: Path) -> None:
+    result = _run_mux_runner_smoke(
+        tmp_path,
+        exit_code=0,
+        repo_git_config_bytes=b"\n[safe]\n\tlarge = " + b"x" * (300 * 1024) + b"\n",
+    )
+
+    assert result.completed.returncode == 1
+    assert "Git config output exceeds limit" in result.completed.stderr
     assert not Path(f"{result.args_file}.trust").exists()
 
 
