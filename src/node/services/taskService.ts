@@ -7596,7 +7596,15 @@ export class TaskService {
           ) {
             continue;
           }
-          if (!(await this.workspaceService.isWorkflowInvocationCurrent(workspace.id, run.id))) {
+          const currentness = await this.workspaceService.getWorkflowInvocationCurrentness(
+            workspace.id,
+            run.id
+          );
+          // Indeterminate (unreadable history/sidecar) must still enqueue: startup recovery is
+          // the only reconstruction point for wakes that never reached the outbox, and no
+          // pending notification exists yet to arm the drain's defer retry. The drain
+          // re-evaluates currentness and defers or supersedes with full context.
+          if (currentness === "not_current") {
             continue;
           }
           const created = await this.terminalAttentionStore.enqueueIfAbsent({

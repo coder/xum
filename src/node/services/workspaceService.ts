@@ -12918,6 +12918,28 @@ export class WorkspaceService extends EventEmitter {
 
     // r41: the discard is durable — sends that entered before it must not be
     // admitted afterwards (their content references the discarded context).
+    // The truncation is committed: any early error return below must first emit the deletion,
+    // or the renderer keeps showing a transcript that no longer exists on disk (the original
+    // deletedSequences cannot be recovered by a retry).
+    const deletedSequences = truncateResult.data;
+    let deletionsEmitted = false;
+    const emitDeletedSequences = () => {
+      if (deletionsEmitted || deletedSequences.length === 0) {
+        return;
+      }
+      deletionsEmitted = true;
+      const deleteMessage: DeleteMessage = {
+        type: "delete",
+        historySequences: deletedSequences,
+      };
+      // Emit through the session so ORPC subscriptions receive the event
+      if (session) {
+        session.emitChatEvent(deleteMessage);
+      } else {
+        // Fallback to direct emit (legacy path)
+        this.emit("chat", { workspaceId, message: deleteMessage });
+      }
+    };
     if (isFullClear) {
       this.advanceContextMutationEpoch(workspaceId);
       // Kernel workflow run references belong to the cleared conversation: a verified-empty
@@ -12930,6 +12952,7 @@ export class WorkspaceService extends EventEmitter {
       try {
         await clearAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
       } catch (error) {
+        emitDeletedSequences();
         return Err(
           `History was cleared, but stale workflow run references could not be retired ` +
             `(${getErrorMessage(error)}). A finished background workflow may re-inject its ` +
@@ -12952,20 +12975,7 @@ export class WorkspaceService extends EventEmitter {
       await clearPendingBranchSummary(workspaceId);
     }
 
-    const deletedSequences = truncateResult.data;
-    if (deletedSequences.length > 0) {
-      const deleteMessage: DeleteMessage = {
-        type: "delete",
-        historySequences: deletedSequences,
-      };
-      // Emit through the session so ORPC subscriptions receive the event
-      if (session) {
-        session.emitChatEvent(deleteMessage);
-      } else {
-        // Fallback to direct emit (legacy path)
-        this.emit("chat", { workspaceId, message: deleteMessage });
-      }
-    }
+    emitDeletedSequences();
 
     // On full clear, also delete plan file and clear file change tracking
     if (isFullClear) {

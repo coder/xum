@@ -6266,6 +6266,67 @@ describe("WorkspaceService workflow invocation events", () => {
     }
   });
 
+  test("a failed reference retirement still emits the committed clear to the renderer", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-retire-emit";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-retire-emit",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user", "user", "hello", { timestamp: 1_000 })
+      );
+      const sessionAccessor = workspaceService as unknown as {
+        getOrCreateSession(id: string): { emitChatEvent(message: unknown): void };
+      };
+      const session = sessionAccessor.getOrCreateSession(workspaceId);
+      const emitSpy = spyOn(session, "emitChatEvent");
+      // A directory at the sidecar path makes retirement fail after the truncation committed.
+      const sidecarPath = path.join(config.getSessionDir(workspaceId), "agent-workflow-runs.json");
+      await fsPromises.mkdir(sidecarPath);
+      try {
+        const clearResult = await workspaceService.truncateHistory(workspaceId, 1.0);
+        expect(clearResult.success).toBe(false);
+        if (!clearResult.success) {
+          expect(clearResult.error).toContain("workflow run references");
+        }
+        // The transcript is already gone on disk and the deleted sequences cannot be recovered
+        // by a retry; the renderer must learn about the deletion even though the cleanup error
+        // aborts the remaining post-clear steps.
+        expect(
+          emitSpy.mock.calls.some((call) => (call[0] as { type?: string }).type === "delete")
+        ).toBe(true);
+      } finally {
+        emitSpy.mockRestore();
+        await fsPromises.rmdir(sidecarPath);
+      }
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("a delivered coalesced workflow result consumes the kernel run's currentness", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const workspaceId = "workflow-currentness-coalesced";
