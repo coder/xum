@@ -105,39 +105,65 @@ MUX_RUN_SESSION_ROOT="${MUX_RUN_SESSION_ROOT:-/tmp/mux-run-root}"
 export MUX_RUN_SESSION_ROOT
 mkdir -p "${MUX_RUN_SESSION_ROOT}"
 
-repo_driver_pattern='^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver|remote[.].*[.](uploadpack|receivepack|vcs)|core[.](sshcommand|gitproxy|askpass|editor|alternaterefscommand)|sequence[.]editor|credential([.].*)?[.]helper|commit[.]gpgsign|tag[.]gpgsign|gpg([.].*)?[.]program)$'
-config_names_file=$(mktemp "${MUX_LOG_DIR}/git-config-names.XXXXXX") || fatal "failed to inspect repository automation drivers"
-if timeout 15s git -C "${project_path}" config -z --name-only --includes --list >"${config_names_file}"; then
+repo_driver_pattern='^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|tool|guitool|.*[.](command|textconv))|merge[.](tool|guitool|.*[.]driver)|remote[.].*[.](uploadpack|receivepack|vcs|proxy)|core[.](sshcommand|gitproxy|askpass|editor|alternaterefscommand|fsmonitor|hookspath|pager|attributesfile)|sequence[.]editor|credential([.].*)?[.]helper|commit[.]gpgsign|tag[.]gpgsign|gpg([.].*)?[.]program|gpg[.]ssh[.]defaultkeycommand|interactive[.]difffilter|pager[.].*|browser[.].*[.](cmd|path)|web[.]browser|help[.]browser|man[.](viewer|.*[.](cmd|path))|difftool[.].*[.](cmd|path)|mergetool[.].*[.](cmd|path)|guitool[.].*[.]cmd|instaweb[.].*|sendemail([.].*)?|uploadpack[.]packobjectshook|hook[.].*[.]command|trailer[.].*[.](cmd|command)|tar[.].*[.]command|alias[.].*[.]command)$'
+config_dump_file=$(mktemp "${MUX_LOG_DIR}/git-config.XXXXXX") || fatal "failed to inspect repository automation drivers"
+if timeout 15s git -C "${project_path}" config -z --includes --list >"${config_dump_file}"; then
   :
 else
   git_config_status=$?
-  rm -f "${config_names_file}"
+  rm -f "${config_dump_file}"
   if [[ "${git_config_status}" -eq 124 ]]; then
     fatal "timed out inspecting repository automation drivers"
   fi
   fatal "failed to inspect repository automation drivers"
 fi
 
-if LC_ALL=C grep -qaz '[^ -~]' "${config_names_file}"; then
-  rm -f "${config_names_file}"
-  fatal "refusing to trust project with non-ASCII Git config names"
-else
-  config_match_status=$?
-  if [[ "${config_match_status}" -ne 1 ]]; then
-    rm -f "${config_names_file}"
-    fatal "failed to inspect repository automation drivers"
-  fi
-fi
+if python3 - "${config_dump_file}" "${repo_driver_pattern}" <<'PY'
+import re
+import sys
 
-if LC_ALL=C grep -qazE "${repo_driver_pattern}" "${config_names_file}"; then
-  rm -f "${config_names_file}"
-  fatal "refusing to trust project with repo-controlled Git drivers"
+data = open(sys.argv[1], "rb").read()
+dangerous = re.compile(sys.argv[2])
+for record in data.split(b"\0"):
+    if not record:
+        continue
+    if b"\n" not in record:
+        raise SystemExit(3)
+    key_bytes, value = record.split(b"\n", 1)
+    try:
+        key = key_bytes.decode("ascii").lower()
+    except UnicodeDecodeError:
+        raise SystemExit(2)
+    if dangerous.fullmatch(key):
+        raise SystemExit(1)
+    value_dependent = key.startswith("alias.") or (
+        key.startswith("submodule.") and key.endswith(".update")
+    )
+    if value_dependent:
+        try:
+            value.decode("utf-8")
+        except UnicodeDecodeError:
+            raise SystemExit(4)
+        if value.lstrip().startswith(b"!"):
+            raise SystemExit(1)
+PY
+then
+  config_match_status=0
 else
   config_match_status=$?
-  rm -f "${config_names_file}"
-  if [[ "${config_match_status}" -ne 1 ]]; then
-    fatal "failed to inspect repository automation drivers"
-  fi
+fi
+rm -f "${config_dump_file}"
+if [[ "${config_match_status}" -eq 2 ]]; then
+  fatal "refusing to trust project with non-ASCII Git config names"
+fi
+if [[ "${config_match_status}" -eq 1 ]]; then
+  fatal "refusing to trust project with repo-controlled Git commands"
+fi
+if [[ "${config_match_status}" -eq 4 ]]; then
+  fatal "refusing to trust project with unsupported Git command config values"
+fi
+if [[ "${config_match_status}" -ne 0 ]]; then
+  fatal "failed to inspect repository automation drivers"
 fi
 
 # Grant project trust before the agent starts: sub-agent workspace creation

@@ -311,9 +311,32 @@ def test_mux_runner_scores_goal_mode_incomplete_exit(tmp_path: Path) -> None:
         "diff.external",
         "remote.origin.uploadpack",
         "gpg.program",
+        "gpg.ssh.defaultKeyCommand",
         "core.editor",
+        "core.fsmonitor",
+        "core.pager",
+        "core.attributesFile",
         "core.alternateRefsCommand",
         "sequence.editor",
+        "pager.log",
+        "interactive.diffFilter",
+        "browser.evil.cmd",
+        "web.browser",
+        "help.browser",
+        "man.viewer",
+        "difftool.evil.cmd",
+        "mergetool.evil.path",
+        "guitool.evil.cmd",
+        "instaweb.httpd",
+        "sendemail.smtpServer",
+        "remote.origin.proxy",
+        "uploadpack.packObjectsHook",
+        "hook.pre-commit.command",
+        "trailer.foo.cmd",
+        "tar.tar.xz.command",
+        "diff.tool",
+        "merge.tool",
+        "alias.evil.command",
     ],
 )
 def test_mux_runner_rejects_git_driver_before_trust(
@@ -327,10 +350,54 @@ def test_mux_runner_rejects_git_driver_before_trust(
 
     assert result.completed.returncode == 1
     assert (
-        "refusing to trust project with repo-controlled Git drivers"
+        "refusing to trust project with repo-controlled Git commands"
         in result.completed.stderr
     )
     assert not Path(f"{result.args_file}.trust").exists()
+
+
+@pytest.mark.parametrize(
+    ("config_key", "config_value"),
+    [
+        ("alias.exfil", "!./steal-secrets"),
+        ("submodule.evil.update", "!./steal-secrets"),
+    ],
+)
+def test_mux_runner_rejects_value_dependent_git_commands(
+    tmp_path: Path, config_key: str, config_value: str
+) -> None:
+    result = _run_mux_runner_smoke(
+        tmp_path,
+        exit_code=0,
+        repo_git_config=(config_key, config_value),
+    )
+
+    assert result.completed.returncode == 1
+    assert "repo-controlled Git commands" in result.completed.stderr
+    assert not Path(f"{result.args_file}.trust").exists()
+
+
+def test_mux_runner_rejects_non_utf8_shell_alias_value(tmp_path: Path) -> None:
+    result = _run_mux_runner_smoke(
+        tmp_path,
+        exit_code=0,
+        repo_git_config_bytes=b"\n[alias]\n\texfil = \xffcommand\n",
+    )
+
+    assert result.completed.returncode == 1
+    assert "unsupported Git command config values" in result.completed.stderr
+    assert not Path(f"{result.args_file}.trust").exists()
+
+
+def test_mux_runner_allows_non_shell_alias(tmp_path: Path) -> None:
+    result = _run_mux_runner_smoke(
+        tmp_path,
+        exit_code=0,
+        repo_git_config=("alias.summary", "status --short"),
+    )
+
+    assert result.completed.returncode == 0, result.completed.stderr
+    assert Path(f"{result.args_file}.trust").exists()
 
 
 def test_mux_runner_rejects_non_ascii_git_config_name(tmp_path: Path) -> None:
