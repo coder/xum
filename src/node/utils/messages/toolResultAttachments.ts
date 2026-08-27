@@ -108,7 +108,7 @@ function buildUnsupportedMediaPlaceholder(item: AISDKMediaPart): AISDKTextPart {
 }
 
 function buildDisplayOnlyFilePlaceholder(item: DisplayOnlyFilePart): AISDKTextPart {
-  const normalizedMediaType = normalizeAttachmentMediaType(item.mediaType);
+  const normalizedMediaType = boundMetadataLabel(normalizeAttachmentMediaType(item.mediaType), 100);
   const filename = normalizeOptionalFilename(item.filename);
   const label = filename != null ? `${filename} (${normalizedMediaType})` : normalizedMediaType;
   const sizeValue = getDisplayOnlyFileMetadata(item.providerOptions)?.size;

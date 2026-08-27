@@ -424,6 +424,12 @@ describe("extractToolMediaAsUserMessages", () => {
               value: [
                 { type: "media", mediaType: junkType, data: "aGVsbG8=" },
                 { type: "media", mediaType: "audio/wav", data: "d2F2", filename: junkName },
+                {
+                  type: "display_file",
+                  mediaType: junkType,
+                  data: "dGV4dA==",
+                  filename: "notes.md",
+                },
               ],
             },
           },

@@ -18,6 +18,7 @@ type Story = StoryObj<typeof meta>;
 const samplePng =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
 const sampleBytes = "ZGlzcGxheS1vbmx5IGZpbGU=";
+const longDisplayMediaType = `application/${"x".repeat(160)}`;
 
 function createAttachFileResult(file: ReturnType<typeof createDisplayOnlyFilePart>) {
   return {
@@ -167,6 +168,49 @@ export const Gallery: Story = {
       </div>
     </ToolStoryShell>
   ),
+};
+
+export const LongMetadataPhone: Story = {
+  tags: ["attachment-responsive"],
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    pixel: {
+      matrix: { themes: ["dark", "light"], viewports: ["phone"] },
+    },
+  },
+  render: () => (
+    <ToolStoryShell>
+      <div className="w-[320px] max-w-full">
+        <AttachFileToolCall
+          toolName="attach_file"
+          args={{ path: "notes.bin" }}
+          result={createAttachFileResult(
+            createDisplayOnlyFilePart({
+              data: sampleBytes,
+              mediaType: longDisplayMediaType,
+              filename: "notes.bin",
+              size: 17,
+            })
+          )}
+          status="completed"
+        />
+      </div>
+    </ToolStoryShell>
+  ),
+  play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+    const canvas = within(canvasElement);
+    const mediaType = await canvas.findByText(longDisplayMediaType);
+    const card = mediaType.parentElement?.parentElement;
+    if (card == null) throw new Error("Display-only attachment card was not rendered");
+
+    await waitFor(() => {
+      if (mediaType.getBoundingClientRect().right > card.getBoundingClientRect().right + 1) {
+        throw new Error("Display-only media type overflows the attachment card");
+      }
+    });
+  },
 };
 
 // Shared render for the interactive image-menu stories below.

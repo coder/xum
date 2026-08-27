@@ -90,11 +90,15 @@ export const DisplayOnlyFile: React.FC<{ file: DisplayOnlyFilePart }> = (props) 
 
   return (
     <div className="border-border-light bg-dark mt-2 max-w-xl rounded border p-3">
-      <div className="mb-2 flex items-center gap-2 text-sm text-[var(--color-subtle)]">
+      <div className="mb-2 flex min-w-0 items-center gap-2 text-sm text-[var(--color-subtle)]">
         <FileText className="h-4 w-4 shrink-0" />
-        <span className="truncate font-medium text-[var(--color-text)]">{label}</span>
-        <span className="counter-nums text-xs">{baseMediaType}</span>
-        {formattedSize != null && <span className="counter-nums text-xs">{formattedSize}</span>}
+        <span className="min-w-0 flex-1 truncate font-medium text-[var(--color-text)]">
+          {label}
+        </span>
+        <span className="counter-nums max-w-[40%] min-w-0 truncate text-xs">{baseMediaType}</span>
+        {formattedSize != null && (
+          <span className="counter-nums shrink-0 text-xs">{formattedSize}</span>
+        )}
       </div>
 
       {dataUrl != null && baseMediaType.startsWith("video/") && (
