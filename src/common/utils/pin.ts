@@ -34,10 +34,15 @@ export function isWorkspacePinnable(workspace: {
   return !isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt);
 }
 
-/** Unparseable/missing pinnedAt sorts first (same fallback the sidebar sort always used). */
+/**
+ * Unparseable/missing pinnedAt sorts first (same fallback the sidebar sort
+ * always used). Corrupted boundary timestamps get the same treatment so the
+ * comparator, the reorder re-deal, and the successor scan agree: the corrupted
+ * row sits stably at the top of the pinned block while new pins keep appending
+ * at the bottom, and any reorder re-deals it to a sane value.
+ */
 function parsePinnedAtMs(pinnedAt: string | undefined): number {
-  const ms = Date.parse(pinnedAt ?? "");
-  return Number.isFinite(ms) ? ms : 0;
+  return pinnedAtMsForSuccessorScan(pinnedAt) ?? 0;
 }
 
 /**
@@ -116,7 +121,7 @@ export function reassignPinnedTimestamps(
   // Corrupted boundary timestamps re-deal from 0 like unparseable ones so the
   // +1ms nudges below can never leave the representable Date range.
   const poolMs = orderedIds
-    .map((id) => pinnedAtMsForSuccessorScan(currentPinnedAtById.get(id)) ?? 0)
+    .map((id) => parsePinnedAtMs(currentPinnedAtById.get(id)))
     .sort((a, b) => a - b);
 
   const changed = new Map<string, string>();

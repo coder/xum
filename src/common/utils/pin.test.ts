@@ -34,6 +34,19 @@ describe("nextMonotonicPinnedAtIso", () => {
 });
 
 describe("comparePinnedOrder", () => {
+  it("sorts corrupted boundary timestamps first so new pins still append last", () => {
+    const rows = [
+      { id: "new-pin", pinnedAt: "2026-01-02T00:00:00.000Z" },
+      { id: "corrupt", pinnedAt: "+275760-09-13T00:00:00.000Z" },
+      { id: "old-pin", pinnedAt: "2026-01-01T00:00:00.000Z" },
+    ];
+    expect(rows.sort(comparePinnedOrder).map((row) => row.id)).toEqual([
+      "corrupt",
+      "old-pin",
+      "new-pin",
+    ]);
+  });
+
   it("sorts by pinnedAt ascending with id tie-break", () => {
     const rows = [
       { id: "b", pinnedAt: "2026-01-01T00:00:02.000Z" },
