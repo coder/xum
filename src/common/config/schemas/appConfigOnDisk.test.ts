@@ -142,6 +142,7 @@ describe("AppConfigOnDiskSchema", () => {
       "ssh+git:user:hunter2@",
       "https://example.com/repo.git?access_token=hunter2",
       "https://example.com/repo.git?passphrase=hunter2",
+      "https://example.com/repo.git?Ocp-Apim-Subscription-Key=hunter2",
       "https://example.com/repo.git#access_token=hunter2",
     ]) {
       expect(SettingsBackupSchema.safeParse({ ...base, repoUrl }).success).toBe(false);

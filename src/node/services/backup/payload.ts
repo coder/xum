@@ -1842,7 +1842,7 @@ const SHELL_REPARSE_EXECUTABLE_NAMES = new Set([
  */
 interface LanguageInterpreter {
   name: RegExp;
-  evalWord: RegExp;
+  evalWord?: RegExp;
   attachedScriptFile?: RegExp;
   separateScriptFileOption?: RegExp;
 }
@@ -1867,6 +1867,9 @@ const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   // through a shell. npm needs its `exec` subcommand tracked separately below.
   { name: /^npx$/, evalWord: /^(?:-c$|--call(?:=|$))/ },
   { name: /^deno$/, evalWord: /^eval$/ },
+  // Tcl-family launchers execute a positional script but have no inline-eval option
+  // needed here; auto-published script operands still localize through the shared check.
+  { name: /^(?:tclsh|wish|expectk?|jimsh)[0-9.]*$/ },
   {
     name: /^r$/,
     evalWord: /^(?:-e$|--expression(?:=|$))/,
@@ -2078,7 +2081,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
         pendingScriptFileOperand = true;
       }
       // An evaluation word after a language interpreter hands that grammar a script.
-      if (pending.evalWord.test(unquoted)) return true;
+      if (pending.evalWord?.test(unquoted) === true) return true;
     }
     if (attachedScriptBoundary) clearInterpreterTracking();
 

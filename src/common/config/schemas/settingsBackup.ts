@@ -116,6 +116,8 @@ export const CREDENTIAL_URL_PARAMETER_NAMES: ReadonlySet<string> = new Set([
   "securitytoken",
   "sessionid",
   "sessiontoken",
+  "subscriptionkey",
+  "ocpapimsubscriptionkey",
   "signature",
   "token",
   "xamzcredential",
