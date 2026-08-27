@@ -13812,12 +13812,28 @@ export class WorkspaceService extends EventEmitter {
             return false;
           }
           const foreignRemoved =
-            // Persisted snapshot vanished from the shared file mid-list
-            // (metadata keys only disappear through removal). Entries that
-            // never had a persisted snapshot are covered by the config check.
+            // Persisted snapshot vanished from the shared file mid-list.
+            // Metadata keys normally only disappear through removal, but
+            // NOT always: a deterministically corrupt file self-heals into
+            // a valid (possibly EMPTY) one on the strict re-read, so a
+            // mid-list quarantine makes every earlier key vanish while the
+            // workspaces stay registered. Disappearance therefore counts as
+            // removal evidence only when a fresh config-derived view
+            // CAPABLE of seeing the id corroborates the deregistration:
+            // raw-visible ids need the fresh raw view to deny them,
+            // raw-invisible (legacy) ids the authoritative enumeration.
+            // With neither view available the entry is retained — keeping a
+            // stale entry briefly is recoverable, wiping live renderer
+            // state on a corruption reset is not. Entries that never had a
+            // persisted snapshot are covered by the config check.
             (freshPersistedIds != null &&
               snapshots.has(workspaceId) &&
-              !freshPersistedIds.has(workspaceId)) ||
+              !freshPersistedIds.has(workspaceId) &&
+              !(authoritativeIds?.has(workspaceId) ?? false) &&
+              ((initialConfigIds?.has(workspaceId) ?? false) ||
+              (freshConfigIds?.has(workspaceId) ?? false)
+                ? freshConfigIds != null && !freshConfigIds.has(workspaceId)
+                : authoritativeIds != null)) ||
             // Deregistered from the shared config mid-list — also covers
             // workflow/bash-monitor-only entries with no persisted snapshot.
             isRemovedFromConfig(workspaceId) ||
@@ -14004,12 +14020,21 @@ export class WorkspaceService extends EventEmitter {
           // emptiness check must not run here.
           for (const workspaceId of Object.keys(activityById)) {
             const foreignRemoved =
-              // Persisted snapshot vanished during the probes (metadata
-              // keys only disappear through removal) — also covers legacy
-              // ids the raw views cannot see.
+              // Persisted snapshot vanished during the probes — also covers
+              // legacy ids the raw views cannot see. Corroborated like the
+              // mid-list filter's vanish arm: a strict re-read self-heals
+              // deterministic corruption into a valid (possibly EMPTY)
+              // file, so disappearance alone is not removal evidence — a
+              // post-probe config-derived view capable of seeing the id
+              // must also deny it.
               (finalSnapshots != null &&
                 (snapshots.has(workspaceId) || (freshSnapshots?.has(workspaceId) ?? false)) &&
-                !finalSnapshots.has(workspaceId)) ||
+                !finalSnapshots.has(workspaceId) &&
+                !(finalConfigIds?.has(workspaceId) ?? false) &&
+                !(finalAuthoritativeIds?.has(workspaceId) ?? false) &&
+                (isRawInvisible(workspaceId)
+                  ? finalAuthoritativeIds != null
+                  : finalConfigIds != null)) ||
               // Verifiably deregistered from the raw config during the
               // probes: visible in an earlier raw view, gone from the
               // post-probe one.
@@ -14058,12 +14083,19 @@ export class WorkspaceService extends EventEmitter {
             const lateForeignRemoved =
               isRemovedFromConfig(workspaceId) ||
               isRemovedPerAuthoritativeIdentity(workspaceId) ||
-              // Persisted snapshot vanished during the probes (metadata keys
-              // only disappear through removal) — also covers legacy ids the
-              // raw views cannot see.
+              // Persisted snapshot vanished during the probes — also covers
+              // legacy ids the raw views cannot see. Same corruption-reset
+              // corroboration as the retained-entry vanish arms: a
+              // self-healed (possibly empty) re-read is not removal
+              // evidence on its own.
               (finalSnapshots != null &&
                 (freshSnapshots?.has(workspaceId) ?? false) &&
-                !finalSnapshots.has(workspaceId)) ||
+                !finalSnapshots.has(workspaceId) &&
+                !(finalConfigIds?.has(workspaceId) ?? false) &&
+                !(finalAuthoritativeIds?.has(workspaceId) ?? false) &&
+                (isRawInvisible(workspaceId)
+                  ? finalAuthoritativeIds != null
+                  : finalConfigIds != null)) ||
               // Verifiably deregistered from the raw config during the
               // probes: the id was visible in an EARLIER raw view — the
               // initial baseline or the fresh re-read that admitted it (a

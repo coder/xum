@@ -94,6 +94,13 @@ export class ExtensionMetadataService {
    * merged and is replayed.
    */
   private static readonly CLAIM_INFIX = ".corrupt-claim-";
+  /**
+   * Prefix (after the main file name) for uniquely named in-flight
+   * moved-aside mains AND the scan claims that consume them when stranded.
+   * The trailing dash keeps the bounded fixed-name `.recreated` leftover
+   * (finalized, proven-superseded bytes) out of the stranded-file scan.
+   */
+  private static readonly RECREATED_INFIX = ".recreated-";
 
   /** Parse the identity token embedded in a claim file name; null when the
    * name does not carry one (fail toward replay — the pre-token behavior). */
@@ -510,10 +517,24 @@ export class ExtensionMetadataService {
     const claimNames = dirNames.filter((name) =>
       name.startsWith(`${basename(this.filePath)}${ExtensionMetadataService.CLAIM_INFIX}`)
     );
-    if (claimNames.length === 0) {
+    // Crash-stranded in-flight moved-aside mains (see
+    // moveMainAsideAsRecreatedLeftover): their unique names make them
+    // invisible to every fixed-path probe, so without this scan an owner
+    // crash before revalidation would orphan a raced healthy main's only
+    // copy forever while the next recovery restores the OLDER sidecar. A
+    // live owner's file listed here is gone again by the time the queue
+    // slot below runs its claim rename (ENOENT — see
+    // recoverStrandedRecreatedLeftover for the steal semantics).
+    const strandedRecreatedNames = dirNames.filter((name) =>
+      name.startsWith(`${basename(this.filePath)}${ExtensionMetadataService.RECREATED_INFIX}`)
+    );
+    if (claimNames.length === 0 && strandedRecreatedNames.length === 0) {
       return reconciledSidecar;
     }
     await this.withSerializedMutation(async () => {
+      for (const strandedName of strandedRecreatedNames) {
+        await this.recoverStrandedRecreatedLeftover(join(dirname(this.filePath), strandedName));
+      }
       for (const claimName of claimNames) {
         const claimPath = join(dirname(this.filePath), claimName);
         // Re-probe inside the queue: a concurrent recovery's discovery (or
@@ -1370,14 +1391,15 @@ export class ExtensionMetadataService {
    * restore it — both recoveries would then restore the OLDER sidecar,
    * permanently losing the newer update. Callers finalize via
    * finalizeRecreatedLeftover once the moved bytes are proven superseded,
-   * or unlink the in-flight file once they are restored. A crash
-   * mid-recovery strands at most one uniquely named file per crash; no
-   * automated cleanup — liveness cannot be probed, and folding a live
-   * process's in-flight file into the fixed name would reintroduce the
-   * destroyed-restore race this unique naming exists to close.
+   * or unlink the in-flight file once they are restored. A crash (or a
+   * transient revalidation failure) can strand the file mid-recovery —
+   * possibly holding a raced healthy save's ONLY copy — so the leftover
+   * scan discovers stranded files by prefix and recovers them (see
+   * recoverStrandedRecreatedLeftover); the fixed name still never holds
+   * unverified bytes another recovery could destroy.
    */
   private async moveMainAsideAsRecreatedLeftover(): Promise<string> {
-    const inflightPath = `${this.filePath}.recreated-${process.pid}-${randomUUID()}`;
+    const inflightPath = `${this.filePath}${ExtensionMetadataService.RECREATED_INFIX}${process.pid}-${randomUUID()}`;
     await rename(this.filePath, inflightPath);
     return inflightPath;
   }
@@ -1405,6 +1427,162 @@ export class ExtensionMetadataService {
       }
     }
     await rename(inflightPath, leftoverPath);
+  }
+
+  /**
+   * Recover one stranded in-flight moved-aside main (unique RECREATED_INFIX
+   * name). The owner recovery's rename is its commit point — revalidation
+   * happens AFTER the move — so an owner crash (or transient revalidation
+   * failure) can strand a raced healthy save's ONLY copy at the unique
+   * name, where no fixed-path probe ever finds it; the next recovery would
+   * then restore the OLDER sidecar and orphan the newer
+   * recency/goal/status forever. Claiming may steal a LIVE owner's
+   * in-flight file: that is deliberate and data-preserving — the owner's
+   * revalidation read fails with a retryable ENOENT (never reported as
+   * success) while the bytes are merged or finalized here, so no copy is
+   * destroyed unmerged and no process-liveness probing is needed. Runs
+   * inside withSerializedMutation.
+   */
+  private async recoverStrandedRecreatedLeftover(strandedPath: string): Promise<void> {
+    // Claim to a fresh unique name under the same scanned prefix first:
+    // concurrent scanners race on the rename (ENOENT = already
+    // claimed/consumed) and a crash after the claim leaves the claim itself
+    // rediscoverable by the same prefix scan. No identity token in the name
+    // (unlike CLAIM_INFIX, whose claims hold VALID bytes whose
+    // already-merged vs foreign-generation identity is undecidable by
+    // parsing): here parsing decides everything — corrupt bytes are proven
+    // superseded, and valid bytes merge idempotently under the
+    // strictly-newer recency gate below, so replaying a claim after a crash
+    // between merge and unlink is a no-op rather than a resurrection.
+    const claimPath = `${this.filePath}${ExtensionMetadataService.RECREATED_INFIX}claim-${process.pid}-${randomUUID()}`;
+    try {
+      await rename(strandedPath, claimPath);
+    } catch (renameError) {
+      if (ExtensionMetadataService.isErrnoCode(renameError, "ENOENT")) {
+        return;
+      }
+      throw renameError;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await readFile(claimPath, "utf-8")) as unknown;
+    } catch (readError) {
+      // The claim path is process-unique, so any read failure other than
+      // deterministic parse corruption is transient: propagate (retryable;
+      // the claim stays discoverable). Corrupt bytes are exactly the
+      // validated-corrupt main the owner moved aside — keep them as the
+      // bounded fixed-name leftover, the same terminal state the owner
+      // itself would have chosen.
+      if (!ExtensionMetadataService.isDeterministicCorruption(readError)) {
+        throw readError;
+      }
+      await this.finalizeRecreatedLeftover(claimPath);
+      return;
+    }
+    if (ExtensionMetadataService.isUnsupportedVersion(parsed)) {
+      // A newer build's main stranded mid-recovery: same upgrade-
+      // preservation swap as an unsupported sidecar (the reconcile treats
+      // the claim path as its sidecar argument and consumes it).
+      await this.reconcileRecreatedMainWithSidecar(claimPath);
+      return;
+    }
+    if (!ExtensionMetadataService.isValidMetadataFileShape(parsed)) {
+      // Parseable but not a metadata file: proven superseded garbage.
+      await this.finalizeRecreatedLeftover(claimPath);
+      return;
+    }
+    // Same tombstone revalidation contract as the sidecar reconcile:
+    // resolve probes BEFORE reading the main file (probes await config, and
+    // holding a pre-probe main snapshot across those awaits would let the
+    // save below clobber a concurrent backend's newer write). Without a
+    // probe the local removal knowledge stands; a FAILING probe propagates
+    // (retryable — the claim stays discoverable) rather than consuming the
+    // stranded bytes on unknowable evidence.
+    for (const workspaceId of Object.keys(parsed.workspaces)) {
+      if (!this.deletedWorkspaceIds.has(workspaceId) || this.registrationProbe == null) {
+        continue;
+      }
+      const generationBefore = this.deletedWorkspaceIds.get(workspaceId);
+      const registered = await this.registrationProbe(workspaceId);
+      if (registered && this.deletedWorkspaceIds.get(workspaceId) === generationBefore) {
+        this.liftTombstone(workspaceId);
+      }
+    }
+    let main: ExtensionMetadataFile;
+    try {
+      const mainParsed = JSON.parse(await readFile(this.filePath, "utf-8")) as unknown;
+      if (!ExtensionMetadataService.isValidMetadataFileShape(mainParsed)) {
+        // Corrupt or newer-schema main: leave the claim for a later pass
+        // (it stays under the scanned prefix) rather than merging across
+        // schemas.
+        return;
+      }
+      main = mainParsed;
+    } catch (readError) {
+      if (ExtensionMetadataService.isErrnoCode(readError, "ENOENT")) {
+        // Missing-main window: the resumable sidecar recovery owns the
+        // path right now; the claim stays discoverable for the next pass.
+        return;
+      }
+      if (!ExtensionMetadataService.isDeterministicCorruption(readError)) {
+        throw readError;
+      }
+      return;
+    }
+    let modified = false;
+    for (const [workspaceId, entry] of Object.entries(parsed.workspaces)) {
+      if (this.deletedWorkspaceIds.has(workspaceId)) {
+        // Still tombstoned after the revalidation pass above: the local
+        // removal knowledge stands.
+        continue;
+      }
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+        continue;
+      }
+      const candidateRecency = (entry as { recency?: unknown }).recency;
+      if (typeof candidateRecency !== "number") {
+        // Unorderable candidate: keep the main entry (fail closed).
+        continue;
+      }
+      const target: unknown = main.workspaces[workspaceId];
+      const targetRecency =
+        target !== null && typeof target === "object" && !Array.isArray(target)
+          ? (target as { recency?: unknown }).recency
+          : undefined;
+      // Entry-level newest-wins, NOT the sidecar reconcile's main-wins
+      // field merge: the stranded bytes are a complete healthy main
+      // snapshot whose age relative to the CURRENT main is unknowable per
+      // field (the current main may be an older sidecar restore plus newer
+      // writes). Every mutation flows through mutateWorkspaceSnapshot with
+      // a fresh recency, so per-entry recency totally orders the two
+      // copies; requiring STRICTLY newer makes crash replay a no-op and
+      // can never re-fill a field a same-or-newer write cleared to null.
+      if (typeof targetRecency === "number" && targetRecency >= candidateRecency) {
+        continue;
+      }
+      // Cross-process crash leftover rule (same as sidecar-only entries): a
+      // truthy streaming flag from a stranded file must not pin the
+      // workspace "streaming" forever; a genuinely streaming workspace
+      // re-asserts the flag with its next write.
+      main.workspaces[workspaceId] =
+        (entry as { streaming?: unknown }).streaming === true
+          ? { ...entry, streaming: false }
+          : entry;
+      modified = true;
+    }
+    if (modified) {
+      await this.save(main);
+    }
+    // The claim path is process-unique: nothing else consumes it, so a
+    // plain unlink suffices (no token verification needed — see the claim
+    // comment above for why replay is idempotent anyway).
+    try {
+      await unlink(claimPath);
+    } catch (unlinkError) {
+      if (!ExtensionMetadataService.isErrnoCode(unlinkError, "ENOENT")) {
+        throw unlinkError;
+      }
+    }
   }
 
   /**

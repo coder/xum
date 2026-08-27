@@ -6084,6 +6084,60 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("a mid-list corruption reset does not read as workspace removal", async () => {
+    // getAllSnapshots self-heals a deterministically corrupt metadata file
+    // into a valid (possibly EMPTY) one, so a quarantine landing between the
+    // initial and fresh reads makes every earlier snapshot key vanish from a
+    // SUCCESSFUL re-read while the config still registers the workspaces.
+    // Treating that disappearance as foreign-removal evidence would evict
+    // the workflow caches and omit live workspaces from an authoritative
+    // response — with no cross-process event to repair the renderer.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "corruption-reset-survivor";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency(workspaceId, 123);
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+      const realGetAll = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      let snapshotReads = 0;
+      const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(
+        (options) => {
+          snapshotReads += 1;
+          if (snapshotReads === 1) {
+            return realGetAll(options);
+          }
+          // Every re-read after the initial one models the post-quarantine
+          // self-healed EMPTY file: a successful, authoritative-looking
+          // read with every previous key gone.
+          return Promise.resolve(new Map<string, WorkspaceActivitySnapshot>());
+        }
+      );
+      try {
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList).not.toBeNull();
+        expect(activityList?.[workspaceId]?.recency).toBe(123);
+      } finally {
+        snapshotsSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("first bootstrap admits snapshotless ids registered after the prune enumerated config", async () => {
     // A workspace another backend registers after the prune captured its id
     // set may have workflow- or bash-monitor-only activity and therefore no
@@ -7159,8 +7213,10 @@ describe("WorkspaceService activity list scoping", () => {
         probeCalls += 1;
         if (probeCalls === 2) {
           // The late candidate's probe is awaited: another backend removes
-          // the RETAINED workspace, deleting its persisted metadata entry
-          // unseen by this process's tombstones.
+          // the RETAINED workspace — config deregistration first (the real
+          // removeUnlocked order), then the metadata entry deletion unseen
+          // by this process's tombstones.
+          await config.removeWorkspace(retainedId);
           await new ExtensionMetadataService(metadataPath).deleteWorkspace(retainedId);
         }
         return [];
@@ -7350,7 +7406,10 @@ describe("WorkspaceService activity list scoping", () => {
       spyOn(extensionMetadata, "getAllSnapshots").mockImplementationOnce(async () => {
         const snapshots = await readSnapshots();
         // Simulates a concurrent removal completing after this request read
-        // its snapshot view but before the response was assembled.
+        // its snapshot view but before the response was assembled — in the
+        // real removeUnlocked order: config deregistration first, then the
+        // metadata deletion.
+        await config.removeWorkspace(workspaceId);
         await extensionMetadata.deleteWorkspace(workspaceId);
         return snapshots;
       });
@@ -7391,7 +7450,12 @@ describe("WorkspaceService activity list scoping", () => {
         const snapshots = await readSnapshots(options);
         // Simulates another backend's removal landing after this request read
         // its snapshot view: rewrite the shared file without the entry, with
-        // no in-process deleteWorkspace tombstone.
+        // no in-process deleteWorkspace tombstone. Faithful to the removal
+        // protocol's write order (removeUnlocked deregisters config BEFORE
+        // deleting metadata): a vanished snapshot with config still
+        // registering the id is a corruption-reset lookalike and must be
+        // retained, so removal simulations must deregister first.
+        await config.removeWorkspace(workspaceId);
         await fsPromises.writeFile(
           metadataPath,
           JSON.stringify({ version: 1, workspaces: {} }),

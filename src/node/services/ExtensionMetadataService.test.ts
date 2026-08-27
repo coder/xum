@@ -1131,15 +1131,13 @@ describe("ExtensionMetadataService", () => {
     expect(strayLeftovers).toEqual([]);
   });
 
-  test("recovery never touches another process's in-flight moved-aside main", async () => {
-    // Another backend is mid-recovery for the same sidecar: it moved a
-    // raced HEALTHY main aside and has not yet re-validated it. Under the
-    // old fixed-name protocol those bytes lived at `.recreated`, where THIS
-    // process's recovery would unlink them before the owner could restore
-    // them — both recoveries would then restore the OLDER sidecar,
-    // permanently losing the newer update. In-flight bytes now live under
-    // a unique per-invocation name that no other recovery may touch; only
-    // proven-superseded bytes are finalized to the shared fixed name.
+  test("a crash-stranded in-flight moved-aside main is recovered, not orphaned", async () => {
+    // Another backend crashed mid-recovery after moving a raced HEALTHY
+    // main aside under its unique in-flight name (the rename is the commit
+    // point; revalidation happens after it). Unique names are invisible to
+    // every fixed-path probe, so without the stranded-leftover scan the
+    // newer snapshot would be orphaned forever while the older sidecar
+    // restores. The scan must merge it back instead.
     const foreignInflight = `${filePath}.recreated-99999-f0e1d2c3`;
     await writeFile(
       foreignInflight,
@@ -1157,12 +1155,55 @@ describe("ExtensionMetadataService", () => {
     );
     await writeFile(filePath, "{corrupt json");
     const healed = await service.getAllSnapshots({ throwOnError: true });
-    // This process's recovery completed: sidecar restored, corrupt main
-    // finalized as the bounded fixed-name leftover.
+    // Sidecar restored AND the stranded newer snapshot merged on top.
     expect(healed.get("ws-old")?.recency).toBe(100);
+    expect(healed.get("ws-newer")?.recency).toBe(900);
+    // The corrupt main finalized as the bounded fixed-name leftover; the
+    // stranded unique file was consumed, not left to accumulate.
     expect(await readFile(`${filePath}.recreated`, "utf-8")).toBe("{corrupt json");
-    // The foreign backend's in-flight bytes stay restorable by their owner.
-    expect(await readFile(foreignInflight, "utf-8")).toContain("ws-newer");
+    const stranded = (await readdir(tempDir)).filter((name) => name.includes(".recreated-"));
+    expect(stranded).toEqual([]);
+  });
+
+  test("stranded leftover entries merge by strictly newer recency with streaming cleared", async () => {
+    // The stranded bytes are a complete main snapshot of unknowable age:
+    // per-entry recency orders the copies, a stale duplicate must never
+    // overwrite newer main data (this also makes crash replay a no-op),
+    // and a truthy streaming flag from a crashed process must not pin the
+    // workspace "streaming" forever.
+    await service.updateRecency("ws-current", 500);
+    await writeFile(
+      `${filePath}.recreated-4242-cafebabe`,
+      JSON.stringify({
+        version: 1,
+        workspaces: {
+          "ws-current": { recency: 300, streaming: false },
+          "ws-imported": { recency: 900, streaming: true },
+        },
+      })
+    );
+    const snapshots = await service.getAllSnapshots();
+    expect(snapshots.get("ws-current")?.recency).toBe(500);
+    expect(snapshots.get("ws-imported")?.recency).toBe(900);
+    expect(snapshots.get("ws-imported")?.streaming).toBe(false);
+    // Consumed cleanly: no stranded unique file and no garbage finalized to
+    // the fixed leftover name.
+    const leftovers = (await readdir(tempDir)).filter((name) => name.includes(".recreated"));
+    expect(leftovers).toEqual([]);
+  });
+
+  test("a corrupt stranded in-flight leftover is finalized, not merged", async () => {
+    // Corrupt stranded bytes are exactly the validated-corrupt main their
+    // owner moved aside: the scan keeps them as the bounded fixed-name
+    // leftover (the owner's own terminal state) instead of merging garbage
+    // or leaving unique files to accumulate.
+    await service.updateRecency("ws-live", 100);
+    await writeFile(`${filePath}.recreated-777-feedface`, "{not json");
+    const snapshots = await service.getAllSnapshots();
+    expect(snapshots.get("ws-live")?.recency).toBe(100);
+    expect(await readFile(`${filePath}.recreated`, "utf-8")).toBe("{not json");
+    const stranded = (await readdir(tempDir)).filter((name) => name.includes(".recreated-"));
+    expect(stranded).toEqual([]);
   });
 
   test("a failing sidecar token probe during consumption propagates instead of reporting success", async () => {
