@@ -1335,9 +1335,16 @@ function executedShellWords(text: string): string[] {
     for (const match of current.matchAll(SHELL_WORD)) {
       const start = match.index;
       const before = start === 0 ? "" : (current[start - 1] ?? "");
+      // Any word break opens a comment position, not just blanks: `cmd;# ...` comments,
+      // and where the grammar wanted a word instead (`>#f`) Bash reports a syntax error
+      // and executes nothing, so skipping the text cannot hide a live word either way.
       if (
         match[0].startsWith("#") &&
-        (start === 0 || before === " " || before === "\t" || before === "\n")
+        (start === 0 ||
+          before === " " ||
+          before === "\t" ||
+          before === "\n" ||
+          SHELL_WORD_BREAK.includes(before))
       ) {
         const lineEnd = current.indexOf("\n", start);
         if (lineEnd !== -1) rest = current.slice(lineEnd + 1);
@@ -1366,6 +1373,51 @@ function isSplitStringOption(unquoted: string): boolean {
 const CONSUMED_ASSIGNMENT = new RegExp(`^${ASSIGNMENT_NAME}${REDACTED_BACKUP_VALUE}$`);
 
 /**
+ * The word with every quoted or escaped character reduced to one placeholder, so a
+ * syntax test sees only the regions Bash parses as syntax: a quoted comma cannot
+ * trigger brace expansion and a quoted bracket cannot open a glob class. The
+ * placeholder keeps the active fragments around a quoted run from splicing into
+ * syntax that never existed (`{a.'x'.b}` must not read as `{a..b}`).
+ */
+function activeWordProjection(word: string): string {
+  let result = "";
+  let i = 0;
+  while (i < word.length) {
+    const char = word[i];
+    if (char === "\\") {
+      result += "_";
+      i += 2;
+      continue;
+    }
+    if (char === "'") {
+      const end = word.indexOf("'", i + 1);
+      result += "_";
+      i = end === -1 ? word.length : end + 1;
+      continue;
+    }
+    if (char === '"') {
+      let j = i + 1;
+      while (j < word.length && word[j] !== '"') {
+        j += word[j] === "\\" ? 2 : 1;
+      }
+      result += "_";
+      i = j + 1;
+      continue;
+    }
+    result += char;
+    i += 1;
+  }
+  return result;
+}
+
+/**
+ * A class with more than one member expands against whatever the working directory
+ * contains, so its output is not decidable here, unlike the single-member class the
+ * scan collapses deterministically. Ranges and negations are multi-member spellings.
+ */
+const MULTI_MEMBER_GLOB_CLASS = /\[[^\]]{2,}\]/;
+
+/**
  * A brace group holding `,` or `..` expands, and expansion output can reassemble a
  * credential from fragments no scanner recognizes (`ghp_...{8..8}...`). Literal braces
  * (`{hunter2}`) do not expand and stay inside the word the ordinary rules cover. A
@@ -1383,7 +1435,11 @@ function hasDisguisedAssignment(redacted: string): boolean {
   let operandsOnly = false;
   for (const word of redacted.match(SHELL_WORD) ?? []) {
     if (CONSUMED_ASSIGNMENT.test(word)) continue;
-    if (BRACE_EXPANSION.test(word)) return true;
+    // Both tests run on the active projection: Bash expands neither syntax from
+    // quoted or escaped text (`--config '{"a":1,"b":2}'` stays a literal argument).
+    const active = activeWordProjection(word);
+    if (BRACE_EXPANSION.test(active)) return true;
+    if (MULTI_MEMBER_GLOB_CLASS.test(active)) return true;
     const unquoted = unquoteShellWord(word);
     // Option terminators end option parsing: past one even a dash-led word is an
     // operand, so `env -- --evil=x` sets an environment entry despite the option look.
@@ -1431,9 +1487,11 @@ function hasDisguisedAssignment(redacted: string): boolean {
  * An expansion body can carry arbitrary bytes into one runtime word (`TOKEN$(printf
  * =hunter2)`, `$'TOKEN\x3d...'`, legacy arithmetic `TOKEN$[0]=...`), so its mere
  * presence makes assignment detection undecidable, whether or not the grammar matched
- * an assignment elsewhere.
+ * an assignment elsewhere. `$!` rides along because its value depends on execution
+ * state: empty until the command string itself starts a background job, a PID after,
+ * so neither the scan's empty assumption nor a literal reading holds for both.
  */
-const CARRIER_EXPANSION = /\$\(|\$\{|\$\[|\$'|\$"|`/;
+const CARRIER_EXPANSION = /\$\(|\$\{|\$\[|\$'|\$"|\$!|`/;
 
 /** Process substitution passes bytes by file, ambiguous once an assignment matched. */
 const PROCESS_SUBSTITUTION = /<\(|>\(/;

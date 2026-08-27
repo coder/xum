@@ -903,6 +903,95 @@ describe("backup payload", () => {
     expect(payloadFileText(payload, "mcp.jsonc")).toContain("ghp_aaaaaaaaaa[b]aaaaaaaaa");
   });
 
+  it("localizes a multi-member glob class instead of publishing the pattern", async () => {
+    // `[px]` expands against whatever the working directory contains, so a file named
+    // for the credential hands the process the token while the pattern publishes; the
+    // whole command goes machine-local like every other undecidable construct.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: "mcp --pattern gh[px]_aaaaaaaaaaaaaaaaaaaa" } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("recognizes comments opened by a word break, not only by whitespace", async () => {
+    // Bash comments start at any word boundary (`cmd;# ...`), and where the grammar
+    // needed a word instead it errors without executing, so the prose cannot run.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: 'mcp-server;# ghp_aaaaaaaaaa"bbbbbbbbbb"' } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe('mcp-server;# ghp_aaaaaaaaaa"bbbbbbbbbb"');
+  });
+
+  it("localizes a command whose $! depends on execution state", async () => {
+    // `$!` is empty until the command string starts a background job and a PID after,
+    // so neither deleting it nor keeping it literal scans both runtimes correctly.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: "true & mcp --pattern ghp_aaaaaaaaaa$!bbbbbbbbbb" } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("keeps quoted braces from localizing an ordinary JSON argument", async () => {
+    // The comma sits inside quotes, so Bash never brace-expands it and the argument
+    // reaches the server literally; the command must stay portable.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: 'mcp-server --config \'{"a":1,"b":2}\'' } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe('mcp-server --config \'{"a":1,"b":2}\'');
+  });
+
   it("keeps the documented AWS example key reviewable instead of hard-blocking", async () => {
     await writeFixtureFile(
       muxRoot,
