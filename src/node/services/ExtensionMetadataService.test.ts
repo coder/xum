@@ -1314,6 +1314,49 @@ describe("ExtensionMetadataService", () => {
     expect(snapshots.get("ws-keep")?.todoStatus?.message).toBe("current status");
   });
 
+  test("equal-recency stranded entries from generation-less builds are preserved", async () => {
+    // A downgraded build's writers drop writeGeneration when mutating an
+    // entry, and its later goal/status write can share recency with an
+    // older generation-carrying copy restored by recovery. The
+    // generation-less side must win the equal-recency tie in BOTH
+    // positions — as the stranded candidate (or the downgrade's update is
+    // permanently lost when the claim is consumed) and as the target (a
+    // stale generation-carrying stranded copy must not displace it).
+    const entry = (message: string, writeGeneration?: number) => ({
+      recency: 500,
+      streaming: false,
+      ...(writeGeneration !== undefined ? { writeGeneration } : {}),
+      lastModel: null,
+      lastThinkingLevel: null,
+      agentStatus: null,
+      lastStatusUrl: null,
+      todoStatus: { emoji: "s", message },
+    });
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        workspaces: {
+          "ws-downgrade": entry("old status", 4),
+          "ws-target": entry("downgrade status"),
+        },
+      })
+    );
+    await writeFile(
+      `${filePath}.recreated-2468-beefcafe`,
+      JSON.stringify({
+        version: 1,
+        workspaces: {
+          "ws-downgrade": entry("downgrade newer status"),
+          "ws-target": entry("stale status", 9),
+        },
+      })
+    );
+    const snapshots = await service.getAllSnapshots();
+    expect(snapshots.get("ws-downgrade")?.todoStatus?.message).toBe("downgrade newer status");
+    expect(snapshots.get("ws-target")?.todoStatus?.message).toBe("downgrade status");
+  });
+
   test("persisted mutations advance the per-entry write generation", async () => {
     // The durable ordering contract behind the merge above: metadata
     // mutations advance the generation even when they preserve recency, so

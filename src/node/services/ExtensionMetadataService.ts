@@ -1649,22 +1649,38 @@ export class ExtensionMetadataService {
       // field merge: the stranded bytes are a complete healthy main
       // snapshot whose age relative to the CURRENT main is unknowable per
       // field (the current main may be an older sidecar restore plus newer
-      // writes). Ordering uses the per-entry writeGeneration (advanced by
-      // EVERY persisted mutation) when both copies carry distinct ones —
-      // recency alone cannot order metadata changes because status/goal/
-      // streaming writers deliberately preserve it, so an equal-recency
-      // newer status must not be dropped. When generations are missing
-      // (bytes written by a build without them) or equal (concurrent
-      // bumps from the same base), the recency comparison is the best
-      // remaining order. Both gates require STRICTLY newer, so crash
-      // replay is a no-op and can never re-fill a field a same-or-newer
-      // write cleared to null.
+      // writes). Ordering, in precedence order:
+      // - per-entry writeGeneration when both copies carry distinct ones
+      //   (advanced by EVERY persisted mutation — recency alone cannot
+      //   order metadata changes because status/goal/streaming writers
+      //   deliberately preserve it);
+      // - strict recency otherwise;
+      // - at EQUAL recency, the generation-LESS side wins. A downgraded
+      //   build's writers drop writeGeneration from the entry they mutate,
+      //   so a generation-less copy facing a generation-carrying one may be
+      //   that build's LATER goal/status write whose only surviving copy is
+      //   here — dropping it (and unlinking the claim) would lose the
+      //   downgrade's update permanently (upgrade↔downgrade preservation),
+      //   while wrongly preferring an ancient pre-generation copy only
+      //   resurrects stale metadata that the next status write or
+      //   regeneration self-heals. The same preference keeps a
+      //   generation-less TARGET against a generation-carrying candidate.
+      //   Ties with no generation information keep the target, so crash
+      //   replay of an already-merged claim stays a no-op (after adopting a
+      //   generation-less candidate the main entry is generation-less too);
+      //   the replay window can re-adopt over an interleaved same-recency
+      //   local write, but it is bounded by the claim's lifetime (crash
+      //   between merge and unlink) and self-heals like any stale status.
       const candidateNewer =
         typeof candidateGeneration === "number" &&
         typeof targetGeneration === "number" &&
         candidateGeneration !== targetGeneration
           ? candidateGeneration > targetGeneration
-          : !(typeof targetRecency === "number" && targetRecency >= candidateRecency);
+          : typeof targetRecency !== "number"
+            ? true
+            : targetRecency !== candidateRecency
+              ? candidateRecency > targetRecency
+              : typeof targetGeneration === "number" && typeof candidateGeneration !== "number";
       if (!candidateNewer) {
         continue;
       }
