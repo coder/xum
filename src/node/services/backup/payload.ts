@@ -106,8 +106,17 @@ function hasDigitBearingSkToken(text: string): boolean {
  */
 const EXAMPLE_ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE";
 
+/**
+ * A run of one repeated character (case-insensitive) is documentation spelling, never
+ * issued-token entropy (`ghp_xxxxxxxx...`), so those spellings stay in the reviewable
+ * scan instead of the no-override block. Replaced with a space like the example key,
+ * so the removal cannot splice neighbors into a match, and a real token padded with an
+ * obvious run still matches on what remains.
+ */
+const PLACEHOLDER_RUN = /(.)\1{15,}/gi;
+
 function matchesCredentialToken(text: string): boolean {
-  const scannable = text.replaceAll(EXAMPLE_ACCESS_KEY, " ");
+  const scannable = text.replaceAll(EXAMPLE_ACCESS_KEY, " ").replace(PLACEHOLDER_RUN, " ");
   return (
     CREDENTIAL_TOKEN_PATTERNS.some((pattern) => pattern.test(scannable)) ||
     hasDigitBearingSkToken(scannable)
@@ -1515,25 +1524,89 @@ function hasDisguisedAssignment(redacted: string): boolean {
 }
 
 /**
- * An expansion body can carry arbitrary bytes into one runtime word (`TOKEN$(printf
- * =hunter2)`, `$'TOKEN\x3d...'`, legacy arithmetic `TOKEN$[0]=...`), so its mere
- * presence makes assignment detection undecidable, whether or not the grammar matched
- * an assignment elsewhere. `$!` rides along because its value depends on execution
- * state: empty until the command string itself starts a background job, a PID after,
- * so neither the scan's empty assumption nor a literal reading holds for both.
+ * The undecidable constructs, detected only where the shell parses them. An expansion
+ * body can carry arbitrary bytes into one runtime word (`TOKEN$(printf =hunter2)`,
+ * `$'TOKEN\x3d...'`, legacy arithmetic `TOKEN$[0]=...`), and `$!` depends on
+ * execution state, so any of them makes assignment detection undecidable. A
+ * here-document or here-string feeds the consumer a body under document rules the word
+ * scans would misread. Process substitution passes bytes by file, ambiguous once an
+ * assignment matched. Single-quoted, escaped, and commented spellings are inert
+ * (`--pattern '$(date)'` is a literal argument a raw-string test would localize), while
+ * double quotes keep expansions live but make redirections literal.
  */
-const CARRIER_EXPANSION = /\$\(|\$\{|\$\[|\$'|\$"|\$!|`/;
-
-/** Process substitution passes bytes by file, ambiguous once an assignment matched. */
-const PROCESS_SUBSTITUTION = /<\(|>\(/;
-
-/**
- * A here-document or here-string feeds the consumer a body whose text follows document
- * rules, not word rules: quotes stay literal while expansions still run for an unquoted
- * delimiter. The word-based scans would misread either direction, so the construct is
- * one more script-input spelling that goes machine-local wholesale.
- */
-const HEREDOC_REDIRECT = "<<";
+function findActiveShellConstructs(command: string): {
+  carrier: boolean;
+  heredoc: boolean;
+  processSubstitution: boolean;
+} {
+  const found = { carrier: false, heredoc: false, processSubstitution: false };
+  let i = 0;
+  let wordStart = true;
+  while (i < command.length) {
+    const char = command[i];
+    if (char === "\\") {
+      i += 2;
+      wordStart = false;
+      continue;
+    }
+    if (char === "'") {
+      const end = command.indexOf("'", i + 1);
+      i = end === -1 ? command.length : end + 1;
+      wordStart = false;
+      continue;
+    }
+    if (char === '"') {
+      let j = i + 1;
+      while (j < command.length && command[j] !== '"') {
+        if (command[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (command[j] === "`") found.carrier = true;
+        if (command[j] === "$" && "({[!".includes(command[j + 1] ?? "")) found.carrier = true;
+        j += 1;
+      }
+      i = j + 1;
+      wordStart = false;
+      continue;
+    }
+    if (char === "#" && wordStart) {
+      const lineEnd = command.indexOf("\n", i);
+      if (lineEnd === -1) break;
+      i = lineEnd + 1;
+      wordStart = true;
+      continue;
+    }
+    if (char === "`") {
+      found.carrier = true;
+      i += 1;
+      wordStart = false;
+      continue;
+    }
+    if (char === "$") {
+      if ("({['\"!".includes(command[i + 1] ?? "")) found.carrier = true;
+      i += 1;
+      wordStart = false;
+      continue;
+    }
+    if (char === "<") {
+      if (command[i + 1] === "<") found.heredoc = true;
+      if (command[i + 1] === "(") found.processSubstitution = true;
+      i += 1;
+      wordStart = true;
+      continue;
+    }
+    if (char === ">") {
+      if (command[i + 1] === "(") found.processSubstitution = true;
+      i += 1;
+      wordStart = true;
+      continue;
+    }
+    wordStart = char === " " || char === "\t" || char === "\n" || SHELL_WORD_BREAK.includes(char);
+    i += 1;
+  }
+  return found;
+}
 
 function redactCommandEnvAssignments(command: string): string {
   const redacted = command.replace(
@@ -1544,12 +1617,13 @@ function redactCommandEnvAssignments(command: string): string {
   // so the whole command goes local and restore puts the exact text back. The residue and
   // quote-led checks run even when nothing was replaced: an unconsumable or quote-led
   // value means the replacement never saw it.
+  const constructs = findActiveShellConstructs(command);
   if (
     UNCONSUMED_ASSIGNMENT.test(redacted) ||
     hasDisguisedAssignment(redacted) ||
-    CARRIER_EXPANSION.test(command) ||
-    command.includes(HEREDOC_REDIRECT) ||
-    (redacted !== command && PROCESS_SUBSTITUTION.test(command))
+    constructs.carrier ||
+    constructs.heredoc ||
+    (redacted !== command && constructs.processSubstitution)
   ) {
     return REDACTED_BACKUP_VALUE;
   }

@@ -537,7 +537,7 @@ describe("backup payload", () => {
   });
 
   it("blocks the export outright when a credential pattern survives redaction", async () => {
-    const token = "glsa_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_00000000";
+    const token = "glsa_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6_00000000";
     await writeFixtureFile(
       muxRoot,
       "mcp.jsonc",
@@ -570,7 +570,7 @@ describe("backup payload", () => {
 
   it("blocks the export when shell quoting splits a known credential token", async () => {
     // Bash removes the backslash at execution, handing the server one contiguous token.
-    const brokenToken = "ghp_aaaaaaaaaaaaaaaaaa\\aaaaaaaaaaaaaaaaaa";
+    const brokenToken = "ghp_a1b2c3d4e5f6g7h8i9\\j0k1l2m3n4o5p6q7r8";
     await writeFixtureFile(
       muxRoot,
       "mcp.jsonc",
@@ -830,7 +830,7 @@ describe("backup payload", () => {
       muxRoot,
       "mcp.jsonc",
       JSON.stringify({
-        servers: { grafana: { url: "https://example.com/mcp?value=ghp_%61aaaaaaaaaaaaaaaaaaa" } },
+        servers: { grafana: { url: "https://example.com/mcp?value=ghp_%61b2c3d4e5f6g7h8i9j0k" } },
       })
     );
     const blocked = await captureRejection(
@@ -849,7 +849,7 @@ describe("backup payload", () => {
       "mcp.jsonc",
       JSON.stringify({
         servers: {
-          grafana: { url: "https://example.com/mcp?value=ghp_%2561aaaaaaaaaaaaaaaaaaa" },
+          grafana: { url: "https://example.com/mcp?value=ghp_%2561b2c3d4e5f6g7h8i9j0k" },
         },
       })
     );
@@ -1086,6 +1086,82 @@ describe("backup payload", () => {
     expect(mcp.servers.grafana.command).toBe('mcp-server --config \'{"a":1,"b":2}\'');
   });
 
+  it("keeps inert expansion syntax from localizing a portable command", async () => {
+    // Single-quoted and commented spellings never reach evaluation, so the command
+    // stays portable...
+    for (const command of [
+      "mcp-server --pattern '$(date)'",
+      "mcp-server # regenerate with $(date)",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(mcp.servers.grafana.command).toBe(command);
+    }
+
+    // ...while double quotes keep the expansion live, so that spelling still localizes.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: 'mcp-server --pattern "$(date)"' } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("keeps repeated-character credential placeholders reviewable", async () => {
+    // The canonical documentation spelling has no issued-token entropy, so it belongs
+    // to the reviewable digest flow rather than the no-override block.
+    await writeFixtureFile(
+      muxRoot,
+      "skills/demo/SKILL.md",
+      "Use ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx as your token\n"
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(payload.files.some((file) => file.path === "skills/demo/SKILL.md")).toBe(true);
+
+    // Padding a real-shaped token with an obvious run must not smuggle it past the
+    // backstop: the stripped remainder still matches.
+    await writeFixtureFile(
+      muxRoot,
+      "skills/demo/SKILL.md",
+      "ghp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8xxxxxxxxxxxxxxxx\n"
+    );
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+  });
+
   it("keeps the documented AWS example key reviewable instead of hard-blocking", async () => {
     await writeFixtureFile(
       muxRoot,
@@ -1138,7 +1214,7 @@ describe("backup payload", () => {
   });
 
   it("blocks the export when a UTF-16 document carries a credential token", async () => {
-    const token = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const token = "ghp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8";
     await fs.mkdir(path.join(muxRoot, "skills", "demo"), { recursive: true });
     await fs.writeFile(
       path.join(muxRoot, "skills", "demo", "SKILL.md"),
@@ -1157,7 +1233,7 @@ describe("backup payload", () => {
   });
 
   it("blocks the export when a credential format appears in a published path", async () => {
-    const token = "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const token = "ghp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8";
     await writeFixtureFile(muxRoot, `skills/${token}/SKILL.md`, "docs only\n");
 
     const blocked = await captureRejection(
