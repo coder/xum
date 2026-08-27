@@ -29,7 +29,7 @@ function parseReferences(value: unknown): AgentWorkflowRunReference[] {
     return [];
   }
 
-  const parsed: AgentWorkflowRunReference[] = [];
+  const parsedByRunId = new Map<string, AgentWorkflowRunReference>();
   const now = Date.now();
   for (const reference of references) {
     if (reference == null || typeof reference !== "object") {
@@ -49,9 +49,15 @@ function parseReferences(value: unknown): AgentWorkflowRunReference[] {
     if (record.createdAtMs > now) {
       continue;
     }
-    parsed.push({ runId: record.runId, createdAtMs: record.createdAtMs });
+    // Collapse corrupted duplicate entries to the newest sane timestamp so order-sensitive
+    // consumers cannot pick a stale duplicate and declare a legitimately re-recorded run
+    // superseded.
+    const existing = parsedByRunId.get(record.runId);
+    if (existing == null || record.createdAtMs > existing.createdAtMs) {
+      parsedByRunId.set(record.runId, { runId: record.runId, createdAtMs: record.createdAtMs });
+    }
   }
-  return parsed;
+  return Array.from(parsedByRunId.values());
 }
 
 export async function readAgentWorkflowRunReferences(

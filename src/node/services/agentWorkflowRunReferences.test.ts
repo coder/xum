@@ -32,6 +32,32 @@ describe("agent workflow run references", () => {
     }
   });
 
+  test("collapses persisted duplicate entries to the newest sane timestamp", async () => {
+    const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
+    try {
+      // Corrupted files can carry duplicates in either order; order-sensitive consumers must
+      // never observe a stale duplicate ahead of a legitimate re-record.
+      await fs.writeFile(
+        path.join(workspaceSessionDir, "agent-workflow-runs.json"),
+        JSON.stringify({
+          references: [
+            { runId: "wfr_dup", createdAtMs: 1_000 },
+            { runId: "wfr_dup", createdAtMs: 2_000 },
+            { runId: "wfr_dup_reversed", createdAtMs: 2_000 },
+            { runId: "wfr_dup_reversed", createdAtMs: 1_000 },
+          ],
+        })
+      );
+
+      const references = await readAgentWorkflowRunReferences(workspaceSessionDir);
+      expect(references).toHaveLength(2);
+      expect(references).toContainEqual({ runId: "wfr_dup", createdAtMs: 2_000 });
+      expect(references).toContainEqual({ runId: "wfr_dup_reversed", createdAtMs: 2_000 });
+    } finally {
+      await fs.rm(workspaceSessionDir, { recursive: true, force: true });
+    }
+  });
+
   test("drops persisted future-dated references and repairs them on the next record", async () => {
     const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
     try {

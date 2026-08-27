@@ -10986,9 +10986,13 @@ export class WorkspaceService extends EventEmitter {
     // would wrongly drop the run's notify_on_terminal wake. Their durable provenance is the
     // agent-workflow-runs sidecar: a reference recorded after that boundary counts as the
     // current invocation. For a consumed boundary that means a background resume/retry issued
-    // after the prior result was delivered. A boundary without a durable timestamp fails safe
-    // to not-current, mirroring TaskService.listAgentReferencedWorkflowRunIds.
-    if (outcome !== null && boundaryAtMs === null) {
+    // after the prior result was delivered. The fallback requires a datable boundary: an
+    // undatable boundary fails safe to not-current (mirroring
+    // TaskService.listAgentReferencedWorkflowRunIds), and so does a decision-free history,
+    // because a full clear (truncateHistory) removes every row WITHOUT appending a reset
+    // boundary while leaving the sidecar intact — a surviving reference must not inject a
+    // workflow result into the freshly cleared conversation.
+    if (boundaryAtMs === null) {
       return false;
     }
     const references = await readAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
@@ -10996,7 +11000,7 @@ export class WorkspaceService extends EventEmitter {
     if (reference == null) {
       return false;
     }
-    return boundaryAtMs === null || reference.createdAtMs > boundaryAtMs;
+    return reference.createdAtMs > boundaryAtMs;
   }
 
   /**
