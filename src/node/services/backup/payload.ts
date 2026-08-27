@@ -1016,16 +1016,133 @@ const JSONC_EDIT_OPTIONS: jsonc.ModificationOptions = {
 /**
  * Rewrites values in place with jsonc edits, leaving the rest of the document as it was.
  * Restore needs that: it writes the file the user just previewed, not a reformatted copy.
+ *
+ * One parse for the whole batch: `jsonc.modify` reparses the document on every call, so
+ * per-edit application costs edit-count times document-size synchronous work on inputs
+ * a crafted backup controls (256 valid deletions on a near-limit file take nearly a
+ * minute). Spans are planned against a single tree and spliced in one pass; any batch
+ * the planner cannot place falls back to the sequential behavior it replaces.
  */
 function applyJsoncEdits(text: string, edits: Array<{ path: jsonc.JSONPath; value: unknown }>) {
-  let result = text;
-  for (const edit of edits) {
-    result = jsonc.applyEdits(
-      result,
-      jsonc.modify(result, edit.path, edit.value, JSONC_EDIT_OPTIONS)
-    );
+  if (edits.length === 0) return text;
+  const spans = planJsoncEditSpans(text, edits);
+  if (spans === undefined) {
+    let result = text;
+    for (const edit of edits) {
+      result = jsonc.applyEdits(
+        result,
+        jsonc.modify(result, edit.path, edit.value, JSONC_EDIT_OPTIONS)
+      );
+    }
+    return result;
   }
-  return result;
+  let result = "";
+  let cursor = 0;
+  for (const span of spans) {
+    result += text.slice(cursor, span.offset) + span.content;
+    cursor = span.offset + span.length;
+  }
+  return result + text.slice(cursor);
+}
+
+interface JsoncEditSpan {
+  offset: number;
+  length: number;
+  content: string;
+}
+
+/**
+ * Plans one text span per replacement and one merged span per deletion run, all against
+ * a single parse. Returns undefined for any batch it cannot place exactly (a missing
+ * node, a segment/container type mismatch, overlapping spans), handing those to the
+ * sequential path instead of guessing.
+ */
+function planJsoncEditSpans(
+  text: string,
+  edits: Array<{ path: jsonc.JSONPath; value: unknown }>
+): JsoncEditSpan[] | undefined {
+  const root = jsonc.parseTree(text);
+  if (root === undefined) return undefined;
+  const spans: JsoncEditSpan[] = [];
+  const deletionsByParent = new Map<
+    string,
+    { parentPath: jsonc.JSONPath; segments: Array<string | number> }
+  >();
+  for (const edit of edits) {
+    if (edit.value !== undefined) {
+      const node = jsonc.findNodeAtLocation(root, edit.path);
+      if (node === undefined) return undefined;
+      spans.push({ offset: node.offset, length: node.length, content: JSON.stringify(edit.value) });
+      continue;
+    }
+    const segment = edit.path[edit.path.length - 1];
+    if (segment === undefined) return undefined;
+    const parentPath = edit.path.slice(0, -1);
+    const key = JSON.stringify(parentPath);
+    const entry = deletionsByParent.get(key) ?? { parentPath, segments: [] };
+    entry.segments.push(segment);
+    deletionsByParent.set(key, entry);
+  }
+  for (const { parentPath, segments } of deletionsByParent.values()) {
+    const parent = parentPath.length === 0 ? root : jsonc.findNodeAtLocation(root, parentPath);
+    if (parent === undefined || (parent.type !== "object" && parent.type !== "array")) {
+      return undefined;
+    }
+    const children = parent.children ?? [];
+    const deleted = new Set<number>();
+    for (const segment of segments) {
+      let index: number;
+      if (parent.type === "array") {
+        if (typeof segment !== "number") return undefined;
+        index = segment;
+      } else {
+        if (typeof segment !== "string") return undefined;
+        index = children.findIndex((child) => child.children?.[0]?.value === segment);
+      }
+      if (index < 0 || index >= children.length || deleted.has(index)) return undefined;
+      deleted.add(index);
+    }
+    if (deleted.size === children.length) {
+      // Empty the container: everything between its delimiters goes.
+      spans.push({ offset: parent.offset + 1, length: parent.length - 2, content: "" });
+      continue;
+    }
+    for (let start = 0; start < children.length; start += 1) {
+      if (!deleted.has(start)) continue;
+      let end = start;
+      while (end + 1 < children.length && deleted.has(end + 1)) end += 1;
+      const first = children[start];
+      const last = children[end];
+      const follower = children[end + 1];
+      if (first === undefined || last === undefined) return undefined;
+      if (follower !== undefined) {
+        // A kept entry follows: the run's span ends where it begins, taking the
+        // run's separators with it and leaving the follower's own separator intact.
+        spans.push({ offset: first.offset, length: follower.offset - first.offset, content: "" });
+      } else {
+        // The run reaches the container's end, so a kept entry precedes it (the
+        // all-deleted case returned above): start after that entry, taking the
+        // separator between them.
+        const previous = children[start - 1];
+        if (previous === undefined) return undefined;
+        const previousEnd = previous.offset + previous.length;
+        spans.push({
+          offset: previousEnd,
+          length: last.offset + last.length - previousEnd,
+          content: "",
+        });
+      }
+      start = end;
+    }
+  }
+  spans.sort((a, b) => a.offset - b.offset);
+  for (let i = 1; i < spans.length; i += 1) {
+    const previous = spans[i - 1];
+    const current = spans[i];
+    if (previous === undefined || current === undefined) return undefined;
+    if (current.offset < previous.offset + previous.length) return undefined;
+  }
+  return spans;
 }
 
 interface JsoncPropertyInsertion {
@@ -1635,6 +1752,7 @@ const SHELL_STATE_WORDS = new Set([
 function hasDisguisedAssignment(redacted: string): boolean {
   let operandsOnly = false;
   let pendingPrintfVariableOption = false;
+  let evalOperandAmbiguous = false;
   // A Set of the static table's RegExp instances: repeated interpreter words cannot
   // grow it past the table size, keeping this lookup linear in command length.
   const pendingEvalWords = new Set<RegExp>();
@@ -1673,12 +1791,20 @@ function hasDisguisedAssignment(redacted: string): boolean {
     const language = LANGUAGE_INTERPRETERS.find((entry) => entry.name.test(executable));
     if (language) {
       pendingEvalWords.add(language.evalWord);
-    } else if (pendingEvalWords.size > 0 && !unquoted.startsWith("-")) {
-      // A non-option word no pending pattern matched is the script/module operand:
-      // later dash-led words belong to that program (`python3 server.py -c
-      // settings.toml` hands -c to server.py), so eval tracking ends here and the
-      // file launchers this table intends to preserve stay portable.
-      pendingEvalWords.clear();
+      evalOperandAmbiguous = false;
+    } else if (pendingEvalWords.size > 0) {
+      if (unquoted.startsWith("-")) {
+        // An interpreter option may take a separate argument this scan cannot pair
+        // (`python3 -W ignore -c x`), so from here a non-option word no longer
+        // proves the script boundary; tracking stays armed, failing closed.
+        evalOperandAmbiguous = true;
+      } else if (!evalOperandAmbiguous) {
+        // The first non-option word no pending pattern matched is the script/module
+        // operand: later dash-led words belong to that program (`python3 server.py
+        // -c settings.toml` hands -c to server.py), so eval tracking ends here and
+        // the file launchers this table intends to preserve stay portable.
+        pendingEvalWords.clear();
+      }
     }
     // Option terminators end option parsing: past one even a dash-led word is an
     // operand, so `env -- --evil=x` sets an environment entry despite the option look.

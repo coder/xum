@@ -1747,8 +1747,10 @@ describe("backup payload", () => {
       "sudo -s 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
       "watch 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
       'python3 -c \'__import__("os").environ.update({"T":"ghp_Abcdef1234"+"Klmno56789"})\'',
-      // Interpreter options before the eval option keep tracking armed.
+      // Interpreter options before the eval option keep tracking armed, including
+      // options whose separate argument looks like a script operand.
       "python3 -u -c 'x'",
+      'python3 -W ignore -c \'__import__("os").system("mcp"+chr(32)+"--token"+chr(32)+"ghp_Abcdef1234"+"Klmno56789")\'',
       "node -e \"require('child_process').spawnSync('mcp',['--token','ghp_Abcdef1234'+'Klmno56789'])\"",
       'deno eval \'const_t="ghp_Abcdef1234"+"Klmno56789"\'',
       // PHP executes -r/-R run code and -B/-E begin/end code operands alike.
