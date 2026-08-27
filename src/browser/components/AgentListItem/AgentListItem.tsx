@@ -105,6 +105,7 @@ interface AgentListItemBaseProps {
   isSelected: boolean;
   depth?: number;
   sectionId?: string;
+  projectBadge?: { name: string; color: string };
 }
 
 /** Props for regular (persisted) workspace items */
@@ -1319,6 +1320,19 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                 >
                   {suppressGroupMemberTitle ? memberOnlyLabel : workspaceTitle}
                 </span>
+                {props.projectBadge && (
+                  <span
+                    data-testid={`workspace-project-badge-${workspaceId}`}
+                    className="max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
+                    style={{
+                      backgroundColor: `${props.projectBadge.color}20`,
+                      color: props.projectBadge.color,
+                      borderColor: `${props.projectBadge.color}40`,
+                    }}
+                  >
+                    {props.projectBadge.name}
+                  </span>
+                )}
                 {groupLabel && !suppressGroupMemberTitle && (
                   <span
                     data-testid={`workspace-scope-label-${workspaceId}`}

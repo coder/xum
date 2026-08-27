@@ -17,6 +17,7 @@ import {
   EXPANDED_PROJECTS_KEY,
   MOBILE_LEFT_SIDEBAR_SCROLL_TOP_KEY,
   SIDEBAR_AGE_GROUPING_KEY,
+  SIDEBAR_FLAT_MODE_KEY,
   SIDEBAR_HIDE_SUBAGENTS_KEY,
   getDraftScopeId,
   getInputAttachmentsKey,
@@ -49,6 +50,7 @@ import {
 import { PlatformPaths } from "@/common/utils/paths";
 import {
   partitionWorkspacesByAge,
+  buildSortedWorkspacesFlat,
   partitionWorkspacesBySection,
   formatDaysThreshold,
   AGE_THRESHOLDS_DAYS,
@@ -162,6 +164,7 @@ function getPinnedReorderGroup(projectPath: string, sectionId: string | undefine
 }
 const SCRATCH_PINNED_REORDER_GROUP = "\u0000scratch";
 const MULTI_PROJECT_PINNED_REORDER_GROUP = "\u0000multi-project";
+const FLAT_PINNED_REORDER_GROUP = "\u0000flat";
 
 // Stable reference so hide-mode rows without descendants don't get a fresh
 // object per render.
@@ -433,6 +436,7 @@ interface DraftAgentListItemWrapperProps {
   isSelected: boolean;
   sectionId?: string;
   onVisibilityChange?: (isVisible: boolean) => void;
+  projectBadge?: { name: string; color: string };
   onOpen: () => void;
   onDelete: () => void;
 }
@@ -517,6 +521,7 @@ function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
       projectPath={props.projectPath}
       isSelected={props.isSelected}
       sectionId={props.sectionId}
+      projectBadge={props.projectBadge}
       draft={{
         draftId: props.draftId,
         draftNumber: props.draftNumber,
@@ -527,6 +532,10 @@ function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
       }}
     />
   );
+}
+
+function GroupedSidebarSection(props: { enabled: boolean; children: React.ReactNode }) {
+  return props.enabled ? <div>{props.children}</div> : null;
 }
 
 // Custom drag layer to show a semi-transparent preview and enforce grabbing cursor
@@ -850,6 +859,10 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   // Whether workspaces are grouped under collapsible "Older than X days" tiers.
   // Toggled from Settings → General; listener keeps the sidebar live-updated.
   const [ageGroupingEnabled] = usePersistedState<boolean>(SIDEBAR_AGE_GROUPING_KEY, true, {
+    listener: true,
+  });
+
+  const [flatSidebarEnabled] = usePersistedState<boolean>(SIDEBAR_FLAT_MODE_KEY, false, {
     listener: true,
   });
 
@@ -1731,6 +1744,29 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const isWorkflowRunActive = (workspaceId: string, runId: string): boolean =>
     getActiveWorkflowRunIds(workspaceId).includes(runId);
   const allSidebarWorkspaces = Array.from(sortedWorkspacesByProject.values()).flat();
+  const flatWorkspaceMetadata = new Map(
+    allSidebarWorkspaces.map((workspace) => [workspace.id, workspace] as const)
+  );
+  const flatWorkspaces = buildSortedWorkspacesFlat(
+    userProjects,
+    flatWorkspaceMetadata,
+    workspaceRecency
+  );
+  const flatRowsForDisplay = hideSubAgentRows
+    ? excludeSubAgentRows(flatWorkspaces)
+    : flatWorkspaces;
+  const flatDepthByWorkspaceId = computeWorkspaceDepthMap(flatRowsForDisplay);
+  const visibleFlatWorkspaces = filterVisibleAgentRows(
+    flatRowsForDisplay,
+    expandedCompletedParentIds,
+    { isWorkspaceLiveActive }
+  );
+  const flatRowMetaByWorkspaceId = computeAgentRowRenderMeta(
+    flatRowsForDisplay,
+    flatDepthByWorkspaceId,
+    expandedCompletedParentIds,
+    { isWorkspaceLiveActive }
+  );
   // Learn run names while a worker row still carries them (workers are deleted
   // after reporting), then drop names whose run is no longer active.
   for (const workspace of allSidebarWorkspaces) {
@@ -1846,6 +1882,32 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     MULTI_PROJECT_SIDEBAR_SECTION_ID
   );
 
+  const flatDrafts = Object.entries(workspaceDraftsByProject)
+    .flatMap(([projectPath, drafts]) => drafts.map((draft) => ({ projectPath, draft })))
+    .sort((a, b) => b.draft.createdAt - a.draft.createdAt);
+  const groupedProjectPaths = flatSidebarEnabled ? [] : sortedProjectPaths;
+  const getFlatProjectBadge = (
+    workspace: FrontendWorkspaceMetadata
+  ): { name: string; color: string } | undefined => {
+    if (workspace.parentWorkspaceId != null || workspace.kind === "scratch") return undefined;
+    if (isMultiProject(workspace)) {
+      return { name: "Multi-project", color: resolveSectionColor(undefined) };
+    }
+    const config = userProjects.get(workspace.projectPath);
+    return {
+      name: config?.displayName ?? getProjectFallbackLabel(workspace.projectPath),
+      color: resolveSectionColor(config?.color),
+    };
+  };
+  const getFlatDraftBadge = (projectPath: string): { name: string; color: string } | undefined => {
+    if (projectPath === SCRATCH_PROJECT_CONFIG_KEY) return undefined;
+    const config = userProjects.get(projectPath);
+    return {
+      name: config?.displayName ?? getProjectFallbackLabel(projectPath),
+      color: resolveSectionColor(config?.color),
+    };
+  };
+
   const handleReorder = useCallback(
     (draggedPath: string, targetPath: string) => {
       const next = reorderProjects(projectOrder, userProjects, draggedPath, targetPath);
@@ -1862,12 +1924,23 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     (draggedId: string, targetId: string, edge: PinnedDropEdge) => {
       const targetMeta = workspaceStore.getWorkspaceMetadata(targetId);
       if (!targetMeta) return;
-      const block = locatePinnedBlock(targetMeta, sortedWorkspacesByProject, userProjects);
+      const block = locatePinnedBlock(
+        targetMeta,
+        sortedWorkspacesByProject,
+        userProjects,
+        flatSidebarEnabled
+      );
       if (!block) return;
       const order = computePinnedDropOrder(block, draggedId, targetId, edge);
       if (order) void reorderPinnedWorkspaces(order);
     },
-    [workspaceStore, sortedWorkspacesByProject, userProjects, reorderPinnedWorkspaces]
+    [
+      workspaceStore,
+      sortedWorkspacesByProject,
+      userProjects,
+      flatSidebarEnabled,
+      reorderPinnedWorkspaces,
+    ]
   );
 
   /**
@@ -1885,12 +1958,19 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         meta,
         direction,
         sortedWorkspacesByProject,
-        userProjects
+        userProjects,
+        flatSidebarEnabled
       );
       if (order) void reorderPinnedWorkspaces(order);
       return true;
     },
-    [workspaceStore, sortedWorkspacesByProject, userProjects, reorderPinnedWorkspaces]
+    [
+      workspaceStore,
+      sortedWorkspacesByProject,
+      userProjects,
+      flatSidebarEnabled,
+      reorderPinnedWorkspaces,
+    ]
   );
 
   const hasProjectMenuTarget = projectMenuTargetPath !== null;
@@ -1973,6 +2053,127 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const archiveConfirmationUntrackedPaths = archiveConfirmation?.untrackedPaths;
   const archiveConfirmationIsStreaming = archiveConfirmation?.isStreaming ?? false;
 
+  const renderFlatWorkspaceRows = (rows: FrontendWorkspaceMetadata[]): React.ReactNode =>
+    rows.map((metadata) => {
+      const rowRenderMeta = flatRowMetaByWorkspaceId.get(metadata.id);
+      return (
+        <AgentListItem
+          key={metadata.id}
+          metadata={metadata}
+          projectPath={metadata.projectPath}
+          projectName={metadata.projectName}
+          projectBadge={getFlatProjectBadge(metadata)}
+          isSelected={selectedWorkspace?.workspaceId === metadata.id}
+          isArchiving={archivingWorkspaceIds.has(metadata.id)}
+          isRemoving={removingWorkspaceIds.has(metadata.id) || metadata.isRemoving === true}
+          onSelectWorkspace={handleSelectWorkspace}
+          onForkWorkspace={handleForkWorkspace}
+          onStopRuntime={handleStopRuntime}
+          onArchiveWorkspace={handleArchiveWorkspace}
+          onCancelCreation={handleCancelWorkspaceCreation}
+          depth={rowRenderMeta?.depth ?? flatDepthByWorkspaceId[metadata.id] ?? 0}
+          pinnedReorderGroup={FLAT_PINNED_REORDER_GROUP}
+          onPinnedReorderDrop={handlePinnedReorderDrop}
+          rowRenderMeta={rowRenderMeta}
+          isWorkspaceLiveActive={isWorkspaceLiveActive(metadata.id)}
+          delegatedActivity={delegatedActivityByWorkspaceId.get(metadata.id)}
+          hiddenSubAgentsSummary={getHiddenSubAgentsSummary(metadata.id)}
+          getWorkflowRunName={getWorkflowRunName}
+          completedChildrenExpanded={expandedCompletedParentIds.has(metadata.id)}
+          onToggleCompletedChildren={toggleCompletedChildrenExpansion}
+        />
+      );
+    });
+
+  const flatAgePartition = ageGroupingEnabled
+    ? partitionWorkspacesByAge(visibleFlatWorkspaces, workspaceRecency)
+    : null;
+  const firstFlatAgeTier = flatAgePartition
+    ? findNextNonEmptyTier(flatAgePartition.buckets, 0)
+    : -1;
+  const renderFlatAgeTier = (tierIndex: number): React.ReactNode => {
+    if (!flatAgePartition) return null;
+    const bucket = flatAgePartition.buckets[tierIndex];
+    const remainingCount = flatAgePartition.buckets
+      .slice(tierIndex)
+      .reduce((sum, rows) => sum + rows.length, 0);
+    if (remainingCount === 0) return null;
+
+    const tierKey = `flat:${tierIndex}`;
+    const isExpanded = expandedOldWorkspaces[tierKey] ?? false;
+    const thresholdLabel = formatDaysThreshold(AGE_THRESHOLDS_DAYS[tierIndex]);
+    const nextTier = findNextNonEmptyTier(flatAgePartition.buckets, tierIndex + 1);
+    return (
+      <React.Fragment key={tierKey}>
+        <button
+          onClick={() => {
+            setExpandedOldWorkspaces((prev) => ({ ...prev, [tierKey]: !prev[tierKey] }));
+          }}
+          aria-expanded={isExpanded}
+          className="text-muted border-hover hover:text-label flex w-full cursor-pointer items-center gap-1 border-t border-none bg-transparent px-3 py-2 text-xs font-medium transition-all duration-150 hover:bg-white/3"
+        >
+          <ChevronRight
+            className="h-4 w-4 transition-transform duration-200"
+            style={{ transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)" }}
+          />
+          <span>Older than {thresholdLabel}</span>
+          <span className="text-dim font-normal">
+            ({isExpanded ? bucket.length : remainingCount})
+          </span>
+        </button>
+        {isExpanded && (
+          <>
+            {renderFlatWorkspaceRows(bucket)}
+            {nextTier !== -1 && renderFlatAgeTier(nextTier)}
+          </>
+        )}
+      </React.Fragment>
+    );
+  };
+
+  const flatSidebarContent = (
+    <div className="py-1">
+      <button
+        onClick={handleAddScratchWorkspace}
+        className="text-secondary hover:bg-hover mx-2 mb-1 flex w-[calc(100%-1rem)] cursor-pointer items-center gap-1.5 rounded px-2 py-1.5 text-left text-xs"
+      >
+        <Plus className="h-3.5 w-3.5" />
+        New chat
+      </button>
+      {flatDrafts.map(({ projectPath, draft }, index) => {
+        const isSelected =
+          pendingNewWorkspaceProject === projectPath &&
+          pendingNewWorkspaceDraftId === draft.draftId;
+        return (
+          <DraftAgentListItemWrapper
+            key={draft.draftId}
+            projectPath={projectPath}
+            draftId={draft.draftId}
+            draftNumber={index + 1}
+            isSelected={isSelected}
+            projectBadge={getFlatDraftBadge(projectPath)}
+            onVisibilityChange={(isVisible) => {
+              handleDraftVisibilityChange(projectPath, draft.draftId, isVisible);
+            }}
+            onOpen={() => handleOpenWorkspaceDraft(projectPath, draft.draftId)}
+            onDelete={() => {
+              if (isSelected) navigateToProject(projectPath);
+              deleteWorkspaceDraft(projectPath, draft.draftId);
+            }}
+          />
+        );
+      })}
+      {flatAgePartition ? (
+        <>
+          {renderFlatWorkspaceRows(flatAgePartition.recent)}
+          {firstFlatAgeTier !== -1 && renderFlatAgeTier(firstFlatAgeTier)}
+        </>
+      ) : (
+        renderFlatWorkspaceRows(visibleFlatWorkspaces)
+      )}
+    </div>
+  );
+
   return (
     <TitleEditProvider onUpdateTitle={onUpdateTitle}>
       <SidebarTitleEditKeybinds
@@ -2021,7 +2222,8 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                 onViewportScroll={handleProjectListScroll}
                 viewportClassName="overflow-x-hidden"
               >
-                <div>
+                {flatSidebarEnabled && flatSidebarContent}
+                <GroupedSidebarSection enabled={!flatSidebarEnabled}>
                   <div className={PROJECT_ITEM_BASE_CLASS}>
                     <button
                       onClick={() => toggleProject(SCRATCH_SIDEBAR_SECTION_ID)}
@@ -2133,9 +2335,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                       )}
                     </div>
                   )}
-                </div>
+                </GroupedSidebarSection>
 
-                {multiProjectWorkspaces.length > 0 && (
+                {!flatSidebarEnabled && multiProjectWorkspaces.length > 0 && (
                   <div>
                     <div className={PROJECT_ITEM_BASE_CLASS}>
                       <button
@@ -2213,7 +2415,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                   </div>
                 )}
 
-                {sortedProjectPaths.length === 0 && multiProjectWorkspaces.length === 0 ? (
+                {!flatSidebarEnabled &&
+                groupedProjectPaths.length === 0 &&
+                multiProjectWorkspaces.length === 0 ? (
                   <div className="px-4 py-8 text-center">
                     <p className="text-muted mb-4 text-[13px]">No projects</p>
                     <div className="flex flex-col gap-2">
@@ -2232,7 +2436,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                     </div>
                   </div>
                 ) : (
-                  sortedProjectPaths.map((projectPath) => {
+                  groupedProjectPaths.map((projectPath) => {
                     const config = userProjects.get(projectPath);
                     if (!config) return null;
                     const projectFolderColor = config.color

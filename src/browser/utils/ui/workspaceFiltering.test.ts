@@ -4,6 +4,7 @@ import {
   formatDaysThreshold,
   AGE_THRESHOLDS_DAYS,
   buildSortedWorkspacesByProject,
+  buildSortedWorkspacesFlat,
   orderMultiProjectSectionRows,
   computeWorkspaceDepthMap,
   computeAgentRowRenderMeta,
@@ -628,6 +629,60 @@ describe("buildSortedWorkspacesByProject", () => {
   });
 });
 
+describe("buildSortedWorkspacesFlat", () => {
+  it("sorts all workspace kinds globally and keeps children under their parent", () => {
+    const projects = new Map<string, ProjectConfig>([
+      ["/project/a", { workspaces: [{ path: "/a/pinned-late", id: "pinned-late" }] }],
+      ["/project/b", { workspaces: [{ path: "/b/pinned-early", id: "pinned-early" }] }],
+    ]);
+    const parent = {
+      ...createWorkspace("parent", "/project/a"),
+      projects: [
+        { projectPath: "/project/a", projectName: "a" },
+        { projectPath: "/project/b", projectName: "b" },
+      ],
+    };
+    const metadata = new Map<string, FrontendWorkspaceMetadata>([
+      [
+        "pinned-late",
+        {
+          ...createWorkspace("pinned-late", "/project/a"),
+          pinnedAt: "2026-01-02T00:00:00.000Z",
+        },
+      ],
+      [
+        "pinned-early",
+        {
+          ...createWorkspace("pinned-early", "/project/b"),
+          pinnedAt: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      ["parent", parent],
+      [
+        "child",
+        createWorkspace("child", { projectPath: "/project/a", parentWorkspaceId: "parent" }),
+      ],
+      ["scratch", { ...createWorkspace("scratch", "/scratch/path"), kind: "scratch" }],
+      ["recent", createWorkspace("recent", "/project/b")],
+    ]);
+
+    const result = buildSortedWorkspacesFlat(projects, metadata, {
+      parent: 300,
+      child: 1,
+      scratch: 200,
+      recent: 100,
+    });
+
+    expect(result.map((workspace) => workspace.id)).toEqual([
+      "pinned-early",
+      "pinned-late",
+      "parent",
+      "child",
+      "scratch",
+      "recent",
+    ]);
+  });
+});
 describe("buildSortedWorkspacesByProject pinning", () => {
   const now = Date.now();
   const projectsWithIds = (ids: string[]): Map<string, ProjectConfig> =>

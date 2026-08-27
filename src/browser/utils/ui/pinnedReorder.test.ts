@@ -139,6 +139,26 @@ describe("locatePinnedBlock", () => {
     expect(block).toEqual({ fullOrder: ["mB", "mA"], blockIds: ["mB", "mA"] });
   });
 
+  it("treats pinned roots from every project as one block in flat mode", () => {
+    const a = createWorkspace("a", {
+      pinnedAt: "2026-01-01T00:00:01.000Z",
+      projectPath: "/test/a",
+    });
+    const b = createWorkspace("b", {
+      pinnedAt: "2026-01-01T00:00:00.000Z",
+      projectPath: "/test/b",
+    });
+    const sorted = new Map([
+      ["/test/a", [a]],
+      ["/test/b", [b]],
+    ]);
+
+    expect(locatePinnedBlock(a, sorted, new Map(), true)).toEqual({
+      fullOrder: ["b", "a"],
+      blockIds: ["b", "a"],
+    });
+  });
+
   it("treats all pinned scratch rows as one block despite distinct workdir projectPaths", () => {
     // Each scratch chat's projectPath is its own app-managed workdir, but the
     // sidebar renders them together in the Chats section, so a reorder between

@@ -4,6 +4,8 @@ import { PIXEL_DUAL_THEME, appMeta, AppWithMocks } from "@/browser/stories/meta.
 import { expandProjects } from "@/browser/stories/helpers/uiState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
+import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { SIDEBAR_FLAT_MODE_KEY } from "@/common/constants/storage";
 
 const PROJECT_PATH = "/home/user/projects/my-app";
 
@@ -299,6 +301,58 @@ export const WorkflowRunGroups: AppStory = {
   },
 };
 
+export const FlatChatList: AppStory = {
+  parameters: {
+    pixel: { matrix: PIXEL_DUAL_THEME },
+  },
+  render: () => (
+    <AppWithMocks
+      setup={() => {
+        updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+        const workspaces = [
+          createWorkspace({
+            id: "alpha-pinned",
+            name: "alpha-pinned",
+            title: "Pinned from a long project name",
+            projectName: "alpha-application-with-a-long-name",
+            pinnedAt: "2026-01-02T00:00:00.000Z",
+          }),
+          createWorkspace({
+            id: "beta-pinned",
+            name: "beta-pinned",
+            title: "Pinned beta chat",
+            projectName: "beta-service",
+            pinnedAt: "2026-01-01T00:00:00.000Z",
+          }),
+          createWorkspace({
+            id: "alpha-recent",
+            name: "alpha-recent",
+            title: "Recent alpha work",
+            projectName: "alpha-application-with-a-long-name",
+          }),
+          {
+            ...createWorkspace({
+              id: "scratch-flat",
+              name: "scratch-flat",
+              title: "Scratch idea",
+              projectName: "Scratch",
+              projectPath: "/home/user/.xum/scratch/scratch-flat",
+            }),
+            kind: "scratch" as const,
+          },
+        ];
+        const projects = groupWorkspacesByProject(workspaces);
+        const alphaPath = "/home/user/projects/alpha-application-with-a-long-name";
+        const betaPath = "/home/user/projects/beta-service";
+        const alphaConfig = projects.get(alphaPath);
+        const betaConfig = projects.get(betaPath);
+        if (alphaConfig) projects.set(alphaPath, { ...alphaConfig, color: "Blue" });
+        if (betaConfig) projects.set(betaPath, { ...betaConfig, color: "Green" });
+        return createMockORPCClient({ projects, workspaces });
+      }}
+    />
+  ),
+};
 // Pinned chats sort by pinnedAt (user-reorderable), not by name or recency:
 // the pinned block deliberately renders as charlie, alpha, bravo while the
 // newest unpinned chat stays below the block.

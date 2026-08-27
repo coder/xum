@@ -27,6 +27,7 @@ import {
   CHAT_TRANSCRIPT_FULL_WIDTH_KEY,
   DEFAULT_BASH_COLLAPSED_SUMMARY_MODE,
   SIDEBAR_AGE_GROUPING_KEY,
+  SIDEBAR_FLAT_MODE_KEY,
   SIDEBAR_HIDE_SUBAGENTS_KEY,
   TRANSCRIPT_DENSITIES,
   normalizeBashCollapsedSummaryMode,
@@ -174,6 +175,11 @@ export function GeneralSection() {
   const [sidebarAgeGrouping, setSidebarAgeGrouping] = usePersistedState<boolean>(
     SIDEBAR_AGE_GROUPING_KEY,
     true
+  );
+  const [sidebarFlatMode, setSidebarFlatMode] = usePersistedState<boolean>(
+    SIDEBAR_FLAT_MODE_KEY,
+    false,
+    { listener: true }
   );
   // The command palette also toggles this key, so stay subscribed to
   // external updates while Settings is mounted.
@@ -595,18 +601,23 @@ export function GeneralSection() {
               </SelectContent>
             </Select>
           </div>
+        </div>
+      </div>
 
+      <div>
+        <h3 className="text-foreground mb-4 text-sm font-medium">Sidebar</h3>
+        <div className="space-y-4">
           <div className="flex items-center justify-between gap-4">
             <div className="flex-1">
-              <div className="text-foreground text-sm">Full-width chat transcript</div>
+              <div className="text-foreground text-sm">Flat chat list</div>
               <div className="text-muted text-xs">
-                Let messages use the full chat pane instead of the default readable column.
+                Show all chats in a single list with project badges instead of project folders.
               </div>
             </div>
             <Switch
-              checked={chatTranscriptFullWidth}
-              onCheckedChange={handleChatTranscriptFullWidthChange}
-              aria-label="Toggle full-width chat transcript"
+              checked={sidebarFlatMode}
+              onCheckedChange={setSidebarFlatMode}
+              aria-label="Toggle flat chat list"
             />
           </div>
 
@@ -637,6 +648,25 @@ export function GeneralSection() {
               checked={sidebarHideSubAgents}
               onCheckedChange={setSidebarHideSubAgents}
               aria-label="Toggle hiding sub-agents in the sidebar"
+            />
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <h3 className="text-foreground mb-4 text-sm font-medium">Transcript</h3>
+        <div className="space-y-4">
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex-1">
+              <div className="text-foreground text-sm">Full-width chat transcript</div>
+              <div className="text-muted text-xs">
+                Let messages use the full chat pane instead of the default readable column.
+              </div>
+            </div>
+            <Switch
+              checked={chatTranscriptFullWidth}
+              onCheckedChange={handleChatTranscriptFullWidthChange}
+              aria-label="Toggle full-width chat transcript"
             />
           </div>
 
@@ -691,7 +721,12 @@ export function GeneralSection() {
               </SelectContent>
             </Select>
           </div>
+        </div>
+      </div>
 
+      <div>
+        <h3 className="text-foreground mb-4 text-sm font-medium">Terminal</h3>
+        <div className="space-y-4">
           <div className="flex items-center justify-between gap-4">
             <div className="flex-1">
               <div className="text-foreground text-sm">Terminal Font</div>
@@ -838,8 +873,112 @@ export function GeneralSection() {
       </div>
 
       <div>
-        <h3 className="text-foreground mb-4 text-sm font-medium">Workspace insights</h3>
-        <div className="divide-border-light divide-y">
+        <h3 className="text-foreground mb-4 text-sm font-medium">Archiving</h3>
+        <div className="space-y-4">
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex-1">
+              <div className="text-foreground text-sm">Coder workspace on archive</div>
+              <div className="text-muted text-xs">
+                Action to take on dedicated Coder workspaces when archiving a chat. Delete is
+                permanent.
+              </div>
+            </div>
+            <Select
+              value={archiveBehavior}
+              onValueChange={(value) =>
+                handleArchiveBehaviorChange(value as CoderWorkspaceArchiveBehavior)
+              }
+              disabled={!api?.config?.updateCoderPrefs || !archiveSettingsLoaded}
+            >
+              <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {ARCHIVE_BEHAVIOR_OPTIONS.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex-1">
+              <div className="text-foreground text-sm">Worktree archive behavior</div>
+              <div className="text-muted text-xs">
+                Control whether archived xum-managed worktrees stay on disk, are deleted, or are
+                snapshotted so they can be restored on unarchive.
+              </div>
+            </div>
+            <Select
+              value={worktreeArchiveBehavior}
+              onValueChange={(value) =>
+                handleWorktreeArchiveBehaviorChange(value as WorktreeArchiveBehavior)
+              }
+              disabled={!api?.config?.updateCoderPrefs || !archiveSettingsLoaded}
+            >
+              <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {WORKTREE_ARCHIVE_BEHAVIOR_OPTIONS.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <h3 className="text-foreground mb-4 text-sm font-medium">Editor & debugging</h3>
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <div className="text-foreground text-sm">Editor</div>
+              <div className="text-muted text-xs">Editor to open files in</div>
+            </div>
+            <Select value={editorConfig.editor} onValueChange={handleEditorChange}>
+              <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {EDITOR_OPTIONS.map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+
+          {editorConfig.editor === "custom" && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <div>
+                  <div className="text-foreground text-sm">Custom Command</div>
+                  <div className="text-muted text-xs">Command to run (path will be appended)</div>
+                </div>
+                <Input
+                  value={editorConfig.customCommand ?? ""}
+                  onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                    handleCustomCommandChange(e.target.value)
+                  }
+                  placeholder="e.g., nvim"
+                  className="border-border-medium bg-background-secondary h-9 w-40"
+                />
+              </div>
+              {isBrowserMode && (
+                <div className="text-warning text-xs">
+                  Custom editors are not supported in browser mode. Use VS Code or Cursor instead.
+                </div>
+              )}
+            </div>
+          )}
+
           <div className="flex items-center justify-between py-3">
             <div className="flex-1 pr-4">
               <div className="text-foreground text-sm">API Debug Logs</div>
@@ -853,125 +992,27 @@ export function GeneralSection() {
               aria-label="Toggle API Debug Logs"
             />
           </div>
-        </div>
-      </div>
 
-      <div className="flex items-center justify-between">
-        <div>
-          <div className="text-foreground text-sm">Editor</div>
-          <div className="text-muted text-xs">Editor to open files in</div>
-        </div>
-        <Select value={editorConfig.editor} onValueChange={handleEditorChange}>
-          <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {EDITOR_OPTIONS.map((option) => (
-              <SelectItem key={option.value} value={option.value}>
-                {option.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
-
-      {editorConfig.editor === "custom" && (
-        <div className="space-y-2">
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-foreground text-sm">Custom Command</div>
-              <div className="text-muted text-xs">Command to run (path will be appended)</div>
-            </div>
-            <Input
-              value={editorConfig.customCommand ?? ""}
-              onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                handleCustomCommandChange(e.target.value)
-              }
-              placeholder="e.g., nvim"
-              className="border-border-medium bg-background-secondary h-9 w-40"
-            />
-          </div>
-          {isBrowserMode && (
-            <div className="text-warning text-xs">
-              Custom editors are not supported in browser mode. Use VS Code or Cursor instead.
+          {isBrowserMode && sshHostLoaded && (
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-foreground text-sm">SSH Host</div>
+                <div className="text-muted text-xs">
+                  SSH hostname for &apos;Open in Editor&apos; deep links
+                </div>
+              </div>
+              <Input
+                value={sshHost}
+                onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+                  handleSshHostChange(e.target.value)
+                }
+                placeholder={window.location.hostname}
+                className="border-border-medium bg-background-secondary h-9 w-40"
+              />
             </div>
           )}
         </div>
-      )}
-
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex-1">
-          <div className="text-foreground text-sm">Coder workspace on archive</div>
-          <div className="text-muted text-xs">
-            Action to take on dedicated Coder workspaces when archiving a chat. Delete is permanent.
-          </div>
-        </div>
-        <Select
-          value={archiveBehavior}
-          onValueChange={(value) =>
-            handleArchiveBehaviorChange(value as CoderWorkspaceArchiveBehavior)
-          }
-          disabled={!api?.config?.updateCoderPrefs || !archiveSettingsLoaded}
-        >
-          <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {ARCHIVE_BEHAVIOR_OPTIONS.map((option) => (
-              <SelectItem key={option.value} value={option.value}>
-                {option.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
       </div>
-
-      <div className="flex items-center justify-between gap-4">
-        <div className="flex-1">
-          <div className="text-foreground text-sm">Worktree archive behavior</div>
-          <div className="text-muted text-xs">
-            Control whether archived xum-managed worktrees stay on disk, are deleted, or are
-            snapshotted so they can be restored on unarchive.
-          </div>
-        </div>
-        <Select
-          value={worktreeArchiveBehavior}
-          onValueChange={(value) =>
-            handleWorktreeArchiveBehaviorChange(value as WorktreeArchiveBehavior)
-          }
-          disabled={!api?.config?.updateCoderPrefs || !archiveSettingsLoaded}
-        >
-          <SelectTrigger className="border-border-medium bg-background-secondary hover:bg-hover h-9 w-auto cursor-pointer rounded-md border px-3 text-sm transition-colors">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {WORKTREE_ARCHIVE_BEHAVIOR_OPTIONS.map((option) => (
-              <SelectItem key={option.value} value={option.value}>
-                {option.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
-
-      {isBrowserMode && sshHostLoaded && (
-        <div className="flex items-center justify-between">
-          <div>
-            <div className="text-foreground text-sm">SSH Host</div>
-            <div className="text-muted text-xs">
-              SSH hostname for &apos;Open in Editor&apos; deep links
-            </div>
-          </div>
-          <Input
-            value={sshHost}
-            onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-              handleSshHostChange(e.target.value)
-            }
-            placeholder={window.location.hostname}
-            className="border-border-medium bg-background-secondary h-9 w-40"
-          />
-        </div>
-      )}
 
       <div>
         <h3 className="text-foreground mb-4 text-sm font-medium">Projects</h3>

@@ -4,7 +4,11 @@ import type { ProjectConfig } from "@/node/config";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import { GlobalWindow } from "happy-dom";
-import { getModelKey, SIDEBAR_HIDE_SUBAGENTS_KEY } from "@/common/constants/storage";
+import {
+  getModelKey,
+  SIDEBAR_FLAT_MODE_KEY,
+  SIDEBAR_HIDE_SUBAGENTS_KEY,
+} from "@/common/constants/storage";
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import type { WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import type { APIClient } from "@/browser/contexts/API";
@@ -1327,6 +1331,33 @@ test("workspace generate title command dispatches a title-generation request eve
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
     globalThis.CustomEvent = originalCustomEvent;
+  }
+});
+
+test("toggle flat chat list command flips the persisted sidebar setting", () => {
+  const testWindow = new GlobalWindow();
+  const originalWindow = globalThis.window;
+  const originalDocument = globalThis.document;
+  globalThis.window = testWindow as unknown as Window & typeof globalThis;
+  globalThis.document = testWindow.document as unknown as Document;
+
+  try {
+    const toggle = () => {
+      const action = getActions().find((a) => a.id === "nav:toggle-flat-chat-list");
+      expect(action).toBeDefined();
+      void action!.run();
+    };
+
+    toggle();
+    expect(window.localStorage.getItem(SIDEBAR_FLAT_MODE_KEY)).toBe("true");
+    expect(getActions().find((a) => a.id === "nav:toggle-flat-chat-list")?.subtitle).toContain(
+      "Flat"
+    );
+    toggle();
+    expect(window.localStorage.getItem(SIDEBAR_FLAT_MODE_KEY)).toBe("false");
+  } finally {
+    globalThis.window = originalWindow;
+    globalThis.document = originalDocument;
   }
 });
 

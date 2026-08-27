@@ -56,9 +56,18 @@ function collectFlatSectionRows(
 export function locatePinnedBlock(
   meta: FrontendWorkspaceMetadata,
   sortedWorkspacesByProject: Map<string, FrontendWorkspaceMetadata[]>,
-  userProjects: Map<string, ProjectConfig>
+  userProjects: Map<string, ProjectConfig>,
+  flatMode = false
 ): PinnedBlock | null {
   if (!isWorkspacePinned(meta)) return null;
+
+  if (flatMode) {
+    const pinnedIds = collectFlatSectionRows(sortedWorkspacesByProject, () => true)
+      .filter((row) => row.parentWorkspaceId == null && isWorkspacePinned(row))
+      .map((row) => row.id);
+    if (!pinnedIds.includes(meta.id)) return null;
+    return { fullOrder: pinnedIds, blockIds: pinnedIds };
+  }
 
   // Scratch chats render as one flat "Chats" section, but each row's
   // projectPath is its own app-managed workdir, so the per-projectPath
@@ -130,9 +139,10 @@ export function computePinnedMoveOrderForWorkspace(
   meta: FrontendWorkspaceMetadata,
   direction: PinnedMoveDirection,
   sortedWorkspacesByProject: Map<string, FrontendWorkspaceMetadata[]>,
-  userProjects: Map<string, ProjectConfig>
+  userProjects: Map<string, ProjectConfig>,
+  flatMode = false
 ): string[] | null {
-  const block = locatePinnedBlock(meta, sortedWorkspacesByProject, userProjects);
+  const block = locatePinnedBlock(meta, sortedWorkspacesByProject, userProjects, flatMode);
   if (!block) return null;
   return computePinnedMoveOrder(block, meta.id, direction);
 }

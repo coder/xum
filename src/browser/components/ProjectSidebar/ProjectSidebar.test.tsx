@@ -7,7 +7,11 @@ import * as ReactDndModule from "react-dnd";
 import * as ReactDndHtml5BackendModule from "react-dnd-html5-backend";
 import * as ReactColorfulModule from "react-colorful";
 import { installDom } from "../../../../tests/ui/dom";
-import { EXPANDED_PROJECTS_KEY, SIDEBAR_HIDE_SUBAGENTS_KEY } from "@/common/constants/storage";
+import {
+  EXPANDED_PROJECTS_KEY,
+  SIDEBAR_FLAT_MODE_KEY,
+  SIDEBAR_HIDE_SUBAGENTS_KEY,
+} from "@/common/constants/storage";
 import { getDraftScopeId, getInputKey } from "@/common/constants/storage";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
@@ -123,6 +127,7 @@ interface MockAgentListItemProps {
   };
   depth?: number;
   rowRenderMeta?: AgentRowRenderMeta;
+  projectBadge?: { name: string; color: string };
   delegatedActivity?: { activeCount: number; queuedCount: number };
   hiddenSubAgentsSummary?: WorkspaceSubAgentsSummary;
   getWorkflowRunName?: (runId: string) => string | undefined;
@@ -369,6 +374,7 @@ function installProjectSidebarTestDoubles() {
           )}
         >
           <span>{displayTitle}</span>
+          {props.projectBadge ? <span>{props.projectBadge.name}</span> : null}
           {hasCompletedChildren && props.onToggleCompletedChildren ? (
             <button
               type="button"
@@ -768,6 +774,60 @@ describe("ProjectSidebar scratch chats", () => {
     expect(view.getByText("Explore an idea")).toBeTruthy();
   });
 
+  test("renders a global pinned-first list with project badges and restores folders when disabled", async () => {
+    const alpha = {
+      ...createWorkspace("alpha", { title: "Alpha chat" }),
+      projects: undefined,
+      projectPath: "/projects/alpha",
+      projectName: "alpha",
+      pinnedAt: "2026-01-02T00:00:00.000Z",
+    };
+    const beta = {
+      ...createWorkspace("beta", { title: "Beta chat" }),
+      projects: undefined,
+      projectPath: "/projects/beta",
+      projectName: "beta",
+      pinnedAt: "2026-01-01T00:00:00.000Z",
+    };
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        ["/projects/alpha", { displayName: "Alpha Project", color: "Blue", workspaces: [] }],
+        ["/projects/beta", { displayName: "Beta Project", color: "Green", workspaces: [] }],
+      ]),
+    });
+    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={
+          new Map([
+            ["/projects/alpha", [alpha]],
+            ["/projects/beta", [beta]],
+          ])
+        }
+        workspaceRecency={{ alpha: 1, beta: 2 }}
+      />
+    );
+
+    expect(view.queryByLabelText("Expand project alpha")).toBeNull();
+    expect(view.getByText("Alpha Project")).toBeTruthy();
+    expect(view.getByText("Beta Project")).toBeTruthy();
+    const workspaceRows = Array.from(
+      view.container.querySelectorAll('[data-testid^="agent-item-"]')
+    );
+    expect(workspaceRows.map((row) => row.getAttribute("data-testid"))).toEqual([
+      agentItemTestId("beta"),
+      agentItemTestId("alpha"),
+    ]);
+
+    act(() => updatePersistedState(SIDEBAR_FLAT_MODE_KEY, false));
+    await waitFor(() => {
+      expect(view.getByLabelText("Expand project alpha")).toBeTruthy();
+      expect(view.getByLabelText("Expand project beta")).toBeTruthy();
+    });
+  });
   test("Ctrl+N from a selected scratch chat opens a scratch draft, not a workdir project draft", () => {
     // Scratch rows are bucketed under the scratch config key while the
     // selection's projectPath is the app-managed workdir, so the keybind
