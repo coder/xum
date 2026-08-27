@@ -6183,6 +6183,77 @@ describe("WorkspaceService workflow invocation events", () => {
     }
   });
 
+  test("treats an unreadable history as indeterminate, not superseded", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-io-error";
+    const runId = "wfr_currentness_io_error";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-io-error",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user", "user", "run the audit workflow", { timestamp: 1_000 })
+      );
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: 1_150,
+        afterBoundaryMessageId: "manual-user",
+      });
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
+
+      const readSpy = spyOn(historyService, "iterateFullHistory").mockResolvedValue(
+        Err("disk read failed")
+      );
+      try {
+        // The drain distinguishes a read failure (retain and retry) from supersession
+        // (tombstone); the boolean view stays fail-safe false for non-destructive callers.
+        expect(await workspaceService.getWorkflowInvocationCurrentness(workspaceId, runId)).toBe(
+          "indeterminate"
+        );
+        expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
+        // The record path must fail loudly instead of persisting a verified-empty boundary that
+        // would permanently strand the run's wake after storage recovers.
+        let boundaryError: unknown;
+        try {
+          await workspaceService.getWorkflowInvocationBoundaryMessageId(workspaceId, runId);
+        } catch (error: unknown) {
+          boundaryError = error;
+        }
+        expect(String(boundaryError)).toContain("boundary unavailable");
+      } finally {
+        readSpy.mockRestore();
+      }
+      expect(await workspaceService.getWorkflowInvocationCurrentness(workspaceId, runId)).toBe(
+        "current"
+      );
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test.each(["workflow_run", "workflow_resume"] as const)(
     "treats terminal %s output as a consumed workflow result",
     async (toolName) => {

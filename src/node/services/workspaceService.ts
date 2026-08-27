@@ -10933,15 +10933,29 @@ export class WorkspaceService extends EventEmitter {
   }
 
   async isWorkflowInvocationCurrent(workspaceId: string, runId: string): Promise<boolean> {
-    assert(workspaceId.length > 0, "isWorkflowInvocationCurrent requires workspaceId");
-    assert(runId.length > 0, "isWorkflowInvocationCurrent requires runId");
+    return (await this.getWorkflowInvocationCurrentness(workspaceId, runId)) === "current";
+  }
+
+  /**
+   * Three-state currentness: "indeterminate" means history could not be read, so the answer is
+   * unknown rather than no. Callers that would permanently drop a terminal wake on a negative
+   * answer (the terminal-attention drain tombstones notifications) must retain and retry on
+   * "indeterminate" instead; boolean callers treat it as not-current, the pre-existing
+   * fail-safe for non-destructive decisions.
+   */
+  async getWorkflowInvocationCurrentness(
+    workspaceId: string,
+    runId: string
+  ): Promise<"current" | "not_current" | "indeterminate"> {
+    assert(workspaceId.length > 0, "getWorkflowInvocationCurrentness requires workspaceId");
+    assert(runId.length > 0, "getWorkflowInvocationCurrentness requires runId");
 
     const decision = await this.findWorkflowInvocationDecisionRow(workspaceId, runId);
     if (decision.status === "error") {
-      return false;
+      return "indeterminate";
     }
     if (decision.status === "found" && decision.outcome === "invocation") {
-      return true;
+      return "current";
     }
 
     // Kernel-launched runs (mux.workflow_run / mux.workflow_resume inside code_execution) leave
@@ -10959,14 +10973,14 @@ export class WorkspaceService extends EventEmitter {
     // the freshly cleared conversation. Legacy references without a boundary snapshot fail safe
     // the same way.
     if (decision.status === "none") {
-      return false;
+      return "not_current";
     }
     const references = await readAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
     const reference = references.find((candidate) => candidate.runId === runId);
     if (reference?.afterBoundaryMessageId == null) {
-      return false;
+      return "not_current";
     }
-    return reference.afterBoundaryMessageId === decision.messageId;
+    return reference.afterBoundaryMessageId === decision.messageId ? "current" : "not_current";
   }
 
   /**
@@ -11037,6 +11051,12 @@ export class WorkspaceService extends EventEmitter {
     assert(workspaceId.length > 0, "getWorkflowInvocationBoundaryMessageId requires workspaceId");
     assert(runId.length > 0, "getWorkflowInvocationBoundaryMessageId requires runId");
     const decision = await this.findWorkflowInvocationDecisionRow(workspaceId, runId);
+    // A read failure must not masquerade as a verified-empty history: persisting null would
+    // permanently fail the run's currentness check even after storage recovers. Throw so the
+    // record path can distinguish and record a rediscovery-only reference instead.
+    if (decision.status === "error") {
+      throw new Error("workflow invocation boundary unavailable: history read failed");
+    }
     return decision.status === "found" ? decision.messageId : null;
   }
 

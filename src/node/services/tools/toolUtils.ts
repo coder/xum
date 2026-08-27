@@ -97,22 +97,35 @@ export async function recordBackgroundWorkflowRunReference(
     return;
   }
 
+  // Snapshot which invocation-decision row is newest at launch so the terminal-wake
+  // currentness check compares row identity instead of wall-clock order, which clock
+  // corrections can reorder (see WorkspaceService.isWorkflowInvocationCurrent). A history read
+  // failure must not be persisted as a verified-empty boundary (null): record without the
+  // field instead, so the run stays rediscoverable (listAgentReferencedWorkflowRunIds) and a
+  // later workflow_resume re-record can repair provenance, while the unverifiable boundary
+  // fails safe for wake delivery.
+  let afterBoundaryMessageId: string | null | undefined;
+  const taskService = config.taskService;
+  if (config.workspaceId != null && taskService?.getWorkflowInvocationBoundaryMessageId != null) {
+    try {
+      afterBoundaryMessageId = await taskService.getWorkflowInvocationBoundaryMessageId(
+        config.workspaceId,
+        runId
+      );
+    } catch (error: unknown) {
+      log.error("Failed to snapshot workflow invocation boundary for run reference", {
+        runId,
+        error: getErrorMessage(error),
+      });
+    }
+  }
+
   try {
-    // Snapshot which invocation-decision row is newest at launch so the terminal-wake
-    // currentness check compares row identity instead of wall-clock order, which clock
-    // corrections can reorder (see WorkspaceService.isWorkflowInvocationCurrent).
-    const afterBoundaryMessageId =
-      config.workspaceId != null
-        ? ((await config.taskService?.getWorkflowInvocationBoundaryMessageId?.(
-            config.workspaceId,
-            runId
-          )) ?? null)
-        : null;
     await recordAgentWorkflowRunReference({
       workspaceSessionDir,
       runId,
       createdAtMs,
-      afterBoundaryMessageId,
+      ...(afterBoundaryMessageId !== undefined ? { afterBoundaryMessageId } : {}),
     });
   } catch (error: unknown) {
     log.warn("Failed to record agent workflow run reference", {

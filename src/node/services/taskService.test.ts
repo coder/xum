@@ -665,6 +665,14 @@ function createWorkspaceServiceMocks(
     mock((_workspaceId: string, _message: WorkspaceChatMessage) => undefined);
   const isWorkflowInvocationCurrent =
     overrides?.isWorkflowInvocationCurrent ?? mock(() => Promise.resolve(true));
+  // Derived from the boolean mock so tests that override isWorkflowInvocationCurrent keep
+  // steering the drain's three-state check.
+  const getWorkflowInvocationCurrentness = mock(
+    async (workspaceId: string, runId: string) =>
+      ((await isWorkflowInvocationCurrent(workspaceId, runId)) === true
+        ? "current"
+        : "not_current") as "current" | "not_current" | "indeterminate"
+  );
   const countQueuedAgentPeerMessages = overrides?.countQueuedAgentPeerMessages ?? mock(() => 0);
   // Granted by default (no live user activity): interrupt_active tests exercise the
   // interruption/archive flow; the hold's own refusal logic lives in workspaceService.test.ts.
@@ -728,6 +736,7 @@ function createWorkspaceServiceMocks(
       isExperimentEnabled,
       emitChatEvent,
       isWorkflowInvocationCurrent,
+      getWorkflowInvocationCurrentness,
       countQueuedAgentPeerMessages,
     } as unknown as WorkspaceService,
     create,
@@ -6237,6 +6246,50 @@ describe("TaskService", () => {
     expect(prompt).toContain("Workflow finished");
     expect(prompt).toContain(runId);
     expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
+  });
+
+  test("terminal workflow wake-up defers when history is unreadable", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_terminal_defer";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    // History unreadable at drain time: currentness is indeterminate, so the notification must
+    // stay pending for a later drain instead of being tombstoned as superseded.
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("indeterminate"));
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+
+    await taskService.enqueueWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "completed",
+    });
+    await flushTerminalAttentionDrains(taskService);
+
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(1);
   });
 
   test("initialize replays and clears persisted pending task guidance", async () => {

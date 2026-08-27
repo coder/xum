@@ -7893,7 +7893,9 @@ export class TaskService {
   private async buildWorkflowTerminalPrompt(
     ownerWorkspaceId: string,
     runId: string
-  ): Promise<string | null> {
+  ): Promise<
+    { outcome: "deliver"; prompt: string } | { outcome: "superseded" } | { outcome: "defer" }
+  > {
     assert(ownerWorkspaceId.length > 0, "buildWorkflowTerminalPrompt requires ownerWorkspaceId");
     assert(runId.length > 0, "buildWorkflowTerminalPrompt requires runId");
     const runStore = new WorkflowRunStore({
@@ -7908,25 +7910,39 @@ export class TaskService {
         runId,
         error: getErrorMessage(error),
       });
-      return null;
+      return { outcome: "superseded" };
     }
     if (
       run.workspaceId !== ownerWorkspaceId ||
       run.parentWorkflow != null ||
-      !isTerminalWorkflowRunStatus(run.status) ||
-      !(await this.workspaceService.isWorkflowInvocationCurrent(ownerWorkspaceId, run.id))
+      !isTerminalWorkflowRunStatus(run.status)
     ) {
-      return null;
+      return { outcome: "superseded" };
+    }
+    const currentness = await this.workspaceService.getWorkflowInvocationCurrentness(
+      ownerWorkspaceId,
+      run.id
+    );
+    // Indeterminate means history was unreadable, not that the run was superseded: tombstoning
+    // now would permanently drop the wake over a transient fault, so defer and retry instead.
+    if (currentness === "indeterminate") {
+      return { outcome: "defer" };
+    }
+    if (currentness === "not_current") {
+      return { outcome: "superseded" };
     }
     const scriptPath = run.workflow.sourcePath ?? run.workflow.name;
-    return buildWorkflowResultContextMessage({
-      rawCommand: `workflow_run ${scriptPath}`,
-      name: scriptPath,
-      runId: run.id,
-      status: run.status,
-      result: null,
-      run,
-    });
+    return {
+      outcome: "deliver",
+      prompt: buildWorkflowResultContextMessage({
+        rawCommand: `workflow_run ${scriptPath}`,
+        name: scriptPath,
+        runId: run.id,
+        status: run.status,
+        result: null,
+        run,
+      }),
+    };
   }
 
   private async ensureAgentTerminalMessages(
@@ -8242,7 +8258,19 @@ export class TaskService {
         ownerWorkspaceId,
         notification.sourceId
       );
-      if (workflowPrompt == null) {
+      if (workflowPrompt.outcome === "defer") {
+        // Currentness was indeterminate (history unreadable): keep the notification pending so
+        // the next drain trigger (a later terminal event, idle scheduling, or startup recovery)
+        // retries it, rather than permanently dropping the wake. No active reschedule here: an
+        // idle-wait resolves immediately on an idle owner and would busy-loop while the fault
+        // persists.
+        log.warn("Deferring workflow terminal attention; history unavailable", {
+          ownerWorkspaceId,
+          runId: notification.sourceId,
+        });
+        continue;
+      }
+      if (workflowPrompt.outcome === "superseded") {
         // Dropping a notify_on_terminal wake strands the run's owner; keep the drop diagnosable.
         log.warn("Dropping superseded workflow terminal attention", {
           ownerWorkspaceId,
@@ -8252,7 +8280,7 @@ export class TaskService {
         continue;
       }
       deliverableWorkflowNotificationIds.add(notification.id);
-      promptSections.push(workflowPrompt);
+      promptSections.push(workflowPrompt.prompt);
     }
 
     // Sub-agent reports and failures are already durable user-context messages. Resume from history

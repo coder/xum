@@ -694,6 +694,44 @@ describe("workflow_run tool", () => {
     expect(result).toEqual({ status: "running", runId: "wfr_background", result: null });
   });
 
+  test("records a rediscovery-only reference when the boundary snapshot fails", async () => {
+    using tempDir = new TestTempDir("test-workflow-run-tool-boundary-error");
+    const scriptPath = await writeWorkflowScript(tempDir.path);
+    const startWorkflowInBackground = mock(async () => ({
+      runId: "wfr_boundary_error",
+      status: "running" as const,
+      result: null,
+    }));
+    const getWorkflowInvocationBoundaryMessageId = mock(async () => {
+      throw new Error("history read failed");
+    });
+    const tool = createWorkflowRunTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      trusted: true,
+      taskService: { getWorkflowInvocationBoundaryMessageId } as unknown as TaskService,
+      workflowService: {
+        startWorkflow: mock(async () => {
+          throw new Error("foreground start should not be used");
+        }),
+        startWorkflowInBackground,
+        getRun: mock(async () => null),
+      },
+    });
+
+    const result = await tool.execute!(
+      { script_path: scriptPath, args: { topic: "workflow tools" }, run_in_background: true },
+      mockToolCallOptions
+    );
+    expect(result).toEqual({ status: "running", runId: "wfr_boundary_error", result: null });
+
+    // A read failure must not persist a verified-empty boundary (null): the entry keeps the run
+    // rediscoverable while a later resume re-record can repair provenance.
+    const references = await readAgentWorkflowRunReferences(tempDir.path);
+    expect(references).toHaveLength(1);
+    expect(references[0]?.runId).toBe("wfr_boundary_error");
+    expect(references[0] != null && "afterBoundaryMessageId" in references[0]).toBe(false);
+  });
+
   test("requires the workflow service", async () => {
     using tempDir = new TestTempDir("test-workflow-run-tool-missing");
     const scriptPath = await writeWorkflowScript(tempDir.path);
