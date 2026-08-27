@@ -8139,9 +8139,12 @@ export class WorkspaceService extends EventEmitter {
    * scope is the union of config buckets referenced by the input ids, so a
    * grouped drag never disturbs other buckets while a flat drag re-deals the
    * whole unified block. Defensive contract: unknown/unpinned ids are
-   * dropped, currently-pinned ids omitted from the input keep their relative
-   * order and are appended, so concurrent pin/unpin from other clients is
-   * absorbed instead of erroring.
+   * dropped, and partial inputs (e.g. the grouped multi-project section sends
+   * only its own pins, which can span project buckets) permute the requested
+   * ids among the slots they already occupy while every omitted pin keeps its
+   * current position, so a section drag never shifts unrelated chats in the
+   * flat global order and concurrent pin/unpin from other clients is absorbed
+   * instead of erroring.
    *
    * Persistence model: pinnedAt is an ordering key, so reordering re-deals the
    * existing pool of pinnedAt timestamps onto the new order (see
@@ -8187,21 +8190,22 @@ export class WorkspaceService extends EventEmitter {
         const currentSet = new Set(currentOrder);
 
         // Desired order: dedupe the input, keep only currently-pinned ids,
-        // then append omitted pins in their current relative order.
+        // then substitute the requested ids into the slots they currently
+        // occupy so omitted pins never move.
         const seen = new Set<string>();
-        const desiredOrder: string[] = [];
+        const requestedIds: string[] = [];
         for (const id of workspaceIds) {
           if (seen.has(id)) continue;
           seen.add(id);
           if (currentSet.has(id)) {
-            desiredOrder.push(id);
+            requestedIds.push(id);
           }
         }
-        for (const id of currentOrder) {
-          if (!seen.has(id)) {
-            desiredOrder.push(id);
-          }
-        }
+        const requestedSet = new Set(requestedIds);
+        let nextRequestedIndex = 0;
+        const desiredOrder = currentOrder.map((id) =>
+          requestedSet.has(id) ? requestedIds[nextRequestedIndex++] : id
+        );
         if (desiredOrder.every((id, index) => id === currentOrder[index])) {
           return config;
         }

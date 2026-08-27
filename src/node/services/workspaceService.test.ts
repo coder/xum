@@ -13556,9 +13556,10 @@ describe("WorkspaceService reorderPinned", () => {
     expect(emittedMetadata).toHaveLength(0);
   });
 
-  test("drops stale/unpinned/duplicate ids and appends omitted pins in current order", async () => {
+  test("drops stale/unpinned/duplicate ids and keeps omitted pins in place", async () => {
     // Client sends duplicates, an unpinned id, a sub-agent, an archived chat,
-    // and a ghost id, and omits B and C entirely.
+    // and a ghost id, and omits B entirely: C and A swap within the slots
+    // they occupy while omitted B keeps its position.
     const result = await workspaceService.reorderPinned([
       idC,
       idC,
@@ -13566,10 +13567,10 @@ describe("WorkspaceService reorderPinned", () => {
       childId,
       archivedId,
       "ws-ghost",
+      idA,
     ]);
     expect(result.success).toBe(true);
-    // C first, then omitted pins A, B keep their relative order.
-    expect(pinnedOrder()).toEqual([idC, idA, idB]);
+    expect(pinnedOrder()).toEqual([idC, idB, idA]);
     // Ineligible ids never gain pinnedAt.
     expect(getEntry(unpinnedId)?.pinnedAt).toBeUndefined();
     expect(getEntry(childId)?.pinnedAt).toBeUndefined();
@@ -13727,6 +13728,21 @@ describe("WorkspaceService reorderPinned across projects", () => {
 
     expect((await workspaceService.setPinned(idA3, true)).success).toBe(true);
     expect(globalPinnedOrder().at(-1)).toBe(idA3);
+  });
+
+  test("partial cross-bucket reorder keeps omitted pins in their global slots", async () => {
+    // The grouped multi-project section sends only its own pinned ids, which
+    // can live in different project buckets. Swapping b1 and a2 must not
+    // displace the ordinary pins a1 and b2 in the flat global order.
+    const a1Before = findEntry(idA1)?.entry.pinnedAt;
+    const b2Before = findEntry(idB2)?.entry.pinnedAt;
+
+    const result = await workspaceService.reorderPinned([idA2, idB1]);
+    expect(result.success).toBe(true);
+    expect(globalPinnedOrder()).toEqual([idA1, idA2, idB1, idB2]);
+    // The untouched slots keep their exact timestamps.
+    expect(findEntry(idA1)?.entry.pinnedAt).toBe(a1Before);
+    expect(findEntry(idB2)?.entry.pinnedAt).toBe(b2Before);
   });
 
   test("grouped-mode reorder of one bucket leaves other buckets' timestamps untouched", async () => {

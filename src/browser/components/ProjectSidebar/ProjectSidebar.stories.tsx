@@ -1,11 +1,15 @@
 import { fireEvent, userEvent, waitFor } from "@storybook/test";
 import type { AppStory } from "@/browser/stories/meta.js";
 import { PIXEL_DUAL_THEME, appMeta, AppWithMocks } from "@/browser/stories/meta.js";
-import { expandProjects } from "@/browser/stories/helpers/uiState";
+import {
+  clearWorkspaceSelection,
+  collapseRightSidebar,
+  expandProjects,
+} from "@/browser/stories/helpers/uiState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { SIDEBAR_FLAT_MODE_KEY } from "@/common/constants/storage";
+import { LEFT_SIDEBAR_COLLAPSED_KEY, SIDEBAR_FLAT_MODE_KEY } from "@/common/constants/storage";
 
 const PROJECT_PATH = "/home/user/projects/my-app";
 
@@ -302,13 +306,23 @@ export const WorkflowRunGroups: AppStory = {
 };
 
 export const FlatChatList: AppStory = {
+  // The flat list replaces the whole sidebar layout, so validate the compact
+  // badge/truncation behavior at the phone width alongside the laptop capture.
+  globals: {
+    viewport: { value: "mobile2", isRotated: false },
+  },
   parameters: {
-    pixel: { matrix: PIXEL_DUAL_THEME },
+    pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone", "laptop"] } },
   },
   render: () => (
     <AppWithMocks
       setup={() => {
         updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+        // Keep the sidebar visible at the phone width: no selected workspace
+        // (mobile shows the chat over the sidebar) and the sidebar expanded.
+        clearWorkspaceSelection();
+        collapseRightSidebar();
+        updatePersistedState(LEFT_SIDEBAR_COLLAPSED_KEY, false);
         const workspaces = [
           createWorkspace({
             id: "alpha-pinned",
@@ -352,6 +366,23 @@ export const FlatChatList: AppStory = {
       }}
     />
   ),
+  // Contract: the flat list (badges) and the project management headers are
+  // actually on screen, so a viewport variant cannot silently snapshot the
+  // wrong UI (e.g. the sidebar hidden behind a selected chat on mobile).
+  play: async ({ canvasElement }: { canvasElement: HTMLElement }) => {
+    await waitFor(() => {
+      if (!canvasElement.querySelector('[data-testid="workspace-project-badge-alpha-pinned"]')) {
+        throw new Error("Expected a project badge on a flat-list chat row");
+      }
+      if (
+        !canvasElement.querySelector(
+          'button[aria-label="Project options for alpha-application-with-a-long-name"]'
+        )
+      ) {
+        throw new Error("Expected project management headers below the flat list");
+      }
+    });
+  },
 };
 // Pinned chats sort by pinnedAt (user-reorderable), not by name or recency:
 // the pinned block deliberately renders as charlie, alpha, bravo while the

@@ -812,8 +812,14 @@ describe("ProjectSidebar scratch chats", () => {
     );
 
     expect(view.queryByLabelText("Expand project alpha")).toBeNull();
-    expect(view.getByText("Alpha Project")).toBeTruthy();
-    expect(view.getByText("Beta Project")).toBeTruthy();
+    // Badge names are asserted inside their rows: the project management
+    // headers below the flat list repeat the display names.
+    expect(
+      within(view.getByTestId(agentItemTestId("alpha"))).getByText("Alpha Project")
+    ).toBeTruthy();
+    expect(
+      within(view.getByTestId(agentItemTestId("beta"))).getByText("Beta Project")
+    ).toBeTruthy();
     const workspaceRows = Array.from(
       view.container.querySelectorAll('[data-testid^="agent-item-"]')
     );
@@ -935,6 +941,34 @@ describe("ProjectSidebar flat chat list", () => {
 
     expect(view.getByTestId(agentItemTestId("single"))).toBeTruthy();
     expect(view.queryByTestId(agentItemTestId("multi"))).toBeNull();
+  });
+
+  test("keeps project management headers reachable in flat mode without nesting chats", () => {
+    const workspace = {
+      ...createWorkspace("solo", { title: "Solo chat" }),
+      projects: singleProjectRefs,
+    };
+    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+    // Grouped-mode expansion state must not nest chats under flat headers.
+    updatePersistedState(EXPANDED_PROJECTS_KEY, ["/projects/demo-project"]);
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [workspace]]])}
+        workspaceRecency={{ solo: Date.now() }}
+      />
+    );
+
+    // Per-project creation and the options menu stay reachable via the
+    // compact header row; the expansion chevron is grouped-mode only.
+    expect(view.getByLabelText("Create workspace in demo-project")).toBeTruthy();
+    expect(view.getByLabelText("Project options for demo-project")).toBeTruthy();
+    expect(view.queryByLabelText("Expand project demo-project")).toBeNull();
+    expect(view.queryByLabelText("Collapse project demo-project")).toBeNull();
+    // The chat renders once in the flat list, never nested under the header.
+    expect(view.getAllByTestId(agentItemTestId("solo"))).toHaveLength(1);
   });
 
   test("coalesces best-of children into a task group in the flat list", () => {
