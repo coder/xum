@@ -850,6 +850,15 @@ export class ExtensionMetadataService {
     // workspace's data. Defaults to getKnownWorkspaceIds.
     recheckKnownWorkspaceIds?: () => Promise<ReadonlySet<string>>
   ): Promise<number> {
+    // Reconcile a crash-stranded sidecar FIRST (outside the mutation queue —
+    // the resume path serializes itself): the prune classifies stale ids
+    // against the file it loads, so sidecar-only entries would dodge the
+    // one-time deletion set and merge back into the main file on the very
+    // next read — with the prune latched, exactly the stale entries this
+    // cleanup exists to remove would keep inflating every read and rewrite
+    // until restart. A failing reconcile propagates so the caller's
+    // fail-closed abort applies instead of pruning against a partial view.
+    await this.reconcileLeftoverSidecarIfPresent();
     return this.withSerializedMutation(async () => {
       const data = await this.load();
       const knownWorkspaceIds = await getKnownWorkspaceIds();

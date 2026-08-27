@@ -5574,6 +5574,119 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("first prune also removes stale entries stranded in a sidecar", async () => {
+    // Crash strands the full snapshot in .corrupt while a valid partial main
+    // was recreated. The one-time prune must reconcile FIRST: sidecar-only
+    // stale entries would otherwise dodge the deletion set and merge back on
+    // the very next read — with the prune latched, they would keep inflating
+    // every read and rewrite until restart.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "sidecar-live";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const metadataPath = path.join(config.rootDir, "extensionMetadata.json");
+      await fsPromises.writeFile(
+        metadataPath,
+        JSON.stringify({
+          version: 1,
+          workspaces: { [workspaceId]: { recency: 100, streaming: false } },
+        })
+      );
+      await fsPromises.writeFile(
+        `${metadataPath}.corrupt`,
+        JSON.stringify({
+          version: 1,
+          workspaces: {
+            [workspaceId]: { recency: 90, streaming: false },
+            "sidecar-stale": { recency: 80, streaming: false },
+          },
+        })
+      );
+      const extensionMetadata = new ExtensionMetadataService(metadataPath);
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+
+      const activityList = await workspaceService.getActivityList();
+      expect(activityList).not.toBeNull();
+      expect(activityList?.["sidecar-stale"]).toBeUndefined();
+
+      const snapshots = await extensionMetadata.getAllSnapshots({ throwOnError: true });
+      expect(snapshots.get(workspaceId)?.recency).toBe(100);
+      expect(snapshots.has("sidecar-stale")).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("late-admitted raw-registered ids keep their initial snapshot when re-reads fail", async () => {
+    // A raw-registered entry outside the normalized scope (invalid project
+    // path) is admitted through the raw config view. When both mid-list
+    // snapshot re-reads fail transiently, the already-loaded initial
+    // snapshot must still supply its recency/goal/status — an authoritative
+    // response omitting the entry would clear that renderer state with no
+    // repair event.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "raw-only-live";
+      const projectPath = path.join(config.rootDir, "project");
+      // A null project path survives the raw id scan but is dropped by the
+      // normalized enumeration, keeping the id out of the per-id scope.
+      await fsPromises.writeFile(
+        path.join(config.rootDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [null, { workspaces: [{ id: workspaceId, path: path.join(projectPath, "ws") }] }],
+          ],
+        })
+      );
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency(workspaceId, 42);
+      const realGetAllSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      let snapshotCalls = 0;
+      const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(
+        async (options?: { throwOnError?: boolean }) => {
+          snapshotCalls += 1;
+          // List #1 (prune latch): initial + fresh reads stay real. List #2:
+          // the initial read (call 3) succeeds; the fresh and final re-reads
+          // fail transiently.
+          if (snapshotCalls > 3) {
+            throw new Error("transient snapshot re-read failure");
+          }
+          return realGetAllSnapshots(options);
+        }
+      );
+      try {
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+        const firstList = await workspaceService.getActivityList();
+        expect(firstList?.[workspaceId]?.recency).toBe(42);
+
+        const secondList = await workspaceService.getActivityList();
+        expect(secondList).not.toBeNull();
+        expect(secondList?.[workspaceId]?.recency).toBe(42);
+      } finally {
+        snapshotsSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("first bootstrap reuses the prune's config enumeration for scoping", async () => {
     // getAllWorkspaceMetadata walks every workspace with per-workspace disk
     // probes; the latency-sensitive first bootstrap must not pay it twice.

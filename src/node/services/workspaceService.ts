@@ -13945,10 +13945,18 @@ export class WorkspaceService extends EventEmitter {
             }
           }
           for (const [workspaceId, activeWorkflowRunIds] of probedWorkflowRunIds) {
+            // Freshest available view, degrading to the INITIAL read: a raw-
+            // registered id outside the normalized scope (e.g. invalid
+            // project path) is admitted here, and when both re-reads failed
+            // transiently its already-loaded initial snapshot must still
+            // supply goal/status/recency — omitting it from an authoritative
+            // response would clear that renderer state with no repair event.
             const lateSnapshot =
               finalSnapshots != null
                 ? (finalSnapshots.get(workspaceId) ?? null)
-                : (freshSnapshots?.get(workspaceId) ?? null);
+                : freshSnapshots != null
+                  ? (freshSnapshots.get(workspaceId) ?? null)
+                  : (snapshots.get(workspaceId) ?? null);
             if (
               // Nothing to contribute: no persisted snapshot and no live
               // counts (a workflow-only candidate legitimately has no
