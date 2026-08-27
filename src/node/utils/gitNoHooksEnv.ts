@@ -77,6 +77,8 @@ export function gitNoRepoAutomationEnv(): Record<string, string> {
     GIT_SSH_COMMAND: "ssh",
     // Exclude ext:: and unknown remote helpers while retaining standard transports.
     GIT_ALLOW_PROTOCOL: "file:http:https:ssh:git",
+    GIT_EDITOR: ":",
+    GIT_SEQUENCE_EDITOR: ":",
   };
   for (const name of providerSecretEnvVarNames()) {
     env[name] = "";

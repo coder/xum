@@ -83,6 +83,8 @@ describe("gitNoRepoAutomationEnv", () => {
     // Environment beats repo-config core.sshCommand.
     expect(env.GIT_SSH_COMMAND).toBe("ssh");
     expect(env.GIT_ALLOW_PROTOCOL).toBe("file:http:https:ssh:git");
+    expect(env.GIT_EDITOR).toBe(":");
+    expect(env.GIT_SEQUENCE_EDITOR).toBe(":");
   });
 
   test("blanks provider secret env vars so leaked processes capture nothing", () => {
@@ -302,6 +304,62 @@ describe("gitNoRepoAutomationEnv", () => {
       .quiet()
       .nothrow();
     expect(result.exitCode).toBe(0);
+    const markerExists = await fs.access(marker).then(
+      () => true,
+      () => false
+    );
+    expect(markerExists).toBe(false);
+  });
+
+  test("disables repo-configured commit editors", async () => {
+    using tmp = new DisposableTempDir("git-editor-automation-off");
+    const repo = path.join(tmp.path, "repo");
+    const marker = path.join(tmp.path, "editor-ran");
+    const editor = path.join(tmp.path, "editor.sh");
+    await fs.mkdir(repo, { recursive: true });
+    await Bun.$`git init`.cwd(repo).quiet();
+    await Bun.$`git config user.email test@example.com`.cwd(repo).quiet();
+    await Bun.$`git config user.name Test`.cwd(repo).quiet();
+    await fs.writeFile(
+      editor,
+      `#!/bin/sh\ntouch "${marker}"\nprintf 'unsafe message\n' > "$1"\n`,
+      "utf-8"
+    );
+    await fs.chmod(editor, 0o755);
+    await Bun.$`git config core.editor ${editor}`.cwd(repo).quiet();
+
+    const previousEditor = process.env.GIT_EDITOR;
+    const previousSequenceEditor = process.env.GIT_SEQUENCE_EDITOR;
+    delete process.env.GIT_EDITOR;
+    delete process.env.GIT_SEQUENCE_EDITOR;
+    try {
+      await Bun.$`git commit --allow-empty`.cwd(repo).quiet().nothrow();
+    } finally {
+      if (previousEditor == null) delete process.env.GIT_EDITOR;
+      else process.env.GIT_EDITOR = previousEditor;
+      if (previousSequenceEditor == null) delete process.env.GIT_SEQUENCE_EDITOR;
+      else process.env.GIT_SEQUENCE_EDITOR = previousSequenceEditor;
+    }
+    await fs.access(marker);
+    await fs.rm(marker);
+
+    delete process.env.GIT_EDITOR;
+    delete process.env.GIT_SEQUENCE_EDITOR;
+    let exitCode: number;
+    try {
+      const result = await Bun.$`git commit --allow-empty`
+        .cwd(repo)
+        .env({ ...process.env, ...gitNoRepoAutomationEnv() })
+        .quiet()
+        .nothrow();
+      exitCode = result.exitCode;
+    } finally {
+      if (previousEditor == null) delete process.env.GIT_EDITOR;
+      else process.env.GIT_EDITOR = previousEditor;
+      if (previousSequenceEditor == null) delete process.env.GIT_SEQUENCE_EDITOR;
+      else process.env.GIT_SEQUENCE_EDITOR = previousSequenceEditor;
+    }
+    expect(exitCode).not.toBe(0);
     const markerExists = await fs.access(marker).then(
       () => true,
       () => false

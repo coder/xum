@@ -925,7 +925,11 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
       if (!gitHooksAllowed(config.trusted)) {
         const repoPaths =
           config.projects != null && config.projects.length > 0
-            ? [...new Set(config.projects.map((project) => project.projectPath))]
+            ? [
+                ...new Set(
+                  config.projects.map((project) => path.join(config.cwd, project.projectName))
+                ),
+              ]
             : [config.cwd];
         const repoEnvs: Array<Record<string, string>> = [];
         for (const repoPath of repoPaths) {

@@ -1634,8 +1634,10 @@ describe("remote bash git hardening", () => {
     const runtime = {
       exec(command: string, options: ExecOptions): Promise<ExecStream> {
         calls.push({ command, options });
-        if (options.cwd === "/remote/project-a") return Promise.resolve(createExecStream("", 1));
-        if (options.cwd === "/remote/project-b") {
+        if (options.cwd === "/remote/workspace/project-a") {
+          return Promise.resolve(createExecStream("", 1));
+        }
+        if (options.cwd === "/remote/workspace/project-b") {
           return Promise.resolve(createExecStream("filter.evil.smudge\0filter.evil.required\0"));
         }
         return Promise.resolve(createExecStream("done\n"));
@@ -1663,8 +1665,8 @@ describe("remote bash git hardening", () => {
 
     expect(result.success).toBe(true);
     expect(calls).toHaveLength(3);
-    expect(calls[0]?.options.cwd).toBe("/remote/project-a");
-    expect(calls[1]?.options.cwd).toBe("/remote/project-b");
+    expect(calls[0]?.options.cwd).toBe("/remote/workspace/project-a");
+    expect(calls[1]?.options.cwd).toBe("/remote/workspace/project-b");
     expect(calls[2]?.options.env?.ANTHROPIC_API_KEY).toBe("");
     expect(Object.values(calls[2]?.options.env ?? {})).toContain("filter.evil.smudge");
   });
