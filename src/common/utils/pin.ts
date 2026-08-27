@@ -103,7 +103,11 @@ export function appendPinnedTimestamp(
     pinned.map((entry) => entry.pinnedAt),
     nowMs
   );
-  if (!pinned.some((entry) => entry.pinnedAt === pinnedAt)) {
+  // Collision detection compares parsed values: JavaScript accepts multiple
+  // string representations of the same capped millisecond, so raw string
+  // equality would miss noncanonical duplicates.
+  const pinnedAtMs = new Date(pinnedAt).getTime();
+  if (!pinned.some((entry) => pinnedAtMsForSuccessorScan(entry.pinnedAt) === pinnedAtMs)) {
     return { changed: new Map(), pinnedAt };
   }
   const order = pinned.filter((entry) => entry.pinnedAt).sort(comparePinnedOrderLoose);

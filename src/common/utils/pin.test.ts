@@ -60,6 +60,20 @@ describe("appendPinnedTimestamp", () => {
     expect(pinnedAt).toBe("2026-01-03T00:00:00.001Z");
   });
 
+  it("detects capped collisions by parsed value, not string equality", () => {
+    const capMs = 8_640_000_000_000_000 - 1;
+    // Noncanonical representation of the cap (offset form instead of Z).
+    const noncanonicalCap = "+275760-09-12T23:59:59.999+00:00";
+    expect(new Date(noncanonicalCap).getTime()).toBe(capMs);
+    const nowMs = Date.parse("2026-01-01T00:00:00.000Z");
+    const { changed, pinnedAt } = appendPinnedTimestamp(
+      [{ id: "capped", pinnedAt: noncanonicalCap }],
+      nowMs
+    );
+    expect(pinnedAt).toBe(new Date(nowMs).toISOString());
+    expect(changed.get("capped")).toBe(new Date(nowMs - 1).toISOString());
+  });
+
   it("renumbers all pins when the sane key range saturates, keeping keys unique and ordered", () => {
     const saneMax = new Date(8_640_000_000_000_000 - 1).toISOString();
     const nowMs = Date.parse("2026-01-01T00:00:00.000Z");
