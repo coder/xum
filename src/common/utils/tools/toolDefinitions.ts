@@ -1544,6 +1544,13 @@ export const WorkflowRunToolArgsSchema = z
         "Defaults to false. Prefer foreground mode for a single workflow; when the returned status is completed, the result is available directly. " +
           "Set true only when you will start another workflow/task or do independent work while it runs. If workflow_run returns status=running or status=backgrounded, await the returned runId with task_await before using the result."
       ),
+    allow_concurrent: z
+      .boolean()
+      .nullish()
+      .describe(
+        "Pass true only to intentionally start another active run of the same script in this workspace. " +
+          "By default workflow_run refuses when the same script already has an active (pending/running/backgrounded) run and reports that run so you can task_await or workflow_resume it instead of duplicating it."
+      ),
   })
   .strict()
   .superRefine((args, ctx) => {
@@ -2470,6 +2477,7 @@ export const TOOL_DEFINITIONS = {
     // Prefer foreground workflows so callers do not waste a turn polling when no other work can proceed.
     description:
       "Start a durable workflow run from exactly one launch source: script_path for a JavaScript file/skill workflow, or script_source for compact one-off inline workflow source. Workflows coordinate delegated agent tasks and preserve run state for replay/resume. " +
+      "An active run of the same script in this workspace blocks a duplicate start unless allow_concurrent=true; reattach to the reported run with task_await or workflow_resume instead of relaunching it. " +
       "Prefer script_path for reusable, reviewable, shared, slash/CLI-invokable, or skill-packaged workflows; use script_source for one-off conductors whose exact source should be snapshotted into the durable run. " +
       "When a skill, instruction block, or plan describes a multi-phase, looping, or multi-agent process in prose and ships no packaged workflow script, prefer codifying that process as a one-off script_source workflow over executing every phase in-context: " +
       "the conductor follows the documented phases more faithfully and gains durable checkpoints, resume, and fresh delegated context per phase. " +
