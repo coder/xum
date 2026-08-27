@@ -619,6 +619,29 @@ describe("backup payload", () => {
     expect((blocked as BackupCredentialDetectedError).files).toEqual(["mcp.jsonc"]);
   });
 
+  it("blocks the export when an empty expansion splices a known credential token", async () => {
+    // Bash expands the unset positional to nothing, joining the fragments.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          grafana: { command: "mcp-grafana --token ghp_1234567890$912345678901234567890" },
+        },
+      })
+    );
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+    expect((blocked as BackupCredentialDetectedError).files).toEqual(["mcp.jsonc"]);
+  });
+
   it("keeps digit-free sk- placeholders reviewable instead of hard-blocking", async () => {
     await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", "Use sk-your-api-key-here to start\n");
     // The reviewable scan still flags it, so the digest approval path stays intact.

@@ -1656,7 +1656,11 @@ export async function createBackupPayload(
         // fragments, and this block has no override.
         if (file.path === "mcp.jsonc") {
           for (const text of collectStringValues(jsonc.parse(content))) {
-            targets.push(text.replace(/\\\r?\n/g, "").replace(/[\\'"]/g, ""));
+            const joined = text.replace(/\\\r?\n/g, "").replace(/[\\'"]/g, "");
+            targets.push(joined);
+            // A simple parameter expansion that is unset at runtime vanishes
+            // (`ghp_...$9123...`), splicing the fragments around it into one token.
+            targets.push(joined.replace(/\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?!$-])/g, ""));
           }
         }
         return CREDENTIAL_TOKEN_PATTERNS.some((pattern) =>
