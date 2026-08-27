@@ -9,7 +9,7 @@ import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { askUserQuestionManager } from "./askUserQuestionManager";
 import { WorkspaceLifecycleHooks } from "./workspaceLifecycleHooks";
 import { EventEmitter } from "events";
-import { existsSync } from "fs";
+import { existsSync, writeFileSync } from "fs";
 import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
 import path from "path";
@@ -5804,6 +5804,94 @@ describe("WorkspaceService activity list scoping", () => {
       } finally {
         enumerationSpy.mockRestore();
         evidenceSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("final enumeration proves removal when the post-probe raw read fails", async () => {
+    // An inline-id workspace is deregistered by another backend while the
+    // late-candidate workflow probes await, and the post-probe raw reads
+    // fail transiently. Without the enumeration fallback every raw
+    // deregistration guard is disabled (finalConfigIds null) and the stale
+    // retained entry rides the authoritative response with no cross-process
+    // event to repair it.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const removedId = "inline-removed-final";
+      const survivorId = "inline-survivor-final";
+      const lateId = "late-registered-final";
+      const projectPath = path.join(config.rootDir, "project");
+      const configPath = path.join(config.rootDir, "config.json");
+      const configFor = (ids: string[]): string =>
+        JSON.stringify({
+          projects: [
+            [
+              projectPath,
+              { workspaces: ids.map((id) => ({ id, path: path.join(projectPath, id) })) },
+            ],
+          ],
+          // Migration flags pre-seeded so the first load never schedules the
+          // async settings-migration persist mid-test.
+          taskSettings: { preserveSubagentsUntilArchive: true },
+          migrations: { persistentSubagentsDefaulted: true, defaultModelFallbacksSeeded: true },
+        });
+      await fsPromises.writeFile(configPath, configFor([removedId, survivorId]));
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency(removedId, 77);
+      await extensionMetadata.updateRecency(survivorId, 55);
+      // Fresh snapshot re-read (call 2) doubles as the moment "another
+      // backend" registers a new workspace: its id enters the fresh raw
+      // view outside the initial scope, forcing the late-candidate probes
+      // and with them the final post-probe views this test exercises.
+      const realGetAllSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
+      let snapshotCalls = 0;
+      const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(
+        async (options?: { throwOnError?: boolean }) => {
+          snapshotCalls += 1;
+          if (snapshotCalls === 2) {
+            await fsPromises.writeFile(configPath, configFor([removedId, survivorId, lateId]));
+          }
+          return realGetAllSnapshots(options);
+        }
+      );
+      // Raw superset reads: #1 initial baseline, #2 prune enumeration
+      // union, #3 post-prune scope refresh. Call #4 is the post-probe read
+      // — the concurrent deregistration lands just before it and every
+      // later raw read fails transiently, so only the fallback enumeration
+      // can prove the removal.
+      const realSuperset = config.readPersistedWorkspaceIdSuperset.bind(config);
+      let supersetCalls = 0;
+      const supersetSpy = spyOn(config, "readPersistedWorkspaceIdSuperset").mockImplementation(
+        () => {
+          supersetCalls += 1;
+          if (supersetCalls >= 4) {
+            if (supersetCalls === 4) {
+              writeFileSync(configPath, configFor([survivorId, lateId]));
+            }
+            throw new Error("transient raw config read failure");
+          }
+          return realSuperset();
+        }
+      );
+      try {
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList).not.toBeNull();
+        expect(activityList?.[survivorId]?.recency).toBe(55);
+        // The enumeration-proven removal is dropped despite the raw view
+        // being unreadable.
+        expect(activityList?.[removedId]).toBeUndefined();
+      } finally {
+        snapshotsSpy.mockRestore();
+        supersetSpy.mockRestore();
       }
     } finally {
       await cleanup();

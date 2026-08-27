@@ -13904,13 +13904,27 @@ export class WorkspaceService extends EventEmitter {
           const isRawInvisible = (workspaceId: string): boolean =>
             !(initialConfigIds?.has(workspaceId) ?? false) &&
             !(freshConfigIds?.has(workspaceId) ?? false);
+          let finalConfigIds: ReadonlySet<string> | null = null;
+          try {
+            finalConfigIds = this.config.readPersistedWorkspaceIdSuperset();
+          } catch {
+            finalConfigIds = null;
+          }
           if (
             Array.from(probedWorkflowRunIds.keys()).some(isRawInvisible) ||
             // Retained entries are re-filtered with the final views below
             // (they were admitted before the probes awaited), and a
             // raw-invisible retained id's removal is provable only through
             // the same fresh enumeration.
-            Object.keys(activityById).some(isRawInvisible)
+            Object.keys(activityById).some(isRawInvisible) ||
+            // A transiently unreadable post-probe raw view would otherwise
+            // disable the raw deregistration guards below entirely: an
+            // inline-id workspace deregistered during the probes (its
+            // metadata key not yet cleaned up) would ride the response with
+            // no cross-process event to repair it. The enumeration
+            // substitutes as removal evidence for ids the scope enumeration
+            // vouched for.
+            finalConfigIds == null
           ) {
             try {
               finalAuthoritativeIds = await this.enumerateAuthoritativeWorkspaceIds();
@@ -13920,14 +13934,15 @@ export class WorkspaceService extends EventEmitter {
               });
               finalAuthoritativeIds = null;
             }
-          }
-          // Read last (synchronous), after every await above, so the raw
-          // deregistration guard sees the freshest possible view.
-          let finalConfigIds: ReadonlySet<string> | null = null;
-          try {
-            finalConfigIds = this.config.readPersistedWorkspaceIdSuperset();
-          } catch {
-            finalConfigIds = null;
+            // Re-read the raw view after the enumeration await so the raw
+            // deregistration guards see the freshest possible view; on a
+            // repeat failure keep the earlier successful read (still a
+            // valid post-probe view) rather than degrading to null.
+            try {
+              finalConfigIds = this.config.readPersistedWorkspaceIdSuperset();
+            } catch {
+              // Keep the pre-enumeration read (possibly null).
+            }
           }
           // The retained-entry filter above ran BEFORE the workflow probes,
           // so a removal landing during those awaits is invisible to every
@@ -13959,6 +13974,15 @@ export class WorkspaceService extends EventEmitter {
               (isRawInvisible(workspaceId) &&
                 !(finalConfigIds?.has(workspaceId) ?? false) &&
                 finalAuthoritativeIds != null &&
+                !finalAuthoritativeIds.has(workspaceId)) ||
+              // Raw view unreadable post-probe: the fallback enumeration
+              // substitutes as removal evidence, but only for ids the scope
+              // enumeration itself vouched for — raw-only ids are
+              // enumeration-invisible by design and stay retained on
+              // transient read failures.
+              (finalConfigIds == null &&
+                finalAuthoritativeIds != null &&
+                (scopeEnumerationIds?.has(workspaceId) ?? false) &&
                 !finalAuthoritativeIds.has(workspaceId))
             ) {
               delete activityById[workspaceId];
@@ -14013,6 +14037,14 @@ export class WorkspaceService extends EventEmitter {
                 !(freshConfigIds?.has(workspaceId) ?? false) &&
                 !(finalConfigIds?.has(workspaceId) ?? false) &&
                 finalAuthoritativeIds != null &&
+                !finalAuthoritativeIds.has(workspaceId)) ||
+              // Raw view unreadable post-probe: same enumeration fallback
+              // as the retained-entry filter, scoped to ids the scope
+              // enumeration vouched for (raw-only ids stay admitted on
+              // transient read failures — see lateSnapshot above).
+              (finalConfigIds == null &&
+                finalAuthoritativeIds != null &&
+                (scopeEnumerationIds?.has(workspaceId) ?? false) &&
                 !finalAuthoritativeIds.has(workspaceId))
             ) {
               continue;

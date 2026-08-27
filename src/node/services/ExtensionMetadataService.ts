@@ -85,6 +85,16 @@ export class ExtensionMetadataService {
    * other's live claims; stranded claims are discovered by this prefix.
    */
   private static readonly CLAIM_INFIX = ".corrupt-claim-";
+
+  /**
+   * Name infix a claim is renamed to once its bytes are verified to match
+   * the generation the caller reconciled — i.e. the bytes are proven
+   * represented at the main path. Discovery DELETES these instead of
+   * replaying them: re-merging already-reconciled bytes would re-fill
+   * fields another backend explicitly cleared to null in the meantime
+   * (the merge's null-fill rule is not idempotent across clears).
+   */
+  private static readonly CONSUMED_INFIX = ".corrupt-consumed-";
   private mutationQueue: Promise<void> = Promise.resolve();
   /**
    * Per-process write tombstones for removed workspaces. Workspace removal
@@ -416,8 +426,24 @@ export class ExtensionMetadataService {
       await this.reconcileRecreatedMainWithSidecar(claimPath);
       return;
     }
+    // Matched: the claim's bytes are proven represented at the main path.
+    // Mark them consumed BEFORE deleting so a crash between the two steps
+    // strands a file discovery deletes rather than replays (a replayed
+    // merge would re-fill fields another backend explicitly cleared to
+    // null after passing its own claim scan). The residual replay window
+    // shrinks to the claim-rename → consumed-rename gap above, part of the
+    // documented unlocked-shared-file boundary.
+    const consumedPath = `${this.filePath}${ExtensionMetadataService.CONSUMED_INFIX}${process.pid}-${randomUUID()}`;
     try {
-      await unlink(claimPath);
+      await rename(claimPath, consumedPath);
+    } catch (renameError) {
+      if (ExtensionMetadataService.isErrnoCode(renameError, "ENOENT")) {
+        return; // A concurrent discovery already took the claim.
+      }
+      throw renameError;
+    }
+    try {
+      await unlink(consumedPath);
     } catch (unlinkError) {
       if (!ExtensionMetadataService.isErrnoCode(unlinkError, "ENOENT")) {
         throw unlinkError;
@@ -464,9 +490,27 @@ export class ExtensionMetadataService {
     // stranded claims by prefix (one readdir next to the full-file read the
     // caller already does); an unreadable directory propagates so the read
     // stays retryable rather than vouching for a possibly partial main.
-    const claimNames = (await readdir(dirname(this.filePath))).filter((name) =>
+    const dirNames = await readdir(dirname(this.filePath));
+    const claimNames = dirNames.filter((name) =>
       name.startsWith(`${basename(this.filePath)}${ExtensionMetadataService.CLAIM_INFIX}`)
     );
+    // Consumed markers hold bytes PROVEN represented at the main path (a
+    // crash landed between the consumed-rename and the unlink): delete,
+    // never replay — a re-merge would re-fill fields another backend
+    // explicitly cleared to null since. Cleanup failures are logged, not
+    // propagated: dead bytes cannot compromise a read, and the next pass
+    // retries the unlink.
+    for (const consumedName of dirNames.filter((name) =>
+      name.startsWith(`${basename(this.filePath)}${ExtensionMetadataService.CONSUMED_INFIX}`)
+    )) {
+      try {
+        await unlink(join(dirname(this.filePath), consumedName));
+      } catch (unlinkError) {
+        if (!ExtensionMetadataService.isErrnoCode(unlinkError, "ENOENT")) {
+          log.debug("Failed to clean up consumed quarantine claim", { consumedName, unlinkError });
+        }
+      }
+    }
     if (claimNames.length === 0) {
       return false;
     }

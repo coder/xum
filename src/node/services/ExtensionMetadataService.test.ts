@@ -1194,6 +1194,33 @@ describe("ExtensionMetadataService", () => {
     expect((await readdir(tempDir)).filter((name) => name.includes(".corrupt-claim-"))).toEqual([]);
   });
 
+  test("stranded consumed claims are deleted without replay", async () => {
+    // A crash between the consumed-rename and the unlink strands a marker
+    // whose bytes are PROVEN represented at the main path. Replaying the
+    // merge would re-fill fields another backend explicitly cleared to
+    // null since (the null-fill merge is not idempotent across clears) —
+    // and resurrect entries pruning already reclaimed. Discovery must
+    // delete the marker, never merge it.
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-live": { recency: 900, streaming: false } },
+      })
+    );
+    await writeFile(
+      `${filePath}.corrupt-consumed-123-stranded`,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-reclaimed": { recency: 700, streaming: false } },
+      })
+    );
+    const snapshots = await service.getAllSnapshots({ throwOnError: true });
+    expect(snapshots.has("ws-reclaimed")).toBe(false);
+    expect(snapshots.get("ws-live")?.recency).toBe(900);
+    expect((await readdir(tempDir)).filter((n) => n.includes(".corrupt-consumed-"))).toEqual([]);
+  });
+
   test("a strict per-workspace read self-heals deterministic corruption", async () => {
     // Live emissions read per-workspace snapshots after the subscription
     // bootstraps. If the file becomes deterministically corrupt afterwards,

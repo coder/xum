@@ -2749,6 +2749,17 @@ export class Config {
               // to the catch below instead of silently substituting the
               // generated legacy path id via the !metadataFound branch.
               if (!isEnoentError(readError)) {
+                // Secondary-candidate failure with a usable canonical
+                // record already in hand: lenient loads keep the canonical
+                // identity instead of discarding it for skeletal path-id
+                // fallback metadata (which would surface the workspace
+                // under the WRONG id with its session history apparently
+                // missing). Destructive strict enumeration still fails
+                // closed — the unreadable alias file may hide a registered
+                // identity.
+                if (legacyMetadataRaw !== undefined && !options?.throwOnError) {
+                  continue;
+                }
                 throw readError;
               }
               continue;

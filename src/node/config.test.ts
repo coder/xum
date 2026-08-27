@@ -968,6 +968,58 @@ describe("Config", () => {
       const loaded = new Config(tempDir).loadConfigOrDefault({ throwOnError: true });
       expect(loaded.projects.size).toBe(0);
     });
+
+    it("keeps the canonical legacy identity when a secondary alias file is unreadable in lenient loads", async () => {
+      // An id-less legacy entry with a HEALTHY canonical (generated-legacy)
+      // metadata file and an unreadable basename-backed second candidate:
+      // lenient loads must keep the canonical identity instead of
+      // discarding it for skeletal path-id fallback metadata (which would
+      // surface the workspace under the WRONG id with its session history
+      // apparently missing). Strict enumeration still fails closed — the
+      // unreadable alias may hide a registered identity.
+      const projectPath = "/repo";
+      const workspacePath = "/repo/legacy-ws";
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
+          // Migration flags pre-seeded so the first load never schedules the
+          // async settings-migration persist mid-test.
+          taskSettings: { preserveSubagentsUntilArchive: true },
+          migrations: { persistentSubagentsDefaulted: true, defaultModelFallbacksSeeded: true },
+        })
+      );
+      const config = new Config(tempDir);
+      const canonicalId = (
+        config as unknown as {
+          generateLegacyId(projectPath: string, workspacePath: string): string;
+        }
+      ).generateLegacyId(projectPath, workspacePath);
+      const canonicalDir = config.getSessionDir(canonicalId);
+      fs.mkdirSync(canonicalDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(canonicalDir, "metadata.json"),
+        JSON.stringify({ id: "stable-canonical-id", name: "legacy-ws" })
+      );
+      // Basename-backed second candidate is unreadable: a directory at the
+      // metadata.json path fails reads with EISDIR (non-ENOENT).
+      fs.mkdirSync(path.join(config.getSessionDir("legacy-ws"), "metadata.json"), {
+        recursive: true,
+      });
+
+      let strictRejected = false;
+      try {
+        await config.getAllWorkspaceMetadata({ throwOnError: true });
+      } catch {
+        strictRejected = true;
+      }
+      expect(strictRejected).toBe(true);
+
+      const lenient = await config.getAllWorkspaceMetadata();
+      const lenientIds = lenient.map((metadata) => metadata.id);
+      expect(lenientIds).toContain("stable-canonical-id");
+      expect(lenientIds).not.toContain(canonicalId);
+    });
   });
 
   describe("readPersistedWorkspaceIdSuperset", () => {
