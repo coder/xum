@@ -1145,6 +1145,7 @@ describe("backup payload", () => {
     // stays portable...
     for (const command of [
       "mcp-server --pattern '$(date)'",
+      "mcp-server --pattern '@(x|y)'",
       "mcp-server # regenerate with $(date)",
       "mcp-server \\\n# regenerate with $(date)",
     ]) {
@@ -1368,6 +1369,96 @@ describe("backup payload", () => {
       servers: { grafana: { command: string } };
     };
     expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("localizes extended glob patterns an inherited extglob would activate", async () => {
+    // With BASHOPTS=extglob in the inherited environment, `@(p|x)` is one active
+    // pathname pattern, and a matching credential-named file hands the process the
+    // contiguous token while the scans split at `(`, `|`, and `)`.
+    for (const command of [
+      "mcp --token gh@(p|x)_1234567890abcdefghij",
+      "mcp --token gh+(p)_1234567890abcdefghij",
+      "mcp --token gh!(q)_1234567890abcdefghij",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+  });
+
+  it("normalizes active line continuations before the shell analyzers run", async () => {
+    // Bash deletes backslash-LF before any expansion, so a continuation can split
+    // syntax the analyzers must still see: a continuation between `$` and `(`
+    // still runs as command substitution, and one splitting a brace sequence's
+    // dots still expands, each yielding a contiguous credential.
+    for (const command of [
+      "mcp --token gh$\\\n(printf p)'_'K3vQ9rT2wY7bN4mJ6hL8cD1fG5sZ0aXe",
+      "mcp --token ghp_aaaaaaaaaaaaaaaaaaa{0.\\\n.0}",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+
+    // A wrapped command with nothing to redact keeps its original spelling...
+    const wrapped = "mcp-server \\\n  --transport stdio";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: wrapped } } })
+    );
+    const portable = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const portableMcp = jsonc.parse(payloadFileText(portable, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(portableMcp.servers.grafana.command).toBe(wrapped);
+
+    // ...while a wrapped assignment goes machine-local whole: the marker's position
+    // is only defined in the unwrapped spelling Bash executes.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: "TOKEN=hunter2 \\\nmcp-server" } } })
+    );
+    const localized = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const localizedMcp = jsonc.parse(payloadFileText(localized, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(localizedMcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
   });
 
   it("localizes an oversized command without parsing it", async () => {

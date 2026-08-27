@@ -1555,7 +1555,9 @@ function hasDisguisedAssignment(redacted: string): boolean {
  * undecidable. A
  * here-document or here-string feeds the consumer a body under document rules the word
  * scans would misread. Process substitution passes bytes by file, ambiguous once an
- * assignment matched. Single-quoted, escaped, and commented spellings are inert
+ * assignment matched. With `extglob` inherited via BASHOPTS, `?( *( +( @( !(` open one
+ * pathname pattern whose file match can complete a credential, undecidable like any
+ * glob. Single-quoted, escaped, and commented spellings are inert
  * (`--pattern '$(date)'` is a literal argument a raw-string test would localize), while
  * double quotes keep expansions live but make redirections literal.
  */
@@ -1567,12 +1569,18 @@ function findActiveShellConstructs(command: string): {
   const found = { carrier: false, heredoc: false, processSubstitution: false };
   let i = 0;
   let wordStart = true;
+  // The previous character as Bash sees it, or "" when that character was quoted or
+  // escaped: extglob operators only form from two adjacent unquoted characters.
+  let prevActive = "";
   while (i < command.length) {
     const char = command[i];
     if (char === "\\") {
       // A backslash-LF continuation vanishes before tokenization, so it neither opens
       // nor ends a word: a `#` right after `cmd \` still sits at a comment position.
-      if (command[i + 1] !== "\n") wordStart = false;
+      if (command[i + 1] !== "\n") {
+        wordStart = false;
+        prevActive = "";
+      }
       i += 2;
       continue;
     }
@@ -1580,6 +1588,7 @@ function findActiveShellConstructs(command: string): {
       const end = command.indexOf("'", i + 1);
       i = end === -1 ? command.length : end + 1;
       wordStart = false;
+      prevActive = "";
       continue;
     }
     if (char === '"') {
@@ -1597,6 +1606,7 @@ function findActiveShellConstructs(command: string): {
       }
       i = j + 1;
       wordStart = false;
+      prevActive = "";
       continue;
     }
     if (char === "#" && wordStart) {
@@ -1604,18 +1614,21 @@ function findActiveShellConstructs(command: string): {
       if (lineEnd === -1) break;
       i = lineEnd + 1;
       wordStart = true;
+      prevActive = "";
       continue;
     }
     if (char === "`") {
       found.carrier = true;
       i += 1;
       wordStart = false;
+      prevActive = char;
       continue;
     }
     if (char === "$") {
       if (/[({['"!0-9@*#?$A-Za-z_-]/.test(command[i + 1] ?? "")) found.carrier = true;
       i += 1;
       wordStart = false;
+      prevActive = char;
       continue;
     }
     if (char === "<") {
@@ -1623,15 +1636,21 @@ function findActiveShellConstructs(command: string): {
       if (command[i + 1] === "(") found.processSubstitution = true;
       i += 1;
       wordStart = true;
+      prevActive = char;
       continue;
     }
     if (char === ">") {
       if (command[i + 1] === "(") found.processSubstitution = true;
       i += 1;
       wordStart = true;
+      prevActive = char;
       continue;
     }
+    if (char === "(" && prevActive !== "" && "?*+@!".includes(prevActive)) {
+      found.carrier = true;
+    }
     wordStart = char === " " || char === "\t" || char === "\n" || SHELL_WORD_BREAK.includes(char);
+    prevActive = char;
     i += 1;
   }
   return found;
@@ -1687,6 +1706,73 @@ function splitCommandComments(command: string): Array<{ code: string; comment: s
 }
 
 /**
+ * The command with every active line continuation removed. Bash deletes an unquoted or
+ * double-quoted backslash-LF before any expansion, so syntax split across one
+ * (`$`+continuation+`(`, a brace sequence's `..`) reads contiguously to the shell
+ * while a per-character analyzer would see an escape pair. Single-quoted pairs stay the
+ * literal bytes the process receives, and a comment's backslash is prose that cannot
+ * hide the newline ending the comment.
+ */
+function removeActiveLineContinuations(command: string): string {
+  let result = "";
+  let i = 0;
+  let wordStart = true;
+  while (i < command.length) {
+    const char = command[i];
+    if (char === "\\") {
+      if (command[i + 1] === "\n") {
+        i += 2;
+        continue;
+      }
+      result += command.slice(i, i + 2);
+      i += 2;
+      wordStart = false;
+      continue;
+    }
+    if (char === "'") {
+      const end = command.indexOf("'", i + 1);
+      const stop = end === -1 ? command.length : end + 1;
+      result += command.slice(i, stop);
+      i = stop;
+      wordStart = false;
+      continue;
+    }
+    if (char === '"') {
+      result += char;
+      let j = i + 1;
+      while (j < command.length && command[j] !== '"') {
+        if (command[j] === "\\" && command[j + 1] === "\n") {
+          j += 2;
+          continue;
+        }
+        if (command[j] === "\\") {
+          result += command.slice(j, j + 2);
+          j += 2;
+          continue;
+        }
+        result += command[j];
+        j += 1;
+      }
+      if (j < command.length) result += '"';
+      i = j + 1;
+      wordStart = false;
+      continue;
+    }
+    if (char === "#" && wordStart) {
+      const lineEnd = command.indexOf("\n", i);
+      const end = lineEnd === -1 ? command.length : lineEnd;
+      result += command.slice(i, end);
+      i = end;
+      continue;
+    }
+    result += char;
+    wordStart = char === " " || char === "\t" || char === "\n" || SHELL_WORD_BREAK.includes(char);
+    i += 1;
+  }
+  return result;
+}
+
+/**
  * Fail closed before any per-character analysis: mcp.jsonc may be megabytes, and the
  * walks below hold per-character state (projection copies, brace stacks), so an
  * adversarial brace wall could stall the synchronous main process for seconds and
@@ -1697,7 +1783,10 @@ const MAX_ANALYZED_COMMAND_LENGTH = 32_768;
 
 function redactCommandEnvAssignments(command: string): string {
   if (command.length > MAX_ANALYZED_COMMAND_LENGTH) return REDACTED_BACKUP_VALUE;
-  const pieces = splitCommandComments(command);
+  // Analysis mirrors execution: active continuations vanish first, so every analyzer
+  // below sees the same contiguous syntax the shell parses.
+  const analyzed = removeActiveLineContinuations(command);
+  const pieces = splitCommandComments(analyzed);
   const redactedPieces = pieces.map((piece) =>
     piece.code.replace(
       COMMAND_ENV_ASSIGNMENT,
@@ -1710,7 +1799,7 @@ function redactCommandEnvAssignments(command: string): string {
   // so the whole command goes local and restore puts the exact text back. The residue and
   // quote-led checks run even when nothing was replaced: an unconsumable or quote-led
   // value means the replacement never saw it.
-  const constructs = findActiveShellConstructs(command);
+  const constructs = findActiveShellConstructs(analyzed);
   if (
     UNCONSUMED_ASSIGNMENT.test(redactedCode) ||
     hasDisguisedAssignment(redactedCode) ||
@@ -1720,7 +1809,15 @@ function redactCommandEnvAssignments(command: string): string {
   ) {
     return REDACTED_BACKUP_VALUE;
   }
-  return redactedPieces.map((piece, index) => piece + (pieces[index]?.comment ?? "")).join("");
+  const rewritten = redactedPieces
+    .map((piece, index) => piece + (pieces[index]?.comment ?? ""))
+    .join("");
+  // Nothing to redact: the original spelling, wrapped lines and all, is what executes.
+  if (rewritten === analyzed) return command;
+  // Markers are positioned in the unwrapped spelling; when the original wrapped lines,
+  // mapping them back onto the wrapped text is not decidable, so the command goes
+  // machine-local instead of publishing a respelled value.
+  return analyzed === command ? rewritten : REDACTED_BACKUP_VALUE;
 }
 
 function redactMcpConfig(content: Buffer): {
