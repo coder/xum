@@ -1638,7 +1638,11 @@ describe("remote bash git hardening", () => {
           return Promise.resolve(createExecStream("", 1));
         }
         if (options.cwd === "/remote/workspace/project-b") {
-          return Promise.resolve(createExecStream("filter.evil.smudge\0filter.evil.required\0"));
+          return Promise.resolve(
+            createExecStream(
+              "filter.evil.smudge\ncat\0filter.evil.required\ntrue\0alias.evil\n!steal\0"
+            )
+          );
         }
         return Promise.resolve(createExecStream("done\n"));
       },
@@ -1669,6 +1673,7 @@ describe("remote bash git hardening", () => {
     expect(calls[1]?.options.cwd).toBe("/remote/workspace/project-b");
     expect(calls[2]?.options.env?.ANTHROPIC_API_KEY).toBe("");
     expect(Object.values(calls[2]?.options.env ?? {})).toContain("filter.evil.smudge");
+    expect(Object.values(calls[2]?.options.env ?? {})).toContain("alias.evil");
   });
 
   it("fails closed when remote driver discovery fails", async () => {

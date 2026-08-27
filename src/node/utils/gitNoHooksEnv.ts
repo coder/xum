@@ -50,7 +50,7 @@ const GIT_EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 export function gitNoRepoAutomationEnv(): Record<string, string> {
   const env: Record<string, string> = {
     ...GIT_NO_HOOKS_ENV,
-    GIT_CONFIG_COUNT: "12",
+    GIT_CONFIG_COUNT: "23",
     GIT_CONFIG_KEY_1: "core.fsmonitor",
     GIT_CONFIG_VALUE_1: "false",
     // An empty credential.helper value resets the helper list.
@@ -74,6 +74,28 @@ export function gitNoRepoAutomationEnv(): Record<string, string> {
     GIT_CONFIG_VALUE_10: "",
     GIT_CONFIG_KEY_11: "core.alternateRefsCommand",
     GIT_CONFIG_VALUE_11: "",
+    GIT_CONFIG_KEY_12: "gpg.ssh.defaultKeyCommand",
+    GIT_CONFIG_VALUE_12: "",
+    GIT_CONFIG_KEY_13: "core.pager",
+    GIT_CONFIG_VALUE_13: "",
+    GIT_CONFIG_KEY_14: "interactive.diffFilter",
+    GIT_CONFIG_VALUE_14: "",
+    GIT_CONFIG_KEY_15: "web.browser",
+    GIT_CONFIG_VALUE_15: "",
+    GIT_CONFIG_KEY_16: "man.viewer",
+    GIT_CONFIG_VALUE_16: "",
+    GIT_CONFIG_KEY_17: "instaweb.browser",
+    GIT_CONFIG_VALUE_17: "",
+    GIT_CONFIG_KEY_18: "instaweb.httpd",
+    GIT_CONFIG_VALUE_18: "",
+    GIT_CONFIG_KEY_19: "sendemail.ccCmd",
+    GIT_CONFIG_VALUE_19: "",
+    GIT_CONFIG_KEY_20: "sendemail.headerCmd",
+    GIT_CONFIG_VALUE_20: "",
+    GIT_CONFIG_KEY_21: "sendemail.toCmd",
+    GIT_CONFIG_VALUE_21: "",
+    GIT_CONFIG_KEY_22: "sendemail.smtpServer",
+    GIT_CONFIG_VALUE_22: "",
     GIT_ATTR_SOURCE: GIT_EMPTY_TREE_OID,
     // Environment beats repo-config core.sshCommand.
     GIT_SSH_COMMAND: "ssh",
@@ -81,6 +103,9 @@ export function gitNoRepoAutomationEnv(): Record<string, string> {
     GIT_ALLOW_PROTOCOL: "file:http:https:ssh:git",
     GIT_EDITOR: ":",
     GIT_SEQUENCE_EDITOR: ":",
+    GIT_PAGER: "cat",
+    GIT_MAN_VIEWER: "cat",
+    GIT_BROWSER: ":",
   };
   for (const name of providerSecretEnvVarNames()) {
     env[name] = "";
@@ -96,20 +121,46 @@ export function gitNoRepoAutomationEnv(): Record<string, string> {
 }
 
 export const GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN =
-  "^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver|remote[.].*[.](uploadpack|receivepack|vcs))$";
+  "^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver|remote[.].*[.](uploadpack|receivepack|vcs|proxy)|alias[.].*|pager[.].*|browser[.].*[.](cmd|path)|difftool[.].*[.](cmd|path)|mergetool[.].*[.](cmd|path)|guitool[.].*[.]cmd|man[.].*[.](cmd|path)|sendemail[.].*[.](ccCmd|headerCmd|toCmd))$";
 export const MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES = 256 * 1024;
 
 const REPO_AUTOMATION_CONFIG_KEY_REGEX =
-  /^(filter|diff|merge|remote)[.](.+)[.](clean|smudge|process|required|command|textconv|driver|uploadpack|receivepack|vcs)$/i;
+  /^(filter|diff|merge|remote)[.](.+)[.](clean|smudge|process|required|command|textconv|driver|uploadpack|receivepack|vcs|proxy)$/i;
 const MAX_REPO_AUTOMATION_DRIVERS = 128;
 
 function appendDisabledRepoAutomationDrivers(
   env: Record<string, string>,
-  configKeys: Iterable<string>
+  configEntries: Iterable<string>
 ): Record<string, string> {
   const drivers = new Map<string, { kind: "filter" | "diff" | "merge" | "remote"; name: string }>();
   let hasDiffExternal = false;
-  for (const key of configKeys) {
+  const exactKeys = new Set<string>();
+  for (const entry of configEntries) {
+    const newlineIndex = entry.indexOf("\n");
+    const key = newlineIndex === -1 ? entry : entry.slice(0, newlineIndex);
+    const value = newlineIndex === -1 ? "" : entry.slice(newlineIndex + 1);
+    if (/[\uFFFD\0\r\n]/.test(key)) {
+      throw new Error("Refusing git operation with an unsupported config key");
+    }
+    if (key.toLowerCase().startsWith("alias.")) {
+      if (value.startsWith("!")) exactKeys.add(key);
+      if (drivers.size + exactKeys.size > MAX_REPO_AUTOMATION_DRIVERS) {
+        throw new Error(
+          "Refusing git operation with more than " +
+            MAX_REPO_AUTOMATION_DRIVERS +
+            " repo automation drivers"
+        );
+      }
+      continue;
+    }
+    if (
+      /^(pager[.]|browser[.].*[.](cmd|path)$|difftool[.].*[.](cmd|path)$|mergetool[.].*[.](cmd|path)$|guitool[.].*[.]cmd$|man[.].*[.](cmd|path)$|sendemail[.].*[.](cccmd|headercmd|tocmd)$)/i.test(
+        key
+      )
+    ) {
+      exactKeys.add(key);
+      continue;
+    }
     if (key.toLowerCase() === "diff.external") {
       hasDiffExternal = true;
       continue;
@@ -134,6 +185,11 @@ function appendDisabledRepoAutomationDrivers(
   }
 
   let configIndex = Number.parseInt(env.GIT_CONFIG_COUNT ?? "0", 10);
+  for (const key of [...exactKeys].sort()) {
+    env["GIT_CONFIG_KEY_" + configIndex] = key;
+    env["GIT_CONFIG_VALUE_" + configIndex] = "";
+    configIndex += 1;
+  }
   if (hasDiffExternal) {
     env["GIT_CONFIG_KEY_" + configIndex] = "diff.external";
     env["GIT_CONFIG_VALUE_" + configIndex] = "";
@@ -161,6 +217,7 @@ function appendDisabledRepoAutomationDrivers(
                 ["uploadpack", ""],
                 ["receivepack", ""],
                 ["vcs", ""],
+                ["proxy", ""],
               ] as const);
     for (const [field, value] of fields) {
       env["GIT_CONFIG_KEY_" + configIndex] = kind + "." + name + "." + field;
@@ -175,7 +232,10 @@ function appendDisabledRepoAutomationDrivers(
 export function gitNoRepoAutomationEnvForConfigKeys(
   configKeys: Iterable<string>
 ): Record<string, string> {
-  return appendDisabledRepoAutomationDrivers(gitNoRepoAutomationEnv(), configKeys);
+  return appendDisabledRepoAutomationDrivers(
+    gitNoRepoAutomationEnv(),
+    [...configKeys].map((key) => key + "\n")
+  );
 }
 
 export function gitEnvPrefix(env: Record<string, string>): string {
@@ -189,13 +249,27 @@ export function gitEnvPrefix(env: Record<string, string>): string {
 export function combineGitNoRepoAutomationEnvs(
   envs: Iterable<Record<string, string>>
 ): Record<string, string> {
-  const configKeys: string[] = [];
-  for (const env of envs) {
-    for (const [key, value] of Object.entries(env)) {
-      if (key.startsWith("GIT_CONFIG_KEY_")) configKeys.push(value);
+  const env = gitNoRepoAutomationEnv();
+  const baseCount = Number.parseInt(env.GIT_CONFIG_COUNT, 10);
+  const overrides = new Map<string, string>();
+  for (const repoEnv of envs) {
+    const count = Number.parseInt(repoEnv.GIT_CONFIG_COUNT ?? "0", 10);
+    for (let index = baseCount; index < count; index += 1) {
+      const key = repoEnv["GIT_CONFIG_KEY_" + index];
+      if (key != null) overrides.set(key, repoEnv["GIT_CONFIG_VALUE_" + index] ?? "");
     }
   }
-  return gitNoRepoAutomationEnvForConfigKeys(configKeys);
+  if (overrides.size > MAX_REPO_AUTOMATION_DRIVERS * 4) {
+    throw new Error("Refusing git operation with too many repo automation overrides");
+  }
+  let index = baseCount;
+  for (const [key, value] of [...overrides].sort(([a], [b]) => a.localeCompare(b))) {
+    env["GIT_CONFIG_KEY_" + index] = key;
+    env["GIT_CONFIG_VALUE_" + index] = value;
+    index += 1;
+  }
+  env.GIT_CONFIG_COUNT = String(index);
+  return env;
 }
 
 export async function gitNoRepoAutomationEnvForRuntimeRepo(
@@ -206,7 +280,7 @@ export async function gitNoRepoAutomationEnvForRuntimeRepo(
   const baseEnv = gitNoRepoAutomationEnv();
   const result = await execBuffered(
     runtime,
-    `${gitEnvPrefix(baseEnv)}LC_ALL=C git config --null --name-only --includes --get-regexp ${shellQuote(
+    `${gitEnvPrefix(baseEnv)}LC_ALL=C git config --null --includes --get-regexp ${shellQuote(
       GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN
     )}`,
     {
@@ -231,7 +305,7 @@ export async function gitNoRepoAutomationEnvForRuntimeRepo(
   ) {
     throw new Error("Repository automation driver config output exceeded the safety limit");
   }
-  return gitNoRepoAutomationEnvForConfigKeys(result.stdout.split("\0"));
+  return appendDisabledRepoAutomationDrivers(baseEnv, result.stdout.split("\0"));
 }
 
 function isNoMatchingConfigError(error: unknown): boolean {
@@ -263,7 +337,6 @@ export async function gitNoRepoAutomationEnvForLocalRepo(
         repoPath,
         "config",
         "--null",
-        "--name-only",
         "--includes",
         "--get-regexp",
         GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN,

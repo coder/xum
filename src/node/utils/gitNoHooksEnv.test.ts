@@ -35,7 +35,7 @@ describe("gitNoHooksPrefix", () => {
 
   test("returns env prefix when untrusted (false)", () => {
     const prefix = gitNoHooksPrefix(false);
-    expect(prefix).toContain("GIT_CONFIG_COUNT='12'");
+    expect(prefix).toContain("GIT_CONFIG_COUNT='23'");
     expect(prefix).toContain("core.hooksPath");
     expect(prefix).toContain("/dev/null");
     expect(prefix).toContain("GIT_CONFIG_PARAMETERS=");
@@ -44,7 +44,7 @@ describe("gitNoHooksPrefix", () => {
 
   test("returns env prefix when untrusted (undefined)", () => {
     const prefix = gitNoHooksPrefix(undefined);
-    expect(prefix).toContain("GIT_CONFIG_COUNT='12'");
+    expect(prefix).toContain("GIT_CONFIG_COUNT='23'");
     expect(prefix).toEndWith(" ");
   });
 });
@@ -53,7 +53,7 @@ describe("gitNoRepoAutomationEnv", () => {
   test("neutralizes every repo-controlled git execution vector", () => {
     const env = gitNoRepoAutomationEnv();
     // Hooks, fsmonitor, and credential helpers via env config entries.
-    expect(env.GIT_CONFIG_COUNT).toBe("12");
+    expect(env.GIT_CONFIG_COUNT).toBe("23");
     expect(env.GIT_CONFIG_KEY_0).toBe("core.hooksPath");
     expect(env.GIT_CONFIG_VALUE_0).toBe("/dev/null");
     expect(env.GIT_CONFIG_KEY_1).toBe("core.fsmonitor");
@@ -78,6 +78,11 @@ describe("gitNoRepoAutomationEnv", () => {
     expect(env.GIT_CONFIG_VALUE_10).toBe("");
     expect(env.GIT_CONFIG_KEY_11).toBe("core.alternateRefsCommand");
     expect(env.GIT_CONFIG_VALUE_11).toBe("");
+    expect(env.GIT_CONFIG_KEY_12).toBe("gpg.ssh.defaultKeyCommand");
+    expect(env.GIT_CONFIG_VALUE_12).toBe("");
+    expect(env.GIT_PAGER).toBe("cat");
+    expect(env.GIT_MAN_VIEWER).toBe("cat");
+    expect(env.GIT_BROWSER).toBe(":");
     // Pointing the tracked attributes source at the empty tree suppresses
     // .gitattributes; the repo-aware builder below additionally overrides
     // drivers selected by highest-precedence .git/info/attributes.
@@ -451,6 +456,72 @@ describe("gitNoRepoAutomationEnv", () => {
     await Bun.$`git rev-list --alternate-refs`
       .cwd(remote)
       .env({ ...process.env, ...gitNoRepoAutomationEnv() })
+      .quiet()
+      .nothrow();
+    const markerExists = await fs.access(marker).then(
+      () => true,
+      () => false
+    );
+    expect(markerExists).toBe(false);
+  });
+
+  test("neutralizes shell aliases discovered from repository config", async () => {
+    using tmp = new DisposableTempDir("git-alias-automation-off");
+    const repo = path.join(tmp.path, "repo");
+    const marker = path.join(tmp.path, "alias-ran");
+    const helper = path.join(tmp.path, "alias.sh");
+    await fs.mkdir(repo, { recursive: true });
+    await Bun.$`git init`.cwd(repo).quiet();
+    await fs.writeFile(helper, `#!/bin/sh\ntouch "${marker}"\n`, "utf-8");
+    await fs.chmod(helper, 0o755);
+    await Bun.$`git config alias.evil ${"!" + helper}`.cwd(repo).quiet();
+
+    await Bun.$`git evil`.cwd(repo).quiet();
+    await fs.access(marker);
+    await fs.rm(marker);
+
+    const env = await gitNoRepoAutomationEnvForLocalRepo(repo);
+    await Bun.$`git evil`
+      .cwd(repo)
+      .env({ ...process.env, ...env })
+      .quiet()
+      .nothrow();
+    const markerExists = await fs.access(marker).then(
+      () => true,
+      () => false
+    );
+    expect(markerExists).toBe(false);
+  });
+
+  test("neutralizes gpg.ssh.defaultKeyCommand", async () => {
+    using tmp = new DisposableTempDir("git-ssh-signing-automation-off");
+    const repo = path.join(tmp.path, "repo");
+    const marker = path.join(tmp.path, "key-command-ran");
+    const helper = path.join(tmp.path, "key-command.sh");
+    await fs.mkdir(repo, { recursive: true });
+    await Bun.$`git init`.cwd(repo).quiet();
+    await Bun.$`git config user.email test@example.com`.cwd(repo).quiet();
+    await Bun.$`git config user.name Test`.cwd(repo).quiet();
+    await Bun.$`git config gpg.format ssh`.cwd(repo).quiet();
+    await Bun.$`git config gpg.ssh.defaultKeyCommand ${helper}`.cwd(repo).quiet();
+    await fs.writeFile(helper, `#!/bin/sh\ntouch "${marker}"\nprintf 'invalid-key\n'\n`, "utf-8");
+    await fs.chmod(helper, 0o755);
+
+    await Bun.$`git commit -S --allow-empty -m unsafe`.cwd(repo).quiet().nothrow();
+    await fs.access(marker);
+    await fs.rm(marker);
+
+    const env = gitNoRepoAutomationEnv();
+    const sshProgramEntry = Object.entries(env).find(
+      ([key, value]) => key.startsWith("GIT_CONFIG_KEY_") && value === "gpg.ssh.program"
+    );
+    expect(sshProgramEntry).toBeDefined();
+    const sshProgramIndex = sshProgramEntry?.[0].slice("GIT_CONFIG_KEY_".length);
+    if (sshProgramIndex != null) env["GIT_CONFIG_VALUE_" + sshProgramIndex] = "ssh-keygen";
+
+    await Bun.$`git commit -S --allow-empty -m safe`
+      .cwd(repo)
+      .env({ ...process.env, ...env })
       .quiet()
       .nothrow();
     const markerExists = await fs.access(marker).then(
