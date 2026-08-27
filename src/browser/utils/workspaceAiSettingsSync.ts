@@ -8,6 +8,7 @@ import {
   getThinkingLevelKey,
 } from "@/common/constants/storage";
 import { normalizeAgentId, resolvePersistedAgentId } from "@/common/utils/agentIds";
+import { serializeWorkspaceAiSettingsWrite } from "@/common/utils/ai/workspaceAiSettingsWrite";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { APIClient } from "@/browser/contexts/API";
@@ -47,8 +48,6 @@ export function resolveEffectiveComposerModel(
   return normalizeModelPreference(preferredModel, metadataModel ?? defaultModel);
 }
 
-const workspaceAiSettingsWriteChains = new Map<string, Promise<unknown>>();
-
 interface WorkspaceSendApi {
   workspace: Pick<APIClient["workspace"], "sendMessage">;
 }
@@ -63,22 +62,6 @@ interface WorkspaceAiSettingsUpdateApi {
 type SendMessageInput = Parameters<APIClient["workspace"]["sendMessage"]>[0];
 type ResumeStreamInput = Parameters<APIClient["workspace"]["resumeStream"]>[0];
 type UpdateAgentAISettingsInput = Parameters<APIClient["workspace"]["updateAgentAISettings"]>[0];
-
-/** Keep browser writes that can persist workspace AI state in initiation order. */
-function serializeWorkspaceAiSettingsWrite<T>(
-  workspaceId: string,
-  write: () => Promise<T>
-): Promise<T> {
-  const previous = workspaceAiSettingsWriteChains.get(workspaceId) ?? Promise.resolve();
-  const result = previous.then(write, write);
-  workspaceAiSettingsWriteChains.set(workspaceId, result);
-
-  return result.finally(() => {
-    if (workspaceAiSettingsWriteChains.get(workspaceId) === result) {
-      workspaceAiSettingsWriteChains.delete(workspaceId);
-    }
-  });
-}
 
 export function updateWorkspaceAgentAISettings(
   api: WorkspaceAiSettingsUpdateApi,

@@ -9,6 +9,10 @@ import { getBuiltInAgentDefinitions } from "@/node/services/agentDefinitions/bui
 import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
 import type { ORPCClient } from "./serverConnection";
 import { resolveAgentAiSettings, type ResolvedAiSettings } from "./resolveAgentAiSettings";
+import {
+  updateAcpWorkspaceAgentAISettings,
+  updateAcpWorkspaceModeAISettings,
+} from "./workspaceAiSettingsSync";
 
 export const AGENT_MODE_CONFIG_ID = "agentMode";
 const MODEL_CONFIG_ID = "model";
@@ -250,7 +254,7 @@ async function persistAgentAiSettings(
   // mode variant cannot record the workspace's selected agent, which ACP mode
   // switches need so reconnects and other clients hydrate the new mode.
   if (options?.persistSelectedAgentId === true) {
-    const updateResult = await client.workspace.updateAgentAISettings({
+    const updateResult = await updateAcpWorkspaceAgentAISettings(client, {
       workspaceId,
       agentId,
       aiSettings,
@@ -261,7 +265,7 @@ async function persistAgentAiSettings(
   }
 
   if (isModeAgentId(agentId)) {
-    const updateModeResult = await client.workspace.updateModeAISettings({
+    const updateModeResult = await updateAcpWorkspaceModeAISettings(client, {
       workspaceId,
       mode: agentId,
       aiSettings,
@@ -270,7 +274,7 @@ async function persistAgentAiSettings(
     return;
   }
 
-  const updateAgentResult = await client.workspace.updateAgentAISettings({
+  const updateAgentResult = await updateAcpWorkspaceAgentAISettings(client, {
     workspaceId,
     agentId,
     aiSettings,

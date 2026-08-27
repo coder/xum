@@ -66,6 +66,11 @@ import { InvalidExplicitAiSettingError } from "@/common/utils/ai/resolveAgentAiS
 import type { ServerConnection } from "./serverConnection";
 import { SessionManager } from "./sessionManager";
 import {
+  sendAcpWorkspaceMessage,
+  updateAcpWorkspaceAgentAISettings,
+  updateAcpWorkspaceModeAISettings,
+} from "./workspaceAiSettingsSync";
+import {
   buildAcpAvailableCommands,
   mapSkillsByName,
   parseAcpSlashCommand,
@@ -728,7 +733,7 @@ export class MuxAgent implements Agent {
         delegatedToolNames
       );
 
-      const sendResult = await this.server.client.workspace.sendMessage({
+      const sendResult = await sendAcpWorkspaceMessage(this.server.client, {
         workspaceId: args.workspaceId,
         message: args.message,
         options: {
@@ -936,7 +941,7 @@ export class MuxAgent implements Agent {
         let response = `Created forked workspace \`${newWorkspaceId}\`.`;
 
         if (parsedCommand.startMessage != null && parsedCommand.startMessage.trim().length > 0) {
-          const startMessageResult = await this.server.client.workspace.sendMessage({
+          const startMessageResult = await sendAcpWorkspaceMessage(this.server.client, {
             workspaceId: newWorkspaceId,
             message: parsedCommand.startMessage,
             options: {
@@ -1000,7 +1005,7 @@ export class MuxAgent implements Agent {
         let response = `Created workspace \`${displayName}\` (id: \`${newWorkspaceId}\`).`;
 
         if (hasStartMessage && parsedCommand.startMessage != null) {
-          const startMessageResult = await this.server.client.workspace.sendMessage({
+          const startMessageResult = await sendAcpWorkspaceMessage(this.server.client, {
             workspaceId: newWorkspaceId,
             message: parsedCommand.startMessage,
             options: {
@@ -2165,7 +2170,7 @@ export class MuxAgent implements Agent {
     aiSettings: ResolvedAiSettings
   ): Promise<void> {
     if (agentId === "plan" || agentId === "exec") {
-      const updateModeResult = await this.server.client.workspace.updateModeAISettings({
+      const updateModeResult = await updateAcpWorkspaceModeAISettings(this.server.client, {
         workspaceId,
         mode: agentId,
         aiSettings,
@@ -2178,7 +2183,7 @@ export class MuxAgent implements Agent {
       return;
     }
 
-    const updateAgentResult = await this.server.client.workspace.updateAgentAISettings({
+    const updateAgentResult = await updateAcpWorkspaceAgentAISettings(this.server.client, {
       workspaceId,
       agentId,
       aiSettings,
