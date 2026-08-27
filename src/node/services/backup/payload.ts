@@ -74,7 +74,11 @@ function isHiddenName(name: string): boolean {
  * defect, and neither is something a backup should publish.
  */
 const CREDENTIAL_TOKEN_PATTERNS = [
-  /\bsk-[A-Za-z0-9_-]{16,}\b/,
+  // The digit requirement keeps documentation placeholders (`sk-your-api-key-here`)
+  // out of this no-override block: issued keys are base62 and practically always carry
+  // digits, while placeholders are dash-separated words. The digit-free spelling stays
+  // in the reviewable scan below.
+  /\bsk-(?=[A-Za-z0-9_-]{16})[A-Za-z_-]*[0-9][A-Za-z0-9_-]*\b/,
   /\bghp_[A-Za-z0-9]{20,}\b/,
   /\bgho_[A-Za-z0-9]{20,}\b/,
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,
@@ -87,6 +91,7 @@ const CREDENTIAL_TOKEN_PATTERNS = [
 
 const SECRET_PATTERNS = [
   ...CREDENTIAL_TOKEN_PATTERNS,
+  /\bsk-[A-Za-z0-9_-]{16,}\b/,
   /\bAIza[A-Za-z0-9_-]{35,}/,
   /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
 ] as const;
@@ -1226,7 +1231,7 @@ function unquoteShellWord(word: string): string {
  * with `s`, so every `--s...` prefix spelling (`--s=`, `--split=`) resolves to it.
  */
 function isSplitStringOption(unquoted: string): boolean {
-  if (/^-[A-Za-z]*S/.test(unquoted)) return true;
+  if (/^-[A-Za-z0-9]*S/.test(unquoted)) return true;
   const abbreviation = /^--([A-Za-z-]*)=/.exec(unquoted);
   return (
     abbreviation !== null && abbreviation[1] !== "" && "split-string".startsWith(abbreviation[1])
@@ -1642,12 +1647,18 @@ export async function createBackupPayload(
         // interleaved NUL characters here; text published as prose has no business
         // holding NULs, so this manufactures no match from ordinary content.
         const targets = [content, content.replaceAll("\u0000", ""), file.path];
-        // The stripped variant catches a token split by shell quoting (`--token
-        // ghp_123\456...`): the shell removes the quoting on execution, and the published
-        // text reconstructs the same credential. Only command content is shell input;
-        // prose can legitimately hold quote-separated token-like fragments, and this
-        // block has no override.
-        if (file.path === "mcp.jsonc") targets.push(content.replace(/[\\'"]/g, ""));
+        // Shell-normalized variants catch a token split by quoting or a line
+        // continuation (`--token ghp_123\456...`, `AKIA...\<newline>...`): the shell
+        // removes both on execution, and the published text reconstructs the same
+        // credential. Normalization works on parsed string values, not the raw JSON
+        // text, whose escape encoding garbles the reassembly. Only command content is
+        // shell input; prose can legitimately hold quote-separated token-like
+        // fragments, and this block has no override.
+        if (file.path === "mcp.jsonc") {
+          for (const text of collectStringValues(jsonc.parse(content))) {
+            targets.push(text.replace(/\\\r?\n/g, "").replace(/[\\'"]/g, ""));
+          }
+        }
         return CREDENTIAL_TOKEN_PATTERNS.some((pattern) =>
           targets.some((target) => pattern.test(target))
         );
@@ -2644,6 +2655,19 @@ function restoredServerUrl(
 function readUrl(server: Record<string, unknown> | undefined): string | undefined {
   const url = server?.url;
   return typeof url === "string" ? url : undefined;
+}
+
+/** Every string value in a parsed tree, for shell-normalized credential scanning. */
+function collectStringValues(value: unknown, found: string[] = []): string[] {
+  if (typeof value === "string") {
+    found.push(value);
+  } else if (Array.isArray(value)) {
+    for (const item of value) collectStringValues(item, found);
+  } else {
+    const record = readRecord(value);
+    if (record) for (const item of Object.values(record)) collectStringValues(item, found);
+  }
+  return found;
 }
 
 /**

@@ -418,6 +418,7 @@ describe("backup payload", () => {
       ["env --split=TOKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
       ["env -S'TOKEN=hunter2 mcp-server'", REDACTED_BACKUP_VALUE],
       ["env -STOKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      ["env -0STOKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
       // Expansion bodies can smuggle assignment bytes past every lexical check.
       ["env TOKEN$(printf =hunter2) mcp-server", REDACTED_BACKUP_VALUE],
       ["env TOKEN$[0]=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
@@ -574,6 +575,72 @@ describe("backup payload", () => {
     );
     expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
     expect((blocked as BackupCredentialDetectedError).files).toEqual(["mcp.jsonc"]);
+  });
+
+  it("blocks the export when a line continuation splits a known credential token", async () => {
+    // Bash removes backslash-newline entirely, handing the server one contiguous key.
+    const brokenKey = "AKIA12345678\\\n90123456";
+    // In a command the continuation-joined word spans whitespace and fails closed at
+    // the redactor, so the whole command goes local before any scan runs.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: `mcp-grafana --key ${brokenKey}` } } })
+    );
+    const localized = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(localized, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+
+    // Other portable strings publish verbatim, so the backstop must reassemble what
+    // Bash would join before matching.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { notes: { command: "npx notes-mcp", toolAllowlist: [brokenKey] } },
+      })
+    );
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+    expect((blocked as BackupCredentialDetectedError).files).toEqual(["mcp.jsonc"]);
+  });
+
+  it("keeps digit-free sk- placeholders reviewable instead of hard-blocking", async () => {
+    await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", "Use sk-your-api-key-here to start\n");
+    // The reviewable scan still flags it, so the digest approval path stays intact.
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(scanBackupFilesForSecrets(payload.files)).toEqual(["skills/demo/SKILL.md"]);
+
+    // A digit-bearing key of the same shape still aborts with no override.
+    await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", "sk-a1b2c3d4e5f6g7h8i9j0\n");
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
   });
 
   it("does not manufacture credentials from quote-separated documentation text", async () => {
