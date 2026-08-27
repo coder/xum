@@ -314,6 +314,12 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     this.lastMonitorProbeFailure = undefined;
   }
 
+  private assertMonitorProbeSucceeded(operation: string, exitCode: number): void {
+    if (exitCode !== 0) {
+      throw new Error(`${operation} exited with code ${exitCode}`);
+    }
+  }
+
   private recordMonitorProbeFailure(
     operation: "readOutput" | "getExitCode",
     error: unknown
@@ -339,6 +345,7 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
         `cat ${exitCodePath} 2>/dev/null || echo ""`,
         { cwd: FALLBACK_CWD, timeout: 10 }
       );
+      this.assertMonitorProbeSucceeded("getExitCode", result.exitCode);
       this.clearMonitorProbeFailure();
       return parseExitCode(result.stdout);
     } catch (error) {
@@ -408,6 +415,7 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
       `wc -c < ${filePath} 2>/dev/null || echo 0`,
       { cwd: FALLBACK_CWD, timeout: 10 }
     );
+    this.assertMonitorProbeSucceeded("readOutput file-size probe", sizeResult.exitCode);
     return parseInt(sizeResult.stdout.trim(), 10) || 0;
   }
 
@@ -441,6 +449,7 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
         `tail -c +${offset + 1} ${filePath} 2>/dev/null`,
         { cwd: FALLBACK_CWD, timeout: 30 }
       );
+      this.assertMonitorProbeSucceeded("readOutput tail probe", readResult.exitCode);
 
       this.clearMonitorProbeFailure();
       return {
