@@ -2938,210 +2938,240 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                         (workspace) => workspaceAttentionById.get(workspace.id) === true
                       );
 
-                      return (
-                        <div key={projectPath}>
-                          <DraggableProjectItem
-                            projectPath={projectPath}
-                            onReorder={handleReorder}
-                            selected={false}
-                            onClick={() => {
-                              if (projectContextMenu.suppressClickIfLongPress()) {
-                                return;
-                              }
-                              if (isEditingProjectDisplayName) {
-                                return;
-                              }
-                              handleAddWorkspace(projectPath);
-                            }}
-                            onContextMenu={(event) => handleOpenProjectMenu(event, projectPath)}
-                            onTouchStart={(event) =>
-                              handleProjectContextMenuTouchStart(event, projectPath)
+                      // Shared by the grouped section drop zones and the flat
+                      // management rows so chats can be assigned to (or cleared
+                      // from) a sub-project in both modes.
+                      const handleWorkspaceSectionDrop = (
+                        workspaceId: string,
+                        targetSectionId: string | null
+                      ) => {
+                        void (async () => {
+                          const result = await assignWorkspaceToSubProject(
+                            projectPath,
+                            workspaceId,
+                            targetSectionId
+                          );
+                          if (result.success) {
+                            // Refresh workspace metadata so UI shows updated sectionId
+                            await refreshWorkspaceMetadata();
+                          }
+                        })();
+                      };
+
+                      const projectHeaderRow = (
+                        <DraggableProjectItem
+                          projectPath={projectPath}
+                          onReorder={handleReorder}
+                          selected={false}
+                          onClick={() => {
+                            if (projectContextMenu.suppressClickIfLongPress()) {
+                              return;
                             }
-                            onTouchEnd={projectContextMenu.touchHandlers.onTouchEnd}
-                            onTouchMove={projectContextMenu.touchHandlers.onTouchMove}
-                            onKeyDown={(e: React.KeyboardEvent) => {
-                              // Ignore key events from child buttons
-                              if (e.target instanceof HTMLElement && e.target !== e.currentTarget) {
-                                return;
-                              }
-                              if (e.key === "Enter" || e.key === " ") {
-                                e.preventDefault();
-                                handleAddWorkspace(projectPath);
-                              }
-                            }}
-                            role="button"
-                            tabIndex={0}
-                            aria-expanded={flatSidebarEnabled ? undefined : isExpanded}
-                            aria-controls={flatSidebarEnabled ? undefined : workspaceListId}
-                            aria-label={`Create workspace in ${projectName}`}
-                            data-project-path={projectPath}
-                          >
-                            {flatSidebarEnabled ? (
-                              // Flat mode has no per-project chat nesting to
-                              // expand, so the folder renders as a static icon.
-                              <span className="text-secondary mr-1.5 flex h-5 w-5 shrink-0 items-center justify-center">
-                                <Folder
-                                  className="h-4 w-4"
-                                  style={
-                                    projectFolderColor ? { color: projectFolderColor } : undefined
-                                  }
+                            if (isEditingProjectDisplayName) {
+                              return;
+                            }
+                            handleAddWorkspace(projectPath);
+                          }}
+                          onContextMenu={(event) => handleOpenProjectMenu(event, projectPath)}
+                          onTouchStart={(event) =>
+                            handleProjectContextMenuTouchStart(event, projectPath)
+                          }
+                          onTouchEnd={projectContextMenu.touchHandlers.onTouchEnd}
+                          onTouchMove={projectContextMenu.touchHandlers.onTouchMove}
+                          onKeyDown={(e: React.KeyboardEvent) => {
+                            // Ignore key events from child buttons
+                            if (e.target instanceof HTMLElement && e.target !== e.currentTarget) {
+                              return;
+                            }
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              handleAddWorkspace(projectPath);
+                            }
+                          }}
+                          role="button"
+                          tabIndex={0}
+                          aria-expanded={flatSidebarEnabled ? undefined : isExpanded}
+                          aria-controls={flatSidebarEnabled ? undefined : workspaceListId}
+                          aria-label={`Create workspace in ${projectName}`}
+                          data-project-path={projectPath}
+                        >
+                          {flatSidebarEnabled ? (
+                            // Flat mode has no per-project chat nesting to
+                            // expand, so the folder renders as a static icon.
+                            <span className="text-secondary mr-1.5 flex h-5 w-5 shrink-0 items-center justify-center">
+                              <Folder
+                                className="h-4 w-4"
+                                style={
+                                  projectFolderColor ? { color: projectFolderColor } : undefined
+                                }
+                              />
+                            </span>
+                          ) : (
+                            <button
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                toggleProject(projectPath);
+                              }}
+                              aria-label={`${isExpanded ? "Collapse" : "Expand"} project ${projectName}`}
+                              data-project-path={projectPath}
+                              className={PROJECT_TOGGLE_BUTTON_CLASSES}
+                            >
+                              <span className="relative flex h-4 w-4 items-center justify-center">
+                                <ChevronRight
+                                  className="absolute inset-0 h-4 w-4 opacity-0 transition-[opacity,transform] duration-200 group-hover:opacity-100"
+                                  style={{
+                                    transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)",
+                                  }}
                                 />
+                                {isExpanded ? (
+                                  <FolderOpen
+                                    className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
+                                    style={
+                                      projectFolderColor ? { color: projectFolderColor } : undefined
+                                    }
+                                  />
+                                ) : (
+                                  <Folder
+                                    className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
+                                    style={
+                                      projectFolderColor ? { color: projectFolderColor } : undefined
+                                    }
+                                  />
+                                )}
                               </span>
-                            ) : (
+                            </button>
+                          )}
+                          <div
+                            className="flex min-w-0 flex-1 items-center pr-1"
+                            onContextMenu={(event) => handleOpenProjectMenu(event, projectPath)}
+                          >
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                {isEditingProjectDisplayName ? (
+                                  <input
+                                    value={editingProjectDisplayName}
+                                    autoFocus
+                                    aria-label={`Edit project name for ${projectName}`}
+                                    className="bg-background text-foreground border-border-light h-6 w-full rounded border px-2 text-sm"
+                                    onClick={(event) => event.stopPropagation()}
+                                    onMouseDown={(event) => event.stopPropagation()}
+                                    onContextMenu={(event) => event.stopPropagation()}
+                                    onChange={(event) => {
+                                      setEditingProjectDisplayName(event.target.value);
+                                    }}
+                                    onKeyDown={(event) => {
+                                      stopKeyboardPropagation(event);
+                                      if (event.key === "Escape") {
+                                        event.preventDefault();
+                                        skipNextProjectNameBlurCommitRef.current = true;
+                                        cancelProjectDisplayNameEditing();
+                                        return;
+                                      }
+
+                                      if (event.key === "Enter") {
+                                        event.preventDefault();
+                                        event.currentTarget.blur();
+                                      }
+                                    }}
+                                    onBlur={(event) => {
+                                      event.stopPropagation();
+                                      if (skipNextProjectNameBlurCommitRef.current) {
+                                        skipNextProjectNameBlurCommitRef.current = false;
+                                        return;
+                                      }
+                                      void commitProjectDisplayNameEdit(
+                                        projectPath,
+                                        event.currentTarget.value
+                                      );
+                                    }}
+                                  />
+                                ) : (
+                                  <div className="text-muted-dark flex min-w-0 items-baseline gap-1.5 text-sm">
+                                    <span
+                                      className={cn(
+                                        "min-w-0 flex-1 truncate font-medium",
+                                        projectHasAttention
+                                          ? "text-content-primary"
+                                          : "text-content-secondary"
+                                      )}
+                                    >
+                                      {displayProjectName}
+                                    </span>
+                                    <span
+                                      className={cn(
+                                        "shrink-0 text-xs",
+                                        projectHasAttention
+                                          ? "text-content-secondary"
+                                          : "text-muted"
+                                      )}
+                                    >
+                                      ({projectAgentCount})
+                                    </span>
+                                  </div>
+                                )}
+                              </TooltipTrigger>
+                              <TooltipContent align="start">{projectPath}</TooltipContent>
+                            </Tooltip>
+                          </div>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
                               <button
                                 onClick={(event) => {
                                   event.stopPropagation();
-                                  toggleProject(projectPath);
+                                  handleAddWorkspace(projectPath);
                                 }}
-                                aria-label={`${isExpanded ? "Collapse" : "Expand"} project ${projectName}`}
+                                aria-label={`New chat in ${projectName}`}
                                 data-project-path={projectPath}
-                                className={PROJECT_TOGGLE_BUTTON_CLASSES}
+                                className="text-content-secondary hover:bg-hover hover:border-border-light pointer-events-none flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent text-sm leading-none opacity-0 transition-all duration-200 focus-visible:pointer-events-auto focus-visible:opacity-100"
                               >
-                                <span className="relative flex h-4 w-4 items-center justify-center">
-                                  <ChevronRight
-                                    className="absolute inset-0 h-4 w-4 opacity-0 transition-[opacity,transform] duration-200 group-hover:opacity-100"
-                                    style={{
-                                      transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)",
-                                    }}
-                                  />
-                                  {isExpanded ? (
-                                    <FolderOpen
-                                      className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
-                                      style={
-                                        projectFolderColor
-                                          ? { color: projectFolderColor }
-                                          : undefined
-                                      }
-                                    />
-                                  ) : (
-                                    <Folder
-                                      className="h-4 w-4 transition-opacity duration-200 group-hover:opacity-0"
-                                      style={
-                                        projectFolderColor
-                                          ? { color: projectFolderColor }
-                                          : undefined
-                                      }
-                                    />
-                                  )}
-                                </span>
+                                <Plus className="h-4 w-4 shrink-0" strokeWidth={1.8} />
                               </button>
-                            )}
-                            <div
-                              className="flex min-w-0 flex-1 items-center pr-1"
-                              onContextMenu={(event) => handleOpenProjectMenu(event, projectPath)}
-                            >
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  {isEditingProjectDisplayName ? (
-                                    <input
-                                      value={editingProjectDisplayName}
-                                      autoFocus
-                                      aria-label={`Edit project name for ${projectName}`}
-                                      className="bg-background text-foreground border-border-light h-6 w-full rounded border px-2 text-sm"
-                                      onClick={(event) => event.stopPropagation()}
-                                      onMouseDown={(event) => event.stopPropagation()}
-                                      onContextMenu={(event) => event.stopPropagation()}
-                                      onChange={(event) => {
-                                        setEditingProjectDisplayName(event.target.value);
-                                      }}
-                                      onKeyDown={(event) => {
-                                        stopKeyboardPropagation(event);
-                                        if (event.key === "Escape") {
-                                          event.preventDefault();
-                                          skipNextProjectNameBlurCommitRef.current = true;
-                                          cancelProjectDisplayNameEditing();
-                                          return;
-                                        }
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              New chat ({formatKeybind(KEYBINDS.NEW_WORKSPACE)})
+                            </TooltipContent>
+                          </Tooltip>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <button
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  handleOpenProjectMenu(event, projectPath);
+                                }}
+                                aria-label={`Project options for ${projectName}`}
+                                data-project-path={projectPath}
+                                className={cn(
+                                  "text-content-secondary hover:bg-hover hover:border-border-light flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent transition-all duration-200 focus-visible:pointer-events-auto focus-visible:opacity-100",
+                                  projectContextMenu.isOpen && projectMenuTargetPath === projectPath
+                                    ? "pointer-events-auto opacity-100"
+                                    : "pointer-events-none opacity-0"
+                                )}
+                              >
+                                <EllipsisVertical className="h-4 w-4 shrink-0" strokeWidth={1.8} />
+                              </button>
+                            </TooltipTrigger>
+                            <TooltipContent align="end">Project options</TooltipContent>
+                          </Tooltip>
+                        </DraggableProjectItem>
+                      );
 
-                                        if (event.key === "Enter") {
-                                          event.preventDefault();
-                                          event.currentTarget.blur();
-                                        }
-                                      }}
-                                      onBlur={(event) => {
-                                        event.stopPropagation();
-                                        if (skipNextProjectNameBlurCommitRef.current) {
-                                          skipNextProjectNameBlurCommitRef.current = false;
-                                          return;
-                                        }
-                                        void commitProjectDisplayNameEdit(
-                                          projectPath,
-                                          event.currentTarget.value
-                                        );
-                                      }}
-                                    />
-                                  ) : (
-                                    <div className="text-muted-dark flex min-w-0 items-baseline gap-1.5 text-sm">
-                                      <span
-                                        className={cn(
-                                          "min-w-0 flex-1 truncate font-medium",
-                                          projectHasAttention
-                                            ? "text-content-primary"
-                                            : "text-content-secondary"
-                                        )}
-                                      >
-                                        {displayProjectName}
-                                      </span>
-                                      <span
-                                        className={cn(
-                                          "shrink-0 text-xs",
-                                          projectHasAttention
-                                            ? "text-content-secondary"
-                                            : "text-muted"
-                                        )}
-                                      >
-                                        ({projectAgentCount})
-                                      </span>
-                                    </div>
-                                  )}
-                                </TooltipTrigger>
-                                <TooltipContent align="start">{projectPath}</TooltipContent>
-                              </Tooltip>
-                            </div>
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <button
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    handleAddWorkspace(projectPath);
-                                  }}
-                                  aria-label={`New chat in ${projectName}`}
-                                  data-project-path={projectPath}
-                                  className="text-content-secondary hover:bg-hover hover:border-border-light pointer-events-none flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent text-sm leading-none opacity-0 transition-all duration-200 focus-visible:pointer-events-auto focus-visible:opacity-100"
-                                >
-                                  <Plus className="h-4 w-4 shrink-0" strokeWidth={1.8} />
-                                </button>
-                              </TooltipTrigger>
-                              <TooltipContent>
-                                New chat ({formatKeybind(KEYBINDS.NEW_WORKSPACE)})
-                              </TooltipContent>
-                            </Tooltip>
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <button
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    handleOpenProjectMenu(event, projectPath);
-                                  }}
-                                  aria-label={`Project options for ${projectName}`}
-                                  data-project-path={projectPath}
-                                  className={cn(
-                                    "text-content-secondary hover:bg-hover hover:border-border-light flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded border border-transparent bg-transparent transition-all duration-200 focus-visible:pointer-events-auto focus-visible:opacity-100",
-                                    projectContextMenu.isOpen &&
-                                      projectMenuTargetPath === projectPath
-                                      ? "pointer-events-auto opacity-100"
-                                      : "pointer-events-none opacity-0"
-                                  )}
-                                >
-                                  <EllipsisVertical
-                                    className="h-4 w-4 shrink-0"
-                                    strokeWidth={1.8}
-                                  />
-                                </button>
-                              </TooltipTrigger>
-                              <TooltipContent align="end">Project options</TooltipContent>
-                            </Tooltip>
-                          </DraggableProjectItem>
+                      return (
+                        <div key={projectPath}>
+                          {flatSidebarEnabled ? (
+                            // Dropping a chat on the project header clears its
+                            // sub-project assignment, mirroring the grouped
+                            // unsectioned drop zone.
+                            <WorkspaceSectionDropZone
+                              projectPath={projectPath}
+                              sectionId={null}
+                              onDrop={handleWorkspaceSectionDrop}
+                              testId={`flat-unsection-drop-${sanitizedProjectId}`}
+                            >
+                              {projectHeaderRow}
+                            </WorkspaceSectionDropZone>
+                          ) : (
+                            projectHeaderRow
+                          )}
 
                           {/* Flat mode keeps sub-project management reachable:
                               the same SectionHeader controls (scoped new chat,
@@ -3153,11 +3183,23 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                 const sectionRows = topLevelProjectWorkspaces.filter(
                                   (workspace) => workspace.subProjectPath === subProjectPath
                                 );
+                                // Grouped mode counts a section's drafts too;
+                                // mirror that so toggling modes never changes
+                                // the displayed count.
+                                const sectionDraftCount = (
+                                  workspaceDraftsByProject[projectPath] ?? []
+                                ).filter((draft) => draft.subProjectPath === subProjectPath).length;
                                 const shouldAutoEditSection =
                                   autoEditingSection?.projectPath === projectPath &&
                                   autoEditingSection?.sectionId === subProjectPath;
                                 return (
-                                  <div key={subProjectPath} className="pl-4">
+                                  <WorkspaceSectionDropZone
+                                    key={subProjectPath}
+                                    projectPath={projectPath}
+                                    sectionId={subProjectPath}
+                                    onDrop={handleWorkspaceSectionDrop}
+                                    className="pl-4"
+                                  >
                                     <SectionHeader
                                       section={{
                                         id: subProjectPath,
@@ -3168,7 +3210,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                         color: subProjectConfig.color,
                                       }}
                                       isExpanded={false}
-                                      workspaceCount={sectionRows.length}
+                                      workspaceCount={sectionRows.length + sectionDraftCount}
                                       hasAttention={sectionRows.some(
                                         (workspace) =>
                                           workspaceAttentionById.get(workspace.id) === true
@@ -3214,7 +3256,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                         );
                                       }}
                                     />
-                                  </div>
+                                  </WorkspaceSectionDropZone>
                                 );
                               }
                             )}
@@ -3496,24 +3538,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                   visibleWorkspacesForNormalRendering,
                                   sections
                                 );
-
-                                // Handle workspace drop into section
-                                const handleWorkspaceSectionDrop = (
-                                  workspaceId: string,
-                                  targetSectionId: string | null
-                                ) => {
-                                  void (async () => {
-                                    const result = await assignWorkspaceToSubProject(
-                                      projectPath,
-                                      workspaceId,
-                                      targetSectionId
-                                    );
-                                    if (result.success) {
-                                      // Refresh workspace metadata so UI shows updated sectionId
-                                      await refreshWorkspaceMetadata();
-                                    }
-                                  })();
-                                };
 
                                 // Render section with its workspaces
                                 const renderSection = (section: SectionConfig) => {

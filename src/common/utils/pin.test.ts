@@ -1,6 +1,37 @@
 import { describe, expect, it } from "bun:test";
 
-import { comparePinnedOrder, reassignPinnedTimestamps, recomposePinnedOrder } from "./pin";
+import {
+  comparePinnedOrder,
+  nextMonotonicPinnedAtIso,
+  reassignPinnedTimestamps,
+  recomposePinnedOrder,
+} from "./pin";
+
+describe("nextMonotonicPinnedAtIso", () => {
+  it("appends strictly after the latest existing pin across all values", () => {
+    const iso = nextMonotonicPinnedAtIso(
+      ["2026-01-01T00:00:00.000Z", "2026-01-03T00:00:00.000Z", undefined],
+      Date.parse("2026-01-02T00:00:00.000Z")
+    );
+    expect(iso).toBe("2026-01-03T00:00:00.001Z");
+  });
+
+  it("uses the current time when it already exceeds every pin", () => {
+    const iso = nextMonotonicPinnedAtIso(
+      ["2026-01-01T00:00:00.000Z"],
+      Date.parse("2026-02-01T00:00:00.000Z")
+    );
+    expect(iso).toBe("2026-02-01T00:00:00.000Z");
+  });
+
+  it("ignores corrupted timestamps whose +1ms successor is unrepresentable", () => {
+    const iso = nextMonotonicPinnedAtIso(
+      ["+275760-09-13T00:00:00.000Z", "2026-01-03T00:00:00.000Z"],
+      Date.parse("2026-01-02T00:00:00.000Z")
+    );
+    expect(iso).toBe("2026-01-03T00:00:00.001Z");
+  });
+});
 
 describe("comparePinnedOrder", () => {
   it("sorts by pinnedAt ascending with id tie-break", () => {
@@ -22,6 +53,19 @@ describe("comparePinnedOrder", () => {
 });
 
 describe("reassignPinnedTimestamps", () => {
+  it("re-deals corrupted boundary timestamps instead of overflowing the Date range", () => {
+    const boundary = "+275760-09-13T00:00:00.000Z";
+    const changed = reassignPinnedTimestamps(
+      ["a", "b"],
+      new Map([
+        ["a", boundary],
+        ["b", boundary],
+      ])
+    );
+    expect(changed.get("a")).toBe("1970-01-01T00:00:00.000Z");
+    expect(changed.get("b")).toBe("1970-01-01T00:00:00.001Z");
+  });
+
   const iso = (ms: number) => new Date(ms).toISOString();
 
   it("re-deals the existing pool onto the new order and reports only changed entries", () => {

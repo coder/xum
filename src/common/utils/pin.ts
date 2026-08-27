@@ -41,6 +41,44 @@ function parsePinnedAtMs(pinnedAt: string | undefined): number {
 }
 
 /**
+ * Highest epoch ms a JS Date can represent. pinnedAt is persisted as an
+ * unrestricted string, so a corrupted-but-parseable boundary timestamp (e.g.
+ * "+275760-09-13T00:00:00.000Z") would otherwise poison every monotonic
+ * successor computation: max + 1ms leaves the representable range and
+ * toISOString() throws, permanently blocking pinning. Successor scans treat
+ * such values as absent instead (self-healing).
+ */
+const MAX_DATE_MS = 8_640_000_000_000_000;
+
+/** Epoch ms of a pinnedAt whose +1ms successor is representable, else null. */
+function pinnedAtMsForSuccessorScan(pinnedAt: string | undefined): number | null {
+  if (!pinnedAt) return null;
+  const ms = new Date(pinnedAt).getTime();
+  return Number.isFinite(ms) && ms + 1 <= MAX_DATE_MS ? ms : null;
+}
+
+/**
+ * Monotonic pin timestamp: strictly greater than every existing
+ * (representable) pin so rapid pins always append deterministically, even if
+ * the wall clock is skewed or several pins land within the same millisecond.
+ * The scan is global (all projects), keeping the flat sidebar's unified pinned
+ * block appending at the bottom. Shared by the backend and the client's
+ * optimistic update so the optimistic row lands where the authoritative
+ * metadata will place it.
+ */
+export function nextMonotonicPinnedAtIso(
+  existingPinnedAts: Iterable<string | undefined>,
+  nowMs: number = Date.now()
+): string {
+  let pinnedAtMs = nowMs;
+  for (const value of existingPinnedAts) {
+    const ms = pinnedAtMsForSuccessorScan(value);
+    if (ms !== null && ms >= pinnedAtMs) pinnedAtMs = ms + 1;
+  }
+  return new Date(pinnedAtMs).toISOString();
+}
+
+/**
  * Stable pinned-block comparator: pinnedAt ascending (new pins append at the
  * bottom of the pinned block), workspace id as deterministic tie-breaker.
  * Shared by frontend sorting and the backend reorder path so both derive the
@@ -75,8 +113,10 @@ export function reassignPinnedTimestamps(
   orderedIds: readonly string[],
   currentPinnedAtById: ReadonlyMap<string, string>
 ): Map<string, string> {
+  // Corrupted boundary timestamps re-deal from 0 like unparseable ones so the
+  // +1ms nudges below can never leave the representable Date range.
   const poolMs = orderedIds
-    .map((id) => parsePinnedAtMs(currentPinnedAtById.get(id)))
+    .map((id) => pinnedAtMsForSuccessorScan(currentPinnedAtById.get(id)) ?? 0)
     .sort((a, b) => a - b);
 
   const changed = new Map<string, string>();

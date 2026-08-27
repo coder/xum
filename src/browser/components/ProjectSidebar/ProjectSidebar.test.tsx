@@ -989,6 +989,34 @@ describe("ProjectSidebar flat chat list", () => {
         ],
       ]),
     });
+    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
+      () =>
+        ({
+          selectedWorkspace: null,
+          setSelectedWorkspace: () => undefined,
+          preflightArchiveWorkspace: () =>
+            Promise.resolve({ success: true, data: { kind: "ready" } }),
+          archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
+          removeWorkspace: () => Promise.resolve({ success: true }),
+          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
+          refreshWorkspaceMetadata: () => Promise.resolve(),
+          pendingNewWorkspaceProject: null,
+          pendingNewWorkspaceDraftId: null,
+          workspaceDraftsByProject: {
+            "/projects/demo-project": [
+              {
+                draftId: "draft-in-section",
+                createdAt: Date.now(),
+                subProjectPath: "/projects/demo-project/features",
+              },
+            ],
+          },
+          workspaceDraftPromotionsByProject: {},
+          createWorkspaceDraft: () => undefined,
+          openWorkspaceDraft: () => undefined,
+          deleteWorkspaceDraft: () => undefined,
+        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
+    );
     updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
 
     const view = render(
@@ -1002,7 +1030,8 @@ describe("ProjectSidebar flat chat list", () => {
 
     // SectionHeader is stubbed in this suite, so assert the management row's
     // contract via its props: the flat row keeps the scoped controls but has
-    // no expansion toggle (nothing nests under it in flat mode).
+    // no expansion toggle (nothing nests under it in flat mode), and its count
+    // includes section drafts like the grouped header.
     expect(view.getByLabelText("Create workspace in demo-project")).toBeTruthy();
     const sectionHeaderCalls = (
       SectionHeaderModule.SectionHeader as unknown as {
@@ -1016,7 +1045,27 @@ describe("ProjectSidebar flat chat list", () => {
       .find((props) => props.section.id === "/projects/demo-project/features");
     expect(sectionProps?.section.name).toBe("Features");
     expect(sectionProps?.onToggleExpand).toBeUndefined();
-    expect(sectionProps?.workspaceCount).toBe(0);
+    expect(sectionProps?.workspaceCount).toBe(1);
+
+    // The management rows stay drop targets: the sub-project row assigns a
+    // dragged chat to the section, the project header clears the assignment.
+    const dropZoneCalls = (
+      WorkspaceSectionDropZoneModule.WorkspaceSectionDropZone as unknown as {
+        mock: {
+          calls: Array<
+            [Parameters<typeof WorkspaceSectionDropZoneModule.WorkspaceSectionDropZone>[0]]
+          >;
+        };
+      }
+    ).mock.calls.map(([props]) => props);
+    const sectionZone = dropZoneCalls.find(
+      (props) => props.sectionId === "/projects/demo-project/features"
+    );
+    expect(typeof sectionZone?.onDrop).toBe("function");
+    const clearZone = dropZoneCalls.find(
+      (props) => props.sectionId === null && props.projectPath === "/projects/demo-project"
+    );
+    expect(typeof clearZone?.onDrop).toBe("function");
   });
 
   test("badges flat rows with their sub-project identity, falling back when stale", () => {

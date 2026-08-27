@@ -64,7 +64,7 @@ import {
 } from "@/browser/utils/rightSidebarLayout";
 import { normalizeAgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { isWorkspaceArchived } from "@/common/utils/archive";
-import { reassignPinnedTimestamps } from "@/common/utils/pin";
+import { nextMonotonicPinnedAtIso, reassignPinnedTimestamps } from "@/common/utils/pin";
 import { shouldApplyWorkspaceAiSettingsFromBackend } from "@/browser/utils/workspaceAiSettingsSync";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import { findAdjacentWorkspaceId } from "@/browser/utils/ui/workspaceDomNav";
@@ -1516,17 +1516,14 @@ export function WorkspaceProvider(props: WorkspaceProviderProps) {
         if (!meta || Boolean(meta.pinnedAt) === pinned) return prev;
         previousPinnedAt = meta.pinnedAt;
         applied = true;
-        // Mirror the server's append-only ordering: strictly greater than every
-        // existing pin in the same project so rapid pins stay in click order.
+        // Mirror the server's global append-only ordering (all projects, not
+        // just this one) so the flat sidebar's unified pinned block shows the
+        // row where the authoritative metadata will keep it.
         let optimisticPinnedAt: string | undefined;
         if (pinned) {
-          let pinnedAtMs = Date.now();
-          for (const other of prev.values()) {
-            if (other.projectPath !== meta.projectPath || !other.pinnedAt) continue;
-            const otherMs = new Date(other.pinnedAt).getTime();
-            if (Number.isFinite(otherMs) && otherMs >= pinnedAtMs) pinnedAtMs = otherMs + 1;
-          }
-          optimisticPinnedAt = new Date(pinnedAtMs).toISOString();
+          optimisticPinnedAt = nextMonotonicPinnedAtIso(
+            Array.from(prev.values(), (other) => other.pinnedAt)
+          );
         }
         const next = new Map(prev);
         next.set(workspaceId, { ...meta, pinnedAt: optimisticPinnedAt });

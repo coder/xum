@@ -14,6 +14,7 @@ import { isWorkspaceArchived } from "@/common/utils/archive";
 import {
   comparePinnedOrder,
   isWorkspacePinned,
+  nextMonotonicPinnedAtIso,
   reassignPinnedTimestamps,
 } from "@/common/utils/pin";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
@@ -8093,22 +8094,13 @@ export class WorkspaceService extends EventEmitter {
           if (workspaceEntry.pinnedAt) {
             return config;
           }
-          // Server-generated monotonic timestamp: strictly greater than every existing
-          // pin across all projects so rapid pins always append deterministically, even
-          // if the wall clock is skewed or several pins land within the same millisecond.
-          // The global scan (not just this bucket) keeps the flat sidebar's unified
-          // pinned block appending at the bottom too.
-          let pinnedAtMs = Date.now();
-          for (const project of config.projects.values()) {
-            for (const entry of project.workspaces) {
-              if (!entry.pinnedAt) continue;
-              const existingMs = new Date(entry.pinnedAt).getTime();
-              if (Number.isFinite(existingMs) && existingMs >= pinnedAtMs) {
-                pinnedAtMs = existingMs + 1;
-              }
-            }
-          }
-          workspaceEntry.pinnedAt = new Date(pinnedAtMs).toISOString();
+          // Server-generated global monotonic timestamp; see nextMonotonicPinnedAtIso
+          // for the ordering and corrupted-timestamp rationale.
+          workspaceEntry.pinnedAt = nextMonotonicPinnedAtIso(
+            Array.from(config.projects.values()).flatMap((project) =>
+              project.workspaces.map((entry) => entry.pinnedAt)
+            )
+          );
           updated = true;
         } else if (workspaceEntry.pinnedAt) {
           delete workspaceEntry.pinnedAt;

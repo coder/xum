@@ -13338,6 +13338,22 @@ describe("WorkspaceService setPinned", () => {
     expect(emittedMetadata[1].metadata?.pinnedAt).toBeUndefined();
   });
 
+  test("corrupted boundary pinnedAt on another chat cannot block pinning", async () => {
+    // A parseable boundary timestamp has no representable +1ms successor; the
+    // global monotonic scan must ignore it rather than fail every future pin.
+    const other = getEntry(otherRootId);
+    if (!other) throw new Error("fixture missing otherRootId");
+    other.pinnedAt = "+275760-09-13T00:00:00.000Z";
+
+    const result = await workspaceService.setPinned(rootId, true);
+    expect(result.success).toBe(true);
+    const pinnedAt = getEntry(rootId)?.pinnedAt;
+    expect(pinnedAt).toBeDefined();
+    // The assigned timestamp is a normal near-now value, not a successor of
+    // the corrupted boundary.
+    expect(new Date(pinnedAt ?? "").getTime()).toBeLessThan(Date.now() + 60_000);
+  });
+
   test("pin-when-pinned and unpin-when-unpinned are no-ops without event churn", async () => {
     const first = await workspaceService.setPinned(rootId, true);
     expect(first.success).toBe(true);
