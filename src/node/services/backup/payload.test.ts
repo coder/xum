@@ -1687,6 +1687,7 @@ describe("backup payload", () => {
       "GNU env split strings without assignments",
       `env -S'mcp\\_--token\\_ghp_Abcdef1234""Klmno56789'`,
     ],
+    ["GNU env clustered split strings", `env -ivS'mcp\\_--token\\_ghp_Abcdef1234""Klmno56789'`],
   ] as const) {
     it(`localizes ${name}`, async () => {
       await writeFixtureFile(
@@ -1711,6 +1712,9 @@ describe("backup payload", () => {
     for (const command of [
       "~/.xum/skills/launch.txt",
       "MODE=fast ~/.xum/skills/launch.txt",
+      "env ~/.xum/skills/launch.txt",
+      "env -u TOKEN ~/.xum/skills/launch.txt",
+      "env env /home/user/.xum/agents/launch.md",
       "true; /home/user/.xum/agents/launch.md",
     ]) {
       await writeFixtureFile(
@@ -2069,6 +2073,9 @@ describe("backup payload", () => {
       "npm --prefix /tmp run exec -c",
       "mcp-server -Ssettings.toml",
       "env -u TOKEN mcp-server -Ssettings.toml",
+      "env -uSESSION mcp-server",
+      "env -CSESSION mcp-server",
+      "env -aSESSION mcp-server",
       "git status",
       "git -C /tmp status",
       "git submodule status",
@@ -5534,6 +5541,22 @@ describe("backup payload", () => {
     } catch (error) {
       if (!(error instanceof Error)) throw error;
       expect(error.message).toContain("AGENTS.md");
+    }
+  });
+
+  it("blocks URL-encoded high-confidence secrets in published documentation", async () => {
+    await writeFixtureFile(
+      muxRoot,
+      "skills/demo/SKILL.md",
+      "https://example.test/?access_token=ghp%5fAbcdef1234567890KlmnoPqrst987654\n"
+    );
+
+    try {
+      await createBackupPayload({ muxRoot, muxVersion: "1.2.3", sourceLabel: "test-host" });
+      throw new Error("Expected encoded secret scan rejection");
+    } catch (error) {
+      if (!(error instanceof Error)) throw error;
+      expect(error.message).toContain("skills/demo/SKILL.md");
     }
   });
 

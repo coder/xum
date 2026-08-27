@@ -1587,20 +1587,24 @@ function executedShellWords(text: string): string[] {
  * with `s`, so every `--s...` prefix spelling (`--s=`, `--split=`) resolves to it.
  */
 function isSplitStringOption(unquoted: string): boolean {
-  if (/^-[A-Za-z0-9]*S/.test(unquoted)) return true;
+  // -u/-C/-a consume the rest of their word, so an S inside that operand is not
+  // a clustered split-string flag. Only no-argument short options may precede -S.
+  if (/^-[i0v]*S/.test(unquoted)) return true;
   const abbreviation = /^--([A-Za-z-]*)=/.exec(unquoted);
   return (
     abbreviation !== null && abbreviation[1] !== "" && "split-string".startsWith(abbreviation[1])
   );
 }
 
-/** GNU env's -u/--unset and -C/--chdir take a separate value in these spellings. */
+/** GNU env options whose following word is an option value, not COMMAND. */
 function envOptionTakesSeparateValue(unquoted: string): boolean {
-  if (unquoted === "-u" || unquoted === "-C") return true;
+  if (unquoted === "-u" || unquoted === "-C" || unquoted === "-a") return true;
   const abbreviation = /^--([A-Za-z-]+)$/.exec(unquoted)?.[1];
   return (
     abbreviation !== undefined &&
-    ("unset".startsWith(abbreviation) || "chdir".startsWith(abbreviation))
+    ("unset".startsWith(abbreviation) ||
+      "chdir".startsWith(abbreviation) ||
+      "argv0".startsWith(abbreviation))
   );
 }
 
@@ -1653,14 +1657,50 @@ const CONSUMED_ASSIGNMENT = new RegExp(`^${ASSIGNMENT_NAME}${REDACTED_BACKUP_VAL
  */
 function hasDirectAutoPublishedCommand(redacted: string): boolean {
   let commandPosition = true;
+  let envWrapper = false;
+  let envOptionValue = false;
   let previousEnd = 0;
   for (const match of redacted.matchAll(SHELL_WORD)) {
     const start = match.index;
-    if (/[;&|()\n]/.test(redacted.slice(previousEnd, start))) commandPosition = true;
+    if (/[;&|()\n]/.test(redacted.slice(previousEnd, start))) {
+      commandPosition = true;
+      envWrapper = false;
+      envOptionValue = false;
+    }
     previousEnd = start + match[0].length;
     if (!commandPosition) continue;
     if (CONSUMED_ASSIGNMENT.test(match[0])) continue;
-    if (isAutoPublishedScriptOperand(unquoteShellWord(match[0]))) return true;
+    const unquoted = unquoteShellWord(match[0]);
+    if (envWrapper) {
+      if (envOptionValue) {
+        envOptionValue = false;
+        continue;
+      }
+      if (unquoted === "-" || unquoted === "--") continue;
+      if (envOptionTakesSeparateValue(unquoted)) {
+        envOptionValue = true;
+        continue;
+      }
+      if (unquoted.startsWith("-")) continue;
+      const executable = unquoted
+        .slice(Math.max(unquoted.lastIndexOf("/"), unquoted.lastIndexOf("\\")) + 1)
+        .toLowerCase()
+        .replace(/\.exe$/, "");
+      if (executable === "env") continue;
+      if (isAutoPublishedScriptOperand(unquoted)) return true;
+      commandPosition = false;
+      envWrapper = false;
+      continue;
+    }
+    const executable = unquoted
+      .slice(Math.max(unquoted.lastIndexOf("/"), unquoted.lastIndexOf("\\")) + 1)
+      .toLowerCase()
+      .replace(/\.exe$/, "");
+    if (executable === "env") {
+      envWrapper = true;
+      continue;
+    }
+    if (isAutoPublishedScriptOperand(unquoted)) return true;
     commandPosition = false;
   }
   return false;
@@ -2891,6 +2931,14 @@ export async function createBackupPayload(
         // rather than doubling the synchronous scan of a size-capped payload.
         const targets = [content, file.path];
         if (content.includes("\u0000")) targets.push(content.replaceAll("\u0000", ""));
+        // A reader's ordinary URL parsing decodes percent triplets in published
+        // documentation. Scan that one-pass decoded view too, but only when a percent
+        // sign exists so ordinary near-limit payloads pay no extra full-file pass.
+        if (AUTO_PUBLISHED_RECURSIVE_FILE.test(file.path) && content.includes("%")) {
+          const decoded = percentDecodeOnce(content);
+          targets.push(decoded);
+          if (decoded.includes("\u0000")) targets.push(decoded.replaceAll("\u0000", ""));
+        }
         // Shell-normalized variants catch a token split by quoting or an expansion
         // (`--token ghp_123\456...`, `ghp_...$9...`): the shell removes both on
         // execution, and the published text reconstructs the same credential.
@@ -3963,10 +4011,43 @@ function collectUrlStrings(root: unknown): string[] {
  * literal `%61` a single standard parse yields, and repeated decoding would manufacture
  * blocks from spellings no consumer resolves to the credential.
  */
+function hexDigitValue(code: number): number {
+  if (code >= 48 && code <= 57) return code - 48;
+  if (code >= 65 && code <= 70) return code - 55;
+  if (code >= 97 && code <= 102) return code - 87;
+  return -1;
+}
+
+/** One-pass %XX decoding without one regex callback/allocation per triplet. */
 function percentDecodeOnce(text: string): string {
-  return text.replace(/%([0-9a-fA-F]{2})/g, (_match, hex: string) =>
-    String.fromCharCode(Number.parseInt(hex, 16))
-  );
+  if (!text.includes("%")) return text;
+  const chunks: string[] = [];
+  const codes = new Uint16Array(16_384);
+  let used = 0;
+  function flush(): void {
+    if (used === 0) return;
+    chunks.push(String.fromCharCode(...codes.subarray(0, used)));
+    used = 0;
+  }
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code === 37 && i + 2 < text.length) {
+      const high = hexDigitValue(text.charCodeAt(i + 1));
+      const low = hexDigitValue(text.charCodeAt(i + 2));
+      if (high >= 0 && low >= 0) {
+        codes[used] = (high << 4) | low;
+        used += 1;
+        i += 2;
+        if (used === codes.length) flush();
+        continue;
+      }
+    }
+    codes[used] = code;
+    used += 1;
+    if (used === codes.length) flush();
+  }
+  flush();
+  return chunks.join("");
 }
 
 /**
