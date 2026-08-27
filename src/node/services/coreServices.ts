@@ -115,7 +115,20 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     if (!evidence.hasWorkspaceEntriesWithoutIds) {
       return false;
     }
-    // Alias ids: a second resolvable compatibility file's identity stays
+    // Targeted lenient positive first: a POSITIVE identity match needs no
+    // completeness, so a re-registered workspace whose own compatibility
+    // metadata is healthy must not stay write-suppressed because an
+    // UNRELATED legacy entry's metadata is malformed (the strict
+    // enumeration below throws on the first such entry, and the tombstone
+    // would then pin every one of the target's writes as transient
+    // indefinitely). A lenient scan only skips unreadable entries — it
+    // never fabricates a match.
+    if (config.findWorkspace(workspaceId) != null) {
+      return true;
+    }
+    // Negatives keep requiring the complete strict view: a lenient miss is
+    // indistinguishable from an identity hidden by a read failure. Alias
+    // ids: a second resolvable compatibility file's identity stays
     // registered for findWorkspace even though it is not any entry's
     // primary id — refusing its writes/deletions requires knowing it here.
     const legacyAliasIds = new Set<string>();

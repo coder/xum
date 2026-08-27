@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import * as path from "path";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
@@ -1026,11 +1026,9 @@ describe("ExtensionMetadataService", () => {
       () => true
     );
     expect(sidecarGone).toBe(true);
-    const claimGone = await readFile(`${quarantinePath}.claimed`, "utf-8").then(
-      () => false,
-      () => true
-    );
-    expect(claimGone).toBe(true);
+    // No claim file left behind (unique names; discovered by prefix).
+    const leftovers = (await readdir(tempDir)).filter((name) => name.includes(".corrupt-claim-"));
+    expect(leftovers).toEqual([]);
   });
 
   test("quarantine preserves an existing healthy sidecar instead of clobbering it", async () => {
@@ -1175,24 +1173,25 @@ describe("ExtensionMetadataService", () => {
       }
       expect(strictRejected).toBe(true);
       // Bytes retained for the retry: the consume claimed the sidecar before
-      // the failing identity probe, so they now sit at the claim path and
-      // are never deleted on unverifiable identity.
-      expect(await readFile(`${filePath}.corrupt.claimed`, "utf-8")).toContain("ws-stranded");
+      // the failing identity probe, so they now sit at a unique claim name
+      // and are never deleted on unverifiable identity.
+      const claims = (await readdir(tempDir)).filter((name) => name.includes(".corrupt-claim-"));
+      expect(claims.length).toBe(1);
+      expect(await readFile(path.join(tempDir, claims[0]), "utf-8")).toContain("ws-stranded");
     } finally {
       statics.statQuarantineToken = realStat;
     }
-    // Retry with the probe healthy: the claim-leftover resume re-merges
+    // Retry with the probe healthy: the stranded-claim discovery re-merges
     // idempotently and consumption completes.
     const snapshots = await service.getAllSnapshots({ throwOnError: true });
     expect(snapshots.get("ws-stranded")?.recency).toBe(700);
     expect(snapshots.get("ws-live")?.recency).toBe(900);
-    for (const leftover of [`${filePath}.corrupt`, `${filePath}.corrupt.claimed`]) {
-      const gone = await readFile(leftover, "utf-8").then(
-        () => false,
-        () => true
-      );
-      expect(gone).toBe(true);
-    }
+    const sidecarGone = await readFile(`${filePath}.corrupt`, "utf-8").then(
+      () => false,
+      () => true
+    );
+    expect(sidecarGone).toBe(true);
+    expect((await readdir(tempDir)).filter((name) => name.includes(".corrupt-claim-"))).toEqual([]);
   });
 
   test("a strict per-workspace read self-heals deterministic corruption", async () => {

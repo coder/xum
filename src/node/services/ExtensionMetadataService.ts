@@ -1,7 +1,9 @@
-import { dirname } from "path";
+import { basename, dirname, join } from "path";
+import { randomUUID } from "crypto";
 import {
   mkdir,
   readFile,
+  readdir,
   access,
   rename,
   link,
@@ -76,6 +78,13 @@ export interface ExtensionMetadataStreamingUpdate {
 
 export class ExtensionMetadataService {
   private readonly filePath: string;
+
+  /**
+   * Name infix for per-consume claim files (`<main><infix><pid>-<uuid>`).
+   * Unique names keep concurrent recoveries from replacing or clearing each
+   * other's live claims; stranded claims are discovered by this prefix.
+   */
+  private static readonly CLAIM_INFIX = ".corrupt-claim-";
   private mutationQueue: Promise<void> = Promise.resolve();
   /**
    * Per-process write tombstones for removed workspaces. Workspace removal
@@ -345,14 +354,19 @@ export class ExtensionMetadataService {
    * a path unlink would leave a window in which that unreconciled newer
    * generation is destroyed. The rename below atomically takes exactly one
    * generation off the shared path first; identity is then verified on the
-   * claimed file, which no other recovery references by design. A claimed
+   * claimed file. The claim name is UNIQUE per consume (pid + uuid): a fixed
+   * name would let a concurrent consumer's claim land on (POSIX rename
+   * replaces) or clear (its own leftover pass) another recovery's live
+   * claim, re-opening the destroyed-generation window this claim exists to
+   * close — and a fresh unique destination also never collides on Windows,
+   * where rename onto an existing file is not reliably a replace. A claimed
    * FOREIGN generation (identity mismatch) is reconciled into the main file
    * rather than deleted. Invariant: a claim file whose identity matched its
    * consumer's token holds already-reconciled bytes (callers merge/restore
    * before consuming), so only a crash between a MISMATCH claim and its
-   * reconcile strands unconsumed data at the claim path —
-   * reconcileLeftoverSidecarIfPresent probes for exactly that and resumes
-   * the merge on the next authoritative read.
+   * reconcile strands unconsumed data at a claim name —
+   * reconcileLeftoverSidecarIfPresent discovers stranded claims by prefix
+   * and resumes the merge on the next authoritative read.
    */
   private async consumeQuarantineSidecar(
     quarantinePath: string,
@@ -364,33 +378,7 @@ export class ExtensionMetadataService {
       // fail closed by leaving the file rather than unlinking blind.
       return;
     }
-    const claimPath = `${quarantinePath}.claimed`;
-    // A leftover at the claim path is either already-reconciled bytes (crash
-    // between a matched claim and its unlink) or a crash-stranded foreign
-    // generation (see the invariant above): reconcile it first so nothing
-    // recoverable is lost, then clear the name — the rename below must not
-    // land on an occupied destination (Windows rename is not reliably a
-    // replace). Post-reconcile bytes are consumed or deterministically
-    // unrecoverable, so the unlink only ever discards dead bytes.
-    const claimLeftoverExists = await access(claimPath).then(
-      () => true,
-      (error: unknown) => {
-        if (ExtensionMetadataService.isErrnoCode(error, "ENOENT")) {
-          return false;
-        }
-        throw error; // Unknowable claim state: retryable, never unlink blind.
-      }
-    );
-    if (claimLeftoverExists) {
-      await this.reconcileRecreatedMainWithSidecar(claimPath);
-      try {
-        await unlink(claimPath);
-      } catch (unlinkError) {
-        if (!ExtensionMetadataService.isErrnoCode(unlinkError, "ENOENT")) {
-          throw unlinkError;
-        }
-      }
-    }
+    const claimPath = `${this.filePath}${ExtensionMetadataService.CLAIM_INFIX}${process.pid}-${randomUUID()}`;
     try {
       await rename(quarantinePath, claimPath);
     } catch (renameError) {
@@ -399,15 +387,17 @@ export class ExtensionMetadataService {
       }
       throw renameError;
     }
-    // Identity check on the CLAIMED file (immutable to other recoveries):
-    // non-ENOENT probe failures propagate (retryable) with the claim left in
-    // place for the leftover resume above — reporting success would let the
-    // caller proceed, e.g. the one-time prune deletes stale entries, a later
-    // read re-merges them from a retained sidecar, and with the prune latch
-    // already set the resurrected entries stay indefinitely.
+    // Identity check on the CLAIMED file (nothing else references the
+    // unique name except the stranded-claim discovery, which reconciles
+    // rather than destroys): non-ENOENT probe failures propagate
+    // (retryable) with the claim left for that discovery — reporting
+    // success would let the caller proceed, e.g. the one-time prune deletes
+    // stale entries, a later read re-merges them from a retained sidecar,
+    // and with the prune latch already set the resurrected entries stay
+    // indefinitely.
     const current = await ExtensionMetadataService.statQuarantineToken(claimPath);
     if (current == null) {
-      return; // Claim vanished (external cleanup); nothing left to consume.
+      return; // Claim vanished (concurrent discovery consumed it).
     }
     if (
       current.ino !== token.ino ||
@@ -417,8 +407,9 @@ export class ExtensionMetadataService {
       // The claim took a NEWER generation another process installed after
       // consuming ours: merge it into the main file instead of destroying
       // it. The reconcile consumes the claim itself on success; a corrupt
-      // foreign generation stays at the bounded claim name until the next
-      // consume's leftover pass discards it.
+      // foreign generation stays at the claim name until the discovery
+      // pass's reconcile classifies it (bounded: one file per crashed or
+      // failed recovery, consumed on the next successful pass).
       log.debug("Claimed a replaced quarantine sidecar generation; reconciling it", {
         quarantinePath,
       });
@@ -468,31 +459,38 @@ export class ExtensionMetadataService {
       return true;
     }
     // A crash between consumeQuarantineSidecar's mismatch claim and its
-    // reconcile strands an unreconciled foreign generation at the fixed
-    // claim path, which the sidecar probe above cannot see. Same access()
-    // cost profile: the reconcile only runs when a claim file actually
-    // exists (re-checked inside the queue — a concurrent consume's leftover
-    // pass may have taken it while this caller waited).
-    const claimPath = `${this.filePath}.corrupt.claimed`;
-    const claimExists = await access(claimPath).then(
-      () => true,
-      (error: unknown) => {
-        if (ExtensionMetadataService.isErrnoCode(error, "ENOENT")) {
-          return false;
-        }
-        throw error; // Unknowable claim state stays a retryable failure.
-      }
+    // reconcile strands an unreconciled foreign generation at a unique
+    // claim name, which the sidecar probe above cannot see. Discover
+    // stranded claims by prefix (one readdir next to the full-file read the
+    // caller already does); an unreadable directory propagates so the read
+    // stays retryable rather than vouching for a possibly partial main.
+    const claimNames = (await readdir(dirname(this.filePath))).filter((name) =>
+      name.startsWith(`${basename(this.filePath)}${ExtensionMetadataService.CLAIM_INFIX}`)
     );
-    if (!claimExists) {
+    if (claimNames.length === 0) {
       return false;
     }
     await this.withSerializedMutation(async () => {
-      const stillExists = await access(claimPath).then(
-        () => true,
-        () => false
-      );
-      if (stillExists) {
-        await this.reconcileRecreatedMainWithSidecar(claimPath);
+      for (const claimName of claimNames) {
+        const claimPath = join(dirname(this.filePath), claimName);
+        // Re-check inside the queue: a concurrent recovery's discovery (or
+        // the claim's own consume) may have taken the file while this
+        // caller waited. Only a verified ENOENT skips — an unprobeable
+        // claim propagates, same contract as the sidecar probe: reporting
+        // success would let a strict read accept and emit a possibly
+        // partial main while recoverable fields sit in the claim.
+        const stillExists = await access(claimPath).then(
+          () => true,
+          (error: unknown) => {
+            if (ExtensionMetadataService.isErrnoCode(error, "ENOENT")) {
+              return false;
+            }
+            throw error;
+          }
+        );
+        if (stillExists) {
+          await this.reconcileRecreatedMainWithSidecar(claimPath);
+        }
       }
     });
     return true;
