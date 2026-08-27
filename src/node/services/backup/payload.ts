@@ -1647,15 +1647,15 @@ export async function createBackupPayload(
         // interleaved NUL characters here; text published as prose has no business
         // holding NULs, so this manufactures no match from ordinary content.
         const targets = [content, content.replaceAll("\u0000", ""), file.path];
-        // Shell-normalized variants catch a token split by quoting or a line
-        // continuation (`--token ghp_123\456...`, `AKIA...\<newline>...`): the shell
-        // removes both on execution, and the published text reconstructs the same
-        // credential. Normalization works on parsed string values, not the raw JSON
-        // text, whose escape encoding garbles the reassembly. Only command content is
-        // shell input; prose can legitimately hold quote-separated token-like
-        // fragments, and this block has no override.
+        // Shell-normalized variants catch a token split by quoting or an expansion
+        // (`--token ghp_123\456...`, `ghp_...$9...`): the shell removes both on
+        // execution, and the published text reconstructs the same credential.
+        // Normalization works on parsed command strings, not the raw JSON text, whose
+        // escape encoding garbles the reassembly. Only command values are shell input;
+        // other strings (tool names, urls, prose) can legitimately hold quote-separated
+        // token-like fragments, and this block has no override.
         if (file.path === "mcp.jsonc") {
-          for (const text of collectStringValues(jsonc.parse(content))) {
+          for (const text of collectCommandStrings(jsonc.parse(content))) {
             const joined = text.replace(/\\\r?\n/g, "").replace(/[\\'"]/g, "");
             targets.push(joined);
             // A simple parameter expansion that is unset at runtime vanishes
@@ -2661,17 +2661,16 @@ function readUrl(server: Record<string, unknown> | undefined): string | undefine
   return typeof url === "string" ? url : undefined;
 }
 
-/** Every string value in a parsed tree, for shell-normalized credential scanning. */
-function collectStringValues(value: unknown, found: string[] = []): string[] {
-  if (typeof value === "string") {
-    found.push(value);
-  } else if (Array.isArray(value)) {
-    for (const item of value) collectStringValues(item, found);
-  } else {
-    const record = readRecord(value);
-    if (record) for (const item of Object.values(record)) collectStringValues(item, found);
+/** Every command string a shell would execute, for shell-normalized credential scans. */
+function collectCommandStrings(root: unknown): string[] {
+  const servers = readRecord(readRecord(root)?.servers);
+  if (!servers) return [];
+  const commands: string[] = [];
+  for (const value of Object.values(servers)) {
+    const command = typeof value === "string" ? value : readRecord(value)?.command;
+    if (typeof command === "string") commands.push(command);
   }
-  return found;
+  return commands;
 }
 
 /**

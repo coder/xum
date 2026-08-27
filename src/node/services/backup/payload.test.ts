@@ -577,7 +577,7 @@ describe("backup payload", () => {
     expect((blocked as BackupCredentialDetectedError).files).toEqual(["mcp.jsonc"]);
   });
 
-  it("blocks the export when a line continuation splits a known credential token", async () => {
+  it("localizes continuation-split command credentials and keeps non-command strings verbatim", async () => {
     // Bash removes backslash-newline entirely, handing the server one contiguous key.
     const brokenKey = "AKIA12345678\\\n90123456";
     // In a command the continuation-joined word spans whitespace and fails closed at
@@ -598,8 +598,8 @@ describe("backup payload", () => {
     };
     expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
 
-    // Other portable strings publish verbatim, so the backstop must reassemble what
-    // Bash would join before matching.
+    // A non-command string is not shell input: nothing at runtime joins its
+    // fragments, so it publishes verbatim instead of manufacturing a block.
     await writeFixtureFile(
       muxRoot,
       "mcp.jsonc",
@@ -607,16 +607,13 @@ describe("backup payload", () => {
         servers: { notes: { command: "npx notes-mcp", toolAllowlist: [brokenKey] } },
       })
     );
-    const blocked = await captureRejection(
-      createBackupPayload({
-        muxRoot,
-        muxVersion: "1.2.3",
-        sourceLabel: "test-host",
-        reportSecrets: true,
-      })
-    );
-    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
-    expect((blocked as BackupCredentialDetectedError).files).toEqual(["mcp.jsonc"]);
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(payloadFileText(payload, "mcp.jsonc")).toContain("AKIA12345678");
   });
 
   it("blocks the export when an empty expansion splices a known credential token", async () => {
