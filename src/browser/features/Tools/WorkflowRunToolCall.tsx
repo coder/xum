@@ -1813,8 +1813,14 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
                   {workflowView.stats.done}/{workflowView.stats.total} steps
                 </span>
                 <span>{formatWorkflowDuration(workflowView.stats.elapsedMs)}</span>
-                <span>{formatWorkflowTokens(workflowView.stats.usage?.tokens)} tokens</span>
-                <span>{formatWorkflowCost(workflowView.stats.usage?.costUsd)}</span>
+                {/* Usage exists only when a per-task overlay was supplied to projectWorkflowRun;
+                    mirror WorkflowRunHeader and omit the cells instead of rendering dashes. */}
+                {workflowView.stats.usage != null && (
+                  <>
+                    <span>{formatWorkflowTokens(workflowView.stats.usage.tokens)} tokens</span>
+                    <span>{formatWorkflowCost(workflowView.stats.usage.costUsd)}</span>
+                  </>
+                )}
               </div>
               <div
                 className="max-h-[400px] overflow-y-auto pr-1"

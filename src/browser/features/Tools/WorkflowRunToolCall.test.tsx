@@ -1920,6 +1920,9 @@ describe("WorkflowRunToolCall", () => {
     );
 
     expect(view.getByText("0/1 steps")).toBeTruthy();
+    // Without a usage overlay the stats row omits the token/cost cells entirely
+    // (mirroring WorkflowRunHeader) instead of rendering dash placeholders.
+    expect(view.queryByText(/tokens/)).toBeNull();
     fireEvent.click(view.getByText("Research"));
     expect(view.getByText("Collect sources")).toBeTruthy();
     expect(view.getByText("Event log")).toBeTruthy();
