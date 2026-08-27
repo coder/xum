@@ -1614,6 +1614,10 @@ function gitConfigOptionTakesSeparateValue(unquoted: string): boolean {
   return /^(?:-[ft]|--(?:file|blob|type|comment|default))$/.test(unquoted);
 }
 
+/** Git config values that Git later executes as commands or helper processes. */
+const GIT_COMMAND_CONFIG_KEY =
+  /^(?:core\.(?:sshcommand|askpass|editor|pager|gitproxy|fsmonitor)|sequence\.editor|diff\.external|interactive\.difffilter|gpg(?:\.[^.]+)?\.program|pager\.[^.]+|(?:diff|merge)tool\.[^.]+\.cmd|filter\.[^.]+\.(?:clean|smudge|process)|credential(?:\..+)?\.helper|man\.[^.]+\.cmd|tar\.[^.]+\.command)$/i;
+
 /**
  * Documentation is the only thing a recursive collection publishes without asking.
  * An interpreter that executes one of these files can reconstruct a credential across
@@ -1895,7 +1899,7 @@ const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   { name: /^(?:lua|luajit)[0-9.]*$/, evalWord: /^-e/ },
   // These launchers execute a positional script but need no inline-eval matcher here;
   // auto-published script operands still localize through the shared check.
-  { name: /^(?:jshell|tclsh|wish|expectk?|jimsh)[0-9.]*$/ },
+  { name: /^(?:elixir|jshell|swift|tclsh|wish|expectk?|jimsh)[0-9.]*$/ },
   {
     name: /^r$/,
     evalWord: /^(?:-e$|--expression(?:=|$))/,
@@ -1984,6 +1988,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
   let pendingGitConfigKey = false;
   let pendingGitConfigOptionValue = false;
   let pendingGitAliasValue = false;
+  let pendingGitCommandValue = false;
   let pendingDenoSubcommand = false;
   let pendingDenoRunScript = false;
   let pendingScriptFileOperand = false;
@@ -2042,6 +2047,10 @@ function hasDisguisedAssignment(redacted: string): boolean {
       pendingGitAliasValue = false;
       if (unquoted.startsWith("!")) return true;
     }
+    if (pendingGitCommandValue) {
+      pendingGitCommandValue = false;
+      return true;
+    }
     if (pendingGitConfigKey) {
       if (pendingGitConfigOptionValue) {
         pendingGitConfigOptionValue = false;
@@ -2049,7 +2058,11 @@ function hasDisguisedAssignment(redacted: string): boolean {
         pendingGitConfigOptionValue = true;
       } else if (!unquoted.startsWith("-")) {
         pendingGitConfigKey = false;
-        if (/^alias\.[^.]+$/i.test(unquoted)) pendingGitAliasValue = true;
+        if (/^alias\.[^.]+$/i.test(unquoted)) {
+          pendingGitAliasValue = true;
+        } else if (GIT_COMMAND_CONFIG_KEY.test(unquoted)) {
+          pendingGitCommandValue = true;
+        }
       }
     }
     if (pendingGitSubmoduleAction) {

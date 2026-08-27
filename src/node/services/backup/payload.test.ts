@@ -1737,6 +1737,8 @@ describe("backup payload", () => {
     ["Rscript", "Rscript ~/.mux/memory/global/launch.markdown"],
     ["Lua", "lua5.4 ~/.xum/skills/launch.txt"],
     ["LuaJIT", "luajit /home/user/.xum/agents/launch.md"],
+    ["Swift", "swift ~/.xum/skills/launch.txt"],
+    ["Elixir", "elixir /home/user/.xum/agents/launch.md"],
     ["JShell", "jshell ~/.xum/skills/launch.txt"],
     ["Tcl", "tclsh ~/.xum/skills/launch.txt"],
     ["Tk wish", "wish8.6 /home/user/.xum/agents/launch.md"],
@@ -1795,10 +1797,13 @@ describe("backup payload", () => {
     }
   });
 
-  it("localizes Git shell aliases installed through config", async () => {
+  it("localizes Git config shell callbacks", async () => {
     for (const command of [
       "git config alias.x '!mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'; git x",
       "git config --global --add alias.launch '!mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'",
+      "git config core.sshCommand 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'; git fetch origin",
+      "git config credential.helper '!mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'",
+      "git config filter.secret.process 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'",
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -2047,6 +2052,8 @@ describe("backup payload", () => {
       "lua /tmp/server.lua",
       "luajit /tmp/server.lua",
       "mcp-server --config ~/.xum/skills/launch.txt",
+      "swift /tmp/launch.swift",
+      "elixir /tmp/launch.exs",
       "jshell /tmp/launch.jsh",
       "tclsh /tmp/server.tcl",
       "wish8.6 /tmp/app.tcl",
@@ -2067,6 +2074,8 @@ describe("backup payload", () => {
       "git submodule status",
       "git config alias.co checkout",
       "git config --get alias.co",
+      "git config core.sshCommand",
+      "git config user.name Alice",
     ]) {
       await writeFixtureFile(
         muxRoot,
