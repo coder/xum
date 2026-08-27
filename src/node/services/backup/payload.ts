@@ -1643,6 +1643,26 @@ const NPM_SUBCOMMANDS = new Set(
 const CONSUMED_ASSIGNMENT = new RegExp(`^${ASSIGNMENT_NAME}${REDACTED_BACKUP_VALUE}$`);
 
 /**
+ * A directly named auto-published document can be executable through its shebang. Track
+ * command starts through assignments and active shell operators, but leave the same path
+ * portable when it is merely an argument to another program.
+ */
+function hasDirectAutoPublishedCommand(redacted: string): boolean {
+  let commandPosition = true;
+  let previousEnd = 0;
+  for (const match of redacted.matchAll(SHELL_WORD)) {
+    const start = match.index;
+    if (/[;&|()\n]/.test(redacted.slice(previousEnd, start))) commandPosition = true;
+    previousEnd = start + match[0].length;
+    if (!commandPosition) continue;
+    if (CONSUMED_ASSIGNMENT.test(match[0])) continue;
+    if (isAutoPublishedScriptOperand(unquoteShellWord(match[0]))) return true;
+    commandPosition = false;
+  }
+  return false;
+}
+
+/**
  * The word with every quoted or escaped character reduced to one placeholder, so a
  * syntax test sees only the regions Bash parses as syntax: a quoted comma cannot
  * trigger brace expansion and a quoted bracket cannot open a glob class. The
@@ -1950,6 +1970,7 @@ const SHELL_STATE_WORDS = new Set([
  * about the rest of that word.
  */
 function hasDisguisedAssignment(redacted: string): boolean {
+  if (hasDirectAutoPublishedCommand(redacted)) return true;
   let envOperandsOnly = false;
   let pendingPrintfVariableOption = false;
   let sawEnv = false;

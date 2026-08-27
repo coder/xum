@@ -1707,6 +1707,30 @@ describe("backup payload", () => {
     });
   }
 
+  it("localizes directly executed auto-published documents", async () => {
+    for (const command of [
+      "~/.xum/skills/launch.txt",
+      "MODE=fast ~/.xum/skills/launch.txt",
+      "true; /home/user/.xum/agents/launch.md",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+  });
+
   for (const [name, command] of [
     ["Python", "python3 ~/.xum/skills/launch.txt"],
     ["Node", "node /home/user/.xum/agents/launch.md"],
@@ -2022,6 +2046,7 @@ describe("backup payload", () => {
       "Rscript server.R --port 8080",
       "lua /tmp/server.lua",
       "luajit /tmp/server.lua",
+      "mcp-server --config ~/.xum/skills/launch.txt",
       "jshell /tmp/launch.jsh",
       "tclsh /tmp/server.tcl",
       "wish8.6 /tmp/app.tcl",
