@@ -1356,12 +1356,20 @@ export class Config {
         const minThinkingLevelByModel = normalizeMinThinkingLevelByModel(
           parsed.minThinkingLevelByModel
         );
-        // One-time seed of the default refusal-fallback chains (e.g. Fable 5 →
+        // One-time seed of the default refusal-fallback chains (e.g. Fable →
         // Opus). Guarded by migrations.defaultModelFallbacksSeeded so the
         // seed is applied exactly once: users who later edit or delete the
         // default chains are not overridden on subsequent loads/updates.
+        // defaultModelFallbacksSeededFable51 re-runs the gap-check once after
+        // the fable alias moved to Fable 5.1: pre-5.1 configs only have a
+        // chain for the old source key, and the new key is a new default that
+        // deserves one seed of its own (still never overwriting an existing
+        // 5.1 chain).
         const migrationsBeforeSeed = normalizeConfigMigrations(parsed.migrations);
-        if (migrationsBeforeSeed.defaultModelFallbacksSeeded !== true) {
+        if (
+          migrationsBeforeSeed.defaultModelFallbacksSeeded !== true ||
+          migrationsBeforeSeed.defaultModelFallbacksSeededFable51 !== true
+        ) {
           // Gap-check against the RAW on-disk map with canonicalized keys, not
           // the sanitized map: a hand-edited entry whose chain sanitizes away
           // (e.g. {enabled:false, models:[]}) is still user intent and must not
@@ -1391,6 +1399,7 @@ export class Config {
           parsed.migrations = {
             ...migrationsBeforeSeed,
             defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
           };
           configModified = true;
         }
@@ -1574,6 +1583,7 @@ export class Config {
       modelFallbacks: { ...DEFAULT_MODEL_FALLBACKS },
       migrations: {
         defaultModelFallbacksSeeded: true,
+        defaultModelFallbacksSeededFable51: true,
         persistentSubagentsDefaulted: true,
       },
     };

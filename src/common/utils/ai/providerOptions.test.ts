@@ -180,6 +180,12 @@ describe("buildProviderOptions - Anthropic", () => {
       // the summarized display flag.
       expect(anthropic.thinking).toEqual({ type: "adaptive", display: "summarized" });
       expect(anthropic.effort).toBe("medium");
+      // Fable 5.1 rides the same Mythos-class wildcard matcher.
+      const anthropic51 = anthropicProviderOptions(
+        buildProviderOptions("anthropic:claude-fable-5-1", "medium")
+      );
+      expect(anthropic51.thinking).toEqual({ type: "adaptive", display: "summarized" });
+      expect(anthropic51.effort).toBe("medium");
     });
 
     test("omits thinking instead of sending disabled when off", () => {
@@ -187,6 +193,9 @@ describe("buildProviderOptions - Anthropic", () => {
       // omitting the field lets it default to adaptive. "off" can still reach here
       // when no thinking level was provided upstream (defaults to off).
       expect(buildProviderOptions("anthropic:claude-fable-5", "off")).toEqual({
+        anthropic: { ...baseAnthropicOptions, effort: "low" },
+      });
+      expect(buildProviderOptions("anthropic:claude-fable-5-1", "off")).toEqual({
         anthropic: { ...baseAnthropicOptions, effort: "low" },
       });
     });

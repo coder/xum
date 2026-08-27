@@ -113,6 +113,7 @@ describe("Config", () => {
           taskSettings: { preserveSubagentsUntilArchive: true },
           migrations: {
             defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
             persistentSubagentsDefaulted: true,
           },
         })
@@ -1551,7 +1552,10 @@ describe("Config", () => {
         JSON.stringify({
           projects: [],
           // Keep this test focused on normalization, not default seeding.
-          migrations: { defaultModelFallbacksSeeded: true },
+          migrations: {
+            defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
+          },
           modelFallbacks: {
             // Gateway-prefixed key + non-string chain entries + unknown trigger.
             "openrouter:anthropic/claude-opus-4-6": {
@@ -1606,11 +1610,67 @@ describe("Config", () => {
         configFilePath(),
         JSON.stringify({
           projects: [],
-          migrations: { defaultModelFallbacksSeeded: true },
+          migrations: {
+            defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
+          },
         })
       );
 
       expect(config.loadConfigOrDefault().modelFallbacks).toBeUndefined();
+    });
+
+    it("seeds the Fable 5.1 chain once for configs seeded before the 5.1 promotion", async () => {
+      // Pre-5.1 configs carry a chain only for the old source key
+      // (anthropic:claude-fable-5); the promoted FABLE key must get its own
+      // one-time seed without touching the legacy chain.
+      fs.writeFileSync(
+        configFilePath(),
+        JSON.stringify({
+          projects: [],
+          migrations: { defaultModelFallbacksSeeded: true },
+          modelFallbacks: {
+            "anthropic:claude-fable-5": { models: ["anthropic:claude-opus-4-8"] },
+          },
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.modelFallbacks).toEqual({
+        "anthropic:claude-fable-5": { models: ["anthropic:claude-opus-4-8"] },
+        [FABLE]: { models: [OPUS] },
+      });
+      expect(loaded.migrations?.defaultModelFallbacksSeededFable51).toBe(true);
+
+      await flushConfigEdits();
+      const raw = JSON.parse(fs.readFileSync(configFilePath(), "utf-8")) as {
+        modelFallbacks?: unknown;
+        migrations?: { defaultModelFallbacksSeededFable51?: unknown };
+      };
+      expect(raw.modelFallbacks).toEqual({
+        "anthropic:claude-fable-5": { models: ["anthropic:claude-opus-4-8"] },
+        [FABLE]: { models: [OPUS] },
+      });
+      expect(raw.migrations?.defaultModelFallbacksSeededFable51).toBe(true);
+    });
+
+    it("does not overwrite an existing Fable 5.1 chain during the 5.1 re-seed", () => {
+      fs.writeFileSync(
+        configFilePath(),
+        JSON.stringify({
+          projects: [],
+          migrations: { defaultModelFallbacksSeeded: true },
+          modelFallbacks: {
+            [FABLE]: { models: ["openai:gpt-5.5"] },
+          },
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.modelFallbacks).toEqual({
+        [FABLE]: { models: ["openai:gpt-5.5"] },
+      });
+      expect(loaded.migrations?.defaultModelFallbacksSeededFable51).toBe(true);
     });
 
     it("merges the seeded default with pre-existing chains for other source models", async () => {
@@ -1649,7 +1709,7 @@ describe("Config", () => {
         JSON.stringify({
           projects: [],
           modelFallbacks: {
-            "openrouter:anthropic/claude-fable-5": { models: ["openai:gpt-5.5"] },
+            "openrouter:anthropic/claude-fable-5-1": { models: ["openai:gpt-5.5"] },
           },
         })
       );
@@ -2687,9 +2747,12 @@ describe("Config", () => {
           routeOverrides: {
             "openai:gpt-4o": "direct",
           },
-          // Without this flag the one-time default-fallbacks seed would write
-          // the file, which is not the rewrite this test guards against.
-          migrations: { defaultModelFallbacksSeeded: true },
+          // Without these flags the one-time default-fallbacks seeds would
+          // write the file, which is not the rewrite this test guards against.
+          migrations: {
+            defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
+          },
         })
       );
 

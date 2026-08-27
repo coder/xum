@@ -16,7 +16,9 @@ export const MODEL_FALLBACK_CHAIN_LIMIT = 3;
  * the sensible out-of-the-box behavior.
  *
  * Seeded into the config exactly once, guarded by
- * migrations.defaultModelFallbacksSeeded — on versions that know the flag,
+ * migrations.defaultModelFallbacksSeeded (plus the one-shot
+ * defaultModelFallbacksSeededFable51 re-seed for the key move to Fable 5.1)
+ * — on versions that know the flag,
  * user edits or deletions of these chains are never overridden by updates.
  * (Versions predating the flag strip it on save, so a downgrade→save→
  * re-upgrade round-trip re-seeds a deleted chain; bounded to re-adding this

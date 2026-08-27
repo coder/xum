@@ -179,6 +179,7 @@ const OPTIONAL_VERSION_SUFFIX = String.raw`(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?`;
 const ANTHROPIC_NATIVE_1M_PATTERNS = [
   // Mythos-class models (Fable 5 / Mythos 5) ship 1M context as standard metadata.
   new RegExp(`^claude-fable-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
+  new RegExp(`^claude-fable-5-1${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-mythos-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-opus-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-opus-4-8${OPTIONAL_VERSION_SUFFIX}$`, "i"),
