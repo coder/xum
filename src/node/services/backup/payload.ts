@@ -1557,6 +1557,9 @@ const LANGUAGE_INTERPRETERS: Array<{ name: RegExp; evalWord: RegExp }> = [
  */
 const SHELL_STATE_WORDS = new Set([
   "eval",
+  // Trap actions are reparsed only when their signal fires, after first-parse quotes
+  // have hidden any expansion or escape inside the handler.
+  "trap",
   "export",
   "declare",
   "typeset",
@@ -1582,6 +1585,7 @@ const SHELL_STATE_WORDS = new Set([
  */
 function hasDisguisedAssignment(redacted: string): boolean {
   let operandsOnly = false;
+  let pendingPrintfVariableOption = false;
   const pendingEvalWords: RegExp[] = [];
   for (const word of redacted.match(SHELL_WORD) ?? []) {
     if (CONSUMED_ASSIGNMENT.test(word)) continue;
@@ -1592,6 +1596,10 @@ function hasDisguisedAssignment(redacted: string): boolean {
     if (hasActiveBraceExpansion(activeWordProjection(word))) return true;
     if (hasNondeterministicGlob(word)) return true;
     const unquoted = unquoteShellWord(word);
+    // With allexport inherited through SHELLOPTS, `printf -v` exports the variable it
+    // builds even when this command contains no explicit export/set/shopt word.
+    if (pendingPrintfVariableOption && unquoted === "-v") return true;
+    pendingPrintfVariableOption = unquoted === "printf";
     // `eval` concatenates its arguments and reparses the result, dissolving one more
     // layer of quoting than any single-pass scan models (`ghp_a\\\\b` reaches the
     // process as `ghp_ab`), wherever the word sits: even mid-command it still names

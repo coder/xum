@@ -1610,7 +1610,13 @@ describe("backup payload", () => {
       "exec 3<&0; { printf ghp_aaaaaaaaaa; printf bbbbbbbbbb; } | { read -r TOKEN; export TOKEN; mcp <&3; }",
       "printf ghp_aaaaaaaaaa | mcp-server",
       "printf -v TOKEN %s%s ghp_aaaaaaaaaa bbbbbbbbbb; export TOKEN; mcp",
+      // Inherited SHELLOPTS=allexport exports a printf-built value without any
+      // explicit state-changing word in the command.
+      "printf -v TOKEN %s%s ghp_aaaaaaaaaa bbbbbbbbbb; mcp",
       "set -a; printf -v TOKEN %s ghp_aaaaaaaaaabbbbbbbbbb; mcp",
+      // Trap actions are reparsed when the signal fires; first-parse quotes can hide
+      // the expansion and escape that join the token at EXIT.
+      "trap 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789' EXIT",
       // `shopt -so allexport` flips the same allexport state `set -a` does.
       "shopt -so allexport; printf -v TOKEN %s%s ghp_aaaaaaaaaa bbbbbbbbbb; mcp",
       // `source` and `.` run a file in this shell with fragments as positionals.
