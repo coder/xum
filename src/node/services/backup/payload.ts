@@ -1501,7 +1501,10 @@ function hasActiveBraceExpansion(active: string): boolean {
  * Shells whose `-c` payload (or script argument) is reparsed under full expansion
  * rules: a quoted script with no literal whitespace still synthesizes separators
  * there (`bash -c 'printf${IFS}%s...'`), so naming one localizes the command.
- * Matched on the quote-removed word's basename, covering `/bin/sh` spellings. A
+ * Matched on the quote-removed word's basename over both separators with a
+ * case-insensitive `.exe` suffix removed, covering `/bin/sh`, `bash.exe`, and
+ * `C:\Tools\PWSH.EXE` spellings alike (Windows names are case-insensitive, and
+ * lowercasing a Unix spelling can only fail closed). A
  * custom wrapper that reparses its argv is per-program knowledge no shell-syntax
  * scan can model, the same boundary drawn for `tee` and option semantics; these
  * names are the shells the platform actually ships.
@@ -1572,7 +1575,10 @@ function hasDisguisedAssignment(redacted: string): boolean {
     // no `=` or `$` in the text (`printf -v TOKEN ...; export TOKEN`), and `set`
     // reaches the same end through `-a` or the positional parameters.
     if (SHELL_STATE_WORDS.has(unquoted)) return true;
-    if (SHELL_INTERPRETER_NAMES.has(unquoted.slice(unquoted.lastIndexOf("/") + 1))) return true;
+    const executable = unquoted
+      .slice(Math.max(unquoted.lastIndexOf("/"), unquoted.lastIndexOf("\\")) + 1)
+      .toLowerCase();
+    if (SHELL_INTERPRETER_NAMES.has(executable.replace(/\.exe$/, ""))) return true;
     // Option terminators end option parsing: past one even a dash-led word is an
     // operand, so `env -- --evil=x` sets an environment entry despite the option look.
     // GNU `env` documents `[-]` as a terminator too, and the consumer sees the word

@@ -1620,6 +1620,9 @@ describe("backup payload", () => {
       // whitespace the interpreter-string rule keys on and \K unescapes.
       "bash -c 'printf${IFS}%s${IFS}ghp_Abcdef1234\\Klmno56789'",
       "/bin/sh -c 'printf${IFS}%s${IFS}ghp_Abcdef1234\\Klmno56789'",
+      // Windows spellings: .exe suffix, backslash paths, case-insensitive names.
+      "bash.exe -c 'printf${IFS}%s${IFS}ghp_Abcdef1234\\Klmno56789'",
+      "'C:\\Tools\\PWSH.EXE' -c 'printf${IFS}%s${IFS}ghp_Abcdef1234\\Klmno56789'",
     ]) {
       await writeFixtureFile(
         muxRoot,
