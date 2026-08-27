@@ -198,13 +198,17 @@ describe("xum trust CLI", () => {
     expect(await materializeResolvedTrust(realConfig, targetConfig, spoofed)).toBe(false);
     expect(targetConfig.loadConfigOrDefault().projects.has(spoofed)).toBe(false);
 
-    // Config.saveConfig swallows write errors; when the ephemeral config root
-    // is unwritable (a regular file), materialization must report failure
-    // instead of letting the run proceed with delegation silently blocked.
+    // A trusted source must fail loudly when Config swallows the target write error.
     const unwritableRoot = path.join(base, "unwritable-root");
     await fs.writeFile(unwritableRoot, "not a directory\n", "utf-8");
     const unwritableConfig = new Config(unwritableRoot);
-    expect(await materializeResolvedTrust(realConfig, unwritableConfig, worktree)).toBe(false);
+    let error: unknown;
+    try {
+      await materializeResolvedTrust(realConfig, unwritableConfig, worktree);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
   }, 15_000);
 
   test("fails loudly when the trust change cannot be persisted", async () => {

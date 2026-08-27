@@ -209,11 +209,11 @@ export async function materializeResolvedTrust(
     project.trusted = true;
     return config;
   });
-  // Config.saveConfig swallows write errors, so confirm the exact-path entry
-  // landed on disk (mirrors runTrust's post-write verification): returning
-  // true without persistence would let the run proceed while the task-spawn
-  // gate still reads the checkout as untrusted.
-  return targetConfig.loadConfigOrDefault().projects.get(projectDir)?.trusted === true;
+  // Config.saveConfig swallows write errors, so verify the exact-path entry before continuing.
+  if (targetConfig.loadConfigOrDefault().projects.get(projectDir)?.trusted !== true) {
+    throw new Error(`Failed to persist resolved trust for ${projectDir}`);
+  }
+  return true;
 }
 
 async function runTrust(options: TrustCLIOptions): Promise<number> {
