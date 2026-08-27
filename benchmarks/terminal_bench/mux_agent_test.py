@@ -740,9 +740,15 @@ def test_run_populates_context_for_successful_exit(
     assert getattr(context, "cost_usd") == 0.42
 
 
-def _sessions_archive_bytes(sessions: dict[str, dict]) -> bytes:
+def _sessions_archive_bytes(
+    sessions: dict[str, dict], extra_files: dict[str, bytes] | None = None
+) -> bytes:
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for path, payload in (extra_files or {}).items():
+            info = tarfile.TarInfo(path)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
         for session_id, usage in sessions.items():
             payload = json.dumps(usage).replace("Infinity", "1e309").encode("utf-8")
             info = tarfile.TarInfo(f"sessions/{session_id}/session-usage.json")
@@ -1069,6 +1075,47 @@ def test_session_usage_leaves_cost_unset_for_unpriced_usage(
     assert totals is not None
     assert totals["input"] == 10 + 42
     assert totals["cost_usd"] is None
+
+
+def test_session_usage_rejects_archive_over_expanded_byte_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    expanded_cap = 64 * 1024
+    archive_bytes = _sessions_archive_bytes(
+        {"ws-main": _usage_display()},
+        {"sessions/ws-main/chat.jsonl": b"0" * (2 * 1024 * 1024)},
+    )
+    assert len(archive_bytes) < expanded_cap
+    monkeypatch.setattr(
+        MuxAgent, "_SESSIONS_ARCHIVE_MAX_EXPANDED_BYTES", expanded_cap, raising=False
+    )
+    agent = MuxAgent(logs_dir=tmp_path)
+    (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).write_bytes(archive_bytes)
+
+    totals = agent._summarize_session_usage()
+
+    assert totals is None
+
+
+def test_session_usage_accepts_archive_below_expanded_byte_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    monkeypatch.setattr(
+        MuxAgent, "_SESSIONS_ARCHIVE_MAX_EXPANDED_BYTES", 64 * 1024, raising=False
+    )
+    agent = MuxAgent(logs_dir=tmp_path)
+    (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).write_bytes(
+        _sessions_archive_bytes({"ws-main": _usage_display()})
+    )
+
+    totals = agent._summarize_session_usage()
+
+    assert totals is not None
+    assert totals["sessions"] == 1
+    assert totals["input"] == 10
+    assert totals["cost_usd"] == pytest.approx(0.15)
 
 
 def test_session_usage_enforces_aggregate_byte_cap(

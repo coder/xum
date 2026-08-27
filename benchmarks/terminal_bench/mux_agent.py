@@ -244,6 +244,7 @@ class MuxAgent(BaseInstalledAgent):
     # Telemetry collection bounds: dataset-controlled trials must not be able to
     # exhaust host disk/memory through the sessions archive.
     _SESSIONS_ARCHIVE_MAX_BYTES = 256 * 1024 * 1024
+    _SESSIONS_ARCHIVE_MAX_EXPANDED_BYTES = 64 * 1024 * 1024
     _SESSION_USAGE_MAX_MEMBERS = 10_000
     _SESSION_USAGE_FILE_MAX_BYTES = 16 * 1024 * 1024
     _SESSION_USAGE_MAX_TOTAL_BYTES = 64 * 1024 * 1024
@@ -684,11 +685,15 @@ class MuxAgent(BaseInstalledAgent):
         try:
             with tarfile.open(archive_path, "r:gz") as archive:
                 members_seen = 0
+                expanded_bytes = 0
                 bytes_read = 0
                 for member in archive:
                     members_seen += 1
                     if members_seen > self._SESSION_USAGE_MAX_MEMBERS:
                         break
+                    expanded_bytes += member.size
+                    if expanded_bytes > self._SESSIONS_ARCHIVE_MAX_EXPANDED_BYTES:
+                        return None
                     parts = Path(member.name).parts
                     if (
                         len(parts) < 3
