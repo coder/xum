@@ -2,7 +2,7 @@ import { tool } from "ai";
 
 import { getErrorMessage } from "@/common/utils/errors";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
-import type { WorkflowRunRecord } from "@/common/types/workflow";
+import { isTerminalWorkflowRunStatus, type WorkflowRunRecord } from "@/common/types/workflow";
 import { getWorkflowCheckpointRetryEligibility } from "@/common/utils/workflowRetryEligibility";
 import { WorkflowRunRecordSchema } from "@/common/orpc/schemas";
 import {
@@ -154,9 +154,25 @@ export const createWorkflowResumeTool: ToolFactory = (config: ToolConfiguration)
       const mode: WorkflowResumeMode = args.mode ?? "resume";
       const invocationStartedAtMs = Date.now();
 
+      // A kernel-nested resume (mux.workflow_resume inside code_execution) leaves no top-level
+      // workflow_resume part in history, so the history-walk consumption predicates cannot see
+      // that this turn already received the terminal result. Persist consumption durably so the
+      // terminal-attention drain never re-delivers it.
+      const markTerminalAttentionConsumed = async (terminalRun: WorkflowRunRecord) => {
+        if (!isTerminalWorkflowRunStatus(terminalRun.status)) {
+          return;
+        }
+        await config.taskService?.markWorkflowRunTerminalAttentionConsumed?.({
+          ownerWorkspaceId: workspaceId,
+          runId: terminalRun.id,
+          status: terminalRun.status,
+        });
+      };
+
       // Idempotent success: the work is already done, so hand back the durable result instead
       // of failing the agent's recovery loop (e.g. resuming after a crash that actually finished).
       if (run.status === "completed" && mode === "resume") {
+        await markTerminalAttentionConsumed(run);
         return parseToolResult(
           WorkflowResumeToolResultSchema,
           {
@@ -230,6 +246,12 @@ export const createWorkflowResumeTool: ToolFactory = (config: ToolConfiguration)
       // result's `status` field plus run polling converge on the live state.
       const refreshedRunIsStale =
         isBackgroundDispatch && refreshedRun != null && refreshedRun.status === run.status;
+
+      // Foreground only: a background dispatch can still observe the stale pre-dispatch terminal
+      // status, and consuming it would tombstone the retried run's future terminal wake.
+      if (!isBackgroundDispatch && refreshedRun != null) {
+        await markTerminalAttentionConsumed(refreshedRun);
+      }
 
       return parseToolResult(
         WorkflowResumeToolResultSchema,
