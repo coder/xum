@@ -1771,13 +1771,7 @@ export class BashMonitorWakeStore {
         if (!recordEntries.includes(entry)) recordEntries.push(entry);
       }
     }
-    // The effective tombstone for the pre-cutoff canonical check at the end of this
-    // scan is read UNCONDITIONALLY (post-rollback), never gated on the readdir
-    // snapshot above: a clear can publish its tombstone after the snapshot was
-    // taken, and a crash-stalled writer can then land a pre-cutoff pending
-    // generation over an already-snapshotted entry mid-scan — served without the
-    // fence, a drain would deliver output that clear is holding or has retired.
-    const tomb = await this.readClearedAt(ownerWorkspaceId);
+
     for (const entry of recordEntries) {
       const filePath = path.join(dir, entry);
       seen.add(entry);
@@ -1894,6 +1888,17 @@ export class BashMonitorWakeStore {
     // into the cleared transcript. Mirroring the temp rules: a COMMITTED cutoff
     // retires it durably; a STAGED one holds it (neither deliver nor retire) until
     // the transaction commits, rolls back, or is grace-rolled-back as crashed.
+    //
+    // The effective tombstone is read HERE — unconditionally (never gated on the
+    // readdir snapshot), post-rollback, and AFTER the record loop above: a
+    // concurrent clear can publish its tombstone at any point during that
+    // potentially long loop, and a cutoff read before the loop would let a
+    // pre-cutoff pending generation collected mid-loop be served (and drained) while
+    // the clear is retiring it. Reading at the last responsible moment fences every
+    // record this scan actually serves against the freshest durable clear state; a
+    // clear that publishes after this read could not have retired these records —
+    // its own supersede snapshot sees them.
+    const tomb = await this.readClearedAt(ownerWorkspaceId);
     if (tomb != null) {
       const cutoffMs = Date.parse(tomb.clearedAt);
       const listable: BashMonitorWakeRecord[] = [];

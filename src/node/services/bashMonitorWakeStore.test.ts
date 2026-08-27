@@ -2894,6 +2894,45 @@ describe("BashMonitorWakeStore", () => {
     expect(await fsPromises.readdir(dir)).toContain("%70roc-1.json");
   });
 
+  test("the pre-cutoff fence sees a clear published during the record pass", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR retired mid-pass"] }));
+    // Strictly order wake < cutoff (same-millisecond stamps fail toward delivery).
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const tombPath = path.join(dir, "cleared-at");
+    // A concurrent instance COMMITS a clear while this scan is inside its record
+    // loop (injected on the record pass's classification lstat): tombstone discovery
+    // pinned before the loop would never see it, serve the pre-cutoff record, and
+    // let a drain deliver output that clear just retired.
+    const realLstat = fsPromises.lstat;
+    const injected = { fired: false };
+    const lstatSpy = spyOn(fsPromises, "lstat").mockImplementation((async (
+      target: Parameters<typeof realLstat>[0]
+    ) => {
+      if (!injected.fired && String(target).endsWith("proc-1.json")) {
+        injected.fired = true;
+        await fsPromises.writeFile(
+          tombPath,
+          JSON.stringify({
+            clearedAt: new Date().toISOString(),
+            clearId: "clear-mid-pass",
+            phase: "committed",
+          }),
+          "utf-8"
+        );
+      }
+      return realLstat(target);
+    }) as typeof fsPromises.lstat);
+    try {
+      expect(await store.listPending("owner-1")).toEqual([]);
+    } finally {
+      lstatSpy.mockRestore();
+    }
+    expect(injected.fired).toBe(true);
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("superseded");
+  });
+
   test("a directory squatting on a tombstone capture is quarantined instead of failing heals", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload({ lines: ["ERROR heals anyway"] }));
