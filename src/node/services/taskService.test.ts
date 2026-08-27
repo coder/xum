@@ -6403,7 +6403,12 @@ describe("TaskService", () => {
     await flushTerminalAttentionDrains(taskService);
 
     expect(sendMessage).toHaveBeenCalledTimes(1);
-    const internal = sendMessage.mock.calls[0]?.[3] as { admissionStale?: () => boolean };
+    const internal = sendMessage.mock.calls[0]?.[3] as {
+      admissionStale?: () => boolean;
+      deliveredWorkflowRunIds?: string[];
+    };
+    // Consumption provenance persisted with the accepted row (crash-replay suppression).
+    expect(internal.deliveredWorkflowRunIds).toEqual([runId]);
     expect(typeof internal.admissionStale).toBe("function");
     expect(internal.admissionStale?.()).toBe(false);
     epoch = 2;
@@ -6850,6 +6855,30 @@ describe("TaskService", () => {
 
     expect(sendMessage).not.toHaveBeenCalled();
     expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(1);
+  });
+
+  test("an unreadable sidecar defers workspace-turn blocker checks", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const { workspaceService } = createWorkspaceServiceMocks();
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const internal = taskService as unknown as {
+      hasActiveWorkspaceTurnDeferredBlockers(record: { workspaceId: string }): Promise<boolean>;
+    };
+
+    expect(await internal.hasActiveWorkspaceTurnDeferredBlockers({ workspaceId: parentId })).toBe(
+      false
+    );
+
+    // The sidecar is the only durable provenance for kernel-launched workflows, and this
+    // result gates completion decisions: an unreadable sidecar must report blockers (defer),
+    // not "none" and let the turn finalize while a workflow may still be running.
+    await fsPromises.mkdir(path.join(config.getSessionDir(parentId), "agent-workflow-runs.json"), {
+      recursive: true,
+    });
+    expect(await internal.hasActiveWorkspaceTurnDeferredBlockers({ workspaceId: parentId })).toBe(
+      true
+    );
   });
 
   test("initialize recovers terminal notify workspace turns without pending notification", async () => {

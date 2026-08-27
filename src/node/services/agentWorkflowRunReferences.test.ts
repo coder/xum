@@ -6,6 +6,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   clearAgentWorkflowRunReferences,
+  getSidecarLifecycleGeneration,
   readAgentWorkflowRunReferences,
   recordAgentWorkflowRunReference,
   scheduleAgentWorkflowRunReferenceRecordRetry,
@@ -217,6 +218,65 @@ describe("agent workflow run references", () => {
         runId: "wfr_lifecycle",
         afterBoundaryMessageId: "resume-row",
       });
+    } finally {
+      await fs.rm(workspaceSessionDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a retry supersedes an older entry for the same run", async () => {
+    const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
+    try {
+      // A workflow_resume re-record fails transiently while an OLDER dispatch entry exists.
+      // The retry must replace that stale provenance (its boundary predates the resume) or the
+      // resumed run's wake is classified not_current; only a strictly newer record wins.
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir,
+        runId: "wfr_supersede",
+        createdAtMs: 500,
+        afterBoundaryMessageId: "old-row",
+      });
+      scheduleAgentWorkflowRunReferenceRecordRetry({
+        workspaceSessionDir,
+        runId: "wfr_supersede",
+        createdAtMs: 2_000,
+        afterBoundaryMessageId: "resume-row",
+        retryDelaysMs: [50],
+      });
+      const deadline = Date.now() + 5_000;
+      let boundary: string | null | undefined;
+      while (Date.now() < deadline) {
+        boundary = (await readAgentWorkflowRunReferences(workspaceSessionDir)).find(
+          (reference) => reference.runId === "wfr_supersede"
+        )?.afterBoundaryMessageId;
+        if (boundary === "resume-row") {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(boundary).toBe("resume-row");
+    } finally {
+      await fs.rm(workspaceSessionDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a chain scheduled before cancellation cannot re-arm after it", async () => {
+    const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
+    try {
+      // Simulates the reschedule window: a failing in-flight write's catch handler schedules
+      // the next retry DURING the cancellation drain, carrying the pre-cancel generation.
+      // Registration must refuse it, or the retry recreates the retired sidecar later.
+      const staleGeneration = getSidecarLifecycleGeneration(workspaceSessionDir);
+      await clearAgentWorkflowRunReferences(workspaceSessionDir);
+      scheduleAgentWorkflowRunReferenceRecordRetry({
+        workspaceSessionDir,
+        runId: "wfr_stale_chain",
+        createdAtMs: 1_000,
+        afterBoundaryMessageId: null,
+        retryDelaysMs: [30],
+        lifecycleGeneration: staleGeneration,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      expect(await readAgentWorkflowRunReferences(workspaceSessionDir)).toEqual([]);
     } finally {
       await fs.rm(workspaceSessionDir, { recursive: true, force: true });
     }

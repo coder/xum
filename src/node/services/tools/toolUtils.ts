@@ -9,6 +9,8 @@ import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 import {
   SIDECAR_MAINTENANCE_RETRY_DELAYS_MS,
+  getSidecarLifecycleGeneration,
+  readAgentWorkflowRunReferences,
   recordAgentWorkflowRunReference,
   registerSidecarMaintenanceTimer,
   scheduleAgentWorkflowRunReferenceRecordRetry,
@@ -103,6 +105,8 @@ function scheduleBoundarySnapshotRepair(input: {
   getBoundary: () => Promise<string | null>;
   retryDelaysMs?: readonly number[] | null;
   attempt?: number;
+  /** Chain state: the lifecycle generation captured when the chain was first scheduled. */
+  lifecycleGeneration?: number;
 }): void {
   const retryDelaysMs = input.retryDelaysMs ?? SIDECAR_MAINTENANCE_RETRY_DELAYS_MS;
   const attempt = input.attempt ?? 0;
@@ -115,11 +119,25 @@ function scheduleBoundarySnapshotRepair(input: {
     return;
   }
   const key = `boundary:${input.runId}`;
+  const lifecycleGeneration =
+    input.lifecycleGeneration ?? getSidecarLifecycleGeneration(input.workspaceSessionDir);
   const timer = setTimeout(() => {
     if (!takeSidecarMaintenanceTimer(input.workspaceSessionDir, key, timer)) {
       return;
     }
     const work = (async () => {
+      // The reference may not exist yet: when the initial write also failed, the independent
+      // record-retry chain lands it later. A missing entry is retryable, not a satisfied
+      // no-op, or that later record would create a permanently boundary-less reference;
+      // lifecycle cancellation kills this chain when the reference was retired instead.
+      const references = await readAgentWorkflowRunReferences(input.workspaceSessionDir);
+      const entry = references.find((reference) => reference.runId === input.runId);
+      if (entry == null) {
+        throw new Error("reference not recorded yet");
+      }
+      if (entry.afterBoundaryMessageId !== undefined) {
+        return;
+      }
       const boundary = await input.getBoundary();
       if (boundary !== null) {
         return;
@@ -137,12 +155,12 @@ function scheduleBoundarySnapshotRepair(input: {
         attempt: attempt + 1,
         error: getErrorMessage(error),
       });
-      scheduleBoundarySnapshotRepair({ ...input, attempt: attempt + 1 });
+      scheduleBoundarySnapshotRepair({ ...input, attempt: attempt + 1, lifecycleGeneration });
     });
     trackSidecarMaintenanceWrite(input.workspaceSessionDir, work);
   }, delayMs);
   timer.unref?.();
-  registerSidecarMaintenanceTimer(input.workspaceSessionDir, key, timer);
+  registerSidecarMaintenanceTimer(input.workspaceSessionDir, key, timer, lifecycleGeneration);
 }
 
 /**

@@ -96,6 +96,8 @@ type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMode"]>;
 interface QueuedMessageInternalOptions {
   synthetic?: boolean;
   agentInitiated?: boolean;
+  /** Persisted onto the dispatched user row; see MuxMetadata.deliveredWorkflowRunIds. */
+  deliveredWorkflowRunIds?: string[];
   /**
    * When the sender authored this message (request entry), before any send
    * preflight awaits (pricing gate, settings persistence). Goal safety

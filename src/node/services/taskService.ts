@@ -1702,13 +1702,10 @@ export class TaskService {
     }
 
     const runIds = new Set<string>();
-    let references: Awaited<ReturnType<typeof readAgentWorkflowRunReferences>> = [];
-    try {
-      references = await readAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
-    } catch (error: unknown) {
-      // Rediscovery is non-destructive and re-runs on the next listing; skip this pass.
-      log.warn("Failed to read agent workflow run references", { workspaceId, error });
-    }
+    // An unreadable sidecar PROPAGATES: callers gate destructive completion decisions
+    // (finalizing task reports, ending workspace turns) on this listing, and treating the
+    // failure as "no references" would let those finalize while a kernel workflow still runs.
+    const references = await readAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
     for (const reference of references) {
       // If the latest user/reset supersession has no durable timestamp, fail safe: only trust
       // workflow provenance re-established by current/post-supersession assistant output below.
@@ -8301,6 +8298,10 @@ export class TaskService {
     const deliverableWorkflowNotificationIds = new Set<string>();
 
     const promptSections: string[] = [];
+    // Persisted onto the accepted row as consumption provenance (see
+    // MuxMetadata.deliveredWorkflowRunIds): after a crash between acceptance and the outbox
+    // delivery mark, restart recovery recognizes the row and does not replay these results.
+    const deliveredWorkflowRunIds: string[] = [];
     if (publicAwaitIds.length > 0) {
       promptSections.push(buildCompletedWorkspaceTurnPrompt(publicAwaitIds));
     }
@@ -8330,6 +8331,7 @@ export class TaskService {
         continue;
       }
       deliverableWorkflowNotificationIds.add(notification.id);
+      deliveredWorkflowRunIds.push(notification.sourceId);
       promptSections.push(workflowPrompt.prompt);
     }
 
@@ -8407,6 +8409,7 @@ export class TaskService {
         agentInitiated: true,
         requireIdle: true,
         admissionStale: sendAdmissionStale,
+        deliveredWorkflowRunIds,
       }
     );
 
@@ -8430,6 +8433,7 @@ export class TaskService {
             synthetic: true,
             agentInitiated: true,
             admissionStale: sendAdmissionStale,
+            deliveredWorkflowRunIds,
             onCanceled: () => {
               this.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
             },
@@ -12535,10 +12539,21 @@ export class TaskService {
       return true;
     }
 
-    const referencedWorkflowRunIds = await this.listAgentReferencedWorkflowRunIds(
-      record.workspaceId,
-      []
-    );
+    let referencedWorkflowRunIds: string[];
+    try {
+      referencedWorkflowRunIds = await this.listAgentReferencedWorkflowRunIds(
+        record.workspaceId,
+        []
+      );
+    } catch (error: unknown) {
+      // Unreadable sidecar: assume blockers exist so the deferred turn is not finalized while
+      // a kernel workflow may still be running; the next evaluation retries.
+      log.warn("Deferring workspace-turn blocker check; sidecar unreadable", {
+        workspaceId: record.workspaceId,
+        error,
+      });
+      return true;
+    }
     if (
       (await this.listActiveBackgroundWorkflowRunIds(record.workspaceId, referencedWorkflowRunIds))
         .length > 0
@@ -14155,11 +14170,22 @@ export class TaskService {
         taskIndex,
         workspaceId
       );
-      const referencedWorkflowRunIds = await this.listAgentReferencedWorkflowRunIds(
-        workspaceId,
-        event.parts,
-        event.messageId
-      );
+      let referencedWorkflowRunIds: string[];
+      try {
+        referencedWorkflowRunIds = await this.listAgentReferencedWorkflowRunIds(
+          workspaceId,
+          event.parts,
+          event.messageId
+        );
+      } catch (error: unknown) {
+        // Unreadable sidecar: neither finalize the turn nor nudge the model about unknown
+        // runs; leave the stream-end unhandled so deferred recovery re-evaluates later.
+        log.warn("Skipping parent stream-end workflow reconciliation; sidecar unreadable", {
+          workspaceId,
+          error,
+        });
+        return;
+      }
       let activeWorkflowRunIds = await this.listActiveBackgroundWorkflowRunIds(
         workspaceId,
         referencedWorkflowRunIds
@@ -14446,11 +14472,22 @@ export class TaskService {
       return;
     }
 
-    const taskReferencedWorkflowRunIds = await this.listAgentReferencedWorkflowRunIds(
-      workspaceId,
-      event.parts,
-      event.messageId
-    );
+    let taskReferencedWorkflowRunIds: string[];
+    try {
+      taskReferencedWorkflowRunIds = await this.listAgentReferencedWorkflowRunIds(
+        workspaceId,
+        event.parts,
+        event.messageId
+      );
+    } catch (error: unknown) {
+      // Unreadable sidecar: defer report finalization like an active blocker instead of
+      // publishing while a kernel workflow may still be running.
+      log.warn("Deferring task finalization; sidecar unreadable", { workspaceId, error });
+      if (status === "awaiting_report") {
+        await this.setTaskStatus(workspaceId, "running");
+      }
+      return;
+    }
     const activeTaskWorkflowRunIds = await this.listActiveBackgroundWorkflowRunIds(
       workspaceId,
       taskReferencedWorkflowRunIds

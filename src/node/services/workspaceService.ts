@@ -204,7 +204,6 @@ import {
 } from "@/node/services/workflows/workflowArchiveAdmission";
 import {
   WORKFLOW_RESULT_METADATA_TYPE,
-  textContainsWorkflowResultPayload,
   WORKFLOW_RUN_CARD_DISPLAY_METADATA_TYPE,
   WORKFLOW_TRIGGER_DISPLAY_METADATA_TYPE,
   buildWorkflowRunCardMessage,
@@ -478,18 +477,16 @@ function isWorkflowResultContinuationMessage(message: MuxMessage, runId: string)
 
 /**
  * The terminal-attention drain delivers workflow results as one synthetic user prompt that may
- * coalesce several runs, so it carries no per-run workflow-result metadata. If a crash lands
- * between the send's durable acceptance and the outbox delivery mark, restart recovery drains
- * the notification again; recognizing the accepted row as consumption is what suppresses the
- * replay. Only synthetic rows qualify: a manual user message is a supersession boundary and is
- * classified before this check runs.
+ * coalesce several runs. If a crash lands between the send's durable acceptance and the outbox
+ * delivery mark, restart recovery drains the notification again; recognizing the accepted row
+ * as consumption is what suppresses the replay. Recognition uses the drain's persisted
+ * provenance (MuxMetadata.deliveredWorkflowRunIds), never the row's text: synthetic rows can
+ * carry user-controlled content (e.g. a heartbeat body), and a quoted run ID must not spoof
+ * consumption and suppress a real wake.
  */
 function isCoalescedWorkflowResultMessage(message: MuxMessage, runId: string): boolean {
-  if (message.role !== "user" || message.metadata?.synthetic !== true) {
-    return false;
-  }
-  return message.parts.some(
-    (part) => part.type === "text" && textContainsWorkflowResultPayload(part.text, runId)
+  return (
+    message.role === "user" && message.metadata?.deliveredWorkflowRunIds?.includes(runId) === true
   );
 }
 
@@ -11254,6 +11251,8 @@ export class WorkspaceService extends EventEmitter {
       goalId?: string;
       /** Force Copilot billing classification to "agent" for internal sends. */
       agentInitiated?: boolean;
+      /** Persisted onto the user row; see MuxMetadata.deliveredWorkflowRunIds. */
+      deliveredWorkflowRunIds?: string[];
       onAccepted?: () => Promise<void> | void;
       onCanceled?: (reason: string) => Promise<void> | void;
       onAcceptedPreStreamFailure?: (error: SendMessageError) => Promise<void> | void;
@@ -11516,6 +11515,7 @@ export class WorkspaceService extends EventEmitter {
           return await session.sendMessage(message, normalizedOptions, {
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
+            deliveredWorkflowRunIds: internal?.deliveredWorkflowRunIds,
             goalKind: internal?.goalKind,
             goalId: internal?.goalId,
             cancelState: internal?.cancelState,
@@ -11660,6 +11660,7 @@ export class WorkspaceService extends EventEmitter {
           {
             synthetic: internal?.synthetic,
             agentInitiated: internal?.agentInitiated,
+            deliveredWorkflowRunIds: internal?.deliveredWorkflowRunIds,
             authoredAtMs,
             workspaceTurnContinuation: internal?.workspaceTurnContinuation,
             dedupeKey: internal?.queueDedupeKey,
@@ -11772,6 +11773,7 @@ export class WorkspaceService extends EventEmitter {
         onTurnAdmissionCommitted: () => sessionInvisiblePreflight.release(),
         synthetic: internal?.synthetic,
         agentInitiated: internal?.agentInitiated,
+        deliveredWorkflowRunIds: internal?.deliveredWorkflowRunIds,
         goalKind: internal?.goalKind,
         goalId: internal?.goalId,
         goalContinuation: internal?.goalContinuation,

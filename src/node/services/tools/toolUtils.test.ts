@@ -93,6 +93,60 @@ describe("recordBackgroundWorkflowRunReference", () => {
     }
   });
 
+  test("boundary repair waits for the record retry to land the entry", async () => {
+    const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "toolutils-boundary-"));
+    try {
+      // Both the boundary read AND the initial sidecar write fail: the reference does not
+      // exist when the repair first fires. A missing entry must stay retryable, or the record
+      // retry that lands later creates a permanently boundary-less reference.
+      let calls = 0;
+      const taskService = {
+        getWorkflowInvocationBoundaryMessageId: (): Promise<string | null> => {
+          calls += 1;
+          return calls === 1
+            ? Promise.reject(new Error("history unavailable"))
+            : Promise.resolve(null);
+        },
+      };
+      const filePath = path.join(workspaceSessionDir, "agent-workflow-runs.json");
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir,
+        runId: "wfr_seed",
+        createdAtMs: 1_000,
+      });
+      await fs.chmod(filePath, 0o000);
+      await recordBackgroundWorkflowRunReference(
+        {
+          workspaceSessionDir,
+          workspaceId: "ws-boundary-late",
+          taskService,
+        } as unknown as ToolConfiguration,
+        "wfr_boundary_late",
+        2_000,
+        [40, 40, 40, 40, 40]
+      );
+      // Storage recovers only after the repair has fired at least once against the missing
+      // entry; the record retry then lands it and a later repair attempt patches null.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      await fs.chmod(filePath, 0o600);
+
+      const deadline = Date.now() + 5_000;
+      let boundary: string | null | undefined;
+      while (Date.now() < deadline) {
+        boundary = (await readAgentWorkflowRunReferences(workspaceSessionDir)).find(
+          (reference) => reference.runId === "wfr_boundary_late"
+        )?.afterBoundaryMessageId;
+        if (boundary === null) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(boundary).toBe(null);
+    } finally {
+      await fs.rm(workspaceSessionDir, { recursive: true, force: true });
+    }
+  });
+
   test("keeps the entry boundary-less when a decision row exists at repair time", async () => {
     const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "toolutils-boundary-"));
     try {

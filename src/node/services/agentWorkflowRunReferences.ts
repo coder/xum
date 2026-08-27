@@ -40,14 +40,31 @@ const pendingSidecarMaintenanceTimersByPath = new Map<
   Map<string, ReturnType<typeof setTimeout>>
 >();
 const inFlightSidecarMaintenanceByPath = new Map<string, Set<Promise<unknown>>>();
+// Bumped by cancellation BEFORE timers are cleared: a maintenance chain captures the
+// generation when it is first scheduled, and registration refuses a stale generation, so a
+// retry rescheduled from a failing write's catch handler DURING the cancellation drain cannot
+// re-arm and later recreate retired state.
+const lifecycleGenerationByPath = new Map<string, number>();
 
-/** Arm a maintenance timer; a newer schedule for the same key supersedes the older timer. */
+export function getSidecarLifecycleGeneration(workspaceSessionDir: string): number {
+  return lifecycleGenerationByPath.get(referencesPath(workspaceSessionDir)) ?? 0;
+}
+
+/**
+ * Arm a maintenance timer; a newer schedule for the same key supersedes the older timer. A
+ * stale lifecycleGeneration (captured before a cancellation) is refused so the chain dies.
+ */
 export function registerSidecarMaintenanceTimer(
   workspaceSessionDir: string,
   key: string,
-  timer: ReturnType<typeof setTimeout>
+  timer: ReturnType<typeof setTimeout>,
+  lifecycleGeneration: number
 ): void {
   const filePath = referencesPath(workspaceSessionDir);
+  if ((lifecycleGenerationByPath.get(filePath) ?? 0) !== lifecycleGeneration) {
+    clearTimeout(timer);
+    return;
+  }
   let byKey = pendingSidecarMaintenanceTimersByPath.get(filePath);
   if (byKey == null) {
     byKey = new Map();
@@ -113,6 +130,7 @@ export async function cancelAgentWorkflowRunReferenceMaintenance(
   workspaceSessionDir: string
 ): Promise<void> {
   const filePath = referencesPath(workspaceSessionDir);
+  lifecycleGenerationByPath.set(filePath, (lifecycleGenerationByPath.get(filePath) ?? 0) + 1);
   const byKey = pendingSidecarMaintenanceTimersByPath.get(filePath);
   if (byKey != null) {
     for (const timer of byKey.values()) {
@@ -242,8 +260,12 @@ export async function recordAgentWorkflowRunReference(input: {
   runId: string;
   createdAtMs?: number;
   afterBoundaryMessageId?: string | null;
-  /** Fill-absence mode for detached retries: an existing entry (any newer record) wins. */
-  onlyIfAbsent?: boolean;
+  /**
+   * Detached-retry mode: skip only when a strictly newer record already exists, so a retry
+   * can supersede the stale entry a failed re-record (e.g. workflow_resume over an old
+   * dispatch) was meant to replace, while a newer successful record still wins.
+   */
+  skipIfNewerRecordExists?: boolean;
   /**
    * Boundary-repair mode: only patch an entry that exists and still lacks a boundary
    * snapshot. A missing entry means the reference was retired (clear/removal) and must not be
@@ -265,7 +287,11 @@ export async function recordAgentWorkflowRunReference(input: {
     // Clamp like parseReferences: never persist a future-dated timestamp.
     const createdAtMs = Math.min(input.createdAtMs ?? Date.now(), Date.now());
     const previous = byRunId.get(input.runId);
-    if (input.onlyIfAbsent === true && previous != null) {
+    if (
+      input.skipIfNewerRecordExists === true &&
+      previous != null &&
+      previous.createdAtMs > createdAtMs
+    ) {
       return;
     }
     if (
@@ -312,6 +338,8 @@ export function scheduleAgentWorkflowRunReferenceRecordRetry(input: {
   afterBoundaryMessageId?: string | null;
   retryDelaysMs?: readonly number[] | null;
   attempt?: number;
+  /** Chain state: the lifecycle generation captured when the chain was first scheduled. */
+  lifecycleGeneration?: number;
 }): void {
   const retryDelaysMs = input.retryDelaysMs ?? SIDECAR_MAINTENANCE_RETRY_DELAYS_MS;
   const attempt = input.attempt ?? 0;
@@ -324,6 +352,8 @@ export function scheduleAgentWorkflowRunReferenceRecordRetry(input: {
     return;
   }
   const key = `record:${input.runId}`;
+  const lifecycleGeneration =
+    input.lifecycleGeneration ?? getSidecarLifecycleGeneration(input.workspaceSessionDir);
   const timer = setTimeout(() => {
     if (!takeSidecarMaintenanceTimer(input.workspaceSessionDir, key, timer)) {
       return;
@@ -334,7 +364,7 @@ export function scheduleAgentWorkflowRunReferenceRecordRetry(input: {
       workspaceSessionDir: input.workspaceSessionDir,
       runId: input.runId,
       createdAtMs: input.createdAtMs,
-      onlyIfAbsent: true,
+      skipIfNewerRecordExists: true,
       ...(input.afterBoundaryMessageId !== undefined
         ? { afterBoundaryMessageId: input.afterBoundaryMessageId }
         : {}),
@@ -344,10 +374,14 @@ export function scheduleAgentWorkflowRunReferenceRecordRetry(input: {
         attempt: attempt + 1,
         error,
       });
-      scheduleAgentWorkflowRunReferenceRecordRetry({ ...input, attempt: attempt + 1 });
+      scheduleAgentWorkflowRunReferenceRecordRetry({
+        ...input,
+        attempt: attempt + 1,
+        lifecycleGeneration,
+      });
     });
     trackSidecarMaintenanceWrite(input.workspaceSessionDir, work);
   }, delayMs);
   timer.unref?.();
-  registerSidecarMaintenanceTimer(input.workspaceSessionDir, key, timer);
+  registerSidecarMaintenanceTimer(input.workspaceSessionDir, key, timer, lifecycleGeneration);
 }

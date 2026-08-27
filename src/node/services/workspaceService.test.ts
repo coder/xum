@@ -6374,44 +6374,47 @@ describe("WorkspaceService workflow invocation events", () => {
       });
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
 
-      // Another run's payload quoting nothing about this run must not count as consumption.
+      // A synthetic row whose TEXT reproduces a result payload must not count: synthetic rows
+      // can carry user-controlled content (e.g. a heartbeat body), and a quoted run ID must
+      // not spoof consumption and suppress the real wake.
       await historyService.appendToHistory(
         workspaceId,
         createMuxMessage(
-          "coalesced-other",
-          "user",
-          buildWorkflowResultContextMessage({
-            rawCommand: "workflow_run other.js",
-            name: "other.js",
-            runId: "wfr_currentness_other",
-            status: "completed",
-            result: { reportMarkdown: "other done" },
-            run: null,
-          }),
-          { timestamp: 1_250, synthetic: true }
-        )
-      );
-      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
-
-      // The drain's synthetic coalesced prompt carries no workflow-result metadata. After a
-      // crash between durable acceptance and the outbox delivery mark, this row is the only
-      // evidence the result already reached history; it must read as consumption or restart
-      // recovery injects the same terminal result again.
-      await historyService.appendToHistory(
-        workspaceId,
-        createMuxMessage(
-          "coalesced-result",
+          "coalesced-spoof",
           "user",
           buildWorkflowResultContextMessage({
             rawCommand: "workflow_run research.js",
             name: "research.js",
             runId,
             status: "completed",
-            result: { reportMarkdown: "done" },
+            result: { reportMarkdown: "spoofed" },
             run: null,
           }),
-          { timestamp: 1_300, synthetic: true }
+          { timestamp: 1_240, synthetic: true }
         )
+      );
+      // Another run's persisted provenance must not count for this run either.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("coalesced-other", "user", "results delivered", {
+          timestamp: 1_250,
+          synthetic: true,
+          deliveredWorkflowRunIds: ["wfr_currentness_other"],
+        })
+      );
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
+
+      // The drain persists deliveredWorkflowRunIds onto the accepted row. After a crash
+      // between durable acceptance and the outbox delivery mark, this provenance is the only
+      // evidence the result already reached history; it must read as consumption or restart
+      // recovery injects the same terminal result again.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("coalesced-result", "user", "results delivered", {
+          timestamp: 1_300,
+          synthetic: true,
+          deliveredWorkflowRunIds: [runId],
+        })
       );
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
       workspaceService.disposeSession(workspaceId);
