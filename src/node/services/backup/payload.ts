@@ -1160,16 +1160,73 @@ const UNCONSUMED_ASSIGNMENT = new RegExp(
     `(?!${REDACTED_BACKUP_VALUE}(?=[\\s${SHELL_WORD_BREAK}]|$))(?=[^\\s${SHELL_WORD_BREAK}])`
 );
 
-/**
- * To the shell a quote-led `NAME=` is word content, not an assignment, but `eval`- and
- * `docker -e`-style consumers still read it as one, and where its value ends inside a
- * quoted context is not decidable here. Tested against the replaced text so a consumed
- * quoted value (`A="B=1"`) cannot fire it.
- */
-const QUOTED_ASSIGNMENT = new RegExp(`['"]${ASSIGNMENT_NAME}`);
+/** One whole shell word, however its quoted and escaped segments interleave. */
+const SHELL_WORD = new RegExp(
+  `(?:\\\\[\\s\\S]|'[^']*'|"(?:\\\\[\\s\\S]|[^"\\\\])*"|[^\\s\\\\'"${SHELL_WORD_BREAK}])+`,
+  "g"
+);
+const ASSIGNMENT_START = new RegExp(`^${ASSIGNMENT_NAME}`);
 
-/** `$(`, `\``, and `${` splice one word across whitespace the grammar cannot see past. */
-const SHELL_EXPANSION = /\$\(|\$\{|`/;
+/**
+ * Quote removal only, and simplified: every backslash escapes, including inside double
+ * quotes where the shell keeps some. The difference only ever turns more words into
+ * detected assignments, never fewer.
+ */
+function unquoteShellWord(word: string): string {
+  let result = "";
+  let i = 0;
+  while (i < word.length) {
+    const char = word[i];
+    if (char === "\\") {
+      result += word[i + 1] ?? "";
+      i += 2;
+      continue;
+    }
+    if (char === "'") {
+      const end = word.indexOf("'", i + 1);
+      result += word.slice(i + 1, end);
+      i = end + 1;
+      continue;
+    }
+    if (char === '"') {
+      let j = i + 1;
+      while (j < word.length && word[j] !== '"') {
+        if (word[j] === "\\") {
+          result += word[j + 1] ?? "";
+          j += 2;
+        } else {
+          result += word[j];
+          j += 1;
+        }
+      }
+      i = j + 1;
+      continue;
+    }
+    result += char;
+    i += 1;
+  }
+  return result;
+}
+
+/**
+ * A word quote removal turns into a `NAME=value` assignment (`TOKEN\\=x`, `'TOKEN'=x`,
+ * `"TOKEN=a b"`): the shell does not treat it as one, but `env`- and `eval`-style
+ * consumers do, and where its value ends inside quoting is not decidable here. A word
+ * already holding a marker was consumed by the replacement above (`A="B=1"` cannot fire).
+ */
+function hasDisguisedAssignment(redacted: string): boolean {
+  for (const word of redacted.match(SHELL_WORD) ?? []) {
+    if (word.includes(REDACTED_BACKUP_VALUE) || !word.includes("=")) continue;
+    if (ASSIGNMENT_START.test(unquoteShellWord(word))) return true;
+  }
+  return false;
+}
+
+/**
+ * `$(`, `\``, `${`, `<(`, and `>(` splice one word across whitespace the grammar cannot
+ * see past.
+ */
+const SHELL_EXPANSION = /\$\(|\$\{|`|<\(|>\(/;
 
 function redactCommandEnvAssignments(command: string): string {
   const redacted = command.replace(
@@ -1182,7 +1239,7 @@ function redactCommandEnvAssignments(command: string): string {
   // value means the replacement never saw it.
   if (
     UNCONSUMED_ASSIGNMENT.test(redacted) ||
-    QUOTED_ASSIGNMENT.test(redacted) ||
+    hasDisguisedAssignment(redacted) ||
     (redacted !== command && SHELL_EXPANSION.test(command))
   ) {
     return REDACTED_BACKUP_VALUE;
@@ -1334,6 +1391,11 @@ function findMcpRedactionPaths(tree: jsonc.Node): BackupRedactionPath[] {
   return paths;
 }
 
+/**
+ * JSON, not delimiter-joined: server and header names come from the backup, so a crafted
+ * name containing the delimiter could collide with another entry's field path and shadow
+ * its resolution (e.g. skipping the header drop for a server named `safe\u0000url`).
+ */
 function redactionPathKey(jsonPath: ReadonlyArray<string | number>): string {
   return JSON.stringify(jsonPath);
 }
@@ -1903,7 +1965,7 @@ function collectRedactionRestoreEdits(
   // Only the paths handled by command or header resolution are skipped, so a mixed entry
   // can still rehydrate its other redacted values. A dropped entry is skipped wholesale,
   // since a nested edit would resurrect what it removed.
-  if (resolvedServers.has(currentPath.join("\u0000"))) return;
+  if (resolvedServers.has(redactionPathKey(currentPath))) return;
   if (typeof backup === "string" && isRedactedBackupValue(backup, currentPath, redactedPaths)) {
     if (local !== undefined) edits.push({ path: currentPath, value: local });
     return;
@@ -2316,12 +2378,12 @@ function resolveRestoredCommands(
       const hasUrl = url !== undefined && url !== "" && !containsRedaction(url);
       const removed: jsonc.JSONPath = hasUrl ? ["servers", name, "command"] : ["servers", name];
       edits.push({ path: removed, value: undefined });
-      handled.add(removed.join("\u0000"));
+      handled.add(redactionPathKey(removed));
       continue;
     }
     const commandPath = isBareMarker ? barePath : objectPath;
     edits.push({ path: commandPath, value: localCommand });
-    handled.add(commandPath.join("\u0000"));
+    handled.add(redactionPathKey(commandPath));
   }
   return handled;
 }
@@ -2347,7 +2409,7 @@ function resolveRestoredUrls(
 
   for (const [name, entry] of Object.entries(servers)) {
     // An entry the command resolution removed has no url left to decide about.
-    if (resolvedServers.has(["servers", name].join("\u0000"))) continue;
+    if (resolvedServers.has(redactionPathKey(["servers", name]))) continue;
     const record = readRecord(entry);
     const url = record?.url;
     const urlPath: jsonc.JSONPath = ["servers", name, "url"];
@@ -2356,7 +2418,7 @@ function resolveRestoredUrls(
     const localUrl = readUrl(readRecord(readOwn(localServers, name)));
     if (localUrl !== undefined) {
       edits.push({ path: urlPath, value: localUrl });
-      handled.add(urlPath.join("\u0000"));
+      handled.add(redactionPathKey(urlPath));
       continue;
     }
     const commandPath: jsonc.JSONPath = ["servers", name, "command"];
@@ -2365,13 +2427,13 @@ function resolveRestoredUrls(
     // backup carries a plain command of its own. A marker command never reaches the second
     // arm: without a local command the command resolution removed the server above.
     const hasCommand =
-      resolvedServers.has(commandPath.join("\u0000")) ||
+      resolvedServers.has(redactionPathKey(commandPath)) ||
       (typeof command === "string" &&
         command.trim() !== "" &&
         !isRedactedBackupValue(command, commandPath, redactedPaths));
     const removed: jsonc.JSONPath = hasCommand ? urlPath : ["servers", name];
     edits.push({ path: removed, value: undefined });
-    handled.add(removed.join("\u0000"));
+    handled.add(redactionPathKey(removed));
   }
   return handled;
 }
@@ -2411,14 +2473,14 @@ function resolveRestoredHeaders(
   for (const [name, entry] of Object.entries(servers)) {
     // An entry command resolution already removed has no headers left to decide about, and
     // `jsonc.modify` cannot address a path whose parent this edit list deletes.
-    if (resolvedServers.has(["servers", name].join("\u0000"))) continue;
+    if (resolvedServers.has(redactionPathKey(["servers", name]))) continue;
     const rawHeaders = readRecord(entry)?.headers;
     if (rawHeaders === undefined) continue;
     const localServer = readRecord(readOwn(localServers, name));
     const headersPath: jsonc.JSONPath = ["servers", name, "headers"];
     // The whole subtree is withheld from the generic walk, so no header can be rehydrated
     // by a path this function did not decide on.
-    handled.add(headersPath.join("\u0000"));
+    handled.add(redactionPathKey(headersPath));
 
     const headers = readRecord(rawHeaders);
     const endpointMatches =

@@ -370,6 +370,13 @@ describe("backup payload", () => {
       // A quote-led assignment is a word to the shell, but eval-style consumers read it.
       ['run-mcp "TOKEN=a hunter2"', REDACTED_BACKUP_VALUE],
       ["eval 'TOKEN=hunter2 mcp'", REDACTED_BACKUP_VALUE],
+      // Quote removal can still hand env-style consumers an assignment.
+      ["env TOKEN\\=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      ["T\\OKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      ['"TOKEN"=hunter2 mcp-server', REDACTED_BACKUP_VALUE],
+      // Process substitution is an expansion, wherever it appears.
+      ["TOKEN=<(printf hunter2) mcp-server", REDACTED_BACKUP_VALUE],
+      ["FOO=1 mcp-server <(printf hunter2)", REDACTED_BACKUP_VALUE],
     ];
     for (const [command, expected] of cases) {
       await expectCommandRedaction(command, expected);
@@ -1514,6 +1521,49 @@ describe("backup payload", () => {
     const text = await fs.readFile(path.join(muxRoot, "mcp.jsonc"), "utf-8");
     expect(text).not.toContain("local-secret");
     expect(text).not.toContain("LOCAL_KEY");
+  });
+
+  it("keeps crafted control-character server names from shadowing resolved paths", async () => {
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { safe: { url: "https://user:hunter2@example.com/mcp" } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+    });
+    const destination = path.join(tempDir, "crafted-name");
+    await writeBackupPayload(destination, payload);
+    const readBack = await readBackupPayload(destination);
+
+    // A repository writer adds a server whose name NUL-joins to the resolved `safe.url`
+    // path, carrying a header reference that would resolve a local secret at its url.
+    const file = readBack.files.find((candidate) => candidate.path === "mcp.jsonc");
+    if (!file) throw new Error("expected mcp.jsonc in the payload");
+    const parsed = jsonc.parse(file.content.toString("utf-8")) as {
+      servers: Record<string, unknown>;
+    };
+    parsed.servers["safe\u0000url"] = {
+      url: "https://evil.example/mcp",
+      headers: { Authorization: { secret: "KEY" } },
+    };
+    const tampered = {
+      ...readBack,
+      files: readBack.files.map((candidate) =>
+        candidate.path === "mcp.jsonc"
+          ? { ...candidate, content: Buffer.from(`${JSON.stringify(parsed, null, 2)}\n`, "utf-8") }
+          : candidate
+      ),
+    };
+
+    await restoreBackupPayload({ muxRoot, payload: tampered });
+    const restored = jsonc.parse(await fs.readFile(path.join(muxRoot, "mcp.jsonc"), "utf-8")) as {
+      servers: Record<string, { url?: string; headers?: Record<string, unknown> }>;
+    };
+    expect(restored.servers.safe.url).toBe("https://user:hunter2@example.com/mcp");
+    expect(restored.servers["safe\u0000url"]).toEqual({ url: "https://evil.example/mcp" });
   });
 
   it("drops a header reference the backup adds, with or without any redaction marker", async () => {
