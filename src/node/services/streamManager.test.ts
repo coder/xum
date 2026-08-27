@@ -751,6 +751,136 @@ describe("StreamManager - refusal usage attribution", () => {
     expect(recordedKeys).toEqual(["anthropic:claude-opus-4-5"]);
   });
 
+  test("zero-usage refused attempt still records a zero-usage hop entry without touching the session ledger", async () => {
+    const recordUsage = mock((_workspaceId: string, _model: string, _usage: unknown) =>
+      Promise.resolve(undefined)
+    );
+    const sessionUsageService = { recordUsage } as unknown as SessionUsageService;
+    const streamManager = new StreamManager(historyService, sessionUsageService);
+    const tryFallback = Reflect.get(streamManager, "tryModelFallbackAfterRefusal") as (
+      workspaceId: string,
+      streamInfo: Record<string, unknown>,
+      refusalFinishReason: string
+    ) => Promise<{ kind: string }>;
+    expect(typeof tryFallback).toBe("function");
+
+    const toolModelUsages: Array<{ toolName: string; model: string; usage: unknown }> = [];
+    const streamInfo = {
+      model: KNOWN_MODELS.SONNET.id,
+      metadataModel: KNOWN_MODELS.SONNET.id,
+      // No billed usage anywhere: neither live-tracked nor via streamResult.
+      cumulativeUsage: undefined,
+      cumulativeProviderMetadata: undefined,
+      streamResult: { usage: Promise.resolve(undefined), finalStep: Promise.resolve(undefined) },
+      startTime: Date.now(),
+      initialMetadata: undefined,
+      parts: [],
+      toolModelUsages,
+      abortController: { signal: { aborted: false } },
+      softInterrupt: { pending: false },
+      // Empty chain: the hop is recorded, then the chain exhausts terminally.
+      modelFallback: {
+        options: { chain: [], prepare: mock(() => Promise.reject(new Error("unused"))) },
+        requestedModel: KNOWN_MODELS.SONNET.id,
+        refusedModels: [],
+        original: { maxOutputTokens: undefined },
+      },
+    };
+
+    const outcome = await tryFallback.call(
+      streamManager,
+      "ws-zero-usage-hop",
+      streamInfo,
+      "refusal"
+    );
+    expect(outcome.kind).toBe("terminal");
+
+    // The refused attempt is durably recorded with explicit zero usage so
+    // analytics counts it, while the session cost ledger stays untouched.
+    expect(toolModelUsages).toHaveLength(1);
+    expect(toolModelUsages[0]).toMatchObject({
+      toolName: "model_fallback_refusal",
+      model: KNOWN_MODELS.SONNET.id,
+      usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    });
+    expect(recordUsage).not.toHaveBeenCalled();
+  });
+
+  test("sidecar flatten labels refusal hops refused_stream and keeps the drop reason for other usage", async () => {
+    const recordHeadlessUsage = mock(
+      (
+        _workspaceId: string,
+        _model: string,
+        _usage: unknown,
+        _providerMetadata: unknown,
+        _options: unknown
+      ) => Promise.resolve(undefined)
+    );
+    const sessionUsageService = { recordHeadlessUsage } as unknown as SessionUsageService;
+    const streamManager = new StreamManager(historyService, sessionUsageService);
+    const recordDropped = Reflect.get(streamManager, "recordDroppedPartialUsageInSidecar") as (
+      workspaceId: string,
+      streamInfo: Record<string, unknown>,
+      usage: Record<string, number> | undefined,
+      providerMetadata: Record<string, unknown> | undefined,
+      analyticsSource: string,
+      streamUsageSource?: string
+    ) => Promise<void>;
+    expect(typeof recordDropped).toBe("function");
+
+    const streamInfo = {
+      model: KNOWN_MODELS.SONNET.id,
+      metadataModel: KNOWN_MODELS.SONNET.id,
+      toolModelUsages: [
+        {
+          toolName: "model_fallback_refusal",
+          timestamp: 1,
+          model: KNOWN_MODELS.SONNET.id,
+          metadataModel: KNOWN_MODELS.SONNET.id,
+          usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        },
+        {
+          toolName: "task",
+          timestamp: 2,
+          model: KNOWN_MODELS.GPT.id,
+          metadataModel: KNOWN_MODELS.GPT.id,
+          usage: { inputTokens: 7, outputTokens: 1, totalTokens: 8 },
+        },
+      ],
+    };
+    const sourcesOf = () =>
+      recordHeadlessUsage.mock.calls.map(
+        (call) => (call[4] as { analyticsSource?: string }).analyticsSource
+      );
+
+    // Aborted turn with a prior refusal hop: the stream's own usage row keeps
+    // the abort label (default streamUsageSource), the hop is still a refusal,
+    // and unrelated tool usage keeps the drop reason.
+    await recordDropped.call(
+      streamManager,
+      "ws-flatten-aborted",
+      streamInfo,
+      { inputTokens: 2, outputTokens: 1, totalTokens: 3 },
+      undefined,
+      "aborted_stream"
+    );
+    expect(sourcesOf()).toEqual(["aborted_stream", "refused_stream", "aborted_stream"]);
+
+    // Terminal-refusal error turn: the stream's own usage row is explicitly
+    // labeled refused_stream while non-refusal tool usage stays errored_stream.
+    recordHeadlessUsage.mockClear();
+    await recordDropped.call(
+      streamManager,
+      "ws-flatten-refused",
+      streamInfo,
+      { inputTokens: 2, outputTokens: 1, totalTokens: 3 },
+      undefined,
+      "errored_stream",
+      "refused_stream"
+    );
+    expect(sourcesOf()).toEqual(["refused_stream", "refused_stream", "errored_stream"]);
+  });
+
   test("ledger key uses the stream's pinned metadata identity when instance metadata is gone", async () => {
     // A catalog refresh can remove/retag the instance while the turn is
     // active: the LIVE config no longer resolves coder:prod/<claude>, so a
@@ -2646,6 +2776,75 @@ describe("StreamManager - empty stream completions", () => {
     expect(committed?.metadata?.errorType).toBeUndefined();
   });
 
+  test("zero-usage terminal refusal reaches the sidecar as refused_stream without touching the session ledger", async () => {
+    const recordUsage = mock((_workspaceId: string, _model: string, _usage: unknown) =>
+      Promise.resolve(undefined)
+    );
+    const recordHeadlessUsage = mock(
+      (
+        _workspaceId: string,
+        _model: string,
+        _usage: unknown,
+        _providerMetadata: unknown,
+        _options: unknown
+      ) => Promise.resolve(undefined)
+    );
+    const sessionUsageService = {
+      recordUsage,
+      recordHeadlessUsage,
+    } as unknown as SessionUsageService;
+    const streamManager = new StreamManager(historyService, sessionUsageService);
+    streamManager.on("error", () => undefined);
+
+    Reflect.set(streamManager, "tokenTracker", {
+      setModel: () => Promise.resolve(undefined),
+      countTokens: () => Promise.resolve(0),
+    });
+
+    const workspaceId = "refusal-zero-usage-sidecar-workspace";
+    const messageId = "refusal-zero-usage-sidecar-message";
+    const historySequence = 1;
+
+    await appendPartialAssistantForTests(workspaceId, messageId, historySequence);
+    const processStreamWithCleanup = getProcessStreamWithCleanupForTests(streamManager);
+    const startTime = Date.now() - 250;
+    const streamInfo = createStreamInfoForTests({
+      streamResult: createStreamResultForTests(
+        (async function* () {
+          await Promise.resolve();
+          yield { type: "finish", finishReason: "content-filter", rawFinishReason: "refusal" };
+        })(),
+        { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
+      ),
+      messageId,
+      startTime,
+      lastPartTimestamp: startTime,
+      model: KNOWN_MODELS.SONNET.id,
+      metadataModel: KNOWN_MODELS.SONNET.id,
+      historySequence,
+      initialMetadata: { agentId: "plan" },
+      runtime,
+    });
+
+    await processStreamWithCleanup.call(streamManager, workspaceId, streamInfo, historySequence);
+
+    // A refusal the provider billed nothing for is still a refusal: exactly
+    // one refused_stream analytics record with explicit zero usage…
+    expect(recordHeadlessUsage).toHaveBeenCalledTimes(1);
+    expect(recordHeadlessUsage.mock.calls[0]?.[0]).toBe(workspaceId);
+    expect(recordHeadlessUsage.mock.calls[0]?.[2]).toEqual({
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+    });
+    expect(recordHeadlessUsage.mock.calls[0]?.[4]).toMatchObject({
+      analyticsSource: "refused_stream",
+      skipSessionLedger: true,
+    });
+    // …and no zero-cost noise in the session cost ledger.
+    expect(recordUsage).not.toHaveBeenCalled();
+  });
+
   test("refusal finish after partial output fails visibly when no fallback is configured", async () => {
     const recordUsage = mock((_workspaceId: string, _model: string, _usage: unknown) =>
       Promise.resolve(undefined)
@@ -2730,8 +2929,10 @@ describe("StreamManager - empty stream completions", () => {
     expect(recordHeadlessUsage).toHaveBeenCalledTimes(1);
     expect(recordHeadlessUsage.mock.calls[0]?.[0]).toBe(workspaceId);
     expect(recordHeadlessUsage.mock.calls[0]?.[2]).toMatchObject({ inputTokens: 3 });
+    // Terminal refusals are labeled refused_stream (not errored_stream) so
+    // analytics can distinguish refusals from generic stream errors.
     expect(recordHeadlessUsage.mock.calls[0]?.[4]).toMatchObject({
-      analyticsSource: "errored_stream",
+      analyticsSource: "refused_stream",
       skipSessionLedger: true,
     });
 
@@ -3635,8 +3836,10 @@ describe("StreamManager - empty stream completions", () => {
     expect(sidecarCalls[1]?.[1]).toBe(fallbackModel);
     expect(sidecarCalls[1]?.[2]).toMatchObject({ inputTokens: 10 });
     for (const call of sidecarCalls) {
+      // Both flattened entries are refused fallback hops, so they carry the
+      // refusal-specific analytics label rather than the generic drop reason.
       expect(call?.[4]).toMatchObject({
-        analyticsSource: "errored_stream",
+        analyticsSource: "refused_stream",
         skipSessionLedger: true,
       });
     }

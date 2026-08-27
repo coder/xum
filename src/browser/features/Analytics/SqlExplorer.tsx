@@ -29,6 +29,24 @@ export const SAMPLE_QUERIES = [
     label: "Tokens by Thinking Level",
     sql: "SELECT thinking_level, sum(input_tokens + output_tokens + reasoning_tokens + cached_tokens + cache_create_tokens) as total_tokens\nFROM events\nWHERE thinking_level IS NOT NULL\nGROUP BY thinking_level\nORDER BY total_tokens DESC;",
   },
+  // Refusal analytics: 'model_fallback_refusal' rows are refused fallback hops
+  // on committed turns; 'headless:refused_stream' rows are refusals on turns
+  // that never committed (terminal refusals, aborted/errored refusal turns).
+  {
+    label: "Refusals per Day",
+    sql: "SELECT date, model, count(*) as refusals\nFROM events\nWHERE tool_name IN ('model_fallback_refusal', 'headless:refused_stream')\nGROUP BY date, model\nORDER BY date ASC;",
+  },
+  {
+    label: "Refusal Downgrades (Requested → Answered)",
+    sql: "SELECT requested_model, model as answered_model, count(*) as turns\nFROM events\nWHERE requested_model IS NOT NULL AND tool_name IS NULL\nGROUP BY requested_model, model\nORDER BY turns DESC;",
+  },
+  {
+    // Attempts are attributed to the model that actually ran: refusal rows
+    // already count the refused model's attempt, so the answered side must
+    // NOT coalesce requested_model (that would double-count downgraded turns).
+    label: "Refusal Rate by Model",
+    sql: "WITH answered AS (\n  SELECT model, count(*) as n FROM events\n  WHERE tool_name IS NULL AND model IS NOT NULL GROUP BY model\n),\nrefused AS (\n  SELECT model, count(*) as n FROM events\n  WHERE tool_name IN ('model_fallback_refusal', 'headless:refused_stream')\n    AND model IS NOT NULL GROUP BY model\n)\nSELECT COALESCE(a.model, r.model) as model,\n  COALESCE(r.n, 0) as refusals,\n  COALESCE(a.n, 0) + COALESCE(r.n, 0) as attempts,\n  ROUND(100.0 * COALESCE(r.n, 0) / NULLIF(COALESCE(a.n, 0) + COALESCE(r.n, 0), 0), 2) as refusal_pct\nFROM answered a FULL OUTER JOIN refused r USING (model)\nORDER BY refusals DESC;",
+  },
 ];
 
 interface SqlExplorerProps {

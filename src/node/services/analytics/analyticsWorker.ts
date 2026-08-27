@@ -6,13 +6,16 @@ import { log } from "@/node/services/log";
 import { decideSyncPlan, type SyncAction } from "./backfillDecision";
 import { shouldCheckpointAfterSync } from "./checkpointDecision";
 import {
+  CURRENT_ETL_SEMANTICS_VERSION,
   clearWorkspaceAnalyticsState,
   deleteCorruptAnalyticsRows,
   getCurrentPricingFingerprint,
   ingestWorkspace,
+  readStoredEtlSemanticsVersion,
   readStoredPricingFingerprint,
   rebuildAll,
   statSessionChatHistory,
+  storeEtlSemanticsVersion,
   storePricingFingerprint,
 } from "./etl";
 import {
@@ -97,6 +100,10 @@ interface RawQueryData {
 
 const EVENTS_COLUMN_MIGRATIONS_SQL = [
   "ALTER TABLE events ADD COLUMN IF NOT EXISTS tool_name TEXT",
+  // Refusal-fallback downgrade columns: order must match CREATE_EVENTS_TABLE_SQL
+  // so migrated and fresh DBs share the physical column order the appender uses.
+  "ALTER TABLE events ADD COLUMN IF NOT EXISTS requested_model VARCHAR",
+  "ALTER TABLE events ADD COLUMN IF NOT EXISTS refused_models_json VARCHAR",
 ] as const;
 
 const DELEGATION_ROLLUPS_COLUMN_MIGRATIONS_SQL = [
@@ -192,9 +199,11 @@ async function handleRebuildAll(data: RebuildAllData): Promise<{ workspacesInges
 
   const result = await rebuildAll(getConn(), data.sessionsDir, data.workspaceMetaById ?? {});
   await sweepCorruptRows("rebuildAll", result.failedWorkspaceIds);
-  // A completed rebuild priced everything with the current tables; refresh the
-  // fingerprint so the next sync check does not schedule a redundant rebuild.
+  // A completed rebuild priced everything with the current tables and derived
+  // all current ETL columns; refresh the fingerprint and semantics version so
+  // the next sync check does not schedule a redundant rebuild.
   await storePricingFingerprint(getConn());
+  await storeEtlSemanticsVersion(getConn());
   return { workspacesIngested: result.workspacesIngested };
 }
 
@@ -376,6 +385,11 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
   const storedPricingFingerprint = await readStoredPricingFingerprint(getConn());
   const pricingFingerprintChanged = storedPricingFingerprint !== getCurrentPricingFingerprint();
 
+  // ETL semantics version: rows ingested before a new derived column existed
+  // (e.g. refusal-downgrade metadata) must be backfilled via a full rebuild.
+  const storedEtlSemanticsVersion = await readStoredEtlSemanticsVersion(getConn());
+  const semanticsVersionChanged = storedEtlSemanticsVersion !== CURRENT_ETL_SEMANTICS_VERSION;
+
   const plan = decideSyncPlan({
     eventCount,
     watermarkCount,
@@ -383,6 +397,7 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
     watermarkWorkspaceIds,
     hasAnyWatermarkAtOrAboveZero,
     pricingFingerprintChanged,
+    semanticsVersionChanged,
     changedSignalWorkspaceIds,
   });
 
@@ -392,6 +407,10 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
   // crashed repricing rebuild re-triggers on the next sync check.
   if (pricingFingerprintChanged && plan.action !== "full_rebuild") {
     await storePricingFingerprint(getConn());
+  }
+  // Same store-after-success policy for the ETL semantics version.
+  if (semanticsVersionChanged && plan.action !== "full_rebuild") {
+    await storeEtlSemanticsVersion(getConn());
   }
 
   if (plan.action === "noop") {
@@ -416,6 +435,9 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
     await sweepCorruptRows("syncCheck full_rebuild", failedWorkspaceIds);
     if (pricingFingerprintChanged) {
       await storePricingFingerprint(getConn());
+    }
+    if (semanticsVersionChanged) {
+      await storeEtlSemanticsVersion(getConn());
     }
     await checkpointIfNeeded(plan.action, workspacesIngested, 0);
 
