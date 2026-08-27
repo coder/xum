@@ -543,6 +543,65 @@ describe("AgentContext", () => {
     expect(updateAgentAISettingsCalls).toHaveLength(1);
   });
 
+  test("stale metadata cannot overwrite settings during an agent switch", async () => {
+    const projectPath = "/tmp/project";
+    const workspaceId = "main-workspace";
+    mockAgentDefinitions = [EXEC_AGENT, PLAN_AGENT];
+    mockWorkspaceMetadata.set(workspaceId, { agentId: "exec" });
+    window.localStorage.setItem(getAgentIdKey(workspaceId), JSON.stringify("exec"));
+    window.localStorage.setItem(getModelKey(workspaceId), JSON.stringify("openai:selected"));
+    window.localStorage.setItem(getThinkingLevelKey(workspaceId), JSON.stringify("high"));
+    deferUpdateAgentAISettings = true;
+
+    let contextValue: AgentContextValue | undefined;
+    let latestMetadata: FrontendWorkspaceMetadata | undefined;
+
+    renderAgentHarness({
+      workspaceId,
+      projectPath,
+      onChange: (value) => (contextValue = value),
+      onMetadataLayout: (metadata) => (latestMetadata = metadata),
+    });
+
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("exec");
+    });
+
+    contextValue?.setAgentId("plan");
+
+    await waitFor(() => {
+      expect(contextValue?.agentId).toBe("plan");
+      expect(resolveUpdateAgentAISettings).not.toBeNull();
+    });
+    expect(updateAgentAISettingsCalls[0]?.aiSettings).toMatchObject({
+      model: "openai:selected",
+      thinkingLevel: "high",
+    });
+
+    emitWorkspaceMetadata?.({
+      workspaceId,
+      metadata: createWorkspaceMetadata(workspaceId, {
+        agentId: "exec",
+        aiSettingsByAgent: {
+          plan: { model: "openai:stale", thinkingLevel: "low" },
+        },
+      }),
+    });
+
+    await waitFor(() => {
+      expect(latestMetadata?.aiSettingsByAgent?.plan?.model).toBe("openai:stale");
+    });
+    expect(contextValue?.agentId).toBe("plan");
+    expect(window.localStorage.getItem(getModelKey(workspaceId))).toBe(
+      JSON.stringify("openai:selected")
+    );
+    expect(window.localStorage.getItem(getThinkingLevelKey(workspaceId))).toBe(
+      JSON.stringify("high")
+    );
+
+    getDeferredUpdateResolver()?.({ success: true, data: undefined });
+  });
+
   test("workspace agent selection persists definition AI defaults", async () => {
     const projectPath = "/tmp/project";
     const workspaceId = "main-workspace";

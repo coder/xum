@@ -41,7 +41,9 @@ import { sortAgentsStable } from "@/browser/utils/agents";
 import { normalizeAgentId, resolveRemovedBuiltinAgentId } from "@/common/utils/agentIds";
 import {
   clearPendingWorkspaceAgentId,
+  clearPendingWorkspaceAiSettings,
   markPendingWorkspaceAgentId,
+  markPendingWorkspaceAiSettings,
   revertRejectedAgentSwitch,
   updateWorkspaceAgentAISettings,
 } from "@/browser/utils/workspaceAiSettingsSync";
@@ -260,15 +262,17 @@ function AgentProviderWithState(props: {
         });
       };
 
+      const nextAiSettings = {
+        model: resolvedModel,
+        thinkingLevel: resolvedThinking,
+        ...(resolvedReasoningMode != null ? { reasoningMode: resolvedReasoningMode } : {}),
+      };
       markPendingWorkspaceAgentId(workspaceId, nextAgentId);
+      markPendingWorkspaceAiSettings(workspaceId, nextAgentId, nextAiSettings);
       updateWorkspaceAgentAISettings(api, {
         workspaceId,
         agentId: nextAgentId,
-        aiSettings: {
-          model: resolvedModel,
-          thinkingLevel: resolvedThinking,
-          ...(resolvedReasoningMode != null ? { reasoningMode: resolvedReasoningMode } : {}),
-        },
+        aiSettings: nextAiSettings,
         persistSelectedAgentId: true,
       })
         .then((result) => {
@@ -276,16 +280,18 @@ function AgentProviderWithState(props: {
             notifySwitchRejected(typeof result.error === "string" ? result.error : "");
             revertRejectedSwitch();
           }
-          // Release the guard on every settled write: no-op writes (backend
-          // already on this agent) and failed writes emit no metadata echo,
-          // and a stuck guard would block future backend agent seeds. For
-          // changed writes the echo is ordered after any stale broadcast, so
-          // releasing on the response cannot strand a stale value.
+          // Release the guards on every settled write: no-op writes (backend
+          // already on these values) and failed writes emit no metadata echo,
+          // and stuck guards would block future backend seeds. For changed
+          // writes the echo is ordered after any stale broadcast, so releasing
+          // on the response cannot strand stale values.
           clearPendingWorkspaceAgentId(workspaceId, nextAgentId);
+          clearPendingWorkspaceAiSettings(workspaceId, nextAgentId);
         })
         .catch((error) => {
           notifySwitchRejected(getErrorMessage(error));
           clearPendingWorkspaceAgentId(workspaceId, nextAgentId);
+          clearPendingWorkspaceAiSettings(workspaceId, nextAgentId);
         });
     },
     [
