@@ -1463,6 +1463,32 @@ export class Config {
             if (!Array.isArray(workspaces)) {
               throw new Error("Config project workspaces must be an array");
             }
+            for (const workspaceEntry of workspaces) {
+              // WorkspaceSchema persists workspace entries as objects; a
+              // non-object entry is mangled state whose identity cannot be
+              // established.
+              if (
+                workspaceEntry === null ||
+                typeof workspaceEntry !== "object" ||
+                Array.isArray(workspaceEntry)
+              ) {
+                throw new Error("Config workspace entries must be objects");
+              }
+              const workspaceId = (workspaceEntry as { id?: unknown }).id;
+              // A truthy non-string id (42, {}) would ride the modern-entry
+              // branch of getAllWorkspaceMetadata as the authoritative id,
+              // so the prune's known set would omit the workspace's REAL
+              // string identity and delete its activity snapshot. Nullish
+              // ids stay valid: legacy entries resolve their stable id
+              // through session metadata.json, and the strict guard there
+              // fails closed when that resolution yields no usable id.
+              if (
+                workspaceId != null &&
+                !(typeof workspaceId === "string" && workspaceId.length > 0)
+              ) {
+                throw new Error("Config workspace ids must be non-empty strings");
+              }
+            }
           }
         }
         const rawPairs = Array.isArray(parsed.projects) ? parsed.projects : [];

@@ -925,6 +925,19 @@ describe("Config", () => {
       // prune an id set missing that workspace.
       ["null project key", { projects: [[null, { workspaces: [] }]] }],
       ["empty-string project key", { projects: [["", { workspaces: [] }]] }],
+      // A truthy non-string workspace id would ride getAllWorkspaceMetadata's
+      // modern-entry branch as the authoritative id, omitting the workspace's
+      // REAL string identity from the prune's known set; non-object entries
+      // have no establishable identity at all.
+      ["non-object workspace entry", { projects: [["/repo", { workspaces: ["bogus"] }]] }],
+      [
+        "numeric workspace id",
+        { projects: [["/repo", { workspaces: [{ id: 42, path: "/repo/ws" }] }]] },
+      ],
+      [
+        "empty-string workspace id",
+        { projects: [["/repo", { workspaces: [{ id: "", path: "/repo/ws" }] }]] },
+      ],
     ];
 
     for (const [label, shape] of invalidShapes) {

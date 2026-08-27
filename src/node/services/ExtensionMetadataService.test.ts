@@ -539,6 +539,50 @@ describe("ExtensionMetadataService", () => {
     expect(persisted.workspaces["stale-workspace"]).toBeUndefined();
   });
 
+  test("pruneMissingWorkspaces preserves writes landing during the re-registration recheck", async () => {
+    // The recheck can perform a full legacy enumeration — the longest await
+    // in the prune. A concurrent backend's write landing during it must not
+    // be rolled back by the pruned rewrite: the fresh snapshot is loaded
+    // strictly AFTER the recheck resolves.
+    await service.updateRecency("known-workspace", 100);
+    await service.updateRecency("stale-workspace", 200);
+    const recheck = async (): Promise<ReadonlySet<string>> => {
+      // Foreign process write landing while the recheck enumerates.
+      const onDisk = JSON.parse(await readFile(filePath, "utf-8")) as ExtensionMetadataFile;
+      (onDisk.workspaces["known-workspace"] as { recency: number }).recency = 999;
+      await writeFile(filePath, JSON.stringify(onDisk));
+      return new Set(["known-workspace"]);
+    };
+    expect(
+      await service.pruneMissingWorkspaces(
+        () => Promise.resolve(new Set(["known-workspace"])),
+        recheck
+      )
+    ).toBe(1);
+    const persisted = JSON.parse(await readFile(filePath, "utf-8")) as ExtensionMetadataFile;
+    expect((persisted.workspaces["known-workspace"] as { recency?: number }).recency).toBe(999);
+    expect(persisted.workspaces["stale-workspace"]).toBeUndefined();
+  });
+
+  test("pruneMissingWorkspaces spares a stale entry rewritten during the recheck", async () => {
+    // Inverse race of the post-recheck reload: an id re-registered and
+    // written by another backend after the recheck read its registration
+    // evidence is still classified deletable while holding fresh activity.
+    // The unchanged-bytes guard proves the writer and fails closed.
+    await service.updateRecency("stale-workspace", 200);
+    const recheck = async (): Promise<ReadonlySet<string>> => {
+      const onDisk = JSON.parse(await readFile(filePath, "utf-8")) as ExtensionMetadataFile;
+      (onDisk.workspaces["stale-workspace"] as { recency: number }).recency = 999;
+      await writeFile(filePath, JSON.stringify(onDisk));
+      return new Set<string>(); // Registration evidence predates the write.
+    };
+    expect(
+      await service.pruneMissingWorkspaces(() => Promise.resolve(new Set<string>()), recheck)
+    ).toBe(0);
+    const persisted = JSON.parse(await readFile(filePath, "utf-8")) as ExtensionMetadataFile;
+    expect((persisted.workspaces["stale-workspace"] as { recency?: number }).recency).toBe(999);
+  });
+
   test("late writers cannot resurrect entries reclaimed by pruneMissingWorkspaces", async () => {
     await service.updateRecency("stale-workspace", 100);
     await service.pruneMissingWorkspaces(() => Promise.resolve(new Set<string>()));
@@ -945,18 +989,24 @@ describe("ExtensionMetadataService", () => {
   test("consumption is scoped to the sidecar generation that was reconciled", async () => {
     // With multiple processes recovering the fixed .corrupt path, another
     // backend can consume the generation this process read and strand a NEW
-    // snapshot at the same path before the unlink runs. A path-only unlink
-    // would destroy that unreconciled generation permanently.
+    // snapshot at the same path before the removal runs. A path-only unlink
+    // would destroy that unreconciled generation permanently; the
+    // claim-then-verify consume must instead take exactly one generation off
+    // the shared path, detect the identity mismatch on the claimed file, and
+    // reconcile the foreign generation into the main file.
     const quarantinePath = `${filePath}.corrupt`;
-    const internals = ExtensionMetadataService as unknown as {
+    const statics = ExtensionMetadataService as unknown as {
       statQuarantineToken(path: string): Promise<unknown>;
+    };
+    const internals = service as unknown as {
       consumeQuarantineSidecar(path: string, token: unknown): Promise<void>;
     };
+    await writeFile(filePath, JSON.stringify({ version: 1, workspaces: {} }));
     await writeFile(
       quarantinePath,
       JSON.stringify({ version: 1, workspaces: { a: { recency: 1, streaming: false } } })
     );
-    const staleToken = await internals.statQuarantineToken(quarantinePath);
+    const staleToken = await statics.statQuarantineToken(quarantinePath);
     // Concurrent recovery consumes that generation and quarantines a new
     // snapshot at the same path (different content => different identity).
     await rm(quarantinePath);
@@ -966,19 +1016,21 @@ describe("ExtensionMetadataService", () => {
     );
 
     await internals.consumeQuarantineSidecar(quarantinePath, staleToken);
-    // The newer generation survives for its own recovery pass.
-    const survivor = JSON.parse(await readFile(quarantinePath, "utf-8")) as {
-      workspaces: Record<string, unknown>;
+    // The newer generation was reconciled into the main file, not destroyed.
+    const main = JSON.parse(await readFile(filePath, "utf-8")) as {
+      workspaces: Record<string, { recency?: number }>;
     };
-    expect(survivor.workspaces.b).toBeDefined();
-
-    const currentToken = await internals.statQuarantineToken(quarantinePath);
-    await internals.consumeQuarantineSidecar(quarantinePath, currentToken);
-    const gone = await readFile(quarantinePath, "utf-8").then(
+    expect(main.workspaces.b?.recency).toBe(22222);
+    const sidecarGone = await readFile(quarantinePath, "utf-8").then(
       () => false,
       () => true
     );
-    expect(gone).toBe(true);
+    expect(sidecarGone).toBe(true);
+    const claimGone = await readFile(`${quarantinePath}.claimed`, "utf-8").then(
+      () => false,
+      () => true
+    );
+    expect(claimGone).toBe(true);
   });
 
   test("quarantine preserves an existing healthy sidecar instead of clobbering it", async () => {
@@ -1122,21 +1174,41 @@ describe("ExtensionMetadataService", () => {
         strictRejected = true;
       }
       expect(strictRejected).toBe(true);
-      // Sidecar retained for the retry: never consumed on unverifiable identity.
-      expect(await readFile(`${filePath}.corrupt`, "utf-8")).toContain("ws-stranded");
+      // Bytes retained for the retry: the consume claimed the sidecar before
+      // the failing identity probe, so they now sit at the claim path and
+      // are never deleted on unverifiable identity.
+      expect(await readFile(`${filePath}.corrupt.claimed`, "utf-8")).toContain("ws-stranded");
     } finally {
       statics.statQuarantineToken = realStat;
     }
-    // Retry with the probe healthy: the re-merge is idempotent and
-    // consumption completes.
+    // Retry with the probe healthy: the claim-leftover resume re-merges
+    // idempotently and consumption completes.
     const snapshots = await service.getAllSnapshots({ throwOnError: true });
     expect(snapshots.get("ws-stranded")?.recency).toBe(700);
     expect(snapshots.get("ws-live")?.recency).toBe(900);
-    const sidecarGone = await readFile(`${filePath}.corrupt`, "utf-8").then(
-      () => false,
-      () => true
-    );
-    expect(sidecarGone).toBe(true);
+    for (const leftover of [`${filePath}.corrupt`, `${filePath}.corrupt.claimed`]) {
+      const gone = await readFile(leftover, "utf-8").then(
+        () => false,
+        () => true
+      );
+      expect(gone).toBe(true);
+    }
+  });
+
+  test("a strict per-workspace read self-heals deterministic corruption", async () => {
+    // Live emissions read per-workspace snapshots after the subscription
+    // bootstraps. If the file becomes deterministically corrupt afterwards,
+    // the workflow-run/bash-monitor handlers drop their emissions on error —
+    // and nothing else is guaranteed to repair the file on an idle process,
+    // pinning stale activity in the renderer indefinitely. The strict read
+    // must route corruption through the same quarantine-and-reread recovery
+    // getAllSnapshots uses instead of failing every retry forever.
+    await writeFile(filePath, "{corrupt json");
+    const snapshot = await service.getSnapshot("ws-any", { throwOnError: true });
+    expect(snapshot).toBeNull();
+    // The canonical file was quarantined and reset to a valid empty file.
+    const healed = JSON.parse(await readFile(filePath, "utf-8")) as { version?: number };
+    expect(healed.version).toBe(1);
   });
 
   test("a strict snapshot read propagates a failed sidecar reconcile instead of the partial main", async () => {

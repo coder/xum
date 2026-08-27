@@ -338,48 +338,95 @@ export class ExtensionMetadataService {
    * with the sidecar still present would let a later process reconcile the
    * stale sidecar again after the main file has moved on, repeatedly
    * re-merging entries that pruning or removal already reclaimed.
+   *
+   * Claim-then-verify: with multiple processes recovering the fixed sidecar
+   * path, another backend can consume the generation this caller read and
+   * quarantine a NEW snapshot at the same path — a stat-compare followed by
+   * a path unlink would leave a window in which that unreconciled newer
+   * generation is destroyed. The rename below atomically takes exactly one
+   * generation off the shared path first; identity is then verified on the
+   * claimed file, which no other recovery references by design. A claimed
+   * FOREIGN generation (identity mismatch) is reconciled into the main file
+   * rather than deleted. Invariant: a claim file whose identity matched its
+   * consumer's token holds already-reconciled bytes (callers merge/restore
+   * before consuming), so only a crash between a MISMATCH claim and its
+   * reconcile strands unconsumed data at the claim path —
+   * reconcileLeftoverSidecarIfPresent probes for exactly that and resumes
+   * the merge on the next authoritative read.
    */
-  private static async consumeQuarantineSidecar(
+  private async consumeQuarantineSidecar(
     quarantinePath: string,
     token: QuarantineSidecarToken | null
   ): Promise<void> {
-    // Generation check: with multiple processes recovering the fixed sidecar
-    // path, another backend can consume the generation this caller read and
-    // quarantine a NEW snapshot at the same path before this unlink runs — a
-    // path-only unlink would permanently destroy that unreconciled
-    // generation. Compare the identity captured when the caller READ the
-    // sidecar and leave a mismatched (newer) file for its own recovery pass.
-    // The residual stat→unlink window is the documented unlocked-shared-file
-    // boundary (see the PR's concurrency contract); closing it entirely
-    // requires an interprocess lock.
     if (token == null) {
       // The caller never observed a sidecar identity (it read the file only
       // after a successful probe, so this is unreachable in practice) —
       // fail closed by leaving the file rather than unlinking blind.
       return;
     }
-    // Non-ENOENT probe failures propagate (retryable): reporting success
-    // with the sidecar retained would let the caller proceed — e.g. the
-    // one-time prune deletes stale entries from the main file, the next
-    // snapshot read re-merges them from the retained sidecar and consumes
-    // it, and with the prune latch already set the resurrected entries
-    // stay indefinitely. statQuarantineToken maps ENOENT to null below.
-    const current = await ExtensionMetadataService.statQuarantineToken(quarantinePath);
+    const claimPath = `${quarantinePath}.claimed`;
+    // A leftover at the claim path is either already-reconciled bytes (crash
+    // between a matched claim and its unlink) or a crash-stranded foreign
+    // generation (see the invariant above): reconcile it first so nothing
+    // recoverable is lost, then clear the name — the rename below must not
+    // land on an occupied destination (Windows rename is not reliably a
+    // replace). Post-reconcile bytes are consumed or deterministically
+    // unrecoverable, so the unlink only ever discards dead bytes.
+    const claimLeftoverExists = await access(claimPath).then(
+      () => true,
+      (error: unknown) => {
+        if (ExtensionMetadataService.isErrnoCode(error, "ENOENT")) {
+          return false;
+        }
+        throw error; // Unknowable claim state: retryable, never unlink blind.
+      }
+    );
+    if (claimLeftoverExists) {
+      await this.reconcileRecreatedMainWithSidecar(claimPath);
+      try {
+        await unlink(claimPath);
+      } catch (unlinkError) {
+        if (!ExtensionMetadataService.isErrnoCode(unlinkError, "ENOENT")) {
+          throw unlinkError;
+        }
+      }
+    }
+    try {
+      await rename(quarantinePath, claimPath);
+    } catch (renameError) {
+      if (ExtensionMetadataService.isErrnoCode(renameError, "ENOENT")) {
+        return; // Already consumed by a concurrent recovery.
+      }
+      throw renameError;
+    }
+    // Identity check on the CLAIMED file (immutable to other recoveries):
+    // non-ENOENT probe failures propagate (retryable) with the claim left in
+    // place for the leftover resume above — reporting success would let the
+    // caller proceed, e.g. the one-time prune deletes stale entries, a later
+    // read re-merges them from a retained sidecar, and with the prune latch
+    // already set the resurrected entries stay indefinitely.
+    const current = await ExtensionMetadataService.statQuarantineToken(claimPath);
     if (current == null) {
-      return; // Already consumed by a concurrent recovery.
+      return; // Claim vanished (external cleanup); nothing left to consume.
     }
     if (
       current.ino !== token.ino ||
       current.mtimeNs !== token.mtimeNs ||
       current.size !== token.size
     ) {
-      log.debug("Leaving replaced quarantine sidecar for its own recovery pass", {
+      // The claim took a NEWER generation another process installed after
+      // consuming ours: merge it into the main file instead of destroying
+      // it. The reconcile consumes the claim itself on success; a corrupt
+      // foreign generation stays at the bounded claim name until the next
+      // consume's leftover pass discards it.
+      log.debug("Claimed a replaced quarantine sidecar generation; reconciling it", {
         quarantinePath,
       });
+      await this.reconcileRecreatedMainWithSidecar(claimPath);
       return;
     }
     try {
-      await unlink(quarantinePath);
+      await unlink(claimPath);
     } catch (unlinkError) {
       if (!ExtensionMetadataService.isErrnoCode(unlinkError, "ENOENT")) {
         throw unlinkError;
@@ -416,10 +463,38 @@ export class ExtensionMetadataService {
    * emissions).
    */
   private async reconcileLeftoverSidecarIfPresent(): Promise<boolean> {
-    if (!(await this.probeQuarantineSidecar())) {
+    if (await this.probeQuarantineSidecar()) {
+      await this.resumeQuarantineRecovery();
+      return true;
+    }
+    // A crash between consumeQuarantineSidecar's mismatch claim and its
+    // reconcile strands an unreconciled foreign generation at the fixed
+    // claim path, which the sidecar probe above cannot see. Same access()
+    // cost profile: the reconcile only runs when a claim file actually
+    // exists (re-checked inside the queue — a concurrent consume's leftover
+    // pass may have taken it while this caller waited).
+    const claimPath = `${this.filePath}.corrupt.claimed`;
+    const claimExists = await access(claimPath).then(
+      () => true,
+      (error: unknown) => {
+        if (ExtensionMetadataService.isErrnoCode(error, "ENOENT")) {
+          return false;
+        }
+        throw error; // Unknowable claim state stays a retryable failure.
+      }
+    );
+    if (!claimExists) {
       return false;
     }
-    await this.resumeQuarantineRecovery();
+    await this.withSerializedMutation(async () => {
+      const stillExists = await access(claimPath).then(
+        () => true,
+        () => false
+      );
+      if (stillExists) {
+        await this.reconcileRecreatedMainWithSidecar(claimPath);
+      }
+    });
     return true;
   }
 
@@ -784,7 +859,7 @@ export class ExtensionMetadataService {
       }
       log.debug("Leftover sidecar reconcile failed during snapshot read", { error });
     }
-    const data = await this.load(options);
+    const data = await this.loadWithCorruptionRecovery(options);
     return this.toSnapshot(data.workspaces[workspaceId]);
   }
 
@@ -966,17 +1041,25 @@ export class ExtensionMetadataService {
       if (staleWorkspaceIds.length === 0) {
         return 0;
       }
-      // Deletion-only merge against a fresh snapshot (see doc comment above).
-      const fresh = await this.load();
-      // Re-fetch the known ids AFTER the fresh load: with multiple instances
-      // a downgraded backend can re-register a deterministic legacy id (and
-      // write new activity for it) between the enumeration above and here.
-      // Deleting on the stale classification would destroy that new entry's
+      // Re-registration recheck: with multiple instances a downgraded
+      // backend can re-register a deterministic legacy id (and write new
+      // activity for it) between the enumeration above and here. Deleting
+      // on the stale classification would destroy that new entry's
       // recency/goal/status — clearing the tombstone later cannot restore
       // data. A re-registered id is dropped from the deletion set and its
       // write tombstone lifted. If the recheck fails, abort the prune (throw
       // to the caller's catch) rather than deleting on stale knowledge.
       const recheckedKnownIds = await (recheckKnownWorkspaceIds ?? getKnownWorkspaceIds)();
+      // Deletion-only merge against a fresh snapshot loaded strictly AFTER
+      // the recheck — the LAST await before the save below. The recheck can
+      // perform a full legacy enumeration, and any recency/goal/status
+      // another backend writes during that await would be absent from a
+      // pre-recheck snapshot: save() would silently roll it back while
+      // deleting the stale keys. The inverse race (an id re-registered
+      // after the recheck read but before this load) is covered by the
+      // unchanged-bytes guard below, which is strictly narrower than the
+      // enumeration-wide window this ordering closes.
+      const fresh = await this.load();
       let prunedCount = 0;
       for (const workspaceId of staleWorkspaceIds) {
         if (recheckedKnownIds.has(workspaceId)) {
@@ -993,10 +1076,25 @@ export class ExtensionMetadataService {
           }
           continue;
         }
-        if (workspaceId in fresh.workspaces) {
-          delete fresh.workspaces[workspaceId];
-          prunedCount++;
+        if (!(workspaceId in fresh.workspaces)) {
+          continue;
         }
+        // Fail-closed bytes guard: the registration evidence above predates
+        // this load, so an id re-registered in that gap says "unregistered"
+        // while a concurrent backend may already have written fresh
+        // activity for it. A stale-classified entry whose bytes CHANGED
+        // between the two loads proves such a writer — spare it (the entry
+        // is re-evaluated on the next process start; the write tombstone
+        // stays until fresh registration evidence clears it through the
+        // normal revival paths).
+        if (
+          JSON.stringify(fresh.workspaces[workspaceId]) !==
+          JSON.stringify(data.workspaces[workspaceId])
+        ) {
+          continue;
+        }
+        delete fresh.workspaces[workspaceId];
+        prunedCount++;
       }
       if (prunedCount > 0) {
         await this.save(fresh);
@@ -1268,7 +1366,7 @@ export class ExtensionMetadataService {
           throw copyError;
         }
       }
-      await ExtensionMetadataService.consumeQuarantineSidecar(quarantinePath, sidecarToken);
+      await this.consumeQuarantineSidecar(quarantinePath, sidecarToken);
       return false;
     }
     // Replace the quarantined main file with a valid EMPTY file instead of
@@ -1420,7 +1518,7 @@ export class ExtensionMetadataService {
           throw copyError;
         }
       }
-      await ExtensionMetadataService.consumeQuarantineSidecar(quarantinePath, sidecarToken);
+      await this.consumeQuarantineSidecar(quarantinePath, sidecarToken);
       return false;
     }
     if (!ExtensionMetadataService.isValidMetadataFileShape(sidecarParsed)) {
@@ -1550,21 +1648,28 @@ export class ExtensionMetadataService {
     }
     // Consumed either way: every surviving sidecar entry is now represented
     // at the main path.
-    await ExtensionMetadataService.consumeQuarantineSidecar(quarantinePath, sidecarToken);
+    await this.consumeQuarantineSidecar(quarantinePath, sidecarToken);
     return false;
   }
 
-  async getAllSnapshots(options?: {
+  /**
+   * load() with self-healing for deterministic corruption. Strict reads must
+   * propagate transient failures (renderer keeps last-known state and
+   * retries), but deterministic corruption would fail every retry forever on
+   * an idle process — no subsequent list read or metadata writer is
+   * guaranteed to repair the file. Quarantine the corrupt bytes and re-read:
+   * the post-quarantine state is authoritative. Shared by getAllSnapshots
+   * and getSnapshot so per-workspace emit reads (workflow-run/bash-monitor
+   * handlers, which drop their emissions on error) self-heal the same way
+   * instead of leaving a workflow-only workspace's stale activity pinned in
+   * the renderer indefinitely.
+   */
+  private async loadWithCorruptionRecovery(options?: {
     throwOnError?: boolean;
-  }): Promise<Map<string, WorkspaceActivitySnapshot>> {
-    let data: ExtensionMetadataFile;
+  }): Promise<ExtensionMetadataFile> {
     try {
-      data = await this.load(options);
+      return await this.load(options);
     } catch (error) {
-      // Strict reads must propagate transient failures (renderer keeps
-      // last-known state and retries), but deterministic corruption would
-      // fail every retry forever on an idle process. Quarantine the corrupt
-      // bytes and re-read: the post-quarantine empty state is authoritative.
       if (ExtensionMetadataService.isDeterministicCorruption(error)) {
         try {
           await this.quarantineCorruptFile();
@@ -1589,8 +1694,14 @@ export class ExtensionMetadataService {
       } else {
         throw error;
       }
-      data = await this.load(options);
+      return this.load(options);
     }
+  }
+
+  async getAllSnapshots(options?: {
+    throwOnError?: boolean;
+  }): Promise<Map<string, WorkspaceActivitySnapshot>> {
+    let data: ExtensionMetadataFile = await this.loadWithCorruptionRecovery(options);
     // A crash between quarantineCorruptFile's rename and its completion can
     // strand the full snapshot in the sidecar while another backend
     // recreates a VALID (typically partial, single-entry) main file from
