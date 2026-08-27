@@ -123,17 +123,14 @@ export const CREDENTIAL_URL_PARAMETER_NAMES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Signed-URL families qualify the credential word with a provider prefix
- * (`X-Goog-Signature`, `X-Amz-Credential`, `x-oss-security-token`), so these
- * unambiguous words match as name suffixes rather than enumerating providers.
+ * Signed-URL families qualify the credential word with a header-style provider
+ * prefix (`X-Goog-Signature`, `X-Amz-Credential`, `x-oss-security-token`), so an
+ * `x`-led name ending in one of these unambiguous words matches without enumerating
+ * providers. Descriptive options that merely end in the word
+ * (`verify_signature=false`) carry no provider marker and stay accepted.
  */
-const CREDENTIAL_NAME_SUFFIXES = [
-  "accesskeyid",
-  "credential",
-  "secretaccesskey",
-  "securitytoken",
-  "signature",
-] as const;
+const PROVIDER_CREDENTIAL_NAME =
+  /^x[a-z0-9]*(?:accesskeyid|credential|secretaccesskey|securitytoken|signature)$/;
 
 function parametersContainCredential(
   parameters: URLSearchParams,
@@ -146,7 +143,7 @@ function parametersContainCredential(
     // Header-style spellings prefix the same names with `x` (`x-api-key`,
     // `X-Auth-Token`), so one stripped leading `x` matches the whole class.
     if (normalizedName.startsWith("x") && names.has(normalizedName.slice(1))) return true;
-    if (CREDENTIAL_NAME_SUFFIXES.some((suffix) => normalizedName.endsWith(suffix))) return true;
+    if (PROVIDER_CREDENTIAL_NAME.test(normalizedName)) return true;
   }
   return false;
 }

@@ -149,6 +149,9 @@ describe("AppConfigOnDiskSchema", () => {
     for (const repoUrl of [
       "https://github.com/me/dotfiles.git",
       "https://github.com/me/dotfiles.git?client_id=mux",
+      // A descriptive option that happens to end in a credential word is not a
+      // provider-qualified signed-URL parameter.
+      "https://github.com/me/dotfiles.git?verify_signature=false",
       "https://github.com/me/dotfiles.git?code=review&key=branch&session=docs",
       "https://github.com/me/dotfiles.git#section=backup",
       "ssh://git@example.com/repo.git",

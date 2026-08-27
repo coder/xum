@@ -4431,7 +4431,7 @@ describe("backup payload", () => {
       JSON.stringify({
         servers: {
           safe: {
-            url: "https://mcp.example.com/mcp?mode=fast&tenant=acme&client_id=public&monkey=banana",
+            url: "https://mcp.example.com/mcp?mode=fast&tenant=acme&client_id=public&monkey=banana&verify_signature=false",
           },
           unusual: { url: "not a url without parameters" },
           email: { url: "mailto:user@example.com" },
@@ -4446,6 +4446,13 @@ describe("backup payload", () => {
       sourceLabel: "test-host",
     });
     expect(scanBackupFilesForSecrets(payload.files)).toEqual([]);
+    // The ordinary parameters must also survive redaction: a false credential match
+    // here removes the server outright on a fresh-device restore.
+    const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { safe: { url: string } };
+    };
+    expect(exported.servers.safe.url).toContain("verify_signature=false");
+    expect(payload.redactions).toEqual([]);
   });
 
   it("charges what a restore writes, not only what it read", async () => {
