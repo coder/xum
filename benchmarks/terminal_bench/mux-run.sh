@@ -257,22 +257,30 @@ cp -f "${MUX_OUTPUT_FILE}" "${MUX_RUN_SESSION_ROOT}/run-stdout.jsonl" 2>/dev/nul
 cp -f "${MUX_STDERR_FILE}" "${MUX_RUN_SESSION_ROOT}/run-stderr.log" 2>/dev/null || true
 cp -f "${MUX_TOKEN_FILE}" "${MUX_RUN_SESSION_ROOT}/mux-tokens.json" 2>/dev/null || true
 
+# Post-run status lines must survive transports that drop channel stderr:
+# append them to the collected stderr file and refresh its archived copy.
+report_status_line() {
+  printf '%s\n' "$1" >&2
+  printf '%s\n' "$1" >>"${MUX_STDERR_FILE}" 2>/dev/null || true
+  cp -f "${MUX_STDERR_FILE}" "${MUX_RUN_SESSION_ROOT}/run-stderr.log" 2>/dev/null || true
+}
+
 if [[ "${mux_status}" -eq 3 && "${mux_run_as_goal_enabled}" == "1" ]]; then
-  printf '[mux-run] WARNING: mux goal run stopped incomplete (exit 3); leaving workspace for verifier scoring\n' >&2
+  report_status_line "[mux-run] WARNING: mux goal run stopped incomplete (exit 3); leaving workspace for verifier scoring"
   mux_status=0
 fi
 
 if [[ "${mux_status}" -ne 0 ]]; then
-  printf '[mux-run] ERROR: mux agent session failed (exit %s)\n' "${mux_status}" >&2
+  report_status_line "[mux-run] ERROR: mux agent session failed (exit ${mux_status})"
   exit "${mux_status}"
 fi
 
 if [[ "${tee_status}" -ne 0 ]]; then
-  printf '[mux-run] ERROR: failed to capture mux stdout (exit %s)\n' "${tee_status}" >&2
+  report_status_line "[mux-run] ERROR: failed to capture mux stdout (exit ${tee_status})"
   exit "${tee_status}"
 fi
 
 if [[ "${stdin_status}" -ne 0 ]]; then
-  printf '[mux-run] ERROR: failed to send instruction to mux (exit %s)\n' "${stdin_status}" >&2
+  report_status_line "[mux-run] ERROR: failed to send instruction to mux (exit ${stdin_status})"
   exit "${stdin_status}"
 fi

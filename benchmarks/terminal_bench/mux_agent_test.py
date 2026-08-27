@@ -18,6 +18,7 @@ from harbor.trial.trial import AgentTimeoutError
 
 from .mux_agent import MuxAgent
 from .mux_payload import build_app_archive
+from .mux_run_contract import mux_run_failure_marker
 
 
 @pytest.fixture(autouse=True)
@@ -300,6 +301,22 @@ def test_mux_runner_preserves_fatal_exit(tmp_path: Path) -> None:
         "cache_write": 3,
         "cost_usd": 0.42,
     }
+
+
+def test_mux_runner_persists_failure_marker_to_collected_stderr(tmp_path: Path) -> None:
+    """Failure markers must survive transports that drop channel stderr.
+
+    Remote exec channels can lose the runner's stderr tail, which previously
+    made a nonzero exit indistinguishable from a fabricated channel failure.
+    The marker must land in the collected stderr file and its archived copy.
+    """
+    result = _run_mux_runner_smoke(tmp_path, exit_code=1)
+
+    assert result.completed.returncode == 1
+    marker = mux_run_failure_marker(1)
+    assert marker in (result.log_dir / "stderr.txt").read_text()
+    session_root = result.log_dir.parents[2] / "session-root"
+    assert marker in (session_root / "run-stderr.log").read_text()
 
 
 def test_mux_runner_leaves_timeout_to_harbor(tmp_path: Path) -> None:

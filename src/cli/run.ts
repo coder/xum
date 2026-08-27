@@ -16,6 +16,7 @@ import * as path from "path";
 import * as fs from "fs/promises";
 import { Config } from "../node/config";
 import { materializeResolvedTrust, replaceRunTrustProjects } from "./trust";
+import { runBestEffortCleanup } from "./runCleanup";
 import { DisposableTempDir } from "../node/services/tempDir";
 import { AgentSession, type AgentSessionChatEvent } from "../node/services/agentSession";
 import { CodexOauthService } from "../node/services/codexOauthService";
@@ -607,6 +608,7 @@ async function main(): Promise<number> {
   const emitJsonLine = (payload: unknown) => {
     if (emitJson) process.stdout.write(`${JSON.stringify(payload)}\n`);
   };
+  fatalJsonMode = emitJson;
 
   // Log startup info (shown at info+ level, i.e., with --verbose)
   log.info(`Directory: ${projectDir}`);
@@ -1545,23 +1547,46 @@ async function main(): Promise<number> {
       }
     }
   } finally {
-    unsubscribe();
-    // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
-    // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
-    backgroundProcessManager.beginShutdown();
-    session.dispose();
-    mcpServerManager.dispose();
-    await codexOauthService.dispose();
-    await coderOauthService.dispose();
-    realProviderService.dispose();
-    policyService.dispose();
-    if (!keepBackgroundProcesses) {
-      await backgroundProcessManager.terminateAll();
-    }
+    // Teardown failures must not flip a finished run into exit 1: a rejection
+    // here would reach main().catch after run-complete was already emitted,
+    // and benchmark harnesses then discard the whole trial as an infra error.
+    // Contain each step, report it, and keep going.
+    await runBestEffortCleanup(
+      [
+        { name: "unsubscribe", run: () => unsubscribe() },
+        // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
+        // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
+        {
+          name: "backgroundProcessManager.beginShutdown",
+          run: () => backgroundProcessManager.beginShutdown(),
+        },
+        { name: "session.dispose", run: () => session.dispose() },
+        { name: "mcpServerManager.dispose", run: () => mcpServerManager.dispose() },
+        { name: "codexOauthService.dispose", run: () => codexOauthService.dispose() },
+        { name: "coderOauthService.dispose", run: () => coderOauthService.dispose() },
+        { name: "realProviderService.dispose", run: () => realProviderService.dispose() },
+        { name: "policyService.dispose", run: () => policyService.dispose() },
+        ...(keepBackgroundProcesses
+          ? []
+          : [
+              {
+                name: "backgroundProcessManager.terminateAll",
+                run: () => backgroundProcessManager.terminateAll(),
+              },
+            ]),
+      ],
+      (stepName, error) => {
+        const message = getErrorMessage(error);
+        process.stderr.write(`[cleanup] ${stepName} failed: ${message}\n`);
+        emitJsonLine({ type: "run-cleanup-error", step: stepName, error: message });
+      }
+    );
   }
 
-  if (budgetExceeded) return 2;
-  if (hasGoal && (goalDriverError != null || finalGoalRecord?.status !== "complete")) {
+  let exitOutcome: number;
+  if (budgetExceeded) {
+    exitOutcome = 2;
+  } else if (hasGoal && (goalDriverError != null || finalGoalRecord?.status !== "complete")) {
     const reason = goalStopReason ?? describeCliGoalStop(finalGoalRecord);
     writeHumanLineClosed(`[goal] stopped: ${reason}`);
     emitJsonLine({
@@ -1571,10 +1596,78 @@ async function main(): Promise<number> {
       status: finalGoalRecord?.status ?? null,
       stopReason: reason,
     });
-    return 3;
+    exitOutcome = 3;
+  } else {
+    exitOutcome = agentExitCode ?? 0;
   }
-  return agentExitCode ?? 0;
+  completedExitCode = exitOutcome;
+  return exitOutcome;
 }
+
+// Fatal diagnostics must survive benchmark transports: stderr is a pipe whose
+// buffered bytes process.exit() discards, so a late failure was previously an
+// invisible exit 1 that voided a completed run. Mirror fatal errors onto
+// stdout as JSON (when --json) and flush both streams before exiting.
+let fatalJsonMode = false;
+let completedExitCode: number | null = null;
+
+function reportFatalError(kind: string, prefix: string, error: unknown): void {
+  const message = getErrorMessage(error);
+  const stack = error instanceof Error ? error.stack : undefined;
+  try {
+    process.stderr.write(`${prefix}${message}\n${stack ? `${stack}\n` : ""}`);
+  } catch {
+    // stderr may already be gone; the JSON mirror below still records it.
+  }
+  if (fatalJsonMode) {
+    try {
+      process.stdout.write(`${JSON.stringify({ type: "run-fatal", kind, error: message })}\n`);
+    } catch {
+      // Nothing left to report to.
+    }
+  }
+}
+
+function exitAfterStreamFlush(exitCode: number): void {
+  const pending = [process.stdout, process.stderr].filter((stream) => stream.writableNeedDrain);
+  const exit = () => process.exit(exitCode);
+  if (pending.length === 0) {
+    exit();
+    return;
+  }
+  let remaining = pending.length;
+  for (const stream of pending) {
+    let settled = false;
+    const settleOne = () => {
+      if (settled) return;
+      settled = true;
+      remaining -= 1;
+      if (remaining <= 0) exit();
+    };
+    stream.once("drain", settleOne);
+    stream.once("error", settleOne);
+    stream.once("close", settleOne);
+  }
+  // Ref'd on purpose: keep the event loop alive until the flush window closes.
+  setTimeout(exit, 5000);
+}
+
+// Last-resort handlers: without them a stray rejection or throw (e.g. from a
+// fire-and-forget teardown promise) exits 1 with its report lost in an
+// unflushed pipe, and a completed benchmark trial gets discarded as an
+// infrastructure failure.
+process.on("uncaughtException", (error) => {
+  reportFatalError("uncaught-exception", "Uncaught exception: ", error);
+  exitAfterStreamFlush(completedExitCode ?? 1);
+});
+process.on("unhandledRejection", (reason) => {
+  reportFatalError("unhandled-rejection", "Unhandled rejection: ", reason);
+  // After the run outcome is final the normal exit path is already in
+  // flight; report only and let it exit with the real code.
+  if (completedExitCode == null) {
+    exitAfterStreamFlush(1);
+  }
+});
 
 // Keep process alive - Bun may exit when stdin closes even if async work is pending
 const keepAliveInterval = setInterval(() => {
@@ -1603,6 +1696,6 @@ main()
   })
   .catch((error) => {
     clearInterval(keepAliveInterval);
-    console.error(`Error: ${getErrorMessage(error)}`);
-    process.exit(1);
+    reportFatalError("run-error", "Error: ", error);
+    exitAfterStreamFlush(1);
   });

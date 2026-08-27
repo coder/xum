@@ -915,11 +915,17 @@ export class AgentSession {
 
     this.retryManager.dispose();
 
-    // Stop any active stream (fire and forget - disposal shouldn't block)
-    void this.aiService.stopStream(this.workspaceId, { abandonPartial: true });
+    // Stop any active stream (fire and forget - disposal shouldn't block).
+    // Contain rejections: an unhandled rejection during CLI teardown would
+    // flip the process exit code after the run already completed.
+    void this.aiService.stopStream(this.workspaceId, { abandonPartial: true }).catch((error) => {
+      log.debug(`dispose: stopStream failed: ${getErrorMessage(error)}`);
+    });
     // Terminate background processes for this workspace (skip when flagged for bench/CI)
     if (!this.keepBackgroundProcesses) {
-      void this.backgroundProcessManager.cleanup(this.workspaceId);
+      void this.backgroundProcessManager.cleanup(this.workspaceId).catch((error) => {
+        log.debug(`dispose: background process cleanup failed: ${getErrorMessage(error)}`);
+      });
     }
 
     for (const { event, handler } of this.aiListeners) {
