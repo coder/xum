@@ -24,6 +24,22 @@ describe("nextMonotonicPinnedAtIso", () => {
     expect(iso).toBe("2026-02-01T00:00:00.000Z");
   });
 
+  it("clamps generated successors so they stay sortable and scannable at the boundary", () => {
+    const saneMax = new Date(8_640_000_000_000_000 - 1).toISOString();
+    const generated = nextMonotonicPinnedAtIso([saneMax], Date.parse("2026-01-01T00:00:00.000Z"));
+    // Clamped to the sane maximum rather than escaping into a value that
+    // ordering and later scans would classify as corrupted.
+    expect(generated).toBe(saneMax);
+    expect(nextMonotonicPinnedAtIso([generated], Date.parse("2026-01-01T00:00:00.000Z"))).toBe(
+      saneMax
+    );
+    const rows = [
+      { id: "clamped", pinnedAt: generated },
+      { id: "normal", pinnedAt: "2026-01-01T00:00:00.000Z" },
+    ];
+    expect(rows.sort(comparePinnedOrder).map((row) => row.id)).toEqual(["normal", "clamped"]);
+  });
+
   it("ignores corrupted timestamps whose +1ms successor is unrepresentable", () => {
     const iso = nextMonotonicPinnedAtIso(
       ["+275760-09-13T00:00:00.000Z", "2026-01-03T00:00:00.000Z"],

@@ -905,7 +905,10 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
         type: WORKSPACE_DRAG_TYPE,
         workspaceId,
         projectPath,
-        currentSectionId: sectionId,
+        // Flat rows render without the sectionId prop (no section indent), so
+        // fall back to the row's own sub-project scope; drop zones use this to
+        // treat same-section drops as no-ops.
+        currentSectionId: sectionId ?? metadata.subProjectPath,
         pinned: isPinned,
         pinnedReorderGroup: props.pinnedReorderGroup,
         // Extra fields for custom drag layer preview
@@ -921,6 +924,7 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
       workspaceId,
       projectPath,
       sectionId,
+      metadata.subProjectPath,
       isDisabled,
       isPinned,
       props.pinnedReorderGroup,

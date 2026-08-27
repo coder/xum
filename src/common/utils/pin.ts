@@ -46,20 +46,23 @@ function parsePinnedAtMs(pinnedAt: string | undefined): number {
 }
 
 /**
- * Highest epoch ms a JS Date can represent. pinnedAt is persisted as an
- * unrestricted string, so a corrupted-but-parseable boundary timestamp (e.g.
- * "+275760-09-13T00:00:00.000Z") would otherwise poison every monotonic
- * successor computation: max + 1ms leaves the representable range and
- * toISOString() throws, permanently blocking pinning. Successor scans treat
- * such values as absent instead (self-healing).
+ * Highest sane pinnedAt epoch ms: one below the maximum representable Date so
+ * every accepted value still has a serializable +1ms successor. pinnedAt is
+ * persisted as an unrestricted string, so a corrupted-but-parseable boundary
+ * timestamp (e.g. "+275760-09-13T00:00:00.000Z") would otherwise poison every
+ * monotonic successor computation: max + 1ms leaves the representable range
+ * and toISOString() throws, permanently blocking pinning. Ordering and
+ * successor scans treat values above this as absent (self-healing), and
+ * generated timestamps clamp to it so they stay valid for later scans; ties at
+ * the clamp fall back to the comparator's id tie-break.
  */
-const MAX_DATE_MS = 8_640_000_000_000_000;
+const MAX_PINNED_AT_MS = 8_640_000_000_000_000 - 1;
 
-/** Epoch ms of a pinnedAt whose +1ms successor is representable, else null. */
+/** Epoch ms of a sane pinnedAt (parseable, within MAX_PINNED_AT_MS), else null. */
 function pinnedAtMsForSuccessorScan(pinnedAt: string | undefined): number | null {
   if (!pinnedAt) return null;
   const ms = new Date(pinnedAt).getTime();
-  return Number.isFinite(ms) && ms + 1 <= MAX_DATE_MS ? ms : null;
+  return Number.isFinite(ms) && ms <= MAX_PINNED_AT_MS ? ms : null;
 }
 
 /**
@@ -75,10 +78,10 @@ export function nextMonotonicPinnedAtIso(
   existingPinnedAts: Iterable<string | undefined>,
   nowMs: number = Date.now()
 ): string {
-  let pinnedAtMs = nowMs;
+  let pinnedAtMs = Math.min(nowMs, MAX_PINNED_AT_MS);
   for (const value of existingPinnedAts) {
     const ms = pinnedAtMsForSuccessorScan(value);
-    if (ms !== null && ms >= pinnedAtMs) pinnedAtMs = ms + 1;
+    if (ms !== null && ms >= pinnedAtMs) pinnedAtMs = Math.min(ms + 1, MAX_PINNED_AT_MS);
   }
   return new Date(pinnedAtMs).toISOString();
 }
@@ -127,7 +130,9 @@ export function reassignPinnedTimestamps(
   const changed = new Map<string, string>();
   let previousMs = Number.NEGATIVE_INFINITY;
   orderedIds.forEach((id, index) => {
-    const ms = Math.max(poolMs[index], previousMs + 1);
+    // Clamped like generation: +1ms nudges near the sane maximum must not
+    // escape the accepted domain (ties there fall to the id tie-break).
+    const ms = Math.min(Math.max(poolMs[index], previousMs + 1), MAX_PINNED_AT_MS);
     previousMs = ms;
     const iso = new Date(ms).toISOString();
     if (currentPinnedAtById.get(id) !== iso) {
