@@ -194,8 +194,15 @@ export class BashMonitorRegistryStore {
     const ownerWorkspaceIds: string[] = [];
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
-      if ((await this.listAll(entry.name)).length > 0) {
-        ownerWorkspaceIds.push(entry.name);
+      try {
+        if ((await this.listAll(entry.name)).length > 0) {
+          ownerWorkspaceIds.push(entry.name);
+        }
+      } catch (error) {
+        // One unreadable session must not block registry recovery for every other workspace.
+        log.warn(
+          `BashMonitorRegistryStore: skipping unreadable session ${entry.name}: ${String(error)}`
+        );
       }
     }
     ownerWorkspaceIds.sort();

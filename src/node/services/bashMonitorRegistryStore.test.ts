@@ -102,6 +102,18 @@ describe("BashMonitorRegistryStore", () => {
     expect(await store.listOwnerWorkspaceIds()).toEqual(["owner-a"]);
   });
 
+  test("one unreadable session does not block owner discovery for others", async () => {
+    const config = makeConfig(rootDir);
+    const store = new BashMonitorRegistryStore(config);
+    await store.upsert(armedPayload({ workspaceId: "owner-good" }));
+    // A plain file where the registry directory should be makes listAll reject with ENOTDIR.
+    const badSession = config.getSessionDir("owner-bad");
+    await fsPromises.mkdir(badSession, { recursive: true });
+    await fsPromises.writeFile(path.join(badSession, BASH_MONITOR_REGISTRY_DIR), "not a dir");
+
+    expect(await store.listOwnerWorkspaceIds()).toEqual(["owner-good"]);
+  });
+
   test("consumeIfArmedBefore takes stale records but preserves live replacements", async () => {
     const store = new BashMonitorRegistryStore(makeConfig(rootDir));
     const cutoffMs = Date.parse("2026-06-01T00:00:00.000Z");

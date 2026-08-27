@@ -1154,7 +1154,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   private startMonitorTail(proc: BackgroundProcess): void {
     void this.monitorTailLoop(proc.id).catch((error: unknown) => {
       const current = this.processes.get(proc.id);
-      if (current?.monitor && !current.monitor.stopped) {
+      // Identity check: a stale tail from a removed generation must not retire the monitor of a
+      // newer process that reused this display-name-derived ID.
+      if (current === proc && current.monitor && !current.monitor.stopped) {
         // No observer remains after this loop rejects. Stopping also makes later settlement claims
         // no-op, so this failure wake is the only lifecycle notice even if the process exits later.
         this.stopMonitor(current, true, "failed", {

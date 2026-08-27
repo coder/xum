@@ -408,11 +408,12 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
 
   private async readOutputFileSize(): Promise<number> {
     const filePath = this.quotePath(`${this.outputDir}/${OUTPUT_FILENAME}`);
-    const sizeResult = await execBuffered(
-      this.runtime,
-      `wc -c < ${filePath} 2>/dev/null || echo 0`,
-      { cwd: FALLBACK_CWD, timeout: 10 }
-    );
+    // No || fallback: a deleted or unreadable output file must fail the strict probe so the
+    // monitor's failure policy can retire it instead of parsing the miss as an empty file.
+    const sizeResult = await execBuffered(this.runtime, `wc -c < ${filePath} 2>/dev/null`, {
+      cwd: FALLBACK_CWD,
+      timeout: 10,
+    });
     this.assertMonitorProbeSucceeded("readOutput file-size probe", sizeResult.exitCode);
     return parseInt(sizeResult.stdout.trim(), 10) || 0;
   }
