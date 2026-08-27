@@ -139,7 +139,14 @@ describe("buildProviderOptions - Anthropic", () => {
   // Native-xhigh models (Opus 4.7+ / Sonnet 5+): xhigh is a distinct native
   // effort and adaptive thinking requires `display: "summarized"` to return
   // thinking content.
-  for (const model of ["claude-opus-4-7", "claude-opus-5", "claude-sonnet-5"] as const) {
+  // claude-opus-5-1 is the pre-release Opus 5.1 id (unconfirmed): it must inherit
+  // the same native-xhigh wire transforms as its predecessor.
+  for (const model of [
+    "claude-opus-4-7",
+    "claude-opus-5",
+    "claude-opus-5-1",
+    "claude-sonnet-5",
+  ] as const) {
     describe(`${model} (native xhigh effort + summarized display)`, () => {
       for (const { thinking, expectedThinking, effort } of [
         {

@@ -431,6 +431,15 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
       "max",
     ]);
+    // Pre-release Opus 5.1 (unconfirmed id) — inherits the forward-compatible Opus policy.
+    expect(getThinkingPolicyForModel("anthropic:claude-opus-5-1")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
   });
 
   test("excludes 'off' for Mythos-class Fable 5 / Mythos 5 (API rejects disabled thinking)", () => {
@@ -444,6 +453,14 @@ describe("getThinkingPolicyForModel", () => {
       "max",
     ]);
     expect(getThinkingPolicyForModel("anthropic:claude-mythos-5")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    // Pre-release Fable 5.1 (unconfirmed id) — inherits the Mythos-class no-"off" policy.
+    expect(getThinkingPolicyForModel("anthropic:claude-fable-5-1")).toEqual([
       "low",
       "medium",
       "high",

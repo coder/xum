@@ -29,6 +29,11 @@ describe("formatModelDisplayName", () => {
       expect(formatModelDisplayName("claude-fable-5")).toBe("Fable 5");
       expect(formatModelDisplayName("claude-mythos-5")).toBe("Mythos 5");
     });
+
+    test("formats pre-release Opus 5.1 / Fable 5.1 ids", () => {
+      expect(formatModelDisplayName("claude-opus-5-1")).toBe("Opus 5.1");
+      expect(formatModelDisplayName("claude-fable-5-1")).toBe("Fable 5.1");
+    });
   });
 
   describe("GPT models", () => {

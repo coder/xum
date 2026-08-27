@@ -71,6 +71,9 @@ describe("supportsAnthropicNativeWebFetch", () => {
     ["claude-opus-5", true],
     ["claude-fable-5", true],
     ["claude-mythos-5", true],
+    // Pre-release 5.1 ids (unconfirmed) parse as major=5 / minor=1 and qualify.
+    ["claude-opus-5-1", true],
+    ["claude-fable-5-1", true],
     // Two-segment IDs at/after the 4.6 cutoff.
     ["claude-sonnet-4-6", true],
     ["claude-opus-4-6", true],
