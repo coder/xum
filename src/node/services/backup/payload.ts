@@ -1338,8 +1338,10 @@ function executedShellWords(text: string): string[] {
       // Any word break opens a comment position, not just blanks: `cmd;# ...` comments,
       // and where the grammar wanted a word instead (`>#f`) Bash reports a syntax error
       // and executes nothing, so skipping the text cannot hide a live word either way.
+      // Leading backslash-LF continuations disappear before tokenization, so a word
+      // spelled `\<LF>#...` opens the same comment its unwrapped form would.
       if (
-        match[0].startsWith("#") &&
+        match[0].replace(/^(?:\\\n)+/, "").startsWith("#") &&
         (start === 0 ||
           before === " " ||
           before === "\t" ||
@@ -1568,8 +1570,10 @@ function findActiveShellConstructs(command: string): {
   while (i < command.length) {
     const char = command[i];
     if (char === "\\") {
+      // A backslash-LF continuation vanishes before tokenization, so it neither opens
+      // nor ends a word: a `#` right after `cmd \` still sits at a comment position.
+      if (command[i + 1] !== "\n") wordStart = false;
       i += 2;
-      wordStart = false;
       continue;
     }
     if (char === "'") {
@@ -1658,8 +1662,9 @@ function splitCommandComments(command: string): Array<{ code: string; comment: s
     }
     if (char === "\\") {
       code += command.slice(i, i + 2);
+      // Invisible to tokenization, a continuation keeps the comment position open.
+      if (command[i + 1] !== "\n") wordStart = false;
       i += 2;
-      wordStart = false;
       continue;
     }
     if (char === "'" || char === '"') {

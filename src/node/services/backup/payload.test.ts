@@ -745,6 +745,28 @@ describe("backup payload", () => {
     expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
   });
 
+  it("keeps a comment opened after a line continuation portable", async () => {
+    // The backslash-LF continuation vanishes before tokenization, so Bash reads
+    // `# TOKEN=hunter2` as the same comment it would be on one line; rewriting the
+    // prose would send a portable command machine-local.
+    const command = "mcp-server \\\n# TOKEN=hunter2";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(command);
+  });
+
   it("consumes Bash-only word breaks so a NBSP-joined value cannot leak its tail", async () => {
     // JS `\s` counts NBSP as whitespace, but Bash keeps it inside the word: the
     // assignment's runtime value runs through it, so the tail must not stay published.
@@ -814,6 +836,25 @@ describe("backup payload", () => {
       servers: { grafana: { command: string } };
     };
     expect(mcp.servers.grafana.command).toBe('mcp-server # ghp_aaaaaaaaaa"bbbbbbbbbb"');
+
+    // A continuation before the `#` disappears first, so the comment position
+    // survives the wrapped line and the scan still skips the prose.
+    const wrapped = 'mcp-server \\\n# ghp_aaaaaaaaaa"bbbbbbbbbb"';
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: wrapped } } })
+    );
+    const wrappedPayload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const wrappedMcp = jsonc.parse(payloadFileText(wrappedPayload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(wrappedMcp.servers.grafana.command).toBe(wrapped);
 
     // Past the newline execution resumes, so the same splice there still blocks.
     await writeFixtureFile(
@@ -1105,6 +1146,7 @@ describe("backup payload", () => {
     for (const command of [
       "mcp-server --pattern '$(date)'",
       "mcp-server # regenerate with $(date)",
+      "mcp-server \\\n# regenerate with $(date)",
     ]) {
       await writeFixtureFile(
         muxRoot,
