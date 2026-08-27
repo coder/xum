@@ -140,7 +140,10 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { isWorkspacePinnable, isWorkspacePinned } from "@/common/utils/pin";
 import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
-import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
+import {
+  MULTI_PROJECT_CONFIG_KEY,
+  MULTI_PROJECT_SIDEBAR_SECTION_ID,
+} from "@/common/constants/multiProject";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { HexColorPicker } from "react-colorful";
@@ -1779,9 +1782,14 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   // Draft-to-workspace promotions: like grouped mode, the just-created
   // workspace renders in its draft's position, so it must be suppressed from
   // the normal rows or the same chat appears twice during creation.
+  // Drafts follow the same experiment gate as flatWorkspaces: _multi drafts
+  // (and their promotions) stay hidden in flat mode while the experiment is off.
+  const isGatedFlatDraftBucket = (projectPath: string): boolean =>
+    !multiProjectWorkspacesEnabled && projectPath === MULTI_PROJECT_CONFIG_KEY;
   const flatDraftPromotionsByDraftId = new Map<string, FrontendWorkspaceMetadata>();
   if (flatSidebarEnabled) {
     for (const [projectPath, drafts] of Object.entries(workspaceDraftsByProject)) {
+      if (isGatedFlatDraftBucket(projectPath)) continue;
       const promotions = workspaceDraftPromotionsByProject[projectPath] ?? {};
       for (const draft of drafts) {
         const promoted = promotions[draft.draftId];
@@ -1959,6 +1967,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   );
 
   const flatDrafts = Object.entries(workspaceDraftsByProject)
+    .filter(([projectPath]) => !isGatedFlatDraftBucket(projectPath))
     .flatMap(([projectPath, drafts]) => drafts.map((draft) => ({ projectPath, draft })))
     .sort((a, b) => b.draft.createdAt - a.draft.createdAt);
   // Project headers render in both modes: grouped mode nests each project's

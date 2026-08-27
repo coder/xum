@@ -943,6 +943,58 @@ describe("ProjectSidebar flat chat list", () => {
     expect(view.queryByTestId(agentItemTestId("multi"))).toBeNull();
   });
 
+  test("filters _multi drafts out of the flat list while the experiment is disabled", () => {
+    spyOn(ExperimentsModule, "useExperimentValue").mockImplementation(() => false);
+    const workspace = {
+      ...createWorkspace("solo-draft-gate", { title: "Solo chat" }),
+      projects: singleProjectRefs,
+    };
+    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
+      () =>
+        ({
+          selectedWorkspace: null,
+          setSelectedWorkspace: () => undefined,
+          preflightArchiveWorkspace: () =>
+            Promise.resolve({ success: true, data: { kind: "ready" } }),
+          archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
+          removeWorkspace: () => Promise.resolve({ success: true }),
+          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
+          refreshWorkspaceMetadata: () => Promise.resolve(),
+          pendingNewWorkspaceProject: null,
+          pendingNewWorkspaceDraftId: null,
+          workspaceDraftsByProject: {
+            _multi: [{ draftId: "draft-multi", createdAt: Date.now() }],
+            "/projects/demo-project": [{ draftId: "draft-single", createdAt: Date.now() }],
+          },
+          workspaceDraftPromotionsByProject: {},
+          createWorkspaceDraft: () => undefined,
+          openWorkspaceDraft: () => undefined,
+          deleteWorkspaceDraft: () => undefined,
+        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
+    );
+    // Give both drafts persisted content so their rows would render.
+    updatePersistedState(getInputKey(getDraftScopeId("_multi", "draft-multi")), "Multi draft");
+    updatePersistedState(
+      getInputKey(getDraftScopeId("/projects/demo-project", "draft-single")),
+      "Single draft"
+    );
+    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [workspace]]])}
+        workspaceRecency={{ "solo-draft-gate": Date.now() }}
+      />
+    );
+
+    // The _multi draft follows the metadata gate: hidden while the experiment
+    // is off, while ordinary project drafts still render.
+    expect(view.getByTestId("draft-item-draft-single")).toBeTruthy();
+    expect(view.queryByTestId("draft-item-draft-multi")).toBeNull();
+  });
+
   test("keeps project management headers reachable in flat mode without nesting chats", () => {
     const workspace = {
       ...createWorkspace("solo", { title: "Solo chat" }),
