@@ -393,6 +393,8 @@ describe("backup payload", () => {
       // An option value can embed a whole assignment for the target program.
       ["systemd-run --setenv=TOKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
       ["docker run --env=TOKEN=hunter2 mcp-image", REDACTED_BACKUP_VALUE],
+      // A short option's attached argument has no boundary before the assignment.
+      ["systemd-run -ETOKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
       // A plain flag value has no inner assignment and stays published.
       [
         "mcp-run --transport=stdio TOKEN=hunter2",
@@ -646,6 +648,29 @@ describe("backup payload", () => {
     }
   });
 
+  it("does not manufacture a credential block from a CRLF-broken command", async () => {
+    // Backslash before CRLF escapes only the CR, so no runtime join produces a token.
+    // The CR-bearing word makes the command machine-local, but creation must succeed
+    // rather than raise the no-override credential error.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: "mcp --pattern ghp_aaaaaaaaaa\\\r\nbbbbbbbbbb" } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
   it("keeps inert dollar literals from manufacturing tokens while active ones splice", async () => {
     // Single-quoted and escaped dollars reach the process literally, and even an
     // active `$NAME` swallows the letters behind it into the variable name, so none
@@ -713,6 +738,22 @@ describe("backup payload", () => {
     );
     expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
     expect((blocked as BackupCredentialDetectedError).files).toEqual(["mcp.jsonc"]);
+  });
+
+  it("keeps the documented AWS example key reviewable instead of hard-blocking", async () => {
+    await writeFixtureFile(
+      muxRoot,
+      "skills/demo/SKILL.md",
+      "Use AKIAIOSFODNN7EXAMPLE as the access key in examples\n"
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    // The reviewable scan still lists the file for the digest approval flow.
+    expect(scanBackupFilesForSecrets(payload.files)).toEqual(["skills/demo/SKILL.md"]);
   });
 
   it("keeps digit-free sk- placeholders reviewable instead of hard-blocking", async () => {

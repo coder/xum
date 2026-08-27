@@ -99,9 +99,18 @@ function hasDigitBearingSkToken(text: string): boolean {
   return false;
 }
 
+/**
+ * AWS's documented example access key is valid-shape but never a live credential;
+ * documentation quoting it stays in the reviewable scan instead of the no-override
+ * block. Replaced with a space so removal cannot splice surrounding text into a match.
+ */
+const EXAMPLE_ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE";
+
 function matchesCredentialToken(text: string): boolean {
+  const scannable = text.replaceAll(EXAMPLE_ACCESS_KEY, " ");
   return (
-    CREDENTIAL_TOKEN_PATTERNS.some((pattern) => pattern.test(text)) || hasDigitBearingSkToken(text)
+    CREDENTIAL_TOKEN_PATTERNS.some((pattern) => pattern.test(scannable)) ||
+    hasDigitBearingSkToken(scannable)
   );
 }
 
@@ -1224,9 +1233,10 @@ function unquoteShellWord(word: string, stripExpansions = false): string {
       }
     }
     if (char === "\\") {
-      // A line continuation disappears entirely.
-      if (word[i + 1] === "\n" || (word[i + 1] === "\r" && word[i + 2] === "\n")) {
-        i += word[i + 1] === "\r" ? 3 : 2;
+      // A line continuation disappears entirely. Only backslash-LF: before CRLF the
+      // backslash escapes the CR, which stays a literal character and breaks the word.
+      if (word[i + 1] === "\n") {
+        i += 2;
         continue;
       }
       result += word[i + 1] ?? "";
@@ -1338,14 +1348,18 @@ function hasDisguisedAssignment(redacted: string): boolean {
     if (isSplitStringOption(unquoted)) return true;
     // An option value can embed a whole assignment for the target program
     // (`systemd-run --setenv=TOKEN=x`, `--env=TOKEN=x`): a second `=` past the
-    // option's own separator marks one. Plain flag values (`--transport=stdio`)
-    // carry no inner `=` and stay published.
+    // option's own separator marks one. Plain long-option flag values
+    // (`--transport=stdio`) carry no inner `=` and stay published.
     if (
       unquoted.startsWith("-") &&
       ASSIGNMENT_START.test(unquoted.slice(unquoted.indexOf("=") + 1))
     ) {
       return true;
     }
+    // A short option with an attached argument leaves no boundary before the
+    // assignment (`systemd-run -ETOKEN=x`, `-Dapi.key=x`), and which letters take
+    // env-like arguments is per-program knowledge this scan cannot have.
+    if (/^-[^-]/.test(unquoted)) return true;
     // `=` mixed with quoting or expansion machinery: some other grammar's assignment
     // (`$env:TOKEN=x`, `python -c 'os.environ["TOKEN"]="x"'` fragments).
     if (/['"\\$]/.test(word)) return true;

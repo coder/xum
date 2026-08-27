@@ -364,6 +364,11 @@ export function BackupSection() {
       const result = await api.backup.preview(savedDraft);
       if (!result.success) {
         setActionError(getOperationErrorMessage(result.error));
+        // The scan state must describe this failure, not a previous push's: a stale
+        // digest would keep rendering an override the backend now rejects.
+        const blocked = result.error.code === "SECRET_DETECTED";
+        setSecretScanBlocked(blocked);
+        setSecretScanApproval(blocked ? (result.error.secretApproval ?? null) : null);
         return;
       }
       setPreview(result.data);

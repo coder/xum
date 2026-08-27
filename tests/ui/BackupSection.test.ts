@@ -403,6 +403,38 @@ describe("BackupSection", () => {
     expect(canvas.queryByRole("checkbox", { name: "Override secret scan" })).toBeNull();
   });
 
+  test("clears a stale override when a preview hits the credential block", async () => {
+    const { client, view } = renderBackupSection();
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    jest.spyOn(client.backup, "push").mockResolvedValueOnce({
+      success: false,
+      error: {
+        code: "SECRET_DETECTED",
+        message: "Potential secrets were found in the backup payload: AGENTS.md",
+        files: ["AGENTS.md"],
+        secretApproval: "digest-stale",
+      },
+    });
+    fireEvent.click(canvas.getByRole("button", { name: "Back up now" }));
+    await canvas.findByText(/Potential secrets were found/i);
+    expect(canvas.getByRole("checkbox", { name: "Override secret scan" })).toBeTruthy();
+
+    jest.spyOn(client.backup, "preview").mockResolvedValueOnce({
+      success: false,
+      error: {
+        code: "SECRET_DETECTED",
+        message:
+          "Backup blocked: values matching known credential formats were found in mcp.jsonc.",
+        files: ["mcp.jsonc"],
+      },
+    });
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText(/Backup blocked/i);
+    expect(canvas.queryByRole("checkbox", { name: "Override secret scan" })).toBeNull();
+  });
+
   test("sends the approved digest and resets when the blocked payload changes", async () => {
     const { client, view } = renderBackupSection();
     const canvas = within(view.container);
