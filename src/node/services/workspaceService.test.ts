@@ -3355,7 +3355,9 @@ describe("WorkspaceService bash monitor wakes", () => {
       await waitForCondition(() => sendSpy.mock.calls.length === 1);
       expect(upsertCalls).toBe(2);
       expect(sendSpy.mock.calls[0][1]).toContain("Remote Watch");
-      expect(sendSpy.mock.calls[0][1]).toContain("output is not currently readable");
+      // The mock manager has no registered process, so the dead-generation label outranks
+      // the unreadable-output one.
+      expect(sendSpy.mock.calls[0][1]).toContain("no longer awaitable");
       expect(await registryStore.listAll(workspaceId)).toHaveLength(0);
     } finally {
       await cleanup();

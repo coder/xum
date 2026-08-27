@@ -5033,6 +5033,35 @@ describe("buildBashMonitorWakePrompt", () => {
     expect(prompt).toContain("Wait for transport recovery");
   });
 
+  test("a dead generation outranks unreadable-output labeling and guidance", () => {
+    const record: BashMonitorWakeRecord = {
+      id: "proc-output-failed",
+      ownerWorkspaceId: "owner-1",
+      processId: "proc-output-failed",
+      taskId: "bash:proc-output-failed",
+      filter: "ERROR",
+      filterExclude: false,
+      kind: "monitor-lost",
+      script: "run-thing --watch",
+      lostReason: "runtime-failure",
+      failedOperations: ["readOutput"],
+      lines: [],
+      totalMatches: 0,
+      droppedLines: 0,
+      status: "pending",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const context = new Map([[record.id, { taskAwaitable: false }]]);
+    const prompt = buildBashMonitorWakePrompt([record], context);
+
+    expect(prompt).toContain("no longer awaitable");
+    expect(prompt).not.toContain("output is not currently readable");
+    expect(prompt).not.toContain("Wait for transport recovery");
+    expect(prompt).not.toContain("task_await(");
+    expect(prompt).toContain("no retrievable report for that process generation");
+  });
+
   test("getExitCode-only failures keep task_await guidance", () => {
     const record: BashMonitorWakeRecord = {
       id: "proc-exit-failed",
