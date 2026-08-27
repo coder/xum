@@ -401,6 +401,7 @@ describe("backup payload", () => {
       ["eval 'TOKEN+=hunter2 mcp'", REDACTED_BACKUP_VALUE],
       // An array value leaves a bare assignment word behind, which fails closed.
       ["TOKEN=(a hunter2) mcp-server", REDACTED_BACKUP_VALUE],
+      ["TOKEN=(hunter2) mcp-server", REDACTED_BACKUP_VALUE],
       // ANSI-C and locale quoting hand env-style consumers their inner text.
       ["env $'TOKEN=hunter2' mcp-server", REDACTED_BACKUP_VALUE],
       ['env $"TOKEN=hunter2" mcp-server', REDACTED_BACKUP_VALUE],
@@ -577,26 +578,25 @@ describe("backup payload", () => {
     expect((blocked as BackupCredentialDetectedError).files).toEqual(["mcp.jsonc"]);
   });
 
-  it("localizes continuation-split command credentials and keeps non-command strings verbatim", async () => {
-    // Bash removes backslash-newline entirely, handing the server one contiguous key.
+  it("blocks continuation-split command credentials and keeps non-command strings verbatim", async () => {
+    // Bash removes backslash-newline entirely, handing the server one contiguous key,
+    // and the backstop's shell normalization reassembles the same token.
     const brokenKey = "AKIA12345678\\\n90123456";
-    // In a command the continuation-joined word spans whitespace and fails closed at
-    // the redactor, so the whole command goes local before any scan runs.
     await writeFixtureFile(
       muxRoot,
       "mcp.jsonc",
       JSON.stringify({ servers: { grafana: { command: `mcp-grafana --key ${brokenKey}` } } })
     );
-    const localized = await createBackupPayload({
-      muxRoot,
-      muxVersion: "1.2.3",
-      sourceLabel: "test-host",
-      reportSecrets: true,
-    });
-    const mcp = jsonc.parse(payloadFileText(localized, "mcp.jsonc")) as {
-      servers: { grafana: { command: string } };
-    };
-    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+    expect((blocked as BackupCredentialDetectedError).files).toEqual(["mcp.jsonc"]);
 
     // A non-command string is not shell input: nothing at runtime joins its
     // fragments, so it publishes verbatim instead of manufacturing a block.
@@ -614,6 +614,28 @@ describe("backup payload", () => {
       reportSecrets: true,
     });
     expect(payloadFileText(payload, "mcp.jsonc")).toContain("AKIA12345678");
+  });
+
+  it("keeps quoted backslashes that the shell preserves from manufacturing tokens", async () => {
+    // Inside single quotes, and before a non-special character inside double quotes,
+    // Bash keeps the backslash, so the runtime argument never becomes one token.
+    for (const command of [
+      "mcp-grafana --pattern 'ghp_aaaaaaaaaa\\bbbbbbbbbb'",
+      'mcp-grafana --pattern "ghp_aaaaaaaaaa\\bbbbbbbbbb"',
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      expect(payloadFileText(payload, "mcp.jsonc")).toContain("ghp_aaaaaaaaaa");
+    }
   });
 
   it("blocks the export when an empty expansion splices a known credential token", async () => {

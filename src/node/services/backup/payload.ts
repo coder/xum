@@ -74,11 +74,6 @@ function isHiddenName(name: string): boolean {
  * defect, and neither is something a backup should publish.
  */
 const CREDENTIAL_TOKEN_PATTERNS = [
-  // The digit requirement keeps documentation placeholders (`sk-your-api-key-here`)
-  // out of this no-override block: issued keys are base62 and practically always carry
-  // digits, while placeholders are dash-separated words. The digit-free spelling stays
-  // in the reviewable scan below.
-  /\bsk-(?=[A-Za-z0-9_-]{16})[A-Za-z_-]*[0-9][A-Za-z0-9_-]*\b/,
   /\bghp_[A-Za-z0-9]{20,}\b/,
   /\bgho_[A-Za-z0-9]{20,}\b/,
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,
@@ -88,6 +83,27 @@ const CREDENTIAL_TOKEN_PATTERNS = [
   /\bAKIA[0-9A-Z]{16}\b/,
   /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/,
 ] as const;
+
+/**
+ * The digit requirement keeps documentation placeholders (`sk-your-api-key-here`) out
+ * of the no-override block: issued keys are base62 and practically always carry digits,
+ * while placeholders are dash-separated words. The digit-free spelling stays in the
+ * reviewable scan. Checked per maximal candidate run instead of inside one regex, whose
+ * digit search would backtrack quadratically across a digit-free `sk-sk-...` wall in
+ * the synchronous scanner.
+ */
+function hasDigitBearingSkToken(text: string): boolean {
+  for (const match of text.matchAll(/\bsk-[A-Za-z0-9_-]{16,}\b/g)) {
+    if (/[0-9]/.test(match[0])) return true;
+  }
+  return false;
+}
+
+function matchesCredentialToken(text: string): boolean {
+  return (
+    CREDENTIAL_TOKEN_PATTERNS.some((pattern) => pattern.test(text)) || hasDigitBearingSkToken(text)
+  );
+}
 
 const SECRET_PATTERNS = [
   ...CREDENTIAL_TOKEN_PATTERNS,
@@ -1180,9 +1196,10 @@ const SHELL_WORD = new RegExp(
 const ASSIGNMENT_START = new RegExp(`^${ASSIGNMENT_NAME}`);
 
 /**
- * Quote removal only, and simplified: every backslash escapes, including inside double
- * quotes where the shell keeps some. The difference only ever turns more words into
- * detected assignments, never fewer.
+ * Bash-accurate quote removal, in both directions on purpose: under-stripping would hide
+ * disguised assignments, while over-stripping would join quoted fragments the shell
+ * keeps apart and manufacture no-override credential matches (`'ghp_aa\\bb'` keeps its
+ * backslash at runtime).
  */
 function unquoteShellWord(word: string): string {
   let result = "";
@@ -1195,6 +1212,11 @@ function unquoteShellWord(word: string): string {
       continue;
     }
     if (char === "\\") {
+      // A line continuation disappears entirely.
+      if (word[i + 1] === "\n" || (word[i + 1] === "\r" && word[i + 2] === "\n")) {
+        i += word[i + 1] === "\r" ? 3 : 2;
+        continue;
+      }
       result += word[i + 1] ?? "";
       i += 2;
       continue;
@@ -1209,12 +1231,24 @@ function unquoteShellWord(word: string): string {
       let j = i + 1;
       while (j < word.length && word[j] !== '"') {
         if (word[j] === "\\") {
-          result += word[j + 1] ?? "";
-          j += 2;
-        } else {
+          const next = word[j + 1] ?? "";
+          // Inside double quotes the shell unescapes only these; any other
+          // backslash stays a literal character.
+          if (next === "$" || next === "`" || next === '"' || next === "\\") {
+            result += next;
+            j += 2;
+            continue;
+          }
+          if (next === "\n") {
+            j += 2;
+            continue;
+          }
           result += word[j];
           j += 1;
+          continue;
         }
+        result += word[j];
+        j += 1;
       }
       i = j + 1;
       continue;
@@ -1656,16 +1690,17 @@ export async function createBackupPayload(
         // token-like fragments, and this block has no override.
         if (file.path === "mcp.jsonc") {
           for (const text of collectCommandStrings(jsonc.parse(content))) {
-            const joined = text.replace(/\\\r?\n/g, "").replace(/[\\'"]/g, "");
+            // Word-by-word, with real quoting rules: raw character stripping would
+            // join fragments the shell keeps apart (a backslash inside single quotes
+            // survives execution) and manufacture a match from a harmless command.
+            const joined = (text.match(SHELL_WORD) ?? []).map(unquoteShellWord).join(" ");
             targets.push(joined);
             // A simple parameter expansion that is unset at runtime vanishes
             // (`ghp_...$9123...`), splicing the fragments around it into one token.
             targets.push(joined.replace(/\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?!$-])/g, ""));
           }
         }
-        return CREDENTIAL_TOKEN_PATTERNS.some((pattern) =>
-          targets.some((target) => pattern.test(target))
-        );
+        return targets.some(matchesCredentialToken);
       })
       .map((file) => file.path)
       .sort();
