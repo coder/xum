@@ -1551,18 +1551,33 @@ export class ExtensionMetadataService {
     // failures on the process-unique claim are transient: propagate
     // (retryable; the claim stays discoverable).
     const strandedMtimeMs = (await stat(claimPath)).mtimeMs;
-    // Preliminary main read, only to bound the probe set below: which
-    // candidate ids are MISSING from the current main. Never saved.
-    let preliminary: ExtensionMetadataFile;
+    // Tombstone revalidation for candidate ids, following the sidecar
+    // reconcile's lift-or-suppress generation contract. Safe to sample
+    // before the main read below: lifts only update the in-memory
+    // suppression map (never the file), and the merge re-checks live
+    // tombstone state per entry.
+    if (this.registrationProbe != null) {
+      for (const workspaceId of Object.keys(parsed.workspaces)) {
+        if (!this.deletedWorkspaceIds.has(workspaceId)) {
+          continue;
+        }
+        const generationBefore = this.deletedWorkspaceIds.get(workspaceId);
+        const registered = await this.registrationProbe(workspaceId);
+        if (registered && this.deletedWorkspaceIds.get(workspaceId) === generationBefore) {
+          this.liftTombstone(workspaceId);
+        }
+      }
+    }
+    let main: ExtensionMetadataFile;
     try {
-      const preliminaryParsed = JSON.parse(await readFile(this.filePath, "utf-8")) as unknown;
-      if (!ExtensionMetadataService.isValidMetadataFileShape(preliminaryParsed)) {
+      const mainParsed = JSON.parse(await readFile(this.filePath, "utf-8")) as unknown;
+      if (!ExtensionMetadataService.isValidMetadataFileShape(mainParsed)) {
         // Corrupt or newer-schema main: leave the claim for a later pass
         // (it stays under the scanned prefix) rather than merging across
         // schemas.
         return;
       }
-      preliminary = preliminaryParsed;
+      main = mainParsed;
     } catch (readError) {
       if (ExtensionMetadataService.isErrnoCode(readError, "ENOENT")) {
         // Missing-main window: the resumable sidecar recovery owns the
@@ -1574,62 +1589,38 @@ export class ExtensionMetadataService {
       }
       return;
     }
-    // Registration evidence, resolved BEFORE the mergeable main read below
-    // (probes await config, and holding a pre-probe main snapshot across
-    // those awaits would let the save clobber a concurrent backend's newer
-    // write). Two decisions share the probe:
-    // - tombstoned ids follow the sidecar reconcile's lift-or-suppress
-    //   generation contract;
-    // - ids MISSING from the main are adopted only with registration
-    //   evidence: the stranded snapshot predates the current main, so a
-    //   missing entry may mean another backend REMOVED the workspace after
-    //   the file was stranded — the local tombstones cannot know — and
-    //   restoring it would resurrect deleted metadata indefinitely (an
-    //   unscoped older build exposes it, and a re-registered deterministic
-    //   legacy id would inherit the stale goal/status).
-    // Without a wired probe, missing-target adoption stays fail-open (the
-    // sidecar reconcile's sidecar-only adoption contract; dropping is
-    // destructive and production always wires the probe). A FAILING probe
-    // propagates (claim retained, retryable) rather than consuming the
-    // stranded bytes on unknowable evidence.
+    // Adoption evidence for candidates MISSING from the loaded main,
+    // gathered strictly AFTER the load (the concurrency contract's
+    // post-load evidence rule for destructive/resurrecting decisions): the
+    // stranded snapshot predates the current main, so a missing entry may
+    // mean another backend REMOVED the workspace — and a positive probe
+    // sampled BEFORE the load can go stale when that removal lands during
+    // the probe awaits, letting the stale positive adopt (resurrect) the
+    // removed workspace's goal/status indefinitely (an unscoped older
+    // build exposes it, and a re-registered deterministic legacy id would
+    // inherit it). These awaits hold the loaded snapshot across config
+    // reads, widening the window in which the save below clobbers a
+    // concurrent backend's write — that window exists on every load→save
+    // slot here and is the contract's documented out-of-scope gap, while
+    // stale-evidence resurrection is exactly the harm the probe exists to
+    // prevent, so evidence freshness wins. Without a wired probe,
+    // missing-target adoption stays fail-open (the sidecar reconcile's
+    // sidecar-only adoption contract; dropping is destructive and
+    // production always wires the probe). A FAILING probe propagates
+    // (claim retained, retryable) rather than consuming the stranded bytes
+    // on unknowable evidence.
     const registrationEvidence = new Map<string, boolean>();
     for (const workspaceId of Object.keys(parsed.workspaces)) {
-      const tombstoned = this.deletedWorkspaceIds.has(workspaceId);
+      if (this.deletedWorkspaceIds.has(workspaceId) || workspaceId in main.workspaces) {
+        // Tombstoned ids are skipped by the merge below; existing targets
+        // are ordered newest-wins, which needs no registration evidence.
+        continue;
+      }
       if (this.registrationProbe == null) {
-        registrationEvidence.set(workspaceId, !tombstoned);
+        registrationEvidence.set(workspaceId, true);
         continue;
       }
-      if (!tombstoned && workspaceId in preliminary.workspaces) {
-        // No decision needs evidence: the target exists and no local
-        // tombstone stands.
-        continue;
-      }
-      const generationBefore = this.deletedWorkspaceIds.get(workspaceId);
-      const registered = await this.registrationProbe(workspaceId);
-      if (
-        tombstoned &&
-        registered &&
-        this.deletedWorkspaceIds.get(workspaceId) === generationBefore
-      ) {
-        this.liftTombstone(workspaceId);
-      }
-      registrationEvidence.set(workspaceId, registered);
-    }
-    let main: ExtensionMetadataFile;
-    try {
-      const mainParsed = JSON.parse(await readFile(this.filePath, "utf-8")) as unknown;
-      if (!ExtensionMetadataService.isValidMetadataFileShape(mainParsed)) {
-        return;
-      }
-      main = mainParsed;
-    } catch (readError) {
-      if (ExtensionMetadataService.isErrnoCode(readError, "ENOENT")) {
-        return;
-      }
-      if (!ExtensionMetadataService.isDeterministicCorruption(readError)) {
-        throw readError;
-      }
-      return;
+      registrationEvidence.set(workspaceId, await this.registrationProbe(workspaceId));
     }
     let modified = false;
     for (const [workspaceId, entry] of Object.entries(parsed.workspaces)) {
@@ -1649,10 +1640,11 @@ export class ExtensionMetadataService {
       if (!(workspaceId in main.workspaces)) {
         const registered = registrationEvidence.get(workspaceId);
         if (registered === undefined) {
-          // The entry vanished between the preliminary read and this one
-          // (deleted during the probes), so no evidence was gathered for
-          // it. Abort the pass without saving or consuming: the claim
-          // stays discoverable and the next scan probes the id. Earlier
+          // No post-load evidence for this missing target: its tombstone
+          // was lifted between the evidence pass above and this check
+          // (writers' pre-queue rechecks run outside this queue slot).
+          // Abort without saving or consuming: the claim stays
+          // discoverable and the next scan probes the id afresh. Earlier
           // candidates' merges replay idempotently.
           return;
         }
@@ -1850,28 +1842,43 @@ export class ExtensionMetadataService {
     // concurrent writer re-created first), and load()'s sidecar check
     // turns any remaining missing-main window into a retryable failure
     // instead of an empty read.
-    const emptyTmpPath = `${this.filePath}.empty.tmp`;
+    // Process-unique temp path: with a fixed shared name, a concurrent
+    // recovery's writeFile could truncate the inode right after this one
+    // links it into the canonical path (the shared temp path then aliases
+    // the canonical file, so the truncate empties BOTH and strict readers
+    // observe empty/partial JSON), or its cleanup unlink could remove the
+    // temp between this writeFile and link, failing a recovery whose
+    // sidecar is still recoverable. Crash leftovers are inert: the suffix
+    // matches no probe or scan prefix, each crashed recovery leaves at most
+    // one tiny file, and no sweeper may reclaim them (unlinking another
+    // process's in-flight temp is exactly the race this name prevents).
+    const emptyTmpPath = `${this.filePath}.empty-${process.pid}-${randomUUID()}.tmp`;
     await writeFile(
       emptyTmpPath,
       JSON.stringify({ version: 1, workspaces: {} } satisfies ExtensionMetadataFile, null, 2),
       "utf-8"
     );
     try {
-      await link(emptyTmpPath, this.filePath);
-    } catch (linkError) {
-      if (!ExtensionMetadataService.isErrnoCode(linkError, "EEXIST")) {
-        try {
-          await copyFile(emptyTmpPath, this.filePath, constants.COPYFILE_EXCL);
-        } catch (copyError) {
-          if (!ExtensionMetadataService.isErrnoCode(copyError, "EEXIST")) {
-            // Main path still missing: rethrow (retryable) so the caller's
-            // re-read hits the sidecar guard instead of reading ENOENT.
-            throw copyError;
+      try {
+        await link(emptyTmpPath, this.filePath);
+      } catch (linkError) {
+        if (!ExtensionMetadataService.isErrnoCode(linkError, "EEXIST")) {
+          try {
+            await copyFile(emptyTmpPath, this.filePath, constants.COPYFILE_EXCL);
+          } catch (copyError) {
+            if (!ExtensionMetadataService.isErrnoCode(copyError, "EEXIST")) {
+              // Main path still missing: rethrow (retryable) so the caller's
+              // re-read hits the sidecar guard instead of reading ENOENT.
+              throw copyError;
+            }
           }
         }
       }
+    } finally {
+      // Caller-owned path only; best-effort on every exit so throw paths do
+      // not strand the temp.
+      await unlink(emptyTmpPath).catch(() => undefined);
     }
-    await unlink(emptyTmpPath).catch(() => undefined);
     log.error(
       `Extension metadata file was corrupt; moved it to ${quarantinePath} and reset to empty`
     );

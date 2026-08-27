@@ -9,7 +9,7 @@ import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { askUserQuestionManager } from "./askUserQuestionManager";
 import { WorkspaceLifecycleHooks } from "./workspaceLifecycleHooks";
 import { EventEmitter } from "events";
-import { existsSync, writeFileSync } from "fs";
+import { existsSync } from "fs";
 import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
 import path from "path";
@@ -5847,34 +5847,33 @@ describe("WorkspaceService activity list scoping", () => {
       // backend" registers a new workspace: its id enters the fresh raw
       // view outside the initial scope, forcing the late-candidate probes
       // and with them the final post-probe views this test exercises.
+      // The final-phase snapshot re-read (call 3) marks the start of the
+      // post-probe views: the concurrent deregistration lands there and
+      // every later raw evidence read fails transiently, so only the
+      // fallback enumeration can prove the removal.
       const realGetAllSnapshots = extensionMetadata.getAllSnapshots.bind(extensionMetadata);
       let snapshotCalls = 0;
+      let failRawEvidenceReads = false;
       const snapshotsSpy = spyOn(extensionMetadata, "getAllSnapshots").mockImplementation(
         async (options?: { throwOnError?: boolean }) => {
           snapshotCalls += 1;
           if (snapshotCalls === 2) {
             await fsPromises.writeFile(configPath, configFor([removedId, survivorId, lateId]));
           }
+          if (snapshotCalls === 3) {
+            await fsPromises.writeFile(configPath, configFor([survivorId, lateId]));
+            failRawEvidenceReads = true;
+          }
           return realGetAllSnapshots(options);
         }
       );
-      // Raw superset reads: #1 initial baseline, #2 prune enumeration
-      // union, #3 post-prune scope refresh. Call #4 is the post-probe read
-      // — the concurrent deregistration lands just before it and every
-      // later raw read fails transiently, so only the fallback enumeration
-      // can prove the removal.
-      const realSuperset = config.readPersistedWorkspaceIdSuperset.bind(config);
-      let supersetCalls = 0;
-      const supersetSpy = spyOn(config, "readPersistedWorkspaceIdSuperset").mockImplementation(
+      const realEvidence = config.readPersistedWorkspaceIdEvidence.bind(config);
+      const evidenceSpy = spyOn(config, "readPersistedWorkspaceIdEvidence").mockImplementation(
         () => {
-          supersetCalls += 1;
-          if (supersetCalls >= 4) {
-            if (supersetCalls === 4) {
-              writeFileSync(configPath, configFor([survivorId, lateId]));
-            }
+          if (failRawEvidenceReads) {
             throw new Error("transient raw config read failure");
           }
-          return realSuperset();
+          return realEvidence();
         }
       );
       try {
@@ -5891,7 +5890,7 @@ describe("WorkspaceService activity list scoping", () => {
         expect(activityList?.[removedId]).toBeUndefined();
       } finally {
         snapshotsSpy.mockRestore();
-        supersetSpy.mockRestore();
+        evidenceSpy.mockRestore();
       }
     } finally {
       await cleanup();
@@ -6132,6 +6131,84 @@ describe("WorkspaceService activity list scoping", () => {
         expect(activityList?.[workspaceId]?.recency).toBe(123);
       } finally {
         snapshotsSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a raw-removed id affirmed by the fresh enumeration is retained, not tombstoned", async () => {
+    // A downgraded backend can remove an inline-id workspace entry and
+    // re-register the SAME deterministic id as an id-less legacy entry
+    // while this list awaits. The id then vanishes from every fresh raw
+    // view (its identity lives in session metadata.json) while the fresh
+    // authoritative enumeration — the very evidence that clears the id's
+    // tombstone — still resolves it. Treating the raw disappearance alone
+    // as removal would drop the revived workspace's activity and republish
+    // the tombstone that evidence just cleared, suppressing it again.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "raw-invisible-revival";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency(workspaceId, 42);
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+      const internals = workspaceService as unknown as {
+        pruneStaleExtensionMetadataOnce(): Promise<unknown>;
+        enumerateAuthoritativeWorkspaceIds(): Promise<Set<string>>;
+      };
+      const realPrune = internals.pruneStaleExtensionMetadataOnce.bind(workspaceService);
+      let revivedIdless = false;
+      internals.pruneStaleExtensionMetadataOnce = async () => {
+        const prefetched = await realPrune();
+        // The removal + id-less re-registration lands after the initial
+        // baseline and the prune, before the fresh evidence read.
+        revivedIdless = true;
+        return prefetched;
+      };
+      const realEvidence = config.readPersistedWorkspaceIdEvidence.bind(config);
+      const evidenceSpy = spyOn(config, "readPersistedWorkspaceIdEvidence").mockImplementation(
+        () => {
+          const evidence = realEvidence();
+          if (!revivedIdless) {
+            return evidence;
+          }
+          // The downgraded backend rewrote the entry without an inline id:
+          // the id disappears from the raw view, and the id-less entry
+          // marks that view incomplete.
+          const ids = new Set(evidence.ids);
+          ids.delete(workspaceId);
+          return { ids, hasWorkspaceEntriesWithoutIds: true };
+        }
+      );
+      const realEnumerate = internals.enumerateAuthoritativeWorkspaceIds.bind(workspaceService);
+      internals.enumerateAuthoritativeWorkspaceIds = async () => {
+        // The enumeration resolves the id-less entry's stable identity.
+        const ids = await realEnumerate();
+        ids.add(workspaceId);
+        return ids;
+      };
+      try {
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList).not.toBeNull();
+        expect(activityList?.[workspaceId]?.recency).toBe(42);
+        // No republished tombstone suppressing the revived workspace.
+        expect(extensionMetadata.isWorkspaceDeleted(workspaceId)).toBe(false);
+      } finally {
+        evidenceSpy.mockRestore();
       }
     } finally {
       await cleanup();

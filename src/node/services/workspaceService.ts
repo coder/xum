@@ -13776,6 +13776,27 @@ export class WorkspaceService extends EventEmitter {
           authoritativeIds != null &&
           (scopeEnumerationIds?.has(workspaceId) ?? false) &&
           !authoritativeIds.has(workspaceId));
+      // Raw-visible→raw-invisible is verifiable removal only while the
+      // fresh raw view is COMPLETE registration evidence. With id-less
+      // legacy entries present, the id may have been removed and
+      // RE-REGISTERED by a downgraded backend as an id-less entry during
+      // the awaits (raw-invisible from then on) — the raw comparison alone
+      // would drop the revived workspace and republish the very tombstone
+      // the authoritative evidence just cleared, suppressing its activity
+      // again. In that case the authoritative enumeration (which resolves
+      // id-less identities, and is attempted whenever id-less entries
+      // exist — see the third trigger above) must DENY the id before the
+      // transition counts as removal; an affirmation or a failed
+      // enumeration retains the entry (keeping a stale entry briefly is
+      // recoverable, wrongly suppressing a live workspace is not). A
+      // revival landing after the enumeration but before the raw re-read
+      // is the contract's out-of-scope window: the next list's initial
+      // baseline no longer contains the id, so the raw arm cannot re-fire
+      // and its fresh evidence clears the republished tombstone.
+      const isVerifiablyRemovedFromRawConfig = (workspaceId: string): boolean =>
+        isRemovedFromConfig(workspaceId) &&
+        (!freshConfigHasRawInvisibleEntries ||
+          (authoritativeIds != null && !authoritativeIds.has(workspaceId)));
       // Tombstones are process-local removal knowledge; the shared config is
       // the authority. A downgraded concurrent backend can legitimately
       // re-register a deterministic legacy id this process pruned earlier —
@@ -13836,7 +13857,7 @@ export class WorkspaceService extends EventEmitter {
                 : authoritativeIds != null)) ||
             // Deregistered from the shared config mid-list — also covers
             // workflow/bash-monitor-only entries with no persisted snapshot.
-            isRemovedFromConfig(workspaceId) ||
+            isVerifiablyRemovedFromRawConfig(workspaceId) ||
             // Raw-invisible (legacy stable) ids: authoritative-lookup
             // counterpart of the raw-superset comparison above.
             isRemovedPerAuthoritativeIdentity(workspaceId);
@@ -13974,10 +13995,17 @@ export class WorkspaceService extends EventEmitter {
           // can prove the removal. Modern deployments never pay this walk.
           let finalAuthoritativeIds: ReadonlySet<string> | null = null;
           let finalConfigIds: ReadonlySet<string> | null = null;
+          // Completeness of the final raw view, mirroring the mid-list
+          // fresh read: id-less legacy entries make raw denial insufficient
+          // removal evidence (see isVerifiablyRemovedFromRawConfig).
+          let finalConfigHasRawInvisibleEntries = false;
           try {
-            finalConfigIds = this.config.readPersistedWorkspaceIdSuperset();
+            const finalEvidence = this.config.readPersistedWorkspaceIdEvidence();
+            finalConfigIds = finalEvidence.ids;
+            finalConfigHasRawInvisibleEntries = finalEvidence.hasWorkspaceEntriesWithoutIds;
           } catch {
             finalConfigIds = null;
+            finalConfigHasRawInvisibleEntries = true;
           }
           if (
             Array.from(probedWorkflowRunIds.keys()).some(isRawInvisible) ||
@@ -13993,7 +14021,15 @@ export class WorkspaceService extends EventEmitter {
             // no cross-process event to repair it. The enumeration
             // substitutes as removal evidence for ids the scope enumeration
             // vouched for.
-            finalConfigIds == null
+            finalConfigIds == null ||
+            // Id-less legacy entries in the final raw view: a raw-visible
+            // id deregistered during the probes is indistinguishable from
+            // one removed-and-revived as an id-less entry by a downgraded
+            // backend, so the raw deregistration guards below need the
+            // enumeration to tell them apart (same rule as the mid-list
+            // isVerifiablyRemovedFromRawConfig). Modern deployments (every
+            // id inline) never pay this walk.
+            finalConfigHasRawInvisibleEntries
           ) {
             try {
               finalAuthoritativeIds = await this.enumerateAuthoritativeWorkspaceIds();
@@ -14022,7 +14058,10 @@ export class WorkspaceService extends EventEmitter {
             // repeat failure keep the earlier successful read (still a
             // valid post-probe view) rather than degrading to null.
             try {
-              finalConfigIds = this.config.readPersistedWorkspaceIdSuperset();
+              const refreshedFinalEvidence = this.config.readPersistedWorkspaceIdEvidence();
+              finalConfigIds = refreshedFinalEvidence.ids;
+              finalConfigHasRawInvisibleEntries =
+                refreshedFinalEvidence.hasWorkspaceEntriesWithoutIds;
             } catch {
               // Keep the pre-enumeration read (possibly null).
             }
@@ -14055,11 +14094,16 @@ export class WorkspaceService extends EventEmitter {
                   : finalConfigIds != null)) ||
               // Verifiably deregistered from the raw config during the
               // probes: visible in an earlier raw view, gone from the
-              // post-probe one.
+              // post-probe one. With id-less entries in the final raw view
+              // the id may instead have been removed-and-revived id-less,
+              // so the final enumeration must deny it (same completeness
+              // rule as isVerifiablyRemovedFromRawConfig).
               (finalConfigIds != null &&
                 !finalConfigIds.has(workspaceId) &&
                 ((initialConfigIds?.has(workspaceId) ?? false) ||
-                  (freshConfigIds?.has(workspaceId) ?? false))) ||
+                  (freshConfigIds?.has(workspaceId) ?? false)) &&
+                (!finalConfigHasRawInvisibleEntries ||
+                  (finalAuthoritativeIds != null && !finalAuthoritativeIds.has(workspaceId)))) ||
               // Raw-invisible retained ids: post-probe authoritative
               // counterpart of the raw guard above.
               (isRawInvisible(workspaceId) &&
@@ -14101,7 +14145,7 @@ export class WorkspaceService extends EventEmitter {
                   ? (freshSnapshots.get(workspaceId) ?? null)
                   : (snapshots.get(workspaceId) ?? null);
             const lateForeignRemoved =
-              isRemovedFromConfig(workspaceId) ||
+              isVerifiablyRemovedFromRawConfig(workspaceId) ||
               isRemovedPerAuthoritativeIdentity(workspaceId) ||
               // Persisted snapshot vanished during the probes — also covers
               // legacy ids the raw views cannot see. Same corruption-reset
@@ -14123,11 +14167,15 @@ export class WorkspaceService extends EventEmitter {
               // definition) — and is gone from the post-probe view. During
               // the normal gap between config deregistration and metadata
               // cleanup the snapshot still exists, so the vanish check
-              // above cannot catch this.
+              // above cannot catch this. Same raw-view completeness rule as
+              // the retained-entry arm: with id-less entries present the
+              // final enumeration must deny a possibly-revived id.
               (finalConfigIds != null &&
                 !finalConfigIds.has(workspaceId) &&
                 ((initialConfigIds?.has(workspaceId) ?? false) ||
-                  (freshConfigIds?.has(workspaceId) ?? false))) ||
+                  (freshConfigIds?.has(workspaceId) ?? false)) &&
+                (!finalConfigHasRawInvisibleEntries ||
+                  (finalAuthoritativeIds != null && !finalAuthoritativeIds.has(workspaceId)))) ||
               // Raw-invisible candidates: post-probe authoritative
               // counterpart of the raw guard above — a legacy workspace
               // deregistered during the probes is invisible to every raw

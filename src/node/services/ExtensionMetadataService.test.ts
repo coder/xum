@@ -1396,6 +1396,60 @@ describe("ExtensionMetadataService", () => {
     expect(stranded).toEqual([]);
   });
 
+  test("stranded adoption samples registration strictly after the main read", async () => {
+    // The post-load evidence rule: a positive probe captured BEFORE the
+    // main read can go stale when another backend deregisters the
+    // workspace during the probe awaits — adopting on it would resurrect
+    // the removed workspace's metadata. Modeled with a probe whose answer
+    // flips between the tombstone-revalidation sample (registered: lifts
+    // the tombstone) and the adoption sample (deregistered meanwhile):
+    // only a post-load adoption sample sees the flip.
+    await service.updateRecency("ws-other", 1);
+    service.suppressForeignRemoval("ws-x");
+    await writeFile(
+      `${filePath}.recreated-4242-cafe`,
+      JSON.stringify({
+        version: 1,
+        workspaces: {
+          "ws-x": {
+            recency: 500,
+            streaming: false,
+            todoStatus: { emoji: "s", message: "resurrected status" },
+          },
+        },
+      })
+    );
+    let probeCalls = 0;
+    service.setRegistrationProbe(() => {
+      probeCalls += 1;
+      return Promise.resolve(probeCalls === 1);
+    });
+    const snapshots = await service.getAllSnapshots();
+    // The first (registration) sample lifted the tombstone…
+    expect(service.isWorkspaceDeleted("ws-x")).toBe(false);
+    // …but the adoption decision used a fresh post-load sample and saw the
+    // deregistration: proven removed, not resurrected, claim consumed.
+    expect(snapshots.has("ws-x")).toBe(false);
+    expect(snapshots.get("ws-other")?.recency).toBe(1);
+    const stranded = (await readdir(tempDir)).filter((name) => name.includes(".recreated-"));
+    expect(stranded).toEqual([]);
+  });
+
+  test("a crash-stranded empty-recovery temp file is inert", async () => {
+    // Empty-file quarantine recovery writes through a process-unique
+    // `.empty-<pid>-<uuid>.tmp` (a shared fixed name lets concurrent
+    // recoveries truncate or unlink each other's in-flight temp). A crash
+    // strands at most one such file, and no scan may consume it — sweeping
+    // another process's in-flight temp is the same race the unique name
+    // prevents.
+    await service.updateRecency("ws-live", 7);
+    const staleTmp = `${filePath}.empty-12345-dead.tmp`;
+    await writeFile(staleTmp, "{}");
+    const snapshots = await service.getAllSnapshots();
+    expect(snapshots.get("ws-live")?.recency).toBe(7);
+    expect(await readFile(staleTmp, "utf-8")).toBe("{}");
+  });
+
   test("persisted mutations advance the per-entry write generation", async () => {
     // The durable ordering contract behind the merge above: metadata
     // mutations advance the generation even when they preserve recency (so
