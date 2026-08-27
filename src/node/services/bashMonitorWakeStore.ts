@@ -919,6 +919,9 @@ export class BashMonitorWakeStore {
     }
     let newest: ClearTombstone | null = null;
     let newestPath: string | null = null;
+    // Every valid capture seen this pass, retained so captures SUPERSEDED by the
+    // standing winner can be swept below.
+    const candidates: Array<{ path: string; tomb: ClearTombstone }> = [];
     for (const entry of entries) {
       if (!entry.startsWith(`${base}.cas-`)) continue;
       const leftoverPath = path.join(dir, entry);
@@ -953,6 +956,7 @@ export class BashMonitorWakeStore {
         await fsPromises.rm(leftoverPath, { force: true }).catch(() => undefined);
         continue;
       }
+      candidates.push({ path: leftoverPath, tomb: parsed });
       if (
         newest == null ||
         Date.parse(parsed.clearedAt) > Date.parse(newest.clearedAt) ||
@@ -977,6 +981,21 @@ export class BashMonitorWakeStore {
       }
     }
     if (newest == null || newestPath == null) return null;
+    // Sweep captures the DURABLY STANDING generation strictly outranks: a superseded
+    // capture left behind can resurrect protection for a clear that was just settled
+    // — after the grace rollback demotes a healed staging, the very next
+    // readClearedAt would heal the older capture straight back, re-holding the
+    // records the rollback restored; the scan then lists nothing and startup owner
+    // discovery schedules no drain, stranding the wake indefinitely. Only run once a
+    // standing canonical is verified (linked by us or read back below): subsumption
+    // is provable only against durable protection. Best-effort — a capture that
+    // survives re-enters this same reconciliation later.
+    const sweepSuperseded = async (standing: ClearTombstone): Promise<void> => {
+      for (const candidate of candidates) {
+        if (!BashMonitorWakeStore.tombstoneStrictlyOutranks(standing, candidate.tomb)) continue;
+        await fsPromises.rm(candidate.path, { force: true }).catch(() => undefined);
+      }
+    };
     try {
       await fsPromises.link(newestPath, target);
     } catch (error) {
@@ -988,21 +1007,47 @@ export class BashMonitorWakeStore {
       // mid-dance mutation's capture holds the PREVIOUS generation, not the one it
       // is publishing). Report the winner, not our stale selection: a caller judging
       // a wake between the two cutoffs would otherwise restore what the newer clear
-      // retired. The leftover stays behind for a later heal, so its protection is
-      // never silently lost.
+      // retired. A leftover the standing generation does not strictly outrank stays
+      // behind for a later heal, so its protection is never silently lost.
       let raw: string;
       try {
         raw = await fsPromises.readFile(target, "utf-8");
       } catch (readError) {
         if (!isErrnoWithCode(readError, "ENOENT")) throw readError;
         // The winner was removed again before we could read it: the capture remains
-        // the newest standing protection.
+        // the newest standing protection. Nothing durably stands, so sweep nothing.
         return newest;
       }
-      return BashMonitorWakeStore.parseTombstone(raw) ?? newest;
+      const standing = BashMonitorWakeStore.parseTombstone(raw);
+      // A malformed canonical is not standing protection: sweep nothing.
+      if (standing == null) return newest;
+      await sweepSuperseded(standing);
+      return standing;
     }
     await fsPromises.rm(newestPath, { force: true }).catch(() => undefined);
+    await sweepSuperseded(newest);
     return newest;
+  }
+
+  /**
+   * Whether `standing` strictly outranks `candidate` under the heal selection
+   * ordering (newer cutoff; committed over staged at an equal cutoff; fresher
+   * stagedAt when both are staged at an equal cutoff). Used to sweep captures that a
+   * durably standing generation supersedes — exact ties are NOT outranked and are
+   * kept, because sweeping requires proof the candidate can never matter again.
+   */
+  private static tombstoneStrictlyOutranks(
+    standing: ClearTombstone,
+    candidate: ClearTombstone
+  ): boolean {
+    const standingMs = Date.parse(standing.clearedAt);
+    const candidateMs = Date.parse(candidate.clearedAt);
+    if (standingMs !== candidateMs) return standingMs > candidateMs;
+    if (candidate.phase === "staged" && standing.phase !== "staged") return true;
+    if (candidate.phase === "staged" && standing.phase === "staged") {
+      return Date.parse(standing.stagedAt ?? "") > Date.parse(candidate.stagedAt ?? "");
+    }
+    return false;
   }
 
   private static parseTombstone(raw: string): ClearTombstone | null {
@@ -1860,10 +1905,17 @@ export class BashMonitorWakeStore {
   /**
    * Like readRecordAt, but distinguishes an absent canonical file from a malformed one:
    * recovery paths must quarantine malformed canonicals (or a valid stranded record is
-   * blocked forever) while treating absence as "safe to place". Transient errors throw.
+   * blocked forever) while treating absence as "safe to place". A syntactically valid
+   * record whose identity disagrees with the path classifies as MALFORMED too (see
+   * recordIdentityMatches): treating the imposter as a real record would let its
+   * equal-or-newer updatedAt condemn a valid crash artifact as stale — deleting the
+   * wake's only durable copy while the record pass rejects the imposter anyway.
+   * Transient errors throw.
    */
   private async readCanonicalState(
-    originalPath: string
+    originalPath: string,
+    ownerWorkspaceId: string,
+    id: string
   ): Promise<
     { kind: "absent" } | { kind: "malformed" } | { kind: "record"; record: BashMonitorWakeRecord }
   > {
@@ -1875,7 +1927,13 @@ export class BashMonitorWakeStore {
       throw error;
     }
     const record = this.parse(raw);
-    return record == null ? { kind: "malformed" } : { kind: "record", record };
+    if (
+      record == null ||
+      !BashMonitorWakeStore.recordIdentityMatches(record, ownerWorkspaceId, id)
+    ) {
+      return { kind: "malformed" };
+    }
+    return { kind: "record", record };
   }
 
   /**
@@ -1895,7 +1953,9 @@ export class BashMonitorWakeStore {
    * as authoritative. Caller must hold the per-record lock.
    */
   private async quarantineMalformedCanonical(
-    originalPath: string
+    originalPath: string,
+    ownerWorkspaceId: string,
+    id: string
   ): Promise<{ kind: "cleared" } | { kind: "occupied"; record: BashMonitorWakeRecord | null }> {
     const capture = `${originalPath}.prune-${randomUUID()}`;
     try {
@@ -1920,9 +1980,14 @@ export class BashMonitorWakeStore {
       }
       throw error;
     }
-    if (captured == null) {
-      // Verified malformed: park it as evidence. A failed rename leaves it as prune
-      // trash, where the age-gated sweep eventually removes it.
+    if (
+      captured == null ||
+      !BashMonitorWakeStore.recordIdentityMatches(captured, ownerWorkspaceId, id)
+    ) {
+      // Verified malformed — including a syntactically valid record whose identity
+      // disagrees with this path (see readCanonicalState): park it as evidence. A
+      // failed rename leaves it as prune trash, where the age-gated sweep eventually
+      // removes it.
       await fsPromises
         .rename(capture, `${originalPath}.malformed-${randomUUID()}`)
         .catch(() => undefined);
@@ -2124,7 +2189,7 @@ export class BashMonitorWakeStore {
         // supersession: a strictly newer pending leftover atomically replaces the
         // canonical record; otherwise the canonical record wins and the leftover is
         // dropped below as superseded.
-        const canonicalState = await this.readCanonicalState(originalPath);
+        const canonicalState = await this.readCanonicalState(originalPath, ownerWorkspaceId, id);
         if (canonicalState.kind === "absent") {
           // Vanished between the failed link and this read: keep the leftover so a
           // later scan retries with a settled canonical state.
@@ -2139,7 +2204,11 @@ export class BashMonitorWakeStore {
             // wait for the age-gated sweep.
             return null;
           }
-          const quarantined = await this.quarantineMalformedCanonical(originalPath);
+          const quarantined = await this.quarantineMalformedCanonical(
+            originalPath,
+            ownerWorkspaceId,
+            id
+          );
           if (quarantined.kind === "occupied") {
             // A valid record regenerated over the malformed one mid-quarantine: it is
             // authoritative; the leftover stays for re-reconciliation against it.
@@ -2373,7 +2442,7 @@ export class BashMonitorWakeStore {
         this.scheduleDeferredTempRecovery(ownerWorkspaceId, filePath, stat.mtimeMs);
         return null;
       }
-      const canonicalState = await this.readCanonicalState(originalPath);
+      const canonicalState = await this.readCanonicalState(originalPath, ownerWorkspaceId, id);
       if (canonicalState.kind !== "record") {
         // The complete temp record may be the ONLY durable copy of this wake (a
         // brand-new wake has no canonical file at all): place the SAME inode at the
@@ -2382,7 +2451,11 @@ export class BashMonitorWakeStore {
         // temp would be blocked forever.
         if (canonicalState.kind === "malformed") {
           if (parsed.status !== "pending") return null; // evidence outranks stale terminals
-          const quarantined = await this.quarantineMalformedCanonical(originalPath);
+          const quarantined = await this.quarantineMalformedCanonical(
+            originalPath,
+            ownerWorkspaceId,
+            id
+          );
           if (quarantined.kind === "occupied") {
             // A valid record regenerated over the malformed one mid-quarantine: it is
             // authoritative; the temp stays for re-reconciliation against it.

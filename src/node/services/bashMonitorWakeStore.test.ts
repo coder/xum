@@ -2667,6 +2667,82 @@ describe("BashMonitorWakeStore", () => {
     }
   });
 
+  test("an identity-mismatched canonical is quarantined so a valid crash temp still restores", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR only durable copy"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const canonicalPath = path.join(dir, "proc-1.json");
+    // The wake's ONLY durable copy crashes into a temp (aged past the freshness
+    // gate)...
+    const temp = `${canonicalPath}.tmp-crashed`;
+    await fsPromises.rename(canonicalPath, temp);
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(temp, past, past);
+    // ...while corruption leaves a syntactically valid record with a FOREIGN
+    // identity and a newer updatedAt at the canonical path.
+    const tempParsed = JSON.parse(
+      await fsPromises.readFile(temp, "utf-8")
+    ) as BashMonitorWakeRecord;
+    const imposter = { ...tempParsed, id: "proc-9", updatedAt: new Date().toISOString() };
+    await fsPromises.writeFile(canonicalPath, JSON.stringify(imposter), "utf-8");
+
+    // Classifying the imposter as a real record would discard the valid temp as
+    // stale (the canonical updatedAt is newer), after which the record pass rejects
+    // the imposter too — no wake left anywhere. The imposter must read as MALFORMED:
+    // quarantined aside, the temp restores to the canonical path.
+    expect((await store.listPending("owner-1")).map((r) => r.lines)).toEqual([
+      ["ERROR only durable copy"],
+    ]);
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("pending");
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
+  });
+
+  test("healing sweeps captures superseded by the standing winner", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR survives twin stale captures"] }));
+    // Strictly order wake < cutoff (same-millisecond stamps fail toward delivery).
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await store.supersedeAllPending("owner-1");
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const tombPath = path.join(dir, "cleared-at");
+    const stagedTomb = JSON.parse(await fsPromises.readFile(tombPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    await store.abandonWorkspaceClears("owner-1");
+    // Crashed heartbeat mutations strand TWO captures of the same crashed clear,
+    // BOTH past the rollback grace window, with distinct liveness generations. The
+    // canonical path is empty.
+    await fsPromises.rm(tombPath);
+    await fsPromises.writeFile(
+      `${tombPath}.cas-older`,
+      JSON.stringify({
+        ...stagedTomb,
+        stagedAt: new Date(Date.now() - STAGED_CLEAR_ROLLBACK_GRACE_MS - 120_000).toISOString(),
+      }),
+      "utf-8"
+    );
+    await fsPromises.writeFile(
+      `${tombPath}.cas-newer`,
+      JSON.stringify({
+        ...stagedTomb,
+        stagedAt: new Date(Date.now() - STAGED_CLEAR_ROLLBACK_GRACE_MS - 60_000).toISOString(),
+      }),
+      "utf-8"
+    );
+    // The heal links the freshest capture and must SWEEP the superseded one: left
+    // behind, it would resurrect protection for the rolled-back clear the moment the
+    // grace rollback demotes the healed staging — the restored records would be held
+    // again, this scan would return empty, and startup owner discovery would
+    // schedule no drain for a wake stranded indefinitely.
+    const scan = new BashMonitorWakeStore(makeConfig(rootDir));
+    expect((await scan.listPending("owner-1")).map((r) => r.lines)).toEqual([
+      ["ERROR survives twin stale captures"],
+    ]);
+    expect((await scan.get("owner-1", "proc-1"))?.status).toBe("pending");
+    expect((await fsPromises.readdir(dir)).filter((e) => e.startsWith("cleared-at"))).toEqual([]);
+  });
+
   test("a directory squatting on a tombstone capture is quarantined instead of failing heals", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload({ lines: ["ERROR heals anyway"] }));
