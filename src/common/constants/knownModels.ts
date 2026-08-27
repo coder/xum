@@ -282,11 +282,23 @@ export const MODEL_ABBREVIATIONS: Record<string, string> = Object.fromEntries(
     .sort(([a], [b]) => a.localeCompare(b))
 );
 
-export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = Object.fromEntries(
-  Object.values(KNOWN_MODELS)
-    .filter((model) => Boolean(model.tokenizerOverride))
-    .map((model) => [model.id, model.tokenizerOverride!])
-);
+// Retired first-class models stay documented as custom model strings (see the
+// FABLE/OPUS comments); keep their approximate-tokenizer overrides so exact-id
+// lookup does not fall back to the generic per-provider tokenizer.
+const LEGACY_TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
+  "anthropic:claude-fable-5": "anthropic/claude-opus-4.5",
+  "anthropic:claude-opus-4-8": "anthropic/claude-opus-4.5",
+};
+
+export const TOKENIZER_MODEL_OVERRIDES: Record<string, string> = {
+  ...LEGACY_TOKENIZER_MODEL_OVERRIDES,
+  // Spread current models last so a returning id always wins over its legacy entry.
+  ...Object.fromEntries(
+    Object.values(KNOWN_MODELS)
+      .filter((model) => Boolean(model.tokenizerOverride))
+      .map((model) => [model.id, model.tokenizerOverride!])
+  ),
+};
 
 /** Tooltip-friendly abbreviation examples: show representative shortcuts */
 export const MODEL_ABBREVIATION_EXAMPLES = (["opus", "sonnet"] as const).map((abbrev) => ({
