@@ -344,6 +344,28 @@ describe("rebuildAll", () => {
     expect(result.workspacesIngested).toBe(1);
     expect(await queryEventCount(conn)).toBe(1);
   });
+
+  test("reports metadata-stage failures so the sweep preserves already-appended rows", async () => {
+    const conn = await createTestConn();
+    const sessionsDir = await createTempSessionDir();
+
+    // Chat parses and appends fine, but the unreadable sidecar (a directory)
+    // throws in ingestHeadlessUsage before the watermark write.
+    const workspaceDir = path.join(sessionsDir, "ws-meta-fail");
+    await fs.mkdir(workspaceDir, { recursive: true });
+    await writeChatJsonl(workspaceDir, [makeUserLine(), makeAssistantLine()]);
+    await fs.mkdir(path.join(workspaceDir, "headless-usage.jsonl"));
+
+    const result = await rebuildAll(conn, sessionsDir, {});
+
+    expect(result.failedWorkspaceIds).toEqual(new Set(["ws-meta-fail"]));
+    expect(await queryEventCount(conn, "ws-meta-fail")).toBe(1);
+
+    // The post-rebuild sweep runs with exactly this failure set; the
+    // watermark-less rows must survive it.
+    expect(await deleteCorruptAnalyticsRows(conn, result.failedWorkspaceIds)).toBe(0);
+    expect(await queryEventCount(conn, "ws-meta-fail")).toBe(1);
+  });
 });
 
 describe("appendEvents", () => {

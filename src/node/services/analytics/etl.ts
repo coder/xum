@@ -1987,6 +1987,10 @@ export async function rebuildAll(
           );
         }
       } catch (error) {
+        // The workspace's chat rows are already appended but its watermark may
+        // not be written; report it failed so the post-rebuild sweep's
+        // missing-watermark evidence does not delete those rows.
+        failedWorkspaceIds.add(workspace.workspaceId);
         log.warn("[analytics-etl] Failed to write metadata during rebuild", {
           workspaceId: workspace.workspaceId,
           error: getErrorMessage(error),
