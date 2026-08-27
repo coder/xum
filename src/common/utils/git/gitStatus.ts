@@ -43,6 +43,11 @@ if [ -z "$PRIMARY_BRANCH" ]; then
   if [ -z "$PRIMARY_BRANCH" ]; then
     PRIMARY_BRANCH=$(git branch -r 2>/dev/null | grep -E 'origin/(main|master)$' | head -1 | sed 's@^.*origin/@@')
   fi
+
+  # Method 4: use a local primary branch when no remote exists
+  if [ -z "$PRIMARY_BRANCH" ]; then
+    PRIMARY_BRANCH=$(git branch --format='%(refname:short)' 2>/dev/null | grep -E '^(main|master)$' | head -1)
+  fi
 fi
 
 # Exit if we can't determine primary branch

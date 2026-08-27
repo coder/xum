@@ -2,6 +2,7 @@ import { afterEach, describe, test, expect } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { generateGitStatusScript } from "@/common/utils/git/gitStatus";
 import {
   GIT_NO_HOOKS_ENV,
   gitHooksAllowed,
@@ -529,6 +530,25 @@ describe("gitNoRepoAutomationEnv", () => {
       () => false
     );
     expect(markerExists).toBe(false);
+  });
+
+  test("runs the git status script in a clean repository without a remote", async () => {
+    using tmp = new DisposableTempDir("git-status-automation-off");
+    const repo = path.join(tmp.path, "repo");
+    await fs.mkdir(repo, { recursive: true });
+    await Bun.$`git init -b main`.cwd(repo).quiet();
+    await Bun.$`git config user.email test@example.com`.cwd(repo).quiet();
+    await Bun.$`git config user.name Test`.cwd(repo).quiet();
+    await Bun.$`git commit --allow-empty -m init`.cwd(repo).quiet();
+
+    const result = await Bun.$`bash -c ${generateGitStatusScript()}`
+      .cwd(repo)
+      .env({ ...process.env, ...(await gitNoRepoAutomationEnvForLocalRepo(repo)) })
+      .quiet()
+      .nothrow();
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.toString()).toContain("---PRIMARY---\nmain");
   });
 });
 
