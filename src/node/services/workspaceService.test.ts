@@ -6137,7 +6137,7 @@ describe("WorkspaceService workflow invocation events", () => {
     }
   });
 
-  test("fails safe for legacy sidecar references without a boundary snapshot", async () => {
+  test("migrates legacy sidecar references through the wall-clock fallback", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const workspaceId = "workflow-currentness-legacy";
     const runId = "wfr_currentness_legacy";
@@ -6169,13 +6169,29 @@ describe("WorkspaceService workflow invocation events", () => {
         workspaceId,
         createMuxMessage("manual-user", "user", "run the audit workflow", { timestamp: 1_000 })
       );
-      // Entries written before boundary snapshots existed carry only a timestamp; without an
-      // orderable identity they must not count as the current invocation.
+      // Entries written before boundary snapshots existed carry only a timestamp. An in-flight
+      // run recorded after the newest boundary must keep its wake across the upgrade.
       await recordAgentWorkflowRunReference({
         workspaceSessionDir: config.getSessionDir(workspaceId),
         runId,
         createdAtMs: 1_150,
       });
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
+
+      // A newer boundary still supersedes a legacy entry.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user-2", "user", "never mind, answer something else", {
+          timestamp: 1_200,
+        })
+      );
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
+
+      // An undatable boundary cannot be ordered against a legacy timestamp: fail safe.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user-undated", "user", "another instruction", {})
+      );
       expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
       workspaceService.disposeSession(workspaceId);
     } finally {

@@ -10970,14 +10970,29 @@ export class WorkspaceService extends EventEmitter {
     // result was delivered. A decision-free history fails safe to not-current, because a full
     // clear (truncateHistory) removes every row WITHOUT appending a reset boundary while
     // leaving the sidecar intact — a surviving reference must not inject a workflow result into
-    // the freshly cleared conversation. Legacy references without a boundary snapshot fail safe
-    // the same way.
+    // the freshly cleared conversation. References without a boundary snapshot (pre-upgrade
+    // entries, record-time read failures) take a wall-clock migration fallback below.
     if (decision.status === "none") {
       return "not_current";
     }
     const references = await readAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
     const reference = references.find((candidate) => candidate.runId === runId);
-    if (reference?.afterBoundaryMessageId == null) {
+    if (reference == null) {
+      return "not_current";
+    }
+    if (reference.afterBoundaryMessageId === undefined) {
+      // Migration fallback: entries written before boundary snapshots existed (or after a
+      // record-time history read failure) carry only a timestamp, and an in-flight run must not
+      // lose its wake across the upgrade. Fall back to wall-clock ordering against a datable
+      // boundary; an undatable boundary fails safe. All new records take the identity path
+      // above, so clock-correction edge cases are confined to this shrinking population.
+      if (decision.timestampMs == null) {
+        return "not_current";
+      }
+      return reference.createdAtMs > decision.timestampMs ? "current" : "not_current";
+    }
+    if (reference.afterBoundaryMessageId === null) {
+      // Verified-empty snapshot: a decision row now exists, so it appeared after the record.
       return "not_current";
     }
     return reference.afterBoundaryMessageId === decision.messageId ? "current" : "not_current";
@@ -10993,20 +11008,31 @@ export class WorkspaceService extends EventEmitter {
     workspaceId: string,
     runId: string
   ): Promise<
-    | { status: "found"; outcome: "invocation" | "consumed" | "superseded"; messageId: string }
+    | {
+        status: "found";
+        outcome: "invocation" | "consumed" | "superseded";
+        messageId: string;
+        timestampMs: number | null;
+      }
     | { status: "none" }
     | { status: "error" }
   > {
     const state: {
-      found: { outcome: "invocation" | "consumed" | "superseded"; messageId: string } | null;
+      found: {
+        outcome: "invocation" | "consumed" | "superseded";
+        messageId: string;
+        timestampMs: number | null;
+      } | null;
     } = { found: null };
     const historyResult = await this.historyService.iterateFullHistory(
       workspaceId,
       "backward",
       (messages) => {
         for (const message of messages) {
+          const timestamp = message.metadata?.timestamp;
+          const timestampMs = typeof timestamp === "number" ? timestamp : null;
           if (isManualUserSupersessionMessage(message) || isResetBoundaryMessage(message)) {
-            state.found = { outcome: "superseded", messageId: message.id };
+            state.found = { outcome: "superseded", messageId: message.id, timestampMs };
             return false;
           }
           if (
@@ -11014,11 +11040,11 @@ export class WorkspaceService extends EventEmitter {
             isTerminalWorkflowTaskAwaitResultMessage(message, runId) ||
             isTerminalWorkflowToolResultMessage(message, runId)
           ) {
-            state.found = { outcome: "consumed", messageId: message.id };
+            state.found = { outcome: "consumed", messageId: message.id, timestampMs };
             return false;
           }
           if (isWorkflowInvocationMessage(message, runId)) {
-            state.found = { outcome: "invocation", messageId: message.id };
+            state.found = { outcome: "invocation", messageId: message.id, timestampMs };
             return false;
           }
         }
@@ -11034,7 +11060,12 @@ export class WorkspaceService extends EventEmitter {
       return { status: "error" };
     }
     return state.found != null
-      ? { status: "found", outcome: state.found.outcome, messageId: state.found.messageId }
+      ? {
+          status: "found",
+          outcome: state.found.outcome,
+          messageId: state.found.messageId,
+          timestampMs: state.found.timestampMs,
+        }
       : { status: "none" };
   }
 
