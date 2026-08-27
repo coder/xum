@@ -1457,12 +1457,31 @@ function hasNondeterministicGlob(word: string): boolean {
 }
 
 /**
- * A brace group holding `,` or `..` expands, and expansion output can reassemble a
- * credential from fragments no scanner recognizes (`ghp_...{8..8}...`). Literal braces
- * (`{hunter2}`) do not expand and stay inside the word the ordinary rules cover. A
- * consumed assignment is exempt: its braces expand into copies of the marker.
+ * A brace group holding `,` or `..` at any nesting depth expands, and expansion output
+ * can reassemble a credential from fragments no scanner recognizes (`ghp_...{8..8}...`,
+ * nested `gh{p,{x}}_...`). Literal braces (`{hunter2}`) do not expand and stay inside
+ * the word the ordinary rules cover. A depth stack rather than a flat regex, because an
+ * inner non-expanding group otherwise hides the expanding outer one. Runs on the active
+ * projection, so quoted commas stay inert.
  */
-const BRACE_EXPANSION = /\{[^{}]*(?:,|\.\.)[^{}]*\}/;
+function hasActiveBraceExpansion(active: string): boolean {
+  const groupExpands: boolean[] = [];
+  let i = 0;
+  while (i < active.length) {
+    const char = active[i];
+    if (char === "{") groupExpands.push(false);
+    else if (char === "}" && groupExpands.length > 0) {
+      if (groupExpands.pop()) return true;
+    } else if (
+      groupExpands.length > 0 &&
+      (char === "," || (char === "." && active[i + 1] === "."))
+    ) {
+      groupExpands[groupExpands.length - 1] = true;
+    }
+    i += 1;
+  }
+  return false;
+}
 
 /**
  * Words that hand a downstream consumer an assignment the shell itself does not see,
@@ -1478,7 +1497,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
     // '{"a":1,"b":2}'` stays a literal argument). The brace test runs on the active
     // projection; the glob analyzer is quote-aware itself and needs the raw word to
     // tell `[\p]` (escaped member) from `[p]`.
-    if (BRACE_EXPANSION.test(activeWordProjection(word))) return true;
+    if (hasActiveBraceExpansion(activeWordProjection(word))) return true;
     if (hasNondeterministicGlob(word)) return true;
     const unquoted = unquoteShellWord(word);
     // Option terminators end option parsing: past one even a dash-led word is an
@@ -1608,26 +1627,79 @@ function findActiveShellConstructs(command: string): {
   return found;
 }
 
+/**
+ * The command split at Bash comment boundaries, quote-aware: assignment-like prose in a
+ * comment must neither be rewritten (Bash never evaluates it, and a marker would make
+ * the whole command machine-local) nor feed the residue checks. Each piece keeps its
+ * trailing comment, and the newline that ends a comment stays in the next piece's code,
+ * so per-piece replacement sees the same boundaries the one-string form did.
+ */
+function splitCommandComments(command: string): Array<{ code: string; comment: string }> {
+  const pieces: Array<{ code: string; comment: string }> = [];
+  let code = "";
+  let i = 0;
+  let wordStart = true;
+  while (i < command.length) {
+    const char = command[i];
+    if (char === "#" && wordStart) {
+      const lineEnd = command.indexOf("\n", i);
+      const end = lineEnd === -1 ? command.length : lineEnd;
+      pieces.push({ code, comment: command.slice(i, end) });
+      code = "";
+      i = end;
+      wordStart = true;
+      continue;
+    }
+    if (char === "\\") {
+      code += command.slice(i, i + 2);
+      i += 2;
+      wordStart = false;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      const quote = char;
+      let j = i + 1;
+      while (j < command.length && command[j] !== quote) {
+        j += quote === '"' && command[j] === "\\" ? 2 : 1;
+      }
+      code += command.slice(i, Math.min(j + 1, command.length));
+      i = j + 1;
+      wordStart = false;
+      continue;
+    }
+    code += char;
+    wordStart = char === " " || char === "\t" || char === "\n" || SHELL_WORD_BREAK.includes(char);
+    i += 1;
+  }
+  pieces.push({ code, comment: "" });
+  return pieces;
+}
+
 function redactCommandEnvAssignments(command: string): string {
-  const redacted = command.replace(
-    COMMAND_ENV_ASSIGNMENT,
-    (_match, lead: string, name: string) => `${lead}${name}${REDACTED_BACKUP_VALUE}`
+  const pieces = splitCommandComments(command);
+  const redactedPieces = pieces.map((piece) =>
+    piece.code.replace(
+      COMMAND_ENV_ASSIGNMENT,
+      (_match, lead: string, name: string) => `${lead}${name}${REDACTED_BACKUP_VALUE}`
+    )
   );
+  const code = pieces.map((piece) => piece.code).join("");
+  const redactedCode = redactedPieces.join("");
   // When an assignment's boundaries cannot be trusted, no partial rewrite can be either,
   // so the whole command goes local and restore puts the exact text back. The residue and
   // quote-led checks run even when nothing was replaced: an unconsumable or quote-led
   // value means the replacement never saw it.
   const constructs = findActiveShellConstructs(command);
   if (
-    UNCONSUMED_ASSIGNMENT.test(redacted) ||
-    hasDisguisedAssignment(redacted) ||
+    UNCONSUMED_ASSIGNMENT.test(redactedCode) ||
+    hasDisguisedAssignment(redactedCode) ||
     constructs.carrier ||
     constructs.heredoc ||
-    (redacted !== command && constructs.processSubstitution)
+    (redactedCode !== code && constructs.processSubstitution)
   ) {
     return REDACTED_BACKUP_VALUE;
   }
-  return redacted;
+  return redactedPieces.map((piece, index) => piece + (pieces[index]?.comment ?? "")).join("");
 }
 
 function redactMcpConfig(content: Buffer): {

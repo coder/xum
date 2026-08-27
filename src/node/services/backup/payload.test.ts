@@ -1185,6 +1185,85 @@ describe("backup payload", () => {
     expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
   });
 
+  it("localizes nested brace expansion an inner group would otherwise hide", async () => {
+    // Bash expands `gh{p,{x}}_...` into an argument carrying the contiguous token; a
+    // flat pattern stops at the inner non-expanding group and would publish it.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: "mcp --pattern gh{p,{x}}_1234567890abcdefghij" } },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+
+    // A comma between two single-member groups expands nothing and stays portable.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: "mcp --flag {a},{b}" } } })
+    );
+    const portable = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const portableMcp = jsonc.parse(payloadFileText(portable, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(portableMcp.servers.grafana.command).toBe("mcp --flag {a},{b}");
+  });
+
+  it("leaves comment prose alone while still redacting executable assignments", async () => {
+    // Bash never evaluates the suffix, so rewriting it would only cost portability...
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: "mcp-server # TOKEN=hunter2" } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe("mcp-server # TOKEN=hunter2");
+
+    // ...while the executable region before the comment still redacts normally.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: "TOKEN=hunter2 mcp-server # NOTE=keep" } },
+      })
+    );
+    const redacted = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const redactedMcp = jsonc.parse(payloadFileText(redacted, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(redactedMcp.servers.grafana.command).toBe(
+      `TOKEN=${REDACTED_BACKUP_VALUE} mcp-server # NOTE=keep`
+    );
+  });
+
   it("keeps the documented AWS example key reviewable instead of hard-blocking", async () => {
     await writeFixtureFile(
       muxRoot,
