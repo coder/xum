@@ -1,5 +1,15 @@
 import { dirname } from "path";
-import { mkdir, readFile, access, rename, link, unlink, copyFile, writeFile } from "fs/promises";
+import {
+  mkdir,
+  readFile,
+  access,
+  rename,
+  link,
+  unlink,
+  copyFile,
+  writeFile,
+  stat,
+} from "fs/promises";
 import { constants } from "fs";
 import writeFileAtomic from "write-file-atomic";
 import {
@@ -15,6 +25,17 @@ import { getXumExtensionMetadataPath } from "@/common/constants/paths";
 import type { WorkspaceActivitySnapshot } from "@/common/types/workspace";
 import type { GoalSnapshot } from "@/common/types/goal";
 import { log } from "@/node/services/log";
+
+/**
+ * Identity of one quarantine-sidecar generation: with multiple processes
+ * recovering the fixed `.corrupt` path, consumption must be scoped to
+ * exactly the file generation a recovery read (see consumeQuarantineSidecar).
+ */
+interface QuarantineSidecarToken {
+  ino: bigint;
+  mtimeNs: bigint;
+  size: bigint;
+}
 
 /**
  * Marker code for "file written by a newer schema version" load failures.
@@ -248,6 +269,15 @@ export class ExtensionMetadataService {
     ) {
       return this.buildTransientSnapshot(workspaceId, recency, mutate);
     }
+    // Write-produced snapshots are broadcast by WorkspaceService: reconcile a
+    // crash-stranded sidecar BEFORE mutating (outside the queue — the resume
+    // path serializes itself). Without this, a valid partial main next to a
+    // healthy full sidecar is saved and EMITTED, clearing goal/status in the
+    // renderer until some read triggers recovery. Failure propagates:
+    // failing one write beats persisting and broadcasting the partial view
+    // (same tradeoff as the unprobeable-sidecar contract in
+    // probeQuarantineSidecar).
+    await this.reconcileLeftoverSidecarIfPresent();
     return this.withSerializedMutation(async () => {
       // Re-check inside the queue: pruneMissingWorkspaces publishes its
       // tombstones only while its queued mutation runs, so a writer that
@@ -309,13 +339,71 @@ export class ExtensionMetadataService {
    * stale sidecar again after the main file has moved on, repeatedly
    * re-merging entries that pruning or removal already reclaimed.
    */
-  private static async consumeQuarantineSidecar(quarantinePath: string): Promise<void> {
+  private static async consumeQuarantineSidecar(
+    quarantinePath: string,
+    token: QuarantineSidecarToken | null
+  ): Promise<void> {
+    // Generation check: with multiple processes recovering the fixed sidecar
+    // path, another backend can consume the generation this caller read and
+    // quarantine a NEW snapshot at the same path before this unlink runs — a
+    // path-only unlink would permanently destroy that unreconciled
+    // generation. Compare the identity captured when the caller READ the
+    // sidecar and leave a mismatched (newer) file for its own recovery pass.
+    // The residual stat→unlink window is the documented unlocked-shared-file
+    // boundary (see the PR's concurrency contract); closing it entirely
+    // requires an interprocess lock.
+    if (token == null) {
+      // The caller never observed a sidecar identity (it read the file only
+      // after a successful probe, so this is unreachable in practice) —
+      // fail closed by leaving the file rather than unlinking blind.
+      return;
+    }
+    let current: QuarantineSidecarToken | null;
+    try {
+      current = await ExtensionMetadataService.statQuarantineToken(quarantinePath);
+    } catch {
+      // Unprobeable: leave the sidecar (retryable) rather than guessing.
+      return;
+    }
+    if (current == null) {
+      return; // Already consumed by a concurrent recovery.
+    }
+    if (
+      current.ino !== token.ino ||
+      current.mtimeNs !== token.mtimeNs ||
+      current.size !== token.size
+    ) {
+      log.debug("Leaving replaced quarantine sidecar for its own recovery pass", {
+        quarantinePath,
+      });
+      return;
+    }
     try {
       await unlink(quarantinePath);
     } catch (unlinkError) {
       if (!ExtensionMetadataService.isErrnoCode(unlinkError, "ENOENT")) {
         throw unlinkError;
       }
+    }
+  }
+
+  /**
+   * Identity of one sidecar generation (inode + mtime + size), captured when
+   * a recovery reads the sidecar and required by consumeQuarantineSidecar so
+   * consumption is scoped to exactly the generation that was reconciled.
+   * Resolves null on ENOENT; other stat failures propagate (retryable).
+   */
+  private static async statQuarantineToken(
+    quarantinePath: string
+  ): Promise<QuarantineSidecarToken | null> {
+    try {
+      const stats = await stat(quarantinePath, { bigint: true });
+      return { ino: stats.ino, mtimeNs: stats.mtimeNs, size: stats.size };
+    } catch (statError) {
+      if (ExtensionMetadataService.isErrnoCode(statError, "ENOENT")) {
+        return null;
+      }
+      throw statError;
     }
   }
 
@@ -563,6 +651,9 @@ export class ExtensionMetadataService {
     ) {
       return null;
     }
+    // Same pre-mutation sidecar reconcile as mutateWorkspaceSnapshot: this
+    // path also saves and returns a snapshot the caller broadcasts.
+    await this.reconcileLeftoverSidecarIfPresent();
     return this.withSerializedMutation(async () => {
       // Re-check inside the queue (see mutateWorkspaceSnapshot): tombstones
       // published by an already-enqueued prune must be honored here too.
@@ -1053,6 +1144,9 @@ export class ExtensionMetadataService {
     // outcome here; a transient failure reading the sidecar means the
     // moved bytes cannot be verified, so it propagates (retryable) rather
     // than reporting a successful reset over possibly-healthy data.
+    // Generation identity captured before the read: consumption below is
+    // scoped to exactly these bytes (see consumeQuarantineSidecar).
+    const sidecarToken = await ExtensionMetadataService.statQuarantineToken(quarantinePath);
     let moved: unknown;
     let movedParses = true;
     try {
@@ -1103,7 +1197,7 @@ export class ExtensionMetadataService {
           throw copyError;
         }
       }
-      await ExtensionMetadataService.consumeQuarantineSidecar(quarantinePath);
+      await ExtensionMetadataService.consumeQuarantineSidecar(quarantinePath, sidecarToken);
       return false;
     }
     // Replace the quarantined main file with a valid EMPTY file instead of
@@ -1198,6 +1292,9 @@ export class ExtensionMetadataService {
    * withSerializedMutation. Returns false (no empty reset happened).
    */
   private async reconcileRecreatedMainWithSidecar(quarantinePath: string): Promise<boolean> {
+    // Generation identity captured before the read: consumption below is
+    // scoped to exactly these bytes (see consumeQuarantineSidecar).
+    const sidecarToken = await ExtensionMetadataService.statQuarantineToken(quarantinePath);
     let sidecarParsed: unknown;
     try {
       sidecarParsed = JSON.parse(await readFile(quarantinePath, "utf-8")) as unknown;
@@ -1252,7 +1349,7 @@ export class ExtensionMetadataService {
           throw copyError;
         }
       }
-      await ExtensionMetadataService.consumeQuarantineSidecar(quarantinePath);
+      await ExtensionMetadataService.consumeQuarantineSidecar(quarantinePath, sidecarToken);
       return false;
     }
     if (!ExtensionMetadataService.isValidMetadataFileShape(sidecarParsed)) {
@@ -1382,7 +1479,7 @@ export class ExtensionMetadataService {
     }
     // Consumed either way: every surviving sidecar entry is now represented
     // at the main path.
-    await ExtensionMetadataService.consumeQuarantineSidecar(quarantinePath);
+    await ExtensionMetadataService.consumeQuarantineSidecar(quarantinePath, sidecarToken);
     return false;
   }
 

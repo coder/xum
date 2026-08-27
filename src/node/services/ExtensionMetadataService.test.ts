@@ -905,6 +905,82 @@ describe("ExtensionMetadataService", () => {
     expect(snapshots.get("ws-partial")?.recency).toBe(300);
   });
 
+  test("mutations reconcile a stranded sidecar before saving and emitting", async () => {
+    // Normal recency/status/goal writes save and BROADCAST their snapshot.
+    // With a valid partial main beside a healthy full sidecar, the mutation
+    // must reconcile first — otherwise it persists and emits the partial
+    // view, clearing goal/status in the renderer until some read recovers.
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-live": { recency: 1, streaming: false } },
+      })
+    );
+    await writeFile(
+      `${filePath}.corrupt`,
+      JSON.stringify({
+        version: 1,
+        workspaces: {
+          "ws-live": { recency: 1, streaming: false },
+          "ws-other": { recency: 5, streaming: false },
+        },
+      })
+    );
+
+    await service.updateRecency("ws-live", 999);
+
+    const main = JSON.parse(await readFile(filePath, "utf-8")) as {
+      workspaces: Record<string, { recency?: number }>;
+    };
+    expect(main.workspaces["ws-other"]?.recency).toBe(5);
+    expect(main.workspaces["ws-live"]?.recency).toBe(999);
+    const sidecarGone = await readFile(`${filePath}.corrupt`, "utf-8").then(
+      () => false,
+      () => true
+    );
+    expect(sidecarGone).toBe(true);
+  });
+
+  test("consumption is scoped to the sidecar generation that was reconciled", async () => {
+    // With multiple processes recovering the fixed .corrupt path, another
+    // backend can consume the generation this process read and strand a NEW
+    // snapshot at the same path before the unlink runs. A path-only unlink
+    // would destroy that unreconciled generation permanently.
+    const quarantinePath = `${filePath}.corrupt`;
+    const internals = ExtensionMetadataService as unknown as {
+      statQuarantineToken(path: string): Promise<unknown>;
+      consumeQuarantineSidecar(path: string, token: unknown): Promise<void>;
+    };
+    await writeFile(
+      quarantinePath,
+      JSON.stringify({ version: 1, workspaces: { a: { recency: 1, streaming: false } } })
+    );
+    const staleToken = await internals.statQuarantineToken(quarantinePath);
+    // Concurrent recovery consumes that generation and quarantines a new
+    // snapshot at the same path (different content => different identity).
+    await rm(quarantinePath);
+    await writeFile(
+      quarantinePath,
+      JSON.stringify({ version: 1, workspaces: { b: { recency: 22222, streaming: false } } })
+    );
+
+    await internals.consumeQuarantineSidecar(quarantinePath, staleToken);
+    // The newer generation survives for its own recovery pass.
+    const survivor = JSON.parse(await readFile(quarantinePath, "utf-8")) as {
+      workspaces: Record<string, unknown>;
+    };
+    expect(survivor.workspaces.b).toBeDefined();
+
+    const currentToken = await internals.statQuarantineToken(quarantinePath);
+    await internals.consumeQuarantineSidecar(quarantinePath, currentToken);
+    const gone = await readFile(quarantinePath, "utf-8").then(
+      () => false,
+      () => true
+    );
+    expect(gone).toBe(true);
+  });
+
   test("quarantine preserves an existing healthy sidecar instead of clobbering it", async () => {
     // Crash strands the full snapshot at .corrupt; another backend recreates
     // the main file, which later becomes corrupt too. The next strict read's

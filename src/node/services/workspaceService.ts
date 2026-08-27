@@ -13478,7 +13478,15 @@ export class WorkspaceService extends EventEmitter {
       // unreadable): only that availability path may serve a response with
       // the cross-process removal guards disabled.
       let scopedFailOpen = false;
+      // Ids the SCOPE's strict enumeration itself vouched for, captured
+      // before raw-view additions: the authoritative-removal fallback below
+      // may treat mid-list enumeration absence as removal evidence only for
+      // these ids — raw-registered ids the normalized view cannot see
+      // (invalid project path) are legitimately absent from every
+      // enumeration and must not read that absence as removal.
+      let scopeEnumerationIds: ReadonlySet<string> | null = null;
       if (prefetchedKnownIds != null) {
+        scopeEnumerationIds = new Set(prefetchedKnownIds);
         workspaceIds = prefetchedKnownIds;
         // The prune enumerated config BEFORE the snapshot read above, so a
         // workspace registered in between would be missing here — and an
@@ -13504,6 +13512,7 @@ export class WorkspaceService extends EventEmitter {
           // fail-open fallback below instead of silently resolving as the
           // empty default and dropping every live entry from the list.
           workspaceIds = await this.enumerateAuthoritativeWorkspaceIds();
+          scopeEnumerationIds = workspaceIds;
         } catch (error) {
           // Fail open: without the config view, stale ids cannot be told apart
           // from live ones, and dropping live entries would strand renderer
@@ -13727,15 +13736,26 @@ export class WorkspaceService extends EventEmitter {
         }
       }
       const isRemovedPerAuthoritativeIdentity = (workspaceId: string): boolean =>
-        initialConfigIds != null &&
-        !initialConfigIds.has(workspaceId) &&
-        // An id visible in the FRESH raw view is verifiably registered
-        // regardless of what the (possibly earlier) authoritative
-        // enumeration saw — e.g. a workspace registered after that
-        // enumeration ran must not read as removed.
-        !(freshConfigIds?.has(workspaceId) ?? false) &&
-        authoritativeIds != null &&
-        !authoritativeIds.has(workspaceId);
+        (initialConfigIds != null &&
+          !initialConfigIds.has(workspaceId) &&
+          // An id visible in the FRESH raw view is verifiably registered
+          // regardless of what the (possibly earlier) authoritative
+          // enumeration saw — e.g. a workspace registered after that
+          // enumeration ran must not read as removed.
+          !(freshConfigIds?.has(workspaceId) ?? false) &&
+          authoritativeIds != null &&
+          !authoritativeIds.has(workspaceId)) ||
+        // Raw view unavailable (initial evidence read or post-enumeration
+        // refresh failed): the mid-list authoritative enumeration is the
+        // only usable post-removal view — without this arm an inline-id
+        // workspace removed during that enumeration would ride the
+        // authoritative response with every raw guard disabled and no
+        // cross-process event to repair the renderer. Confined to ids the
+        // scope enumeration itself vouched for (see scopeEnumerationIds).
+        (freshConfigIds == null &&
+          authoritativeIds != null &&
+          (scopeEnumerationIds?.has(workspaceId) ?? false) &&
+          !authoritativeIds.has(workspaceId));
       // Tombstones are process-local removal knowledge; the shared config is
       // the authority. A downgraded concurrent backend can legitimately
       // re-register a deterministic legacy id this process pruned earlier —

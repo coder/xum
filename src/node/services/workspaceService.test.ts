@@ -5687,6 +5687,108 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("mid-list enumeration proves removal when the raw refresh fails", async () => {
+    // An inline-id workspace is removed by another backend while the
+    // mid-list authoritative enumeration awaits, and the post-enumeration
+    // raw refresh fails transiently. The raw comparison is disabled (fresh
+    // view null) and the id sits in the initial baseline, so without the
+    // enumeration fallback every removal guard passes and the stale entry
+    // rides the authoritative response with no event to repair the
+    // renderer.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "inline-removed-mid-enum";
+      const projectPath = path.join(config.rootDir, "project");
+      const configPath = path.join(config.rootDir, "config.json");
+      await fsPromises.writeFile(
+        configPath,
+        JSON.stringify({
+          projects: [
+            [
+              projectPath,
+              {
+                workspaces: [
+                  { id: workspaceId, path: path.join(projectPath, "ws") },
+                  // Id-less legacy entry whose stable id lives in session
+                  // metadata.json: raw-INVISIBLE at the initial baseline, so
+                  // its retained entry forces the mid-list authoritative
+                  // enumeration this test exercises (the read-time migration
+                  // may persist the id later, but the baseline predates it).
+                  { path: path.join(projectPath, "legacy-ws") },
+                ],
+              },
+            ],
+          ],
+        })
+      );
+      const legacyStableId = "legacy-stable-mid-enum";
+      const legacySessionDir = config.getSessionDir("legacy-ws");
+      await fsPromises.mkdir(legacySessionDir, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(legacySessionDir, "metadata.json"),
+        JSON.stringify({ id: legacyStableId, name: "legacy-ws" })
+      );
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency(workspaceId, 77);
+      await extensionMetadata.updateRecency(legacyStableId, 55);
+      const realEnumerate = config.getAllWorkspaceMetadata.bind(config);
+      let enumerationCalls = 0;
+      let failEvidenceReads = false;
+      const enumerationSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(
+        async (options?: Parameters<typeof realEnumerate>[0]) => {
+          enumerationCalls += 1;
+          if (enumerationCalls === 2) {
+            // Mid-list enumeration: another backend deregisters the inline-id
+            // workspace just before the config read, and every later raw
+            // view read fails transiently.
+            const parsed = JSON.parse(await fsPromises.readFile(configPath, "utf-8")) as {
+              projects: Array<[string, { workspaces: Array<{ id?: string }> }]>;
+            };
+            for (const [, projectConfig] of parsed.projects) {
+              projectConfig.workspaces = projectConfig.workspaces.filter(
+                (workspace) => workspace.id !== workspaceId
+              );
+            }
+            await fsPromises.writeFile(configPath, JSON.stringify(parsed));
+            const result = await realEnumerate(options);
+            failEvidenceReads = true;
+            return result;
+          }
+          return realEnumerate(options);
+        }
+      );
+      const realEvidence = config.readPersistedWorkspaceIdEvidence.bind(config);
+      const evidenceSpy = spyOn(config, "readPersistedWorkspaceIdEvidence").mockImplementation(
+        () => {
+          if (failEvidenceReads) {
+            throw new Error("transient raw config read failure");
+          }
+          return realEvidence();
+        }
+      );
+      try {
+        const workspaceService = createWorkspaceServiceForTest({
+          config,
+          historyService,
+          extensionMetadata,
+        });
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList).not.toBeNull();
+        // The still-registered raw-invisible entry survives the fallback...
+        expect(activityList?.[legacyStableId]?.recency).toBe(55);
+        // ...while the enumeration-proven removal is dropped.
+        expect(activityList?.[workspaceId]).toBeUndefined();
+      } finally {
+        enumerationSpy.mockRestore();
+        evidenceSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("first bootstrap reuses the prune's config enumeration for scoping", async () => {
     // getAllWorkspaceMetadata walks every workspace with per-workspace disk
     // probes; the latency-sensitive first bootstrap must not pay it twice.
