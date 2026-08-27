@@ -1220,11 +1220,12 @@ const ASSIGNMENT_START = new RegExp(`^${ASSIGNMENT_NAME}`);
 /**
  * A parameter expansion that can turn into nothing at runtime: an unset variable. No
  * plain `$NAME` can gain a value mid-command without an assignment the redaction
- * already rewrites. The specials Bash always fills under `-c` ($0, $?, $#, $$, $-)
- * stay literal instead: their `$` spelling already breaks a token run for the scan,
- * and deleting a value the runtime inserts would manufacture no-override matches from
- * fragments that never join. Positionals and `$@`/`$*`/`$!` are carriers, because the
- * same command string can populate them first (`set -- p`, `&`).
+ * already rewrites, so deletion models its only dangerous runtime faithfully. Every
+ * special parameter is a carrier instead: positionals and `$@`/`$*`/`$!` because the
+ * command string can populate them first (`set -- p`, `&`), and the always-set ones
+ * ($0, $?, $#, $$, $-) because their expansions produce token-charset output
+ * (`ghp_...$#` runs with a trailing `0`) that completes a credential no textual scan
+ * of the spelling reconstructs.
  */
 const SIMPLE_EXPANSION = /^\$[A-Za-z_][A-Za-z0-9_]*/;
 
@@ -1584,7 +1585,7 @@ function findActiveShellConstructs(command: string): {
           continue;
         }
         if (command[j] === "`") found.carrier = true;
-        if (command[j] === "$" && "({[!123456789@*".includes(command[j + 1] ?? "")) {
+        if (command[j] === "$" && "({[!0123456789@*#?$-".includes(command[j + 1] ?? "")) {
           found.carrier = true;
         }
         j += 1;
@@ -1607,7 +1608,7 @@ function findActiveShellConstructs(command: string): {
       continue;
     }
     if (char === "$") {
-      if ("({['\"!123456789@*".includes(command[i + 1] ?? "")) found.carrier = true;
+      if ("({['\"!0123456789@*#?$-".includes(command[i + 1] ?? "")) found.carrier = true;
       i += 1;
       wordStart = false;
       continue;
@@ -1679,7 +1680,17 @@ function splitCommandComments(command: string): Array<{ code: string; comment: s
   return pieces;
 }
 
+/**
+ * Fail closed before any per-character analysis: mcp.jsonc may be megabytes, and the
+ * walks below hold per-character state (projection copies, brace stacks), so an
+ * adversarial brace wall could stall the synchronous main process for seconds and
+ * balloon memory. No legitimate portable command approaches this length; beyond it the
+ * command goes machine-local without being parsed at all.
+ */
+const MAX_ANALYZED_COMMAND_LENGTH = 32_768;
+
 function redactCommandEnvAssignments(command: string): string {
+  if (command.length > MAX_ANALYZED_COMMAND_LENGTH) return REDACTED_BACKUP_VALUE;
   const pieces = splitCommandComments(command);
   const redactedPieces = pieces.map((piece) =>
     piece.code.replace(

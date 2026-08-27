@@ -764,23 +764,31 @@ describe("backup payload", () => {
     expect(mcp.servers.grafana.command).toBe(`TOKEN=${REDACTED_BACKUP_VALUE} mcp-server`);
   });
 
-  it("keeps always-set special parameters from manufacturing a credential block", async () => {
-    // Under `bash -c`, $0 is the shell name: the fragments never join at runtime, and
-    // the published `$` keeps the run broken for the scan, so creation must succeed.
-    await writeFixtureFile(
-      muxRoot,
-      "mcp.jsonc",
-      JSON.stringify({
-        servers: { grafana: { command: "mcp --pattern ghp_aaaaaaaaaa$0bbbbbbbbbb" } },
-      })
-    );
-    const payload = await createBackupPayload({
-      muxRoot,
-      muxVersion: "1.2.3",
-      sourceLabel: "test-host",
-      reportSecrets: true,
-    });
-    expect(payloadFileText(payload, "mcp.jsonc")).toContain("ghp_aaaaaaaaaa$0bbbbbbbbbb");
+  it("localizes always-set special parameters instead of blocking or publishing", async () => {
+    // Their expansions produce token-charset output ($# is `0`, $0 the shell name), so
+    // `ghp_...$#` runs with a completed credential no scan of the spelling sees, while
+    // deleting them would manufacture no-override blocks; machine-local avoids both,
+    // and creation must succeed either way.
+    for (const command of [
+      "mcp --pattern ghp_aaaaaaaaaa$0bbbbbbbbbb",
+      "mcp --token ghp_aaaaaaaaaaaaaaaaaaa$#",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+    }
   });
 
   it("stops the credential scan at a Bash comment but resumes on the next line", async () => {
@@ -1277,6 +1285,26 @@ describe("backup payload", () => {
           grafana: { command: "set -- p; mcp --token gh$1_1234567890abcdefghijklmnopqrstuvwxyz" },
         },
       })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("localizes an oversized command without parsing it", async () => {
+    // The per-character walks hold state proportional to command length, so an
+    // adversarial brace wall must go machine-local before any analysis allocates.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: `mcp ${"{".repeat(40000)}` } } })
     );
     const payload = await createBackupPayload({
       muxRoot,

@@ -359,6 +359,10 @@ export function BackupSection() {
     setStatusMessage(null);
     setPreview(null);
     setOverrideSecretScan(false);
+    // Cleared before the await, so a rejection (transport failure, not a scan result)
+    // cannot leave a previous scan's override rendering beside an unrelated error.
+    setSecretScanBlocked(false);
+    setSecretScanApproval(null);
 
     try {
       const result = await api.backup.preview(savedDraft);
@@ -372,7 +376,6 @@ export function BackupSection() {
         return;
       }
       setPreview(result.data);
-      setSecretScanBlocked(false);
       const nextApprovals = result.data.commandApprovals;
       // An approval only covers the exact command text the user read, so a changed list
       // has to be read again.

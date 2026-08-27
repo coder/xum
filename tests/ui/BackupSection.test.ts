@@ -435,6 +435,32 @@ describe("BackupSection", () => {
     expect(canvas.queryByRole("checkbox", { name: "Override secret scan" })).toBeNull();
   });
 
+  test("clears a stale override when a preview rejects outright", async () => {
+    const { client, view } = renderBackupSection();
+    const canvas = within(view.container);
+    await canvas.findByText("Settings backup");
+
+    jest.spyOn(client.backup, "push").mockResolvedValueOnce({
+      success: false,
+      error: {
+        code: "SECRET_DETECTED",
+        message: "Potential secrets were found in the backup payload: AGENTS.md",
+        files: ["AGENTS.md"],
+        secretApproval: "digest-stale",
+      },
+    });
+    fireEvent.click(canvas.getByRole("button", { name: "Back up now" }));
+    await canvas.findByText(/Potential secrets were found/i);
+    expect(canvas.getByRole("checkbox", { name: "Override secret scan" })).toBeTruthy();
+
+    // A rejection is a transport failure, not a scan result: the previous scan's
+    // override must not keep rendering beside the unrelated error.
+    jest.spyOn(client.backup, "preview").mockRejectedValueOnce(new Error("ipc closed"));
+    fireEvent.click(canvas.getByRole("button", { name: "Preview changes" }));
+    await canvas.findByText(/ipc closed/i);
+    expect(canvas.queryByRole("checkbox", { name: "Override secret scan" })).toBeNull();
+  });
+
   test("sends the approved digest and resets when the blocked payload changes", async () => {
     const { client, view } = renderBackupSection();
     const canvas = within(view.container);
