@@ -1747,6 +1747,8 @@ describe("backup payload", () => {
       "sudo -s 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
       "watch 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
       'python3 -c \'__import__("os").environ.update({"T":"ghp_Abcdef1234"+"Klmno56789"})\'',
+      // Interpreter options before the eval option keep tracking armed.
+      "python3 -u -c 'x'",
       "node -e \"require('child_process').spawnSync('mcp',['--token','ghp_Abcdef1234'+'Klmno56789'])\"",
       'deno eval \'const_t="ghp_Abcdef1234"+"Klmno56789"\'',
       // PHP executes -r/-R run code and -B/-E begin/end code operands alike.
@@ -1775,6 +1777,10 @@ describe("backup payload", () => {
     for (const command of [
       "node ./server.js --transport stdio",
       "python3 -m mcp_server --port 8080",
+      // Dash-led words after the script/module operand belong to that program, not
+      // the interpreter: server.py receives -c, Rails receives -e.
+      "python3 server.py -c settings.toml",
+      "ruby app.rb -e production",
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -4241,6 +4247,8 @@ describe("backup payload", () => {
       "https://mcp.example.com/mcp?api_key=hunter2",
       "https://mcp.example.com/mcp?clientSecret=abc",
       "https://mcp.example.com/mcp?apiToken=hunter2",
+      "https://mcp.example.com/mcp?x-api-key=hunter2",
+      "https://mcp.example.com/mcp?X-Auth-Token=hunter2",
       "https://mcp.example.com/mcp?private_token=hunter2",
       "https://mcp.example.com/mcp?sessionToken=hunter2",
       "https://mcp.example.com/mcp?code=review",

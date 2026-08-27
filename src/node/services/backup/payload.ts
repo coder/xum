@@ -1671,7 +1671,15 @@ function hasDisguisedAssignment(redacted: string): boolean {
       if (pattern.test(unquoted)) return true;
     }
     const language = LANGUAGE_INTERPRETERS.find((entry) => entry.name.test(executable));
-    if (language) pendingEvalWords.add(language.evalWord);
+    if (language) {
+      pendingEvalWords.add(language.evalWord);
+    } else if (pendingEvalWords.size > 0 && !unquoted.startsWith("-")) {
+      // A non-option word no pending pattern matched is the script/module operand:
+      // later dash-led words belong to that program (`python3 server.py -c
+      // settings.toml` hands -c to server.py), so eval tracking ends here and the
+      // file launchers this table intends to preserve stay portable.
+      pendingEvalWords.clear();
+    }
     // Option terminators end option parsing: past one even a dash-led word is an
     // operand, so `env -- --evil=x` sets an environment entry despite the option look.
     // GNU `env` documents `[-]` as a terminator too, and the consumer sees the word

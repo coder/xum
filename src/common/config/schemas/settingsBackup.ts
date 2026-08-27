@@ -128,7 +128,11 @@ function parametersContainCredential(
 ): boolean {
   for (const [name, value] of parameters) {
     const normalizedName = name.toLowerCase().replace(/[^a-z0-9]/g, "");
-    if (value !== "" && names.has(normalizedName)) return true;
+    if (value === "") continue;
+    if (names.has(normalizedName)) return true;
+    // Header-style spellings prefix the same names with `x` (`x-api-key`,
+    // `X-Auth-Token`), so one stripped leading `x` matches the whole class.
+    if (normalizedName.startsWith("x") && names.has(normalizedName.slice(1))) return true;
   }
   return false;
 }
