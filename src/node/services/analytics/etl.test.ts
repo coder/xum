@@ -291,7 +291,7 @@ describe("rebuildAll", () => {
 
     const result = await rebuildAll(conn, createMissingSessionsDir());
 
-    expect(result).toEqual({ workspacesIngested: 0 });
+    expect(result).toEqual({ workspacesIngested: 0, failedWorkspaceIds: new Set() });
     expect(getSqlStatements(runMock)).toEqual([
       "BEGIN TRANSACTION",
       "DELETE FROM events",
@@ -341,7 +341,7 @@ describe("rebuildAll", () => {
 
     const result = await rebuildAll(conn, sessionsDir, {});
 
-    expect(result).toEqual({ workspacesIngested: 1 });
+    expect(result.workspacesIngested).toBe(1);
     expect(await queryEventCount(conn)).toBe(1);
   });
 });
@@ -1217,7 +1217,7 @@ describe("ingestArchivedSubagentTranscripts", () => {
 
     const result = await rebuildAll(conn, sessionsDir);
 
-    expect(result).toEqual({ workspacesIngested: 1 });
+    expect(result).toEqual({ workspacesIngested: 1, failedWorkspaceIds: new Set() });
     expect(await queryEventCount(conn)).toBe(2);
     expect(await queryEventCount(conn, parentWorkspaceId)).toBe(1);
     expect(await queryEventCount(conn, childWorkspaceId)).toBe(1);
@@ -1713,5 +1713,41 @@ describe("deleteCorruptAnalyticsRows", () => {
 
     // Idempotent: nothing left to delete.
     expect(await deleteCorruptAnalyticsRows(conn)).toBe(0);
+  });
+
+  test("exempts failed-ingest workspaces from watermark evidence but not length evidence", async () => {
+    const conn = await createTestConn();
+
+    // A poison record makes this workspace's ingest throw before its
+    // watermark write on every retry; its real partial rows must survive
+    // the post-sync sweep or the workspace's spend disappears permanently.
+    await conn.run("INSERT INTO events (workspace_id, model, total_cost_usd) VALUES (?, ?, ?)", [
+      "ws-failed-ingest",
+      "anthropic:claude-haiku-4-5",
+      1.0,
+    ]);
+    await conn.run(
+      `INSERT INTO delegation_rollups (parent_workspace_id, child_workspace_id, model)
+       VALUES (?, ?, ?)`,
+      ["ws-failed-ingest", "child-a", "openai:gpt-5.6-sol"]
+    );
+    // Length evidence is structural corruption regardless of exemption.
+    await conn.run(
+      "INSERT INTO events (workspace_id, parent_workspace_id, model) VALUES (?, ?, ?)",
+      ["ws-failed-ingest", "x".repeat(2000), "anthropic:claude-haiku-4-5"]
+    );
+
+    expect(await deleteCorruptAnalyticsRows(conn, new Set(["ws-failed-ingest"]))).toBe(1);
+
+    const eventRows = await queryRows(conn, "SELECT workspace_id, model FROM events");
+    expect(eventRows).toEqual([
+      { workspace_id: "ws-failed-ingest", model: "anthropic:claude-haiku-4-5" },
+    ]);
+    expect(await queryRows(conn, "SELECT child_workspace_id FROM delegation_rollups")).toEqual([
+      { child_workspace_id: "child-a" },
+    ]);
+
+    // A later pass without the exemption treats the same rows as orphans.
+    expect(await deleteCorruptAnalyticsRows(conn)).toBe(2);
   });
 });

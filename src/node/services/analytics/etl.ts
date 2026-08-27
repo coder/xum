@@ -865,6 +865,8 @@ export async function clearWorkspaceAnalyticsState(
   }
 }
 
+const CORRUPT_IDENTIFIER_MAX_LENGTH = 1024;
+
 /**
  * Self-healing sweep for a rare native-layer corruption class: a phantom row
  * can materialize whose every VARCHAR column is the concatenation of that
@@ -882,7 +884,8 @@ export async function clearWorkspaceAnalyticsState(
  *    IDs are short hex; migrated legacy IDs are
  *    `${projectBasename}-${workspaceBasename}` (config.generateLegacyId),
  *    each basename bounded by the filesystem's NAME_MAX (255 bytes), so 511
- *    is the ceiling. Agent IDs/types also derive from basenames. Cap at 1024.
+ *    is the construction ceiling. Agent IDs/types also derive from basenames.
+ *    CORRUPT_IDENTIFIER_MAX_LENGTH doubles that ceiling for headroom.
  *
  * 2. Workspace identity unknown to ingest_watermarks. A concatenation of two
  *    or more workspace IDs can never equal a real workspace ID, no matter how
@@ -891,29 +894,42 @@ export async function clearWorkspaceAnalyticsState(
  *    run after those passes complete). If a crash lands between the event
  *    write and the watermark write, deleting the orphans is still safe: the
  *    missing watermark makes the next syncCheck re-ingest that workspace from
- *    disk in full. delegation_rollups joins on parent_workspace_id only;
+ *    disk in full. The exception is a workspace whose ingest FAILED in the
+ *    current pass (a poison record makes every retry throw before the
+ *    watermark write): callers pass those IDs as preserveWorkspaceIds so the
+ *    sweep does not delete a failing workspace's real rows after every sync.
+ *    delegation_rollups joins on parent_workspace_id only;
  *    child_workspace_id may legitimately reference a removed child workspace.
  */
-export async function deleteCorruptAnalyticsRows(conn: DuckDBConnection): Promise<number> {
+export async function deleteCorruptAnalyticsRows(
+  conn: DuckDBConnection,
+  preserveWorkspaceIds: ReadonlySet<string> = new Set()
+): Promise<number> {
+  // Length evidence stays authoritative for preserved workspaces; only the
+  // watermark-membership evidence is exempted for them.
+  const preserveList = [...preserveWorkspaceIds]
+    .map((id) => `'${id.replaceAll("'", "''")}'`)
+    .join(", ");
+
   const eventsResult = await conn.run(`
     DELETE FROM events
-    WHERE LENGTH(workspace_id) > 1024
-       OR LENGTH(parent_workspace_id) > 1024
-       OR LENGTH(agent_id) > 1024
-       OR NOT EXISTS (
+    WHERE LENGTH(workspace_id) > ${CORRUPT_IDENTIFIER_MAX_LENGTH}
+       OR LENGTH(parent_workspace_id) > ${CORRUPT_IDENTIFIER_MAX_LENGTH}
+       OR LENGTH(agent_id) > ${CORRUPT_IDENTIFIER_MAX_LENGTH}
+       OR (NOT EXISTS (
          SELECT 1 FROM ingest_watermarks w WHERE w.workspace_id = events.workspace_id
-       )
+       )${preserveList ? ` AND events.workspace_id NOT IN (${preserveList})` : ""})
   `);
 
   const rollupsResult = await conn.run(`
     DELETE FROM delegation_rollups
-    WHERE LENGTH(parent_workspace_id) > 1024
-       OR LENGTH(child_workspace_id) > 1024
-       OR LENGTH(agent_type) > 1024
-       OR NOT EXISTS (
+    WHERE LENGTH(parent_workspace_id) > ${CORRUPT_IDENTIFIER_MAX_LENGTH}
+       OR LENGTH(child_workspace_id) > ${CORRUPT_IDENTIFIER_MAX_LENGTH}
+       OR LENGTH(agent_type) > ${CORRUPT_IDENTIFIER_MAX_LENGTH}
+       OR (NOT EXISTS (
          SELECT 1 FROM ingest_watermarks w
          WHERE w.workspace_id = delegation_rollups.parent_workspace_id
-       )
+       )${preserveList ? ` AND delegation_rollups.parent_workspace_id NOT IN (${preserveList})` : ""})
   `);
 
   return eventsResult.rowsChanged + rollupsResult.rowsChanged;
@@ -1843,7 +1859,7 @@ export async function rebuildAll(
   conn: DuckDBConnection,
   sessionsDir: string,
   workspaceMetaById: WorkspaceMetaById = {}
-): Promise<{ workspacesIngested: number }> {
+): Promise<{ workspacesIngested: number; failedWorkspaceIds: Set<string> }> {
   assert(sessionsDir.trim().length > 0, "rebuildAll: sessionsDir is required");
   assert(
     isRecord(workspaceMetaById) && !Array.isArray(workspaceMetaById),
@@ -1868,7 +1884,7 @@ export async function rebuildAll(
     entries = await fs.readdir(sessionsDir, { withFileTypes: true });
   } catch (error) {
     if (isRecord(error) && error.code === "ENOENT") {
-      return { workspacesIngested: 0 };
+      return { workspacesIngested: 0, failedWorkspaceIds: new Set() };
     }
 
     throw error;
@@ -1999,5 +2015,5 @@ export async function rebuildAll(
     }
   }
 
-  return { workspacesIngested };
+  return { workspacesIngested, failedWorkspaceIds };
 }

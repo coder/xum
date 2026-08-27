@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { parentPort } from "node:worker_threads";
 import { DuckDBInstance, type DuckDBConnection } from "@duckdb/node-api";
 import { getErrorMessage } from "@/common/utils/errors";
+import { log } from "@/node/services/log";
 import { decideSyncPlan, type SyncAction } from "./backfillDecision";
 import { shouldCheckpointAfterSync } from "./checkpointDecision";
 import {
@@ -158,18 +159,17 @@ async function handleInit(data: InitData): Promise<void> {
  * worker error and disable analytics until restart) or fail an
  * otherwise-successful ingest, so errors are logged and swallowed.
  */
-async function sweepCorruptRows(context: string): Promise<void> {
+async function sweepCorruptRows(
+  context: string,
+  preserveWorkspaceIds?: ReadonlySet<string>
+): Promise<void> {
   try {
-    const deleted = await deleteCorruptAnalyticsRows(getConn());
+    const deleted = await deleteCorruptAnalyticsRows(getConn(), preserveWorkspaceIds);
     if (deleted > 0) {
-      process.stderr.write(
-        `[analytics-worker] Deleted ${deleted} corrupt analytics row(s) (${context})\n`
-      );
+      log.info(`[analytics-worker] Deleted ${deleted} corrupt analytics row(s) (${context})`);
     }
   } catch (error) {
-    process.stderr.write(
-      `[analytics-worker] Corrupt-row sweep failed (${context}): ${getErrorMessage(error)}\n`
-    );
+    log.warn(`[analytics-worker] Corrupt-row sweep failed (${context}): ${getErrorMessage(error)}`);
   }
 }
 
@@ -194,8 +194,8 @@ async function handleRebuildAll(data: RebuildAllData): Promise<{ workspacesInges
   // A completed rebuild priced everything with the current tables; refresh the
   // fingerprint so the next sync check does not schedule a redundant rebuild.
   await storePricingFingerprint(getConn());
-  await sweepCorruptRows("rebuildAll");
-  return result;
+  await sweepCorruptRows("rebuildAll", result.failedWorkspaceIds);
+  return { workspacesIngested: result.workspacesIngested };
 }
 
 async function handleClearWorkspace(data: ClearWorkspaceData): Promise<void> {
@@ -408,7 +408,7 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
   }
 
   if (plan.action === "full_rebuild") {
-    const { workspacesIngested } = await rebuildAll(
+    const { workspacesIngested, failedWorkspaceIds } = await rebuildAll(
       getConn(),
       data.sessionsDir,
       data.workspaceMetaById
@@ -416,7 +416,7 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
     if (pricingFingerprintChanged) {
       await storePricingFingerprint(getConn());
     }
-    await sweepCorruptRows("syncCheck full_rebuild");
+    await sweepCorruptRows("syncCheck full_rebuild", failedWorkspaceIds);
     await checkpointIfNeeded(plan.action, workspacesIngested, 0);
 
     const elapsedMs = Math.round(performance.now() - syncStartMs);
@@ -432,6 +432,7 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
   }
 
   let workspacesIngested = 0;
+  const failedIngestWorkspaceIds = new Set<string>();
   for (const workspaceId of plan.workspaceIdsToIngest) {
     const discoveredWorkspace = discoveredWorkspacesById.get(workspaceId);
     assert(
@@ -457,6 +458,7 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
       await ingestWorkspace(getConn(), workspaceId, discoveredWorkspace.sessionDir, workspaceMeta);
       workspacesIngested += 1;
     } catch (error) {
+      failedIngestWorkspaceIds.add(workspaceId);
       process.stderr.write(
         `[analytics-worker] Failed to ingest workspace during sync check (${workspaceId}): ${getErrorMessage(error)}\n`
       );
@@ -475,7 +477,7 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
     }
   }
 
-  await sweepCorruptRows("syncCheck incremental");
+  await sweepCorruptRows("syncCheck incremental", failedIngestWorkspaceIds);
   await checkpointIfNeeded(plan.action, workspacesIngested, workspacesPurged);
 
   const elapsedMs = Math.round(performance.now() - syncStartMs);
