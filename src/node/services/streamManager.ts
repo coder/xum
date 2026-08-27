@@ -33,6 +33,7 @@ import type {
 
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import type { MuxMetadata, MuxMessage, PersistedToolModelUsage } from "@/common/types/message";
+import { hasTokenUsage, MODEL_FALLBACK_REFUSAL_TOOL_NAME } from "@/common/types/message";
 import {
   findFirstReasoningPartIndexInTrailingRun,
   mergeReasoningProviderOptions,
@@ -111,13 +112,6 @@ const EMPTY_STREAM_OUTPUT_ERROR_MESSAGE =
   "The model ended the stream before producing any assistant-visible output. This usually means the upstream stream was dropped rather than completed normally. Xum will retry automatically when possible, and if retries keep failing you should try again or switch models.";
 
 const MAX_EMPTY_STREAM_RECOVERY_ATTEMPTS = 1;
-
-/**
- * toolModelUsages entry marker for a refused fallback attempt. Analytics keys
- * on this exact string (events.tool_name), and the sidecar flatten path uses
- * it to relabel refusal usage as "refused_stream" on non-committed turns.
- */
-const MODEL_FALLBACK_REFUSAL_TOOL_NAME = "model_fallback_refusal";
 
 /** Drop reason for a partial that never reaches chat.jsonl. */
 type DroppedStreamSource = "aborted_stream" | "errored_stream";
@@ -528,17 +522,6 @@ function clonePersistedToolModelUsage(event: PersistedToolModelUsage): Persisted
     usage: { ...event.usage },
     ...(event.providerMetadata != null ? { providerMetadata: event.providerMetadata } : {}),
   };
-}
-
-function hasTokenUsage(usage: LanguageModelV2Usage | undefined): usage is LanguageModelV2Usage {
-  return (
-    usage !== undefined &&
-    ((usage.inputTokens ?? 0) > 0 ||
-      (usage.outputTokens ?? 0) > 0 ||
-      (usage.totalTokens ?? 0) > 0 ||
-      (usage.cachedInputTokens ?? 0) > 0 ||
-      (usage.reasoningTokens ?? 0) > 0)
-  );
 }
 
 function cloneUsage(usage: LanguageModelV2Usage): LanguageModelV2Usage {

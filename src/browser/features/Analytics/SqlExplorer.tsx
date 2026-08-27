@@ -41,11 +41,14 @@ export const SAMPLE_QUERIES = [
     sql: "SELECT requested_model, model as answered_model, count(*) as turns\nFROM events\nWHERE requested_model IS NOT NULL AND tool_name IS NULL\nGROUP BY requested_model, model\nORDER BY turns DESC;",
   },
   {
-    // Attempts are attributed to the model that actually ran: refusal rows
-    // already count the refused model's attempt, so the answered side must
-    // NOT coalesce requested_model (that would double-count downgraded turns).
+    // Every events row is one recorded invocation of `model` (committed turns,
+    // tool-internal calls, and billed errored/aborted/refused attempts via
+    // headless:* rows), so attempts = count(*) per model and refusal rows are
+    // a subset — billed non-refusal failures count in the denominator instead
+    // of inflating refusal_pct. Refusal rows already carry the refused model,
+    // so requested_model must not be coalesced in (double-count).
     label: "Refusal Rate by Model",
-    sql: "WITH answered AS (\n  SELECT model, count(*) as n FROM events\n  WHERE tool_name IS NULL AND model IS NOT NULL GROUP BY model\n),\nrefused AS (\n  SELECT model, count(*) as n FROM events\n  WHERE tool_name IN ('model_fallback_refusal', 'headless:refused_stream')\n    AND model IS NOT NULL GROUP BY model\n)\nSELECT COALESCE(a.model, r.model) as model,\n  COALESCE(r.n, 0) as refusals,\n  COALESCE(a.n, 0) + COALESCE(r.n, 0) as attempts,\n  ROUND(100.0 * COALESCE(r.n, 0) / NULLIF(COALESCE(a.n, 0) + COALESCE(r.n, 0), 0), 2) as refusal_pct\nFROM answered a FULL OUTER JOIN refused r USING (model)\nORDER BY refusals DESC;",
+    sql: "WITH attempts AS (\n  SELECT model, count(*) as n FROM events\n  WHERE model IS NOT NULL GROUP BY model\n),\nrefused AS (\n  SELECT model, count(*) as n FROM events\n  WHERE tool_name IN ('model_fallback_refusal', 'headless:refused_stream')\n    AND model IS NOT NULL GROUP BY model\n)\nSELECT a.model,\n  COALESCE(r.n, 0) as refusals,\n  a.n as attempts,\n  ROUND(100.0 * COALESCE(r.n, 0) / a.n, 2) as refusal_pct\nFROM attempts a LEFT JOIN refused r USING (model)\nORDER BY refusals DESC;",
   },
 ];
 

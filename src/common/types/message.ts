@@ -833,6 +833,29 @@ export interface PersistedToolModelUsage {
 }
 
 /**
+ * PersistedToolModelUsage.toolName marker for a refused fallback attempt.
+ * Analytics keys on this exact string (events.tool_name), the sidecar flatten
+ * path uses it to relabel refusal usage as "refused_stream", and the session
+ * ledger rebuild uses it to skip zero-usage refusal markers (which exist only
+ * so analytics can count refused attempts, never as ledger entries).
+ */
+export const MODEL_FALLBACK_REFUSAL_TOOL_NAME = "model_fallback_refusal";
+
+/** True when any token counter on the usage payload is positive. */
+export function hasTokenUsage(
+  usage: LanguageModelV2Usage | undefined
+): usage is LanguageModelV2Usage {
+  return (
+    usage !== undefined &&
+    ((usage.inputTokens ?? 0) > 0 ||
+      (usage.outputTokens ?? 0) > 0 ||
+      (usage.totalTokens ?? 0) > 0 ||
+      (usage.cachedInputTokens ?? 0) > 0 ||
+      (usage.reasoningTokens ?? 0) > 0)
+  );
+}
+
+/**
  * Record of a model-fallback chain application. `requestedModel` is the model
  * originally asked for; `refusedModels` lists every model that refused, in
  * chain order (the requested model is always the first entry). The effective
