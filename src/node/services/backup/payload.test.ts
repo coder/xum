@@ -386,6 +386,13 @@ describe("backup payload", () => {
       // ANSI-C and locale quoting hand env-style consumers their inner text.
       ["env $'TOKEN=hunter2' mcp-server", REDACTED_BACKUP_VALUE],
       ['env $"TOKEN=hunter2" mcp-server', REDACTED_BACKUP_VALUE],
+      // GNU env re-splits a split-string value into assignments.
+      ["env --split-string='TOKEN=hunter2 mcp-server'", REDACTED_BACKUP_VALUE],
+      ["env -STOKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
+      // Expansion bodies can smuggle assignment bytes past every lexical check.
+      ["env TOKEN$(printf =hunter2) mcp-server", REDACTED_BACKUP_VALUE],
+      ["env $'TOKEN\\x3dhunter2' mcp-server", REDACTED_BACKUP_VALUE],
+      ["mcp-run ${X:-hunter2}", REDACTED_BACKUP_VALUE],
     ];
     for (const [command, expected] of cases) {
       await expectCommandRedaction(command, expected);

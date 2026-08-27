@@ -1214,25 +1214,37 @@ function unquoteShellWord(word: string): string {
   return result;
 }
 
+/** GNU `env -S`/`--split-string` re-splits its attached value into assignments. */
+const SPLIT_STRING_OPTION = /^-[A-Za-z]*S|^--split-string/;
+
 /**
- * A word quote removal turns into a `NAME=value` assignment (`TOKEN\\=x`, `'TOKEN'=x`,
- * `"TOKEN=a b"`): the shell does not treat it as one, but `env`- and `eval`-style
- * consumers do, and where its value ends inside quoting is not decidable here. A word
- * already holding a marker was consumed by the replacement above (`A="B=1"` cannot fire).
+ * Words that hand a downstream consumer an assignment the shell itself does not see,
+ * none of them decidable here: a quote-mangled `NAME=` spelling for `env`/`eval`
+ * (`TOKEN\\=x`, `'TOKEN'=x`, `"TOKEN=a b"`), a quoted region whose whitespace an
+ * `env -S`-style re-split would break into assignments, or a split-string option with
+ * its value attached. A word already holding a marker was consumed by the replacement
+ * above (`A="B=1"` cannot fire).
  */
 function hasDisguisedAssignment(redacted: string): boolean {
   for (const word of redacted.match(SHELL_WORD) ?? []) {
     if (word.includes(REDACTED_BACKUP_VALUE) || !word.includes("=")) continue;
-    if (ASSIGNMENT_START.test(unquoteShellWord(word))) return true;
+    const unquoted = unquoteShellWord(word);
+    if (ASSIGNMENT_START.test(unquoted)) return true;
+    if (/\s/.test(unquoted)) return true;
+    if (SPLIT_STRING_OPTION.test(unquoted)) return true;
   }
   return false;
 }
 
 /**
- * `$(`, `\``, `${`, `<(`, and `>(` splice one word across whitespace the grammar cannot
- * see past.
+ * An expansion body can carry arbitrary bytes into one runtime word (`TOKEN$(printf
+ * =hunter2)`, `$'TOKEN\x3d...'`), so its mere presence makes assignment detection
+ * undecidable, whether or not the grammar matched an assignment elsewhere.
  */
-const SHELL_EXPANSION = /\$\(|\$\{|`|<\(|>\(/;
+const CARRIER_EXPANSION = /\$\(|\$\{|\$'|\$"|`/;
+
+/** Process substitution passes bytes by file, ambiguous once an assignment matched. */
+const PROCESS_SUBSTITUTION = /<\(|>\(/;
 
 function redactCommandEnvAssignments(command: string): string {
   const redacted = command.replace(
@@ -1246,7 +1258,8 @@ function redactCommandEnvAssignments(command: string): string {
   if (
     UNCONSUMED_ASSIGNMENT.test(redacted) ||
     hasDisguisedAssignment(redacted) ||
-    (redacted !== command && SHELL_EXPANSION.test(command))
+    CARRIER_EXPANSION.test(command) ||
+    (redacted !== command && PROCESS_SUBSTITUTION.test(command))
   ) {
     return REDACTED_BACKUP_VALUE;
   }
