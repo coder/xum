@@ -329,10 +329,16 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
 
   private async getExitCodeStrict(): Promise<number | null> {
     const exitCodePath = this.quotePath(`${this.outputDir}/${EXIT_CODE_FILENAME}`);
-    const result = await execBuffered(this.runtime, `cat ${exitCodePath} 2>/dev/null || echo ""`, {
-      cwd: FALLBACK_CWD,
-      timeout: 10,
-    });
+    // Absent marker means still running (exit 0, empty); any other cat failure (unreadable,
+    // replaced by a directory) must surface so the strict probe can count it.
+    const result = await execBuffered(
+      this.runtime,
+      `[ ! -e ${exitCodePath} ] || cat ${exitCodePath} 2>/dev/null`,
+      {
+        cwd: FALLBACK_CWD,
+        timeout: 10,
+      }
+    );
     this.assertMonitorProbeSucceeded("getExitCode", result.exitCode);
     const parsed = parseExitCode(result.stdout);
     // A nonempty marker that fails to parse is a corrupted write, not a still-running process.

@@ -1155,8 +1155,15 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     void this.monitorTailLoop(proc.id).catch((error: unknown) => {
       const current = this.processes.get(proc.id);
       // Identity check: a stale tail from a removed generation must not retire the monitor of a
-      // newer process that reused this display-name-derived ID.
-      if (current === proc && current.monitor && !current.monitor.stopped) {
+      // newer process that reused this display-name-derived ID. A claimed settlement also wins:
+      // its owner emits the deterministic terminal wake, so a late probe rejection must not
+      // convert a settling monitor into a runtime failure.
+      if (
+        current === proc &&
+        current.monitor &&
+        !current.monitor.stopped &&
+        !current.monitor.settled
+      ) {
         // No observer remains after this loop rejects. Stopping also makes later settlement claims
         // no-op, so this failure wake is the only lifecycle notice even if the process exits later.
         this.stopMonitor(current, true, "failed", {
