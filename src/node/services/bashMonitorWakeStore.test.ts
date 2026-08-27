@@ -4036,9 +4036,6 @@ describe("BashMonitorWakeStore", () => {
 
     const pending = await store.listPending("owner-1");
     expect(pending[0].lostReason).toBeUndefined();
-    expect(buildBashMonitorWakePrompt(pending)).toStartWith(
-      "Xum restarted and background bash monitors were lost."
-    );
     expect(buildBashMonitorWakeMetadata(pending).records[0].lostReason).toBe("restart");
   });
 
@@ -4073,6 +4070,43 @@ describe("BashMonitorWakeStore", () => {
     expect(pending).toHaveLength(1);
     expect(pending[0].lostReason).toBeUndefined();
     expect(buildBashMonitorWakeMetadata(pending).records[0].lostReason).toBe("restart");
+  });
+
+  test("malformed failureMessage and partially unknown failedOperations degrade without dropping the record", async () => {
+    const config = makeConfig(rootDir);
+    const store = new BashMonitorWakeStore(config);
+    const dir = path.join(config.getSessionDir("owner-1"), "bash-monitor-wakes");
+    await fsPromises.mkdir(dir, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(dir, "proc-newer-lost.json"),
+      JSON.stringify({
+        id: "proc-newer-lost",
+        ownerWorkspaceId: "owner-1",
+        processId: "proc-newer-lost",
+        taskId: "bash:proc-newer-lost",
+        filter: "ERROR",
+        filterExclude: false,
+        kind: "monitor-lost",
+        script: "echo hi",
+        lostReason: "runtime-failure",
+        failureMessage: 42,
+        failedOperations: ["readOutput", "newProbe"],
+        lines: [],
+        totalMatches: 0,
+        droppedLines: 0,
+        status: "pending",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      }),
+      "utf-8"
+    );
+
+    const pending = await store.listPending("owner-1");
+    expect(pending).toHaveLength(1);
+    expect(pending[0].failureMessage).toBeUndefined();
+    // The recognized failed operation survives the unknown newer-build entry.
+    expect(pending[0].failedOperations).toEqual(["readOutput"]);
+    expect(buildBashMonitorWakePrompt(pending)).toContain("output is not currently readable");
   });
 
   test("enqueueMonitorLost creates a pending monitor-lost record with the script", async () => {

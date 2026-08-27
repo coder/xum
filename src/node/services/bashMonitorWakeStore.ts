@@ -281,12 +281,20 @@ const BashMonitorWakeRecordSchema = z
     kind: z.enum(BASH_MONITOR_WAKE_KINDS).default("match"),
     script: z.string().optional(),
     lostReason: z.enum(["restart", "runtime-failure"]).optional().catch(undefined),
-    failureMessage: z.string().optional(),
+    failureMessage: z.string().optional().catch(undefined),
+    // Element-level degradation: an unknown operation from a newer build must not discard the
+    // still-recognized failures alongside it (or the whole record).
     failedOperations: z
-      .array(z.enum(["readOutput", "getExitCode"]))
+      .array(z.string().catch(""))
       .optional()
-      .catch(undefined),
-    monitorArmedAt: z.string().optional(),
+      .catch(undefined)
+      .transform((ops) => {
+        const known = ops?.filter(
+          (op): op is BashMonitorFailedOperation => op === "readOutput" || op === "getExitCode"
+        );
+        return known != null && known.length > 0 ? known : undefined;
+      }),
+    monitorArmedAt: z.string().optional().catch(undefined),
     lines: z.array(z.string()),
     totalMatches: z.number().int().nonnegative(),
     droppedLines: z.number().int().nonnegative(),
