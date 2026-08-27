@@ -6,8 +6,18 @@ log() {
   printf '[mux-run] %s\n' "$1"
 }
 
+report_status_line() {
+  printf '%s\n' "$1" >&2
+  if [[ -n "${MUX_STDERR_FILE:-}" ]]; then
+    printf '%s\n' "$1" >>"${MUX_STDERR_FILE}" 2>/dev/null || true
+  fi
+  if [[ -n "${MUX_STDERR_FILE:-}" && -n "${MUX_RUN_SESSION_ROOT:-}" ]]; then
+    cp -f "${MUX_STDERR_FILE}" "${MUX_RUN_SESSION_ROOT}/run-stderr.log" 2>/dev/null || true
+  fi
+}
+
 fatal() {
-  printf '[mux-run] ERROR: %s\n' "$1" >&2
+  report_status_line "[mux-run] ERROR: $1"
   exit 1
 }
 
@@ -80,7 +90,22 @@ cd "${MUX_APP_ROOT}"
 export XUM_DISABLE_PROJECT_AUTOMATION=1
 export MUX_DISABLE_PROJECT_AUTOMATION=1
 
-repo_driver_pattern='^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver|remote[.].*[.](uploadpack|receivepack|vcs)|core[.](sshcommand|gitproxy|askpass)|credential([.].*)?[.]helper|commit[.]gpgsign|tag[.]gpgsign|gpg([.].*)?[.]program)$'
+# NOTE: Harbor only automatically collects /logs/agent on timeouts.
+# Persist stdout/stderr there so partial agent output survives cancellation.
+MUX_LOG_DIR="${MUX_LOG_DIR:-/logs/agent/command-0}"
+mkdir -p "${MUX_LOG_DIR}"
+trap 'printf "%s" "$?" > "${MUX_LOG_DIR}/mux-run-exit-code.txt" 2>/dev/null || true' EXIT
+MUX_OUTPUT_FILE="${MUX_LOG_DIR}/stdout.txt"
+MUX_STDERR_FILE="${MUX_LOG_DIR}/stderr.txt"
+MUX_TOKEN_FILE="${MUX_TOKEN_FILE:-/tmp/mux-tokens.json}"
+
+# Pin the CLI's session data (chat.jsonl, session-usage.json) to a persistent
+# root instead of its ephemeral temp dir so the harness can archive it post-run.
+MUX_RUN_SESSION_ROOT="${MUX_RUN_SESSION_ROOT:-/tmp/mux-run-root}"
+export MUX_RUN_SESSION_ROOT
+mkdir -p "${MUX_RUN_SESSION_ROOT}"
+
+repo_driver_pattern='^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver|remote[.].*[.](uploadpack|receivepack|vcs)|core[.](sshcommand|gitproxy|askpass|editor)|sequence[.]editor|credential([.].*)?[.]helper|commit[.]gpgsign|tag[.]gpgsign|gpg([.].*)?[.]program)$'
 if timeout 15s git -C "${project_path}" config --name-only --includes --get-regexp "${repo_driver_pattern}" >/dev/null; then
   fatal "refusing to trust project with repo-controlled Git drivers"
 else
@@ -98,7 +123,15 @@ fi
 # silently strips delegation from every trial. Fatal on failure so a broken
 # config root surfaces as an infra error instead of an invisible handicap.
 log "trusting project ${project_path}"
-bun src/cli/trust.ts --dir "${project_path}" || fatal "failed to trust project ${project_path}"
+if timeout 60s bun src/cli/trust.ts --dir "${project_path}"; then
+  :
+else
+  trust_status=$?
+  if [[ "${trust_status}" -eq 124 ]]; then
+    fatal "timed out trusting project ${project_path}"
+  fi
+  fatal "failed to trust project ${project_path}"
+fi
 
 cmd=(bun src/cli/run.ts
   --dir "${project_path}"
@@ -139,21 +172,6 @@ if [[ -n "${MUX_RUN_ARGS:-}" ]]; then
   fi
   cmd+=("${mux_run_args[@]}")
 fi
-
-# NOTE: Harbor only automatically collects /logs/agent on timeouts.
-# Persist stdout/stderr there so partial agent output survives cancellation.
-MUX_LOG_DIR="${MUX_LOG_DIR:-/logs/agent/command-0}"
-mkdir -p "${MUX_LOG_DIR}"
-trap 'printf "%s" "$?" > "${MUX_LOG_DIR}/mux-run-exit-code.txt" 2>/dev/null || true' EXIT
-MUX_OUTPUT_FILE="${MUX_LOG_DIR}/stdout.txt"
-MUX_STDERR_FILE="${MUX_LOG_DIR}/stderr.txt"
-MUX_TOKEN_FILE="${MUX_TOKEN_FILE:-/tmp/mux-tokens.json}"
-
-# Pin the CLI's session data (chat.jsonl, session-usage.json) to a persistent
-# root instead of its ephemeral temp dir so the harness can archive it post-run.
-MUX_RUN_SESSION_ROOT="${MUX_RUN_SESSION_ROOT:-/tmp/mux-run-root}"
-export MUX_RUN_SESSION_ROOT
-mkdir -p "${MUX_RUN_SESSION_ROOT}"
 
 # Let Harbor classify task timeouts; GNU timeout would surface as exit 124.
 if [[ -n "${MUX_TIMEOUT_MS}" ]]; then
@@ -256,14 +274,6 @@ print(json.dumps(result))
 cp -f "${MUX_OUTPUT_FILE}" "${MUX_RUN_SESSION_ROOT}/run-stdout.jsonl" 2>/dev/null || true
 cp -f "${MUX_STDERR_FILE}" "${MUX_RUN_SESSION_ROOT}/run-stderr.log" 2>/dev/null || true
 cp -f "${MUX_TOKEN_FILE}" "${MUX_RUN_SESSION_ROOT}/mux-tokens.json" 2>/dev/null || true
-
-# Post-run status lines must survive transports that drop channel stderr:
-# append them to the collected stderr file and refresh its archived copy.
-report_status_line() {
-  printf '%s\n' "$1" >&2
-  printf '%s\n' "$1" >>"${MUX_STDERR_FILE}" 2>/dev/null || true
-  cp -f "${MUX_STDERR_FILE}" "${MUX_RUN_SESSION_ROOT}/run-stderr.log" 2>/dev/null || true
-}
 
 if [[ "${mux_status}" -eq 3 && "${mux_run_as_goal_enabled}" == "1" ]]; then
   report_status_line "[mux-run] WARNING: mux goal run stopped incomplete (exit 3); leaving workspace for verifier scoring"

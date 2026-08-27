@@ -40,6 +40,7 @@ class _RunnerSmokeResult:
     token_file: Path
     exit_code_file: Path
     timeout_marker: Path
+    trust_timeout_args_file: Path
     args_file: Path
 
 
@@ -56,6 +57,7 @@ def _run_mux_runner_smoke(
     timeout_ms: str | None = None,
     repo_git_config: tuple[str, str] | None = None,
     pretrust_git_timeout: bool = False,
+    trust_timeout: bool = False,
     fake_tee_exit_code: int | None = None,
     emit_run_complete: bool = True,
 ) -> _RunnerSmokeResult:
@@ -67,6 +69,7 @@ def _run_mux_runner_smoke(
     token_file = tmp_path / "mux-tokens.json"
     args_file = tmp_path / "bun-args.txt"
     timeout_marker = tmp_path / "timeout-invoked.txt"
+    trust_timeout_args_file = tmp_path / "trust-timeout-args.txt"
 
     app_root.mkdir()
     project_path.mkdir()
@@ -115,6 +118,14 @@ if [[ "${1:-}" == "15s" ]]; then
   shift
   exec "$@"
 fi
+if [[ "${1:-}" == "60s" ]]; then
+  printf '%s\n' "$*" >"${FAKE_TRUST_TIMEOUT_ARGS_FILE}"
+  if [[ "${FAKE_TRUST_TIMEOUT:-0}" == "1" ]]; then
+    exit 124
+  fi
+  shift
+  exec "$@"
+fi
 printf 'timeout invoked\n' >"${FAKE_TIMEOUT_MARKER}"
 exit 99
 """,
@@ -128,6 +139,8 @@ exit 99
             "FAKE_MUX_EXIT_CODE": str(exit_code),
             "FAKE_TIMEOUT_MARKER": str(timeout_marker),
             "FAKE_PRETRUST_GIT_TIMEOUT": "1" if pretrust_git_timeout else "0",
+            "FAKE_TRUST_TIMEOUT": "1" if trust_timeout else "0",
+            "FAKE_TRUST_TIMEOUT_ARGS_FILE": str(trust_timeout_args_file),
             "MUX_APP_ROOT": str(app_root),
             "MUX_LOG_DIR": str(log_dir),
             "MUX_PROJECT_PATH": str(project_path),
@@ -161,6 +174,7 @@ exit 99
         token_file=token_file,
         exit_code_file=log_dir / MuxAgent._RUN_EXIT_CODE_NAME,
         timeout_marker=timeout_marker,
+        trust_timeout_args_file=trust_timeout_args_file,
         args_file=args_file,
     )
 
@@ -246,6 +260,10 @@ def test_mux_runner_scores_goal_mode_incomplete_exit(tmp_path: Path) -> None:
     trust_args = Path(f"{result.args_file}.trust").read_text()
     assert "src/cli/trust.ts" in trust_args
     assert str(tmp_path / "project") in trust_args
+    timeout_args = result.trust_timeout_args_file.read_text()
+    assert timeout_args.startswith("60s ")
+    assert "bun src/cli/trust.ts --dir" in timeout_args
+    assert str(tmp_path / "project") in timeout_args
     assert json.loads(result.token_file.read_text()) == {
         "input": 7,
         "output": 11,
@@ -264,7 +282,14 @@ def test_mux_runner_scores_goal_mode_incomplete_exit(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "config_key",
-    ["merge.evil.driver", "diff.external", "remote.origin.uploadpack", "gpg.program"],
+    [
+        "merge.evil.driver",
+        "diff.external",
+        "remote.origin.uploadpack",
+        "gpg.program",
+        "core.editor",
+        "sequence.editor",
+    ],
 )
 def test_mux_runner_rejects_git_driver_before_trust(
     tmp_path: Path, config_key: str
@@ -294,6 +319,21 @@ def test_mux_runner_refuses_trust_when_git_inspection_times_out(tmp_path: Path) 
     assert (
         "timed out inspecting repository automation drivers" in result.completed.stderr
     )
+    assert not Path(f"{result.args_file}.trust").exists()
+
+
+def test_mux_runner_refuses_trust_when_trust_command_times_out(tmp_path: Path) -> None:
+    result = _run_mux_runner_smoke(
+        tmp_path,
+        exit_code=0,
+        trust_timeout=True,
+    )
+
+    assert result.completed.returncode == 1
+    assert "timed out trusting project" in result.completed.stderr
+    assert "timed out trusting project" in (result.log_dir / "stderr.txt").read_text()
+    session_stderr = result.log_dir.parents[2] / "session-root" / "run-stderr.log"
+    assert "timed out trusting project" in session_stderr.read_text()
     assert not Path(f"{result.args_file}.trust").exists()
 
 
