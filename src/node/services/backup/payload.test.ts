@@ -14,6 +14,7 @@ import {
   MAX_BACKUP_DIRECTORY_COUNT,
   MAX_BACKUP_FILE_BYTES,
   MAX_BACKUP_FILE_COUNT,
+  MAX_ANALYZED_COMMAND_LENGTH,
   MAX_BACKUP_MCP_REDACTIONS,
   MAX_BACKUP_MCP_REDACTION_PATH_SEGMENTS,
   MAX_BACKUP_MCP_REDACTION_SEGMENTS,
@@ -1612,6 +1613,9 @@ describe("backup payload", () => {
       "set -a; printf -v TOKEN %s ghp_aaaaaaaaaabbbbbbbbbb; mcp",
       // `shopt -so allexport` flips the same allexport state `set -a` does.
       "shopt -so allexport; printf -v TOKEN %s%s ghp_aaaaaaaaaa bbbbbbbbbb; mcp",
+      // `source` and `.` run a file in this shell with fragments as positionals.
+      "source ./launch ghp_aaaaaaaaaa bbbbbbbbbb",
+      ". ./launch ghp_aaaaaaaaaa bbbbbbbbbb",
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -1649,10 +1653,11 @@ describe("backup payload", () => {
     expect(mcp.servers.grafana.command).toBe(portable);
   });
 
-  it("blocks every issued GitHub token prefix without an override", async () => {
-    // App user (ghu_), installation (ghs_), and refresh (ghr_) tokens are issued-only
-    // like ghp_/gho_; a collected documentation file must not publish any of them.
-    for (const prefix of ["ghu_", "ghs_", "ghr_"]) {
+  it("blocks every issued GitHub and Slack token prefix without an override", async () => {
+    // App user (ghu_), installation (ghs_), and refresh (ghr_) GitHub tokens and
+    // Slack app-level (xapp-) tokens are issued-only like ghp_/gho_/xoxb-; a
+    // collected documentation file must not publish any of them.
+    for (const prefix of ["ghu_", "ghs_", "ghr_", "xapp-1-"]) {
       await writeFixtureFile(
         muxRoot,
         "skills/demo/SKILL.md",
@@ -1669,6 +1674,30 @@ describe("backup payload", () => {
       expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
       expect((blocked as BackupCredentialDetectedError).files).toEqual(["skills/demo/SKILL.md"]);
     }
+  });
+
+  it("bounds aggregate command analysis across one config", async () => {
+    // Each command below the per-command cap still costs a per-character walk, so a
+    // near-8MB config of cap-length commands could freeze the main process for
+    // seconds; past the aggregate budget, commands localize without being parsed.
+    const wall = `mcp ${"{".repeat(MAX_ANALYZED_COMMAND_LENGTH - 4)}`;
+    const servers = Object.fromEntries(
+      Array.from({ length: 10 }, (_, index) => [`c${index}`, { command: wall }])
+    );
+    await writeFixtureFile(muxRoot, "mcp.jsonc", JSON.stringify({ servers }));
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: Record<string, { command: string }>;
+    };
+    // The first commands fit the budget and publish; the rest go machine-local.
+    expect(mcp.servers.c0?.command).toBe(wall);
+    expect(mcp.servers.c8?.command).toBe(REDACTED_BACKUP_VALUE);
+    expect(mcp.servers.c9?.command).toBe(REDACTED_BACKUP_VALUE);
   });
 
   it("localizes an oversized command without parsing it", async () => {

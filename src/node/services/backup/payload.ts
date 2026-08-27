@@ -84,7 +84,8 @@ const CREDENTIAL_TOKEN_PATTERNS = [
   /\blin_api_[A-Za-z0-9]{16,}\b/,
   /\bntn_[A-Za-z0-9]{16,}\b/,
   /\bAKIA[0-9A-Z]{16}\b/,
-  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/,
+  // Slack workspace (xox?-) and app-level (xapp-) issued tokens.
+  /\bx(?:ox[baprs]|app)-[A-Za-z0-9-]{10,}\b/,
 ] as const;
 
 /**
@@ -1513,6 +1514,12 @@ const SHELL_STATE_WORDS = new Set([
   // `shopt -so allexport` flips the same allexport state `set -a` does, and
   // `shopt -s expand_aliases` opens alias rewriting of later lines.
   "shopt",
+  // `source`/`.` run a file in this shell with the remaining words as positionals
+  // (`source ./launch ghp_aaa bbb` can join them into one runtime token). A bare `.`
+  // argument (the cwd) localizes with it: keywords like `do` make command-position
+  // detection undecidable here, so the dot fails closed like every ambiguous form.
+  "source",
+  ".",
 ]);
 
 /**
@@ -1849,7 +1856,15 @@ function removeActiveLineContinuations(command: string): string {
  * balloon memory. No legitimate portable command approaches this length; beyond it the
  * command goes machine-local without being parsed at all.
  */
-const MAX_ANALYZED_COMMAND_LENGTH = 32_768;
+export const MAX_ANALYZED_COMMAND_LENGTH = 32_768;
+
+/**
+ * The per-command cap composes: a near-8 MB mcp.jsonc can hold ~250 commands that each
+ * pass it, and their walks together still stall the synchronous main process for
+ * seconds. One aggregate budget per config bounds total analysis work; commands past
+ * it go machine-local unparsed, exactly like a single oversized command.
+ */
+export const MAX_TOTAL_ANALYZED_COMMAND_LENGTH = 8 * MAX_ANALYZED_COMMAND_LENGTH;
 
 function redactCommandEnvAssignments(command: string): string {
   if (command.length > MAX_ANALYZED_COMMAND_LENGTH) return REDACTED_BACKUP_VALUE;
@@ -1905,8 +1920,16 @@ function redactMcpConfig(content: Buffer): {
     redactionPaths.push([...jsonPath]);
   }
 
+  let analysisBudget = MAX_TOTAL_ANALYZED_COMMAND_LENGTH;
+
   function redactCommand(jsonPath: jsonc.JSONPath, command: string): void {
-    const redacted = redactCommandEnvAssignments(command);
+    let redacted: string;
+    if (command.length > analysisBudget) {
+      redacted = REDACTED_BACKUP_VALUE;
+    } else {
+      analysisBudget -= command.length;
+      redacted = redactCommandEnvAssignments(command);
+    }
     if (redacted === command) return;
     edits.push({ path: jsonPath, value: redacted });
     redactionPaths.push([...jsonPath]);
