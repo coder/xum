@@ -1986,6 +1986,21 @@ function redactCommandEnvAssignments(command: string): string {
   return analyzed === command ? rewritten : REDACTED_BACKUP_VALUE;
 }
 
+/**
+ * Non-interactive Bash consults inherited startup state before parsing its `-c`
+ * command: a non-empty `BASH_ENV` names a file it sources first, and `BASH_FUNC_*`
+ * environment entries import exported functions. Either hook can redefine any command
+ * word (`mcp(){ mcp --token "$2$3"; }`), so the word-level semantics every command
+ * analyzer above relies on stop binding. The stdio launch inherits this process's
+ * environment (mcpServerManager passes commands to `runtime.exec`, a `bash -c`), so
+ * while a hook is present commands go machine-local without being analyzed at all.
+ * An empty `BASH_ENV` sources nothing and is inert.
+ */
+function isBashStartupHookVariable(name: string, value: unknown): boolean {
+  if (name.startsWith("BASH_FUNC_")) return true;
+  return name === "BASH_ENV" && value !== "" && value !== undefined;
+}
+
 function redactMcpConfig(content: Buffer): {
   content: Buffer;
   redactionPaths: BackupRedactionPath[];
@@ -2001,10 +2016,17 @@ function redactMcpConfig(content: Buffer): {
   }
 
   let analysisBudget = MAX_TOTAL_ANALYZED_COMMAND_LENGTH;
+  const ambientStartupHooks = Object.entries(process.env).some(([name, value]) =>
+    isBashStartupHookVariable(name, value)
+  );
 
-  function redactCommand(jsonPath: jsonc.JSONPath, command: string): void {
+  function redactCommand(
+    jsonPath: jsonc.JSONPath,
+    command: string,
+    serverStartupHooks = false
+  ): void {
     let redacted: string;
-    if (command.length > analysisBudget) {
+    if (ambientStartupHooks || serverStartupHooks || command.length > analysisBudget) {
       redacted = REDACTED_BACKUP_VALUE;
     } else {
       analysisBudget -= command.length;
@@ -2061,6 +2083,15 @@ function redactMcpConfig(content: Buffer): {
       continue;
     }
 
+    // Config env merges over the inherited environment at spawn, so a server entry can
+    // hook its own shell even when this process's environment is clean.
+    const serverEnv = readRecord(readOwn(server, "env"));
+    const serverStartupHooks =
+      serverEnv !== undefined &&
+      objectKeyNames(tree, ["servers", serverName, "env"]).some((name) =>
+        isBashStartupHookVariable(name, readOwn(serverEnv, name))
+      );
+
     for (const field of objectKeyNames(tree, ["servers", serverName])) {
       const fieldPath: jsonc.JSONPath = ["servers", serverName, field];
       const value = readOwn(server, field);
@@ -2074,7 +2105,8 @@ function redactMcpConfig(content: Buffer): {
           redact(fieldPath);
           continue;
         }
-        if (field === "command" && typeof value === "string") redactCommand(fieldPath, value);
+        if (field === "command" && typeof value === "string")
+          redactCommand(fieldPath, value, serverStartupHooks);
         // Whole-value, not in-string: the userinfo/parameter detection deliberately covers
         // malformed and percent-encoded spellings a partial rewrite could misparse and leave
         // the credential in. Restore puts the local url back at this path.

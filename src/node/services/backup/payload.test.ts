@@ -136,6 +136,23 @@ function withPayloadFileText(
   return { ...payload, files };
 }
 
+// Ambient Bash startup hooks (BASH_ENV, exported BASH_FUNC_* functions) localize every
+// command, which would silently flip portability expectations on hosts whose
+// environment carries them.
+let ambientStartupHookEnv: Array<[string, string]> = [];
+beforeEach(() => {
+  ambientStartupHookEnv = [];
+  for (const [name, value] of Object.entries(process.env)) {
+    if ((name === "BASH_ENV" || name.startsWith("BASH_FUNC_")) && value !== undefined) {
+      ambientStartupHookEnv.push([name, value]);
+      delete process.env[name];
+    }
+  }
+});
+afterEach(() => {
+  for (const [name, value] of ambientStartupHookEnv) process.env[name] = value;
+});
+
 describe("backup payload", () => {
   let tempDir: string;
   let muxRoot: string;
@@ -1556,6 +1573,79 @@ describe("backup payload", () => {
       expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
       expect((blocked as BackupCredentialDetectedError).files).toEqual(["skills/demo/SKILL.md"]);
     }
+  });
+
+  it("localizes every command while Bash startup hooks are inherited", async () => {
+    // A sourced BASH_ENV file or an imported exported function can redefine any
+    // command word (`mcp(){ mcp --token "$2$3"; }` joins published fragments), so no
+    // word-level analysis binds while the stdio spawn inherits a hook.
+    const portable = "mcp-server --port 8080";
+    const fixture = JSON.stringify({ servers: { grafana: { command: portable } } });
+    for (const [name, value] of [
+      ["BASH_ENV", "./startup.sh"],
+      ["BASH_FUNC_mcp%%", "() { :; }"],
+    ]) {
+      await writeFixtureFile(muxRoot, "mcp.jsonc", fixture);
+      process.env[name] = value;
+      try {
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { grafana: { command: string } };
+        };
+        expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+      } finally {
+        delete process.env[name];
+      }
+    }
+
+    // An empty BASH_ENV sources nothing, so analysis keeps its authority.
+    await writeFixtureFile(muxRoot, "mcp.jsonc", fixture);
+    process.env.BASH_ENV = "";
+    try {
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(mcp.servers.grafana.command).toBe(portable);
+    } finally {
+      delete process.env.BASH_ENV;
+    }
+  });
+
+  it("localizes a server's command when its config env installs startup hooks", async () => {
+    // server.env merges over the inherited environment at spawn, so one entry can hook
+    // its own shell on a clean machine; only that server's command goes local.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: {
+          hooked: { command: "mcp-server --port 8080", env: { BASH_ENV: "./startup.sh" } },
+          clean: { command: "other-server --flag value" },
+        },
+      })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { hooked: { command: string }; clean: { command: string } };
+    };
+    expect(mcp.servers.hooked.command).toBe(REDACTED_BACKUP_VALUE);
+    expect(mcp.servers.clean.command).toBe("other-server --flag value");
   });
 
   it("localizes commands that write files through active redirection", async () => {
