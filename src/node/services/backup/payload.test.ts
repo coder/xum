@@ -1623,6 +1623,11 @@ describe("backup payload", () => {
       // Windows spellings: .exe suffix, backslash paths, case-insensitive names.
       "bash.exe -c 'printf${IFS}%s${IFS}ghp_Abcdef1234\\Klmno56789'",
       "'C:\\Tools\\PWSH.EXE' -c 'printf${IFS}%s${IFS}ghp_Abcdef1234\\Klmno56789'",
+      // Language interpreters concatenate fragments under their own grammar when a
+      // script-evaluation option is present.
+      'python3 -c \'__import__("os").environ.update({"T":"ghp_Abcdef1234"+"Klmno56789"})\'',
+      "node -e \"require('child_process').spawnSync('mcp',['--token','ghp_Abcdef1234'+'Klmno56789'])\"",
+      'deno eval \'const_t="ghp_Abcdef1234"+"Klmno56789"\'',
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -1639,6 +1644,29 @@ describe("backup payload", () => {
         servers: { grafana: { command: string } };
       };
       expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+
+    // Without a script-evaluation option the interpreter runs a file: the everyday
+    // portable MCP launchers must keep publishing.
+    for (const command of [
+      "node ./server.js --transport stdio",
+      "python3 -m mcp_server --port 8080",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const filePayload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const fileMcp = jsonc.parse(payloadFileText(filePayload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(fileMcp.servers.grafana.command).toBe(command);
     }
 
     // `||` is a control operator: no bytes flow between its sides.
@@ -1665,7 +1693,7 @@ describe("backup payload", () => {
     // Slack app-level (xapp-) tokens, and Stripe live secret/restricted keys
     // (sk_live_/rk_live_) are issued-only like ghp_/gho_/xoxb-; a collected
     // documentation file must not publish any of them.
-    for (const prefix of ["ghu_", "ghs_", "ghr_", "xapp-1-", "sk_live_", "rk_live_"]) {
+    for (const prefix of ["ghu_", "ghs_", "ghr_", "xapp-1-", "sk_live_", "rk_live_", "npm_"]) {
       await writeFixtureFile(
         muxRoot,
         "skills/demo/SKILL.md",

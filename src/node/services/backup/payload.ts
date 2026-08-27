@@ -89,6 +89,8 @@ const CREDENTIAL_TOKEN_PATTERNS = [
   // Stripe live secret and restricted keys. Test-mode keys stay reviewable:
   // documentation routinely quotes them, and the block has no override.
   /\b[sr]k_live_[A-Za-z0-9]{16,}\b/,
+  // npm issued access tokens.
+  /\bnpm_[A-Za-z0-9]{24,}\b/,
 ] as const;
 
 /**
@@ -1529,6 +1531,25 @@ const SHELL_INTERPRETER_NAMES = new Set([
 ]);
 
 /**
+ * Language interpreters whose script-evaluation spellings reparse an operand under the
+ * language's own grammar, where quoted fragments concatenate into one runtime value
+ * (`python3 -c '..."ghp_a"+"b"...'`, `node -e "...'ghp_a'+'b'..."`, `deno eval ...`).
+ * Only the evaluation spelling localizes: file launchers (`node server.js`,
+ * `python -m pkg`) are the everyday portable MCP commands and stay published. Cluster
+ * spellings count (`-Bc`, `-pe`); which letters evaluate is per-interpreter knowledge
+ * this table owns, unlike arbitrary programs' options.
+ */
+const LANGUAGE_INTERPRETERS: Array<{ name: RegExp; evalWord: RegExp }> = [
+  { name: /^python[0-9.]*$/, evalWord: /^-[A-Za-z]*c/ },
+  { name: /^(?:node|nodejs)$/, evalWord: /^(?:--eval|--print|-[A-Za-z]*[ep])/ },
+  { name: /^bun$/, evalWord: /^(?:--eval|--print|-[A-Za-z]*[ep])/ },
+  { name: /^deno$/, evalWord: /^eval$/ },
+  { name: /^perl[0-9.]*$/, evalWord: /^-[A-Za-z]*[eE]/ },
+  { name: /^ruby[0-9.]*$/, evalWord: /^-[A-Za-z]*e/ },
+  { name: /^php[0-9.]*$/, evalWord: /^-[A-Za-z]*[rR]/ },
+];
+
+/**
  * Builtins that rewrite shell state the word scans cannot follow: `eval` reparses its
  * concatenated arguments, and the others give a shell-built value environment or
  * parameter visibility without any `=` or `$` spelling. Matched on quote-removed
@@ -1561,6 +1582,7 @@ const SHELL_STATE_WORDS = new Set([
  */
 function hasDisguisedAssignment(redacted: string): boolean {
   let operandsOnly = false;
+  const pendingEvalWords: RegExp[] = [];
   for (const word of redacted.match(SHELL_WORD) ?? []) {
     if (CONSUMED_ASSIGNMENT.test(word)) continue;
     // Bash expands neither syntax from quoted or escaped text (`--config
@@ -1580,8 +1602,13 @@ function hasDisguisedAssignment(redacted: string): boolean {
     if (SHELL_STATE_WORDS.has(unquoted)) return true;
     const executable = unquoted
       .slice(Math.max(unquoted.lastIndexOf("/"), unquoted.lastIndexOf("\\")) + 1)
-      .toLowerCase();
-    if (SHELL_INTERPRETER_NAMES.has(executable.replace(/\.exe$/, ""))) return true;
+      .toLowerCase()
+      .replace(/\.exe$/, "");
+    if (SHELL_INTERPRETER_NAMES.has(executable)) return true;
+    // An evaluation word after a language interpreter hands that grammar a script.
+    if (pendingEvalWords.some((pattern) => pattern.test(unquoted))) return true;
+    const language = LANGUAGE_INTERPRETERS.find((entry) => entry.name.test(executable));
+    if (language) pendingEvalWords.push(language.evalWord);
     // Option terminators end option parsing: past one even a dash-led word is an
     // operand, so `env -- --evil=x` sets an environment entry despite the option look.
     // GNU `env` documents `[-]` as a terminator too, and the consumer sees the word
