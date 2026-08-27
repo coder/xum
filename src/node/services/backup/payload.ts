@@ -1502,6 +1502,11 @@ function hasDisguisedAssignment(redacted: string): boolean {
     if (hasActiveBraceExpansion(activeWordProjection(word))) return true;
     if (hasNondeterministicGlob(word)) return true;
     const unquoted = unquoteShellWord(word);
+    // `eval` concatenates its arguments and reparses the result, dissolving one more
+    // layer of quoting than any single-pass scan models (`ghp_a\\\\b` reaches the
+    // process as `ghp_ab`), wherever the word sits: even mid-command it still names
+    // the builtin to some consumer (`env eval ...`, `bash -c 'eval ...'`).
+    if (unquoted === "eval") return true;
     // Option terminators end option parsing: past one even a dash-led word is an
     // operand, so `env -- --evil=x` sets an environment entry despite the option look.
     // GNU `env` documents `[-]` as a terminator too, and the consumer sees the word
@@ -1554,8 +1559,9 @@ function hasDisguisedAssignment(redacted: string): boolean {
  * no scan of the spelling reconstructs. Any of them makes assignment detection
  * undecidable. A
  * here-document or here-string feeds the consumer a body under document rules the word
- * scans would misread. Process substitution passes bytes by file, ambiguous once an
- * assignment matched. With `extglob` inherited via BASHOPTS, `?( *( +( @( !(` open one
+ * scans would misread. Process substitution hands the consumer a file whose bytes its
+ * inner script chooses (`--token-file <(printf a;printf b)` delivers the joined
+ * credential), assignment or not. With `extglob` inherited via BASHOPTS, `?( *( +( @( !(` open one
  * pathname pattern whose file match can complete a credential, undecidable like any
  * glob. Single-quoted, escaped, and commented spellings are inert
  * (`--pattern '$(date)'` is a literal argument a raw-string test would localize), while
@@ -1793,7 +1799,6 @@ function redactCommandEnvAssignments(command: string): string {
       (_match, lead: string, name: string) => `${lead}${name}${REDACTED_BACKUP_VALUE}`
     )
   );
-  const code = pieces.map((piece) => piece.code).join("");
   const redactedCode = redactedPieces.join("");
   // When an assignment's boundaries cannot be trusted, no partial rewrite can be either,
   // so the whole command goes local and restore puts the exact text back. The residue and
@@ -1805,7 +1810,7 @@ function redactCommandEnvAssignments(command: string): string {
     hasDisguisedAssignment(redactedCode) ||
     constructs.carrier ||
     constructs.heredoc ||
-    (redactedCode !== code && constructs.processSubstitution)
+    constructs.processSubstitution
   ) {
     return REDACTED_BACKUP_VALUE;
   }

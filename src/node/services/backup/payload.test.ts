@@ -1461,6 +1461,51 @@ describe("backup payload", () => {
     expect(localizedMcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
   });
 
+  it("localizes reparse and file-synthesis constructs regardless of assignments", async () => {
+    // `eval` concatenates and reparses its arguments, dissolving a second quoting
+    // layer (`ghp_aaaaaaaaaa\\bbbbbbbbbb` loses one backslash per parse and runs
+    // contiguous), and a process substitution's inner script can synthesize a
+    // credential file; neither needs an assignment, so both localize on their own.
+    for (const command of [
+      "eval mcp --token ghp_aaaaaaaaaa\\\\bbbbbbbbbb",
+      "mcp --token-file <(printf ghp_aaaaaaaaaa;printf bbbbbbbbbb)",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+
+    // A word merely containing the letters stays an ordinary argument.
+    const portable = "run-mcp --formatter evaluate";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: portable } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(portable);
+  });
+
   it("localizes an oversized command without parsing it", async () => {
     // The per-character walks hold state proportional to command length, so an
     // adversarial brace wall must go machine-local before any analysis allocates.
