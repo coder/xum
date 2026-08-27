@@ -123,6 +123,7 @@ export function gitNoRepoAutomationEnv(): Record<string, string> {
 export const GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN =
   "^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver|remote[.].*[.](uploadpack|receivepack|vcs|proxy)|alias[.].*|pager[.].*|browser[.].*[.](cmd|path)|difftool[.].*[.](cmd|path)|mergetool[.].*[.](cmd|path)|guitool[.].*[.]cmd|man[.].*[.](cmd|path)|sendemail[.].*[.](ccCmd|headerCmd|toCmd))$";
 export const MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES = 256 * 1024;
+const GIT_CONDITIONAL_INCLUDE_CONFIG_KEY_PATTERN = "^includeif[.].*[.]path$";
 
 const REPO_AUTOMATION_CONFIG_KEY_REGEX =
   /^(filter|diff|merge|remote)[.](.+)[.](clean|smudge|process|required|command|textconv|driver|uploadpack|receivepack|vcs|proxy)$/i;
@@ -278,9 +279,33 @@ export async function gitNoRepoAutomationEnvForRuntimeRepo(
   signal?: AbortSignal
 ): Promise<Record<string, string>> {
   const baseEnv = gitNoRepoAutomationEnv();
+  const prefix = `${gitEnvPrefix(baseEnv)}LC_ALL=C `;
+  const includeResult = await execBuffered(
+    runtime,
+    `${prefix}git config --null --name-only --get-regexp ${shellQuote(
+      GIT_CONDITIONAL_INCLUDE_CONFIG_KEY_PATTERN
+    )}`,
+    {
+      cwd: repoPath,
+      timeout: 10,
+      abortSignal: signal,
+      maxOutputBytes: MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES + 1,
+    }
+  );
+  if (includeResult.exitCode === 0 && includeResult.stdout.length > 0) {
+    throw new Error("Refusing git operation with conditional config includes");
+  }
+  if (includeResult.exitCode !== 1 || includeResult.stdout.length > 0) {
+    throw new Error(
+      includeResult.stderr.trim() ||
+        includeResult.stdout.trim() ||
+        "Failed to inspect repository conditional includes"
+    );
+  }
+
   const result = await execBuffered(
     runtime,
-    `${gitEnvPrefix(baseEnv)}LC_ALL=C git config --null --includes --get-regexp ${shellQuote(
+    `${prefix}git config --null --includes --get-regexp ${shellQuote(
       GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN
     )}`,
     {
@@ -329,6 +354,34 @@ export async function gitNoRepoAutomationEnvForLocalRepo(
   signal?: AbortSignal
 ): Promise<Record<string, string>> {
   const baseEnv = gitNoRepoAutomationEnv();
+  try {
+    using includeProc = execFileAsync(
+      "git",
+      [
+        "-C",
+        repoPath,
+        "config",
+        "--null",
+        "--name-only",
+        "--get-regexp",
+        GIT_CONDITIONAL_INCLUDE_CONFIG_KEY_PATTERN,
+      ],
+      {
+        env: { ...baseEnv, LC_ALL: "C" },
+        signal,
+        timeoutMs: 10_000,
+        maxOutputBytes: MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES,
+        killTreeOnTermination: true,
+      }
+    );
+    await includeProc.result;
+    throw new Error("Refusing git operation with conditional config includes");
+  } catch (error) {
+    if (!isNoMatchingConfigError(error)) {
+      throw new Error("Failed to inspect repository conditional includes", { cause: error });
+    }
+  }
+
   try {
     using proc = execFileAsync(
       "git",

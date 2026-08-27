@@ -1634,6 +1634,7 @@ describe("remote bash git hardening", () => {
     const runtime = {
       exec(command: string, options: ExecOptions): Promise<ExecStream> {
         calls.push({ command, options });
+        if (command.includes("includeif[.]")) return Promise.resolve(createExecStream("", 1));
         if (options.cwd === "/remote/workspace/project-a") {
           return Promise.resolve(createExecStream("", 1));
         }
@@ -1668,12 +1669,12 @@ describe("remote bash git hardening", () => {
     )) as BashToolResult;
 
     expect(result.success).toBe(true);
-    expect(calls).toHaveLength(3);
+    expect(calls).toHaveLength(5);
     expect(calls[0]?.options.cwd).toBe("/remote/workspace/project-a");
-    expect(calls[1]?.options.cwd).toBe("/remote/workspace/project-b");
-    expect(calls[2]?.options.env?.ANTHROPIC_API_KEY).toBe("");
-    expect(Object.values(calls[2]?.options.env ?? {})).toContain("filter.evil.smudge");
-    expect(Object.values(calls[2]?.options.env ?? {})).toContain("alias.evil");
+    expect(calls[2]?.options.cwd).toBe("/remote/workspace/project-b");
+    expect(calls[4]?.options.env?.ANTHROPIC_API_KEY).toBe("");
+    expect(Object.values(calls[4]?.options.env ?? {})).toContain("filter.evil.smudge");
+    expect(Object.values(calls[4]?.options.env ?? {})).toContain("alias.evil");
   });
 
   it("fails closed when remote driver discovery fails", async () => {
@@ -1681,7 +1682,7 @@ describe("remote bash git hardening", () => {
     const runtime = {
       exec(): Promise<ExecStream> {
         callCount += 1;
-        return Promise.resolve(createExecStream("", callCount === 1 ? 1 : 2));
+        return Promise.resolve(createExecStream("", callCount < 3 ? 1 : 2));
       },
     } as unknown as Runtime;
     const config = createTestToolConfig("/remote/workspace");
@@ -1708,10 +1709,8 @@ describe("remote bash git hardening", () => {
       rejection = error;
     }
     expect(rejection).toBeInstanceOf(Error);
-    expect((rejection as Error).message).toContain(
-      "Failed to inspect repository automation drivers"
-    );
-    expect(callCount).toBe(2);
+    expect((rejection as Error).message).toContain("Failed to inspect repository");
+    expect(callCount).toBe(3);
   });
 
   it("blanks run-session roots inherited by local Bash", async () => {

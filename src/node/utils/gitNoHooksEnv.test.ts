@@ -550,6 +550,28 @@ describe("gitNoRepoAutomationEnv", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout.toString()).toContain("---PRIMARY---\nmain");
   });
+
+  test("refuses conditional config includes before branch changes", async () => {
+    using tmp = new DisposableTempDir("git-conditional-include");
+    const repo = path.join(tmp.path, "repo");
+    const includedConfig = path.join(repo, ".git", "other-branch.config");
+    await fs.mkdir(repo, { recursive: true });
+    await Bun.$`git init -b main`.cwd(repo).quiet();
+    await Bun.$`git config user.email test@example.com`.cwd(repo).quiet();
+    await Bun.$`git config user.name Test`.cwd(repo).quiet();
+    await Bun.$`git commit --allow-empty -m init`.cwd(repo).quiet();
+    await fs.writeFile(includedConfig, '[filter "evil"]\n\tsmudge = cat\n', "utf-8");
+    await Bun.$`git config includeIf.onbranch:other.path other-branch.config`.cwd(repo).quiet();
+
+    let rejection: unknown;
+    try {
+      await gitNoRepoAutomationEnvForLocalRepo(repo);
+    } catch (error) {
+      rejection = error;
+    }
+    expect(rejection).toBeInstanceOf(Error);
+    expect((rejection as Error).message).toContain("conditional includes");
+  });
 });
 
 describe("gitHooksAllowed", () => {

@@ -93,11 +93,26 @@ async function runSubmoduleCommand(args: {
 
 const FILTER_CONFIG_DISCOVERY_COMMAND = `
 set -e
+reject_conditional_includes() {
+  if git config --null --name-only "$@" --get-regexp '^includeif[.].*[.]path$' >/dev/null; then
+    return 4
+  else
+    status=$?
+    [ "$status" -eq 1 ]
+  fi
+}
 emit_filter_keys() {
   git config --null --name-only --includes "$@" --get-regexp '^filter[.].*[.](clean|smudge|process|required)$' || [ "$?" -eq 1 ]
 }
+reject_conditional_includes
 emit_filter_keys
 git submodule foreach --quiet --recursive '
+  if git config --null --name-only --get-regexp "^includeif[.].*[.]path$" >/dev/null; then
+    exit 4
+  else
+    status=$?
+    [ "$status" -eq 1 ] || exit "$status"
+  fi
   git config --null --name-only --includes --get-regexp "^filter[.].*[.](clean|smudge|process|required)$" || [ "$?" -eq 1 ]
 '
 `;
