@@ -6215,6 +6215,90 @@ describe("WorkspaceService activity list scoping", () => {
     }
   });
 
+  test("a revival landing between the enumeration and the raw refresh is re-checked, not dropped", async () => {
+    // The staleness window the post-refresh re-enumeration closes: the id
+    // is removed BEFORE the mid-list enumeration runs (so that enumeration
+    // denies it) and re-registered id-less right after it. The raw refresh
+    // then reports id-less entries — proof the earlier denial may be
+    // stale — so the removal arms must consult a fresh enumeration (which
+    // resolves the revived identity) instead of dropping the workspace on
+    // the stale denial and tombstoning it.
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    try {
+      const workspaceId = "revived-between-reads";
+      const projectPath = path.join(config.rootDir, "project");
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: workspaceId,
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const extensionMetadata = new ExtensionMetadataService(
+        path.join(config.rootDir, "extensionMetadata.json")
+      );
+      await extensionMetadata.updateRecency(workspaceId, 42);
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        extensionMetadata,
+      });
+      const internals = workspaceService as unknown as {
+        pruneStaleExtensionMetadataOnce(): Promise<unknown>;
+        enumerateAuthoritativeWorkspaceIds(): Promise<Set<string>>;
+      };
+      const realPrune = internals.pruneStaleExtensionMetadataOnce.bind(workspaceService);
+      let removed = false;
+      internals.pruneStaleExtensionMetadataOnce = async () => {
+        const prefetched = await realPrune();
+        // The cross-process removal lands after the initial baseline and
+        // the prune.
+        removed = true;
+        return prefetched;
+      };
+      const realEvidence = config.readPersistedWorkspaceIdEvidence.bind(config);
+      const evidenceSpy = spyOn(config, "readPersistedWorkspaceIdEvidence").mockImplementation(
+        () => {
+          const evidence = realEvidence();
+          if (!removed) {
+            return evidence;
+          }
+          // Post-removal raw views: the id is gone, and an unrelated
+          // id-less legacy entry keeps the view incomplete throughout.
+          const ids = new Set(evidence.ids);
+          ids.delete(workspaceId);
+          return { ids, hasWorkspaceEntriesWithoutIds: true };
+        }
+      );
+      const realEnumerate = internals.enumerateAuthoritativeWorkspaceIds.bind(workspaceService);
+      let postRemovalEnumerations = 0;
+      internals.enumerateAuthoritativeWorkspaceIds = async () => {
+        const ids = await realEnumerate();
+        if (!removed) {
+          return ids;
+        }
+        postRemovalEnumerations += 1;
+        if (postRemovalEnumerations === 1) {
+          // First post-removal enumeration: the removal is visible, the
+          // id-less re-registration has not landed yet — a stale denial.
+          ids.delete(workspaceId);
+        }
+        // Later enumerations resolve the revived id-less identity.
+        return ids;
+      };
+      try {
+        const activityList = await workspaceService.getActivityList();
+        expect(activityList).not.toBeNull();
+        expect(activityList?.[workspaceId]?.recency).toBe(42);
+        expect(extensionMetadata.isWorkspaceDeleted(workspaceId)).toBe(false);
+      } finally {
+        evidenceSpy.mockRestore();
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("first bootstrap admits snapshotless ids registered after the prune enumerated config", async () => {
     // A workspace another backend registers after the prune captured its id
     // set may have workflow- or bash-monitor-only activity and therefore no

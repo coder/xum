@@ -13754,6 +13754,27 @@ export class WorkspaceService extends EventEmitter {
           freshConfigIds = null;
           freshConfigHasRawInvisibleEntries = true;
         }
+        if (freshConfigHasRawInvisibleEntries) {
+          // The refresh postdates the enumeration and reveals id-less
+          // entries, so the enumeration's DENIALS may already be stale: an
+          // id removed before the enumeration can have been re-registered
+          // id-less (with fresh cross-process activity) in the gap, and
+          // trusting the stale denial would drop the revived workspace and
+          // tombstone it. Re-enumerate ONCE so the enumeration-backed
+          // removal arms use the freshest capable view; a revival landing
+          // after this last read is the contract's out-of-scope window
+          // (the next list's evidence clears any republished tombstone).
+          // The raw view deliberately stays at its pre-re-enumeration
+          // read: staleness there errs toward retention (an id present in
+          // the older view is kept), never toward a wrong drop. On failure
+          // fall back to retention, not the stale denial set.
+          try {
+            authoritativeIds = await this.enumerateAuthoritativeWorkspaceIds();
+          } catch (error) {
+            log.debug("Failed to re-enumerate authoritative ids after raw refresh", { error });
+            authoritativeIds = null;
+          }
+        }
       }
       const isRemovedPerAuthoritativeIdentity = (workspaceId: string): boolean =>
         (initialConfigIds != null &&
@@ -13788,11 +13809,14 @@ export class WorkspaceService extends EventEmitter {
       // exist — see the third trigger above) must DENY the id before the
       // transition counts as removal; an affirmation or a failed
       // enumeration retains the entry (keeping a stale entry briefly is
-      // recoverable, wrongly suppressing a live workspace is not). A
-      // revival landing after the enumeration but before the raw re-read
-      // is the contract's out-of-scope window: the next list's initial
-      // baseline no longer contains the id, so the raw arm cannot re-fire
-      // and its fresh evidence clears the republished tombstone.
+      // recoverable, wrongly suppressing a live workspace is not). The
+      // enumeration consulted here postdates the raw refresh whenever that
+      // refresh reports id-less entries (see the re-enumeration above), so
+      // a stale pre-refresh denial can never veto a revived id; a revival
+      // landing after that last enumeration is the contract's out-of-scope
+      // window — the next list's initial baseline no longer contains the
+      // id, so the raw arm cannot re-fire and its fresh evidence clears
+      // the republished tombstone.
       const isVerifiablyRemovedFromRawConfig = (workspaceId: string): boolean =>
         isRemovedFromConfig(workspaceId) &&
         (!freshConfigHasRawInvisibleEntries ||
@@ -14064,6 +14088,25 @@ export class WorkspaceService extends EventEmitter {
                 refreshedFinalEvidence.hasWorkspaceEntriesWithoutIds;
             } catch {
               // Keep the pre-enumeration read (possibly null).
+            }
+            if (finalConfigHasRawInvisibleEntries) {
+              // Same staleness rule as the mid-list re-enumeration: the
+              // refresh revealed id-less entries, so the enumeration's
+              // denials may predate an id-less re-registration — the
+              // enumeration-backed drops below must use the freshest
+              // capable view (a revival after this last read is the
+              // contract's out-of-scope window). The raw and snapshot
+              // views deliberately stay at their earlier reads: their
+              // staleness errs toward retention, never a wrong drop. On
+              // failure retain rather than trust the stale denial set.
+              try {
+                finalAuthoritativeIds = await this.enumerateAuthoritativeWorkspaceIds();
+              } catch (error) {
+                log.debug("Failed to re-enumerate authoritative ids after final raw refresh", {
+                  error,
+                });
+                finalAuthoritativeIds = null;
+              }
             }
           }
           // The retained-entry filter above ran BEFORE the workflow probes,
