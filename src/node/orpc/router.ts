@@ -1847,7 +1847,7 @@ export const router = (authToken?: string) => {
                   workspaceId: input.workspaceId ?? discoveryPath,
                   includeAgentPlugins,
                 });
-                const { targetDefinitionAiDefaults } = collectDefinitionLayers(
+                const { targetDefinitionAiDefaults, ancestors } = collectDefinitionLayers(
                   descriptor.id,
                   inheritanceChain
                 );
@@ -1875,6 +1875,7 @@ export const router = (authToken?: string) => {
                   descriptor,
                   resolvedFrontmatter,
                   targetDefinitionAiDefaults,
+                  ancestors,
                   uiSelectableBase,
                 };
               } catch {
@@ -1902,6 +1903,7 @@ export const router = (authToken?: string) => {
                 base: entry.resolvedFrontmatter.base,
                 aiDefaults: entry.resolvedFrontmatter.ai,
                 ownAiDefaults: entry.targetDefinitionAiDefaults,
+                aiAncestors: entry.ancestors,
                 tools: entry.resolvedFrontmatter.tools,
               },
             ];

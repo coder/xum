@@ -172,6 +172,36 @@ describe("resolveWorkspaceAiSettingsForAgent", () => {
     expect(result.resolvedThinking).toBe("high");
   });
 
+  test("uses embedded defaults from a non-selectable declared ancestor", () => {
+    const result = resolveWorkspaceAiSettingsForAgent({
+      agentId: "researcher",
+      agentAiDefaults: {},
+      fallbackModel: "openai:gpt-5.2-mini",
+      existingModel: "anthropic:claude-opus-4-6",
+      existingThinking: "off",
+      agents: [
+        {
+          id: "researcher",
+          base: "analysis",
+          aiAncestors: [
+            {
+              agentId: "analysis",
+              definitionAiDefaults: {
+                model: "openai:gpt-5.6-sol",
+                thinkingLevel: "high",
+              },
+            },
+            { agentId: "exec" },
+          ],
+        },
+      ],
+      mode: "explicit-switch",
+    });
+
+    expect(result?.resolvedModel).toBe("openai:gpt-5.6-sol");
+    expect(result?.resolvedThinking).toBe("high");
+  });
+
   test("ignores workspace-by-agent fallback when disabled", () => {
     const result = resolveWorkspaceAiSettingsForAgent({
       agentId: "exec",

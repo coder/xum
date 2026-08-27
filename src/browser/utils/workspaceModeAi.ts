@@ -65,7 +65,10 @@ export function resolveConfiguredAiDefaults(
 
 type WorkspaceAiResolutionMode = "explicit-switch" | "background-sync" | "creation-sync";
 
-type WorkspaceAgentDescriptor = Pick<AgentDefinitionDescriptor, "id" | "base" | "ownAiDefaults">;
+type WorkspaceAgentDescriptor = Pick<
+  AgentDefinitionDescriptor,
+  "id" | "base" | "ownAiDefaults" | "aiAncestors"
+>;
 
 interface WorkspaceAiResolutionArgs {
   agentId: string;
@@ -178,7 +181,15 @@ export function resolveWorkspaceAiSettingsForAgent(
   }
 
   const workspaceOverride = args.workspaceByAgent?.[normalizedAgentId];
-  const descriptorsById = buildAgentDescriptorLookup(args, mode !== "background-sync");
+  const includeDefinitionDefaults = mode !== "background-sync";
+  const descriptorsById = buildAgentDescriptorLookup(args, includeDefinitionDefaults);
+  const targetDescriptor = args.agents?.find(
+    (agent) => normalizeAgentId(agent.id) === normalizedAgentId
+  );
+  const ancestors =
+    includeDefinitionDefaults && targetDescriptor?.aiAncestors
+      ? targetDescriptor.aiAncestors
+      : collectDeclaredAncestorLayers(normalizedAgentId, descriptorsById);
   const resolved = resolveAgentAiSettings({
     targetAgentId: normalizedAgentId,
     profile: "interactive",
@@ -188,7 +199,7 @@ export function resolveWorkspaceAiSettingsForAgent(
         : undefined,
     agentAiDefaults: args.agentAiDefaults,
     targetDefinitionAiDefaults: descriptorsById.get(normalizedAgentId)?.definitionAiDefaults,
-    ancestors: collectDeclaredAncestorLayers(normalizedAgentId, descriptorsById),
+    ancestors,
     parentRuntime: {
       model: typeof args.existingModel === "string" ? args.existingModel : undefined,
       thinkingLevel: coerceThinkingLevel(args.existingThinking),

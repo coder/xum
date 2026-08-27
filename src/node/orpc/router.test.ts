@@ -108,6 +108,67 @@ describe("router agent definition routes", () => {
   });
 });
 
+describe("router agent definition ancestry", () => {
+  test("embeds disabled base defaults in selectable child descriptors", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "xum-router-agent-ancestry-test-"));
+    const previousXumRoot = process.env.XUM_ROOT;
+    const previousMuxRoot = process.env.MUX_ROOT;
+
+    try {
+      const xumRoot = path.join(tempDir, "xum-home");
+      const projectPath = path.join(tempDir, "project");
+      const projectAgentsRoot = path.join(projectPath, ".xum", "agents");
+      process.env.XUM_ROOT = xumRoot;
+      delete process.env.MUX_ROOT;
+
+      fs.mkdirSync(projectAgentsRoot, { recursive: true });
+      fs.writeFileSync(
+        path.join(projectAgentsRoot, "analysis.md"),
+        "---\nname: Analysis\nbase: exec\nai:\n  model: openai:gpt-5.6-sol\n  thinkingLevel: high\n---\nAnalyze.\n"
+      );
+      fs.writeFileSync(
+        path.join(projectAgentsRoot, "researcher.md"),
+        "---\nname: Researcher\nbase: analysis\n---\nResearch.\n"
+      );
+
+      const config = new Config(xumRoot);
+      await config.editConfig((current) => ({
+        ...current,
+        agentAiDefaults: {
+          ...current.agentAiDefaults,
+          analysis: { enabled: false },
+        },
+      }));
+      const context = {
+        config,
+        experimentsService: {
+          isExperimentEnabled: mock(() => false),
+        },
+      } as unknown as ORPCContext;
+      const client = createRouterClient(router(), { context });
+
+      const agents = await client.agents.list({ projectPath });
+      const researcher = agents.find((agent) => agent.id === "researcher");
+
+      expect(agents.some((agent) => agent.id === "analysis")).toBe(false);
+      expect(researcher?.aiAncestors?.map((ancestor) => ancestor.agentId)).toEqual([
+        "analysis",
+        "exec",
+      ]);
+      expect(researcher?.aiAncestors?.[0]?.definitionAiDefaults).toEqual({
+        model: "openai:gpt-5.6-sol",
+        thinkingLevel: "high",
+      });
+    } finally {
+      if (previousXumRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousXumRoot;
+      if (previousMuxRoot === undefined) delete process.env.MUX_ROOT;
+      else process.env.MUX_ROOT = previousMuxRoot;
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("router agent skill routes", () => {
   test("subproject workspaces inherit parent skills with nearest precedence", async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-router-skills-test-"));
