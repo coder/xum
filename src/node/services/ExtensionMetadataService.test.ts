@@ -1309,6 +1309,89 @@ describe("ExtensionMetadataService", () => {
     expect(healed.get("ws-stranded")?.recency).toBe(700);
   });
 
+  test("deleteWorkspace reconciles a stranded sidecar so the removed entry cannot be resurrected", async () => {
+    // Full sidecar beside a recreated partial main: deleting from the
+    // partial main alone would leave the removed workspace's complete entry
+    // in the sidecar, where a concurrent backend without this
+    // process-local tombstone could reconcile it back onto disk (visible
+    // immediately on unscoped builds; inherited as stale goal/status by a
+    // deterministic legacy-id re-registration).
+    await writeFile(
+      filePath,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-other": { recency: 300, streaming: false } },
+      })
+    );
+    await writeFile(
+      `${filePath}.corrupt`,
+      JSON.stringify({
+        version: 1,
+        workspaces: {
+          "ws-other": { recency: 300, streaming: false },
+          "ws-removed": { recency: 700, streaming: false },
+        },
+      })
+    );
+    service.setRegistrationProbe(() => Promise.resolve(false));
+    await service.deleteWorkspace("ws-removed");
+    // Sidecar consumed (tombstoned entry skipped by the merge); the removed
+    // entry survives on NEITHER file.
+    const persisted = JSON.parse(await readFile(filePath, "utf-8")) as {
+      workspaces: Record<string, unknown>;
+    };
+    expect("ws-removed" in persisted.workspaces).toBe(false);
+    expect("ws-other" in persisted.workspaces).toBe(true);
+    const sidecarGone = await readFile(`${filePath}.corrupt`, "utf-8").then(
+      () => false,
+      () => true
+    );
+    expect(sidecarGone).toBe(true);
+  });
+
+  test("a sidecar swapped during the missing-main restore is not restored under the stale token", async () => {
+    // Same stat-to-read race as the recreated-main reconcile, on the
+    // missing-main restore path (completeQuarantineRecovery): another
+    // recovery consumes the captured generation and installs a newer one
+    // before the read. Restoring under the stale token would double-apply
+    // the bytes through the consume-side mismatch replay.
+    await writeFile(
+      `${filePath}.corrupt`,
+      JSON.stringify({
+        version: 1,
+        workspaces: { "ws-stranded": { recency: 700, streaming: false } },
+      })
+    );
+    const statics = ExtensionMetadataService as unknown as {
+      statQuarantineToken(p: string): Promise<unknown>;
+    };
+    const realStat = statics.statQuarantineToken.bind(ExtensionMetadataService);
+    let statCalls = 0;
+    statics.statQuarantineToken = async (p: string) => {
+      statCalls += 1;
+      if (statCalls === 1) {
+        return { ino: 1n, mtimeNs: 2n, size: 3n };
+      }
+      return realStat(p);
+    };
+    try {
+      let strictRejected = false;
+      try {
+        await service.getAllSnapshots({ throwOnError: true });
+      } catch {
+        strictRejected = true;
+      }
+      // Not restored under the stale token: the read stays retryable with
+      // the sidecar retained for the next pass.
+      expect(strictRejected).toBe(true);
+      expect(await readFile(`${filePath}.corrupt`, "utf-8")).toContain("ws-stranded");
+    } finally {
+      statics.statQuarantineToken = realStat;
+    }
+    const healed = await service.getAllSnapshots({ throwOnError: true });
+    expect(healed.get("ws-stranded")?.recency).toBe(700);
+  });
+
   test("stranded claims that do not match their embedded token are replayed", async () => {
     // Crash between a MISMATCH claim (foreign generation another backend
     // installed at the sidecar path) and its reconcile: nobody merged

@@ -980,6 +980,18 @@ export class ExtensionMetadataService {
     // Synchronously, before the queued mutation: any writer enqueued from now
     // on must see the tombstone (see deletedWorkspaceIds).
     const publishedGeneration = this.publishTombstone(workspaceId);
+    // Reconcile a crash-stranded sidecar BEFORE the queued deletion (outside
+    // the queue — the resume path serializes itself), same as the emitting
+    // write entry points: deleting from a recreated PARTIAL main would skip
+    // the removed workspace's complete entry sitting in the sidecar, and a
+    // concurrent backend without this process-local tombstone could later
+    // reconcile that sidecar and restore the removed entry (visible
+    // immediately on unscoped builds; inherited as stale goal/status by a
+    // deterministic legacy-id re-registration). A failing reconcile
+    // propagates: the tombstone stays (fail closed, writes suppressed) and
+    // the disk entry remains recoverable for a retried removal or the
+    // process-start prune.
+    await this.reconcileLeftoverSidecarIfPresent();
     await this.withSerializedMutation(async () => {
       const data = await this.load();
       // In-queue registration revalidation, strictly AFTER the load (same
@@ -1371,6 +1383,23 @@ export class ExtensionMetadataService {
     let movedParses = true;
     try {
       moved = JSON.parse(await readFile(quarantinePath, "utf-8")) as unknown;
+      // Bind the token to the bytes just read (same contract as
+      // reconcileRecreatedMainWithSidecar): another recovery can consume
+      // the captured generation and install a newer one between the stat
+      // and the read. Restoring the new bytes under the OLD token would
+      // double-apply them — the consume claims the new generation, sees
+      // the mismatch, and replays it, re-filling fields another backend
+      // explicitly cleared to null in between. On mismatch leave the file
+      // for its own recovery pass (the retried read resumes with a fresh
+      // token).
+      const postReadToken = await ExtensionMetadataService.statQuarantineToken(quarantinePath);
+      if (
+        sidecarToken == null ||
+        postReadToken == null ||
+        !ExtensionMetadataService.tokensMatch(sidecarToken, postReadToken)
+      ) {
+        return false;
+      }
     } catch (readError) {
       if (!ExtensionMetadataService.isDeterministicCorruption(readError)) {
         throw readError;
