@@ -10,6 +10,7 @@ import {
 import { normalizeAgentId, resolvePersistedAgentId } from "@/common/utils/agentIds";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { APIClient } from "@/browser/contexts/API";
 
 interface WorkspaceAiSettingsSnapshot {
   model: string;
@@ -48,8 +49,18 @@ export function resolveEffectiveComposerModel(
 
 const workspaceAiSettingsWriteChains = new Map<string, Promise<unknown>>();
 
-/** Keep direct renderer writes in initiation order so the latest local choice commits last. */
-export function serializeWorkspaceAiSettingsWrite<T>(
+interface WorkspaceSendApi {
+  workspace: Pick<APIClient["workspace"], "sendMessage">;
+}
+
+interface WorkspaceAiSettingsUpdateApi {
+  workspace: Pick<APIClient["workspace"], "updateAgentAISettings">;
+}
+type SendMessageInput = Parameters<APIClient["workspace"]["sendMessage"]>[0];
+type UpdateAgentAISettingsInput = Parameters<APIClient["workspace"]["updateAgentAISettings"]>[0];
+
+/** Keep browser writes that can persist workspace AI state in initiation order. */
+function serializeWorkspaceAiSettingsWrite<T>(
   workspaceId: string,
   write: () => Promise<T>
 ): Promise<T> {
@@ -62,6 +73,25 @@ export function serializeWorkspaceAiSettingsWrite<T>(
       workspaceAiSettingsWriteChains.delete(workspaceId);
     }
   });
+}
+
+export function updateWorkspaceAgentAISettings(
+  api: WorkspaceAiSettingsUpdateApi,
+  input: UpdateAgentAISettingsInput
+): ReturnType<APIClient["workspace"]["updateAgentAISettings"]> {
+  return serializeWorkspaceAiSettingsWrite(input.workspaceId, () =>
+    api.workspace.updateAgentAISettings(input)
+  );
+}
+
+export function sendWorkspaceMessage(
+  api: WorkspaceSendApi,
+  input: SendMessageInput
+): ReturnType<APIClient["workspace"]["sendMessage"]> {
+  const send = () => api.workspace.sendMessage(input);
+  return input.options.skipAiSettingsPersistence === true
+    ? send()
+    : serializeWorkspaceAiSettingsWrite(input.workspaceId, send);
 }
 
 const pendingAiSettingsByWorkspace = new Map<string, WorkspaceAiSettingsSnapshot>();

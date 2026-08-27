@@ -58,8 +58,10 @@ import {
   clearPendingWorkspaceAgentId,
   markPendingWorkspaceAgentId,
   revertRejectedAgentSwitch,
+  sendWorkspaceMessage,
 } from "@/browser/utils/workspaceAiSettingsSync";
 import {
+  hasWorkspaceAiTargetDescriptor,
   resolveWorkspaceAiSettingsForAgent,
   type WorkspaceAISettingsCache,
 } from "@/browser/utils/workspaceModeAi";
@@ -193,8 +195,10 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   // also implicitly scopes lookups away from neighbouring tool calls/transcripts.
   const planContentRef = useRef<HTMLDivElement>(null);
   const { api } = useAPI();
-  const { agentId: currentAgentId, agents } = useAgent();
+  const { agentId: currentAgentId, agents, loaded: agentsLoaded } = useAgent();
   const isAutoMode = currentAgentId === "auto";
+  const canResolveExec = agentsLoaded && hasWorkspaceAiTargetDescriptor("exec", agents);
+  const canResolveAuto = agentsLoaded && hasWorkspaceAiTargetDescriptor("auto", agents);
   const openInEditor = useOpenInEditor();
   const workspaceContext = useOptionalWorkspaceContext();
   const workspaceStore = useWorkspaceStoreRaw();
@@ -487,7 +491,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     resolvedThinking: ThinkingLevel;
     /** Undo this switch after a typed send rejection (transport failures keep it). */
     revertSelection: () => void;
-  } => {
+  } | null => {
     const modelKey = getModelKey(args.workspaceId);
     const thinkingKey = getThinkingLevelKey(args.workspaceId);
     const reasoningKey = getReasoningModeKey(args.workspaceId);
@@ -502,25 +506,19 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       {}
     );
 
-    const { resolvedModel, resolvedThinking, resolvedReasoningMode } =
-      resolveWorkspaceAiSettingsForAgent({
-        agentId: args.targetAgentId,
-        agentAiDefaults,
-        // Propose-plan actions are explicit mode switches; honor any per-agent
-        // workspace override before inheriting the previously active plan settings.
-        workspaceByAgent,
-        useWorkspaceByAgentFallback: true,
-        fallbackModel,
-        existingModel,
-        existingThinking,
-        existingReasoningMode: existingReasoning,
-        agentDescriptorById: new Map(
-          agents.map((agent) => [
-            agent.id,
-            { base: agent.base, definitionAiDefaults: agent.ownAiDefaults },
-          ])
-        ),
-      });
+    const resolvedSettings = resolveWorkspaceAiSettingsForAgent({
+      agentId: args.targetAgentId,
+      agentAiDefaults,
+      workspaceByAgent,
+      fallbackModel,
+      existingModel,
+      existingThinking,
+      existingReasoningMode: existingReasoning,
+      agents,
+      mode: "explicit-switch",
+    });
+    if (!resolvedSettings) return null;
+    const { resolvedModel, resolvedThinking, resolvedReasoningMode } = resolvedSettings;
 
     const previousAgentId =
       readPersistedState<string | null>(getAgentIdKey(args.workspaceId), null) ?? currentAgentId;
@@ -566,7 +564,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
   };
 
   const handleImplement = async () => {
-    if (!workspaceId || !api) return;
+    if (!workspaceId || !api || !canResolveExec) return;
     if (isImplementingRef.current) return;
 
     isImplementingRef.current = true;
@@ -593,11 +591,12 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         });
       }
 
-      const { resolvedModel, resolvedThinking, revertSelection } =
-        resolveAndPersistTargetAgentSettings({
-          workspaceId,
-          targetAgentId,
-        });
+      const targetSettings = resolveAndPersistTargetAgentSettings({
+        workspaceId,
+        targetAgentId,
+      });
+      if (!targetSettings) return;
+      const { resolvedModel, resolvedThinking, revertSelection } = targetSettings;
       const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
 
       // The send carries the switch and persists it backend-side best-effort
@@ -605,7 +604,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       // local switch (the next send re-persists it), but a typed rejection
       // (e.g. the budgeted-goal pricing gate) refuses every send before
       // persistence — no self-heal is coming — so it reverts the switch.
-      const result = await api.workspace.sendMessage({
+      const result = await sendWorkspaceMessage(api, {
         workspaceId,
         message: "Implement the plan",
         options: {
@@ -632,7 +631,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
     }
   };
   const handleContinueInAuto = async () => {
-    if (!workspaceId || !api) return;
+    if (!workspaceId || !api || !canResolveAuto) return;
     if (isContinuingInAutoRef.current) return;
 
     isContinuingInAutoRef.current = true;
@@ -659,16 +658,17 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         });
       }
 
-      const { resolvedModel, resolvedThinking, revertSelection } =
-        resolveAndPersistTargetAgentSettings({
-          workspaceId,
-          targetAgentId,
-        });
+      const targetSettings = resolveAndPersistTargetAgentSettings({
+        workspaceId,
+        targetAgentId,
+      });
+      if (!targetSettings) return;
+      const { resolvedModel, resolvedThinking, revertSelection } = targetSettings;
       const sendMessageOptions = getSendOptionsFromStorage(workspaceId);
 
       // See handleImplement: transport failures keep the switch; typed
       // rejections revert it.
-      const result = await api.workspace.sendMessage({
+      const result = await sendWorkspaceMessage(api, {
         workspaceId,
         message: "Implement the plan",
         options: {
@@ -763,7 +763,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       ? {
           label: "Implement",
           onClick: () => void handleImplement(),
-          disabled: !api || isImplementing || isContinuingInAuto,
+          disabled: !api || !canResolveExec || isImplementing || isContinuingInAuto,
           icon: <Play className="size-4" />,
           tooltip: implementReplacesChatHistory
             ? "Replace chat history with this plan, switch to Exec, and start implementing"
@@ -776,7 +776,7 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
       ? {
           label: "Continue in Auto",
           onClick: () => void handleContinueInAuto(),
-          disabled: !api || isContinuingInAuto || isImplementing,
+          disabled: !api || !canResolveAuto || isContinuingInAuto || isImplementing,
           icon: <Sparkles className="size-4" />,
           tooltip: implementReplacesChatHistory
             ? "Replace chat history with this plan, switch to Auto, and let it decide the executor"

@@ -28,12 +28,36 @@ const noop = () => {
   // intentional noop for tests
 };
 
+const DEFAULT_AGENTS: AgentDefinitionDescriptor[] = [
+  {
+    id: "exec",
+    scope: "built-in",
+    name: "Exec",
+    uiSelectable: true,
+    subagentRunnable: false,
+  },
+  {
+    id: "plan",
+    scope: "built-in",
+    name: "Plan",
+    uiSelectable: true,
+    subagentRunnable: false,
+  },
+  {
+    id: "auto",
+    scope: "built-in",
+    name: "Auto",
+    uiSelectable: true,
+    subagentRunnable: false,
+  },
+];
+
 function SyncHarness(props: {
   workspaceId: string;
   agentId: string;
   agents?: AgentDefinitionDescriptor[];
 }) {
-  const agents = props.agents ?? [];
+  const agents = props.agents ?? DEFAULT_AGENTS;
   return (
     <AgentProvider
       value={{
@@ -133,6 +157,41 @@ describe("WorkspaceModeAISync", () => {
     });
   });
 
+  test("preserves a hydrated workspace bucket when descriptors arrive", async () => {
+    const workspaceId = nextWorkspaceId();
+    const hydratedModel = "anthropic:claude-sonnet-4-6";
+    const hydratedThinking = "high";
+    const definitionModel = "openai:gpt-5.6-sol";
+    const agents: AgentDefinitionDescriptor[] = [
+      {
+        id: "exec",
+        scope: "built-in",
+        name: "Exec",
+        uiSelectable: true,
+        subagentRunnable: false,
+        ownAiDefaults: { model: definitionModel, thinkingLevel: "low" },
+      },
+    ];
+
+    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {});
+    updatePersistedState(getWorkspaceAISettingsByAgentKey(workspaceId), {
+      exec: { model: hydratedModel, thinkingLevel: hydratedThinking },
+    });
+    updatePersistedState(getModelKey(workspaceId), hydratedModel);
+    updatePersistedState(getThinkingLevelKey(workspaceId), hydratedThinking);
+
+    const { rerender } = renderSync({ workspaceId, agentId: "exec", agents: [] });
+    await waitFor(() => {
+      expect(readPersistedState(getModelKey(workspaceId), "")).toBe(hydratedModel);
+    });
+
+    rerender(<SyncHarness workspaceId={workspaceId} agentId="exec" agents={agents} />);
+
+    await waitFor(() => {
+      expect(readPersistedState(getModelKey(workspaceId), "")).toBe(hydratedModel);
+      expect(readPersistedState(getThinkingLevelKey(workspaceId), "off")).toBe(hydratedThinking);
+    });
+  });
   test("applies custom agent definition defaults on an explicit switch", async () => {
     const workspaceId = nextWorkspaceId();
     const existingModel = "anthropic:claude-sonnet-4-5";

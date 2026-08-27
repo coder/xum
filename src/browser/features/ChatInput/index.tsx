@@ -56,7 +56,8 @@ import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
 import {
   clearPendingWorkspaceAiSettings,
   markPendingWorkspaceAiSettings,
-  serializeWorkspaceAiSettingsWrite,
+  sendWorkspaceMessage,
+  updateWorkspaceAgentAISettings,
 } from "@/browser/utils/workspaceAiSettingsSync";
 import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
 import {
@@ -963,13 +964,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         reasoningMode,
       });
 
-      serializeWorkspaceAiSettingsWrite(workspaceId, () =>
-        api.workspace.updateAgentAISettings({
-          workspaceId,
-          agentId: normalizedAgentId,
-          aiSettings: { model: selectedModel, thinkingLevel, reasoningMode },
-        })
-      )
+      updateWorkspaceAgentAISettings(api, {
+        workspaceId,
+        agentId: normalizedAgentId,
+        aiSettings: { model: selectedModel, thinkingLevel, reasoningMode },
+      })
         .then((result) => {
           if (!result.success) {
             clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
@@ -1314,7 +1313,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       existingModel,
       existingThinking,
       existingReasoningMode: existingReasoning,
-      agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
+      agents,
+      mode: "creation-sync",
     });
 
     if (existingModel !== resolvedModel) {
@@ -3210,7 +3210,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
         props.onMessageSendStarted?.(overrides?.queueDispatchMode ?? "tool-end");
 
-        const result = await api.workspace.sendMessage({
+        const result = await sendWorkspaceMessage(api, {
           workspaceId: props.workspaceId,
           message: finalMessageText,
           options: sendOptions,

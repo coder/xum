@@ -1,4 +1,5 @@
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
+import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { targetWorkspaceBucketToLayer, type AiSettingSource } from "@/common/types/agentAiSettings";
 import {
   coerceOpenAIReasoningMode,
@@ -61,36 +62,104 @@ export function resolveConfiguredAiDefaults(
   };
 }
 
-// Keep agent -> model/thinking precedence in one place so mode switches that send immediately
-// (like propose_plan Implement / Continue in Auto) resolve the same settings as sync effects.
-export function resolveWorkspaceAiSettingsForAgent(args: {
+type WorkspaceAiResolutionMode = "explicit-switch" | "background-sync" | "creation-sync";
+
+type WorkspaceAgentDescriptor = Pick<AgentDefinitionDescriptor, "id" | "base" | "ownAiDefaults">;
+
+interface WorkspaceAiResolutionArgs {
   agentId: string;
   agentAiDefaults: AgentAiDefaults;
   workspaceByAgent?: WorkspaceAISettingsCache;
-  useWorkspaceByAgentFallback?: boolean;
   fallbackModel: string;
   existingModel: string;
   existingThinking: ThinkingLevel;
   existingReasoningMode?: OpenAIReasoningMode;
-  /** Agent id -> base id, for base-chain reasoning-mode inheritance (custom agents). */
+  agents?: readonly WorkspaceAgentDescriptor[];
+  /** Compatibility inputs for pure resolver tests and non-UI adapters. */
+  useWorkspaceByAgentFallback?: boolean;
   agentBaseById?: ReadonlyMap<string, string | undefined>;
   agentDescriptorById?: ReadonlyMap<string, AgentAncestorDescriptor>;
-}): {
+  mode?: WorkspaceAiResolutionMode;
+}
+
+interface ResolvedWorkspaceAiSettings {
   resolvedModel: string;
   resolvedThinking: ThinkingLevel;
   resolvedReasoningMode: OpenAIReasoningMode;
-} {
-  const normalizedAgentId = normalizeAgentId(args.agentId);
-  const workspaceOverride = args.workspaceByAgent?.[normalizedAgentId];
-  const descriptorsById = new Map(args.agentDescriptorById ?? []);
-  for (const [id, base] of args.agentBaseById ?? []) {
-    descriptorsById.set(id, { ...descriptorsById.get(id), base });
+}
+
+function buildAgentDescriptorLookup(
+  args: WorkspaceAiResolutionArgs,
+  includeDefinitionDefaults: boolean
+): Map<string, AgentAncestorDescriptor> {
+  const descriptors = new Map<string, AgentAncestorDescriptor>();
+  for (const agent of args.agents ?? []) {
+    descriptors.set(agent.id, {
+      base: agent.base,
+      ...(includeDefinitionDefaults && agent.ownAiDefaults
+        ? { definitionAiDefaults: agent.ownAiDefaults }
+        : {}),
+    });
   }
+  for (const [id, descriptor] of args.agentDescriptorById ?? []) {
+    descriptors.set(id, {
+      base: descriptor.base,
+      ...(includeDefinitionDefaults && descriptor.definitionAiDefaults
+        ? { definitionAiDefaults: descriptor.definitionAiDefaults }
+        : {}),
+    });
+  }
+  for (const [id, base] of args.agentBaseById ?? []) {
+    descriptors.set(id, { ...descriptors.get(id), base });
+  }
+  return descriptors;
+}
+
+export function hasWorkspaceAiTargetDescriptor(
+  agentId: string,
+  agents: readonly WorkspaceAgentDescriptor[]
+): boolean {
+  const normalizedAgentId = normalizeAgentId(agentId);
+  return agents.some((agent) => normalizeAgentId(agent.id) === normalizedAgentId);
+}
+
+// Keep agent -> model/thinking precedence in one place so explicit switches,
+// background sync, and workspace creation agree on descriptor availability.
+export function resolveWorkspaceAiSettingsForAgent(
+  args: WorkspaceAiResolutionArgs & { mode: "explicit-switch" }
+): ResolvedWorkspaceAiSettings | null;
+export function resolveWorkspaceAiSettingsForAgent(
+  args: WorkspaceAiResolutionArgs & { mode?: "background-sync" | "creation-sync" }
+): ResolvedWorkspaceAiSettings;
+export function resolveWorkspaceAiSettingsForAgent(
+  args: WorkspaceAiResolutionArgs
+): ResolvedWorkspaceAiSettings;
+export function resolveWorkspaceAiSettingsForAgent(
+  args: WorkspaceAiResolutionArgs
+): ResolvedWorkspaceAiSettings | null {
+  const normalizedAgentId = normalizeAgentId(args.agentId);
+  const mode =
+    args.mode ??
+    (args.useWorkspaceByAgentFallback === true
+      ? "explicit-switch"
+      : args.useWorkspaceByAgentFallback === false
+        ? "background-sync"
+        : "creation-sync");
+  if (
+    mode === "explicit-switch" &&
+    args.agents != null &&
+    !hasWorkspaceAiTargetDescriptor(normalizedAgentId, args.agents)
+  ) {
+    return null;
+  }
+
+  const workspaceOverride = args.workspaceByAgent?.[normalizedAgentId];
+  const descriptorsById = buildAgentDescriptorLookup(args, mode !== "background-sync");
   const resolved = resolveAgentAiSettings({
     targetAgentId: normalizedAgentId,
     profile: "interactive",
     targetWorkspaceSettings:
-      args.useWorkspaceByAgentFallback && workspaceOverride != null
+      mode === "explicit-switch" && workspaceOverride != null
         ? targetWorkspaceBucketToLayer(workspaceOverride)
         : undefined,
     agentAiDefaults: args.agentAiDefaults,
@@ -104,10 +173,10 @@ export function resolveWorkspaceAiSettingsForAgent(args: {
     defaultModel: args.fallbackModel,
   });
 
-  // Background sync trusts the live workspace mode, which hydration seeds from
-  // the backend bucket, instead of restoring the saved bucket or configured mode.
+  // A hydrated per-agent bucket owns the active background runtime. Descriptor
+  // arrival must not reinterpret an absent reasoning value as a new default.
   const resolvedReasoningMode =
-    workspaceOverride != null && !args.useWorkspaceByAgentFallback
+    workspaceOverride != null && mode === "background-sync"
       ? (coerceOpenAIReasoningMode(args.existingReasoningMode) ?? "standard")
       : (resolved.selected.reasoningMode ?? "standard");
 

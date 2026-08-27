@@ -43,7 +43,7 @@ import {
   clearPendingWorkspaceAgentId,
   markPendingWorkspaceAgentId,
   revertRejectedAgentSwitch,
-  serializeWorkspaceAiSettingsWrite,
+  updateWorkspaceAgentAISettings,
 } from "@/browser/utils/workspaceAiSettingsSync";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
@@ -202,23 +202,22 @@ function AgentProviderWithState(props: {
         getWorkspaceAISettingsByAgentKey(workspaceId),
         {}
       );
-      const { resolvedModel, resolvedThinking, resolvedReasoningMode } =
-        resolveWorkspaceAiSettingsForAgent({
-          agentId: nextAgentId,
-          agentAiDefaults,
-          workspaceByAgent,
-          useWorkspaceByAgentFallback: true,
-          fallbackModel: getDefaultModel(),
-          existingModel: previousModel,
-          existingThinking: previousThinking,
-          existingReasoningMode: previousReasoning,
-          agentDescriptorById: new Map(
-            agents.map((agent) => [
-              agent.id,
-              { base: agent.base, definitionAiDefaults: agent.ownAiDefaults },
-            ])
-          ),
-        });
+      const resolvedSettings = resolveWorkspaceAiSettingsForAgent({
+        agentId: nextAgentId,
+        agentAiDefaults,
+        workspaceByAgent,
+        fallbackModel: getDefaultModel(),
+        existingModel: previousModel,
+        existingThinking: previousThinking,
+        existingReasoningMode: previousReasoning,
+        agents,
+        mode: "explicit-switch",
+      });
+      if (!resolvedSettings) {
+        setAgentIdRaw(previousAgentId);
+        return;
+      }
+      const { resolvedModel, resolvedThinking, resolvedReasoningMode } = resolvedSettings;
 
       // The local update above is authoritative for this client and the write
       // below is best-effort: every send carries the selection and re-persists
@@ -262,18 +261,16 @@ function AgentProviderWithState(props: {
       };
 
       markPendingWorkspaceAgentId(workspaceId, nextAgentId);
-      serializeWorkspaceAiSettingsWrite(workspaceId, () =>
-        api.workspace.updateAgentAISettings({
-          workspaceId,
-          agentId: nextAgentId,
-          aiSettings: {
-            model: resolvedModel,
-            thinkingLevel: resolvedThinking,
-            ...(resolvedReasoningMode != null ? { reasoningMode: resolvedReasoningMode } : {}),
-          },
-          persistSelectedAgentId: true,
-        })
-      )
+      updateWorkspaceAgentAISettings(api, {
+        workspaceId,
+        agentId: nextAgentId,
+        aiSettings: {
+          model: resolvedModel,
+          thinkingLevel: resolvedThinking,
+          ...(resolvedReasoningMode != null ? { reasoningMode: resolvedReasoningMode } : {}),
+        },
+        persistSelectedAgentId: true,
+      })
         .then((result) => {
           if (!result.success) {
             notifySwitchRejected(typeof result.error === "string" ? result.error : "");

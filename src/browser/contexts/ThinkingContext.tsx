@@ -32,7 +32,7 @@ import {
   clearPendingWorkspaceAiSettings,
   getWorkspaceAiSettingsFromMetadata,
   markPendingWorkspaceAiSettings,
-  serializeWorkspaceAiSettingsWrite,
+  updateWorkspaceAgentAISettings,
 } from "@/browser/utils/workspaceAiSettingsSync";
 import { useOptionalWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
@@ -184,13 +184,11 @@ export const ThinkingProvider: React.FC<ThinkingProviderProps> = (props) => {
       // click through levels quickly (tests reproduce this by cycling to xhigh).
       markPendingWorkspaceAiSettings(workspaceId, normalizedAgentId, settings);
 
-      serializeWorkspaceAiSettingsWrite(workspaceId, () =>
-        api.workspace.updateAgentAISettings({
-          workspaceId,
-          agentId: normalizedAgentId,
-          aiSettings: settings,
-        })
-      )
+      updateWorkspaceAgentAISettings(api, {
+        workspaceId,
+        agentId: normalizedAgentId,
+        aiSettings: settings,
+      })
         .then((result) => {
           if (!result.success) {
             clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);

@@ -62,7 +62,9 @@ interface MockApi {
     }) => Promise<ResultVoid>;
     sendMessage: (
       args: SendMessageArgs
-    ) => Promise<{ success: true; data: undefined } | { success: false; error: string }>;
+    ) => Promise<
+      { success: true; data: Record<string, never> } | { success: false; error: string }
+    >;
     updateAgentAISettings: (args: {
       workspaceId: string;
       agentId: string;
@@ -234,21 +236,27 @@ function createTestAgent(
 const TEST_AGENTS = [
   createTestAgent("exec", "Exec", "openai:gpt-5.2", "low"),
   createTestAgent("plan", "Plan", "anthropic:claude-sonnet-4-5", "high"),
+  createTestAgent("auto", "Auto", "openai:gpt-5.6-sol", "medium"),
 ];
 
 const noop = () => {
   // intentional noop for tests
 };
 
-function renderToolCall(content: JSX.Element, agentId = "plan") {
+function renderToolCall(
+  content: JSX.Element,
+  agentId = "plan",
+  agents: AgentDefinitionDescriptor[] = TEST_AGENTS,
+  loaded = true
+) {
   return render(
     <AgentProvider
       value={{
         agentId,
         setAgentId: noop,
-        currentAgent: TEST_AGENTS.find((entry) => entry.id === agentId),
-        agents: TEST_AGENTS,
-        loaded: true,
+        currentAgent: agents.find((entry) => entry.id === agentId),
+        agents,
+        loaded,
         loadFailed: false,
         refresh: () => Promise.resolve(),
         refreshing: false,
@@ -284,8 +292,7 @@ function createMockApi(
           })),
       replaceChatHistory:
         overrides.replaceChatHistory ?? (() => Promise.resolve({ success: true, data: undefined })),
-      sendMessage:
-        overrides.sendMessage ?? (() => Promise.resolve({ success: true, data: undefined })),
+      sendMessage: overrides.sendMessage ?? (() => Promise.resolve({ success: true, data: {} })),
       updateAgentAISettings: (args) => {
         updateAgentAISettingsCalls.push(args);
         return overrides.updateAgentAISettings
@@ -321,7 +328,7 @@ function startInPlanMode(workspaceId = WORKSPACE_ID, model?: string, thinkingLev
 function recordSendMessage(calls: SendMessageArgs[]): MockApi["workspace"]["sendMessage"] {
   return (args) => {
     calls.push(args);
-    return Promise.resolve({ success: true, data: undefined });
+    return Promise.resolve({ success: true, data: {} });
   };
 }
 
@@ -509,6 +516,33 @@ describe("ProposePlanToolCall", () => {
 
     expect(view.queryByRole("button", { name: "Exit Annotate" })).toBeNull();
     expect(view.getAllByRole("button", { name: "Annotate" }).length).toBe(2);
+  });
+
+  test("disables Implement until the exec descriptor is available", async () => {
+    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+
+    const view = renderToolCall(
+      <ProposePlanToolCall
+        args={{}}
+        workspaceId={WORKSPACE_ID}
+        status="completed"
+        result={{ success: true, planPath: PLAN_PATH, planContent: PLAN_CONTENT }}
+        isLatest
+      />,
+      "plan",
+      [],
+      false
+    );
+
+    const implement = view.getByRole("button", { name: "Implement" });
+    expect(implement.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(implement);
+    await Promise.resolve();
+
+    expect(sendMessageCalls).toHaveLength(0);
+    expect(updateAgentAISettingsCalls).toHaveLength(0);
   });
 
   test("switches to exec and sends a message when clicking Implement", async () => {
@@ -723,7 +757,7 @@ describe("ProposePlanToolCall", () => {
       sendMessage: (args) => {
         calls.push("sendMessage");
         sendMessageCalls.push(args);
-        return Promise.resolve({ success: true, data: undefined });
+        return Promise.resolve({ success: true, data: {} });
       },
     });
 

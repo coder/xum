@@ -67,26 +67,19 @@ export function WorkspaceModeAISync(props: { workspaceId: string }): null {
     const reasoningKey = getReasoningModeKey(workspaceId);
     const existingReasoning = readPersistedState<OpenAIReasoningMode>(reasoningKey, "standard");
 
-    const { resolvedModel, resolvedThinking, resolvedReasoningMode } =
-      resolveWorkspaceAiSettingsForAgent({
-        agentId: normalizedAgentId,
-        agentAiDefaults,
-        // Keep deterministic handoff behavior: background sync should trust the
-        // currently active workspace model, but explicit mode switches should
-        // restore the selected agent's per-workspace override (if any).
-        workspaceByAgent,
-        useWorkspaceByAgentFallback: isExplicitAgentSwitch,
-        fallbackModel,
-        existingModel,
-        existingThinking,
-        existingReasoningMode: existingReasoning,
-        agentDescriptorById: new Map(
-          agents.map((agent) => [
-            agent.id,
-            { base: agent.base, definitionAiDefaults: agent.ownAiDefaults },
-          ])
-        ),
-      });
+    const resolvedSettings = resolveWorkspaceAiSettingsForAgent({
+      agentId: normalizedAgentId,
+      agentAiDefaults,
+      workspaceByAgent,
+      fallbackModel,
+      existingModel,
+      existingThinking,
+      existingReasoningMode: existingReasoning,
+      agents,
+      mode: isExplicitAgentSwitch ? "explicit-switch" : "background-sync",
+    });
+    if (!resolvedSettings) return;
+    const { resolvedModel, resolvedThinking, resolvedReasoningMode } = resolvedSettings;
 
     if (existingModel !== resolvedModel) {
       setWorkspaceModelWithOrigin(

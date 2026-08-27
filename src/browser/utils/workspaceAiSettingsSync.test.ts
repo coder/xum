@@ -7,12 +7,14 @@ import {
   getThinkingLevelKey,
 } from "@/common/constants/storage";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { APIClient } from "@/browser/contexts/API";
 import {
   clearPendingWorkspaceAgentId,
   markPendingWorkspaceAgentId,
   revertRejectedAgentSwitch,
-  serializeWorkspaceAiSettingsWrite,
+  sendWorkspaceMessage,
   shouldApplyWorkspaceAgentIdFromBackend,
+  updateWorkspaceAgentAISettings,
 } from "./workspaceAiSettingsSync";
 
 const WORKSPACE_ID = "ws-revert";
@@ -58,39 +60,52 @@ describe("workspace agent persistence guard", () => {
     expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true);
   });
 
-  test("commits overlapping selections in initiation order", async () => {
+  test("commits settings updates and sends in initiation order", async () => {
     let resolvePlan!: () => void;
-    let resolveReview!: () => void;
     const planCommit = new Promise<void>((resolve) => {
       resolvePlan = resolve;
     });
-    const reviewCommit = new Promise<void>((resolve) => {
-      resolveReview = resolve;
-    });
     const started: string[] = [];
     let persistedAgentId = "exec";
+    const api = {
+      workspace: {
+        updateAgentAISettings: async (
+          input: Parameters<APIClient["workspace"]["updateAgentAISettings"]>[0]
+        ) => {
+          started.push(input.agentId);
+          await planCommit;
+          persistedAgentId = input.agentId;
+          return { success: true as const, data: undefined };
+        },
+        sendMessage: (input: Parameters<APIClient["workspace"]["sendMessage"]>[0]) => {
+          started.push(input.options.agentId ?? "missing");
+          persistedAgentId = input.options.agentId ?? persistedAgentId;
+          return Promise.resolve({ success: true as const, data: {} });
+        },
+      },
+    };
 
-    const planWrite = serializeWorkspaceAiSettingsWrite(WORKSPACE_ID, async () => {
-      started.push("plan");
-      await planCommit;
-      persistedAgentId = "plan";
+    const planWrite = updateWorkspaceAgentAISettings(api, {
+      workspaceId: WORKSPACE_ID,
+      agentId: "plan",
+      aiSettings: { model: "openai:plan", thinkingLevel: "high" },
+      persistSelectedAgentId: true,
     });
-    const reviewWrite = serializeWorkspaceAiSettingsWrite(WORKSPACE_ID, async () => {
-      started.push("review");
-      await reviewCommit;
-      persistedAgentId = "review";
+    const execSend = sendWorkspaceMessage(api, {
+      workspaceId: WORKSPACE_ID,
+      message: "Implement the plan",
+      options: { agentId: "exec", model: "openai:exec", thinkingLevel: "medium" },
     });
 
-    resolveReview();
     await Promise.resolve();
     expect(started).toEqual(["plan"]);
     expect(persistedAgentId).toBe("exec");
 
     resolvePlan();
-    await Promise.all([planWrite, reviewWrite]);
+    await Promise.all([planWrite, execSend]);
 
-    expect(started).toEqual(["plan", "review"]);
-    expect(persistedAgentId).toBe("review");
+    expect(started).toEqual(["plan", "exec"]);
+    expect(persistedAgentId).toBe("exec");
   });
 });
 

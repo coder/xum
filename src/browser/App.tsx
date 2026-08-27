@@ -88,7 +88,7 @@ import {
   clearPendingWorkspaceAiSettings,
   markPendingWorkspaceAiSettings,
   resolveEffectiveComposerModel,
-  serializeWorkspaceAiSettingsWrite,
+  updateWorkspaceAgentAISettings,
 } from "@/browser/utils/workspaceAiSettingsSync";
 import { AuthTokenModal } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 
@@ -581,13 +581,11 @@ function AppInner() {
           reasoningMode,
         });
 
-        serializeWorkspaceAiSettingsWrite(workspaceId, () =>
-          api.workspace.updateAgentAISettings({
-            workspaceId,
-            agentId: normalizedAgentId,
-            aiSettings: { model, thinkingLevel: normalized, reasoningMode },
-          })
-        )
+        updateWorkspaceAgentAISettings(api, {
+          workspaceId,
+          agentId: normalizedAgentId,
+          aiSettings: { model, thinkingLevel: normalized, reasoningMode },
+        })
           .then((result) => {
             if (!result.success) {
               clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
@@ -663,13 +661,11 @@ function AppInner() {
           reasoningMode: next,
         });
 
-        serializeWorkspaceAiSettingsWrite(workspaceId, () =>
-          api.workspace.updateAgentAISettings({
-            workspaceId,
-            agentId: normalizedAgentId,
-            aiSettings: { model, thinkingLevel, reasoningMode: next },
-          })
-        )
+        updateWorkspaceAgentAISettings(api, {
+          workspaceId,
+          agentId: normalizedAgentId,
+          aiSettings: { model, thinkingLevel, reasoningMode: next },
+        })
           .then((result) => {
             if (!result.success) {
               clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);

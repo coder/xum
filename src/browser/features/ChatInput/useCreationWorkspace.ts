@@ -16,7 +16,10 @@ import {
 } from "@/common/types/thinking";
 import { useDraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
-import { serializeWorkspaceAiSettingsWrite } from "@/browser/utils/workspaceAiSettingsSync";
+import {
+  sendWorkspaceMessage,
+  updateWorkspaceAgentAISettings,
+} from "@/browser/utils/workspaceAiSettingsSync";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import {
@@ -623,18 +626,16 @@ export function useCreationWorkspace({
         // is portable across devices even before the first stream starts. Initial /goal commands do
         // not send a normal user message, so they await this write before setting the goal; that lets
         // the backend kickoff continuation use the same model/agent selected in creation.
-        const initialAiSettingsPersisted = serializeWorkspaceAiSettingsWrite(metadata.id, () =>
-          api.workspace.updateAgentAISettings({
-            workspaceId: metadata.id,
-            agentId: settings.agentId,
-            aiSettings: {
-              model: settings.model,
-              thinkingLevel: settings.thinkingLevel,
-              reasoningMode: settings.reasoningMode,
-            },
-            persistSelectedAgentId: true,
-          })
-        ).catch(() => null);
+        const initialAiSettingsPersisted = updateWorkspaceAgentAISettings(api, {
+          workspaceId: metadata.id,
+          agentId: settings.agentId,
+          aiSettings: {
+            model: settings.model,
+            thinkingLevel: settings.thinkingLevel,
+            reasoningMode: settings.reasoningMode,
+          },
+          persistSelectedAgentId: true,
+        }).catch(() => null);
 
         const isDraftScope = typeof draftId === "string" && draftId.trim().length > 0;
         const pendingScopeId = projectPath
@@ -805,24 +806,22 @@ export function useCreationWorkspace({
         // A transport-level rejection (e.g. oRPC disconnect) must flow through
         // the same failure branch as success:false: the outer catch would skip
         // the staged-draft transfer and the creation draft is already cleared.
-        const sendResult = await api.workspace
-          .sendMessage({
-            workspaceId: metadata.id,
-            message: appendStagedAttachmentNotice(messageText, stagingOutcome.staged),
-            options: {
-              ...sendMessageOptions,
-              ...optionsOverride,
-              ...(muxMetadataWithNotice ? { muxMetadata: muxMetadataWithNotice } : {}),
-              additionalSystemInstructions: additionalSystemInstructions.length
-                ? additionalSystemInstructions
-                : undefined,
-              fileParts: fileParts && fileParts.length > 0 ? fileParts : undefined,
-            },
-          })
-          .catch((sendErr: unknown): { success: false; error: SendMessageError } => ({
-            success: false,
-            error: { type: "unknown", raw: getErrorMessage(sendErr) },
-          }));
+        const sendResult = await sendWorkspaceMessage(api, {
+          workspaceId: metadata.id,
+          message: appendStagedAttachmentNotice(messageText, stagingOutcome.staged),
+          options: {
+            ...sendMessageOptions,
+            ...optionsOverride,
+            ...(muxMetadataWithNotice ? { muxMetadata: muxMetadataWithNotice } : {}),
+            additionalSystemInstructions: additionalSystemInstructions.length
+              ? additionalSystemInstructions
+              : undefined,
+            fileParts: fileParts && fileParts.length > 0 ? fileParts : undefined,
+          },
+        }).catch((sendErr: unknown): { success: false; error: SendMessageError } => ({
+          success: false,
+          error: { type: "unknown", raw: getErrorMessage(sendErr) },
+        }));
 
         if (!sendResult.success) {
           if (createdWorkspaceId) {
