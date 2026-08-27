@@ -169,14 +169,24 @@ export function reassignPinnedTimestamps(
     .map((id) => parsePinnedAtMs(currentPinnedAtById.get(id)))
     .sort((a, b) => a - b);
 
-  const changed = new Map<string, string>();
+  const assignedMs: number[] = [];
   let previousMs = Number.NEGATIVE_INFINITY;
+  for (let index = 0; index < orderedIds.length; index++) {
+    previousMs = Math.max(poolMs[index], previousMs + 1);
+    assignedMs.push(previousMs);
+  }
+  // Backward clamp: capped values compact strictly below the sane maximum so
+  // the assigned sequence stays strictly monotonic (unique keys) and the
+  // requested order always persists, even when corrupted pool values tie at
+  // the cap.
+  for (let index = assignedMs.length - 1; index >= 0; index--) {
+    const bound = index === assignedMs.length - 1 ? MAX_PINNED_AT_MS : assignedMs[index + 1] - 1;
+    if (assignedMs[index] > bound) assignedMs[index] = bound;
+  }
+
+  const changed = new Map<string, string>();
   orderedIds.forEach((id, index) => {
-    // Clamped like generation: +1ms nudges near the sane maximum must not
-    // escape the accepted domain (ties there fall to the id tie-break).
-    const ms = Math.min(Math.max(poolMs[index], previousMs + 1), MAX_PINNED_AT_MS);
-    previousMs = ms;
-    const iso = new Date(ms).toISOString();
+    const iso = new Date(assignedMs[index]).toISOString();
     if (currentPinnedAtById.get(id) !== iso) {
       changed.set(id, iso);
     }

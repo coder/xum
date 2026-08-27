@@ -2001,12 +2001,15 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
       color: resolveSectionColor(config.color),
     };
   };
+  // The _multi bucket is a system key excluded from userProjects, so both
+  // chats and drafts label it explicitly instead of leaking the internal key.
+  const multiProjectBadge = { name: "Multi-project", color: resolveSectionColor(undefined) };
   const getFlatProjectBadge = (
     workspace: FrontendWorkspaceMetadata
   ): { name: string; color: string } | undefined => {
     if (workspace.parentWorkspaceId != null || workspace.kind === "scratch") return undefined;
     if (isMultiProject(workspace)) {
-      return { name: "Multi-project", color: resolveSectionColor(undefined) };
+      return multiProjectBadge;
     }
     return (
       resolveSubProjectBadge(workspace.projectPath, workspace.subProjectPath) ??
@@ -2019,7 +2022,9 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   ): { name: string; color: string } | undefined =>
     projectPath === SCRATCH_PROJECT_CONFIG_KEY
       ? undefined
-      : (resolveSubProjectBadge(projectPath, subProjectPath) ?? getProjectBadge(projectPath));
+      : projectPath === MULTI_PROJECT_CONFIG_KEY
+        ? multiProjectBadge
+        : (resolveSubProjectBadge(projectPath, subProjectPath) ?? getProjectBadge(projectPath));
 
   const handleReorder = useCallback(
     (draggedPath: string, targetPath: string) => {

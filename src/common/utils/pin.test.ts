@@ -113,6 +113,22 @@ describe("comparePinnedOrder", () => {
 });
 
 describe("reassignPinnedTimestamps", () => {
+  it("compacts capped ties below the sane maximum so reorders still apply", () => {
+    const capMs = 8_640_000_000_000_000 - 1;
+    const capIso = new Date(capMs).toISOString();
+    const changed = reassignPinnedTimestamps(
+      ["b", "a"],
+      new Map([
+        ["a", capIso],
+        ["b", capIso],
+      ])
+    );
+    // Both share the cap, so the id tie-break renders a before b; requesting
+    // b first must yield strictly increasing unique keys within the cap.
+    expect(changed.get("b")).toBe(new Date(capMs - 1).toISOString());
+    expect(changed.has("a")).toBe(false);
+  });
+
   it("re-deals corrupted boundary timestamps instead of overflowing the Date range", () => {
     const boundary = "+275760-09-13T00:00:00.000Z";
     const changed = reassignPinnedTimestamps(

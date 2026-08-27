@@ -316,6 +316,7 @@ function installProjectSidebarTestDoubles() {
         return (
           <div data-testid={`draft-item-${props.draft.draftId}`}>
             {props.draft.title ?? "Draft"}
+            {props.projectBadgeName != null && <span>{props.projectBadgeName}</span>}
           </div>
         );
       }
@@ -993,6 +994,55 @@ describe("ProjectSidebar flat chat list", () => {
     // is off, while ordinary project drafts still render.
     expect(view.getByTestId("draft-item-draft-single")).toBeTruthy();
     expect(view.queryByTestId("draft-item-draft-multi")).toBeNull();
+  });
+
+  test("labels _multi drafts with the multi-project badge instead of the internal key", () => {
+    const workspace = {
+      ...createWorkspace("solo-multi-badge", { title: "Solo chat" }),
+      projects: singleProjectRefs,
+    };
+    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
+      () =>
+        ({
+          selectedWorkspace: null,
+          setSelectedWorkspace: () => undefined,
+          preflightArchiveWorkspace: () =>
+            Promise.resolve({ success: true, data: { kind: "ready" } }),
+          archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
+          removeWorkspace: () => Promise.resolve({ success: true }),
+          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
+          refreshWorkspaceMetadata: () => Promise.resolve(),
+          pendingNewWorkspaceProject: null,
+          pendingNewWorkspaceDraftId: null,
+          workspaceDraftsByProject: {
+            _multi: [{ draftId: "draft-multi-badge", createdAt: Date.now() }],
+          },
+          workspaceDraftPromotionsByProject: {},
+          createWorkspaceDraft: () => undefined,
+          openWorkspaceDraft: () => undefined,
+          deleteWorkspaceDraft: () => undefined,
+        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
+    );
+    updatePersistedState(
+      getInputKey(getDraftScopeId("_multi", "draft-multi-badge")),
+      "Multi draft"
+    );
+    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [workspace]]])}
+        workspaceRecency={{ "solo-multi-badge": Date.now() }}
+      />
+    );
+
+    // The _multi bucket is a system key excluded from userProjects; the badge
+    // must show the explicit multi-project label, never the raw key.
+    const row = view.getByTestId("draft-item-draft-multi-badge");
+    expect(within(row).getByText("Multi-project")).toBeTruthy();
+    expect(within(row).queryByText(/_multi/)).toBeNull();
   });
 
   test("keeps project management headers reachable in flat mode without nesting chats", () => {
