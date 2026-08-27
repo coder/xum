@@ -1672,6 +1672,10 @@ describe("backup payload", () => {
     ["npx call operands", "npx -c 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'"],
     ["npm exec call operands", "npm exec -c 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'"],
     [
+      "npm global option values before exec",
+      "npm --prefix /tmp exec -c 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
+    ],
+    [
       "Rscript expression operands",
       `Rscript -e 'system(paste0("mcp",intToUtf8(32),"--token",intToUtf8(32),"ghp_Abcdef1234","Klmno56789"))'`,
     ],
@@ -1681,6 +1685,31 @@ describe("backup payload", () => {
     ],
   ] as const) {
     it(`localizes ${name}`, async () => {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
+    });
+  }
+
+  for (const [name, command] of [
+    ["Python", "python3 ~/.xum/skills/launch.txt"],
+    ["Node", "node /home/user/.xum/agents/launch.md"],
+    ["Rscript", "Rscript ~/.mux/memory/global/launch.markdown"],
+    ["Deno", "deno run --config deno.json 'C:\\Users\\me\\.xum\\skills\\launch.mdx'"],
+  ] as const) {
+    it(`localizes ${name} execution of auto-published documents`, async () => {
       await writeFixtureFile(
         muxRoot,
         "mcp.jsonc",
@@ -1944,6 +1973,8 @@ describe("backup payload", () => {
       "Rscript server.R --port 8080",
       "npx notes-mcp --port 8080",
       "npm exec notes-mcp -- --port 8080",
+      "npm --prefix /tmp install exec -c",
+      "npm --prefix /tmp run exec -c",
       "mcp-server -Ssettings.toml",
       "env -u TOKEN mcp-server -Ssettings.toml",
       "git status",

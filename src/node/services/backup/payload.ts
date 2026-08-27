@@ -1609,6 +1609,31 @@ function gitOptionTakesSeparateValue(unquoted: string): boolean {
   return /^(?:-[cC]|--(?:git-dir|work-tree|namespace|super-prefix|config-env))$/.test(unquoted);
 }
 
+/**
+ * Documentation is the only thing a recursive collection publishes without asking.
+ * An interpreter that executes one of these files can reconstruct a credential across
+ * the command and file even when neither spelling matches the token backstop.
+ */
+const AUTO_PUBLISHED_RECURSIVE_FILE = /\.(?:md|mdx|markdown|txt)$/i;
+
+function isAutoPublishedScriptOperand(unquoted: string): boolean {
+  const normalized = unquoted.replaceAll("\\", "/");
+  const relative = /(?:^|\/)\.(?:xum|mux)\/(.+)$/i.exec(normalized)?.[1];
+  if (relative === undefined) return false;
+  if (/^AGENTS\.md$/i.test(relative)) return true;
+  if (/^agents\/[^/]+\.md$/i.test(relative)) return true;
+  return (
+    /^(?:skills|memory\/global)\//i.test(relative) && AUTO_PUBLISHED_RECURSIVE_FILE.test(relative)
+  );
+}
+
+/** Known npm commands and aliases terminate global-option parsing. */
+const NPM_SUBCOMMANDS = new Set(
+  "access adduser audit bugs cache ci completion config dedupe deprecate diff dist-tag docs doctor edit exec explain explore find-dupes fund get help help-search hook init install install-ci-test install-test link ll login logout ls org outdated owner pack ping pkg prefix profile prune publish query rebuild repo restart root run-script sbom search set shrinkwrap star stars start stop team test token uninstall unpublish unstar update version view whoami add add-user author c cit clean-install clean-install-test create ddp dist-tags find hlep home i ic in info innit ins inst insta instal install-clean isnt isnta isntal isntall isntall-clean issues it la list ln ogr r rb remove rm rum run s se show sit t tst udpate un unlink up upgrade urn v verison why x".split(
+    " "
+  )
+);
+
 /** Exactly one replaced assignment, nothing else riding along in the same word. */
 const CONSUMED_ASSIGNMENT = new RegExp(`^${ASSIGNMENT_NAME}${REDACTED_BACKUP_VALUE}$`);
 
@@ -1908,6 +1933,8 @@ function hasDisguisedAssignment(redacted: string): boolean {
   let pendingGitOptionValue = false;
   let pendingGitSubmoduleAction = false;
   let pendingGitRebaseOptions = false;
+  let pendingDenoSubcommand = false;
+  let pendingDenoRunScript = false;
   let evalOperandAmbiguous = false;
   // A Set of the static table's RegExp instances: repeated interpreter words cannot
   // grow it past the table size, keeping this lookup linear in command length.
@@ -1964,8 +1991,19 @@ function hasDisguisedAssignment(redacted: string): boolean {
       if (unquoted === "exec" || unquoted === "x") {
         pendingNpmSubcommand = false;
         pendingNpmExecOptions = true;
-      } else if (!unquoted.startsWith("-")) {
+      } else if (NPM_SUBCOMMANDS.has(unquoted)) {
         pendingNpmSubcommand = false;
+      }
+      // Anything else can be a separated value for a global config option
+      // (`--prefix /tmp`), so tracking stays armed until a known subcommand.
+    }
+    if (pendingDenoRunScript && isAutoPublishedScriptOperand(unquoted)) return true;
+    if (pendingDenoSubcommand) {
+      if (unquoted === "run") {
+        pendingDenoSubcommand = false;
+        pendingDenoRunScript = true;
+      } else if (!unquoted.startsWith("-")) {
+        pendingDenoSubcommand = false;
       }
     }
     // With allexport inherited through SHELLOPTS, `printf -v` exports the variable it
@@ -1990,6 +2028,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
     if (executable === "env") sawEnv = true;
     if (executable === "npm") pendingNpmSubcommand = true;
     if (executable === "git") pendingGitSubcommand = true;
+    if (executable === "deno") pendingDenoSubcommand = true;
     if (SHELL_INTERPRETER_NAMES.has(executable)) return true;
     if (PROGRAM_OPERAND_INTERPRETER_NAMES.has(executable)) return true;
     if (SHELL_REPARSE_EXECUTABLE_NAMES.has(executable)) return true;
@@ -2007,6 +2046,11 @@ function hasDisguisedAssignment(redacted: string): boolean {
         // (`python3 -W ignore -c x`), so from here a non-option word no longer
         // proves the script boundary; tracking stays armed, failing closed.
         evalOperandAmbiguous = true;
+      } else if (isAutoPublishedScriptOperand(unquoted)) {
+        // The backup publishes this document automatically. An interpreter executing
+        // it can join credential fragments across the command and file even when
+        // neither spelling matches the non-overridable token backstop.
+        return true;
       } else if (!evalOperandAmbiguous) {
         // The first non-option word no pending pattern matched is the script/module
         // operand: later dash-led words belong to that program (`python3 server.py
@@ -2579,15 +2623,6 @@ function validateMcpRedactionPaths(tree: jsonc.Node, paths: readonly BackupRedac
     }
   }
 }
-
-/**
- * Documentation is the only thing a recursive collection publishes without asking. `skills/`
- * and `memory/global/` hold whatever the user put there, and no content scanner can decide
- * whether an arbitrary file is a credential: `{"password":"hunter2"}` has no distinguishing
- * shape. So the gate is structural rather than pattern-based, and anything outside the
- * documented set is surfaced for review instead of being published or silently dropped.
- */
-const AUTO_PUBLISHED_RECURSIVE_FILE = /\.(?:md|mdx|markdown|txt)$/i;
 
 /** A name promising credentials earns review even when the extension is documentation. */
 const CREDENTIAL_PATH_HINT =
