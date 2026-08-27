@@ -3240,6 +3240,18 @@ export async function collectMcpCommandApprovals(
   if (!file) return [];
 
   const restored = await resolveRestoredContent(muxRoot, file, mcpRedactions);
+  return collectApprovalsForResolvedMcp(muxRoot, restored);
+}
+
+/**
+ * Approvals for already-resolved MCP bytes, so restore can gate the exact content its
+ * plan writes: the local file can change between reads, and a separate resolution could
+ * observe a different rehydration than the one being written.
+ */
+export async function collectApprovalsForResolvedMcp(
+  muxRoot: string,
+  restored: Buffer
+): Promise<BackupCommandApproval[]> {
   const incoming = readServerCommands(restored.toString("utf-8"));
   const localText = await readLocalMcpText(muxRoot);
   const local =
@@ -3887,18 +3899,19 @@ export async function restoreBackupPayload(
       .filter((file) => file.path !== "preferences.json")
       .map((file) => file.path)
   );
+  const plan = await planRestoreWrites(options.muxRoot, options.payload);
   // Recomputed here rather than trusted from the preview, so an approval cannot authorize
-  // a command the repository changed between the preview and this restore.
+  // a command the repository changed between the preview and this restore. Computed from
+  // the exact bytes the plan writes, not a separate resolution: the local file can change
+  // between reads, and a divergent rehydration could exempt a command (url restored,
+  // shadowing it) that the planned content then carries runnable (url dropped).
+  const plannedMcp = plan.writes.find((write) => write.path === "mcp.jsonc");
   assertBackupCommandsApproved(
-    await collectMcpCommandApprovals(
-      options.muxRoot,
-      options.payload.files,
-      options.payload.manifest.mcpRedactions
-    ),
+    plannedMcp === undefined
+      ? []
+      : await collectApprovalsForResolvedMcp(options.muxRoot, plannedMcp.content),
     options.approvedCommandTokens
   );
-
-  const plan = await planRestoreWrites(options.muxRoot, options.payload);
   // Classify against the pre-restore filesystem state before writes change file identities.
   const { localOnly } = await localOnlyPayloadFiles(options.muxRoot, localPaths, restoredPaths);
 

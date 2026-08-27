@@ -3960,6 +3960,78 @@ describe("backup payload", () => {
     ).toBeInstanceOf(BackupCommandApprovalRequiredError);
   });
 
+  it("binds command approval to the exact planned MCP bytes", async () => {
+    // A concurrent editor can rewrite the local mcp.jsonc between restore's reads. If
+    // approval and planning resolve the file separately, the first resolution can
+    // rehydrate a redacted url (shadowing the backup's command, exempting it from
+    // approval) while the second sees the url gone and writes the command runnable.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      '{ "servers": { "evil": { "command": "npx notes-mcp --root /data", "url": "https://mcp.example.com/mcp?api_key=hunter2" } } }\n'
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(payload.redactions).toEqual(["servers.evil.url"]);
+    const destination = path.join(tempDir, "toctou-approval");
+    await writeBackupPayload(destination, payload);
+    const readBack = await readBackupPayload(destination);
+
+    const withUrl = '{ "servers": { "evil": { "url": "https://mcp.example.com/mcp" } } }\n';
+    await writeFixtureFile(muxRoot, "mcp.jsonc", withUrl);
+
+    // The editor removes the url right after the first marker resolution has observed
+    // it: opens 1 (restore's local file listing) and 2 (the first resolution) see the
+    // url; the file is rewritten before open 3.
+    const realOpen = fs.open;
+    let localMcpOpens = 0;
+    const openSpy = spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+      if (
+        typeof target === "string" &&
+        target.endsWith("mcp.jsonc") &&
+        !target.includes("toctou-approval")
+      ) {
+        localMcpOpens += 1;
+        if (localMcpOpens === 3) {
+          openSpy.mockRestore();
+          await fs.writeFile(target, '{ "servers": {} }\n', "utf-8");
+          return fs.open(target, flags, mode);
+        }
+      }
+      return realOpen.call(fs, target, flags, mode);
+    });
+    try {
+      let approvalError: unknown = null;
+      try {
+        await restoreBackupPayload({ muxRoot, payload: readBack });
+      } catch (error) {
+        approvalError = error;
+      }
+      // Whatever interleaving restore observed, the repository-controlled command must
+      // not become runnable without approval: either restore demanded approval, or the
+      // written entry still carries a url shadowing the command (or lost the server).
+      if (approvalError === null) {
+        const written = jsonc.parse(
+          await fs.readFile(path.join(muxRoot, "mcp.jsonc"), "utf-8")
+        ) as {
+          servers?: Record<string, { command?: string; url?: string }>;
+        };
+        const entry = written.servers?.evil;
+        if (entry?.command !== undefined) {
+          expect(typeof entry.url === "string" && entry.url !== "").toBe(true);
+        }
+      } else {
+        expect(approvalError).toBeInstanceOf(BackupCommandApprovalRequiredError);
+      }
+    } finally {
+      openSpy.mockRestore();
+    }
+  });
+
   it("needs no approval to disable a command or for an empty one", async () => {
     await writeFixtureFile(
       muxRoot,
