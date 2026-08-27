@@ -238,6 +238,7 @@ class MuxAgent(BaseInstalledAgent):
     _TOKEN_FILE_PATH = "/tmp/mux-tokens.json"
     _DEFAULT_RUN_LOG_DIR = "/logs/agent/command-0"
     _RUN_EXIT_CODE_NAME = "mux-run-exit-code.txt"
+    _RUN_EXIT_CODE_MAX_BYTES = 3
     _DEFAULT_RUN_SESSION_ROOT = "/tmp/mux-run-root"
     _SESSIONS_ARCHIVE_NAME = "mux-sessions.tar.gz"
     _SESSION_USAGE_SUMMARY_NAME = "mux-session-usage.json"
@@ -465,17 +466,24 @@ class MuxAgent(BaseInstalledAgent):
                 break
 
         runner_exit_code: int | None = None
-        runner_exit_path = self.logs_dir / self._RUN_EXIT_CODE_NAME
-        runner_exit_path.unlink(missing_ok=True)
         if runner_marker_cleared:
             try:
                 # The sandbox already authors trusted telemetry in this harness;
                 # independent task verification remains the correctness boundary.
-                await environment.download_file(
-                    runner_exit_sandbox_path, runner_exit_path
+                marker_result = await environment.exec(
+                    command=(
+                        f"head -c {self._RUN_EXIT_CODE_MAX_BYTES + 1} -- "
+                        f"{shlex.quote(runner_exit_sandbox_path)}"
+                    ),
+                    user="root",
+                    timeout_sec=30,
                 )
-                raw_exit_code = runner_exit_path.read_text()
-                if raw_exit_code.isdecimal() and len(raw_exit_code) <= 3:
+                raw_exit_code = marker_result.stdout or ""
+                if (
+                    marker_result.return_code == 0
+                    and len(raw_exit_code.encode()) <= self._RUN_EXIT_CODE_MAX_BYTES
+                    and raw_exit_code.isdecimal()
+                ):
                     parsed_exit_code = int(raw_exit_code)
                     if parsed_exit_code <= 255:
                         runner_exit_code = parsed_exit_code
@@ -690,7 +698,7 @@ class MuxAgent(BaseInstalledAgent):
                 for member in archive:
                     members_seen += 1
                     if members_seen > self._SESSION_USAGE_MAX_MEMBERS:
-                        break
+                        return None
                     expanded_bytes += member.size
                     if expanded_bytes > self._SESSIONS_ARCHIVE_MAX_EXPANDED_BYTES:
                         return None
@@ -705,7 +713,7 @@ class MuxAgent(BaseInstalledAgent):
                     # Aggregate cap: many small-header members must not add up
                     # to an unbounded allocation either.
                     if bytes_read + member.size > self._SESSION_USAGE_MAX_TOTAL_BYTES:
-                        break
+                        return None
                     try:
                         extracted = archive.extractfile(member)
                         if extracted is None:

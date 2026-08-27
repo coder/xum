@@ -56,9 +56,11 @@ def _run_mux_runner_smoke(
     goal_mode: str | None = None,
     timeout_ms: str | None = None,
     repo_git_config: tuple[str, str] | None = None,
+    repo_git_config_bytes: bytes | None = None,
     pretrust_git_timeout: bool = False,
     trust_timeout: bool = False,
     fake_tee_exit_code: int | None = None,
+    overwrite_stderr_after_status: bool = False,
     emit_run_complete: bool = True,
 ) -> _RunnerSmokeResult:
     app_root = tmp_path / "app"
@@ -80,6 +82,9 @@ def _run_mux_runner_smoke(
             ["git", "-C", str(project_path), "config", *repo_git_config],
             check=True,
         )
+    if repo_git_config_bytes is not None:
+        with (project_path / ".git/config").open("ab") as config_file:
+            config_file.write(repo_git_config_bytes)
 
     _write_executable(
         fake_bin / "bun",
@@ -97,14 +102,28 @@ fi
 exit "${FAKE_MUX_EXIT_CODE}"
 """,
     )
-    if fake_tee_exit_code is not None:
+    if fake_tee_exit_code is not None or overwrite_stderr_after_status:
         real_tee = shutil.which("tee")
         assert real_tee is not None
         _write_executable(
             fake_bin / "tee",
             f"""#!/usr/bin/env bash
+set -euo pipefail
+target=${{!#}}
+input_source=$(readlink /proc/$$/fd/0)
+if [[ "${{FAKE_OVERWRITE_STDERR_AFTER_STATUS:-0}}" == "1" \
+  && "$target" == "${{FAKE_STDERR_FILE}}" \
+  && "$input_source" == pipe:* ]]; then
+  captured=$(mktemp)
+  cat >"$captured"
+  cat "$captured"
+  while ! grep -Fq '[mux-run] ERROR:' "$target" 2>/dev/null; do :; done
+  cat "$captured" >"$target"
+  rm -f "$captured"
+  exit 0
+fi
 "{real_tee}" "$@"
-exit "${{FAKE_TEE_EXIT_CODE}}"
+exit "${{FAKE_TEE_EXIT_CODE:-0}}"
 """,
         )
     _write_executable(
@@ -141,6 +160,10 @@ exit 99
             "FAKE_PRETRUST_GIT_TIMEOUT": "1" if pretrust_git_timeout else "0",
             "FAKE_TRUST_TIMEOUT": "1" if trust_timeout else "0",
             "FAKE_TRUST_TIMEOUT_ARGS_FILE": str(trust_timeout_args_file),
+            "FAKE_OVERWRITE_STDERR_AFTER_STATUS": (
+                "1" if overwrite_stderr_after_status else "0"
+            ),
+            "FAKE_STDERR_FILE": str(log_dir / "stderr.txt"),
             "MUX_APP_ROOT": str(app_root),
             "MUX_LOG_DIR": str(log_dir),
             "MUX_PROJECT_PATH": str(project_path),
@@ -288,6 +311,7 @@ def test_mux_runner_scores_goal_mode_incomplete_exit(tmp_path: Path) -> None:
         "remote.origin.uploadpack",
         "gpg.program",
         "core.editor",
+        "core.alternateRefsCommand",
         "sequence.editor",
     ],
 )
@@ -305,6 +329,18 @@ def test_mux_runner_rejects_git_driver_before_trust(
         "refusing to trust project with repo-controlled Git drivers"
         in result.completed.stderr
     )
+    assert not Path(f"{result.args_file}.trust").exists()
+
+
+def test_mux_runner_rejects_non_ascii_git_config_name(tmp_path: Path) -> None:
+    result = _run_mux_runner_smoke(
+        tmp_path,
+        exit_code=0,
+        repo_git_config_bytes=b'\n[filter "\xffevil"]\n\tclean = ./steal-secrets\n',
+    )
+
+    assert result.completed.returncode == 1
+    assert "non-ASCII Git config names" in result.completed.stderr
     assert not Path(f"{result.args_file}.trust").exists()
 
 
@@ -378,6 +414,21 @@ def test_mux_runner_persists_failure_marker_to_collected_stderr(tmp_path: Path) 
     assert marker in (session_root / "run-stderr.log").read_text()
 
 
+def test_mux_runner_waits_for_stderr_capture_before_persisting_status(
+    tmp_path: Path,
+) -> None:
+    result = _run_mux_runner_smoke(
+        tmp_path,
+        exit_code=1,
+        overwrite_stderr_after_status=True,
+    )
+
+    marker = mux_run_failure_marker(1)
+    assert marker in (result.log_dir / "stderr.txt").read_text()
+    session_root = result.log_dir.parents[2] / "session-root"
+    assert marker in (session_root / "run-stderr.log").read_text()
+
+
 def test_mux_runner_downgrades_tee_failure_after_run_complete(tmp_path: Path) -> None:
     """A dropped exec-channel stdout reader fails tee with EPIPE after the run
     finished; the complete collected file must keep the trial scoreable."""
@@ -439,6 +490,7 @@ class _FakeEnvironment:
         self.preexisting_session_dirs = preexisting_session_dirs
         self.token_payload = token_payload
         self.snapshot_requested = False
+        self.marker_download_bytes = 0
         self.exec_commands: list[str] = []
         self.download_attempts: list[tuple[str, Path]] = []
 
@@ -446,6 +498,19 @@ class _FakeEnvironment:
         command = _kwargs.get("command")
         if isinstance(command, str):
             self.exec_commands.append(command)
+        if (
+            isinstance(command, str)
+            and "head -c" in command
+            and MuxAgent._RUN_EXIT_CODE_NAME in command
+        ):
+            exit_code = self.runner_exit_code or self.stale_runner_exit_code
+            if exit_code is None:
+                return _ExecResult(return_code=1)
+            cap_match = re.search(r"head -c (\d+)", command)
+            assert cap_match is not None
+            return _ExecResult(
+                return_code=0, stdout=exit_code[: int(cap_match.group(1))]
+            )
         if (
             isinstance(command, str)
             and command.startswith("rm -f -- ")
@@ -500,6 +565,7 @@ class _FakeEnvironment:
             exit_code = self.runner_exit_code or self.stale_runner_exit_code
             if exit_code is None:
                 raise FileNotFoundError(source_path)
+            self.marker_download_bytes += len(exit_code.encode())
             target_path.write_text(exit_code)
             return
         assert source_path == MuxAgent._TOKEN_FILE_PATH
@@ -527,10 +593,6 @@ def test_run_raises_after_preserving_logs_for_nonzero_exit(
     assert (command_dir / MuxAgent._COMMAND_STDOUT_NAME).read_text() == "out"
     assert (command_dir / MuxAgent._COMMAND_STDERR_NAME).read_text() == "err"
     assert environment.download_attempts == [
-        (
-            f"{agent._DEFAULT_RUN_LOG_DIR}/{agent._RUN_EXIT_CODE_NAME}",
-            tmp_path / agent._RUN_EXIT_CODE_NAME,
-        ),
         (agent._TOKEN_FILE_PATH, tmp_path / "mux-tokens.json"),
     ]
     # input(7) + cache_read(5) + cache_write(3): cache traffic counts as input
@@ -554,6 +616,26 @@ def test_run_uses_runner_exit_code_over_channel_failure(
     diagnostic = tmp_path / "command-0" / "transport-diagnostic.log"
     assert "channel return code 1 disagreed with mux-run exit code 0" in (
         diagnostic.read_text()
+    )
+
+
+def test_run_bounds_oversized_runner_exit_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    environment = _FakeEnvironment(
+        _ExecResult(return_code=7),
+        runner_exit_code="0" * 1024,
+    )
+
+    with pytest.raises(RuntimeError, match="exit 7"):
+        asyncio.run(agent.run("do the task", environment, SimpleNamespace()))
+
+    assert environment.marker_download_bytes == 0
+    assert any(
+        "head -c 4" in command and agent._RUN_EXIT_CODE_NAME in command
+        for command in environment.exec_commands
     )
 
 
@@ -622,10 +704,6 @@ def test_run_timeout_surfaces_agent_timeout_error(
         asyncio.run(agent.run("do the task", environment, context))
 
     assert environment.download_attempts == [
-        (
-            f"{agent._DEFAULT_RUN_LOG_DIR}/{agent._RUN_EXIT_CODE_NAME}",
-            tmp_path / agent._RUN_EXIT_CODE_NAME,
-        ),
         (agent._TOKEN_FILE_PATH, tmp_path / "mux-tokens.json"),
     ]
     # input(7) + cache_read(5) + cache_write(3): cache traffic counts as input
@@ -1140,8 +1218,7 @@ def test_session_usage_enforces_aggregate_byte_cap(
 
     totals = agent._summarize_session_usage()
 
-    assert totals is not None
-    assert totals["sessions"] == 1
+    assert totals is None
 
 
 def test_session_usage_skips_malformed_entries(

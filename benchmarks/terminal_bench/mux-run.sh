@@ -105,15 +105,37 @@ MUX_RUN_SESSION_ROOT="${MUX_RUN_SESSION_ROOT:-/tmp/mux-run-root}"
 export MUX_RUN_SESSION_ROOT
 mkdir -p "${MUX_RUN_SESSION_ROOT}"
 
-repo_driver_pattern='^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver|remote[.].*[.](uploadpack|receivepack|vcs)|core[.](sshcommand|gitproxy|askpass|editor)|sequence[.]editor|credential([.].*)?[.]helper|commit[.]gpgsign|tag[.]gpgsign|gpg([.].*)?[.]program)$'
-if timeout 15s git -C "${project_path}" config --name-only --includes --get-regexp "${repo_driver_pattern}" >/dev/null; then
-  fatal "refusing to trust project with repo-controlled Git drivers"
+repo_driver_pattern='^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver|remote[.].*[.](uploadpack|receivepack|vcs)|core[.](sshcommand|gitproxy|askpass|editor|alternaterefscommand)|sequence[.]editor|credential([.].*)?[.]helper|commit[.]gpgsign|tag[.]gpgsign|gpg([.].*)?[.]program)$'
+config_names_file=$(mktemp "${MUX_LOG_DIR}/git-config-names.XXXXXX") || fatal "failed to inspect repository automation drivers"
+if timeout 15s git -C "${project_path}" config -z --name-only --includes --list >"${config_names_file}"; then
+  :
 else
   git_config_status=$?
+  rm -f "${config_names_file}"
   if [[ "${git_config_status}" -eq 124 ]]; then
     fatal "timed out inspecting repository automation drivers"
   fi
-  if [[ "${git_config_status}" -ne 1 ]]; then
+  fatal "failed to inspect repository automation drivers"
+fi
+
+if LC_ALL=C grep -qaz '[^ -~]' "${config_names_file}"; then
+  rm -f "${config_names_file}"
+  fatal "refusing to trust project with non-ASCII Git config names"
+else
+  config_match_status=$?
+  if [[ "${config_match_status}" -ne 1 ]]; then
+    rm -f "${config_names_file}"
+    fatal "failed to inspect repository automation drivers"
+  fi
+fi
+
+if LC_ALL=C grep -qazE "${repo_driver_pattern}" "${config_names_file}"; then
+  rm -f "${config_names_file}"
+  fatal "refusing to trust project with repo-controlled Git drivers"
+else
+  config_match_status=$?
+  rm -f "${config_names_file}"
+  if [[ "${config_match_status}" -ne 1 ]]; then
     fatal "failed to inspect repository automation drivers"
   fi
 fi
@@ -183,12 +205,18 @@ fi
 
 # Capture output to file while streaming to terminal for token extraction.
 # Keep stderr separate so the stdout log stays valid JSONL.
+stderr_fifo="${MUX_LOG_DIR}/stderr.fifo"
+rm -f "${stderr_fifo}"
+mkfifo "${stderr_fifo}"
+tee "${MUX_STDERR_FILE}" <"${stderr_fifo}" >&2 &
+stderr_tee_pid=$!
 set +e
 printf '%s' "${instruction}" \
-  | "${cmd[@]}" \
-    2> >(tee "${MUX_STDERR_FILE}" >&2) \
+  | "${cmd[@]}" 2>"${stderr_fifo}" \
   | tee "${MUX_OUTPUT_FILE}"
 pipeline_status=("${PIPESTATUS[@]}")
+wait "${stderr_tee_pid}"
+rm -f "${stderr_fifo}"
 set -e
 stdin_status="${pipeline_status[0]}"
 mux_status="${pipeline_status[1]}"
