@@ -1815,6 +1815,25 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     expandedCompletedParentIds,
     { isWorkspaceLiveActive }
   );
+  // Pinned-at-the-top invariant vs drafts: pinned roots (their subtrees stay
+  // adjacent and never age out) render as their own segment above the draft
+  // rows, so adding a draft never displaces the user's pinned chats.
+  const flatPinnedRowIds = new Set<string>();
+  if (flatSidebarEnabled) {
+    let inPinnedSubtree = false;
+    for (const row of flatRowsForDisplay) {
+      if ((flatDepthByWorkspaceId[row.id] ?? 0) === 0) {
+        inPinnedSubtree = isWorkspacePinned(row);
+      }
+      if (inPinnedSubtree) flatPinnedRowIds.add(row.id);
+    }
+  }
+  const visiblePinnedFlatWorkspaces = visibleFlatWorkspaces.filter((row) =>
+    flatPinnedRowIds.has(row.id)
+  );
+  const visibleUnpinnedFlatWorkspaces = visibleFlatWorkspaces.filter(
+    (row) => !flatPinnedRowIds.has(row.id)
+  );
   if (flatSidebarEnabled) {
     // Track runs that are (or were, this session) active so their groups stay
     // mounted across step gaps (mirrors the grouped per-project seeding).
@@ -1956,9 +1975,11 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     };
   };
   // Flat mode drops the section headers that used to convey sub-project
-  // scope, so rows scoped to a valid sub-project badge with its identity
-  // instead of the parent's. Stale references (deleted sections) fall back
-  // to the parent badge, mirroring getDraftSectionId's validation.
+  // scope, so rows scoped to a valid sub-project badge with a hierarchical
+  // "Parent / Sub" label: sub-project names are only unique within their
+  // parent, so the bare sub name (badge text and aria-label both derive from
+  // it) could collide across projects. Stale references (deleted sections)
+  // fall back to the parent badge, mirroring getDraftSectionId's validation.
   const resolveSubProjectBadge = (
     parentProjectPath: string,
     subProjectPath: string | null | undefined
@@ -1967,7 +1988,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     const config = userProjects.get(subProjectPath);
     if (config?.parentProjectPath !== parentProjectPath) return undefined;
     return {
-      name: getProjectDisplayName(subProjectPath, config),
+      name: `${getProjectBadge(parentProjectPath).name} / ${getProjectDisplayName(subProjectPath, config)}`,
       color: resolveSectionColor(config.color),
     };
   };
@@ -2563,6 +2584,12 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         <Plus className="h-3.5 w-3.5" />
         New chat
       </button>
+      {renderCoalescedWorkspaceList(visiblePinnedFlatWorkspaces, flatRowsForDisplay, {
+        tierKeyPrefix: "flat",
+        depthByWorkspaceId: flatDepthByWorkspaceId,
+        baseRowMetaByWorkspaceId: flatRowMetaByWorkspaceId,
+        renderRow: renderFlatRow,
+      })}
       {flatDrafts.map(({ projectPath, draft }, index) => {
         const promotedMetadata = flatDraftPromotionsByDraftId.get(draft.draftId);
         if (promotedMetadata) {
@@ -2607,7 +2634,7 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
           />
         );
       })}
-      {renderCoalescedWorkspaceList(visibleFlatWorkspaces, flatRowsForDisplay, {
+      {renderCoalescedWorkspaceList(visibleUnpinnedFlatWorkspaces, flatRowsForDisplay, {
         tierKeyPrefix: "flat",
         depthByWorkspaceId: flatDepthByWorkspaceId,
         baseRowMetaByWorkspaceId: flatRowMetaByWorkspaceId,

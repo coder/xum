@@ -1056,10 +1056,11 @@ describe("ProjectSidebar flat chat list", () => {
       />
     );
 
-    // A valid sub-project reference badges with the sub-project's identity;
-    // a stale (deleted) reference falls back to the parent project badge.
+    // A valid sub-project reference badges hierarchically (sub names are only
+    // unique within a parent); a stale (deleted) reference falls back to the
+    // parent project badge.
     expect(
-      within(view.getByTestId(agentItemTestId("in-section"))).getByText("Features")
+      within(view.getByTestId(agentItemTestId("in-section"))).getByText("Demo / Features")
     ).toBeTruthy();
     expect(
       within(view.getByTestId(agentItemTestId("stale-section"))).getByText("Demo")
@@ -1107,6 +1108,66 @@ describe("ProjectSidebar flat chat list", () => {
     expect(view.queryByTestId(agentItemTestId("child-1"))).toBeNull();
     expect(view.queryByTestId(agentItemTestId("child-2"))).toBeNull();
     expect(view.getByTestId(agentItemTestId("parent"))).toBeTruthy();
+  });
+
+  test("keeps the pinned block above drafts in the flat list", () => {
+    const pinned = {
+      ...createWorkspace("pinned-chat", { title: "Pinned chat" }),
+      projects: singleProjectRefs,
+      pinnedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const regular = {
+      ...createWorkspace("regular-chat", { title: "Regular chat" }),
+      projects: singleProjectRefs,
+    };
+    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
+      () =>
+        ({
+          selectedWorkspace: null,
+          setSelectedWorkspace: () => undefined,
+          preflightArchiveWorkspace: () =>
+            Promise.resolve({ success: true, data: { kind: "ready" } }),
+          archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
+          removeWorkspace: () => Promise.resolve({ success: true }),
+          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
+          refreshWorkspaceMetadata: () => Promise.resolve(),
+          pendingNewWorkspaceProject: null,
+          pendingNewWorkspaceDraftId: null,
+          workspaceDraftsByProject: {
+            "/projects/demo-project": [{ draftId: "draft-order", createdAt: Date.now() }],
+          },
+          workspaceDraftPromotionsByProject: {},
+          createWorkspaceDraft: () => undefined,
+          openWorkspaceDraft: () => undefined,
+          deleteWorkspaceDraft: () => undefined,
+        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
+    );
+    // Non-empty drafts render as rows; empty ones stay hidden.
+    updatePersistedState(
+      getInputKey(getDraftScopeId("/projects/demo-project", "draft-order")),
+      "Draft prompt"
+    );
+    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [pinned, regular]]])}
+        workspaceRecency={{ "pinned-chat": Date.now(), "regular-chat": Date.now() }}
+      />
+    );
+
+    // Pinned chats keep the top of the flat list: a new draft slots in
+    // between the pinned block and the unpinned chats, never above pins.
+    const rows = Array.from(
+      view.container.querySelectorAll('[data-testid^="agent-item-"], [data-testid^="draft-item-"]')
+    ).map((row) => row.getAttribute("data-testid"));
+    expect(rows).toEqual([
+      agentItemTestId("pinned-chat"),
+      "draft-item-draft-order",
+      agentItemTestId("regular-chat"),
+    ]);
   });
 
   test("renders a promoted flat draft once as the live workspace row", () => {
