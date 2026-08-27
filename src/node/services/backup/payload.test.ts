@@ -1652,15 +1652,20 @@ describe("backup payload", () => {
 
   it("scans a file holding a multi-megabyte repeated-character run", async () => {
     // The run stripper must stay linear: a backreference regex exhausts V8's call
-    // stack near 4 MiB and rejected size-valid files before scanning them.
-    await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", "x".repeat(4 * 1024 * 1024));
-    const payload = await createBackupPayload({
-      muxRoot,
-      muxVersion: "1.2.3",
-      sourceLabel: "test-host",
-      reportSecrets: true,
-    });
-    expect(payloadFileText(payload, "skills/demo/SKILL.md").length).toBe(4 * 1024 * 1024);
+    // stack near 4 MiB and rejected size-valid files before scanning them. The
+    // alternating U+212A KELVIN SIGN/k spelling forces every comparison through the
+    // non-ASCII fold path, which must treat the cross-plane pair as one run without
+    // allocating per character.
+    for (const content of ["x".repeat(4 * 1024 * 1024), "\u212Ak".repeat(2 * 1024 * 1024)]) {
+      await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", content);
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      expect(payloadFileText(payload, "skills/demo/SKILL.md")).toBe(content);
+    }
   });
 
   it("localizes commands that write files through active redirection", async () => {
@@ -1760,6 +1765,10 @@ describe("backup payload", () => {
       // su/runuser/sudo hand their command operand to the target user's shell, and
       // watch runs its command through `sh -c`; each adds a parse pass that expands
       // ${IFS} and removes the backslash the first parse kept.
+      // xargs' default input parsing removes backslashes and quotes from the argument
+      // file, reconstructing a split token; GNU parallel runs its command via a shell.
+      "xargs -a /home/user/.xum/AGENTS.md mcp --token",
+      "parallel 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789' ::: run",
       "su target -c 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
       "runuser target -c 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
       "sudo -s 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",

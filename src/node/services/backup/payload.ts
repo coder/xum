@@ -117,10 +117,34 @@ function hasDigitBearingSkToken(text: string): boolean {
 const EXAMPLE_ACCESS_KEY = "AKIAIOSFODNN7EXAMPLE";
 
 /**
+ * Lazily filled fold-class ids for the non-ASCII comparison path: two units share an
+ * id exactly when their single-unit `toLowerCase` strings are equal, so a run
+ * alternating case-equivalent units (U+212A KELVIN SIGN with `k`) costs one typed
+ * array read per unit instead of two string allocations per comparison across a
+ * size-capped payload. The table is bounded by the UTF-16 alphabet (256 KiB).
+ */
+const FOLD_CLASS_IDS = new Uint32Array(65536);
+const FOLD_CLASS_BY_STRING = new Map<string, number>();
+
+function foldClassId(code: number): number {
+  let id = FOLD_CLASS_IDS[code];
+  if (id === 0) {
+    const folded = String.fromCharCode(code).toLowerCase();
+    id = FOLD_CLASS_BY_STRING.get(folded) ?? 0;
+    if (id === 0) {
+      id = FOLD_CLASS_BY_STRING.size + 1;
+      FOLD_CLASS_BY_STRING.set(folded, id);
+    }
+    FOLD_CLASS_IDS[code] = id;
+  }
+  return id;
+}
+
+/**
  * Case-insensitive equality of two UTF-16 units without allocating per-character
  * lowercase strings, which dominated the synchronous scan of a size-capped payload.
- * ASCII folds arithmetically; only a non-ASCII unit pays for string folding (which
- * also catches cross-plane pairs like U+212A KELVIN SIGN and `k`).
+ * ASCII folds arithmetically; only a non-ASCII unit pays for a cached fold-class
+ * lookup (which also catches cross-plane pairs like U+212A KELVIN SIGN and `k`).
  */
 function sameFoldedUnit(a: number, b: number): boolean {
   if (a === b) return true;
@@ -128,7 +152,7 @@ function sameFoldedUnit(a: number, b: number): boolean {
   const foldedB = b >= 65 && b <= 90 ? b + 32 : b;
   if (foldedA === foldedB) return true;
   if (a < 128 && b < 128) return false;
-  return String.fromCharCode(a).toLowerCase() === String.fromCharCode(b).toLowerCase();
+  return foldClassId(a) === foldClassId(b);
 }
 
 /**
@@ -1759,6 +1783,11 @@ const SHELL_REPARSE_EXECUTABLE_NAMES = new Set([
   "flock",
   "script",
   "tmux",
+  // xargs' default input parsing removes backslashes and quotes from stdin or an
+  // `-a` argument file, reconstructing a token a collected file carries split; GNU
+  // parallel additionally runs its composed command lines through a shell.
+  "xargs",
+  "parallel",
 ]);
 
 /**
