@@ -1146,6 +1146,9 @@ describe("backup payload", () => {
     for (const command of [
       "mcp-server --pattern '$(date)'",
       "mcp-server --pattern '@(x|y)'",
+      // ANSI-C quoting is not recognized inside double quotes: `$'` there is the
+      // two literal characters the process receives.
+      "mcp-server --label \"price$'5'\"",
       "mcp-server # regenerate with $(date)",
       "mcp-server \\\n# regenerate with $(date)",
     ]) {
@@ -1489,6 +1492,71 @@ describe("backup payload", () => {
 
     // A word merely containing the letters stays an ordinary argument.
     const portable = "run-mcp --formatter evaluate";
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({ servers: { grafana: { command: portable } } })
+    );
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+      servers: { grafana: { command: string } };
+    };
+    expect(mcp.servers.grafana.command).toBe(portable);
+  });
+
+  it("blocks GitLab tokens in collected files without an override", async () => {
+    // `glpat-` is an issued-only prefix like `ghp_`; a generically named collected
+    // file must not publish one just because no path-based gate covers it. Assembled
+    // at runtime so this source file never holds a contiguous token-shaped string,
+    // which GitHub push protection would itself refuse.
+    await writeFixtureFile(
+      muxRoot,
+      "skills/demo/SKILL.md",
+      ["token: glpat-", "K3vQ9rT2wY7bN4mJ6hL8", "\n"].join("")
+    );
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+    expect((blocked as BackupCredentialDetectedError).files).toEqual(["skills/demo/SKILL.md"]);
+  });
+
+  it("localizes commands that write files through active redirection", async () => {
+    // A write redirection lets the command assemble a credential file the scans
+    // cannot model (`printf a >f; printf b >>f`), so any active `>` goes
+    // machine-local; quoted arrows are ordinary argument text.
+    for (const command of [
+      "printf ghp_aaaaaaaaaa >/tmp/token; printf bbbbbbbbbb >>/tmp/token; mcp --token-file /tmp/token",
+      "mcp-server 2>&1",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+    }
+
+    const portable = "mcp --arrow '->'";
     await writeFixtureFile(
       muxRoot,
       "mcp.jsonc",

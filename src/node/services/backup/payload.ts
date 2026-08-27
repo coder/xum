@@ -78,6 +78,8 @@ const CREDENTIAL_TOKEN_PATTERNS = [
   /\bgho_[A-Za-z0-9]{20,}\b/,
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,
   /\bglsa_[A-Za-z0-9_]{20,}\b/,
+  // GitLab issued prefixes: personal, deploy, runner, service-account, trigger tokens.
+  /\bgl(?:pat|dt|rt|soat|ptt)-[A-Za-z0-9_-]{20,}\b/,
   /\blin_api_[A-Za-z0-9]{16,}\b/,
   /\bntn_[A-Za-z0-9]{16,}\b/,
   /\bAKIA[0-9A-Z]{16}\b/,
@@ -1559,9 +1561,11 @@ function hasDisguisedAssignment(redacted: string): boolean {
  * no scan of the spelling reconstructs. Any of them makes assignment detection
  * undecidable. A
  * here-document or here-string feeds the consumer a body under document rules the word
- * scans would misread. Process substitution hands the consumer a file whose bytes its
- * inner script chooses (`--token-file <(printf a;printf b)` delivers the joined
- * credential), assignment or not. With `extglob` inherited via BASHOPTS, `?( *( +( @( !(` open one
+ * scans would misread. Process substitution and write redirection each hand the
+ * consumer a file whose bytes the command chooses (`--token-file <(printf a;printf b)`,
+ * `printf a >f; printf b >>f`), assignment or not, so both localize; program-internal
+ * writes (`tee`) are per-program knowledge no shell-syntax scan can model, the same
+ * boundary drawn for option semantics. With `extglob` inherited via BASHOPTS, `?( *( +( @( !(` open one
  * pathname pattern whose file match can complete a credential, undecidable like any
  * glob. Single-quoted, escaped, and commented spellings are inert
  * (`--pattern '$(date)'` is a literal argument a raw-string test would localize), while
@@ -1571,8 +1575,9 @@ function findActiveShellConstructs(command: string): {
   carrier: boolean;
   heredoc: boolean;
   processSubstitution: boolean;
+  redirection: boolean;
 } {
-  const found = { carrier: false, heredoc: false, processSubstitution: false };
+  const found = { carrier: false, heredoc: false, processSubstitution: false, redirection: false };
   let i = 0;
   let wordStart = true;
   // The previous character as Bash sees it, or "" when that character was quoted or
@@ -1647,6 +1652,9 @@ function findActiveShellConstructs(command: string): {
     }
     if (char === ">") {
       if (command[i + 1] === "(") found.processSubstitution = true;
+      // Any write redirection lets the command assemble a file whose bytes the scans
+      // cannot model (`printf a >f; printf b >>f; mcp --token-file f`).
+      found.redirection = true;
       i += 1;
       wordStart = true;
       prevActive = char;
@@ -1810,7 +1818,8 @@ function redactCommandEnvAssignments(command: string): string {
     hasDisguisedAssignment(redactedCode) ||
     constructs.carrier ||
     constructs.heredoc ||
-    constructs.processSubstitution
+    constructs.processSubstitution ||
+    constructs.redirection
   ) {
     return REDACTED_BACKUP_VALUE;
   }
