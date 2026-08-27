@@ -296,11 +296,20 @@ export async function spawnProcess(
  * Output files (output.log, exit_code) are on the runtime's filesystem.
  * This handle provides lifecycle management via execBuffered commands.
  */
+type MonitorProbeOperation = "readOutput" | "getExitCode";
+
+// One or two misses can be transient; three means that capability cannot serve the monitor.
+const MAX_CONSECUTIVE_MONITOR_PROBE_FAILURES = 3;
+
+interface MonitorProbeFailure {
+  consecutiveFailures: number;
+  message: string;
+}
+
 class RuntimeBackgroundHandle implements BackgroundHandle {
-  private lastMonitorProbeFailure?: {
-    operation: "readOutput" | "getExitCode";
-    message: string;
-  };
+  private readonly monitorProbeFailures: Partial<
+    Record<MonitorProbeOperation, MonitorProbeFailure>
+  > = {};
   private terminated = false;
 
   constructor(
@@ -310,8 +319,8 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
     private readonly quotePath: (p: string) => string
   ) {}
 
-  private clearMonitorProbeFailure(): void {
-    this.lastMonitorProbeFailure = undefined;
+  private recordMonitorProbeSuccess(operation: MonitorProbeOperation): void {
+    delete this.monitorProbeFailures[operation];
   }
 
   private assertMonitorProbeSucceeded(operation: string, exitCode: number): void {
@@ -321,16 +330,31 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
   }
 
   private recordMonitorProbeFailure(
-    operation: "readOutput" | "getExitCode",
+    operation: MonitorProbeOperation,
     error: unknown
   ): Error | null {
     const message = errorMsg(error);
-    const previous = this.lastMonitorProbeFailure;
-    this.lastMonitorProbeFailure = { operation, message };
-    if (previous == null || previous.operation === operation) return null;
-    return new Error(
-      `Background process monitor probes failed (${previous.operation}: ${previous.message}; ${operation}: ${message})`
-    );
+    const previous = this.monitorProbeFailures[operation];
+    const current: MonitorProbeFailure = {
+      consecutiveFailures: (previous?.consecutiveFailures ?? 0) + 1,
+      message,
+    };
+    this.monitorProbeFailures[operation] = current;
+
+    const otherOperation: MonitorProbeOperation =
+      operation === "readOutput" ? "getExitCode" : "readOutput";
+    const otherFailure = this.monitorProbeFailures[otherOperation];
+    if (otherFailure != null) {
+      return new Error(
+        `Background process monitor probes failed (${operation}: ${message}; ${otherOperation}: ${otherFailure.message})`
+      );
+    }
+    if (current.consecutiveFailures >= MAX_CONSECUTIVE_MONITOR_PROBE_FAILURES) {
+      return new Error(
+        `Background process monitor probe failed ${current.consecutiveFailures} consecutive times (${operation}: ${message})`
+      );
+    }
+    return null;
   }
 
   /**
@@ -346,7 +370,7 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
         { cwd: FALLBACK_CWD, timeout: 10 }
       );
       this.assertMonitorProbeSucceeded("getExitCode", result.exitCode);
-      this.clearMonitorProbeFailure();
+      this.recordMonitorProbeSuccess("getExitCode");
       return parseExitCode(result.stdout);
     } catch (error) {
       log.debug(`RuntimeBackgroundHandle.getExitCode: Error: ${errorMsg(error)}`);
@@ -438,7 +462,7 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
       const fileSize = await this.readOutputFileSize();
 
       if (offset >= fileSize) {
-        this.clearMonitorProbeFailure();
+        this.recordMonitorProbeSuccess("readOutput");
         return { content: "", newOffset: offset };
       }
 
@@ -451,7 +475,7 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
       );
       this.assertMonitorProbeSucceeded("readOutput tail probe", readResult.exitCode);
 
-      this.clearMonitorProbeFailure();
+      this.recordMonitorProbeSuccess("readOutput");
       return {
         content: readResult.stdout,
         newOffset: offset + Buffer.byteLength(readResult.stdout),
