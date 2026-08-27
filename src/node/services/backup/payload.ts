@@ -1498,6 +1498,31 @@ function hasActiveBraceExpansion(active: string): boolean {
 }
 
 /**
+ * Shells whose `-c` payload (or script argument) is reparsed under full expansion
+ * rules: a quoted script with no literal whitespace still synthesizes separators
+ * there (`bash -c 'printf${IFS}%s...'`), so naming one localizes the command.
+ * Matched on the quote-removed word's basename, covering `/bin/sh` spellings. A
+ * custom wrapper that reparses its argv is per-program knowledge no shell-syntax
+ * scan can model, the same boundary drawn for `tee` and option semantics; these
+ * names are the shells the platform actually ships.
+ */
+const SHELL_INTERPRETER_NAMES = new Set([
+  "sh",
+  "bash",
+  "dash",
+  "ash",
+  "zsh",
+  "ksh",
+  "mksh",
+  "csh",
+  "tcsh",
+  "fish",
+  "busybox",
+  "pwsh",
+  "powershell",
+]);
+
+/**
  * Builtins that rewrite shell state the word scans cannot follow: `eval` reparses its
  * concatenated arguments, and the others give a shell-built value environment or
  * parameter visibility without any `=` or `$` spelling. Matched on quote-removed
@@ -1547,6 +1572,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
     // no `=` or `$` in the text (`printf -v TOKEN ...; export TOKEN`), and `set`
     // reaches the same end through `-a` or the positional parameters.
     if (SHELL_STATE_WORDS.has(unquoted)) return true;
+    if (SHELL_INTERPRETER_NAMES.has(unquoted.slice(unquoted.lastIndexOf("/") + 1))) return true;
     // Option terminators end option parsing: past one even a dash-led word is an
     // operand, so `env -- --evil=x` sets an environment entry despite the option look.
     // GNU `env` documents `[-]` as a terminator too, and the consumer sees the word

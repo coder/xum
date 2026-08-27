@@ -1616,6 +1616,10 @@ describe("backup payload", () => {
       // `source` and `.` run a file in this shell with fragments as positionals.
       "source ./launch ghp_aaaaaaaaaa bbbbbbbbbb",
       ". ./launch ghp_aaaaaaaaaa bbbbbbbbbb",
+      // A named shell reparses its -c payload, where ${IFS} synthesizes the
+      // whitespace the interpreter-string rule keys on and \K unescapes.
+      "bash -c 'printf${IFS}%s${IFS}ghp_Abcdef1234\\Klmno56789'",
+      "/bin/sh -c 'printf${IFS}%s${IFS}ghp_Abcdef1234\\Klmno56789'",
     ]) {
       await writeFixtureFile(
         muxRoot,
