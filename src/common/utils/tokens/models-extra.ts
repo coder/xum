@@ -178,6 +178,26 @@ export const modelsExtra: Record<string, ModelData> = {
     supports_response_schema: true,
   },
 
+  // Claude Mythos 5.1 - successor to Mythos 5, the restricted-access twin of
+  // Fable 5.1, assumed at the same pricing/shape: $10/M input, $50/M output, cache
+  // write 1.25x input / cache read 0.1x input, native 1M context, 128K max output,
+  // native xhigh effort level.
+  "claude-mythos-5-1": {
+    max_input_tokens: 1000000,
+    max_output_tokens: 128000,
+    input_cost_per_token: 0.00001, // $10 per million input tokens
+    output_cost_per_token: 0.00005, // $50 per million output tokens
+    cache_creation_input_token_cost: 0.0000125, // $12.50 per million tokens (1.25× input)
+    cache_read_input_token_cost: 0.000001, // $1.00 per million tokens (0.1× input)
+    litellm_provider: "anthropic",
+    mode: "chat",
+    supports_function_calling: true,
+    supports_vision: true,
+    supports_pdf_input: true,
+    supports_reasoning: true,
+    supports_response_schema: true,
+  },
+
   // Same underlying model as Fable 5 (identical pricing/shape); restricted access.
   "claude-mythos-5": {
     max_input_tokens: 1000000,

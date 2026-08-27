@@ -29,6 +29,7 @@ describe("formatModelDisplayName", () => {
       expect(formatModelDisplayName("claude-fable-5")).toBe("Fable 5");
       expect(formatModelDisplayName("claude-fable-5-1")).toBe("Fable 5.1");
       expect(formatModelDisplayName("claude-mythos-5")).toBe("Mythos 5");
+      expect(formatModelDisplayName("claude-mythos-5-1")).toBe("Mythos 5.1");
     });
   });
 

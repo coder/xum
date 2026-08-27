@@ -186,6 +186,12 @@ describe("buildProviderOptions - Anthropic", () => {
       );
       expect(anthropic51.thinking).toEqual({ type: "adaptive", display: "summarized" });
       expect(anthropic51.effort).toBe("medium");
+      // Mythos 5.1 does too.
+      const mythos51 = anthropicProviderOptions(
+        buildProviderOptions("anthropic:claude-mythos-5-1", "medium")
+      );
+      expect(mythos51.thinking).toEqual({ type: "adaptive", display: "summarized" });
+      expect(mythos51.effort).toBe("medium");
     });
 
     test("omits thinking instead of sending disabled when off", () => {
@@ -196,6 +202,9 @@ describe("buildProviderOptions - Anthropic", () => {
         anthropic: { ...baseAnthropicOptions, effort: "low" },
       });
       expect(buildProviderOptions("anthropic:claude-fable-5-1", "off")).toEqual({
+        anthropic: { ...baseAnthropicOptions, effort: "low" },
+      });
+      expect(buildProviderOptions("anthropic:claude-mythos-5-1", "off")).toEqual({
         anthropic: { ...baseAnthropicOptions, effort: "low" },
       });
     });
