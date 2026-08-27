@@ -1618,6 +1618,13 @@ function gitConfigOptionTakesSeparateValue(unquoted: string): boolean {
   return /^(?:-[ft]|--(?:file|blob|type|comment|default))$/.test(unquoted);
 }
 
+/** Java launcher options whose following word is an option value, not the source file. */
+function javaOptionTakesSeparateValue(unquoted: string): boolean {
+  return /^(?:-cp|-classpath|-p|--(?:class-path|module-path|upgrade-module-path|add-modules|enable-native-access|describe-module|add-reads|add-exports|add-opens|limit-modules|patch-module))$/.test(
+    unquoted
+  );
+}
+
 /** Git config values that Git later executes as commands or helper processes. */
 const GIT_COMMAND_CONFIG_KEY =
   /^(?:core\.(?:sshcommand|askpass|editor|pager|gitproxy|fsmonitor)|sequence\.editor|diff\.external|interactive\.difffilter|gpg(?:\.[^.]+)?\.program|pager\.[^.]+|(?:diff|merge)tool\.[^.]+\.cmd|filter\.[^.]+\.(?:clean|smudge|process)|credential(?:\..+)?\.helper|man\.[^.]+\.cmd|tar\.[^.]+\.command)$/i;
@@ -2032,6 +2039,10 @@ function hasDisguisedAssignment(redacted: string): boolean {
   let pendingGitCommandValue = false;
   let pendingDenoSubcommand = false;
   let pendingDenoRunScript = false;
+  let pendingJavaOptions = false;
+  let pendingJavaSourceVersion = false;
+  let pendingJavaSourceFile = false;
+  let pendingJavaOptionValue = false;
   let pendingScriptFileOperand = false;
   let evalOperandAmbiguous = false;
   // Static table entries keep the pending set bounded, so repeated interpreter words
@@ -2068,6 +2079,10 @@ function hasDisguisedAssignment(redacted: string): boolean {
       pendingEnvOptionValue = false;
       pendingNpmExecOptions = false;
       pendingGitRebaseOptions = false;
+      pendingJavaOptions = false;
+      pendingJavaSourceVersion = false;
+      pendingJavaSourceFile = false;
+      pendingJavaOptionValue = false;
       continue;
     }
     // GNU env reparses its split-string value even without an assignment or literal
@@ -2144,6 +2159,27 @@ function hasDisguisedAssignment(redacted: string): boolean {
       // (`--prefix /tmp`), so tracking stays armed until a known subcommand.
     }
     if (pendingDenoRunScript && isAutoPublishedScriptOperand(unquoted)) return true;
+    if (pendingJavaOptionValue) {
+      pendingJavaOptionValue = false;
+    } else if (pendingJavaSourceVersion) {
+      pendingJavaSourceVersion = false;
+      pendingJavaSourceFile = true;
+    } else if (pendingJavaOptions || pendingJavaSourceFile) {
+      if (javaOptionTakesSeparateValue(unquoted)) {
+        pendingJavaOptionValue = true;
+      } else if (unquoted === "--source") {
+        pendingJavaSourceVersion = true;
+      } else if (unquoted.startsWith("--source=")) {
+        pendingJavaSourceFile = true;
+      } else if (pendingJavaSourceFile && !unquoted.startsWith("-")) {
+        const autoPublished = isAutoPublishedScriptOperand(unquoted);
+        pendingJavaOptions = false;
+        pendingJavaSourceFile = false;
+        if (autoPublished) return true;
+      } else if (pendingJavaOptions && !unquoted.startsWith("-")) {
+        pendingJavaOptions = false;
+      }
+    }
     if (pendingDenoSubcommand) {
       if (unquoted === "run") {
         pendingDenoSubcommand = false;
@@ -2175,6 +2211,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
     if (executable === "npm") pendingNpmSubcommand = true;
     if (executable === "git") pendingGitSubcommand = true;
     if (executable === "deno") pendingDenoSubcommand = true;
+    if (executable === "java") pendingJavaOptions = true;
     if (SHELL_INTERPRETER_NAMES.has(executable)) return true;
     if (PROGRAM_OPERAND_INTERPRETER_NAMES.has(executable)) return true;
     if (SHELL_REPARSE_EXECUTABLE_NAMES.has(executable)) return true;
