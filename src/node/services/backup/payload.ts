@@ -1219,18 +1219,17 @@ const SPLIT_STRING_OPTION = /^-[A-Za-z]*S|^--split-string/;
 
 /**
  * Words that hand a downstream consumer an assignment the shell itself does not see,
- * none of them decidable here: a quote-mangled `NAME=` spelling for `env`/`eval`
- * (`TOKEN\\=x`, `'TOKEN'=x`, `"TOKEN=a b"`), a quoted region whose whitespace an
- * `env -S`-style re-split would break into assignments, or a split-string option with
- * its value attached. A word already holding a marker was consumed by the replacement
- * above (`A="B=1"` cannot fire).
+ * neither decidable here: a quote-mangled `NAME=` spelling for `env`/`eval`
+ * (`TOKEN\\=x`, `'TOKEN'=x`, `"TOKEN=a b"`), or a split-string option with its value
+ * attached. A word already holding a marker was consumed by the replacement above
+ * (`A="B=1"` cannot fire), which also covers assignments quoting embeds mid-word after
+ * a space, since the replacement matches boundaries in the raw text.
  */
 function hasDisguisedAssignment(redacted: string): boolean {
   for (const word of redacted.match(SHELL_WORD) ?? []) {
     if (word.includes(REDACTED_BACKUP_VALUE) || !word.includes("=")) continue;
     const unquoted = unquoteShellWord(word);
     if (ASSIGNMENT_START.test(unquoted)) return true;
-    if (/\s/.test(unquoted)) return true;
     if (SPLIT_STRING_OPTION.test(unquoted)) return true;
   }
   return false;

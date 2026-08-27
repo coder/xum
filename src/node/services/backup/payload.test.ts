@@ -386,8 +386,11 @@ describe("backup payload", () => {
       // ANSI-C and locale quoting hand env-style consumers their inner text.
       ["env $'TOKEN=hunter2' mcp-server", REDACTED_BACKUP_VALUE],
       ['env $"TOKEN=hunter2" mcp-server', REDACTED_BACKUP_VALUE],
+      // Boundaries match in the raw text, so a quote-embedded assignment still redacts.
+      ["sh -c 'exec TOKEN=hunter2 mcp'", `sh -c 'exec TOKEN=${REDACTED_BACKUP_VALUE} mcp'`],
       // GNU env re-splits a split-string value into assignments.
       ["env --split-string='TOKEN=hunter2 mcp-server'", REDACTED_BACKUP_VALUE],
+      ["env -S'TOKEN=hunter2 mcp-server'", REDACTED_BACKUP_VALUE],
       ["env -STOKEN=hunter2 mcp-server", REDACTED_BACKUP_VALUE],
       // Expansion bodies can smuggle assignment bytes past every lexical check.
       ["env TOKEN$(printf =hunter2) mcp-server", REDACTED_BACKUP_VALUE],
