@@ -32,6 +32,43 @@ describe("agent workflow run references", () => {
     }
   });
 
+  test("drops persisted future-dated references and repairs them on the next record", async () => {
+    const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
+    try {
+      const futureMs = Date.now() + 86_400_000;
+      await fs.writeFile(
+        path.join(workspaceSessionDir, "agent-workflow-runs.json"),
+        JSON.stringify({
+          references: [
+            { runId: "wfr_corrupt_future", createdAtMs: futureMs },
+            { runId: "wfr_sane", createdAtMs: 1_000 },
+          ],
+        })
+      );
+
+      // A per-read clamp would re-evaluate to "now" on every read and outrank every later
+      // user/reset boundary; the corrupted entry must be dropped instead.
+      expect(await readAgentWorkflowRunReferences(workspaceSessionDir)).toEqual([
+        { runId: "wfr_sane", createdAtMs: 1_000 },
+      ]);
+
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir,
+        runId: "wfr_corrupt_future",
+        createdAtMs: 2_000,
+      });
+      const repaired = await readAgentWorkflowRunReferences(workspaceSessionDir);
+      expect(repaired).toContainEqual({ runId: "wfr_corrupt_future", createdAtMs: 2_000 });
+      const raw = await fs.readFile(
+        path.join(workspaceSessionDir, "agent-workflow-runs.json"),
+        "utf-8"
+      );
+      expect(raw).not.toContain(String(futureMs));
+    } finally {
+      await fs.rm(workspaceSessionDir, { recursive: true, force: true });
+    }
+  });
+
   test("clamps future-dated createdAtMs to the current time", async () => {
     const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
     try {

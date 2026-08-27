@@ -42,10 +42,14 @@ function parseReferences(value: unknown): AgentWorkflowRunReference[] {
     if (typeof record.createdAtMs !== "number" || !Number.isFinite(record.createdAtMs)) {
       continue;
     }
-    // Self-heal implausible future timestamps (clock correction, corruption): a future-dated
-    // reference would otherwise outrank every later user/reset boundary in supersession
-    // comparisons until wall time catches up.
-    parsed.push({ runId: record.runId, createdAtMs: Math.min(record.createdAtMs, now) });
+    // Reject future-dated references (clock correction, corruption) instead of clamping at
+    // read time: a per-read clamp re-evaluates to "now" on every read, so the entry would
+    // outrank every later user/reset boundary until wall time catches up. Rejected entries are
+    // replaced with a sane timestamp by the next legitimate record.
+    if (record.createdAtMs > now) {
+      continue;
+    }
+    parsed.push({ runId: record.runId, createdAtMs: record.createdAtMs });
   }
   return parsed;
 }
