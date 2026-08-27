@@ -3,6 +3,7 @@ import { AlertTriangle, RefreshCw } from "lucide-react";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceState } from "@/browser/stores/WorkspaceStore";
+import { resumeWorkspaceStream } from "@/browser/utils/workspaceAiSettingsSync";
 import { getLastMainRetryCandidateMessage } from "@/common/utils/messages/retryEligibility";
 import { KEYBINDS, formatKeybind } from "@/browser/utils/ui/keybinds";
 import { VIM_ENABLED_KEY } from "@/common/constants/storage";
@@ -201,7 +202,7 @@ export const RetryBarrier: React.FC<RetryBarrierProps> = (props) => {
         manualRetryRollbackBaselineMessageCountRef.current = workspaceState.messages.length;
       }
 
-      const resumeResult = await api.workspace.resumeStream({
+      const resumeResult = await resumeWorkspaceStream(api, {
         workspaceId: props.workspaceId,
         options,
       });

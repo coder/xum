@@ -12,6 +12,7 @@ import {
   clearPendingWorkspaceAgentId,
   markPendingWorkspaceAgentId,
   revertRejectedAgentSwitch,
+  resumeWorkspaceStream,
   sendWorkspaceMessage,
   shouldApplyWorkspaceAgentIdFromBackend,
   updateWorkspaceAgentAISettings,
@@ -106,6 +107,52 @@ describe("workspace agent persistence guard", () => {
 
     expect(started).toEqual(["plan", "exec"]);
     expect(persistedAgentId).toBe("exec");
+  });
+
+  test("commits resumes and later settings updates in initiation order", async () => {
+    let resolveResume!: () => void;
+    const resumeCommit = new Promise<void>((resolve) => {
+      resolveResume = resolve;
+    });
+    const started: string[] = [];
+    let persistedAgentId = "exec";
+    const api = {
+      workspace: {
+        resumeStream: async (input: Parameters<APIClient["workspace"]["resumeStream"]>[0]) => {
+          started.push(input.options.agentId ?? "missing");
+          await resumeCommit;
+          persistedAgentId = input.options.agentId ?? persistedAgentId;
+          return { success: true as const, data: { started: true } };
+        },
+        updateAgentAISettings: (
+          input: Parameters<APIClient["workspace"]["updateAgentAISettings"]>[0]
+        ) => {
+          started.push(input.agentId);
+          persistedAgentId = input.agentId;
+          return Promise.resolve({ success: true as const, data: undefined });
+        },
+      },
+    };
+
+    const execResume = resumeWorkspaceStream(api, {
+      workspaceId: WORKSPACE_ID,
+      options: { agentId: "exec", model: "openai:exec", thinkingLevel: "medium" },
+    });
+    const planWrite = updateWorkspaceAgentAISettings(api, {
+      workspaceId: WORKSPACE_ID,
+      agentId: "plan",
+      aiSettings: { model: "openai:plan", thinkingLevel: "high" },
+      persistSelectedAgentId: true,
+    });
+
+    await Promise.resolve();
+    expect(started).toEqual(["exec"]);
+
+    resolveResume();
+    await Promise.all([execResume, planWrite]);
+
+    expect(started).toEqual(["exec", "plan"]);
+    expect(persistedAgentId).toBe("plan");
   });
 });
 

@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceState } from "@/browser/stores/WorkspaceStore";
+import { resumeWorkspaceStream } from "@/browser/utils/workspaceAiSettingsSync";
 import { getSendOptionsFromStorage } from "@/browser/utils/messages/sendOptions";
 import { applyCompactionOverrides } from "@/browser/utils/messages/compactionOptions";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
@@ -75,7 +76,7 @@ export function useResumeStream(
         options = applyCompactionOverrides(options, lastUserMessage.compactionRequest.parsed);
       }
 
-      const result = await api.workspace.resumeStream({ workspaceId, options });
+      const result = await resumeWorkspaceStream(api, { workspaceId, options });
       if (!result.success) {
         const formatted = formatSendMessageError(result.error);
         applyIfCurrent(() =>

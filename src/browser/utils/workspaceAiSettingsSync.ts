@@ -53,10 +53,15 @@ interface WorkspaceSendApi {
   workspace: Pick<APIClient["workspace"], "sendMessage">;
 }
 
+interface WorkspaceResumeApi {
+  workspace: Pick<APIClient["workspace"], "resumeStream">;
+}
+
 interface WorkspaceAiSettingsUpdateApi {
   workspace: Pick<APIClient["workspace"], "updateAgentAISettings">;
 }
 type SendMessageInput = Parameters<APIClient["workspace"]["sendMessage"]>[0];
+type ResumeStreamInput = Parameters<APIClient["workspace"]["resumeStream"]>[0];
 type UpdateAgentAISettingsInput = Parameters<APIClient["workspace"]["updateAgentAISettings"]>[0];
 
 /** Keep browser writes that can persist workspace AI state in initiation order. */
@@ -92,6 +97,16 @@ export function sendWorkspaceMessage(
   return input.options.skipAiSettingsPersistence === true
     ? send()
     : serializeWorkspaceAiSettingsWrite(input.workspaceId, send);
+}
+
+export function resumeWorkspaceStream(
+  api: WorkspaceResumeApi,
+  input: ResumeStreamInput
+): ReturnType<APIClient["workspace"]["resumeStream"]> {
+  const resume = () => api.workspace.resumeStream(input);
+  return input.options.skipAiSettingsPersistence === true
+    ? resume()
+    : serializeWorkspaceAiSettingsWrite(input.workspaceId, resume);
 }
 
 const pendingAiSettingsByWorkspace = new Map<string, WorkspaceAiSettingsSnapshot>();
