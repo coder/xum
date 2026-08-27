@@ -1739,9 +1739,19 @@ describe("backup payload", () => {
       // historically expand through the same remote shell.
       "ssh mcp-host mcp --token ghp_Abcdef1234\\\\Klmno56789",
       "scp 'mcp-host:ghp_Abcdef1234\\Klmno56789' /tmp/dest",
+      // su/runuser/sudo hand their command operand to the target user's shell, and
+      // watch runs its command through `sh -c`; each adds a parse pass that expands
+      // ${IFS} and removes the backslash the first parse kept.
+      "su target -c 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
+      "runuser target -c 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
+      "sudo -s 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
+      "watch 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'",
       'python3 -c \'__import__("os").environ.update({"T":"ghp_Abcdef1234"+"Klmno56789"})\'',
       "node -e \"require('child_process').spawnSync('mcp',['--token','ghp_Abcdef1234'+'Klmno56789'])\"",
       'deno eval \'const_t="ghp_Abcdef1234"+"Klmno56789"\'',
+      // PHP executes -r/-R run code and -B/-E begin/end code operands alike.
+      'php -B \'system("mcp".chr(32)."--token".chr(32)."ghp_Abcdef1234"."Klmno56789");\'',
+      'php8.3 -E \'system("mcp".chr(32)."--token".chr(32)."ghp_Abcdef1234"."Klmno56789");\'',
     ]) {
       await writeFixtureFile(
         muxRoot,

@@ -1550,14 +1550,29 @@ const PROGRAM_OPERAND_INTERPRETER_NAMES = new Set([
 ]);
 
 /**
- * Executables whose operands are handed to another shell parse this scan never sees:
- * OpenSSH sends command words to the remote login shell for re-evaluation
+ * Executables whose operands are handed to another shell parse this scan never sees.
+ * Remotely: OpenSSH sends command words to the remote login shell for re-evaluation
  * (`ssh host mcp --token a\\b` loses the second backslash remotely), and the
- * scp/rsync remote-path grammars expand through that same remote shell. Naming one
+ * scp/rsync remote-path grammars expand through that same remote shell. Locally:
+ * su/runuser/sudo hand their command operand to the target user's shell, and
+ * watch/flock/script/tmux run theirs through a `sh -c`-style pass. Naming one
  * localizes the invocation, accepting the portability cost like the program-operand
  * interpreters above.
  */
-const REMOTE_REPARSE_EXECUTABLE_NAMES = new Set(["ssh", "slogin", "autossh", "scp", "rsync"]);
+const SHELL_REPARSE_EXECUTABLE_NAMES = new Set([
+  "ssh",
+  "slogin",
+  "autossh",
+  "scp",
+  "rsync",
+  "su",
+  "runuser",
+  "sudo",
+  "watch",
+  "flock",
+  "script",
+  "tmux",
+]);
 
 /**
  * Language interpreters whose script-evaluation spellings reparse an operand under the
@@ -1575,7 +1590,8 @@ const LANGUAGE_INTERPRETERS: Array<{ name: RegExp; evalWord: RegExp }> = [
   { name: /^deno$/, evalWord: /^eval$/ },
   { name: /^perl[0-9.]*$/, evalWord: /^-[A-Za-z]*[eE]/ },
   { name: /^ruby[0-9.]*$/, evalWord: /^-[A-Za-z]*e/ },
-  { name: /^php[0-9.]*$/, evalWord: /^-[A-Za-z]*[rR]/ },
+  // -r/-R run code; -B/-E execute begin/end code blocks around per-line runs.
+  { name: /^php[0-9.]*$/, evalWord: /^-[A-Za-z]*[rRBE]/ },
 ];
 
 /**
@@ -1647,7 +1663,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
       .replace(/\.exe$/, "");
     if (SHELL_INTERPRETER_NAMES.has(executable)) return true;
     if (PROGRAM_OPERAND_INTERPRETER_NAMES.has(executable)) return true;
-    if (REMOTE_REPARSE_EXECUTABLE_NAMES.has(executable)) return true;
+    if (SHELL_REPARSE_EXECUTABLE_NAMES.has(executable)) return true;
     // An evaluation word after a language interpreter hands that grammar a script.
     if (pendingEvalWords.some((pattern) => pattern.test(unquoted))) return true;
     const language = LANGUAGE_INTERPRETERS.find((entry) => entry.name.test(executable));
