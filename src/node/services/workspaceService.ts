@@ -10967,16 +10967,21 @@ export class WorkspaceService extends EventEmitter {
     // Row identity, not wall-clock ordering, so a backward clock correction can neither strand
     // a legitimate wake nor let a pre-supersession reference outrank a newer boundary. For a
     // consumed boundary, equality means a background resume/retry was recorded after the prior
-    // result was delivered. A decision-free history fails safe to not-current, because a full
-    // clear (truncateHistory) removes every row WITHOUT appending a reset boundary while
-    // leaving the sidecar intact — a surviving reference must not inject a workflow result into
-    // the freshly cleared conversation. References without a boundary snapshot (pre-upgrade
-    // entries, record-time read failures) take a wall-clock migration fallback below.
-    if (decision.status === "none") {
-      return "not_current";
-    }
+    // result was delivered. References without a boundary snapshot (pre-upgrade entries,
+    // record-time read failures) take a wall-clock migration fallback below.
     const references = await readAgentWorkflowRunReferences(this.config.getSessionDir(workspaceId));
     const reference = references.find((candidate) => candidate.runId === runId);
+    if (decision.status === "none") {
+      // A decision-free history is current only for a reference whose snapshot verified an
+      // empty history at record time (null): kernel launches from a new or fully cleared
+      // workspace (e.g. a heartbeat turn) have no decision row before or after, and their wake
+      // must still deliver. Every other surviving reference fails safe, because a full clear
+      // (truncateHistory) removes every row WITHOUT appending a reset boundary while leaving
+      // the sidecar intact, and a reference pointing at a cleared row, or one without a
+      // verified snapshot, must not inject a workflow result into the freshly cleared
+      // conversation.
+      return reference?.afterBoundaryMessageId === null ? "current" : "not_current";
+    }
     if (reference == null) {
       return "not_current";
     }

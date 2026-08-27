@@ -6079,6 +6079,71 @@ describe("WorkspaceService workflow invocation events", () => {
     }
   });
 
+  test("delivers kernel launches recorded against a decision-free history", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-currentness-empty";
+    const runId = "wfr_currentness_empty";
+    const legacyRunId = "wfr_currentness_empty_legacy";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-currentness-empty",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      // A kernel launch from a synthetic turn in a new (or fully cleared) workspace records a
+      // verified-empty snapshot (null). History still having no decision row means the launch
+      // context is unchanged, so the wake must deliver.
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId,
+        createdAtMs: 1_150,
+        afterBoundaryMessageId: null,
+      });
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(true);
+
+      // A reference without a verified snapshot cannot claim the empty history as its launch
+      // context; it may merely have survived a full clear.
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId: legacyRunId,
+        createdAtMs: 1_150,
+      });
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, legacyRunId)).toBe(
+        false
+      );
+
+      // A decision row appearing after the launch supersedes the verified-empty snapshot.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user", "user", "never mind, answer something else", {
+          timestamp: 1_200,
+        })
+      );
+      expect(await workspaceService.isWorkflowInvocationCurrent(workspaceId, runId)).toBe(false);
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
   test("decides sidecar currentness by boundary identity, not wall-clock order", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const workspaceId = "workflow-currentness-clock";
