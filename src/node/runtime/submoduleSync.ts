@@ -94,11 +94,20 @@ async function runSubmoduleCommand(args: {
 const FILTER_CONFIG_DISCOVERY_COMMAND = `
 set -e
 reject_conditional_includes() {
-  if git config --null --name-only "$@" --get-regexp '^includeif[.].*[.]path$' >/dev/null; then
+  if git config --local --null --name-only "$@" --get-regexp '^(includeif[.].*[.]path|gc[.]recentobjectshook|uploadpack[.]packobjectshook)$' >/dev/null; then
     return 4
   else
     status=$?
-    [ "$status" -eq 1 ]
+    [ "$status" -eq 1 ] || return "$status"
+  fi
+  worktree_config=$(git config --local --bool extensions.worktreeConfig || true)
+  if [ "$worktree_config" = true ]; then
+    if git config --worktree --null --name-only "$@" --get-regexp '^(includeif[.].*[.]path|gc[.]recentobjectshook|uploadpack[.]packobjectshook)$' >/dev/null; then
+      return 4
+    else
+      status=$?
+      [ "$status" -eq 1 ] || return "$status"
+    fi
   fi
 }
 emit_filter_keys() {
@@ -107,11 +116,20 @@ emit_filter_keys() {
 reject_conditional_includes
 emit_filter_keys
 git submodule foreach --quiet --recursive '
-  if git config --null --name-only --get-regexp "^includeif[.].*[.]path$" >/dev/null; then
+  if git config --local --null --name-only --get-regexp "^(includeif[.].*[.]path|gc[.]recentobjectshook|uploadpack[.]packobjectshook)$" >/dev/null; then
     exit 4
   else
     status=$?
     [ "$status" -eq 1 ] || exit "$status"
+  fi
+  worktree_config=$(git config --local --bool extensions.worktreeConfig || true)
+  if [ "$worktree_config" = true ]; then
+    if git config --worktree --null --name-only --get-regexp "^(includeif[.].*[.]path|gc[.]recentobjectshook|uploadpack[.]packobjectshook)$" >/dev/null; then
+      exit 4
+    else
+      status=$?
+      [ "$status" -eq 1 ] || exit "$status"
+    fi
   fi
   git config --null --name-only --includes --get-regexp "^filter[.].*[.](clean|smudge|process|required)$" || [ "$?" -eq 1 ]
 '

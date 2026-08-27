@@ -36,7 +36,7 @@ describe("gitNoHooksPrefix", () => {
 
   test("returns env prefix when untrusted (false)", () => {
     const prefix = gitNoHooksPrefix(false);
-    expect(prefix).toContain("GIT_CONFIG_COUNT='23'");
+    expect(prefix).toContain("GIT_CONFIG_COUNT='25'");
     expect(prefix).toContain("core.hooksPath");
     expect(prefix).toContain("/dev/null");
     expect(prefix).toContain("GIT_CONFIG_PARAMETERS=");
@@ -45,7 +45,7 @@ describe("gitNoHooksPrefix", () => {
 
   test("returns env prefix when untrusted (undefined)", () => {
     const prefix = gitNoHooksPrefix(undefined);
-    expect(prefix).toContain("GIT_CONFIG_COUNT='23'");
+    expect(prefix).toContain("GIT_CONFIG_COUNT='25'");
     expect(prefix).toEndWith(" ");
   });
 });
@@ -54,7 +54,7 @@ describe("gitNoRepoAutomationEnv", () => {
   test("neutralizes every repo-controlled git execution vector", () => {
     const env = gitNoRepoAutomationEnv();
     // Hooks, fsmonitor, and credential helpers via env config entries.
-    expect(env.GIT_CONFIG_COUNT).toBe("23");
+    expect(env.GIT_CONFIG_COUNT).toBe("25");
     expect(env.GIT_CONFIG_KEY_0).toBe("core.hooksPath");
     expect(env.GIT_CONFIG_VALUE_0).toBe("/dev/null");
     expect(env.GIT_CONFIG_KEY_1).toBe("core.fsmonitor");
@@ -84,6 +84,10 @@ describe("gitNoRepoAutomationEnv", () => {
     expect(env.GIT_PAGER).toBe("cat");
     expect(env.GIT_MAN_VIEWER).toBe("cat");
     expect(env.GIT_BROWSER).toBe(":");
+    expect(env.GIT_CONFIG_KEY_23).toBe("gc.recentObjectsHook");
+    expect(env.GIT_CONFIG_VALUE_23).toBe("");
+    expect(env.GIT_CONFIG_KEY_24).toBe("uploadpack.packObjectsHook");
+    expect(env.GIT_CONFIG_VALUE_24).toBe("");
     // Pointing the tracked attributes source at the empty tree suppresses
     // .gitattributes; the repo-aware builder below additionally overrides
     // drivers selected by highest-precedence .git/info/attributes.
@@ -571,6 +575,128 @@ describe("gitNoRepoAutomationEnv", () => {
     }
     expect(rejection).toBeInstanceOf(Error);
     expect((rejection as Error).message).toContain("conditional includes");
+  });
+
+  test("allows global conditional includes for clean repositories", async () => {
+    using tmp = new DisposableTempDir("git-global-conditional-include");
+    const repo = path.join(tmp.path, "repo");
+    const globalConfig = path.join(tmp.path, "global.gitconfig");
+    const includedConfig = path.join(tmp.path, "included.gitconfig");
+    await fs.mkdir(repo, { recursive: true });
+    await Bun.$`git init -b main`.cwd(repo).quiet();
+    await fs.writeFile(includedConfig, "[color]\n\tui = false\n", "utf-8");
+    await fs.writeFile(
+      globalConfig,
+      '[includeIf "gitdir:' + repo + '/"]\n\tpath = ' + includedConfig + "\n",
+      "utf-8"
+    );
+    const previousHome = process.env.HOME;
+    const previousGlobal = process.env.GIT_CONFIG_GLOBAL;
+    process.env.HOME = tmp.path;
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    try {
+      const env = await gitNoRepoAutomationEnvForLocalRepo(repo);
+      const result = await Bun.$`git status --porcelain`
+        .cwd(repo)
+        .env({ ...process.env, ...env })
+        .quiet()
+        .nothrow();
+      expect(result.exitCode).toBe(0);
+    } finally {
+      if (previousHome == null) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousGlobal == null) delete process.env.GIT_CONFIG_GLOBAL;
+      else process.env.GIT_CONFIG_GLOBAL = previousGlobal;
+    }
+  });
+
+  test("neutralizes gc.recentObjectsHook", async () => {
+    using tmp = new DisposableTempDir("git-gc-hook-automation-off");
+    const repo = path.join(tmp.path, "repo");
+    const marker = path.join(tmp.path, "gc-hook-ran");
+    const helper = path.join(tmp.path, "gc-hook.sh");
+    await fs.mkdir(repo, { recursive: true });
+    await Bun.$`git init`.cwd(repo).quiet();
+    await Bun.$`git config user.email test@example.com`.cwd(repo).quiet();
+    await Bun.$`git config user.name Test`.cwd(repo).quiet();
+    await Bun.$`git commit --allow-empty -m init`.cwd(repo).quiet();
+    await fs.writeFile(path.join(repo, "unreachable.txt"), "unreachable", "utf-8");
+    await Bun.$`git hash-object -w unreachable.txt`.cwd(repo).quiet();
+    await fs.writeFile(helper, `#!/bin/sh\ntouch "${marker}"\n`, "utf-8");
+    await fs.chmod(helper, 0o755);
+    await Bun.$`git config gc.recentObjectsHook ${helper}`.cwd(repo).quiet();
+
+    await Bun.$`git gc --cruft --prune=now`.cwd(repo).quiet().nothrow();
+    await fs.access(marker);
+    await fs.rm(marker);
+
+    let env: Record<string, string> | undefined;
+    let rejection: unknown;
+    try {
+      env = await gitNoRepoAutomationEnvForLocalRepo(repo);
+    } catch (error) {
+      rejection = error;
+    }
+    if (env != null) {
+      await fs.writeFile(path.join(repo, "unreachable-2.txt"), "unreachable-2", "utf-8");
+      await Bun.$`git hash-object -w unreachable-2.txt`.cwd(repo).quiet();
+      await Bun.$`git gc --cruft --prune=now`
+        .cwd(repo)
+        .env({ ...process.env, ...env })
+        .quiet()
+        .nothrow();
+    }
+    expect(rejection).toBeInstanceOf(Error);
+    expect((rejection as Error).message).toContain("Failed to inspect repository");
+    const markerExists = await fs.access(marker).then(
+      () => true,
+      () => false
+    );
+    expect(markerExists).toBe(false);
+  });
+
+  test("neutralizes shell submodule update commands", async () => {
+    using tmp = new DisposableTempDir("git-submodule-update-automation-off");
+    const source = path.join(tmp.path, "source");
+    const repo = path.join(tmp.path, "repo");
+    const marker = path.join(tmp.path, "submodule-update-ran");
+    const helper = path.join(tmp.path, "submodule-update.sh");
+    for (const dir of [source, repo]) await fs.mkdir(dir, { recursive: true });
+    await Bun.$`git init`.cwd(source).quiet();
+    await Bun.$`git config user.email test@example.com`.cwd(source).quiet();
+    await Bun.$`git config user.name Test`.cwd(source).quiet();
+    await Bun.$`git commit --allow-empty -m init`.cwd(source).quiet();
+    await Bun.$`git init`.cwd(repo).quiet();
+    await Bun.$`git config user.email test@example.com`.cwd(repo).quiet();
+    await Bun.$`git config user.name Test`.cwd(repo).quiet();
+    await Bun.$`git -c protocol.file.allow=always submodule add ${source} vendor`.cwd(repo).quiet();
+    await Bun.$`git commit -am submodule`.cwd(repo).quiet();
+    await fs.writeFile(helper, `#!/bin/sh\ntouch "${marker}"\n`, "utf-8");
+    await fs.chmod(helper, 0o755);
+    await Bun.$`git config submodule.vendor.update ${"!" + helper}`.cwd(repo).quiet();
+
+    await Bun.$`git submodule update --force`.cwd(repo).quiet();
+    await fs.access(marker);
+    await fs.rm(marker);
+
+    await Bun.$`git submodule update --force`
+      .cwd(repo)
+      .env({ ...process.env, ...gitNoRepoAutomationEnv() })
+      .quiet();
+    await fs.access(marker);
+    await fs.rm(marker);
+
+    const env = await gitNoRepoAutomationEnvForLocalRepo(repo);
+    await Bun.$`git submodule update --force`
+      .cwd(repo)
+      .env({ ...process.env, ...env })
+      .quiet()
+      .nothrow();
+    const markerExists = await fs.access(marker).then(
+      () => true,
+      () => false
+    );
+    expect(markerExists).toBe(false);
   });
 });
 

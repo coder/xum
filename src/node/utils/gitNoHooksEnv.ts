@@ -50,7 +50,7 @@ const GIT_EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 export function gitNoRepoAutomationEnv(): Record<string, string> {
   const env: Record<string, string> = {
     ...GIT_NO_HOOKS_ENV,
-    GIT_CONFIG_COUNT: "23",
+    GIT_CONFIG_COUNT: "25",
     GIT_CONFIG_KEY_1: "core.fsmonitor",
     GIT_CONFIG_VALUE_1: "false",
     // An empty credential.helper value resets the helper list.
@@ -96,6 +96,10 @@ export function gitNoRepoAutomationEnv(): Record<string, string> {
     GIT_CONFIG_VALUE_21: "",
     GIT_CONFIG_KEY_22: "sendemail.smtpServer",
     GIT_CONFIG_VALUE_22: "",
+    GIT_CONFIG_KEY_23: "gc.recentObjectsHook",
+    GIT_CONFIG_VALUE_23: "",
+    GIT_CONFIG_KEY_24: "uploadpack.packObjectsHook",
+    GIT_CONFIG_VALUE_24: "",
     GIT_ATTR_SOURCE: GIT_EMPTY_TREE_OID,
     // Environment beats repo-config core.sshCommand.
     GIT_SSH_COMMAND: "ssh",
@@ -121,9 +125,10 @@ export function gitNoRepoAutomationEnv(): Record<string, string> {
 }
 
 export const GIT_REPO_AUTOMATION_CONFIG_KEY_PATTERN =
-  "^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver|remote[.].*[.](uploadpack|receivepack|vcs|proxy)|alias[.].*|pager[.].*|browser[.].*[.](cmd|path)|difftool[.].*[.](cmd|path)|mergetool[.].*[.](cmd|path)|guitool[.].*[.]cmd|man[.].*[.](cmd|path)|sendemail[.].*[.](ccCmd|headerCmd|toCmd))$";
+  "^(filter[.].*[.](clean|smudge|process|required)|diff[.](external|.*[.](command|textconv))|merge[.].*[.]driver|remote[.].*[.](uploadpack|receivepack|vcs|proxy)|alias[.].*|pager[.].*|browser[.].*[.](cmd|path)|difftool[.].*[.](cmd|path)|mergetool[.].*[.](cmd|path)|guitool[.].*[.]cmd|man[.].*[.](cmd|path)|sendemail[.].*[.](ccCmd|headerCmd|toCmd)|submodule[.].*[.]update|hook[.].*[.]command)$";
 export const MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES = 256 * 1024;
-const GIT_CONDITIONAL_INCLUDE_CONFIG_KEY_PATTERN = "^includeif[.].*[.]path$";
+const GIT_UNREPRESENTABLE_LOCAL_CONFIG_KEY_PATTERN =
+  "^(includeif[.].*[.]path|gc[.]recentobjectshook|uploadpack[.]packobjectshook)$";
 
 const REPO_AUTOMATION_CONFIG_KEY_REGEX =
   /^(filter|diff|merge|remote)[.](.+)[.](clean|smudge|process|required|command|textconv|driver|uploadpack|receivepack|vcs|proxy)$/i;
@@ -143,6 +148,17 @@ function appendDisabledRepoAutomationDrivers(
     if (/[\uFFFD\0\r\n]/.test(key)) {
       throw new Error("Refusing git operation with an unsupported config key");
     }
+    if (/^submodule[.].*[.]update$/i.test(key)) {
+      if (value.startsWith("!")) exactKeys.add(key);
+      if (drivers.size + exactKeys.size > MAX_REPO_AUTOMATION_DRIVERS) {
+        throw new Error(
+          "Refusing git operation with more than " +
+            MAX_REPO_AUTOMATION_DRIVERS +
+            " repo automation drivers"
+        );
+      }
+      continue;
+    }
     if (key.toLowerCase().startsWith("alias.")) {
       if (value.startsWith("!")) exactKeys.add(key);
       if (drivers.size + exactKeys.size > MAX_REPO_AUTOMATION_DRIVERS) {
@@ -155,7 +171,7 @@ function appendDisabledRepoAutomationDrivers(
       continue;
     }
     if (
-      /^(pager[.]|browser[.].*[.](cmd|path)$|difftool[.].*[.](cmd|path)$|mergetool[.].*[.](cmd|path)$|guitool[.].*[.]cmd$|man[.].*[.](cmd|path)$|sendemail[.].*[.](cccmd|headercmd|tocmd)$)/i.test(
+      /^(pager[.]|browser[.].*[.](cmd|path)$|difftool[.].*[.](cmd|path)$|mergetool[.].*[.](cmd|path)$|guitool[.].*[.]cmd$|man[.].*[.](cmd|path)$|sendemail[.].*[.](cccmd|headercmd|tocmd)$|hook[.].*[.]command$)/i.test(
         key
       )
     ) {
@@ -280,11 +296,29 @@ export async function gitNoRepoAutomationEnvForRuntimeRepo(
 ): Promise<Record<string, string>> {
   const baseEnv = gitNoRepoAutomationEnv();
   const prefix = `${gitEnvPrefix(baseEnv)}LC_ALL=C `;
+  const repoResult = await execBuffered(runtime, `${prefix}git rev-parse --git-dir`, {
+    cwd: repoPath,
+    timeout: 10,
+    abortSignal: signal,
+    maxOutputBytes: 1024,
+  });
+  if (repoResult.exitCode === 128) return baseEnv;
+  if (repoResult.exitCode !== 0) {
+    throw new Error(repoResult.stderr.trim() || "Failed to inspect repository");
+  }
+
   const includeResult = await execBuffered(
     runtime,
-    `${prefix}git config --null --name-only --get-regexp ${shellQuote(
-      GIT_CONDITIONAL_INCLUDE_CONFIG_KEY_PATTERN
-    )}`,
+    `${prefix}git config --local --null --name-only --get-regexp ${shellQuote(
+      GIT_UNREPRESENTABLE_LOCAL_CONFIG_KEY_PATTERN
+    )} || [ "$?" -eq 1 ]; ` +
+      `worktree_config=$(${prefix}git config --local --bool extensions.worktreeConfig); ` +
+      `worktree_status=$?; ` +
+      `if [ "$worktree_status" -eq 0 ] && [ "$worktree_config" = true ]; then ` +
+      `${prefix}git config --worktree --null --name-only --get-regexp ${shellQuote(
+        GIT_UNREPRESENTABLE_LOCAL_CONFIG_KEY_PATTERN
+      )} || [ "$?" -eq 1 ]; ` +
+      `elif [ "$worktree_status" -ne 1 ]; then exit "$worktree_status"; fi`,
     {
       cwd: repoPath,
       timeout: 10,
@@ -292,10 +326,13 @@ export async function gitNoRepoAutomationEnvForRuntimeRepo(
       maxOutputBytes: MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES + 1,
     }
   );
-  if (includeResult.exitCode === 0 && includeResult.stdout.length > 0) {
-    throw new Error("Refusing git operation with conditional config includes");
+  if (includeResult.stdout.length > 0) {
+    if (includeResult.stdout.toLowerCase().includes("includeif.")) {
+      throw new Error("Refusing git operation with conditional config includes");
+    }
+    throw new Error("Refusing git operation with unsupported executable config");
   }
-  if (includeResult.exitCode !== 1 || includeResult.stdout.length > 0) {
+  if (includeResult.exitCode !== 0 && includeResult.exitCode !== 1) {
     throw new Error(
       includeResult.stderr.trim() ||
         includeResult.stdout.trim() ||
@@ -355,30 +392,78 @@ export async function gitNoRepoAutomationEnvForLocalRepo(
 ): Promise<Record<string, string>> {
   const baseEnv = gitNoRepoAutomationEnv();
   try {
-    using includeProc = execFileAsync(
+    using repoProc = execFileAsync("git", ["-C", repoPath, "rev-parse", "--git-dir"], {
+      env: baseEnv,
+      signal,
+      timeoutMs: 10_000,
+      maxOutputBytes: 1024,
+      killTreeOnTermination: true,
+    });
+    await repoProc.result;
+  } catch (error) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      (error as { code?: unknown }).code === 128
+    ) {
+      return baseEnv;
+    }
+    throw new Error("Failed to inspect repository", { cause: error });
+  }
+
+  const scopes: Array<"--local" | "--worktree"> = ["--local"];
+  try {
+    using worktreeConfigProc = execFileAsync(
       "git",
-      [
-        "-C",
-        repoPath,
-        "config",
-        "--null",
-        "--name-only",
-        "--get-regexp",
-        GIT_CONDITIONAL_INCLUDE_CONFIG_KEY_PATTERN,
-      ],
+      ["-C", repoPath, "config", "--local", "--bool", "extensions.worktreeConfig"],
       {
         env: { ...baseEnv, LC_ALL: "C" },
         signal,
         timeoutMs: 10_000,
-        maxOutputBytes: MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES,
+        maxOutputBytes: 1024,
         killTreeOnTermination: true,
       }
     );
-    await includeProc.result;
-    throw new Error("Refusing git operation with conditional config includes");
+    const { stdout } = await worktreeConfigProc.result;
+    if (stdout.trim() === "true") scopes.push("--worktree");
   } catch (error) {
     if (!isNoMatchingConfigError(error)) {
-      throw new Error("Failed to inspect repository conditional includes", { cause: error });
+      throw new Error("Failed to inspect repository worktree config", { cause: error });
+    }
+  }
+
+  for (const scope of scopes) {
+    try {
+      using includeProc = execFileAsync(
+        "git",
+        [
+          "-C",
+          repoPath,
+          "config",
+          scope,
+          "--null",
+          "--name-only",
+          "--get-regexp",
+          GIT_UNREPRESENTABLE_LOCAL_CONFIG_KEY_PATTERN,
+        ],
+        {
+          env: { ...baseEnv, LC_ALL: "C" },
+          signal,
+          timeoutMs: 10_000,
+          maxOutputBytes: MAX_GIT_REPO_AUTOMATION_CONFIG_OUTPUT_BYTES,
+          killTreeOnTermination: true,
+        }
+      );
+      const { stdout } = await includeProc.result;
+      if (stdout.toLowerCase().includes("includeif.")) {
+        throw new Error("Refusing git operation with conditional config includes");
+      }
+      throw new Error("Refusing git operation with unsupported executable config");
+    } catch (error) {
+      if (!isNoMatchingConfigError(error)) {
+        throw new Error("Failed to inspect repository conditional includes", { cause: error });
+      }
     }
   }
 

@@ -1634,7 +1634,9 @@ describe("remote bash git hardening", () => {
     const runtime = {
       exec(command: string, options: ExecOptions): Promise<ExecStream> {
         calls.push({ command, options });
-        if (command.includes("includeif[.]")) return Promise.resolve(createExecStream("", 1));
+        if (command.includes("rev-parse --git-dir"))
+          return Promise.resolve(createExecStream(".git\n"));
+        if (command.includes("includeif[.]")) return Promise.resolve(createExecStream(""));
         if (options.cwd === "/remote/workspace/project-a") {
           return Promise.resolve(createExecStream("", 1));
         }
@@ -1669,20 +1671,22 @@ describe("remote bash git hardening", () => {
     )) as BashToolResult;
 
     expect(result.success).toBe(true);
-    expect(calls).toHaveLength(5);
+    expect(calls).toHaveLength(7);
     expect(calls[0]?.options.cwd).toBe("/remote/workspace/project-a");
-    expect(calls[2]?.options.cwd).toBe("/remote/workspace/project-b");
-    expect(calls[4]?.options.env?.ANTHROPIC_API_KEY).toBe("");
-    expect(Object.values(calls[4]?.options.env ?? {})).toContain("filter.evil.smudge");
-    expect(Object.values(calls[4]?.options.env ?? {})).toContain("alias.evil");
+    expect(calls[3]?.options.cwd).toBe("/remote/workspace/project-b");
+    expect(calls[6]?.options.env?.ANTHROPIC_API_KEY).toBe("");
+    expect(Object.values(calls[6]?.options.env ?? {})).toContain("filter.evil.smudge");
+    expect(Object.values(calls[6]?.options.env ?? {})).toContain("alias.evil");
   });
 
   it("fails closed when remote driver discovery fails", async () => {
     let callCount = 0;
     const runtime = {
       exec(): Promise<ExecStream> {
+        const exitCodes = [0, 0, 1, 0, 2];
+        const exitCode = exitCodes[callCount] ?? 2;
         callCount += 1;
-        return Promise.resolve(createExecStream("", callCount < 3 ? 1 : 2));
+        return Promise.resolve(createExecStream("", exitCode));
       },
     } as unknown as Runtime;
     const config = createTestToolConfig("/remote/workspace");
@@ -1710,7 +1714,7 @@ describe("remote bash git hardening", () => {
     }
     expect(rejection).toBeInstanceOf(Error);
     expect((rejection as Error).message).toContain("Failed to inspect repository");
-    expect(callCount).toBe(3);
+    expect(callCount).toBe(5);
   });
 
   it("blanks run-session roots inherited by local Bash", async () => {
