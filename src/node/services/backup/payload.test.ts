@@ -1771,6 +1771,10 @@ describe("backup payload", () => {
       'python3 -W ignore -c \'__import__("os").system("mcp"+chr(32)+"--token"+chr(32)+"ghp_Abcdef1234"+"Klmno56789")\'',
       "node -e \"require('child_process').spawnSync('mcp',['--token','ghp_Abcdef1234'+'Klmno56789'])\"",
       'deno eval \'const_t="ghp_Abcdef1234"+"Klmno56789"\'',
+      // Perl and Ruby cluster the numeric `-0[octal]` switch before the eval
+      // letter, so digits count as cluster characters alongside letters.
+      'perl -0e \'exec("mcp","--token","ghp_Abcdef1234"."Klmno56789")\'',
+      'ruby -0e \'exec("mcp","--token","ghp_Abcdef1234"+"Klmno56789")\'',
       // PHP executes -r/-R run code and -B/-E begin/end code operands alike.
       'php -B \'system("mcp".chr(32)."--token".chr(32)."ghp_Abcdef1234"."Klmno56789");\'',
       'php8.3 -E \'system("mcp".chr(32)."--token".chr(32)."ghp_Abcdef1234"."Klmno56789");\'',

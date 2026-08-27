@@ -1749,18 +1749,19 @@ const SHELL_REPARSE_EXECUTABLE_NAMES = new Set([
  * (`python3 -c '..."ghp_a"+"b"...'`, `node -e "...'ghp_a'+'b'..."`, `deno eval ...`).
  * Only the evaluation spelling localizes: file launchers (`node server.js`,
  * `python -m pkg`) are the everyday portable MCP commands and stay published. Cluster
- * spellings count (`-Bc`, `-pe`); which letters evaluate is per-interpreter knowledge
- * this table owns, unlike arbitrary programs' options.
+ * spellings count (`-Bc`, `-pe`), and digits cluster too: perl and ruby take the
+ * numeric `-0[octal]` switch before the eval letter (`-0e`). Which letters evaluate
+ * is per-interpreter knowledge this table owns, unlike arbitrary programs' options.
  */
 const LANGUAGE_INTERPRETERS: Array<{ name: RegExp; evalWord: RegExp }> = [
-  { name: /^python[0-9.]*$/, evalWord: /^-[A-Za-z]*c/ },
-  { name: /^(?:node|nodejs)$/, evalWord: /^(?:--eval|--print|-[A-Za-z]*[ep])/ },
-  { name: /^bun$/, evalWord: /^(?:--eval|--print|-[A-Za-z]*[ep])/ },
+  { name: /^python[0-9.]*$/, evalWord: /^-[A-Za-z0-9]*c/ },
+  { name: /^(?:node|nodejs)$/, evalWord: /^(?:--eval|--print|-[A-Za-z0-9]*[ep])/ },
+  { name: /^bun$/, evalWord: /^(?:--eval|--print|-[A-Za-z0-9]*[ep])/ },
   { name: /^deno$/, evalWord: /^eval$/ },
-  { name: /^perl[0-9.]*$/, evalWord: /^-[A-Za-z]*[eE]/ },
-  { name: /^ruby[0-9.]*$/, evalWord: /^-[A-Za-z]*e/ },
+  { name: /^perl[0-9.]*$/, evalWord: /^-[A-Za-z0-9]*[eE]/ },
+  { name: /^ruby[0-9.]*$/, evalWord: /^-[A-Za-z0-9]*e/ },
   // -r/-R run code; -B/-E execute begin/end code blocks around per-line runs.
-  { name: /^php[0-9.]*$/, evalWord: /^-[A-Za-z]*[rRBE]/ },
+  { name: /^php[0-9.]*$/, evalWord: /^-[A-Za-z0-9]*[rRBE]/ },
 ];
 
 /**
