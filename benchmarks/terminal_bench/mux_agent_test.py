@@ -277,6 +277,7 @@ def test_mux_runner_scores_goal_mode_incomplete_exit(tmp_path: Path) -> None:
     assert "WARNING: mux goal run stopped incomplete" in result.completed.stderr
     args = result.args_file.read_text()
     assert "--goal" in args
+    assert "--no-mcp-config" in args
     assert "solve it" in args
     # Trust must be granted (against the resolved project dir) before the
     # agent starts, or sub-agent spawns fail the trust gate inside the run.
@@ -1386,6 +1387,51 @@ def test_session_usage_keeps_child_of_fractional_usage_rollup_parent(
 
     assert totals is not None
     assert totals["sessions"] == 2
+    assert totals["input"] == 10
+    assert totals["cost_usd"] == pytest.approx(0.15)
+
+
+def test_session_usage_keeps_child_for_false_rollup_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    parent = _usage_display()
+    parent["rolledUpFrom"] = {"ws-child": False}
+    (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).write_bytes(
+        _sessions_archive_bytes({"ws-parent": parent, "ws-child": _usage_display()})
+    )
+
+    totals = agent._summarize_session_usage()
+
+    assert totals is not None
+    assert totals["sessions"] == 2
+    assert totals["input"] == 20
+    assert totals["cost_usd"] == pytest.approx(0.3)
+
+
+def test_session_usage_skips_child_for_enriched_rollup_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("MUX_AGENT_REPO_ROOT", str(_repo_root()))
+    agent = MuxAgent(logs_dir=tmp_path)
+    parent = _usage_display()
+    parent["rolledUpFrom"] = {
+        "ws-child": {
+            "totalTokens": 142,
+            "inputTokens": 10,
+            "outputTokens": 20,
+            "rolledUpAtMs": 1_000,
+        }
+    }
+    (tmp_path / MuxAgent._SESSIONS_ARCHIVE_NAME).write_bytes(
+        _sessions_archive_bytes({"ws-parent": parent, "ws-child": _usage_display()})
+    )
+
+    totals = agent._summarize_session_usage()
+
+    assert totals is not None
+    assert totals["sessions"] == 1
     assert totals["input"] == 10
     assert totals["cost_usd"] == pytest.approx(0.15)
 

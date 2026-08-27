@@ -159,6 +159,7 @@ cmd=(bun src/cli/run.ts
   --dir "${project_path}"
   --model "${MUX_MODEL}"
   --keep-background-processes
+  --no-mcp-config
   --json)
 
 # Add experiment flags (comma-separated → repeated --experiment flags)

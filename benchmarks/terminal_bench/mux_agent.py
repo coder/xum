@@ -661,6 +661,35 @@ class MuxAgent(BaseInstalledAgent):
         return not isinstance(value, bool) and isinstance(value, int) and value >= 0
 
     @classmethod
+    def _is_valid_rollup_entry(cls, entry: object) -> bool:
+        if entry is True:
+            return True
+        if not isinstance(entry, dict):
+            return False
+        if not cls._is_valid_token_count(entry.get("totalTokens")):
+            return False
+        if not cls._is_valid_usage_number(entry.get("rolledUpAtMs")):
+            return False
+        for key in (
+            "inputTokens",
+            "outputTokens",
+            "reasoningTokens",
+            "cachedTokens",
+            "cacheCreateTokens",
+            "contextTokens",
+        ):
+            if key in entry and not cls._is_valid_token_count(entry[key]):
+                return False
+        if "totalCostUsd" in entry and not cls._is_valid_usage_number(
+            entry["totalCostUsd"]
+        ):
+            return False
+        for key in ("agentType", "model"):
+            if key in entry and not isinstance(entry[key], str):
+                return False
+        return True
+
+    @classmethod
     def _has_usable_session_usage(cls, data: dict[str, Any]) -> bool:
         by_model = data.get("byModel")
         if not isinstance(by_model, dict):
@@ -738,7 +767,11 @@ class MuxAgent(BaseInstalledAgent):
                 continue
             rolled_up = data.get("rolledUpFrom")
             if isinstance(rolled_up, dict):
-                rolled_up_ids.update(rolled_up.keys())
+                rolled_up_ids.update(
+                    child_id
+                    for child_id, entry in rolled_up.items()
+                    if self._is_valid_rollup_entry(entry)
+                )
 
         totals: dict[str, Any] = {
             "input": 0,
