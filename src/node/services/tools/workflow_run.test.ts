@@ -983,15 +983,64 @@ describe("workflow_run duplicate guard", () => {
   test("serializes overlapping launches across equivalent path spellings", async () => {
     using tempDir = new TestTempDir("test-workflow-run-duplicate");
     const scriptPath = await writeWorkflowScript(tempDir.path);
+
+    const deferred = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((res) => {
+        resolve = res;
+      });
+      return { promise, resolve };
+    };
+    // Signals when the Nth read of the workflow script finishes, marking the last async step
+    // of that launch's script resolution; everything from there to the duplicate check is
+    // microtasks, so one macrotask turn afterwards deterministically settles the launch at
+    // either the admission gate or the listRuns gate.
+    class ReadSignalingRuntime extends LocalRuntime {
+      scriptReads = 0;
+      onSecondScriptRead: (() => void) | null = null;
+      override readFile(path: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
+        const inner = super.readFile(path, abortSignal);
+        if (!path.includes("deep-research.js")) {
+          return inner;
+        }
+        this.scriptReads += 1;
+        const notify = this.scriptReads === 2 ? this.onSecondScriptRead : null;
+        const reader = inner.getReader();
+        return new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            const { done, value } = await reader.read();
+            if (done) {
+              notify?.();
+              controller.close();
+              return;
+            }
+            controller.enqueue(value);
+          },
+        });
+      }
+    }
+    const runtime = new ReadSignalingRuntime(tempDir.path);
+    const secondScriptRead = deferred();
+    runtime.onSecondScriptRead = secondScriptRead.resolve;
+
     const runs: WorkflowRunRecord[] = [];
-    const pendingListGates: Array<() => void> = [];
+    const firstListReached = deferred();
+    const firstListGate = deferred();
+    const secondListGate = deferred();
     let listRunsCalls = 0;
     const listRuns = async () => {
       listRunsCalls += 1;
-      await new Promise<void>((resolve) => {
-        pendingListGates.push(resolve);
-      });
-      return [...runs];
+      // Snapshot at invocation time: a call that starts while the first launch still holds
+      // its gate must observe the pre-persist (empty) state, so an admission-key regression
+      // cannot be masked by the record landing before the gates are released below.
+      const snapshot = [...runs];
+      if (listRunsCalls === 1) {
+        firstListReached.resolve();
+        await firstListGate.promise;
+      } else {
+        await secondListGate.promise;
+      }
+      return snapshot;
     };
     const startWorkflow = mock(
       async (input: {
@@ -1014,20 +1063,18 @@ describe("workflow_run duplicate guard", () => {
       }
     );
     const tool = createWorkflowRunTool({
-      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1" }),
+      ...createTestToolConfig(tempDir.path, { workspaceId: "workspace-1", runtime }),
       trusted: true,
       workflowService: { listRuns, startWorkflow, getRun: completedGetRun },
     });
 
-    const settle = async () => new Promise((resolve) => setTimeout(resolve, 25));
     const firstLaunch = Promise.resolve(
       tool.execute!(
         { script_path: scriptPath, script_source: null, args: {}, run_in_background: false },
         mockToolCallOptions
       )
     );
-    await settle();
-    expect(listRunsCalls).toBe(1);
+    await firstListReached.promise;
     // Same file, different spelling: must queue on the same admission gate instead of
     // racing its own duplicate check before the first launch persists a run.
     const secondLaunch = Promise.resolve(
@@ -1041,11 +1088,13 @@ describe("workflow_run duplicate guard", () => {
         mockToolCallOptions
       )
     );
-    await settle();
+    await secondScriptRead.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    // With the first launch still parked inside its listing, the second must be waiting on
+    // the shared admission gate rather than running its own duplicate check.
     expect(listRunsCalls).toBe(1);
-    pendingListGates.shift()!();
-    await settle();
-    pendingListGates.shift()?.();
+    firstListGate.resolve();
+    secondListGate.resolve();
     await expect(secondLaunch).rejects.toThrow(/already has an active run/);
     await firstLaunch;
     expect(startWorkflow).toHaveBeenCalledTimes(1);
