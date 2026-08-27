@@ -101,8 +101,8 @@ export const AgentDefinitionDescriptorSchema = z
     // Base agent ID for inheritance (e.g., "exec", "plan", or custom agent)
     base: AgentIdSchema.optional(),
     aiDefaults: AgentDefinitionAiDefaultsSchema.optional(),
-    // This descriptor's unmerged frontmatter defaults. Resolution consumers use
-    // this field per hop; aiDefaults remains the effective value for UI display.
+    // This agent ID's defaults merged field-wise across same-ID scope refinements.
+    // Named base-agent defaults remain separate hops; aiDefaults is effective UI display data.
     ownAiDefaults: AgentDefinitionAiDefaultsSchema.optional(),
     // Tool configuration (for UI display / inheritance computation)
     tools: AgentDefinitionToolsSchema.optional(),

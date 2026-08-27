@@ -514,7 +514,12 @@ export const ProposePlanToolCall: React.FC<ProposePlanToolCallProps> = (props) =
         existingModel,
         existingThinking,
         existingReasoningMode: existingReasoning,
-        agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
+        agentDescriptorById: new Map(
+          agents.map((agent) => [
+            agent.id,
+            { base: agent.base, definitionAiDefaults: agent.ownAiDefaults },
+          ])
+        ),
       });
 
     const previousAgentId =

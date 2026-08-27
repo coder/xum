@@ -227,6 +227,7 @@ function createTestAgent(
     uiSelectable: true,
     subagentRunnable: true,
     aiDefaults: { model, thinkingLevel },
+    ownAiDefaults: { model, thinkingLevel },
   };
 }
 
@@ -560,6 +561,25 @@ describe("ProposePlanToolCall", () => {
     await waitFor(() =>
       expect(shouldApplyWorkspaceAgentIdFromBackend(WORKSPACE_ID, "plan")).toBe(true)
     );
+  });
+
+  test("uses exec definition defaults for Implement without saved overrides", async () => {
+    const execModel = "openai:gpt-5.2";
+    const execThinking = "low";
+
+    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
+    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {});
+
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+
+    const view = renderCompletedPlan();
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+    expect(sendMessageCalls[0]?.options.agentId).toBe("exec");
+    expect(sendMessageCalls[0]?.options.model).toBe(execModel);
+    expect(sendMessageCalls[0]?.options.thinkingLevel).toBe(execThinking);
   });
 
   test("typed rejection reverts the optimistic Implement switch", async () => {

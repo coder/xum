@@ -57,6 +57,57 @@ describe("router workspace goal validation", () => {
   });
 });
 
+describe("router agent definition routes", () => {
+  test("exposes same-ID lower-scope AI defaults in the winning descriptor", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "xum-router-agents-test-"));
+    const previousXumRoot = process.env.XUM_ROOT;
+    const previousMuxRoot = process.env.MUX_ROOT;
+
+    try {
+      const xumRoot = path.join(tempDir, "xum-home");
+      const projectPath = path.join(tempDir, "project");
+      const projectAgentsRoot = path.join(projectPath, ".xum", "agents");
+      const globalAgentsRoot = path.join(xumRoot, "agents");
+      process.env.XUM_ROOT = xumRoot;
+      delete process.env.MUX_ROOT;
+
+      fs.mkdirSync(projectAgentsRoot, { recursive: true });
+      fs.mkdirSync(globalAgentsRoot, { recursive: true });
+      fs.writeFileSync(
+        path.join(globalAgentsRoot, "exec.md"),
+        "---\nname: Global Exec\nai:\n  model: custom:global-exec\n  thinkingLevel: low\n---\nGlobal exec.\n"
+      );
+      fs.writeFileSync(
+        path.join(projectAgentsRoot, "exec.md"),
+        "---\nname: Project Exec\nbase: exec\nai:\n  thinkingLevel: high\n---\nProject exec.\n"
+      );
+
+      const context = {
+        config: new Config(xumRoot),
+        experimentsService: {
+          isExperimentEnabled: mock(() => false),
+        },
+      } as unknown as ORPCContext;
+      const client = createRouterClient(router(), { context });
+
+      const agents = await client.agents.list({ projectPath });
+      const exec = agents.find((agent) => agent.id === "exec");
+
+      expect(exec?.scope).toBe("project");
+      expect(exec?.ownAiDefaults).toEqual({
+        model: "custom:global-exec",
+        thinkingLevel: "high",
+      });
+    } finally {
+      if (previousXumRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousXumRoot;
+      if (previousMuxRoot === undefined) delete process.env.MUX_ROOT;
+      else process.env.MUX_ROOT = previousMuxRoot;
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("router agent skill routes", () => {
   test("subproject workspaces inherit parent skills with nearest precedence", async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-router-skills-test-"));
