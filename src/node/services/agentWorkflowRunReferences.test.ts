@@ -95,6 +95,25 @@ describe("agent workflow run references", () => {
     }
   });
 
+  test("keeps references within the backward-clock skew tolerance", async () => {
+    const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
+    try {
+      // A backward clock correction makes a legitimately recorded reference look slightly
+      // future-dated; dropping it would strand the run's terminal wake.
+      const slightlyFutureMs = Date.now() + 5 * 60_000;
+      await fs.writeFile(
+        path.join(workspaceSessionDir, "agent-workflow-runs.json"),
+        JSON.stringify({ references: [{ runId: "wfr_clock_skew", createdAtMs: slightlyFutureMs }] })
+      );
+
+      expect(await readAgentWorkflowRunReferences(workspaceSessionDir)).toEqual([
+        { runId: "wfr_clock_skew", createdAtMs: slightlyFutureMs },
+      ]);
+    } finally {
+      await fs.rm(workspaceSessionDir, { recursive: true, force: true });
+    }
+  });
+
   test("clamps future-dated createdAtMs to the current time", async () => {
     const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-workflow-runs-"));
     try {

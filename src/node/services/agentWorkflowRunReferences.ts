@@ -13,6 +13,11 @@ export interface AgentWorkflowRunReference {
 
 const AGENT_WORKFLOW_RUN_REFERENCES_FILE = "agent-workflow-runs.json";
 
+// Backward clock corrections (e.g. an NTP step after booting with a fast clock) can make a
+// legitimately recorded reference look future-dated. Tolerate that bounded skew so the run's
+// terminal wake is not dropped; only implausibly future values are treated as corruption.
+const MAX_FUTURE_SKEW_MS = 60 * 60_000;
+
 const referenceFileLocks = new MutexMap<string>();
 
 function referencesPath(workspaceSessionDir: string): string {
@@ -42,11 +47,12 @@ function parseReferences(value: unknown): AgentWorkflowRunReference[] {
     if (typeof record.createdAtMs !== "number" || !Number.isFinite(record.createdAtMs)) {
       continue;
     }
-    // Reject future-dated references (clock correction, corruption) instead of clamping at
-    // read time: a per-read clamp re-evaluates to "now" on every read, so the entry would
-    // outrank every later user/reset boundary until wall time catches up. Rejected entries are
-    // replaced with a sane timestamp by the next legitimate record.
-    if (record.createdAtMs > now) {
+    // Reject implausibly future-dated references (corruption) instead of clamping at read
+    // time: a per-read clamp re-evaluates to "now" on every read, so the entry would outrank
+    // every later user/reset boundary until wall time catches up. Values within
+    // MAX_FUTURE_SKEW_MS are kept as-is (backward clock correction, not corruption). Rejected
+    // entries are replaced with a sane timestamp by the next legitimate record.
+    if (record.createdAtMs > now + MAX_FUTURE_SKEW_MS) {
       continue;
     }
     // Collapse corrupted duplicate entries to the newest sane timestamp so order-sensitive
