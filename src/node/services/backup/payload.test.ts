@@ -377,6 +377,12 @@ describe("backup payload", () => {
       // Process substitution is an expansion, wherever it appears.
       ["TOKEN=<(printf hunter2) mcp-server", REDACTED_BACKUP_VALUE],
       ["FOO=1 mcp-server <(printf hunter2)", REDACTED_BACKUP_VALUE],
+      // Append assignments set an unset name and export the same way.
+      ["TOKEN+=hunter2 mcp-server", `TOKEN+=${REDACTED_BACKUP_VALUE} mcp-server`],
+      ["mcp-a;TOKEN+=hunter2 mcp-b", `mcp-a;TOKEN+=${REDACTED_BACKUP_VALUE} mcp-b`],
+      ["eval 'TOKEN+=hunter2 mcp'", REDACTED_BACKUP_VALUE],
+      // An array value leaves a bare assignment word behind, which fails closed.
+      ["TOKEN=(a hunter2) mcp-server", REDACTED_BACKUP_VALUE],
     ];
     for (const [command, expected] of cases) {
       await expectCommandRedaction(command, expected);

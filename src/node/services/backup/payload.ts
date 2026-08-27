@@ -1143,7 +1143,8 @@ function valueHasRedactionAtPath(
 // The shell ends a word at these without whitespace, so an assignment can directly follow
 // one (`bootstrap;TOKEN=... mcp`) and an unquoted value ends at the next one.
 const SHELL_WORD_BREAK = ";&|<>(){}`";
-const ASSIGNMENT_NAME = "[A-Za-z_][A-Za-z0-9_]*=";
+// `+?=`: Bash `NAME+=value` appends, or plainly sets an unset name, and exports the same way.
+const ASSIGNMENT_NAME = "[A-Za-z_][A-Za-z0-9_]*\\+?=";
 const ASSIGNMENT_VALUE = `(?:\\\\[\\s\\S]|'[^']*'|"(?:\\\\[\\s\\S]|[^"\\\\])*"|[^\\s\\\\'"${SHELL_WORD_BREAK}]+)+`;
 const COMMAND_ENV_ASSIGNMENT = new RegExp(
   `(^|[\\s${SHELL_WORD_BREAK}])(${ASSIGNMENT_NAME})(${ASSIGNMENT_VALUE})`,
