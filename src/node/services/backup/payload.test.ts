@@ -1684,6 +1684,14 @@ describe("backup payload", () => {
       `lua -e 'os.execute("mcp"..string.char(32).."--token"..string.char(32).."ghp_Abcdef1234".."Klmno56789")'`,
     ],
     [
+      "Elixir expression operands",
+      `elixir -e 'System.cmd("mcp",["--token","ghp_Abcdef1234"<>"Klmno567890123456"])'`,
+    ],
+    [
+      "IEx RPC evaluation operands",
+      `iex --rpc-eval node@host 'System.cmd("mcp",["--token","ghp_Abcdef1234"<>"Klmno567890123456"])'`,
+    ],
+    [
       "GNU env split strings without assignments",
       `env -S'mcp\\_--token\\_ghp_Abcdef1234""Klmno56789'`,
     ],
@@ -2058,6 +2066,7 @@ describe("backup payload", () => {
       "mcp-server --config ~/.xum/skills/launch.txt",
       "swift /tmp/launch.swift",
       "elixir /tmp/launch.exs",
+      "iex /tmp/launch.exs",
       "jshell /tmp/launch.jsh",
       "tclsh /tmp/server.tcl",
       "wish8.6 /tmp/app.tcl",

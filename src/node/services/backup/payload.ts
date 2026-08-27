@@ -1937,9 +1937,10 @@ const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   { name: /^npx$/, evalWord: /^(?:-c$|--call(?:=|$))/ },
   { name: /^deno$/, evalWord: /^eval$/ },
   { name: /^(?:lua|luajit)[0-9.]*$/, evalWord: /^-e/ },
+  { name: /^(?:elixir|iex)[0-9.]*$/, evalWord: /^(?:-e$|--eval(?:=|$)|--rpc-eval(?:=|$))/ },
   // These launchers execute a positional script but need no inline-eval matcher here;
   // auto-published script operands still localize through the shared check.
-  { name: /^(?:elixir|jshell|swift|tclsh|wish|expectk?|jimsh)[0-9.]*$/ },
+  { name: /^(?:jshell|swift|tclsh|wish|expectk?|jimsh)[0-9.]*$/ },
   {
     name: /^r$/,
     evalWord: /^(?:-e$|--expression(?:=|$))/,
