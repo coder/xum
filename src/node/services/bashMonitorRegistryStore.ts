@@ -182,16 +182,17 @@ export class BashMonitorRegistryStore {
     return records;
   }
 
-  async listOwnerWorkspaceIds(): Promise<string[]> {
+  async listOwnerWorkspaceIds(): Promise<{ ownerWorkspaceIds: string[]; scanFailed: boolean }> {
     let entries: Dirent[];
     try {
       entries = await fsPromises.readdir(this.config.sessionsDir, { withFileTypes: true });
     } catch (error) {
-      if (isErrnoWithCode(error, "ENOENT")) return [];
+      if (isErrnoWithCode(error, "ENOENT")) return { ownerWorkspaceIds: [], scanFailed: false };
       throw error;
     }
 
     const ownerWorkspaceIds: string[] = [];
+    let scanFailed = false;
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       try {
@@ -199,14 +200,16 @@ export class BashMonitorRegistryStore {
           ownerWorkspaceIds.push(entry.name);
         }
       } catch (error) {
-        // One unreadable session must not block registry recovery for every other workspace.
+        // One unreadable session must not block registry recovery for every other workspace,
+        // but the caller still needs the failure signal to schedule its retry pass.
+        scanFailed = true;
         log.warn(
           `BashMonitorRegistryStore: skipping unreadable session ${entry.name}: ${String(error)}`
         );
       }
     }
     ownerWorkspaceIds.sort();
-    return ownerWorkspaceIds;
+    return { ownerWorkspaceIds, scanFailed };
   }
 
   private parse(raw: string): BashMonitorRegistryRecord | null {

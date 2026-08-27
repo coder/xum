@@ -634,6 +634,39 @@ describe("BackgroundProcessManager", () => {
       }
     });
 
+    it("retires the monitor when the exit marker is corrupted", async () => {
+      const stoppedEvents: MonitorStoppedPayload[] = [];
+      manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+      const remoteRuntime = createRemoteLikeRuntime(new LocalRuntime(process.cwd()));
+      const result = await manager.spawn(remoteRuntime, testWorkspaceId, "sleep 10", {
+        cwd: process.cwd(),
+        displayName: "monitor-exit-marker-corrupt",
+        monitor: {
+          filter: "NEVER",
+          pattern: /NEVER/,
+          exclude: false,
+          cooldownMs: 10_000,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+
+      try {
+        await fs.writeFile(path.join(result.outputDir, "exit_code"), "garbage\n", "utf-8");
+        for (let attempt = 0; attempt < 120 && stoppedEvents.length === 0; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        const stoppedEvent = stoppedEvents.find(
+          (event) => event.processId === result.processId && event.reason === "failed"
+        );
+        expect(stoppedEvent).toBeDefined();
+        expect(stoppedEvent?.failedOperations).toEqual(["getExitCode"]);
+      } finally {
+        await manager.terminate(result.processId, { monitorDisposition: "discard" });
+      }
+    });
+
     it("resets consecutive output failures after an output probe succeeds", async () => {
       const stoppedEvents: MonitorStoppedPayload[] = [];
       manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));

@@ -2502,7 +2502,10 @@ export class WorkspaceService extends EventEmitter {
     let retryNeeded = false;
     let ownerWorkspaceIds: string[];
     try {
-      ownerWorkspaceIds = await this.bashMonitorRegistryStore.listOwnerWorkspaceIds();
+      const scan = await this.bashMonitorRegistryStore.listOwnerWorkspaceIds();
+      ownerWorkspaceIds = scan.ownerWorkspaceIds;
+      // A skipped unreadable session still needs the bounded retry pass.
+      retryNeeded = scan.scanFailed;
     } catch (error) {
       log.warn("Failed to list stale bash monitor registry records", { error });
       return true;

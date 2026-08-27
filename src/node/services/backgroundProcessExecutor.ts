@@ -334,7 +334,12 @@ class RuntimeBackgroundHandle implements BackgroundHandle {
       timeout: 10,
     });
     this.assertMonitorProbeSucceeded("getExitCode", result.exitCode);
-    return parseExitCode(result.stdout);
+    const parsed = parseExitCode(result.stdout);
+    // A nonempty marker that fails to parse is a corrupted write, not a still-running process.
+    if (parsed == null && result.stdout.trim().length > 0) {
+      throw new Error(`getExitCode marker is not a number: ${result.stdout.trim().slice(0, 32)}`);
+    }
+    return parsed;
   }
 
   /**

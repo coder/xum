@@ -635,7 +635,7 @@ export function buildBashMonitorWakePrompt(
       const taskIds = [...new Set(awaitableRuntimeFailures.map((record) => record.taskId))];
       const taskAwaitExample = `task_await({ task_ids: [${taskIds.map((id) => JSON.stringify(id)).join(", ")}], timeout_secs: 0 })`;
       closingParts.push(
-        `Use \`${taskAwaitExample}\` to inspect current output, then re-arm a new monitor if more wakes are needed.`
+        `Use \`${taskAwaitExample}\` to inspect current output. A failed monitor cannot be re-attached to a running process; if you still need condition-driven wakes, terminate this process and relaunch the script with the bash tool's monitor option instead of starting a duplicate.`
       );
     }
     const unreadableRuntimeFailures = runtimeLostRecords.filter(
@@ -643,7 +643,7 @@ export function buildBashMonitorWakePrompt(
     );
     if (unreadableRuntimeFailures.length > 0) {
       closingParts.push(
-        "Output is not currently readable for the affected process generation. Re-arm a monitor only after transport recovery."
+        "Output is not currently readable for the affected process generation. Wait for transport recovery before terminating and relaunching with a new monitor."
       );
     }
     if (
@@ -1695,6 +1695,19 @@ export class BashMonitorWakeStore {
           const terminalMarkerMs = Date.parse(existing.terminalOriginAt ?? existing.createdAt);
           const armedAtMs = Date.parse(payload.createdAt ?? "");
           if (!(armedAtMs > terminalMarkerMs)) return null;
+        }
+        // A pending non-settled match written before this monitor generation armed belongs to a
+        // prior run; replace it so old output is not attributed to the new failure. NaN-safe:
+        // malformed timestamps compare false and keep the merge path.
+        if (
+          existing.kind === "match" &&
+          existing.terminal == null &&
+          payload.createdAt != null &&
+          Date.parse(existing.updatedAt) < Date.parse(payload.createdAt)
+        ) {
+          const record = createRecord();
+          await this.write(record);
+          return record;
         }
         const record: BashMonitorWakeRecord = {
           ...existing,

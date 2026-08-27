@@ -99,7 +99,10 @@ describe("BashMonitorRegistryStore", () => {
     // Session dir without a registry dir must be skipped, not crash the walk.
     await fsPromises.mkdir(config.getSessionDir("owner-empty"), { recursive: true });
 
-    expect(await store.listOwnerWorkspaceIds()).toEqual(["owner-a"]);
+    expect(await store.listOwnerWorkspaceIds()).toEqual({
+      ownerWorkspaceIds: ["owner-a"],
+      scanFailed: false,
+    });
   });
 
   test("one unreadable session does not block owner discovery for others", async () => {
@@ -111,7 +114,10 @@ describe("BashMonitorRegistryStore", () => {
     await fsPromises.mkdir(badSession, { recursive: true });
     await fsPromises.writeFile(path.join(badSession, BASH_MONITOR_REGISTRY_DIR), "not a dir");
 
-    expect(await store.listOwnerWorkspaceIds()).toEqual(["owner-good"]);
+    expect(await store.listOwnerWorkspaceIds()).toEqual({
+      ownerWorkspaceIds: ["owner-good"],
+      scanFailed: true,
+    });
   });
 
   test("consumeIfArmedBefore takes stale records but preserves live replacements", async () => {
