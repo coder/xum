@@ -86,6 +86,9 @@ const CREDENTIAL_TOKEN_PATTERNS = [
   /\bAKIA[0-9A-Z]{16}\b/,
   // Slack workspace (xox?-) and app-level (xapp-) issued tokens.
   /\bx(?:ox[baprs]|app)-[A-Za-z0-9-]{10,}\b/,
+  // Stripe live secret and restricted keys. Test-mode keys stay reviewable:
+  // documentation routinely quotes them, and the block has no override.
+  /\b[sr]k_live_[A-Za-z0-9]{16,}\b/,
 ] as const;
 
 /**

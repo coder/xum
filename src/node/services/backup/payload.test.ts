@@ -1660,11 +1660,12 @@ describe("backup payload", () => {
     expect(mcp.servers.grafana.command).toBe(portable);
   });
 
-  it("blocks every issued GitHub and Slack token prefix without an override", async () => {
-    // App user (ghu_), installation (ghs_), and refresh (ghr_) GitHub tokens and
-    // Slack app-level (xapp-) tokens are issued-only like ghp_/gho_/xoxb-; a
-    // collected documentation file must not publish any of them.
-    for (const prefix of ["ghu_", "ghs_", "ghr_", "xapp-1-"]) {
+  it("blocks every issued GitHub, Slack, and Stripe token prefix without an override", async () => {
+    // App user (ghu_), installation (ghs_), and refresh (ghr_) GitHub tokens,
+    // Slack app-level (xapp-) tokens, and Stripe live secret/restricted keys
+    // (sk_live_/rk_live_) are issued-only like ghp_/gho_/xoxb-; a collected
+    // documentation file must not publish any of them.
+    for (const prefix of ["ghu_", "ghs_", "ghr_", "xapp-1-", "sk_live_", "rk_live_"]) {
       await writeFixtureFile(
         muxRoot,
         "skills/demo/SKILL.md",
