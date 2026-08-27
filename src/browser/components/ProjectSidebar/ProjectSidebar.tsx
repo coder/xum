@@ -103,7 +103,6 @@ import {
   computeSidebarTaskGroups,
   computeTaskGroupMemberRowMeta,
   type SidebarTaskGroupModel,
-  type SidebarTaskGroupsResult,
 } from "./sidebarTaskGroups";
 import { TitleEditProvider, useTitleEdit } from "@/browser/contexts/WorkspaceTitleEditContext";
 import { useConfirmDialog } from "@/browser/contexts/ConfirmDialogContext";
@@ -436,9 +435,35 @@ interface DraftAgentListItemWrapperProps {
   isSelected: boolean;
   sectionId?: string;
   onVisibilityChange?: (isVisible: boolean) => void;
-  projectBadge?: { name: string; color: string };
+  projectBadgeName?: string;
+  projectBadgeColor?: string;
   onOpen: () => void;
   onDelete: () => void;
+}
+
+/** Per-row options the coalesced list pipeline passes to a list's row renderer. */
+interface CoalescedRowRenderOptions {
+  sectionId?: string;
+  /** undefined = fall back to the list's base meta; null = render without meta. */
+  rowRenderMeta?: AgentRowRenderMeta | null;
+  depthOverride?: number;
+  keyOverride?: string;
+  subAgentConnectorLayout?: "default" | "task-group-member";
+  taskGroupHeaderTitle?: string;
+}
+
+/** List-specific inputs for the shared coalesced workspace list pipeline. */
+interface CoalescedWorkspaceListContext {
+  sectionId?: string;
+  tierKeyPrefix: string;
+  /** Grouped lists indent age-tier toggles to align with folder content. */
+  tierButtonClassName?: string;
+  depthByWorkspaceId: Record<string, number>;
+  baseRowMetaByWorkspaceId: ReadonlyMap<string, AgentRowRenderMeta>;
+  renderRow: (
+    metadata: FrontendWorkspaceMetadata,
+    opts?: CoalescedRowRenderOptions
+  ) => React.ReactNode;
 }
 
 // Debounce delay for sidebar preview updates during typing.
@@ -521,7 +546,8 @@ function DraftAgentListItemWrapper(props: DraftAgentListItemWrapperProps) {
       projectPath={props.projectPath}
       isSelected={props.isSelected}
       sectionId={props.sectionId}
-      projectBadge={props.projectBadge}
+      projectBadgeName={props.projectBadgeName}
+      projectBadgeColor={props.projectBadgeColor}
       draft={{
         draftId: props.draftId,
         draftNumber: props.draftNumber,
@@ -1740,12 +1766,43 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const isWorkflowRunActive = (workspaceId: string, runId: string): boolean =>
     getActiveWorkflowRunIds(workspaceId).includes(runId);
   const allSidebarWorkspaces = Array.from(sortedWorkspacesByProject.values()).flat();
+  // Mirror the grouped collection's experiment gate: multi-project chats stay
+  // hidden in flat mode too while the experiment is off.
   const flatWorkspaces = flatSidebarEnabled
-    ? buildSortedWorkspacesFlat(allSidebarWorkspaces, workspaceRecency)
+    ? buildSortedWorkspacesFlat(
+        multiProjectWorkspacesEnabled
+          ? allSidebarWorkspaces
+          : allSidebarWorkspaces.filter((workspace) => !isMultiProject(workspace)),
+        workspaceRecency
+      )
     : [];
-  const flatRowsForDisplay = hideSubAgentRows
+  // Draft-to-workspace promotions: like grouped mode, the just-created
+  // workspace renders in its draft's position, so it must be suppressed from
+  // the normal rows or the same chat appears twice during creation.
+  const flatDraftPromotionsByDraftId = new Map<string, FrontendWorkspaceMetadata>();
+  if (flatSidebarEnabled) {
+    for (const [projectPath, drafts] of Object.entries(workspaceDraftsByProject)) {
+      const promotions = workspaceDraftPromotionsByProject[projectPath] ?? {};
+      for (const draft of drafts) {
+        const promoted = promotions[draft.draftId];
+        if (promoted) {
+          flatDraftPromotionsByDraftId.set(draft.draftId, promoted);
+        }
+      }
+    }
+  }
+  const flatPromotedWorkspaceIds = new Set(
+    [...flatDraftPromotionsByDraftId.values()].map((metadata) => metadata.id)
+  );
+  const flatRowsBeforePromotionFilter = hideSubAgentRows
     ? excludeSubAgentRows(flatWorkspaces)
     : flatWorkspaces;
+  const flatRowsForDisplay =
+    flatPromotedWorkspaceIds.size > 0
+      ? flatRowsBeforePromotionFilter.filter(
+          (workspace) => !flatPromotedWorkspaceIds.has(workspace.id)
+        )
+      : flatRowsBeforePromotionFilter;
   const flatDepthByWorkspaceId = computeWorkspaceDepthMap(flatRowsForDisplay);
   const visibleFlatWorkspaces = filterVisibleAgentRows(
     flatRowsForDisplay,
@@ -1758,6 +1815,15 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
     expandedCompletedParentIds,
     { isWorkspaceLiveActive }
   );
+  if (flatSidebarEnabled) {
+    // Track runs that are (or were, this session) active so their groups stay
+    // mounted across step gaps (mirrors the grouped per-project seeding).
+    for (const key of collectActiveWorkflowGroupKeys(flatRowsForDisplay, {
+      isWorkspaceLiveActive,
+    })) {
+      sessionActiveTaskGroupKeysRef.current.add(key);
+    }
+  }
   // Learn run names while a worker row still carries them (workers are deleted
   // after reporting), then drop names whose run is no longer active.
   for (const workspace of allSidebarWorkspaces) {
@@ -2041,81 +2107,419 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
   const archiveConfirmationUntrackedPaths = archiveConfirmation?.untrackedPaths;
   const archiveConfirmationIsStreaming = archiveConfirmation?.isStreaming ?? false;
 
-  const renderFlatWorkspaceRows = (rows: FrontendWorkspaceMetadata[]): React.ReactNode =>
-    rows.map((metadata) => {
-      const rowRenderMeta = flatRowMetaByWorkspaceId.get(metadata.id);
-      return (
-        <AgentListItem
-          key={metadata.id}
-          metadata={metadata}
-          projectPath={metadata.projectPath}
-          projectName={metadata.projectName}
-          projectBadge={getFlatProjectBadge(metadata)}
-          isSelected={selectedWorkspace?.workspaceId === metadata.id}
-          isArchiving={archivingWorkspaceIds.has(metadata.id)}
-          isRemoving={removingWorkspaceIds.has(metadata.id) || metadata.isRemoving === true}
-          onSelectWorkspace={handleSelectWorkspace}
-          onForkWorkspace={handleForkWorkspace}
-          onStopRuntime={handleStopRuntime}
-          onArchiveWorkspace={handleArchiveWorkspace}
-          onCancelCreation={handleCancelWorkspaceCreation}
-          depth={rowRenderMeta?.depth ?? flatDepthByWorkspaceId[metadata.id] ?? 0}
-          pinnedReorderGroup={FLAT_PINNED_REORDER_GROUP}
-          onPinnedReorderDrop={handlePinnedReorderDrop}
-          rowRenderMeta={rowRenderMeta}
-          isWorkspaceLiveActive={isWorkspaceLiveActive(metadata.id)}
-          delegatedActivity={delegatedActivityByWorkspaceId.get(metadata.id)}
-          hiddenSubAgentsSummary={getHiddenSubAgentsSummary(metadata.id)}
-          getWorkflowRunName={getWorkflowRunName}
-          completedChildrenExpanded={expandedCompletedParentIds.has(metadata.id)}
-          onToggleCompletedChildren={toggleCompletedChildrenExpansion}
-        />
-      );
+  // ── Shared coalesced list pipeline ──────────────────────────────────────
+  // One rendering pipeline for every workspace list (grouped project sections
+  // and the flat chat list): age tiers, task-group coalescing (best-of and
+  // workflow runs), retained workflow headers, and connector geometry. Only
+  // row presentation differs per list, injected via ctx.renderRow.
+  const renderCoalescedWorkspaceList = (
+    workspaces: FrontendWorkspaceMetadata[],
+    allRowsForTaskGroupCoalescing: FrontendWorkspaceMetadata[],
+    ctx: CoalescedWorkspaceListContext
+  ): React.ReactNode => {
+    // With age grouping disabled, keep every workspace in the recent path
+    // (flat recency-sorted list); full-length empty buckets preserve
+    // tier-index assumptions below.
+    const { recent: topVisibleRows, buckets } = ageGroupingEnabled
+      ? partitionWorkspacesByAge(workspaces, workspaceRecency)
+      : {
+          recent: workspaces,
+          buckets: AGE_THRESHOLDS_DAYS.map((): FrontendWorkspaceMetadata[] => []),
+        };
+
+    const expandedTierVisibleIds = new Set<string>();
+    const markExpandedTierRowsVisible = (tierIndex: number): void => {
+      const bucket = buckets[tierIndex];
+      const remainingCount = buckets
+        .slice(tierIndex)
+        .reduce((sum, bucketRows) => sum + bucketRows.length, 0);
+      if (remainingCount === 0) {
+        return;
+      }
+
+      const tierKey = `${ctx.tierKeyPrefix}:${tierIndex}`;
+      const isTierExpanded = expandedOldWorkspaces[tierKey] ?? false;
+      if (!isTierExpanded) {
+        return;
+      }
+
+      for (const workspace of bucket) {
+        expandedTierVisibleIds.add(workspace.id);
+      }
+
+      const nextTier = findNextNonEmptyTier(buckets, tierIndex + 1);
+      if (nextTier !== -1) {
+        markExpandedTierRowsVisible(nextTier);
+      }
+    };
+
+    const firstTier = findNextNonEmptyTier(buckets, 0);
+    if (firstTier !== -1) {
+      markExpandedTierRowsVisible(firstTier);
+    }
+
+    // Connector geometry should match the rows users can currently see,
+    // not hidden siblings parked behind collapsed age tiers.
+    const visibleRowIds = new Set<string>([
+      ...topVisibleRows.map((workspace) => workspace.id),
+      ...expandedTierVisibleIds,
+    ]);
+    const visibleRows = workspaces.filter((workspace) => visibleRowIds.has(workspace.id));
+    // Coalesce grouped task rows (best-of + workflow runs)
+    // before deriving connector geometry: headers join the row model
+    // as synthetic nodes so trunks/elbows stay continuous (D5).
+    const taskGroups = computeSidebarTaskGroups({
+      rows: visibleRows,
+      allRows: allRowsForTaskGroupCoalescing,
+      selectedWorkspaceId: selectedWorkspace?.workspaceId,
+      isWorkspaceLiveActive,
     });
 
-  const flatAgePartition = ageGroupingEnabled
-    ? partitionWorkspacesByAge(visibleFlatWorkspaces, workspaceRecency)
-    : null;
-  const firstFlatAgeTier = flatAgePartition
-    ? findNextNonEmptyTier(flatAgePartition.buckets, 0)
-    : -1;
-  const renderFlatAgeTier = (tierIndex: number): React.ReactNode => {
-    if (!flatAgePartition) return null;
-    const bucket = flatAgePartition.buckets[tierIndex];
-    const remainingCount = flatAgePartition.buckets
-      .slice(tierIndex)
-      .reduce((sum, rows) => sum + rows.length, 0);
-    if (remainingCount === 0) return null;
+    for (const group of taskGroups.groupsByStorageKey.values()) {
+      if (
+        group.kind === "workflow" &&
+        (group.hasActiveMember || sessionActiveTaskGroupKeysRef.current.has(group.storageKey))
+      ) {
+        retainedWorkflowTaskGroupsRef.current.set(group.storageKey, group);
+      }
+    }
 
-    const tierKey = `flat:${tierIndex}`;
-    const isExpanded = expandedOldWorkspaces[tierKey] ?? false;
-    const thresholdLabel = formatDaysThreshold(AGE_THRESHOLDS_DAYS[tierIndex]);
-    const nextTier = findNextNonEmptyTier(flatAgePartition.buckets, tierIndex + 1);
-    return (
-      <React.Fragment key={tierKey}>
-        <button
-          onClick={() => {
-            setExpandedOldWorkspaces((prev) => ({ ...prev, [tierKey]: !prev[tierKey] }));
+    const retainedWorkflowGroupsByParentId = new Map<string, SidebarTaskGroupModel[]>();
+    for (const [storageKey, retainedGroup] of retainedWorkflowTaskGroupsRef.current) {
+      if (taskGroups.groupsByStorageKey.has(storageKey)) {
+        continue;
+      }
+      if (!isWorkflowRunActive(retainedGroup.parentWorkspaceId, retainedGroup.id)) {
+        retainedWorkflowTaskGroupsRef.current.delete(storageKey);
+        sessionActiveTaskGroupKeysRef.current.delete(storageKey);
+        continue;
+      }
+      // The parent's hidden-sub-agents summary replaces retained
+      // workflow headers while sub-agent rows are hidden.
+      if (hideSubAgentRows) {
+        continue;
+      }
+      if (!visibleRowIds.has(retainedGroup.parentWorkspaceId)) {
+        continue;
+      }
+
+      const groups = retainedWorkflowGroupsByParentId.get(retainedGroup.parentWorkspaceId) ?? [];
+      groups.push({
+        ...retainedGroup,
+        displayMembers: [],
+        // The workflow run itself remains active between transient worker
+        // steps, without inventing a running member-task count.
+        runningCount: 0,
+        queuedCount: 0,
+        runActiveWithoutMembers: true,
+        hasActiveMember: true,
+      });
+      retainedWorkflowGroupsByParentId.set(retainedGroup.parentWorkspaceId, groups);
+    }
+
+    const rowNodes: SidebarVisibleRowNode[] = [];
+    const seenGroupKeys = new Set<string>();
+    for (const workspace of visibleRows) {
+      const groupKey = taskGroups.memberGroupStorageKeyByWorkspaceId.get(workspace.id);
+      const group = groupKey != null ? taskGroups.groupsByStorageKey.get(groupKey) : undefined;
+      if (group != null) {
+        if (seenGroupKeys.has(group.storageKey)) {
+          continue;
+        }
+        seenGroupKeys.add(group.storageKey);
+        const anchorMeta = ctx.baseRowMetaByWorkspaceId.get(workspace.id);
+        const headerDepth = anchorMeta?.depth ?? ctx.depthByWorkspaceId[workspace.id] ?? 0;
+        rowNodes.push({
+          id: group.storageKey,
+          parentId: anchorMeta?.visibleParentWorkspaceId ?? group.parentWorkspaceId,
+          depth: headerDepth,
+          isRunning: group.runningCount > 0,
+          baseMeta: {
+            depth: headerDepth,
+            rowKind: "subagent",
+            connectorPosition: "single",
+            connectorStartsAtParent: false,
+            sharedTrunkActiveThroughRow: false,
+            sharedTrunkActiveBelowRow: false,
+            ancestorTrunks: [],
+            hasHiddenCompletedChildren: false,
+            visibleCompletedChildrenCount: 0,
+          },
+        });
+        continue;
+      }
+
+      const baseRowMeta = ctx.baseRowMetaByWorkspaceId.get(workspace.id);
+      if (!baseRowMeta) {
+        continue;
+      }
+      rowNodes.push({
+        id: workspace.id,
+        parentId: baseRowMeta.visibleParentWorkspaceId ?? workspace.parentWorkspaceId,
+        depth: baseRowMeta.depth,
+        isRunning: isSidebarSubAgentRunning(workspace, {
+          isWorkspaceLiveActive,
+        }),
+        baseMeta: baseRowMeta,
+      });
+      for (const retainedGroup of retainedWorkflowGroupsByParentId.get(workspace.id) ?? []) {
+        const headerDepth = baseRowMeta.depth + 1;
+        rowNodes.push({
+          id: retainedGroup.storageKey,
+          parentId: workspace.id,
+          depth: headerDepth,
+          isRunning: true,
+          baseMeta: {
+            depth: headerDepth,
+            rowKind: "subagent",
+            connectorPosition: "single",
+            connectorStartsAtParent: false,
+            sharedTrunkActiveThroughRow: false,
+            sharedTrunkActiveBelowRow: false,
+            ancestorTrunks: [],
+            hasHiddenCompletedChildren: false,
+            visibleCompletedChildrenCount: 0,
+          },
+        });
+      }
+    }
+    const rowMetaByVisibleWorkspaceId = computeRowMetaForVisibleNodes(rowNodes);
+
+    // Expanded members hang off their header row, so their connector
+    // meta derives from the header's computed geometry.
+    const memberMetaByWorkspaceId = new Map<string, AgentRowRenderMeta>();
+    for (const group of taskGroups.groupsByStorageKey.values()) {
+      const headerMeta = rowMetaByVisibleWorkspaceId.get(group.storageKey);
+      if (headerMeta == null) {
+        continue;
+      }
+      for (const [memberId, memberMeta] of computeTaskGroupMemberRowMeta({
+        group,
+        headerMeta,
+        headerDepth: headerMeta.depth,
+        isWorkspaceLiveActive,
+      })) {
+        memberMetaByWorkspaceId.set(memberId, memberMeta);
+      }
+    }
+
+    const renderTaskGroupRows = (group: SidebarTaskGroupModel): React.ReactNode[] => {
+      const headerMeta = rowMetaByVisibleWorkspaceId.get(group.storageKey);
+      const headerDepth =
+        headerMeta?.depth ??
+        ctx.depthByWorkspaceId[group.anchorId] ??
+        (ctx.depthByWorkspaceId[group.parentWorkspaceId] ?? -1) + 1;
+
+      if (group.kind === "workflow" && group.hasActiveMember) {
+        sessionActiveTaskGroupKeysRef.current.add(group.storageKey);
+      }
+      const defaultExpanded =
+        group.kind === "workflow" &&
+        (group.hasActiveMember || sessionActiveTaskGroupKeysRef.current.has(group.storageKey));
+      const isExpanded = expandedTaskGroups[group.storageKey] ?? defaultExpanded;
+      const isGroupSelected = group.allMembers.some(
+        (member) => member.id === selectedWorkspace?.workspaceId
+      );
+
+      const headerRow = (
+        <TaskGroupListItem
+          groupId={group.id}
+          title={group.title}
+          kind={group.kind}
+          sectionId={ctx.sectionId}
+          depth={headerDepth}
+          totalCount={group.totalCount}
+          visibleCount={group.displayMembers.length}
+          completedCount={group.completedCount}
+          isRunActive={group.runActiveWithoutMembers === true}
+          runningCount={group.runningCount}
+          queuedCount={group.queuedCount}
+          interruptedCount={group.interruptedCount}
+          isExpanded={isExpanded}
+          isSelected={isGroupSelected}
+          onToggle={() => {
+            toggleTaskGroupExpansion(group.storageKey, isExpanded);
           }}
-          aria-expanded={isExpanded}
-          className="text-muted border-hover hover:text-label flex w-full cursor-pointer items-center gap-1 border-t border-none bg-transparent px-3 py-2 text-xs font-medium transition-all duration-150 hover:bg-white/3"
-        >
-          <ChevronRight
-            className="h-4 w-4 transition-transform duration-200"
-            style={{ transform: isExpanded ? "rotate(90deg)" : "rotate(0deg)" }}
-          />
-          <span>Older than {thresholdLabel}</span>
-          <span className="text-dim font-normal">
-            ({isExpanded ? bucket.length : remainingCount})
-          </span>
-        </button>
-        {isExpanded && (
-          <>
-            {renderFlatWorkspaceRows(bucket)}
-            {nextTier !== -1 && renderFlatAgeTier(nextTier)}
-          </>
-        )}
-      </React.Fragment>
+        />
+      );
+      const renderedRows: React.ReactNode[] = [
+        headerMeta != null ? (
+          <SubAgentListItem
+            key={`task-group:${group.storageKey}`}
+            connectorPosition={headerMeta.connectorPosition}
+            connectorStartsAtParent={headerMeta.connectorStartsAtParent}
+            sharedTrunkActiveThroughRow={headerMeta.sharedTrunkActiveThroughRow}
+            sharedTrunkActiveBelowRow={headerMeta.sharedTrunkActiveBelowRow}
+            ancestorTrunks={headerMeta.ancestorTrunks.map((trunk) => ({
+              left: getAncestorRailX(trunk.depth, "default"),
+              active: trunk.active,
+            }))}
+            connectorRailX={getSubAgentParentRailX(headerDepth, "default")}
+            childStatusCenterX={getSubAgentChildStatusCenterX(headerDepth)}
+            isSelected={isGroupSelected}
+            isElbowActive={group.runActiveWithoutMembers === true || group.runningCount > 0}
+          >
+            {headerRow}
+          </SubAgentListItem>
+        ) : (
+          <React.Fragment key={`task-group:${group.storageKey}`}>{headerRow}</React.Fragment>
+        ),
+      ];
+
+      if (isExpanded) {
+        for (const member of group.displayMembers) {
+          renderedRows.push(
+            ctx.renderRow(member, {
+              sectionId: ctx.sectionId,
+              rowRenderMeta: memberMetaByWorkspaceId.get(member.id) ?? null,
+              depthOverride: getTaskGroupMemberDepth(headerDepth),
+              keyOverride: `task-group-member:${group.storageKey}:${member.id}`,
+              subAgentConnectorLayout: "task-group-member",
+              taskGroupHeaderTitle: group.title,
+            })
+          );
+        }
+      }
+      return renderedRows;
+    };
+
+    const renderWorkspaceRows = (rows: FrontendWorkspaceMetadata[]): React.ReactNode[] => {
+      const renderedRows: React.ReactNode[] = [];
+
+      for (const workspace of rows) {
+        const groupKey = taskGroups.memberGroupStorageKeyByWorkspaceId.get(workspace.id);
+        const group = groupKey != null ? taskGroups.groupsByStorageKey.get(groupKey) : undefined;
+        if (group == null) {
+          renderedRows.push(
+            ctx.renderRow(workspace, {
+              sectionId: ctx.sectionId,
+              rowRenderMeta: rowMetaByVisibleWorkspaceId.get(workspace.id),
+            })
+          );
+          for (const retainedGroup of retainedWorkflowGroupsByParentId.get(workspace.id) ?? []) {
+            renderedRows.push(...renderTaskGroupRows(retainedGroup));
+          }
+          continue;
+        }
+
+        if (group.anchorId !== workspace.id) {
+          // Non-anchor members render under the group header at the
+          // anchor's position (D5), so suppress them here.
+          continue;
+        }
+
+        renderedRows.push(...renderTaskGroupRows(group));
+      }
+
+      return renderedRows;
+    };
+
+    const renderTier = (tierIndex: number): React.ReactNode => {
+      const bucket = buckets[tierIndex];
+      const remainingCount = buckets.slice(tierIndex).reduce((sum, b) => sum + b.length, 0);
+
+      if (remainingCount === 0) return null;
+
+      const tierKey = `${ctx.tierKeyPrefix}:${tierIndex}`;
+      const isTierExpanded = expandedOldWorkspaces[tierKey] ?? false;
+      const thresholdDays = AGE_THRESHOLDS_DAYS[tierIndex];
+      const thresholdLabel = formatDaysThreshold(thresholdDays);
+      const displayCount = isTierExpanded ? bucket.length : remainingCount;
+
+      return (
+        <React.Fragment key={tierKey}>
+          <button
+            onClick={() => {
+              setExpandedOldWorkspaces((prev) => ({
+                ...prev,
+                [tierKey]: !prev[tierKey],
+              }));
+            }}
+            aria-label={
+              isTierExpanded
+                ? `Collapse workspaces older than ${thresholdLabel}`
+                : `Expand workspaces older than ${thresholdLabel}`
+            }
+            aria-expanded={isTierExpanded}
+            className={cn(
+              "text-muted border-hover hover:text-label [&:hover_.arrow]:text-label flex w-full cursor-pointer items-center gap-1 border-t border-none bg-transparent px-3 py-2 text-xs font-medium transition-all duration-150 hover:bg-white/3",
+              ctx.tierButtonClassName
+            )}
+          >
+            <span
+              className="arrow text-dim text-[11px] transition-transform duration-200 ease-in-out"
+              style={{
+                transform: isTierExpanded ? "rotate(90deg)" : "rotate(0deg)",
+              }}
+            >
+              <ChevronRight className="h-4 w-4" />
+            </span>
+            <div className="flex items-center gap-1.5">
+              <span>Older than {thresholdLabel}</span>
+              <span className="text-dim font-normal">({displayCount})</span>
+            </div>
+          </button>
+          {isTierExpanded && (
+            <>
+              {renderWorkspaceRows(bucket)}
+              {(() => {
+                const nextTier = findNextNonEmptyTier(buckets, tierIndex + 1);
+                return nextTier !== -1 ? renderTier(nextTier) : null;
+              })()}
+            </>
+          )}
+        </React.Fragment>
+      );
+    };
+
+    return (
+      <>
+        {renderWorkspaceRows(topVisibleRows)}
+        {firstTier !== -1 && renderTier(firstTier)}
+      </>
+    );
+  };
+
+  const renderFlatRow = (
+    metadata: FrontendWorkspaceMetadata,
+    opts?: CoalescedRowRenderOptions
+  ): React.ReactNode => {
+    const rowRenderMeta =
+      opts?.rowRenderMeta === undefined
+        ? flatRowMetaByWorkspaceId.get(metadata.id)
+        : (opts.rowRenderMeta ?? undefined);
+    const badge = getFlatProjectBadge(metadata);
+    return (
+      <AgentListItem
+        key={opts?.keyOverride ?? metadata.id}
+        metadata={metadata}
+        projectPath={metadata.projectPath}
+        projectName={metadata.projectName}
+        projectBadgeName={badge?.name}
+        projectBadgeColor={badge?.color}
+        isSelected={selectedWorkspace?.workspaceId === metadata.id}
+        isArchiving={archivingWorkspaceIds.has(metadata.id)}
+        isRemoving={removingWorkspaceIds.has(metadata.id) || metadata.isRemoving === true}
+        onSelectWorkspace={handleSelectWorkspace}
+        onForkWorkspace={handleForkWorkspace}
+        onStopRuntime={handleStopRuntime}
+        onArchiveWorkspace={handleArchiveWorkspace}
+        onCancelCreation={handleCancelWorkspaceCreation}
+        depth={
+          opts?.depthOverride ?? rowRenderMeta?.depth ?? flatDepthByWorkspaceId[metadata.id] ?? 0
+        }
+        pinnedReorderGroup={FLAT_PINNED_REORDER_GROUP}
+        onPinnedReorderDrop={handlePinnedReorderDrop}
+        rowRenderMeta={rowRenderMeta}
+        subAgentConnectorLayout={opts?.subAgentConnectorLayout}
+        taskGroupHeaderTitle={opts?.taskGroupHeaderTitle}
+        isWorkspaceLiveActive={isWorkspaceLiveActive(metadata.id)}
+        delegatedActivity={delegatedActivityByWorkspaceId.get(metadata.id)}
+        hiddenSubAgentsSummary={getHiddenSubAgentsSummary(metadata.id)}
+        getWorkflowRunName={getWorkflowRunName}
+        completedChildrenExpanded={expandedCompletedParentIds.has(metadata.id)}
+        onToggleCompletedChildren={toggleCompletedChildrenExpansion}
+      />
     );
   };
 
@@ -2129,9 +2533,19 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
         New chat
       </button>
       {flatDrafts.map(({ projectPath, draft }, index) => {
+        const promotedMetadata = flatDraftPromotionsByDraftId.get(draft.draftId);
+        if (promotedMetadata) {
+          // The just-created workspace renders in the draft's position while
+          // the draft entry is still present (grouped mode does the same).
+          const liveMetadata =
+            flatWorkspaces.find((workspace) => workspace.id === promotedMetadata.id) ??
+            promotedMetadata;
+          return <React.Fragment key={draft.draftId}>{renderFlatRow(liveMetadata)}</React.Fragment>;
+        }
         const isSelected =
           pendingNewWorkspaceProject === projectPath &&
           pendingNewWorkspaceDraftId === draft.draftId;
+        const draftBadge = getFlatDraftBadge(projectPath);
         return (
           <DraftAgentListItemWrapper
             key={draft.draftId}
@@ -2139,26 +2553,35 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
             draftId={draft.draftId}
             draftNumber={index + 1}
             isSelected={isSelected}
-            projectBadge={getFlatDraftBadge(projectPath)}
+            projectBadgeName={draftBadge?.name}
+            projectBadgeColor={draftBadge?.color}
             onVisibilityChange={(isVisible) => {
               handleDraftVisibilityChange(projectPath, draft.draftId, isVisible);
             }}
             onOpen={() => handleOpenWorkspaceDraft(projectPath, draft.draftId)}
             onDelete={() => {
-              if (isSelected) navigateToProject(projectPath);
+              if (isSelected) {
+                // Mirror grouped-mode deletion: hand selection to an adjacent
+                // remaining draft, falling back to the project route only when
+                // this was the last one.
+                const fallback = flatDrafts[index + 1] ?? flatDrafts[index - 1];
+                if (fallback) {
+                  openWorkspaceDraft(fallback.projectPath, fallback.draft.draftId);
+                } else {
+                  navigateToProject(projectPath);
+                }
+              }
               deleteWorkspaceDraft(projectPath, draft.draftId);
             }}
           />
         );
       })}
-      {flatAgePartition ? (
-        <>
-          {renderFlatWorkspaceRows(flatAgePartition.recent)}
-          {firstFlatAgeTier !== -1 && renderFlatAgeTier(firstFlatAgeTier)}
-        </>
-      ) : (
-        renderFlatWorkspaceRows(visibleFlatWorkspaces)
-      )}
+      {renderCoalescedWorkspaceList(visibleFlatWorkspaces, flatRowsForDisplay, {
+        tierKeyPrefix: "flat",
+        depthByWorkspaceId: flatDepthByWorkspaceId,
+        baseRowMetaByWorkspaceId: flatRowMetaByWorkspaceId,
+        renderRow: renderFlatRow,
+      })}
     </div>
   );
 
@@ -2801,186 +3224,6 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                 );
                               };
 
-                              const renderTaskGroupRows = (params: {
-                                group: SidebarTaskGroupModel;
-                                sectionId?: string;
-                                rowMetaByWorkspaceId: ReadonlyMap<string, AgentRowRenderMeta>;
-                                memberMetaByWorkspaceId: ReadonlyMap<string, AgentRowRenderMeta>;
-                              }): React.ReactNode[] => {
-                                const headerMeta = params.rowMetaByWorkspaceId.get(
-                                  params.group.storageKey
-                                );
-                                const headerDepth =
-                                  headerMeta?.depth ??
-                                  depthByWorkspaceId[params.group.anchorId] ??
-                                  (depthByWorkspaceId[params.group.parentWorkspaceId] ?? -1) + 1;
-
-                                if (
-                                  params.group.kind === "workflow" &&
-                                  params.group.hasActiveMember
-                                ) {
-                                  sessionActiveTaskGroupKeysRef.current.add(
-                                    params.group.storageKey
-                                  );
-                                }
-                                const defaultExpanded =
-                                  params.group.kind === "workflow" &&
-                                  (params.group.hasActiveMember ||
-                                    sessionActiveTaskGroupKeysRef.current.has(
-                                      params.group.storageKey
-                                    ));
-                                const isExpanded =
-                                  expandedTaskGroups[params.group.storageKey] ?? defaultExpanded;
-                                const isGroupSelected = params.group.allMembers.some(
-                                  (member) => member.id === selectedWorkspace?.workspaceId
-                                );
-
-                                const headerRow = (
-                                  <TaskGroupListItem
-                                    groupId={params.group.id}
-                                    title={params.group.title}
-                                    kind={params.group.kind}
-                                    sectionId={params.sectionId}
-                                    depth={headerDepth}
-                                    totalCount={params.group.totalCount}
-                                    visibleCount={params.group.displayMembers.length}
-                                    completedCount={params.group.completedCount}
-                                    isRunActive={params.group.runActiveWithoutMembers === true}
-                                    runningCount={params.group.runningCount}
-                                    queuedCount={params.group.queuedCount}
-                                    interruptedCount={params.group.interruptedCount}
-                                    isExpanded={isExpanded}
-                                    isSelected={isGroupSelected}
-                                    onToggle={() => {
-                                      toggleTaskGroupExpansion(params.group.storageKey, isExpanded);
-                                    }}
-                                  />
-                                );
-                                const renderedRows: React.ReactNode[] = [
-                                  headerMeta != null ? (
-                                    <SubAgentListItem
-                                      key={`task-group:${params.group.storageKey}`}
-                                      connectorPosition={headerMeta.connectorPosition}
-                                      connectorStartsAtParent={headerMeta.connectorStartsAtParent}
-                                      sharedTrunkActiveThroughRow={
-                                        headerMeta.sharedTrunkActiveThroughRow
-                                      }
-                                      sharedTrunkActiveBelowRow={
-                                        headerMeta.sharedTrunkActiveBelowRow
-                                      }
-                                      ancestorTrunks={headerMeta.ancestorTrunks.map((trunk) => ({
-                                        left: getAncestorRailX(trunk.depth, "default"),
-                                        active: trunk.active,
-                                      }))}
-                                      connectorRailX={getSubAgentParentRailX(
-                                        headerDepth,
-                                        "default"
-                                      )}
-                                      childStatusCenterX={getSubAgentChildStatusCenterX(
-                                        headerDepth
-                                      )}
-                                      isSelected={isGroupSelected}
-                                      isElbowActive={
-                                        params.group.runActiveWithoutMembers === true ||
-                                        params.group.runningCount > 0
-                                      }
-                                    >
-                                      {headerRow}
-                                    </SubAgentListItem>
-                                  ) : (
-                                    <React.Fragment key={`task-group:${params.group.storageKey}`}>
-                                      {headerRow}
-                                    </React.Fragment>
-                                  ),
-                                ];
-
-                                if (isExpanded) {
-                                  for (const member of params.group.displayMembers) {
-                                    renderedRows.push(
-                                      renderWorkspace(
-                                        member,
-                                        params.sectionId,
-                                        params.memberMetaByWorkspaceId.get(member.id) ?? null,
-                                        getTaskGroupMemberDepth(headerDepth),
-                                        `task-group-member:${params.group.storageKey}:${member.id}`,
-                                        "task-group-member",
-                                        params.group.title
-                                      )
-                                    );
-                                  }
-                                }
-                                return renderedRows;
-                              };
-
-                              const renderWorkspaceRowsWithTaskGroupCoalescing = ({
-                                rows,
-                                sectionId,
-                                rowMetaByWorkspaceId,
-                                taskGroups,
-                                memberMetaByWorkspaceId,
-                                retainedWorkflowGroupsByParentId,
-                              }: {
-                                rows: FrontendWorkspaceMetadata[];
-                                sectionId?: string;
-                                rowMetaByWorkspaceId: ReadonlyMap<string, AgentRowRenderMeta>;
-                                taskGroups: SidebarTaskGroupsResult;
-                                memberMetaByWorkspaceId: ReadonlyMap<string, AgentRowRenderMeta>;
-                                retainedWorkflowGroupsByParentId: ReadonlyMap<
-                                  string,
-                                  SidebarTaskGroupModel[]
-                                >;
-                              }): React.ReactNode[] => {
-                                const renderedRows: React.ReactNode[] = [];
-
-                                for (const workspace of rows) {
-                                  const groupKey =
-                                    taskGroups.memberGroupStorageKeyByWorkspaceId.get(workspace.id);
-                                  const group =
-                                    groupKey != null
-                                      ? taskGroups.groupsByStorageKey.get(groupKey)
-                                      : undefined;
-                                  if (group == null) {
-                                    renderedRows.push(
-                                      renderWorkspace(
-                                        workspace,
-                                        sectionId,
-                                        rowMetaByWorkspaceId.get(workspace.id)
-                                      )
-                                    );
-                                    for (const retainedGroup of retainedWorkflowGroupsByParentId.get(
-                                      workspace.id
-                                    ) ?? []) {
-                                      renderedRows.push(
-                                        ...renderTaskGroupRows({
-                                          group: retainedGroup,
-                                          sectionId,
-                                          rowMetaByWorkspaceId,
-                                          memberMetaByWorkspaceId,
-                                        })
-                                      );
-                                    }
-                                    continue;
-                                  }
-
-                                  if (group.anchorId !== workspace.id) {
-                                    // Non-anchor members render under the group header at the
-                                    // anchor's position (D5), so suppress them here.
-                                    continue;
-                                  }
-
-                                  renderedRows.push(
-                                    ...renderTaskGroupRows({
-                                      group,
-                                      sectionId,
-                                      rowMetaByWorkspaceId,
-                                      memberMetaByWorkspaceId,
-                                    })
-                                  );
-                                }
-
-                                return renderedRows;
-                              };
-
                               const renderDraft = (
                                 draft: (typeof sortedDrafts)[number]
                               ): React.ReactNode => {
@@ -3048,325 +3291,29 @@ const ProjectSidebarInner: React.FC<ProjectSidebarProps> = ({
                                 tierKeyPrefix: string,
                                 sectionId?: string,
                                 allRowsForTaskGroupCoalescing: FrontendWorkspaceMetadata[] = workspaces
-                              ): React.ReactNode => {
-                                // With age grouping disabled, keep every workspace in the
-                                // recent path (flat recency-sorted list); full-length empty
-                                // buckets preserve tier-index assumptions below.
-                                const { recent: topVisibleRows, buckets } = ageGroupingEnabled
-                                  ? partitionWorkspacesByAge(workspaces, workspaceRecency)
-                                  : {
-                                      recent: workspaces,
-                                      buckets: AGE_THRESHOLDS_DAYS.map(
-                                        (): FrontendWorkspaceMetadata[] => []
+                              ): React.ReactNode =>
+                                renderCoalescedWorkspaceList(
+                                  workspaces,
+                                  allRowsForTaskGroupCoalescing,
+                                  {
+                                    sectionId,
+                                    tierKeyPrefix,
+                                    // Tier toggles align with folder-nested content.
+                                    tierButtonClassName: "pl-7",
+                                    depthByWorkspaceId,
+                                    baseRowMetaByWorkspaceId,
+                                    renderRow: (metadata, opts) =>
+                                      renderWorkspace(
+                                        metadata,
+                                        opts?.sectionId,
+                                        opts?.rowRenderMeta,
+                                        opts?.depthOverride,
+                                        opts?.keyOverride,
+                                        opts?.subAgentConnectorLayout,
+                                        opts?.taskGroupHeaderTitle
                                       ),
-                                    };
-
-                                const expandedTierVisibleIds = new Set<string>();
-                                const markExpandedTierRowsVisible = (tierIndex: number): void => {
-                                  const bucket = buckets[tierIndex];
-                                  const remainingCount = buckets
-                                    .slice(tierIndex)
-                                    .reduce((sum, bucketRows) => sum + bucketRows.length, 0);
-                                  if (remainingCount === 0) {
-                                    return;
                                   }
-
-                                  const tierKey = `${tierKeyPrefix}:${tierIndex}`;
-                                  const isTierExpanded = expandedOldWorkspaces[tierKey] ?? false;
-                                  if (!isTierExpanded) {
-                                    return;
-                                  }
-
-                                  for (const workspace of bucket) {
-                                    expandedTierVisibleIds.add(workspace.id);
-                                  }
-
-                                  const nextTier = findNextNonEmptyTier(buckets, tierIndex + 1);
-                                  if (nextTier !== -1) {
-                                    markExpandedTierRowsVisible(nextTier);
-                                  }
-                                };
-
-                                const firstTier = findNextNonEmptyTier(buckets, 0);
-                                if (firstTier !== -1) {
-                                  markExpandedTierRowsVisible(firstTier);
-                                }
-
-                                // Connector geometry should match the rows users can currently see,
-                                // not hidden siblings parked behind collapsed age tiers.
-                                const visibleRowIds = new Set<string>([
-                                  ...topVisibleRows.map((workspace) => workspace.id),
-                                  ...expandedTierVisibleIds,
-                                ]);
-                                const visibleRows = workspaces.filter((workspace) =>
-                                  visibleRowIds.has(workspace.id)
                                 );
-                                // Coalesce grouped task rows (best-of + workflow runs)
-                                // before deriving connector geometry: headers join the row model
-                                // as synthetic nodes so trunks/elbows stay continuous (D5).
-                                const taskGroups = computeSidebarTaskGroups({
-                                  rows: visibleRows,
-                                  allRows: allRowsForTaskGroupCoalescing,
-                                  selectedWorkspaceId: selectedWorkspace?.workspaceId,
-                                  isWorkspaceLiveActive,
-                                });
-
-                                for (const group of taskGroups.groupsByStorageKey.values()) {
-                                  if (
-                                    group.kind === "workflow" &&
-                                    (group.hasActiveMember ||
-                                      sessionActiveTaskGroupKeysRef.current.has(group.storageKey))
-                                  ) {
-                                    retainedWorkflowTaskGroupsRef.current.set(
-                                      group.storageKey,
-                                      group
-                                    );
-                                  }
-                                }
-
-                                const retainedWorkflowGroupsByParentId = new Map<
-                                  string,
-                                  SidebarTaskGroupModel[]
-                                >();
-                                for (const [
-                                  storageKey,
-                                  retainedGroup,
-                                ] of retainedWorkflowTaskGroupsRef.current) {
-                                  if (taskGroups.groupsByStorageKey.has(storageKey)) {
-                                    continue;
-                                  }
-                                  if (
-                                    !isWorkflowRunActive(
-                                      retainedGroup.parentWorkspaceId,
-                                      retainedGroup.id
-                                    )
-                                  ) {
-                                    retainedWorkflowTaskGroupsRef.current.delete(storageKey);
-                                    sessionActiveTaskGroupKeysRef.current.delete(storageKey);
-                                    continue;
-                                  }
-                                  // The parent's hidden-sub-agents summary replaces retained
-                                  // workflow headers while sub-agent rows are hidden.
-                                  if (hideSubAgentRows) {
-                                    continue;
-                                  }
-                                  if (!visibleRowIds.has(retainedGroup.parentWorkspaceId)) {
-                                    continue;
-                                  }
-
-                                  const groups =
-                                    retainedWorkflowGroupsByParentId.get(
-                                      retainedGroup.parentWorkspaceId
-                                    ) ?? [];
-                                  groups.push({
-                                    ...retainedGroup,
-                                    displayMembers: [],
-                                    // The workflow run itself remains active between transient worker
-                                    // steps, without inventing a running member-task count.
-                                    runningCount: 0,
-                                    queuedCount: 0,
-                                    runActiveWithoutMembers: true,
-                                    hasActiveMember: true,
-                                  });
-                                  retainedWorkflowGroupsByParentId.set(
-                                    retainedGroup.parentWorkspaceId,
-                                    groups
-                                  );
-                                }
-
-                                const rowNodes: SidebarVisibleRowNode[] = [];
-                                const seenGroupKeys = new Set<string>();
-                                for (const workspace of visibleRows) {
-                                  const groupKey =
-                                    taskGroups.memberGroupStorageKeyByWorkspaceId.get(workspace.id);
-                                  const group =
-                                    groupKey != null
-                                      ? taskGroups.groupsByStorageKey.get(groupKey)
-                                      : undefined;
-                                  if (group != null) {
-                                    if (seenGroupKeys.has(group.storageKey)) {
-                                      continue;
-                                    }
-                                    seenGroupKeys.add(group.storageKey);
-                                    const anchorMeta = baseRowMetaByWorkspaceId.get(workspace.id);
-                                    const headerDepth =
-                                      anchorMeta?.depth ?? depthByWorkspaceId[workspace.id] ?? 0;
-                                    rowNodes.push({
-                                      id: group.storageKey,
-                                      parentId:
-                                        anchorMeta?.visibleParentWorkspaceId ??
-                                        group.parentWorkspaceId,
-                                      depth: headerDepth,
-                                      isRunning: group.runningCount > 0,
-                                      baseMeta: {
-                                        depth: headerDepth,
-                                        rowKind: "subagent",
-                                        connectorPosition: "single",
-                                        connectorStartsAtParent: false,
-                                        sharedTrunkActiveThroughRow: false,
-                                        sharedTrunkActiveBelowRow: false,
-                                        ancestorTrunks: [],
-                                        hasHiddenCompletedChildren: false,
-                                        visibleCompletedChildrenCount: 0,
-                                      },
-                                    });
-                                    continue;
-                                  }
-
-                                  const baseRowMeta = baseRowMetaByWorkspaceId.get(workspace.id);
-                                  if (!baseRowMeta) {
-                                    continue;
-                                  }
-                                  rowNodes.push({
-                                    id: workspace.id,
-                                    parentId:
-                                      baseRowMeta.visibleParentWorkspaceId ??
-                                      workspace.parentWorkspaceId,
-                                    depth: baseRowMeta.depth,
-                                    isRunning: isSidebarSubAgentRunning(workspace, {
-                                      isWorkspaceLiveActive,
-                                    }),
-                                    baseMeta: baseRowMeta,
-                                  });
-                                  for (const retainedGroup of retainedWorkflowGroupsByParentId.get(
-                                    workspace.id
-                                  ) ?? []) {
-                                    const headerDepth = baseRowMeta.depth + 1;
-                                    rowNodes.push({
-                                      id: retainedGroup.storageKey,
-                                      parentId: workspace.id,
-                                      depth: headerDepth,
-                                      isRunning: true,
-                                      baseMeta: {
-                                        depth: headerDepth,
-                                        rowKind: "subagent",
-                                        connectorPosition: "single",
-                                        connectorStartsAtParent: false,
-                                        sharedTrunkActiveThroughRow: false,
-                                        sharedTrunkActiveBelowRow: false,
-                                        ancestorTrunks: [],
-                                        hasHiddenCompletedChildren: false,
-                                        visibleCompletedChildrenCount: 0,
-                                      },
-                                    });
-                                  }
-                                }
-                                const rowMetaByVisibleWorkspaceId =
-                                  computeRowMetaForVisibleNodes(rowNodes);
-
-                                // Expanded members hang off their header row, so their connector
-                                // meta derives from the header's computed geometry.
-                                const memberMetaByWorkspaceId = new Map<
-                                  string,
-                                  AgentRowRenderMeta
-                                >();
-                                for (const group of taskGroups.groupsByStorageKey.values()) {
-                                  const headerMeta = rowMetaByVisibleWorkspaceId.get(
-                                    group.storageKey
-                                  );
-                                  if (headerMeta == null) {
-                                    continue;
-                                  }
-                                  for (const [
-                                    memberId,
-                                    memberMeta,
-                                  ] of computeTaskGroupMemberRowMeta({
-                                    group,
-                                    headerMeta,
-                                    headerDepth: headerMeta.depth,
-                                    isWorkspaceLiveActive,
-                                  })) {
-                                    memberMetaByWorkspaceId.set(memberId, memberMeta);
-                                  }
-                                }
-
-                                const renderTier = (tierIndex: number): React.ReactNode => {
-                                  const bucket = buckets[tierIndex];
-                                  const remainingCount = buckets
-                                    .slice(tierIndex)
-                                    .reduce((sum, b) => sum + b.length, 0);
-
-                                  if (remainingCount === 0) return null;
-
-                                  const tierKey = `${tierKeyPrefix}:${tierIndex}`;
-                                  const isTierExpanded = expandedOldWorkspaces[tierKey] ?? false;
-                                  const thresholdDays = AGE_THRESHOLDS_DAYS[tierIndex];
-                                  const thresholdLabel = formatDaysThreshold(thresholdDays);
-                                  const displayCount = isTierExpanded
-                                    ? bucket.length
-                                    : remainingCount;
-
-                                  return (
-                                    <React.Fragment key={tierKey}>
-                                      <button
-                                        onClick={() => {
-                                          setExpandedOldWorkspaces((prev) => ({
-                                            ...prev,
-                                            [tierKey]: !prev[tierKey],
-                                          }));
-                                        }}
-                                        aria-label={
-                                          isTierExpanded
-                                            ? `Collapse workspaces older than ${thresholdLabel}`
-                                            : `Expand workspaces older than ${thresholdLabel}`
-                                        }
-                                        aria-expanded={isTierExpanded}
-                                        className="text-muted border-hover hover:text-label [&:hover_.arrow]:text-label flex w-full cursor-pointer items-center gap-1 border-t border-none bg-transparent px-3 py-2 pl-7 text-xs font-medium transition-all duration-150 hover:bg-white/3"
-                                      >
-                                        <span
-                                          className="arrow text-dim text-[11px] transition-transform duration-200 ease-in-out"
-                                          style={{
-                                            transform: isTierExpanded
-                                              ? "rotate(90deg)"
-                                              : "rotate(0deg)",
-                                          }}
-                                        >
-                                          <ChevronRight className="h-4 w-4" />
-                                        </span>
-                                        <div className="flex items-center gap-1.5">
-                                          <span>Older than {thresholdLabel}</span>
-                                          <span className="text-dim font-normal">
-                                            ({displayCount})
-                                          </span>
-                                        </div>
-                                      </button>
-                                      {isTierExpanded && (
-                                        <>
-                                          {renderWorkspaceRowsWithTaskGroupCoalescing({
-                                            rows: bucket,
-                                            sectionId,
-                                            rowMetaByWorkspaceId: rowMetaByVisibleWorkspaceId,
-                                            taskGroups,
-                                            memberMetaByWorkspaceId,
-                                            retainedWorkflowGroupsByParentId,
-                                          })}
-                                          {(() => {
-                                            const nextTier = findNextNonEmptyTier(
-                                              buckets,
-                                              tierIndex + 1
-                                            );
-                                            return nextTier !== -1 ? renderTier(nextTier) : null;
-                                          })()}
-                                        </>
-                                      )}
-                                    </React.Fragment>
-                                  );
-                                };
-
-                                return (
-                                  <>
-                                    {renderWorkspaceRowsWithTaskGroupCoalescing({
-                                      rows: topVisibleRows,
-                                      sectionId,
-                                      rowMetaByWorkspaceId: rowMetaByVisibleWorkspaceId,
-                                      taskGroups,
-                                      memberMetaByWorkspaceId,
-                                      retainedWorkflowGroupsByParentId,
-                                    })}
-                                    {firstTier !== -1 && renderTier(firstTier)}
-                                  </>
-                                );
-                              };
 
                               // Partition both the full section membership and the filtered visible rows.
                               // Best-of grouping stays leaf-only by consulting the unfiltered section data,

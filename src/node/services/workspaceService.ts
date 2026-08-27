@@ -8094,14 +8094,18 @@ export class WorkspaceService extends EventEmitter {
             return config;
           }
           // Server-generated monotonic timestamp: strictly greater than every existing
-          // pin in the project so rapid pins always append deterministically, even if
-          // the wall clock is skewed or several pins land within the same millisecond.
+          // pin across all projects so rapid pins always append deterministically, even
+          // if the wall clock is skewed or several pins land within the same millisecond.
+          // The global scan (not just this bucket) keeps the flat sidebar's unified
+          // pinned block appending at the bottom too.
           let pinnedAtMs = Date.now();
-          for (const entry of projectConfig.workspaces) {
-            if (!entry.pinnedAt) continue;
-            const existingMs = new Date(entry.pinnedAt).getTime();
-            if (Number.isFinite(existingMs) && existingMs >= pinnedAtMs) {
-              pinnedAtMs = existingMs + 1;
+          for (const project of config.projects.values()) {
+            for (const entry of project.workspaces) {
+              if (!entry.pinnedAt) continue;
+              const existingMs = new Date(entry.pinnedAt).getTime();
+              if (Number.isFinite(existingMs) && existingMs >= pinnedAtMs) {
+                pinnedAtMs = existingMs + 1;
+              }
             }
           }
           workspaceEntry.pinnedAt = new Date(pinnedAtMs).toISOString();

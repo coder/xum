@@ -127,7 +127,7 @@ interface MockAgentListItemProps {
   };
   depth?: number;
   rowRenderMeta?: AgentRowRenderMeta;
-  projectBadge?: { name: string; color: string };
+  projectBadgeName?: string;
   delegatedActivity?: { activeCount: number; queuedCount: number };
   hiddenSubAgentsSummary?: WorkspaceSubAgentsSummary;
   getWorkflowRunName?: (runId: string) => string | undefined;
@@ -374,7 +374,7 @@ function installProjectSidebarTestDoubles() {
           )}
         >
           <span>{displayTitle}</span>
-          {props.projectBadge ? <span>{props.projectBadge.name}</span> : null}
+          {props.projectBadgeName != null ? <span>{props.projectBadgeName}</span> : null}
           {hasCompletedChildren && props.onToggleCompletedChildren ? (
             <button
               type="button"
@@ -896,6 +896,138 @@ describe("ProjectSidebar scratch chats", () => {
     fireEvent.keyDown(window, { key: "n", ctrlKey: true });
 
     expect(createWorkspaceDraftMock).toHaveBeenCalledWith(SCRATCH_PROJECT_CONFIG_KEY, undefined);
+  });
+});
+
+describe("ProjectSidebar flat chat list", () => {
+  beforeEach(() => {
+    setupProjectSidebarDom();
+    /* eslint-disable @typescript-eslint/no-require-imports */
+    ({ default: ProjectSidebar } = require("./ProjectSidebar?project-sidebar-flat-test=1") as {
+      default: typeof ProjectSidebarComponent;
+    });
+    /* eslint-enable @typescript-eslint/no-require-imports */
+    updatePersistedState(SIDEBAR_FLAT_MODE_KEY, true);
+  });
+
+  afterEach(cleanupProjectSidebarDom);
+
+  const singleProjectRefs = [
+    { projectPath: "/projects/demo-project", projectName: "demo-project" },
+  ];
+
+  test("filters multi-project rows out of the flat list while the experiment is disabled", () => {
+    spyOn(ExperimentsModule, "useExperimentValue").mockImplementation(() => false);
+    const single = {
+      ...createWorkspace("single", { title: "Single chat" }),
+      projects: singleProjectRefs,
+    };
+    const multi = createWorkspace("multi", { title: "Multi chat" });
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [single, multi]]])}
+        workspaceRecency={{ single: Date.now(), multi: Date.now() }}
+      />
+    );
+
+    expect(view.getByTestId(agentItemTestId("single"))).toBeTruthy();
+    expect(view.queryByTestId(agentItemTestId("multi"))).toBeNull();
+  });
+
+  test("coalesces best-of children into a task group in the flat list", () => {
+    const parentWorkspace = {
+      ...createWorkspace("parent", { title: "Parent workspace" }),
+      projects: singleProjectRefs,
+    };
+    const bestOfGroup = { groupId: "best-of-flat", index: 0, total: 2 } as const;
+    const childOne = {
+      ...createWorkspace("child-1", {
+        parentWorkspaceId: "parent",
+        taskStatus: "running",
+        title: "Candidate",
+        bestOf: bestOfGroup,
+      }),
+      projects: singleProjectRefs,
+    };
+    const childTwo = {
+      ...createWorkspace("child-2", {
+        parentWorkspaceId: "parent",
+        taskStatus: "queued",
+        title: "Candidate",
+        bestOf: { ...bestOfGroup, index: 1 },
+      }),
+      projects: singleProjectRefs,
+    };
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={
+          new Map([["/projects/demo-project", [parentWorkspace, childOne, childTwo]]])
+        }
+        workspaceRecency={{ parent: Date.now(), "child-1": Date.now(), "child-2": Date.now() }}
+      />
+    );
+
+    // Best-of workers render behind one collapsed group header, not as bare rows.
+    expect(view.getByTestId("task-group-best-of-flat")).toBeTruthy();
+    expect(view.queryByTestId(agentItemTestId("child-1"))).toBeNull();
+    expect(view.queryByTestId(agentItemTestId("child-2"))).toBeNull();
+    expect(view.getByTestId(agentItemTestId("parent"))).toBeTruthy();
+  });
+
+  test("renders a promoted flat draft once as the live workspace row", () => {
+    const promotedWorkspace = {
+      ...createWorkspace("promoted", { title: "Promoted chat" }),
+      projects: singleProjectRefs,
+    };
+    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
+      () =>
+        ({
+          selectedWorkspace: null,
+          setSelectedWorkspace: () => undefined,
+          preflightArchiveWorkspace: () =>
+            Promise.resolve({ success: true, data: { kind: "ready" } }),
+          archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
+          removeWorkspace: () => Promise.resolve({ success: true }),
+          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
+          refreshWorkspaceMetadata: () => Promise.resolve(),
+          pendingNewWorkspaceProject: null,
+          pendingNewWorkspaceDraftId: null,
+          workspaceDraftsByProject: {
+            "/projects/demo-project": [{ draftId: "draft-promoted", createdAt: Date.now() }],
+          },
+          workspaceDraftPromotionsByProject: {
+            "/projects/demo-project": { "draft-promoted": promotedWorkspace },
+          },
+          createWorkspaceDraft: () => undefined,
+          openWorkspaceDraft: () => undefined,
+          deleteWorkspaceDraft: () => undefined,
+        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
+    );
+    // Give the draft persisted content so the draft row would render pre-substitution.
+    updatePersistedState(
+      getInputKey(getDraftScopeId("/projects/demo-project", "draft-promoted")),
+      "Draft prompt"
+    );
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [promotedWorkspace]]])}
+        workspaceRecency={{}}
+      />
+    );
+
+    expect(
+      view.container.querySelectorAll(`[data-testid="${agentItemTestId("promoted")}"]`)
+    ).toHaveLength(1);
+    expect(view.queryByTestId("draft-item-draft-promoted")).toBeNull();
   });
 });
 

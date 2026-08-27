@@ -105,7 +105,9 @@ interface AgentListItemBaseProps {
   isSelected: boolean;
   depth?: number;
   sectionId?: string;
-  projectBadge?: { name: string; color: string };
+  // Stable primitives (not an object) so React Compiler can skip unchanged rows.
+  projectBadgeName?: string;
+  projectBadgeColor?: string;
 }
 
 /** Props for regular (persisted) workspace items */
@@ -472,7 +474,11 @@ function DraftAgentListItemInner(props: DraftAgentListItemProps) {
       role="button"
       tabIndex={0}
       aria-current={isSelected ? "true" : undefined}
-      aria-label={`Open workspace draft ${draft.draftNumber}`}
+      aria-label={
+        props.projectBadgeName != null
+          ? `Open workspace draft ${draft.draftNumber} (${props.projectBadgeName})`
+          : `Open workspace draft ${draft.draftNumber}`
+      }
       data-project-path={projectPath}
       data-draft-id={draft.draftId}
     >
@@ -491,17 +497,20 @@ function DraftAgentListItemInner(props: DraftAgentListItemProps) {
           >
             {draft.title}
           </span>
-          {props.projectBadge && (
+          {props.projectBadgeName != null && (
             <span
               data-testid={`workspace-project-badge-draft-${draft.draftId}`}
-              className="max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
-              style={{
-                backgroundColor: `${props.projectBadge.color}20`,
-                color: props.projectBadge.color,
-                borderColor: `${props.projectBadge.color}40`,
-              }}
+              className="text-secondary max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
+              style={
+                props.projectBadgeColor != null
+                  ? {
+                      backgroundColor: `${props.projectBadgeColor}20`,
+                      borderColor: `${props.projectBadgeColor}40`,
+                    }
+                  : undefined
+              }
             >
-              {props.projectBadge.name}
+              {props.projectBadgeName}
             </span>
           )}
         </div>
@@ -1055,15 +1064,21 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
         aria-current={isSelected ? "true" : undefined}
         aria-expanded={canToggleCompletedChildren ? isCompletedChildrenExpanded : undefined}
         aria-keyshortcuts={canToggleCompletedChildren ? "ArrowRight ArrowLeft" : undefined}
-        aria-label={
-          isRemoving
-            ? `Deleting workspace ${displayTitle}`
+        aria-label={(() => {
+          // The explicit label overrides descendant badge text, so include the
+          // project identity whenever the badge is the only visible project cue.
+          const accessibleTitle =
+            props.projectBadgeName != null
+              ? `${displayTitle} (${props.projectBadgeName})`
+              : displayTitle;
+          return isRemoving
+            ? `Deleting workspace ${accessibleTitle}`
             : isInitializing
-              ? `Initializing workspace ${displayTitle}`
+              ? `Initializing workspace ${accessibleTitle}`
               : isArchiving
-                ? `Archiving workspace ${displayTitle}`
-                : `Select workspace ${displayTitle}`
-        }
+                ? `Archiving workspace ${accessibleTitle}`
+                : `Select workspace ${accessibleTitle}`;
+        })()}
         aria-describedby={secondaryStatusDescriptionId}
         aria-disabled={isDisabled}
         data-workspace-path={namedWorkspacePath}
@@ -1333,17 +1348,20 @@ function RegularAgentListItemInner(props: AgentListItemProps) {
                 >
                   {suppressGroupMemberTitle ? memberOnlyLabel : workspaceTitle}
                 </span>
-                {props.projectBadge && (
+                {props.projectBadgeName != null && (
                   <span
                     data-testid={`workspace-project-badge-${workspaceId}`}
-                    className="max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
-                    style={{
-                      backgroundColor: `${props.projectBadge.color}20`,
-                      color: props.projectBadge.color,
-                      borderColor: `${props.projectBadge.color}40`,
-                    }}
+                    className="text-secondary max-w-20 shrink-0 truncate rounded border px-1.5 py-0.5 text-[10px] leading-none font-medium"
+                    style={
+                      props.projectBadgeColor != null
+                        ? {
+                            backgroundColor: `${props.projectBadgeColor}20`,
+                            borderColor: `${props.projectBadgeColor}40`,
+                          }
+                        : undefined
+                    }
                   >
-                    {props.projectBadge.name}
+                    {props.projectBadgeName}
                   </span>
                 )}
                 {groupLabel && !suppressGroupMemberTitle && (

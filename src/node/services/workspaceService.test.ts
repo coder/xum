@@ -13619,6 +13619,7 @@ describe("WorkspaceService reorderPinned across projects", () => {
   const projectB = "/tmp/project-b";
   const idA1 = "ws-a1";
   const idA2 = "ws-a2";
+  const idA3 = "ws-a3";
   const idB1 = "ws-b1";
   const idB2 = "ws-b2";
 
@@ -13653,6 +13654,7 @@ describe("WorkspaceService reorderPinned across projects", () => {
             workspaces: [
               { path: `${projectA}/${idA1}`, id: idA1, pinnedAt: "2026-01-01T00:00:00.000Z" },
               { path: `${projectA}/${idA2}`, id: idA2, pinnedAt: "2026-01-01T00:00:20.000Z" },
+              { path: `${projectA}/${idA3}`, id: idA3 },
             ],
           },
         ],
@@ -13715,6 +13717,16 @@ describe("WorkspaceService reorderPinned across projects", () => {
       ...[idA1, idA2, idB1, idB2].map((id) => Date.parse(findEntry(id)?.entry.pinnedAt ?? ""))
     );
     expect(maxAfter).toBe(maxBefore);
+  });
+
+  test("setPinned appends after the global pinned max, not just its own bucket's", async () => {
+    // Give the other bucket the newest pin so a bucket-local max would sort the
+    // new pin above it in the flat sidebar's unified block.
+    const future = new Date(Date.now() + 60_000).toISOString();
+    findEntry(idB2)!.entry.pinnedAt = future;
+
+    expect((await workspaceService.setPinned(idA3, true)).success).toBe(true);
+    expect(globalPinnedOrder().at(-1)).toBe(idA3);
   });
 
   test("grouped-mode reorder of one bucket leaves other buckets' timestamps untouched", async () => {
