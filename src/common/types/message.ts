@@ -9,6 +9,7 @@ import type {
 } from "@/common/constants/contextBoundary";
 import type { GoalSyntheticMessageKind } from "@/constants/goals";
 import type { SendMessageOptions } from "@/common/orpc/types";
+import { withLegacyPtcExclusiveMirror } from "@/common/constants/experiments";
 import type { z } from "zod";
 import type { AgentMode } from "./mode";
 import type { AgentSkillScope } from "./agentSkill";
@@ -77,7 +78,9 @@ export function pickPreservedSendOptions(options: SendMessageOptions): Preserved
     reasoningMode: options.reasoningMode,
     additionalSystemInstructions: options.additionalSystemInstructions,
     providerOptions: options.providerOptions,
-    experiments: options.experiments,
+    // Downgrade-compat (see withLegacyPtcExclusiveMirror): preserved options
+    // can persist across restarts and build versions.
+    experiments: withLegacyPtcExclusiveMirror(options.experiments),
     disableWorkspaceAgents: options.disableWorkspaceAgents,
     // Delegated turns with explicit agent overrides must stay loud across the
     // compaction replay too — dropping this would let the follow-up silently
@@ -147,7 +150,9 @@ export function pickStartupRetrySendOptions(
     additionalSystemInstructions: options.additionalSystemInstructions,
     maxOutputTokens: options.maxOutputTokens,
     providerOptions: options.providerOptions,
-    experiments: options.experiments,
+    // Downgrade-compat: retry snapshots persist to chat.jsonl and cross build
+    // versions, so an enabled merged PTC also stamps the legacy exclusive key.
+    experiments: withLegacyPtcExclusiveMirror(options.experiments),
     disableWorkspaceAgents: options.disableWorkspaceAgents,
     // Keep explicit-agent turns loud across restart recovery (see pickPreservedSendOptions).
     strictAgentResolution: options.strictAgentResolution,
@@ -561,6 +566,17 @@ export interface BashMonitorWakeDisplayRecord {
   displayName: string;
   filter: string;
   filterExclude: boolean;
+  /**
+   * Present when the wake reported process settlement (exit, kill, timeout). "unknown" is the
+   * backend's read-time degrade of malformed persisted metadata — still a settlement for
+   * display.
+   */
+  terminal?: { status: "exited" | "killed" | "failed" | "unknown"; exitCode?: number };
+  /**
+   * Present when the wake carries a dead earlier generation's settlement whose processId was
+   * re-armed by a new live process — still a settlement for display, never "monitor matched".
+   */
+  staleTerminal?: { status: "exited" | "killed" | "failed" | "unknown"; exitCode?: number };
 }
 
 export type MuxMessageMetadata = MuxMessageMetadataBase &
@@ -1024,6 +1040,14 @@ export interface MuxFilePart {
   mediaType: string; // IANA media type, e.g., "image/png", "application/pdf"
   url: string; // Data URL (e.g., "data:application/pdf;base64,...") or hosted URL
   filename?: string; // Optional filename
+  /**
+   * Part-level metadata convertToModelMessages forwards as FilePart.providerOptions.
+   * Used to mark request-only synthetic tool-media parts (see
+   * SYNTHETIC_TOOL_MEDIA_PART_METADATA in toolResultAttachments.ts) so per-step
+   * transforms can evict the oldest ones under the request-wide media cap
+   * instead of treating them like immutable user uploads (r34).
+   */
+  providerMetadata?: Record<string, Record<string, unknown>>;
 }
 
 // XumMessage extends UIMessage with our metadata and custom parts
@@ -1156,10 +1180,12 @@ export type DisplayedMessage =
       /** Durable workflow run attachment recovered from partial history. */
       workflowRun?: MuxToolPart["workflowRun"];
       // Nested tool calls for code_execution (from PTC streaming or reconstructed from result)
+      // input is optional to mirror NestedToolCallSchema: zero-arg kernel calls
+      // persist without an input key.
       nestedCalls?: Array<{
         toolCallId: string;
         toolName: string;
-        input: unknown;
+        input?: unknown;
         output?: unknown;
         state: "input-available" | "output-available" | "output-redacted";
         failed?: boolean;

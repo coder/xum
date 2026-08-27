@@ -865,6 +865,75 @@ export async function clearWorkspaceAnalyticsState(
   }
 }
 
+const CORRUPT_IDENTIFIER_MAX_LENGTH = 1024;
+
+/**
+ * Self-healing sweep for a rare native-layer corruption class: a phantom row
+ * can materialize whose every VARCHAR column is the concatenation of that
+ * column's non-null values across an entire batch of inserted rows (observed
+ * once in the wild: a 17KB "model" string spanning ~670 events, which then
+ * wallpapered the Analytics dashboard as one giant legend entry). The donor
+ * rows are written correctly, so deleting rows with impossible string lengths
+ * loses no real data.
+ *
+ * Two evidence classes, both structural (unbounded columns like model,
+ * paths, and workspace names are never deletion evidence on their own, since
+ * custom-provider model IDs etc. have no schema max length):
+ *
+ * 1. Identifier length beyond the legal construction maximum. New workspace
+ *    IDs are short hex; migrated legacy IDs are
+ *    `${projectBasename}-${workspaceBasename}` (config.generateLegacyId),
+ *    each basename bounded by the filesystem's NAME_MAX (255 bytes), so 511
+ *    is the construction ceiling. Agent IDs also derive from basenames.
+ *    CORRUPT_IDENTIFIER_MAX_LENGTH doubles that ceiling for headroom.
+ *    agent_type is excluded: legacy workspace metadata and rollup entries
+ *    accept unbounded agent-type strings, so length there is not evidence.
+ *
+ * 2. Workspace identity unknown to ingest_watermarks. A concatenation of two
+ *    or more workspace IDs can never equal a real workspace ID, no matter how
+ *    small the corrupted batch. This evidence is only safe at init, before
+ *    any ingest of the session (prior-session rows either have watermarks or
+ *    are orphans the first syncCheck re-ingests from disk), or right after a
+ *    rebuild that reports the workspaces whose ingest failed before their
+ *    watermark write via preserveWorkspaceIds. Running it after ordinary
+ *    ingests deletes real rows of workspaces whose ingest keeps failing on a
+ *    poison record, so callers must not sweep there.
+ *    delegation_rollups joins on parent_workspace_id only;
+ *    child_workspace_id may legitimately reference a removed child workspace.
+ */
+export async function deleteCorruptAnalyticsRows(
+  conn: DuckDBConnection,
+  preserveWorkspaceIds: ReadonlySet<string> = new Set()
+): Promise<number> {
+  // Length evidence stays authoritative for preserved workspaces; only the
+  // watermark-membership evidence is exempted for them.
+  const preserveList = [...preserveWorkspaceIds]
+    .map((id) => `'${id.replaceAll("'", "''")}'`)
+    .join(", ");
+
+  const eventsResult = await conn.run(`
+    DELETE FROM events
+    WHERE LENGTH(workspace_id) > ${CORRUPT_IDENTIFIER_MAX_LENGTH}
+       OR LENGTH(parent_workspace_id) > ${CORRUPT_IDENTIFIER_MAX_LENGTH}
+       OR LENGTH(agent_id) > ${CORRUPT_IDENTIFIER_MAX_LENGTH}
+       OR (NOT EXISTS (
+         SELECT 1 FROM ingest_watermarks w WHERE w.workspace_id = events.workspace_id
+       )${preserveList ? ` AND events.workspace_id NOT IN (${preserveList})` : ""})
+  `);
+
+  const rollupsResult = await conn.run(`
+    DELETE FROM delegation_rollups
+    WHERE LENGTH(parent_workspace_id) > ${CORRUPT_IDENTIFIER_MAX_LENGTH}
+       OR LENGTH(child_workspace_id) > ${CORRUPT_IDENTIFIER_MAX_LENGTH}
+       OR (NOT EXISTS (
+         SELECT 1 FROM ingest_watermarks w
+         WHERE w.workspace_id = delegation_rollups.parent_workspace_id
+       )${preserveList ? ` AND delegation_rollups.parent_workspace_id NOT IN (${preserveList})` : ""})
+  `);
+
+  return eventsResult.rowsChanged + rollupsResult.rowsChanged;
+}
+
 function serializeHeadSignatureValue(value: string | number | null): string {
   if (value === null) {
     return "null";
@@ -1789,7 +1858,7 @@ export async function rebuildAll(
   conn: DuckDBConnection,
   sessionsDir: string,
   workspaceMetaById: WorkspaceMetaById = {}
-): Promise<{ workspacesIngested: number }> {
+): Promise<{ workspacesIngested: number; failedWorkspaceIds: Set<string> }> {
   assert(sessionsDir.trim().length > 0, "rebuildAll: sessionsDir is required");
   assert(
     isRecord(workspaceMetaById) && !Array.isArray(workspaceMetaById),
@@ -1814,7 +1883,7 @@ export async function rebuildAll(
     entries = await fs.readdir(sessionsDir, { withFileTypes: true });
   } catch (error) {
     if (isRecord(error) && error.code === "ENOENT") {
-      return { workspacesIngested: 0 };
+      return { workspacesIngested: 0, failedWorkspaceIds: new Set() };
     }
 
     throw error;
@@ -1917,6 +1986,10 @@ export async function rebuildAll(
           );
         }
       } catch (error) {
+        // The workspace's chat rows are already appended but its watermark may
+        // not be written; report it failed so the post-rebuild sweep's
+        // missing-watermark evidence does not delete those rows.
+        failedWorkspaceIds.add(workspace.workspaceId);
         log.warn("[analytics-etl] Failed to write metadata during rebuild", {
           workspaceId: workspace.workspaceId,
           error: getErrorMessage(error),
@@ -1945,5 +2018,5 @@ export async function rebuildAll(
     }
   }
 
-  return { workspacesIngested };
+  return { workspacesIngested, failedWorkspaceIds };
 }

@@ -193,6 +193,11 @@ export function isFailedToolOutput(output: unknown): boolean {
  * - output-available + success → "completed"
  * - input-available + parentInterrupted → "interrupted"
  * - input-available + running → "executing"
+ *
+ * An explicit `failed` flag wins over shape-derived detection: reload-time
+ * reconstruction of RLM kernel-mode records persists no output to sniff, so
+ * failure travels out-of-band (never as a synthetic output shape that a real
+ * tool result could collide with).
  */
 export function getNestedToolStatus(
   state: "input-available" | "output-available" | "output-redacted",
@@ -201,7 +206,7 @@ export function getNestedToolStatus(
   failed?: boolean
 ): ToolStatus {
   if (state === "output-available") {
-    return isFailedToolOutput(output) ? "failed" : "completed";
+    return (failed ?? isFailedToolOutput(output)) ? "failed" : "completed";
   }
   if (state === "output-redacted") return failed ? "failed" : "redacted";
   return parentInterrupted ? "interrupted" : "executing";

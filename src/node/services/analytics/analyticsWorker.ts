@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import { parentPort } from "node:worker_threads";
 import { DuckDBInstance, type DuckDBConnection } from "@duckdb/node-api";
 import { getErrorMessage } from "@/common/utils/errors";
+import { log } from "@/node/services/log";
 import { decideSyncPlan, type SyncAction } from "./backfillDecision";
 import { shouldCheckpointAfterSync } from "./checkpointDecision";
 import {
   clearWorkspaceAnalyticsState,
+  deleteCorruptAnalyticsRows,
   getCurrentPricingFingerprint,
   ingestWorkspace,
   readStoredPricingFingerprint,
@@ -147,6 +149,29 @@ async function handleInit(data: InitData): Promise<void> {
   for (const migrationSql of DELEGATION_ROLLUPS_COLUMN_MIGRATIONS_SQL) {
     await activeConn.run(migrationSql);
   }
+
+  await sweepCorruptRows("init");
+}
+
+/**
+ * Delete corruption-class rows and log when anything was actually removed.
+ * Best-effort: a failed sweep must never reject init (which would cache a
+ * worker error and disable analytics until restart), so errors are logged
+ * and swallowed. Runs only at init and after rebuilds: missing-watermark
+ * evidence is unsafe after ordinary ingests (see deleteCorruptAnalyticsRows).
+ */
+async function sweepCorruptRows(
+  context: string,
+  preserveWorkspaceIds?: ReadonlySet<string>
+): Promise<void> {
+  try {
+    const deleted = await deleteCorruptAnalyticsRows(getConn(), preserveWorkspaceIds);
+    if (deleted > 0) {
+      log.info(`[analytics-worker] Deleted ${deleted} corrupt analytics row(s) (${context})`);
+    }
+  } catch (error) {
+    log.warn(`[analytics-worker] Corrupt-row sweep failed (${context}): ${getErrorMessage(error)}`);
+  }
 }
 
 async function handleIngest(data: IngestData): Promise<void> {
@@ -166,10 +191,11 @@ async function handleRebuildAll(data: RebuildAllData): Promise<{ workspacesInges
   }
 
   const result = await rebuildAll(getConn(), data.sessionsDir, data.workspaceMetaById ?? {});
+  await sweepCorruptRows("rebuildAll", result.failedWorkspaceIds);
   // A completed rebuild priced everything with the current tables; refresh the
   // fingerprint so the next sync check does not schedule a redundant rebuild.
   await storePricingFingerprint(getConn());
-  return result;
+  return { workspacesIngested: result.workspacesIngested };
 }
 
 async function handleClearWorkspace(data: ClearWorkspaceData): Promise<void> {
@@ -382,11 +408,12 @@ async function handleSyncCheck(data: SyncCheckData): Promise<SyncCheckResult> {
   }
 
   if (plan.action === "full_rebuild") {
-    const { workspacesIngested } = await rebuildAll(
+    const { workspacesIngested, failedWorkspaceIds } = await rebuildAll(
       getConn(),
       data.sessionsDir,
       data.workspaceMetaById
     );
+    await sweepCorruptRows("syncCheck full_rebuild", failedWorkspaceIds);
     if (pricingFingerprintChanged) {
       await storePricingFingerprint(getConn());
     }

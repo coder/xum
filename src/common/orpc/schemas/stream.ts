@@ -755,21 +755,39 @@ export const ToolPolicySchema = z.array(ToolPolicyFilterSchema).meta({
 // Unknown keys (e.g. `goals` from older persisted send-options written
 // before the Goals experiment graduated to GA) are stripped by Zod's
 // default behavior, so we do not need to retain a deprecated field.
-export const ExperimentsSchema = z.object({
-  programmaticToolCalling: z.boolean().optional(),
-  programmaticToolCallingExclusive: z.boolean().optional(),
-  /**
-   * RLM mode (sub-experiment of Programmatic Tool Calling): persistent
-   * sandbox kernel for code_execution. Inert unless a PTC flag is also on.
-   */
-  rlm: z.boolean().optional(),
-  advisorTool: z.boolean().optional(),
-  dynamicWorkflows: z.boolean().optional(),
-  memory: z.boolean().optional(),
-  timeline: z.boolean().optional(),
-  workspaceHeartbeats: z.boolean().optional(),
-  toolSearch: z.boolean().optional(),
-});
+export const ExperimentsSchema = z.preprocess(
+  // Legacy alias: startup-retry snapshots persisted by builds where "PTC
+  // Exclusive Mode" was a separate experiment may carry only the exclusive
+  // flag; the merged PTC experiment activates exactly that posture (`true`
+  // wins over an explicit programmaticToolCalling: false).
+  (value) =>
+    typeof value === "object" &&
+    value !== null &&
+    (value as Record<string, unknown>).programmaticToolCallingExclusive === true
+      ? { ...value, programmaticToolCalling: true }
+      : value,
+  z.object({
+    programmaticToolCalling: z.boolean().optional(),
+    /**
+     * Downgrade-compat mirror (see withLegacyPtcExclusiveMirror): retained
+     * through parsing and stamped alongside programmaticToolCalling in
+     * persisted startup-retry snapshots so a downgraded build resumes in the
+     * exclusive posture instead of supplement mode.
+     */
+    programmaticToolCallingExclusive: z.boolean().optional(),
+    /**
+     * RLM mode (sub-experiment of Programmatic Tool Calling): persistent
+     * sandbox kernel for code_execution. Inert unless a PTC flag is also on.
+     */
+    rlm: z.boolean().optional(),
+    advisorTool: z.boolean().optional(),
+    dynamicWorkflows: z.boolean().optional(),
+    memory: z.boolean().optional(),
+    timeline: z.boolean().optional(),
+    workspaceHeartbeats: z.boolean().optional(),
+    toolSearch: z.boolean().optional(),
+  })
+);
 
 /**
  * `steer` is accepted for older clients, but the backend treats every manual

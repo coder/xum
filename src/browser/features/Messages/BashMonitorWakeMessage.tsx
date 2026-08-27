@@ -8,19 +8,53 @@ interface BashMonitorWakeMessageProps {
   className?: string;
 }
 
+/** A stale terminal (re-armed processId) still summarizes as a settlement, never as a match. */
+function settlementOf(
+  record: BashMonitorWakeDisplayRecord
+): BashMonitorWakeDisplayRecord["terminal"] {
+  return record.terminal ?? record.staleTerminal;
+}
+
+function summarizeTerminal(record: BashMonitorWakeDisplayRecord): string {
+  const terminal = settlementOf(record);
+  if (terminal == null) return `${record.displayName} monitor matched`;
+  // Attribute a stale settlement to the earlier run so the card cannot read as the live
+  // (re-armed) process having settled.
+  const suffix = record.terminal == null ? " — earlier run, ID re-armed" : "";
+  switch (terminal.status) {
+    case "exited":
+      return terminal.exitCode != null
+        ? `${record.displayName} exited (code ${terminal.exitCode})${suffix}`
+        : `${record.displayName} exited${suffix}`;
+    case "killed":
+      return `${record.displayName} killed${suffix}`;
+    case "failed":
+      return `${record.displayName} failed${suffix}`;
+    case "unknown":
+      // Backend read-time degrade of malformed settlement metadata: still a settlement.
+      return `${record.displayName} settled${suffix}`;
+  }
+}
+
 function summarizeRecords(records: BashMonitorWakeDisplayRecord[]): string {
   if (records.length === 1) {
     const record = records[0];
     return record.kind === "monitor-lost"
       ? `${record.displayName} monitor stopped after restart`
-      : `${record.displayName} monitor matched`;
+      : summarizeTerminal(record);
   }
 
-  const matchCount = records.filter((record) => record.kind === "match").length;
-  if (matchCount === records.length) {
+  const matchRecords = records.filter((record) => record.kind === "match");
+  if (matchRecords.length === records.length) {
+    if (matchRecords.every((record) => settlementOf(record) != null)) {
+      return `${records.length} background processes finished`;
+    }
+    if (matchRecords.some((record) => settlementOf(record) != null)) {
+      return `${records.length} background monitor updates`;
+    }
     return `${records.length} background monitors matched`;
   }
-  if (matchCount === 0) {
+  if (matchRecords.length === 0) {
     return `${records.length} background monitors stopped after restart`;
   }
   return `${records.length} background monitor updates`;

@@ -2312,6 +2312,13 @@ export class StreamManager extends EventEmitter {
       error?: string;
     }
   ): void {
+    // Kernel guests can call capabilities with zero arguments. JSON.stringify
+    // drops an `args: undefined` key, and the wire schema requires args on
+    // tool-call-start, so an unnormalized event would fail oRPC output
+    // validation and kill every live onChat subscription. Normalize to {} —
+    // the same shape a provider zero-arg tool call carries.
+    const args = event.args === undefined ? {} : event.args;
+
     // Persist nested calls to streamInfo.parts for crash/interrupt resilience
     const streamInfo = this.workspaceStreams.get(workspaceId as WorkspaceId);
     if (streamInfo) {
@@ -2328,7 +2335,7 @@ export class StreamManager extends EventEmitter {
           nestedCalls.push({
             toolCallId: event.callId,
             toolName: event.toolName,
-            input: event.args,
+            input: args,
             state: "input-available",
             timestamp: event.startTime,
           });
@@ -2358,7 +2365,7 @@ export class StreamManager extends EventEmitter {
         messageId,
         toolCallId: event.callId,
         toolName: event.toolName,
-        args: event.args,
+        args,
         tokens: 0, // Nested calls don't count toward stream tokens
         timestamp: event.startTime,
         parentToolCallId: event.parentToolCallId,

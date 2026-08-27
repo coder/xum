@@ -204,6 +204,37 @@ describe("AgentSession continue-message agentId fallback", () => {
     expect(dispatchedInternal?.synthetic).toBe(true);
   });
 
+  test("dispatchPendingFollowUp aliases legacy exclusive-PTC experiments", async () => {
+    // An older build can persist {programmaticToolCalling: false,
+    // programmaticToolCallingExclusive: true}; dispatch copies raw persisted
+    // JSON into the next send, and the explicit false would otherwise win
+    // over backend overrides while the removed legacy field is ignored —
+    // silently downgrading the crash-safe follow-up to PTC-off (and making
+    // its rlm flag inert).
+    let dispatchedOptions: SendOptions | undefined;
+    const { internals } = await createSession([
+      compactionSummaryMessage("summary-legacy-ptc", {
+        text: "continue after compaction",
+        model: "openai:gpt-4o",
+        agentId: "exec",
+        experiments: {
+          programmaticToolCalling: false,
+          programmaticToolCallingExclusive: true,
+          rlm: true,
+        },
+      }),
+    ]);
+    internals.sendMessage = mock((_message: string, options?: SendOptions) => {
+      dispatchedOptions = options;
+      return Promise.resolve({ success: true as const });
+    });
+
+    await internals.dispatchPendingFollowUp();
+
+    expect(dispatchedOptions?.experiments?.programmaticToolCalling).toBe(true);
+    expect(dispatchedOptions?.experiments?.rlm).toBe(true);
+  });
+
   test("dispatchPendingFollowUp preserves agent-initiated attribution", async () => {
     let dispatchedInternal: { synthetic?: boolean; agentInitiated?: boolean } | undefined;
     const { internals } = await createSession([

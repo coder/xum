@@ -15,11 +15,35 @@ import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import { KERNEL_COMPACT_ARGS_CAP_BYTES } from "@/constants/kernelOutput";
 import { RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES } from "@/constants/resultHandles";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST } from "@/common/constants/imageAttachments";
 import {
   FULL_GRANTS,
   isBridgeToolGranted,
   type CapabilityGrants,
 } from "@/common/types/capabilityGrants";
+import { isToolContentResult } from "@/common/utils/tools/toolContentResult";
+import { isSupportedAttachmentMediaType } from "@/common/utils/attachments/supportedAttachmentMediaTypes";
+import { isDisplayOnlyFilePart } from "@/common/utils/attachments/displayOnlyFileParts";
+import {
+  DISPLAY_DATA_STUB,
+  MEDIA_BUDGET_EXCEEDED_STUB,
+  MEDIA_DATA_STUB,
+  mediaUnsupportedStub,
+  isMediaPart,
+  type ToolAttachmentPart,
+} from "@/common/utils/attachments/toolAttachmentParts";
+import {
+  retainExemptKernelRecordResult,
+  retainPersistenceCriticalArgsFields,
+  sanitizeMediaRecordCapture,
+} from "./types";
+
+/**
+ * Aggregate per-eval limits for attachment parts stripped from bridged results.
+ * Forwardable parts live outside QuickJS memory accounting, and unsupported
+ * media still consumes the byte budget to bound repeated calls.
+ */
+export const MAX_PENDING_ATTACHMENT_BYTES = 32 * 1024 * 1024;
 
 /**
  * Result shape of an AI SDK Schema's optional custom validator
@@ -134,6 +158,17 @@ const EXCLUDED_TOOLS = new Set([
   "todo_read", // UI-specific
   "status_set", // UI-specific
   "agent_report", // Must be top-level for taskService to read args from history
+  // Context-coupled tools: AIService keys system-prompt context off their
+  // top-level presence (memory index / hot-set block for `memory`, proactive
+  // guidance for `advisor`). Bridging them would silently drop that context
+  // in the exclusive posture.
+  "memory",
+  "advisor",
+  // Media-producing built-ins (attach_file, desktop_screenshot) are
+  // deliberately bridgeable: stripAttachmentParts removes their base64 from
+  // sandbox-visible values and the code_execution attachments carrier delivers
+  // the real bytes to request-time extraction, so guest code like
+  // xum.attach_file(...) works without retaining media in QuickJS memory.
 ]);
 
 /**
@@ -151,6 +186,14 @@ export class ToolBridge {
    * authoritative host-side record of successful loads, immune to
    * model-visible record bounding (see drainNewlyLoadedVarsKeys). */
   private newlyLoadedVarsKeys: string[] = [];
+  /** Attachment parts (model media + display-only files) stripped from
+   * bridged results, keyed per runtime so parallel code_execution calls
+   * sharing this bridge cannot claim each other's parts (ephemeral runtimes
+   * are per-call; persistent mounts serialize evals under the scope lock). */
+  private readonly pendingAttachments = new WeakMap<IJSRuntime, ToolAttachmentPart[]>();
+  /** Aggregate stripped-media bytes per runtime/eval, including unsupported
+   * media that is discarded rather than forwarded to the provider. */
+  private readonly pendingAttachmentBytes = new WeakMap<IJSRuntime, number>();
 
   constructor(tools: Record<string, Tool>, grants?: CapabilityGrants) {
     this.bridgeableTools = new Map();
@@ -218,18 +261,34 @@ export class ToolBridge {
    * not just when the parent stream is cancelled.
    */
   register(runtime: IJSRuntime, kernel?: KernelBridgeOptions): void {
+    // Every execution re-registers before eval, so this is the per-eval reset
+    // point: stale attachments from a crashed/aborted prior eval on this
+    // runtime must not leak into the next eval's drain.
+    this.pendingAttachments.delete(runtime);
+    this.pendingAttachmentBytes.delete(runtime);
     // Kernel mode bounds record/event capture at creation (host memory and
     // streamed-to-history events); ephemeral registrations keep full records
-    // (the byte-identical supplement contract). Post-eval compaction still
-    // bounds the model-visible set.
+    // (the non-RLM inline-results contract). Post-eval compaction still
+    // bounds the model-visible set. Exempt records (persistence-critical
+    // tools, media containers) keep full results through BOTH stages — see
+    // isKernelRecordResultExempt.
     runtime.setKernelRecordBounds(
       kernel !== undefined
         ? {
             argsCapBytes: KERNEL_COMPACT_ARGS_CAP_BYTES,
             resultCapBytes: RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES,
+            captureRetained: retainExemptKernelRecordResult,
+            captureArgsRetained: retainPersistenceCriticalArgsFields,
           }
         : undefined
     );
+    // Media containers are budgeted at capture in BOTH modes: classic records
+    // keep full inline results by contract, but exclusive PTC makes the
+    // bridge the only route to executable MCP tools, and request-time
+    // attachment extraction rewrites only the provider copy — records/events
+    // persisted into partial.json/chat.jsonl need the budget regardless of
+    // kernel mode.
+    runtime.setCaptureResultSanitizer(sanitizeMediaRecordCapture);
     const xumObj: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
 
     // Grant-denied tools get an explicit stub: the guest sees a clear
@@ -279,7 +338,7 @@ export class ToolBridge {
         });
 
         // Ensure result is JSON-serializable
-        return this.serializeResult(result);
+        return this.stripAttachmentParts(runtime, this.serializeResult(result));
       };
     }
 
@@ -413,6 +472,93 @@ export class ToolBridge {
         };
   }
 
+  /**
+   * Attachment-carrying parts inside bridged tool results (e.g. attach_file)
+   * are useless as sandbox values: guests cannot see pixels, and the base64
+   * would bloat vars, result handles, model-visible records, and the
+   * host-side nested-call records/events (which sit outside QuickJS memory
+   * accounting). Supported media and display-only files are carried onto
+   * code_execution's result, while unsupported media is discarded. Nested
+   * media copies become text so request extraction cannot treat stubs as files.
+   */
+  private stripAttachmentParts(runtime: IJSRuntime, serialized: unknown): unknown {
+    if (!isToolContentResult(serialized)) {
+      return serialized;
+    }
+    const carriedParts: ToolAttachmentPart[] = [];
+    const pending = this.pendingAttachments.get(runtime) ?? [];
+    let pendingBytes = this.pendingAttachmentBytes.get(runtime) ?? 0;
+    let changed = false;
+    const strip = <T extends ToolAttachmentPart>(
+      part: T,
+      stub: string,
+      carry: boolean
+    ): T | { type: "text"; text: string } => {
+      if (
+        carry &&
+        pending.length + carriedParts.length >= MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST
+      ) {
+        return { type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB };
+      }
+      const partBytes = Buffer.byteLength(JSON.stringify(part), "utf8");
+      if (pendingBytes + partBytes > MAX_PENDING_ATTACHMENT_BYTES) {
+        return { type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB };
+      }
+      const stripped = isMediaPart(part)
+        ? { type: "text" as const, text: stub }
+        : { ...part, data: stub };
+      const strippedBytes = carry ? Buffer.byteLength(JSON.stringify(stripped), "utf8") : 0;
+      const retainedBytes = partBytes + strippedBytes;
+      if (pendingBytes + retainedBytes > MAX_PENDING_ATTACHMENT_BYTES) {
+        return { type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB };
+      }
+      pendingBytes += retainedBytes;
+      this.pendingAttachmentBytes.set(runtime, pendingBytes);
+      if (carry) {
+        carriedParts.push(part);
+      }
+      return stripped;
+    };
+    const newValue = serialized.value.map((item) => {
+      if (isMediaPart(item)) {
+        changed = true;
+        const supported = isSupportedAttachmentMediaType(item.mediaType);
+        return strip(
+          item,
+          supported ? MEDIA_DATA_STUB : mediaUnsupportedStub(item.mediaType),
+          supported
+        );
+      }
+      if (isDisplayOnlyFilePart(item)) {
+        changed = true;
+        return strip(item, DISPLAY_DATA_STUB, true);
+      }
+      return item;
+    });
+    if (!changed) {
+      return serialized;
+    }
+    if (carriedParts.length > 0) {
+      for (const part of carriedParts) {
+        pending.push(part);
+      }
+      this.pendingAttachments.set(runtime, pending);
+    }
+    return { type: "content", value: newValue };
+  }
+
+  /**
+   * Drain forwardable attachment parts stripped from bridged results on this
+   * runtime. register() clears stale entries before each eval, so a post-eval
+   * drain yields exactly that eval's supported media and display-only files.
+   */
+  drainPendingAttachments(runtime: IJSRuntime): ToolAttachmentPart[] {
+    const pending = this.pendingAttachments.get(runtime) ?? [];
+    this.pendingAttachments.delete(runtime);
+    this.pendingAttachmentBytes.delete(runtime);
+    return pending;
+  }
+
   private hasExecute(tool: Tool): tool is Tool & { execute: NonNullable<Tool["execute"]> } {
     return typeof tool.execute === "function";
   }
@@ -423,6 +569,15 @@ export class ToolBridge {
     args: unknown,
     abortSignal?: AbortSignal
   ): Promise<unknown> {
+    // Guests may call a capability with zero arguments (mux.tool()). Provider
+    // tool calls always deliver an args object, and downstream consumers (MCP
+    // servers, Zod object schemas) assume one — passing undefined through
+    // produced opaque TypeErrors instead of readable validation errors.
+    // Treat a zero-arg call as the canonical empty-args call.
+    if (args === undefined) {
+      args = {};
+    }
+
     // AI SDK tools carry their schema on 'inputSchema'; some legacy tools use 'parameters'.
     const toolRecord = tool as { inputSchema?: unknown; parameters?: unknown };
     const schema = toolRecord.inputSchema ?? toolRecord.parameters;
@@ -480,7 +635,11 @@ export class ToolBridge {
 
   private serializeResult(result: unknown): unknown {
     try {
-      // Round-trip through JSON to ensure QuickJS can handle the value
+      // Round-trip through JSON to ensure QuickJS can handle the value.
+      // Media returned by bridged MCP tools passes through intact: the guest
+      // may legitimately process the bytes, and the classic (non-RLM) record
+      // keeps the full result so extractAttachmentsFromToolOutput can lift
+      // nested media into model-visible multimodal parts at request time.
       return JSON.parse(JSON.stringify(result));
     } catch {
       return { error: "Result not JSON-serializable" };

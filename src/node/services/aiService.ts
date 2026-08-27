@@ -5,6 +5,7 @@ import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import assert from "@/common/utils/assert";
 import { type LanguageModel, type Tool } from "ai";
 
+import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { linkAbortSignal } from "@/node/utils/abort";
 import { ensurePrivateDir } from "@/node/utils/fs";
 import type { Result } from "@/common/types/result";
@@ -190,14 +191,9 @@ import {
 import {
   applyToolPolicyAndExperiments,
   captureMcpToolTelemetry,
-  reconcileHookReplacedCodeExecution,
   resolveBackendGatedPtcExperiments,
-  retargetCodeExecution,
 } from "./toolAssembly";
-import {
-  createKernelFileLoader,
-  type KernelFileLoader,
-} from "@/node/services/tools/kernelFileLoad";
+import { createKernelFileLoader } from "@/node/services/tools/kernelFileLoad";
 import { eventSpine, type RequestAssembleContext } from "@/node/services/events/eventSpine";
 import { getErrorMessage } from "@/common/utils/errors";
 import { validateJsonSchemaSubsetSchema } from "@/common/utils/jsonSchemaSubset";
@@ -1077,81 +1073,6 @@ export class AIService extends EventEmitter {
     });
   }
 
-  /**
-   * Supplement-mode PTC reconcile after the request.assemble waterfall: when
-   * middleware changed any tool the bridge exposes (added/removed names OR a
-   * same-name replacement such as an audit wrapper), the pre-hook
-   * code_execution instance closes over a stale ToolBridge — rebuild it from
-   * the post-hook record. When the hook replaced code_execution ITSELF, its
-   * replacement wins (never silently drop a middleware wrapper) — but such a
-   * wrapper typically delegates to the PRE-hook instance, so that instance is
-   * retargeted in place onto the rebuilt bridge/mount. Delegation through the
-   * wrapper then reaches the post-hook toolset even when the wrapper captured
-   * the original execute function directly.
-   */
-  private async rebuildCodeExecutionAfterAssembleHook(opts: {
-    preHookTools: Record<string, Tool>;
-    postHookTools: Record<string, Tool>;
-    effectiveToolPolicy: ToolPolicy | undefined;
-    experiments: SendMessageOptions["experiments"];
-    emitNestedToolEvent: (event: PTCEventWithParent) => void;
-    workspaceId: string;
-    kernelFileLoader: KernelFileLoader;
-  }): Promise<Record<string, Tool>> {
-    const { preHookTools, postHookTools, workspaceId } = opts;
-    const hookReplacedCodeExecution =
-      postHookTools.code_execution !== undefined &&
-      preHookTools.code_execution !== undefined &&
-      postHookTools.code_execution !== preHookTools.code_execution;
-    // Identity-aware change detection over everything EXCEPT code_execution
-    // (the instance this rebuild replaces): names and same-name replacements.
-    const bridgeRelevantChanged =
-      Object.keys(postHookTools).filter((n) => n !== "code_execution").length !==
-        Object.keys(preHookTools).filter((n) => n !== "code_execution").length ||
-      Object.entries(postHookTools).some(
-        ([name, t]) => name !== "code_execution" && preHookTools[name] !== t
-      );
-    if (!bridgeRelevantChanged) {
-      return postHookTools;
-    }
-    const { code_execution: hookCodeExecution, ...bridgeInputTools } = postHookTools;
-    const rebuilt = await applyToolPolicyAndExperiments({
-      allTools: bridgeInputTools,
-      effectiveToolPolicy: opts.effectiveToolPolicy,
-      experiments: opts.experiments,
-      emitNestedToolEvent: opts.emitNestedToolEvent,
-      sandbox: {
-        workspaceId,
-        sessionDir: this.config.getSessionDir(workspaceId),
-        kernelFileLoader: opts.kernelFileLoader,
-      },
-    });
-    // Reinstate a middleware-provided code_execution replacement over the
-    // freshly built instance — but first graft the rebuilt bridge/mount onto
-    // the PRE-hook instance the wrapper delegates to. code_execution reads its
-    // bridge late-bound at call time, so this retargets the wrapper's
-    // delegation path (even a captured execute reference) to the post-hook
-    // toolset instead of leaving it closed over the stale bridge. Then
-    // reconcile model-facing metadata a spread-style wrapper inherited from
-    // the pre-hook instance (description advertising removed tools).
-    if (hookReplacedCodeExecution && hookCodeExecution !== undefined) {
-      const rebuiltCodeExecution = rebuilt.code_execution;
-      if (rebuiltCodeExecution !== undefined && preHookTools.code_execution !== undefined) {
-        await retargetCodeExecution(preHookTools.code_execution, rebuiltCodeExecution);
-        return {
-          ...rebuilt,
-          code_execution: reconcileHookReplacedCodeExecution(
-            preHookTools.code_execution,
-            hookCodeExecution,
-            rebuiltCodeExecution
-          ),
-        };
-      }
-      return { ...rebuilt, code_execution: hookCodeExecution };
-    }
-    return rebuilt;
-  }
-
   private wrapToolsForDelegation(
     workspaceId: string,
     tools: Record<string, Tool>,
@@ -1983,7 +1904,12 @@ export class AIService extends EventEmitter {
       } = agentResult.data;
       const legacyModeForMetadata = getLegacyModeForAgentMetadata(effectiveAgentId, effectiveMode);
       const projectTrusted = isWorkspaceProjectTrusted(this.config, metadata);
-      const sharedExecutionTrusted = isWorkspaceTrustedForSharedExecution(metadata, cfg.projects);
+      // projectAutomationDisabled: benchmark harnesses opt out of automatic
+      // repo hook execution (tool_env/tool_pre/tool_post) while keeping
+      // config trust for sub-agent delegation.
+      const sharedExecutionTrusted =
+        isWorkspaceTrustedForSharedExecution(metadata, cfg.projects) &&
+        !projectAutomationDisabled();
       const agentAdvisorEnabled = resolveAdvisorEnabledForAgent(
         effectiveAgentId,
         cfg.agentAiDefaults?.[effectiveAgentId]?.advisorEnabled
@@ -2924,9 +2850,7 @@ export class AIService extends EventEmitter {
       // PTC gate uses the same condition toolAssembly uses to add code_execution:
       // presence-sniffing the record would misfire on an MCP tool named
       // code_execution (see prepareToolSearch).
-      const ptcEnabled =
-        experiments?.programmaticToolCalling === true ||
-        experiments?.programmaticToolCallingExclusive === true;
+      const ptcEnabled = experiments?.programmaticToolCalling === true;
       if (toolSearchRuntime) {
         const toolSearchPrep = prepareToolSearch({
           tools,
@@ -2997,10 +2921,6 @@ export class AIService extends EventEmitter {
       // (append-time materialization) — see eventSpine module docs. Gated on
       // hasMiddleware so the empty-pipeline hot path skips ctx construction.
       if (eventSpine.hasMiddleware("request.assemble")) {
-        // Shallow copy: detects added/removed names AND same-name
-        // replacements (e.g. middleware wrapping a tool with an audit check),
-        // which a key-only comparison would miss.
-        const preHookTools = { ...tools };
         const assembleCtx: RequestAssembleContext = {
           workspaceId,
           modelString,
@@ -3009,27 +2929,12 @@ export class AIService extends EventEmitter {
         };
         await eventSpine.run("request.assemble", assembleCtx);
         tools = assembleCtx.tools;
-        // Supplement-mode PTC: the code_execution instance created during
-        // assembly closes over a ToolBridge built from the PRE-hook toolset
-        // (and its description advertises those tools), so a hook-removed or
-        // hook-replaced bridgeable tool would remain reachable via mux.*.
-        // Rebuild code_execution from the post-hook record. Exclusive mode is
-        // unaffected: bridgeable tools are not in the hook-visible record.
-        if (
-          experiments?.programmaticToolCalling === true &&
-          experiments?.programmaticToolCallingExclusive !== true &&
-          tools.code_execution !== undefined
-        ) {
-          tools = await this.rebuildCodeExecutionAfterAssembleHook({
-            preHookTools,
-            postHookTools: tools,
-            effectiveToolPolicy,
-            experiments,
-            emitNestedToolEvent: emitNestedPtcToolEvent,
-            workspaceId,
-            kernelFileLoader,
-          });
-        }
+        // PTC needs no post-hook bridge reconcile: bridgeable tools are not
+        // in the hook-visible record, so middleware cannot invalidate the
+        // ToolBridge code_execution closes over. Tools promoted to the
+        // model-visible set (policy-required tools, mcp_prompt_get) are
+        // excluded from the bridge at assembly time (see toolAssembly), so
+        // a hook that filters or wraps them affects the only dispatch path.
         // Tool-search state was classified from the pre-hook record; a hook
         // that added/removed tools would leave allToolNames/deferred/active
         // sets stale (prepareStep scoping + sentinel names both read them).
@@ -3722,9 +3627,6 @@ export class AIService extends EventEmitter {
                   // request.assemble over the rebuilt request too (see the
                   // primary-path run above).
                   if (eventSpine.hasMiddleware("request.assemble")) {
-                    // Shallow copy: same identity-aware change detection as
-                    // the primary path (names AND same-name replacements).
-                    const preHookNextTools = { ...nextTools };
                     const nextAssembleCtx: RequestAssembleContext = {
                       workspaceId,
                       modelString: nextModelString,
@@ -3733,24 +3635,6 @@ export class AIService extends EventEmitter {
                     };
                     await eventSpine.run("request.assemble", nextAssembleCtx);
                     nextTools = nextAssembleCtx.tools;
-                    // Same rebuild as the primary path: hook-removed or
-                    // hook-replaced tools must not stay reachable via a stale
-                    // code_execution bridge (supplement mode only).
-                    if (
-                      experiments?.programmaticToolCalling === true &&
-                      experiments?.programmaticToolCallingExclusive !== true &&
-                      nextTools.code_execution !== undefined
-                    ) {
-                      nextTools = await this.rebuildCodeExecutionAfterAssembleHook({
-                        preHookTools: preHookNextTools,
-                        postHookTools: nextTools,
-                        effectiveToolPolicy,
-                        experiments,
-                        emitNestedToolEvent: emitNestedPtcToolEvent,
-                        workspaceId,
-                        kernelFileLoader,
-                      });
-                    }
                     // Same reconcile as the primary path: tool-search state
                     // must describe the post-hook toolset.
                     if (toolSearchRuntime?.state) {

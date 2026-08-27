@@ -225,7 +225,29 @@ function getValidBashMonitorWakeRecords(
     typeof record.displayName === "string" &&
     typeof record.filter === "string" &&
     typeof record.filterExclude === "boolean";
-  return records.every(isValidRecord) ? records : undefined;
+  if (!records.every(isValidRecord)) return undefined;
+  // Self-healing for the optional settlement fields: an invalid terminal or staleTerminal shape
+  // drops that field, not the record, so the wake still renders with its base summary.
+  const isValidTerminal = (
+    terminal: unknown
+  ): terminal is NonNullable<BashMonitorWakeDisplayRecord["terminal"]> =>
+    isPlainObject(terminal) &&
+    (terminal.status === "exited" ||
+      terminal.status === "killed" ||
+      terminal.status === "failed" ||
+      terminal.status === "unknown") &&
+    (terminal.exitCode === undefined || typeof terminal.exitCode === "number");
+  return records.map((record) => {
+    const terminalValid = record.terminal === undefined || isValidTerminal(record.terminal);
+    const staleValid = record.staleTerminal === undefined || isValidTerminal(record.staleTerminal);
+    if (terminalValid && staleValid) return record;
+    const { terminal, staleTerminal, ...rest } = record;
+    return {
+      ...rest,
+      ...(terminalValid && terminal !== undefined ? { terminal } : {}),
+      ...(staleValid && staleTerminal !== undefined ? { staleTerminal } : {}),
+    };
+  });
 }
 
 /**
@@ -533,22 +555,28 @@ function reconstructCodeExecutionNestedCalls(part: DynamicToolPart): NestedToolC
       continue;
     }
 
+    const output =
+      record.result ??
+      (typeof record.error === "string"
+        ? // success:false matches the failure shape tool cards and
+          // isFailedToolOutput already understand, so the error stays
+          // visible (e.g. bash's ErrorBox) after reload.
+          { success: false, error: record.error }
+        : undefined);
+    // RLM kernel-mode compact record (r12): the full nested result never
+    // persists in the tool output, so degraded detail after reload is expected
+    // (live streaming keeps full detail via part.nestedCalls, which takes
+    // precedence). Failure travels out-of-band via `failed` instead of a
+    // synthetic output shape, so a real tool result can never be mistaken
+    // for a reconstruction stand-in.
+    const kernelFailure = output === undefined && record.ok === false;
+
     nestedCalls.push({
       toolCallId: `${part.toolCallId}-nested-${idx}`,
       toolName: record.toolName,
       input: record.args,
-      output:
-        record.result ??
-        (typeof record.error === "string"
-          ? { error: record.error }
-          : typeof record.bytes === "number" && typeof record.ok === "boolean"
-            ? // RLM kernel-mode compact record (r12): the full nested result
-              // never persists in the tool output — degraded detail after
-              // reload is expected. Surface the summary so the card still
-              // renders something meaningful. Live streaming keeps full
-              // detail via part.nestedCalls, which takes precedence here.
-              { suppressed: true, ok: record.ok, bytes: record.bytes }
-            : undefined),
+      output,
+      ...(kernelFailure ? { failed: true } : {}),
       state: "output-available",
       timestamp: part.timestamp,
     });

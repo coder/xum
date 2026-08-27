@@ -189,6 +189,16 @@ export const BackgroundProcessMonitorInfoSchema = z.object({
   droppedLines: z.number(),
   lastLines: z.array(z.string()),
   stopped: z.boolean(),
+  /**
+   * Set when a monitor wake is durably queued but its synthetic wake turn has not been
+   * delivered yet. Without this, a one-shot watcher that matched and exited looks like a
+   * lost wake in the UI (nothing running, no visible pending delivery). Carries the wake
+   * kind so the UI does not claim a "match" for monitor-lost restart notices.
+   */
+  // "settled": the wake reports only process settlement (a monitored process that
+  // exited without ever matching, or an earlier run's preserved settlement) — never
+  // labeled as a match the filter did not produce.
+  pendingWakeKind: z.enum(["match", "monitor-lost", "settled"]).optional(),
 });
 
 // Background process info (for UI display)
@@ -197,6 +207,12 @@ export const BackgroundProcessInfoSchema = z.object({
   pid: z.number(),
   script: z.string(),
   displayName: z.string().optional(),
+  /**
+   * True for rows synthesized from a durable pending wake with no manager entry behind
+   * them (e.g. after an app restart). Such rows have no queryable output or live process.
+   * Deliberately not inferred from pid: migrated manager-backed processes also use pid 0.
+   */
+  synthesized: z.boolean().optional(),
   startTime: z.number(),
   status: BackgroundProcessStatusSchema,
   monitor: BackgroundProcessMonitorInfoSchema.optional(),

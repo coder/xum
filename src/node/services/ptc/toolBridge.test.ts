@@ -3,7 +3,14 @@
  */
 
 import { describe, it, expect, mock } from "bun:test";
-import { ToolBridge, type KernelBridgeOptions } from "./toolBridge";
+import { MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST } from "@/common/constants/imageAttachments";
+import { ToolBridge, MAX_PENDING_ATTACHMENT_BYTES, type KernelBridgeOptions } from "./toolBridge";
+import {
+  DISPLAY_DATA_STUB,
+  MEDIA_BUDGET_EXCEEDED_STUB,
+  MEDIA_DATA_STUB,
+  mediaUnsupportedStub,
+} from "@/common/utils/attachments/toolAttachmentParts";
 import { jsonSchema, type Tool } from "ai";
 import type { IJSRuntime, RuntimeLimits } from "./runtime";
 import type { PTCEvent, PTCExecutionResult } from "./types";
@@ -29,6 +36,7 @@ function createMockRuntime(overrides: Partial<IJSRuntime> = {}): IJSRuntime {
     registerSyncFunction: mock((_name: string, _fn: () => unknown) => undefined),
     setVarsProperty: mock((_key: string, _value: string) => undefined),
     setKernelRecordBounds: mock(() => undefined),
+    setCaptureResultSanitizer: mock(() => undefined),
     setPendingJobGate: mock((_gate: (run: () => void) => void) => undefined),
     setLimits: mock((_limits: RuntimeLimits) => undefined),
     onEvent: mock((_handler: (event: PTCEvent) => void) => undefined),
@@ -249,6 +257,45 @@ describe("ToolBridge", () => {
       // Args flow through untouched — the MCP server is the validator of record.
       expect(mockExecute).toHaveBeenCalledWith({ query: "eng" });
       expect(result).toEqual({ echoed: { query: "eng" } });
+    });
+
+    it("normalizes a zero-argument call to empty args", async () => {
+      // Guests may call mux.tool() with no arguments. Providers always send an
+      // args object and downstream consumers (MCP servers, Zod object schemas)
+      // assume one — undefined must become {} so the call behaves like the
+      // provider path instead of dying with an opaque TypeError downstream.
+      const mcpExecute = mock((args: unknown) => ({ echoed: args }));
+      const zodExecute = mock(() => ({ ok: true }));
+      const tools: Record<string, Tool> = {
+        mcp_list: {
+          description: "MCP-style tool with only optional params",
+          inputSchema: jsonSchema<{ limit?: number }>({
+            type: "object",
+            properties: { limit: { type: "number" } },
+          }),
+          execute: (args) => Promise.resolve(mcpExecute(args)),
+        },
+        file_read: createMockTool("file_read", z.object({}), zodExecute),
+      };
+
+      const bridge = new ToolBridge(tools);
+
+      let registeredMux: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+      const mockRegisterObject = mock(
+        (name: string, obj: Record<string, (...args: unknown[]) => Promise<unknown>>) => {
+          if (name === "mux") registeredMux = obj;
+          return undefined;
+        }
+      );
+      bridge.register(createMockRuntime({ registerObject: mockRegisterObject }));
+
+      const mcpList = registeredMux.mcp_list as (...args: unknown[]) => Promise<unknown>;
+      await mcpList();
+      expect(mcpExecute).toHaveBeenCalledWith({});
+
+      const fileRead = registeredMux.file_read as (...args: unknown[]) => Promise<unknown>;
+      await fileRead();
+      expect(zodExecute).toHaveBeenCalledTimes(1);
     });
 
     it("honors a jsonSchema wrapper's custom validator (reject + normalize)", async () => {
@@ -784,5 +831,307 @@ describe("ToolBridge", () => {
         }
       });
     });
+  });
+});
+
+describe("attachment part stripping", () => {
+  const mediaPart = {
+    type: "media" as const,
+    data: "BASE64DATA",
+    mediaType: "image/png",
+    filename: "board.png",
+  };
+  const contentResult = {
+    type: "content",
+    value: [{ type: "text", text: "[Attachment prepared: board.png]" }, mediaPart],
+  };
+
+  function registerCapturingXum(bridge: ToolBridge) {
+    const captured: { xum: Record<string, (...args: unknown[]) => Promise<unknown>> } = { xum: {} };
+    const runtime = createMockRuntime({
+      registerObject: (
+        name: string,
+        obj: Record<string, (...args: unknown[]) => Promise<unknown>>
+      ) => {
+        if (name === "xum") {
+          captured.xum = obj;
+        }
+      },
+    });
+    bridge.register(runtime);
+    return { captured, runtime };
+  }
+
+  it("strips media from bridged content results and drains it per runtime", async () => {
+    const bridge = new ToolBridge({
+      attach_file: createMockTool(
+        "attach_file",
+        z.object({ path: z.string() }),
+        () => contentResult
+      ),
+    });
+    const { captured, runtime } = registerCapturingXum(bridge);
+
+    const sandboxValue = (await captured.xum.attach_file({ path: "/board.png" })) as {
+      type: string;
+      value: Array<{ type: string; text?: string }>;
+    };
+    expect(JSON.stringify(sandboxValue)).not.toContain("BASE64DATA");
+    expect(sandboxValue.type).toBe("content");
+    expect(sandboxValue.value).toHaveLength(2);
+    expect(sandboxValue.value[1]).toEqual({ type: "text", text: MEDIA_DATA_STUB });
+
+    expect(bridge.drainPendingAttachments(runtime)).toEqual([mediaPart]);
+    // Drain empties the pending set
+    expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
+  });
+
+  it("attributes stripped media to the invoking runtime", async () => {
+    const bridge = new ToolBridge({
+      attach_file: createMockTool(
+        "attach_file",
+        z.object({ path: z.string() }),
+        () => contentResult
+      ),
+    });
+    const a = registerCapturingXum(bridge);
+    const b = registerCapturingXum(bridge);
+
+    await a.captured.xum.attach_file({ path: "/a.png" });
+    expect(bridge.drainPendingAttachments(b.runtime)).toEqual([]);
+    expect(bridge.drainPendingAttachments(a.runtime)).toEqual([mediaPart]);
+
+    await b.captured.xum.attach_file({ path: "/b.png" });
+    expect(bridge.drainPendingAttachments(b.runtime)).toEqual([mediaPart]);
+  });
+
+  it("counts supported media metadata toward the aggregate budget", async () => {
+    const bigData = "a".repeat(MAX_PENDING_ATTACHMENT_BYTES - 512);
+    const bigPart = { type: "media", data: bigData, mediaType: "image/png" };
+    const oversizedFilename = "x".repeat(1024);
+    const smallPart = {
+      type: "media",
+      data: "b",
+      mediaType: "application/pdf",
+      filename: oversizedFilename,
+    };
+    const bridge = new ToolBridge({
+      attach_file: createMockTool("attach_file", z.object({ path: z.string() }), (args) =>
+        (args as { path: string }).path === "/big.png"
+          ? { type: "content", value: [bigPart] }
+          : { type: "content", value: [smallPart] }
+      ),
+    });
+    const { captured, runtime } = registerCapturingXum(bridge);
+
+    const first = (await captured.xum.attach_file({ path: "/big.png" })) as {
+      value: Array<{ type: string; text?: string }>;
+    };
+    expect(first.value[0]).toEqual({ type: "text", text: MEDIA_DATA_STUB });
+
+    // Second attach would push the aggregate over budget: it must be refused
+    // with the budget stub and must NOT be carried host-side.
+    const second = (await captured.xum.attach_file({ path: "/small.pdf" })) as {
+      value: Array<{ type: string; text?: string }>;
+    };
+    expect(second.value[0]).toEqual({ type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB });
+    expect(JSON.stringify(second)).not.toContain(oversizedFilename);
+
+    const drained = bridge.drainPendingAttachments(runtime);
+    expect(drained).toHaveLength(1);
+    expect(drained[0].data).toBe(bigData);
+  });
+
+  it("caps carried attachment parts per execution", async () => {
+    const total = MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST + 2;
+    const parts = Array.from({ length: total }, (_, index) => ({
+      type: "media",
+      data: "data-" + index,
+      mediaType: "image/png",
+    }));
+    const bridge = new ToolBridge({
+      attach_file: createMockTool("attach_file", z.object({ path: z.string() }), () => ({
+        type: "content",
+        value: parts,
+      })),
+    });
+    const { captured, runtime } = registerCapturingXum(bridge);
+
+    const sandboxValue = (await captured.xum.attach_file({ path: "/many" })) as {
+      value: Array<{ type: string; text?: string }>;
+    };
+    expect(sandboxValue.value).toHaveLength(total);
+    expect(sandboxValue.value.slice(MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST)).toEqual([
+      { type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB },
+      { type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB },
+    ]);
+    expect(bridge.drainPendingAttachments(runtime)).toHaveLength(
+      MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST
+    );
+  });
+
+  it("register clears stale pending attachments for that runtime", async () => {
+    const bridge = new ToolBridge({
+      attach_file: createMockTool(
+        "attach_file",
+        z.object({ path: z.string() }),
+        () => contentResult
+      ),
+    });
+    const { captured, runtime } = registerCapturingXum(bridge);
+    await captured.xum.attach_file({ path: "/board.png" });
+
+    // Re-register simulates the next execution's setup: stale media from a
+    // crashed prior eval must not leak into the new eval's drain.
+    bridge.register(runtime);
+    expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
+  });
+
+  it("leaves non-content results unchanged but strips unsupported media", async () => {
+    const bashResult = { success: true, output: "plain output" };
+    const unsupportedMedia = {
+      type: "content",
+      value: [{ type: "media", data: "RAWBYTES", mediaType: "application/x-custom" }],
+    };
+    const bridge = new ToolBridge({
+      bash: createMockTool("bash", z.object({ script: z.string() }), () => bashResult),
+      attach_file: createMockTool(
+        "attach_file",
+        z.object({ path: z.string() }),
+        () => unsupportedMedia
+      ),
+    });
+    const { captured, runtime } = registerCapturingXum(bridge);
+
+    expect(await captured.xum.bash({ script: "true" })).toEqual(bashResult);
+    const sandboxValue = (await captured.xum.attach_file({ path: "/x.bin" })) as {
+      value: Array<{ type: string; text?: string }>;
+    };
+    expect(sandboxValue.value[0]).toEqual({
+      type: "text",
+      text: mediaUnsupportedStub("application/x-custom"),
+    });
+    // Unsupported media is discarded rather than forwarded to the provider.
+    expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
+  });
+
+  it("bounds unsupported media types in sandbox-visible placeholders", async () => {
+    const oversizedMediaType = `audio/${"x".repeat(4096)}`;
+    const bridge = new ToolBridge({
+      attach_file: createMockTool("attach_file", z.object({ path: z.string() }), () => ({
+        type: "content",
+        value: [{ type: "media", data: "", mediaType: oversizedMediaType }],
+      })),
+    });
+    const { captured, runtime } = registerCapturingXum(bridge);
+
+    const sandboxValue = await captured.xum.attach_file({ path: "/audio.bin" });
+    const serialized = JSON.stringify(sandboxValue);
+    expect(serialized.length).toBeLessThan(512);
+    expect(serialized).not.toContain("x".repeat(200));
+    expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
+  });
+
+  it("counts discarded unsupported media against the aggregate budget", async () => {
+    const bigData = "a".repeat(MAX_PENDING_ATTACHMENT_BYTES - 512);
+    const bridge = new ToolBridge({
+      attach_file: createMockTool("attach_file", z.object({ path: z.string() }), (args) =>
+        (args as { path: string }).path === "/audio.bin"
+          ? {
+              type: "content",
+              value: [{ type: "media", data: bigData, mediaType: "audio/wav" }],
+            }
+          : {
+              type: "content",
+              value: [{ type: "media", data: "b".repeat(1024), mediaType: "image/png" }],
+            }
+      ),
+    });
+    const { captured, runtime } = registerCapturingXum(bridge);
+
+    const unsupported = (await captured.xum.attach_file({ path: "/audio.bin" })) as {
+      value: Array<{ type: string; text?: string }>;
+    };
+    expect(unsupported.value[0]).toEqual({ type: "text", text: mediaUnsupportedStub("audio/wav") });
+
+    const supported = (await captured.xum.attach_file({ path: "/image.png" })) as {
+      value: Array<{ type: string; text?: string }>;
+    };
+    expect(supported.value[0]).toEqual({ type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB });
+    expect(bridge.drainPendingAttachments(runtime)).toEqual([]);
+  });
+
+  it("strips display_file parts onto the carrier with a display stub", async () => {
+    const displayPart = {
+      type: "display_file" as const,
+      data: "RElTUExBWQ==",
+      mediaType: "text/markdown",
+      filename: "notes.md",
+      providerOptions: { mux: { displayOnly: true as const, size: 7 } },
+    };
+    const displayResult = {
+      type: "content",
+      value: [{ type: "text", text: "[File shown to user: notes.md]" }, displayPart],
+    };
+    const bridge = new ToolBridge({
+      attach_file: createMockTool(
+        "attach_file",
+        z.object({ path: z.string() }),
+        () => displayResult
+      ),
+    });
+    const { captured, runtime } = registerCapturingXum(bridge);
+
+    // Display-only bytes are user-preview data, but leaving them inline lets
+    // guests grow host-side records without bound: they ride the carrier and
+    // render from the code_execution card instead of the nested result.
+    const sandboxValue = (await captured.xum.attach_file({ path: "/notes.md" })) as {
+      value: Array<{ type: string; data?: string; filename?: string }>;
+    };
+    expect(JSON.stringify(sandboxValue)).not.toContain("RElTUExBWQ==");
+    expect(sandboxValue.value[1].type).toBe("display_file");
+    expect(sandboxValue.value[1].data).toBe(DISPLAY_DATA_STUB);
+    expect(sandboxValue.value[1].filename).toBe("notes.md");
+
+    expect(bridge.drainPendingAttachments(runtime)).toEqual([displayPart]);
+  });
+
+  it("counts display_file metadata toward the aggregate attachment budget", async () => {
+    const bigData = "a".repeat(MAX_PENDING_ATTACHMENT_BYTES - 512);
+    const oversizedMetadata = "x".repeat(1024);
+    const bridge = new ToolBridge({
+      attach_file: createMockTool("attach_file", z.object({ path: z.string() }), (args) =>
+        (args as { path: string }).path === "/big.png"
+          ? { type: "content", value: [{ type: "media", data: bigData, mediaType: "image/png" }] }
+          : {
+              type: "content",
+              value: [
+                {
+                  type: "display_file",
+                  data: "b",
+                  mediaType: "text/markdown",
+                  providerOptions: {
+                    mux: { displayOnly: true, size: 1 },
+                    external: oversizedMetadata,
+                  },
+                },
+              ],
+            }
+      ),
+    });
+    const { captured, runtime } = registerCapturingXum(bridge);
+
+    await captured.xum.attach_file({ path: "/big.png" });
+    // The media part above nearly exhausted the shared budget: the display
+    // part must be refused with the budget stub and not carried host-side.
+    const second = (await captured.xum.attach_file({ path: "/notes.md" })) as {
+      value: Array<{ type: string; text?: string }>;
+    };
+    expect(second.value[0]).toEqual({ type: "text", text: MEDIA_BUDGET_EXCEEDED_STUB });
+    expect(JSON.stringify(second)).not.toContain(oversizedMetadata);
+
+    const drained = bridge.drainPendingAttachments(runtime);
+    expect(drained).toHaveLength(1);
+    expect(drained[0].type).toBe("media");
   });
 });

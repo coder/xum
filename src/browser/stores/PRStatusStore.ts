@@ -3,13 +3,13 @@
  *
  * Architecture:
  * - Lives outside React lifecycle (stable references)
- * - Detects workspace PR from current branch via `gh pr view`
+ * - Detects workspace PR via branch, tracked merge ref, then commit SHA fallbacks
  * - Caches status with TTL
  * - Refreshes on focus (like GitStatusStore)
  * - Notifies subscribers when status changes
  *
  * PR detection:
- * - Branch-based: Runs `gh pr view` without URL to detect PR for current branch
+ * - Tries `gh pr view` for the current branch, its tracked merge ref, then its commit SHA
  */
 
 import type { RouterClient } from "@orpc/server";
@@ -57,6 +57,26 @@ const STACK_CACHE_TTL_MS = 60_000;
 // GraphQL query for merge queue data (not available in `gh pr view --json`).
 const MERGE_QUEUE_QUERY =
   "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){mergeQueueEntry{state position}}}}";
+
+export const DETECT_PR_SCRIPT = `fields='number,url,state,mergeable,mergeStateStatus,title,isDraft,headRefName,baseRefName,statusCheckRollup'
+if out=$(gh pr view --json "$fields" 2>/dev/null); then printf '%s\n' "$out"; exit 0; fi
+branch=$(git branch --show-current 2>/dev/null)
+merge_ref=$(git config "branch.$branch.merge" 2>/dev/null)
+merge_ref=\${merge_ref#refs/heads/}
+# The tracked merge ref covers local branches tracking a differently named remote branch.
+if [ -n "$merge_ref" ] && [ "$merge_ref" != "$branch" ]; then
+  if out=$(gh pr view "$merge_ref" --json "$fields" 2>/dev/null); then printf '%s\n' "$out"; exit 0; fi
+fi
+sha=$(git rev-parse HEAD 2>/dev/null)
+if [ -n "$sha" ]; then
+  # The SHA lookup is the only fallback with zero local hints after a differently named refspec push.
+  # Open-only avoids matching the merged PR that introduced an ancestor of a fresh workspace HEAD.
+  num=$(gh api "repos/{owner}/{repo}/commits/$sha/pulls" --jq '[.[] | select(.state == "open")][0].number' 2>/dev/null)
+  if [ -n "$num" ] && [ "$num" != "null" ]; then
+    if out=$(gh pr view "$num" --json "$fields" 2>/dev/null); then printf '%s\n' "$out"; exit 0; fi
+  fi
+fi
+echo '{"no_pr":true}'`;
 
 interface PersistedPRStatus {
   prLink: GitHubPRLink | null;
@@ -595,7 +615,7 @@ export class PRStatusStore {
   }
 
   /**
-   * Detect PR for workspace's current branch via `gh pr view`.
+   * Detect a workspace PR using branch, tracked merge ref, and commit SHA fallbacks.
    */
   private async detectWorkspacePR(workspaceId: string): Promise<void> {
     if (!this.client || !this.isActive) return;
@@ -611,13 +631,12 @@ export class PRStatusStore {
     this.workspacePRSubscriptions.bump(workspaceId);
 
     try {
-      // Run gh pr view without URL - detects PR for current branch
       const result = await this.client.workspace.executeBash({
         workspaceId,
-        script: `gh pr view --json number,url,state,mergeable,mergeStateStatus,title,isDraft,headRefName,baseRefName,statusCheckRollup 2>/dev/null || echo '{"no_pr":true}'`,
+        script: DETECT_PR_SCRIPT,
         // gh requires the runtime environment for devcontainer workspaces where
         // the CLI / auth may only exist inside the container.
-        options: repoRootBashOptions(15),
+        options: repoRootBashOptions(30),
       });
 
       if (!this.isActive) return;

@@ -9,6 +9,7 @@ import {
   appendEvents,
   CHAT_FILE_NAME,
   clearWorkspaceAnalyticsState,
+  deleteCorruptAnalyticsRows,
   getCurrentPricingFingerprint,
   ingestWorkspace,
   parseWorkspaceFromDisk,
@@ -290,7 +291,7 @@ describe("rebuildAll", () => {
 
     const result = await rebuildAll(conn, createMissingSessionsDir());
 
-    expect(result).toEqual({ workspacesIngested: 0 });
+    expect(result).toEqual({ workspacesIngested: 0, failedWorkspaceIds: new Set() });
     expect(getSqlStatements(runMock)).toEqual([
       "BEGIN TRANSACTION",
       "DELETE FROM events",
@@ -340,8 +341,30 @@ describe("rebuildAll", () => {
 
     const result = await rebuildAll(conn, sessionsDir, {});
 
-    expect(result).toEqual({ workspacesIngested: 1 });
+    expect(result.workspacesIngested).toBe(1);
     expect(await queryEventCount(conn)).toBe(1);
+  });
+
+  test("reports metadata-stage failures so the sweep preserves already-appended rows", async () => {
+    const conn = await createTestConn();
+    const sessionsDir = await createTempSessionDir();
+
+    // Chat parses and appends fine, but the unreadable sidecar (a directory)
+    // throws in ingestHeadlessUsage before the watermark write.
+    const workspaceDir = path.join(sessionsDir, "ws-meta-fail");
+    await fs.mkdir(workspaceDir, { recursive: true });
+    await writeChatJsonl(workspaceDir, [makeUserLine(), makeAssistantLine()]);
+    await fs.mkdir(path.join(workspaceDir, "headless-usage.jsonl"));
+
+    const result = await rebuildAll(conn, sessionsDir, {});
+
+    expect(result.failedWorkspaceIds).toEqual(new Set(["ws-meta-fail"]));
+    expect(await queryEventCount(conn, "ws-meta-fail")).toBe(1);
+
+    // The post-rebuild sweep runs with exactly this failure set; the
+    // watermark-less rows must survive it.
+    expect(await deleteCorruptAnalyticsRows(conn, result.failedWorkspaceIds)).toBe(0);
+    expect(await queryEventCount(conn, "ws-meta-fail")).toBe(1);
   });
 });
 
@@ -1216,7 +1239,7 @@ describe("ingestArchivedSubagentTranscripts", () => {
 
     const result = await rebuildAll(conn, sessionsDir);
 
-    expect(result).toEqual({ workspacesIngested: 1 });
+    expect(result).toEqual({ workspacesIngested: 1, failedWorkspaceIds: new Set() });
     expect(await queryEventCount(conn)).toBe(2);
     expect(await queryEventCount(conn, parentWorkspaceId)).toBe(1);
     expect(await queryEventCount(conn, childWorkspaceId)).toBe(1);
@@ -1632,5 +1655,136 @@ describe("pricing fingerprint", () => {
     // Idempotent upsert: storing again keeps a single row with the same value.
     await storePricingFingerprint(conn);
     expect(await readStoredPricingFingerprint(conn)).toBe(getCurrentPricingFingerprint());
+  });
+});
+
+describe("deleteCorruptAnalyticsRows", () => {
+  async function seedWatermark(conn: DuckDBConnection, workspaceId: string): Promise<void> {
+    await conn.run(
+      "INSERT INTO ingest_watermarks (workspace_id, last_sequence, last_modified) VALUES (?, ?, ?)",
+      [workspaceId, 1, 1]
+    );
+  }
+
+  test("deletes corrupt rows while keeping healthy rows", async () => {
+    const conn = await createTestConn();
+
+    // Migrated legacy IDs are `${projectBasename}-${workspaceBasename}` with
+    // no length limit (up to 2x NAME_MAX + 1 = 511 chars) and must survive.
+    const legacyId = `${"p".repeat(255)}-${"w".repeat(255)}`;
+    // Custom-provider model IDs have no schema max length; an extremely long
+    // model on an otherwise-healthy row must never be deletion evidence.
+    const longModel = `custom:${"m".repeat(2000)}`;
+
+    for (const workspaceId of ["ws-healthy", legacyId, "ws-long-model", "parent-healthy"]) {
+      await seedWatermark(conn, workspaceId);
+    }
+
+    for (const [workspaceId, model, cost] of [
+      ["ws-healthy", "anthropic:claude-haiku-4-5", 1.0],
+      [legacyId, "anthropic:claude-haiku-4-5", 2.0],
+      ["ws-long-model", longModel, 3.0],
+      // Large-batch phantom: concatenated identifiers exceed the length caps.
+      ["x".repeat(2000), "anthropic:claude-haiku-4-5".repeat(100), 0.05],
+      // Small-batch phantom: two concatenated 10-char workspace IDs stay far
+      // under the length caps but can never match a real watermark.
+      ["aaaaabbbbbcccccddddd", "openai:gpt-5.6-solopenai:gpt-5.6-sol", 0.05],
+    ] as const) {
+      await conn.run("INSERT INTO events (workspace_id, model, total_cost_usd) VALUES (?, ?, ?)", [
+        workspaceId,
+        model,
+        cost,
+      ]);
+    }
+
+    for (const [parent, child] of [
+      ["parent-healthy", "child-healthy"],
+      // A rollup may outlive its removed child workspace; only the parent
+      // must be a known workspace.
+      ["parent-healthy", "child-removed"],
+      ["p".repeat(2000), "child-corrupt"],
+      // Small-batch phantom parent: unknown to watermarks.
+      ["par-aaaaapar-bbbbb", "child-x"],
+    ] as const) {
+      await conn.run(
+        `INSERT INTO delegation_rollups (parent_workspace_id, child_workspace_id, model)
+         VALUES (?, ?, ?)`,
+        [parent, child, "openai:gpt-5.6-sol"]
+      );
+    }
+
+    expect(await deleteCorruptAnalyticsRows(conn)).toBe(4);
+
+    const eventRows = await queryRows(
+      conn,
+      "SELECT workspace_id FROM events ORDER BY LENGTH(workspace_id)"
+    );
+    expect(eventRows).toEqual([
+      { workspace_id: "ws-healthy" },
+      { workspace_id: "ws-long-model" },
+      { workspace_id: legacyId },
+    ]);
+    const rollupRows = await queryRows(
+      conn,
+      "SELECT child_workspace_id FROM delegation_rollups ORDER BY child_workspace_id"
+    );
+    expect(rollupRows).toEqual([
+      { child_workspace_id: "child-healthy" },
+      { child_workspace_id: "child-removed" },
+    ]);
+
+    // Idempotent: nothing left to delete.
+    expect(await deleteCorruptAnalyticsRows(conn)).toBe(0);
+  });
+
+  test("exempts failed-ingest workspaces from watermark evidence but not length evidence", async () => {
+    const conn = await createTestConn();
+
+    // A poison record makes this workspace's ingest throw before its
+    // watermark write on every retry; its real partial rows must survive
+    // the post-sync sweep or the workspace's spend disappears permanently.
+    await conn.run("INSERT INTO events (workspace_id, model, total_cost_usd) VALUES (?, ?, ?)", [
+      "ws-failed-ingest",
+      "anthropic:claude-haiku-4-5",
+      1.0,
+    ]);
+    await conn.run(
+      `INSERT INTO delegation_rollups (parent_workspace_id, child_workspace_id, model)
+       VALUES (?, ?, ?)`,
+      ["ws-failed-ingest", "child-a", "openai:gpt-5.6-sol"]
+    );
+    // Length evidence is structural corruption regardless of exemption.
+    await conn.run(
+      "INSERT INTO events (workspace_id, parent_workspace_id, model) VALUES (?, ?, ?)",
+      ["ws-failed-ingest", "x".repeat(2000), "anthropic:claude-haiku-4-5"]
+    );
+
+    expect(await deleteCorruptAnalyticsRows(conn, new Set(["ws-failed-ingest"]))).toBe(1);
+
+    const eventRows = await queryRows(conn, "SELECT workspace_id, model FROM events");
+    expect(eventRows).toEqual([
+      { workspace_id: "ws-failed-ingest", model: "anthropic:claude-haiku-4-5" },
+    ]);
+    expect(await queryRows(conn, "SELECT child_workspace_id FROM delegation_rollups")).toEqual([
+      { child_workspace_id: "child-a" },
+    ]);
+
+    // A later pass without the exemption treats the same rows as orphans.
+    expect(await deleteCorruptAnalyticsRows(conn)).toBe(2);
+  });
+
+  test("keeps rollups whose legacy agent_type is arbitrarily long", async () => {
+    const conn = await createTestConn();
+    await seedWatermark(conn, "parent-legacy");
+
+    // Legacy metadata and rollup entries accept unbounded agent types, so
+    // agent_type length alone is never corruption evidence.
+    await conn.run(
+      `INSERT INTO delegation_rollups (parent_workspace_id, child_workspace_id, agent_type, model)
+       VALUES (?, ?, ?, ?)`,
+      ["parent-legacy", "child-a", "t".repeat(2000), "openai:gpt-5.6-sol"]
+    );
+
+    expect(await deleteCorruptAnalyticsRows(conn)).toBe(0);
   });
 });

@@ -16,7 +16,11 @@ import {
 } from "@/common/utils/tools/toolDefinitions";
 import { shellQuote } from "@/common/utils/shell";
 import { execBuffered } from "@/node/utils/runtime/helpers";
-import { gitNoHooksPrefix } from "@/node/utils/gitNoHooksEnv";
+import {
+  gitEnvPrefix,
+  gitHooksAllowed,
+  gitNoRepoAutomationEnvForRuntimeRepo,
+} from "@/node/utils/gitNoHooksEnv";
 import { isPathInsideDir } from "@/node/utils/pathUtils";
 import {
   getSubagentGitPatchMboxPath,
@@ -103,12 +107,23 @@ function mergeNotes(...notes: Array<string | undefined>): string | undefined {
   return parts.length > 0 ? parts.join("\n") : undefined;
 }
 
+async function gitNoRepoAutomationPrefixForRuntime(params: {
+  runtime: ToolConfiguration["runtime"];
+  cwd: string;
+  trusted: boolean;
+}): Promise<string> {
+  if (gitHooksAllowed(params.trusted)) return "";
+
+  return gitEnvPrefix(await gitNoRepoAutomationEnvForRuntimeRepo(params.runtime, params.cwd));
+}
+
 async function tryRevParseHead(params: {
   runtime: ToolConfiguration["runtime"];
   cwd: string;
+  gitPrefix: string;
 }): Promise<string | undefined> {
   try {
-    const headResult = await execBuffered(params.runtime, "git rev-parse HEAD", {
+    const headResult = await execBuffered(params.runtime, `${params.gitPrefix}git rev-parse HEAD`, {
       cwd: params.cwd,
       timeout: 10,
     });
@@ -128,6 +143,7 @@ async function getAppliedCommits(params: {
   beforeHeadSha: string | undefined;
   commitCountHint: number | undefined;
   includeSha: boolean;
+  gitPrefix: string;
 }): Promise<AppliedCommit[]> {
   const format = "%H%x00%s";
 
@@ -136,7 +152,7 @@ async function getAppliedCommits(params: {
     includeSha: boolean;
   }): Promise<AppliedCommit[] | undefined> {
     try {
-      const result = await execBuffered(params.runtime, args.cmd, {
+      const result = await execBuffered(params.runtime, params.gitPrefix + args.cmd, {
         cwd: params.cwd,
         timeout: 30,
       });
@@ -229,14 +245,19 @@ function parseFailedPatchSubjectFromGitAmOutput(output: string): string | undefi
 async function tryGetConflictPaths(params: {
   runtime: ToolConfiguration["runtime"];
   cwd: string;
+  gitPrefix: string;
 }): Promise<string[]> {
   assert(params.cwd.length > 0, "tryGetConflictPaths: cwd must be non-empty");
 
   try {
-    const diffResult = await execBuffered(params.runtime, "git diff --name-only --diff-filter=U", {
-      cwd: params.cwd,
-      timeout: 30,
-    });
+    const diffResult = await execBuffered(
+      params.runtime,
+      `${params.gitPrefix}git diff --name-only --diff-filter=U`,
+      {
+        cwd: params.cwd,
+        timeout: 30,
+      }
+    );
 
     if (diffResult.exitCode !== 0) {
       log.debug("task_apply_git_patch: git diff --name-only --diff-filter=U failed", {
@@ -266,13 +287,14 @@ async function tryGetConflictPaths(params: {
 async function isGitAmInProgress(params: {
   runtime: ToolConfiguration["runtime"];
   cwd: string;
+  gitPrefix: string;
 }): Promise<boolean> {
   assert(params.cwd.length > 0, "isGitAmInProgress: cwd must be non-empty");
 
   try {
     const checkResult = await execBuffered(
       params.runtime,
-      'test -d "$(git rev-parse --git-path rebase-apply)"',
+      `test -d "$(${params.gitPrefix}git rev-parse --git-path rebase-apply)"`,
       {
         cwd: params.cwd,
         timeout: 30,
@@ -955,10 +977,11 @@ async function checkDirtyPatchPathOverlap(params: {
   cwd: string;
   remotePatchPath: string;
   threeWay: boolean;
+  gitPrefix: string;
 }): Promise<{ error: string; conflictPaths?: string[] } | undefined> {
   const statusResult = await execBuffered(
     params.runtime,
-    "git status --porcelain -z --untracked-files=all",
+    `${params.gitPrefix}git status --porcelain -z --untracked-files=all`,
     {
       cwd: params.cwd,
       timeout: 10,
@@ -975,7 +998,7 @@ async function checkDirtyPatchPathOverlap(params: {
 
   const cachedResult = await execBuffered(
     params.runtime,
-    "git diff-index --cached --name-only -z HEAD --",
+    `${params.gitPrefix}git diff-index --cached --name-only -z HEAD --`,
     {
       cwd: params.cwd,
       timeout: 10,
@@ -1002,7 +1025,7 @@ async function checkDirtyPatchPathOverlap(params: {
   )}`;
   const numstatResult = await execBuffered(
     params.runtime,
-    `${patchBodyCommand} | git apply --numstat -z`,
+    `${patchBodyCommand} | ${params.gitPrefix}git apply --numstat -z`,
     {
       cwd: params.cwd,
       timeout: 30,
@@ -1078,11 +1101,16 @@ async function checkExpectedHead(params: {
   runtime: ToolConfiguration["runtime"];
   cwd: string;
   expectedHeadSha?: string;
+  gitPrefix: string;
 }): Promise<string | undefined> {
   if (params.expectedHeadSha == null) {
     return undefined;
   }
-  const currentHeadSha = await tryRevParseHead({ runtime: params.runtime, cwd: params.cwd });
+  const currentHeadSha = await tryRevParseHead({
+    runtime: params.runtime,
+    cwd: params.cwd,
+    gitPrefix: params.gitPrefix,
+  });
   if (currentHeadSha == null) {
     return "Could not determine current HEAD before applying patch.";
   }
@@ -1160,10 +1188,16 @@ async function applyProjectPatch(params: {
     };
   }
 
+  const gitPrefix = await gitNoRepoAutomationPrefixForRuntime({
+    runtime: params.runtime,
+    cwd: params.repoCwd,
+    trusted: params.trusted,
+  });
   const expectedHeadError = await checkExpectedHead({
     runtime: params.runtime,
     cwd: params.repoCwd,
     expectedHeadSha: params.expectedHeadSha,
+    gitPrefix,
   });
   if (expectedHeadError != null) {
     return {
@@ -1188,8 +1222,7 @@ async function applyProjectPatch(params: {
 
     const flags: string[] = [];
     if (params.threeWay) flags.push("--3way");
-
-    const nhp = gitNoHooksPrefix(params.trusted);
+    if (!gitHooksAllowed(params.trusted)) flags.push("--no-gpg-sign");
 
     if (params.dryRun) {
       const dryRunDirtyOverlap = await checkDirtyPatchPathOverlap({
@@ -1197,6 +1230,7 @@ async function applyProjectPatch(params: {
         cwd: params.repoCwd,
         remotePatchPath,
         threeWay: params.threeWay,
+        gitPrefix,
       });
       if (dryRunDirtyOverlap != null) {
         return {
@@ -1219,6 +1253,7 @@ async function applyProjectPatch(params: {
         runtime: params.runtime,
         cwd: params.repoCwd,
         expectedHeadSha: params.expectedHeadSha,
+        gitPrefix,
       });
       if (dryRunHeadError != null) {
         return {
@@ -1241,7 +1276,7 @@ async function applyProjectPatch(params: {
 
       const addResult = await execBuffered(
         params.runtime,
-        `${nhp}git worktree add --detach ${shellQuote(dryRunWorktreePath)} HEAD`,
+        `${gitPrefix}git worktree add --detach ${shellQuote(dryRunWorktreePath)} HEAD`,
         { cwd: params.repoCwd, timeout: 60 }
       );
       if (addResult.exitCode !== 0) {
@@ -1260,9 +1295,10 @@ async function applyProjectPatch(params: {
         const beforeHeadSha = await tryRevParseHead({
           runtime: params.runtime,
           cwd: dryRunWorktreePath,
+          gitPrefix,
         });
 
-        const amCmd = `${nhp}git am ${flags.join(" ")} ${shellQuote(remotePatchPath)}`.trim();
+        const amCmd = `${gitPrefix}git am ${flags.join(" ")} ${shellQuote(remotePatchPath)}`.trim();
         const amResult = await execBuffered(params.runtime, amCmd, {
           cwd: dryRunWorktreePath,
           timeout: 300,
@@ -1279,6 +1315,7 @@ async function applyProjectPatch(params: {
           const conflictPaths = await tryGetConflictPaths({
             runtime: params.runtime,
             cwd: dryRunWorktreePath,
+            gitPrefix,
           });
           const failedPatchSubject = parseFailedPatchSubjectFromGitAmOutput(errorOutput);
 
@@ -1308,6 +1345,7 @@ async function applyProjectPatch(params: {
           beforeHeadSha,
           commitCountHint: params.projectArtifact.commitCount,
           includeSha: false,
+          gitPrefix,
         });
 
         return {
@@ -1322,7 +1360,7 @@ async function applyProjectPatch(params: {
         };
       } finally {
         try {
-          const abortResult = await execBuffered(params.runtime, `${nhp}git am --abort`, {
+          const abortResult = await execBuffered(params.runtime, `${gitPrefix}git am --abort`, {
             cwd: dryRunWorktreePath,
             timeout: 30,
           });
@@ -1350,7 +1388,7 @@ async function applyProjectPatch(params: {
         try {
           const removeResult = await execBuffered(
             params.runtime,
-            `${nhp}git worktree remove --force ${shellQuote(dryRunWorktreePath)}`,
+            `${gitPrefix}git worktree remove --force ${shellQuote(dryRunWorktreePath)}`,
             { cwd: params.repoCwd, timeout: 60 }
           );
           if (removeResult.exitCode !== 0) {
@@ -1375,7 +1413,7 @@ async function applyProjectPatch(params: {
         }
 
         try {
-          const pruneResult = await execBuffered(params.runtime, "git worktree prune", {
+          const pruneResult = await execBuffered(params.runtime, `${gitPrefix}git worktree prune`, {
             cwd: params.repoCwd,
             timeout: 60,
           });
@@ -1408,6 +1446,7 @@ async function applyProjectPatch(params: {
       cwd: params.repoCwd,
       remotePatchPath,
       threeWay: params.threeWay,
+      gitPrefix,
     });
     if (dirtyOverlap != null) {
       return {
@@ -1430,6 +1469,7 @@ async function applyProjectPatch(params: {
       runtime: params.runtime,
       cwd: params.repoCwd,
       expectedHeadSha: params.expectedHeadSha,
+      gitPrefix,
     });
     if (applyHeadError != null) {
       return {
@@ -1444,9 +1484,13 @@ async function applyProjectPatch(params: {
       };
     }
 
-    const beforeHeadSha = await tryRevParseHead({ runtime: params.runtime, cwd: params.repoCwd });
+    const beforeHeadSha = await tryRevParseHead({
+      runtime: params.runtime,
+      cwd: params.repoCwd,
+      gitPrefix,
+    });
 
-    const amCmd = `${nhp}git am ${flags.join(" ")} ${shellQuote(remotePatchPath)}`.trim();
+    const amCmd = `${gitPrefix}git am ${flags.join(" ")} ${shellQuote(remotePatchPath)}`.trim();
     const amResult = await execBuffered(params.runtime, amCmd, {
       cwd: params.repoCwd,
       timeout: 300,
@@ -1463,11 +1507,13 @@ async function applyProjectPatch(params: {
       const conflictPaths = await tryGetConflictPaths({
         runtime: params.runtime,
         cwd: params.repoCwd,
+        gitPrefix,
       });
       const failedPatchSubject = parseFailedPatchSubjectFromGitAmOutput(errorOutput);
       const gitAmInProgress = await isGitAmInProgress({
         runtime: params.runtime,
         cwd: params.repoCwd,
+        gitPrefix,
       });
       const conflictRecoveryNote =
         conflictPaths.length > 0 || gitAmInProgress
@@ -1489,7 +1535,11 @@ async function applyProjectPatch(params: {
       };
     }
 
-    const headCommitSha = await tryRevParseHead({ runtime: params.runtime, cwd: params.repoCwd });
+    const headCommitSha = await tryRevParseHead({
+      runtime: params.runtime,
+      cwd: params.repoCwd,
+      gitPrefix,
+    });
 
     const appliedCommits = await getAppliedCommits({
       runtime: params.runtime,
@@ -1497,6 +1547,7 @@ async function applyProjectPatch(params: {
       beforeHeadSha,
       commitCountHint: params.projectArtifact.commitCount,
       includeSha: true,
+      gitPrefix,
     });
 
     if (!params.isReplay) {

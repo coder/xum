@@ -802,6 +802,48 @@ describe("Config", () => {
     });
   });
 
+  describe("legacy PTC exclusive taskExperiments alias", () => {
+    it("aliases programmaticToolCallingExclusive onto programmaticToolCalling at load time", () => {
+      // Tasks stamped by pre-merge builds may carry only the exclusive flag;
+      // loadConfigOrDefault does not parse workspaces through
+      // WorkspaceConfigSchema, so the runtime loader must apply the alias
+      // itself or resumed tasks silently lose PTC (and rlm becomes inert).
+      const configFile = path.join(tempDir, "config.json");
+      fs.writeFileSync(
+        configFile,
+        JSON.stringify({
+          projects: [
+            [
+              "/repo",
+              {
+                workspaces: [
+                  {
+                    path: "/repo/task-ws",
+                    id: "task-ws-1",
+                    name: "task-ws",
+                    taskExperiments: { rlm: true, programmaticToolCallingExclusive: true },
+                  },
+                ],
+              },
+            ],
+          ],
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      const workspaces = (loaded.projects.get("/repo") as Record<string, unknown> | undefined)
+        ?.workspaces;
+      const workspace = Array.isArray(workspaces)
+        ? (workspaces[0] as { taskExperiments?: Record<string, unknown> } | undefined)
+        : undefined;
+
+      expect(workspace?.taskExperiments?.programmaticToolCalling).toBe(true);
+      expect(workspace?.taskExperiments?.rlm).toBe(true);
+      // The legacy key is retained for downgrade compatibility.
+      expect(workspace?.taskExperiments?.programmaticToolCallingExclusive).toBe(true);
+    });
+  });
+
   describe("editConfig", () => {
     it("serializes concurrent edits so no update is lost", async () => {
       // Regression: editConfig used to be a non-serialized read-modify-write

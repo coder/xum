@@ -453,11 +453,8 @@ describe("WorkspaceGoalService", () => {
     // Reconciliation must not pause it — the in-memory kickoff candidate can be
     // lost (restart, eviction), and the next getGoal (heartbeat/wake tool
     // assembly) would otherwise silently pause the goal before it ever ran.
-    // Explicitly pre-goal: the consent arm compares strictly (same-ms fails
-    // closed to pause), so a fast runner landing this append and the goal's
-    // activation stamp in the same millisecond flakes the keep-active path.
     await appendUserHistoryMessage(historyService, workspaceId, "Set yourself a goal", {
-      timestamp: Date.now() - 1_000,
+      timestamp: 10_000,
     });
     await setGoalOk(service, { workspaceId, objective: "Follow chat tail" });
 

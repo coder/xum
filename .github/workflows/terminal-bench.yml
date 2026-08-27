@@ -271,11 +271,27 @@ jobs:
           SAFE_DATASET=$(sanitize "${DATASET:-unknown-dataset}")
           if [ -n "${TASK_NAMES:-}" ]; then
             SAFE_TASKS=$(sanitize "$TASK_NAMES")
+            # GitHub caps artifact names at 256 chars; embedding many task
+            # names made CreateArtifact fail with "invalid length for
+            # artifact name". Truncate and disambiguate with a short hash of
+            # the full selection.
+            if [ "${#SAFE_TASKS}" -gt 80 ]; then
+              TASKS_HASH=$(printf "%s" "$TASK_NAMES" | sha256sum | cut -c1-8)
+              SAFE_TASKS="${SAFE_TASKS:0:80}-h${TASKS_HASH}"
+            fi
           else
             SAFE_TASKS="all-tasks"
           fi
 
           ARTIFACT_NAME="terminal-bench-results-${SAFE_MODEL}-${SAFE_DATASET}-${SAFE_TASKS}-${RUN_ID}-a${RUN_ATTEMPT}"
+          # model_name and dataset are unbounded workflow inputs, so bounding
+          # SAFE_TASKS alone cannot guarantee the 256-char artifact-name limit.
+          # Cap the final composed name and disambiguate with a hash of the
+          # full name (which embeds RUN_ID/RUN_ATTEMPT, preserving uniqueness).
+          if [ "${#ARTIFACT_NAME}" -gt 200 ]; then
+            NAME_HASH=$(printf "%s" "$ARTIFACT_NAME" | sha256sum | cut -c1-8)
+            ARTIFACT_NAME="${ARTIFACT_NAME:0:200}-h${NAME_HASH}"
+          fi
           echo "name=$ARTIFACT_NAME" >> "$GITHUB_OUTPUT"
           echo "Artifact name: $ARTIFACT_NAME"
 

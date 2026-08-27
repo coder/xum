@@ -24,7 +24,13 @@ import { toBashTaskId } from "./taskId";
 import { migrateToBackground } from "@/node/services/backgroundProcessExecutor";
 import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { getToolEnvPath } from "@/node/services/hooks";
-import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
+import {
+  combineGitNoRepoAutomationEnvs,
+  gitHooksAllowed,
+  gitNoRepoAutomationEnv,
+  gitNoRepoAutomationEnvForLocalRepo,
+  gitNoRepoAutomationEnvForRuntimeRepo,
+} from "@/node/utils/gitNoHooksEnv";
 import { getErrorMessage } from "@/common/utils/errors";
 import { emitChatEventBestEffort } from "./toolUtils";
 import type { BackgroundProcessMonitorConfig } from "@/node/services/backgroundProcessManager";
@@ -912,10 +918,36 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
         config.trusted && config.runtime ? await getToolEnvPath(config.runtime, config.cwd) : null;
       const toolEnvPrelude = buildToolEnvPrelude(toolEnvPath);
 
-      // Neutralize git hooks for untrusted projects — prevent repository-controlled
-      // hooks from executing when the model runs git subcommands (for example,
-      // `git commit` or `git am`) through this bash tool.
-      const hooksEnv = config.trusted !== true ? GIT_NO_HOOKS_ENV : {};
+      // Neutralize repo-controlled git automation when trust is absent or the
+      // benchmark kill-switch is active. Repo-aware discovery covers drivers
+      // selected by highest-precedence .git/info/attributes on every runtime.
+      let hooksEnv: Record<string, string> = {};
+      if (!gitHooksAllowed(config.trusted)) {
+        const repoPaths =
+          config.projects != null && config.projects.length > 0
+            ? [
+                ...new Set(
+                  config.projects.map((project) => path.join(config.cwd, project.projectName))
+                ),
+              ]
+            : [config.cwd];
+        const repoEnvs: Array<Record<string, string>> = [];
+        for (const repoPath of repoPaths) {
+          repoEnvs.push(
+            config.runtime instanceof LocalBaseRuntime
+              ? await gitNoRepoAutomationEnvForLocalRepo(repoPath, abortSignal, true)
+              : config.runtime != null
+                ? await gitNoRepoAutomationEnvForRuntimeRepo(
+                    config.runtime,
+                    repoPath,
+                    abortSignal,
+                    true
+                  )
+                : gitNoRepoAutomationEnv()
+          );
+        }
+        hooksEnv = combineGitNoRepoAutomationEnvs(repoEnvs);
+      }
 
       // On Windows, models sometimes emit cmd.exe-style `>nul` / `2>nul` redirections.
       // Since the bash tool runs via bash, `nul` becomes a real file in the workspace.
@@ -977,17 +1009,20 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
 
           const filterExclude = monitor.filter_exclude ?? false;
           const cooldownMs = monitor.cooldown_ms ?? 1000;
+          const wakeOnExit = monitor.wake_on_exit ?? true;
           monitorConfig = {
             filter: monitor.filter,
             pattern,
             exclude: filterExclude,
             cooldownMs,
+            wakeOnExit,
             ...(monitor.max_events != null ? { maxEvents: monitor.max_events } : {}),
           };
           monitorResult = {
             filter: monitor.filter,
             filter_exclude: filterExclude,
             cooldown_ms: cooldownMs,
+            wake_on_exit: wakeOnExit,
             ...(monitor.max_events != null ? { max_events: monitor.max_events } : {}),
           };
         }
@@ -999,8 +1034,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
           scriptWithEnv,
           {
             cwd: config.cwd,
-            // Match foreground bash behavior: xumEnv is present and secrets override it.
-            env: { ...hooksEnv, ...(config.xumEnv ?? {}), ...(config.secrets ?? {}) },
+            env: { ...(config.xumEnv ?? {}), ...(config.secrets ?? {}), ...hooksEnv },
             displayName: safeDisplayName,
             isForeground: false, // Explicit background
             ...(monitorConfig ? { monitor: monitorConfig } : {}),
@@ -1079,7 +1113,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
 ${scriptWithEnv}`;
       const execStream = await config.runtime.exec(scriptWithClosedStdin, {
         cwd: config.cwd,
-        env: { ...hooksEnv, ...config.xumEnv, ...config.secrets, ...NON_INTERACTIVE_ENV_VARS },
+        env: { ...config.xumEnv, ...config.secrets, ...hooksEnv, ...NON_INTERACTIVE_ENV_VARS },
         timeout: effectiveTimeout,
         abortSignal: wrappedAbortController.signal,
       });

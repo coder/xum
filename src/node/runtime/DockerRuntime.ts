@@ -33,7 +33,7 @@ import { findInitHookRelativePath, runInitHookOnRuntime, runWorkspaceInitHook } 
 import { getProjectName } from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
 import { syncProjectViaGitBundle } from "./gitBundleSync";
-import { GIT_NO_HOOKS_ENV, gitNoHooksPrefix } from "@/node/utils/gitNoHooksEnv";
+import { gitNoHooksPrefix } from "@/node/utils/gitNoHooksEnv";
 import {
   readHostGitconfig,
   resolveGhToken,
@@ -1175,14 +1175,10 @@ export class DockerRuntime extends RemoteRuntime {
       }
 
       initLogger.logStep("Cloning repository in destination...");
-      // Disable git hooks inside the container for untrusted projects
-      const noHooksEnvCmd = params.trusted
-        ? ""
-        : "env " +
-          Object.entries(GIT_NO_HOOKS_ENV)
-            .map(([k, v]) => `${k}=${v}`)
-            .join(" ") +
-          " ";
+      // Disable git hooks inside the container unless gitHooksAllowed (docker
+      // exec has no shell, so the assignments need an explicit env wrapper).
+      const cloneNhp = gitNoHooksPrefix(params.trusted);
+      const noHooksEnvCmd = cloneNhp === "" ? "" : `env ${cloneNhp}`;
       throwIfAborted();
       const cloneResult = await runDockerCommand(
         `exec ${destContainerName} ${noHooksEnvCmd}git clone ${containerBundlePath} ${CONTAINER_SRC_DIR}`,

@@ -2,7 +2,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as os from "os";
 import * as path from "path";
 import * as fsPromises from "fs/promises";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import * as disposableExec from "@/node/utils/disposableExec";
 import type { InitLogger } from "@/node/runtime/Runtime";
 import * as submoduleSync from "@/node/runtime/submoduleSync";
@@ -162,6 +162,83 @@ describe("WorktreeManager.createWorkspace", () => {
       20_000
     );
   }
+  it("returns a structured failure when git preflight cannot inspect the repository", async () => {
+    const fixture = await createWorktreeManagerFixture();
+
+    try {
+      await fsPromises.rm(fixture.projectPath, { recursive: true, force: true });
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: "feature-missing-repo",
+        trunkBranch: "main",
+        initLogger: fixture.initLogger,
+        trusted: false,
+      });
+
+      expect(result.success).toBe(false);
+      if (result.success) {
+        throw new Error("Expected createWorkspace to fail");
+      }
+      expect(result.error).toContain("Failed to inspect repository automation drivers");
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it("skips repo-configured upload-pack commands when project automation is disabled", async () => {
+    const fixture = await createWorktreeManagerFixture();
+    const marker = path.join(fixture.rootDir, "upload-pack-ran");
+    const uploadPack = path.join(fixture.rootDir, "upload-pack.sh");
+    const previous = process.env.XUM_DISABLE_PROJECT_AUTOMATION;
+
+    try {
+      await fsPromises.writeFile(
+        uploadPack,
+        `#!/bin/sh\nprintf ran > "${marker}"\nexit 1\n`,
+        "utf-8"
+      );
+      await fsPromises.chmod(uploadPack, 0o755);
+      execFileSync("git", ["remote", "add", "origin", "."], {
+        cwd: fixture.projectPath,
+        stdio: "ignore",
+      });
+      execFileSync("git", ["config", "remote.origin.uploadpack", uploadPack], {
+        cwd: fixture.projectPath,
+        stdio: "ignore",
+      });
+      process.env.XUM_DISABLE_PROJECT_AUTOMATION = "1";
+      const steps: string[] = [];
+
+      const result = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: "feature-no-upload-pack",
+        trunkBranch: "main",
+        trusted: true,
+        initLogger: {
+          ...fixture.initLogger,
+          logStep: (message) => steps.push(message),
+        },
+      });
+
+      expect(result.success).toBe(true);
+      expect(steps).toContain(
+        "Skipping origin fetch while project automation is disabled; using local state."
+      );
+      const uploadPackRan = await fsPromises.access(marker).then(
+        () => true,
+        () => false
+      );
+      expect(uploadPackRan).toBe(false);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.XUM_DISABLE_PROJECT_AUTOMATION;
+      } else {
+        process.env.XUM_DISABLE_PROJECT_AUTOMATION = previous;
+      }
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
   it("uses a sanitized directory for slash branch names and persists the mapping", async () => {
     const fixture = await createWorktreeManagerFixture();
     const branchName = "feature/foo";
@@ -265,9 +342,84 @@ describe("WorktreeManager.renameWorkspace", () => {
       await fixture.cleanup();
     }
   }, 20_000);
+
+  it("returns a structured failure when git preflight cannot inspect the repository", async () => {
+    const fixture = await createWorktreeManagerFixture();
+
+    try {
+      const oldName = "rename-preflight-old";
+      const createResult = await fixture.manager.createWorkspace({
+        projectPath: fixture.projectPath,
+        branchName: oldName,
+        trunkBranch: "main",
+        initLogger: fixture.initLogger,
+        trusted: true,
+      });
+      expect(createResult.success).toBe(true);
+      await fsPromises.rm(fixture.projectPath, { recursive: true, force: true });
+
+      const result = await fixture.manager.renameWorkspace(
+        fixture.projectPath,
+        oldName,
+        "rename-preflight-new",
+        false
+      );
+
+      expect(result.success).toBe(false);
+      if (result.success) {
+        throw new Error("Expected renameWorkspace to fail");
+      }
+      expect(result.error).toContain("Failed to inspect repository automation drivers");
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
 });
 
 describe("WorktreeManager.deleteWorkspace", () => {
+  it("keeps returning declared results and force-deletes when the main checkout is gone", async () => {
+    const fixture = await createWorktreeManagerFixture({
+      tempDirPrefix: "worktree-manager-delete-",
+    });
+
+    try {
+      const { projectPath, manager, initLogger } = fixture;
+      const branchName = "feature-stale-cleanup";
+      const createResult = await manager.createWorkspace({
+        projectPath,
+        branchName,
+        trunkBranch: "main",
+        initLogger,
+      });
+      expect(createResult.success).toBe(true);
+      if (!createResult.success) return;
+      if (!createResult.workspacePath) {
+        throw new Error("Expected workspacePath from createWorkspace");
+      }
+      const workspacePath = createResult.workspacePath;
+
+      // Simulate a deleted main checkout with a stale managed workspace left
+      // behind: repo-aware filter discovery fails closed for it.
+      await fsPromises.rm(projectPath, { recursive: true, force: true });
+
+      const preflight = await manager.canDeleteWorkspaceWithoutForce(projectPath, branchName);
+      expect(preflight.success).toBe(false);
+
+      const nonForce = await manager.deleteWorkspace(projectPath, branchName, false);
+      expect(nonForce.success).toBe(false);
+
+      const forced = await manager.deleteWorkspace(projectPath, branchName, true);
+      expect(forced.success).toBe(true);
+      const workspaceRemains = await fsPromises.access(workspacePath).then(
+        () => true,
+        () => false
+      );
+      expect(workspaceRemains).toBe(false);
+    } finally {
+      await fixture.cleanup();
+    }
+  }, 20_000);
+
   it("deletes non-agent branches when removing worktrees (force)", async () => {
     const fixture = await createWorktreeManagerFixture({
       tempDirPrefix: "worktree-manager-delete-",

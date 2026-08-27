@@ -75,7 +75,8 @@ import { secretsToRecord } from "@/common/types/secrets";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { roundToBase2 } from "@/common/telemetry/utils";
-import { createAsyncEventQueue } from "@/common/utils/asyncEventIterator";
+import { createAsyncEventQueue, createLatestValueQueue } from "@/common/utils/asyncEventIterator";
+import { createCoalescedReader } from "@/common/utils/coalescedReader";
 import { withQueueHeartbeat } from "@/common/utils/withQueueHeartbeat";
 import {
   DEFAULT_LAYOUT_PRESETS_CONFIG,
@@ -5503,7 +5504,11 @@ export const router = (authToken?: string) => {
               foregroundToolCallIds: service.getForegroundToolCallIds(workspaceId),
             });
 
-            const queue = createAsyncEventQueue<Awaited<ReturnType<typeof getState>>>();
+            // Latest-value queue, not FIFO: each pushed value is a FULL state snapshot,
+            // so an unconsumed older snapshot is disposable. A FIFO would retain every
+            // snapshot a slow ORPC consumer has not yet serialized — unbounded memory
+            // and stale intermediate UI replays under sustained monitor output.
+            const queue = createLatestValueQueue<Awaited<ReturnType<typeof getState>>>();
 
             const onAbort = () => {
               queue.end();
@@ -5513,21 +5518,64 @@ export const router = (authToken?: string) => {
               signal.addEventListener("abort", onAbort, { once: true });
             }
 
+            // Coalesce event-driven reads: a monitor with cooldown_ms 0 can emit one
+            // change per matching output line, and reading full state once per event
+            // would launch an unbounded backlog of manager refreshes while only the
+            // latest state matters. The reader also serializes reads (overlapping
+            // getState() calls could resolve out of order and publish a stale
+            // pre-persistence snapshot over a newer one) and retries failed reads —
+            // a change event may be the only signal an exited process ever emits, so
+            // dropping it would leave the renderer stale with no reconnect.
+            // Bootstrap failures FAIL OPEN: if the very first read keeps failing (e.g.
+            // a remote status probe is down), endless silent retries would leave the
+            // subscriber without any signal — BackgroundBashStore could never run its
+            // error path that marks workspace state known, blocking the chat view's
+            // first-paint barrier indefinitely. Surface the first pre-snapshot failure
+            // as a subscription error instead; once a snapshot has been delivered the
+            // reader's silent retry loop takes over (the renderer has state to show).
+            // Boxed (not bare `let`s) so the reader closure's writes stay visible to
+            // the generator body: TS flow analysis keeps a captured let narrowed to
+            // its initial null in this scope, so `throw bootstrap.error` would be
+            // rejected as throwing a non-Error.
+            const bootstrap = { delivered: false, error: null as Error | null };
+            const reader = createCoalescedReader({
+              read: async () => {
+                let state: Awaited<ReturnType<typeof getState>>;
+                try {
+                  state = await getState();
+                } catch (error) {
+                  if (!bootstrap.delivered) {
+                    bootstrap.error =
+                      error instanceof Error ? error : new Error(getErrorMessage(error));
+                    queue.end();
+                    return;
+                  }
+                  throw error;
+                }
+                bootstrap.delivered = true;
+                queue.push(state);
+              },
+              retryDelayMs: 1_000,
+            });
             const onChange = (changedWorkspaceId: string) => {
-              if (changedWorkspaceId === workspaceId) {
-                void getState().then(queue.push);
-              }
+              if (changedWorkspaceId === workspaceId) reader.trigger();
             };
 
             service.onBackgroundBashChange(onChange);
 
             try {
-              // Emit initial state immediately
-              yield await getState();
+              // Bootstrap through the SAME serialized reader as event-driven reads. A
+              // separate `yield await getState()` can race an onChange-triggered read:
+              // the event read's snapshot waits in the queue while the slower bootstrap
+              // yields a NEWER snapshot first, and consuming the queued older value then
+              // regresses the renderer with no later event to repair it.
+              reader.trigger();
               yield* queue.iterate();
+              if (bootstrap.error != null) throw bootstrap.error;
             } finally {
               signal?.removeEventListener("abort", onAbort);
               queue.end();
+              reader.stop();
               service.offBackgroundBashChange(onChange);
             }
           }),

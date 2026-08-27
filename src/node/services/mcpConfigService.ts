@@ -19,6 +19,7 @@ import type {
 } from "@/node/services/agentPlugins/mcpConfig";
 import { isCanonicalPluginServerKey } from "@/node/services/agentPlugins/mcpConfig";
 import { log } from "@/node/services/log";
+import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { getErrorMessage } from "@/common/utils/errors";
 
 /**
@@ -324,9 +325,17 @@ export class MCPConfigService {
     const globalCfg = await this.getGlobalConfig();
     const globalServers = omitReservedPluginKeys(globalCfg.servers, "global");
 
-    if (!projectPath || !trusted) {
+    // projectAutomationDisabled: benchmark harness kill-switch: dataset
+    // repos keep config trust for delegation, but repo-configured MCP
+    // servers must not start with provider credentials in the environment.
+    const projectConfigAllowed = trusted && !projectAutomationDisabled();
+    if (!projectPath || !projectConfigAllowed) {
       if (projectPath && !trusted) {
         log.debug("[MCP] Skipping project-local MCP config for untrusted project", { projectPath });
+      } else if (projectPath) {
+        log.debug("[MCP] Skipping project-local MCP config (project automation disabled)", {
+          projectPath,
+        });
       }
       return { plugin: pluginServers, global: globalServers, project: {} };
     }
