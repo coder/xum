@@ -1296,20 +1296,11 @@ function unquoteShellWord(word: string, stripExpansions = false, collapseGlobs =
     if (collapseGlobs) {
       // Pathname expansion is live in this unquoted context. A single-member class is
       // deterministic (`[8]` can only produce `8`), and any reader collapses the
-      // published spelling the same way, so scan what it yields. `?` scans as a
-      // representative member and `*` as its empty match for the same reason.
+      // published spelling the same way, so scan what it yields. Nondeterministic
+      // wildcards never reach this scan: redaction localizes their whole command.
       if (char === "[" && word[i + 2] === "]" && !"!^".includes(word[i + 1] ?? "")) {
         result += word[i + 1];
         i += 3;
-        continue;
-      }
-      if (char === "?") {
-        result += "0";
-        i += 1;
-        continue;
-      }
-      if (char === "*") {
-        i += 1;
         continue;
       }
     }
@@ -1411,11 +1402,13 @@ function activeWordProjection(word: string): string {
 }
 
 /**
- * A class with more than one member expands against whatever the working directory
- * contains, so its output is not decidable here, unlike the single-member class the
- * scan collapses deterministically. Ranges and negations are multi-member spellings.
+ * A glob whose output depends on the working directory: `?`, `*`, and any class with
+ * more than one member (ranges and negations included) expand against whatever files
+ * exist, so a wildcard inside a known token prefix (`gh?_...`) can hand the process a
+ * credential no textual scan reconstructs. Only the single-member class is
+ * deterministic, and the scan collapses that one instead.
  */
-const MULTI_MEMBER_GLOB_CLASS = /\[[^\]]{2,}\]/;
+const NONDETERMINISTIC_GLOB = /[?*]|\[[^\]]{2,}\]/;
 
 /**
  * A brace group holding `,` or `..` expands, and expansion output can reassemble a
@@ -1439,7 +1432,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
     // quoted or escaped text (`--config '{"a":1,"b":2}'` stays a literal argument).
     const active = activeWordProjection(word);
     if (BRACE_EXPANSION.test(active)) return true;
-    if (MULTI_MEMBER_GLOB_CLASS.test(active)) return true;
+    if (NONDETERMINISTIC_GLOB.test(active)) return true;
     const unquoted = unquoteShellWord(word);
     // Option terminators end option parsing: past one even a dash-led word is an
     // operand, so `env -- --evil=x` sets an environment entry despite the option look.

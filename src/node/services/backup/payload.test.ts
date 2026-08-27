@@ -863,28 +863,24 @@ describe("backup payload", () => {
   });
 
   it("collapses deterministic globs so a bracketed spelling cannot hide a token", async () => {
-    // `[b]` matches only `b` and `?` exactly one character: pathname expansion can hand
-    // the process the contiguous token, and the published text collapses the same way
-    // for any reader.
-    for (const command of [
-      "mcp --pattern ghp_aaaaaaaaaa[b]aaaaaaaaa",
-      "mcp --pattern ghp_aaaaaaaaaa?aaaaaaaaa",
-    ]) {
-      await writeFixtureFile(
+    // `[b]` matches only `b`: pathname expansion can hand the process the contiguous
+    // token, and the published text collapses the same way for any reader.
+    await writeFixtureFile(
+      muxRoot,
+      "mcp.jsonc",
+      JSON.stringify({
+        servers: { grafana: { command: "mcp --pattern ghp_aaaaaaaaaa[b]aaaaaaaaa" } },
+      })
+    );
+    const blocked = await captureRejection(
+      createBackupPayload({
         muxRoot,
-        "mcp.jsonc",
-        JSON.stringify({ servers: { grafana: { command } } })
-      );
-      const blocked = await captureRejection(
-        createBackupPayload({
-          muxRoot,
-          muxVersion: "1.2.3",
-          sourceLabel: "test-host",
-          reportSecrets: true,
-        })
-      );
-      expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
-    }
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
 
     // Quoting suppresses pathname expansion, so the same spelling stays publishable.
     await writeFixtureFile(
@@ -924,6 +920,32 @@ describe("backup payload", () => {
       servers: { grafana: { command: string } };
     };
     expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+  });
+
+  it("localizes nondeterministic wildcards instead of publishing them", async () => {
+    // A wildcard inside a known token prefix (`gh?_...`) expands to the credential
+    // when a matching file exists, and no textual scan of the published spelling can
+    // reconstruct that, so the command goes machine-local like the class spellings.
+    for (const command of [
+      "mcp --pattern gh?_aaaaaaaaaaaaaaaaaaaa",
+      "mcp --pattern ghp_aaaaaaaaaa*aaaaaaaaa",
+    ]) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { grafana: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const mcp = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { grafana: { command: string } };
+      };
+      expect(mcp.servers.grafana.command).toBe(REDACTED_BACKUP_VALUE);
+    }
   });
 
   it("recognizes comments opened by a word break, not only by whitespace", async () => {
