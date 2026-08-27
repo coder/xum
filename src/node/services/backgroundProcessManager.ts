@@ -1199,7 +1199,20 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // Check for exit BEFORE processing the just-read chunk: a matching line in the very chunk
       // that accompanies the exit must coalesce into the single settlement payload instead of
       // triggering a cooldown_ms=0 emit or maxEvents retirement ahead of it.
-      const exitCode = await this.getExitCodeForMonitor(proc, monitor);
+      let exitCode: number | null;
+      try {
+        exitCode = await this.getExitCodeForMonitor(proc, monitor);
+      } catch (error) {
+        // The exit-probe escalation retires the monitor through the tail catch, but the read
+        // above already succeeded: fold its chunk into monitor state first, or the matched
+        // lines would vanish from the failure payload (unrecoverable if the process
+        // generation dies before the suggested task_await).
+        if (!monitor.stopped && !monitor.settled) {
+          monitor.lastReadOffset = read.newOffset;
+          this.processMonitorContent(proc, read.content, { chunkStartOffset });
+        }
+        throw error;
+      }
       if (monitor.stopped || monitor.settled) return;
 
       if (exitCode !== null) {

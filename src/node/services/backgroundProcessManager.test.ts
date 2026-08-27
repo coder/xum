@@ -507,6 +507,54 @@ describe("BackgroundProcessManager", () => {
       });
     });
 
+    it("folds a same-poll read chunk into the failure payload when the exit probe escalates", async () => {
+      const stoppedEvents: MonitorStoppedPayload[] = [];
+      manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
+
+      const result = await manager.spawn(runtime, testWorkspaceId, "sleep 5", {
+        cwd: process.cwd(),
+        displayName: "monitor-exit-probe-chunk",
+        monitor: {
+          filter: "READY",
+          pattern: /READY/,
+          exclude: false,
+          cooldownMs: 10_000,
+        },
+      });
+      expect(result.success).toBe(true);
+      if (!result.success) return;
+      const proc = await manager.getProcess(result.processId);
+      expect(proc).not.toBeNull();
+      if (!proc) return;
+
+      // The matched chunk must arrive on the poll whose exit probe records the third (fatal)
+      // consecutive failure, so the escalation throw is the only step between the read chunk
+      // and the failure payload. Keying the chunk to two already-recorded exit failures makes
+      // the setup phase-independent: the spies may land mid-iteration (between a read and its
+      // exit probe), shifting which read precedes the fatal probe.
+      let exitProbes = 0;
+      spyOn(proc.handle, "readOutputForMonitor").mockImplementation(() =>
+        Promise.resolve(
+          exitProbes >= 2
+            ? { success: true as const, value: { content: "READY\n", newOffset: 6 } }
+            : { success: true as const, value: { content: "", newOffset: 0 } }
+        )
+      );
+      spyOn(proc.handle, "getExitCodeForMonitor").mockImplementation(() => {
+        exitProbes += 1;
+        return Promise.resolve({ success: false as const, error: "exit probe down" });
+      });
+
+      for (let attempt = 0; attempt < 60 && stoppedEvents.length === 0; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const stoppedEvent = stoppedEvents.find(
+        (event) => event.processId === result.processId && event.reason === "failed"
+      );
+      expect(stoppedEvent?.failedOperations).toEqual(["getExitCode"]);
+      expect(stoppedEvent?.failedMatch).toMatchObject({ lines: ["READY"], totalMatches: 1 });
+    });
+
     it("retires a monitor after repeated output failures while exit probes stay healthy", async () => {
       const outputProbeFailure = { value: false, calls: 0 };
       const remoteRuntime = createRemoteLikeRuntime(new LocalRuntime(process.cwd()), {
