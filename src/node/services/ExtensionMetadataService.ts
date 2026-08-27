@@ -80,21 +80,34 @@ export class ExtensionMetadataService {
   private readonly filePath: string;
 
   /**
-   * Name infix for per-consume claim files (`<main><infix><pid>-<uuid>`).
-   * Unique names keep concurrent recoveries from replacing or clearing each
-   * other's live claims; stranded claims are discovered by this prefix.
+   * Name infix for per-consume claim files
+   * (`<main><infix><ino>-<mtimeNs>-<size>-<pid>-<uuid>`). Unique names keep
+   * concurrent recoveries from replacing or clearing each other's live
+   * claims, and the embedded identity token makes every crash point
+   * replay-safe: the consumer only calls consume AFTER merging the
+   * generation identified by the token, so a stranded claim whose file
+   * identity MATCHES its embedded token is proven represented at the main
+   * path (rename preserves ino/mtime/size) and is deleted by discovery —
+   * replaying it would re-fill fields another backend explicitly cleared
+   * to null (the null-fill merge is not idempotent across clears). A
+   * mismatched or unparseable claim holds a foreign generation nobody
+   * merged and is replayed.
    */
   private static readonly CLAIM_INFIX = ".corrupt-claim-";
 
-  /**
-   * Name infix a claim is renamed to once its bytes are verified to match
-   * the generation the caller reconciled — i.e. the bytes are proven
-   * represented at the main path. Discovery DELETES these instead of
-   * replaying them: re-merging already-reconciled bytes would re-fill
-   * fields another backend explicitly cleared to null in the meantime
-   * (the merge's null-fill rule is not idempotent across clears).
-   */
-  private static readonly CONSUMED_INFIX = ".corrupt-consumed-";
+  /** Parse the identity token embedded in a claim file name; null when the
+   * name does not carry one (fail toward replay — the pre-token behavior). */
+  private static parseClaimToken(claimName: string): QuarantineSidecarToken | null {
+    const match = /\.corrupt-claim-(\d+)-(\d+)-(\d+)-/.exec(claimName);
+    if (match == null) {
+      return null;
+    }
+    return { ino: BigInt(match[1]), mtimeNs: BigInt(match[2]), size: BigInt(match[3]) };
+  }
+
+  private static tokensMatch(a: QuarantineSidecarToken, b: QuarantineSidecarToken): boolean {
+    return a.ino === b.ino && a.mtimeNs === b.mtimeNs && a.size === b.size;
+  }
   private mutationQueue: Promise<void> = Promise.resolve();
   /**
    * Per-process write tombstones for removed workspaces. Workspace removal
@@ -388,7 +401,11 @@ export class ExtensionMetadataService {
       // fail closed by leaving the file rather than unlinking blind.
       return;
     }
-    const claimPath = `${this.filePath}${ExtensionMetadataService.CLAIM_INFIX}${process.pid}-${randomUUID()}`;
+    // The claim name embeds the token of the generation the caller just
+    // merged (see CLAIM_INFIX): a crash at ANY later point leaves a claim
+    // discovery can classify by identity — matching bytes were merged
+    // (delete), anything else is a foreign generation (replay).
+    const claimPath = `${this.filePath}${ExtensionMetadataService.CLAIM_INFIX}${token.ino}-${token.mtimeNs}-${token.size}-${process.pid}-${randomUUID()}`;
     try {
       await rename(quarantinePath, claimPath);
     } catch (renameError) {
@@ -409,11 +426,7 @@ export class ExtensionMetadataService {
     if (current == null) {
       return; // Claim vanished (concurrent discovery consumed it).
     }
-    if (
-      current.ino !== token.ino ||
-      current.mtimeNs !== token.mtimeNs ||
-      current.size !== token.size
-    ) {
+    if (!ExtensionMetadataService.tokensMatch(current, token)) {
       // The claim took a NEWER generation another process installed after
       // consuming ours: merge it into the main file instead of destroying
       // it. The reconcile consumes the claim itself on success; a corrupt
@@ -426,24 +439,12 @@ export class ExtensionMetadataService {
       await this.reconcileRecreatedMainWithSidecar(claimPath);
       return;
     }
-    // Matched: the claim's bytes are proven represented at the main path.
-    // Mark them consumed BEFORE deleting so a crash between the two steps
-    // strands a file discovery deletes rather than replays (a replayed
-    // merge would re-fill fields another backend explicitly cleared to
-    // null after passing its own claim scan). The residual replay window
-    // shrinks to the claim-rename → consumed-rename gap above, part of the
-    // documented unlocked-shared-file boundary.
-    const consumedPath = `${this.filePath}${ExtensionMetadataService.CONSUMED_INFIX}${process.pid}-${randomUUID()}`;
+    // Matched: the claim's bytes are proven represented at the main path,
+    // and its name says so (the embedded token matches the file), so a
+    // crash before this unlink strands a file discovery deletes rather
+    // than replays.
     try {
-      await rename(claimPath, consumedPath);
-    } catch (renameError) {
-      if (ExtensionMetadataService.isErrnoCode(renameError, "ENOENT")) {
-        return; // A concurrent discovery already took the claim.
-      }
-      throw renameError;
-    }
-    try {
-      await unlink(consumedPath);
+      await unlink(claimPath);
     } catch (unlinkError) {
       if (!ExtensionMetadataService.isErrnoCode(unlinkError, "ENOENT")) {
         throw unlinkError;
@@ -494,47 +495,40 @@ export class ExtensionMetadataService {
     const claimNames = dirNames.filter((name) =>
       name.startsWith(`${basename(this.filePath)}${ExtensionMetadataService.CLAIM_INFIX}`)
     );
-    // Consumed markers hold bytes PROVEN represented at the main path (a
-    // crash landed between the consumed-rename and the unlink): delete,
-    // never replay — a re-merge would re-fill fields another backend
-    // explicitly cleared to null since. Cleanup failures are logged, not
-    // propagated: dead bytes cannot compromise a read, and the next pass
-    // retries the unlink.
-    for (const consumedName of dirNames.filter((name) =>
-      name.startsWith(`${basename(this.filePath)}${ExtensionMetadataService.CONSUMED_INFIX}`)
-    )) {
-      try {
-        await unlink(join(dirname(this.filePath), consumedName));
-      } catch (unlinkError) {
-        if (!ExtensionMetadataService.isErrnoCode(unlinkError, "ENOENT")) {
-          log.debug("Failed to clean up consumed quarantine claim", { consumedName, unlinkError });
-        }
-      }
-    }
     if (claimNames.length === 0) {
       return false;
     }
     await this.withSerializedMutation(async () => {
       for (const claimName of claimNames) {
         const claimPath = join(dirname(this.filePath), claimName);
-        // Re-check inside the queue: a concurrent recovery's discovery (or
+        // Re-probe inside the queue: a concurrent recovery's discovery (or
         // the claim's own consume) may have taken the file while this
         // caller waited. Only a verified ENOENT skips — an unprobeable
         // claim propagates, same contract as the sidecar probe: reporting
         // success would let a strict read accept and emit a possibly
         // partial main while recoverable fields sit in the claim.
-        const stillExists = await access(claimPath).then(
-          () => true,
-          (error: unknown) => {
-            if (ExtensionMetadataService.isErrnoCode(error, "ENOENT")) {
-              return false;
-            }
-            throw error;
-          }
-        );
-        if (stillExists) {
-          await this.reconcileRecreatedMainWithSidecar(claimPath);
+        const current = await ExtensionMetadataService.statQuarantineToken(claimPath);
+        if (current == null) {
+          continue;
         }
+        // Identity classification (see CLAIM_INFIX): a claim whose file
+        // matches its embedded token holds bytes its consumer had already
+        // merged before claiming — delete, never replay (a re-merge would
+        // re-fill fields another backend explicitly cleared to null
+        // since). Mismatched or token-less claims hold a foreign
+        // generation nobody merged: replay it.
+        const expected = ExtensionMetadataService.parseClaimToken(claimName);
+        if (expected != null && ExtensionMetadataService.tokensMatch(current, expected)) {
+          try {
+            await unlink(claimPath);
+          } catch (unlinkError) {
+            if (!ExtensionMetadataService.isErrnoCode(unlinkError, "ENOENT")) {
+              throw unlinkError;
+            }
+          }
+          continue;
+        }
+        await this.reconcileRecreatedMainWithSidecar(claimPath);
       }
     });
     return true;

@@ -13934,7 +13934,21 @@ export class WorkspaceService extends EventEmitter {
               });
               finalAuthoritativeIds = null;
             }
-            // Re-read the raw view after the enumeration await so the raw
+            // The enumeration is itself an await: a raw-invisible legacy
+            // workspace can be admitted by it and then removed (metadata
+            // key deleted) before it finishes — invisible to the snapshot
+            // view captured before it and to every raw view. Re-read the
+            // snapshot evidence after the enumeration so the vanish guard
+            // sees the removal; on failure keep the pre-enumeration view
+            // (still a post-probe view).
+            try {
+              finalSnapshots = await this.extensionMetadata.getAllSnapshots({
+                throwOnError: true,
+              });
+            } catch {
+              // Keep the pre-enumeration re-read (possibly null).
+            }
+            // Re-read the raw view after the awaits above so the raw
             // deregistration guards see the freshest possible view; on a
             // repeat failure keep the earlier successful read (still a
             // valid post-probe view) rather than degrading to null.
