@@ -1550,6 +1550,16 @@ const PROGRAM_OPERAND_INTERPRETER_NAMES = new Set([
 ]);
 
 /**
+ * Executables whose operands are handed to another shell parse this scan never sees:
+ * OpenSSH sends command words to the remote login shell for re-evaluation
+ * (`ssh host mcp --token a\\b` loses the second backslash remotely), and the
+ * scp/rsync remote-path grammars expand through that same remote shell. Naming one
+ * localizes the invocation, accepting the portability cost like the program-operand
+ * interpreters above.
+ */
+const REMOTE_REPARSE_EXECUTABLE_NAMES = new Set(["ssh", "slogin", "autossh", "scp", "rsync"]);
+
+/**
  * Language interpreters whose script-evaluation spellings reparse an operand under the
  * language's own grammar, where quoted fragments concatenate into one runtime value
  * (`python3 -c '..."ghp_a"+"b"...'`, `node -e "...'ghp_a'+'b'..."`, `deno eval ...`).
@@ -1579,6 +1589,10 @@ const SHELL_STATE_WORDS = new Set([
   // Trap actions are reparsed only when their signal fires, after first-parse quotes
   // have hidden any expansion or escape inside the handler.
   "trap",
+  // `mapfile`/`readarray` evaluate their `-C` callback text as a command each time
+  // lines are read, after first-parse quotes have hidden what joins inside it.
+  "mapfile",
+  "readarray",
   "export",
   "declare",
   "typeset",
@@ -1633,6 +1647,7 @@ function hasDisguisedAssignment(redacted: string): boolean {
       .replace(/\.exe$/, "");
     if (SHELL_INTERPRETER_NAMES.has(executable)) return true;
     if (PROGRAM_OPERAND_INTERPRETER_NAMES.has(executable)) return true;
+    if (REMOTE_REPARSE_EXECUTABLE_NAMES.has(executable)) return true;
     // An evaluation word after a language interpreter hands that grammar a script.
     if (pendingEvalWords.some((pattern) => pattern.test(unquoted))) return true;
     const language = LANGUAGE_INTERPRETERS.find((entry) => entry.name.test(executable));

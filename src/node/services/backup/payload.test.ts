@@ -1711,6 +1711,9 @@ describe("backup payload", () => {
       // Trap actions are reparsed when the signal fires; first-parse quotes can hide
       // the expansion and escape that join the token at EXIT.
       "trap 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789' EXIT",
+      // `mapfile -C` evaluates its callback text as a command when lines are read;
+      // a plain `<` read redirection is otherwise portable.
+      "mapfile -C 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789;:' -c 1 </etc/hostname",
       // `shopt -so allexport` flips the same allexport state `set -a` does.
       "shopt -so allexport; printf -v TOKEN %s%s ghp_aaaaaaaaaa bbbbbbbbbb; mcp",
       // `source` and `.` run a file in this shell with fragments as positionals.
@@ -1731,6 +1734,11 @@ describe("backup payload", () => {
       // GNU sed evaluates its first non-option operand as a program whose `e`
       // command hands the script text to a shell.
       "sed '1eexec${IFS}mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789' /etc/hostname",
+      // OpenSSH hands command operands to the remote login shell for a second parse
+      // pass that removes the surviving backslash; scp/rsync remote paths
+      // historically expand through the same remote shell.
+      "ssh mcp-host mcp --token ghp_Abcdef1234\\\\Klmno56789",
+      "scp 'mcp-host:ghp_Abcdef1234\\Klmno56789' /tmp/dest",
       'python3 -c \'__import__("os").environ.update({"T":"ghp_Abcdef1234"+"Klmno56789"})\'',
       "node -e \"require('child_process').spawnSync('mcp',['--token','ghp_Abcdef1234'+'Klmno56789'])\"",
       'deno eval \'const_t="ghp_Abcdef1234"+"Klmno56789"\'',
