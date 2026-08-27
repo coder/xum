@@ -992,7 +992,18 @@ export class BashMonitorWakeStore {
     // survives re-enters this same reconciliation later.
     const sweepSuperseded = async (standing: ClearTombstone): Promise<void> => {
       for (const candidate of candidates) {
-        if (!BashMonitorWakeStore.tombstoneStrictlyOutranks(standing, candidate.tomb)) continue;
+        // Swept when the standing generation strictly outranks the candidate — or
+        // when the candidate IS the identical generation (a duplicate stranded by a
+        // crash or failed cleanup): the standing canonical carries its exact
+        // protection, so the duplicate can only ever resurrect a generation that was
+        // deliberately settled. Genuinely incomparable ties (same rank, different
+        // fields) are kept.
+        if (
+          !BashMonitorWakeStore.tombstoneStrictlyOutranks(standing, candidate.tomb) &&
+          !BashMonitorWakeStore.tombstonesIdentical(standing, candidate.tomb)
+        ) {
+          continue;
+        }
         await fsPromises.rm(candidate.path, { force: true }).catch(() => undefined);
       }
     };
@@ -1033,8 +1044,9 @@ export class BashMonitorWakeStore {
    * Whether `standing` strictly outranks `candidate` under the heal selection
    * ordering (newer cutoff; committed over staged at an equal cutoff; fresher
    * stagedAt when both are staged at an equal cutoff). Used to sweep captures that a
-   * durably standing generation supersedes — exact ties are NOT outranked and are
-   * kept, because sweeping requires proof the candidate can never matter again.
+   * durably standing generation supersedes — ties are NOT outranked (sweeping on
+   * rank alone requires proof the candidate can never matter again; exact duplicates
+   * are handled separately via tombstonesIdentical).
    */
   private static tombstoneStrictlyOutranks(
     standing: ClearTombstone,
@@ -1048,6 +1060,17 @@ export class BashMonitorWakeStore {
       return Date.parse(standing.stagedAt ?? "") > Date.parse(candidate.stagedAt ?? "");
     }
     return false;
+  }
+
+  /** Whether two tombstones are the exact same generation, field for field. */
+  private static tombstonesIdentical(a: ClearTombstone, b: ClearTombstone): boolean {
+    return (
+      a.clearedAt === b.clearedAt &&
+      a.clearId === b.clearId &&
+      a.phase === b.phase &&
+      a.stagedAt === b.stagedAt &&
+      a.previousClearedAt === b.previousClearedAt
+    );
   }
 
   private static parseTombstone(raw: string): ClearTombstone | null {
@@ -1919,6 +1942,20 @@ export class BashMonitorWakeStore {
   ): Promise<
     { kind: "absent" } | { kind: "malformed" } | { kind: "record"; record: BashMonitorWakeRecord }
   > {
+    // Non-regular guard: artifacts-first recovery reaches this read BEFORE the
+    // record pass's own non-regular skip — a directory left at the canonical path by
+    // corruption would fail every scan with EISDIR, and a FIFO would block reads
+    // forever, stranding every other wake in the workspace. Classify as MALFORMED so
+    // the quarantine (which re-verifies whatever it captures) parks it as evidence
+    // and the caller can place its durable artifact.
+    let stat: Stats;
+    try {
+      stat = await fsPromises.stat(originalPath);
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT")) return { kind: "absent" };
+      throw error;
+    }
+    if (!stat.isFile()) return { kind: "malformed" };
     let raw: string;
     try {
       raw = await fsPromises.readFile(originalPath, "utf-8");
@@ -1965,6 +2002,30 @@ export class BashMonitorWakeStore {
       // other failure propagates into caller retries.
       if (isErrnoWithCode(error, "ENOENT")) return { kind: "cleared" };
       throw error;
+    }
+    // Non-regular guard mirroring readCanonicalState: reading a captured directory
+    // fails with EISDIR and a captured FIFO blocks forever. Park it in the evidence
+    // namespace directly — it can never hold a restorable record, and left under the
+    // prune-trash name the artifact loop's isFile guard would merely skip it forever.
+    let capturedStat: Stats;
+    try {
+      capturedStat = await fsPromises.stat(capture);
+    } catch (error) {
+      // Vanished: a concurrent recover consumed the capture, so the path is free.
+      if (isErrnoWithCode(error, "ENOENT")) return { kind: "cleared" };
+      // Cannot verify what we captured; it stays behind as prune trash, where a
+      // regular record heals and anything else is skipped. Propagate into retries.
+      throw error;
+    }
+    if (!capturedStat.isFile()) {
+      log.debug("Quarantining non-regular bash monitor wake canonical", {
+        ownerWorkspaceId,
+        id,
+      });
+      await fsPromises
+        .rename(capture, `${originalPath}.malformed-${randomUUID()}`)
+        .catch(() => undefined);
+      return { kind: "cleared" };
     }
     let captured: BashMonitorWakeRecord | null;
     try {

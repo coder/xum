@@ -2743,6 +2743,68 @@ describe("BashMonitorWakeStore", () => {
     expect((await fsPromises.readdir(dir)).filter((e) => e.startsWith("cleared-at"))).toEqual([]);
   });
 
+  test("healing sweeps duplicate captures of the identical generation", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR survives duplicate captures"] }));
+    // Strictly order wake < cutoff (same-millisecond stamps fail toward delivery).
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await store.supersedeAllPending("owner-1");
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const tombPath = path.join(dir, "cleared-at");
+    const stagedTomb = JSON.parse(await fsPromises.readFile(tombPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    await store.abandonWorkspaceClears("owner-1");
+    // A crash (or failed cleanup) strands TWO captures holding the EXACT same
+    // crashed staged generation, aged past the rollback grace. The canonical path is
+    // empty.
+    const staleRaw = JSON.stringify({
+      ...stagedTomb,
+      stagedAt: new Date(Date.now() - STAGED_CLEAR_ROLLBACK_GRACE_MS - 60_000).toISOString(),
+    });
+    await fsPromises.rm(tombPath);
+    await fsPromises.writeFile(`${tombPath}.cas-dup1`, staleRaw, "utf-8");
+    await fsPromises.writeFile(`${tombPath}.cas-dup2`, staleRaw, "utf-8");
+    // The heal links one duplicate and must sweep the IDENTICAL other: left behind,
+    // it would resurrect the staging the moment the grace rollback demotes the
+    // healed one — the restored record would be held again, this scan would return
+    // empty, and startup owner discovery would schedule no drain.
+    const scan = new BashMonitorWakeStore(makeConfig(rootDir));
+    expect((await scan.listPending("owner-1")).map((r) => r.lines)).toEqual([
+      ["ERROR survives duplicate captures"],
+    ]);
+    expect((await scan.get("owner-1", "proc-1"))?.status).toBe("pending");
+    expect((await fsPromises.readdir(dir)).filter((e) => e.startsWith("cleared-at"))).toEqual([]);
+  });
+
+  test("a non-regular canonical path cannot wedge artifact recovery", async () => {
+    const store = new BashMonitorWakeStore(makeConfig(rootDir));
+    await store.enqueueOrMergePending(payload({ lines: ["ERROR behind a directory"] }));
+    const dir = path.join(rootDir, "sessions", "owner-1", "bash-monitor-wakes");
+    const canonicalPath = path.join(dir, "proc-1.json");
+    // The wake's ONLY durable copy crashes into a temp (aged past the freshness
+    // gate)...
+    const temp = `${canonicalPath}.tmp-crashed`;
+    await fsPromises.rename(canonicalPath, temp);
+    const past = new Date(Date.now() - 10 * 60 * 1000);
+    await fsPromises.utimes(temp, past, past);
+    // ...while corruption leaves a DIRECTORY at the canonical path. Artifacts-first
+    // recovery reads the canonical state BEFORE the record pass's non-regular skip:
+    // unguarded, every scan fails with EISDIR (a FIFO would block forever),
+    // stranding every wake in the workspace.
+    await fsPromises.mkdir(canonicalPath);
+
+    expect((await store.listPending("owner-1")).map((r) => r.lines)).toEqual([
+      ["ERROR behind a directory"],
+    ]);
+    expect((await store.get("owner-1", "proc-1"))?.status).toBe("pending");
+    expect((await fsPromises.readdir(dir)).filter((e) => e.includes(".tmp-"))).toHaveLength(0);
+    // The imposter directory is parked as evidence; a regular record file stands at
+    // the canonical path again.
+    expect((await fsPromises.stat(canonicalPath)).isFile()).toBe(true);
+  });
+
   test("a directory squatting on a tombstone capture is quarantined instead of failing heals", async () => {
     const store = new BashMonitorWakeStore(makeConfig(rootDir));
     await store.enqueueOrMergePending(payload({ lines: ["ERROR heals anyway"] }));
