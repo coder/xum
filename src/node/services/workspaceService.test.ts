@@ -6472,10 +6472,11 @@ describe("WorkspaceService workflow invocation events", () => {
     }
   });
 
-  test("crash-resume repair re-snapshots only boundaryless references", async () => {
+  test("crash-resume repair restores provenance only on supersession-free evidence", async () => {
     const { config, historyService, cleanup } = await createTestHistoryService();
     const workspaceId = "workflow-crash-repair";
     const strippedRunId = "wfr_crash_repair_stripped";
+    const supersededRunId = "wfr_crash_repair_superseded";
     const anchoredRunId = "wfr_crash_repair_anchored";
     const projectPath = path.join(config.rootDir, "project");
     try {
@@ -6501,13 +6502,9 @@ describe("WorkspaceService workflow invocation events", () => {
         } as unknown as InitStateManager,
       });
 
-      await historyService.appendToHistory(
-        workspaceId,
-        createMuxMessage("manual-user", "user", "run the audit workflow", { timestamp: 1_000 })
-      );
-      // A downgrade rewrote the sidecar without boundary fields (or a record-time read failure
-      // omitted them): crash-resume repair re-snapshots the boundary, keeping the recorded
-      // launch identity, and the deferred wake becomes deliverable again.
+      // A downgrade rewrote the sidecar without boundary fields. With a decision-free history
+      // the repair has supersession-free evidence: it records a verified-empty boundary,
+      // keeps the recorded launch identity, and the deferred wake becomes deliverable.
       await recordAgentWorkflowRunReference({
         workspaceSessionDir: config.getSessionDir(workspaceId),
         runId: strippedRunId,
@@ -6519,13 +6516,36 @@ describe("WorkspaceService workflow invocation events", () => {
       const repaired = await readAgentWorkflowRunReferences(config.getSessionDir(workspaceId));
       expect(repaired.find((reference) => reference.runId === strippedRunId)).toMatchObject({
         createdAtMs: 1_150,
-        afterBoundaryMessageId: "manual-user",
+        afterBoundaryMessageId: null,
         agentId: "plan",
         strictAgentResolution: { expectedScope: "built-in" },
       });
       expect(
         await workspaceService.getWorkflowInvocationCurrentness(workspaceId, strippedRunId)
       ).toBe("current");
+
+      // Once a manual row is the newest decision row, a stripped launch cannot be ordered
+      // against it: the run may predate the supersession, so repair must refuse and the wake
+      // must stay deferred rather than resurrect a possibly superseded result.
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user", "user", "never mind, do something else", {
+          timestamp: 1_200,
+        })
+      );
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId: supersededRunId,
+        createdAtMs: 1_100,
+      });
+      await workspaceService.repairWorkflowRunReferenceBoundary(workspaceId, supersededRunId);
+      const refused = await readAgentWorkflowRunReferences(config.getSessionDir(workspaceId));
+      const refusedReference = refused.find((reference) => reference.runId === supersededRunId);
+      expect(refusedReference).toBeDefined();
+      expect(refusedReference != null && "afterBoundaryMessageId" in refusedReference).toBe(false);
+      expect(
+        await workspaceService.getWorkflowInvocationCurrentness(workspaceId, supersededRunId)
+      ).toBe("indeterminate");
 
       // A reference that still carries its boundary may record a pre-supersession launch:
       // repair must not refresh it into the current context.
@@ -6550,6 +6570,7 @@ describe("WorkspaceService workflow invocation events", () => {
       expect(after.map((reference) => reference.runId).sort()).toEqual([
         anchoredRunId,
         strippedRunId,
+        supersededRunId,
       ]);
       workspaceService.disposeSession(workspaceId);
     } finally {

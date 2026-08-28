@@ -11128,10 +11128,15 @@ export class WorkspaceService extends EventEmitter {
    * the sidecar with only runId/createdAtMs on any record (upgrade -> downgrade -> upgrade
    * strips the field), and a boundaryless reference defers its terminal wake as indeterminate
    * until provenance is re-established. Crash recovery calls this before restarting an
-   * orphaned run: the run is verifiably non-terminal there, so a resume-time snapshot is
-   * legitimate launch provenance for the continued execution, mirroring the workflow_resume
-   * tool's re-record. References that still carry a boundary (including verified-empty null)
-   * are left untouched: refreshing them would forgive manual supersessions on every restart.
+   * orphaned run, but the repair proceeds only on supersession-free evidence: a decision-free
+   * history (recorded as a verified-empty boundary) or a newest decision row that belongs to
+   * this run. A newest manual/reset row is refused: the stripped launch cannot be ordered
+   * against it by identity, and snapshotting it would resurrect a possibly pre-supersession
+   * result into the newer conversation (the same reference with a surviving boundary would
+   * stay not_current). Those wakes stay deferred until an explicit workflow_resume, which
+   * carries current-context intent. References that still carry a boundary (including
+   * verified-empty null) are left untouched: refreshing them would forgive manual
+   * supersessions on every restart.
    */
   async repairWorkflowRunReferenceBoundary(workspaceId: string, runId: string): Promise<void> {
     assert(workspaceId.length > 0, "repairWorkflowRunReferenceBoundary requires workspaceId");
@@ -11142,15 +11147,21 @@ export class WorkspaceService extends EventEmitter {
     if (reference == null || reference.afterBoundaryMessageId !== undefined) {
       return;
     }
-    const afterBoundaryMessageId = await this.getWorkflowInvocationBoundaryMessageId(
-      workspaceId,
-      runId
-    );
+    const decision = await this.findWorkflowInvocationDecisionRow(workspaceId, runId);
+    if (decision.status === "error") {
+      throw new Error("workflow invocation boundary unavailable: history read failed");
+    }
+    if (decision.status === "found" && decision.outcome === "superseded") {
+      return;
+    }
+    // Supersession-free evidence only: no decision row at all (verified-empty null), or the
+    // newest decision row is this run's own invocation/consumed row, which no manual row can
+    // postdate (the backward walk would have found that manual row first).
     await recordAgentWorkflowRunReference({
       workspaceSessionDir: sessionDir,
       runId,
       createdAtMs: reference.createdAtMs,
-      afterBoundaryMessageId,
+      afterBoundaryMessageId: decision.status === "found" ? decision.messageId : null,
       ...(reference.agentId != null
         ? {
             agentId: reference.agentId,
