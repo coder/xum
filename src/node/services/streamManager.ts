@@ -2156,75 +2156,61 @@ export class StreamManager {
    * Atomically creates a new stream with all necessary setup
    */
   private createStreamAtomically(
-    workspaceId: WorkspaceId,
-    streamToken: StreamToken,
-    runtimeTempDir: string,
-    runtime: Runtime,
-    messages: ModelMessage[],
-    model: LanguageModel,
-    modelString: string,
-    abortController: AbortController,
-    system: string,
-    historySequence: number,
-    messageId: string,
-    tools?: Record<string, Tool>,
-    initialMetadata?: Partial<MuxMetadata>,
-    providerOptions?: Record<string, unknown>,
-    maxOutputTokens?: number,
-    toolPolicy?: ToolPolicy,
-    callSettingsOverrides?: ResolvedCallSettingsOverrides,
-    hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean,
-    workspaceName?: string,
-    thinkingLevel?: string,
-    headers?: Record<string, string | undefined>,
-    anthropicCacheTtlOverride?: AnthropicCacheTtl,
-    onChunk?: StreamTextOnChunk,
-    onStepMessages?: (messages: ModelMessage[]) => void,
-    modelFallback?: ModelFallbackOptions,
-    toolSearchState?: ToolSearchStreamState,
-    thinkingOverrideState?: ActiveTurnThinkingOverride,
-    rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel,
-    forcedFirstStepToolNames?: string[],
-    providersConfigSnapshot?: ProvidersConfigMap,
-    rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel,
-    completionController?: TurnCompletionController
+    options: TurnExecutionOptions,
+    ctx: {
+      streamToken: StreamToken;
+      runtimeTempDir: string;
+      abortController: AbortController;
+      completionController: TurnCompletionController;
+    }
   ): WorkspaceStreamInfo {
-    // abortController is created and linked to the caller-provided abortSignal in startStream().
-
-    const stepTracker: StepMessageTracker = {};
-    const metadataModel = this.resolveMetadataModel(modelString, providersConfigSnapshot);
-    const request = this.buildStreamRequestConfig(
-      model,
+    // ctx.abortController is created and linked to the caller-provided abortSignal in startStream().
+    const workspaceId = options.workspaceId as WorkspaceId;
+    const {
+      messageId,
       modelString,
-      messages,
-      system,
-      initialMetadata?.routeProvider,
-      tools,
-      providerOptions,
+      historySequence,
+      workspaceName,
+      thinkingLevel,
+      initialMetadata,
+      modelFallback,
       maxOutputTokens,
-      callSettingsOverrides,
-      toolPolicy,
-      hasQueuedMessages,
-      headers,
-      anthropicCacheTtlOverride,
-      onChunk,
-      onStepMessages,
-      toolSearchState,
+      runtime,
+    } = options;
+    const stepTracker: StepMessageTracker = {};
+    const metadataModel = this.resolveMetadataModel(modelString, options.providersConfigSnapshot);
+    const request = this.buildStreamRequestConfig(
+      options.model,
+      modelString,
+      options.messages,
+      options.system,
+      initialMetadata?.routeProvider,
+      options.tools,
+      options.providerOptions,
+      maxOutputTokens,
+      options.callSettingsOverrides,
+      options.toolPolicy,
+      options.hasQueuedMessages,
+      options.headers,
+      options.anthropicCacheTtlOverride,
+      options.onChunk,
+      options.onStepMessages,
+      options.toolSearchState,
       (toolCallId) => this.handleToolExecutionStart(workspaceId, messageId, toolCallId),
-      thinkingOverrideState,
-      rebuildProviderOptionsForThinkingLevel,
-      forcedFirstStepToolNames,
-      providersConfigSnapshot,
-      rebuildFirstStepForThinkingLevel
+      options.thinkingOverrideState,
+      options.rebuildProviderOptionsForThinkingLevel,
+      options.forcedFirstStepToolNames,
+      options.providersConfigSnapshot,
+      options.rebuildFirstStepForThinkingLevel
     );
 
     // Start streaming - this can throw immediately if API key is missing
     let streamResult;
     try {
-      streamResult = this.createStreamResult(request, abortController, stepTracker);
+      streamResult = this.createStreamResult(request, ctx.abortController, stepTracker);
     } catch (error) {
       // Clean up abort controller if stream creation fails
-      abortController.abort();
+      ctx.abortController.abort();
       // Re-throw the error to be caught by startStream
       throw error;
     }
@@ -2234,9 +2220,9 @@ export class StreamManager {
       state: StreamState.STARTING,
       streamResult,
       workspaceName,
-      abortController,
+      abortController: ctx.abortController,
       messageId,
-      token: streamToken,
+      token: ctx.streamToken,
       startTime,
       lastPartTimestamp: startTime,
       toolCompletionTimestamps: new Map(),
@@ -2271,8 +2257,8 @@ export class StreamManager {
       partialWritePromise: undefined, // No write in flight initially
       processingPromise: Promise.resolve(), // Placeholder, overwritten in startStream
       softInterrupt: { pending: false },
-      completionController: completionController ?? createTurnCompletionController(),
-      runtimeTempDir, // Stream-scoped temp directory for tool outputs
+      completionController: ctx.completionController,
+      runtimeTempDir: ctx.runtimeTempDir, // Stream-scoped temp directory for tool outputs
       runtime, // Runtime for temp directory cleanup
       // Initialize cumulative tracking for multi-step streams
       cumulativeUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
@@ -4532,33 +4518,12 @@ export class StreamManager {
       model,
       modelString,
       historySequence,
-      system,
       runtime,
       messageId,
       abortSignal,
-      tools,
-      initialMetadata,
-      providerOptions,
-      maxOutputTokens,
-      toolPolicy,
       providedStreamToken,
-      hasQueuedMessages,
-      workspaceName,
-      thinkingLevel,
-      headers,
-      anthropicCacheTtlOverride,
-      callSettingsOverrides,
-      onChunk,
-      onStepMessages,
       providedRuntimeTempDir,
-      modelFallback,
-      toolSearchState,
-      thinkingOverrideState,
-      rebuildProviderOptionsForThinkingLevel,
-      forcedFirstStepToolNames,
-      providersConfigSnapshot,
       onStreamConstructed,
-      rebuildFirstStepForThinkingLevel,
     } = options;
     const completionController = createTurnCompletionController();
     const createHandle = (streamToken: StreamToken): TurnStreamHandle => ({
@@ -4625,40 +4590,12 @@ export class StreamManager {
         }
 
         // Step 4: Atomic stream creation and registration
-        const streamInfo = this.createStreamAtomically(
-          typedWorkspaceId,
+        const streamInfo = this.createStreamAtomically(options, {
           streamToken,
           runtimeTempDir,
-          runtime,
-          messages,
-          model,
-          modelString,
-          streamAbortController,
-          system,
-          historySequence,
-          messageId,
-          tools,
-          initialMetadata,
-          providerOptions,
-          maxOutputTokens,
-          toolPolicy,
-          callSettingsOverrides,
-          hasQueuedMessages,
-          workspaceName,
-          thinkingLevel,
-          headers,
-          anthropicCacheTtlOverride,
-          onChunk,
-          onStepMessages,
-          modelFallback,
-          toolSearchState,
-          thinkingOverrideState,
-          rebuildProviderOptionsForThinkingLevel,
-          forcedFirstStepToolNames,
-          providersConfigSnapshot,
-          rebuildFirstStepForThinkingLevel,
-          completionController
-        );
+          abortController: streamAbortController,
+          completionController,
+        });
 
         // Guard against a narrow race:
         // - stopStream() may abort while we're between the last aborted-check and stream registration.

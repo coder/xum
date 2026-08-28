@@ -2403,22 +2403,8 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
       streamManager,
       "createStreamAtomically",
       (
-        wsId: string,
-        streamToken: string,
-        _runtimeTempDir: string,
-        _runtime: unknown,
-        _messages: unknown,
-        _modelArg: unknown,
-        modelString: string,
-        abortController: AbortController,
-        _system: string,
-        historySequence: number,
-        _messageId: string,
-        _tools?: Record<string, unknown>,
-        initialMetadata?: Record<string, unknown>,
-        _providerOptions?: Record<string, unknown>,
-        _maxOutputTokens?: number,
-        _toolPolicy?: unknown
+        options: TurnExecutionOptions,
+        ctx: { streamToken: string; abortController: AbortController }
       ): WorkspaceStreamInfoStub => {
         operations.push("create");
 
@@ -2431,13 +2417,13 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
             usage: Promise.resolve(undefined),
             providerMetadata: Promise.resolve(undefined),
           },
-          abortController,
+          abortController: ctx.abortController,
           messageId: `test-${Math.random().toString(36).slice(2)}`,
-          token: streamToken,
+          token: ctx.streamToken,
           startTime: Date.now(),
-          model: modelString,
-          initialMetadata,
-          historySequence,
+          model: options.modelString,
+          initialMetadata: options.initialMetadata,
+          historySequence: options.historySequence,
           parts: [],
           lastPartialWriteTime: 0,
           partialWriteTimer: undefined,
@@ -2445,7 +2431,7 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
           processingPromise: Promise.resolve(),
         };
 
-        workspaceStreams.set(wsId, streamInfo);
+        workspaceStreams.set(options.workspaceId, streamInfo);
         return streamInfo;
       }
     );
