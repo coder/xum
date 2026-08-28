@@ -42,6 +42,7 @@ export const NestedToolsContainer: React.FC<NestedToolsContainerProps> = ({
             workspaceId={workspaceId}
             toolCallId={call.toolCallId}
             toolCallTimestamp={call.timestamp ?? toolCallTimestamp}
+            workflowRunHint={call.workflowRun}
           />
         );
       })}

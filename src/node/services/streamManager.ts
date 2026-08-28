@@ -795,6 +795,18 @@ export class StreamManager extends EventEmitter {
       (part) => part.type === "dynamic-tool" && part.toolCallId === event.toolCallId
     );
     if (partIndex === -1) {
+      // Kernel-launched workflows target a NESTED call persisted on a
+      // code_execution part (see emitNestedToolEvent), not a top-level part.
+      if (
+        await this.attachWorkflowRunToNestedCall(
+          workspaceId,
+          streamInfo,
+          event.toolCallId,
+          attachment
+        )
+      ) {
+        return true;
+      }
       (streamInfo.pendingWorkflowRunAttachments ??= new Map()).set(event.toolCallId, attachment);
       return true;
     }
@@ -812,6 +824,36 @@ export class StreamManager extends EventEmitter {
 
     await this.flushPartialWrite(workspaceId, streamInfo);
     return true;
+  }
+
+  /**
+   * Persist a workflow run attachment onto the nested call record it targets,
+   * so a kernel-launched run's identity survives reload even when kernel
+   * bounding replaced the nested args/result with a marker. The live event
+   * still reaches the frontend through the normal emit path.
+   */
+  private async attachWorkflowRunToNestedCall(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    toolCallId: string,
+    attachment: WorkflowRunToolAttachment
+  ): Promise<boolean> {
+    for (const part of streamInfo.parts) {
+      if (part.type !== "dynamic-tool") {
+        continue;
+      }
+      const parentPart = part as { nestedCalls?: NestedToolCall[] };
+      const nestedCalls = parentPart.nestedCalls;
+      const nestedIndex =
+        nestedCalls?.findIndex((nested) => nested.toolCallId === toolCallId) ?? -1;
+      if (nestedCalls == null || nestedIndex === -1) {
+        continue;
+      }
+      nestedCalls[nestedIndex] = { ...nestedCalls[nestedIndex], workflowRun: attachment };
+      await this.flushPartialWrite(workspaceId, streamInfo);
+      return true;
+    }
+    return false;
   }
 
   /**

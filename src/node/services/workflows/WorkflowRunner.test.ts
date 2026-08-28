@@ -3237,6 +3237,9 @@ describe("WorkflowRunner", () => {
             getAbortSignal() {
               return undefined;
             },
+            takeActiveHostCallId() {
+              return undefined;
+            },
             async eval() {
               evalSawLimits = limitsApplied;
               return {

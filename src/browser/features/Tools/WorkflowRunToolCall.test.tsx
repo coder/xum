@@ -2136,6 +2136,84 @@ describe("WorkflowRunToolCall", () => {
     );
   });
 
+  test("renders a workflow card from kernel-bounded args via the attached run hint", async () => {
+    // A kernel-nested workflow_run whose launch args were replaced by a
+    // __kernelBounded marker must still render the live card: identity comes
+    // from the attached run hint, and the marker offers nothing for the
+    // heuristic name+args discovery to match (listRuns must stay untouched).
+    const attachedRun = createWorkflowRunForExpansionTest({ id: "wfr_kernel", status: "running" });
+    const listRuns = mock(async () => []);
+    const getRun = mock(async () => attachedRun);
+
+    const view = render(
+      <APIHarness client={{ workflows: { listRuns, getRun } }}>
+        <ThemeProvider forcedTheme="dark">
+          <TooltipProvider>
+            <WorkflowRunToolCall
+              args={{ __kernelBounded: true, bytes: 18_457, preview: "{…}" }}
+              status="executing"
+              workspaceId={TEST_WORKSPACE_ID}
+              toolCallId="nested-workflow-1"
+              workflowRunHint={{ runId: "wfr_kernel", run: attachedRun }}
+            />
+          </TooltipProvider>
+        </ThemeProvider>
+      </APIHarness>
+    );
+
+    // The workflow name renders in both the header and the script card.
+    expect(view.getAllByText("deep-research").length).toBeGreaterThan(0);
+    expect(view.getByText("wfr_kernel")).toBeTruthy();
+    expect(listRuns).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(getRun).toHaveBeenCalledWith({ workspaceId: TEST_WORKSPACE_ID, runId: "wfr_kernel" })
+    );
+  });
+
+  test("recovers run identity from a kernel-bounded result marker", async () => {
+    // With both args and result bounded, the retained runId on the result
+    // marker is the only identity; expanding the card must refetch the
+    // durable run by that id.
+    const completedRun = createWorkflowRunForExpansionTest({
+      id: "wfr_bounded_result",
+      status: "completed",
+    });
+    const getRun = mock(async () => completedRun);
+
+    const view = render(
+      <APIHarness client={{ workflows: { getRun } }}>
+        <ThemeProvider forcedTheme="dark">
+          <TooltipProvider>
+            <WorkflowRunToolCall
+              args={{ __kernelBounded: true, bytes: 18_457, preview: "{…}" }}
+              result={
+                {
+                  __kernelBounded: true,
+                  bytes: 40_000,
+                  preview: "{…}",
+                  runId: "wfr_bounded_result",
+                  status: "completed",
+                } as never
+              }
+              status="completed"
+              workspaceId={TEST_WORKSPACE_ID}
+              toolCallId="nested-workflow-2"
+            />
+          </TooltipProvider>
+        </ThemeProvider>
+      </APIHarness>
+    );
+
+    fireEvent.click(getWorkflowHeader(view));
+    await waitFor(() =>
+      expect(getRun).toHaveBeenCalledWith({
+        workspaceId: TEST_WORKSPACE_ID,
+        runId: "wfr_bounded_result",
+      })
+    );
+    await waitFor(() => expect(view.getAllByText("deep-research").length).toBeGreaterThan(0));
+  });
+
   test("uses resume result status when the attachment run snapshot is stale", async () => {
     const staleRun = {
       ...createWorkflowRunForExpansionTest({ id: "wfr_resume_stale", status: "running" }),

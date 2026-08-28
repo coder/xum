@@ -158,6 +158,19 @@ export interface IJSRuntime extends Disposable {
   getAbortSignal(): AbortSignal | undefined;
 
   /**
+   * Consume the record callId of the host call currently being dispatched.
+   * The runtime sets it synchronously immediately before invoking a
+   * registered host function, and the tool bridge must read it as its FIRST
+   * synchronous operation (before any await): the value is only coherent
+   * inside that same synchronous window. Consuming (clear-on-read) prevents a
+   * stale id from leaking into a host function invoked outside the runtime
+   * dispatch path. Bridges use it as the nested tool call's toolCallId so
+   * UI events emitted by the tool (workflow-run-attached, task-created, live
+   * bash output) land on the SAME id the transcript's nested record carries.
+   */
+  takeActiveHostCallId(): string | undefined;
+
+  /**
    * Clean up resources. Called automatically with `using` declarations.
    */
   dispose(): void;
@@ -186,6 +199,18 @@ export interface KernelRecordBounds {
    * retained diff. Marker fields win on key collisions.
    */
   captureArgsRetained?: (toolName: string, args: unknown) => Record<string, unknown> | undefined;
+  /**
+   * Identity fields merged onto a __kernelBounded RESULT marker when bounding
+   * replaces the result of a record (see retainWorkflowResultIdentityFields):
+   * an oversized workflow_run/workflow_resume result would otherwise lose the
+   * runId and status the transcript card needs to re-render the durable run
+   * after reload. Marker fields win on key collisions, so retained fields can
+   * never spoof __kernelBounded/bytes/preview.
+   */
+  captureResultRetained?: (
+    toolName: string,
+    result: unknown
+  ) => Record<string, unknown> | undefined;
 }
 
 /**

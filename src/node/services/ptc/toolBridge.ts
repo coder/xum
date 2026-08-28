@@ -35,6 +35,7 @@ import {
 import {
   retainExemptKernelRecordResult,
   retainPersistenceCriticalArgsFields,
+  retainWorkflowResultIdentityFields,
   sanitizeMediaRecordCapture,
 } from "./types";
 
@@ -279,6 +280,7 @@ export class ToolBridge {
             resultCapBytes: RESULT_HANDLE_OFFLOAD_THRESHOLD_BYTES,
             captureRetained: retainExemptKernelRecordResult,
             captureArgsRetained: retainPersistenceCriticalArgsFields,
+            captureResultRetained: retainWorkflowResultIdentityFields,
           }
         : undefined
     );
@@ -304,6 +306,13 @@ export class ToolBridge {
       const toolName = name;
 
       xumObj[name] = async (args: unknown) => {
+        // MUST be the first operation: the runtime hands over the nested
+        // record's callId through a synchronous window (see
+        // IJSRuntime.takeActiveHostCallId). Using it as the execute
+        // toolCallId lets tool-emitted UI events (workflow-run-attached,
+        // task-created, live bash output) target the transcript's nested
+        // tool call instead of an id no rendered card carries.
+        const bridgedToolCallId = runtime.takeActiveHostCallId() ?? syntheticToolCallId(toolName);
         // Defense in depth: re-check the grant at call time so a stale or
         // mutated bridge can never invoke a non-granted tool.
         if (!isBridgeToolGranted(this.grants, toolName)) {
@@ -329,10 +338,10 @@ export class ToolBridge {
         }
 
         // Execute tool with full options (toolCallId and messages are required by type
-        // but not used by most tools - generate synthetic values for sandbox context)
+        // but not used by most tools; messages stay synthetic for sandbox context)
         const result: unknown = await boundTool.execute!(validatedArgs, {
           abortSignal,
-          toolCallId: syntheticToolCallId(toolName),
+          toolCallId: bridgedToolCallId,
           messages: [],
           context: undefined,
         });
@@ -371,6 +380,10 @@ export class ToolBridge {
     const taskTool = this.bridgeableTools.get("task");
     if (taskTool !== undefined) {
       xumObj.task_spawn = async (args: unknown) => {
+        // First operation, same synchronous-window contract as the regular
+        // bridged tools above.
+        const bridgedToolCallId =
+          runtime.takeActiveHostCallId() ?? syntheticToolCallId("task_spawn");
         // task_spawn is subject to the same grant as task (defense in depth,
         // mirroring the per-call re-check on regular bridged tools).
         if (!isBridgeToolGranted(this.grants, "task")) {
@@ -394,7 +407,7 @@ export class ToolBridge {
         }
         const result: unknown = await taskTool.execute!(validatedArgs, {
           abortSignal,
-          toolCallId: syntheticToolCallId("task_spawn"),
+          toolCallId: bridgedToolCallId,
           messages: [],
           context: undefined,
         });

@@ -1939,17 +1939,26 @@ export class WorkspaceStore {
     const activeBashToolCallIds = new Set<string>();
     const activeAdvisorToolCallIds = new Set<string>();
     const activeWorkflowToolCallIds = new Set<string>();
+    const collectToolCallId = (toolName: string, toolCallId: string) => {
+      if (toolName === "bash") {
+        activeBashToolCallIds.add(toolCallId);
+      }
+      if (toolName === "advisor") {
+        activeAdvisorToolCallIds.add(toolCallId);
+      }
+      if (isWorkflowRunEmittingToolName(toolName)) {
+        activeWorkflowToolCallIds.add(toolCallId);
+      }
+    };
     for (const msg of aggregator.getDisplayedMessages()) {
       if (msg.type !== "tool") continue;
 
-      if (msg.toolName === "bash") {
-        activeBashToolCallIds.add(msg.toolCallId);
-      }
-      if (msg.toolName === "advisor") {
-        activeAdvisorToolCallIds.add(msg.toolCallId);
-      }
-      if (isWorkflowRunEmittingToolName(msg.toolName)) {
-        activeWorkflowToolCallIds.add(msg.toolCallId);
+      collectToolCallId(msg.toolName, msg.toolCallId);
+      // Kernel-nested calls (code_execution) render inside the parent card but
+      // key their live state by their own nested ids; without collecting them
+      // the sweep would prune a nested workflow/bash card's live state mid-run.
+      for (const nested of msg.nestedCalls ?? []) {
+        collectToolCallId(nested.toolName, nested.toolCallId);
       }
     }
 

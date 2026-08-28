@@ -282,6 +282,62 @@ describe("StreamManager - workflow run attachments", () => {
     });
   });
 
+  test("persists workflow attachments onto nested kernel tool calls", async () => {
+    const streamManager = new StreamManager(historyService);
+    const workspaceId = "workflow-nested-attachment-workspace";
+    const messageId = "workflow-nested-attachment-message";
+    const timestamp = Date.now();
+    const streamInfo = createStreamInfoForTests({
+      messageId,
+      lastPartialWriteTime: timestamp,
+      parts: [
+        {
+          type: "dynamic-tool",
+          toolCallId: "code-exec-1",
+          toolName: "code_execution",
+          input: { code: "mux.workflow_run({...})" },
+          state: "input-available",
+          timestamp,
+          nestedCalls: [
+            {
+              toolCallId: "nested-workflow-1",
+              toolName: "workflow_run",
+              // Kernel bounding replaced the launch args with a marker; the
+              // attachment is the only durable run identity for this call.
+              input: { __kernelBounded: true, bytes: 18_457, preview: "{…}" },
+              state: "input-available",
+              timestamp,
+            },
+          ],
+        },
+      ],
+    });
+
+    getWorkspaceStreamsForTests(streamManager).set(workspaceId, streamInfo);
+
+    const attached = await streamManager.attachWorkflowRunToToolCall({
+      type: "workflow-run-attached",
+      workspaceId,
+      messageId,
+      toolCallId: "nested-workflow-1",
+      runId: "wfr_nested",
+      timestamp: timestamp + 1,
+    });
+
+    expect(attached).toBe(true);
+    const partial = await historyService.readPartial(workspaceId);
+    const part = partial?.parts[0];
+    if (part?.type !== "dynamic-tool") {
+      throw new Error("Expected code_execution tool part in persisted partial");
+    }
+    expect(part.nestedCalls?.[0]?.workflowRun).toEqual({
+      runId: "wfr_nested",
+      timestamp: timestamp + 1,
+    });
+    // The attachment landed on the nested record, not the pending map.
+    expect((streamInfo.pendingWorkflowRunAttachments as Map<string, unknown>).size).toBe(0);
+  });
+
   test("persists workflow attachments that arrive before the tool part", async () => {
     const streamManager = new StreamManager(historyService);
     const workspaceId = "workflow-attachment-race-workspace";

@@ -1217,6 +1217,8 @@ export type DisplayedMessage =
         state: "input-available" | "output-available" | "output-redacted";
         failed?: boolean;
         timestamp?: number;
+        /** Durable run identity for nested workflow tool calls (see NestedToolCallSchema). */
+        workflowRun?: MuxToolPart["workflowRun"];
       }>;
     }
   | {

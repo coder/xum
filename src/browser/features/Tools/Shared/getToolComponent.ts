@@ -229,8 +229,14 @@ const TOOL_REGISTRY: Record<string, ToolRegistryEntry> = {
     schema: TaskWorkspaceLifecycleToolArgsSchema,
   },
   workflow_run: {
+    // Kernel-nested calls can arrive with a __kernelBounded args marker
+    // (oversized launch args); the card still renders from the attached
+    // durable run, so don't bounce those to the generic JSON renderer.
     component: WorkflowRunToolCall,
-    schema: TOOL_DEFINITIONS.workflow_run.schema,
+    schema: z.union([
+      TOOL_DEFINITIONS.workflow_run.schema,
+      z.object({ __kernelBounded: z.literal(true), script_path: z.string().nullish() }),
+    ]),
   },
   workflow_resume: {
     component: WorkflowResumeToolCall,

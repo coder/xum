@@ -38,6 +38,18 @@ describe("getToolComponent", () => {
     expect(component).toBe(WorkflowRunToolCall);
   });
 
+  test("routes kernel-bounded workflow_run args to the workflow card", () => {
+    // Kernel-nested calls with oversized launch args arrive as a marker; the
+    // card renders from the attached durable run instead of raw JSON.
+    const marker = { __kernelBounded: true, bytes: 18_457, preview: '{"script_path":"skill…' };
+    expect(getToolComponent("workflow_run", marker)).toBe(WorkflowRunToolCall);
+    expect(
+      getToolComponent("workflow_run", { ...marker, script_path: "skill://demo/workflow.js" })
+    ).toBe(WorkflowRunToolCall);
+    // Other tools keep the generic fallback for bounded args.
+    expect(getToolComponent("bash", marker)).toBe(GenericToolCall);
+  });
+
   test("returns WorkflowResumeToolCall for workflow_resume", () => {
     const component = getToolComponent("workflow_resume", { run_id: "wfr_123" });
     expect(component).toBe(WorkflowResumeToolCall);

@@ -70,6 +70,11 @@ export const NestedToolCallSchema = z.object({
   state: z.enum(["input-available", "output-available", "output-redacted"]),
   failed: z.boolean().optional(),
   timestamp: z.number().optional(),
+  // Durable run identity for nested workflow_run/workflow_resume calls, set
+  // by streamManager when the workflow-run-attached event targets a nested
+  // call. Kernel bounding can replace the nested args/result with a marker,
+  // so without this the transcript card loses the run after reload.
+  workflowRun: WorkflowRunToolAttachmentSchema.optional(),
 });
 
 export type NestedToolCall = z.infer<typeof NestedToolCallSchema>;

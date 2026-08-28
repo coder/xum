@@ -3,6 +3,7 @@ import type { ToolStatus } from "./toolUtils";
 import { getToolComponent } from "./getToolComponent";
 import { HookOutputDisplay, extractHookDuration, extractHookOutput } from "./HookOutputDisplay";
 import { ToolNameProvider } from "../../Messages/ToolNameContext";
+import type { WorkflowRunToolAttachment } from "@/common/orpc/schemas/message";
 
 interface NestedToolRendererProps {
   toolName: string;
@@ -12,6 +13,8 @@ interface NestedToolRendererProps {
   workspaceId?: string;
   toolCallId?: string;
   toolCallTimestamp?: number;
+  /** Persisted run identity for nested workflow tool calls; only the workflow card consumes it. */
+  workflowRunHint?: WorkflowRunToolAttachment;
 }
 
 /**
@@ -26,6 +29,7 @@ export const NestedToolRenderer: React.FC<NestedToolRendererProps> = ({
   workspaceId,
   toolCallId,
   toolCallTimestamp,
+  workflowRunHint,
 }) => {
   const ToolComponent = getToolComponent(toolName, input);
   const hookOutput = extractHookOutput(output);
@@ -43,6 +47,7 @@ export const NestedToolRenderer: React.FC<NestedToolRendererProps> = ({
           workspaceId={workspaceId}
           toolCallId={toolCallId}
           toolCallTimestamp={toolCallTimestamp}
+          workflowRunHint={workflowRunHint}
         />
       </ToolNameProvider>
       {hookOutput && <HookOutputDisplay output={hookOutput} durationMs={hookDuration} />}

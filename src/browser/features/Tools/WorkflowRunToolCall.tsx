@@ -72,11 +72,31 @@ import {
   type WorkflowToolLiveRunState,
 } from "@/browser/stores/WorkspaceStore";
 import { workflowScriptMatchesPath } from "@/browser/utils/workflowRunScriptPaths";
+import {
+  isKernelBoundedMarker,
+  type KernelBoundedMarker,
+} from "@/common/utils/tools/kernelBoundedMarker";
 import { MarkdownRenderer } from "../Messages/MarkdownRenderer";
 
-type WorkflowRunToolDisplayArgs =
+type WorkflowRunToolLaunchArgs =
   | WorkflowRunToolArgs
   | (Omit<WorkflowRunToolArgs, "script_path"> & { script_path?: string; name: string });
+
+/**
+ * Kernel-nested calls can arrive with their launch args replaced by a
+ * __kernelBounded marker; capture retains script_path when it fits (see
+ * retainPersistenceCriticalArgsFields). Run identity then comes from the
+ * workflow-run-attached hint or the result's retained runId.
+ */
+type KernelBoundedWorkflowRunArgs = KernelBoundedMarker & { script_path?: string | null };
+
+type WorkflowRunToolDisplayArgs = WorkflowRunToolLaunchArgs | KernelBoundedWorkflowRunArgs;
+
+function getWorkflowRunLaunchArgs(
+  args: WorkflowRunToolDisplayArgs
+): WorkflowRunToolLaunchArgs | null {
+  return isKernelBoundedMarker(args) ? null : args;
+}
 
 interface WorkflowRunToolCallProps {
   args: WorkflowRunToolDisplayArgs;
@@ -204,7 +224,21 @@ async function updateWorkflowRunFromAction(input: {
 function isWorkflowRunSuccessResult(
   value: WorkflowRunToolResult | undefined
 ): value is WorkflowRunToolSuccessResult {
-  return value != null && !isToolErrorResult(value);
+  return value != null && !isToolErrorResult(value) && !isKernelBoundedMarker(value);
+}
+
+/** RunId/status retained on a kernel-bounded result marker (see retainWorkflowResultIdentityFields). */
+function getKernelBoundedResultIdentity(
+  result: unknown
+): { runId: string; status?: string } | null {
+  if (!isKernelBoundedMarker(result)) {
+    return null;
+  }
+  const { runId, status } = result as { runId?: unknown; status?: unknown };
+  if (typeof runId !== "string" || runId.length === 0) {
+    return null;
+  }
+  return { runId, ...(typeof status === "string" ? { status } : {}) };
 }
 
 // Schema-shaped workflow agent reports carry structuredOutput only; their placeholder
@@ -1133,12 +1167,16 @@ function getWorkflowRunDisplayName(args: WorkflowRunToolDisplayArgs): string {
   if (scriptPath.length > 0) {
     return scriptPath;
   }
+  if (isKernelBoundedMarker(args)) {
+    // Placeholder until the attached durable run supplies the real name.
+    return "workflow";
+  }
   return args.script_source != null ? "inline workflow" : "";
 }
 
 function workflowRunMatchesLaunchArgs(
   run: WorkflowRunRecord,
-  args: WorkflowRunToolDisplayArgs
+  args: WorkflowRunToolLaunchArgs
 ): boolean {
   const invocationArgs = args.args ?? {};
   if (!workflowArgsEqual(run.args ?? {}, invocationArgs)) {
@@ -1154,7 +1192,7 @@ function workflowRunMatchesLaunchArgs(
 
 function findForegroundWorkflowRun(input: {
   runs: readonly WorkflowRunRecord[];
-  args: WorkflowRunToolDisplayArgs;
+  args: WorkflowRunToolLaunchArgs;
   startedAt?: number;
 }): WorkflowRunRecord | null {
   const candidates = input.runs.filter(
@@ -1241,6 +1279,10 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
   const registerCommandSource = commandRegistry?.registerSource;
   const errorResult = isToolErrorResult(result) ? result : null;
   const successResult = isWorkflowRunSuccessResult(result) ? result : null;
+  // Kernel-nested calls: launch args may be a bounded marker (no launch args
+  // to match against) and the result marker may retain only runId/status.
+  const launchArgs = getWorkflowRunLaunchArgs(args);
+  const boundedResultIdentity = getKernelBoundedResultIdentity(result);
   const liveWorkflowRunHint = useWorkflowToolLiveRun(workspaceId, toolCallId);
   const workflowRunHint = explicitWorkflowRunHint ?? liveWorkflowRunHint;
   const [refreshedRun, setRefreshedRun] = useState<WorkflowRunRecord | null>(null);
@@ -1260,7 +1302,8 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
   const selectedRun = selectWorkflowRunSnapshot({
     // knownRunId (workflow_resume) and workflowRunHint provide exact identities before any
     // result arrives, which also disables the heuristic name+args foreground discovery below.
-    runId: successResult?.runId ?? knownRunId ?? workflowRunHint?.runId,
+    runId:
+      successResult?.runId ?? boundedResultIdentity?.runId ?? knownRunId ?? workflowRunHint?.runId,
     baseRun,
     refreshedRun,
   });
@@ -1274,13 +1317,13 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
   const displayStatus =
     successResult?.run == null && successResult?.status != null && !hasRefreshedRunSnapshot
       ? successResult.status
-      : (run?.status ?? successResult?.status ?? status);
+      : (run?.status ?? successResult?.status ?? boundedResultIdentity?.status ?? status);
   const parentRunActive = isWorkflowDisplayStatusActive(displayStatus);
   const displayEventSequence = getLatestWorkflowEventSequence(run);
   const resultValue = successResult?.result ?? getLatestResultEvent(run);
   const reportMarkdown = getReportMarkdown(resultValue);
   const structuredOutput = getStructuredOutput(resultValue);
-  const invocationArgs = run?.args ?? args.args ?? {};
+  const invocationArgs = run?.args ?? launchArgs?.args ?? {};
   const events = run?.events ?? [];
   const displayRows = getWorkflowDisplayRows(events);
   const headerStatus = toToolStatus(displayStatus);
@@ -1335,7 +1378,8 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
   // A uniquely discovered foreground run is actionable before the blocking tool call returns.
   const discoveredForegroundRunConfirmed =
     status === "executing" &&
-    args.run_in_background !== true &&
+    launchArgs != null &&
+    launchArgs.run_in_background !== true &&
     workspaceId != null &&
     refreshedRun != null &&
     runId === refreshedRun.id &&
@@ -1353,6 +1397,7 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
     (workflowRunHint.run?.workspaceId == null || workflowRunHint.run.workspaceId === workspaceId);
   const runIdentityConfirmed =
     successResult?.runId != null ||
+    boundedResultIdentity?.runId != null ||
     baseRun?.id != null ||
     discoveredForegroundRunConfirmed ||
     discoveredKnownRunConfirmed ||
@@ -1496,7 +1541,10 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
       workspaceId == null ||
       runId != null ||
       status !== "executing" ||
-      args.run_in_background === true
+      // Bounded marker args carry nothing to match against; identity arrives
+      // via the workflow-run-attached hint instead.
+      launchArgs == null ||
+      launchArgs.run_in_background === true
     ) {
       return;
     }
@@ -1507,7 +1555,7 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
         const runs = await apiState.api.workflows.listRuns({ workspaceId });
         const foregroundRun = findForegroundWorkflowRun({
           runs,
-          args,
+          args: launchArgs,
           startedAt: discoveryFreshnessBound,
         });
         if (!ignore && foregroundRun != null) {
@@ -1526,9 +1574,9 @@ export const WorkflowRunToolCall: React.FC<WorkflowRunToolCallProps> = ({
       ignore = true;
       window.clearInterval(interval);
     };
-  }, [apiState?.api, args, runId, discoveryFreshnessBound, status, workspaceId]);
+  }, [apiState?.api, launchArgs, runId, discoveryFreshnessBound, status, workspaceId]);
 
-  const exactDiscoveryRunId = knownRunId ?? workflowRunHint?.runId;
+  const exactDiscoveryRunId = knownRunId ?? workflowRunHint?.runId ?? boundedResultIdentity?.runId;
 
   useEffect(() => {
     // workflow_resume args and workflowRunHint carry exact run identity, so fetch by ID while
