@@ -2229,6 +2229,7 @@ interface LanguageInterpreter {
 const NODE_BASED_LAUNCHER_NAMES = new Set(["node", "nodejs", "npm", "npx", "corepack"]);
 const PHP_LAUNCHER_NAME = /^(?:php[0-9.]*|php-win)$/;
 const JAVA_RUNTIME_LAUNCHER_NAME = /^(?:javaw?|jshell[0-9.]*)$/;
+const LUA_LAUNCHER_NAME = /^(?:lua|luajit)[0-9.]*$/;
 
 const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   // Windows spellings count alongside the Unix names: the `py`/`pyw` launcher and the
@@ -2254,7 +2255,7 @@ const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   // through a shell. npm needs its `exec` subcommand tracked separately below.
   { name: /^npx$/, evalWord: /^(?:-c$|--call(?:=|$))/ },
   { name: /^deno$/, evalWord: /^eval$/ },
-  { name: /^(?:lua|luajit)[0-9.]*$/, evalWord: /^-e/ },
+  { name: LUA_LAUNCHER_NAME, evalWord: /^-e/ },
   { name: /^(?:elixir|iex)[0-9.]*$/, evalWord: /^(?:-e$|--eval(?:=|$)|--rpc-eval(?:=|$))/ },
   // erl's -eval runs an expression, and -run/-s call Mod:Func with the remaining
   // words as arguments (`-run os cmd "..."` reaches a shell; os:cmd also accepts
@@ -2932,6 +2933,7 @@ function hasDisguisedAssignment(
       if (inherited.nodeCodeOptions && NODE_BASED_LAUNCHER_NAMES.has(executable)) return true;
       if (inherited.phpConfigHook && PHP_LAUNCHER_NAME.test(executable)) return true;
       if (inherited.javaAgentHook && JAVA_RUNTIME_LAUNCHER_NAME.test(executable)) return true;
+      if (inherited.luaStartupHook && LUA_LAUNCHER_NAME.test(executable)) return true;
       if (executable === "env") sawEnv = true;
       if (executable === "npm") pendingNpmSubcommand = true;
       if (executable === "mise") pendingMiseSubcommand = true;
@@ -3429,6 +3431,8 @@ interface InheritedLaunchContext {
   phpConfigHook: boolean;
   /** A JVM environment variable names an auto-published Java agent archive. */
   javaAgentHook: boolean;
+  /** A LUA_INIT variable's @file form names an auto-published document. */
+  luaStartupHook: boolean;
 }
 
 /** Whether inherited NODE_OPTIONS asks Node to execute a preload/import module. */
@@ -3458,6 +3462,17 @@ function hasInheritedJavaAgent(
   return false;
 }
 
+function hasInheritedLuaStartupFile(rootPrefixes: readonly string[]): boolean {
+  for (const [name, value] of Object.entries(process.env)) {
+    // Lua runs LUA_INIT (and per-version LUA_INIT_5_4 spellings) at startup; the
+    // @ prefix names a file, and any other value is inline code, not a document.
+    if (!/^LUA_INIT(?:_\d+_\d+)?$/.test(name)) continue;
+    if (typeof value !== "string" || !value.startsWith("@")) continue;
+    if (isAutoPublishedScriptOperand(value.slice(1), rootPrefixes)) return true;
+  }
+  return false;
+}
+
 function redactMcpConfig(
   content: Buffer,
   muxRoot: string
@@ -3481,6 +3496,7 @@ function redactMcpConfig(
       [process.env.JAVA_TOOL_OPTIONS, process.env._JAVA_OPTIONS, process.env.JDK_JAVA_OPTIONS],
       rootPrefixes
     ),
+    luaStartupHook: hasInheritedLuaStartupFile(rootPrefixes),
   };
   const text = content.toString("utf-8");
   const { parsed: root, tree } = parseJsoncObjectWithTree(text, "mcp.jsonc");

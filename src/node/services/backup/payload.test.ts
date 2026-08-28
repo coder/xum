@@ -2180,6 +2180,56 @@ describe("backup payload", () => {
     }
   });
 
+  it("localizes Lua launchers under an inherited published startup file", async () => {
+    const variableNames = ["LUA_INIT", "LUA_INIT_5_4"] as const;
+    const originals = variableNames.map((name) => process.env[name]);
+    try {
+      for (const [variable, value, command, expected] of [
+        ["LUA_INIT", `@${muxRoot}/skills/launch.txt`, "lua /opt/server.lua", REDACTED_BACKUP_VALUE],
+        [
+          "LUA_INIT_5_4",
+          `@${muxRoot}/agents/launch.md`,
+          "luajit /opt/server.lua",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // A non-Lua command never runs the startup hook.
+        [
+          "LUA_INIT",
+          `@${muxRoot}/skills/launch.txt`,
+          "python3 /opt/server.py",
+          "python3 /opt/server.py",
+        ],
+        // A non-@ value is inline code, and a foreign @file is not collected.
+        ["LUA_INIT", "print('ready')", "lua /opt/server.lua", "lua /opt/server.lua"],
+        ["LUA_INIT", "@/opt/init.lua", "lua /opt/server.lua", "lua /opt/server.lua"],
+      ] as const) {
+        for (const name of variableNames) delete process.env[name];
+        process.env[variable] = value;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      for (const [index, name] of variableNames.entries()) {
+        const original = originals[index];
+        if (original === undefined) delete process.env[name];
+        else process.env[name] = original;
+      }
+    }
+  });
+
   it("localizes the pre-rename spelling of a renamed settings root", async () => {
     const xumRoot = path.join(tempDir, ".xum");
     await fs.mkdir(xumRoot);
