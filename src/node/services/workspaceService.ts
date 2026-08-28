@@ -305,7 +305,12 @@ import {
   type BashMonitorWakeRecord,
 } from "@/node/services/bashMonitorWakeStore";
 import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycleHooks";
-import type { TaskService } from "@/node/services/taskService";
+import {
+  areArchiveUntrackedPathListsEqual,
+  normalizeArchiveUntrackedPaths,
+  type AgentTaskIntegration,
+  type WorkspaceHost,
+} from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import type { WorktreeArchiveSnapshotService } from "@/node/services/worktreeArchiveSnapshotService";
 
@@ -667,18 +672,6 @@ function normalizeRepoRootProjectPath(projectPath: string | null | undefined): s
   return stripTrailingSlashes(path.posix.normalize(normalizedPath));
 }
 
-function normalizeArchiveUntrackedPaths(paths: readonly string[]): string[] {
-  const normalizedPaths = paths.map((untrackedPath) => {
-    const trimmedPath = untrackedPath.trim();
-    assert(
-      trimmedPath.length > 0,
-      "normalizeArchiveUntrackedPaths: untracked paths must be non-empty"
-    );
-    return trimmedPath;
-  });
-  return [...new Set(normalizedPaths)].sort();
-}
-
 function buildArchiveLossyUntrackedFilesConfirmation(
   paths: readonly string[]
 ): ArchiveLossyUntrackedFilesConfirmation {
@@ -691,23 +684,6 @@ function buildArchiveLossyUntrackedFilesConfirmation(
     kind: "confirm-lossy-untracked-files",
     paths: normalizedPaths,
   };
-}
-
-// Exported so TaskService's pre-interruption archive preflight applies the exact
-// acknowledgement semantics enforced at the archive sink (getArchiveUntrackedFilesConfirmation):
-// a drifted acknowledged set — extra OR missing paths — must re-confirm before any
-// destructive interruption, not after.
-export function areArchiveUntrackedPathListsEqual(
-  leftPaths: readonly string[],
-  rightPaths: readonly string[]
-): boolean {
-  const normalizedLeftPaths = normalizeArchiveUntrackedPaths(leftPaths);
-  const normalizedRightPaths = normalizeArchiveUntrackedPaths(rightPaths);
-  if (normalizedLeftPaths.length !== normalizedRightPaths.length) {
-    return false;
-  }
-
-  return normalizedLeftPaths.every((path, index) => path === normalizedRightPaths[index]);
 }
 
 function isArchiveLossyUntrackedFilesConfirmation(
@@ -1886,7 +1862,7 @@ const DELEGATED_TURN_CONTINUATION_OPTIONS_SCHEMA = SendMessageOptionsSchema.pick
 });
 
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging
-export class WorkspaceService extends EventEmitter {
+export class WorkspaceService extends EventEmitter implements WorkspaceHost {
   private readonly sessions = new Map<string, AgentSession>();
   private readonly providerConfigChangedListener = (): void => {
     const liveSessions = new Map([
@@ -2383,7 +2359,7 @@ export class WorkspaceService extends EventEmitter {
   private readonly initSettlementPromises = new Map<string, Promise<void>>();
 
   /**
-   * Registers a fire-and-forget background init started outside this service (TaskService
+   * Registers a fire-and-forget background init started outside this service (task orchestration
    * starts inits for task workspaces after materializing their checkouts) with the same
    * abort-and-settlement mechanism archive uses: archiveUnlocked aborts the registered
    * controller when init state is still running, and always awaits the retained settlement
@@ -3410,7 +3386,7 @@ export class WorkspaceService extends EventEmitter {
     cancelInFlightConsolidation(workspaceId: string): Promise<void>;
   };
   private worktreeArchiveSnapshotService?: WorktreeArchiveSnapshotLifecycleService;
-  private taskService?: TaskService;
+  private agentTaskIntegration?: AgentTaskIntegration;
   private workspaceGoalService?: WorkspaceGoalService;
   /** Narrow DevTools cleanup surface; wired by coreServices when a DevToolsService exists. */
   private devToolsService?: { removeWorkspaceData(workspaceId: string): Promise<void> };
@@ -3474,7 +3450,7 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * TaskService entry point: task worktrees are REGISTERED before their
+   * Task orchestration entry point: task worktrees are REGISTERED before their
    * checkout exists (queued/reserved launches persist the entry with a future
    * path), so creation-time sanitization cannot cover them and an uninstall's
    * override pruning enumerates a path with nothing to prune — the later
@@ -3756,12 +3732,8 @@ export class WorkspaceService extends EventEmitter {
     this.worktreeArchiveSnapshotService = service;
   }
 
-  /**
-   * Set the task service for auto-resume counter resets.
-   * Called after construction due to circular dependency.
-   */
-  setTaskService(taskService: TaskService): void {
-    this.taskService = taskService;
+  setAgentTaskIntegration(integration: AgentTaskIntegration): void {
+    this.agentTaskIntegration = integration;
   }
 
   /** DevTools debug-log cleanup on archive/remove; wired by coreServices. */
@@ -6215,8 +6187,8 @@ export class WorkspaceService extends EventEmitter {
     workspaceId: string,
     operation: () => Promise<T>
   ): Promise<T> {
-    const taskService = this.taskService;
-    const withLock = taskService?.withTaskTreeLifecycleLock?.bind(taskService);
+    const integration = this.agentTaskIntegration;
+    const withLock = integration?.withTaskTreeLifecycleLock?.bind(integration);
     return withLock == null ? await operation() : await withLock(workspaceId, operation);
   }
 
@@ -6227,9 +6199,9 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * Internal entry point for TaskService callers that already hold the task-tree lifecycle lock,
+   * Internal entry point for task orchestration callers that already hold the task-tree lifecycle lock,
    * or that must not acquire it for lock-ordering reasons (e.g. createWorkspaceTurn cleanup runs
-   * under TaskService's creation mutex, which the tree lock is ordered before).
+   * under the task creation mutex, which the tree lock is ordered before).
    */
   async removeWhileTaskTreeLocked(workspaceId: string, force = false): Promise<Result<void>> {
     return await this.removeUnlocked(workspaceId, force);
@@ -6265,7 +6237,7 @@ export class WorkspaceService extends EventEmitter {
 
     // Try to remove from runtime (filesystem)
     try {
-      if (this.taskService?.hasDescendantAgentTasks?.(workspaceId) === true) {
+      if (this.agentTaskIntegration?.hasDescendantAgentTasks?.(workspaceId) === true) {
         return Err(DESCENDANT_WORKSPACE_REMOVE_ERROR);
       }
 
@@ -8412,7 +8384,9 @@ export class WorkspaceService extends EventEmitter {
     options?: { worktreeArchiveBehaviorOverride?: WorktreeArchiveBehavior }
   ): Promise<Result<ArchivePreflightResult>> {
     try {
-      if (this.taskService?.hasActiveDescendantAgentTasksForWorkspace(workspaceId) === true) {
+      if (
+        this.agentTaskIntegration?.hasActiveDescendantAgentTasksForWorkspace(workspaceId) === true
+      ) {
         return Err(ACTIVE_DESCENDANT_ARCHIVE_ERROR);
       }
 
@@ -9061,7 +9035,7 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * Internal entry point for TaskService callers that already hold the task-tree lifecycle
+   * Internal entry point for task orchestration callers that already hold the task-tree lifecycle
    * lock. The model-facing workspace lifecycle path pre-acquires that lock before its own
    * lifecycle locks to preserve the global lock order (task-tree → task-creation mutex →
    * workspace lifecycle), so the sink must not re-acquire it.
@@ -9154,7 +9128,9 @@ export class WorkspaceService extends EventEmitter {
         // entering later observe the armed guard and refuse. This closes the window between
         // the caller's earlier active-run snapshot and this sink.
         if (
-          (await this.taskService?.hasActiveTopLevelWorkflowRunsForWorkspace(workspaceId)) === true
+          (await this.agentTaskIntegration?.hasActiveTopLevelWorkflowRunsForWorkspace(
+            workspaceId
+          )) === true
         ) {
           return Err(
             "Workspace has active workflow runs that archiving would orphan. Wait for them to finish or ask the user to archive manually."
@@ -9179,7 +9155,9 @@ export class WorkspaceService extends EventEmitter {
       if (!workspace) {
         return Err("Workspace not found");
       }
-      if (this.taskService?.hasActiveDescendantAgentTasksForWorkspace(workspaceId) === true) {
+      if (
+        this.agentTaskIntegration?.hasActiveDescendantAgentTasksForWorkspace(workspaceId) === true
+      ) {
         return Err(ACTIVE_DESCENDANT_ARCHIVE_ERROR);
       }
       const initState = this.initStateManager.getInitState(workspaceId);
@@ -9527,7 +9505,7 @@ export class WorkspaceService extends EventEmitter {
   }
 
   /**
-   * Internal entry point for TaskService callers that already hold the task-tree lifecycle
+   * Internal entry point for task orchestration callers that already hold the task-tree lifecycle
    * lock (the model-facing unarchive path pre-acquires it for lock ordering; agent-task
    * ancestry unarchive runs under the send path's tree lock).
    */
@@ -11367,7 +11345,7 @@ export class WorkspaceService extends EventEmitter {
       }
 
       // Guard: queued agent tasks must not start streaming via generic sendMessage calls.
-      // They should only be started by TaskService once a parallel slot is available.
+      // They should only be started by task orchestration once a parallel slot is available.
       if (!internal?.allowQueuedAgentTask) {
         const config = this.config.loadConfigOrDefault();
         for (const [_projectPath, project] of config.projects) {
@@ -11542,7 +11520,7 @@ export class WorkspaceService extends EventEmitter {
         if (internal?.admissionStale?.() === true) {
           return Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
         }
-        const taskStatus = this.taskService?.getAgentTaskStatus?.(workspaceId);
+        const taskStatus = this.agentTaskIntegration?.getAgentTaskStatus?.(workspaceId);
         if (taskStatus === "interrupted") {
           return Err({
             type: "unknown",
@@ -11646,18 +11624,18 @@ export class WorkspaceService extends EventEmitter {
         }
 
         if (effectiveQueueDispatchMode != null && !internal?.skipAutoResumeReset) {
-          this.taskService?.resetAutoResumeCount?.(workspaceId);
+          this.agentTaskIntegration?.resetAutoResumeCount?.(workspaceId);
         }
 
         if (effectiveQueueDispatchMode === "tool-end") {
-          this.taskService?.backgroundForegroundWaitsForWorkspace?.(workspaceId);
+          this.agentTaskIntegration?.backgroundForegroundWaitsForWorkspace?.(workspaceId);
         }
 
         return Ok(undefined);
       }
 
       if (!internal?.skipAutoResumeReset) {
-        this.taskService?.resetAutoResumeCount(workspaceId);
+        this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
       }
 
       // A stale caller probe must refuse BEFORE the interrupted-task rescue below: a peer send
@@ -11668,7 +11646,7 @@ export class WorkspaceService extends EventEmitter {
       }
 
       // Non-destructive interrupt cascades preserve descendant task workspaces with
-      // taskStatus=interrupted. Transition before starting a new stream so TaskService
+      // taskStatus=interrupted. Transition before starting a new stream so task orchestration
       // stream-end handling does not early-return on interrupted status.
       //
       // Guarded sends (peer messages) skip this rescue entirely: it exists for user-driven
@@ -11679,7 +11657,7 @@ export class WorkspaceService extends EventEmitter {
       if (internal?.admissionStale == null) {
         try {
           resumedInterruptedTask =
-            (await this.taskService?.markInterruptedTaskRunning?.(workspaceId)) ?? false;
+            (await this.agentTaskIntegration?.markInterruptedTaskRunning?.(workspaceId)) ?? false;
         } catch (error: unknown) {
           log.error("Failed to restore interrupted task status before sendMessage", {
             workspaceId,
@@ -11692,7 +11670,9 @@ export class WorkspaceService extends EventEmitter {
       const onAcceptedPreStreamFailure = async (error: SendMessageError) => {
         if (resumedInterruptedTask && normalizedOptions?.editMessageId) {
           try {
-            await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure?.(
+              workspaceId
+            );
           } catch (restoreError: unknown) {
             log.error(
               "Failed to restore interrupted task status after accepted edit startup failure",
@@ -11761,7 +11741,9 @@ export class WorkspaceService extends EventEmitter {
 
         if (resumedInterruptedTask) {
           try {
-            await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure?.(
+              workspaceId
+            );
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after sendMessage failure", {
               workspaceId,
@@ -11796,7 +11778,7 @@ export class WorkspaceService extends EventEmitter {
 
       if (resumedInterruptedTask) {
         try {
-          await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+          await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
         } catch (restoreError: unknown) {
           log.error("Failed to restore interrupted task status after sendMessage throw", {
             workspaceId,
@@ -11906,7 +11888,7 @@ export class WorkspaceService extends EventEmitter {
       }
 
       // Guard: queued agent tasks must not be resumed by generic UI/API calls.
-      // TaskService is responsible for dequeuing and starting them.
+      // Task orchestration is responsible for dequeuing and starting them.
       if (!internal?.allowQueuedAgentTask) {
         const config = this.config.loadConfigOrDefault();
         for (const [_projectPath, project] of config.projects) {
@@ -11936,7 +11918,7 @@ export class WorkspaceService extends EventEmitter {
 
       const session = this.getOrCreateSession(workspaceId);
 
-      const taskStatus = this.taskService?.getAgentTaskStatus?.(workspaceId);
+      const taskStatus = this.agentTaskIntegration?.getAgentTaskStatus?.(workspaceId);
       if (taskStatus === "interrupted" && session.isBusy()) {
         return Err({
           type: "unknown",
@@ -11960,11 +11942,11 @@ export class WorkspaceService extends EventEmitter {
       await this.maybePersistAISettingsFromOptions(workspaceId, normalizedOptions, "resume");
 
       // Non-destructive interrupt cascades preserve descendant task workspaces with
-      // taskStatus=interrupted. Transition before stream start so TaskService stream-end
+      // taskStatus=interrupted. Transition before stream start so task orchestration stream-end
       // handling does not early-return on interrupted status.
       try {
         resumedInterruptedTask =
-          (await this.taskService?.markInterruptedTaskRunning?.(workspaceId)) ?? false;
+          (await this.agentTaskIntegration?.markInterruptedTaskRunning?.(workspaceId)) ?? false;
       } catch (error: unknown) {
         log.error("Failed to restore interrupted task status before resumeStream", {
           workspaceId,
@@ -11991,7 +11973,9 @@ export class WorkspaceService extends EventEmitter {
         });
         if (resumedInterruptedTask) {
           try {
-            await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure?.(
+              workspaceId
+            );
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after resumeStream failure", {
               workspaceId,
@@ -12007,7 +11991,9 @@ export class WorkspaceService extends EventEmitter {
       if (!result.data.started) {
         if (resumedInterruptedTask) {
           try {
-            await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+            await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure?.(
+              workspaceId
+            );
           } catch (error: unknown) {
             log.error("Failed to restore interrupted task status after no-op resumeStream", {
               workspaceId,
@@ -12022,7 +12008,7 @@ export class WorkspaceService extends EventEmitter {
     } catch (error) {
       if (resumedInterruptedTask) {
         try {
-          await this.taskService?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
+          await this.agentTaskIntegration?.restoreInterruptedTaskAfterResumeFailure?.(workspaceId);
         } catch (restoreError: unknown) {
           log.error("Failed to restore interrupted task status after resumeStream throw", {
             workspaceId,
@@ -12097,11 +12083,11 @@ export class WorkspaceService extends EventEmitter {
   ): Promise<Result<void>> {
     let releaseHardStopLatch: (() => void) | undefined;
     try {
-      this.taskService?.resetAutoResumeCount(workspaceId);
+      this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
       if (!options?.soft) {
         // Mark before attempting the session interrupt to close races where a child
         // could report between stop initiation and descendant cascade termination.
-        this.taskService?.markParentWorkspaceInterrupted(workspaceId);
+        this.agentTaskIntegration?.markParentWorkspaceInterrupted(workspaceId);
         // Latch synchronously at the request boundary, BEFORE the session-interrupt await
         // below: the suppression mark above is level-triggered (a user resume clears it), so
         // a peer send from a still-running descendant entering during that await — or during
@@ -12109,8 +12095,8 @@ export class WorkspaceService extends EventEmitter {
         // ancestor epoch as its clean baseline and wake workspaces outside the stopped
         // subtree. Released in the finally, after the descendant cascade persisted terminal
         // statuses.
-        // Optional call: test harnesses mock TaskService with a narrow method surface.
-        releaseHardStopLatch = this.taskService?.latchHardInterruptCascade?.(workspaceId);
+        // Optional call: test harnesses mock the task integration port with a narrow method surface.
+        releaseHardStopLatch = this.agentTaskIntegration?.latchHardInterruptCascade?.(workspaceId);
       }
 
       const session = this.getOrCreateSession(workspaceId);
@@ -12118,7 +12104,7 @@ export class WorkspaceService extends EventEmitter {
       if (!stopResult.success) {
         // Interrupt failed, so clear hard-interrupt suppression we set above.
         if (!options?.soft) {
-          this.taskService?.resetAutoResumeCount(workspaceId);
+          this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
         }
         log.error("Failed to stop stream:", stopResult.error);
         return Err(stopResult.error);
@@ -12136,7 +12122,7 @@ export class WorkspaceService extends EventEmitter {
       if (!options?.soft) {
         try {
           const interruptedTaskIds =
-            await this.taskService?.terminateAllDescendantAgentTasks?.(workspaceId);
+            await this.agentTaskIntegration?.terminateAllDescendantAgentTasks?.(workspaceId);
           if (interruptedTaskIds && interruptedTaskIds.length > 0) {
             log.debug("Cascade-interrupted descendant tasks on interrupt", {
               workspaceId,
@@ -12155,7 +12141,7 @@ export class WorkspaceService extends EventEmitter {
       if (options?.sendQueuedImmediately) {
         // `sendQueuedMessages()` routes through AgentSession directly, so explicitly
         // clear hard-interrupt suppression first (it won't flow through sendMessage()).
-        this.taskService?.resetAutoResumeCount(workspaceId);
+        this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
         // The card represents only user-authored queue content. Prioritize that
         // entry over hidden synthetic/background work before dispatching.
         session.sendNextUserQueuedMessage();
@@ -12168,7 +12154,7 @@ export class WorkspaceService extends EventEmitter {
     } catch (error) {
       if (!options?.soft) {
         // Keep suppression state consistent if interrupt setup/stop throws.
-        this.taskService?.resetAutoResumeCount(workspaceId);
+        this.agentTaskIntegration?.resetAutoResumeCount(workspaceId);
       }
       const errorMessage = getErrorMessage(error);
       log.error("Unexpected error in interruptStream handler:", error);

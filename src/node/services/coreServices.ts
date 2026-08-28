@@ -289,7 +289,7 @@ export function createCoreServices(opts: CoreServicesOptions): CoreServices {
     workspaceGoalService
   );
   aiService.setTaskService(taskService);
-  workspaceService.setTaskService(taskService);
+  workspaceService.setAgentTaskIntegration(taskService);
 
   // Goal continuation bridge lives at the core scope so every codepath that
   // uses createCoreServices (xum run, xum server via ServiceContainer, tests)

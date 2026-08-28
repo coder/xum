@@ -17,9 +17,13 @@ import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import type { Config, ProjectsConfig, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
-import type { WorkspaceService } from "@/node/services/workspaceService";
 import type { QueueCutCutter } from "@/node/services/messageQueue";
-import { areArchiveUntrackedPathListsEqual } from "@/node/services/workspaceService";
+import {
+  areArchiveUntrackedPathListsEqual,
+  type AgentTaskIntegration,
+  type AgentTaskStatus,
+  type WorkspaceHost,
+} from "@/node/services/taskWorkspaceSeam";
 import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
@@ -226,7 +230,7 @@ export class AgentReportWaitTimeoutError extends Error {
   }
 }
 
-export type AgentTaskStatus = NonNullable<WorkspaceConfigEntry["taskStatus"]>;
+export type { AgentTaskStatus } from "@/node/services/taskWorkspaceSeam";
 
 /**
  * Resolved per-agent AI settings (canonical model + optional thinking level).
@@ -1601,7 +1605,7 @@ function buildWorkflowTimeoutFinalizationPrompt(
   return `${base}\n\nAdditional workflow-specific finalization instructions:\n${finalInstructions}`;
 }
 
-export class TaskService {
+export class TaskService implements AgentTaskIntegration {
   // Serialize stream-end processing per workspace to avoid races when
   // finalizing reported tasks and cleanup state transitions.
   private readonly workspaceEventLocks = new MutexMap<string>();
@@ -1706,7 +1710,7 @@ export class TaskService {
   private readonly familyMessageTargetTotals = new Map<string, { count: number; chars: number }>();
 
   // Task workspace removals that outlived their termination timeout. Retries must
-  // await the ORIGINAL removal outcome: WorkspaceService.remove() short-circuits Ok
+  // await the ORIGINAL removal outcome: the host's remove() short-circuits Ok
   // for IDs already being removed, so re-calling it would count a still-in-flight
   // (possibly failing) removal as success and let ancestor deletion orphan the child.
   private readonly pendingTaskWorkspaceRemovals = new Map<string, Promise<Result<void>>>();
@@ -2239,7 +2243,7 @@ export class TaskService {
     private readonly config: Config,
     private readonly historyService: HistoryService,
     private readonly aiService: AIService,
-    private readonly workspaceService: WorkspaceService,
+    private readonly workspaceService: WorkspaceHost,
     private readonly initStateManager: InitStateManager,
     private readonly sessionUsageService?: SessionUsageService,
     private readonly workspaceGoalService?: WorkspaceGoalService
@@ -3956,7 +3960,7 @@ export class TaskService {
       // registered, so creation-time plugin-override sanitization never saw
       // this checkout — a tracked stale `plugin:` enable would re-activate a
       // same-name reinstall's default-disabled MCP server on the first send.
-      // Same contract as WorkspaceService.create/fork: sanitize or fail.
+      // Same contract as the host's create/fork paths: sanitize or fail.
       const sanitizeError = await this.workspaceService.sanitizeMaterializedTaskWorkspace(
         plan.taskId,
         workspacePath,
@@ -3988,7 +3992,7 @@ export class TaskService {
       const secrets = await secretsToRecord(
         this.config.getEffectiveSecrets(plan.parentMeta.projectPath)
       );
-      // Registered (not just fired) with WorkspaceService's abort-and-settlement mechanism:
+      // Registered (not just fired) with the host's abort-and-settlement mechanism:
       // a model-driven archive of this task workspace must be able to cancel the init and
       // must wait for the hook process's actual exit before snapshot capture, checkout
       // deletion, or Coder hooks can proceed (see initSettlementPromises).
@@ -4336,7 +4340,7 @@ export class TaskService {
     }
     const taskProjectConfig = cfg.projects.get(stripTrailingSlashes(parentMeta.projectPath));
     if ((parentMeta.projects?.length ?? 0) > 1) {
-      // WorkspaceService.create only materializes one project checkout; fail loudly instead of
+      // The host's create() only materializes one project checkout; fail loudly instead of
       // silently dropping secondary repos from a multi-project caller's task context.
       return Err("Task.createWorkspaceTurn: multi-project workspace turns are not supported yet");
     }
@@ -5550,8 +5554,8 @@ export class TaskService {
     });
 
     if (!useSharedWorkspace) {
-      // SECURITY: this checkout materialized outside WorkspaceService.create/
-      // fork, so registration-time plugin-override sanitization never saw it —
+      // SECURITY: this checkout materialized outside the host's create/fork paths, so
+      // registration-time plugin-override sanitization never saw it —
       // a tracked stale `plugin:` enable would re-activate a same-name
       // reinstall's default-disabled MCP server on the send below. Runs
       // BEFORE emitWorkspaceMetadata (the pre-announcement invariant of
@@ -5585,7 +5589,7 @@ export class TaskService {
       const secrets = await secretsToRecord(
         this.config.getEffectiveSecrets(parentMeta.projectPath)
       );
-      // Registered (not just fired) with WorkspaceService's abort-and-settlement mechanism:
+      // Registered (not just fired) with the host's abort-and-settlement mechanism:
       // a model-driven archive of this task workspace must be able to cancel the init and
       // must wait for the hook process's actual exit before snapshot capture, checkout
       // deletion, or Coder hooks can proceed (see initSettlementPromises).
@@ -6468,9 +6472,9 @@ export class TaskService {
 
         // Admission staleness probe: neither interruptStream nor stopDescendantAgentTask takes
         // this target's event lock, so a user Stop or task_stop can land during ANY await between
-        // here and the real admission — including WorkspaceService.sendMessage's own pricing/
-        // settings awaits and the session's turn preparation. The probe is synchronous and
-        // re-evaluated by WorkspaceService at the enqueue block and the session's turn-admission
+        // here and the real admission — including the host's sendMessage() pricing/settings
+        // awaits and the session's turn preparation. The probe is synchronous and
+        // re-evaluated by the host at the enqueue block and the session's turn-admission
         // gates, so a stop in those windows refuses the send instead of queueing a wake or
         // resurrecting the stopped task via markInterruptedTaskRunning.
         let admissionRefusal: SendAgentTreeMessageError | null = null;
@@ -6675,7 +6679,7 @@ export class TaskService {
       };
     }
 
-    // Optional chaining: test harnesses mock WorkspaceService with a narrow method surface.
+    // Optional chaining: test harnesses mock the host port with a narrow method surface.
     const queuedCount = this.workspaceService.countQueuedAgentPeerMessages?.(targetId) ?? 0;
     if (queuedCount >= MAX_QUEUED_PEER_MESSAGES_PER_TARGET) {
       return {
@@ -7129,7 +7133,7 @@ export class TaskService {
   }
 
   /**
-   * Archive task workspaces deepest-first (so WorkspaceService.archive preconditions on
+   * Archive task workspaces deepest-first (so the host's archive preconditions on
    * descendants hold), logging and continuing on per-task failures — one failed archive
    * must not abort the sweep; failures self-heal on the next startup sweep.
    */

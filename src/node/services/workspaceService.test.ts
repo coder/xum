@@ -42,7 +42,7 @@ import type {
   WorkspaceActivitySnapshot,
   WorkspaceMetadata,
 } from "@/common/types/workspace";
-import type { TaskService } from "./taskService";
+import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import { BashMonitorRegistryStore } from "./bashMonitorRegistryStore";
 import { BashMonitorWakeStore, buildBashMonitorWakeMetadata } from "./bashMonitorWakeStore";
@@ -11932,11 +11932,13 @@ describe("WorkspaceService sendMessage status clearing", () => {
 
     const markInterruptedTaskRunning = mock(() => Promise.resolve(true));
     const restoreInterruptedTaskAfterResumeFailure = mock(() => Promise.resolve());
-    workspaceService.setTaskService({
-      markInterruptedTaskRunning,
-      restoreInterruptedTaskAfterResumeFailure,
-      resetAutoResumeCount: mock(() => undefined),
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        markInterruptedTaskRunning,
+        restoreInterruptedTaskAfterResumeFailure,
+        resetAutoResumeCount: mock(() => undefined),
+      })
+    );
 
     const result = await workspaceService.sendMessage("test-workspace", "hello", {
       model: "openai:gpt-4o-mini",
@@ -11953,11 +11955,13 @@ describe("WorkspaceService sendMessage status clearing", () => {
 
     const markInterruptedTaskRunning = mock(() => Promise.resolve(true));
     const restoreInterruptedTaskAfterResumeFailure = mock(() => Promise.resolve());
-    workspaceService.setTaskService({
-      markInterruptedTaskRunning,
-      restoreInterruptedTaskAfterResumeFailure,
-      resetAutoResumeCount: mock(() => undefined),
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        markInterruptedTaskRunning,
+        restoreInterruptedTaskAfterResumeFailure,
+        resetAutoResumeCount: mock(() => undefined),
+      })
+    );
 
     const startupFailureHandled = createDeferred<void>();
     fakeSession.sendMessage.mockImplementation(
@@ -11995,11 +11999,13 @@ describe("WorkspaceService sendMessage status clearing", () => {
   test("resumeStream restores interrupted task status before successful resume", async () => {
     const markInterruptedTaskRunning = mock(() => Promise.resolve(true));
     const restoreInterruptedTaskAfterResumeFailure = mock(() => Promise.resolve());
-    workspaceService.setTaskService({
-      markInterruptedTaskRunning,
-      restoreInterruptedTaskAfterResumeFailure,
-      resetAutoResumeCount: mock(() => undefined),
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        markInterruptedTaskRunning,
+        restoreInterruptedTaskAfterResumeFailure,
+        resetAutoResumeCount: mock(() => undefined),
+      })
+    );
 
     const result = await workspaceService.resumeStream("test-workspace", {
       model: "openai:gpt-4o-mini",
@@ -12016,11 +12022,13 @@ describe("WorkspaceService sendMessage status clearing", () => {
 
     const markInterruptedTaskRunning = mock(() => Promise.resolve(true));
     const restoreInterruptedTaskAfterResumeFailure = mock(() => Promise.resolve());
-    workspaceService.setTaskService({
-      markInterruptedTaskRunning,
-      restoreInterruptedTaskAfterResumeFailure,
-      resetAutoResumeCount: mock(() => undefined),
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        markInterruptedTaskRunning,
+        restoreInterruptedTaskAfterResumeFailure,
+        resetAutoResumeCount: mock(() => undefined),
+      })
+    );
 
     const result = await workspaceService.resumeStream("test-workspace", {
       model: "openai:gpt-4o-mini",
@@ -12038,11 +12046,13 @@ describe("WorkspaceService sendMessage status clearing", () => {
   test("resumeStream does not start interrupted tasks while still busy", async () => {
     const getAgentTaskStatus = mock(() => "interrupted" as const);
     const markInterruptedTaskRunning = mock(() => Promise.resolve(false));
-    workspaceService.setTaskService({
-      getAgentTaskStatus,
-      markInterruptedTaskRunning,
-      resetAutoResumeCount: mock(() => undefined),
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        getAgentTaskStatus,
+        markInterruptedTaskRunning,
+        resetAutoResumeCount: mock(() => undefined),
+      })
+    );
 
     const result = await workspaceService.resumeStream("test-workspace", {
       model: "openai:gpt-4o-mini",
@@ -12061,11 +12071,13 @@ describe("WorkspaceService sendMessage status clearing", () => {
   test("sendMessage does not queue interrupted tasks while still busy", async () => {
     const getAgentTaskStatus = mock(() => "interrupted" as const);
     const markInterruptedTaskRunning = mock(() => Promise.resolve(false));
-    workspaceService.setTaskService({
-      getAgentTaskStatus,
-      markInterruptedTaskRunning,
-      resetAutoResumeCount: mock(() => undefined),
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        getAgentTaskStatus,
+        markInterruptedTaskRunning,
+        resetAutoResumeCount: mock(() => undefined),
+      })
+    );
 
     const result = await workspaceService.sendMessage("test-workspace", "hello", {
       model: "openai:gpt-4o-mini",
@@ -12085,10 +12097,12 @@ describe("WorkspaceService sendMessage status clearing", () => {
     fakeSession.isBusy.mockReturnValue(true);
 
     const resetAutoResumeCount = mock(() => undefined);
-    workspaceService.setTaskService({
-      getAgentTaskStatus: mock(() => "running" as const),
-      resetAutoResumeCount,
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        getAgentTaskStatus: mock(() => "running" as const),
+        resetAutoResumeCount,
+      })
+    );
 
     const result = await workspaceService.sendMessage("test-workspace", "hello", {
       model: "openai:gpt-4o-mini",
@@ -12104,10 +12118,12 @@ describe("WorkspaceService sendMessage status clearing", () => {
     fakeSession.isBusy.mockReturnValue(true);
 
     const resetAutoResumeCount = mock(() => undefined);
-    workspaceService.setTaskService({
-      getAgentTaskStatus: mock(() => "running" as const),
-      resetAutoResumeCount,
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        getAgentTaskStatus: mock(() => "running" as const),
+        resetAutoResumeCount,
+      })
+    );
 
     const result = await workspaceService.sendMessage(
       "test-workspace",
@@ -12332,10 +12348,12 @@ describe("WorkspaceService sendMessage status clearing", () => {
     fakeSession.isBusy.mockReturnValue(true);
 
     const backgroundForegroundWaitsForWorkspace = mock(() => 0);
-    workspaceService.setTaskService({
-      getAgentTaskStatus: mock(() => "running" as const),
-      backgroundForegroundWaitsForWorkspace,
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        getAgentTaskStatus: mock(() => "running" as const),
+        backgroundForegroundWaitsForWorkspace,
+      })
+    );
 
     const result = await workspaceService.sendMessage("test-workspace", "hello", {
       model: "openai:gpt-4o-mini",
@@ -12352,10 +12370,12 @@ describe("WorkspaceService sendMessage status clearing", () => {
     fakeSession.queueMessage.mockReturnValue("turn-end");
 
     const backgroundForegroundWaitsForWorkspace = mock(() => 0);
-    workspaceService.setTaskService({
-      getAgentTaskStatus: mock(() => "running" as const),
-      backgroundForegroundWaitsForWorkspace,
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        getAgentTaskStatus: mock(() => "running" as const),
+        backgroundForegroundWaitsForWorkspace,
+      })
+    );
 
     const result = await workspaceService.sendMessage("test-workspace", "hello", {
       model: "openai:gpt-4o-mini",
@@ -12373,10 +12393,12 @@ describe("WorkspaceService sendMessage status clearing", () => {
     fakeSession.queueMessage.mockReturnValue(null);
 
     const backgroundForegroundWaitsForWorkspace = mock(() => 0);
-    workspaceService.setTaskService({
-      getAgentTaskStatus: mock(() => "running" as const),
-      backgroundForegroundWaitsForWorkspace,
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        getAgentTaskStatus: mock(() => "running" as const),
+        backgroundForegroundWaitsForWorkspace,
+      })
+    );
 
     const result = await workspaceService.sendMessage("test-workspace", "   ", {
       model: "openai:gpt-4o-mini",
@@ -12393,10 +12415,12 @@ describe("WorkspaceService sendMessage status clearing", () => {
     fakeSession.queueMessage.mockReturnValue("tool-end");
 
     const backgroundForegroundWaitsForWorkspace = mock(() => 0);
-    workspaceService.setTaskService({
-      getAgentTaskStatus: mock(() => "running" as const),
-      backgroundForegroundWaitsForWorkspace,
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        getAgentTaskStatus: mock(() => "running" as const),
+        backgroundForegroundWaitsForWorkspace,
+      })
+    );
 
     const result = await workspaceService.sendMessage("test-workspace", "hello", {
       model: "openai:gpt-4o-mini",
@@ -12420,11 +12444,13 @@ describe("WorkspaceService sendMessage status clearing", () => {
 
     const markInterruptedTaskRunning = mock(() => Promise.resolve(true));
     const restoreInterruptedTaskAfterResumeFailure = mock(() => Promise.resolve());
-    workspaceService.setTaskService({
-      markInterruptedTaskRunning,
-      restoreInterruptedTaskAfterResumeFailure,
-      resetAutoResumeCount: mock(() => undefined),
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        markInterruptedTaskRunning,
+        restoreInterruptedTaskAfterResumeFailure,
+        resetAutoResumeCount: mock(() => undefined),
+      })
+    );
 
     const result = await workspaceService.sendMessage("test-workspace", "hello", {
       model: "openai:gpt-4o-mini",
@@ -12442,11 +12468,13 @@ describe("WorkspaceService sendMessage status clearing", () => {
 
     const markInterruptedTaskRunning = mock(() => Promise.resolve(true));
     const restoreInterruptedTaskAfterResumeFailure = mock(() => Promise.resolve());
-    workspaceService.setTaskService({
-      markInterruptedTaskRunning,
-      restoreInterruptedTaskAfterResumeFailure,
-      resetAutoResumeCount: mock(() => undefined),
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        markInterruptedTaskRunning,
+        restoreInterruptedTaskAfterResumeFailure,
+        resetAutoResumeCount: mock(() => undefined),
+      })
+    );
 
     const result = await workspaceService.sendMessage("test-workspace", "hello", {
       model: "openai:gpt-4o-mini",
@@ -12463,11 +12491,13 @@ describe("WorkspaceService sendMessage status clearing", () => {
 
     const markInterruptedTaskRunning = mock(() => Promise.resolve(true));
     const restoreInterruptedTaskAfterResumeFailure = mock(() => Promise.resolve());
-    workspaceService.setTaskService({
-      markInterruptedTaskRunning,
-      restoreInterruptedTaskAfterResumeFailure,
-      resetAutoResumeCount: mock(() => undefined),
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        markInterruptedTaskRunning,
+        restoreInterruptedTaskAfterResumeFailure,
+        resetAutoResumeCount: mock(() => undefined),
+      })
+    );
 
     const result = await workspaceService.resumeStream("test-workspace", {
       model: "openai:gpt-4o-mini",
@@ -15192,23 +15222,30 @@ describe("WorkspaceService remove lifecycle coordination", () => {
     });
     let insideLifecycleLock = false;
     const withTaskTreeLifecycleLock = mock(
-      async <T>(_workspaceId: string, operation: () => Promise<T>): Promise<T> => {
-        insideLifecycleLock = true;
-        try {
-          return await operation();
-        } finally {
-          insideLifecycleLock = false;
-        }
-      }
+      (_workspaceId: string, _operation: () => Promise<unknown>) => undefined
     );
+    const runWithTaskTreeLifecycleLock = async <T>(
+      workspaceId: string,
+      operation: () => Promise<T>
+    ): Promise<T> => {
+      withTaskTreeLifecycleLock(workspaceId, operation);
+      insideLifecycleLock = true;
+      try {
+        return await operation();
+      } finally {
+        insideLifecycleLock = false;
+      }
+    };
     const hasDescendantAgentTasks = mock(() => {
       expect(insideLifecycleLock).toBe(true);
       return true;
     });
-    workspaceService.setTaskService({
-      withTaskTreeLifecycleLock,
-      hasDescendantAgentTasks,
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        withTaskTreeLifecycleLock: runWithTaskTreeLifecycleLock,
+        hasDescendantAgentTasks,
+      })
+    );
 
     expect(await workspaceService.remove(workspaceId, true)).toEqual(
       Err(
@@ -16519,12 +16556,20 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
   test("archive coordinates through the task-tree lifecycle lock", async () => {
     const withTaskTreeLifecycleLock = mock(
-      <T>(_: string, operation: () => Promise<T>): Promise<T> => operation()
+      (_workspaceId: string, _operation: () => Promise<unknown>) => undefined
     );
-    workspaceService.setTaskService({
-      withTaskTreeLifecycleLock,
-      hasActiveDescendantAgentTasksForWorkspace: mock(() => false),
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        withTaskTreeLifecycleLock: <T>(
+          workspaceId: string,
+          operation: () => Promise<T>
+        ): Promise<T> => {
+          withTaskTreeLifecycleLock(workspaceId, operation);
+          return operation();
+        },
+        hasActiveDescendantAgentTasksForWorkspace: mock(() => false),
+      })
+    );
 
     expect(await workspaceService.archive(workspaceId)).toEqual(Ok({ kind: "archived" }));
     expect(withTaskTreeLifecycleLock).toHaveBeenCalledWith(workspaceId, expect.any(Function));
@@ -16532,9 +16577,11 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
   test("archive refuses to hide a parent while descendant sub-agents remain active", async () => {
     const hasActiveDescendantAgentTasksForWorkspace = mock(() => true);
-    workspaceService.setTaskService({
-      hasActiveDescendantAgentTasksForWorkspace,
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        hasActiveDescendantAgentTasksForWorkspace,
+      })
+    );
 
     const preflight = await workspaceService.preflightArchive(workspaceId);
     const archive = await workspaceService.archive(workspaceId);
@@ -16730,10 +16777,12 @@ describe("WorkspaceService archive lifecycle hooks", () => {
 
   test("archive() does not trigger irreversible descendant cleanup", async () => {
     const cleanupReportedDescendantsAfterArchive = mock(() => Promise.resolve());
-    workspaceService.setTaskService({
-      cleanupReportedDescendantsAfterArchive,
-      hasActiveDescendantAgentTasksForWorkspace: () => false,
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        cleanupReportedDescendantsAfterArchive,
+        hasActiveDescendantAgentTasksForWorkspace: () => false,
+      })
+    );
 
     const result = await workspaceService.archive(workspaceId);
 
@@ -16975,13 +17024,12 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("archive() rechecks durably active workflow runs after arming the admission gate", async () => {
-    workspaceService.setTaskService({
-      hasActiveDescendantAgentTasksForWorkspace: mock(() => false),
-      hasActiveTopLevelWorkflowRunsForWorkspace: mock(() => Promise.resolve(true)),
-      withTaskTreeLifecycleLock: mock(
-        <T>(_: string, operation: () => Promise<T>): Promise<T> => operation()
-      ),
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        hasActiveDescendantAgentTasksForWorkspace: mock(() => false),
+        hasActiveTopLevelWorkflowRunsForWorkspace: mock(() => Promise.resolve(true)),
+      })
+    );
 
     const result = await workspaceService.archive(workspaceId, undefined, {
       refuseLiveUserActivity: true,
@@ -20649,11 +20697,13 @@ describe("WorkspaceService interruptStream", () => {
     const resetAutoResumeCount = mock(() => undefined);
     const markParentWorkspaceInterrupted = mock(() => undefined);
     const terminateAllDescendantAgentTasks = mock(() => Promise.resolve([] as string[]));
-    workspaceService.setTaskService({
-      resetAutoResumeCount,
-      markParentWorkspaceInterrupted,
-      terminateAllDescendantAgentTasks,
-    } as unknown as TaskService);
+    workspaceService.setAgentTaskIntegration(
+      makeAgentTaskIntegrationFake({
+        resetAutoResumeCount,
+        markParentWorkspaceInterrupted,
+        terminateAllDescendantAgentTasks,
+      })
+    );
 
     const sendNextUserQueuedMessage = mock(() => true);
     const restoreQueueToInput = mock(() => undefined);

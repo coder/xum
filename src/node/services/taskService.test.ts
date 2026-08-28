@@ -82,7 +82,7 @@ import {
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProvidersConfigMap, WorkspaceChatMessage } from "@/common/orpc/types";
 import type { AIService } from "@/node/services/aiService";
-import type { WorkspaceService } from "@/node/services/workspaceService";
+import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { InitStateManager as RealInitStateManager } from "@/node/services/initStateManager";
 import assert from "node:assert";
@@ -559,7 +559,7 @@ function createWorkspaceServiceMocks(
     countQueuedAgentPeerMessages: ReturnType<typeof mock>;
   }>
 ): {
-  workspaceService: WorkspaceService;
+  workspaceService: WorkspaceHost;
   sendMessage: ReturnType<typeof mock>;
   resumeStream: ReturnType<typeof mock>;
   clearQueue: ReturnType<typeof mock>;
@@ -706,14 +706,12 @@ function createWorkspaceServiceMocks(
       getQueueCutCutter,
       hasPendingAutoRetry,
       waitForIdleAndNoQueuedMessages,
-      waitForIdle,
       waitForPendingCompactionCompletionDecision,
       waitForPendingStreamErrorRecoveryDecision,
       archive,
       // Same mocks: the lifecycle path holds the (real) task-tree lock and calls the
       // WhileTaskTreeLocked sinks; assertions target one archive/unarchive surface.
       archiveWhileTaskTreeLocked: archive,
-      unarchive,
       unarchiveWhileTaskTreeLocked: unarchive,
       preflightArchive,
       listLiveWorkspaceActivity,
@@ -724,19 +722,17 @@ function createWorkspaceServiceMocks(
       // Task launches register their fire-and-forget background inits for archive gating;
       // a no-op suffices since these tests archive nothing mid-init.
       registerExternalBackgroundInit: mock(() => undefined),
-      deleteWorktree,
       removeWhileTaskTreeLocked: remove,
       remove,
       emit,
       getInfo,
       replaceHistory,
       updateTitle,
-      updateAgentStatus,
       isExperimentEnabled,
       emitChatEvent,
       isWorkflowInvocationCurrent,
       countQueuedAgentPeerMessages,
-    } as unknown as WorkspaceService,
+    } satisfies WorkspaceHost,
     create,
     discardExtensionMetadataEntry,
     sendMessage,
@@ -779,7 +775,7 @@ function createTaskServiceHarness(
   config: Config,
   overrides?: {
     aiService?: AIService;
-    workspaceService?: WorkspaceService;
+    workspaceService?: WorkspaceHost;
     initStateManager?: InitStateManager;
     sessionUsageService?: SessionUsageService;
     workspaceGoalService?: WorkspaceGoalService;
@@ -789,7 +785,7 @@ function createTaskServiceHarness(
   partialService: HistoryService;
   taskService: TaskService;
   aiService: AIService;
-  workspaceService: WorkspaceService;
+  workspaceService: WorkspaceHost;
   initStateManager: InitStateManager;
 } {
   const historyService = new HistoryService(config);
