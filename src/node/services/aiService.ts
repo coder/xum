@@ -164,7 +164,7 @@ import type {
   RebuildProviderOptionsForThinkingLevel,
 } from "@/node/services/thinkingOverride";
 
-import type { StreamAbortEvent, StreamAbortReason } from "@/common/types/stream";
+import type { ErrorEvent, StreamAbortEvent, StreamAbortReason } from "@/common/types/stream";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import {
   computeActiveToolNames,
@@ -296,6 +296,8 @@ export interface StreamMessageOptions {
   strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
   /** ACP prompt correlation id used to match stream events to a specific request. */
   acpPromptId?: string;
+  /** Invoked with each fatal pre-start error event this call emits before returning Err. */
+  onPreStartError?: (event: ErrorEvent) => void;
   /** Tool names that should be delegated back to ACP clients for this request. */
   delegatedToolNames?: string[];
   recordFileState?: (filePath: string, state: FileState) => Promise<void>;
@@ -1317,6 +1319,7 @@ export class AIService extends EventEmitter {
       agentId,
       strictAgentResolution,
       acpPromptId,
+      onPreStartError,
       delegatedToolNames,
       recordFileState,
       postCompactionAttachments,
@@ -1787,15 +1790,14 @@ export class AIService extends EventEmitter {
         // This mirrors the context_exceeded pattern - the fire-and-forget sendMessage
         // call in useCreationWorkspace.ts won't see the returned Err, but will receive
         // this event through the workspace chat subscription.
-        this.emit(
-          "error",
-          createErrorEvent(workspaceId, {
-            messageId: errorMessageId,
-            error: errorMessage,
-            errorType,
-            acpPromptId,
-          })
-        );
+        const errorEvent = createErrorEvent(workspaceId, {
+          messageId: errorMessageId,
+          error: errorMessage,
+          errorType,
+          acpPromptId,
+        });
+        this.emit("error", errorEvent);
+        onPreStartError?.(errorEvent);
 
         logSlowStreamStartup?.({
           outcome: "runtime_not_ready",
@@ -1870,7 +1872,10 @@ export class AIService extends EventEmitter {
         disableWorkspaceAgents: disableWorkspaceAgents ?? false,
         callerToolPolicy: toolPolicy,
         cfg,
-        emitError: (event) => this.emit("error", event),
+        emitError: (event) => {
+          this.emit("error", event);
+          onPreStartError?.(event);
+        },
         isAdvisorExperimentEnabled: advisorExperimentEnabled,
         includeAgentPlugins: agentPluginsExperimentEnabled,
       });

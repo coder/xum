@@ -1,7 +1,7 @@
 import { describe, expect, it, mock, afterEach } from "bun:test";
 import { EventEmitter } from "events";
 import { PROVIDER_DISPLAY_NAMES } from "@/common/constants/providers";
-import type { AIService } from "@/node/services/aiService";
+import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { SendMessageError } from "@/common/types/errors";
@@ -1124,15 +1124,19 @@ describe("AgentSession pre-stream errors", () => {
     const preStartMessageId = "assistant-prestart-error";
 
     // Mirrors AIService's runtime-readiness failure: the error event fires for
-    // fire-and-forget senders, then streamMessage returns Err with no handle.
+    // fire-and-forget senders (and the caller's onPreStartError collector),
+    // then streamMessage returns Err with no handle.
     const aiEmitter = new EventEmitter();
-    const streamMessage = mock((_history: MuxMessage[]) => {
-      aiEmitter.emit("error", {
+    const streamMessage = mock((opts: StreamMessageOptions) => {
+      const errorEvent = {
+        type: "error" as const,
         workspaceId,
         messageId: preStartMessageId,
         error: "Runtime unavailable.",
-        errorType: "runtime_not_ready",
-      });
+        errorType: "runtime_not_ready" as const,
+      };
+      aiEmitter.emit("error", errorEvent);
+      opts.onPreStartError?.(errorEvent);
       return Promise.resolve(Err({ type: "runtime_not_ready", message: "Runtime unavailable." }));
     });
 

@@ -1963,7 +1963,7 @@ describe("StreamManager - turn completion", () => {
     Reflect.set(
       streamManager,
       "createStreamResult",
-      input.createStreamResult ?? (() => createStreamResultForTests(input.fullStream))
+      input.createStreamResult ?? (() => createStreamResultForTests(input.fullStream!))
     );
     await appendPartialAssistantForTests(input.workspaceId, input.messageId, 1);
 
