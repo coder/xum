@@ -1204,4 +1204,49 @@ describe("AgentSession pre-stream errors", () => {
     expect(replayInit).toHaveBeenCalledWith(workspaceId);
     expect(events.some((event) => "type" in event && event.type === "caught-up")).toBe(true);
   });
+
+  it("handles a pre-start error event once and resolves its recovery decision", async () => {
+    const workspaceId = "ws-prestart-error-event";
+    const preStartMessageId = "assistant-prestart-error";
+
+    // Mirrors AIService's runtime-readiness failure: the error event fires for
+    // fire-and-forget senders, then streamMessage returns Err with no handle.
+    const aiEmitter = new EventEmitter();
+    const streamMessage = mock((_history: MuxMessage[]) => {
+      aiEmitter.emit("error", {
+        workspaceId,
+        messageId: preStartMessageId,
+        error: "Runtime unavailable.",
+        errorType: "runtime_not_ready",
+      });
+      return Promise.resolve(Err({ type: "runtime_not_ready", message: "Runtime unavailable." }));
+    });
+
+    const harness = await createAgentSessionHarness({
+      workspaceId,
+      aiEmitter,
+      aiServiceOverrides: {
+        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+      },
+      captureEvents: true,
+    });
+    historyCleanup = harness.cleanup;
+
+    await harness.session.sendMessage("hello", {
+      model: "anthropic:claude-3-5-sonnet-latest",
+      agentId: "exec",
+    });
+
+    // The decision opened at event emission must resolve through the returned
+    // failure path; an unresolved decision would hang settlement waiters.
+    expect(await harness.session.waitForPendingStreamErrorRecoveryDecision(preStartMessageId)).toBe(
+      "terminal"
+    );
+
+    const streamErrors = harness.events.filter(
+      (event): event is StreamErrorMessage =>
+        "type" in event && event.type === "stream-error" && event.messageId === preStartMessageId
+    );
+    expect(streamErrors).toHaveLength(1);
+  });
 });

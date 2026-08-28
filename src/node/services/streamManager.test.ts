@@ -2160,6 +2160,53 @@ describe("StreamManager - turn completion", () => {
       abortReason: "user",
     });
   });
+
+  test("debug-injected stream errors settle a failed completion", async () => {
+    const streamManager = new StreamManager(historyService);
+    stubTokenTracker(streamManager);
+    Reflect.set(
+      streamManager,
+      "createStreamResult",
+      (_request: unknown, abortController: AbortController) =>
+        createStreamResultForTests(
+          (async function* () {
+            await new Promise<void>((resolve) => {
+              abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+            });
+            yield* [];
+          })()
+        )
+    );
+    await appendPartialAssistantForTests(
+      "completion-debug-error-workspace",
+      "completion-debug-error-message",
+      1
+    );
+    const result = await streamManager.startStream({
+      workspaceId: "completion-debug-error-workspace",
+      messages: [{ role: "user", content: "hello" }],
+      model: createTestLanguageModel(),
+      modelString: "openai:gpt-4.1-mini",
+      historySequence: 1,
+      system: "system",
+      runtime,
+      messageId: "completion-debug-error-message",
+      providedRuntimeTempDir: "",
+    });
+    expect(result.success).toBe(true);
+    if (!result.success) throw new Error("Expected stream to start");
+
+    const triggered = await streamManager.debugTriggerStreamError(
+      "completion-debug-error-workspace",
+      "debug injected failure"
+    );
+    expect(triggered).toBe(true);
+
+    const completion = await result.data.completion;
+    expect(completion.status).toBe("failed");
+    if (completion.status !== "failed") throw new Error("Expected failed completion");
+    expect(completion.streamError.error).toBe("debug injected failure");
+  });
 });
 
 describe("StreamManager - stripEncryptedContent", () => {

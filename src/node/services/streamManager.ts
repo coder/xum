@@ -5129,11 +5129,19 @@ export class StreamManager {
     };
 
     // Write error state to partial.json (same as real error handling)
-    await this.persistStreamError(typedWorkspaceId, streamInfo, {
+    const persistedPayload = await this.persistStreamError(typedWorkspaceId, streamInfo, {
       messageId: streamInfo.messageId,
       error: errorMessage,
       errorType: "network",
     });
+    // Debug-injected failures bypass handleStreamFailure, so record the failed
+    // completion here or cleanup would never settle the turn handle.
+    streamInfo.terminalCompletion = {
+      status: "failed",
+      messageId: streamInfo.messageId,
+      error: { type: "unknown", raw: persistedPayload.error },
+      streamError: persistedPayload,
+    };
 
     // Wait for the stream processing to complete (cleanup)
     await streamInfo.processingPromise;

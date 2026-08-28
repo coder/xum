@@ -9,7 +9,7 @@ import { log } from "@/node/services/log";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import type { Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
-import type { TurnCompletion } from "@/node/services/streamManager";
+import type { TurnStreamHandle } from "@/node/services/streamManager";
 import type { HistoryService } from "@/node/services/historyService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { InitStateManager } from "@/node/services/initStateManager";
@@ -1151,6 +1151,20 @@ export class AgentSession {
     decision.outcome = handled;
     decision.resolve(handled);
   }
+
+  /** Turn handle whose completion consumeTurnCompletion() is currently observing. */
+  private activeTurnStreamHandle: TurnStreamHandle | null = null;
+
+  /**
+   * Capture list for error events observed while this session's streamMessage
+   * call is in flight and no turn handle owns them (pre-start failures such as
+   * runtime readiness or strict agent resolution). AIService emits these for
+   * fire-and-forget senders and then returns Err, so no completion will ever
+   * deliver them; the Err path handles each exactly once via the event's own
+   * messageId. Null outside the in-flight window so unrelated error events
+   * (e.g. a later mid-turn failure) are never captured.
+   */
+  private preStartErrorCapture: StreamErrorPayload[] | null = null;
 
   private beginStreamErrorRecoveryDecision(messageId: string): void {
     // Duplicate error events for the same attempt share one decision.
@@ -4833,8 +4847,28 @@ export class AgentSession {
 
   private async handleStreamWithHistoryFailure(
     error: SendMessageError,
-    acpPromptId?: string
+    acpPromptId?: string,
+    preStartErrors?: StreamErrorPayload[] | null
   ): Promise<AgentSessionResult<void>> {
+    // Pre-start failures that AIService also announced as error events (for
+    // fire-and-forget senders) have no turn handle, so their handling and
+    // recovery-decision resolution must run here, keyed by each event's own
+    // messageId. Handling them first keeps this the single owner: the branches
+    // below only cover failures that produced no error event.
+    if (preStartErrors != null && preStartErrors.length > 0) {
+      for (const payload of preStartErrors) {
+        try {
+          await this.handleStreamError({
+            ...payload,
+            acpPromptId: payload.acpPromptId ?? acpPromptId,
+          });
+        } finally {
+          this.resolveStreamErrorRecoveryDecision(payload.messageId, "terminal");
+        }
+      }
+      return { success: false, error, failureHandled: true };
+    }
+
     const failureType = error.type;
 
     if (failureType === "runtime_not_ready" || failureType === "runtime_start_failed") {
@@ -4853,8 +4887,9 @@ export class AgentSession {
     return { success: false, error, failureHandled: true };
   }
 
-  private consumeTurnCompletion(completion: Promise<TurnCompletion>): void {
-    void completion
+  private consumeTurnCompletion(handle: TurnStreamHandle): void {
+    this.activeTurnStreamHandle = handle;
+    void handle.completion
       .then(async (outcome) => {
         if (outcome.status !== "failed") return;
 
@@ -4869,6 +4904,11 @@ export class AgentSession {
           workspaceId: this.workspaceId,
           error: getErrorMessage(error),
         });
+      })
+      .finally(() => {
+        if (this.activeTurnStreamHandle === handle) {
+          this.activeTurnStreamHandle = null;
+        }
       });
   }
 
@@ -5082,50 +5122,64 @@ export class AgentSession {
       normalizeDelegatedToolNames(options?.delegatedToolNames) ??
       extractAcpDelegatedTools(optionsMuxMetadata);
 
-    const streamResult = await this.aiService.streamMessage({
-      messages: requestMessages,
-      workspaceId: this.workspaceId,
-      modelString,
-      abortSignal,
-      thinkingLevel: effectiveThinkingLevel,
-      // Orthogonal to thinking level; buildRequestHeaders gates it per model.
-      reasoningMode: options?.reasoningMode,
-      toolPolicy: options?.toolPolicy,
-      additionalSystemContext: options?.additionalSystemContext,
-      additionalSystemInstructions: options?.additionalSystemInstructions,
-      maxOutputTokens: options?.maxOutputTokens,
-      muxProviderOptions: options?.providerOptions,
-      agentInitiated,
-      agentId: options?.agentId,
-      acpPromptId,
-      delegatedToolNames,
-      muxMetadata: streamMuxMetadata,
-      recordFileState,
-      postCompactionAttachments,
-      // Invoked by AIService after runtime.ensureReady() (project-scope
-      // listing needs a running runtime). Still ordered after the
-      // post-compaction check above: a just-consumed compaction boundary has
-      // already reset the segment cache, so this stream recomputes the context.
-      resolveMemoryContext: (forModelString, memoryOptions) =>
-        this.resolveMemoryContext(forModelString, memoryOptions),
-      allowAgentSetGoal: options?.allowAgentSetGoal === true,
-      workspaceGoalService: this.workspaceGoalService,
-      experiments: options?.experiments,
-      disableWorkspaceAgents: options?.disableWorkspaceAgents,
-      strictAgentResolution: options?.strictAgentResolution,
-      hasQueuedMessages: this.hasQueuedMessages.bind(this),
-      openaiTruncationModeOverride,
-      // Mid-turn thinking overrides clamp against the same floor as the
-      // send-time level above (single source of truth for the floor).
-      minThinkingLevel,
-      activeTurnThinkingOverride,
-    });
-
-    if (!streamResult.success) {
-      return await this.handleStreamWithHistoryFailure(streamResult.error, acpPromptId);
+    // Capture pre-start error events emitted during this call (see
+    // preStartErrorCapture); the window closes before the result is handled.
+    this.preStartErrorCapture = [];
+    let capturedPreStartErrors: StreamErrorPayload[] | null = null;
+    let streamResult: Awaited<ReturnType<AIService["streamMessage"]>>;
+    try {
+      streamResult = await this.aiService.streamMessage({
+        messages: requestMessages,
+        workspaceId: this.workspaceId,
+        modelString,
+        abortSignal,
+        thinkingLevel: effectiveThinkingLevel,
+        // Orthogonal to thinking level; buildRequestHeaders gates it per model.
+        reasoningMode: options?.reasoningMode,
+        toolPolicy: options?.toolPolicy,
+        additionalSystemContext: options?.additionalSystemContext,
+        additionalSystemInstructions: options?.additionalSystemInstructions,
+        maxOutputTokens: options?.maxOutputTokens,
+        muxProviderOptions: options?.providerOptions,
+        agentInitiated,
+        agentId: options?.agentId,
+        acpPromptId,
+        delegatedToolNames,
+        muxMetadata: streamMuxMetadata,
+        recordFileState,
+        postCompactionAttachments,
+        // Invoked by AIService after runtime.ensureReady() (project-scope
+        // listing needs a running runtime). Still ordered after the
+        // post-compaction check above: a just-consumed compaction boundary has
+        // already reset the segment cache, so this stream recomputes the context.
+        resolveMemoryContext: (forModelString, memoryOptions) =>
+          this.resolveMemoryContext(forModelString, memoryOptions),
+        allowAgentSetGoal: options?.allowAgentSetGoal === true,
+        workspaceGoalService: this.workspaceGoalService,
+        experiments: options?.experiments,
+        disableWorkspaceAgents: options?.disableWorkspaceAgents,
+        strictAgentResolution: options?.strictAgentResolution,
+        hasQueuedMessages: this.hasQueuedMessages.bind(this),
+        openaiTruncationModeOverride,
+        // Mid-turn thinking overrides clamp against the same floor as the
+        // send-time level above (single source of truth for the floor).
+        minThinkingLevel,
+        activeTurnThinkingOverride,
+      });
+    } finally {
+      capturedPreStartErrors = this.preStartErrorCapture;
+      this.preStartErrorCapture = null;
     }
 
-    this.consumeTurnCompletion(streamResult.data.completion);
+    if (!streamResult.success) {
+      return await this.handleStreamWithHistoryFailure(
+        streamResult.error,
+        acpPromptId,
+        capturedPreStartErrors
+      );
+    }
+
+    this.consumeTurnCompletion(streamResult.data);
     return Ok(undefined);
   }
 
@@ -6124,6 +6178,13 @@ export class AgentSession {
       // Begin synchronously at event emission so completion waiters always find
       // this attempt's decision before they run.
       this.beginStreamErrorRecoveryDecision(data.messageId);
+      if (
+        this.preStartErrorCapture != null &&
+        this.activeTurnStreamHandle?.messageId !== data.messageId
+      ) {
+        const { workspaceId: _workspaceId, ...payload } = data;
+        this.preStartErrorCapture.push(payload);
+      }
     };
 
     this.aiListeners.push({ event: "error", handler: errorHandler });
