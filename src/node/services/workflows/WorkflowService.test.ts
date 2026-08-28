@@ -1062,4 +1062,62 @@ describe("WorkflowService crash recovery", () => {
     expect(events).toContain("status:completed");
     await expect(runStore.getRun("wfr_crash")).resolves.toMatchObject({ status: "completed" });
   });
+
+  test("failed crash-resume provenance repair retries on a bounded timer", async () => {
+    using tmp = new DisposableTempDir("workflow-service-crash-repair-retry");
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    await runStore.createRun({
+      id: "wfr_crash_repair_retry",
+      workspaceId: "workspace-1",
+      workflow: { name: "demo", description: "Demo workflow", scope: "built-in", executable: true },
+      source: 'export default function workflow() { return { reportMarkdown: "done" }; }\n',
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    await runStore.appendStatus("wfr_crash_repair_retry", "running", "2026-05-29T00:00:01.000Z");
+
+    // The repair hook only fires at resume time; if its transient failure were terminal, the
+    // reference would stay boundaryless after the run settles and every drain would defer the
+    // wake as indeterminate with nothing left to repair it.
+    const repairCalls: string[] = [];
+    let failFirstRepair = true;
+    const service = new WorkflowService({
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        async runAgent() {
+          throw new Error("No agent steps expected");
+        },
+      },
+      generateRunId: () => "wfr_unused",
+      runnerId: "runner-a",
+      onRunCrashResumed: (event) => {
+        repairCalls.push(`${event.workspaceId}:${event.runId}`);
+        if (failFirstRepair) {
+          failFirstRepair = false;
+          throw new Error("EIO: sidecar write failed");
+        }
+      },
+    });
+    (
+      service as unknown as { crashResumeRepairRetryDelayMs: number }
+    ).crashResumeRepairRetryDelayMs = 10;
+
+    const resumed = await service.resumeCrashedRuns({
+      workspaceId: "workspace-1",
+      projectTrusted: true,
+    });
+    expect(resumed).toEqual(["wfr_crash_repair_retry"]);
+    expect(repairCalls).toEqual(["workspace-1:wfr_crash_repair_retry"]);
+
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline && repairCalls.length < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(repairCalls).toEqual([
+      "workspace-1:wfr_crash_repair_retry",
+      "workspace-1:wfr_crash_repair_retry",
+    ]);
+  });
 });

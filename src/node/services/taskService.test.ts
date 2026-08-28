@@ -6484,6 +6484,78 @@ describe("TaskService", () => {
     expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
   });
 
+  test("workflow wake restriction recovery stops at a context reset boundary", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_policy_reset_boundary";
+    const restrictedPolicy = [{ regex_match: "^bash$", action: "disable" as const }];
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+
+    // The pre-reset manual row disabled bash, but the context reset discarded that
+    // conversation. The workflow launched from a post-reset synthetic turn (heartbeat), so
+    // its wake must use fresh defaults instead of resurrecting the discarded restriction.
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual-restricted", "user", "run the audit", {
+        timestamp: 1_000,
+        toolPolicy: restrictedPolicy,
+        disableWorkspaceAgents: true,
+      })
+    );
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("reset-boundary", "assistant", "Context reset", {
+        timestamp: 2_000,
+        contextBoundaryKind: "reset",
+      })
+    );
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("heartbeat-launch", "user", "[heartbeat] launch the workflow", {
+        timestamp: 3_000,
+        synthetic: true,
+      })
+    );
+
+    await taskService.enqueueWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "completed",
+    });
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const options = sendMessage.mock.calls[0]?.[2] as {
+      toolPolicy?: unknown;
+      disableWorkspaceAgents?: unknown;
+    };
+    expect(options.toolPolicy).toBeUndefined();
+    expect(options.disableWorkspaceAgents).toBeUndefined();
+  });
+
   test("workflow wakes restore the caller tool policy from the newest manual row", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);

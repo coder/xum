@@ -7994,8 +7994,10 @@ export class TaskService {
    * conversation's persisted restrictions; synthetic rows without any (earlier wakes,
    * heartbeat scaffolding) do not define them and are skipped. The walk is unbounded: a long
    * assistant/synthetic tail after the launch turn must not push the defining row out of
-   * sight and silently lift the restrictions. Throws when history is unreadable so the caller
-   * can fail closed instead of waking with unrestricted tools.
+   * sight and silently lift the restrictions. It stops at the newest context reset boundary,
+   * since rows from the discarded context must not re-disable tools available to the reset
+   * context. Throws when history is unreadable so the caller can fail closed instead of
+   * waking with unrestricted tools.
    */
   private async resolveTerminalWakeCallerSendRestrictions(ownerWorkspaceId: string): Promise<{
     toolPolicy?: ToolPolicy;
@@ -8015,6 +8017,12 @@ export class TaskService {
       "backward",
       (messages) => {
         for (const message of messages) {
+          // A context reset discards everything before it: pre-reset rows must not define
+          // the wake's restrictions or pin. Stopping here leaves undefined fields as fresh
+          // defaults, matching a manual send in the post-reset context.
+          if (isResetBoundaryMessage(message)) {
+            return false;
+          }
           if (message.role !== "user") {
             continue;
           }

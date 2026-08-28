@@ -118,6 +118,13 @@ const WORKFLOW_BACKGROUND_CONTINUATION_STATUSES = new Set<WorkflowRunStatus>([
 // oRPC creates a WorkflowService per request, so workflow lifecycle state that spans requests
 // needs process-wide registries.
 const pendingCrashResumeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+// Crash-resume provenance repair only fires at resume time: once the run settles, nothing
+// else re-records the boundary and its terminal wake stays indeterminate on every drain.
+// Retry a failed repair on a bounded timer. Module-level like pendingCrashResumeTimers
+// because WorkflowService instances are per-request.
+const CRASH_RESUME_REPAIR_RETRY_DELAY_MS = 30_000;
+const CRASH_RESUME_REPAIR_MAX_ATTEMPTS = 5;
+const pendingCrashResumeRepairTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const activeWorkflowInterruptStatusWrites = new Map<string, Promise<void>>();
 const activeWorkflowRunnerAbortControllers = new Map<string, AbortController>();
 
@@ -137,6 +144,8 @@ export class WorkflowService {
     workspaceId: string;
     runId: string;
   }) => Promise<void> | void;
+  // Field, not the constant, so tests can shrink the repair retry backoff.
+  private crashResumeRepairRetryDelayMs = CRASH_RESUME_REPAIR_RETRY_DELAY_MS;
   private readonly onRunStatusChanged?: (
     event: WorkflowRunStatusChangedEvent
   ) => Promise<void> | void;
@@ -589,8 +598,11 @@ export class WorkflowService {
         await this.onRunCrashResumed({ workspaceId: run.workspaceId, runId: run.id });
       } catch (error) {
         // Best-effort: an unrepaired reference defers its wake as indeterminate rather than
-        // losing it, so a failed repair must not block the resume itself.
+        // losing it, so a failed repair must not block the resume itself. Retry off-path:
+        // repair is CAS-guarded and refuses once a boundary exists, so late success (even
+        // after the run settles) only unblocks the deferred wake.
         console.error("Workflow crash-resume provenance repair failed:", error);
+        this.scheduleCrashResumeRepairRetry({ workspaceId: run.workspaceId, runId: run.id }, 1);
       }
     }
 
@@ -649,6 +661,32 @@ export class WorkflowService {
     }, delayMs);
     unrefTimer(timer);
     pendingCrashResumeTimers.set(input.runId, timer);
+  }
+
+  private scheduleCrashResumeRepairRetry(
+    input: { workspaceId: string; runId: string },
+    attempt: number
+  ): void {
+    const repairHook = this.onRunCrashResumed;
+    if (repairHook == null || attempt > CRASH_RESUME_REPAIR_MAX_ATTEMPTS) {
+      return;
+    }
+    if (pendingCrashResumeRepairTimers.has(input.runId)) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      pendingCrashResumeRepairTimers.delete(input.runId);
+      void (async () => {
+        try {
+          await repairHook({ workspaceId: input.workspaceId, runId: input.runId });
+        } catch (error) {
+          console.error("Workflow crash-resume provenance repair retry failed:", error);
+          this.scheduleCrashResumeRepairRetry(input, attempt + 1);
+        }
+      })();
+    }, this.crashResumeRepairRetryDelayMs);
+    unrefTimer(timer);
+    pendingCrashResumeRepairTimers.set(input.runId, timer);
   }
 
   private registerActiveRunnerAbortController(

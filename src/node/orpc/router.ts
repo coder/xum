@@ -116,6 +116,7 @@ import * as path from "node:path";
 
 import type { DevToolsEvent } from "@/common/types/devtools";
 import type { WorkflowRunStreamEvent } from "@/common/types/workflow";
+import { isTerminalWorkflowRunStatus } from "@/common/types/workflow";
 import type { WorkflowRunLivenessEntry } from "@/common/orpc/schemas/api";
 import type { MuxMessage } from "@/common/types/message";
 import { coerceThinkingLevel } from "@/common/types/thinking";
@@ -583,7 +584,19 @@ export async function resolveWorkflowContext(
           includeAgentPlugins,
           skillStorageContext,
         }),
-      onRunStatusChanged: (event) => context.workspaceService.emitWorkflowRunActivity(event),
+      onRunStatusChanged: async (event) => {
+        // Router-managed restarts (resume / retry / crash recovery) must clear a prior
+        // delivered or superseded notification when the run leaves terminal state, or
+        // enqueueIfAbsent would preserve the stale record and silently drop the resumed
+        // run's next terminal wake (mirrors the AIService-owned service).
+        if (!isTerminalWorkflowRunStatus(event.status)) {
+          await context.taskService.resetWorkflowRunTerminalAttention({
+            ownerWorkspaceId: event.workspaceId,
+            runId: event.runId,
+          });
+        }
+        await context.workspaceService.emitWorkflowRunActivity(event);
+      },
       onRunCrashResumed: (event) =>
         context.workspaceService.repairWorkflowRunReferenceBoundary(event.workspaceId, event.runId),
       // Read paths (listRuns / stream subscribe) create services purely to observe runs, but
