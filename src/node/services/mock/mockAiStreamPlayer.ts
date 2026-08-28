@@ -817,7 +817,6 @@ export class MockAiStreamPlayer {
         );
         active.settleCompletion({
           status: "failed",
-          messageId,
           streamError: { messageId, error: payload.error, errorType: payload.errorType },
         });
         this.cleanup(workspaceId);
@@ -884,7 +883,7 @@ export class MockAiStreamPlayer {
         if (!this.isCurrentActiveStream(workspaceId, active)) return;
 
         this.deps.aiService.emit("stream-end", payload);
-        active.settleCompletion({ status: "completed", messageId });
+        active.settleCompletion({ status: "completed" });
         this.cleanup(workspaceId);
         break;
       }
@@ -897,11 +896,7 @@ export class MockAiStreamPlayer {
 
     active.cancelled = true;
     // Settle-once backstop: terminal events settled above; cancels settle here.
-    active.settleCompletion({
-      status: "aborted",
-      messageId: active.messageId,
-      abortReason: "user",
-    });
+    active.settleCompletion({ status: "aborted", abortReason: "user" });
 
     if (active.partialWriteTimer) {
       clearTimeout(active.partialWriteTimer);

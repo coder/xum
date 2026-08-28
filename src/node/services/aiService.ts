@@ -850,12 +850,12 @@ export class AIService extends EventEmitter {
     this.emit(event.type, event);
   }
 
-  private createSettledTurnHandle(completion: TurnCompletion): TurnStreamHandle {
-    return { messageId: completion.messageId, completion: Promise.resolve(completion) };
+  private createSettledTurnHandle(messageId: string, completion: TurnCompletion): TurnStreamHandle {
+    return { messageId, completion: Promise.resolve(completion) };
   }
 
   private createAbortedTurnHandle(messageId: string): TurnStreamHandle {
-    return this.createSettledTurnHandle({ status: "aborted", messageId, abortReason: "startup" });
+    return this.createSettledTurnHandle(messageId, { status: "aborted", abortReason: "startup" });
   }
 
   private trackPendingDevToolsRunMetadata(
@@ -3056,17 +3056,11 @@ export class AIService extends EventEmitter {
         if (forceContextLimitError) {
           const streamError = await simulateContextLimitError(simulationCtx, this.historyService);
           return Ok(
-            this.createSettledTurnHandle({
-              status: "failed",
-              messageId: assistantMessageId,
-              streamError,
-            })
+            this.createSettledTurnHandle(assistantMessageId, { status: "failed", streamError })
           );
         }
         await simulateToolPolicyNoop(simulationCtx, effectiveToolPolicy, this.historyService);
-        return Ok(
-          this.createSettledTurnHandle({ status: "completed", messageId: assistantMessageId })
-        );
+        return Ok(this.createSettledTurnHandle(assistantMessageId, { status: "completed" }));
       }
 
       // Build provider options based on thinking level and request-sliced message history.

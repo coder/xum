@@ -539,7 +539,6 @@ describe("AgentSession disposal race conditions", () => {
       session.dispose();
       settleCompletion({
         status: "failed",
-        messageId: "assistant-post-dispose",
         streamError: { messageId: "assistant-post-dispose", error: "boom", errorType: "api" },
       });
       await new Promise((resolve) => setTimeout(resolve, 0));

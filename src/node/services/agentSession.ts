@@ -1152,9 +1152,6 @@ export class AgentSession {
     decision.resolve(handled);
   }
 
-  /** Turn handle whose completion consumeTurnCompletion() is currently observing. */
-  private activeTurnStreamHandle: TurnStreamHandle | null = null;
-
   private beginStreamErrorRecoveryDecision(messageId: string): void {
     // Duplicate error events for the same attempt share one decision.
     if (this.streamErrorRecoveryDecisions.has(messageId)) {
@@ -4839,9 +4836,19 @@ export class AgentSession {
     acpPromptId?: string,
     preStartErrors?: StreamErrorPayload[] | null
   ): Promise<AgentSessionResult<void>> {
-    // Captured pre-start error events own this failure; the branches below
+    // Collected pre-start error events own this failure; the branches below
     // only cover failures that produced no error event.
-    if (await this.handleCapturedStreamErrors(preStartErrors, acpPromptId)) {
+    if (preStartErrors != null && preStartErrors.length > 0) {
+      for (const payload of preStartErrors) {
+        try {
+          await this.handleStreamError({
+            ...payload,
+            acpPromptId: payload.acpPromptId ?? acpPromptId,
+          });
+        } finally {
+          this.resolveStreamErrorRecoveryDecision(payload.messageId, "terminal");
+        }
+      }
       return { success: false, error, failureHandled: true };
     }
 
@@ -4863,29 +4870,7 @@ export class AgentSession {
     return { success: false, error, failureHandled: true };
   }
 
-  /** Handle collected pre-start error events exactly once each. */
-  private async handleCapturedStreamErrors(
-    captured: StreamErrorPayload[] | null | undefined,
-    acpPromptId?: string
-  ): Promise<boolean> {
-    if (captured == null || captured.length === 0) {
-      return false;
-    }
-    for (const payload of captured) {
-      try {
-        await this.handleStreamError({
-          ...payload,
-          acpPromptId: payload.acpPromptId ?? acpPromptId,
-        });
-      } finally {
-        this.resolveStreamErrorRecoveryDecision(payload.messageId, "terminal");
-      }
-    }
-    return true;
-  }
-
   private consumeTurnCompletion(handle: TurnStreamHandle): void {
-    this.activeTurnStreamHandle = handle;
     void handle.completion
       .then(async (outcome) => {
         // A disposed session must not persist retry/goal state post-teardown.
@@ -4894,7 +4879,7 @@ export class AgentSession {
         try {
           await this.handleStreamError(outcome.streamError);
         } finally {
-          this.resolveStreamErrorRecoveryDecision(outcome.messageId, "terminal");
+          this.resolveStreamErrorRecoveryDecision(outcome.streamError.messageId, "terminal");
         }
       })
       .catch((error: unknown) => {
@@ -4902,11 +4887,6 @@ export class AgentSession {
           workspaceId: this.workspaceId,
           error: getErrorMessage(error),
         });
-      })
-      .finally(() => {
-        if (this.activeTurnStreamHandle === handle) {
-          this.activeTurnStreamHandle = null;
-        }
       });
   }
 

@@ -204,14 +204,11 @@ export type TurnEngineEvent =
 
 export type TurnEngineEventSink = (event: TurnEngineEvent) => void | Promise<void>;
 
+// Turn identity lives on TurnStreamHandle.messageId; completions cannot diverge from it.
 export type TurnCompletion =
-  | { status: "completed"; messageId: string }
-  | { status: "aborted"; messageId: string; abortReason: StreamAbortReason }
-  | {
-      status: "failed";
-      messageId: string;
-      streamError: StreamErrorPayload & { errorType: StreamErrorType };
-    };
+  | { status: "completed" }
+  | { status: "aborted"; abortReason: StreamAbortReason }
+  | { status: "failed"; streamError: StreamErrorPayload & { errorType: StreamErrorType } };
 
 export interface TurnStreamHandle {
   messageId: string;
@@ -1711,11 +1708,7 @@ export class StreamManager {
     // Clean up immediately
     this.workspaceStreams.delete(workspaceId);
     void abortDelivery.finally(() => {
-      streamInfo.completionController?.settle({
-        status: "aborted",
-        messageId: streamInfo.messageId,
-        abortReason,
-      });
+      streamInfo.completionController?.settle({ status: "aborted", abortReason });
     });
   }
 
@@ -3809,10 +3802,7 @@ export class StreamManager {
             // before updateHistory completes, compaction can clear the file and then
             // updateHistory writes stale data back.
             this.emitTurnEvent(streamEndEvent);
-            streamInfo.terminalCompletion = {
-              status: "completed",
-              messageId: streamInfo.messageId,
-            };
+            streamInfo.terminalCompletion = { status: "completed" };
           }
           break;
         } catch (error) {
@@ -3900,11 +3890,7 @@ export class StreamManager {
 
     const errorPayload = this.buildStreamErrorPayload(streamInfo, error);
     const persistedPayload = await this.persistStreamError(workspaceId, streamInfo, errorPayload);
-    streamInfo.terminalCompletion = {
-      status: "failed",
-      messageId: streamInfo.messageId,
-      streamError: persistedPayload,
-    };
+    streamInfo.terminalCompletion = { status: "failed", streamError: persistedPayload };
   }
 
   private buildStreamErrorPayload(
@@ -4581,7 +4567,7 @@ export class StreamManager {
         // If the stream was interrupted while we were waiting on async setup (mutex,
         // temp dir creation, etc), avoid starting the stream entirely.
         if (streamAbortController.signal.aborted) {
-          completionController.settle({ status: "aborted", messageId, abortReason: "startup" });
+          completionController.settle({ status: "aborted", abortReason: "startup" });
           return Ok(handle);
         }
 
@@ -4592,7 +4578,7 @@ export class StreamManager {
           providedRuntimeTempDir ?? (await this.createTempDirForStream(streamToken, runtime));
 
         if (streamAbortController.signal.aborted) {
-          completionController.settle({ status: "aborted", messageId, abortReason: "startup" });
+          completionController.settle({ status: "aborted", abortReason: "startup" });
           return Ok(handle);
         }
 
@@ -4611,7 +4597,7 @@ export class StreamManager {
         // In that case, immediately drop the registered stream and rely on the caller to handle UI.
         if (streamAbortController.signal.aborted) {
           this.workspaceStreams.delete(typedWorkspaceId);
-          completionController.settle({ status: "aborted", messageId, abortReason: "startup" });
+          completionController.settle({ status: "aborted", abortReason: "startup" });
           return Ok(handle);
         }
 
@@ -4637,7 +4623,7 @@ export class StreamManager {
             this.workspaceStreams.delete(typedWorkspaceId);
           }
           streamRegistered = false;
-          completionController.settle({ status: "aborted", messageId, abortReason: "startup" });
+          completionController.settle({ status: "aborted", abortReason: "startup" });
           return Ok(handle);
         }
 
@@ -5078,11 +5064,7 @@ export class StreamManager {
     });
     // Debug-injected failures bypass handleStreamFailure, so record the failed
     // completion here or cleanup would never settle the turn handle.
-    streamInfo.terminalCompletion = {
-      status: "failed",
-      messageId: streamInfo.messageId,
-      streamError: persistedPayload,
-    };
+    streamInfo.terminalCompletion = { status: "failed", streamError: persistedPayload };
 
     // Wait for the stream processing to complete (cleanup)
     await streamInfo.processingPromise;

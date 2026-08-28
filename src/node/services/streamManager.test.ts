@@ -2005,11 +2005,7 @@ describe("StreamManager - turn completion", () => {
     );
     expect(aborted.success).toBe(true);
     if (!aborted.success) throw new Error("Expected aborted startup handle");
-    expect(await aborted.data.completion).toEqual({
-      status: "aborted",
-      messageId: "prestart-abort-message",
-      abortReason: "startup",
-    });
+    expect(await aborted.data.completion).toEqual({ status: "aborted", abortReason: "startup" });
   });
 
   test("completed and failed turns settle once after their terminal event", async () => {
@@ -2028,10 +2024,7 @@ describe("StreamManager - turn completion", () => {
     void completed.handle.completion.then(() => {
       completedSettlements += 1;
     });
-    expect(await completed.handle.completion).toEqual({
-      status: "completed",
-      messageId: "completion-success-message",
-    });
+    expect(await completed.handle.completion).toEqual({ status: "completed" });
     await Promise.resolve();
     expect(completedEvents.at(-1)?.type).toBe("stream-end");
     expect(completedSettlements).toBe(1);
@@ -2080,11 +2073,7 @@ describe("StreamManager - turn completion", () => {
     expect(settled).toBe(false);
 
     releaseAbortDelivery();
-    expect(await handle.completion).toEqual({
-      status: "aborted",
-      messageId: "completion-abort-message",
-      abortReason: "user",
-    });
+    expect(await handle.completion).toEqual({ status: "aborted", abortReason: "user" });
   });
 
   test("debug-injected stream errors settle a failed completion", async () => {
@@ -2375,27 +2364,24 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
       return Promise.resolve();
     });
 
-    const anthropic = createAnthropic({ apiKey: "dummy-key" });
-    const model = anthropic("claude-sonnet-4-5");
-
-    const startPromise = streamManager.startStream({
-      workspaceId,
-      messages: [{ role: "user", content: "test" }],
-      model,
-      modelString: KNOWN_MODELS.SONNET.id,
-      historySequence: 1,
-      system: "system",
-      runtime,
-      messageId: "test-msg-abort",
-      abortSignal: abortController.signal,
-      tools: {},
-    });
+    const startPromise = streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId: "test-msg-abort",
+        model: createTestLanguageModel(),
+        runtime,
+        abortSignal: abortController.signal,
+        tools: {},
+      })
+    );
 
     await tempDirStarted;
     abortController.abort();
 
     const result = await startPromise;
     expect(result.success).toBe(true);
+    if (!result.success) throw new Error("Expected aborted startup handle");
+    expect(await result.data.completion).toEqual({ status: "aborted", abortReason: "startup" });
     expect(createCalled).toBe(false);
     expect(cleanupCalled).toBe(true);
     expect(processCalled).toBe(false);

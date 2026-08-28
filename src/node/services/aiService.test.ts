@@ -691,33 +691,9 @@ describe("AIService turn engine events", () => {
     expect(internals.pendingDevToolsRunMetadataByMessageId.has(abortEvent.messageId)).toBe(false);
   });
 
-  it("forwards stream-abort with empty messageId without throwing", async () => {
-    using harness = createForwardingHarness("ai-service-stream-abort-empty-message-id");
-    const { service, internals, clearPendingRunMetadataSpy } = harness;
-    internals.pendingDevToolsRunMetadataByMessageId.set("message-1", {
-      workspaceId: "workspace-1",
-      metadataId: "metadata-1",
-    });
-    const abortEvent: StreamAbortEvent = {
-      type: "stream-abort",
-      workspaceId: "workspace-1",
-      messageId: "",
-      abandonPartial: true,
-    };
-
-    const forwardedAbortPromise = new Promise<StreamAbortEvent>((resolve) => {
-      service.once("stream-abort", (event) => resolve(event as StreamAbortEvent));
-    });
-    await internals.emitEngineEvent(abortEvent);
-
-    expect(await forwardedAbortPromise).toEqual(abortEvent);
-    expect(clearPendingRunMetadataSpy).not.toHaveBeenCalled();
-    expect(internals.pendingDevToolsRunMetadataByMessageId.has("message-1")).toBe(true);
-  });
-
   it.each([
     {
-      name: "stream error",
+      name: "stream error clears tracked metadata",
       eventName: "error" as const,
       event: {
         type: "error" as const,
@@ -726,9 +702,10 @@ describe("AIService turn engine events", () => {
         error: "request failed",
         errorType: "rate_limit" as const,
       } satisfies ErrorEvent,
+      expectCleared: true,
     },
     {
-      name: "stream-end",
+      name: "stream-end clears tracked metadata",
       eventName: "stream-end" as const,
       event: {
         type: "stream-end" as const,
@@ -737,11 +714,24 @@ describe("AIService turn engine events", () => {
         metadata: { model: "anthropic:claude-opus-4-1" },
         parts: [],
       } satisfies StreamEndEvent,
+      expectCleared: true,
     },
-  ])("clears tracked devtools run metadata on $name", async ({ eventName, event }) => {
+    {
+      name: "stream-abort with empty messageId leaves unrelated metadata",
+      eventName: "stream-abort" as const,
+      event: {
+        type: "stream-abort" as const,
+        workspaceId: "workspace-1",
+        messageId: "",
+        abandonPartial: true,
+      } satisfies StreamAbortEvent,
+      expectCleared: false,
+    },
+  ])("devtools run metadata: $name", async ({ eventName, event, expectCleared }) => {
     using harness = createForwardingHarness(`ai-service-${eventName}-devtools-cleanup`);
     const { service, internals, clearPendingRunMetadataSpy } = harness;
-    internals.pendingDevToolsRunMetadataByMessageId.set(event.messageId, {
+    const trackedMessageId = event.messageId || "message-1";
+    internals.pendingDevToolsRunMetadataByMessageId.set(trackedMessageId, {
       workspaceId: event.workspaceId,
       metadataId: "metadata-1",
     });
@@ -752,8 +742,14 @@ describe("AIService turn engine events", () => {
     await internals.emitEngineEvent(event);
 
     expect(await forwardedPromise).toEqual(event);
-    expect(clearPendingRunMetadataSpy).toHaveBeenCalledWith(event.workspaceId, "metadata-1");
-    expect(internals.pendingDevToolsRunMetadataByMessageId.has(event.messageId)).toBe(false);
+    if (expectCleared) {
+      expect(clearPendingRunMetadataSpy).toHaveBeenCalledWith(event.workspaceId, "metadata-1");
+    } else {
+      expect(clearPendingRunMetadataSpy).not.toHaveBeenCalled();
+    }
+    expect(internals.pendingDevToolsRunMetadataByMessageId.has(trackedMessageId)).toBe(
+      !expectCleared
+    );
   });
 });
 

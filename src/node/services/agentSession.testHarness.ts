@@ -27,8 +27,7 @@ export function createFailedTurnHandle(
   return {
     messageId,
     completion: Promise.resolve({
-      status: "failed",
-      messageId,
+      status: "failed" as const,
       streamError: { messageId, ...failure },
     }),
   };
@@ -61,8 +60,6 @@ function createMockAiService(args?: { emitter?: EventEmitter; overrides?: Partia
   aiService: AIService;
 } {
   const aiEmitter = args?.emitter ?? new EventEmitter();
-  const overrides = args?.overrides ?? {};
-
   return {
     aiEmitter,
     aiService: Object.assign(aiEmitter, {
@@ -72,7 +69,7 @@ function createMockAiService(args?: { emitter?: EventEmitter; overrides?: Partia
       streamMessage: mock(() =>
         Promise.resolve(Ok(createStartedTurnHandle("test-assistant-message")))
       ) as unknown as AIService["streamMessage"],
-      ...overrides,
+      ...args?.overrides,
     }) as unknown as AIService,
   };
 }
