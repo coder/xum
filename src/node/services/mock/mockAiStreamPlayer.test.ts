@@ -101,7 +101,7 @@ describe("MockAiStreamPlayer", () => {
     );
     expect(secondResult.success).toBe(true);
     if (!secondResult.success || !secondResult.data) throw new Error("expected a stream handle");
-    await expect(secondResult.data.completion).resolves.toMatchObject({ status: "failed" });
+    expect(await secondResult.data.completion).toMatchObject({ status: "failed" });
 
     // Read back all messages and check the assistant placeholders
     const allResult = await historyService.getLastMessages(workspaceId, 100);
@@ -689,7 +689,7 @@ describe("MockAiStreamPlayer", () => {
 
     await waitForCondition(() => !player.isStreaming(workspaceId), 2000);
     if (!playResult.success || !playResult.data) throw new Error("expected a stream handle");
-    await expect(playResult.data.completion).resolves.toMatchObject({ status: "completed" });
+    expect(await playResult.data.completion).toMatchObject({ status: "completed" });
 
     const partial = await historyService.readPartial(workspaceId);
     expect(partial).toBeNull();
@@ -807,6 +807,6 @@ describe("MockAiStreamPlayer", () => {
     expect(deltaCount).toBe(deltasAtStop);
     expect(abortCount).toBe(1);
     if (!playResult.success || !playResult.data) throw new Error("expected a stream handle");
-    await expect(playResult.data.completion).resolves.toMatchObject({ status: "aborted" });
+    expect(await playResult.data.completion).toMatchObject({ status: "aborted" });
   });
 });

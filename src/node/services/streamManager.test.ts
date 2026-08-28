@@ -2008,7 +2008,7 @@ describe("StreamManager - turn completion", () => {
     expect(await aborted.data.completion).toEqual({ status: "aborted", abortReason: "startup" });
   });
 
-  test("completed and failed turns settle once after their terminal event", async () => {
+  test("completed, failed, and debug-injected turns settle once after their terminal event", async () => {
     const completedEvents: TurnEngineEvent[] = [];
     const completed = await startWithStreamResult({
       workspaceId: "completion-success-workspace",
@@ -2050,6 +2050,23 @@ describe("StreamManager - turn completion", () => {
     await failed.streamManager.stopStream("completion-failure-workspace");
     await Promise.resolve();
     expect(failedSettlements).toBe(1);
+
+    // Debug-injected failures reach the same terminal settlement path.
+    const debug = await startWithStreamResult({
+      workspaceId: "completion-debug-error-workspace",
+      messageId: "completion-debug-error-message",
+      createStreamResult: hangUntilAbort,
+    });
+    expect(
+      await debug.streamManager.debugTriggerStreamError(
+        "completion-debug-error-workspace",
+        "debug injected failure"
+      )
+    ).toBe(true);
+    expect(await debug.handle.completion).toMatchObject({
+      status: "failed",
+      streamError: { error: "debug injected failure" },
+    });
   });
 
   test("aborted completion waits for asynchronous abort delivery", async () => {
@@ -2074,25 +2091,6 @@ describe("StreamManager - turn completion", () => {
 
     releaseAbortDelivery();
     expect(await handle.completion).toEqual({ status: "aborted", abortReason: "user" });
-  });
-
-  test("debug-injected stream errors settle a failed completion", async () => {
-    const { streamManager, handle } = await startWithStreamResult({
-      workspaceId: "completion-debug-error-workspace",
-      messageId: "completion-debug-error-message",
-      createStreamResult: hangUntilAbort,
-    });
-
-    const triggered = await streamManager.debugTriggerStreamError(
-      "completion-debug-error-workspace",
-      "debug injected failure"
-    );
-    expect(triggered).toBe(true);
-
-    expect(await handle.completion).toMatchObject({
-      status: "failed",
-      streamError: { error: "debug injected failure" },
-    });
   });
 });
 

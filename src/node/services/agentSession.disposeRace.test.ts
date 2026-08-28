@@ -508,16 +508,9 @@ describe("AgentSession disposal race conditions", () => {
   });
 
   test("drops failed turn completions delivered after disposal", async () => {
-    let settleCompletion: (completion: TurnCompletion) => void = () => undefined;
+    const completion = createDeferred<TurnCompletion>();
     const streamMessage = mock((_opts: StreamMessageOptions) =>
-      Promise.resolve(
-        Ok({
-          messageId: "assistant-post-dispose",
-          completion: new Promise<TurnCompletion>((resolve) => {
-            settleCompletion = resolve;
-          }),
-        })
-      )
+      Promise.resolve(Ok({ messageId: "assistant-post-dispose", completion: completion.promise }))
     );
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId: "ws-dispose-turn-completion",
@@ -537,7 +530,7 @@ describe("AgentSession disposal race conditions", () => {
       };
       const handleStreamErrorSpy = spyOn(errorSink, "handleStreamError");
       session.dispose();
-      settleCompletion({
+      completion.resolve({
         status: "failed",
         streamError: { messageId: "assistant-post-dispose", error: "boom", errorType: "api" },
       });

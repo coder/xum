@@ -271,8 +271,6 @@ export interface TurnExecutionOptions {
   rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel;
 }
 
-// Stream request config for start/retry
-
 // Request-construction inputs shared by the primary turn (sourced from
 // TurnExecutionOptions) and model-fallback hops (sourced from the prepared
 // fallback). routeProvider is the backend-resolved route
