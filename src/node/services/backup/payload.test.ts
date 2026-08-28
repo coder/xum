@@ -1706,6 +1706,14 @@ describe("backup payload", () => {
     ["option-carrying carrier wrappers", "nice -n 10 bash -c exit"],
     ["env-terminated option lists", "env -- bash -c exit"],
     ["keyword-guarded shells", "if bash -c exit; then mcp; fi"],
+    // coproc runs its command asynchronously; a function body runs at its call site.
+    ["coproc-wrapped shells", "coproc bash -c exit"],
+    ["named coproc compound bodies", "coproc PROXY { bash -c exit; }"],
+    ["function bodies", "function launch { bash -c exit; }; launch"],
+    ["prlimit-wrapped shells", "prlimit --nofile=256 bash -c exit"],
+    ["setpriv-wrapped shells", "setpriv --reuid 1000 bash -c exit"],
+    // setarch's leading arch operand is optional, so every operand is checked.
+    ["setarch-wrapped shells", "setarch linux64 bash -c exit"],
   ] as const) {
     it(`localizes ${name}`, async () => {
       await writeFixtureFile(
@@ -1736,6 +1744,11 @@ describe("backup payload", () => {
       `true; ${muxRoot}/agents/launch.md`,
       `timeout 30 ${muxRoot}/skills/launch.txt`,
       `nohup ${muxRoot}/skills/launch.txt`,
+      `prlimit ${muxRoot}/skills/launch.txt`,
+      `setpriv ${muxRoot}/skills/launch.txt`,
+      // Redirected stdin hands the same executable input to an interpreter.
+      `node < ${muxRoot}/skills/launch.txt`,
+      `sh 0< ${muxRoot}/skills/launch.txt`,
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -1765,6 +1778,8 @@ describe("backup payload", () => {
       "mcp-server --tool git config core.sshCommand ssh",
       "nohup mcp-server --shell bash",
       "mcp-server --mode find -exec /tmp/plugin",
+      "mcp-server --wrap prlimit --mode coproc",
+      "mcp-server < /tmp/input.json",
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -2488,6 +2503,24 @@ describe("backup payload", () => {
     );
     expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
     expect((blocked as BackupCredentialDetectedError).files).toEqual(["skills/demo/SKILL.md"]);
+  });
+
+  it("flags any private-key PEM label for review", async () => {
+    for (const label of [
+      "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+      "-----BEGIN DSA PRIVATE KEY-----",
+      "-----BEGIN PGP PRIVATE KEY BLOCK-----",
+    ]) {
+      await writeFixtureFile(muxRoot, "skills/notes.md", `example key material\n${label}\n`);
+      // Reviewable only: documentation quoting key blocks stays overridable.
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      expect(scanBackupFilesForSecrets(payload.files)).toEqual(["skills/notes.md"]);
+    }
   });
 
   it("keeps a digit-free sk- wall reviewable at the size limit", async () => {

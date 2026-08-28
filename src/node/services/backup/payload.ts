@@ -149,7 +149,9 @@ const REVIEW_ONLY_TOKEN_SHAPES: readonly IssuedTokenShape[] = [
   { prefixes: ["AIza"], runClass: "word-dash", minRun: 35, openEnded: true },
 ];
 
-const PRIVATE_KEY_PATTERN = /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/;
+// Any qualifier before PRIVATE KEY counts: OpenSSL emits ENCRYPTED/DSA qualifiers and
+// PGP armors a BLOCK suffix, and a prose false positive only flags a file for review.
+const PRIVATE_KEY_PATTERN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----/;
 
 function isAsciiDigitCode(code: number): boolean {
   return code >= 48 && code <= 57;
@@ -2057,6 +2059,11 @@ const SHELL_COMMAND_KEYWORDS = new Set([
   "!",
   "{",
   "}",
+  // Both run what follows: coproc executes its command asynchronously, and a
+  // function body executes at the call site later in the same command string.
+  // Their optional/required NAME operand is handled where the keyword is seen.
+  "coproc",
+  "function",
 ]);
 
 /**
@@ -2081,10 +2088,18 @@ const COMMAND_CARRIER_OPERANDS = new Map<string, number>([
   ["command", 0],
   ["builtin", 0],
   ["exec", 0],
+  ["prlimit", 0],
+  ["setpriv", 0],
+  ["numactl", 0],
+  ["eatmydata", 0],
   ["timeout", 1],
   ["chrt", 1],
   ["taskset", 1],
   ["chroot", 1],
+  ["runcon", 1],
+  // -1: the wrapper's leading operand is optional (setarch [ARCH] COMMAND), so no
+  // fixed count is safe; every following word is checked instead, failing closed.
+  ["setarch", -1],
 ]);
 
 /**
@@ -2215,6 +2230,7 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
   let carrierSticky = false;
   let carrierOperandSkips = 0;
   let pendingFindPrimaries = false;
+  let pendingBodyName: "coproc" | "function" | null = null;
   let envOperandsOnly = false;
   let pendingPrintfVariableOption = false;
   let sawEnv = false;
@@ -2265,12 +2281,18 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
       carrierSticky = false;
       carrierOperandSkips = 0;
       pendingFindPrimaries = false;
+      pendingBodyName = null;
       sawEnv = false;
       pendingEnvOptionValue = false;
     }
     // The word after `<` is a read redirection's filename, never a command or an
-    // operand; the command word can still follow it (`< input sh -c x`).
-    if (gap.includes("<")) continue;
+    // operand; the command word can still follow it (`< input sh -c x`). A published
+    // document as redirected input is executable to a stdin-reading interpreter
+    // (`node < launch.txt` runs it as a script), so that filename localizes.
+    if (gap.includes("<")) {
+      if (isAutoPublishedScriptOperand(unquoteShellWord(word), rootPrefixes)) return true;
+      continue;
+    }
     if (CONSUMED_ASSIGNMENT.test(word)) continue;
     // Bash expands neither syntax from quoted or escaped text (`--config
     // '{"a":1,"b":2}'` stays a literal argument). The brace test runs on the active
@@ -2314,8 +2336,25 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
       pendingJavaOptionValue = false;
       continue;
     }
+    if (pendingBodyName !== null) {
+      const keyword = pendingBodyName;
+      pendingBodyName = null;
+      // The NAME between the keyword and its compound body does not execute; the
+      // body's opening `{` keeps command position through the keyword set. coproc
+      // treats the word as a name only when a compound follows; otherwise it is the
+      // simple command itself and falls through to the checks below.
+      if (
+        /^[A-Za-z_][A-Za-z0-9_]*$/.test(unquoted) &&
+        (keyword === "function" || unquoteShellWord(words[index + 1]?.[0] ?? "") === "{")
+      ) {
+        continue;
+      }
+    }
     // Reserved words leave the following word in command position.
-    if (commandPosition && SHELL_COMMAND_KEYWORDS.has(unquoted)) continue;
+    if (commandPosition && SHELL_COMMAND_KEYWORDS.has(unquoted)) {
+      if (unquoted === "coproc" || unquoted === "function") pendingBodyName = unquoted;
+      continue;
+    }
     // Whether this word can execute: a command start, env's utility operand, or a
     // carrier's wrapped command. Only such words can name an interpreter, a wrapper,
     // or a state-changing builtin; everywhere else the same spelling is an ordinary
@@ -2490,7 +2529,9 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
       if (executable === "java") pendingJavaOptions = true;
       if (FIND_EXECUTABLE_NAMES.has(executable)) pendingFindPrimaries = true;
       const carrierSkips = COMMAND_CARRIER_OPERANDS.get(executable);
-      if (carrierSkips !== undefined) {
+      if (carrierSkips === -1) {
+        carrierSticky = true;
+      } else if (carrierSkips !== undefined) {
         carrierArmed = true;
         carrierOperandSkips = carrierSkips;
       }
