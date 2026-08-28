@@ -54,6 +54,12 @@ export interface WorkflowServiceOptions {
   resolveWorkflowScript?: (scriptPath: string) => Promise<ResolvedWorkflowScript>;
   onBackgroundRunTerminal?: (event: WorkflowBackgroundRunTerminalEvent) => Promise<void> | void;
   onRunStatusChanged?: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void;
+  /**
+   * Fired when crash recovery is about to resume an orphaned run, before the runner restarts.
+   * Used to repair wake provenance a pre-boundary build stripped from the sidecar; awaited so
+   * a fast run cannot reach terminal before the repair lands.
+   */
+  onRunCrashResumed?: (event: { workspaceId: string; runId: string }) => Promise<void> | void;
   /** When true, background terminal notifications also fire for interrupted runs. */
   notifyInterruptedBackgroundRunTerminal?: boolean;
   generateRunId?: () => string;
@@ -127,6 +133,10 @@ export class WorkflowService {
   private readonly onBackgroundRunTerminal?: (
     event: WorkflowBackgroundRunTerminalEvent
   ) => Promise<void> | void;
+  private readonly onRunCrashResumed?: (event: {
+    workspaceId: string;
+    runId: string;
+  }) => Promise<void> | void;
   private readonly onRunStatusChanged?: (
     event: WorkflowRunStatusChangedEvent
   ) => Promise<void> | void;
@@ -150,6 +160,7 @@ export class WorkflowService {
     this.taskAdapterFactory = options.taskAdapterFactory;
     this.resolveWorkflowScript = options.resolveWorkflowScript;
     this.onBackgroundRunTerminal = options.onBackgroundRunTerminal;
+    this.onRunCrashResumed = options.onRunCrashResumed;
     this.onRunStatusChanged = options.onRunStatusChanged;
     this.notifyInterruptedBackgroundRunTerminal =
       options.notifyInterruptedBackgroundRunTerminal === true;
@@ -571,6 +582,16 @@ export class WorkflowService {
     const run = await this.getCrashRecoverableRun(input.runId);
     if (run == null || !canResumeRunWithCurrentTrust(run, projectTrusted)) {
       return false;
+    }
+
+    if (this.onRunCrashResumed != null) {
+      try {
+        await this.onRunCrashResumed({ workspaceId: run.workspaceId, runId: run.id });
+      } catch (error) {
+        // Best-effort: an unrepaired reference defers its wake as indeterminate rather than
+        // losing it, so a failed repair must not block the resume itself.
+        console.error("Workflow crash-resume provenance repair failed:", error);
+      }
     }
 
     const retryDelayMs = await this.runStore.getLeaseRetryDelayMs(

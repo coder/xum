@@ -6,6 +6,7 @@ import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import {
   clearAgentWorkflowRunReferences,
   readAgentWorkflowRunReferences,
+  recordAgentWorkflowRunReference,
   type AgentWorkflowRunReference,
 } from "@/node/services/agentWorkflowRunReferences";
 import * as fsPromises from "fs/promises";
@@ -11120,6 +11121,45 @@ export class WorkspaceService extends EventEmitter {
       throw new Error("workflow invocation boundary unavailable: history read failed");
     }
     return decision.status === "found" ? decision.messageId : null;
+  }
+
+  /**
+   * Re-snapshot the boundary for a run reference that lost it: a pre-boundary build rewrites
+   * the sidecar with only runId/createdAtMs on any record (upgrade -> downgrade -> upgrade
+   * strips the field), and a boundaryless reference defers its terminal wake as indeterminate
+   * until provenance is re-established. Crash recovery calls this before restarting an
+   * orphaned run: the run is verifiably non-terminal there, so a resume-time snapshot is
+   * legitimate launch provenance for the continued execution, mirroring the workflow_resume
+   * tool's re-record. References that still carry a boundary (including verified-empty null)
+   * are left untouched: refreshing them would forgive manual supersessions on every restart.
+   */
+  async repairWorkflowRunReferenceBoundary(workspaceId: string, runId: string): Promise<void> {
+    assert(workspaceId.length > 0, "repairWorkflowRunReferenceBoundary requires workspaceId");
+    assert(runId.length > 0, "repairWorkflowRunReferenceBoundary requires runId");
+    const sessionDir = this.config.getSessionDir(workspaceId);
+    const references = await readAgentWorkflowRunReferences(sessionDir);
+    const reference = references.find((candidate) => candidate.runId === runId);
+    if (reference == null || reference.afterBoundaryMessageId !== undefined) {
+      return;
+    }
+    const afterBoundaryMessageId = await this.getWorkflowInvocationBoundaryMessageId(
+      workspaceId,
+      runId
+    );
+    await recordAgentWorkflowRunReference({
+      workspaceSessionDir: sessionDir,
+      runId,
+      createdAtMs: reference.createdAtMs,
+      afterBoundaryMessageId,
+      ...(reference.agentId != null
+        ? {
+            agentId: reference.agentId,
+            ...(reference.strictAgentResolution !== undefined
+              ? { strictAgentResolution: reference.strictAgentResolution }
+              : {}),
+          }
+        : {}),
+    });
   }
 
   /**

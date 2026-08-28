@@ -1059,6 +1059,15 @@ interface WorkflowWakeInitiatingAgent {
   strictAgentResolution?: AgentWorkflowRunStrictPin | null;
 }
 
+// Coalescing key for terminal workflow wakes: the pin is part of the launch identity, so an
+// agentId alone must not merge a pinned launch with an unpinned (or differently pinned) one.
+// undefined (legacy walk fallback), null (verified unpinned), and each concrete pin are
+// distinct groups; over-splitting structurally equal pins is safe, merging them is not.
+function workflowWakeGroupKey(agent: WorkflowWakeInitiatingAgent): string {
+  const pin = agent.strictAgentResolution;
+  return `${agent.agentId}\u0000${pin === undefined ? "walk" : JSON.stringify(pin)}`;
+}
+
 function isTypedWorkspaceEvent(value: unknown, type: string): boolean {
   return (
     typeof value === "object" &&
@@ -8477,13 +8486,15 @@ export class TaskService {
           : {}),
       });
     }
-    // Deliver one initiating-agent group per drain: the whole coalesced prompt is handled
-    // under the single agentId passed to sendMessage, so batching runs from different agents
-    // would hand a restricted agent's (attacker-influenced) output to another agent's tool
-    // grants. The same applies to mixed batches: workspace-turn and sub-agent attention
-    // resumes under the conversation's own (history-walk) identity, so agent-bound workflow
-    // groups never share their send. Deferred groups stay pending and deliver on the re-armed
-    // retry drain; among agent-bound groups the newest launch goes first.
+    // Deliver one launch-identity group per drain, keyed by agentId AND recorded strict pin:
+    // the whole coalesced prompt is handled under the single agentId/pin passed to
+    // sendMessage, so batching runs from different agents (or runs sharing an agentId but
+    // launched under different pins, e.g. an agent definition replaced between synthetic
+    // turns) would hand a restricted launch's (attacker-influenced) output to another
+    // launch's tool grants. The same applies to mixed batches: workspace-turn and sub-agent
+    // attention resumes under the conversation's own (history-walk) identity, so agent-bound
+    // workflow groups never share their send. Deferred groups stay pending and deliver on the
+    // re-armed retry drain; among agent-bound groups the newest launch goes first.
     const hasNonWorkflowDeliverables =
       deliverableAgentNotificationIds.size > 0 || deliverableWorkspaceTurnNotificationIds.size > 0;
     let workflowInitiatingAgent: WorkflowWakeInitiatingAgent | undefined;
@@ -8499,11 +8510,14 @@ export class TaskService {
         }
       }
     }
-    const selectedAgentId = workflowInitiatingAgent?.agentId;
+    const selectedGroupKey =
+      workflowInitiatingAgent != null ? workflowWakeGroupKey(workflowInitiatingAgent) : undefined;
     const selectedWorkflowPrompts = deliverableWorkflowPrompts.filter((candidate) =>
       hasNonWorkflowDeliverables
         ? candidate.initiatingAgent == null
-        : selectedAgentId == null || candidate.initiatingAgent?.agentId === selectedAgentId
+        : selectedGroupKey == null ||
+          (candidate.initiatingAgent != null &&
+            workflowWakeGroupKey(candidate.initiatingAgent) === selectedGroupKey)
     );
     if (selectedWorkflowPrompts.length < deliverableWorkflowPrompts.length) {
       this.scheduleTerminalAttentionDeferRetry(ownerWorkspaceId);

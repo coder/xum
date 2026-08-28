@@ -1007,3 +1007,59 @@ describe("WorkflowRunStore.listActiveRunSummaries", () => {
     expect(summaries.map((summary) => summary.runId)).toEqual(["wfr_healthy"]);
   });
 });
+
+describe("WorkflowService crash recovery", () => {
+  test("crash resume fires provenance repair before the run reaches terminal", async () => {
+    using tmp = new DisposableTempDir("workflow-service-crash-repair");
+    const runStore = new WorkflowRunStore({ sessionDir: tmp.path });
+    await runStore.createRun({
+      id: "wfr_crash",
+      workspaceId: "workspace-1",
+      workflow: { name: "demo", description: "Demo workflow", scope: "built-in", executable: true },
+      source: 'export default function workflow() { return { reportMarkdown: "done" }; }\n',
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-05-29T00:00:00.000Z",
+    });
+    // Orphaned by a crash: durable status says running, but no runner holds the lease.
+    await runStore.appendStatus("wfr_crash", "running", "2026-05-29T00:00:01.000Z");
+
+    const events: string[] = [];
+    let resolveCompleted: (() => void) | undefined;
+    const completed = new Promise<void>((resolve) => {
+      resolveCompleted = resolve;
+    });
+    const service = new WorkflowService({
+      runStore,
+      runtimeFactory: new QuickJSRuntimeFactory(),
+      taskAdapter: {
+        async runAgent() {
+          throw new Error("No agent steps expected");
+        },
+      },
+      generateRunId: () => "wfr_unused",
+      runnerId: "runner-a",
+      onRunCrashResumed: (event) => {
+        events.push(`repair:${event.workspaceId}:${event.runId}`);
+      },
+      onRunStatusChanged: (event) => {
+        events.push(`status:${event.status}`);
+        if (event.status === "completed") {
+          resolveCompleted?.();
+        }
+      },
+    });
+
+    const resumed = await service.resumeCrashedRuns({
+      workspaceId: "workspace-1",
+      projectTrusted: true,
+    });
+    expect(resumed).toEqual(["wfr_crash"]);
+    await completed;
+    // The repair hook is awaited before the runner restarts, so even an instantly completing
+    // run cannot reach terminal with unrepaired provenance.
+    expect(events[0]).toBe("repair:workspace-1:wfr_crash");
+    expect(events).toContain("status:completed");
+    await expect(runStore.getRun("wfr_crash")).resolves.toMatchObject({ status: "completed" });
+  });
+});

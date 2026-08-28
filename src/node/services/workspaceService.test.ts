@@ -59,7 +59,10 @@ import {
   WORKFLOW_TRIGGER_DISPLAY_METADATA_TYPE,
   buildWorkflowResultContextMessage,
 } from "@/common/utils/workflowRunMessages";
-import { recordAgentWorkflowRunReference } from "@/node/services/agentWorkflowRunReferences";
+import {
+  readAgentWorkflowRunReferences,
+  recordAgentWorkflowRunReference,
+} from "@/node/services/agentWorkflowRunReferences";
 import { getPlanFilePath } from "@/common/utils/planStorage";
 import * as todoStorageModule from "@/node/services/todos/todoStorage";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
@@ -6463,6 +6466,91 @@ describe("WorkspaceService workflow invocation events", () => {
       expect(await workspaceService.getWorkflowInvocationCurrentness(workspaceId, runId)).toBe(
         "indeterminate"
       );
+      workspaceService.disposeSession(workspaceId);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("crash-resume repair re-snapshots only boundaryless references", async () => {
+    const { config, historyService, cleanup } = await createTestHistoryService();
+    const workspaceId = "workflow-crash-repair";
+    const strippedRunId = "wfr_crash_repair_stripped";
+    const anchoredRunId = "wfr_crash_repair_anchored";
+    const projectPath = path.join(config.rootDir, "project");
+    try {
+      await config.addWorkspace(projectPath, {
+        id: workspaceId,
+        name: "workflow-crash-repair",
+        projectName: "project",
+        projectPath,
+        runtimeConfig: { type: "local" },
+      });
+      const workspaceService = createWorkspaceServiceForTest({
+        config,
+        historyService,
+        aiService: createMockAIService({
+          stopStream: mock(() => Promise.resolve(Ok(undefined))),
+        }),
+        extensionMetadata: new ExtensionMetadataService(
+          path.join(config.rootDir, "extensionMetadata.json")
+        ),
+        initStateManager: {
+          ...mockInitStateManager,
+          off: mock(() => undefined as unknown as InitStateManager),
+        } as unknown as InitStateManager,
+      });
+
+      await historyService.appendToHistory(
+        workspaceId,
+        createMuxMessage("manual-user", "user", "run the audit workflow", { timestamp: 1_000 })
+      );
+      // A downgrade rewrote the sidecar without boundary fields (or a record-time read failure
+      // omitted them): crash-resume repair re-snapshots the boundary, keeping the recorded
+      // launch identity, and the deferred wake becomes deliverable again.
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId: strippedRunId,
+        createdAtMs: 1_150,
+        agentId: "plan",
+        strictAgentResolution: { expectedScope: "built-in" },
+      });
+      await workspaceService.repairWorkflowRunReferenceBoundary(workspaceId, strippedRunId);
+      const repaired = await readAgentWorkflowRunReferences(config.getSessionDir(workspaceId));
+      expect(repaired.find((reference) => reference.runId === strippedRunId)).toMatchObject({
+        createdAtMs: 1_150,
+        afterBoundaryMessageId: "manual-user",
+        agentId: "plan",
+        strictAgentResolution: { expectedScope: "built-in" },
+      });
+      expect(
+        await workspaceService.getWorkflowInvocationCurrentness(workspaceId, strippedRunId)
+      ).toBe("current");
+
+      // A reference that still carries its boundary may record a pre-supersession launch:
+      // repair must not refresh it into the current context.
+      await recordAgentWorkflowRunReference({
+        workspaceSessionDir: config.getSessionDir(workspaceId),
+        runId: anchoredRunId,
+        createdAtMs: 1_050,
+        afterBoundaryMessageId: "older-row",
+      });
+      await workspaceService.repairWorkflowRunReferenceBoundary(workspaceId, anchoredRunId);
+      const untouched = await readAgentWorkflowRunReferences(config.getSessionDir(workspaceId));
+      expect(
+        untouched.find((reference) => reference.runId === anchoredRunId)?.afterBoundaryMessageId
+      ).toBe("older-row");
+      expect(
+        await workspaceService.getWorkflowInvocationCurrentness(workspaceId, anchoredRunId)
+      ).toBe("not_current");
+
+      // Unknown run: nothing to repair, nothing recorded.
+      await workspaceService.repairWorkflowRunReferenceBoundary(workspaceId, "wfr_unknown");
+      const after = await readAgentWorkflowRunReferences(config.getSessionDir(workspaceId));
+      expect(after.map((reference) => reference.runId).sort()).toEqual([
+        anchoredRunId,
+        strippedRunId,
+      ]);
       workspaceService.disposeSession(workspaceId);
     } finally {
       await cleanup();

@@ -584,6 +584,8 @@ export async function resolveWorkflowContext(
           skillStorageContext,
         }),
       onRunStatusChanged: (event) => context.workspaceService.emitWorkflowRunActivity(event),
+      onRunCrashResumed: (event) =>
+        context.workspaceService.repairWorkflowRunReferenceBoundary(event.workspaceId, event.runId),
       ...(options.onBackgroundRunTerminal != null
         ? { onBackgroundRunTerminal: options.onBackgroundRunTerminal }
         : {}),

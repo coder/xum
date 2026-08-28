@@ -6670,6 +6670,101 @@ describe("TaskService", () => {
     expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
   });
 
+  test("coalesced workflow wakes split by strict pin within one agent", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const createRun = async (runId: string) => {
+      await runStore.createRun({
+        id: runId,
+        workspaceId: parentId,
+        workflow: {
+          name: "research",
+          description: "Research workflow",
+          scope: "built-in",
+          executable: true,
+        },
+        source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+        args: {},
+        attentionPolicy: "notify_on_terminal",
+        now: "2026-06-19T00:00:00.000Z",
+      });
+      await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+      await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+    };
+    await createRun("wfr_pin_split_pinned");
+    await createRun("wfr_pin_split_unpinned");
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+    const drain = (
+      taskService as unknown as {
+        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+      }
+    ).drainTerminalAttention.bind(taskService);
+
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual", "user", "run both audits", { timestamp: 1_000 })
+    );
+    // Same agentId, different launch pins (an agent definition replaced between synthetic
+    // launches): one coalesced wake would process the pinned run's output under the newer
+    // verified-unpinned launch.
+    await recordAgentWorkflowRunReference({
+      workspaceSessionDir: config.getSessionDir(parentId),
+      runId: "wfr_pin_split_pinned",
+      createdAtMs: 1_000,
+      agentId: "plan",
+      strictAgentResolution: { expectedScope: "built-in" },
+    });
+    await recordAgentWorkflowRunReference({
+      workspaceSessionDir: config.getSessionDir(parentId),
+      runId: "wfr_pin_split_unpinned",
+      createdAtMs: 2_000,
+      agentId: "plan",
+      strictAgentResolution: null,
+    });
+
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    await terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: parentId,
+      sourceKind: "workflow_run",
+      sourceId: "wfr_pin_split_pinned",
+    });
+    await terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: parentId,
+      sourceKind: "workflow_run",
+      sourceId: "wfr_pin_split_unpinned",
+    });
+    await drain(parentId);
+
+    // The newest launch delivers first, alone, without the other launch's pin.
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const firstPrompt = String(sendMessage.mock.calls[0]?.[1]);
+    expect(firstPrompt).toContain("wfr_pin_split_unpinned");
+    expect(firstPrompt).not.toContain("wfr_pin_split_pinned");
+    const firstOptions = sendMessage.mock.calls[0]?.[2] as Record<string, unknown>;
+    expect(firstOptions.agentId).toBe("plan");
+    expect(firstOptions.strictAgentResolution).toBeUndefined();
+
+    // The pinned launch delivers on the retry drain under its own recorded pin.
+    await drain(parentId);
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    const secondPrompt = String(sendMessage.mock.calls[1]?.[1]);
+    expect(secondPrompt).toContain("wfr_pin_split_pinned");
+    expect(secondPrompt).not.toContain("wfr_pin_split_unpinned");
+    expect(sendMessage.mock.calls[1]?.[2] as Record<string, unknown>).toMatchObject({
+      agentId: "plan",
+      strictAgentResolution: { expectedScope: "built-in" },
+    });
+    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
+  });
+
   test("mixed drains keep workspace-turn attention off the workflow's agent", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
