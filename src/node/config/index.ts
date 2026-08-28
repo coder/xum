@@ -2457,7 +2457,7 @@ export class Config {
           const currentBytes = fs.readFileSync(this.configFile);
           currentSignature = configContentSignature(currentBytes);
         } catch (readError) {
-          if ((readError as NodeJS.ErrnoException).code !== "ENOENT") {
+          if (!isEnoentError(readError)) {
             rejectEdit(
               `the file could not be re-read before writing (${readError instanceof Error ? readError.message : String(readError)}). Retry the settings change.`
             );
