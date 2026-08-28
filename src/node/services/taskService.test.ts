@@ -7559,6 +7559,116 @@ describe("TaskService", () => {
     expect(error.message).toContain("wst_successor");
   });
 
+  test("cut attribution is captured at event time, before the workspace event lock", async () => {
+    // Codex P1: when another operation holds the workspace event lock as
+    // stream-end arrives, the session can drain the real manual cutter and
+    // engage a later same-owner follow-up during the wait. The snapshot must
+    // be captured synchronously in the event listener (before the lock), so
+    // the manual supersede keeps its wake.
+    const { config, parentId, taskService, workspaceMocks, aiMocks } =
+      await startWorkspaceTurnForTest();
+    let followUpEngaged = false;
+    workspaceMocks.getQueueCutCutter.mockImplementation(() =>
+      followUpEngaged
+        ? ownerFollowUpCutter(parentId, "wst_successor")
+        : { stage: "preparing" as const, muxMetadata: undefined }
+    );
+    const streamEndListener = aiMocks.on.mock.calls.find(
+      (call: unknown[]) => call[0] === "stream-end"
+    )?.[1] as ((payload: unknown) => void) | undefined;
+    assert(streamEndListener != null, "stream-end listener must be registered");
+    const internal = taskService as unknown as {
+      workspaceEventLocks: { withLock: <T>(key: string, fn: () => Promise<T>) => Promise<T> };
+    };
+
+    let releaseLock: (() => void) | undefined;
+    const lockHeld = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    const lockOwner = internal.workspaceEventLocks.withLock("childworkspace", async () => {
+      await lockHeld;
+    });
+    // Event arrives while the lock is held: capture happens NOW (manual
+    // cutter engaged), handling is queued behind the lock.
+    streamEndListener(ownerFollowUpCutEvent(parentId, "msg_lock_wait_cut"));
+    // The follow-up engages before the queued handler can run.
+    followUpEngaged = true;
+    assert(releaseLock != null, "lock owner must have started");
+    releaseLock();
+    await lockOwner;
+    // Sequence after the queued stream-end handler.
+    await internal.workspaceEventLocks.withLock("childworkspace", () => Promise.resolve());
+
+    expect(
+      await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+    ).toMatchObject({
+      status: "interrupted",
+      error:
+        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report",
+    });
+  });
+
+  test("cancelled successor forwards disposable ownership to the next queued follow-up", async () => {
+    // Codex P1 (three-handle chain): A transferred ownership to B; B is then
+    // cancelled through the non-stream settlement path while C is still
+    // queued. Cleanup must forward ownership to C instead of deleting the
+    // workspace under it, and only the last handle in the chain removes it.
+    const remove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
+      disposable: true,
+      remove,
+    });
+    const taskHandleStore = new TaskHandleStore(config);
+    const queuedBase = {
+      kind: "workspace_turn" as const,
+      ownerWorkspaceId: parentId,
+      workspaceId: "childworkspace",
+      status: "queued" as const,
+      createdWorkspace: false,
+      disposableWorkspace: false,
+    };
+    await taskHandleStore.upsertWorkspaceTurn({
+      ...queuedBase,
+      handleId: "wst_successor",
+      turnId: "turn2",
+      createdAt: "2026-08-11T00:00:01.000Z",
+      updatedAt: "2026-08-11T00:00:01.000Z",
+    });
+    await taskHandleStore.upsertWorkspaceTurn({
+      ...queuedBase,
+      handleId: "wst_successor2",
+      turnId: "turn3",
+      createdAt: "2026-08-11T00:00:02.000Z",
+      updatedAt: "2026-08-11T00:00:02.000Z",
+    });
+    workspaceMocks.getQueueCutCutter.mockImplementation(() =>
+      ownerFollowUpCutter(parentId, "wst_successor")
+    );
+    const internal = taskService as unknown as {
+      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+    };
+    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_chain_cut"));
+    expect(
+      (await taskHandleStore.getWorkspaceTurn(parentId, "wst_successor"))?.disposableWorkspace
+    ).toBe(true);
+
+    const stopped = await taskService.interruptWorkspaceTurn(parentId, "wst_successor");
+    expect(stopped.success).toBe(true);
+    expect(await taskHandleStore.getWorkspaceTurn(parentId, "wst_successor")).toMatchObject({
+      status: "interrupted",
+      disposableWorkspace: false,
+    });
+    expect(
+      (await taskHandleStore.getWorkspaceTurn(parentId, "wst_successor2"))?.disposableWorkspace
+    ).toBe(true);
+    expect(remove).not.toHaveBeenCalled();
+
+    // The last handle in the chain has no live successor left: remove for real.
+    const stoppedLast = await taskService.interruptWorkspaceTurn(parentId, "wst_successor2");
+    expect(stoppedLast.success).toBe(true);
+    expect(remove).toHaveBeenCalledTimes(1);
+  });
+
   test("late correlated completion self-heals a quiet supersede and re-arms the corrected wake", async () => {
     const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest();
     const taskHandleStore = new TaskHandleStore(config);

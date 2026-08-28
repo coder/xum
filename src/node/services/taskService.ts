@@ -2251,9 +2251,16 @@ export class TaskService {
     this.aiService.on("stream-end", (payload: unknown) => {
       if (!isStreamEndEvent(payload)) return;
 
+      // Captured synchronously at event time, BEFORE the workspace event lock:
+      // another operation holding the lock would otherwise let the session
+      // drain the real (manual/cross-owner) cutter and engage a later
+      // same-owner follow-up during the wait, misattributing the cut and
+      // wrongly suppressing the real cutter's wake (see
+      // QueueCutAttributionSnapshot).
+      const queueCutSnapshot = this.captureQueueCutAttributionSnapshot(payload.workspaceId);
       void this.workspaceEventLocks
         .withLock(payload.workspaceId, async () => {
-          await this.handleStreamEnd(payload);
+          await this.handleStreamEnd(payload, queueCutSnapshot);
         })
         .catch((error: unknown) => {
           log.error("TaskService.handleStreamEnd failed", { error });
@@ -8408,29 +8415,38 @@ export class TaskService {
 
     // Last-moment suppression revalidation: a quiet owner-follow-up resettle
     // deletes its notification files, but cannot retract this drain's
-    // already-taken listPending() snapshot, so the handle record (re-read here,
-    // after every await except delivery itself) is the source of truth. A
-    // suppressed handle is dropped instead of waking the owner from the stale
-    // snapshot. The residual window is the sendMessage call below — closing it
-    // would require holding settlement locks across delivery, which the drain
-    // must not do; worst case is one redundant wake (fail toward notify).
+    // already-taken listPending() snapshot, so the handle records are the
+    // source of truth. All candidates are re-read in ONE parallel batch and
+    // partitioned synchronously, so no candidate's check goes stale behind a
+    // later candidate's await; suppressed handles are dropped instead of
+    // waking the owner, and their notifications are marked superseded only
+    // after the delivery decision. The residual window is the batch read →
+    // sendMessage gap below (no awaits in between besides delivery itself) —
+    // closing it would require holding settlement locks across delivery,
+    // which the drain must not do; worst case is one redundant wake (fail
+    // toward notify, never a lost wake).
+    const candidateRecords = await Promise.all(
+      workspaceTurnCandidates.map((candidate) =>
+        this.taskHandleStore.getWorkspaceTurn(ownerWorkspaceId, candidate.notification.sourceId)
+      )
+    );
     const deliverableWorkspaceTurnNotificationIds = new Set<string>();
     const publicAwaitIds: string[] = [];
-    for (const candidate of workspaceTurnCandidates) {
-      const record = await this.taskHandleStore.getWorkspaceTurn(
-        ownerWorkspaceId,
-        candidate.notification.sourceId
-      );
+    const suppressedNotificationIds: string[] = [];
+    workspaceTurnCandidates.forEach((candidate, index) => {
+      const record = candidateRecords[index];
       if (record != null && workspaceTurnTerminalAttentionSuppressed(record)) {
-        await this.terminalAttentionStore.markSuperseded(
-          ownerWorkspaceId,
-          candidate.notification.id
-        );
-        continue;
+        suppressedNotificationIds.push(candidate.notification.id);
+        return;
       }
       deliverableWorkspaceTurnNotificationIds.add(candidate.notification.id);
       publicAwaitIds.push(candidate.publicAwaitId);
-    }
+    });
+    const markSuppressedSuperseded = async () => {
+      for (const id of suppressedNotificationIds) {
+        await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, id);
+      }
+    };
 
     // Sub-agent reports and failures are already durable user-context messages. Resume from history
     // directly instead of injecting a second user turn that merely tells the model they exist.
@@ -8449,7 +8465,10 @@ export class TaskService {
       }
       return deliverableWorkspaceTurnNotificationIds.has(notification.id);
     });
-    if (effectivePending.length === 0) return;
+    if (effectivePending.length === 0) {
+      await markSuppressedSuperseded();
+      return;
+    }
 
     const markPendingDelivered = async () => {
       for (const notification of effectivePending) {
@@ -8472,6 +8491,9 @@ export class TaskService {
     };
     if (prompt.length === 0) {
       assert(agentNotifications.length > 0, "prompt-free terminal drain requires sub-agent work");
+      // No workspace-turn wakes are delivered on this path, so marking the
+      // suppressed ones first cannot go stale against a delivery.
+      await markSuppressedSuperseded();
       const resumeResult = await this.workspaceService.resumeStream(ownerWorkspaceId, sendOptions, {
         agentInitiated: true,
       });
@@ -8499,6 +8521,11 @@ export class TaskService {
       // Synthetic, idle-only auto-resume — same flags as the active-work auto-resume path.
       { skipAutoResumeReset: true, synthetic: true, agentInitiated: true, requireIdle: true }
     );
+    // Deferred until after the delivery attempt so no await separates the
+    // batch revalidation above from sendMessage. Best-effort: an early return
+    // above leaves these pending, and a later drain re-derives suppression
+    // from the records and drops them again.
+    await markSuppressedSuperseded();
 
     if (!sendResult.success && isWorkspaceBusyIdleOnlySend(sendResult.error)) {
       const latestCfg = this.config.loadConfigOrDefault();
@@ -8647,10 +8674,61 @@ export class TaskService {
     });
   }
 
+  /**
+   * Forward disposable-workspace ownership from a terminally settled handle to
+   * the oldest live same-owner turn still targeting the same workspace, if
+   * any. Covers settlement paths with no queue-cut attribution (cancellation,
+   * accepted pre-stream failures, stale-handle recovery) and three-handle
+   * chains where the announced successor itself failed while another follow-up
+   * remains queued. Returns true when ownership moved.
+   */
+  private async forwardDisposableOwnershipToLiveSuccessor(
+    record: WorkspaceTurnTaskHandleRecord
+  ): Promise<boolean> {
+    // createdAt-ascending: prefer the next turn in line; if it settles too,
+    // its own cleanup forwards again, so the cascade always terminates at a
+    // live successor or actual removal.
+    const candidates = await this.taskHandleStore.listWorkspaceTurns(record.ownerWorkspaceId);
+    for (const candidate of candidates) {
+      if (
+        candidate.handleId === record.handleId ||
+        candidate.workspaceId !== record.workspaceId ||
+        !isActiveWorkspaceTurnTaskStatus(candidate.status)
+      ) {
+        continue;
+      }
+      if (await this.transferDisposableWorkspaceToSuccessor(record, candidate.handleId)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private async cleanupDisposableWorkspaceTurn(
     record: WorkspaceTurnTaskHandleRecord
   ): Promise<void> {
     if (!record.disposableWorkspace) return;
+    // Forward instead of deleting while another live same-owner turn still
+    // targets this workspace. Every caller invokes cleanup only after
+    // persisting this record's terminal status, which makes the candidate
+    // scan deadlock-free: a concurrently settling candidate scanning back at
+    // this record sees it terminal on disk and skips it (and transfer
+    // re-validates the successor under its settlement lock), so two
+    // settlements can never wait on each other's locks.
+    if (await this.forwardDisposableOwnershipToLiveSuccessor(record)) {
+      // Metadata-only flip off a fresh read (updatedAt unchanged), mirroring
+      // transferDisposableWorkspaceToSuccessor, so terminal-attention
+      // generation ids and staleness comparisons are unaffected.
+      const current = await this.taskHandleStore.getWorkspaceTurn(
+        record.ownerWorkspaceId,
+        record.handleId
+      );
+      await this.taskHandleStore.upsertWorkspaceTurn({
+        ...(current ?? record),
+        disposableWorkspace: false,
+      });
+      return;
+    }
     try {
       const removeResult = await this.workspaceService.remove(record.workspaceId, true);
       if (!removeResult.success) {
@@ -14437,11 +14515,18 @@ export class TaskService {
     return true;
   }
 
-  private async handleStreamEnd(event: StreamEndEvent): Promise<void> {
-    // Captured before ANY await in this method: cut attribution must reflect
-    // the state at the ended stream's own event, not whatever input engaged
-    // while the awaits below ran (see QueueCutAttributionSnapshot).
-    const queueCutSnapshot = this.captureQueueCutAttributionSnapshot(event.workspaceId);
+  private async handleStreamEnd(
+    event: StreamEndEvent,
+    // The production stream-end listener captures this synchronously at event
+    // time, before waiting on the workspace event lock; the entry-time capture
+    // below is a fallback for direct callers (tests) only.
+    eventTimeQueueCutSnapshot?: QueueCutAttributionSnapshot
+  ): Promise<void> {
+    // Cut attribution must reflect the state at the ended stream's own event,
+    // not whatever input engaged while the lock wait or the awaits below ran
+    // (see QueueCutAttributionSnapshot).
+    const queueCutSnapshot =
+      eventTimeQueueCutSnapshot ?? this.captureQueueCutAttributionSnapshot(event.workspaceId);
     const isCompaction = event.metadata.agentId === "compact" || event.metadata.mode === "compact";
     // AgentSession resolves true only after a durable compaction follow-up is accepted. Bare,
     // rejected, and failed-to-dispatch compactions remain on the normal child recovery path.
