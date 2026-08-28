@@ -2249,6 +2249,10 @@ const SHELL_STATE_WORDS = new Set([
   // `alias` rebinds later command words themselves; POSIX shells expand aliases in
   // non-interactive scripts, so no later word reliably names what actually runs.
   "alias",
+  // `enable` rewrites the builtin table: `-f` dlopens FILENAME as builtin NAME (dlopen
+  // needs no .so suffix, so any collected file qualifies), and `-n` makes a builtin
+  // word run a PATH program instead. Either changes what later words execute.
+  "enable",
   // With inherited SHELLOPTS=history, `history -s` stores its arguments as one entry
   // and `fc -s` reparses the stored command, expanding what the first parse kept
   // quoted (`history -s 'mcp${IFS}--token${IFS}ghp_a\\b'; fc -s`).
@@ -2298,7 +2302,6 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
   let pendingJavaSourceFile = false;
   let pendingJavaOptionValue = false;
   let pendingHashOptions = false;
-  let pendingHashPathValue = false;
   let pendingScriptFileOperand = false;
   let evalOperandAmbiguous = false;
   // Static table entries keep the pending set bounded, so repeated interpreter words
@@ -2355,7 +2358,6 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
       pendingJavaSourceFile = false;
       pendingJavaOptionValue = false;
       pendingHashOptions = false;
-      pendingHashPathValue = false;
       clearInterpreterTracking();
     }
     // The word after `<` is a read redirection's filename, never a command or an
@@ -2588,21 +2590,12 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
         pendingDenoSubcommand = false;
       }
     }
-    if (pendingHashPathValue) {
-      pendingHashPathValue = false;
-      if (isAutoPublishedScriptOperand(unquoted, rootPrefixes)) return true;
-    } else if (pendingHashOptions) {
-      // `hash -p FILE NAME` binds NAME to FILE, which then runs on the name's next
-      // use, so a published file localizes. The value may be attached to the flag
-      // cluster or arrive as the next word; scanning past bash's option terminator
-      // or its first name operand only fails closed.
-      const remapped = /^-[dlrt]*p(.*)$/.exec(unquoted)?.[1];
-      if (remapped === "") {
-        pendingHashPathValue = true;
-      } else if (remapped !== undefined && isAutoPublishedScriptOperand(remapped, rootPrefixes)) {
-        return true;
-      }
-    }
+    // `hash -p PATHNAME NAME` binds NAME to any full pathname, so every remap
+    // changes what a later word executes (`hash -p /usr/bin/python3 launch` hands
+    // launch's arguments to an installed evaluator); the pathname's location proves
+    // nothing, so any -p spelling localizes. Scanning past bash's option terminator
+    // or its first name operand only fails closed.
+    if (pendingHashOptions && /^-[dlrt]*p/.test(unquoted)) return true;
     // With allexport inherited through SHELLOPTS, `printf -v` exports the variable it
     // builds even when this command contains no explicit export/set/shopt word.
     if (pendingPrintfVariableOption && unquoted.startsWith("-v")) return true;

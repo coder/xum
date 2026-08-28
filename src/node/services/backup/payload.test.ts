@@ -1803,7 +1803,6 @@ describe("backup payload", () => {
       "git config merge.conflictstyle diff3",
       "java @/tmp/opts.txt Main --port 8080",
       "jshell --startup=/tmp/snippets.jsh /tmp/main.jsh",
-      "hash -p /tmp/wrapper.sh mcp-server; mcp-server",
       "hash -r; mcp-server",
     ]) {
       await writeFixtureFile(
@@ -1977,10 +1976,6 @@ describe("backup payload", () => {
     ["JShell", "jshell <root>/skills/launch.txt"],
     ["JShell attached startup file", "jshell --startup=<root>/skills/launch.txt"],
     ["JShell separate startup file", "jshell --startup <root>/skills/launch.txt"],
-    // `hash -p` binds a command name to the file, which runs on the name's next use.
-    ["Bash hash separate remapping", "hash -p <root>/skills/launch.txt launch; launch"],
-    ["Bash hash attached remapping", "hash -p<root>/agents/launch.md launch"],
-    ["Bash hash clustered remapping", "hash -rp <root>/skills/launch.txt launch"],
     ["Tcl", "tclsh <root>/skills/launch.txt"],
     ["Tk wish", "wish8.6 <root>/agents/launch.md"],
     ["Expect", "expect <root>/memory/global/launch.txt"],
@@ -2192,6 +2187,14 @@ describe("backup payload", () => {
       // `alias` rebinds later command words; POSIX shells expand aliases in
       // non-interactive scripts, so the scan cannot follow what a later word runs.
       "alias mcp='mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'; mcp",
+      // `hash -p` binds a command name to any full pathname, so the remapped word
+      // can hand its arguments to an installed evaluator on the name's next use.
+      "hash -p /usr/bin/python3 launch; launch -c 'x'",
+      "hash -p/usr/bin/python3 launch",
+      "hash -rp /usr/bin/python3 launch",
+      // `enable -f` dlopens any file as a builtin; `-n` remaps a builtin word to a
+      // PATH program. Either changes what later words execute.
+      "enable -f ./module.txt leak; leak",
       // `source` and `.` run a file in this shell with fragments as positionals.
       "source ./launch ghp_aaaaaaaaaa bbbbbbbbbb",
       ". ./launch ghp_aaaaaaaaaa bbbbbbbbbb",
