@@ -6670,6 +6670,160 @@ describe("TaskService", () => {
     expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
   });
 
+  test("mixed drains keep workspace-turn attention off the workflow's agent", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runId = "wfr_mixed";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+    const drain = (
+      taskService as unknown as {
+        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+      }
+    ).drainTerminalAttention.bind(taskService);
+
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual", "user", "run the audit", { timestamp: 1_000 })
+    );
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("agent-turn", "assistant", "on it", { timestamp: 1_001, agentId: "plan" })
+    );
+    await recordAgentWorkflowRunReference({
+      workspaceSessionDir: config.getSessionDir(parentId),
+      runId,
+      agentId: "exec",
+    });
+
+    // A workspace-turn result resumes under the conversation's own identity; sharing its wake
+    // with an agent-bound workflow group would process it under the workflow's agent instead.
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    await terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: parentId,
+      sourceKind: "workspace_turn",
+      sourceId: "wst_mixed_handle",
+    });
+    await terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: parentId,
+      sourceKind: "workflow_run",
+      sourceId: runId,
+    });
+    await drain(parentId);
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const firstPrompt = String(sendMessage.mock.calls[0]?.[1]);
+    expect(firstPrompt).toContain("wst_mixed_handle");
+    expect(firstPrompt).not.toContain(runId);
+    expect(sendMessage.mock.calls[0]?.[2] as Record<string, unknown>).toMatchObject({
+      agentId: "plan",
+    });
+
+    await drain(parentId);
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    const secondPrompt = String(sendMessage.mock.calls[1]?.[1]);
+    expect(secondPrompt).toContain(runId);
+    expect(sendMessage.mock.calls[1]?.[2] as Record<string, unknown>).toMatchObject({
+      agentId: "exec",
+    });
+    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
+  });
+
+  test("wake keeps a synthetic launch row's strict pin without lifting the manual policy", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const restrictedPolicy = [{ regex_match: "^bash$", action: "disable" as const }];
+    const runId = "wfr_synthetic_pin";
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    await runStore.createRun({
+      id: runId,
+      workspaceId: parentId,
+      workflow: {
+        name: "research",
+        description: "Research workflow",
+        scope: "built-in",
+        executable: true,
+      },
+      source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+      args: {},
+      attentionPolicy: "notify_on_terminal",
+      now: "2026-06-19T00:00:00.000Z",
+    });
+    await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+    await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual-restricted", "user", "run the audit", {
+        timestamp: 1_000,
+        toolPolicy: restrictedPolicy,
+      })
+    );
+    // The kernel workflow launched from a pinned synthetic turn (preserved heartbeat or
+    // compaction follow-up): its pin must ride the wake without lifting the manual policy.
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("synthetic-launch", "user", "heartbeat", {
+        timestamp: 1_100,
+        synthetic: true,
+        retrySendOptions: {
+          model: "openai:gpt-4o",
+          agentId: "plan",
+          strictAgentResolution: { expectedScope: "built-in" },
+        },
+      })
+    );
+    await recordAgentWorkflowRunReference({
+      workspaceSessionDir: config.getSessionDir(parentId),
+      runId,
+      agentId: "plan",
+    });
+
+    await taskService.enqueueWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId,
+      status: "completed",
+    });
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[2] as Record<string, unknown>).toMatchObject({
+      agentId: "plan",
+      toolPolicy: restrictedPolicy,
+      strictAgentResolution: { expectedScope: "built-in" },
+    });
+  });
+
   test("a malformed persisted toolPolicy cannot block the wake or leak into the send", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);

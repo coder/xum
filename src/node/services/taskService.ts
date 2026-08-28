@@ -7928,13 +7928,14 @@ export class TaskService {
     disableWorkspaceAgents?: boolean;
     strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
   }> {
+    // The pin and the policy resolve independently: a synthetic launch row (preserved
+    // heartbeat, compaction follow-up) can carry only a strict pin, and the wake bound to that
+    // turn's agent must keep the pin loud without lifting an older manual row's policy.
+    // Manual rows still define both wholesale (absence means lifted).
     const state: {
-      found: {
-        toolPolicy?: ToolPolicy;
-        disableWorkspaceAgents?: boolean;
-        strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
-      } | null;
-    } = { found: null };
+      pin: { strictAgentResolution?: SendMessageOptions["strictAgentResolution"] } | null;
+      restrictions: { toolPolicy?: ToolPolicy; disableWorkspaceAgents?: boolean } | null;
+    } = { pin: null, restrictions: null };
     const historyResult = await this.historyService.iterateFullHistory(
       ownerWorkspaceId,
       "backward",
@@ -7963,30 +7964,38 @@ export class TaskService {
             });
           }
           const strictAgentResolution = parsedStrictPin?.success ? parsedStrictPin.data : undefined;
-          if (metadata?.toolPolicy != null || metadata?.disableWorkspaceAgents != null) {
+          if (
+            state.pin == null &&
+            (strictAgentResolution != null || metadata?.synthetic !== true)
+          ) {
+            state.pin = strictAgentResolution != null ? { strictAgentResolution } : {};
+          }
+          if (
+            state.restrictions == null &&
+            (metadata?.toolPolicy != null ||
+              metadata?.disableWorkspaceAgents != null ||
+              metadata?.synthetic !== true)
+          ) {
             // Persisted rows are untrusted disk state: a malformed toolPolicy would throw deep
             // inside send resolution and leave the wake permanently blocked on the same corrupt
             // row. Sanitize instead of trusting the JSON shape; an unparseable policy restores
             // nothing while a valid disable flag still applies (self-healing doctrine).
             const parsedPolicy =
-              metadata.toolPolicy != null ? ToolPolicySchema.safeParse(metadata.toolPolicy) : null;
+              metadata?.toolPolicy != null ? ToolPolicySchema.safeParse(metadata.toolPolicy) : null;
             if (parsedPolicy != null && !parsedPolicy.success) {
               log.warn("Ignoring malformed persisted toolPolicy on terminal wake", {
                 ownerWorkspaceId,
                 messageId: message.id,
               });
             }
-            state.found = {
+            state.restrictions = {
               ...(parsedPolicy?.success ? { toolPolicy: parsedPolicy.data } : {}),
-              ...(typeof metadata.disableWorkspaceAgents === "boolean"
+              ...(typeof metadata?.disableWorkspaceAgents === "boolean"
                 ? { disableWorkspaceAgents: metadata.disableWorkspaceAgents }
                 : {}),
-              ...(strictAgentResolution != null ? { strictAgentResolution } : {}),
             };
-            return false;
           }
-          if (metadata?.synthetic !== true) {
-            state.found = strictAgentResolution != null ? { strictAgentResolution } : {};
+          if (state.pin != null && state.restrictions != null) {
             return false;
           }
         }
@@ -7996,7 +8005,7 @@ export class TaskService {
     if (!historyResult.success) {
       throw new Error(`history unavailable: ${historyResult.error}`);
     }
-    return state.found ?? {};
+    return { ...(state.restrictions ?? {}), ...(state.pin ?? {}) };
   }
 
   private scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId: string): void {
@@ -8445,25 +8454,31 @@ export class TaskService {
     // Deliver one initiating-agent group per drain: the whole coalesced prompt is handled
     // under the single agentId passed to sendMessage, so batching runs from different agents
     // would hand a restricted agent's (attacker-influenced) output to another agent's tool
-    // grants. The newest launch's group goes first; runs bound to other agents, and the
-    // history-walk fallback group, stay pending and deliver on the re-armed retry drain.
+    // grants. The same applies to mixed batches: workspace-turn and sub-agent attention
+    // resumes under the conversation's own (history-walk) identity, so agent-bound workflow
+    // groups never share their send. Deferred groups stay pending and deliver on the re-armed
+    // retry drain; among agent-bound groups the newest launch goes first.
+    const hasNonWorkflowDeliverables =
+      deliverableAgentNotificationIds.size > 0 || deliverableWorkspaceTurnNotificationIds.size > 0;
     let workflowInitiatingAgent: { agentId: string; createdAtMs: number } | undefined;
-    for (const candidate of deliverableWorkflowPrompts) {
-      const agent = candidate.initiatingAgent;
-      if (
-        agent != null &&
-        (workflowInitiatingAgent == null || agent.createdAtMs > workflowInitiatingAgent.createdAtMs)
-      ) {
-        workflowInitiatingAgent = agent;
+    if (!hasNonWorkflowDeliverables) {
+      for (const candidate of deliverableWorkflowPrompts) {
+        const agent = candidate.initiatingAgent;
+        if (
+          agent != null &&
+          (workflowInitiatingAgent == null ||
+            agent.createdAtMs > workflowInitiatingAgent.createdAtMs)
+        ) {
+          workflowInitiatingAgent = agent;
+        }
       }
     }
     const selectedAgentId = workflowInitiatingAgent?.agentId;
-    const selectedWorkflowPrompts =
-      selectedAgentId == null
-        ? deliverableWorkflowPrompts
-        : deliverableWorkflowPrompts.filter(
-            (candidate) => candidate.initiatingAgent?.agentId === selectedAgentId
-          );
+    const selectedWorkflowPrompts = deliverableWorkflowPrompts.filter((candidate) =>
+      hasNonWorkflowDeliverables
+        ? candidate.initiatingAgent == null
+        : selectedAgentId == null || candidate.initiatingAgent?.agentId === selectedAgentId
+    );
     if (selectedWorkflowPrompts.length < deliverableWorkflowPrompts.length) {
       this.scheduleTerminalAttentionDeferRetry(ownerWorkspaceId);
     }
