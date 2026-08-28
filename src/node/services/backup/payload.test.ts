@@ -1803,6 +1803,8 @@ describe("backup payload", () => {
       "git config merge.conflictstyle diff3",
       "java @/tmp/opts.txt Main --port 8080",
       "jshell --startup=/tmp/snippets.jsh /tmp/main.jsh",
+      "hash -p /tmp/wrapper.sh mcp-server; mcp-server",
+      "hash -r; mcp-server",
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -1975,6 +1977,10 @@ describe("backup payload", () => {
     ["JShell", "jshell <root>/skills/launch.txt"],
     ["JShell attached startup file", "jshell --startup=<root>/skills/launch.txt"],
     ["JShell separate startup file", "jshell --startup <root>/skills/launch.txt"],
+    // `hash -p` binds a command name to the file, which runs on the name's next use.
+    ["Bash hash separate remapping", "hash -p <root>/skills/launch.txt launch; launch"],
+    ["Bash hash attached remapping", "hash -p<root>/agents/launch.md launch"],
+    ["Bash hash clustered remapping", "hash -rp <root>/skills/launch.txt launch"],
     ["Tcl", "tclsh <root>/skills/launch.txt"],
     ["Tk wish", "wish8.6 <root>/agents/launch.md"],
     ["Expect", "expect <root>/memory/global/launch.txt"],
@@ -2183,6 +2189,9 @@ describe("backup payload", () => {
       "read TOKEN <./config.txt; mcp",
       // `shopt -so allexport` flips the same allexport state `set -a` does.
       "shopt -so allexport; printf -v TOKEN %s%s ghp_aaaaaaaaaa bbbbbbbbbb; mcp",
+      // `alias` rebinds later command words; POSIX shells expand aliases in
+      // non-interactive scripts, so the scan cannot follow what a later word runs.
+      "alias mcp='mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno56789'; mcp",
       // `source` and `.` run a file in this shell with fragments as positionals.
       "source ./launch ghp_aaaaaaaaaa bbbbbbbbbb",
       ". ./launch ghp_aaaaaaaaaa bbbbbbbbbb",
