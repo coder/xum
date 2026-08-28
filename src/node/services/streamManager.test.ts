@@ -19,7 +19,6 @@ import {
   StreamManager,
   type ModelFallbackPrepareOptions,
   type TurnEngineEvent,
-  type TurnEngineEventSink,
   type TurnExecutionOptions,
 } from "./streamManager";
 import type {
@@ -51,27 +50,7 @@ import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { attachLanguageModelCleanup } from "./languageModelCleanup";
 import { shellQuote } from "@/common/utils/shell";
-
-type TurnEngineEventOfType<T extends TurnEngineEvent["type"]> = Extract<
-  TurnEngineEvent,
-  { type: T }
->;
-
-function onTurnEngineEvent<T extends TurnEngineEvent["type"]>(
-  streamManager: StreamManager,
-  type: T,
-  listener: (event: TurnEngineEventOfType<T>) => void
-): void {
-  const internals = streamManager as unknown as { eventSink: TurnEngineEventSink };
-  const previous = internals.eventSink;
-  internals.eventSink = (event) => {
-    const result = previous(event);
-    if (event.type === type) {
-      listener(event as TurnEngineEventOfType<T>);
-    }
-    return result;
-  };
-}
+import { onTurnEngineEvent } from "./streamManager.testHarness";
 
 function createTestLanguageModel(modelId = "cleanup-model"): LanguageModel {
   return {
@@ -1260,7 +1239,6 @@ describe("StreamManager - OpenAI GPT-5.6 cached system instructions", () => {
       undefined,
       () => eligibleProvidersConfig
     );
-    onTurnEngineEvent(streamManager, "error", () => undefined);
     Reflect.set(streamManager, "tokenTracker", {
       setModel: () => Promise.resolve(undefined),
       countTokens: () => Promise.resolve(0),
@@ -1776,7 +1754,6 @@ describe("StreamManager - language model cleanup", () => {
     streamInfoOverrides?: Record<string, unknown>;
   }): Promise<void> {
     const streamManager = new StreamManager(historyService);
-    onTurnEngineEvent(streamManager, "error", () => undefined);
     const historySequence = 1;
 
     await appendPartialAssistantForTests(params.workspaceId, params.messageId, historySequence);
@@ -1927,7 +1904,6 @@ describe("StreamManager - language model cleanup", () => {
 
   test("interrupt during onStreamConstructed skips processing and preserves a replacement registration", async () => {
     const streamManager = new StreamManager(historyService);
-    onTurnEngineEvent(streamManager, "error", () => undefined);
     const { model, getCleanupCalls } = createCleanupModel("constructed-abort-model");
     const startEvents: unknown[] = [];
     onTurnEngineEvent(streamManager, "stream-start", (event) => startEvents.push(event));
@@ -2273,7 +2249,6 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
   beforeEach(() => {
     streamManager = new StreamManager(historyService);
     // Suppress error events from bubbling up as uncaught exceptions during tests
-    onTurnEngineEvent(streamManager, "error", () => undefined);
   });
 
   // Integration test - requires API key and TEST_INTEGRATION=1
@@ -3002,7 +2977,6 @@ describe("StreamManager - empty stream completions", () => {
 
   test("zero-output refusal finishReason survives commit when usage is unavailable", async () => {
     const streamManager = new StreamManager(historyService);
-    onTurnEngineEvent(streamManager, "error", () => undefined);
 
     Reflect.set(streamManager, "tokenTracker", {
       setModel: () => Promise.resolve(undefined),
@@ -3074,7 +3048,6 @@ describe("StreamManager - empty stream completions", () => {
       recordHeadlessUsage,
     } as unknown as SessionUsageService;
     const streamManager = new StreamManager(historyService, sessionUsageService);
-    onTurnEngineEvent(streamManager, "error", () => undefined);
 
     Reflect.set(streamManager, "tokenTracker", {
       setModel: () => Promise.resolve(undefined),
@@ -4368,7 +4341,6 @@ describe("StreamManager - TTFT metadata persistence", () => {
   }) {
     const streamManager = params.streamManager ?? new StreamManager(historyService);
     // Suppress error events from bubbling up as uncaught exceptions during tests
-    onTurnEngineEvent(streamManager, "error", () => undefined);
 
     if (params.onStreamStart) {
       onTurnEngineEvent(streamManager, "stream-start", params.onStreamStart);
@@ -5088,7 +5060,6 @@ describe("StreamManager - replayStream", () => {
   function createReplayStreamManager(): StreamManager {
     const streamManager = new StreamManager(historyService);
     // Suppress error events from bubbling up as uncaught exceptions during tests.
-    onTurnEngineEvent(streamManager, "error", () => undefined);
     return streamManager;
   }
 
@@ -5559,7 +5530,6 @@ describe("StreamManager - aborted stream usage persistence", () => {
 
   test("stamps cumulative usage on the partial so committed history rows stay billable", async () => {
     const streamManager = new StreamManager(historyService);
-    onTurnEngineEvent(streamManager, "stream-abort", () => undefined);
     const workspaceId = "abort-usage-workspace";
     const messageId = "abort-usage-message";
     await appendPartialAssistantForTests(workspaceId, messageId, 1);
@@ -5595,7 +5565,6 @@ describe("StreamManager - aborted stream usage persistence", () => {
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
       const streamManager = new StreamManager(hs, sessionUsageService);
-      onTurnEngineEvent(streamManager, "stream-abort", () => undefined);
       const workspaceId = "abort-tool-only-workspace";
 
       const usage = { inputTokens: 500, outputTokens: 0, totalTokens: 500 };
@@ -5654,7 +5623,6 @@ describe("StreamManager - aborted stream usage persistence", () => {
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
       const streamManager = new StreamManager(hs, sessionUsageService);
-      onTurnEngineEvent(streamManager, "stream-abort", () => undefined);
       const workspaceId = "abort-commit-worthy-workspace";
       await appendPartialAssistantForTests(workspaceId, "abort-commit-worthy-message", 1);
 
@@ -5687,7 +5655,6 @@ describe("StreamManager - aborted stream usage persistence", () => {
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
       const streamManager = new StreamManager(hs, sessionUsageService);
-      onTurnEngineEvent(streamManager, "error", () => undefined);
       const workspaceId = "error-nondurable-workspace";
 
       const usage = { inputTokens: 900, outputTokens: 0, totalTokens: 900 };
@@ -5734,7 +5701,6 @@ describe("StreamManager - aborted stream usage persistence", () => {
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
       const streamManager = new StreamManager(hs, sessionUsageService);
-      onTurnEngineEvent(streamManager, "error", () => undefined);
       const workspaceId = "error-commit-worthy-workspace";
 
       const usage = { inputTokens: 900, outputTokens: 40, totalTokens: 940 };
@@ -5784,7 +5750,6 @@ describe("StreamManager - aborted stream usage persistence", () => {
     try {
       const sessionUsageService = new SessionUsageService(config, hs);
       const streamManager = new StreamManager(hs, sessionUsageService);
-      onTurnEngineEvent(streamManager, "stream-abort", () => undefined);
       const workspaceId = "abort-abandon-workspace";
       const messageId = "abort-abandon-message";
 

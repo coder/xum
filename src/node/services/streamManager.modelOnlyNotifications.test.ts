@@ -1,30 +1,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
-import { StreamManager, type TurnEngineEvent, type TurnEngineEventSink } from "./streamManager";
+import { StreamManager } from "./streamManager";
+import { onTurnEngineEvent } from "./streamManager.testHarness";
 
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
-
-type TurnEngineEventOfType<T extends TurnEngineEvent["type"]> = Extract<
-  TurnEngineEvent,
-  { type: T }
->;
-
-function onTurnEngineEvent<T extends TurnEngineEvent["type"]>(
-  streamManager: StreamManager,
-  type: T,
-  listener: (event: TurnEngineEventOfType<T>) => void
-): void {
-  const internals = streamManager as unknown as { eventSink: TurnEngineEventSink };
-  const previous = internals.eventSink;
-  internals.eventSink = (event) => {
-    const result = previous(event);
-    if (event.type === type) {
-      listener(event as TurnEngineEventOfType<T>);
-    }
-    return result;
-  };
-}
 
 describe("StreamManager - model-only tool notifications", () => {
   let historyService: HistoryService;
