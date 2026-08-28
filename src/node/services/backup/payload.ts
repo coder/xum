@@ -1868,6 +1868,13 @@ function isAutoPublishedScriptOperand(unquoted: string, rootPrefixes: readonly s
   return false;
 }
 
+/** Resolve an absolute/home target, or a relative target from a known directory. */
+function resolveKnownDirectory(target: string, current: string | null): string | null {
+  if (/^(?:\/|\\|~|[a-z]:)/i.test(target)) return normalizeComparablePath(target);
+  if (current === null) return null;
+  return normalizeComparablePath(`${current}/${target}`);
+}
+
 /** Whether the operand names the collected root itself or a directory inside it. */
 function isUnderCollectedRoot(unquoted: string, rootPrefixes: readonly string[]): boolean {
   const normalized = normalizeComparablePath(unquoted);
@@ -2178,6 +2185,8 @@ interface LanguageInterpreter {
   evalWord?: RegExp;
   attachedScriptFile?: RegExp;
   separateScriptFileOption?: RegExp;
+  /** Captures an attached cwd, or an empty string when the next word is the cwd. */
+  workingDirectoryOption?: RegExp;
   /**
    * Attached option naming an auxiliary file the interpreter executes before its
    * main operands (jshell --startup=FILE). Unlike attachedScriptFile it is not a
@@ -2230,7 +2239,11 @@ const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
     name: /^w?perl[0-9.]*$/,
     evalWord: /^-(?:(?:0(?:x[0-9A-Fa-f]+|[0-7]*))|l[0-7]*|[acfnpsStTuUvVwWX])*[eE]/,
   },
-  { name: /^rubyw?[0-9.]*$/, evalWord: /^-(?:(?:0[0-7]*|W[0-2]?)|[acdlnpsvwy])*e/ },
+  {
+    name: /^rubyw?[0-9.]*$/,
+    evalWord: /^-(?:(?:0[0-7]*|W[0-2]?)|[acdlnpsvwy])*e/,
+    workingDirectoryOption: /^-C(.*)$/,
+  },
   // -r/-R run code; -B/-E execute begin/end code blocks around per-line runs.
   {
     name: /^(?:php[0-9.]*|php-win)$/,
@@ -2300,7 +2313,9 @@ const SHELL_STATE_WORDS = new Set([
 function hasDisguisedAssignment(
   redacted: string,
   rootPrefixes: readonly string[],
-  publishedPathDirs: readonly string[]
+  publishedPathDirs: readonly string[],
+  cdPathDirs: readonly string[],
+  inheritedNodeCodeOptions: boolean
 ): boolean {
   let commandPosition = true;
   let envCommandExpected = false;
@@ -2333,6 +2348,8 @@ function hasDisguisedAssignment(
   let pendingJavaSourceFile = false;
   let pendingJavaOptionValue = false;
   let pendingHashOptions = false;
+  let pendingStartStopDaemonOptions = false;
+  let pendingStartStopDaemonExecutable = false;
   let pendingCdBuiltin: "cd" | "pushd" | null = null;
   // Lexical spelling of the working directory once a cd/pushd chain makes it known;
   // it survives separators because the moved directory outlives the command.
@@ -2345,9 +2362,24 @@ function hasDisguisedAssignment(
   // Static table entries keep the pending set bounded, so repeated interpreter words
   // cannot make these checks superlinear in command length.
   const pendingLanguages = new Set<LanguageInterpreter>();
+  const languageWorkingDirectories = new Map<LanguageInterpreter, string>();
+  let pendingLanguageWorkingDirectory: LanguageInterpreter | null = null;
+
+  function isPendingLanguageScriptOperand(value: string): boolean {
+    if (isAutoPublishedScriptOperand(value, rootPrefixes)) return true;
+    for (const language of pendingLanguages) {
+      const directory = languageWorkingDirectories.get(language);
+      if (directory === undefined) continue;
+      const resolved = resolveKnownDirectory(value, directory);
+      if (resolved !== null && isAutoPublishedScriptOperand(resolved, rootPrefixes)) return true;
+    }
+    return false;
+  }
 
   function clearInterpreterTracking(): void {
     pendingLanguages.clear();
+    languageWorkingDirectories.clear();
+    pendingLanguageWorkingDirectory = null;
     pendingScriptFileOperand = false;
     evalOperandAmbiguous = false;
   }
@@ -2396,6 +2428,8 @@ function hasDisguisedAssignment(
       pendingJavaSourceFile = false;
       pendingJavaOptionValue = false;
       pendingHashOptions = false;
+      pendingStartStopDaemonOptions = false;
+      pendingStartStopDaemonExecutable = false;
       // A bare cd goes home; a bare pushd swaps to a stack entry this scan
       // cannot resolve.
       if (pendingCdBuiltin === "cd") trackedCwd = "~";
@@ -2439,8 +2473,17 @@ function hasDisguisedAssignment(
     ) {
       continue;
     }
+    if (pendingLanguageWorkingDirectory !== null) {
+      const language = pendingLanguageWorkingDirectory;
+      pendingLanguageWorkingDirectory = null;
+      const directory = resolveKnownDirectory(unquoted, trackedCwd);
+      if (directory === null) languageWorkingDirectories.delete(language);
+      else languageWorkingDirectories.set(language, directory);
+      continue;
+    }
     if (pendingScriptFileOperand) {
-      const autoPublished = isAutoPublishedScriptOperand(unquoted, rootPrefixes);
+      const autoPublished = isPendingLanguageScriptOperand(unquoted);
+      commandConsumesStdin = false;
       clearInterpreterTracking();
       if (autoPublished) return true;
     }
@@ -2455,17 +2498,24 @@ function hasDisguisedAssignment(
         trackedCwd = null;
       }
       const scriptOperandFollows = unquoted === "--" && pendingLanguages.size > 0;
-      clearInterpreterTracking();
-      // `--` only ends option parsing, so an armed interpreter's next positional
-      // is still its script operand (`python3 -- launch.txt` executes the file);
-      // a bare dash reads the script from stdin instead.
-      pendingScriptFileOperand = scriptOperandFollows;
+      if (scriptOperandFollows) {
+        // Preserve interpreter-specific cwd state until the one script operand is
+        // consumed; only option/eval parsing ends at the terminator.
+        pendingLanguageWorkingDirectory = null;
+        pendingScriptFileOperand = true;
+        evalOperandAmbiguous = false;
+      } else {
+        // A bare dash reads the script from stdin instead.
+        clearInterpreterTracking();
+      }
       envOperandsOnly ||= sawEnv;
       // `--` ends env option parsing, so the next word is the utility; a bare `-`
       // is `-i`, leaving option parsing armed.
       if (unquoted === "--") {
         envCommandExpected ||= sawEnv;
         sawEnv = false;
+        pendingStartStopDaemonOptions = false;
+        pendingStartStopDaemonExecutable = false;
       }
       pendingEnvOptionValue = false;
       pendingNpmExecOptions = false;
@@ -2673,14 +2723,17 @@ function hasDisguisedAssignment(
       // root at all (`cd ~ && cd .xum && python3 skills/launch.txt`), so the
       // move itself localizes. Dash words are cd's own options and keep the
       // target pending.
-      // Annotated because inference would cycle through the loop back-edge
-      // (target -> trackedCwd narrowing -> this assignment).
-      const target: string | null = /^(?:\/|\\|~|[a-z]:)/i.test(unquoted)
-        ? unquoted
-        : trackedCwd !== null
-          ? `${trackedCwd}/${unquoted}`
-          : null;
-      trackedCwd = target === null ? null : normalizeComparablePath(target);
+      if (!/^(?:\/|\\|~|[a-z]:)/i.test(unquoted)) {
+        // Bash searches inherited CDPATH before its ordinary relative target. A
+        // candidate inside the collected root localizes even when the server's
+        // original cwd is unknown (CDPATH=<root>; cd skills).
+        for (const entry of cdPathDirs) {
+          const base = entry === "" ? trackedCwd : resolveKnownDirectory(entry, trackedCwd);
+          const candidate = base === null ? null : resolveKnownDirectory(unquoted, base);
+          if (candidate !== null && isUnderCollectedRoot(candidate, rootPrefixes)) return true;
+        }
+      }
+      trackedCwd = resolveKnownDirectory(unquoted, trackedCwd);
       if (trackedCwd !== null && isUnderCollectedRoot(trackedCwd, rootPrefixes)) return true;
     }
     // `hash -p PATHNAME NAME` binds NAME to any full pathname, so every remap
@@ -2706,27 +2759,45 @@ function hasDisguisedAssignment(
     // prevents interpreter option tracking from reaching them.
     if (/^data:[^,]*(?:javascript|ecmascript|typescript)/i.test(unquoted)) return true;
     if (pendingFindPrimaries && FIND_EXEC_PRIMARY.test(unquoted)) return true;
-    const executable = unquoted
-      .slice(Math.max(unquoted.lastIndexOf("/"), unquoted.lastIndexOf("\\")) + 1)
+    let executableWord = unquoted;
+    if (pendingStartStopDaemonExecutable) {
+      pendingStartStopDaemonExecutable = false;
+      executableWord = unquoted;
+      executesHere = true;
+    } else if (pendingStartStopDaemonOptions) {
+      const attachedExecutable = /^(?:--(?:exec|startas)=|-[xa])(.+)$/.exec(unquoted)?.[1];
+      if (attachedExecutable !== undefined) {
+        executableWord = attachedExecutable;
+        executesHere = true;
+      } else if (/^(?:-x|-a|--exec|--startas)$/.test(unquoted)) {
+        pendingStartStopDaemonExecutable = true;
+      }
+    }
+    const executable = executableWord
+      .slice(Math.max(executableWord.lastIndexOf("/"), executableWord.lastIndexOf("\\")) + 1)
       .toLowerCase()
       .replace(/\.exe$/, "");
     if (executesHere) {
       commandWordSeen = true;
       // A directly executed auto-published document runs through its shebang,
       // publishing an executable relationship no marker can rehydrate elsewhere.
-      if (isAutoPublishedScriptOperand(unquoted, rootPrefixes)) return true;
+      if (isAutoPublishedScriptOperand(executableWord, rootPrefixes)) return true;
       // A bare name resolves through the inherited PATH, so an entry inside the
       // collected root reaches the same documents without spelling the root.
-      if (!/[/\\]/.test(unquoted)) {
+      if (!/[/\\]/.test(executableWord)) {
         for (const dir of publishedPathDirs) {
-          if (isAutoPublishedScriptOperand(`${dir}/${unquoted}`, rootPrefixes)) return true;
+          if (isAutoPublishedScriptOperand(`${dir}/${executableWord}`, rootPrefixes)) return true;
         }
+      }
+      if (inheritedNodeCodeOptions && (executable === "node" || executable === "nodejs")) {
+        return true;
       }
       if (executable === "env") sawEnv = true;
       if (executable === "npm") pendingNpmSubcommand = true;
       if (executable === "git") pendingGitSubcommand = true;
       if (executable === "deno") pendingDenoSubcommand = true;
       if (executable === "java" || executable === "javaw") pendingJavaOptions = true;
+      if (executable === "start-stop-daemon") pendingStartStopDaemonOptions = true;
       // Builtins, so matched on the quote-removed word like the state words above.
       if (unquoted === "hash") pendingHashOptions = true;
       if (unquoted === "cd" || unquoted === "pushd") pendingCdBuiltin = unquoted;
@@ -2747,14 +2818,27 @@ function hasDisguisedAssignment(
     // ambiguous. Either form ends tracking so later script arguments are not mistaken
     // for code; an automatically published script localizes first.
     let attachedScriptBoundary = false;
+    let workingDirectoryOptionMatched = false;
     for (const pending of pendingLanguages) {
+      const workingDirectory = pending.workingDirectoryOption?.exec(unquoted)?.[1];
+      if (workingDirectory !== undefined) {
+        if (workingDirectory === "") {
+          pendingLanguageWorkingDirectory = pending;
+        } else {
+          const resolved = resolveKnownDirectory(workingDirectory, trackedCwd);
+          if (resolved === null) languageWorkingDirectories.delete(pending);
+          else languageWorkingDirectories.set(pending, resolved);
+        }
+        workingDirectoryOptionMatched = true;
+        break;
+      }
       const startup = pending.attachedStartupFile?.exec(unquoted)?.[1];
       if (startup !== undefined && isAutoPublishedScriptOperand(startup, rootPrefixes)) {
         return true;
       }
       const script = pending.attachedScriptFile?.exec(unquoted)?.[1];
       if (script !== undefined) {
-        if (isAutoPublishedScriptOperand(script, rootPrefixes)) return true;
+        if (isPendingLanguageScriptOperand(script)) return true;
         attachedScriptBoundary = true;
         break;
       }
@@ -2764,7 +2848,11 @@ function hasDisguisedAssignment(
       // An evaluation word after a language interpreter hands that grammar a script.
       if (pending.evalWord?.test(unquoted) === true) return true;
     }
-    if (attachedScriptBoundary) clearInterpreterTracking();
+    if (workingDirectoryOptionMatched) continue;
+    if (attachedScriptBoundary) {
+      commandConsumesStdin = false;
+      clearInterpreterTracking();
+    }
 
     const language = executesHere
       ? LANGUAGE_INTERPRETERS.find((entry) => entry.name.test(executable))
@@ -2782,16 +2870,17 @@ function hasDisguisedAssignment(
         // (`python3 -W ignore -c x`), so from here a non-option word no longer
         // proves the script boundary; tracking stays armed, failing closed.
         evalOperandAmbiguous = true;
-      } else if (isAutoPublishedScriptOperand(unquoted, rootPrefixes)) {
+      } else if (isPendingLanguageScriptOperand(unquoted)) {
         // The backup publishes this document automatically. An interpreter executing
         // it can join credential fragments across the command and file even when
         // neither spelling matches the non-overridable token backstop.
         return true;
       } else if (!evalOperandAmbiguous) {
         // The first non-option word no pending pattern matched is the script/module
-        // operand: later dash-led words belong to that program (`python3 server.py
-        // -c settings.toml` hands -c to server.py), so eval tracking ends here and
-        // the file launchers this table intends to preserve stay portable.
+        // operand: later dash-led words and stdin belong to that program (`python3
+        // server.py -c settings.toml` hands -c to server.py), so eval tracking ends
+        // here and the file launchers this table intends to preserve stay portable.
+        commandConsumesStdin = false;
         clearInterpreterTracking();
       }
     }
@@ -3107,7 +3196,9 @@ export const MAX_TOTAL_ANALYZED_COMMAND_LENGTH = 8 * MAX_ANALYZED_COMMAND_LENGTH
 function redactCommandEnvAssignments(
   command: string,
   rootPrefixes: readonly string[],
-  publishedPathDirs: readonly string[]
+  publishedPathDirs: readonly string[],
+  cdPathDirs: readonly string[],
+  inheritedNodeCodeOptions: boolean
 ): string {
   if (command.length > MAX_ANALYZED_COMMAND_LENGTH) return REDACTED_BACKUP_VALUE;
   // Analysis mirrors execution: active continuations vanish first, so every analyzer
@@ -3128,7 +3219,13 @@ function redactCommandEnvAssignments(
   const constructs = findActiveShellConstructs(analyzed);
   if (
     UNCONSUMED_ASSIGNMENT.test(redactedCode) ||
-    hasDisguisedAssignment(redactedCode, rootPrefixes, publishedPathDirs) ||
+    hasDisguisedAssignment(
+      redactedCode,
+      rootPrefixes,
+      publishedPathDirs,
+      cdPathDirs,
+      inheritedNodeCodeOptions
+    ) ||
     constructs.carrier ||
     constructs.heredoc ||
     constructs.processSubstitution ||
@@ -3171,6 +3268,18 @@ function isBashStartupHookVariable(name: string, value: unknown): boolean {
   return name === "BASH_ENV" && value !== "" && value !== undefined;
 }
 
+/** Whether inherited NODE_OPTIONS asks Node to execute a preload/import module. */
+function hasInheritedNodeCodeOptions(value: unknown): boolean {
+  if (typeof value !== "string" || value === "") return false;
+  for (const match of value.matchAll(SHELL_WORD)) {
+    const option = unquoteShellWord(match[0]);
+    if (/^(?:-r(?:.*)|--(?:require|import|loader|experimental-loader)(?:=|$))/.test(option)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function redactMcpConfig(
   content: Buffer,
   muxRoot: string
@@ -3185,6 +3294,8 @@ function redactMcpConfig(
   const publishedPathDirs = (process.env.PATH ?? "")
     .split(path.delimiter)
     .filter((entry) => isUnderCollectedRoot(entry, rootPrefixes));
+  const cdPathDirs = (process.env.CDPATH ?? "").split(path.delimiter);
+  const inheritedNodeCodeOptions = hasInheritedNodeCodeOptions(process.env.NODE_OPTIONS);
   const text = content.toString("utf-8");
   const { parsed: root, tree } = parseJsoncObjectWithTree(text, "mcp.jsonc");
   const redactionPaths: BackupRedactionPath[] = [];
@@ -3210,7 +3321,13 @@ function redactMcpConfig(
       redacted = REDACTED_BACKUP_VALUE;
     } else {
       analysisBudget -= command.length;
-      redacted = redactCommandEnvAssignments(command, rootPrefixes, publishedPathDirs);
+      redacted = redactCommandEnvAssignments(
+        command,
+        rootPrefixes,
+        publishedPathDirs,
+        cdPathDirs,
+        inheritedNodeCodeOptions
+      );
     }
     if (redacted === command) return;
     edits.push({ path: jsonPath, value: redacted });

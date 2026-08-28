@@ -1754,6 +1754,10 @@ describe("backup payload", () => {
       `node < ${muxRoot}/skills/launch.txt`,
       `sh 0< ${muxRoot}/skills/launch.txt`,
       `systemd-run --user --scope ${muxRoot}/skills/launch.txt`,
+      // start-stop-daemon executes the pathname supplied by --exec/--startas.
+      `start-stop-daemon --start --exec ${muxRoot}/skills/launch.txt --`,
+      `start-stop-daemon --start --startas=${muxRoot}/agents/launch.md --`,
+      `start-stop-daemon --start -a${muxRoot}/skills/launch.txt --`,
       // The util-linux setarch hard links run their first operand as the program.
       `linux32 ${muxRoot}/skills/launch.txt`,
       `linux64 ${muxRoot}/agents/launch.md`,
@@ -1808,6 +1812,8 @@ describe("backup payload", () => {
       "mcp-server --wrap prlimit --mode coproc",
       "mcp-server < /tmp/input.json",
       "mcp-server --launcher systemd-run",
+      "start-stop-daemon --stop --exec /usr/bin/mcp-server --",
+      `mcp-server --launcher start-stop-daemon --exec ${muxRoot}/skills/config.txt`,
       "cmake --build build --target package",
       // A control operator starts a new command, ending interpreter tracking.
       "python3 --version && mcp-server -c config.toml",
@@ -1815,6 +1821,8 @@ describe("backup payload", () => {
       `deno run /opt/server.ts ${muxRoot}/skills/config.txt`,
       // The script operand after `--` ends tracking; later published paths are data.
       `python3 -- /tmp/main.py ${muxRoot}/skills/config.txt`,
+      "ruby -C /opt app.rb --config skills/config.txt",
+      "ruby -C/opt app.rb",
       // Two-segment merge/diff keys hold settings, not driver commands.
       "git config merge.conflictstyle diff3",
       "java @/tmp/opts.txt Main --port 8080",
@@ -1824,8 +1832,10 @@ describe("backup payload", () => {
       // A relative cd from the server's own unknown cwd stays portable, matching
       // the relative-operand policy.
       "cd .xum && python3 skills/launch.txt",
-      // A non-interpreter consumes redirected documents as data.
+      // A non-interpreter, or an interpreter after its script boundary, consumes
+      // redirected documents as data rather than source code.
       `mcp-server < ${muxRoot}/skills/config.txt`,
+      `python3 /tmp/main.py < ${muxRoot}/skills/config.txt`,
       // A foreign jar ends option tracking; later published paths are its data.
       `java -jar /opt/app.jar ${muxRoot}/skills/config.txt`,
     ]) {
@@ -1935,6 +1945,69 @@ describe("backup payload", () => {
     } finally {
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
+    }
+  });
+
+  it("resolves relative cd targets through inherited CDPATH", async () => {
+    const originalCdPath = process.env.CDPATH;
+    const command = "cd skills && ruby launch.txt";
+    try {
+      for (const [cdPath, expected] of [
+        [muxRoot, REDACTED_BACKUP_VALUE],
+        ["/opt", command],
+      ] as const) {
+        process.env.CDPATH = cdPath;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalCdPath === undefined) delete process.env.CDPATH;
+      else process.env.CDPATH = originalCdPath;
+    }
+  });
+
+  it("localizes inherited Node preload options", async () => {
+    const originalNodeOptions = process.env.NODE_OPTIONS;
+    try {
+      for (const [nodeOptions, command, expected] of [
+        [`--require=${muxRoot}/skills/launch.txt`, "node /opt/server.js", REDACTED_BACKUP_VALUE],
+        [`--import ${muxRoot}/agents/launch.md`, "nodejs /opt/server.js", REDACTED_BACKUP_VALUE],
+        ["--require=/opt/register.js", "python3 /opt/server.py", "python3 /opt/server.py"],
+        ["--max-old-space-size=4096", "node /opt/server.js", "node /opt/server.js"],
+      ] as const) {
+        process.env.NODE_OPTIONS = nodeOptions;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+      else process.env.NODE_OPTIONS = originalNodeOptions;
     }
   });
 
@@ -2050,6 +2123,9 @@ describe("backup payload", () => {
     ["Python after option terminator", "python3 -- <root>/skills/launch.txt"],
     ["Node", "node <root>/agents/launch.md"],
     ["Rscript", "Rscript <root>/memory/global/launch.markdown"],
+    ["Ruby separate working directory", "ruby -C <root> skills/launch.txt"],
+    ["Ruby attached working directory", "ruby -C<root> agents/launch.md"],
+    ["Ruby working directory before --", "ruby -C<root> -- skills/launch.txt"],
     ["Lua", "lua5.4 <root>/skills/launch.txt"],
     ["LuaJIT", "luajit <root>/agents/launch.md"],
     ["Swift", "swift <root>/skills/launch.txt"],
