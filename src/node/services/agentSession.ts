@@ -4850,22 +4850,12 @@ export class AgentSession {
     acpPromptId?: string,
     preStartErrors?: StreamErrorPayload[] | null
   ): Promise<AgentSessionResult<void>> {
-    // Pre-start failures that AIService also announced as error events (for
-    // fire-and-forget senders) have no turn handle, so their handling and
-    // recovery-decision resolution must run here, keyed by each event's own
-    // messageId. Handling them first keeps this the single owner: the branches
-    // below only cover failures that produced no error event.
-    if (preStartErrors != null && preStartErrors.length > 0) {
-      for (const payload of preStartErrors) {
-        try {
-          await this.handleStreamError({
-            ...payload,
-            acpPromptId: payload.acpPromptId ?? acpPromptId,
-          });
-        } finally {
-          this.resolveStreamErrorRecoveryDecision(payload.messageId, "terminal");
-        }
-      }
+    // Pre-start and synthetic failures that AIService announced as error
+    // events (for fire-and-forget senders) have no turn handle, so their
+    // handling and recovery-decision resolution run here, keyed by each
+    // event's own messageId. When any were captured they own this failure:
+    // the branches below only cover failures that produced no error event.
+    if (await this.handleCapturedStreamErrors(preStartErrors, acpPromptId)) {
       return { success: false, error, failureHandled: true };
     }
 
@@ -4885,6 +4875,27 @@ export class AgentSession {
     }
 
     return { success: false, error, failureHandled: true };
+  }
+
+  /** Handle captured handle-less error events exactly once each (see preStartErrorCapture). */
+  private async handleCapturedStreamErrors(
+    captured: StreamErrorPayload[] | null | undefined,
+    acpPromptId?: string
+  ): Promise<boolean> {
+    if (captured == null || captured.length === 0) {
+      return false;
+    }
+    for (const payload of captured) {
+      try {
+        await this.handleStreamError({
+          ...payload,
+          acpPromptId: payload.acpPromptId ?? acpPromptId,
+        });
+      } finally {
+        this.resolveStreamErrorRecoveryDecision(payload.messageId, "terminal");
+      }
+    }
+    return true;
   }
 
   private consumeTurnCompletion(handle: TurnStreamHandle): void {
@@ -5180,6 +5191,14 @@ export class AgentSession {
     }
 
     this.consumeTurnCompletion(streamResult.data);
+    // Mock playback returns Ok after emitting synthetic error events under its
+    // own message IDs; drain those so the failures are still handled. Events
+    // owned by the returned handle are excluded: completion delivers them, so
+    // a stream failing inside the capture window is not handled twice.
+    await this.handleCapturedStreamErrors(
+      capturedPreStartErrors?.filter((event) => event.messageId !== streamResult.data.messageId),
+      acpPromptId
+    );
     return Ok(undefined);
   }
 

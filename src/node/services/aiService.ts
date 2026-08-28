@@ -164,12 +164,7 @@ import type {
   RebuildProviderOptionsForThinkingLevel,
 } from "@/node/services/thinkingOverride";
 
-import type {
-  ErrorEvent,
-  StreamAbortEvent,
-  StreamAbortReason,
-  StreamEndEvent,
-} from "@/common/types/stream";
+import type { StreamAbortEvent, StreamAbortReason } from "@/common/types/stream";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import {
   computeActiveToolNames,
@@ -861,80 +856,6 @@ export class AIService extends EventEmitter {
     };
   }
 
-  private observeFacadeTurnCompletion(input: {
-    workspaceId: string;
-    messageId: string;
-    adoptStreamStartMessageId?: boolean;
-  }): { handle: TurnStreamHandle; cancel: () => void } {
-    let messageId = input.messageId;
-    let settled = false;
-    let resolveCompletion!: (completion: TurnCompletion) => void;
-    const completion = new Promise<TurnCompletion>((resolve) => {
-      resolveCompletion = resolve;
-    });
-
-    const cleanup = (): void => {
-      this.off("stream-start", onStreamStart as never);
-      this.off("stream-end", onStreamEnd as never);
-      this.off("stream-abort", onStreamAbort as never);
-      this.off("error", onError as never);
-    };
-    const settle = (outcome: TurnCompletion): void => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      resolveCompletion(outcome);
-    };
-    const matches = (event: { workspaceId: string; messageId: string }): boolean =>
-      event.workspaceId === input.workspaceId && event.messageId === messageId;
-    const onStreamStart = (event: TurnEngineEvent): void => {
-      if (
-        input.adoptStreamStartMessageId === true &&
-        event.type === "stream-start" &&
-        event.workspaceId === input.workspaceId
-      ) {
-        messageId = event.messageId;
-      }
-    };
-    const onStreamEnd = (event: StreamEndEvent): void => {
-      if (matches(event)) settle({ status: "completed", messageId });
-    };
-    const onStreamAbort = (event: StreamAbortEvent): void => {
-      if (matches(event)) {
-        settle({ status: "aborted", messageId, abortReason: event.abortReason ?? "system" });
-      }
-    };
-    const onError = (event: ErrorEvent): void => {
-      if (matches(event)) {
-        settle({
-          status: "failed",
-          messageId,
-          error: { type: "unknown", raw: event.error },
-          streamError: {
-            messageId,
-            error: event.error,
-            errorType: event.errorType ?? "unknown",
-            acpPromptId: event.acpPromptId,
-          },
-        });
-      }
-    };
-
-    this.on("stream-start", onStreamStart as never);
-    this.on("stream-end", onStreamEnd as never);
-    this.on("stream-abort", onStreamAbort as never);
-    this.on("error", onError as never);
-
-    const handle: TurnStreamHandle = {
-      streamToken: this.streamManager.generateStreamToken(),
-      get messageId() {
-        return messageId;
-      },
-      completion,
-    };
-    return { handle, cancel: cleanup };
-  }
-
   private trackPendingDevToolsRunMetadata(
     messageId: string,
     workspaceId: string,
@@ -1458,11 +1379,9 @@ export class AIService extends EventEmitter {
             })
           );
         }
-        const observed = this.observeFacadeTurnCompletion({
-          workspaceId,
-          messageId: syntheticMessageId,
-          adoptStreamStartMessageId: true,
-        });
+        // play() resolves after the scripted playback (including any error
+        // events, which the session drains from its in-flight capture), so the
+        // handle can settle immediately.
         const result = await this.mockAiStreamPlayer.play(messages, workspaceId, {
           model: modelString,
           agentId,
@@ -1471,10 +1390,14 @@ export class AIService extends EventEmitter {
           abortSignal: combinedAbortSignal,
         });
         if (!result.success) {
-          observed.cancel();
           return result;
         }
-        return Ok(observed.handle);
+        return Ok(
+          this.createSettledTurnHandle(syntheticMessageId, {
+            status: "completed",
+            messageId: syntheticMessageId,
+          })
+        );
       }
 
       // DEBUG: Log streamMessage call
@@ -3131,10 +3054,6 @@ export class AIService extends EventEmitter {
         effectiveMuxProviderOptions.openai?.simulateToolPolicyNoop === true;
 
       if (forceContextLimitError || simulateToolPolicyNoopFlag) {
-        const observed = this.observeFacadeTurnCompletion({
-          workspaceId,
-          messageId: assistantMessageId,
-        });
         const simulationCtx: SimulationContext = {
           workspaceId,
           assistantMessageId,
@@ -3150,17 +3069,25 @@ export class AIService extends EventEmitter {
           emit: (event, data) => this.emit(event, data),
         };
 
-        try {
-          if (forceContextLimitError) {
-            await simulateContextLimitError(simulationCtx, this.historyService);
-          } else {
-            await simulateToolPolicyNoop(simulationCtx, effectiveToolPolicy, this.historyService);
-          }
-          return Ok(observed.handle);
-        } catch (error) {
-          observed.cancel();
-          throw error;
+        // Simulations emit their synthetic events before returning, so the
+        // handle settles immediately with the matching terminal outcome.
+        if (forceContextLimitError) {
+          const streamError = await simulateContextLimitError(simulationCtx, this.historyService);
+          return Ok(
+            this.createSettledTurnHandle(assistantMessageId, {
+              status: "failed",
+              messageId: assistantMessageId,
+              streamError,
+            })
+          );
         }
+        await simulateToolPolicyNoop(simulationCtx, effectiveToolPolicy, this.historyService);
+        return Ok(
+          this.createSettledTurnHandle(assistantMessageId, {
+            status: "completed",
+            messageId: assistantMessageId,
+          })
+        );
       }
 
       // Build provider options based on thinking level and request-sliced message history.

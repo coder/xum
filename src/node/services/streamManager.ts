@@ -210,7 +210,6 @@ export type TurnCompletion =
   | {
       status: "failed";
       messageId: string;
-      error: SendMessageError;
       streamError: StreamErrorPayload & { errorType: StreamErrorType };
     };
 
@@ -3907,7 +3906,6 @@ export class StreamManager {
     streamInfo.terminalCompletion = {
       status: "failed",
       messageId: streamInfo.messageId,
-      error: { type: "unknown", raw: persistedPayload.error },
       streamError: persistedPayload,
     };
   }
@@ -5139,7 +5137,6 @@ export class StreamManager {
     streamInfo.terminalCompletion = {
       status: "failed",
       messageId: streamInfo.messageId,
-      error: { type: "unknown", raw: persistedPayload.error },
       streamError: persistedPayload,
     };
 
