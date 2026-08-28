@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ArrowLeft, Menu } from "lucide-react";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useRouter } from "@/browser/contexts/RouterContext";
@@ -16,6 +16,7 @@ import {
 } from "@/browser/hooks/useAnalytics";
 import { DESKTOP_TITLEBAR_HEIGHT_CLASS, isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { useFocusMainRegion } from "@/browser/hooks/useFocusMainRegion";
 import { isEditableElement, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { ToggleGroup } from "@/browser/components/ToggleGroup/ToggleGroup";
 import { Button } from "@/browser/components/Button/Button";
@@ -130,6 +131,7 @@ function getBrowserTimeZone(): string {
 export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
   const { navigateFromAnalytics } = useRouter();
   const { userProjects } = useProjectContext();
+  const mainRegionRef = useRef<HTMLDivElement | null>(null);
 
   const [projectPath, setProjectPath] = useState<string | null>(null);
   const [rawTimeRange, setTimeRange] = usePersistedState<TimeRange>(
@@ -232,6 +234,7 @@ export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [navigateFromAnalytics]);
+  useFocusMainRegion(mainRegionRef);
 
   return (
     <div className="bg-surface-primary flex min-h-0 flex-1 flex-col overflow-hidden">
@@ -347,7 +350,11 @@ export function AnalyticsDashboard(props: AnalyticsDashboardProps) {
       </div>
 
       <div className="flex-1 overflow-y-auto p-4">
-        <div className="mx-auto flex w-full max-w-6xl flex-col gap-4">
+        <div
+          ref={mainRegionRef}
+          tabIndex={-1}
+          className="mx-auto flex w-full max-w-6xl flex-col gap-4 outline-none"
+        >
           <SummaryCards data={summary.data} loading={summary.loading} error={summary.error} />
           <SpendChart
             data={spendOverTime.data}

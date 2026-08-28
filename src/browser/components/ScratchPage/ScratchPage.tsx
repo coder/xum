@@ -16,6 +16,7 @@ import { useAPI, type APIClient } from "@/browser/contexts/API";
 import { ArchivedWorkspaces } from "@/browser/components/ArchivedWorkspaces/ArchivedWorkspaces";
 import { Button } from "@/browser/components/Button/Button";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
+import { useFocusMainRegion } from "@/browser/hooks/useFocusMainRegion";
 
 interface ScratchPageProps {
   leftSidebarCollapsed: boolean;
@@ -36,6 +37,7 @@ async function listArchivedScratchWorkspaces(api: APIClient | null) {
 export function ScratchPage(props: ScratchPageProps) {
   const { api } = useAPI();
   const [archivedWorkspaces, setArchivedWorkspaces] = useState<FrontendWorkspaceMetadata[]>([]);
+  const chatInputRef = useRef<ChatInputAPI | null>(null);
   const didAutoFocusRef = useRef(false);
   const { config: providersConfig, loading: providersLoading } = useProvidersConfig();
   const hasProviders = hasConfiguredProvider(providersConfig);
@@ -57,10 +59,12 @@ export function ScratchPage(props: ScratchPageProps) {
   }, [api]);
 
   function handleChatReady(api: ChatInputAPI) {
+    chatInputRef.current = api;
     if (didAutoFocusRef.current) return;
     didAutoFocusRef.current = true;
     api.focus();
   }
+  useFocusMainRegion(chatInputRef);
 
   return (
     <AgentProvider projectPath={SCRATCH_PROJECT_CONFIG_KEY}>

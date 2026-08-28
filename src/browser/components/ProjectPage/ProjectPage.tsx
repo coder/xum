@@ -33,6 +33,7 @@ import {
 import { Button } from "@/browser/components/Button/Button";
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
+import { useFocusMainRegion } from "@/browser/hooks/useFocusMainRegion";
 
 interface ProjectPageProps {
   projectPath: string;
@@ -252,6 +253,7 @@ export const ProjectPage: React.FC<ProjectPageProps> = ({
     didAutoFocusRef.current = true;
     api.focus();
   }, []);
+  useFocusMainRegion(chatInputRef);
 
   return (
     <AgentProvider projectPath={projectPath}>

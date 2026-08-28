@@ -29,6 +29,12 @@ export const CUSTOM_EVENTS = {
   CLEAR_CHAT_COMPOSER: "mux:clearChatComposer",
 
   /**
+   * Event to focus the active route's main region after layout chrome collapses.
+   * No detail
+   */
+  FOCUS_MAIN_REGION: "mux:focusMainRegion",
+
+  /**
    * Event to open the model selector
    * No detail
    */
@@ -158,6 +164,7 @@ export interface CustomEventPayloads {
   [CUSTOM_EVENTS.CLEAR_CHAT_COMPOSER]: {
     workspaceId: string;
   };
+  [CUSTOM_EVENTS.FOCUS_MAIN_REGION]: never; // No payload
   [CUSTOM_EVENTS.OPEN_AGENT_PICKER]: never; // No payload
   [CUSTOM_EVENTS.CLOSE_AGENT_PICKER]: never; // No payload
   [CUSTOM_EVENTS.AGENTS_REFRESH_REQUESTED]: never; // No payload

@@ -121,6 +121,7 @@ import {
   type CustomEventType,
   type CustomEventPayloads,
 } from "@/common/constants/events";
+import { useFocusMainRegion } from "@/browser/hooks/useFocusMainRegion";
 
 const TRANSCRIPT_ONLY_NOTICE =
   "This workspace's worktree is no longer available. This is a read-only chat transcript kept for historical and usage-tracking reasons.";
@@ -823,6 +824,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const handleChatInputReady = useCallback((api: ChatInputAPI) => {
     chatInputAPI.current = api;
   }, []);
+  useFocusMainRegion(chatInputAPI);
 
   // Handler for review notes from Code Review tab - adds review (starts attached)
   // Depend only on addReview (not whole reviews object) to keep callback stable

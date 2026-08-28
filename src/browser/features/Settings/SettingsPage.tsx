@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import {
   ArrowLeft,
   Blocks,
@@ -32,6 +32,7 @@ import { ModelsSection } from "./Sections/ModelsSection";
 import { GovernorSection } from "./Sections/GovernorSection";
 import { MemorySection } from "./Sections/MemorySection";
 import { Button } from "@/browser/components/Button/Button";
+import { useFocusMainRegion } from "@/browser/hooks/useFocusMainRegion";
 import { MCPSettingsSection } from "./Sections/MCPSettingsSection";
 import { PluginsSettingsSection } from "./Sections/PluginsSettingsSection";
 import { SecretsSection } from "./Sections/SecretsSection";
@@ -208,6 +209,7 @@ interface SettingsPageProps {
 
 export function SettingsPage(props: SettingsPageProps) {
   const { close, activeSection, setActiveSection } = useSettings();
+  const mainRegionRef = useRef<HTMLDivElement | null>(null);
   const onboardingPause = useOnboardingPause();
   const governorEnabled = useExperimentValue(EXPERIMENT_IDS.MUX_GOVERNOR);
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
@@ -250,6 +252,8 @@ export function SettingsPage(props: SettingsPageProps) {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [close]);
+  useFocusMainRegion(mainRegionRef);
+
   const sections = getSettingsSections(governorEnabled, memoryEnabled, agentPluginsEnabled);
   const currentSection = sections.find((section) => section.id === activeSection) ?? sections[0];
   const SectionComponent = currentSection.component;
@@ -362,7 +366,11 @@ export function SettingsPage(props: SettingsPageProps) {
             {/* Keep settings content width bounded so long forms remain readable on wide screens.
                 min-h-full + flex-col lets full-height sections (Settings → Memory editor) grow to
                 the bottom via flex-1 while content-sized sections keep their natural height. */}
-            <div className="flex min-h-full w-full max-w-4xl flex-col">
+            <div
+              ref={mainRegionRef}
+              tabIndex={-1}
+              className="flex min-h-full w-full max-w-4xl flex-col outline-none"
+            >
               {onboardingPause.paused && (
                 <div className="bg-accent/10 border-accent/30 text-foreground mb-3 flex items-center justify-between rounded-md border px-3 py-2 text-sm">
                   <span>Setup is paused while you configure providers.</span>

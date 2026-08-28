@@ -1,5 +1,6 @@
 import React from "react";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
+import { requestMainRegionFocus } from "@/browser/hooks/useFocusMainRegion";
 
 interface SidebarCollapseButtonProps {
   collapsed: boolean;
@@ -26,11 +27,20 @@ export const SidebarCollapseButton: React.FC<SidebarCollapseButtonProps> = ({
 
   const label = collapsed ? "Expand sidebar" : "Collapse sidebar";
 
+  const handleClick = () => {
+    onToggle();
+    if (collapsed) {
+      return;
+    }
+
+    requestMainRegionFocus();
+  };
+
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <button
-          onClick={onToggle}
+          onClick={handleClick}
           aria-label={label}
           className={
             collapsed
