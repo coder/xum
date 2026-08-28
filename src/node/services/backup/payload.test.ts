@@ -1774,6 +1774,11 @@ describe("backup payload", () => {
       `pushd ${muxRoot}/skills; tclsh launch.txt`,
       // A relative cd resolves against the tracked directory of an earlier cd.
       `cd ${path.dirname(muxRoot)} && cd ${path.basename(muxRoot)} && python3 skills/launch.txt`,
+      // All shell-resolved executable inputs use the tracked cwd, not only a bare
+      // interpreter script operand.
+      `cd ${path.dirname(muxRoot)} && python3 ${path.basename(muxRoot)}/skills/launch.txt`,
+      `cd ${path.dirname(muxRoot)} && java -cp ${path.basename(muxRoot)}/skills/launch.txt Leak`,
+      `cd ${path.dirname(muxRoot)} && php -c${path.basename(muxRoot)}/skills/config.txt /opt/server.php`,
       // The command word can follow the redirection, and an interpreter later in
       // the same command still executes the redirected document.
       `< ${muxRoot}/skills/launch.txt sh`,
@@ -1790,6 +1795,8 @@ describe("backup payload", () => {
       `git --exec-path=${muxRoot}/skills leak.txt`,
       `mise exec -- python3 ${muxRoot}/skills/launch.txt`,
       `mise x -- ${muxRoot}/agents/launch.md`,
+      `sqlite3 -init ${muxRoot}/skills/launch.txt :memory:`,
+      `sqlite3 -batch -init ${muxRoot}/agents/launch.md /tmp/data.db`,
       "mise exec --command=launch.txt",
       "mise x -c launch.txt",
     ]) {
@@ -1833,6 +1840,9 @@ describe("backup payload", () => {
       "cmake --build build --target package",
       "mise --version",
       "mise exec python@3.11",
+      "sqlite3 -init /tmp/init.sql :memory:",
+      `sqlite3 ${muxRoot}/skills/config.txt`,
+      `mcp-server --database sqlite3 -init ${muxRoot}/skills/config.txt`,
       `mcp-server --launcher mise exec -- ${muxRoot}/skills/config.txt`,
       // A control operator starts a new command, ending interpreter tracking.
       "python3 --version && mcp-server -c config.toml",

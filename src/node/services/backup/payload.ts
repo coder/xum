@@ -1761,10 +1761,16 @@ function javaOptionTakesSeparateValue(unquoted: string): boolean {
   );
 }
 
-function javaClassPathPublishesExecutable(value: string, rootPrefixes: readonly string[]): boolean {
-  return value
-    .split(path.delimiter)
-    .some((entry) => isAutoPublishedScriptOperand(entry, rootPrefixes));
+function javaClassPathPublishesExecutable(
+  value: string,
+  rootPrefixes: readonly string[],
+  currentDirectory: string | null
+): boolean {
+  return value.split(path.delimiter).some((entry) => {
+    if (isAutoPublishedScriptOperand(entry, rootPrefixes)) return true;
+    const resolved = resolveKnownDirectory(entry, currentDirectory);
+    return resolved !== null && isAutoPublishedScriptOperand(resolved, rootPrefixes);
+  });
 }
 
 /**
@@ -2376,6 +2382,8 @@ function hasDisguisedAssignment(
   let pendingDenoSubcommand = false;
   let pendingDenoRunScript = false;
   let pendingDenoRunAmbiguous = false;
+  let pendingSqliteOptions = false;
+  let pendingSqliteInitFile = false;
   let pendingJavaOptions = false;
   let pendingJavaSourceVersion = false;
   let pendingJavaSourceFile = false;
@@ -2402,8 +2410,14 @@ function hasDisguisedAssignment(
   const languageWorkingDirectories = new Map<LanguageInterpreter, string>();
   let pendingLanguageWorkingDirectory: LanguageInterpreter | null = null;
 
-  function isPendingLanguageScriptOperand(value: string): boolean {
+  function isShellResolvedPublishedOperand(value: string): boolean {
     if (isAutoPublishedScriptOperand(value, rootPrefixes)) return true;
+    const resolved = resolveKnownDirectory(value, trackedCwd);
+    return resolved !== null && isAutoPublishedScriptOperand(resolved, rootPrefixes);
+  }
+
+  function isPendingLanguageScriptOperand(value: string): boolean {
+    if (isShellResolvedPublishedOperand(value)) return true;
     for (const language of pendingLanguages) {
       const directory = languageWorkingDirectories.get(language);
       if (directory === undefined) continue;
@@ -2469,6 +2483,8 @@ function hasDisguisedAssignment(
       pendingDenoSubcommand = false;
       pendingDenoRunScript = false;
       pendingDenoRunAmbiguous = false;
+      pendingSqliteOptions = false;
+      pendingSqliteInitFile = false;
       pendingJavaOptions = false;
       pendingJavaSourceVersion = false;
       pendingJavaSourceFile = false;
@@ -2494,7 +2510,7 @@ function hasDisguisedAssignment(
     // document as redirected input is executable to a stdin-reading interpreter
     // (`node < launch.txt` runs it as a script), so that filename localizes.
     if (gap.includes("<")) {
-      if (isAutoPublishedScriptOperand(unquoteShellWord(word), rootPrefixes)) {
+      if (isShellResolvedPublishedOperand(unquoteShellWord(word))) {
         // Published input localizes only when something can execute it: a
         // stdin-running interpreter in this command or a command word not yet
         // seen (`< input sh -c x`), which fails closed. A non-interpreter
@@ -2568,6 +2584,8 @@ function hasDisguisedAssignment(
         pendingStartStopDaemonExecutable = false;
         pendingSystemdRunOptions = false;
         pendingSystemdRunWorkingDirectory = false;
+        pendingSqliteOptions = false;
+        pendingSqliteInitFile = false;
       }
       pendingEnvOptionValue = false;
       pendingEnvWorkingDirectory = false;
@@ -2750,7 +2768,7 @@ function hasDisguisedAssignment(
       // (`--prefix /tmp`), so tracking stays armed until a known subcommand.
     }
     if (pendingDenoRunScript) {
-      if (isAutoPublishedScriptOperand(unquoted, rootPrefixes)) return true;
+      if (isShellResolvedPublishedOperand(unquoted)) return true;
       if (unquoted.startsWith("-")) {
         // The option may take a separate value this scan cannot pair, so from here
         // a non-option word no longer proves the entrypoint; tracking stays armed,
@@ -2762,9 +2780,15 @@ function hasDisguisedAssignment(
         pendingDenoRunScript = false;
       }
     }
+    if (pendingSqliteInitFile) {
+      pendingSqliteInitFile = false;
+      if (isShellResolvedPublishedOperand(unquoted)) return true;
+    } else if (pendingSqliteOptions && unquoted === "-init") {
+      pendingSqliteInitFile = true;
+    }
     if (pendingJavaClassPathValue) {
       pendingJavaClassPathValue = false;
-      if (javaClassPathPublishesExecutable(unquoted, rootPrefixes)) return true;
+      if (javaClassPathPublishesExecutable(unquoted, rootPrefixes, trackedCwd)) return true;
     } else if (pendingJavaOptionValue) {
       pendingJavaOptionValue = false;
     } else if (pendingJavaSourceVersion) {
@@ -2776,12 +2800,16 @@ function hasDisguisedAssignment(
         // published file can inject --source and a script operand; the file itself
         // localizes, and any other @-file leaves tracking armed because the options
         // it expands to are not visible here.
-        if (isAutoPublishedScriptOperand(unquoted.slice(1), rootPrefixes)) return true;
+        if (isShellResolvedPublishedOperand(unquoted.slice(1))) return true;
       } else if (isJavaClassPathOption(unquoted)) {
         pendingJavaClassPathValue = true;
       } else if (unquoted.startsWith("--class-path=")) {
         if (
-          javaClassPathPublishesExecutable(unquoted.slice("--class-path=".length), rootPrefixes)
+          javaClassPathPublishesExecutable(
+            unquoted.slice("--class-path=".length),
+            rootPrefixes,
+            trackedCwd
+          )
         ) {
           return true;
         }
@@ -2796,7 +2824,7 @@ function hasDisguisedAssignment(
         // runs, and the launcher opens it regardless of filename extension.
         pendingJavaSourceFile = true;
       } else if (pendingJavaSourceFile && !unquoted.startsWith("-")) {
-        const autoPublished = isAutoPublishedScriptOperand(unquoted, rootPrefixes);
+        const autoPublished = isShellResolvedPublishedOperand(unquoted);
         pendingJavaOptions = false;
         pendingJavaSourceFile = false;
         if (autoPublished) return true;
@@ -2893,7 +2921,7 @@ function hasDisguisedAssignment(
       commandWordSeen = true;
       // A directly executed auto-published document runs through its shebang,
       // publishing an executable relationship no marker can rehydrate elsewhere.
-      if (isAutoPublishedScriptOperand(executableWord, rootPrefixes)) return true;
+      if (isShellResolvedPublishedOperand(executableWord)) return true;
       // A bare name resolves through the inherited PATH, so an entry inside the
       // collected root reaches the same documents without spelling the root.
       if (!/[/\\]/.test(executableWord)) {
@@ -2909,6 +2937,7 @@ function hasDisguisedAssignment(
       if (executable === "mise") pendingMiseSubcommand = true;
       if (executable === "git") pendingGitSubcommand = true;
       if (executable === "deno") pendingDenoSubcommand = true;
+      if (/^sqlite3[0-9.]*$/.test(executable)) pendingSqliteOptions = true;
       if (executable === "java" || executable === "javaw") pendingJavaOptions = true;
       if (executable === "start-stop-daemon") pendingStartStopDaemonOptions = true;
       if (executable === "systemd-run") pendingSystemdRunOptions = true;
@@ -2947,7 +2976,7 @@ function hasDisguisedAssignment(
         break;
       }
       const startup = pending.attachedStartupFile?.exec(unquoted)?.[1];
-      if (startup !== undefined && isAutoPublishedScriptOperand(startup, rootPrefixes)) {
+      if (startup !== undefined && isShellResolvedPublishedOperand(startup)) {
         return true;
       }
       const script = pending.attachedScriptFile?.exec(unquoted)?.[1];
