@@ -2297,7 +2297,11 @@ const SHELL_STATE_WORDS = new Set([
  * exempt (`A="B=1"` cannot fire); a marker merely inside a larger word proves nothing
  * about the rest of that word.
  */
-function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[]): boolean {
+function hasDisguisedAssignment(
+  redacted: string,
+  rootPrefixes: readonly string[],
+  publishedPathDirs: readonly string[]
+): boolean {
   let commandPosition = true;
   let envCommandExpected = false;
   let carrierArmed = false;
@@ -2557,6 +2561,10 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
         pendingGitConfigKey = false;
         if (/^alias\.[^.]+$/i.test(unquoted)) {
           pendingGitAliasValue = true;
+        } else if (/^submodule\..+\.update$/i.test(unquoted)) {
+          // Shares the alias rule: only a `!`-prefixed update value is a command,
+          // which `git submodule update` executes in place of the built-in modes.
+          pendingGitAliasValue = true;
         } else if (GIT_FSMONITOR_CONFIG_KEY.test(unquoted)) {
           pendingGitFsmonitorValue = true;
         } else if (GIT_INCLUDE_PATH_CONFIG_KEY.test(unquoted)) {
@@ -2707,6 +2715,13 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
       // A directly executed auto-published document runs through its shebang,
       // publishing an executable relationship no marker can rehydrate elsewhere.
       if (isAutoPublishedScriptOperand(unquoted, rootPrefixes)) return true;
+      // A bare name resolves through the inherited PATH, so an entry inside the
+      // collected root reaches the same documents without spelling the root.
+      if (!/[/\\]/.test(unquoted)) {
+        for (const dir of publishedPathDirs) {
+          if (isAutoPublishedScriptOperand(`${dir}/${unquoted}`, rootPrefixes)) return true;
+        }
+      }
       if (executable === "env") sawEnv = true;
       if (executable === "npm") pendingNpmSubcommand = true;
       if (executable === "git") pendingGitSubcommand = true;
@@ -3089,7 +3104,11 @@ export const MAX_ANALYZED_COMMAND_LENGTH = 32_768;
  */
 export const MAX_TOTAL_ANALYZED_COMMAND_LENGTH = 8 * MAX_ANALYZED_COMMAND_LENGTH;
 
-function redactCommandEnvAssignments(command: string, rootPrefixes: readonly string[]): string {
+function redactCommandEnvAssignments(
+  command: string,
+  rootPrefixes: readonly string[],
+  publishedPathDirs: readonly string[]
+): string {
   if (command.length > MAX_ANALYZED_COMMAND_LENGTH) return REDACTED_BACKUP_VALUE;
   // Analysis mirrors execution: active continuations vanish first, so every analyzer
   // below sees the same contiguous syntax the shell parses.
@@ -3109,7 +3128,7 @@ function redactCommandEnvAssignments(command: string, rootPrefixes: readonly str
   const constructs = findActiveShellConstructs(analyzed);
   if (
     UNCONSUMED_ASSIGNMENT.test(redactedCode) ||
-    hasDisguisedAssignment(redactedCode, rootPrefixes) ||
+    hasDisguisedAssignment(redactedCode, rootPrefixes, publishedPathDirs) ||
     constructs.carrier ||
     constructs.heredoc ||
     constructs.processSubstitution ||
@@ -3160,6 +3179,12 @@ function redactMcpConfig(
   redactionPaths: BackupRedactionPath[];
 } {
   const rootPrefixes = collectedDocumentRootPrefixes(muxRoot);
+  // The stdio launch inherits this process's environment (see
+  // isBashStartupHookVariable), so a PATH entry inside the collected root makes
+  // published executable documents reachable as bare command names.
+  const publishedPathDirs = (process.env.PATH ?? "")
+    .split(path.delimiter)
+    .filter((entry) => isUnderCollectedRoot(entry, rootPrefixes));
   const text = content.toString("utf-8");
   const { parsed: root, tree } = parseJsoncObjectWithTree(text, "mcp.jsonc");
   const redactionPaths: BackupRedactionPath[] = [];
@@ -3185,7 +3210,7 @@ function redactMcpConfig(
       redacted = REDACTED_BACKUP_VALUE;
     } else {
       analysisBudget -= command.length;
-      redacted = redactCommandEnvAssignments(command, rootPrefixes);
+      redacted = redactCommandEnvAssignments(command, rootPrefixes, publishedPathDirs);
     }
     if (redacted === command) return;
     edits.push({ path: jsonPath, value: redacted });

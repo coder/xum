@@ -1905,6 +1905,39 @@ describe("backup payload", () => {
     expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
   });
 
+  it("localizes bare commands resolvable through a PATH entry inside the root", async () => {
+    // The spawned server inherits this process's PATH, so an entry inside the
+    // collected root makes a published executable document reachable by name.
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${muxRoot}/skills${path.delimiter}${originalPath ?? ""}`;
+    try {
+      for (const [command, expected] of [
+        ["launch.txt --serve", REDACTED_BACKUP_VALUE],
+        // A name that does not resolve to a published document stays portable.
+        ["mcp-server --transport stdio", "mcp-server --transport stdio"],
+      ] as const) {
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    }
+  });
+
   it("localizes the pre-rename spelling of a renamed settings root", async () => {
     const xumRoot = path.join(tempDir, ".xum");
     await fs.mkdir(xumRoot);
@@ -2103,6 +2136,8 @@ describe("backup payload", () => {
       "git config core.sshCommand 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'; git fetch origin",
       // git gc runs the configured recent-objects hook while pruning cruft.
       "git config gc.recentObjectsHook /tmp/hook.sh; git gc --cruft --prune=now",
+      // A !-prefixed submodule update value runs in place of the built-in modes.
+      "git config submodule.vendor.update '!mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'; git submodule update",
       "git config credential.helper '!mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'",
       "git config filter.secret.process 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'",
       "git config merge.leak.driver 'mcp${IFS}--token${IFS}ghp_Abcdef1234\\Klmno567890123456'; git merge side",
@@ -2402,6 +2437,7 @@ describe("backup payload", () => {
       "git -C /tmp status",
       "git submodule status",
       "git config alias.co checkout",
+      "git config submodule.vendor.update rebase",
       "git config --get alias.co",
       "git config core.sshCommand",
       "git config user.name Alice",
