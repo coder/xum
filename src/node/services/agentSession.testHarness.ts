@@ -6,6 +6,7 @@ import type { MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import type { Config } from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
+import type { TurnStreamHandle } from "@/node/services/streamManager";
 import { AgentSession } from "@/node/services/agentSession";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
@@ -42,16 +43,36 @@ function createMockAiService(args?: { emitter?: EventEmitter; overrides?: Partia
   aiService: AIService;
 } {
   const aiEmitter = args?.emitter ?? new EventEmitter();
+  const { streamMessage: streamMessageOverride, ...overrides } = args?.overrides ?? {};
+  const streamMessage =
+    streamMessageOverride ??
+    (mock((_history: MuxMessage[]) =>
+      Promise.resolve(Ok(undefined))
+    ) as unknown as AIService["streamMessage"]);
+  const normalizedStreamMessage = mock(
+    async (...streamArgs: Parameters<AIService["streamMessage"]>) => {
+      const result = await streamMessage(...streamArgs);
+      if (!result.success || result.data != null) {
+        return result;
+      }
+
+      const handle: TurnStreamHandle = {
+        streamToken: "test-stream-token",
+        messageId: "test-assistant-message",
+        completion: new Promise(() => undefined),
+      };
+      return Ok(handle);
+    }
+  );
+
   return {
     aiEmitter,
     aiService: Object.assign(aiEmitter, {
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
       getStreamInfo: mock((_workspaceId: string) => null),
-      streamMessage: mock((_history: MuxMessage[]) =>
-        Promise.resolve(Ok(undefined))
-      ) as unknown as AIService["streamMessage"],
-      ...args?.overrides,
+      streamMessage: normalizedStreamMessage as AIService["streamMessage"],
+      ...overrides,
     }) as unknown as AIService,
   };
 }

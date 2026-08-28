@@ -24,7 +24,15 @@ import type { GoalRecordV1 } from "@/common/types/goal";
 import type { ModelMessage, MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import { createMuxMessage } from "@/common/types/message";
 import type { Config } from "@/node/config";
-import { StreamManager, type ModelFallbackOptions, type StreamTextOnChunk } from "./streamManager";
+import {
+  StreamManager,
+  type ModelFallbackOptions,
+  type StreamTextOnChunk,
+  type TurnCompletion,
+  type TurnEngineEvent,
+  type TurnExecutionOptions,
+  type TurnStreamHandle,
+} from "./streamManager";
 import { emitTurnEnvelope } from "./turnEnvelope";
 import {
   sharedDurableEventJournal,
@@ -620,8 +628,11 @@ export class AIService extends EventEmitter {
     this.experimentsService = experimentsService;
     this.providerService = providerService;
     this.providerService.onConfigChanged(() => this.emit("providers-config-changed"));
-    this.streamManager = new StreamManager(historyService, sessionUsageService, () =>
-      this.providerService.getConfig()
+    this.streamManager = new StreamManager(
+      historyService,
+      sessionUsageService,
+      () => this.providerService.getConfig(),
+      (event) => this.emitEngineEvent(event)
     );
     this.devToolsService = devToolsService;
     this.providerModelFactory = new ProviderModelFactory(
@@ -632,7 +643,6 @@ export class AIService extends EventEmitter {
       devToolsService
     );
     void this.ensureSessionsDir();
-    this.setupStreamEventForwarding();
     this.mockModeEnabled = false;
 
     if (resolveXumEnvironmentValue("MOCK_AI", process.env) === "1") {
@@ -780,57 +790,31 @@ export class AIService extends EventEmitter {
     this.extraTools = tools;
   }
 
-  /**
-   * Forward all stream events from StreamManager to AIService consumers
-   */
-  private setupStreamEventForwarding(): void {
-    // Simple one-to-one event forwarding from StreamManager → AIService consumers
-    for (const event of [
-      "stream-start",
-      "stream-delta",
-      "tool-call-start",
-      "tool-call-execution-start",
-      "tool-call-delta",
-      "tool-call-end",
-      "reasoning-delta",
-      "reasoning-end",
-      "workflow-run-attached",
-      "usage-delta",
-    ] as const) {
-      this.streamManager.on(event, (data) => this.emit(event, data));
+  private emitEngineEvent(event: TurnEngineEvent): void | Promise<void> {
+    if (event.type === "error") {
+      this.clearTrackedPendingDevToolsRunMetadata(event.messageId);
+      this.emit("error", event);
+      return;
     }
 
-    // Stream errors can bypass stream-end/stream-abort. Clear any queued metadata
-    // so failed requests don't leak pending-run tracking entries.
-    this.streamManager.on("error", (data: ErrorEvent) => {
-      this.clearTrackedPendingDevToolsRunMetadata(data.messageId);
-      this.emit("error", data);
-    });
+    if (event.type === "stream-end") {
+      this.clearTrackedPendingDevToolsRunMetadata(event.messageId);
 
-    // stream-end needs extra logic: capture provider response for debug modal
-    this.streamManager.on("stream-end", (data: StreamEndEvent) => {
-      // Streams can end before DevTools middleware creates a run (for example when
-      // interrupted early). Clear any still-queued run metadata for this message.
-      this.clearTrackedPendingDevToolsRunMetadata(data.messageId);
-
-      // Best-effort capture of the provider response for the "Last LLM request" debug modal.
-      // Must never break live streaming.
       try {
-        const snapshot = this.lastLlmRequestByWorkspace.get(data.workspaceId);
+        const snapshot = this.lastLlmRequestByWorkspace.get(event.workspaceId);
         if (snapshot) {
-          // If messageId is missing (legacy fixtures), attach anyway.
-          const shouldAttach = snapshot.messageId === data.messageId || snapshot.messageId == null;
+          const shouldAttach = snapshot.messageId === event.messageId || snapshot.messageId == null;
           if (shouldAttach) {
             const updated: DebugLlmRequestSnapshot = {
               ...snapshot,
               response: {
                 capturedAt: Date.now(),
-                metadata: data.metadata,
-                parts: data.parts,
+                metadata: event.metadata,
+                parts: event.parts,
               },
             };
 
-            this.lastLlmRequestByWorkspace.set(data.workspaceId, structuredClone(updated));
+            this.lastLlmRequestByWorkspace.set(event.workspaceId, structuredClone(updated));
           }
         }
       } catch (error) {
@@ -838,41 +822,117 @@ export class AIService extends EventEmitter {
         log.warn("Failed to capture debug LLM response snapshot", { error: errMsg });
       }
 
-      this.emit("stream-end", data);
-    });
+      this.emit("stream-end", event);
+      return;
+    }
 
-    // Handle stream-abort: dispose of partial based on abandonPartial flag
-    this.streamManager.on("stream-abort", (data: StreamAbortEvent) => {
-      // Aborts can happen before the first provider call reaches DevTools middleware.
-      // Clear any queued run metadata for this message to avoid memory growth.
-      this.clearTrackedPendingDevToolsRunMetadata(data.messageId);
-
-      void (async () => {
+    if (event.type === "stream-abort") {
+      this.clearTrackedPendingDevToolsRunMetadata(event.messageId);
+      return (async () => {
         try {
-          if (data.abandonPartial) {
-            // Caller requested discarding partial - delete without committing
-            await this.historyService.deletePartial(data.workspaceId);
+          if (event.abandonPartial) {
+            await this.historyService.deletePartial(event.workspaceId);
           } else {
-            // Commit interrupted message to history with partial:true metadata
-            // This ensures /clear can clean up interrupted messages
-            const partial = await this.historyService.readPartial(data.workspaceId);
+            const partial = await this.historyService.readPartial(event.workspaceId);
             if (partial) {
-              await this.historyService.commitPartial(data.workspaceId);
-              await this.historyService.deletePartial(data.workspaceId);
+              await this.historyService.commitPartial(event.workspaceId);
+              await this.historyService.deletePartial(event.workspaceId);
             }
           }
         } catch (error) {
           log.error("Failed partial cleanup during stream-abort", {
-            workspaceId: data.workspaceId,
+            workspaceId: event.workspaceId,
             error: getErrorMessage(error),
           });
         } finally {
-          // Always forward abort event to consumers (workspaceService, agentSession)
-          // even if partial cleanup failed — stream lifecycle consistency is higher priority.
-          this.emit("stream-abort", data);
+          this.emit("stream-abort", event);
         }
       })();
+    }
+
+    this.emit(event.type, event);
+  }
+
+  private createSettledTurnHandle(messageId: string, completion: TurnCompletion): TurnStreamHandle {
+    return {
+      streamToken: this.streamManager.generateStreamToken(),
+      messageId,
+      completion: Promise.resolve(completion),
+    };
+  }
+
+  private observeFacadeTurnCompletion(input: {
+    workspaceId: string;
+    messageId: string;
+    adoptStreamStartMessageId?: boolean;
+  }): { handle: TurnStreamHandle; cancel: () => void } {
+    let messageId = input.messageId;
+    let settled = false;
+    let resolveCompletion!: (completion: TurnCompletion) => void;
+    const completion = new Promise<TurnCompletion>((resolve) => {
+      resolveCompletion = resolve;
     });
+
+    const cleanup = (): void => {
+      this.off("stream-start", onStreamStart as never);
+      this.off("stream-end", onStreamEnd as never);
+      this.off("stream-abort", onStreamAbort as never);
+      this.off("error", onError as never);
+    };
+    const settle = (outcome: TurnCompletion): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolveCompletion(outcome);
+    };
+    const matches = (event: { workspaceId: string; messageId: string }): boolean =>
+      event.workspaceId === input.workspaceId && event.messageId === messageId;
+    const onStreamStart = (event: TurnEngineEvent): void => {
+      if (
+        input.adoptStreamStartMessageId === true &&
+        event.type === "stream-start" &&
+        event.workspaceId === input.workspaceId
+      ) {
+        messageId = event.messageId;
+      }
+    };
+    const onStreamEnd = (event: StreamEndEvent): void => {
+      if (matches(event)) settle({ status: "completed", messageId });
+    };
+    const onStreamAbort = (event: StreamAbortEvent): void => {
+      if (matches(event)) {
+        settle({ status: "aborted", messageId, abortReason: event.abortReason ?? "system" });
+      }
+    };
+    const onError = (event: ErrorEvent): void => {
+      if (matches(event)) {
+        settle({
+          status: "failed",
+          messageId,
+          error: { type: "unknown", raw: event.error },
+          streamError: {
+            messageId,
+            error: event.error,
+            errorType: event.errorType ?? "unknown",
+            acpPromptId: event.acpPromptId,
+          },
+        });
+      }
+    };
+
+    this.on("stream-start", onStreamStart as never);
+    this.on("stream-end", onStreamEnd as never);
+    this.on("stream-abort", onStreamAbort as never);
+    this.on("error", onError as never);
+
+    const handle: TurnStreamHandle = {
+      streamToken: this.streamManager.generateStreamToken(),
+      get messageId() {
+        return messageId;
+      },
+      completion,
+    };
+    return { handle, cancel: cleanup };
   }
 
   private trackPendingDevToolsRunMetadata(
@@ -1317,7 +1377,9 @@ export class AIService extends EventEmitter {
   }
 
   /** Stream a message conversation to the AI model. */
-  async streamMessage(opts: StreamMessageOptions): Promise<Result<void, SendMessageError>> {
+  async streamMessage(
+    opts: StreamMessageOptions
+  ): Promise<Result<TurnStreamHandle, SendMessageError>> {
     const {
       messages,
       workspaceId,
@@ -1388,15 +1450,31 @@ export class AIService extends EventEmitter {
       if (this.mockModeEnabled && this.mockAiStreamPlayer) {
         await this.initStateManager.waitForInit(workspaceId, combinedAbortSignal);
         if (combinedAbortSignal.aborted) {
-          return Ok(undefined);
+          return Ok(
+            this.createSettledTurnHandle(syntheticMessageId, {
+              status: "aborted",
+              messageId: syntheticMessageId,
+              abortReason: "startup",
+            })
+          );
         }
-        return await this.mockAiStreamPlayer.play(messages, workspaceId, {
+        const observed = this.observeFacadeTurnCompletion({
+          workspaceId,
+          messageId: syntheticMessageId,
+          adoptStreamStartMessageId: true,
+        });
+        const result = await this.mockAiStreamPlayer.play(messages, workspaceId, {
           model: modelString,
           agentId,
           thinkingLevel,
           muxMetadata,
           abortSignal: combinedAbortSignal,
         });
+        if (!result.success) {
+          observed.cancel();
+          return result;
+        }
+        return Ok(observed.handle);
       }
 
       // DEBUG: Log streamMessage call
@@ -1759,7 +1837,13 @@ export class AIService extends EventEmitter {
       await this.initStateManager.waitForInit(workspaceId, combinedAbortSignal);
       recordStartupPhaseTiming("waitForInitMs", waitForInitStartedAt);
       if (combinedAbortSignal.aborted) {
-        return Ok(undefined);
+        return Ok(
+          this.createSettledTurnHandle(syntheticMessageId, {
+            status: "aborted",
+            messageId: syntheticMessageId,
+            abortReason: "startup",
+          })
+        );
       }
 
       // Verify runtime is actually reachable after init completes.
@@ -3006,7 +3090,13 @@ export class AIService extends EventEmitter {
       });
 
       if (combinedAbortSignal.aborted) {
-        return Ok(undefined);
+        return Ok(
+          this.createSettledTurnHandle(assistantMessageId, {
+            status: "aborted",
+            messageId: assistantMessageId,
+            abortReason: "startup",
+          })
+        );
       }
 
       const requestHistorySequence = providerRequestMessages.reduce(
@@ -3041,6 +3131,10 @@ export class AIService extends EventEmitter {
         effectiveMuxProviderOptions.openai?.simulateToolPolicyNoop === true;
 
       if (forceContextLimitError || simulateToolPolicyNoopFlag) {
+        const observed = this.observeFacadeTurnCompletion({
+          workspaceId,
+          messageId: assistantMessageId,
+        });
         const simulationCtx: SimulationContext = {
           workspaceId,
           assistantMessageId,
@@ -3056,12 +3150,17 @@ export class AIService extends EventEmitter {
           emit: (event, data) => this.emit(event, data),
         };
 
-        if (forceContextLimitError) {
-          await simulateContextLimitError(simulationCtx, this.historyService);
-        } else {
-          await simulateToolPolicyNoop(simulationCtx, effectiveToolPolicy, this.historyService);
+        try {
+          if (forceContextLimitError) {
+            await simulateContextLimitError(simulationCtx, this.historyService);
+          } else {
+            await simulateToolPolicyNoop(simulationCtx, effectiveToolPolicy, this.historyService);
+          }
+          return Ok(observed.handle);
+        } catch (error) {
+          observed.cancel();
+          throw error;
         }
-        return Ok(undefined);
       }
 
       // Build provider options based on thinking level and request-sliced message history.
@@ -3336,7 +3435,13 @@ export class AIService extends EventEmitter {
 
       if (combinedAbortSignal.aborted) {
         await deleteAbortedPlaceholder(assistantMessageId);
-        return Ok(undefined);
+        return Ok(
+          this.createSettledTurnHandle(assistantMessageId, {
+            status: "aborted",
+            messageId: assistantMessageId,
+            abortReason: "startup",
+          })
+        );
       }
 
       // Capture request payload for the debug modal, then delegate to StreamManager.
@@ -4097,43 +4202,41 @@ export class AIService extends EventEmitter {
 
       emitStartupBreadcrumb("starting_stream");
       const startStreamStartedAt = Date.now();
-      const streamResult = await this.streamManager.startStream(
+      const turnExecutionOptions: TurnExecutionOptions = {
         workspaceId,
-        streamFinalMessages,
-        modelResult.data.model,
+        messages: streamFinalMessages,
+        model: modelResult.data.model,
         modelString,
         historySequence,
-        systemMessage,
+        system: systemMessage,
         runtime,
-        assistantMessageId, // Shared messageId ensures nested tool events match stream events
-        combinedAbortSignal,
-        toolsForStream,
-        {
+        messageId: assistantMessageId,
+        abortSignal: combinedAbortSignal,
+        tools: toolsForStream,
+        initialMetadata: {
           ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
           systemMessageTokens,
           timestamp: Date.now(),
           agentId: effectiveAgentId,
           ...(legacyModeForMetadata != null ? { mode: legacyModeForMetadata } : {}),
           routedThroughGateway,
-          // Preserve the resolved route source so stream events and persisted messages
-          // keep non-gateway attribution even when the model ID itself is gateway-agnostic.
           ...(routeProvider != null ? { routeProvider } : {}),
           ...(muxMetadata !== undefined ? { muxMetadata } : {}),
           ...(acpPromptId != null ? { acpPromptId } : {}),
           ...(modelCostsIncluded(modelResult.data.model) ? { costsIncluded: true } : {}),
         },
-        streamProviderOptions,
+        providerOptions: streamProviderOptions,
         maxOutputTokens,
-        effectiveToolPolicy,
-        streamToken, // Pass the pre-generated stream token
+        toolPolicy: effectiveToolPolicy,
+        providedStreamToken: streamToken,
         hasQueuedMessages,
-        metadata.name,
-        streamThinkingLevel,
-        requestHeaders,
-        effectiveMuxProviderOptions.anthropic?.cacheTtl ?? undefined,
-        resolvedOverrides.standard,
-        advisorToolEligible ? onAdvisorChunk : undefined,
-        advisorToolEligible
+        workspaceName: metadata.name,
+        thinkingLevel: streamThinkingLevel,
+        headers: requestHeaders,
+        anthropicCacheTtlOverride: effectiveMuxProviderOptions.anthropic?.cacheTtl ?? undefined,
+        callSettingsOverrides: resolvedOverrides.standard,
+        onChunk: advisorToolEligible ? onAdvisorChunk : undefined,
+        onStepMessages: advisorToolEligible
           ? (stepMessages) => {
               advisorTranscriptRef.messages = stepMessages;
               advisorStepCaptureRef.currentStepText = "";
@@ -4141,16 +4244,17 @@ export class AIService extends EventEmitter {
               advisorStepCaptureRef.frozenSnapshotsByToolCallId.clear();
             }
           : undefined,
-        runtimeTempDir,
+        providedRuntimeTempDir: runtimeTempDir,
         modelFallback,
-        toolSearchRuntime?.state,
-        activeTurnThinkingOverride,
+        toolSearchState: toolSearchRuntime?.state,
+        thinkingOverrideState: activeTurnThinkingOverride,
         rebuildProviderOptionsForThinkingLevel,
         forcedFirstStepToolNames,
-        requestProvidersConfig,
-        emitPrimaryEnvelope,
-        rebuildFirstStepForThinkingLevel
-      );
+        providersConfigSnapshot: requestProvidersConfig,
+        onStreamConstructed: emitPrimaryEnvelope,
+        rebuildFirstStepForThinkingLevel,
+      };
+      const streamResult = await this.streamManager.startStream(turnExecutionOptions);
       recordStartupPhaseTiming("startStreamMs", startStreamStartedAt);
 
       if (!streamResult.success) {
@@ -4204,9 +4308,8 @@ export class AIService extends EventEmitter {
         finalMessageCount: finalMessages.length,
       });
 
-      // StreamManager now handles history updates directly on stream-end
-      // No need for event listener here
-      return Ok(undefined);
+      // StreamManager now handles history updates directly on stream-end.
+      return Ok(streamResult.data);
     } catch (error) {
       if (pendingRunMetadataId != null) {
         this.clearTrackedPendingDevToolsRunMetadataById(workspaceId, pendingRunMetadataId);

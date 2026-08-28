@@ -1,9 +1,30 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
-import { StreamManager } from "./streamManager";
+import { StreamManager, type TurnEngineEvent, type TurnEngineEventSink } from "./streamManager";
 
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
+
+type TurnEngineEventOfType<T extends TurnEngineEvent["type"]> = Extract<
+  TurnEngineEvent,
+  { type: T }
+>;
+
+function onTurnEngineEvent<T extends TurnEngineEvent["type"]>(
+  streamManager: StreamManager,
+  type: T,
+  listener: (event: TurnEngineEventOfType<T>) => void
+): void {
+  const internals = streamManager as unknown as { eventSink: TurnEngineEventSink };
+  const previous = internals.eventSink;
+  internals.eventSink = (event) => {
+    const result = previous(event);
+    if (event.type === type) {
+      listener(event as TurnEngineEventOfType<T>);
+    }
+    return result;
+  };
+}
 
 describe("StreamManager - model-only tool notifications", () => {
   let historyService: HistoryService;
@@ -29,9 +50,13 @@ describe("StreamManager - model-only tool notifications", () => {
     };
 
     const events: Array<{ toolName?: string; result?: unknown }> = [];
-    streamManager.on("tool-call-end", (data: { toolName: string; result: unknown }) => {
-      events.push({ toolName: data.toolName, result: data.result });
-    });
+    onTurnEngineEvent(
+      streamManager,
+      "tool-call-end",
+      (data: { toolName: string; result: unknown }) => {
+        events.push({ toolName: data.toolName, result: data.result });
+      }
+    );
 
     const mockStreamResult = {
       // eslint-disable-next-line @typescript-eslint/require-await
@@ -115,7 +140,8 @@ describe("StreamManager - model-only tool notifications", () => {
       result?: unknown;
       providerExecuted?: boolean;
     }> = [];
-    streamManager.on(
+    onTurnEngineEvent(
+      streamManager,
       "tool-call-end",
       (data: { toolName: string; result: unknown; providerExecuted?: boolean }) => {
         events.push({

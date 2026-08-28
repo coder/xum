@@ -443,25 +443,39 @@ describe("AgentSession pre-stream errors", () => {
     session.dispose();
   });
 
-  it("does not double-schedule auto-retry when runtime startup failure already emitted", async () => {
+  it("does not double-schedule auto-retry when a failed completion follows its error event", async () => {
     const workspaceId = "ws-runtime-start-failed-pre-emitted-error";
 
     const { historyService, config, cleanup } = await createTestHistoryService();
     historyCleanup = cleanup;
 
     const aiEmitter = new EventEmitter();
+    const messageId = "assistant-stream-startup-failed";
     const streamMessage = mock((_history: MuxMessage[]) => {
       aiEmitter.emit("error", {
         workspaceId,
-        messageId: "assistant-stream-startup-failed",
+        messageId,
         error: "Runtime is still starting",
         errorType: "runtime_start_failed",
       });
 
       return Promise.resolve(
-        Err({
-          type: "runtime_start_failed",
-          message: "Runtime is still starting",
+        Ok({
+          streamToken: "stream-token",
+          messageId,
+          completion: Promise.resolve({
+            status: "failed" as const,
+            messageId,
+            error: {
+              type: "runtime_start_failed" as const,
+              message: "Runtime is still starting",
+            },
+            streamError: {
+              messageId,
+              error: "Runtime is still starting",
+              errorType: "runtime_start_failed" as const,
+            },
+          }),
         })
       );
     });
@@ -469,9 +483,7 @@ describe("AgentSession pre-stream errors", () => {
     const aiService = Object.assign(aiEmitter, {
       isStreaming: mock((_workspaceId: string) => false),
       stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-      streamMessage: streamMessage as unknown as (
-        ...args: Parameters<AIService["streamMessage"]>
-      ) => Promise<Result<void, SendMessageError>>,
+      streamMessage: streamMessage as unknown as AIService["streamMessage"],
     }) as unknown as AIService;
 
     const initStateManager = new EventEmitter() as unknown as InitStateManager;
@@ -502,7 +514,7 @@ describe("AgentSession pre-stream errors", () => {
       agentId: "exec",
     });
 
-    expect(result.success).toBe(false);
+    expect(result.success).toBe(true);
 
     await session.waitForIdle();
 
