@@ -1,11 +1,7 @@
 import type { AgentTaskIntegration } from "@/node/services/taskWorkspaceSeam";
 
-interface AgentTaskIntegrationTestOverrides extends Partial<AgentTaskIntegration> {
-  cleanupReportedDescendantsAfterArchive?: () => Promise<void>;
-}
-
 export function makeAgentTaskIntegrationFake(
-  overrides: AgentTaskIntegrationTestOverrides = {}
+  overrides: Partial<AgentTaskIntegration> = {}
 ): AgentTaskIntegration {
   return {
     withTaskTreeLifecycleLock: <T>(_workspaceId: string, operation: () => Promise<T>): Promise<T> =>
