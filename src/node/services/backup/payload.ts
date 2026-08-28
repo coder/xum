@@ -2880,6 +2880,18 @@ function hasDisguisedAssignment(
         ) {
           return true;
         }
+      } else if (/^-Xbootclasspath(?:\/[ap])?:/.test(unquoted)) {
+        // Boot-class-path entries execute like the class path: they load ahead
+        // of the application regardless of filename extension.
+        if (
+          javaClassPathPublishesExecutable(
+            unquoted.slice(unquoted.indexOf(":") + 1),
+            rootPrefixes,
+            trackedCwd
+          )
+        ) {
+          return true;
+        }
       } else if (javaOptionTakesSeparateValue(unquoted)) {
         pendingJavaOptionValue = true;
       } else if (unquoted === "--source") {

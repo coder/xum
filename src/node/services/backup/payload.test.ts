@@ -2534,6 +2534,34 @@ describe("backup payload", () => {
     }
   });
 
+  it("localizes direct java boot-class-path archives", async () => {
+    for (const [command, expected] of [
+      [`java -Xbootclasspath/a:${muxRoot}/skills/launch.txt Leak`, REDACTED_BACKUP_VALUE],
+      [`java -Xbootclasspath:${muxRoot}/skills/launch.txt Leak`, REDACTED_BACKUP_VALUE],
+      // A foreign archive is not a collected document.
+      [
+        "java -Xbootclasspath/a:/opt/lib/leak.jar Leak",
+        "java -Xbootclasspath/a:/opt/lib/leak.jar Leak",
+      ],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
   it("localizes sqlite3 command options", async () => {
     for (const [command, expected] of [
       // -cmd hands its operand to SQLite's own parse before stdin.
