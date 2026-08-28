@@ -1756,6 +1756,9 @@ describe("backup payload", () => {
       `systemd-run --user --scope ${muxRoot}/skills/launch.txt`,
       `cmake -P ${muxRoot}/skills/launch.txt`,
       `ctest -S ${muxRoot}/skills/launch.txt`,
+      // Redundant separators and dot segments name the same collected file.
+      `${muxRoot}//skills/launch.txt`,
+      `env ${muxRoot}/./skills/launch.txt`,
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -1789,6 +1792,10 @@ describe("backup payload", () => {
       "mcp-server < /tmp/input.json",
       "mcp-server --launcher systemd-run",
       "cmake --build build --target package",
+      // A control operator starts a new command, ending interpreter tracking.
+      "python3 --version && mcp-server -c config.toml",
+      // deno's entrypoint ends script tracking; later published paths are data.
+      `deno run /opt/server.ts ${muxRoot}/skills/config.txt`,
     ]) {
       await writeFixtureFile(
         muxRoot,
@@ -1967,6 +1974,7 @@ describe("backup payload", () => {
     ["PHP process-file option", "php -F<root>/skills/launch.txt"],
     ["PHP long process-file option", "php --process-file=<root>/skills/launch.txt"],
     ["PHP separate process-file option", "php --process-file <root>/skills/launch.txt"],
+    ["Deno bare entrypoint", "deno run <root>/skills/launch.mdx"],
     // Backslash spelling of the same root, normalized like a Windows path.
     ["Deno", "deno run --config deno.json '<rootbs>\\skills\\launch.mdx'"],
   ] as const) {

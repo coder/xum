@@ -1778,9 +1778,14 @@ const GIT_INCLUDE_PATH_CONFIG_KEY = /^include(?:if\..+)?\.path$/i;
  */
 const AUTO_PUBLISHED_RECURSIVE_FILE = /\.(?:md|mdx|markdown|txt)$/i;
 
-/** Lowercased forward-slash spelling without trailing separators, for prefix compares. */
-function normalizeRootPrefix(root: string): string {
-  return root.replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
+/**
+ * Lowercased forward-slash spelling with redundant separators and dot segments
+ * collapsed lexically (`//`, `/./`, `a/../`), without trailing separators, for prefix
+ * compares. Lexical `..` collapse can differ from the filesystem across symlinks,
+ * which can only localize a spelling that resolves elsewhere, failing closed.
+ */
+function normalizeComparablePath(value: string): string {
+  return path.posix.normalize(value.replaceAll("\\", "/")).replace(/\/+$/, "").toLowerCase();
 }
 
 /**
@@ -1793,7 +1798,7 @@ function normalizeRootPrefix(root: string): string {
  */
 function collectedDocumentRootPrefixes(muxRoot: string): string[] {
   const absolute = new Set<string>();
-  const root = normalizeRootPrefix(muxRoot);
+  const root = normalizeComparablePath(muxRoot);
   if (root !== "") {
     absolute.add(root);
     const basename = root.slice(root.lastIndexOf("/") + 1);
@@ -1805,7 +1810,7 @@ function collectedDocumentRootPrefixes(muxRoot: string): string[] {
     if (renamed !== null) absolute.add(root.slice(0, root.length - basename.length) + renamed);
   }
   const prefixes = new Set<string>(absolute);
-  const home = normalizeRootPrefix(os.homedir());
+  const home = normalizeComparablePath(os.homedir());
   if (home !== "") {
     for (const candidate of absolute) {
       if (candidate.startsWith(`${home}/`)) prefixes.add(`~${candidate.slice(home.length)}`);
@@ -1822,7 +1827,7 @@ function collectedDocumentRootPrefixes(muxRoot: string): string[] {
  * only remove a portable launcher on a fresh-device restore.
  */
 function isAutoPublishedScriptOperand(unquoted: string, rootPrefixes: readonly string[]): boolean {
-  const normalized = unquoted.replaceAll("\\", "/").toLowerCase();
+  const normalized = normalizeComparablePath(unquoted);
   for (const prefix of rootPrefixes) {
     if (!normalized.startsWith(`${prefix}/`)) continue;
     const relative = normalized.slice(prefix.length + 1);
@@ -2259,6 +2264,7 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
   let pendingGitIncludePathValue = false;
   let pendingDenoSubcommand = false;
   let pendingDenoRunScript = false;
+  let pendingDenoRunAmbiguous = false;
   let pendingJavaOptions = false;
   let pendingJavaSourceVersion = false;
   let pendingJavaSourceFile = false;
@@ -2285,6 +2291,9 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
     // characters, a live backtick localizes upstream as a carrier and a write
     // redirection localizes on its own, so only `<` still needs position handling.
     if (/[;&|()\n]/.test(gap)) {
+      // A control operator starts a new command, so no parser state from the
+      // previous one applies: retained interpreter tracking would read the next
+      // command's ordinary options as evaluation (`python3 --version && mcp -c x`).
       commandPosition = true;
       envCommandExpected = false;
       carrierArmed = false;
@@ -2294,6 +2303,28 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
       pendingBodyName = null;
       sawEnv = false;
       pendingEnvOptionValue = false;
+      envOperandsOnly = false;
+      pendingPrintfVariableOption = false;
+      pendingNpmSubcommand = false;
+      pendingNpmExecOptions = false;
+      pendingGitSubcommand = false;
+      pendingGitOptionValue = false;
+      pendingGitSubmoduleAction = false;
+      pendingGitRebaseOptions = false;
+      pendingGitConfigKey = false;
+      pendingGitConfigOptionValue = false;
+      pendingGitAliasValue = false;
+      pendingGitCommandValue = false;
+      pendingGitFsmonitorValue = false;
+      pendingGitIncludePathValue = false;
+      pendingDenoSubcommand = false;
+      pendingDenoRunScript = false;
+      pendingDenoRunAmbiguous = false;
+      pendingJavaOptions = false;
+      pendingJavaSourceVersion = false;
+      pendingJavaSourceFile = false;
+      pendingJavaOptionValue = false;
+      clearInterpreterTracking();
     }
     // The word after `<` is a read redirection's filename, never a command or an
     // operand; the command word can still follow it (`< input sh -c x`). A published
@@ -2477,7 +2508,19 @@ function hasDisguisedAssignment(redacted: string, rootPrefixes: readonly string[
       // Anything else can be a separated value for a global config option
       // (`--prefix /tmp`), so tracking stays armed until a known subcommand.
     }
-    if (pendingDenoRunScript && isAutoPublishedScriptOperand(unquoted, rootPrefixes)) return true;
+    if (pendingDenoRunScript) {
+      if (isAutoPublishedScriptOperand(unquoted, rootPrefixes)) return true;
+      if (unquoted.startsWith("-")) {
+        // The option may take a separate value this scan cannot pair, so from here
+        // a non-option word no longer proves the entrypoint; tracking stays armed,
+        // failing closed like the interpreter boundary below.
+        pendingDenoRunAmbiguous = true;
+      } else if (!pendingDenoRunAmbiguous) {
+        // The entrypoint ends tracking: later words are that program's arguments,
+        // and a published path among them is data, not something deno executes.
+        pendingDenoRunScript = false;
+      }
+    }
     if (pendingJavaOptionValue) {
       pendingJavaOptionValue = false;
     } else if (pendingJavaSourceVersion) {
