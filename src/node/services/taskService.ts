@@ -118,7 +118,7 @@ import {
 import type { ProjectRef, WorkspaceMetadata } from "@/common/types/workspace";
 import { getRuntimeType } from "@/node/runtime/initHook";
 import { AgentIdSchema } from "@/common/orpc/schemas";
-import { ToolPolicySchema } from "@/common/orpc/schemas/stream";
+import { SendMessageOptionsSchema, ToolPolicySchema } from "@/common/orpc/schemas/stream";
 import type { AgentDefinitionScope } from "@/common/types/agentDefinition";
 import {
   normalizeAgentId,
@@ -7926,13 +7926,13 @@ export class TaskService {
   private async resolveTerminalWakeCallerSendRestrictions(ownerWorkspaceId: string): Promise<{
     toolPolicy?: ToolPolicy;
     disableWorkspaceAgents?: boolean;
-    strictAgentResolution?: boolean;
+    strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
   }> {
     const state: {
       found: {
         toolPolicy?: ToolPolicy;
         disableWorkspaceAgents?: boolean;
-        strictAgentResolution?: boolean;
+        strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
       } | null;
     } = { found: null };
     const historyResult = await this.historyService.iterateFullHistory(
@@ -7947,8 +7947,22 @@ export class TaskService {
           // The strict-agent pin lives in the row's retry snapshot: an explicit agent override
           // must stay loud on the wake too, or a vanished/corrupted definition would silently
           // recompose the send from the exec fallback (same rule as startup retry and
-          // compaction follow-ups).
-          const strictAgentResolution = metadata?.retrySendOptions?.strictAgentResolution === true;
+          // compaction follow-ups). Forwarded verbatim per the field's design note: the object
+          // form pins the validated definition's scope/source/chain provenance, not just
+          // loudness. Schema-validated like toolPolicy below, since it crosses the same
+          // persisted-row boundary; invalid shapes are dropped.
+          const rawStrictPin = metadata?.retrySendOptions?.strictAgentResolution;
+          const parsedStrictPin =
+            rawStrictPin != null && rawStrictPin !== false
+              ? SendMessageOptionsSchema.shape.strictAgentResolution.safeParse(rawStrictPin)
+              : null;
+          if (parsedStrictPin != null && !parsedStrictPin.success) {
+            log.warn("Ignoring malformed persisted strictAgentResolution on terminal wake", {
+              ownerWorkspaceId,
+              messageId: message.id,
+            });
+          }
+          const strictAgentResolution = parsedStrictPin?.success ? parsedStrictPin.data : undefined;
           if (metadata?.toolPolicy != null || metadata?.disableWorkspaceAgents != null) {
             // Persisted rows are untrusted disk state: a malformed toolPolicy would throw deep
             // inside send resolution and leave the wake permanently blocked on the same corrupt
@@ -7967,12 +7981,12 @@ export class TaskService {
               ...(typeof metadata.disableWorkspaceAgents === "boolean"
                 ? { disableWorkspaceAgents: metadata.disableWorkspaceAgents }
                 : {}),
-              ...(strictAgentResolution ? { strictAgentResolution: true } : {}),
+              ...(strictAgentResolution != null ? { strictAgentResolution } : {}),
             };
             return false;
           }
           if (metadata?.synthetic !== true) {
-            state.found = strictAgentResolution ? { strictAgentResolution: true } : {};
+            state.found = strictAgentResolution != null ? { strictAgentResolution } : {};
             return false;
           }
         }
@@ -8437,7 +8451,7 @@ export class TaskService {
     let wakeRestrictions: {
       toolPolicy?: ToolPolicy;
       disableWorkspaceAgents?: boolean;
-      strictAgentResolution?: boolean;
+      strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
     };
     try {
       wakeRestrictions = await this.resolveTerminalWakeCallerSendRestrictions(ownerWorkspaceId);
@@ -8458,7 +8472,9 @@ export class TaskService {
       reasoningMode: resumeOptions.reasoningMode,
       ...(wakeRestrictions.toolPolicy != null ? { toolPolicy: wakeRestrictions.toolPolicy } : {}),
       ...(wakeRestrictions.disableWorkspaceAgents === true ? { disableWorkspaceAgents: true } : {}),
-      ...(wakeRestrictions.strictAgentResolution === true ? { strictAgentResolution: true } : {}),
+      ...(wakeRestrictions.strictAgentResolution != null
+        ? { strictAgentResolution: wakeRestrictions.strictAgentResolution }
+        : {}),
       ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     };
     if (prompt.length === 0) {

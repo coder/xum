@@ -6470,7 +6470,11 @@ describe("TaskService", () => {
         timestamp: 1_000,
         toolPolicy: restrictedPolicy,
         disableWorkspaceAgents: true,
-        retrySendOptions: { model: "openai:gpt-4o", agentId: "exec", strictAgentResolution: true },
+        retrySendOptions: {
+          model: "openai:gpt-4o",
+          agentId: "exec",
+          strictAgentResolution: { expectedScope: "project", expectedSource: "/repo/.xum/agents" },
+        },
       })
     );
     await historyService.appendToHistory(
@@ -6494,7 +6498,7 @@ describe("TaskService", () => {
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage.mock.calls[0]?.[2] as Record<string, unknown>).toMatchObject({
       agentId: "plan",
-      strictAgentResolution: true,
+      strictAgentResolution: { expectedScope: "project", expectedSource: "/repo/.xum/agents" },
       toolPolicy: restrictedPolicy,
       disableWorkspaceAgents: true,
     });
