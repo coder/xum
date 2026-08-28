@@ -16,6 +16,7 @@ import { registerNoopContinuationBridgeForTest } from "./testDispatchHelpers";
 import { Ok } from "@/common/types/result";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { GoalRecordV1 } from "@/common/types/goal";
+import type { TurnStreamHandle } from "./streamManager";
 
 const PROJECT_PATH = "/tmp/mux-agent-session-budget-gate-test-project";
 const PRICED_OPTIONS: SendMessageOptions = { model: "openai:gpt-4o-mini", agentId: "exec" };
@@ -23,6 +24,14 @@ const UNPRICED_OPTIONS: SendMessageOptions = {
   model: "openai:not-priced-model",
   agentId: "exec",
 };
+
+function createStartedTurnHandle(): TurnStreamHandle {
+  return {
+    streamToken: "test-stream-token",
+    messageId: "test-assistant",
+    completion: new Promise(() => undefined),
+  };
+}
 
 interface SessionHarness {
   historyService: HistoryService;
@@ -48,7 +57,7 @@ function createAiService(workspaceId: string): AIService {
   return Object.assign(aiEmitter, {
     isStreaming: mock((_workspaceId: string) => false),
     stopStream: mock((_workspaceId: string) => Promise.resolve(Ok(undefined))),
-    streamMessage: mock((_request: unknown) => Promise.resolve(Ok(undefined))),
+    streamMessage: mock((_request: unknown) => Promise.resolve(Ok(createStartedTurnHandle()))),
     getStreamInfo: mock((_workspaceId: string) => null),
     getProvidersConfig: mock(() => null),
     getWorkspaceMetadata: mock((_workspaceId: string) =>

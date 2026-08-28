@@ -12,6 +12,15 @@ import type { AIService, StreamMessageOptions } from "./aiService";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
 import type { InitStateManager } from "./initStateManager";
 import { createTestHistoryService } from "./testHistoryService";
+import type { TurnStreamHandle } from "./streamManager";
+
+function createStartedTurnHandle(): TurnStreamHandle {
+  return {
+    streamToken: "test-stream-token",
+    messageId: "test-assistant",
+    completion: new Promise(() => undefined),
+  };
+}
 
 /**
  * Log purity: externally-edited files must produce a durable <system-file-update>
@@ -47,7 +56,7 @@ describe("AgentSession file-change notification (turn start)", () => {
     const capturedRequests: MuxMessage[][] = [];
     const streamMessage = mock((opts: StreamMessageOptions) => {
       capturedRequests.push(opts.messages);
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle()));
     });
     const aiService: AIService = {
       on: mock(() => aiService),
