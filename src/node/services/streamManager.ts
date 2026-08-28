@@ -236,70 +236,50 @@ export function createTurnCompletionController(): TurnCompletionController {
   };
 }
 
-export interface TurnExecutionOptions {
-  workspaceId: string;
-  messages: ModelMessage[];
+// Request-construction options shared by the primary turn and model-fallback
+// hops (fallbacks rebuild these from the prepared fallback request).
+interface StreamRequestOptions {
   model: LanguageModel;
   modelString: string;
-  historySequence: number;
+  messages: ModelMessage[];
   system: string;
-  runtime: Runtime;
-  messageId: string;
-  abortSignal?: AbortSignal;
   tools?: Record<string, Tool>;
-  initialMetadata?: Partial<MuxMetadata>;
   providerOptions?: Record<string, unknown>;
   maxOutputTokens?: number;
+  callSettingsOverrides?: ResolvedCallSettingsOverrides;
   toolPolicy?: ToolPolicy;
-  providedStreamToken?: StreamToken;
   hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
-  workspaceName?: string;
-  thinkingLevel?: string;
   headers?: Record<string, string | undefined>;
   anthropicCacheTtlOverride?: AnthropicCacheTtl;
-  callSettingsOverrides?: ResolvedCallSettingsOverrides;
   onChunk?: StreamTextOnChunk;
   onStepMessages?: (messages: ModelMessage[]) => void;
-  providedRuntimeTempDir?: string;
-  modelFallback?: ModelFallbackOptions;
   toolSearchState?: ToolSearchStreamState;
   thinkingOverrideState?: ActiveTurnThinkingOverride;
   rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
   forcedFirstStepToolNames?: string[];
   providersConfigSnapshot?: ProvidersConfigMap;
-  onStreamConstructed?: () => Promise<void>;
   rebuildFirstStepForThinkingLevel?: RebuildFirstStepForThinkingLevel;
 }
 
-// Request-construction inputs shared by the primary turn (sourced from
-// TurnExecutionOptions) and model-fallback hops (sourced from the prepared
-// fallback). routeProvider is the backend-resolved route
-// (initialMetadata.routeProvider for the primary request,
-// initialMetadataPatch.routeProvider for fallbacks); missing route metadata
-// fails closed for OpenAI explicit prompt caching.
-type StreamRequestInput = Pick<
-  TurnExecutionOptions,
-  | "model"
-  | "modelString"
-  | "messages"
-  | "system"
-  | "tools"
-  | "providerOptions"
-  | "maxOutputTokens"
-  | "callSettingsOverrides"
-  | "toolPolicy"
-  | "hasQueuedMessages"
-  | "headers"
-  | "anthropicCacheTtlOverride"
-  | "onChunk"
-  | "onStepMessages"
-  | "toolSearchState"
-  | "thinkingOverrideState"
-  | "rebuildProviderOptionsForThinkingLevel"
-  | "forcedFirstStepToolNames"
-  | "providersConfigSnapshot"
-  | "rebuildFirstStepForThinkingLevel"
-> & {
+export interface TurnExecutionOptions extends StreamRequestOptions {
+  workspaceId: string;
+  historySequence: number;
+  runtime: Runtime;
+  messageId: string;
+  abortSignal?: AbortSignal;
+  initialMetadata?: Partial<MuxMetadata>;
+  providedStreamToken?: StreamToken;
+  workspaceName?: string;
+  thinkingLevel?: string;
+  providedRuntimeTempDir?: string;
+  modelFallback?: ModelFallbackOptions;
+  onStreamConstructed?: () => Promise<void>;
+}
+
+// routeProvider is the backend-resolved route (initialMetadata.routeProvider
+// for the primary request, initialMetadataPatch.routeProvider for fallbacks);
+// missing route metadata fails closed for OpenAI explicit prompt caching.
+type StreamRequestInput = StreamRequestOptions & {
   routeProvider?: string;
   onToolExecutionStart?: (toolCallId: string) => void;
 };
@@ -4522,6 +4502,10 @@ export class StreamManager {
     } = options;
     const completionController = createTurnCompletionController();
     const handle: TurnStreamHandle = { messageId, completion: completionController.promise };
+    const settleStartupAbort = (): Result<TurnStreamHandle, SendMessageError> => {
+      completionController.settle({ status: "aborted", abortReason: "startup" });
+      return Ok(handle);
+    };
 
     const typedWorkspaceId = workspaceId as WorkspaceId;
 
@@ -4565,8 +4549,7 @@ export class StreamManager {
         // If the stream was interrupted while we were waiting on async setup (mutex,
         // temp dir creation, etc), avoid starting the stream entirely.
         if (streamAbortController.signal.aborted) {
-          completionController.settle({ status: "aborted", abortReason: "startup" });
-          return Ok(handle);
+          return settleStartupAbort();
         }
 
         // Step 3: Create temp directory for this stream using runtime.
@@ -4576,8 +4559,7 @@ export class StreamManager {
           providedRuntimeTempDir ?? (await this.createTempDirForStream(streamToken, runtime));
 
         if (streamAbortController.signal.aborted) {
-          completionController.settle({ status: "aborted", abortReason: "startup" });
-          return Ok(handle);
+          return settleStartupAbort();
         }
 
         // Step 4: Atomic stream creation and registration
@@ -4595,8 +4577,7 @@ export class StreamManager {
         // In that case, immediately drop the registered stream and rely on the caller to handle UI.
         if (streamAbortController.signal.aborted) {
           this.workspaceStreams.delete(typedWorkspaceId);
-          completionController.settle({ status: "aborted", abortReason: "startup" });
-          return Ok(handle);
+          return settleStartupAbort();
         }
 
         streamInfo.unlinkAbortSignal = unlinkAbortSignal;
@@ -4621,8 +4602,7 @@ export class StreamManager {
             this.workspaceStreams.delete(typedWorkspaceId);
           }
           streamRegistered = false;
-          completionController.settle({ status: "aborted", abortReason: "startup" });
-          return Ok(handle);
+          return settleStartupAbort();
         }
 
         // Step 5: Track the processing promise for guaranteed cleanup
