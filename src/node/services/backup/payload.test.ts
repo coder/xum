@@ -1959,6 +1959,8 @@ describe("backup payload", () => {
         ["launch.txt --serve", REDACTED_BACKUP_VALUE],
         ["ruby -S launch.txt", REDACTED_BACKUP_VALUE],
         ["rubyw -S launch.txt", REDACTED_BACKUP_VALUE],
+        ["perl -S launch.txt", REDACTED_BACKUP_VALUE],
+        ["wperl -S launch.txt", REDACTED_BACKUP_VALUE],
         // A name that does not resolve to a published document stays portable.
         ["mcp-server --transport stdio", "mcp-server --transport stdio"],
       ] as const) {
@@ -2539,6 +2541,9 @@ describe("backup payload", () => {
 
   it("localizes direct java boot-class-path archives", async () => {
     for (const [command, expected] of [
+      [`java -javaagent:${muxRoot}/skills/launch.txt Main`, REDACTED_BACKUP_VALUE],
+      [`java -agentpath:${muxRoot}/skills/launch.txt=trace Main`, REDACTED_BACKUP_VALUE],
+      ["java -javaagent:/opt/agent.jar Main", "java -javaagent:/opt/agent.jar Main"],
       [`java -Xbootclasspath/a:${muxRoot}/skills/launch.txt Leak`, REDACTED_BACKUP_VALUE],
       [`java -Xbootclasspath:${muxRoot}/skills/launch.txt Leak`, REDACTED_BACKUP_VALUE],
       // A foreign archive is not a collected document.
@@ -2570,6 +2575,9 @@ describe("backup payload", () => {
       // -cmd hands its operand to SQLite's own parse before stdin.
       ["sqlite3 -cmd .dump :memory:", REDACTED_BACKUP_VALUE],
       ["sqlite3 --cmd .dump :memory:", REDACTED_BACKUP_VALUE],
+      // The second positional operand is SQL that SQLite evaluates.
+      [`sqlite3 :memory: ".read ${muxRoot}/skills/launch.txt"`, REDACTED_BACKUP_VALUE],
+      ["sqlite3 :memory: .dump", REDACTED_BACKUP_VALUE],
       // Both dash spellings of -init name the startup file.
       [`sqlite3 --init ${muxRoot}/skills/launch.txt :memory:`, REDACTED_BACKUP_VALUE],
       ["sqlite3 --init /opt/init.sql :memory:", "sqlite3 --init /opt/init.sql :memory:"],
@@ -2742,6 +2750,150 @@ describe("backup payload", () => {
         if (original === undefined) delete process.env[name];
         else process.env[name] = original;
       }
+    }
+  });
+
+  it("localizes direct dynamic-loader preload and audit operands", async () => {
+    for (const [command, expected] of [
+      [`/usr/bin/ld.so --preload ${muxRoot}/skills/launch.txt /bin/true`, REDACTED_BACKUP_VALUE],
+      [
+        `/lib64/ld-linux-x86-64.so.2 --audit=${muxRoot}/skills/launch.txt /bin/true`,
+        REDACTED_BACKUP_VALUE,
+      ],
+      [
+        `ld.so --library-path ${muxRoot}/skills --preload launch.txt /bin/true`,
+        REDACTED_BACKUP_VALUE,
+      ],
+      [
+        "/usr/bin/ld.so --preload /opt/lib/probe.so /bin/true",
+        "/usr/bin/ld.so --preload /opt/lib/probe.so /bin/true",
+      ],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes Clang forwarded plugin loads", async () => {
+    for (const [command, expected] of [
+      [`clang -Xclang -load -Xclang ${muxRoot}/skills/launch.txt source.c`, REDACTED_BACKUP_VALUE],
+      [
+        `x86_64-linux-gnu-clang++-18 -Xclang -load -Xclang ${muxRoot}/skills/launch.txt source.cc`,
+        REDACTED_BACKUP_VALUE,
+      ],
+      [
+        "clang -Xclang -load -Xclang /opt/plugin.so source.c",
+        "clang -Xclang -load -Xclang /opt/plugin.so source.c",
+      ],
+      ["clang source.c", "clang source.c"],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes CMake under an inherited published toolchain file", async () => {
+    const originalToolchain = process.env.CMAKE_TOOLCHAIN_FILE;
+    try {
+      for (const [toolchain, command, expected] of [
+        [`${muxRoot}/skills/launch.txt`, "cmake -S /opt/project -B build", REDACTED_BACKUP_VALUE],
+        [
+          "/opt/toolchain.cmake",
+          "cmake -S /opt/project -B build",
+          "cmake -S /opt/project -B build",
+        ],
+        [
+          `${muxRoot}/skills/launch.txt`,
+          "mcp-server --transport stdio",
+          "mcp-server --transport stdio",
+        ],
+      ] as const) {
+        process.env.CMAKE_TOOLCHAIN_FILE = toolchain;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalToolchain === undefined) delete process.env.CMAKE_TOOLCHAIN_FILE;
+      else process.env.CMAKE_TOOLCHAIN_FILE = originalToolchain;
+    }
+  });
+
+  it("localizes GNU Make under inherited published MAKEFILES", async () => {
+    const originalMakefiles = process.env.MAKEFILES;
+    try {
+      for (const [makefiles, command, expected] of [
+        [`${muxRoot}/skills/launch.txt`, "make -C /opt/project", REDACTED_BACKUP_VALUE],
+        [
+          `/opt/base.mk ${muxRoot}/skills/launch.txt`,
+          "gmake -C /opt/project",
+          REDACTED_BACKUP_VALUE,
+        ],
+        ["/opt/base.mk", "make -C /opt/project", "make -C /opt/project"],
+        [
+          `${muxRoot}/skills/launch.txt`,
+          "mcp-server --transport stdio",
+          "mcp-server --transport stdio",
+        ],
+      ] as const) {
+        process.env.MAKEFILES = makefiles;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      if (originalMakefiles === undefined) delete process.env.MAKEFILES;
+      else process.env.MAKEFILES = originalMakefiles;
     }
   });
 
@@ -2965,6 +3117,36 @@ describe("backup payload", () => {
     } finally {
       if (originalConf === undefined) delete process.env.OPENSSL_CONF;
       else process.env.OPENSSL_CONF = originalConf;
+    }
+  });
+
+  it("localizes Git remote helper program operands", async () => {
+    for (const [command, expected] of [
+      [`git fetch --upload-pack ${muxRoot}/skills/launch.txt origin`, REDACTED_BACKUP_VALUE],
+      [`git clone --upload-pack=${muxRoot}/skills/launch.txt repo`, REDACTED_BACKUP_VALUE],
+      [`git clone -u ${muxRoot}/skills/launch.txt repo`, REDACTED_BACKUP_VALUE],
+      [`git push --receive-pack ${muxRoot}/skills/launch.txt origin`, REDACTED_BACKUP_VALUE],
+      [`git push --exec=${muxRoot}/skills/launch.txt origin`, REDACTED_BACKUP_VALUE],
+      [
+        "git fetch --upload-pack /usr/bin/git-upload-pack origin",
+        "git fetch --upload-pack /usr/bin/git-upload-pack origin",
+      ],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
     }
   });
 

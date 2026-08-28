@@ -2325,6 +2325,7 @@ const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   {
     name: /^w?perl[0-9.]*$/,
     evalWord: /^-(?:(?:0(?:x[0-9A-Fa-f]+|[0-7]*))|l[0-7]*|[acfnpsStTuUvVwWX])*[eE]/,
+    pathScriptFileOption: /^-S$/,
     debuggerOption: /^-d(?:$|[:t])/,
   },
   {
@@ -2426,6 +2427,8 @@ function hasDisguisedAssignment(
   let pendingMiseExecOptions = false;
   let pendingGitSubcommand = false;
   let pendingGitOptionValue = false;
+  let pendingGitRemoteProgramOptions: "fetch" | "clone" | "push" | null = null;
+  let pendingGitRemoteProgramValue = false;
   let pendingGitConfigOverrideValue = false;
   let pendingGitConfigEnvValue = false;
   let pendingGitSubmoduleAction = false;
@@ -2441,6 +2444,15 @@ function hasDisguisedAssignment(
   let pendingDenoRunAmbiguous = false;
   let pendingSqliteOptions = false;
   let pendingSqliteInitFile = false;
+  let sqliteDatabaseSeen = false;
+  let pendingLoaderOptions = false;
+  let pendingLoaderPreloadValue = false;
+  let pendingLoaderLibraryPathValue = false;
+  let loaderSearchDirs: string[] = [];
+  let pendingClangOptions = false;
+  let pendingClangForwardedOption = false;
+  let pendingClangPluginMarker = false;
+  let pendingClangPluginOperand = false;
   let pendingOpensslOptions = false;
   let pendingOpensslConfigFile = false;
   let pendingLldbOptions = false;
@@ -2540,6 +2552,8 @@ function hasDisguisedAssignment(
       pendingMiseExecOptions = false;
       pendingGitSubcommand = false;
       pendingGitOptionValue = false;
+      pendingGitRemoteProgramOptions = null;
+      pendingGitRemoteProgramValue = false;
       pendingGitConfigOverrideValue = false;
       pendingGitConfigEnvValue = false;
       pendingGitSubmoduleAction = false;
@@ -2555,6 +2569,15 @@ function hasDisguisedAssignment(
       pendingDenoRunAmbiguous = false;
       pendingSqliteOptions = false;
       pendingSqliteInitFile = false;
+      sqliteDatabaseSeen = false;
+      pendingLoaderOptions = false;
+      pendingLoaderPreloadValue = false;
+      pendingLoaderLibraryPathValue = false;
+      loaderSearchDirs = [];
+      pendingClangOptions = false;
+      pendingClangForwardedOption = false;
+      pendingClangPluginMarker = false;
+      pendingClangPluginOperand = false;
       pendingOpensslOptions = false;
       pendingOpensslConfigFile = false;
       pendingLldbOptions = false;
@@ -2807,6 +2830,21 @@ function hasDisguisedAssignment(
         }
       }
     }
+    if (pendingGitRemoteProgramValue) {
+      pendingGitRemoteProgramValue = false;
+      if (isShellResolvedPublishedOperand(unquoted)) return true;
+    } else if (pendingGitRemoteProgramOptions !== null) {
+      const names =
+        pendingGitRemoteProgramOptions === "push" ? "(?:receive-pack|exec)" : "upload-pack";
+      const attached = new RegExp(`^--${names}=(.+)$`).exec(unquoted)?.[1];
+      if (attached !== undefined && isShellResolvedPublishedOperand(attached)) return true;
+      if (
+        new RegExp(`^--${names}$`).test(unquoted) ||
+        (pendingGitRemoteProgramOptions === "clone" && unquoted === "-u")
+      ) {
+        pendingGitRemoteProgramValue = true;
+      }
+    }
     if (pendingGitSubmoduleAction) {
       if (unquoted === "foreach") return true;
       if (!unquoted.startsWith("-")) pendingGitSubmoduleAction = false;
@@ -2833,6 +2871,12 @@ function hasDisguisedAssignment(
           pendingGitSubcommand = false;
           if (unquoted === "config") {
             pendingGitConfigKey = true;
+          } else if (unquoted === "fetch" || unquoted === "pull") {
+            pendingGitRemoteProgramOptions = "fetch";
+          } else if (unquoted === "clone") {
+            pendingGitRemoteProgramOptions = "clone";
+          } else if (unquoted === "push") {
+            pendingGitRemoteProgramOptions = "push";
           } else if (unquoted === "submodule") {
             pendingGitSubmoduleAction = true;
           } else if (unquoted === "rebase") {
@@ -2899,17 +2943,59 @@ function hasDisguisedAssignment(
         pendingDenoRunScript = false;
       }
     }
+    if (pendingLoaderPreloadValue) {
+      pendingLoaderPreloadValue = false;
+      if (loaderListPublishesExecutable(unquoted, rootPrefixes, trackedCwd, loaderSearchDirs)) {
+        return true;
+      }
+      continue;
+    }
+    if (pendingLoaderLibraryPathValue) {
+      pendingLoaderLibraryPathValue = false;
+      loaderSearchDirs = unquoted
+        .split(path.delimiter)
+        .map((entry) => resolveKnownDirectory(entry, trackedCwd))
+        .filter((entry): entry is string => entry !== null);
+      continue;
+    }
+    if (pendingLoaderOptions) {
+      const preload = /^--(?:preload|audit)=(.+)$/.exec(unquoted)?.[1];
+      if (
+        preload !== undefined &&
+        loaderListPublishesExecutable(preload, rootPrefixes, trackedCwd, loaderSearchDirs)
+      ) {
+        return true;
+      }
+      const libraryPath = /^--library-path=(.+)$/.exec(unquoted)?.[1];
+      if (libraryPath !== undefined) {
+        loaderSearchDirs = libraryPath
+          .split(path.delimiter)
+          .map((entry) => resolveKnownDirectory(entry, trackedCwd))
+          .filter((entry): entry is string => entry !== null);
+      } else if (/^--(?:preload|audit)$/.test(unquoted)) {
+        pendingLoaderPreloadValue = true;
+      } else if (unquoted === "--library-path") {
+        pendingLoaderLibraryPathValue = true;
+      } else if (!unquoted.startsWith("-")) {
+        pendingLoaderOptions = false;
+      }
+    }
     if (pendingSqliteInitFile) {
       pendingSqliteInitFile = false;
       if (isShellResolvedPublishedOperand(unquoted)) return true;
+      continue;
     } else if (pendingSqliteOptions && /^--?init$/.test(unquoted)) {
       // SQLite accepts every option with one or two leading dashes.
       pendingSqliteInitFile = true;
+      continue;
     } else if (pendingSqliteOptions && /^--?cmd$/.test(unquoted)) {
       // -cmd runs its operand through SQLite's own parse before stdin, an
       // evaluation channel this scan cannot follow (.shell and dot-command
       // quoting), so it localizes like other eval words.
       return true;
+    } else if (pendingSqliteOptions && !unquoted.startsWith("-")) {
+      if (sqliteDatabaseSeen) return true;
+      sqliteDatabaseSeen = true;
     }
     if (pendingOpensslConfigFile) {
       pendingOpensslConfigFile = false;
@@ -2918,6 +3004,27 @@ function hasDisguisedAssignment(
       if (isShellResolvedPublishedOperand(unquoted)) return true;
     } else if (pendingOpensslOptions && /^--?config$/.test(unquoted)) {
       pendingOpensslConfigFile = true;
+    }
+    if (pendingClangPluginOperand) {
+      pendingClangPluginOperand = false;
+      if (isShellResolvedPublishedOperand(unquoted)) return true;
+      continue;
+    }
+    if (pendingClangPluginMarker) {
+      pendingClangPluginMarker = false;
+      if (unquoted === "-Xclang") {
+        pendingClangPluginOperand = true;
+        continue;
+      }
+    }
+    if (pendingClangForwardedOption) {
+      pendingClangForwardedOption = false;
+      if (unquoted === "-load") pendingClangPluginMarker = true;
+      continue;
+    }
+    if (pendingClangOptions && unquoted === "-Xclang") {
+      pendingClangForwardedOption = true;
+      continue;
     }
     if (pendingGdbCommandFile) {
       pendingGdbCommandFile = false;
@@ -2993,6 +3100,9 @@ function hasDisguisedAssignment(
         ) {
           return true;
         }
+      } else if (/^-(?:javaagent|agentpath):/.test(unquoted)) {
+        const agent = /^-(?:javaagent|agentpath):([^=]+)/.exec(unquoted)?.[1];
+        if (agent !== undefined && isShellResolvedPublishedOperand(agent)) return true;
       } else if (/^-Xbootclasspath(?:\/[ap])?:/.test(unquoted)) {
         // Boot-class-path entries execute like the class path: they load ahead
         // of the application regardless of filename extension.
@@ -3136,6 +3246,10 @@ function hasDisguisedAssignment(
       if (inherited.loaderPreloadHook) return true;
       if (inherited.gitConfigHook && executable === "git") return true;
       if (inherited.opensslConfigHook && executable === "openssl") return true;
+      if (inherited.cmakeToolchainHook && executable === "cmake") return true;
+      if (inherited.makefilesHook && /^(?:g?make|mingw(?:32|64)-make)$/.test(executable)) {
+        return true;
+      }
       if (executable === "env") sawEnv = true;
       if (executable === "npm") pendingNpmSubcommand = true;
       if (executable === "uv") pendingUvSubcommand = true;
@@ -3144,6 +3258,10 @@ function hasDisguisedAssignment(
       if (executable === "deno") pendingDenoSubcommand = true;
       if (/^sqlite3[0-9.]*$/.test(executable)) pendingSqliteOptions = true;
       if (executable === "openssl") pendingOpensslOptions = true;
+      if (/^(?:ld\.so|ld-(?:linux|musl)[^/]*\.so)(?:\.[0-9]+)*$/.test(executable)) {
+        pendingLoaderOptions = true;
+      }
+      if (/^(?:.*-)?clang(?:\+\+)?(?:-[0-9.]+)?$/.test(executable)) pendingClangOptions = true;
       if (/^lldb(?:-[0-9.]+)?$/.test(executable)) pendingLldbOptions = true;
       if (/^(?:.*-)?gdb(?:-multiarch)?(?:-[0-9.]+)?$/.test(executable)) pendingGdbOptions = true;
       if (/^ninja(?:-build)?$/.test(executable)) pendingNinjaOptions = true;
@@ -3655,6 +3773,10 @@ interface InheritedLaunchContext {
   opensslConfigHook: boolean;
   /** A non-empty PERL5DB program runs when Perl's debugger is enabled. */
   perlDebuggerHook: boolean;
+  /** CMAKE_TOOLCHAIN_FILE names an auto-published toolchain script. */
+  cmakeToolchainHook: boolean;
+  /** MAKEFILES includes an auto-published makefile before the normal inputs. */
+  makefilesHook: boolean;
 }
 
 /** Whether inherited NODE_OPTIONS asks Node to execute a preload/import module. */
@@ -3720,6 +3842,27 @@ function hasInheritedLuaStartupFile(rootPrefixes: readonly string[]): boolean {
     if (typeof value !== "string" || !value.startsWith("@")) continue;
     if (isAutoPublishedScriptOperand(canonicalizeInheritedPath(value.slice(1)), rootPrefixes)) {
       return true;
+    }
+  }
+  return false;
+}
+
+function loaderListPublishesExecutable(
+  value: string,
+  rootPrefixes: readonly string[],
+  currentDirectory: string | null,
+  searchDirs: readonly string[]
+): boolean {
+  for (const entry of value.split(/[:\s]+/)) {
+    if (entry === "") continue;
+    if (/[/\\]/.test(entry)) {
+      if (isAutoPublishedScriptOperand(entry, rootPrefixes)) return true;
+      const resolved = resolveKnownDirectory(entry, currentDirectory);
+      if (resolved !== null && isAutoPublishedScriptOperand(resolved, rootPrefixes)) return true;
+    } else {
+      for (const directory of searchDirs) {
+        if (isAutoPublishedScriptOperand(`${directory}/${entry}`, rootPrefixes)) return true;
+      }
     }
   }
   return false;
@@ -3888,6 +4031,15 @@ function redactMcpConfig(
       rootPrefixes
     ),
     perlDebuggerHook: (process.env.PERL5DB ?? "").trim() !== "",
+    cmakeToolchainHook: isAutoPublishedScriptOperand(
+      canonicalizeInheritedPath(process.env.CMAKE_TOOLCHAIN_FILE ?? ""),
+      rootPrefixes
+    ),
+    makefilesHook: (process.env.MAKEFILES ?? "")
+      .split(/\s+/)
+      .some((entry) =>
+        isAutoPublishedScriptOperand(canonicalizeInheritedPath(entry), rootPrefixes)
+      ),
   };
   inherited.gitConfigHook ||= hasInheritedGitExecutionHook(rootPrefixes, inherited);
   const text = content.toString("utf-8");
