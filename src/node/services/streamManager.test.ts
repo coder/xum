@@ -64,7 +64,6 @@ function createTestLanguageModel(modelId = "cleanup-model"): LanguageModel {
 }
 
 // Skip integration tests if TEST_INTEGRATION is not set
-const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
 // Validate API keys before running tests
 if (shouldRunIntegrationTests()) {
@@ -1932,18 +1931,39 @@ describe("StreamManager - turn completion", () => {
     });
   }
 
+  /** Stream body that stays open until its turn abort controller fires. */
+  const hangUntilAbort = (_request: unknown, abortController: AbortController) =>
+    createStreamResultForTests(
+      (async function* () {
+        await new Promise<void>((resolve) => {
+          abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        yield* [];
+      })()
+    );
+
   async function startWithStreamResult(input: {
     workspaceId: string;
     messageId: string;
-    fullStream: AsyncGenerator<unknown, void, unknown>;
+    fullStream?: AsyncGenerator<unknown, void, unknown>;
+    createStreamResult?: (request: unknown, abortController: AbortController) => unknown;
+    sink?: (event: TurnEngineEvent) => void | Promise<void>;
     events?: TurnEngineEvent[];
   }) {
-    const streamManager = new StreamManager(historyService, undefined, undefined, (event) => {
-      input.events?.push(event);
-    });
+    const streamManager = new StreamManager(
+      historyService,
+      undefined,
+      undefined,
+      input.sink ??
+        ((event) => {
+          input.events?.push(event);
+        })
+    );
     stubTokenTracker(streamManager);
-    Reflect.set(streamManager, "createStreamResult", () =>
-      createStreamResultForTests(input.fullStream)
+    Reflect.set(
+      streamManager,
+      "createStreamResult",
+      input.createStreamResult ?? (() => createStreamResultForTests(input.fullStream))
     );
     await appendPartialAssistantForTests(input.workspaceId, input.messageId, 1);
 
@@ -2044,41 +2064,15 @@ describe("StreamManager - turn completion", () => {
     const abortDelivery = new Promise<void>((resolve) => {
       releaseAbortDelivery = resolve;
     });
-    const streamManager = new StreamManager(historyService, undefined, undefined, (event) =>
-      event.type === "stream-abort" ? abortDelivery : undefined
-    );
-    stubTokenTracker(streamManager);
-    Reflect.set(
-      streamManager,
-      "createStreamResult",
-      (_request: unknown, abortController: AbortController) =>
-        createStreamResultForTests(
-          (async function* () {
-            await new Promise<void>((resolve) => {
-              abortController.signal.addEventListener("abort", () => resolve(), { once: true });
-            });
-            yield* [];
-          })()
-        )
-    );
-    await appendPartialAssistantForTests(
-      "completion-abort-workspace",
-      "completion-abort-message",
-      1
-    );
-    const result = await streamManager.startStream(
-      testStartOptions({
-        workspaceId: "completion-abort-workspace",
-        messageId: "completion-abort-message",
-        model: createTestLanguageModel(),
-        providedRuntimeTempDir: "",
-      })
-    );
-    expect(result.success).toBe(true);
-    if (!result.success) throw new Error("Expected stream to start");
+    const { streamManager, handle } = await startWithStreamResult({
+      workspaceId: "completion-abort-workspace",
+      messageId: "completion-abort-message",
+      createStreamResult: hangUntilAbort,
+      sink: (event) => (event.type === "stream-abort" ? abortDelivery : undefined),
+    });
 
     let settled = false;
-    void result.data.completion.then(() => {
+    void handle.completion.then(() => {
       settled = true;
     });
     await streamManager.stopStream("completion-abort-workspace", { abortReason: "user" });
@@ -2086,7 +2080,7 @@ describe("StreamManager - turn completion", () => {
     expect(settled).toBe(false);
 
     releaseAbortDelivery();
-    expect(await result.data.completion).toEqual({
+    expect(await handle.completion).toEqual({
       status: "aborted",
       messageId: "completion-abort-message",
       abortReason: "user",
@@ -2094,36 +2088,11 @@ describe("StreamManager - turn completion", () => {
   });
 
   test("debug-injected stream errors settle a failed completion", async () => {
-    const streamManager = new StreamManager(historyService);
-    stubTokenTracker(streamManager);
-    Reflect.set(
-      streamManager,
-      "createStreamResult",
-      (_request: unknown, abortController: AbortController) =>
-        createStreamResultForTests(
-          (async function* () {
-            await new Promise<void>((resolve) => {
-              abortController.signal.addEventListener("abort", () => resolve(), { once: true });
-            });
-            yield* [];
-          })()
-        )
-    );
-    await appendPartialAssistantForTests(
-      "completion-debug-error-workspace",
-      "completion-debug-error-message",
-      1
-    );
-    const result = await streamManager.startStream(
-      testStartOptions({
-        workspaceId: "completion-debug-error-workspace",
-        messageId: "completion-debug-error-message",
-        model: createTestLanguageModel(),
-        providedRuntimeTempDir: "",
-      })
-    );
-    expect(result.success).toBe(true);
-    if (!result.success) throw new Error("Expected stream to start");
+    const { streamManager, handle } = await startWithStreamResult({
+      workspaceId: "completion-debug-error-workspace",
+      messageId: "completion-debug-error-message",
+      createStreamResult: hangUntilAbort,
+    });
 
     const triggered = await streamManager.debugTriggerStreamError(
       "completion-debug-error-workspace",
@@ -2131,10 +2100,10 @@ describe("StreamManager - turn completion", () => {
     );
     expect(triggered).toBe(true);
 
-    const completion = await result.data.completion;
-    expect(completion.status).toBe("failed");
-    if (completion.status !== "failed") throw new Error("Expected failed completion");
-    expect(completion.streamError.error).toBe("debug injected failure");
+    expect(await handle.completion).toMatchObject({
+      status: "failed",
+      streamError: { error: "debug injected failure" },
+    });
   });
 });
 
@@ -2211,88 +2180,6 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
   beforeEach(() => {
     streamManager = new StreamManager(historyService);
     // Suppress error events from bubbling up as uncaught exceptions during tests
-  });
-
-  // Integration test - requires API key and TEST_INTEGRATION=1
-  describeIntegration("with real API", () => {
-    test("should prevent concurrent streams for the same workspace", async () => {
-      const workspaceId = "test-workspace-concurrent";
-      const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-      const model = anthropic("claude-sonnet-4-5");
-
-      // Track when streams are actively processing
-      const streamStates: Record<string, { started: boolean; finished: boolean }> = {};
-      let firstMessageId: string | undefined;
-
-      onTurnEngineEvent(
-        streamManager,
-        "stream-start",
-        (data: { messageId: string; historySequence: number }) => {
-          streamStates[data.messageId] = { started: true, finished: false };
-          if (data.historySequence === 1) {
-            firstMessageId = data.messageId;
-          }
-        }
-      );
-
-      onTurnEngineEvent(streamManager, "stream-end", (data: { messageId: string }) => {
-        if (streamStates[data.messageId]) {
-          streamStates[data.messageId].finished = true;
-        }
-      });
-
-      onTurnEngineEvent(streamManager, "stream-abort", (data: { messageId: string }) => {
-        if (streamStates[data.messageId]) {
-          streamStates[data.messageId].finished = true;
-        }
-      });
-
-      // Start first stream
-      const result1 = await streamManager.startStream({
-        workspaceId,
-        messages: [{ role: "user", content: "Say hello and nothing else" }],
-        model,
-        modelString: KNOWN_MODELS.SONNET.id,
-        historySequence: 1,
-        system: "You are a helpful assistant",
-        runtime,
-        messageId: "test-msg-1",
-        tools: {},
-      });
-
-      expect(result1.success).toBe(true);
-
-      // Wait for first stream to actually start
-      await new Promise((resolve) => setTimeout(resolve, 200));
-
-      // Start second stream - should cancel first
-      const result2 = await streamManager.startStream({
-        workspaceId,
-        messages: [{ role: "user", content: "Say goodbye and nothing else" }],
-        model,
-        modelString: KNOWN_MODELS.SONNET.id,
-        historySequence: 2,
-        system: "You are a helpful assistant",
-        runtime,
-        messageId: "test-msg-2",
-        tools: {},
-      });
-
-      expect(result2.success).toBe(true);
-
-      // Wait for second stream to complete
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-
-      // Verify: first stream should have been cancelled before second stream started
-      expect(firstMessageId).toBeDefined();
-      const trackedFirstMessageId = firstMessageId!;
-      expect(streamStates[trackedFirstMessageId]).toBeDefined();
-      expect(streamStates[trackedFirstMessageId].started).toBe(true);
-      expect(streamStates[trackedFirstMessageId].finished).toBe(true);
-
-      // Verify no streams are active after completion
-      expect(streamManager.isStreaming(workspaceId)).toBe(false);
-    }, 10000);
   });
 
   // Unit test - doesn't require API key
@@ -2467,61 +2354,26 @@ describe("StreamManager - Concurrent Stream Prevention", () => {
       tempDirStartedResolve = resolve;
     });
 
-    const replaceTempDirResult = Reflect.set(
-      streamManager,
-      "createTempDirForStream",
-      (_streamToken: string, _runtime: unknown): Promise<string> => {
-        tempDirStartedResolve?.();
-        return new Promise((resolve) => {
-          abortController.signal.addEventListener("abort", () => resolve("/tmp/mock-stream-temp"), {
-            once: true,
-          });
-        });
-      }
-    );
-
-    if (!replaceTempDirResult) {
-      throw new Error("Failed to mock StreamManager.createTempDirForStream");
-    }
-
     let cleanupCalled = false;
-    const replaceCleanupResult = Reflect.set(
-      streamManager,
-      "cleanupStreamTempDir",
-      (..._args: unknown[]): void => {
-        cleanupCalled = true;
-      }
-    );
-
-    if (!replaceCleanupResult) {
-      throw new Error("Failed to mock StreamManager.cleanupStreamTempDir");
-    }
-
-    const replaceCreateResult = Reflect.set(
-      streamManager,
-      "createStreamAtomically",
-      (..._args: unknown[]): never => {
-        createCalled = true;
-        throw new Error("createStreamAtomically should not be called");
-      }
-    );
-
-    if (!replaceCreateResult) {
-      throw new Error("Failed to mock StreamManager.createStreamAtomically");
-    }
-
-    const replaceProcessResult = Reflect.set(
-      streamManager,
-      "processStreamWithCleanup",
-      (..._args: unknown[]): Promise<void> => {
-        processCalled = true;
-        return Promise.resolve();
-      }
-    );
-
-    if (!replaceProcessResult) {
-      throw new Error("Failed to mock StreamManager.processStreamWithCleanup");
-    }
+    Reflect.set(streamManager, "createTempDirForStream", (): Promise<string> => {
+      tempDirStartedResolve?.();
+      return new Promise((resolve) => {
+        abortController.signal.addEventListener("abort", () => resolve("/tmp/mock-stream-temp"), {
+          once: true,
+        });
+      });
+    });
+    Reflect.set(streamManager, "cleanupStreamTempDir", (): void => {
+      cleanupCalled = true;
+    });
+    Reflect.set(streamManager, "createStreamAtomically", (): never => {
+      createCalled = true;
+      throw new Error("createStreamAtomically should not be called");
+    });
+    Reflect.set(streamManager, "processStreamWithCleanup", (): Promise<void> => {
+      processCalled = true;
+      return Promise.resolve();
+    });
 
     const anthropic = createAnthropic({ apiKey: "dummy-key" });
     const model = anthropic("claude-sonnet-4-5");
