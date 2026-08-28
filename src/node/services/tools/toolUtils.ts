@@ -89,10 +89,26 @@ export async function emitWorkflowRunAttachedEvent(input: {
 export async function recordBackgroundWorkflowRunReference(
   config: ToolConfiguration,
   runId: string,
-  createdAtMs: number
+  createdAtMs: number,
+  options?: {
+    /**
+     * Pre-launch records must not fail soft: the sidecar is the kernel invocation's only
+     * durable provenance, and starting the runner without it lets a fast terminal run have
+     * its wake permanently marked superseded. Throwing before dispatch leaves the run
+     * pending and resumable (workflow_resume re-records), so the caller surfaces a loud,
+     * recoverable launch failure instead. Post-dispatch records stay best-effort because the
+     * run already started and failing the tool would strand it.
+     */
+    propagateWriteFailure?: boolean;
+  }
 ): Promise<void> {
   const workspaceSessionDir = config.workspaceSessionDir;
   if (workspaceSessionDir == null || workspaceSessionDir.length === 0) {
+    if (options?.propagateWriteFailure === true) {
+      throw new Error(
+        `Cannot record workflow run provenance without a workspace session dir: ${runId}`
+      );
+    }
     log.warn("Skipping agent workflow run reference without workspace session dir", { runId });
     return;
   }
@@ -126,9 +142,22 @@ export async function recordBackgroundWorkflowRunReference(
       runId,
       createdAtMs,
       ...(afterBoundaryMessageId !== undefined ? { afterBoundaryMessageId } : {}),
-      ...(config.agentId != null && config.agentId.length > 0 ? { agentId: config.agentId } : {}),
+      ...(config.agentId != null && config.agentId.length > 0
+        ? {
+            agentId: config.agentId,
+            // The pin pairs with the identity: null records a verified-unpinned launch so the
+            // wake never inherits another row's pin (see AgentWorkflowRunReference).
+            strictAgentResolution:
+              config.strictAgentResolution != null && config.strictAgentResolution !== false
+                ? config.strictAgentResolution
+                : null,
+          }
+        : {}),
     });
   } catch (error: unknown) {
+    if (options?.propagateWriteFailure === true) {
+      throw error;
+    }
     log.warn("Failed to record agent workflow run reference", {
       runId,
       error: getErrorMessage(error),

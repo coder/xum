@@ -2,7 +2,7 @@ import { xai } from "@ai-sdk/xai";
 import { type LanguageModel, type Tool } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
-import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
 import { isGrokFrontierModel } from "@/common/types/thinking";
 import type { BackgroundWorkAttentionPolicy } from "@/common/types/backgroundWorkAttention";
 import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
@@ -186,6 +186,8 @@ export interface ToolConfiguration {
   workspaceId?: string;
   /** Resolved agent identity of the turn executing the tools (workflow wake provenance). */
   agentId?: string;
+  /** The turn's strict-agent pin, persisted with workflow run provenance so wakes re-pin the launch agent. */
+  strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
   /** Pre-resolved mux-managed resource scope (global ~/.xum vs project root). */
   xumScope?: XumToolScope;
   /** Memory service for the memory tool (present only when the memory experiment is enabled). */

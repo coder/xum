@@ -3,9 +3,17 @@ import * as path from "node:path";
 
 import writeFileAtomic from "write-file-atomic";
 
+import { SendMessageOptionsSchema } from "@/common/orpc/schemas/stream";
+import type { SendMessageOptions } from "@/common/orpc/types";
 import { AgentIdSchema } from "@/common/schemas/ids";
 import assert from "@/common/utils/assert";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+
+/** A meaningful strict-agent pin: `false` and absence both mean "not pinned" and persist as null. */
+export type AgentWorkflowRunStrictPin = Exclude<
+  NonNullable<SendMessageOptions["strictAgentResolution"]>,
+  false
+>;
 
 export interface AgentWorkflowRunReference {
   runId: string;
@@ -25,7 +33,17 @@ export interface AgentWorkflowRunReference {
    * fall back to the history walk.
    */
   agentId?: string;
+  /**
+   * The launch turn's strict-agent pin, paired with agentId: a wake that re-binds this agent
+   * must re-pin the launch turn's provenance, because the newest pin-bearing history row can
+   * belong to a different group's wake and a mismatched pin makes resolution reject every
+   * retry. null records a verified-unpinned launch; absent (legacy or invalid persisted
+   * shape) falls back to the history-walk pin.
+   */
+  strictAgentResolution?: AgentWorkflowRunStrictPin | null;
 }
+
+const StrictPinSchema = SendMessageOptionsSchema.shape.strictAgentResolution;
 
 const AGENT_WORKFLOW_RUN_REFERENCES_FILE = "agent-workflow-runs.json";
 
@@ -95,6 +113,21 @@ function parseReferences(value: unknown): AgentWorkflowRunReference[] {
     // ID would silently swap a restricted agent's wake onto exec's tool surface.
     const agentIdParse = AgentIdSchema.safeParse(record.agentId);
     const agentId = agentIdParse.success ? agentIdParse.data : undefined;
+    // The pin only means anything paired with a surviving identity; false and invalid shapes
+    // degrade differently (unpinned vs legacy walk fallback), matching the field doc above.
+    let strictAgentResolution: AgentWorkflowRunStrictPin | null | undefined;
+    if (agentId !== undefined && "strictAgentResolution" in record) {
+      const pinRaw = record.strictAgentResolution;
+      if (pinRaw === null || pinRaw === false) {
+        strictAgentResolution = null;
+      } else {
+        const pinParse = StrictPinSchema.safeParse(pinRaw);
+        strictAgentResolution =
+          pinParse.success && pinParse.data != null && pinParse.data !== false
+            ? pinParse.data
+            : undefined;
+      }
+    }
     // Collapse corrupted duplicate entries to the newest sane timestamp so order-sensitive
     // consumers cannot pick a stale duplicate and declare a legitimately re-recorded run
     // superseded. The chosen record is kept wholesale, including its boundary snapshot.
@@ -105,6 +138,7 @@ function parseReferences(value: unknown): AgentWorkflowRunReference[] {
         createdAtMs: record.createdAtMs,
         ...(afterBoundaryMessageId !== undefined ? { afterBoundaryMessageId } : {}),
         ...(agentId !== undefined ? { agentId } : {}),
+        ...(strictAgentResolution !== undefined ? { strictAgentResolution } : {}),
       });
     }
   }
@@ -155,6 +189,7 @@ export async function recordAgentWorkflowRunReference(input: {
   createdAtMs?: number;
   afterBoundaryMessageId?: string | null;
   agentId?: string;
+  strictAgentResolution?: AgentWorkflowRunStrictPin | null;
 }): Promise<void> {
   assert(input.runId.length > 0, "agent workflow reference requires runId");
   const filePath = referencesPath(input.workspaceSessionDir);
@@ -181,7 +216,14 @@ export async function recordAgentWorkflowRunReference(input: {
       ...(input.afterBoundaryMessageId !== undefined
         ? { afterBoundaryMessageId: input.afterBoundaryMessageId }
         : {}),
-      ...(input.agentId != null && input.agentId.length > 0 ? { agentId: input.agentId } : {}),
+      ...(input.agentId != null && input.agentId.length > 0
+        ? {
+            agentId: input.agentId,
+            ...(input.strictAgentResolution !== undefined
+              ? { strictAgentResolution: input.strictAgentResolution }
+              : {}),
+          }
+        : {}),
     });
 
     await fs.mkdir(path.dirname(filePath), { recursive: true });

@@ -66,12 +66,14 @@ describe("agent workflow run references", () => {
         runId: "wfr_agent",
         createdAtMs: 1_000,
         agentId: "plan",
+        strictAgentResolution: { expectedScope: "built-in" },
       });
       let references = await readAgentWorkflowRunReferences(workspaceSessionDir);
       expect(references).toContainEqual({
         runId: "wfr_agent",
         createdAtMs: 1_000,
         agentId: "plan",
+        strictAgentResolution: { expectedScope: "built-in" },
       });
 
       // Identity is advisory: a malformed persisted agentId drops the field, not the entry,
@@ -85,6 +87,20 @@ describe("agent workflow run references", () => {
             // Non-empty but schema-invalid: stream resolution would normalize it to exec,
             // silently swapping a restricted agent's wake onto exec's tool surface.
             { runId: "wfr_agent_malformed", createdAtMs: 1_000, agentId: "bad id" },
+            // Invalid pin shapes degrade to the legacy walk fallback (field dropped); a
+            // persisted false means verified-unpinned (null), like absence at record time.
+            {
+              runId: "wfr_pin_invalid",
+              createdAtMs: 1_000,
+              agentId: "plan",
+              strictAgentResolution: { expectedScope: 42 },
+            },
+            {
+              runId: "wfr_pin_false",
+              createdAtMs: 1_000,
+              agentId: "plan",
+              strictAgentResolution: false,
+            },
           ],
         })
       );
@@ -92,6 +108,17 @@ describe("agent workflow run references", () => {
       expect(references).toContainEqual({ runId: "wfr_agent_number", createdAtMs: 1_000 });
       expect(references).toContainEqual({ runId: "wfr_agent_empty", createdAtMs: 1_000 });
       expect(references).toContainEqual({ runId: "wfr_agent_malformed", createdAtMs: 1_000 });
+      expect(references).toContainEqual({
+        runId: "wfr_pin_invalid",
+        createdAtMs: 1_000,
+        agentId: "plan",
+      });
+      expect(references).toContainEqual({
+        runId: "wfr_pin_false",
+        createdAtMs: 1_000,
+        agentId: "plan",
+        strictAgentResolution: null,
+      });
     } finally {
       await fs.rm(workspaceSessionDir, { recursive: true, force: true });
     }

@@ -210,6 +210,7 @@ import {
   type TerminalAttentionOutcome,
 } from "@/node/services/terminalAttentionStore";
 import { readAgentWorkflowRunReferences } from "@/node/services/agentWorkflowRunReferences";
+import type { AgentWorkflowRunStrictPin } from "@/node/services/agentWorkflowRunReferences";
 import { isWorkflowRunTaskId } from "@/node/services/tools/taskId";
 import { normalizeWorkflowAgentReportPayloadForHostSchema } from "@/common/utils/tools/workflowReportPayload";
 import {
@@ -1049,6 +1050,13 @@ interface CompletedAgentReportCacheEntry {
 
 interface ParentAutoResumeHint {
   agentId?: string;
+}
+
+/** Launch identity recorded with a workflow run reference; see AgentWorkflowRunReference. */
+interface WorkflowWakeInitiatingAgent {
+  agentId: string;
+  createdAtMs: number;
+  strictAgentResolution?: AgentWorkflowRunStrictPin | null;
 }
 
 function isTypedWorkspaceEvent(value: unknown, type: string): boolean {
@@ -8030,11 +8038,7 @@ export class TaskService {
     ownerWorkspaceId: string,
     runId: string
   ): Promise<
-    | {
-        outcome: "deliver";
-        prompt: string;
-        initiatingAgent?: { agentId: string; createdAtMs: number };
-      }
+    | { outcome: "deliver"; prompt: string; initiatingAgent?: WorkflowWakeInitiatingAgent }
     | { outcome: "superseded" }
     | { outcome: "defer" }
   > {
@@ -8047,6 +8051,22 @@ export class TaskService {
     try {
       run = await runStore.getRun(runId);
     } catch (error: unknown) {
+      // A missing run (ENOENT) or an unparseable record (no fs code; rereading cannot repair
+      // it) is definitively ineligible. Every other fs failure (EIO, EACCES, EISDIR...) is
+      // potentially transient, and tombstoning on it would permanently drop the wake over a
+      // recoverable fault: defer those like indeterminate currentness below.
+      const code =
+        error != null && typeof error === "object" && "code" in error
+          ? (error as { code?: unknown }).code
+          : undefined;
+      if (typeof code === "string" && code !== "ENOENT") {
+        log.warn("Deferring workflow terminal wake-up; run record unreadable", {
+          ownerWorkspaceId,
+          runId,
+          error: getErrorMessage(error),
+        });
+        return { outcome: "defer" };
+      }
       log.warn("Failed to load terminal workflow run for wake-up", {
         ownerWorkspaceId,
         runId,
@@ -8077,14 +8097,20 @@ export class TaskService {
     // can belong to an unrelated later synthetic turn (a heartbeat is not a supersession
     // boundary), which would pair a different agent's tool surface with the launch turn's
     // caller policy. Advisory: legacy references fall back to the history walk.
-    let initiatingAgent: { agentId: string; createdAtMs: number } | undefined;
+    let initiatingAgent: WorkflowWakeInitiatingAgent | undefined;
     try {
       const references = await readAgentWorkflowRunReferences(
         this.config.getSessionDir(ownerWorkspaceId)
       );
       const reference = references.find((candidate) => candidate.runId === run.id);
       if (reference?.agentId != null) {
-        initiatingAgent = { agentId: reference.agentId, createdAtMs: reference.createdAtMs };
+        initiatingAgent = {
+          agentId: reference.agentId,
+          createdAtMs: reference.createdAtMs,
+          ...(reference.strictAgentResolution !== undefined
+            ? { strictAgentResolution: reference.strictAgentResolution }
+            : {}),
+        };
       }
     } catch {
       // Identity is advisory; an unreadable sidecar already deferred delivery above whenever
@@ -8411,7 +8437,7 @@ export class TaskService {
     const deliverableWorkflowPrompts: Array<{
       notificationId: string;
       prompt: string;
-      initiatingAgent?: { agentId: string; createdAtMs: number };
+      initiatingAgent?: WorkflowWakeInitiatingAgent;
     }> = [];
 
     const promptSections: string[] = [];
@@ -8460,7 +8486,7 @@ export class TaskService {
     // retry drain; among agent-bound groups the newest launch goes first.
     const hasNonWorkflowDeliverables =
       deliverableAgentNotificationIds.size > 0 || deliverableWorkspaceTurnNotificationIds.size > 0;
-    let workflowInitiatingAgent: { agentId: string; createdAtMs: number } | undefined;
+    let workflowInitiatingAgent: WorkflowWakeInitiatingAgent | undefined;
     if (!hasNonWorkflowDeliverables) {
       for (const candidate of deliverableWorkflowPrompts) {
         const agent = candidate.initiatingAgent;
@@ -8544,6 +8570,14 @@ export class TaskService {
       return;
     }
 
+    // Pair the pin with the selected group: the newest pin-bearing history row can belong to
+    // a different group's wake (each wake persists its own pin), and pinning another agent's
+    // provenance onto this group's agentId makes resolution reject the wake on every retry. A
+    // recorded pin (or a verified-unpinned null) overrides the walk; legacy references
+    // without the field keep the walk pin.
+    const groupPin = workflowInitiatingAgent?.strictAgentResolution;
+    const effectiveStrictPin =
+      groupPin !== undefined ? (groupPin ?? undefined) : wakeRestrictions.strictAgentResolution;
     const sendOptions = {
       model: resumeOptions.model,
       agentId: resumeOptions.agentId,
@@ -8551,9 +8585,7 @@ export class TaskService {
       reasoningMode: resumeOptions.reasoningMode,
       ...(wakeRestrictions.toolPolicy != null ? { toolPolicy: wakeRestrictions.toolPolicy } : {}),
       ...(wakeRestrictions.disableWorkspaceAgents === true ? { disableWorkspaceAgents: true } : {}),
-      ...(wakeRestrictions.strictAgentResolution != null
-        ? { strictAgentResolution: wakeRestrictions.strictAgentResolution }
-        : {}),
+      ...(effectiveStrictPin != null ? { strictAgentResolution: effectiveStrictPin } : {}),
       ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     };
     if (prompt.length === 0) {

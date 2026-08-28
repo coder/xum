@@ -6824,6 +6824,144 @@ describe("TaskService", () => {
     });
   });
 
+  test("transient run-store read failures defer the wake instead of tombstoning it", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService });
+    const drain = (
+      taskService as unknown as {
+        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+      }
+    ).drainTerminalAttention.bind(taskService);
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+
+    // run.json exists but is unreadable (EISDIR): potentially transient, so the wake must
+    // stay pending for a later drain instead of being durably tombstoned.
+    const unreadableRunId = "wfr_unreadable";
+    await fsPromises.mkdir(
+      path.join(config.getSessionDir(parentId), "workflows", unreadableRunId, "run.json"),
+      { recursive: true }
+    );
+    await terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: parentId,
+      sourceKind: "workflow_run",
+      sourceId: unreadableRunId,
+    });
+    await drain(parentId);
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(1);
+
+    // A definitively missing run (ENOENT) is still tombstoned, not deferred forever.
+    await terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: parentId,
+      sourceKind: "workflow_run",
+      sourceId: "wfr_missing",
+    });
+    await drain(parentId);
+    expect(sendMessage).not.toHaveBeenCalled();
+    expect(await terminalAttentionStore.get(parentId, "workflow_run:wfr_missing")).toMatchObject({
+      status: "superseded",
+    });
+    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(1);
+  });
+
+  test("wake re-pins the selected group's recorded launch pin, not the newest row's", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const createRun = async (runId: string) => {
+      await runStore.createRun({
+        id: runId,
+        workspaceId: parentId,
+        workflow: {
+          name: "research",
+          description: "Research workflow",
+          scope: "built-in",
+          executable: true,
+        },
+        source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+        args: {},
+        attentionPolicy: "notify_on_terminal",
+        now: "2026-06-19T00:00:00.000Z",
+      });
+      await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+      await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+    };
+    await createRun("wfr_pin_unpinned");
+    await createRun("wfr_pin_recorded");
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual", "user", "run the audits", { timestamp: 1_000 })
+    );
+    // The newest pin-bearing row belongs to a DIFFERENT group's wake: pinning its provenance
+    // onto this group's agentId would make resolution reject the wake on every retry.
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("other-group-wake", "user", "earlier group results", {
+        timestamp: 1_100,
+        synthetic: true,
+        retrySendOptions: {
+          model: "openai:gpt-4o",
+          agentId: "plan",
+          strictAgentResolution: { expectedScope: "project", expectedSource: "/repo/.xum/agents" },
+        },
+      })
+    );
+
+    // A verified-unpinned launch (null) must suppress the walk pin entirely.
+    await recordAgentWorkflowRunReference({
+      workspaceSessionDir: config.getSessionDir(parentId),
+      runId: "wfr_pin_unpinned",
+      agentId: "exec",
+      strictAgentResolution: null,
+    });
+    await taskService.enqueueWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId: "wfr_pin_unpinned",
+      status: "completed",
+    });
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const unpinnedOptions = sendMessage.mock.calls[0]?.[2] as {
+      agentId?: string;
+      strictAgentResolution?: unknown;
+    };
+    expect(unpinnedOptions.agentId).toBe("exec");
+    expect(unpinnedOptions.strictAgentResolution).toBeUndefined();
+
+    // A recorded launch pin overrides the walk pin exactly.
+    await recordAgentWorkflowRunReference({
+      workspaceSessionDir: config.getSessionDir(parentId),
+      runId: "wfr_pin_recorded",
+      agentId: "plan",
+      strictAgentResolution: { expectedScope: "built-in" },
+    });
+    await taskService.enqueueWorkflowRunTerminalAttention({
+      ownerWorkspaceId: parentId,
+      runId: "wfr_pin_recorded",
+      status: "completed",
+    });
+    await flushTerminalAttentionDrains(taskService);
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect(sendMessage.mock.calls[1]?.[2] as Record<string, unknown>).toMatchObject({
+      agentId: "plan",
+      strictAgentResolution: { expectedScope: "built-in" },
+    });
+  });
+
   test("a malformed persisted toolPolicy cannot block the wake or leak into the send", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);

@@ -276,7 +276,9 @@ export const createWorkflowRunTool: ToolFactory = (config: ToolConfiguration) =>
           // process exit mid-dispatch) can reach terminal state before any post-dispatch
           // write, and a terminal wake with no sidecar reference is permanently superseded.
           if (args.run_in_background === true) {
-            await recordBackgroundWorkflowRunReference(config, event.runId, invocationStartedAtMs);
+            await recordBackgroundWorkflowRunReference(config, event.runId, invocationStartedAtMs, {
+              propagateWriteFailure: true,
+            });
           }
           await emitWorkflowRunAttachedEvent({
             config,
