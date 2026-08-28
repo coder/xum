@@ -2597,6 +2597,18 @@ describe("backup payload", () => {
       "GIT_CONFIG_VALUE_0",
       "GIT_CONFIG_GLOBAL",
       "GIT_CONFIG_SYSTEM",
+      "GIT_SSH_COMMAND",
+      "GIT_SSH",
+      "GIT_ASKPASS",
+      "SSH_ASKPASS",
+      "GIT_EXEC_PATH",
+      "GIT_EDITOR",
+      "GIT_SEQUENCE_EDITOR",
+      "GIT_PAGER",
+      "GIT_EXTERNAL_DIFF",
+      "VISUAL",
+      "EDITOR",
+      "PAGER",
     ] as const;
     const originals = variableNames.map((name) => process.env[name]);
     try {
@@ -2621,6 +2633,44 @@ describe("backup payload", () => {
           { GIT_CONFIG_SYSTEM: `${muxRoot}/skills/gitconfig.txt` },
           "git fetch origin",
           REDACTED_BACKUP_VALUE,
+        ],
+        // Git executes inherited SSH commands and direct helper programs.
+        [
+          { GIT_SSH_COMMAND: `${muxRoot}/skills/launch.txt --ssh` },
+          "git ls-remote ssh://example.invalid/repo",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          { GIT_SSH: `${muxRoot}/skills/launch.txt` },
+          "git ls-remote ssh://example.invalid/repo",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          { GIT_ASKPASS: `${muxRoot}/skills/launch.txt` },
+          "git fetch origin",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          { SSH_ASKPASS: `${muxRoot}/skills/launch.txt` },
+          "git fetch origin",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // Git also executes inherited editor, pager, and diff commands.
+        [{ GIT_EDITOR: `${muxRoot}/skills/launch.txt` }, "git commit", REDACTED_BACKUP_VALUE],
+        [
+          { GIT_SEQUENCE_EDITOR: `${muxRoot}/skills/launch.txt` },
+          "git rebase -i HEAD~2",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [{ GIT_PAGER: `${muxRoot}/skills/launch.txt` }, "git log", REDACTED_BACKUP_VALUE],
+        [{ GIT_EXTERNAL_DIFF: `${muxRoot}/skills/launch.txt` }, "git diff", REDACTED_BACKUP_VALUE],
+        // The helper search directory can supply a published git subprogram.
+        [{ GIT_EXEC_PATH: `${muxRoot}/skills` }, "git launch.txt", REDACTED_BACKUP_VALUE],
+        // A foreign direct SSH helper stays portable.
+        [
+          { GIT_SSH: "/usr/bin/ssh" },
+          "git ls-remote ssh://example.invalid/repo",
+          "git ls-remote ssh://example.invalid/repo",
         ],
         // A data key stays portable.
         [

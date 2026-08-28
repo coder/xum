@@ -3673,6 +3673,44 @@ function hasInheritedGitConfig(rootPrefixes: readonly string[]): boolean {
   return false;
 }
 
+/**
+ * Git also executes commands inherited directly from the environment. Shell
+ * command variables use the same bounded command analyzer as MCP commands;
+ * direct program variables and the helper search directory resolve as paths.
+ */
+function hasInheritedGitExecutionHook(
+  rootPrefixes: readonly string[],
+  inherited: InheritedLaunchContext
+): boolean {
+  const nestedContext = { ...inherited, gitConfigHook: false };
+  for (const command of [
+    process.env.GIT_SSH_COMMAND,
+    process.env.GIT_EDITOR,
+    process.env.GIT_SEQUENCE_EDITOR,
+    process.env.GIT_PAGER,
+    process.env.GIT_EXTERNAL_DIFF,
+    process.env.VISUAL,
+    process.env.EDITOR,
+    process.env.PAGER,
+  ]) {
+    if (typeof command !== "string" || command.trim() === "") continue;
+    if (
+      redactCommandEnvAssignments(command, rootPrefixes, nestedContext) === REDACTED_BACKUP_VALUE
+    ) {
+      return true;
+    }
+  }
+  for (const program of [process.env.GIT_SSH, process.env.GIT_ASKPASS, process.env.SSH_ASKPASS]) {
+    if (typeof program !== "string") continue;
+    if (isAutoPublishedScriptOperand(canonicalizeInheritedPath(program), rootPrefixes)) return true;
+  }
+  const execPath = process.env.GIT_EXEC_PATH;
+  return (
+    typeof execPath === "string" &&
+    isUnderCollectedRoot(canonicalizeInheritedPath(execPath), rootPrefixes)
+  );
+}
+
 function redactMcpConfig(
   content: Buffer,
   muxRoot: string
@@ -3724,6 +3762,7 @@ function redactMcpConfig(
       rootPrefixes
     ),
   };
+  inherited.gitConfigHook ||= hasInheritedGitExecutionHook(rootPrefixes, inherited);
   const text = content.toString("utf-8");
   const { parsed: root, tree } = parseJsoncObjectWithTree(text, "mcp.jsonc");
   const redactionPaths: BackupRedactionPath[] = [];
