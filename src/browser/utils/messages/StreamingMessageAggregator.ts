@@ -2503,6 +2503,13 @@ export class StreamingMessageAggregator {
       if (parentPart) {
         // Initialize nestedCalls array if needed
         parentPart.nestedCalls ??= [];
+        // Reconnect replays re-emit nested starts for rows the renderer may
+        // already have (the parent part replays whenever any of its nested
+        // activity is newer than the cursor); skip duplicates like the
+        // top-level path below does.
+        if (parentPart.nestedCalls.some((nc) => nc.toolCallId === data.toolCallId)) {
+          return;
+        }
         parentPart.nestedCalls.push({
           toolCallId: data.toolCallId,
           toolName: data.toolName,

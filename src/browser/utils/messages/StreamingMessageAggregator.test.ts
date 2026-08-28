@@ -3795,6 +3795,26 @@ describe("StreamingMessageAggregator", () => {
       }
     });
 
+    test("skips duplicate nested starts (reconnect replays re-emit them with the parent part)", () => {
+      const aggregator = createTestAggregator();
+      startParentTool(aggregator);
+      for (let i = 0; i < 2; i++) {
+        startToolCall(aggregator, {
+          toolCallId: "nested-tool-1",
+          toolName: "workflow_run",
+          args: { script_path: "wf.js" },
+          timestamp: 1100,
+          parentToolCallId: "parent-tool-1",
+        });
+      }
+
+      const toolMsg = parentToolMessage(aggregator);
+      if (toolMsg?.type !== "tool") {
+        throw new Error("Expected parent tool message");
+      }
+      expect(toolMsg.nestedCalls).toHaveLength(1);
+    });
+
     test("updates nested call with output on tool-call-end with parentToolCallId", () => {
       const aggregator = createTestAggregator();
       startParentTool(aggregator);
