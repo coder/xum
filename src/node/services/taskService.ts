@@ -8399,7 +8399,11 @@ export class TaskService {
       (notification) => notification.sourceKind === "workflow_run"
     );
     const deliverableWorkflowNotificationIds = new Set<string>();
-    let workflowInitiatingAgent: { agentId: string; createdAtMs: number } | undefined;
+    const deliverableWorkflowPrompts: Array<{
+      notificationId: string;
+      prompt: string;
+      initiatingAgent?: { agentId: string; createdAtMs: number };
+    }> = [];
 
     const promptSections: string[] = [];
     if (publicAwaitIds.length > 0) {
@@ -8430,16 +8434,42 @@ export class TaskService {
         await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, notification.id);
         continue;
       }
-      deliverableWorkflowNotificationIds.add(notification.id);
-      // Newest launch wins when several current runs coalesce into one wake.
+      deliverableWorkflowPrompts.push({
+        notificationId: notification.id,
+        prompt: workflowPrompt.prompt,
+        ...(workflowPrompt.initiatingAgent != null
+          ? { initiatingAgent: workflowPrompt.initiatingAgent }
+          : {}),
+      });
+    }
+    // Deliver one initiating-agent group per drain: the whole coalesced prompt is handled
+    // under the single agentId passed to sendMessage, so batching runs from different agents
+    // would hand a restricted agent's (attacker-influenced) output to another agent's tool
+    // grants. The newest launch's group goes first; runs bound to other agents, and the
+    // history-walk fallback group, stay pending and deliver on the re-armed retry drain.
+    let workflowInitiatingAgent: { agentId: string; createdAtMs: number } | undefined;
+    for (const candidate of deliverableWorkflowPrompts) {
+      const agent = candidate.initiatingAgent;
       if (
-        workflowPrompt.initiatingAgent != null &&
-        (workflowInitiatingAgent == null ||
-          workflowPrompt.initiatingAgent.createdAtMs > workflowInitiatingAgent.createdAtMs)
+        agent != null &&
+        (workflowInitiatingAgent == null || agent.createdAtMs > workflowInitiatingAgent.createdAtMs)
       ) {
-        workflowInitiatingAgent = workflowPrompt.initiatingAgent;
+        workflowInitiatingAgent = agent;
       }
-      promptSections.push(workflowPrompt.prompt);
+    }
+    const selectedAgentId = workflowInitiatingAgent?.agentId;
+    const selectedWorkflowPrompts =
+      selectedAgentId == null
+        ? deliverableWorkflowPrompts
+        : deliverableWorkflowPrompts.filter(
+            (candidate) => candidate.initiatingAgent?.agentId === selectedAgentId
+          );
+    if (selectedWorkflowPrompts.length < deliverableWorkflowPrompts.length) {
+      this.scheduleTerminalAttentionDeferRetry(ownerWorkspaceId);
+    }
+    for (const candidate of selectedWorkflowPrompts) {
+      deliverableWorkflowNotificationIds.add(candidate.notificationId);
+      promptSections.push(candidate.prompt);
     }
 
     // Sub-agent reports and failures are already durable user-context messages. Resume from history

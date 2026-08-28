@@ -6577,6 +6577,99 @@ describe("TaskService", () => {
     });
   });
 
+  test("coalesced workflow wakes split by initiating agent", async () => {
+    const config = await createTestConfig(rootDir);
+    const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+    const runStore = new WorkflowRunStore({ sessionDir: config.getSessionDir(parentId) });
+    const createRun = async (runId: string) => {
+      await runStore.createRun({
+        id: runId,
+        workspaceId: parentId,
+        workflow: {
+          name: "research",
+          description: "Research workflow",
+          scope: "built-in",
+          executable: true,
+        },
+        source: "export default function workflow() { return { reportMarkdown: 'done' }; }\n",
+        args: {},
+        attentionPolicy: "notify_on_terminal",
+        now: "2026-06-19T00:00:00.000Z",
+      });
+      await runStore.appendStatus(runId, "running", "2026-06-19T00:00:01.000Z");
+      await runStore.appendStatus(runId, "completed", "2026-06-19T00:00:03.000Z");
+    };
+    await createRun("wfr_split_plan");
+    await createRun("wfr_split_exec");
+
+    const sendMessage = mock(
+      (..._args: unknown[]): Promise<Result<void>> => Promise.resolve(Ok(undefined))
+    );
+    const { workspaceService } = createWorkspaceServiceMocks({ sendMessage });
+    (workspaceService as unknown as Record<string, unknown>).getWorkflowInvocationCurrentness =
+      mock(() => Promise.resolve("current"));
+    const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
+    const drain = (
+      taskService as unknown as {
+        drainTerminalAttention: (ownerWorkspaceId: string) => Promise<void>;
+      }
+    ).drainTerminalAttention.bind(taskService);
+
+    await historyService.appendToHistory(
+      parentId,
+      createMuxMessage("manual", "user", "run both audits", { timestamp: 1_000 })
+    );
+    // Two current runs from different initiating agents: one coalesced wake would hand the
+    // older run's (attacker-influenced) output to the newer agent's tool grants.
+    await recordAgentWorkflowRunReference({
+      workspaceSessionDir: config.getSessionDir(parentId),
+      runId: "wfr_split_exec",
+      createdAtMs: 1_000,
+      agentId: "exec",
+    });
+    await recordAgentWorkflowRunReference({
+      workspaceSessionDir: config.getSessionDir(parentId),
+      runId: "wfr_split_plan",
+      createdAtMs: 2_000,
+      agentId: "plan",
+    });
+
+    // Seed the store directly so ONE drain observes both pending notifications; per-enqueue
+    // drains would deliver them separately without exercising the coalescing path.
+    const terminalAttentionStore = new TerminalAttentionStore(config);
+    await terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: parentId,
+      sourceKind: "workflow_run",
+      sourceId: "wfr_split_plan",
+    });
+    await terminalAttentionStore.enqueueIfAbsent({
+      ownerWorkspaceId: parentId,
+      sourceKind: "workflow_run",
+      sourceId: "wfr_split_exec",
+    });
+    await drain(parentId);
+
+    // The newest launch's group delivers first, alone, under its own agent.
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const firstPrompt = String(sendMessage.mock.calls[0]?.[1]);
+    expect(firstPrompt).toContain("wfr_split_plan");
+    expect(firstPrompt).not.toContain("wfr_split_exec");
+    expect(sendMessage.mock.calls[0]?.[2] as Record<string, unknown>).toMatchObject({
+      agentId: "plan",
+    });
+
+    // The deferred group delivers on a later drain under its own agent.
+    await drain(parentId);
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    const secondPrompt = String(sendMessage.mock.calls[1]?.[1]);
+    expect(secondPrompt).toContain("wfr_split_exec");
+    expect(secondPrompt).not.toContain("wfr_split_plan");
+    expect(sendMessage.mock.calls[1]?.[2] as Record<string, unknown>).toMatchObject({
+      agentId: "exec",
+    });
+    expect(await terminalAttentionStore.listPending(parentId)).toHaveLength(0);
+  });
+
   test("a malformed persisted toolPolicy cannot block the wake or leak into the send", async () => {
     const config = await createTestConfig(rootDir);
     const { parentId } = await saveLocalParentWorkspace(config, rootDir);
