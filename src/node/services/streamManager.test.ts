@@ -20,6 +20,7 @@ import {
   type ModelFallbackPrepareOptions,
   type TurnEngineEvent,
   type TurnEngineEventSink,
+  type TurnExecutionOptions,
 } from "./streamManager";
 import type {
   ActiveTurnThinkingOverride,
@@ -131,6 +132,21 @@ function createExecStreamForTests(): ExecStream {
 const TEST_STREAM_MODEL_ID = KNOWN_MODELS.SONNET.id;
 const TEST_USAGE = { inputTokens: 1, outputTokens: 1, totalTokens: 2 };
 const LOCAL_TEST_RUNTIME = createRuntime({ type: "local", srcBaseDir: "/tmp" });
+
+/** Base startStream options; scenarios override only what they assert. */
+function testStartOptions(
+  overrides: Partial<TurnExecutionOptions> &
+    Pick<TurnExecutionOptions, "workspaceId" | "messageId" | "model">
+): TurnExecutionOptions {
+  return {
+    messages: [{ role: "user", content: "hello" }],
+    modelString: "openai:gpt-4.1-mini",
+    historySequence: 1,
+    system: "system",
+    runtime: LOCAL_TEST_RUNTIME,
+    ...overrides,
+  };
+}
 
 type ProcessStreamWithCleanupForTests = (
   workspaceId: string,
@@ -1896,17 +1912,14 @@ describe("StreamManager - language model cleanup", () => {
     const abortController = new AbortController();
     abortController.abort(new Error("pre-abort"));
 
-    const result = await streamManager.startStream({
-      workspaceId: "cleanup-preabort-workspace",
-      messages: [{ role: "user", content: "hello" }],
-      model,
-      modelString: "openai:gpt-4.1-mini",
-      historySequence: 1,
-      system: "system",
-      runtime,
-      messageId: "cleanup-preabort-message",
-      abortSignal: abortController.signal,
-    });
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: "cleanup-preabort-workspace",
+        messageId: "cleanup-preabort-message",
+        model,
+        abortSignal: abortController.signal,
+      })
+    );
 
     expect(result.success).toBe(true);
     expect(getCleanupCalls()).toBe(1);
@@ -1931,17 +1944,14 @@ describe("StreamManager - language model cleanup", () => {
       streams.set(workspaceId, replacementSentinel);
     };
 
-    const result = await streamManager.startStream({
-      workspaceId,
-      messages: [{ role: "user", content: "hello" }],
-      model,
-      modelString: "openai:gpt-4.1-mini",
-      historySequence: 1,
-      system: "system",
-      runtime,
-      messageId: "constructed-abort-message",
-      onStreamConstructed,
-    });
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId,
+        messageId: "constructed-abort-message",
+        model,
+        onStreamConstructed,
+      })
+    );
 
     expect(result.success).toBe(true);
     // The canceled stream must never start processing: stream-start after the
@@ -1963,16 +1973,13 @@ describe("StreamManager - language model cleanup", () => {
     });
     expect(replaceCreateStreamResult).toBe(true);
 
-    const result = await streamManager.startStream({
-      workspaceId: "cleanup-create-throw-workspace",
-      messages: [{ role: "user", content: "hello" }],
-      model,
-      modelString: "openai:gpt-4.1-mini",
-      historySequence: 1,
-      system: "system",
-      runtime,
-      messageId: "cleanup-create-throw-message",
-    });
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: "cleanup-create-throw-workspace",
+        messageId: "cleanup-create-throw-message",
+        model,
+      })
+    );
 
     expect(result.success).toBe(false);
     expect(getCleanupCalls()).toBe(1);
@@ -1980,8 +1987,6 @@ describe("StreamManager - language model cleanup", () => {
 });
 
 describe("StreamManager - turn completion", () => {
-  const runtime = LOCAL_TEST_RUNTIME;
-
   function stubTokenTracker(streamManager: StreamManager): void {
     Reflect.set(streamManager, "tokenTracker", {
       setModel: () => Promise.resolve(),
@@ -2004,17 +2009,14 @@ describe("StreamManager - turn completion", () => {
     );
     await appendPartialAssistantForTests(input.workspaceId, input.messageId, 1);
 
-    const result = await streamManager.startStream({
-      workspaceId: input.workspaceId,
-      messages: [{ role: "user", content: "hello" }],
-      model: createTestLanguageModel(),
-      modelString: "openai:gpt-4.1-mini",
-      historySequence: 1,
-      system: "system",
-      runtime,
-      messageId: input.messageId,
-      providedRuntimeTempDir: "",
-    });
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: input.workspaceId,
+        messageId: input.messageId,
+        model: createTestLanguageModel(),
+        providedRuntimeTempDir: "",
+      })
+    );
     expect(result.success).toBe(true);
     if (!result.success) throw new Error("Expected stream to start");
     return { streamManager, handle: result.data };
@@ -2023,31 +2025,26 @@ describe("StreamManager - turn completion", () => {
   test("pre-start failures return Err while successful startup owns an aborted completion", async () => {
     const streamManager = new StreamManager(historyService);
     const model = createTestLanguageModel();
-    const failed = await streamManager.startStream({
-      workspaceId: "completion-prestart-failure",
-      messages: [],
-      model,
-      modelString: "openai:gpt-4.1-mini",
-      historySequence: 1,
-      system: "system",
-      runtime,
-      messageId: "prestart-failure-message",
-    });
+    const failed = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: "completion-prestart-failure",
+        messageId: "prestart-failure-message",
+        model,
+        messages: [],
+      })
+    );
     expect(failed.success).toBe(false);
 
     const abortController = new AbortController();
     abortController.abort();
-    const aborted = await streamManager.startStream({
-      workspaceId: "completion-prestart-abort",
-      messages: [{ role: "user", content: "hello" }],
-      model,
-      modelString: "openai:gpt-4.1-mini",
-      historySequence: 1,
-      system: "system",
-      runtime,
-      messageId: "prestart-abort-message",
-      abortSignal: abortController.signal,
-    });
+    const aborted = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: "completion-prestart-abort",
+        messageId: "prestart-abort-message",
+        model,
+        abortSignal: abortController.signal,
+      })
+    );
     expect(aborted.success).toBe(true);
     if (!aborted.success) throw new Error("Expected aborted startup handle");
     expect(await aborted.data.completion).toEqual({
@@ -2131,17 +2128,14 @@ describe("StreamManager - turn completion", () => {
       "completion-abort-message",
       1
     );
-    const result = await streamManager.startStream({
-      workspaceId: "completion-abort-workspace",
-      messages: [{ role: "user", content: "hello" }],
-      model: createTestLanguageModel(),
-      modelString: "openai:gpt-4.1-mini",
-      historySequence: 1,
-      system: "system",
-      runtime,
-      messageId: "completion-abort-message",
-      providedRuntimeTempDir: "",
-    });
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: "completion-abort-workspace",
+        messageId: "completion-abort-message",
+        model: createTestLanguageModel(),
+        providedRuntimeTempDir: "",
+      })
+    );
     expect(result.success).toBe(true);
     if (!result.success) throw new Error("Expected stream to start");
 
@@ -2182,17 +2176,14 @@ describe("StreamManager - turn completion", () => {
       "completion-debug-error-message",
       1
     );
-    const result = await streamManager.startStream({
-      workspaceId: "completion-debug-error-workspace",
-      messages: [{ role: "user", content: "hello" }],
-      model: createTestLanguageModel(),
-      modelString: "openai:gpt-4.1-mini",
-      historySequence: 1,
-      system: "system",
-      runtime,
-      messageId: "completion-debug-error-message",
-      providedRuntimeTempDir: "",
-    });
+    const result = await streamManager.startStream(
+      testStartOptions({
+        workspaceId: "completion-debug-error-workspace",
+        messageId: "completion-debug-error-message",
+        model: createTestLanguageModel(),
+        providedRuntimeTempDir: "",
+      })
+    );
     expect(result.success).toBe(true);
     if (!result.success) throw new Error("Expected stream to start");
 
