@@ -573,6 +573,12 @@ export const TaskToolCompletedResultSchema = z
     reports: z.array(TaskToolCompletedReportSchema).min(1).optional(),
     modelString: z.string().optional(),
     thinkingLevel: TaskThinkingLevelSchema.optional(),
+    /**
+     * Follow-up context the caller needs alongside the terminal report — e.g.
+     * that the caller's previously tracked handle was quietly superseded by
+     * this completed follow-up (that handle produces no separate wake).
+     */
+    note: z.string().optional(),
   })
   .strict()
   .superRefine((value, ctx) => {

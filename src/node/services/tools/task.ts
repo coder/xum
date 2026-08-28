@@ -448,12 +448,18 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
 
         // Announce the probable quiet supersession at creation time so the
         // owner is not surprised when its old handle settles interrupted
-        // without a separate wake. Only pending (queued/running) results carry
-        // the note — a foreground terminal result already knows the outcome.
+        // without a separate wake. Pending (queued/running) results carry the
+        // forward-looking note; the foreground terminal result carries a
+        // past-tense equivalent because the old handle's suppressed wake means
+        // this result is the owner's only notification about that handle.
         const supersedeNote =
           created.data.maySupersedeTaskId != null
             ? ` Queued behind your active turn ${created.data.maySupersedeTaskId}; at the target's next tool boundary this follow-up may supersede it — if so, ${created.data.maySupersedeTaskId} settles as interrupted quietly (no separate wake) and this new handle carries the workspace's continuation.`
             : "";
+        const completedSupersedeNote =
+          created.data.maySupersedeTaskId != null
+            ? `This follow-up was queued behind your earlier turn ${created.data.maySupersedeTaskId}; if it cut that turn at a tool boundary, ${created.data.maySupersedeTaskId} settled as interrupted quietly (no separate wake) and this result carries the workspace's continuation.`
+            : undefined;
         const pendingResult = {
           status: created.data.status,
           taskId: created.data.taskId,
@@ -482,6 +488,7 @@ export const createTaskTool: ToolFactory = (config: ToolConfiguration) => {
               title: report.title,
               messageId: report.messageId,
               finalMessageRef: report.finalMessageRef,
+              ...(completedSupersedeNote != null ? { note: completedSupersedeNote } : {}),
             },
             "task"
           );

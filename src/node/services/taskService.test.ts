@@ -7849,6 +7849,186 @@ describe("TaskService", () => {
     expect(followUp.data.maySupersedeTaskId).toBeUndefined();
   });
 
+  test("cut attribution uses the state captured at stream-end, not later live state", async () => {
+    // Race pin (Codex P1): a manual/cross-owner input cuts the turn, then a
+    // same-owner follow-up engages while handleStreamEnd's awaits run.
+    // Classification must use the attribution snapshot captured synchronously
+    // at the stream-end event (the manual cutter) — not whatever is engaged by
+    // classification time — so the real manual supersede keeps its wake.
+    let cutterReads = 0;
+    const getQueueCutCutter = mock(() => {
+      cutterReads += 1;
+      return cutterReads === 1
+        ? { stage: "preparing" as const, muxMetadata: undefined }
+        : ownerFollowUpCutter("will-be-set-below", "wst_successor");
+    });
+    const { config, parentId, taskService } = await startWorkspaceTurnForTest({
+      getQueueCutCutter,
+    });
+    getQueueCutCutter.mockImplementation(() => {
+      cutterReads += 1;
+      return cutterReads === 1
+        ? { stage: "preparing" as const, muxMetadata: undefined }
+        : ownerFollowUpCutter(parentId, "wst_successor");
+    });
+    const internal = taskService as unknown as {
+      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+    };
+
+    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_snapshot_race_cut"));
+
+    expect(cutterReads).toBeGreaterThanOrEqual(1);
+    expect(
+      await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+    ).toMatchObject({
+      status: "interrupted",
+      error:
+        "Workspace turn superseded by new input in the target workspace; the workspace continues under that input and this delegated turn will not report",
+    });
+  });
+
+  test("quiet supersede transfers disposable ownership to the successor", async () => {
+    // Codex P1: settling the old handle must not force-remove a disposable
+    // workspace out from under the announced successor. Ownership moves to the
+    // successor handle, whose own terminal settlement cleans the workspace up.
+    const remove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
+      disposable: true,
+      remove,
+    });
+    const taskHandleStore = new TaskHandleStore(config);
+    await taskHandleStore.upsertWorkspaceTurn({
+      kind: "workspace_turn",
+      handleId: "wst_successor",
+      ownerWorkspaceId: parentId,
+      workspaceId: "childworkspace",
+      turnId: "turn2",
+      status: "queued",
+      createdAt: "2026-08-11T00:00:00.000Z",
+      updatedAt: "2026-08-11T00:00:00.000Z",
+      createdWorkspace: false,
+      disposableWorkspace: false,
+    });
+    workspaceMocks.getQueueCutCutter.mockImplementation(() =>
+      ownerFollowUpCutter(parentId, "wst_successor")
+    );
+    const internal = taskService as unknown as {
+      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+    };
+
+    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_disposable_transfer"));
+
+    const settled = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
+    expect(settled).toMatchObject({ status: "interrupted", disposableWorkspace: false });
+    expect(settled?.error?.startsWith(OWNER_FOLLOW_UP_SUPERSEDE_PREFIX)).toBe(true);
+    expect(
+      (await taskHandleStore.getWorkspaceTurn(parentId, "wst_successor"))?.disposableWorkspace
+    ).toBe(true);
+    expect(remove).not.toHaveBeenCalled();
+  });
+
+  test("quiet supersede keeps disposable cleanup when the successor is unavailable", async () => {
+    // Transfer fail-safe: a missing (or already terminal) successor record
+    // cannot inherit cleanup responsibility, so the old handle keeps it and
+    // the disposable workspace is not leaked.
+    const remove = mock((): Promise<Result<void>> => Promise.resolve(Ok(undefined)));
+    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest({
+      disposable: true,
+      remove,
+    });
+    workspaceMocks.getQueueCutCutter.mockImplementation(() =>
+      ownerFollowUpCutter(parentId, "wst_missing_successor")
+    );
+    const internal = taskService as unknown as {
+      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+    };
+
+    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_disposable_no_successor"));
+
+    expect(
+      await new TaskHandleStore(config).getWorkspaceTurn(parentId, "wst_handle")
+    ).toMatchObject({
+      status: "interrupted",
+      disposableWorkspace: true,
+    });
+    expect(remove).toHaveBeenCalledTimes(1);
+  });
+
+  test("quiet resettle deletes the stale wake enqueued by the superseded settlement", async () => {
+    // Codex P2: an error settlement enqueued a pending wake; a later
+    // correlated tool-calls resettle to the quiet owner-follow-up flavor must
+    // delete that stale generation instead of letting the drain deliver it.
+    const { config, parentId, taskService, workspaceMocks } = await startWorkspaceTurnForTest();
+    const taskHandleStore = new TaskHandleStore(config);
+    const running = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
+    assert(running, "running handle must exist");
+    await taskHandleStore.upsertWorkspaceTurn({
+      ...running,
+      attentionPolicy: "notify_on_terminal",
+    });
+    const internal = taskService as unknown as {
+      handleStreamEnd: (event: StreamEndEvent) => Promise<void>;
+    };
+
+    // Length-truncated correlated final settles the handle as error and arms a wake.
+    await internal.handleStreamEnd({
+      type: "stream-end",
+      workspaceId: "childworkspace",
+      messageId: "msg_truncated_error",
+      metadata: {
+        model: "anthropic:claude-opus-4-6",
+        agentId: "exec",
+        finishReason: "length",
+        muxMetadata: {
+          type: "workspace-turn-task",
+          taskHandleId: "wst_handle",
+          ownerWorkspaceId: parentId,
+          turnId: "turn",
+        },
+      },
+      parts: [{ type: "text", text: "Truncated" }],
+    });
+    const errored = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
+    assert(errored, "errored handle must exist");
+    expect(errored.status).toBe("error");
+    const attentionStore = new TerminalAttentionStore(config);
+    const staleVersionedId = TerminalAttentionStore.notificationId(
+      "workspace_turn",
+      "wst_handle",
+      `wst_handle:error:${errored.updatedAt}`
+    );
+    expect(await attentionStore.get(parentId, staleVersionedId)).not.toBeNull();
+
+    // Same-turn auto-retry gets cut by the owner's follow-up: quiet resettle.
+    workspaceMocks.getQueueCutCutter.mockImplementation(() =>
+      ownerFollowUpCutter(parentId, "wst_successor")
+    );
+    await internal.handleStreamEnd(ownerFollowUpCutEvent(parentId, "msg_quiet_resettle_cut"));
+
+    const resettled = await taskHandleStore.getWorkspaceTurn(parentId, "wst_handle");
+    assert(resettled, "resettled handle must exist");
+    expect(resettled.status).toBe("interrupted");
+    expect(resettled.error?.startsWith(OWNER_FOLLOW_UP_SUPERSEDE_PREFIX)).toBe(true);
+    expect(resettled.terminalAttentionNotifiedAt).toBeUndefined();
+    expect(await attentionStore.get(parentId, staleVersionedId)).toBeNull();
+    expect(
+      await attentionStore.get(
+        parentId,
+        TerminalAttentionStore.notificationId("workspace_turn", "wst_handle")
+      )
+    ).toBeNull();
+    expect(
+      await attentionStore.get(
+        parentId,
+        TerminalAttentionStore.notificationId(
+          "workspace_turn",
+          "wst_handle",
+          `wst_handle:interrupted:${resettled.updatedAt}`
+        )
+      )
+    ).toBeNull();
+  });
+
   test("mode=existing follow-up over a different owner's active turn reports no supersession", async () => {
     const hasPendingQueuedOrPreparingTurn = mock(
       (workspaceId: string) => workspaceId === "childworkspace"
@@ -14002,9 +14182,12 @@ describe("TaskService", () => {
       }
     );
     let queueChecks = 0;
+    // handleStreamEnd consumes one extra read at entry for the queue-cut
+    // attribution snapshot; the follow-up turn must appear on the idle
+    // fallback's own re-check (the fourth read overall).
     const hasPendingQueuedOrPreparingTurn = mock(() => {
       queueChecks += 1;
-      return queueChecks >= 3;
+      return queueChecks >= 4;
     });
     const { aiService } = createAIServiceMocks(config);
     const { workspaceService } = createWorkspaceServiceMocks({
