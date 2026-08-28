@@ -67,44 +67,168 @@ function isForbiddenBasename(name: string): boolean {
 function isHiddenName(name: string): boolean {
   return name.startsWith(".");
 }
+/** Suffix alphabets of the issued-token shapes; `word` is exactly the regexp `\w` set. */
+type TokenRunClass = "alnum" | "word" | "alnum-dash" | "word-dash";
+
+/**
+ * One `\b<prefix>[<runClass>]{minRun,}\b` token format, matched by hasIssuedToken's
+ * linear scan rather than that regexp: V8 grows its backtrack stack per unbounded
+ * quantifier iteration, so a size-capped file that is one in-class wall
+ * (`glsa_glsa_...`) exhausts it with a RangeError before the scan can classify
+ * anything. Bounded quantifiers and literal alternations stay regexps below.
+ */
+interface IssuedTokenShape {
+  /** Literal case-sensitive spellings that start every candidate; each begins with a word char. */
+  prefixes: readonly string[];
+  runClass: TokenRunClass;
+  minRun: number;
+  /**
+   * Hard-block only digit-bearing bodies: issued keys embed digits practically always
+   * (base62 randomness, Slack's numeric workspace and app IDs), while documentation
+   * placeholders (`sk-your-api-key-here`, `xoxb-your-token-here`) are dash-separated
+   * words. The digit-free spelling stays in the reviewable scan, which ignores this flag.
+   */
+  hardBlockRequiresDigit?: boolean;
+  /** No trailing word boundary: any long-enough body matches even mid-word. */
+  openEnded?: boolean;
+}
+
 /**
  * Formats issued only as live credentials. A match aborts the export outright, with no
  * user override: redaction is the primary mechanism, so a surviving match means either a
  * shape redaction does not classify (a token passed as a command argument) or a redaction
  * defect, and neither is something a backup should publish.
  */
-const CREDENTIAL_TOKEN_PATTERNS = [
+const ISSUED_TOKEN_SHAPES: readonly IssuedTokenShape[] = [
   // GitHub issued prefixes: personal, OAuth, App user, installation, refresh tokens.
-  /\bgh[opusr]_[A-Za-z0-9]{20,}\b/,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,
-  /\bglsa_[A-Za-z0-9_]{20,}\b/,
-  // GitLab issued prefixes: personal, deploy, runner, service-account, trigger,
-  // CI job, OAuth app, feature-flag, incoming-mail, and cluster-agent tokens.
-  /\bgl(?:pat|dt|rt|soat|ptt|cbt|oas|ffct|imt|agent)-[A-Za-z0-9_-]{20,}\b/,
-  /\blin_api_[A-Za-z0-9]{16,}\b/,
-  /\bntn_[A-Za-z0-9]{16,}\b/,
-  // AWS long-term (AKIA) and temporary-session (ASIA) access-key IDs.
-  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/,
+  { prefixes: ["gho_", "ghp_", "ghu_", "ghs_", "ghr_"], runClass: "alnum", minRun: 20 },
+  { prefixes: ["github_pat_"], runClass: "word", minRun: 20 },
+  { prefixes: ["glsa_"], runClass: "word", minRun: 20 },
+  {
+    // GitLab issued prefixes: personal, deploy, runner, service-account, trigger,
+    // CI job, OAuth app, feature-flag, incoming-mail, and cluster-agent tokens.
+    prefixes: [
+      "glpat-",
+      "gldt-",
+      "glrt-",
+      "glsoat-",
+      "glptt-",
+      "glcbt-",
+      "gloas-",
+      "glffct-",
+      "glimt-",
+      "glagent-",
+    ],
+    runClass: "word-dash",
+    minRun: 20,
+  },
+  { prefixes: ["lin_api_"], runClass: "alnum", minRun: 16 },
+  { prefixes: ["ntn_"], runClass: "alnum", minRun: 16 },
   // Slack workspace (xox?-) and app-level (xapp-) issued tokens.
-  /\bx(?:ox[baprs]|app)-[A-Za-z0-9-]{10,}\b/,
+  {
+    prefixes: ["xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-", "xapp-"],
+    runClass: "alnum-dash",
+    minRun: 10,
+    hardBlockRequiresDigit: true,
+  },
   // Stripe live secret and restricted keys. Test-mode keys stay reviewable:
   // documentation routinely quotes them, and the block has no override.
-  /\b[sr]k_live_[A-Za-z0-9]{16,}\b/,
+  { prefixes: ["sk_live_", "rk_live_"], runClass: "alnum", minRun: 16 },
   // npm issued access tokens.
-  /\bnpm_[A-Za-z0-9]{24,}\b/,
-] as const;
+  { prefixes: ["npm_"], runClass: "alnum", minRun: 24 },
+  { prefixes: ["sk-"], runClass: "word-dash", minRun: 16, hardBlockRequiresDigit: true },
+];
+
+// AWS long-term (AKIA) and temporary-session (ASIA) access-key IDs. The exact {16}
+// count leaves the quantifier no choice points, so the regexp form cannot backtrack.
+const AWS_ACCESS_KEY_ID_PATTERN = /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/;
+
+/** Key formats that documentation legitimately quotes: reviewable, never hard-blocked. */
+const REVIEW_ONLY_TOKEN_SHAPES: readonly IssuedTokenShape[] = [
+  { prefixes: ["AIza"], runClass: "word-dash", minRun: 35, openEnded: true },
+];
+
+const PRIVATE_KEY_PATTERN = /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/;
+
+function isAsciiDigitCode(code: number): boolean {
+  return code >= 48 && code <= 57;
+}
+
+/** Exactly the alphabet the regexp `\b` assertion evaluates. */
+function isWordCode(code: number): boolean {
+  return (
+    isAsciiDigitCode(code) ||
+    (code >= 65 && code <= 90) ||
+    (code >= 97 && code <= 122) ||
+    code === 95
+  );
+}
+
+function isRunCode(code: number, runClass: TokenRunClass): boolean {
+  if (code === 95) return runClass === "word" || runClass === "word-dash";
+  if (code === 45) return runClass === "alnum-dash" || runClass === "word-dash";
+  return isAsciiDigitCode(code) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+function rangeHasDigit(text: string, start: number, end: number): boolean {
+  for (let pos = start; pos < end; pos += 1) {
+    if (isAsciiDigitCode(text.charCodeAt(pos))) return true;
+  }
+  return false;
+}
 
 /**
- * The digit requirement keeps documentation placeholders (`sk-your-api-key-here`) out
- * of the no-override block: issued keys are base62 and practically always carry digits,
- * while placeholders are dash-separated words. The digit-free spelling stays in the
- * reviewable scan. Checked per maximal candidate run instead of inside one regex, whose
- * digit search would backtrack quadratically across a digit-free `sk-sk-...` wall in
- * the synchronous scanner.
+ * Linear-time equivalent of the shape's regexp. Each candidate extends its maximal
+ * in-class run once; when no trailing boundary satisfies the run, later candidates
+ * inside the same run are skipped, because they would need a boundary even further
+ * right than the ones that already failed. The trailing boundary walks backward from
+ * the run end so the digit check sees the same greedy span the regexp would match,
+ * and a digit-free match resumes at its end exactly like a matchAll iteration.
  */
-function hasDigitBearingSkToken(text: string): boolean {
-  for (const match of text.matchAll(/\bsk-[A-Za-z0-9_-]{16,}\b/g)) {
-    if (/[0-9]/.test(match[0])) return true;
+function hasIssuedToken(text: string, shape: IssuedTokenShape, requireDigit: boolean): boolean {
+  for (const prefix of shape.prefixes) {
+    let from = 0;
+    let idx = text.indexOf(prefix, from);
+    while (idx !== -1) {
+      if (idx > 0 && isWordCode(text.charCodeAt(idx - 1))) {
+        // No word boundary before the prefix. A candidate hidden inside a run this
+        // scan skips below is always in this case: run alphabets contain only word
+        // characters and `-`, and a `-` before a skipped candidate implies a
+        // boundary the failed enclosing candidate would have matched first.
+        from = idx + 1;
+      } else {
+        const runStart = idx + prefix.length;
+        let runEnd = runStart;
+        while (runEnd < text.length && isRunCode(text.charCodeAt(runEnd), shape.runClass)) {
+          runEnd += 1;
+        }
+        const shortestEnd = runStart + shape.minRun;
+        if (runEnd < shortestEnd) {
+          from = runEnd;
+        } else {
+          let matchEnd = -1;
+          if (shape.openEnded === true) {
+            matchEnd = runEnd;
+          } else {
+            for (let pos = runEnd; pos >= shortestEnd; pos -= 1) {
+              const wordAfter = pos < text.length && isWordCode(text.charCodeAt(pos));
+              if (isWordCode(text.charCodeAt(pos - 1)) !== wordAfter) {
+                matchEnd = pos;
+                break;
+              }
+            }
+          }
+          if (matchEnd === -1) {
+            from = runEnd;
+          } else if (!requireDigit || rangeHasDigit(text, runStart, matchEnd)) {
+            return true;
+          } else {
+            from = matchEnd;
+          }
+        }
+      }
+      idx = text.indexOf(prefix, from);
+    }
   }
   return false;
 }
@@ -187,17 +311,21 @@ function stripPlaceholderRuns(text: string): string {
 function matchesCredentialToken(text: string): boolean {
   const scannable = stripPlaceholderRuns(text.replaceAll(EXAMPLE_ACCESS_KEY, " "));
   return (
-    CREDENTIAL_TOKEN_PATTERNS.some((pattern) => pattern.test(scannable)) ||
-    hasDigitBearingSkToken(scannable)
+    ISSUED_TOKEN_SHAPES.some((shape) =>
+      hasIssuedToken(scannable, shape, shape.hardBlockRequiresDigit === true)
+    ) || AWS_ACCESS_KEY_ID_PATTERN.test(scannable)
   );
 }
 
-const SECRET_PATTERNS = [
-  ...CREDENTIAL_TOKEN_PATTERNS,
-  /\bsk-[A-Za-z0-9_-]{16,}\b/,
-  /\bAIza[A-Za-z0-9_-]{35,}/,
-  /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/,
-] as const;
+/** The reviewable scan flags every issued shape, digit-bearing or not. */
+function matchesReviewableSecret(content: string): boolean {
+  return (
+    ISSUED_TOKEN_SHAPES.some((shape) => hasIssuedToken(content, shape, false)) ||
+    REVIEW_ONLY_TOKEN_SHAPES.some((shape) => hasIssuedToken(content, shape, false)) ||
+    AWS_ACCESS_KEY_ID_PATTERN.test(content) ||
+    PRIVATE_KEY_PATTERN.test(content)
+  );
+}
 
 export interface BackupFile {
   path: string;
@@ -2898,7 +3026,7 @@ export function scanBackupFilesForSecrets(files: readonly BackupFile[]): string[
   return files
     .filter((file) => {
       const content = file.content.toString("utf-8");
-      if (SECRET_PATTERNS.some((pattern) => pattern.test(content))) return true;
+      if (matchesReviewableSecret(content)) return true;
       if (file.path === "mcp.jsonc" && mcpConfigRequiresPublishApproval(content)) return true;
       // Every collected file, not just the recursive ones: `agents/` is collected by name and
       // its `.md` filter would otherwise auto-publish `agents/api-key.md`.

@@ -2261,6 +2261,63 @@ describe("backup payload", () => {
     expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
   });
 
+  it("keeps digit-free Slack token placeholders reviewable instead of hard-blocking", async () => {
+    await writeFixtureFile(
+      muxRoot,
+      "skills/demo/SKILL.md",
+      "Use xoxb-your-token-here to connect\n"
+    );
+    // The reviewable scan still flags it, so the digest approval path stays intact.
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(scanBackupFilesForSecrets(payload.files)).toEqual(["skills/demo/SKILL.md"]);
+
+    // A digit-bearing token of the same shape still aborts with no override.
+    await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", "xoxb-12345abcde\n");
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+  });
+
+  it("classifies a size-limit document that is one wall of token candidates", async () => {
+    // Walls of in-class candidates previously exhausted V8's regexp backtrack stack
+    // (RangeError) before the scan could return a classification at all.
+    const wall = "glsa_".repeat(Math.floor(MAX_BACKUP_FILE_BYTES / 5));
+    await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", wall);
+    const blocked = await captureRejection(
+      createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      })
+    );
+    expect(blocked).toBeInstanceOf(BackupCredentialDetectedError);
+    expect((blocked as BackupCredentialDetectedError).files).toEqual(["skills/demo/SKILL.md"]);
+  });
+
+  it("keeps a digit-free sk- wall reviewable at the size limit", async () => {
+    const wall = "sk-".repeat(Math.floor(MAX_BACKUP_FILE_BYTES / 3));
+    await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", wall);
+    const payload = await createBackupPayload({
+      muxRoot,
+      muxVersion: "1.2.3",
+      sourceLabel: "test-host",
+      reportSecrets: true,
+    });
+    expect(scanBackupFilesForSecrets(payload.files)).toEqual(["skills/demo/SKILL.md"]);
+  });
+
   it("does not manufacture credentials from quote-separated documentation text", async () => {
     // Only command content is shell input; prose keeps its bytes as written.
     await writeFixtureFile(muxRoot, "skills/demo/SKILL.md", 'ghp_aaaaaaaaaa"bbbbbbbbbb\n');
