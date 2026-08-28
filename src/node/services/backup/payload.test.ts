@@ -1949,6 +1949,38 @@ describe("backup payload", () => {
     expect(exported.servers.private.command).toBe(REDACTED_BACKUP_VALUE);
   });
 
+  it("localizes direct executable operands symlinked into the collected root", async () => {
+    await fs.mkdir(path.join(muxRoot, "skills"), { recursive: true });
+    const target = path.join(muxRoot, "skills", "launch.txt");
+    await fs.writeFile(target, "program");
+    const linkedScript = path.join(tempDir, "linked-script");
+    await fs.symlink(target, linkedScript, "file");
+    const foreignTarget = path.join(tempDir, "foreign-script.txt");
+    await fs.writeFile(foreignTarget, "program");
+    const foreignLink = path.join(tempDir, "foreign-script");
+    await fs.symlink(foreignTarget, foreignLink, "file");
+    for (const [command, expected] of [
+      [`python3 ${linkedScript}`, REDACTED_BACKUP_VALUE],
+      [`python3 ${foreignLink}`, `python3 ${foreignLink}`],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
   it("localizes bare commands resolvable through a PATH entry inside the root", async () => {
     // The spawned server inherits this process's PATH, so an entry inside the
     // collected root makes a published executable document reachable by name.
@@ -2068,7 +2100,27 @@ describe("backup payload", () => {
         [`--require=${muxRoot}/skills/launch.txt`, "npx -y mcp-server", REDACTED_BACKUP_VALUE],
         [`--require=${muxRoot}/skills/launch.txt`, "npm exec mcp-server", REDACTED_BACKUP_VALUE],
         [`--require=${muxRoot}/skills/launch.txt`, "corepack pnpm start", REDACTED_BACKUP_VALUE],
+        [
+          `--openssl-shared-config --openssl-config=${muxRoot}/skills/config.txt`,
+          "node /opt/server.js",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          `--openssl-config ${muxRoot}/skills/config.txt --openssl-shared-config`,
+          "node /opt/server.js",
+          REDACTED_BACKUP_VALUE,
+        ],
         ["--require=/opt/register.js", "python3 /opt/server.py", "python3 /opt/server.py"],
+        [
+          `--openssl-config=${muxRoot}/skills/config.txt`,
+          "node /opt/server.js",
+          "node /opt/server.js",
+        ],
+        [
+          "--openssl-shared-config --openssl-config=/etc/ssl/openssl.cnf",
+          "node /opt/server.js",
+          "node /opt/server.js",
+        ],
         ["--max-old-space-size=4096", "node /opt/server.js", "node /opt/server.js"],
       ] as const) {
         process.env.NODE_OPTIONS = nodeOptions;
@@ -2091,6 +2143,36 @@ describe("backup payload", () => {
     } finally {
       if (originalNodeOptions === undefined) delete process.env.NODE_OPTIONS;
       else process.env.NODE_OPTIONS = originalNodeOptions;
+    }
+  });
+
+  it("localizes Node startup snapshot blobs", async () => {
+    for (const [command, expected] of [
+      [`node --snapshot-blob=${muxRoot}/skills/launch.txt /opt/server.js`, REDACTED_BACKUP_VALUE],
+      [
+        "node --snapshot-blob=/opt/snapshot.blob /opt/server.js",
+        "node --snapshot-blob=/opt/snapshot.blob /opt/server.js",
+      ],
+      [
+        `mcp-server --snapshot-blob=${muxRoot}/skills/launch.txt`,
+        `mcp-server --snapshot-blob=${muxRoot}/skills/launch.txt`,
+      ],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
     }
   });
 
@@ -2502,6 +2584,18 @@ describe("backup payload", () => {
         // The JVM expands inherited @argument files into further options.
         ["JDK_JAVA_OPTIONS", `@${muxRoot}/skills/options.txt`, "java Leak", REDACTED_BACKUP_VALUE],
         ["JDK_JAVA_OPTIONS", "@/opt/options.txt", "java Leak", "java Leak"],
+        [
+          "JDK_JAVA_OPTIONS",
+          `--patch-module leak=${muxRoot}/skills/launch.txt`,
+          "java --module-path /opt/modules -m leak/leak.Main",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          "JAVA_TOOL_OPTIONS",
+          `--module-path=${muxRoot}/skills/launch.txt`,
+          "java -m leak/leak.Main",
+          REDACTED_BACKUP_VALUE,
+        ],
         // Other launchers do not consult the JVM option variables.
         [
           "JAVA_TOOL_OPTIONS",
@@ -2544,6 +2638,11 @@ describe("backup payload", () => {
       [`java -javaagent:${muxRoot}/skills/launch.txt Main`, REDACTED_BACKUP_VALUE],
       [`java -agentpath:${muxRoot}/skills/launch.txt=trace Main`, REDACTED_BACKUP_VALUE],
       ["java -javaagent:/opt/agent.jar Main", "java -javaagent:/opt/agent.jar Main"],
+      [
+        `java --patch-module leak=${muxRoot}/skills/launch.txt -m leak/leak.Main`,
+        REDACTED_BACKUP_VALUE,
+      ],
+      [`java --module-path=${muxRoot}/skills/launch.txt -m leak/leak.Main`, REDACTED_BACKUP_VALUE],
       [`java -Xbootclasspath/a:${muxRoot}/skills/launch.txt Leak`, REDACTED_BACKUP_VALUE],
       [`java -Xbootclasspath:${muxRoot}/skills/launch.txt Leak`, REDACTED_BACKUP_VALUE],
       // A foreign archive is not a collected document.
@@ -2611,6 +2710,7 @@ describe("backup payload", () => {
       "GIT_CONFIG_GLOBAL",
       "GIT_CONFIG_SYSTEM",
       "GIT_SSH_COMMAND",
+      "GIT_PROXY_COMMAND",
       "GIT_SSH",
       "GIT_ASKPASS",
       "SSH_ASKPASS",
@@ -2667,6 +2767,11 @@ describe("backup payload", () => {
         [
           { GIT_SSH_COMMAND: `${muxRoot}/skills/launch.txt --ssh` },
           "git ls-remote ssh://example.invalid/repo",
+          REDACTED_BACKUP_VALUE,
+        ],
+        [
+          { GIT_PROXY_COMMAND: `${muxRoot}/skills/launch.txt --proxy` },
+          "git ls-remote git://example.invalid/repo",
           REDACTED_BACKUP_VALUE,
         ],
         [
@@ -2939,6 +3044,56 @@ describe("backup payload", () => {
     }
   });
 
+  it("localizes Perl when inherited PERL5OPT enables an inherited debugger", async () => {
+    const variableNames = ["PERL5DB", "PERL5OPT"] as const;
+    const originals = variableNames.map((name) => process.env[name]);
+    try {
+      for (const [env, command, expected] of [
+        [
+          {
+            PERL5DB: `BEGIN { do q(${muxRoot}/skills/launch.txt) }`,
+            PERL5OPT: "-d",
+          },
+          "perl /opt/server.pl",
+          REDACTED_BACKUP_VALUE,
+        ],
+        // Both inherited pieces are required.
+        [{ PERL5DB: "sub DB::DB {}" }, "perl /opt/server.pl", "perl /opt/server.pl"],
+        [{ PERL5OPT: "-d" }, "perl /opt/server.pl", "perl /opt/server.pl"],
+        // Other launchers ignore Perl's environment.
+        [
+          { PERL5DB: "sub DB::DB {}", PERL5OPT: "-d" },
+          "python3 /opt/server.py",
+          "python3 /opt/server.py",
+        ],
+      ] as const) {
+        for (const name of variableNames) delete process.env[name];
+        for (const [name, value] of Object.entries(env)) process.env[name] = value;
+        await writeFixtureFile(
+          muxRoot,
+          "mcp.jsonc",
+          JSON.stringify({ servers: { private: { command } } })
+        );
+        const payload = await createBackupPayload({
+          muxRoot,
+          muxVersion: "1.2.3",
+          sourceLabel: "test-host",
+          reportSecrets: true,
+        });
+        const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+          servers: { private: { command: string } };
+        };
+        expect(exported.servers.private.command).toBe(expected);
+      }
+    } finally {
+      for (const [index, name] of variableNames.entries()) {
+        const original = originals[index];
+        if (original === undefined) delete process.env[name];
+        else process.env[name] = original;
+      }
+    }
+  });
+
   it("localizes uv run command invocations", async () => {
     for (const [command, expected] of [
       [`uv run python3 ${muxRoot}/skills/launch.txt`, REDACTED_BACKUP_VALUE],
@@ -3035,6 +3190,38 @@ describe("backup payload", () => {
       // A foreign source file and a plain invocation stay portable.
       ["lldb -s /opt/init.lldb app", "lldb -s /opt/init.lldb app"],
       ["lldb app", "lldb app"],
+    ] as const) {
+      await writeFixtureFile(
+        muxRoot,
+        "mcp.jsonc",
+        JSON.stringify({ servers: { private: { command } } })
+      );
+      const payload = await createBackupPayload({
+        muxRoot,
+        muxVersion: "1.2.3",
+        sourceLabel: "test-host",
+        reportSecrets: true,
+      });
+      const exported = jsonc.parse(payloadFileText(payload, "mcp.jsonc")) as {
+        servers: { private: { command: string } };
+      };
+      expect(exported.servers.private.command).toBe(expected);
+    }
+  });
+
+  it("localizes tar compression-program operands", async () => {
+    for (const [command, expected] of [
+      [`tar -I ${muxRoot}/skills/launch.txt -cf out.tar input`, REDACTED_BACKUP_VALUE],
+      [`tar -I${muxRoot}/skills/launch.txt -cf out.tar input`, REDACTED_BACKUP_VALUE],
+      [
+        `gtar --use-compress-program=${muxRoot}/skills/launch.txt -cf out.tar input`,
+        REDACTED_BACKUP_VALUE,
+      ],
+      [
+        "tar --use-compress-program=/usr/bin/gzip -cf out.tar input",
+        "tar --use-compress-program=/usr/bin/gzip -cf out.tar input",
+      ],
+      ["tar -cf out.tar input", "tar -cf out.tar input"],
     ] as const) {
       await writeFixtureFile(
         muxRoot,

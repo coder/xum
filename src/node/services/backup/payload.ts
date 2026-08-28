@@ -1767,10 +1767,31 @@ function javaClassPathPublishesExecutable(
   currentDirectory: string | null
 ): boolean {
   return value.split(path.delimiter).some((entry) => {
-    if (isAutoPublishedScriptOperand(entry, rootPrefixes)) return true;
+    if (
+      isAutoPublishedScriptOperand(entry, rootPrefixes) ||
+      isAutoPublishedScriptOperand(canonicalizeInheritedPath(entry), rootPrefixes)
+    ) {
+      return true;
+    }
     const resolved = resolveKnownDirectory(entry, currentDirectory);
-    return resolved !== null && isAutoPublishedScriptOperand(resolved, rootPrefixes);
+    return (
+      resolved !== null &&
+      (isAutoPublishedScriptOperand(resolved, rootPrefixes) ||
+        isAutoPublishedScriptOperand(canonicalizeInheritedPath(resolved), rootPrefixes))
+    );
   });
+}
+
+function javaPatchModulePublishesExecutable(
+  value: string,
+  rootPrefixes: readonly string[],
+  currentDirectory: string | null
+): boolean {
+  const separator = value.indexOf("=");
+  return (
+    separator !== -1 &&
+    javaClassPathPublishesExecutable(value.slice(separator + 1), rootPrefixes, currentDirectory)
+  );
 }
 
 /**
@@ -2279,6 +2300,7 @@ const NODE_BASED_LAUNCHER_NAMES = new Set(["node", "nodejs", "npm", "npx", "core
 const PYTHON_LAUNCHER_NAME = /^(?:py|pyw|pythonw?[0-9.]*)$/;
 const PHP_LAUNCHER_NAME = /^(?:php[0-9.]*|php-win)$/;
 const JAVA_RUNTIME_LAUNCHER_NAME = /^(?:javaw?|jshell[0-9.]*)$/;
+const PERL_LAUNCHER_NAME = /^w?perl[0-9.]*$/;
 const LUA_LAUNCHER_NAME = /^(?:lua|luajit)[0-9.]*$/;
 
 const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
@@ -2295,6 +2317,7 @@ const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
     name: /^(?:node|nodejs)$/,
     evalWord:
       /^(?:(?:--eval|--print|--import|--loader|--experimental-loader|--require)(?:=|$)|-[epr])/,
+    attachedStartupFile: /^--snapshot-blob=(.+)$/,
   },
   {
     name: /^bun$/,
@@ -2323,7 +2346,7 @@ const LANGUAGE_INTERPRETERS: LanguageInterpreter[] = [
   },
   { name: /^rscript$/, evalWord: /^(?:-e$|--expression(?:=|$))/ },
   {
-    name: /^w?perl[0-9.]*$/,
+    name: PERL_LAUNCHER_NAME,
     evalWord: /^-(?:(?:0(?:x[0-9A-Fa-f]+|[0-7]*))|l[0-7]*|[acfnpsStTuUvVwWX])*[eE]/,
     pathScriptFileOption: /^-S$/,
     debuggerOption: /^-d(?:$|[:t])/,
@@ -2461,11 +2484,14 @@ function hasDisguisedAssignment(
   let pendingGdbCommandFile = false;
   let pendingNinjaOptions = false;
   let pendingNinjaBuildFile = false;
+  let pendingTarOptions = false;
+  let pendingTarProgramValue = false;
   let pendingJavaOptions = false;
   let pendingJavaSourceVersion = false;
   let pendingJavaSourceFile = false;
   let pendingJavaOptionValue = false;
   let pendingJavaClassPathValue = false;
+  let pendingJavaPatchModuleValue = false;
   let pendingHashOptions = false;
   let pendingStartStopDaemonOptions = false;
   let pendingStartStopDaemonExecutable = false;
@@ -2488,9 +2514,18 @@ function hasDisguisedAssignment(
   let pendingLanguageWorkingDirectory: LanguageInterpreter | null = null;
 
   function isShellResolvedPublishedOperand(value: string): boolean {
-    if (isAutoPublishedScriptOperand(value, rootPrefixes)) return true;
+    if (
+      isAutoPublishedScriptOperand(value, rootPrefixes) ||
+      isAutoPublishedScriptOperand(canonicalizeInheritedPath(value), rootPrefixes)
+    ) {
+      return true;
+    }
     const resolved = resolveKnownDirectory(value, trackedCwd);
-    return resolved !== null && isAutoPublishedScriptOperand(resolved, rootPrefixes);
+    return (
+      resolved !== null &&
+      (isAutoPublishedScriptOperand(resolved, rootPrefixes) ||
+        isAutoPublishedScriptOperand(canonicalizeInheritedPath(resolved), rootPrefixes))
+    );
   }
 
   function isPendingLanguageScriptOperand(value: string): boolean {
@@ -2499,7 +2534,13 @@ function hasDisguisedAssignment(
       const directory = languageWorkingDirectories.get(language);
       if (directory === undefined) continue;
       const resolved = resolveKnownDirectory(value, directory);
-      if (resolved !== null && isAutoPublishedScriptOperand(resolved, rootPrefixes)) return true;
+      if (
+        resolved !== null &&
+        (isAutoPublishedScriptOperand(resolved, rootPrefixes) ||
+          isAutoPublishedScriptOperand(canonicalizeInheritedPath(resolved), rootPrefixes))
+      ) {
+        return true;
+      }
     }
     if (pendingScriptFileUsesPath && !/[/\\]/.test(value)) {
       for (const directory of inherited.publishedPathDirs) {
@@ -2586,11 +2627,14 @@ function hasDisguisedAssignment(
       pendingGdbCommandFile = false;
       pendingNinjaOptions = false;
       pendingNinjaBuildFile = false;
+      pendingTarOptions = false;
+      pendingTarProgramValue = false;
       pendingJavaOptions = false;
       pendingJavaSourceVersion = false;
       pendingJavaSourceFile = false;
       pendingJavaOptionValue = false;
       pendingJavaClassPathValue = false;
+      pendingJavaPatchModuleValue = false;
       pendingHashOptions = false;
       pendingStartStopDaemonOptions = false;
       pendingStartStopDaemonExecutable = false;
@@ -2624,6 +2668,10 @@ function hasDisguisedAssignment(
       continue;
     }
     if (CONSUMED_ASSIGNMENT.test(word)) {
+      if (pendingJavaPatchModuleValue) {
+        pendingJavaPatchModuleValue = false;
+        return true;
+      }
       // A git -c or --config-env value can itself be the replaced assignment
       // (`-c core.sshCommand=<marker>`): the key still classifies, and the
       // hidden value fails closed wherever it would decide.
@@ -2709,6 +2757,7 @@ function hasDisguisedAssignment(
       pendingJavaSourceFile = false;
       pendingJavaOptionValue = false;
       pendingJavaClassPathValue = false;
+      pendingJavaPatchModuleValue = false;
       continue;
     }
     if (pendingBodyName !== null) {
@@ -2997,6 +3046,18 @@ function hasDisguisedAssignment(
       if (sqliteDatabaseSeen) return true;
       sqliteDatabaseSeen = true;
     }
+    if (pendingTarProgramValue) {
+      pendingTarProgramValue = false;
+      if (isShellResolvedPublishedOperand(unquoted)) return true;
+    } else if (pendingTarOptions) {
+      const attachedProgram = /^(?:-I|--use-compress-program=)(.+)$/.exec(unquoted)?.[1];
+      if (attachedProgram !== undefined && isShellResolvedPublishedOperand(attachedProgram)) {
+        return true;
+      }
+      if (unquoted === "-I" || unquoted === "--use-compress-program") {
+        pendingTarProgramValue = true;
+      }
+    }
     if (pendingOpensslConfigFile) {
       pendingOpensslConfigFile = false;
       // A published OpenSSL config can load another collected document as a
@@ -3073,7 +3134,10 @@ function hasDisguisedAssignment(
         return true;
       }
     }
-    if (pendingJavaClassPathValue) {
+    if (pendingJavaPatchModuleValue) {
+      pendingJavaPatchModuleValue = false;
+      if (javaPatchModulePublishesExecutable(unquoted, rootPrefixes, trackedCwd)) return true;
+    } else if (pendingJavaClassPathValue) {
       pendingJavaClassPathValue = false;
       if (javaClassPathPublishesExecutable(unquoted, rootPrefixes, trackedCwd)) return true;
     } else if (pendingJavaOptionValue) {
@@ -3088,12 +3152,27 @@ function hasDisguisedAssignment(
         // localizes, and any other @-file leaves tracking armed because the options
         // it expands to are not visible here.
         if (isShellResolvedPublishedOperand(unquoted.slice(1))) return true;
-      } else if (isJavaClassPathOption(unquoted)) {
+      } else if (
+        isJavaClassPathOption(unquoted) ||
+        /^(?:-p|--module-path|--upgrade-module-path)$/.test(unquoted)
+      ) {
         pendingJavaClassPathValue = true;
-      } else if (unquoted.startsWith("--class-path=")) {
+      } else if (/^--(?:class-path|module-path|upgrade-module-path)=/.test(unquoted)) {
         if (
           javaClassPathPublishesExecutable(
-            unquoted.slice("--class-path=".length),
+            unquoted.slice(unquoted.indexOf("=") + 1),
+            rootPrefixes,
+            trackedCwd
+          )
+        ) {
+          return true;
+        }
+      } else if (unquoted === "--patch-module") {
+        pendingJavaPatchModuleValue = true;
+      } else if (unquoted.startsWith("--patch-module=")) {
+        if (
+          javaPatchModulePublishesExecutable(
+            unquoted.slice("--patch-module=".length),
             rootPrefixes,
             trackedCwd
           )
@@ -3241,6 +3320,13 @@ function hasDisguisedAssignment(
       if (inherited.pythonPathHook && PYTHON_LAUNCHER_NAME.test(executable)) return true;
       if (inherited.javaClassPathHook && JAVA_RUNTIME_LAUNCHER_NAME.test(executable)) return true;
       if (inherited.luaStartupHook && LUA_LAUNCHER_NAME.test(executable)) return true;
+      if (
+        inherited.perlDebuggerHook &&
+        inherited.perlDebuggerEnvHook &&
+        PERL_LAUNCHER_NAME.test(executable)
+      ) {
+        return true;
+      }
       // The dynamic loader injects an inherited published preload into every
       // dynamically linked launcher, ahead of whatever the command runs.
       if (inherited.loaderPreloadHook) return true;
@@ -3265,6 +3351,7 @@ function hasDisguisedAssignment(
       if (/^lldb(?:-[0-9.]+)?$/.test(executable)) pendingLldbOptions = true;
       if (/^(?:.*-)?gdb(?:-multiarch)?(?:-[0-9.]+)?$/.test(executable)) pendingGdbOptions = true;
       if (/^ninja(?:-build)?$/.test(executable)) pendingNinjaOptions = true;
+      if (/^g?tar$/.test(executable)) pendingTarOptions = true;
       if (executable === "java" || executable === "javaw") pendingJavaOptions = true;
       if (executable === "start-stop-daemon") pendingStartStopDaemonOptions = true;
       if (executable === "systemd-run") pendingSystemdRunOptions = true;
@@ -3773,28 +3860,58 @@ interface InheritedLaunchContext {
   opensslConfigHook: boolean;
   /** A non-empty PERL5DB program runs when Perl's debugger is enabled. */
   perlDebuggerHook: boolean;
+  /** PERL5OPT enables the debugger before command-line option parsing. */
+  perlDebuggerEnvHook: boolean;
   /** CMAKE_TOOLCHAIN_FILE names an auto-published toolchain script. */
   cmakeToolchainHook: boolean;
   /** MAKEFILES includes an auto-published makefile before the normal inputs. */
   makefilesHook: boolean;
 }
 
-/** Whether inherited NODE_OPTIONS asks Node to execute a preload/import module. */
-function hasInheritedNodeCodeOptions(value: unknown): boolean {
+/** Whether inherited NODE_OPTIONS asks Node to execute a preload/import/config input. */
+function hasInheritedNodeCodeOptions(value: unknown, rootPrefixes: readonly string[]): boolean {
   if (typeof value !== "string" || value === "") return false;
+  let sharedOpenSslConfig = false;
+  let publishedOpenSslConfig = false;
+  let pendingOpenSslConfig = false;
   for (const match of value.matchAll(SHELL_WORD)) {
     const option = unquoteShellWord(match[0]);
+    if (pendingOpenSslConfig) {
+      pendingOpenSslConfig = false;
+      publishedOpenSslConfig ||= isAutoPublishedScriptOperand(
+        canonicalizeInheritedPath(option),
+        rootPrefixes
+      );
+      continue;
+    }
     if (/^(?:-r(?:.*)|--(?:require|import|loader|experimental-loader)(?:=|$))/.test(option)) {
       return true;
     }
+    if (option === "--openssl-shared-config") sharedOpenSslConfig = true;
+    const config = /^--openssl-config=(.+)$/.exec(option)?.[1];
+    if (config !== undefined) {
+      publishedOpenSslConfig ||= isAutoPublishedScriptOperand(
+        canonicalizeInheritedPath(config),
+        rootPrefixes
+      );
+    } else if (option === "--openssl-config") {
+      pendingOpenSslConfig = true;
+    }
   }
-  return false;
+  return sharedOpenSslConfig && publishedOpenSslConfig;
+}
+
+function hasInheritedPerlDebuggerOption(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  return [...value.matchAll(SHELL_WORD)].some((match) =>
+    /^-d(?:$|[:t])/.test(unquoteShellWord(match[0]))
+  );
 }
 
 /**
- * JVM option variables inject execution into every launched JVM: an agent
- * archive runs its premain, and a boot-class-path entry supplies executable
- * classes ahead of the application regardless of filename extension.
+ * JVM option variables inject execution into every launched JVM: agents,
+ * class/module paths, module patches, boot paths, and argument files can all
+ * supply executable bytecode before the application starts.
  */
 function hasInheritedJavaLaunchOptions(
   values: readonly unknown[],
@@ -3802,10 +3919,18 @@ function hasInheritedJavaLaunchOptions(
 ): boolean {
   for (const value of values) {
     if (typeof value !== "string") continue;
+    let pendingPathOption: "path" | "patch" | null = null;
     for (const match of value.matchAll(SHELL_WORD)) {
       const option = unquoteShellWord(match[0]);
-      // The JVM expands an inherited @argument file into options before
-      // parsing, so a published file can inject an agent or boot class path.
+      if (pendingPathOption !== null) {
+        const publishes =
+          pendingPathOption === "patch"
+            ? javaPatchModulePublishesExecutable(option, rootPrefixes, null)
+            : javaClassPathPublishesExecutable(option, rootPrefixes, null);
+        pendingPathOption = null;
+        if (publishes) return true;
+        continue;
+      }
       if (
         option.startsWith("@") &&
         isAutoPublishedScriptOperand(canonicalizeInheritedPath(option.slice(1)), rootPrefixes)
@@ -3821,13 +3946,34 @@ function hasInheritedJavaLaunchOptions(
       }
       const bootClassPath = /^-Xbootclasspath(?:\/[ap])?:(.+)$/.exec(option)?.[1];
       if (
-        bootClassPath
-          ?.split(path.delimiter)
-          .some((entry) =>
-            isAutoPublishedScriptOperand(canonicalizeInheritedPath(entry), rootPrefixes)
-          ) === true
+        bootClassPath !== undefined &&
+        javaClassPathPublishesExecutable(bootClassPath, rootPrefixes, null)
       ) {
         return true;
+      }
+      const pathOption = /^--(?:class-path|module-path|upgrade-module-path)=(.+)$/.exec(
+        option
+      )?.[1];
+      if (
+        pathOption !== undefined &&
+        javaClassPathPublishesExecutable(pathOption, rootPrefixes, null)
+      ) {
+        return true;
+      }
+      const patchModule = /^--patch-module=(.+)$/.exec(option)?.[1];
+      if (
+        patchModule !== undefined &&
+        javaPatchModulePublishesExecutable(patchModule, rootPrefixes, null)
+      ) {
+        return true;
+      }
+      if (
+        isJavaClassPathOption(option) ||
+        /^(?:-p|--module-path|--upgrade-module-path)$/.test(option)
+      ) {
+        pendingPathOption = "path";
+      } else if (option === "--patch-module") {
+        pendingPathOption = "patch";
       }
     }
   }
@@ -3954,6 +4100,7 @@ function hasInheritedGitExecutionHook(
   const nestedContext = { ...inherited, gitConfigHook: false };
   for (const command of [
     process.env.GIT_SSH_COMMAND,
+    process.env.GIT_PROXY_COMMAND,
     process.env.GIT_EDITOR,
     process.env.GIT_SEQUENCE_EDITOR,
     process.env.GIT_PAGER,
@@ -4000,7 +4147,7 @@ function redactMcpConfig(
       .map(canonicalizeInheritedPath)
       .filter((entry) => isUnderCollectedRoot(entry, rootPrefixes)),
     cdPathDirs: (process.env.CDPATH ?? "").split(path.delimiter).map(canonicalizeInheritedPath),
-    nodeCodeOptions: hasInheritedNodeCodeOptions(process.env.NODE_OPTIONS),
+    nodeCodeOptions: hasInheritedNodeCodeOptions(process.env.NODE_OPTIONS, rootPrefixes),
     pythonStartupHook: isAutoPublishedScriptOperand(
       canonicalizeInheritedPath(process.env.PYTHONSTARTUP ?? ""),
       rootPrefixes
@@ -4031,6 +4178,7 @@ function redactMcpConfig(
       rootPrefixes
     ),
     perlDebuggerHook: (process.env.PERL5DB ?? "").trim() !== "",
+    perlDebuggerEnvHook: hasInheritedPerlDebuggerOption(process.env.PERL5OPT),
     cmakeToolchainHook: isAutoPublishedScriptOperand(
       canonicalizeInheritedPath(process.env.CMAKE_TOOLCHAIN_FILE ?? ""),
       rootPrefixes
