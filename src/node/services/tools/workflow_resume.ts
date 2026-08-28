@@ -204,15 +204,6 @@ export const createWorkflowResumeTool: ToolFactory = (config: ToolConfiguration)
         runId,
         projectTrusted: config.trusted === true,
       };
-      // Provenance must be durable BEFORE the dispatch: background execution starts at lease
-      // acquisition, and a fast run (or a process exit mid-dispatch) can reach terminal state
-      // before any post-dispatch write, permanently superseding its wake. A failed dispatch
-      // leaves the re-recorded reference behind, which is benign: it mirrors what a
-      // successful resume would persist for a run this turn explicitly re-engaged with, and
-      // rediscovery filters against the run store.
-      if (args.run_in_background === true) {
-        await recordBackgroundWorkflowRunReference(config, runId, invocationStartedAtMs);
-      }
       let dispatched: { runId: string; status: string; result: unknown };
       try {
         if (mode === "retry_from_checkpoint") {
@@ -243,11 +234,15 @@ export const createWorkflowResumeTool: ToolFactory = (config: ToolConfiguration)
 
       // Background-style resumes outlive this turn; persist provenance so the run is
       // rediscoverable (task_await/task_list) and its terminal result re-engages the agent.
-      // Explicit background resumes already recorded it pre-dispatch; this covers a
-      // foreground resume that backgrounded itself.
+      // Deliberately AFTER the dispatch, unlike workflow_run's onRunCreated record: the
+      // resumed run sits in an old terminal state until the dispatch durably restarts it, and
+      // a pre-dispatch reference would let a crash in that window make startup recovery
+      // deliver the stale failure/interruption as a current wake. Recording late fails safe
+      // instead (a crash loses this resume's wake); with the process alive, delivery always
+      // waits for the owner to go idle, by which point this record is durable.
       const isBackgroundDispatch =
         args.run_in_background === true || dispatched.status === "backgrounded";
-      if (isBackgroundDispatch && args.run_in_background !== true) {
+      if (isBackgroundDispatch) {
         await recordBackgroundWorkflowRunReference(config, runId, invocationStartedAtMs);
       }
 

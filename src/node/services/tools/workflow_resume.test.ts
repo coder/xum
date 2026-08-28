@@ -169,8 +169,9 @@ describe("workflow_resume tool", () => {
 
   test("resumes in background and records an agent workflow run reference", async () => {
     using tempDir = new TestTempDir("test-workflow-resume-bg");
-    // The reference must be durable BEFORE the dispatch: background execution starts at lease
-    // acquisition, and a fast run could otherwise reach terminal state with no provenance.
+    // The reference must NOT be durable before the dispatch: the run still sits in its old
+    // terminal state until the dispatch restarts it, and a pre-dispatch reference would let a
+    // crash in that window replay the stale failure/interruption as a current wake.
     let referenceDurableAtDispatch = false;
     const workflowService = buildWorkflowService({
       resumeRunInBackground: mock(async () => {
@@ -198,7 +199,7 @@ describe("workflow_resume tool", () => {
       projectTrusted: false,
     });
     expect(workflowService.resumeRun).not.toHaveBeenCalled();
-    expect(referenceDurableAtDispatch).toBe(true);
+    expect(referenceDurableAtDispatch).toBe(false);
     const references = await readAgentWorkflowRunReferences(tempDir.path);
     expect(references.map((reference) => reference.runId)).toContain("wfr_resume_me");
     expect(result).toMatchObject({ status: "running", runId: "wfr_resume_me", mode: "resume" });
